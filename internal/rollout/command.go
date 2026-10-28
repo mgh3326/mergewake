@@ -204,7 +204,16 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			name := j.Order[i]
 			prior := j.Targets[name]
 			s, ok := specs[name]
-			if !ok || recipe(s) != prior.Recipe || !manifest.SHA.MatchString(prior.SHA) {
+			denied := false
+			for _, g := range o.Deny {
+				match, e := policy.Match(g, name)
+				if e != nil {
+					errs = append(errs, e)
+					denied = true
+				}
+				denied = denied || match
+			}
+			if denied || !ok || recipe(s) != prior.Recipe || !manifest.SHA.MatchString(prior.SHA) {
 				errs = append(errs, errors.New("rollback recipe changed or previous SHA missing"))
 				continue
 			}
@@ -321,8 +330,20 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			return
 		}
 	}
+	publish := func() error {
+		for _, s := range selected {
+			if s.ReceiptsDir != "" {
+				name := filepath.Join(config.Expand(s.ReceiptsDir), m.Commit, host, s.Target+".json")
+				if e := writeJSON(name, GateReceipt{host, m.Repo, s.Target, m.Commit, "success"}); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
+	}
 	if current && old.Manifest.Commit == m.Commit {
 		res.Status = "current"
+		err = publish()
 		return
 	}
 	if err = writeJSON(journalPath, j); err != nil {
@@ -382,14 +403,6 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		return
 	}
 	res.Status = "success"
-	for _, s := range selected {
-		if s.ReceiptsDir != "" {
-			name := filepath.Join(config.Expand(s.ReceiptsDir), m.Commit, host, s.Target+".json")
-			if e = writeJSON(name, GateReceipt{host, m.Repo, s.Target, m.Commit, "success"}); e != nil {
-				err = e
-				return
-			}
-		}
-	}
+	err = publish()
 	return
 }

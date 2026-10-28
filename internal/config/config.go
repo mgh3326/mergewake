@@ -114,7 +114,7 @@ func Load(name string) (Config, error) {
 	if e = Decode(f, &c); e != nil {
 		return c, e
 	}
-	if c.Version != 1 || c.Host == "" {
+	if c.Version != 1 || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(c.Host) {
 		return c, errors.New("config requires version: 1 and host")
 	}
 	if c.StateDir == "" {

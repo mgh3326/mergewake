@@ -9,7 +9,7 @@ import (
 )
 
 func TestHelpAndFlagValidation(t *testing.T) {
-	for _, cmd := range []string{"land", "review", "watch", "release", "rollout", "agent", "status", "superfan"} {
+	for _, cmd := range []string{"land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "superfan"} {
 		t.Run(cmd, func(t *testing.T) {
 			var out bytes.Buffer
 			if e := run(context.Background(), []string{cmd, "--help"}, &out, &out); e != nil {

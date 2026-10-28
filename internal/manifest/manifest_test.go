@@ -63,3 +63,15 @@ func TestResolveSymlinks(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestCommandManifestCarriesNoExecutableRecipe(t *testing.T) {
+	specs := []config.Install{{Kind: "command", Target: "tools/example", Command: config.Command{Command: "local-installer", Args: []string{"{sha}"}}}}
+	m, e := Build("example/project", strings.Repeat("a", 40), specs, nil)
+	if e != nil || m.Version != 2 || len(m.Commands) != 1 || len(m.Files) != 0 {
+		t.Fatalf("manifest=%+v err=%v", m, e)
+	}
+	m.Files = []File{{Source: "tool", Target: "bin/tool"}}
+	if m.Validate() == nil {
+		t.Fatal("mixed file/command transaction accepted")
+	}
+}

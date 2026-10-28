@@ -64,3 +64,28 @@ func TestAdapterErrorsPropagate(t *testing.T) {
 		t.Fatal("show failure did not stop transition")
 	}
 }
+
+type oldServerRunner struct{ calls int }
+
+func (r *oldServerRunner) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
+	r.calls++
+	if args[1] == "show" {
+		return []byte(`{"state":"merged"}`), nil
+	}
+	if args[1] == "reopen" {
+		return nil, errors.New("HTTP 404: unsupported operation")
+	}
+	return nil, nil
+}
+func TestReopenOlderServerFailsExplicitly(t *testing.T) {
+	r := &oldServerRunner{}
+	h := Handoffkeep{r, "handoffkeep", "reopened"}
+	err := h.Reopen(context.Background(), "42", "reverted")
+	if err == nil || !strings.Contains(err.Error(), "comment recorded") || !strings.Contains(err.Error(), "lack explicit reopen support") || r.calls != 3 {
+		t.Fatalf("calls=%d err=%v", r.calls, err)
+	}
+	before := r.calls
+	if h.Reopen(context.Background(), "42", " ") == nil || r.calls != before {
+		t.Fatal("empty reason sent requests")
+	}
+}

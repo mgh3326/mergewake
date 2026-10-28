@@ -29,12 +29,30 @@ flowchart TD
     O --> Q[Resident component monitors]
 ```
 
-A webhook adapter or scheduler can invoke `review` and `land` on PR events.
-mergewake intentionally does not ship an HTTP webhook server. `watch` and `agent`
-provide resident polling loops; `--once` supports an external scheduler. A green
-watch result does not implicitly publish a release: the scheduler invokes
-`release` after green CI. These are separate commands so release credentials
-and installation authority can live on separate hosts.
+`daemon` runs one goroutine per enabled role: PR polling feeds review and land,
+main CI feeds watch, green-main detection feeds release, and host polling feeds
+rollout. Each role polls every configured repo and reports errors independently.
+Polling alone completes delivery; no public ingress is required. The daemon
+package exposes `Trigger(role)` for optional trusted webhook adapters. Timers
+remain active if no adapter is present.
+
+Every role uses positive jitter and exponential backoff (capped at 30 minutes,
+or its configured interval when longer). The shared GitHub transport serializes
+requests, revalidates cached GET bodies with ETags, observes X-Poll-Interval,
+X-RateLimit-Remaining/Reset and Retry-After, and delays subsequent requests.
+Mutations are never implicitly retried and invalidate cached representations.
+
+OS advisory locks in the user's cache directory exclude duplicate host roles
+even across different state/config directories, and release automatically at
+process exit. Operators running multiple users must use a single service account.
+Per-role status files are atomically written under state_dir/daemon. Cancellation
+stops new polls and aborts API/model/install work. Local command process groups
+are killed together; rollback uses a fresh bounded context before shutdown
+returns. File and command journals preserve recovery after a hard kill.
+
+Shadow is the daemon default. Acting requires host `daemon.act` and `--apply`;
+landing and recovery also obey repository policy. Standalone review, release and
+rollout likewise require `--apply`.
 
 ## Package boundaries
 
@@ -43,6 +61,7 @@ and installation authority can live on separate hosts.
 | `config` | Strict YAML, model-option validation, explicit host and repo selection. |
 | `policy` | Slash-aware path globs, previous names on renames, change-kind matching. |
 | `github` | Bounded HTTP requests and pagination, CI evidence, PR operations, inverse trees, release assets. |
+| `daemon` | Independent role scheduling, advisory locks, status, backoff and optional triggers. |
 | `pipeline` | Landing, one-pass review, CI diagnosis, release and rollout orchestration. |
 | `manifest` | Deterministic inventories, SHA256 and size validation, safe relative paths. |
 | `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, rollback. |
@@ -130,10 +149,10 @@ latch remains. No distributed service or lease system is needed.
 After opening a revert, the sink records recovery and attempts to reopen the
 origin task, and the notifier posts an event with a deterministic ID. A
 `Mergewake-Task` PR trailer selects the task, with a configured repo task as a
-fallback. The handoffkeep adapter uses show, comment, then transition. Its current
-upstream state machine prohibits terminal reopening: the comment survives, the
-error is returned and included in the notification, and the latch stays set.
-This limitation needs an upstream API or another Sink implementation.
+fallback. The handoffkeep adapter uses show, comment, then the explicit reopen
+operation with a required reason, entering `reopened`. Unsupported older servers
+and protected authority refusals return a clear failure after the comment; the
+notification includes it and the recovery latch remains set.
 
 ## Manifests and verified installs
 
@@ -197,9 +216,15 @@ operators must give each inventory its own root.
 - The release asset is authenticated through GitHub and checked against Git
   contents and a tag. There is no signature, transparency log, or offline trust
   root; repository writers and host config owners are trusted.
-- Install sources are Git-backed regular files. Building and uploading binary
-  payloads, package managers, remote host execution, service supervision, database
-  migrations, deployment windows, and fleet-wide canaries are outside this version.
+- File manifests use schema 1; command/release manifests use schema 2. Mixed
+  file and command inventories in one transaction are refused. Host recipes are
+  trusted local code and can have side effects beyond the target label. Only the
+  same pinned installer, verify and smoke can establish rollback success; this
+  cannot reverse database changes or arbitrary external actions.
+- Serial/canary gates trust operator-owned success receipts. The desk must share
+  or replicate that directory across hosts; mergewake supplies no fleet transport.
+- The v* workflow builds release binaries; no service activation or restart occurs.
+  Service units are examples for the desk to install separately.
 - CI recovery uses recorded checks; any-ref workflow dispatch and flaky-test
   reruns are not implemented. Missing evidence deliberately requires an operator.
 - Superfan contracts guide a trusted session runner; the binary neither enforces
@@ -214,3 +239,27 @@ operators must give each inventory its own root.
 These constraints keep the first release reviewable while providing real API
 operations, durable local rollback, and an explicit path from shadow observation
 to operator-approved activation.
+
+## Command and release installs
+
+A schema-2 manifest contains commit, repo and logical target/kind pairs. It never
+carries executable commands. The host config independently supplies recipes,
+verify expectations and deny patterns. For pure `release` inventories, rollout
+selects the newest compatible published v* release and resolves its tag to a
+commit, then checks main ancestry and CI as usual. The binary downloader resolves
+the requested SHA to a release tag and checks SHA256SUMS and asset size before
+atomic replacement; it rechecks the tag after download.
+
+Before mutation every selected target needs an installed receipt or an explicit
+initial_sha whose verify command proves the prior installation. The journal
+records each previous SHA and recipe fingerprint before each command begins.
+On install/verify/smoke failure, cancellation or interrupted-process recovery,
+the exact same recipe reinstalls the previous SHA, verifies it and runs smoke.
+Failed rollback retains the journal; every attempt writes a rollback receipt and
+rejects the failed release. An operator must inspect before retry. Changed recipes
+or newly denied rollback targets cause refusal rather than unauthorized execution.
+
+Only after every target's verification and smoke pass are the installed receipt
+and per-target gate receipts published. A serial host waits for earlier hosts;
+a canary follower waits for the canary's success for this exact repo/commit/target.
+Repeated healthy polls reverify commands and can repair missing shared receipts.

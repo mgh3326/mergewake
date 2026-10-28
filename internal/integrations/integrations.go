@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -40,6 +41,8 @@ func (Exec) Run(ctx context.Context, command string, args []string, input, dir s
 		return nil, errors.New("empty command")
 	}
 	c := exec.CommandContext(ctx, command, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
 	c.Dir = dir
 	c.Stdin = strings.NewReader(input)
 	c.WaitDelay = 2 * time.Second
@@ -98,6 +101,9 @@ type Handoffkeep struct {
 var TaskID = regexp.MustCompile(`^[1-9][0-9]*$`)
 
 func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
+	if strings.TrimSpace(note) == "" {
+		return errors.New("reopen requires a reason")
+	}
 	if !TaskID.MatchString(task) {
 		return errors.New("task ID must be a positive integer")
 	}
@@ -119,9 +125,6 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 
 	if current.State != "merged" && current.State != "dropped" {
 		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged or dropped", task, current.State)
-	}
-	if strings.TrimSpace(note) == "" {
-		return errors.New("reopen requires a reason")
 	}
 	_, e = h.Runner.Run(ctx, h.Command, []string{"tasks", "reopen", task, "--reason", note}, "", "")
 	if e != nil {

@@ -3,7 +3,7 @@
 **The after-merge pipeline for your agent fleet.**
 
 mergewake is one Go binary for policy-based landing, one independent review per
-PR head, main CI recovery, release manifests, verified file rollouts, and
+PR head, main CI recovery, release manifests, verified file and command rollouts, a polling daemon, and
 experimental resident monitors. It stays on Git and GitHub. Hosts and model
 pairings are configuration, so the same tool runs across macOS, Linux, and
 Linux arm64 hosts.
@@ -40,10 +40,19 @@ value in either YAML file.
 ./mergewake watch --config /path/to/host.yaml --repo example/project --once --shadow
 ```
 
-Without `--dry-run`, `review` invokes a model and posts its findings. Shadow mode
-applies to landing and CI recovery only. Dry runs make no remote writes, run no
-reviewer or smoke command, and write no local state. Shadow observations are
-printed and appended to the host's `decisions.jsonl`.
+Review, release, rollout and agent commands stay in shadow mode unless passed
+`--apply`. `land` and `watch` also require repository policy opt-in; `--shadow`
+forces observation. `--dry-run` makes no remote writes, runs no reviewer or smoke
+command, and writes no pipeline state. Daemon status and role locks are local
+supervision state; the daemon keeps them even while observing.
+
+Install a published binary without Go (the command below is for an operator):
+
+```sh
+curl -fsSLo /tmp/mergewake-install.sh https://raw.githubusercontent.com/mgh3326/mergewake/v0.2.0/install.sh
+sh /tmp/mergewake-install.sh --tag v0.2.0
+# Use --tag latest for the latest release; default destination: ~/.local/bin/mergewake
+```
 
 ## Components
 
@@ -54,6 +63,8 @@ printed and appended to the host's `decisions.jsonl`.
 | `watch --repo …` | Poll main CI, find a green-to-red boundary among squash commits using existing checks, open a revert PR, reopen the task when its API permits, and notify. `--once` inspects once. |
 | `release --repo …` | Verify green main ancestry and publish an immutable manifest as a GitHub Release asset. `--commit` accepts a full SHA. |
 | `rollout --repo …` | Pull the newest mergewake manifest, verify bytes, install permitted files, smoke-test, roll back on failure, and report. |
+| `daemon` | Run enabled PR, CI watch, green-main release and host rollout loops concurrently. Shadow by default; acting needs `daemon.act: true` and `--apply`. |
+| `status --daemon` | Show each role’s last run, last error, failure count and next run. |
 | `agent` | Poll all configured repositories for verified rollouts. `--once` runs a single poll; `--repo` selects one. |
 | `status` | Read local receipts and check installed digests and modes. Returns failure on drift; supports `--repo`. |
 | `superfan --name …` | Print a relay, CI, quota, or drift monitor spec. `--launch --runner /path/to/runner` sends it to a trusted session runner on stdin. |
@@ -78,23 +89,27 @@ Adapters use only APIs or CLI argument vectors:
 
 - GitHub REST plus a read-only GraphQL query for review-thread resolution.
 - `panewire emit` for notifications, with stdout and no-op alternatives.
-- `handoffkeep tasks show`, `comment`, `transition`, and `doc put` for task recovery
+- `handoffkeep tasks show`, `comment`, `reopen`, and `doc put` for task recovery
   and rollout records; a no-op sink is available.
 - Optional `scopefuel gate -m <profile>` before a configured reviewer runs.
 
-The current handoffkeep API does not reopen terminal `merged` or `dropped` tasks.
-mergewake records a recovery comment, surfaces the failed transition, and reports
-the limitation in the notification. It does not claim that the task reopened.
-Supporting terminal reopen requires a task sink with that capability or an upstream
-handoffkeep API change.
+The handoffkeep sink uses explicit `tasks reopen ID --reason TEXT`, entering the
+separate `reopened` state. A recovery comment survives if an older CLI/server
+lacks the operation, and the failure is returned and included in the notification.
+The server update must be deployed separately; protected task authority fences
+remain enforced.
 
-This initial release supports linear squash history, existing CI evidence,
-regular Git-backed files, and operator-managed session runners. Missing CI,
-overlapping later edits during a revert, and unsupported Git file types stop the
-action. There is no any-ref CI dispatcher, binary artifact builder, service
-manager, fleet transport, or durable notification outbox. See
-[DESIGN.md](DESIGN.md) for failure handling and [docs/config.md](docs/config.md)
-for every configuration key and recovery procedure.
+Polling needs no public ingress. Conditional GitHub requests, rate headers,
+jitter, bounded backoff, role locks and local status support supervision; examples
+are in [deploy/](deploy/). An optional in-process trigger seam can wake roles from
+trusted webhook adapters without changing the pipeline.
+
+Command installs use host-owned recipes with `{sha}` arguments, exact-output
+verification, smoke checks, prior-SHA journals and rollback receipts. `release`
+installs download the same checksummed binaries as `install.sh`. Serial/canary
+ordering uses success receipts supplied through an operator-owned shared or
+replicated directory. See [docs/config.md](docs/config.md) for templates and
+remaining operating limits, and [DESIGN.md](DESIGN.md) for failure boundaries.
 
 ## Development
 

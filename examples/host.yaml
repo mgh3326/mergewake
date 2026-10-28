@@ -48,3 +48,11 @@ sink:
   type: noop
   command: handoffkeep
   reopen_state: reopened
+# All daemon roles are optional and shadow by default. Opting into action also
+# needs --apply; land/watch still obey the repository policy.
+daemon:
+  act: false
+  pr: {enabled: false, interval: 60s}
+  watch: {enabled: false, interval: 60s}
+  release: {enabled: false, interval: 2m}
+  rollout: {enabled: false, interval: 2m}

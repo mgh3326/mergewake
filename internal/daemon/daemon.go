@@ -36,6 +36,7 @@ type Status struct {
 }
 type Daemon struct {
 	StateDir, Host string
+	LockDir        string
 	Log            *slog.Logger
 	RateWait       func() time.Duration
 	mu             sync.Mutex
@@ -73,7 +74,10 @@ func lock(name string) (*os.File, error) {
 }
 func Delay(interval time.Duration, failures int, rate time.Duration) time.Duration {
 	n := min(failures, 8)
-	base := min(interval*time.Duration(1<<n), max(interval, 30*time.Minute))
+	base := interval
+	for i := 0; i < n && base < 30*time.Minute; i++ {
+		base = min(base*2, 30*time.Minute)
+	}
 	// Positive jitter never wakes before a rate-limit reset.
 	return max(base, rate) + time.Duration(rand.Float64()*0.2*float64(base))
 }
@@ -87,6 +91,14 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	d.mu.Lock()
 	d.wake = map[string]chan struct{}{}
 	d.mu.Unlock()
+	lockDir := d.LockDir
+	if lockDir == "" {
+		cache, err := os.UserCacheDir()
+		if err != nil {
+			return err
+		}
+		lockDir = filepath.Join(cache, "mergewake", "daemon-locks")
+	}
 	var locks []*os.File
 	defer func() {
 		for _, f := range locks {
@@ -103,7 +115,7 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 		if exists || (l.Role != "pr" && l.Role != "watch" && l.Role != "release" && l.Role != "rollout") {
 			return errors.New("invalid or duplicate daemon role")
 		}
-		f, err := lock(filepath.Join(d.StateDir, "daemon", l.Role+".lock"))
+		f, err := lock(filepath.Join(lockDir, l.Role+".lock"))
 		if err != nil {
 			return fmt.Errorf("%s: %w", l.Role, err)
 		}

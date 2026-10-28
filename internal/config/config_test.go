@@ -60,3 +60,22 @@ func TestExampleConfig(t *testing.T) {
 		t.Fatal(c)
 	}
 }
+
+func TestCommandAndDaemonValidation(t *testing.T) {
+	for _, tc := range []struct {
+		extra string
+		fail  bool
+	}{
+		{"daemon:\n  pr: {enabled: true, interval: 0s}\n", true},
+		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: ['{sha}']}\n        verify: {command: verify}\n", false},
+		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: [main]}\n        verify: {command: verify}\n", true},
+		{"repos:\n  - name: example/project\n    install:\n      - kind: release\n        target: bin/mergewake\n        verify: {command: verify}\n        canary: host-a\n", true},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
+		_, err := Load(path)
+		if (err != nil) != tc.fail {
+			t.Fatalf("config %s err=%v", tc.extra, err)
+		}
+	}
+}

@@ -257,6 +257,16 @@ func status(c config.Config, repo string, out io.Writer) error {
 			errs = append(errs, fmt.Errorf("%s: root required for status", r.Name))
 			continue
 		}
+		commands := false
+		for _, spec := range r.Install {
+			commands = commands || spec.Kind == "command" || spec.Kind == "release"
+		}
+		if commands {
+			if err := commandStatus(c, r, out); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
 		b, e := os.ReadFile(filepath.Join(c.StateDir, r.Name, "rollout", "installed.json"))
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))

@@ -23,6 +23,7 @@ Different hosts may use the same inventory and different deny lists.
 | `poll_interval` | `60s` | Positive Go duration between completed `watch` or `agent` iterations. |
 | `watch_limit` | `100` | Maximum commit interval inspected during recovery, from 2 through 1000. |
 | `repos` | Empty list | Repositories this host may operate on. Names must be unique; `agent` requires at least one. |
+| `daemon` | All roles disabled | Role config and explicit acting opt-in; see below. |
 | `review` | Empty object | Independent-review configuration described below. |
 | `notifier` | No-op | Notification adapter described below. |
 | `sink` | No-op | Task and report adapter described below. |
@@ -45,7 +46,8 @@ Each `install[]` entry has:
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
-| `source` | Required | Regular Git file at the release commit, relative to repo root. Symlinks, trees, submodules and files over 32 MiB are refused. |
+| `kind` | `file` | `file`, `command`, or `release`. A repo inventory cannot mix files with commands/releases. |
+| `source` | Required for file | Regular Git file at the release commit, relative to repo root. Symlinks, trees, submodules and files over 32 MiB are refused. |
 | `target` | Required | Clean relative path beneath `root`. Absolute paths, traversal, duplicate targets, and file/directory overlaps are refused. |
 | `mode` | Quoted `"0644"` | Octal string: only `"0644"` and `"0755"`. Must agree with the manifest. |
 
@@ -127,21 +129,15 @@ Healthy repeated agent polls do not emit a fresh installation notification.
 | --- | --- | --- |
 | `type` | `noop` (also empty) | `noop` or `handoffkeep`. |
 | `command` | `handoffkeep` for that adapter | Executable path or a compatible CLI wrapper. |
-| `reopen_state` | `in_progress` | State requested after a CI regression. The upstream queue must permit that transition. |
+| `reopen_state` | `reopened` | Only `reopened` is accepted; terminal tasks use the explicit reason-required operation. |
 
-The handoffkeep adapter calls `tasks show ID`, then `tasks comment ID --body TEXT`,
-then `tasks transition ID --to STATE --note TEXT`. For `in_progress`/`claimed`, it
-adds an explicit `--no-job` reason: recovery does not claim an agent session.
-If the task is already in the requested state, only the recovery comment is
-added. Task IDs must be positive integers. Structured recovery/rollout reports
-use `doc put --key KEY --kind note --file FILE` with a temporary JSON file.
-
-The currently referenced handoffkeep API has no legal transition out of terminal
-`merged` or `dropped`. The adapter still records the comment and attempts the
-requested transition, but returns a clear error if it is refused; the watcher
-includes that failure in its notification. Another Sink implementation or a
-compatible future API can supply terminal reopen. No database or integration
-source code is modified.
+The handoffkeep adapter calls `tasks show ID`, `tasks comment ID --body TEXT`,
+then `tasks reopen ID --reason TEXT` for a merged or dropped task. An already
+reopened task only receives the comment. Empty reasons are refused. An older
+CLI/server that lacks reopen returns an explicit failure; the recovery comment
+is retained and the watch notification reports the failure. Protected upstream
+authority fences remain enforced. No fallback generic transition is attempted.
+Structured reports use `doc put --key KEY --kind note --file FILE`.
 
 ## Per-repo policy
 
@@ -183,12 +179,9 @@ Mergewake-Task: 42
 Treat the family label as trusted automation metadata, not model provenance
 attestation. A handoffkeep-backed watcher refuses recovery with no valid task ID.
 
-Schedule `review --repo OWNER/REPO --pr NUMBER` on PR opened/synchronize events,
-then invoke `land` after CI/review updates. Schedule `release` after green main
-CI; it only publishes a manifest and never commits one. Run `watch` and `agent`
-as foreground processes under your existing process supervisor, or use `--once`.
-Signal interruption exits resident loops; no launchd/systemd configuration or
-service installation is performed by the binary.
+Use `daemon` for complete polling, or invoke individual commands from optional
+webhook/scheduler adapters. The binary never installs or enables service units;
+examples in `deploy/` are for the operator's process supervisor.
 
 ## Credentials and trust
 
@@ -254,3 +247,136 @@ model choice, host placement, session lifetime, source collection, and enforceme
 of allowed actions. It should return after launching a resident session. With
 `--dry-run`, mergewake prints the spec and does not execute the runner. Existing
 fleet spawners can be wrapped around this protocol without importing their code.
+
+## Daemon
+
+```yaml
+daemon:
+  act: false
+  pr: {enabled: true, interval: 60s}
+  watch: {enabled: true, interval: 60s}
+  release: {enabled: true, interval: 2m}
+  rollout: {enabled: true, interval: 2m}
+```
+
+All roles default disabled; omitted intervals inherit poll_interval. `daemon`
+runs only configured roles, one goroutine each. Shadow is the default for all
+roles; acting needs both `daemon.act: true` and `mergewake daemon --apply`.
+Land/watch additionally require enabled repository policy. Standalone review,
+release, rollout and agent need `--apply` to mutate. `--shadow` forces the daemon
+back to observation, and `--dry-run` suppresses pipeline state too. The daemon
+still maintains its supervision locks and status in shadow/dry-run modes.
+
+Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
+Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,
+last_error, next_run, running and failures. Values are the last saved observation;
+a hard crash can leave a stale running/next_run value. Role locks use the OS user
+cache under `mergewake/daemon-locks/`, independent of state_dir. Use one service
+account per host. Locks release automatically at exit. Install-transaction locks
+still require inspection after crashes.
+
+Delays have positive jitter up to 20%, exponential failure backoff up to 30m (or
+the base interval if longer), and rate-limit pacing. Conditional GET caches are
+bounded to 32 MiB and revalidated on every request; mutations invalidate them.
+SIGINT/SIGTERM cancel work; command process groups stop together and any rollback
+finishes with an independent timeout. Configure the supervisor's stop timeout
+above the total possible rollback duration for your inventory.
+
+## Command installs and receipt ordering
+
+Each `kind: command` or `kind: release` entry additionally accepts:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `command.command`, `command.args` | Required for command | Trusted installer executable and literal arguments. Args must contain `{sha}`. |
+| `verify.command`, `verify.args` | Required | Read-only verification command, run after install and rollback. |
+| `verify_output` | `{sha}` | Exact trimmed stdout expected from verify; must include `{sha}`. Use a wrapper to validate a version plus revision. |
+| `initial_sha` | Empty | Full previous installed SHA, required until a receipt exists. Verified before mutation. Retain it when editing config so the recipe fingerprint stays stable. |
+| `timeout` | `5m` | Timeout for each install + verify; rollback gets a fresh bounded context. |
+| `serial` | Empty | Ordered list of host labels. A host waits for all preceding hosts' successful receipts for the same commit. |
+| `canary` | Empty | Host label whose successful smoke receipt every other host must see first. |
+| `receipts_dir` | Required with serial/canary | Trusted shared or desk-replicated receipt directory. No network transport is supplied. |
+
+Placeholders `{sha}`, `{repo}`, `{root}` and `{target}` expand in argument values
+only; commands never pass through a shell. Target is a clean relative logical
+install label and remains subject to the per-host deny list. For `release`, it is
+the binary path beneath root. Commands and their other paths are operator-owned;
+manifest targets cannot constrain the side effects of an arbitrary script.
+
+Use separate inventories for files and command installs. The following are
+independent templates, with public-safe placeholders:
+
+```yaml
+# (a) An existing clone; a reviewed wrapper checks out the exact SHA, then runs
+# that repository's own ./install.sh. No git pull or branch name is substituted.
+install:
+  - kind: command
+    target: tools/example
+    command:
+      command: /path/to/install-checkout
+      args: [/path/to/configured-clone, '{sha}']
+    verify:
+      command: /path/to/check-installed-sha
+    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    canary: host-a
+    serial: [host-a, host-b]
+    receipts_dir: /path/to/shared-receipts
+```
+
+A reviewed `install-checkout` wrapper can use the following sequence. It must
+refuse a dirty clone and ensure the configured repository identity is correct;
+the clone must already contain the requested commit:
+
+```sh
+#!/bin/sh
+set -eu
+cd "$1"
+[ -z "$(git status --porcelain)" ]
+git checkout --detach "$2"
+[ "$(git rev-parse HEAD)" = "$2" ]
+./install.sh
+```
+
+```yaml
+# (b) uv installs directly from the pinned commit. The verify wrapper must
+# independently inspect the installed package's recorded source revision.
+install:
+  - kind: command
+    target: tools/example
+    command:
+      command: uv
+      args: [tool, install, --force, 'git+https://github.com/<owner>/<repo>@{sha}']
+    verify: {command: /path/to/check-installed-source-sha}
+    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+```yaml
+# (c) mergewake release binaries, identical assets to install.sh. Pure release
+# inventories poll published v* releases without needing a manifest release.
+root: /path/to/dedicated-root
+install:
+  - kind: release
+    target: bin/mergewake
+    verify: {command: ./bin/mergewake, args: [commit]}
+    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+smoke: {command: ./bin/mergewake, args: [--help]}
+```
+
+The initial SHA must correspond to the installed binary, and a published binary
+release must exist for it so rollback can reinstall it. Bootstrap with install.sh
+as a separate desk action. Binary installs resolve tags to full SHAs, check CI
+and ancestry, verify size and SHA256SUMS, and atomically replace the binary.
+
+Command state uses `command-installed.json` (per-target sha/previous_sha and recipe
+fingerprint), `command-journal.json`, `command-rejected.json`, and timestamped
+`command-rollback-*.json` under the repo's rollout state directory. Recovery
+refuses changed recipes or denied targets. Shared gate receipts live at
+`<receipts_dir>/<sha>/<host>/<target>.json` and are written only after all verify
+and smoke checks pass. Protect that directory: an operator-supplied receipt is a
+trust assertion. Missing, failed, wrong-host, wrong-repo or wrong-SHA receipts
+never authorize a follower. No empty prior SHA is treated as a rollback plan.
+
+`status` checks file digests or runs command verify as appropriate; denied targets
+are reported without execution. There are no implicit service restarts, database
+migration reversals or notifications outbox. Smoke and verification should be
+read-only, and install scripts must be safe to repeat at the same commit.

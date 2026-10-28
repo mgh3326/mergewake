@@ -1,0 +1,16 @@
+[Unit]
+Description=mergewake pipeline daemon (shadow by default)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mergewake daemon --config %h/.config/mergewake/config.yaml
+EnvironmentFile=-%h/.config/mergewake/environment
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=15min
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target
