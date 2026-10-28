@@ -133,11 +133,28 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	d := p.Classify(files)
 	d.Shadow = d.Shadow || o.Shadow
 	d.Action = "wait-for-ci"
+	// While main is red or its required evidence is unknown, ordinary landing
+	// pauses; only a recovery PR from the watch latch may still land.
+	watchChecks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		watchChecks = p.WatchChecks
+	}
+	mainCI, e := s.GH.Check(ctx, r.Name, head, watchChecks)
+	if e != nil {
+		return e
+	}
+	paused := mainCI != github.Green && pr.Head.Ref != github.RecoveryBranch
+	if paused {
+		d.Action = "pause-red-main"
+		if d.Shadow {
+			d.Action = "would-pause-red-main"
+		}
+	}
 	ci, e := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {
 		return e
 	}
-	if ci == github.Green {
+	if !paused && ci == github.Green {
 		d.Action = "merge"
 		if d.Class == "blocking" {
 			done, e := s.GH.Reviewed(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
@@ -160,9 +177,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e = s.audit(r.Name, "land", struct {
 		PR   int       `json:"pr"`
 		Head string    `json:"head"`
+		Base string    `json:"base"`
 		CI   github.CI `json:"ci"`
+		Main github.CI `json:"main"`
 		policy.Decision
-	}{n, pr.Head.SHA, ci, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, ci, mainCI, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, o.DryRun); e != nil {

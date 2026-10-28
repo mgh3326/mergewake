@@ -39,6 +39,8 @@ type fakeGH struct {
 	head                                                         string
 	checks                                                       map[string]github.CI
 	parents                                                      map[string]string
+	parents2                                                     map[string][]string
+	commitPRs                                                    map[string][]github.Pull
 	latch, headChanged                                           bool
 	policyReads                                                  []string
 	m                                                            manifest.Manifest
@@ -101,12 +103,19 @@ func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 }
 func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
 	v := github.Commit{SHA: sha}
-	if p := g.parents[sha]; p != "" {
+	if ps := g.parents2[sha]; len(ps) > 0 {
+		for _, p := range ps {
+			v.Parents = append(v.Parents, github.Ref{SHA: p})
+		}
+	} else if p := g.parents[sha]; p != "" {
 		v.Parents = []github.Ref{{SHA: p}}
 	}
 	return v, nil
 }
-func (g *fakeGH) PRsForCommit(context.Context, string, string) ([]github.Pull, error) {
+func (g *fakeGH) PRsForCommit(_ context.Context, _, sha string) ([]github.Pull, error) {
+	if prs, ok := g.commitPRs[sha]; ok {
+		return prs, nil
+	}
 	return []github.Pull{g.pull}, nil
 }
 func (g *fakeGH) Revert(context.Context, string, string, string, string, int) (string, error) {
@@ -274,6 +283,113 @@ func TestWatchRecoveryLatchAndAdapters(t *testing.T) {
 		})
 	}
 }
+
+// Replay: green → cancelled → non-squash merge → red. The cancelled run is
+// unknown evidence, so the watch holds instead of blaming a boundary. Without
+// the unknown commit, the merge commit maps to its PR through the recorded
+// landing SHA; a blocking-path culprit is reported, never auto-reverted.
+func TestWatchCulpritMergeCommitAndUnknownEvidence(t *testing.T) {
+	shaE := strings.Repeat("e", 40)
+	mergedPull := func() github.Pull {
+		merged := "2026-01-01T00:00:00Z"
+		p := github.Pull{Number: 7, State: "closed", Merged: true, MergedAt: &merged, MergeCommitSHA: shaC, ChangedFiles: 1, Base: github.Ref{Ref: "main"}, Head: github.Ref{SHA: shaE}}
+		p.Body = "Mergewake-Task: 42"
+		return p
+	}
+	for _, tt := range []struct {
+		name     string
+		checks   map[string]github.CI
+		blocking bool
+		action   string
+		reverts  int
+		reports  int
+	}{
+		{"unknown evidence holds", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaB: github.Pending, shaA: github.Green}, false, "hold", 0, 1},
+		{"merge commit culprit reverts", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaA: github.Green}, false, "opened-revert-pr", 1, 0},
+		{"blocking culprit reported", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaA: github.Green}, true, "report-culprit", 0, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, sink, n, r := setup(t)
+			g.enabled = true
+			g.blocking = tt.blocking
+			g.head = shaD
+			g.checks = tt.checks
+			// shaC is a non-squash merge: first parent walks mainline, the
+			// merged side branch shaE stays off the search path.
+			g.parents2 = map[string][]string{shaD: {shaC}, shaC: {shaA, shaE}, shaA: {}}
+			if _, ok := tt.checks[shaB]; ok {
+				g.parents2[shaC] = []string{shaB, shaE}
+				g.parents2[shaB] = []string{shaA}
+			}
+			g.commitPRs = map[string][]github.Pull{shaC: {mergedPull()}}
+			s.Config.Sink.Type = "handoffkeep"
+			var out strings.Builder
+			s.Out = &out
+			if e := s.Watch(context.Background(), r, Options{}); e != nil {
+				t.Fatal(e)
+			}
+			if !strings.Contains(out.String(), `"action":"`+tt.action+`"`) {
+				t.Fatal(out.String())
+			}
+			if g.revertCount != tt.reverts {
+				t.Fatalf("reverts=%d", g.revertCount)
+			}
+			if sink.records != tt.reports+tt.reverts || n.count != tt.reports+tt.reverts {
+				t.Fatalf("records=%d notify=%d", sink.records, n.count)
+			}
+			if tt.reports > 0 {
+				// A second poll on the same head stays quiet.
+				if e := s.Watch(context.Background(), r, Options{}); e != nil {
+					t.Fatal(e)
+				}
+				if sink.records != tt.reports || n.count != tt.reports {
+					t.Fatal("repeat report was not deduplicated")
+				}
+			}
+		})
+	}
+}
+
+// Red or unknown main pauses ordinary landing; a recovery PR from the watch
+// latch may still land, and shadow records the pause as would-pause.
+func TestLandRedMainPause(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		mainCI   github.CI
+		recovery bool
+		shadow   bool
+		action   string
+		merges   int
+	}{
+		{"red main pauses", github.Red, false, false, "pause-red-main", 0},
+		{"unknown main pauses", github.Pending, false, false, "pause-red-main", 0},
+		{"shadow records would-pause", github.Red, false, true, "would-pause-red-main", 0},
+		{"recovery lands on red main", github.Red, true, false, "merge", 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, r := setup(t)
+			g.enabled = true
+			g.checks = map[string]github.CI{shaB: tt.mainCI, shaA: github.Green}
+			if tt.recovery {
+				g.pull.Head.Ref = github.RecoveryBranch
+			}
+			if e := s.Land(context.Background(), r, 7, Options{Shadow: tt.shadow}); e != nil {
+				t.Fatal(e)
+			}
+			if g.mergeCount != tt.merges {
+				t.Fatalf("merges=%d", g.mergeCount)
+			}
+			state, e := s.ledger().Read()
+			if e != nil {
+				t.Fatal(e)
+			}
+			if v := state.Latest["https://github.com/"+r.Name+"/pull/7"]; v.Action != tt.action {
+				t.Fatalf("action=%s", v.Action)
+			}
+		})
+	}
+}
+
 func TestReviewOnePassAndIsolation(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	runner := s.Runner.(*fakeRunner)

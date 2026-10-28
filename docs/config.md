@@ -335,6 +335,7 @@ For `example/project`, state resides beneath
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
+| `watch-reported` | Heads plus hold/report keys already notified; repeat polls stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
@@ -412,6 +413,30 @@ bounded to 32 MiB and revalidated on every request; mutations invalidate them.
 SIGINT/SIGTERM cancel work; command process groups stop together and any rollback
 finishes with an independent timeout. Configure the supervisor's stop timeout
 above the total possible rollback duration for your inventory.
+
+## CI watch and recovery
+
+`watch` diagnoses red main from the merge-history graph, not timestamps. It
+walks the first-parent ancestry of the configured branch: a merge commit's
+second parent is the merged branch, and the merge commit itself is the
+integration unit. A candidate is a merged PR whose recorded landing SHA
+(`merge_commit_sha`) sits inside the red bracket, covering squash merges, merge
+commits and rebased chains alike.
+
+Only a successful check run is green evidence. Missing, pending, skipped or
+cancelled runs are unknown, never green and never a red boundary. The search
+brackets the red head with the nearest confirmed-green ancestor for the same
+checks; if exactly one candidate PR remains it is the culprit, otherwise the
+watch holds and reports (`action: hold`) without reverting. A culprit that
+touched a blocking path is reported (`action: report-culprit`), never
+auto-reverted. Holds and reports notify once per head via the `watch-reported`
+state file.
+
+While main is red or its watch evidence is unknown, ordinary `land` calls pause
+(`action: pause-red-main`, or `would-pause-red-main` in shadow). Recovery PRs
+opened from `mergewake/recovery` remain landable so the latch can close.
+Immediately before opening a revert PR the watch rechecks the current main head
+and its CI, and the recovery latch tag still serializes recovery attempts.
 
 ## Container installs
 
