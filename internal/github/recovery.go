@@ -8,6 +8,28 @@ import (
 )
 
 const RecoveryBranch = "mergewake/recovery"
+const RecoveryTag = "mergewake-recovery-latch"
+
+// RecoveryActive also honors a leftover recovery branch, but the tag survives
+// GitHub's automatic deletion of merged PR branches.
+func (c *Client) RecoveryActive(ctx context.Context, repo string) (bool, error) {
+	var ref any
+	e := c.json(ctx, "GET", base(repo)+"/git/ref/tags/"+RecoveryTag, nil, &ref)
+	if e == nil {
+		return true, nil
+	}
+	if !NotFound(e) {
+		return false, e
+	}
+	_, e = c.Head(ctx, repo, RecoveryBranch)
+	if e == nil {
+		return true, nil
+	}
+	if NotFound(e) {
+		return false, nil
+	}
+	return false, e
+}
 
 // Revert restores only paths whose current blobs still equal the culprit's
 // postimage. Later edits on the same path need an operator rather than a guess.
@@ -95,13 +117,16 @@ func (c *Client) Revert(ctx context.Context, repo, branch, head, culprit string,
 	if e = c.json(ctx, "POST", base(repo)+"/git/commits", map[string]any{"message": fmt.Sprintf("Revert PR #%d after main CI failure", pr), "tree": tree.SHA, "parents": []string{head}}, &commit); e != nil {
 		return "", e
 	}
-	// A permanent, fixed-name ref is a GitHub-side CAS latch across all hosts.
+	// A permanent tag is the CAS latch. A PR branch alone can be auto-deleted.
+	if e = c.json(ctx, "POST", base(repo)+"/git/refs", map[string]string{"ref": "refs/tags/" + RecoveryTag, "sha": commit.SHA}, nil); e != nil {
+		return "", e
+	}
 	if e = c.CreateRef(ctx, repo, RecoveryBranch, commit.SHA); e != nil {
 		return "", e
 	}
 	var pull struct {
 		HTMLURL string `json:"html_url"`
 	}
-	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery latch remains until an operator deletes the recovery branch.", culprit, pr)}, &pull)
+	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery tag latch remains until an operator deletes it and any remaining recovery branch.", culprit, pr)}, &pull)
 	return pull.HTMLURL, e
 }

@@ -310,12 +310,20 @@ func TestRevertOverlapAndCASLatch(t *testing.T) {
 				case strings.HasSuffix(p, "/git/commits"):
 					reply(w, Ref{SHA: strings.Repeat("d", 40)})
 				case strings.HasSuffix(p, "/git/refs"):
-					if latched {
-						w.WriteHeader(422)
-					} else {
-						latched = true
-						reply(w, Ref{SHA: strings.Repeat("d", 40)})
+					var v map[string]string
+					if e := json.NewDecoder(r.Body).Decode(&v); e != nil {
+						t.Fatal(e)
 					}
+					if v["ref"] == "refs/tags/"+RecoveryTag {
+						if latched {
+							w.WriteHeader(422)
+							return
+						}
+						latched = true
+					} else if v["ref"] != "refs/heads/"+RecoveryBranch || !latched {
+						t.Fatal("branch before latch", v)
+					}
+					reply(w, Ref{SHA: strings.Repeat("d", 40)})
 				case strings.HasSuffix(p, "/pulls") && r.Method == "POST":
 					prs++
 					reply(w, map[string]string{"html_url": "https://github.com/example/project/pull/8"})
@@ -336,6 +344,48 @@ func TestRevertOverlapAndCASLatch(t *testing.T) {
 				if _, e = c.Revert(context.Background(), "example/project", "main", strings.Repeat("c", 40), strings.Repeat("b", 40), 7); e == nil || prs != 1 {
 					t.Fatal("second recovery escaped latch")
 				}
+			}
+		})
+	}
+}
+
+func TestRecoveryTagSurvivesBranchDeletion(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		tag, branch  bool
+		status       int
+		active, fail bool
+	}{
+		{name: "persistent tag with deleted branch", tag: true, active: true}, {name: "legacy branch alone", branch: true, active: true}, {name: "no recovery", active: false}, {name: "API refusal", status: 403, fail: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			branchReads := 0
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.status != 0 {
+					w.WriteHeader(tt.status)
+					return
+				}
+				if strings.Contains(r.URL.Path, "/git/ref/tags/") {
+					if tt.tag {
+						reply(w, map[string]any{"object": Ref{SHA: testSHA}})
+					} else {
+						http.NotFound(w, r)
+					}
+					return
+				}
+				branchReads++
+				if tt.branch {
+					reply(w, map[string]any{"object": Ref{SHA: testSHA}})
+				} else {
+					http.NotFound(w, r)
+				}
+			})
+			active, e := c.RecoveryActive(context.Background(), "example/project")
+			if (e != nil) != tt.fail || active != tt.active {
+				t.Fatalf("%t %v", active, e)
+			}
+			if tt.tag && branchReads != 0 {
+				t.Fatal("tag latch depended on branch")
 			}
 		})
 	}

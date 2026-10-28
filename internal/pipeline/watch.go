@@ -97,11 +97,13 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if ci != github.Red {
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	if _, e = s.GH.Head(ctx, r.Name, github.RecoveryBranch); e == nil {
+	active, e := s.GH.RecoveryActive(ctx, r.Name)
+	if e != nil {
+		return e
+	}
+	if active {
 		result.Action = "operator-required-recovery-latch"
 		return s.audit(r.Name, "watch", result, o.DryRun)
-	} else if !github.NotFound(e) {
-		return e
 	}
 	baselineBytes, e := os.ReadFile(checkpoint)
 	if e != nil && !os.IsNotExist(e) {

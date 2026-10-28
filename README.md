@@ -5,7 +5,7 @@
 mergewake is one Go binary for policy-based landing, one independent review per
 PR head, main CI recovery, release manifests, verified file rollouts, and
 experimental resident monitors. It stays on Git and GitHub. Hosts and model
-pairings are configuration, so the same binary works across macOS, Linux, and
+pairings are configuration, so the same tool runs across macOS, Linux, and
 Linux arm64 hosts.
 
 The shared policy rule is simple: if harm can occur before a revert lands, the
@@ -60,10 +60,10 @@ printed and appended to the host's `decisions.jsonl`.
 
 All acting commands support `--dry-run`. There is no merge lock, mandatory
 rebase, multi-round tester loop, or committed manifest/hash-pin file. A fixed
-recovery branch is a durable stop after **one** revert PR; the watcher never
-merges the revert itself. An operator must inspect recovery and remove that
-branch before another recovery can begin. Disable GitHub's automatic deletion of
-`mergewake/recovery`, or use a ruleset that preserves that branch.
+recovery tag (`mergewake-recovery-latch`) is a durable stop after **one** revert
+PR; the watcher never merges the revert itself. An operator must inspect recovery
+and remove that tag and any remaining `mergewake/recovery` branch before another
+recovery can begin. The tag survives automatic deletion of merged PR branches.
 
 Release inventories describe regular files at a verified Git commit, their
 SHA256, mode, and relative install targets. Hosts separately authorize the file
@@ -110,7 +110,9 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o dist/mergewake-darwin-arm64 .
 CI runs vet, the race-enabled test suite, and all four CGO-disabled cross-builds.
 Tests use fake GitHub, task sinks, notifiers, and local runners; they do not invoke
 models or fleet services. No Go dependency is imported from an integration project.
-The only direct external dependency is `gopkg.in/yaml.v3`.
+The only direct external dependency is `gopkg.in/yaml.v3`. Linux outputs are
+statically linked. CGO-disabled Darwin outputs use macOS system libraries;
+fully static macOS executables are not provided.
 
 Inspired by Anthropic's [Redesigning source control](https://www.anthropic.com/research/redesigning-source-control):
 post-merge verification, derived data outside the source tree, review of intent,

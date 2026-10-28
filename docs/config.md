@@ -234,10 +234,10 @@ For a failed independent review, inspect
 claim if no reviewer remains active and no complete review was posted; then a
 rerun can attempt that head. Completed claims can remain as evidence.
 
-For CI recovery, inspect the revert PR and the fixed `mergewake/recovery` branch.
-After recovery is complete, an operator may delete that branch to authorize
-another recovery. Keep it present while recovery is in flight, and preserve it
-from automatic PR branch deletion. After an API timeout or a reporting failure,
+For CI recovery, inspect the revert PR, the fixed `mergewake-recovery-latch` tag,
+and any `mergewake/recovery` branch. After recovery is complete, an operator may
+delete the tag and any remaining branch to authorize another recovery. Keep the
+tag while recovery is in flight; it survives automatic PR branch deletion. After an API timeout or a reporting failure,
 inspect GitHub/task records and local audit rather than blindly rerunning a
 mutation. The initial release has no automatic report outbox/reconciliation.
 

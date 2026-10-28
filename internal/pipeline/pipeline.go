@@ -27,6 +27,7 @@ type GitHub interface {
 	Merge(context.Context, string, int, string) error
 	Head(context.Context, string, string) (string, error)
 	CreateRef(context.Context, string, string, string) error
+	RecoveryActive(context.Context, string) (bool, error)
 	Check(context.Context, string, string, []string) (github.CI, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
 	Unresolved(context.Context, string, int) (int, error)

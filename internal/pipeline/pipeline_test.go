@@ -47,6 +47,7 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 	}
 	return p, nil
 }
+func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
 	if branch == github.RecoveryBranch {
 		if g.latch {

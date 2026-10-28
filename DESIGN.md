@@ -119,12 +119,13 @@ changed path, non-regular files, ambiguous PR mappings, or non-linear history
 require an operator. This is deliberately more conservative than applying fuzzy
 reverse patches. The watcher opens a revert PR; it never auto-merges one.
 
-The fixed `mergewake/recovery` branch is created by an exclusive Git-ref operation.
-It is a repository-wide latch across watcher hosts. It stays present after a
-recovery PR closes. Preserve it from GitHub's automatic branch deletion; clearing
-it is the operator's explicit authorization for another recovery. If creation of
-the PR fails after the branch exists, the latch remains and prevents another PR.
-No distributed service or lease system is needed.
+The fixed `mergewake-recovery-latch` Git tag is created by an exclusive Git-ref
+operation before creating the `mergewake/recovery` branch. It is a repository-wide
+latch across watcher hosts and survives GitHub's automatic deletion of merged PR
+branches. Clearing the tag and any remaining branch is the operator's explicit
+authorization for another recovery. A leftover branch also stops recovery even
+when its tag is absent. If branch or PR creation fails after the tag exists, the
+latch remains. No distributed service or lease system is needed.
 
 After opening a revert, the sink records recovery and attempts to reopen the
 origin task, and the notifier posts an event with a deterministic ID. A
@@ -204,6 +205,9 @@ operators must give each inventory its own root.
 - Superfan contracts guide a trusted session runner; the binary neither enforces
   an external agent's capability boundary nor manages its session lifetime.
   There is no autonomous privileged monitor by default.
+- All four builds disable CGO. Linux outputs are statically linked; Darwin outputs
+  retain macOS system-library dependencies. Fully static Darwin executables are
+  not provided.
 - No git replacement, source-control server, global merge queue, lease framework,
   multi-round review manager, or integration-source imports are included.
 
