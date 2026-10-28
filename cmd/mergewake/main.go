@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -23,6 +24,7 @@ import (
 )
 
 var version = "dev"
+var commit = "unknown"
 
 const usage = `mergewake: the after-merge pipeline for your agent fleet
 
@@ -32,6 +34,7 @@ Usage: mergewake <command> [flags]
   watch      Watch main CI and open one recovery PR (shadow until opt in)
   release    Publish a verified manifest as a GitHub Release asset
   rollout    Pull and install the latest verified manifest once
+  daemon     Run enabled pipeline roles (shadow by default)
   agent      Poll configured repositories and perform verified rollouts
   status     Read installed receipts and check local drift
   superfan   Print or launch an experimental resident monitor spec
@@ -57,15 +60,21 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		_, e := fmt.Fprintln(out, version)
 		return e
 	}
+	if args[0] == "commit" {
+		_, err := fmt.Fprintln(out, commit)
+		return err
+	}
 	command := args[0]
 	switch command {
-	case "land", "review", "watch", "release", "rollout", "agent", "status", "superfan":
+	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "superfan":
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg := fs.String("config", "~/.config/mergewake/config.yaml", "host YAML config")
+	apply := fs.Bool("apply", false, "allow acting review, release, rollout or daemon (daemon also needs daemon.act)")
+	daemonStatus := fs.Bool("daemon", false, "read loop status (status only)")
 	dry := fs.Bool("dry-run", false, "print planned actions without mutations or model execution")
 	repo := fs.String("repo", "", "configured owner/name (required except agent, status, superfan)")
 	var pr *int
@@ -81,6 +90,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		} else {
 			shadow = fs.Bool("shadow", false, "force decision-only mode")
 		}
+	case "daemon":
+		shadow = fs.Bool("shadow", false, "force all roles into shadow mode")
 	case "watch":
 		shadow = fs.Bool("shadow", false, "force decision-only mode")
 		once = fs.Bool("once", false, "inspect once instead of polling")
@@ -110,7 +121,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	r := config.Repo{}
-	if command != "agent" && command != "status" || *repo != "" {
+	if command != "agent" && command != "status" && command != "daemon" || *repo != "" {
 		if *repo == "" {
 			return errors.New("--repo is required")
 		}
@@ -120,20 +131,33 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		}
 	}
 	if command == "status" {
+		if *daemonStatus {
+			return daemon.ReadStatus(c.StateDir, out)
+		}
 		return status(c, *repo, out)
+	}
+	if command == "daemon" {
+		out = &lockedWriter{out: out}
+		stderr = &lockedWriter{out: stderr}
 	}
 	exec := integrations.Exec{}
 	sink, notifier := integrations.New(c, exec, out)
-	s := pipeline.Service{Config: c, GH: github.New(os.Getenv(c.TokenEnv)), Runner: exec, Sink: sink, Notifier: notifier, Out: out}
-	o := pipeline.Options{DryRun: *dry}
+	gh := github.New(os.Getenv(c.TokenEnv))
+	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
+	o := pipeline.Options{DryRun: *dry, Shadow: !*apply}
 	if shadow != nil {
-		o.Shadow = *shadow
+		o.Shadow = o.Shadow || *shadow
 	}
 	if pr != nil && *pr <= 0 {
 		return errors.New("--pr must be positive")
 	}
 	switch command {
+	case "daemon":
+		o.Shadow = o.Shadow || !c.Daemon.Act
+		return runDaemon(ctx, &s, gh, *repo, o, stderr)
 	case "land":
+		// Landing's opt-in is repository policy; --shadow still forces observation.
+		o.Shadow = *shadow
 		return s.Land(ctx, r, *pr, o)
 	case "review":
 		return s.Review(ctx, r, *pr, *family, o)
@@ -142,6 +166,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "rollout":
 		return s.Rollout(ctx, r, o)
 	case "watch":
+		o.Shadow = *shadow
 		return poll(ctx, c.PollInterval, *once || *dry, func() error { return s.Watch(ctx, r, o) }, stderr)
 	case "agent":
 		if len(c.Repos) == 0 {

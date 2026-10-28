@@ -21,6 +21,9 @@ func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) (
 	if r.fail {
 		return nil, errors.New("offline")
 	}
+	if len(a) > 1 && a[0] == "tasks" && a[1] == "show" {
+		return []byte(`{"state":"merged"}`), nil
+	}
 	return nil, nil
 }
 func TestAdaptersUseArgumentVectors(t *testing.T) {
@@ -33,11 +36,11 @@ func TestAdaptersUseArgumentVectors(t *testing.T) {
 	if r.calls[0].args[len(r.calls[0].args)-1] != text {
 		t.Fatal("text changed")
 	}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "in_progress"}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
 	if e := h.Reopen(context.Background(), "42", "CI red"); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(strings.Join(r.calls[1].args, " "), "tasks show 42") || !strings.Contains(strings.Join(r.calls[3].args, " "), "tasks transition 42 --to in_progress") {
+	if !strings.Contains(strings.Join(r.calls[1].args, " "), "tasks show 42") || !strings.Contains(strings.Join(r.calls[3].args, " "), "tasks reopen 42 --reason CI red") {
 		t.Fatal(r.calls)
 	}
 	before := len(r.calls)

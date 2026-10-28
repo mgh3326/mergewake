@@ -58,7 +58,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if len(candidates) == 0 {
 		return errors.New("no reviewer from a different model family is configured")
 	}
-	if o.DryRun {
+	if o.DryRun || o.Shadow {
 		return s.Print(map[string]any{"action": "review", "head": pr.Head.SHA, "candidates": candidates, "dry_run": true})
 	}
 	timeout, e := config.Duration(s.Config.Review.Timeout)

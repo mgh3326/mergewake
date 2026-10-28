@@ -113,16 +113,19 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 		State string `json:"state"`
 	}
 	_ = json.Unmarshal(shown, &current)
-	if current.State == h.State {
+	if current.State == "reopened" {
 		return nil
 	}
-	args := []string{"tasks", "transition", task, "--to", h.State, "--note", note}
-	if h.State == "in_progress" || h.State == "claimed" {
-		args = append(args, "--no-job", "mergewake CI recovery; no agent session claimed")
+
+	if current.State != "merged" && current.State != "dropped" {
+		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged or dropped", task, current.State)
 	}
-	_, e = h.Runner.Run(ctx, h.Command, args, "", "")
+	if strings.TrimSpace(note) == "" {
+		return errors.New("reopen requires a reason")
+	}
+	_, e = h.Runner.Run(ctx, h.Command, []string{"tasks", "reopen", task, "--reason", note}, "", "")
 	if e != nil {
-		return fmt.Errorf("recovery comment recorded, but task %s could not transition from %q to %q (terminal states may require upstream support): %w", task, current.State, h.State, e)
+		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to reopened; server/CLI may lack explicit reopen support: %w", task, current.State, e)
 	}
 	return nil
 }

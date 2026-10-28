@@ -30,11 +30,16 @@ type File struct {
 	Size   int64  `json:"size"`
 	Mode   uint32 `json:"mode"`
 }
+type CommandTarget struct {
+	Target string `json:"target"`
+	Kind   string `json:"kind"`
+}
 type Manifest struct {
-	Version int    `json:"version"`
-	Repo    string `json:"repo"`
-	Commit  string `json:"commit"`
-	Files   []File `json:"files"`
+	Version  int             `json:"version"`
+	Repo     string          `json:"repo"`
+	Commit   string          `json:"commit"`
+	Files    []File          `json:"files"`
+	Commands []CommandTarget `json:"commands,omitempty"`
 }
 
 func SafePath(p string) bool {
@@ -42,8 +47,29 @@ func SafePath(p string) bool {
 }
 func Sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 func (m Manifest) Validate() error {
-	if m.Version != 1 || !SHA.MatchString(m.Commit) || !config.ValidRepo(m.Repo) || len(m.Files) == 0 {
+	if (m.Version != 1 && m.Version != 2) || !SHA.MatchString(m.Commit) || !config.ValidRepo(m.Repo) || len(m.Files)+len(m.Commands) == 0 {
 		return errors.New("invalid manifest identity or empty file list")
+	}
+	if len(m.Commands) > 0 {
+		if m.Version != 2 || len(m.Files) > 0 {
+			return errors.New("command manifests use version 2 and cannot mix file installs")
+		}
+		seen := map[string]bool{}
+		for _, t := range m.Commands {
+			if !SafePath(t.Target) || (t.Kind != "command" && t.Kind != "release") || seen[t.Target] {
+				return errors.New("invalid command target")
+			}
+			for old := range seen {
+				if strings.HasPrefix(old, t.Target+"/") || strings.HasPrefix(t.Target, old+"/") {
+					return errors.New("overlapping command targets")
+				}
+			}
+			seen[t.Target] = true
+		}
+		return nil
+	}
+	if m.Version != 1 {
+		return errors.New("file manifests require version 1")
 	}
 	seen := map[string]bool{}
 	for _, f := range m.Files {
@@ -70,6 +96,14 @@ func Verify(f File, b []byte) error {
 func Build(repo, commit string, specs []config.Install, read func(string) ([]byte, error)) (Manifest, error) {
 	m := Manifest{Version: 1, Repo: repo, Commit: commit}
 	for _, s := range specs {
+		if s.Kind == "command" || s.Kind == "release" {
+			m.Version = 2
+			m.Commands = append(m.Commands, CommandTarget{Target: s.Target, Kind: s.Kind})
+			continue
+		}
+		if s.Kind != "" && s.Kind != "file" {
+			return m, errors.New("unknown install kind")
+		}
 		mode := uint64(0644)
 		var e error
 		if s.Mode != "" {
@@ -87,6 +121,7 @@ func Build(repo, commit string, specs []config.Install, read func(string) ([]byt
 		}
 		m.Files = append(m.Files, File{Source: s.Source, Target: s.Target, SHA256: Sum(b), Size: int64(len(b)), Mode: uint32(mode)})
 	}
+	sort.Slice(m.Commands, func(i, j int) bool { return m.Commands[i].Target < m.Commands[j].Target })
 	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Target < m.Files[j].Target })
 	return m, m.Validate()
 }

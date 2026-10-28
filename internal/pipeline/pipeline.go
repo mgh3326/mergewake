@@ -229,7 +229,7 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if e = s.Print(m); e != nil {
 		return e
 	}
-	if o.DryRun {
+	if o.DryRun || o.Shadow {
 		return nil
 	}
 	return s.GH.Publish(ctx, m)
@@ -238,7 +238,27 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if r.Root == "" || r.Smoke.Command == "" {
 		return errors.New("rollout requires root and a smoke command")
 	}
-	m, e := s.GH.Latest(ctx, r.Name)
+	var m manifest.Manifest
+	var e error
+	binaryOnly := len(r.Install) > 0
+	for _, spec := range r.Install {
+		binaryOnly = binaryOnly && spec.Kind == "release"
+	}
+	if binaryOnly {
+		source, ok := s.GH.(interface {
+			BinaryHead(context.Context, string) (string, error)
+		})
+		if !ok {
+			return errors.New("GitHub adapter lacks binary releases")
+		}
+		sha, err := source.BinaryHead(ctx, r.Name)
+		if err != nil {
+			return err
+		}
+		m, e = manifest.Build(r.Name, sha, r.Install, nil)
+	} else {
+		m, e = s.GH.Latest(ctx, r.Name)
+	}
 	if e != nil {
 		return e
 	}
@@ -271,7 +291,11 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return errors.New("manifest commit CI is not green")
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
-	b, e := os.ReadFile(filepath.Join(state, "installed.json"))
+	receiptName := "installed.json"
+	if len(m.Commands) > 0 {
+		receiptName = "command-installed.json"
+	}
+	b, e := os.ReadFile(filepath.Join(state, receiptName))
 	if e == nil {
 		var old struct {
 			Manifest manifest.Manifest `json:"manifest"`
@@ -297,15 +321,44 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return e
 	}
 	root := config.Expand(r.Root)
-	result, installErr := rollout.Apply(ctx, m, rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun}, func(ctx context.Context, name string) ([]byte, error) {
-		return s.GH.ReadFile(ctx, r.Name, m.Commit, name)
-	}, func(ctx context.Context) error {
+	smoke := func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		_, e := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
-		return e
-	})
-	if o.DryRun || result.Status == "current" || result.Status == "rejected" {
+		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
+		return err
+	}
+	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow}
+	var result rollout.Result
+	var installErr error
+	if len(m.Commands) > 0 {
+		result, installErr = rollout.ApplyCommands(ctx, m, installOptions, s.Config.Host, s.Runner, func(ctx context.Context, spec config.Install, sha string) error {
+			if spec.Kind == "release" {
+				source, ok := s.GH.(interface {
+					BinaryAtCommit(context.Context, string, string) ([]byte, error)
+				})
+				if !ok {
+					return errors.New("GitHub adapter lacks pinned binary releases")
+				}
+				b, err := source.BinaryAtCommit(ctx, r.Name, sha)
+				if err != nil {
+					return err
+				}
+				target, err := manifest.Resolve(root, spec.Target)
+				if err != nil {
+					return err
+				}
+				return rollout.Atomic(target, b, 0755)
+			}
+			command := rollout.ExpandCommand(spec.Command, r.Name, sha, root, spec.Target)
+			_, err := s.Runner.Run(ctx, command.Command, command.Args, "", root)
+			return err
+		}, smoke)
+	} else {
+		result, installErr = rollout.Apply(ctx, m, installOptions, func(ctx context.Context, name string) ([]byte, error) {
+			return s.GH.ReadFile(ctx, r.Name, m.Commit, name)
+		}, smoke)
+	}
+	if o.DryRun || o.Shadow || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}
 	record := struct {

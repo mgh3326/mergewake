@@ -22,6 +22,7 @@ import (
 type Client struct {
 	BaseURL, UploadURL, Token string
 	HTTP                      *http.Client
+	poll                      pollingState
 }
 
 func New(token string) *Client {
@@ -42,11 +43,20 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	if strings.HasPrefix(route, "UPLOAD ") {
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
+	key := method + " " + endpoint + " " + accept
+	release, cached, e := c.beginRequest(ctx, key)
+	if e != nil {
+		return nil, e
+	}
+	defer release()
 	req, e := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(data))
 	if e != nil {
 		return nil, e
 	}
 	req.Header.Set("Accept", accept)
+	if method == "GET" && cached.ETag != "" {
+		req.Header.Set("If-None-Match", cached.ETag)
+	}
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
 	req.Header.Set("User-Agent", "mergewake")
 	if c.Token != "" {
@@ -60,12 +70,22 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		return nil, fmt.Errorf("GitHub %s request failed", method)
 	}
 	defer resp.Body.Close()
+	c.observeHeaders(resp.Header, resp.StatusCode, key)
+	if resp.StatusCode == http.StatusNotModified && method == "GET" {
+		if cached.ETag == "" {
+			return nil, errUncached304
+		}
+		return append([]byte(nil), cached.Body...), nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &APIError{resp.StatusCode, method, strings.Split(route, "?")[0]}
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, manifest.MaxFileSize*2+1))
 	if len(b) > manifest.MaxFileSize*2 {
 		return nil, errors.New("GitHub response too large")
+	}
+	if e == nil {
+		c.cacheResponse(key, resp.Header.Get("ETag"), b, method != "GET" && route != "/graphql")
 	}
 	return b, e
 }

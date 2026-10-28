@@ -43,9 +43,18 @@ type Sink struct {
 	ReopenState string `yaml:"reopen_state"`
 }
 type Install struct {
-	Source string `yaml:"source"`
-	Target string `yaml:"target"`
-	Mode   string `yaml:"mode"`
+	Kind         string   `yaml:"kind" json:"kind"`
+	Command      Command  `yaml:"command" json:"command"`
+	Verify       Command  `yaml:"verify" json:"verify"`
+	VerifyOutput string   `yaml:"verify_output" json:"verify_output"`
+	InitialSHA   string   `yaml:"initial_sha" json:"initial_sha"`
+	Timeout      string   `yaml:"timeout" json:"timeout"`
+	Serial       []string `yaml:"serial" json:"serial"`
+	Canary       string   `yaml:"canary" json:"canary"`
+	ReceiptsDir  string   `yaml:"receipts_dir" json:"receipts_dir"`
+	Source       string   `yaml:"source"`
+	Target       string   `yaml:"target"`
+	Mode         string   `yaml:"mode"`
 }
 type Repo struct {
 	Name         string    `yaml:"name"`
@@ -58,8 +67,20 @@ type Repo struct {
 	SmokeTimeout string    `yaml:"smoke_timeout"`
 	Task         string    `yaml:"task"`
 }
+type Loop struct {
+	Enabled  bool   `yaml:"enabled"`
+	Interval string `yaml:"interval"`
+}
+type Daemon struct {
+	PR      Loop `yaml:"pr"`
+	Watch   Loop `yaml:"watch"`
+	Release Loop `yaml:"release"`
+	Rollout Loop `yaml:"rollout"`
+	Act     bool `yaml:"act"`
+}
 type Config struct {
 	Version      int      `yaml:"version"`
+	Daemon       Daemon   `yaml:"daemon"`
 	Host         string   `yaml:"host"`
 	StateDir     string   `yaml:"state_dir"`
 	TokenEnv     string   `yaml:"token_env"`
@@ -115,6 +136,14 @@ func Load(name string) (Config, error) {
 	if _, e = Duration(c.PollInterval); e != nil {
 		return c, e
 	}
+	for _, loop := range []*Loop{&c.Daemon.PR, &c.Daemon.Watch, &c.Daemon.Release, &c.Daemon.Rollout} {
+		if loop.Interval == "" {
+			loop.Interval = c.PollInterval
+		}
+		if _, err := Duration(loop.Interval); err != nil {
+			return c, err
+		}
+	}
 	if c.Review.Timeout == "" {
 		c.Review.Timeout = "10m"
 	}
@@ -140,6 +169,57 @@ func Load(name string) (Config, error) {
 		if _, e = Duration(r.SmokeTimeout); e != nil {
 			return c, e
 		}
+		for j := range r.Install {
+			spec := &r.Install[j]
+			if spec.Kind == "" {
+				spec.Kind = "file"
+			}
+			switch spec.Kind {
+			case "file":
+			case "command", "release":
+				if spec.Verify.Command == "" {
+					return c, errors.New("command/release installs require verify")
+				}
+				if spec.Kind == "command" && (spec.Command.Command == "" || !strings.Contains(strings.Join(spec.Command.Args, " "), "{sha}")) {
+					return c, errors.New("command install requires a pinned {sha} argument")
+				}
+				if spec.VerifyOutput == "" {
+					spec.VerifyOutput = "{sha}"
+				}
+				if !strings.Contains(spec.VerifyOutput, "{sha}") {
+					return c, errors.New("verify_output must include {sha}")
+				}
+				if spec.InitialSHA != "" && !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(spec.InitialSHA) {
+					return c, errors.New("initial_sha requires a full SHA")
+				}
+				if spec.Timeout == "" {
+					spec.Timeout = "5m"
+				}
+				if _, err := Duration(spec.Timeout); err != nil {
+					return c, err
+				}
+				if len(spec.Serial) > 0 || spec.Canary != "" {
+					if spec.ReceiptsDir == "" {
+						return c, errors.New("serial/canary requires receipts_dir")
+					}
+					names := append(append([]string{}, spec.Serial...), spec.Canary)
+					for _, host := range names {
+						if host != "" && (!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(host)) {
+							return c, errors.New("invalid serial/canary host label")
+						}
+					}
+					seenHosts := map[string]bool{}
+					for _, host := range spec.Serial {
+						if seenHosts[host] {
+							return c, errors.New("duplicate serial host")
+						}
+						seenHosts[host] = true
+					}
+				}
+			default:
+				return c, errors.New("install kind must be file, command or release")
+			}
+		}
 		for _, g := range r.Deny {
 			if _, e = policy.Match(g, "probe"); e != nil {
 				return c, e
@@ -160,7 +240,10 @@ func Load(name string) (Config, error) {
 		return c, errors.New("panewire notifier requires lane")
 	}
 	if c.Sink.ReopenState == "" {
-		c.Sink.ReopenState = "in_progress"
+		c.Sink.ReopenState = "reopened"
+	}
+	if c.Sink.ReopenState != "reopened" {
+		return c, errors.New("sink.reopen_state must be reopened")
 	}
 	for name, p := range c.Review.Profiles {
 		if name == "" || p.Family == "" || (filepath.Base(p.Command) != "pi" && filepath.Base(p.Command) != "cmd") {

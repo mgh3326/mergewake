@@ -47,4 +47,4 @@ notifier:
 sink:
   type: noop
   command: handoffkeep
-  reopen_state: in_progress
+  reopen_state: reopened
