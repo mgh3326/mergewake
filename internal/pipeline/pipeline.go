@@ -93,7 +93,12 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	}
 	return p, p.Validate()
 }
-func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) error {
+func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, s.audit(r.Name, "land-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
+		}
+	}()
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e

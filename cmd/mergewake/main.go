@@ -215,13 +215,21 @@ func runSuperfan(ctx context.Context, name string, launch bool, runner string, d
 	if runner == "" {
 		return errors.New("--launch requires --runner")
 	}
-	_, e = (integrations.Exec{}).Run(ctx, runner, nil, string(b), "")
+	result, e := (integrations.Exec{}).Run(ctx, runner, nil, string(b), "")
+	if e != nil {
+		return e
+	}
+	_, e = out.Write(result)
 	return e
 }
 func status(c config.Config, repo string, out io.Writer) error {
 	var errs []error
 	for _, r := range c.Repos {
 		if repo != "" && r.Name != repo {
+			continue
+		}
+		if r.Root == "" {
+			errs = append(errs, fmt.Errorf("%s: root required for status", r.Name))
 			continue
 		}
 		b, e := os.ReadFile(filepath.Join(c.StateDir, r.Name, "rollout", "installed.json"))
@@ -234,6 +242,10 @@ func status(c config.Config, repo string, out io.Writer) error {
 		}
 		if e = json.Unmarshal(b, &receipt); e != nil {
 			errs = append(errs, e)
+			continue
+		}
+		if receipt.Manifest.Repo != r.Name {
+			errs = append(errs, fmt.Errorf("%s: receipt repo mismatch", r.Name))
 			continue
 		}
 		if e = receipt.Manifest.Validate(); e != nil {

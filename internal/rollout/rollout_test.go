@@ -128,3 +128,59 @@ func TestDeniedFileIsNeverFetched(t *testing.T) {
 		t.Fatalf("%+v %v", res, e)
 	}
 }
+
+func TestRollbackFailureRetainsJournal(t *testing.T) {
+	root, state := t.TempDir(), t.TempDir()
+	if e := os.WriteFile(filepath.Join(root, "tool"), []byte("old"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	specs := []config.Install{{Source: "tool", Target: "tool"}}
+	m, _ := manifest.Build("example/project", strings.Repeat("a", 40), specs, func(string) ([]byte, error) { return []byte("new"), nil })
+	res, e := Apply(context.Background(), m, Options{Root: root, StateDir: state, Allowed: specs}, func(context.Context, string) ([]byte, error) { return []byte("new"), nil }, func(context.Context) error {
+		if e := os.Remove(filepath.Join(root, "tool")); e != nil {
+			return e
+		}
+		if e := os.Mkdir(filepath.Join(root, "tool"), 0700); e != nil {
+			return e
+		}
+		return errors.New("smoke replaced target with directory")
+	})
+	if e == nil || res.Status != "rollback-failed" {
+		t.Fatalf("%+v %v", res, e)
+	}
+	if _, e = os.Stat(filepath.Join(state, "transaction", "journal.json")); e != nil {
+		t.Fatal("journal lost", e)
+	}
+	if e = os.Remove(filepath.Join(root, "tool")); e != nil {
+		t.Fatal(e)
+	}
+	if e = Recover(root, state); e != nil {
+		t.Fatal(e)
+	}
+	b, _ := os.ReadFile(filepath.Join(root, "tool"))
+	if string(b) != "old" {
+		t.Fatal(string(b))
+	}
+}
+func TestInterruptedReceiptRestoresPriorReceipt(t *testing.T) {
+	root, state := t.TempDir(), t.TempDir()
+	dir := filepath.Join(state, "transaction")
+	if e := os.Mkdir(dir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	previous := []byte(`{"commit":"previous"}`)
+	if e := os.WriteFile(filepath.Join(state, "installed.json"), []byte(`{"commit":"uncommitted"}`), 0600); e != nil {
+		t.Fatal(e)
+	}
+	j := Journal{Root: root, PreviousReceipt: previous, ReceiptExisted: true}
+	if e := writeJSON(filepath.Join(dir, "journal.json"), j); e != nil {
+		t.Fatal(e)
+	}
+	if e := Recover(root, state); e != nil {
+		t.Fatal(e)
+	}
+	b, _ := os.ReadFile(filepath.Join(state, "installed.json"))
+	if string(b) != string(previous) {
+		t.Fatalf("receipt is %s", b)
+	}
+}

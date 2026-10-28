@@ -24,6 +24,8 @@ var shaD = strings.Repeat("d", 40)
 
 type fakeGH struct {
 	GitHub
+	pullCalls                                                    int
+	nextHead                                                     string
 	pull                                                         github.Pull
 	enabled, blocking, reviewed                                  bool
 	findings                                                     int
@@ -37,7 +39,14 @@ type fakeGH struct {
 	m                                                            manifest.Manifest
 }
 
-func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) { return g.pull, nil }
+func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
+	g.pullCalls++
+	p := g.pull
+	if g.pullCalls > 1 && g.nextHead != "" {
+		p.Head.SHA = g.nextHead
+	}
+	return p, nil
+}
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
 	if branch == github.RecoveryBranch {
 		if g.latch {
@@ -343,4 +352,45 @@ type smokeRunner struct{}
 
 func (smokeRunner) Run(context.Context, string, []string, string, string) ([]byte, error) {
 	return nil, nil
+}
+
+func TestChangedHeadStopsReviewAndLand(t *testing.T) {
+	for _, command := range []string{"review", "land"} {
+		t.Run(command, func(t *testing.T) {
+			s, g, _, _, r := setup(t)
+			g.enabled = true
+			g.nextHead = shaC
+			var e error
+			if command == "review" {
+				e = s.Review(context.Background(), r, 7, "openai", Options{})
+			} else {
+				e = s.Land(context.Background(), r, 7, Options{})
+			}
+			if e == nil || g.mergeCount != 0 || g.postCount != 0 {
+				t.Fatalf("head race acted: %v merges=%d posts=%d", e, g.mergeCount, g.postCount)
+			}
+		})
+	}
+}
+func TestLaterGreenSupersedesOldCheckpoint(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.head = shaD
+	g.parents = map[string]string{shaD: shaC, shaC: shaB, shaB: shaA}
+	g.checks = map[string]github.CI{shaD: github.Red, shaC: github.Green, shaB: github.Red, shaA: github.Green}
+	g.pull.Merged = true
+	g.pull.MergeCommitSHA = shaD
+	if e := os.MkdirAll(s.state(r.Name), 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(s.state(r.Name), "last-green"), []byte(shaA), 0600); e != nil {
+		t.Fatal(e)
+	}
+	var out strings.Builder
+	s.Out = &out
+	if e := s.Watch(context.Background(), r, Options{DryRun: true}); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(out.String(), `"culprit":"`+shaD+`"`) {
+		t.Fatal(out.String())
+	}
 }

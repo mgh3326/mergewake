@@ -65,7 +65,12 @@ func Bisect(shas []string, check func(string) (github.CI, error)) (int, error) {
 	}
 	return hi, nil
 }
-func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) error {
+func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, s.audit(r.Name, "watch-error", map[string]any{"error": retErr.Error()}, o.DryRun))
+		}
+	}()
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
