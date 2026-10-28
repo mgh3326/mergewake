@@ -1,0 +1,14 @@
+version: 1
+# Omission also means shadow. Opt in only after inspecting recorded decisions.
+enabled: false
+required_checks: [CI]
+blocking:
+  - paths: [src/orders/**]
+    reason: Live external effects can occur before a revert lands
+  - paths: [src/cleanup/**]
+    reason: File deletion can destroy data before a revert lands
+  - paths: ['**']
+    kinds: [removed]
+    reason: Removed installation or recovery files can break rollback
+  - paths: [.mergewake/**, .github/workflows/**]
+    reason: Changed verification controls can admit unsafe actions before recovery

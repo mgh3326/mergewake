@@ -50,3 +50,13 @@ func TestRepoAndHome(t *testing.T) {
 		t.Fatal("home expansion")
 	}
 }
+
+func TestExampleConfig(t *testing.T) {
+	c, e := Load("../../examples/host.yaml")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c.Host != "host-a" || len(c.Repos) != 1 {
+		t.Fatal(c)
+	}
+}

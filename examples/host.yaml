@@ -1,0 +1,50 @@
+version: 1
+host: host-a
+state_dir: ~/.local/state/mergewake
+token_env: GITHUB_TOKEN
+poll_interval: 60s
+watch_limit: 100
+repos:
+  - name: example/project
+    branch: main
+    policy: .mergewake/policy.yaml
+    root: ~/.local/share/example-tools
+    deny:
+      - bin/relay-hub
+      - bin/operator-daemon
+    install:
+      - source: scripts/tool
+        target: bin/tool
+        mode: "0755"
+    smoke:
+      command: ./bin/tool
+      args: [--version]
+    smoke_timeout: 30s
+    task: "42"
+review:
+  login: review-bot
+  timeout: 10m
+  scopefuel: ""
+  pairings:
+    openai: [claude, deepseek]
+    anthropic: [deepseek]
+    deepseek: [claude]
+  profiles:
+    claude:
+      family: anthropic
+      command: pi
+      args: [--provider, anthropic, --model, claude-model-id]
+      gate_profile: ""
+    deepseek:
+      family: deepseek
+      command: cmd
+      args: [--model, deepseek-model-id]
+      gate_profile: ""
+notifier:
+  type: stdout
+  command: panewire
+  lane: operator-desk
+sink:
+  type: noop
+  command: handoffkeep
+  reopen_state: in_progress
