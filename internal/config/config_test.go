@@ -36,6 +36,49 @@ func TestReviewerArgs(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+func TestReapConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name, extra string
+		fail        bool
+	}{
+		{"defaults", "", false},
+		{"enabled", "reap:\n  enabled: true\n", false},
+		{"bad after", "reap:\n  worktree_after: 0s\n", true},
+		{"bad glob", "reap:\n  protect: ['..']\n", true},
+		{"local host", "hosts:\n  - {name: desk}\n", false},
+		{"ssh host", "hosts:\n  - {name: node, ssh: ops@node.example}\n", false},
+		{"local ssh", "hosts:\n  - {name: node, ssh: local}\n", false},
+		{"dup host", "hosts:\n  - {name: node}\n  - {name: node}\n", true},
+		{"bad host name", "hosts:\n  - {name: 'bad name'}\n", true},
+		{"ssh option", "hosts:\n  - {name: node, ssh: '-oProxy=x'}\n", true},
+		{"ssh space", "hosts:\n  - {name: node, ssh: 'ops@node -p 22'}\n", true},
+		{"local jobs", "hosts:\n  - {name: desk, jobs: '~/jobs'}\n", false},
+		{"local jobs rel", "hosts:\n  - {name: desk, jobs: 'jobs'}\n", true},
+		{"ssh jobs abs", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: /home/ops/jobs}\n", false},
+		{"ssh jobs home", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: '~/jobs'}\n", true},
+		{"ssh jobs rel", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: 'jobs'}\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\n"+tt.extra), 0600); e != nil {
+				t.Fatal(e)
+			}
+			c, e := Load(p)
+			if (e != nil) != tt.fail {
+				t.Fatalf("%+v %v", c, e)
+			}
+			if e == nil {
+				if c.Reap.WorktreeAfter != "168h" {
+					t.Fatal(c.Reap.WorktreeAfter)
+				}
+				if len(c.Reap.Protect) == 0 {
+					t.Fatal("missing default protect list")
+				}
+			}
+		})
+	}
+}
+
 func TestRepoAndHome(t *testing.T) {
 	for _, r := range []string{"../x", "a/..", "a/b/c", "a/b?query"} {
 		if ValidRepo(r) {

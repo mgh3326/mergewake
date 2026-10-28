@@ -60,3 +60,18 @@ daemon:
   watch: {enabled: false, interval: 60s}
   release: {enabled: false, interval: 2m}
   rollout: {enabled: false, interval: 2m}
+# Session hosts scanned by `mergewake reap`. An empty/local ssh value means this
+# machine; `jobs` is the base directory of per-pane job dirs and must be
+# absolute on ssh hosts.
+hosts:
+  - {name: desk, jobs: ~/work/herdr-inbox/jobs}
+  - {name: node, ssh: ops@node.example, jobs: /home/ops/herdr-inbox/jobs}
+# Close panes that worked on merged PRs (their report.md or last screen is
+# saved under jobs first), then remove the worktree and local branch after
+# worktree_after with no revert. Default protect list: *-integrator,
+# director-*, fleet-tooling-*, consult-*, cmd. Unnamed panes and panes outside
+# a linked worktree are always protected.
+reap:
+  enabled: false
+  worktree_after: 168h
+  protect: []

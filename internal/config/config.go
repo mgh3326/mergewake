@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/reap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -106,19 +107,32 @@ type Daemon struct {
 	Rollout Loop `yaml:"rollout"`
 	Act     bool `yaml:"act"`
 }
+type Reap struct {
+	Enabled       bool     `yaml:"enabled"`
+	WorktreeAfter string   `yaml:"worktree_after"`
+	Protect       []string `yaml:"protect"`
+}
+
+// DefaultReapProtect names resident and desk panes that reap never closes. A
+// configured reap.protect list replaces this list; unnamed panes and panes
+// outside a linked worktree are always protected regardless of the list.
+var DefaultReapProtect = []string{"*-integrator", "director-*", "fleet-tooling-*", "consult-*", "cmd"}
+
 type Config struct {
-	Version      int      `yaml:"version"`
-	Daemon       Daemon   `yaml:"daemon"`
-	Host         string   `yaml:"host"`
-	StateDir     string   `yaml:"state_dir"`
-	TokenEnv     string   `yaml:"token_env"`
-	PollInterval string   `yaml:"poll_interval"`
-	WatchLimit   int      `yaml:"watch_limit"`
-	Repos        []Repo   `yaml:"repos"`
-	Review       Review   `yaml:"review"`
-	Outcomes     Outcomes `yaml:"outcomes"`
-	Notifier     Notifier `yaml:"notifier"`
-	Sink         Sink     `yaml:"sink"`
+	Version      int         `yaml:"version"`
+	Daemon       Daemon      `yaml:"daemon"`
+	Host         string      `yaml:"host"`
+	StateDir     string      `yaml:"state_dir"`
+	TokenEnv     string      `yaml:"token_env"`
+	PollInterval string      `yaml:"poll_interval"`
+	WatchLimit   int         `yaml:"watch_limit"`
+	Repos        []Repo      `yaml:"repos"`
+	Hosts        []reap.Host `yaml:"hosts"`
+	Reap         Reap        `yaml:"reap"`
+	Review       Review      `yaml:"review"`
+	Outcomes     Outcomes    `yaml:"outcomes"`
+	Notifier     Notifier    `yaml:"notifier"`
+	Sink         Sink        `yaml:"sink"`
 }
 
 func Decode(r io.Reader, v any) error {
@@ -171,6 +185,41 @@ func Load(name string) (Config, error) {
 		}
 		if _, err := Duration(loop.Interval); err != nil {
 			return c, err
+		}
+	}
+	if c.Reap.WorktreeAfter == "" {
+		c.Reap.WorktreeAfter = "168h"
+	}
+	if _, e = Duration(c.Reap.WorktreeAfter); e != nil {
+		return c, e
+	}
+	if len(c.Reap.Protect) == 0 {
+		c.Reap.Protect = DefaultReapProtect
+	}
+	for _, g := range c.Reap.Protect {
+		if _, e = policy.Match(g, "probe"); e != nil {
+			return c, e
+		}
+	}
+	seenHosts := map[string]bool{}
+	for i, h := range c.Hosts {
+		if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(h.Name) || seenHosts[h.Name] {
+			return c, errors.New("hosts require unique name labels")
+		}
+		seenHosts[h.Name] = true
+		if strings.HasPrefix(h.SSH, "-") || strings.ContainsAny(h.SSH, " \t\r\n") {
+			return c, errors.New("hosts[].ssh must be empty, local, or an ssh destination")
+		}
+		if h.Jobs == "" {
+			continue
+		}
+		if h.Local() {
+			c.Hosts[i].Jobs = Expand(h.Jobs)
+			if !filepath.IsAbs(c.Hosts[i].Jobs) {
+				return c, errors.New("hosts[].jobs must be an absolute path")
+			}
+		} else if !filepath.IsAbs(h.Jobs) {
+			return c, errors.New("ssh host jobs must be an absolute path; ~ does not expand remotely")
 		}
 	}
 	if c.Review.Timeout == "" {

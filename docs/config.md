@@ -24,6 +24,8 @@ Different hosts may use the same inventory and different deny lists.
 | `poll_interval` | `60s` | Positive Go duration between completed `watch` or `agent` iterations. |
 | `watch_limit` | `100` | Maximum commit interval inspected during recovery, from 2 through 1000. |
 | `repos` | Empty list | Repositories this host may operate on. Names must be unique; `agent` requires at least one. |
+| `hosts` | Empty list | Session hosts scanned by `reap`; see below. |
+| `reap` | Disabled | Merged-PR session/worktree reaping; see below. |
 | `daemon` | All roles disabled | Role config and explicit acting opt-in; see below. |
 | `review` | Empty object | Independent-review configuration described below. |
 | `notifier` | No-op | Notification adapter described below. |
@@ -70,6 +72,55 @@ smoke:
 Commands are invoked directly, with no shell expansion. Use a separately
 reviewed script for more complex checks. Smoke should be read-only: rollback
 restores installed files, not external actions taken by a smoke command.
+
+### `hosts[]`
+
+Session hosts where agent panes may run, used only by `reap`.
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `name` | Required | Unique label for receipts; same alphabet as `host`. |
+| `ssh` | Empty / `local` | Empty or `local` runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`; options, whitespace and leading `-` are refused. |
+| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`). Needed before any pane on this host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. |
+
+### `reap`
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Gates the `reap` command and daemon role. |
+| `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
+| `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
+
+`mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
+daemon role close merged-PR sessions, then clean their worktrees once they
+age out. For each merged PR on a configured repo's base branch, every host is
+scanned with `herdr agent list` (remote hosts over `ssh <ssh> herdr agent
+list`). A pane matches only when its `cwd` is a linked git worktree, its
+current branch equals the PR head branch, and the worktree's origin remote
+names the configured repository. Titles and names are never used for matching.
+
+Before a matching pane is closed it must be reported as not `working` and its
+output must be captured: an existing `<jobs>/<name>/report.md` wins, otherwise
+the pane's last screen is saved to `<jobs>/<name>/pane-screen.txt` first. The
+saved path is recorded in the receipt. A pane is closed with `herdr pane
+close <pane_id>` only in acting mode.
+
+After `worktree_after` with no revert, a merged PR's worktree is removed. The
+revert knowledge comes from the watch role's recovery-PR convention: a
+recovery merged within seven days of the PR's merge, or one still open, skips
+cleanup. Removal also requires the worktree to still exist in `git worktree
+list`, to be clean, to have no live pane (agent or plain shell, from `herdr
+pane list`) using it, and to have no unpushed commits — the branch must merge
+into the base branch (remote-tracking `origin/<branch>` first, then local) or
+be fully pushed upstream. Anything dirty, unknown or ambiguous is skipped with
+the reason recorded; removal is `git worktree remove` without `--force` and the
+local branch is deleted with `git branch -d`, never `-D`. The remote branch
+stays. Worktrees are found from the panes and from prior `reap.jsonl` rows, so
+a worktree whose pane already closed still gets cleaned.
+
+Every decision is appended to `<state_dir>/<repo>/reap.jsonl` — including
+shadow `would-*` rows, which is how a later pass still finds a worktree it
+planned earlier. Dry-run prints rows without writing the file.
 
 ### `review`
 
@@ -334,6 +385,7 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
+| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |

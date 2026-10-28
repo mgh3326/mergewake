@@ -67,6 +67,7 @@ rollout likewise require `--apply`.
 | `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
+| `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |
 
 The command layer handles flags, signals, and polling. Tests replace each external
 boundary with a fake or a local HTTP test server. Mutating operations have no
@@ -153,6 +154,38 @@ fallback. The handoffkeep adapter uses show, comment, then the explicit reopen
 operation with a required reason, entering `reopened`. Unsupported older servers
 and protected authority refusals return a clear failure after the comment; the
 notification includes it and the recovery latch remains set.
+
+## Merged-PR reaping
+
+Agent panes and git worktrees accumulate on session hosts after their PRs
+merge. The `reap` role closes the pane that worked on a merged PR, and after
+`reap.worktree_after` (default seven days) with no revert it removes the
+worktree and local branch.
+
+Panes are matched by evidence, never by title or name alone: `herdr agent
+list` runs on each configured `hosts[]` entry (`ssh <ssh>` for remote hosts),
+and a pane's `cwd` must inspect as a linked git worktree whose current branch
+equals the PR head branch and whose origin remote names the configured
+repository. URL and scp-style `git@host:owner/name` remotes both parse; a
+canonical clone, subdirectory checkout, detached head or foreign remote never
+matches.
+
+A matching pane is closed only when it is not `working`, is named, misses the
+`reap.protect` globs, and its output was captured first: an existing
+`<jobs>/<name>/report.md` counts, otherwise `herdr pane read` saves the last
+screen to `<jobs>/<name>/pane-screen.txt`. The saved path lands in the
+receipt. A host without `jobs` configured cannot lose panes.
+
+Worktree removal is additive on top of the age gate: the merge must be older
+than `worktree_after`, the watch role's recovery convention must show neither
+an open recovery nor one merged within seven days, the worktree must still be
+registered, unlocked, clean and unattached, no live pane (from `herdr pane
+list`, which also sees plain shells) may use it, and the branch must carry no
+unpushed commits — merged into the base or fully pushed. Removal is `git
+worktree remove` and `git branch -d`; the code has no force flags to reach
+for. Candidates come from live panes and from prior `reap.jsonl` rows so a
+worktree survives its pane's earlier close. Anything unknown or ambiguous is
+skipped with a reason rather than deleted.
 
 ## Manifests and verified installs
 
