@@ -41,7 +41,7 @@ func TestShadowOutcomesAndSevenDayFollowup(t *testing.T) {
 	if err := s.ObservePR(context.Background(), repo, g.pull, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.recordFindings(repo.Name, 7, g.pull.Head.SHA, []github.Finding{}, false); err != nil {
+	if err := s.recordReview(repo.Name, 7, g.pull.Head.SHA, []github.Finding{}, github.PassReceipt{}, false); err != nil {
 		t.Fatal(err)
 	}
 	state, err := s.ledger().Read()

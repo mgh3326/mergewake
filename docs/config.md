@@ -91,14 +91,32 @@ Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
 refused. Codex effort becomes a TOML override; Kimi effort is set in its isolated
 model config from `gate_effort`. Use concrete model IDs from the installed CLI.
 
-Selection preserves the quota tool's ranked `rows` order, admits only
-`kind: candidate` rows, filters out the author's family, and tries quota gates
-in order. Unknown profiles are skipped. `gate_effort` must match an explicit
-recommended effort; it is also passed to the gate. Missing executables and failed
-gates fall through. A failed recommendation fails closed. After a head claim and
-model invocation, failures or invalid output retain the claim; there is no second
-model pass or output repair. Dry-run and shadow may read recommendations but
-never invoke a reviewer, gate, claim or post a review.
+Selection preserves the quota tool's ranked `rows` order and admits only
+`kind: candidate` rows. Routine changes need one diff-only pass on the exact PR
+head; blocking paths need two. For each pass the reviewer is chosen in this
+order: a different model family than the author, preferring `pairings` order and
+families not already used on this head; any different family; the author's
+family with a different model (from `Mergewake-Author-Model` or the configured
+author profile's `--model`); the author's family at all; and finally any
+admitted profile in a fresh diff-only call. Review never stops merely because
+no different-family reviewer has quota; only an empty eligible set fails.
+Unknown profiles are skipped. `gate_effort` must match an explicit recommended
+effort; it is also passed to the gate. Missing executables and failed gates
+fall through. A failed recommendation fails closed. After a head claim and
+model invocation, failures or invalid output retain the claim; there is no
+output repair or same-claim retry. Dry-run and shadow may read recommendations
+but never invoke a reviewer, gate, claim or post a review.
+
+Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
+invoking the model. When every required pass is posted, the
+`mergewake/reviews/<pr>/<head>-done` marker is created and the daemon skips
+that head. An interrupted pass retains its claim and is not retried
+automatically. Posted reviews embed a `mergewake-pass` JSON marker recording
+the pass number, lens, reviewer profile, family, and `same_family` flag;
+receipts and outcomes bind to the exact PR head, so a head change invalidates
+them. When both passes of a blocking PR fall back to the author's family, pass
+1 uses a correctness/regressions lens and pass 2 a state/migration/security/deploy
+lens; in every other case passes use the default lens.
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
@@ -273,7 +291,8 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
-| `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. |
+| `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
+| `review_gate` | Absent | Graded review-thread enforcement described below. An absent section keeps the legacy rule: a blocking PR waits until every unresolved review thread is resolved. |
 
 Each blocking rule has:
 
@@ -288,6 +307,38 @@ segment and spans zero or more components. Ordinary `*` never crosses `/`.
 Leading `/`, backslashes, empty segments and `..` are refused. Blocking rules
 combine with OR; there are no per-rule merge overrides, finding severity bypasses,
 or advisory rounds for blocking findings.
+
+Each `review_gate` rule has an `author` (a normalized bot login), a nonempty
+`severity` list, and an optional `classes` list (`blocking`, `routine`; empty
+means both). Severities come from a `<!-- mergewake-severity:... -->` marker in
+the thread's first comment, or prose conventions: `critical`, `major`, `minor`,
+`nitpick` for CodeRabbit; `p1`, `p2`, `p3` for the Codex connector; plus
+`blocking`, `high`, `medium`, `low` for mergewake's own review. A thread is
+*answered* when a human (a non-bot author different from the finding's author)
+replies; an answered thread covers a different bot's duplicate on the same path
+and line. Resolved or outdated threads are ignored. `block` rules stop the merge
+until fixed; `triage` rules hold it until answered; everything else is
+advisory. A gate-referenced bot that left no evidence at all is recorded as a
+coverage gap — never a clean pass, never a block. Findings from the configured
+`review.login` block blocking paths at `critical`, `high`, `blocking`, or
+`major` severity. Present-but-empty fields take these defaults:
+
+```yaml
+review_gate:
+  block:
+    - {author: coderabbitai, severity: [critical]}
+    - {author: coderabbitai, severity: [major], classes: [blocking]}
+    - {author: chatgpt-codex-connector, severity: [p1], classes: [blocking]}
+  triage:
+    - {author: coderabbitai, severity: [major]}
+    - {author: chatgpt-codex-connector, severity: [p2]}
+  ignore_authors: [qlty, commitcheck, wip, accesslint, codecov, gitguardian]
+  ignore_outdated: true
+  ignore_bot_resolved: true
+```
+
+Older mergewake versions cannot parse `review_gate`; enable the section only
+after every landing host runs a release that understands it.
 
 The repository's policy should cover its own verification controls where changing
 them can admit irreversible actions. A PR cannot use its own new policy to grant
@@ -354,9 +405,13 @@ this avoids an immediate unintended retry. No dry run clears locks or recovers a
 journal.
 
 For a failed independent review, inspect
-`mergewake/reviews/<PR>/<full-head-SHA>` and GitHub reviews first. Only delete the
-claim if no reviewer remains active and no complete review was posted; then a
-rerun can attempt that head. Completed claims can remain as evidence.
+`mergewake/reviews/<PR>/<full-head-SHA>` (plus `-p2` for a second pass) and
+GitHub reviews first. Only delete a claim if no reviewer remains active and no
+complete review was posted; then a rerun can attempt that head. The
+`mergewake/reviews/<PR>/<full-head-SHA>-done` marker is created only when every required pass is
+posted; removing it makes the daemon re-check the head, while retained pass
+claims still prevent duplicate model invocation. Completed claims can remain as
+evidence.
 
 For CI recovery, inspect the revert PR, the fixed `mergewake-recovery-latch` tag,
 and any `mergewake/recovery` branch. After recovery is complete, an operator may

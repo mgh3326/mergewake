@@ -111,9 +111,10 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		if pr.Draft {
 			continue
 		}
-		// A failed retained claim is not a retry signal. Landing remains independent
-		// so advisory review failures do not block routine policy decisions.
-		claimed, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA)
+		// A failed retained claim is not a retry signal; only the -done marker
+		// means all required passes finished. Landing stays independent so
+		// advisory review failures do not block routine policy decisions.
+		claimed, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 		if e == nil && !claimed {
 			e = s.Review(ctx, r, pr.Number, "", childOptions)
 		}

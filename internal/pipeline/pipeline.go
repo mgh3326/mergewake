@@ -30,8 +30,11 @@ type GitHub interface {
 	RecoveryActive(context.Context, string) (bool, error)
 	Check(context.Context, string, string, []string) (github.CI, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
+	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
+	ReviewClaimed(context.Context, string, int, string) (bool, error)
+	ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error)
 	Unresolved(context.Context, string, int) (int, error)
-	PostReview(context.Context, string, int, string, []github.Finding) error
+	PostReview(context.Context, string, int, string, []github.Finding, github.PassReceipt) error
 	Commit(context.Context, string, string) (github.Commit, error)
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
 	Ancestor(context.Context, string, string, string) (bool, error)
@@ -97,6 +100,58 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	}
 	return p, p.Validate()
 }
+
+// reviewGate folds review threads into the land decision. Without a
+// review_gate section, blocking PRs keep the legacy all-unresolved-must-clear
+// rule and routine PRs stay advisory. With the section, graded author+severity
+// rules decide: blocking findings stop the merge until fixed, triage findings
+// gate it until answered, and a missing gate bot is a recorded coverage gap,
+// never a pass or a block.
+func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy) (string, *policy.GateVerdict, []string, *int, error) {
+	if p.ReviewGate == nil {
+		if class != "blocking" {
+			return "", nil, nil, nil, nil
+		}
+		count, e := s.GH.Unresolved(ctx, r.Name, n)
+		if e != nil {
+			return "", nil, nil, nil, e
+		}
+		if count > 0 {
+			return "wait-for-findings", nil, nil, &count, nil
+		}
+		return "", nil, nil, &count, nil
+	}
+	fb, e := s.GH.ReviewFeedback(ctx, r.Name, n)
+	if e != nil {
+		return "", nil, nil, nil, e
+	}
+	gate := p.ReviewGate.WithDefaults()
+	login := policy.NormalizeAuthor(s.Config.Review.Login)
+	if login != "" {
+		// The independent review's own findings are graded like any gate author:
+		// critical/high always blocks; legacy blocking/major blocks stateful paths.
+		gate.Block = append(gate.Block,
+			policy.ReviewGateRule{Author: login, Severity: []string{"critical", "high"}},
+			policy.ReviewGateRule{Author: login, Severity: []string{"blocking", "major"}, Classes: []string{"blocking"}})
+	}
+	bots := gate.GateAuthors()
+	for _, a := range gate.IgnoreAuthors {
+		bots[policy.NormalizeAuthor(a)] = true
+	}
+	if login != "" {
+		bots[login] = true
+	}
+	fs := fb.Findings(bots)
+	v := gate.Evaluate(fs, class)
+	gap := gate.CoverageGap(fs, fb.ReviewAuthors)
+	switch {
+	case len(v.Blocking) > 0:
+		return "wait-for-blocking-findings", &v, gap, nil, nil
+	case len(v.Triage) > 0:
+		return "wait-for-triage-reply", &v, gap, nil, nil
+	}
+	return "", &v, gap, nil, nil
+}
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -130,42 +185,59 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if len(files) != pr.ChangedFiles {
 		return errors.New("incomplete PR file list")
 	}
-	d := p.Classify(files)
+	d := p.ClassifyGuarded(files, r.Policy)
 	d.Shadow = d.Shadow || o.Shadow
 	d.Action = "wait-for-ci"
 	ci, e := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {
 		return e
 	}
+	var verdict *policy.GateVerdict
+	var gap []string
+	var unresolved, reviewed *int
+	sameFamily := false
 	if ci == github.Green {
 		d.Action = "merge"
 		if d.Class == "blocking" {
-			done, e := s.GH.Reviewed(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+			receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
 			if e != nil {
 				return e
 			}
-			if !done {
+			count := len(receipts)
+			reviewed = &count
+			for _, receipt := range receipts {
+				sameFamily = sameFamily || receipt.SameFamily
+			}
+			if count < 2 {
 				d.Action = "wait-for-independent-review"
-			} else {
-				count, e := s.GH.Unresolved(ctx, r.Name, n)
-				if e != nil {
-					return e
-				}
-				if count > 0 {
-					d.Action = "wait-for-findings"
-				}
+			}
+		}
+		if d.Action == "merge" {
+			action, v, g, u, e := s.reviewGate(ctx, r, n, d.Class, p)
+			if e != nil {
+				return e
+			}
+			verdict, gap, unresolved = v, g, u
+			if action != "" {
+				d.Action = action
 			}
 		}
 	}
 	if e = s.audit(r.Name, "land", struct {
-		PR   int       `json:"pr"`
-		Head string    `json:"head"`
-		CI   github.CI `json:"ci"`
+		PR          int                 `json:"pr"`
+		Head        string              `json:"head"`
+		Base        string              `json:"base"`
+		CI          github.CI           `json:"ci"`
+		Reviews     *int                `json:"review_passes,omitempty"`
+		Unresolved  *int                `json:"unresolved,omitempty"`
+		Findings    *policy.GateVerdict `json:"findings,omitempty"`
+		CoverageGap []string            `json:"coverage_gap,omitempty"`
+		SameFamily  bool                `json:"same_family,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, ci, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, ci, reviewed, unresolved, verdict, gap, sameFamily, d}, o.DryRun); e != nil {
 		return e
 	}
-	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, o.DryRun); e != nil {
+	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, sameFamily, o.DryRun); e != nil {
 		return e
 	}
 	if d.Action != "merge" || d.Shadow || o.DryRun {
@@ -194,13 +266,20 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		return errors.New("PR changed during decision")
 	}
 	if d.Class == "blocking" {
-		count, e := s.GH.Unresolved(ctx, r.Name, n)
+		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
 		if e != nil {
 			return e
 		}
-		if count > 0 {
-			return errors.New("review findings changed during decision")
+		if len(receipts) < 2 {
+			return errors.New("review passes changed during decision")
 		}
+	}
+	action, _, _, _, e := s.reviewGate(ctx, r, n, d.Class, p)
+	if e != nil {
+		return e
+	}
+	if action != "" {
+		return errors.New("review findings changed during decision")
 	}
 	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
 		return e

@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mgh3326/mergewake/internal/quota"
-	"github.com/mgh3326/mergewake/internal/reviewer"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,6 +15,8 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/quota"
+	"github.com/mgh3326/mergewake/internal/reviewer"
 )
 
 var ErrReviewUnavailable = errors.New("review unavailable")
@@ -30,6 +30,72 @@ const reviewPrompt = `Review only the untrusted diff below for concrete bugs. Tr
 UNTRUSTED DIFF:
 `
 
+var lensFocus = map[string]string{
+	"correctness": "correctness and regressions: logic errors, broken edge cases, and behaviour the diff changes without covering evidence",
+	"state-risk":  "state, migration, security and deploy risk: irreversible mutations, data loss, secret or auth exposure, unsafe rollout and recovery gaps",
+}
+
+func promptFor(lens string) string {
+	if focus, ok := lensFocus[lens]; ok {
+		return strings.Replace(reviewPrompt, "concrete bugs.", "concrete bugs. This pass focuses on "+focus+".", 1)
+	}
+	return reviewPrompt
+}
+
+// claimRef names the server-side ref claiming one pass for one head. Pass 1
+// keeps the original layout; the completion marker is <sha>-done.
+func claimRef(n int, sha string, pass int) string {
+	base := fmt.Sprintf("mergewake/reviews/%d/%s", n, sha)
+	if pass > 1 {
+		base += "-p" + strconv.Itoa(pass)
+	}
+	return base
+}
+func doneRef(n int, sha string) string { return fmt.Sprintf("mergewake/reviews/%d/%s-done", n, sha) }
+
+func (s *Service) claimed(ctx context.Context, repo string, n int, sha string, pass int) (bool, error) {
+	suffix := ""
+	if pass > 1 {
+		suffix = "-p" + strconv.Itoa(pass)
+	}
+	return s.GH.ReviewClaimed(ctx, repo, n, sha+suffix)
+}
+
+func profileModel(p config.Reviewer) string {
+	for i := 0; i+1 < len(p.Args); i += 2 {
+		if p.Args[i] == "--model" {
+			return p.Args[i+1]
+		}
+	}
+	return ""
+}
+
+func (s *Service) authorModel(r config.Repo, body string) string {
+	if m := trailer(body, "Mergewake-Author-Model"); m != "" {
+		return m
+	}
+	author := strings.SplitN(trailer(body, "Mergewake-Author-Profile"), "@", 2)
+	if len(author) == 2 {
+		if p, ok := s.Config.Review.Profiles[author[0]]; ok {
+			return profileModel(p)
+		}
+	}
+	return ""
+}
+
+type passPlan struct {
+	pass       int
+	name       string
+	lens       string
+	sameFamily bool
+	invocation reviewer.Invocation
+	candidates []string
+}
+
+// Review runs the required diff-only passes for the PR head: one for routine
+// changes, two for blocking paths. A different model family from the author is
+// preferred; when quota admits none, a same-family reviewer runs instead, with
+// a different model preferred and a fresh same-model call as the last resort.
 func (s *Service) Review(ctx context.Context, r config.Repo, n int, family string, o Options) error {
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
@@ -61,12 +127,57 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if family == "" {
 		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
 	}
-	done, e := s.GH.Reviewed(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	head, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
 	}
-	if done {
-		return s.Print(map[string]any{"action": "already-reviewed", "head": pr.Head.SHA})
+	p, e := s.Policy(ctx, r, head)
+	if e != nil {
+		return e
+	}
+	files, e := s.GH.Files(ctx, r.Name, n)
+	if e != nil {
+		return e
+	}
+	if len(files) != pr.ChangedFiles {
+		return errors.New("incomplete PR file list")
+	}
+	needed := 1
+	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+		needed = 2
+	}
+	receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	if e != nil {
+		return e
+	}
+	posted := map[int]github.PassReceipt{}
+	for _, receipt := range receipts {
+		posted[receipt.Pass] = receipt
+	}
+	missing, pending := []int{}, []int{}
+	for i := 1; i <= needed; i++ {
+		if _, ok := posted[i]; ok {
+			continue
+		}
+		claimed, e := s.claimed(ctx, r.Name, n, pr.Head.SHA, i)
+		if e != nil {
+			return e
+		}
+		if claimed {
+			pending = append(pending, i)
+		} else {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		action := "review-pending"
+		if len(pending) == 0 {
+			action = "already-reviewed"
+			if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
+				return e
+			}
+		}
+		return s.Print(map[string]any{"action": action, "head": pr.Head.SHA, "passes": len(posted), "needed": needed})
 	}
 	timeout, e := config.Duration(s.Config.Review.Timeout)
 	if e != nil {
@@ -96,16 +207,17 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if e != nil {
 		return fmt.Errorf("quota recommendation: %w", e)
 	}
-	candidates := []string{}
-	eligible := map[string]bool{}
+	profiles := s.Config.Review.Profiles
 	names := []string{}
-	for name := range s.Config.Review.Profiles {
+	for name := range profiles {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	rankedOrder := []string{}
+	eligible := map[string]bool{}
 	for _, c := range ranked {
 		for _, name := range names {
-			p := s.Config.Review.Profiles[name]
+			p := profiles[name]
 			if p.GateEffort != "" && c.Effort != "" && p.GateEffort != c.Effort {
 				continue
 			}
@@ -113,25 +225,85 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if gate == "" {
 				gate = name
 			}
-			if gate == c.Profile && p.Family != "" && p.Family != family && !eligible[name] {
-				candidates = append(candidates, name)
+			if gate == c.Profile && p.Family != "" && !eligible[name] {
+				rankedOrder = append(rankedOrder, name)
 				eligible[name] = true
 			}
 		}
 	}
-	if names, ok := s.Config.Review.Pairings[family]; ok {
-		candidates = nil
-		for _, name := range names {
-			if eligible[name] {
-				candidates = append(candidates, name)
-			}
+	otherOrder := append([]string{}, s.Config.Review.Pairings[family]...)
+	if len(otherOrder) == 0 {
+		otherOrder = rankedOrder
+	}
+	authorModel := s.authorModel(r, pr.Body)
+	model := func(name string) string { return profileModel(profiles[name]) }
+	fam := func(name string) string { return profiles[name].Family }
+	usedProfiles := map[string]bool{}
+	usedFamilies := map[string]bool{}
+	for _, receipt := range posted {
+		if receipt.Reviewer != "" {
+			usedProfiles[receipt.Reviewer] = true
+		}
+		if receipt.Family != "" {
+			usedFamilies[receipt.Family] = true
 		}
 	}
-	if len(candidates) == 0 {
-		return fmt.Errorf("%w: quota has no eligible independent reviewer", ErrReviewUnavailable)
+	// Preference order per pass: another family not yet used, another family,
+	// same family with a different model, same family, then a fresh call on any
+	// admitted profile. An empty candidate list means quota admitted nobody.
+	order := func() []string {
+		var list []string
+		seen := map[string]bool{}
+		emit := func(src []string, keep func(string) bool) {
+			for _, name := range src {
+				if eligible[name] && !seen[name] && keep(name) {
+					list = append(list, name)
+					seen[name] = true
+				}
+			}
+		}
+		emit(otherOrder, func(n string) bool { return fam(n) != family && !usedFamilies[fam(n)] && !usedProfiles[n] })
+		emit(otherOrder, func(n string) bool { return fam(n) != family && !usedProfiles[n] })
+		emit(rankedOrder, func(n string) bool { return fam(n) == family && model(n) != authorModel && !usedProfiles[n] })
+		emit(rankedOrder, func(n string) bool { return fam(n) == family && !usedProfiles[n] })
+		emit(rankedOrder, func(n string) bool { return !usedProfiles[n] })
+		emit(rankedOrder, func(n string) bool { return true })
+		return list
+	}
+	var plans []*passPlan
+	for _, pass := range missing {
+		plans = append(plans, &passPlan{pass: pass, candidates: order()})
+		if len(plans[len(plans)-1].candidates) == 0 {
+			return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
+		}
+		usedProfiles[plans[len(plans)-1].candidates[0]] = true
+		usedFamilies[fam(plans[len(plans)-1].candidates[0])] = true
+	}
+	families := map[int]string{}
+	for pass, receipt := range posted {
+		families[pass] = receipt.Family
+	}
+	for _, plan := range plans {
+		families[plan.pass] = fam(plan.candidates[0])
+	}
+	lens := func(plan *passPlan, selected string) string {
+		families[plan.pass] = fam(selected)
+		if needed == 2 && families[1] != "" && families[1] == families[2] {
+			if plan.pass == 1 {
+				return "correctness"
+			}
+			return "state-risk"
+		}
+		return "default"
 	}
 	if o.DryRun || o.Shadow {
-		return s.Print(map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "candidates": candidates, "dry_run": true})
+		out := []map[string]any{}
+		for _, plan := range plans {
+			plan.lens = lens(plan, plan.candidates[0])
+			plan.sameFamily = fam(plan.candidates[0]) == family
+			out = append(out, map[string]any{"pass": plan.pass, "lens": plan.lens, "same_family": plan.sameFamily, "candidates": plan.candidates})
+		}
+		return s.Print(map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true})
 	}
 	diff, e := s.GH.Diff(ctx, r.Name, n)
 	if e != nil {
@@ -152,74 +324,106 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 	}
-	selected := ""
-	var invocation reviewer.Invocation
-	for i, name := range candidates {
-		p := s.Config.Review.Profiles[name]
-		gate := p.GateProfile
-		if gate == "" {
-			gate = name
-		}
-		if available, ok := s.Runner.(interface{ Available(string) error }); ok {
-			if available.Available(config.Expand(p.Command)) != nil {
+	for _, plan := range plans {
+		selected := ""
+		for i, name := range plan.candidates {
+			p := profiles[name]
+			gate := p.GateProfile
+			if gate == "" {
+				gate = name
+			}
+			if available, ok := s.Runner.(interface{ Available(string) error }); ok {
+				if available.Available(config.Expand(p.Command)) != nil {
+					continue
+				}
+			}
+			if e = provider.Gate(ctx, gate, p.GateEffort); e != nil {
 				continue
 			}
+			candidateControl := filepath.Join(control, fmt.Sprintf("%d-%d", plan.pass, i))
+			if e = os.Mkdir(candidateControl, 0700); e != nil {
+				return e
+			}
+			invocation, e := reviewer.Prepare(p, candidateControl)
+			if e != nil {
+				continue
+			}
+			selected = name
+			plan.invocation = invocation
+			break
 		}
-		if e = provider.Gate(ctx, gate, p.GateEffort); e != nil {
-			continue
+		if selected == "" {
+			return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
 		}
-		candidateControl := filepath.Join(control, strconv.Itoa(i))
-		if e = os.Mkdir(candidateControl, 0700); e != nil {
-			return e
+		plan.name = selected
+		plan.lens = lens(plan, selected)
+		plan.sameFamily = fam(selected) == family
+		profile := profiles[selected]
+		// A GitHub ref claims this PR head across hosts before invoking the model.
+		claim := claimRef(n, pr.Head.SHA, plan.pass)
+		if e = s.GH.CreateRef(ctx, r.Name, claim, pr.Head.SHA); e != nil {
+			return fmt.Errorf("review claim unavailable; inspect existing claim before retrying: %w", e)
 		}
-		invocation, e = reviewer.Prepare(p, candidateControl)
+		if filepath.Base(profile.Command) == "cmd" {
+			// The hook also denies control-flow tools that bypass permission deny lists.
+			if e = os.MkdirAll(filepath.Join(dir, ".commandcode"), 0700); e != nil {
+				return e
+			}
+			settings := `{"permissions":{"deny":["*"]},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Diff-only review: all tools disabled\"}}'"}]}]}}`
+			if e = os.WriteFile(filepath.Join(dir, ".commandcode", "settings.json"), []byte(settings), 0600); e != nil {
+				return e
+			}
+		}
+		output, e := reviewer.Run(ctx, s.Runner, plan.invocation, promptFor(plan.lens)+diff, dir, s.Config.TokenEnv)
 		if e != nil {
-			continue
-		}
-		selected = name
-		break
-	}
-	if selected == "" {
-		return fmt.Errorf("%w: quota admitted no available independent reviewer", ErrReviewUnavailable)
-	}
-	profile := s.Config.Review.Profiles[selected]
-	// A GitHub ref claims this PR head across hosts before invoking the model.
-	claim := fmt.Sprintf("mergewake/reviews/%d/%s", n, pr.Head.SHA)
-	if e = s.GH.CreateRef(ctx, r.Name, claim, pr.Head.SHA); e != nil {
-		return fmt.Errorf("review claim unavailable; inspect existing claim before retrying: %w", e)
-	}
-	if filepath.Base(profile.Command) == "cmd" {
-		// The hook also denies control-flow tools that bypass permission deny lists.
-		if e = os.MkdirAll(filepath.Join(dir, ".commandcode"), 0700); e != nil {
 			return e
 		}
-		settings := `{"permissions":{"deny":["*"]},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Diff-only review: all tools disabled\"}}'"}]}]}}`
-		if e = os.WriteFile(filepath.Join(dir, ".commandcode", "settings.json"), []byte(settings), 0600); e != nil {
+		findings, e := parseFindings(output, diff)
+		if e != nil {
+			return e
+		}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: fam(selected), SameFamily: plan.sameFamily}
+		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
+			return e
+		}
+		fresh, e := s.GH.Pull(ctx, r.Name, n)
+		if e != nil {
+			return e
+		}
+		if fresh.Head.SHA != pr.Head.SHA {
+			return errors.New("PR head changed during review; run once for the new head")
+		}
+		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
+			return e
+		}
+		if e = s.audit(r.Name, "review", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings)}, false); e != nil {
 			return e
 		}
 	}
-	output, e := reviewer.Run(ctx, s.Runner, invocation, reviewPrompt+diff, dir, s.Config.TokenEnv)
+	if len(posted)+len(plans) >= needed {
+		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
+	}
+	return nil
+}
+
+// markDone creates the completion ref once every required pass is posted; the
+// daemon skips only done heads. A lost create race is tolerated when the ref
+// exists on recheck.
+func (s *Service) markDone(ctx context.Context, repo string, n int, sha string) error {
+	done, e := s.GH.ReviewClaimed(ctx, repo, n, sha+"-done")
 	if e != nil {
 		return e
 	}
-	findings, e := parseFindings(output, diff)
-	if e != nil {
-		return e
+	if done {
+		return nil
 	}
-	if e = s.recordFindings(r.Name, n, pr.Head.SHA, findings, o.DryRun); e != nil {
-		return e
+	if e = s.GH.CreateRef(ctx, repo, doneRef(n, sha), sha); e != nil {
+		exists, check := s.GH.ReviewClaimed(ctx, repo, n, sha+"-done")
+		if check != nil || !exists {
+			return errors.Join(e, check)
+		}
 	}
-	fresh, e := s.GH.Pull(ctx, r.Name, n)
-	if e != nil {
-		return e
-	}
-	if fresh.Head.SHA != pr.Head.SHA {
-		return errors.New("PR head changed during review; run once for the new head")
-	}
-	if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings); e != nil {
-		return e
-	}
-	return s.audit(r.Name, "review", map[string]any{"pr": n, "head": pr.Head.SHA, "reviewer": selected, "findings": len(findings)}, false)
+	return nil
 }
 
 var hunk = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
