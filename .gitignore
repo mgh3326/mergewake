@@ -1,0 +1,5 @@
+/dist/
+/mergewake
+*.test
+coverage.out
+.mergewake-state/
