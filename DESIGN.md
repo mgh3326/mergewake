@@ -64,7 +64,7 @@ rollout likewise require `--apply`.
 | `daemon` | Independent role scheduling, advisory locks, status, backoff and optional triggers. |
 | `pipeline` | Landing, one-pass review, CI diagnosis, release and rollout orchestration. |
 | `manifest` | Deterministic inventories, SHA256 and size validation, safe relative paths. |
-| `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, rollback. |
+| `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
 
@@ -225,6 +225,9 @@ operators must give each inventory its own root.
   or replicate that directory across hosts; mergewake supplies no fleet transport.
 - The v* workflow builds release binaries; no service activation or restart occurs.
   Service units are examples for the desk to install separately.
+- Container deploys stop the previous container first, so each target is briefly
+  unavailable. There is no blue-green swap, replica management, registry API call,
+  or rollback of volume-contents or database changes.
 - CI recovery uses recorded checks; any-ref workflow dispatch and flaky-test
   reruns are not implemented. Missing evidence deliberately requires an operator.
 - Superfan contracts guide a trusted session runner; the binary neither enforces
@@ -242,13 +245,14 @@ to operator-approved activation.
 
 ## Command and release installs
 
-A schema-2 manifest contains commit, repo and logical target/kind pairs. It never
-carries executable commands. The host config independently supplies recipes,
-verify expectations and deny patterns. For pure `release` inventories, rollout
-selects the newest compatible published v* release and resolves its tag to a
-commit, then checks main ancestry and CI as usual. The binary downloader resolves
-the requested SHA to a release tag and checks SHA256SUMS and asset size before
-atomic replacement; it rechecks the tag after download.
+A schema-2 manifest contains commit, repo and logical target/kind entries, plus a
+digest for container targets. It never carries executable commands. The host
+config independently supplies recipes, verify expectations and deny patterns. For
+pure `release` inventories, rollout selects the newest compatible published v*
+release and resolves its tag to a commit, then checks main ancestry and CI as
+usual. The binary downloader resolves the requested SHA to a release tag and
+checks SHA256SUMS and asset size before atomic replacement; it rechecks the tag
+after download.
 
 Before mutation every selected target needs an installed receipt or an explicit
 initial_sha whose verify command proves the prior installation. The journal
@@ -263,3 +267,30 @@ Only after every target's verification and smoke pass are the installed receipt
 and per-target gate receipts published. A serial host waits for earlier hosts;
 a canary follower waits for the canary's success for this exact repo/commit/target.
 Repeated healthy polls reverify commands and can repair missing shared receipts.
+
+## Container installs
+
+The container kind deliberately implements a small subset of cluster scheduling
+for single-host services: an immutable image digest, host ports, one env file,
+optional volumes, a restart policy and an HTTP health check. It does not model
+replicas, services, ingress or storage classes. A schema-2 manifest entry names
+the logical target, `kind: container`, and normally the digest; `rollout --digest`
+supplies or overrides it for a single target. Tags are never resolved or deployed.
+
+Both containers need the same host ports, so a rolling start is impossible without
+a proxy or a second port set. The chosen swap is stop, rename to
+`<name>.mergewake-prev`, start the new digest, then health-check. The rename keeps
+the previous writable layer, so rollback does not need a pull or a writable-layer
+copy. The cost is a short outage per target, reported as normal rollout state.
+If the new container is unhealthy, it is removed, the preserved container is
+renamed back and started, and its health is checked again before the prior receipt
+is restored. Both the journal and the receipt are written before the operations
+they authorize, and a crash is replayed from the journal.
+
+After success, images of that repository are collected except the current digest,
+the newest `keep` previous digests, and any image referenced by a container. The
+receipt's digest history is the retention list, so collection does not depend on
+image timestamps. Removal failures are warnings; they do not reverse a healthy
+deploy. Adopt records an operator-started container as the first receipt, and
+status compares the receipt with the runtime and the health URL. Drift always
+refuses a deploy rather than silently replacing an unrecorded container.

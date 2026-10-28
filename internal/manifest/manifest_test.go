@@ -75,3 +75,24 @@ func TestCommandManifestCarriesNoExecutableRecipe(t *testing.T) {
 		t.Fatal("mixed file/command transaction accepted")
 	}
 }
+
+func TestContainerManifestCarriesDigest(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("b", 64)
+	specs := []config.Install{{Kind: "container", Target: "api", Digest: digest}}
+	m, e := Build("example/project", strings.Repeat("a", 40), specs, nil)
+	if e != nil || m.Version != 2 || len(m.Commands) != 1 {
+		t.Fatalf("manifest=%+v err=%v", m, e)
+	}
+	if m.Commands[0].Kind != "container" || m.Commands[0].Digest != digest {
+		t.Fatalf("target=%+v", m.Commands[0])
+	}
+	bad := specs[0]
+	bad.Digest = "sha256:nothex"
+	if _, e = Build("example/project", strings.Repeat("a", 40), []config.Install{bad}, nil); e == nil {
+		t.Fatal("invalid container digest accepted")
+	}
+	bad = config.Install{Kind: "command", Target: "tools/example", Digest: digest}
+	if _, e = Build("example/project", strings.Repeat("a", 40), []config.Install{bad}, nil); e == nil {
+		t.Fatal("digest on a command target accepted")
+	}
+}

@@ -87,6 +87,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	var shadow, once *bool
 	var name, runner *string
 	var launch *bool
+	var digest, adopt *string
 	switch command {
 	case "land", "review":
 		pr = fs.Int("pr", 0, "pull request number")
@@ -102,6 +103,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		once = fs.Bool("once", false, "inspect once instead of polling")
 	case "release":
 		commit = fs.String("commit", "", "full main commit SHA (default branch head)")
+	case "rollout":
+		digest = fs.String("digest", "", "container digest repo@sha256:... for a single container target")
+		adopt = fs.String("adopt", "", "record an already-running container as the current receipt")
 	case "agent":
 		once = fs.Bool("once", false, "poll each repo once")
 	case "superfan":
@@ -150,6 +154,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	gh := github.New(os.Getenv(c.TokenEnv))
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
 	o := pipeline.Options{DryRun: *dry, Shadow: !*apply}
+	if digest != nil {
+		o.Digest = *digest
+	}
+	if adopt != nil {
+		o.Adopt = *adopt
+	}
 	if shadow != nil {
 		o.Shadow = o.Shadow || *shadow
 	}
@@ -258,8 +268,14 @@ func status(c config.Config, repo string, out io.Writer) error {
 		if repo != "" && r.Name != repo {
 			continue
 		}
-		if r.Root == "" {
+		if r.Root == "" && !hasContainerTarget(r) {
 			errs = append(errs, fmt.Errorf("%s: root required for status", r.Name))
+			continue
+		}
+		if hasContainerTarget(r) {
+			if err := containerStatus(c, r, out); err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
 		commands := false

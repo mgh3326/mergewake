@@ -21,7 +21,16 @@ import (
 const MaxFileSize = 32 << 20
 
 var SHA = regexp.MustCompile(`^[a-f0-9]{40}$`)
+var ContainerDigest = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var digest = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+func commandKind(kind string) bool {
+	switch kind {
+	case "command", "release", "container":
+		return true
+	}
+	return false
+}
 
 type File struct {
 	Source string `json:"source"`
@@ -33,6 +42,7 @@ type File struct {
 type CommandTarget struct {
 	Target string `json:"target"`
 	Kind   string `json:"kind"`
+	Digest string `json:"digest,omitempty"`
 }
 type Manifest struct {
 	Version  int             `json:"version"`
@@ -56,8 +66,15 @@ func (m Manifest) Validate() error {
 		}
 		seen := map[string]bool{}
 		for _, t := range m.Commands {
-			if !SafePath(t.Target) || (t.Kind != "command" && t.Kind != "release") || seen[t.Target] {
+			if !SafePath(t.Target) || !commandKind(t.Kind) || seen[t.Target] {
 				return errors.New("invalid command target")
+			}
+			if t.Kind == "container" {
+				if t.Digest != "" && !ContainerDigest.MatchString(t.Digest) {
+					return errors.New("container digest must be sha256:<64 hex>")
+				}
+			} else if t.Digest != "" {
+				return errors.New("only container targets may carry a digest")
 			}
 			for old := range seen {
 				if strings.HasPrefix(old, t.Target+"/") || strings.HasPrefix(t.Target, old+"/") {
@@ -96,9 +113,9 @@ func Verify(f File, b []byte) error {
 func Build(repo, commit string, specs []config.Install, read func(string) ([]byte, error)) (Manifest, error) {
 	m := Manifest{Version: 1, Repo: repo, Commit: commit}
 	for _, s := range specs {
-		if s.Kind == "command" || s.Kind == "release" {
+		if s.Kind == "command" || s.Kind == "release" || s.Kind == "container" {
 			m.Version = 2
-			m.Commands = append(m.Commands, CommandTarget{Target: s.Target, Kind: s.Kind})
+			m.Commands = append(m.Commands, CommandTarget{Target: s.Target, Kind: s.Kind, Digest: s.Digest})
 			continue
 		}
 		if s.Kind != "" && s.Kind != "file" {
