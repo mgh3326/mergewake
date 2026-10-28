@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/manifest"
 )
@@ -40,7 +43,12 @@ func TestInstallerPlatformsAndChecksum(t *testing.T) {
 			os.WriteFile(filepath.Join(tmp, "sums"), []byte(sums), 0600)
 			dest := filepath.Join(tmp, "output")
 			run := func() error {
-				c := exec.Command("sh", "../../install.sh", "--tag", "v0.2.0", "--bin-dir", dest)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				c := exec.CommandContext(ctx, "sh", "../../install.sh", "--tag", "v0.2.0", "--bin-dir", dest)
+				c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+				c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+				c.WaitDelay = 2 * time.Second
 				c.Env = []string{"PATH=" + tools + ":/usr/bin:/bin", "HOME=" + os.Getenv("HOME"), "TEST_PLATFORM=" + platform, "TEST_FIXTURE=" + tmp}
 				b, err := c.CombinedOutput()
 				if err != nil && !strings.Contains(string(b), "Checksum mismatch") {

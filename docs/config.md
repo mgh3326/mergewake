@@ -72,38 +72,164 @@ restores installed files, not external actions taken by a smoke command.
 
 ### `review`
 
-| Key | Required / default | Meaning |
+| Key | Default | Meaning |
 | --- | --- | --- |
-| `login` | Required for review and blocking land | GitHub login that posts the independent reviews. Only that identity's exact-head marker counts. For an app installation, use its review bot login. |
-| `timeout` | `10m` | Positive Go duration bounding optional quota gates, model invocation, and review submission. |
-| `scopefuel` | Empty / disabled | Optional `scopefuel` executable path. Candidates without `gate_profile` are skipped when this is enabled. |
-| `pairings` | Empty map | Author-family label → ordered list of allowed reviewer profile names. All named profiles must exist and differ from the author family. |
-| `profiles` | Empty map | Named reviewer definitions. The name is an arbitrary config identifier. |
+| `login` | Required | GitHub identity posting the independent exact-head review. |
+| `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
+| `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json` and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
+| `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
+| `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
+| `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
+| `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
 
-Each profile has:
+Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
+to the profile name), and optional `gate_effort`. Commands may be installed paths
+ending in `claude`, `codex`, `devin`, `grok`, `kimi`, `pi`, or `cmd`. Args are
+option/value pairs: `--model` for all adapters, `--effort` for Claude, Codex,
+Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
+refused. Codex effort becomes a TOML override; Kimi effort is set in its isolated
+model config from `gate_effort`. Use concrete model IDs from the installed CLI.
 
-| Key | Required / default | Meaning |
-| --- | --- | --- |
-| `family` | Required | Underlying model family label, such as `anthropic` or `deepseek`. Compared with the author's label, regardless of CLI brand. |
-| `command` | Required | Installed `pi` or `cmd` executable, optionally an absolute path ending in that name. |
-| `args` | Empty list | Option/value pairs for `--model`, `--provider`, `--thinking`, or `--effort`. Other flags are refused to preserve diff-only semantics. Model identifiers must be valid for the chosen CLI/provider. |
-| `gate_profile` | Empty | Profile passed to optional `scopefuel gate -m`. Gate failures try the next configured independent candidate. |
+Selection preserves the quota tool's ranked `rows` order, admits only
+`kind: candidate` rows, filters out the author's family, and tries quota gates
+in order. Unknown profiles are skipped. `gate_effort` must match an explicit
+recommended effort; it is also passed to the gate. Missing executables and failed
+gates fall through. A failed recommendation fails closed. After a head claim and
+model invocation, failures or invalid output retain the claim; there is no second
+model pass or output repair. Dry-run and shadow may read recommendations but
+never invoke a reviewer, gate, claim or post a review.
 
-Select actual model IDs with the installed CLIs' model-list commands. The
-example Claude profile uses pi with the Anthropic provider; the DeepSeek profile
-uses Command Code. Provider credentials and billing belong to those CLIs.
-mergewake does not embed API keys, choose a model by CLI name, or infer a family
-from a provider's changing model catalog.
+Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
+`subscribed=false`, excluded pool classes, and matching recommendation exclusions
+are ineligible, including through `pairings`. The quota tool remains the policy
+authority; mergewake never enables a pool. Inspect it with `scopefuel policy list`.
+For example, keep the Kimi profile configured and use:
 
-The review command adds its own context/tool restrictions. Output must be exactly:
-
-```json
-{"findings":[{"path":"src/tool.go","line":12,"body":"Concrete bug and consequence"}]}
+```sh
+scopefuel policy set kimi --subscribed on
+scopefuel policy set kimi --subscribed off
 ```
 
-An empty `findings` array is valid. Lines refer to the right/new side of the diff.
-At most 50 findings and 4000 bytes per finding body are accepted. Invalid output
-stops the pass and retains its review claim. No output-repair round runs.
+A pool also classified `exclude` stays excluded until that policy is cleared or
+changed (inspect `scopefuel policy list`; `scopefuel policy clear kimi` clears its
+pool override). Once the quota tool returns an eligible Kimi recommendation, no
+mergewake code or config change is needed. Do not switch providers merely to
+circumvent an underlying pool's subscription state.
+
+Every adapter receives the diff on stdin in an empty temporary working directory.
+Only adapter-owned control files may be present (Command Code's deny hook).
+GitHub credentials are removed from the review process environment. Claude uses
+safe/restricted print mode, no built-in tools, no MCP and no settings discovery;
+pi disables tools, MCP and context discovery; Command Code uses safe mode, deny
+permissions and a PreToolUse deny hook. Devin print mode receives a private deny
+configuration disabling file, shell, MCP, imports and subagents as far as its CLI
+supports. Grok uses an empty tool list, MCP deny, no web and no subagents. Codex
+exec ignores user config/rules, disables shell, code mode, search, plugins, MCP,
+apps and delegation, and uses a read-only sandbox. These are CLI restrictions,
+not a uniform OS sandbox for the CLIs themselves; credentials remain owned by
+the provider CLI.
+
+Kimi uses ACP instead of `-p`, which only accepts an argv prompt. ACP receives
+one stdin prompt, no filesystem/terminal client capabilities or MCP servers, and
+any attempted tool call ends the pass. Its temporary private home keeps only
+provider/model configuration and transient credential copies; global tool access
+is disabled. Temporary files are removed on normal completion/cancellation.
+The Kimi configuration semantics are documented in its
+[configuration reference](https://moonshotai.github.io/kimi-code/en/configuration/config-files)
+and [ACP reference](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html).
+Codex controls follow the official [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json).
+
+Output must be exactly one JSON object:
+
+```json
+{"findings":[{"path":"src/tool.go","line":12,"severity":"high","body":"Concrete bug and consequence"}]}
+```
+
+Severity is `critical`, `high`, `medium`, or `low`; legacy `blocking`, `major`,
+`minor`, and missing severity remain readable. Missing severity is recorded as
+`unspecified` and cannot support a clean pass. An empty findings array is valid.
+Lines refer to the new side of the diff. At most 50 findings and 4000 bytes per
+body are accepted; unknown fields, extra JSON and findings outside the diff fail.
+
+### Outcomes and shared measurement
+
+Observations are appended to `<state_dir>/outcomes.jsonl`, even in shadow mode.
+The file is also a durable publication outbox; it is protected by an OS lock,
+uses mode 0600, and is fsynced before shared publication. Dry-run writes no ledger
+or reps. Daemon PR polling records drafts too, revisits tracked PRs after they
+leave the open list, and observes desk merges and closures.
+
+Author attribution comes from these PR **body trailers**:
+
+```text
+Mergewake-Author-Family: openai
+Mergewake-Author-Profile: example-profile@high
+Mergewake-Author-Model: concrete-model-id
+Mergewake-Experiment: experiment-name/baseline
+Mergewake-Grade: A
+Mergewake-Tier: T1
+```
+
+`Mergewake-Author-Model` is optional when the configured author profile has a
+concrete `--model` argument. Use `baseline` and `downshift` arm names for pacelever exploration compatibility.
+Grade defaults to `review.default_grade`; tier defaults
+to `outcomes.default_tier` (`T1`). Missing attribution stays visible locally and
+is retained for repair rather than fabricated for a shared rep.
+
+The first CI observation uses attempt 1 of the earliest PR run of each required
+workflow, across prior heads. A successful rerun cannot overwrite an initial red
+run. Missing, expired or pending evidence remains unknown. Existing exact-head reviews and severity markers are recovered from GitHub as well
+as from the local pass. Findings are counted
+by severity and head without counting the same review twice. Merge latency is
+measured from GitHub's `created_at` to `merged_at`. Recovery creation is recorded
+separately from an actual merged watch revert within seven days.
+
+The conservative rule is shared by ledger reports and structured rep notes:
+
+- **clean_pass** requires first CI green, a completed review of the landed head without critical/high
+  (or legacy blocking) findings, and a completed seven-day window with no revert.
+- **failure** includes critical/high/blocking findings or a merged watch revert in
+  that window.
+- **with_fixes** covers an initially red CI run or unspecified finding severity
+  after the other observations complete; initial red CI alone is not demotion evidence.
+- **pending** covers incomplete observations, missing review, and an
+  unfinished seven-day window. An open or unmerged PR cannot earn a clean pass.
+
+Merge time is an efficiency metric and never changes evidence classification or
+a grade. Mergewake does not change model grades automatically.
+
+`outcomes.command` defaults to `review.quota`. Its replaceable reps interface uses
+`scopefuel reps add`, the handoffkeep bench reps store, rather than writing hk
+HTTP/SQL directly. Each finalized merged/closed PR publishes profile, model,
+effort, PR URL as task ref, role `impl`, task grade, tier, rounds `1`, blocking
+findings count, and completed `1` only for a landed PR. Structured notes contain
+first CI, severity counts (unknown until the landed head is reviewed), seven-day
+revert, merge time, experiment/arm, stable
+outcome/event IDs, revision and rule classification. Shadow suppresses GitHub
+mutations while still publishing factual measurement reps.
+
+A seven-day result or later revert is an append-only follow-up rep, since the
+current reps CLI has no mutable update command. Consumers must collapse records
+by `notes.outcome.task_ref` and take the latest revision; a follow-up is not a
+second implementation sample. `mergewake outcomes report --source hk` does this.
+Quota/grade consumers must use this same convention before counting outcome reps.
+Reports expose an attribution_missing count; missing metadata does not stall other
+PRs or publish invented samples. The local outbox records confirmed server receipts. It checks stable event IDs
+before retrying to cover successful writes followed by a crash before local ack;
+unconfirmed/pending CLI responses remain buffered. Inspect and retry errors with
+`outcomes sync`; no test writes fabricated reps into the shared store.
+
+```sh
+mergewake outcomes report --since 2026-10-01
+mergewake outcomes report --since 168h --source hk
+mergewake outcomes sync
+```
+
+`--since` filters by PR open time and accepts YYYY-MM-DD, RFC3339 or a positive Go
+duration ago. Reports group by profile@effort and experiment/arm and show clean,
+failed, with-fixes, pending, CI-known, revert-known and latency denominators separately.
+`--source local` is the default. The hk source reads confirmed mergewake notes
+through the configured reps CLI, not other manual bench records.
 
 ### `notifier`
 
@@ -381,3 +507,9 @@ never authorize a follower. No empty prior SHA is treated as a rollback plan.
 are reported without execution. There are no implicit service restarts, database
 migration reversals or notifications outbox. Smoke and verification should be
 read-only, and install scripts must be safe to repeat at the same commit.
+
+
+`policy.watch_checks` optionally names main-branch checks when their names differ
+from PR merge checks. Omission reuses `required_checks`. For example a project
+with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
+without weakening the PR gate. First-PR CI measurement always uses required_checks.

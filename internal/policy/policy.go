@@ -22,6 +22,7 @@ type Policy struct {
 	Version        int      `yaml:"version"`
 	Enabled        bool     `yaml:"enabled"`
 	RequiredChecks []string `yaml:"required_checks"`
+	WatchChecks    []string `yaml:"watch_checks"`
 	Blocking       []Rule   `yaml:"blocking"`
 }
 type Decision struct {
@@ -44,6 +45,13 @@ func (p Policy) Validate() error {
 			return errors.New("required_checks must be nonempty and unique")
 		}
 		seen[n] = true
+	}
+	watchSeen := map[string]bool{}
+	for _, n := range p.WatchChecks {
+		if strings.TrimSpace(n) == "" || watchSeen[n] {
+			return errors.New("watch_checks must be nonempty and unique")
+		}
+		watchSeen[n] = true
 	}
 	for _, r := range p.Blocking {
 		if len(r.Paths) == 0 || strings.TrimSpace(r.Reason) == "" {

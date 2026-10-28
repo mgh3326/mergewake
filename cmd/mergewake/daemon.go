@@ -96,7 +96,15 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		return err
 	}
 	var errs []error
+	seen := map[int]bool{}
 	for _, pr := range prs {
+		seen[pr.Number] = true
+		observationErr := s.ObservePR(ctx, r, pr, o)
+		childOptions := o
+		childOptions.Observed = observationErr == nil
+		if e := observationErr; e != nil {
+			errs = append(errs, fmt.Errorf("PR %d outcomes: %w", pr.Number, e))
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -107,14 +115,21 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		// so advisory review failures do not block routine policy decisions.
 		claimed, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA)
 		if e == nil && !claimed {
-			e = s.Review(ctx, r, pr.Number, "", o)
+			e = s.Review(ctx, r, pr.Number, "", childOptions)
 		}
 		if e != nil {
-			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
+			if errors.Is(e, pipeline.ErrReviewUnavailable) {
+				if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
+					errs = append(errs, printErr)
+				}
+			} else {
+				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
+			}
 		}
-		if e = s.Land(ctx, r, pr.Number, o); e != nil {
+		if e = s.Land(ctx, r, pr.Number, childOptions); e != nil {
 			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
 		}
 	}
+	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
 }

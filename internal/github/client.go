@@ -132,6 +132,9 @@ type Ref struct {
 	Ref string `json:"ref"`
 }
 type Pull struct {
+	CreatedAt      string  `json:"created_at"`
+	ClosedAt       *string `json:"closed_at"`
+	HTMLURL        string  `json:"html_url"`
 	MergedAt       *string `json:"merged_at"`
 	Number         int     `json:"number"`
 	State          string  `json:"state"`
@@ -279,9 +282,10 @@ type Review struct {
 	} `json:"user"`
 }
 type Finding struct {
-	Path string `json:"path"`
-	Line int    `json:"line"`
-	Body string `json:"body"`
+	Severity string `json:"severity,omitempty"`
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
+	Body     string `json:"body"`
 }
 
 func Marker(sha string) string { return "<!-- mergewake-review:" + sha + " -->" }
@@ -377,7 +381,11 @@ func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error
 func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string, findings []Finding) error {
 	comments := []map[string]any{}
 	for _, f := range findings {
-		comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": f.Body})
+		body := f.Body
+		if f.Severity != "" {
+			body = "<!-- mergewake-severity:" + f.Severity + " -->\n" + body
+		}
+		comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 	}
 	body := Marker(sha) + "\nOne independent diff-only pass. Findings are advisory except under blocking policy."
 	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)

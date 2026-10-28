@@ -21,7 +21,7 @@ import (
 type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
-type Exec struct{}
+type Exec struct{ ReapGroup bool }
 type limited struct {
 	bytes.Buffer
 	overflow bool
@@ -36,7 +36,12 @@ func (b *limited) Write(p []byte) (int, error) {
 	_, _ = b.Buffer.Write(p)
 	return n, nil
 }
-func (Exec) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+func (x Exec) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	return x.RunEnv(ctx, command, args, input, dir, nil)
+}
+
+// RunEnv applies per-process overrides without changing the daemon environment.
+func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, dir string, env []string) ([]byte, error) {
 	if command == "" {
 		return nil, errors.New("empty command")
 	}
@@ -44,12 +49,18 @@ func (Exec) Run(ctx context.Context, command string, args []string, input, dir s
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
 	c.Dir = dir
+	if env != nil {
+		c.Env = env
+	}
 	c.Stdin = strings.NewReader(input)
 	c.WaitDelay = 2 * time.Second
 	var out, stderr limited
 	c.Stdout = &out
 	c.Stderr = &stderr
 	e := c.Run()
+	if x.ReapGroup && c.Process != nil {
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
 	if e != nil {
 		return nil, fmt.Errorf("%s failed: %w", command, e)
 	}
@@ -169,4 +180,47 @@ func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {
 		n = Panewire{r, cmd, c.Notifier.Lane}
 	}
 	return s, n
+}
+
+// RunDuplex owns one foreground protocol session and always reaps its process
+// group after the single exchange, including errors and cancellation.
+func (Exec) RunDuplex(ctx context.Context, command string, args []string, dir string, exchange func(io.Reader, io.Writer) ([]byte, error)) ([]byte, error) {
+	c := exec.CommandContext(ctx, command, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 2 * time.Second
+	c.Dir = dir
+	var stderr limited
+	c.Stderr = &stderr
+	r, err := c.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	w, err := c.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err = c.Start(); err != nil {
+		return nil, err
+	}
+	b, exchangeErr := exchange(r, w)
+	_ = w.Close()
+	_ = c.Cancel()
+	_ = c.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if exchangeErr != nil {
+		return nil, exchangeErr
+	}
+	if stderr.overflow {
+		return nil, errors.New("protocol output exceeds limit")
+	}
+	return b, nil
+}
+
+func (Exec) Available(command string) error { _, err := exec.LookPath(command); return err }
+
+func (Exec) RunReview(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	return (Exec{ReapGroup: true}).Run(ctx, command, args, input, dir)
 }

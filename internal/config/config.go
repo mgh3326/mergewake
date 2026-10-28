@@ -24,13 +24,20 @@ type Reviewer struct {
 	Command     string   `yaml:"command"`
 	Args        []string `yaml:"args"`
 	GateProfile string   `yaml:"gate_profile"`
+	GateEffort  string   `yaml:"gate_effort"`
 }
 type Review struct {
-	Login     string              `yaml:"login"`
-	Pairings  map[string][]string `yaml:"pairings"`
-	Profiles  map[string]Reviewer `yaml:"profiles"`
-	Scopefuel string              `yaml:"scopefuel"`
-	Timeout   string              `yaml:"timeout"`
+	Login        string              `yaml:"login"`
+	Pairings     map[string][]string `yaml:"pairings"`
+	Profiles     map[string]Reviewer `yaml:"profiles"`
+	Scopefuel    string              `yaml:"scopefuel"`
+	Quota        string              `yaml:"quota"`
+	DefaultGrade string              `yaml:"default_grade"`
+	Timeout      string              `yaml:"timeout"`
+}
+type Outcomes struct {
+	Command string `yaml:"command"`
+	Tier    string `yaml:"default_tier"`
 }
 type Notifier struct {
 	Type    string `yaml:"type"`
@@ -88,6 +95,7 @@ type Config struct {
 	WatchLimit   int      `yaml:"watch_limit"`
 	Repos        []Repo   `yaml:"repos"`
 	Review       Review   `yaml:"review"`
+	Outcomes     Outcomes `yaml:"outcomes"`
 	Notifier     Notifier `yaml:"notifier"`
 	Sink         Sink     `yaml:"sink"`
 }
@@ -147,8 +155,33 @@ func Load(name string) (Config, error) {
 	if c.Review.Timeout == "" {
 		c.Review.Timeout = "10m"
 	}
+	if c.Review.DefaultGrade == "" {
+		c.Review.DefaultGrade = "B"
+	}
+	if !ValidGrade(c.Review.DefaultGrade) {
+		return c, errors.New("invalid review.default_grade")
+	}
+	if c.Review.Quota == "" {
+		c.Review.Quota = c.Review.Scopefuel
+	}
+	if c.Review.Quota == "" {
+		c.Review.Quota = "scopefuel"
+	}
+	c.Review.Quota = Expand(c.Review.Quota)
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return c, e
+	}
+	if c.Outcomes.Command == "" {
+		c.Outcomes.Command = c.Review.Quota
+	}
+	c.Outcomes.Command = Expand(c.Outcomes.Command)
+	if c.Outcomes.Tier == "" {
+		c.Outcomes.Tier = "T1"
+	}
+	switch c.Outcomes.Tier {
+	case "T0", "T1", "T2", "T3":
+	default:
+		return c, errors.New("invalid outcomes.default_tier")
 	}
 	seen := map[string]bool{}
 	for i := range c.Repos {
@@ -246,10 +279,10 @@ func Load(name string) (Config, error) {
 		return c, errors.New("sink.reopen_state must be reopened")
 	}
 	for name, p := range c.Review.Profiles {
-		if name == "" || p.Family == "" || (filepath.Base(p.Command) != "pi" && filepath.Base(p.Command) != "cmd") {
-			return c, errors.New("review profiles require a name, family, and pi or cmd command")
+		if name == "" || p.Family == "" || !ReviewerCommand(p.Command) {
+			return c, errors.New("review profiles require a name, family, and supported reviewer command")
 		}
-		if e := ValidateReviewArgs(p.Args); e != nil {
+		if e := ValidateReviewer(p); e != nil {
 			return c, e
 		}
 	}
@@ -265,6 +298,22 @@ func Load(name string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+func ValidGrade(s string) bool {
+	switch s {
+	case "S+", "S", "A+", "A", "B", "C":
+		return true
+	}
+	return false
+}
+
+func ReviewerCommand(s string) bool {
+	switch filepath.Base(s) {
+	case "claude", "codex", "devin", "grok", "kimi", "pi", "cmd":
+		return true
+	}
+	return false
 }
 func Duration(s string) (time.Duration, error) {
 	d, e := time.ParseDuration(s)
@@ -308,6 +357,34 @@ func ValidateReviewArgs(args []string) error {
 		case "--model", "--provider", "--thinking", "--effort":
 		default:
 			return fmt.Errorf("review option %q is not a model-selection option", args[i])
+		}
+	}
+	return nil
+}
+
+func ValidateReviewer(p Reviewer) error {
+	if e := ValidateReviewArgs(p.Args); e != nil {
+		return e
+	}
+	kind := filepath.Base(p.Command)
+	for i := 0; i < len(p.Args); i += 2 {
+		k := p.Args[i]
+		if k == "--model" {
+			continue
+		}
+		if kind == "pi" && (k == "--provider" || k == "--thinking") {
+			continue
+		}
+		if k == "--effort" && (kind == "claude" || kind == "codex" || kind == "grok" || kind == "cmd") {
+			continue
+		}
+		return fmt.Errorf("review option %s unsupported by %s", k, kind)
+	}
+	if p.GateEffort != "" {
+		switch p.GateEffort {
+		case "low", "medium", "high", "xhigh", "max":
+		default:
+			return errors.New("invalid reviewer gate_effort")
 		}
 	}
 	return nil

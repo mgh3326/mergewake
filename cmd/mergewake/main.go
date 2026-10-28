@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/superfan"
@@ -36,6 +37,7 @@ Usage: mergewake <command> [flags]
   rollout    Pull and install the latest verified manifest once
   daemon     Run enabled pipeline roles (shadow by default)
   agent      Poll configured repositories and perform verified rollouts
+  outcomes   Report or sync the shadow-safe model outcomes ledger
   status     Read installed receipts and check local drift
   superfan   Print or launch an experimental resident monitor spec
 
@@ -63,6 +65,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if args[0] == "commit" {
 		_, err := fmt.Fprintln(out, commit)
 		return err
+	}
+	if args[0] == "outcomes" {
+		return runOutcomes(ctx, args[1:], out, stderr)
 	}
 	command := args[0]
 	switch command {
@@ -311,4 +316,68 @@ func status(c config.Config, repo string, out io.Writer) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func runOutcomes(ctx context.Context, args []string, out, stderr io.Writer) error {
+	if len(args) == 0 || (args[0] != "report" && args[0] != "sync") {
+		return errors.New("usage: mergewake outcomes report|sync [--config PATH] [--since DATE|RFC3339|DURATION] [--source local|hk]")
+	}
+	fs := flag.NewFlagSet("outcomes "+args[0], flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg := fs.String("config", "~/.config/mergewake/config.yaml", "host YAML config")
+	sinceArg := fs.String("since", "", "include PRs opened since this date, timestamp or duration ago")
+	source := fs.String("source", "local", "report source: local or hk (via reps CLI)")
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	c, err := config.Load(config.Expand(*cfg))
+	if err != nil {
+		return err
+	}
+	ledger := outcomes.Ledger{Dir: c.StateDir}
+	reps := outcomes.CLI{Command: c.Outcomes.Command, Runner: integrations.Exec{}}
+	if args[0] == "sync" {
+		return ledger.Flush(ctx, reps)
+	}
+	var since time.Time
+	if *sinceArg != "" {
+		since, err = time.Parse(time.RFC3339, *sinceArg)
+		if err != nil {
+			since, err = time.Parse("2006-01-02", *sinceArg)
+		}
+		if err != nil {
+			var d time.Duration
+			d, err = time.ParseDuration(*sinceArg)
+			if err == nil && d > 0 {
+				since = time.Now().Add(-d)
+			} else {
+				return errors.New("invalid --since; use YYYY-MM-DD, RFC3339 or a positive duration")
+			}
+		}
+	}
+	values := []outcomes.Outcome{}
+	switch *source {
+	case "local":
+		state, e := ledger.Read()
+		if e != nil {
+			return e
+		}
+		for _, v := range state.Latest {
+			values = append(values, v)
+		}
+	case "hk":
+		values, err = reps.Read(ctx)
+		if err != nil {
+			return err
+		}
+	default:
+		return errors.New("source must be local or hk")
+	}
+	return json.NewEncoder(out).Encode(outcomes.Report(values, since))
 }

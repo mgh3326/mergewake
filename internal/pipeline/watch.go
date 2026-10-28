@@ -79,7 +79,11 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if e != nil {
 		return e
 	}
-	ci, e := s.GH.Check(ctx, r.Name, head, p.RequiredChecks)
+	checks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		checks = p.WatchChecks
+	}
+	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		return e
 	}
@@ -118,7 +122,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		if v, ok := cache[sha]; ok {
 			return v, nil
 		}
-		v, e := s.GH.Check(ctx, r.Name, sha, p.RequiredChecks)
+		v, e := s.GH.Check(ctx, r.Name, sha, checks)
 		if e == nil {
 			cache[sha] = v
 		}
@@ -193,6 +197,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if origin == nil {
 		return errors.New("culprit is not an identifiable squash-merged PR")
 	}
+	if e = s.ObservePR(ctx, r, *origin, o); e != nil {
+		return e
+	}
 	// The confirmed boundary must be one independently green parent and one red PR.
 	parent, e := s.GH.Commit(ctx, r.Name, culprit)
 	if e != nil {
@@ -224,7 +231,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if fresh != head {
 		return errors.New("main changed during diagnosis; rerun watch")
 	}
-	ci, e = s.GH.Check(ctx, r.Name, head, p.RequiredChecks)
+	ci, e = s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		return e
 	}
@@ -233,6 +240,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	}
 	result.URL, e = s.GH.Revert(ctx, r.Name, r.Branch, head, culprit, origin.Number)
 	if e != nil {
+		return e
+	}
+	if e = s.recordRevert(r.Name, origin.Number, result.URL); e != nil {
 		return e
 	}
 	result.Action = "opened-revert-pr"

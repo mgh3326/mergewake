@@ -15,8 +15,8 @@ a repository must explicitly set `enabled: true` in its policy before they act.
 
 ## Quick start
 
-Requires Go 1.27 or newer to build, GitHub API credentials to act, and `pi` or
-`cmd` on a reviewer host. The binary itself requires no Go installation.
+Requires Go 1.27 or newer to build, GitHub API credentials to act, and a supported
+reviewer CLI on a reviewer host. The binary itself requires no Go installation.
 
 ```sh
 go build -o mergewake ./cmd/mergewake
@@ -91,7 +91,7 @@ Adapters use only APIs or CLI argument vectors:
 - `panewire emit` for notifications, with stdout and no-op alternatives.
 - `handoffkeep tasks show`, `comment`, `reopen`, and `doc put` for task recovery
   and rollout records; a no-op sink is available.
-- Optional `scopefuel gate -m <profile>` before a configured reviewer runs.
+- Quota-ranked independent reviewers with subscription/exclusion filtering and a gate before invocation.
 
 The handoffkeep sink uses explicit `tasks reopen ID --reason TEXT`, entering the
 separate `reopened` state. A recovery comment survives if an older CLI/server
@@ -133,5 +133,11 @@ Inspired by Anthropic's [Redesigning source control](https://www.anthropic.com/r
 post-merge verification, derived data outside the source tree, review of intent,
 and component-focused monitors. mergewake applies those ideas without replacing
 Git or running a source-control server.
+
+Model measurement uses PR outcomes rather than tester-round counts. Shadow polling
+buffers an append-only local ledger and publishes finalized evidence to handoffkeep
+bench reps via the configured quota/reps CLI. `mergewake outcomes report --since 168h` groups clean passes, failures and pending evidence by author profile, effort
+and experiment arm. See [configuration](docs/config.md#outcomes-and-shared-measurement)
+for the conservative seven-day rule, outbox recovery and shared follow-up semantics.
 
 Licensed under [Apache-2.0](LICENSE).

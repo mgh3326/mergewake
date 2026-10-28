@@ -140,6 +140,12 @@ type fakeRunner struct {
 }
 
 func (r *fakeRunner) Run(_ context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "scopefuel" {
+		if len(args) > 0 && args[0] == "--recommend" {
+			return []byte(`{"rows":[{"profile":"claude","kind":"candidate"}]}`), nil
+		}
+		return nil, nil
+	}
 	r.calls++
 	r.input = input
 	r.args = args

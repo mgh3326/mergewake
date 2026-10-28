@@ -24,7 +24,8 @@ repos:
 review:
   login: review-bot
   timeout: 10m
-  scopefuel: ""
+  quota: scopefuel
+  default_grade: B
   pairings:
     openai: [claude, deepseek]
     anthropic: [deepseek]
@@ -34,12 +35,15 @@ review:
       family: anthropic
       command: pi
       args: [--provider, anthropic, --model, claude-model-id]
-      gate_profile: ""
+      gate_profile: example-claude-profile
     deepseek:
       family: deepseek
       command: cmd
       args: [--model, deepseek-model-id]
-      gate_profile: ""
+      gate_profile: example-deepseek-profile
+outcomes:
+  command: scopefuel
+  default_tier: T1
 notifier:
   type: stdout
   command: panewire

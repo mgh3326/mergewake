@@ -48,7 +48,7 @@ type Service struct {
 	Notifier integrations.Notifier
 	Out      io.Writer
 }
-type Options struct{ DryRun, Shadow bool }
+type Options struct{ DryRun, Shadow, Observed bool }
 
 func (s *Service) Print(v any) error        { return json.NewEncoder(s.Out).Encode(v) }
 func (s *Service) state(repo string) string { return filepath.Join(s.Config.StateDir, repo) }
@@ -104,6 +104,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
+	if !o.Observed {
+		if e = s.ObservePR(ctx, r, pr, o); e != nil {
+			return e
+		}
+	}
 	if pr.State != "open" || pr.Draft || pr.Base.Ref != r.Branch {
 		return errors.New("land requires an open, ready PR against the configured branch")
 	}
@@ -157,6 +162,9 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	}{n, pr.Head.SHA, ci, d}, o.DryRun); e != nil {
 		return e
 	}
+	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, o.DryRun); e != nil {
+		return e
+	}
 	if d.Action != "merge" || d.Shadow || o.DryRun {
 		return nil
 	}
@@ -191,7 +199,17 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 			return errors.New("review findings changed during decision")
 		}
 	}
-	return s.GH.Merge(ctx, r.Name, n, pr.Head.SHA)
+	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
+		return e
+	}
+	merged, e := s.GH.Pull(ctx, r.Name, n)
+	if e != nil {
+		return e
+	}
+	if e = s.ObservePR(ctx, r, merged, o); e != nil {
+		return e
+	}
+	return s.FlushOutcomes(ctx)
 }
 func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Options) error {
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)
