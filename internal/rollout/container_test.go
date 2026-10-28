@@ -221,6 +221,36 @@ func TestContainerDeploySuccessAndGarbageCollection(t *testing.T) {
 	}
 }
 
+func TestContainerGarbageCollectionKeepsUnselectedTargetDigests(t *testing.T) {
+	spec := containerSpec()
+	state := t.TempDir()
+	rt := newFakeRuntime()
+	rt.containers[spec.Name] = &fakeContainer{digest: oldDigest, running: true, id: "img-" + oldDigest}
+	rt.images = []Image{
+		{ID: "img-" + oldDigest, Digest: oldDigest, Ref: spec.Image + "@" + oldDigest},
+		{ID: "img-" + olderDigest, Digest: olderDigest, Ref: spec.Image + "@" + olderDigest},
+		{ID: "img-" + staleDigest, Digest: staleDigest, Ref: spec.Image + "@" + staleDigest},
+	}
+	// A second target shares the repository but is not part of this deploy and
+	// has no container now, so only its receipt protects its digest.
+	prior := ContainerReceipt{Host: "host-a", Repo: "example/project", Commit: strings.Repeat("d", 40), Targets: map[string]ContainerTargetState{
+		spec.Target: {Image: spec.Image, Digest: oldDigest, Previous: []string{olderDigest}},
+		"worker":    {Image: spec.Image, Digest: staleDigest},
+	}}
+	if e := writeJSON(filepath.Join(state, ContainerReceiptName), prior); e != nil {
+		t.Fatal(e)
+	}
+	m := containerManifest(t, strings.Repeat("e", 40), newDigest)
+	res, e := ApplyContainer(context.Background(), m, Options{StateDir: state, Allowed: []config.Install{spec}}, "host-a", runtimeFor(rt), healthy)
+	if e != nil || res.Status != "success" {
+		t.Fatalf("%+v %v", res, e)
+	}
+	want := []string{spec.Image + "@" + olderDigest}
+	if !reflect.DeepEqual(rt.removals, want) {
+		t.Fatalf("gc removed another target's receipt digest: %v", rt.removals)
+	}
+}
+
 func TestContainerHealthFailureRollsBack(t *testing.T) {
 	spec := containerSpec()
 	state := t.TempDir()

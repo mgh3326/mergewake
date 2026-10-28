@@ -643,6 +643,20 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 			set[d] = true
 		}
 	}
+	// Targets outside this deploy (denied, or absent from the manifest) still
+	// own the digests their receipt records; a shared repository must keep them.
+	for name, rec := range receipt.Targets {
+		set := protected[rec.Image]
+		if set == nil || digests[name] != "" {
+			continue
+		}
+		if rec.Digest != "" {
+			set[rec.Digest] = true
+		}
+		for _, d := range rec.Previous {
+			set[d] = true
+		}
+	}
 	collected := map[string]bool{}
 	for _, s := range selected {
 		if collected[s.Image] {
