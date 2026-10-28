@@ -53,10 +53,12 @@ func rfc(t time.Time) *string {
 
 var testRepo = config.Repo{Name: "example/project", Branch: "main"}
 
+const headSHA = "aaaa1111"
+
 // mergedPull is the merged PR every reap test shares.
 var mergedPull = github.Pull{
 	Number: 12, State: "closed", Merged: true,
-	Head: github.Ref{Ref: "wk/x"}, Base: github.Ref{Ref: "main"},
+	Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "abc123",
 }
 
@@ -118,6 +120,7 @@ func worktreeOuts(cwd2 string) map[string]string {
 		key("herdr", "pane", "close", "w1:p1"): "",
 		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
 		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
 		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"):    "/repo/.git\n/repo/.git\n/repo\n",
 		key("git", "-C", "/repo", "branch", "--show-current"):                                                  "main\n",
@@ -314,9 +317,11 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("herdr", "pane", "list"):  panes,
 		key("git", "-C", "/elsewhere", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/other/.git/worktrees/elsewhere\n/other/.git\n/elsewhere\n",
 		key("git", "-C", "/elsewhere", "branch", "--show-current"):                                               "wk/other\n",
+		key("git", "-C", "/elsewhere", "rev-parse", "HEAD"):                                                      "bbbb2222\n",
 		key("git", "-C", "/elsewhere", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo.gone", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.gone\n/repo/.git\n/repo.gone\n",
 		key("git", "-C", "/repo.gone", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.gone", "rev-parse", "HEAD"):                                                      headSHA + "\n",
 		key("git", "-C", "/repo.gone", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"):      "/repo/.git\n/repo/.git\n/repo\n",
 		key("git", "-C", "/repo", "branch", "--show-current"):                                                    "main\n",

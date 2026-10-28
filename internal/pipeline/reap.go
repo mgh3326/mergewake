@@ -130,6 +130,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if !s.Config.Reap.Enabled {
 		return errors.New("reap requires reap.enabled in host config")
 	}
+	if prNum < 0 {
+		return errors.New("--pr must be positive")
+	}
 	after, e := config.Duration(s.Config.Reap.WorktreeAfter)
 	if e != nil {
 		return e
@@ -211,6 +214,22 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 
 	scanned, closed, planned, removed, deleted, skipped, failed := 0, 0, 0, 0, 0, 0, 0
+	// lastRow remembers the newest logged result per receipt identity so a
+	// repeat pass only writes rows whose outcome changed: a shadow run logging
+	// the same would-* every poll, or a removed worktree logging worktree-gone
+	// forever, would otherwise grow reap.jsonl without bound.
+	rowKey := func(v reapReceipt) string {
+		path := v.Pane
+		if v.Action != "close-pane" && v.Worktree != "" {
+			path = v.Worktree
+		}
+		return fmt.Sprintf("%s|%d|%s|%s", v.Action, v.PR, v.Host, path)
+	}
+	rowSig := func(v reapReceipt) string { return v.Result + "|" + v.Reason }
+	lastRow := map[string]string{}
+	for _, rec := range receipts {
+		lastRow[rowKey(rec)] = rowSig(rec)
+	}
 	note := func(v reapReceipt) {
 		switch v.Result {
 		case "closed":
@@ -226,12 +245,16 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		case "error":
 			failed++
 		}
-		if e := s.reapNote(v, o.DryRun); e != nil {
+		// Every row prints; only changed outcomes append to the receipt file.
+		repeat := lastRow[rowKey(v)] == rowSig(v)
+		lastRow[rowKey(v)] = rowSig(v)
+		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)
 		}
 	}
 	matches := func(w *reap.Worktree, p github.Pull) bool {
-		return w != nil && w.Branch != "" && w.Branch == p.Head.Ref && strings.EqualFold(w.Repo, r.Name)
+		return w != nil && w.Branch != "" && w.Branch == p.Head.Ref &&
+			p.Head.SHA != "" && w.Head == p.Head.SHA && strings.EqualFold(w.Repo, r.Name)
 	}
 
 	for _, p := range pulls {
@@ -376,6 +399,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if path == "" {
 				path = rec.Cwd
 			}
+			// A worktree already removed or proven gone is terminal: re-adding
+			// it as a candidate would only log the same skip every pass. Live
+			// pane matches are never suppressed.
+			sig := lastRow[rowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: rec.Host, Worktree: path})]
+			if sig == "removed|" || sig == "worktree-gone|" {
+				continue
+			}
 			add(byName[rec.Host], path)
 		}
 		for _, c := range cands {
@@ -387,7 +417,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, c.path, e))
 			case w == nil:
 				rec.Result, rec.Reason = "skipped", "worktree-gone"
-			case w.Branch != p.Head.Ref || !strings.EqualFold(w.Repo, r.Name):
+			case w.Branch != p.Head.Ref || w.Head != p.Head.SHA || !strings.EqualFold(w.Repo, r.Name):
 				rec.Result, rec.Reason = "skipped", "worktree-changed"
 			}
 			if rec.Result != "" {

@@ -165,10 +165,10 @@ worktree and local branch.
 Panes are matched by evidence, never by title or name alone: `herdr agent
 list` runs on each configured `hosts[]` entry (`ssh <ssh>` for remote hosts),
 and a pane's `cwd` must inspect as a linked git worktree whose current branch
-equals the PR head branch and whose origin remote names the configured
-repository. URL and scp-style `git@host:owner/name` remotes both parse; a
-canonical clone, subdirectory checkout, detached head or foreign remote never
-matches.
+equals the PR head branch, whose checked-out commit equals the PR head SHA,
+and whose origin remote names the configured repository. URL and scp-style
+`git@host:owner/name` remotes both parse; a canonical clone, subdirectory
+checkout, detached head, foreign remote or reused branch tip never matches.
 
 A matching pane is closed only when it is not `working`, is named, misses the
 `reap.protect` globs, and its output was captured first: an existing

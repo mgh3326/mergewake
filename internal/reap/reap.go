@@ -66,6 +66,7 @@ type Pane struct {
 type Worktree struct {
 	Path   string // worktree toplevel
 	Branch string // checked-out branch; empty on a detached HEAD
+	Head   string // checked-out commit; branches can be reused, heads cannot
 	Repo   string // owner/name of the origin remote; empty when unknown
 	Common string // absolute git common dir, <main>/.git
 }
@@ -217,6 +218,9 @@ func (e Exec) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 	w := &Worktree{Path: top, Common: common}
 	if b, err = e.Run(ctx, "git", "-C", cwd, "branch", "--show-current"); err == nil {
 		w.Branch = strings.TrimSpace(string(b))
+	}
+	if b, err = e.Run(ctx, "git", "-C", cwd, "rev-parse", "HEAD"); err == nil {
+		w.Head = strings.TrimSpace(string(b))
 	}
 	if b, err = e.Run(ctx, "git", "-C", cwd, "remote", "get-url", "origin"); err == nil {
 		w.Repo = RepoFromRemote(string(b))

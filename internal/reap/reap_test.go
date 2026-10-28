@@ -82,6 +82,7 @@ func TestInspectLinkedCanonicalAndPlain(t *testing.T) {
 	outs := map[string]string{
 		key("git", []string{"-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
 		key("git", []string{"-C", "/repo.wt", "branch", "--show-current"}):                                               "wk/session-reap\n",
+		key("git", []string{"-C", "/repo.wt", "rev-parse", "HEAD"}):                                                      "cccc3333\n",
 		key("git", []string{"-C", "/repo.wt", "remote", "get-url", "origin"}):                                            "git@github.com:example/project.git\n",
 		key("git", []string{"-C", "/repo", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}):    "/repo/.git\n/repo/.git\n/repo\n",
 		key("git", []string{"-C", "/sub", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}):     "/repo/.git/modules/sub\n/repo/.git/modules/sub\n/repo/sub\n",
@@ -94,7 +95,7 @@ func TestInspectLinkedCanonicalAndPlain(t *testing.T) {
 	if err != nil || w == nil {
 		t.Fatalf("%+v %v", w, err)
 	}
-	if w.Path != "/repo.wt" || w.Branch != "wk/session-reap" || w.Repo != "example/project" || w.Common != "/repo/.git" {
+	if w.Path != "/repo.wt" || w.Branch != "wk/session-reap" || w.Head != "cccc3333" || w.Repo != "example/project" || w.Common != "/repo/.git" {
 		t.Fatalf("%+v", w)
 	}
 	for _, dir := range []string{"/repo", "/sub", "/plain"} {

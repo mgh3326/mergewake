@@ -96,8 +96,10 @@ daemon role close merged-PR sessions, then clean their worktrees once they
 age out. For each merged PR on a configured repo's base branch, every host is
 scanned with `herdr agent list` (remote hosts over `ssh <ssh> herdr agent
 list`). A pane matches only when its `cwd` is a linked git worktree, its
-current branch equals the PR head branch, and the worktree's origin remote
-names the configured repository. Titles and names are never used for matching.
+current branch equals the PR head branch, its checked-out commit equals the
+PR head SHA, and the worktree's origin remote names the configured
+repository. Titles and names are never used for matching; a reused branch
+whose tip moved on does not match.
 
 Before a matching pane is closed it must be reported as not `working` and its
 output must be captured: an existing `<jobs>/<name>/report.md` wins, otherwise
