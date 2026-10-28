@@ -284,7 +284,8 @@ above the total possible rollback duration for your inventory.
 
 ## Command installs and receipt ordering
 
-Each `kind: command` or `kind: release` entry additionally accepts:
+Every install kind accepts `serial`, `canary` and `receipts_dir` for receipt
+ordering. Command/release entries additionally accept the recipe fields below:
 
 | Key | Default | Meaning |
 | --- | --- | --- |

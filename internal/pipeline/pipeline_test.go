@@ -15,6 +15,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
 var shaA = strings.Repeat("a", 40)
@@ -393,5 +394,35 @@ func TestLaterGreenSupersedesOldCheckpoint(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"culprit":"`+shaD+`"`) {
 		t.Fatal(out.String())
+	}
+}
+
+func TestFileRolloutCanaryGate(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	s.Config.Host = "host-b"
+	spec := config.Install{Source: "tool", Target: "bin/tool", Mode: "0755", Canary: "host-a", ReceiptsDir: t.TempDir()}
+	r.Install = []config.Install{spec}
+	r.Root = t.TempDir()
+	r.Smoke = config.Command{Command: "smoke"}
+	s.Runner = smokeRunner{}
+	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	if e = s.Rollout(context.Background(), r, Options{}); e == nil {
+		t.Fatal("file install ignored canary")
+	}
+	if _, e = os.Stat(filepath.Join(r.Root, "bin/tool")); !os.IsNotExist(e) {
+		t.Fatal("waiting follower mutated files")
+	}
+	if e = rollout.PublishGate(spec, "host-a", r.Name, m.Commit); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if e = rollout.CheckGate(config.Install{Canary: "host-b", ReceiptsDir: spec.ReceiptsDir, Target: spec.Target}, "host-c", r.Name, m.Commit); e != nil {
+		t.Fatal("follower did not publish success receipt:", e)
 	}
 }

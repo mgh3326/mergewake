@@ -353,11 +353,45 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 			_, err := s.Runner.Run(ctx, command.Command, command.Args, "", root)
 			return err
 		}, smoke)
+
 	} else {
+		selected := []config.Install{}
+		for _, file := range m.Files {
+			denied := false
+			for _, g := range r.Deny {
+				match, e := policy.Match(g, file.Target)
+				if e != nil {
+					return e
+				}
+				denied = denied || match
+			}
+			if denied {
+				continue
+			}
+			for _, spec := range r.Install {
+				if spec.Target == file.Target {
+					selected = append(selected, spec)
+					break
+				}
+			}
+		}
+		if !o.DryRun && !o.Shadow {
+			for _, spec := range selected {
+				if err := rollout.CheckGate(spec, s.Config.Host, r.Name, m.Commit); err != nil {
+					return err
+				}
+			}
+		}
 		result, installErr = rollout.Apply(ctx, m, installOptions, func(ctx context.Context, name string) ([]byte, error) {
 			return s.GH.ReadFile(ctx, r.Name, m.Commit, name)
 		}, smoke)
+		if !o.DryRun && !o.Shadow && installErr == nil && (result.Status == "success" || result.Status == "current") {
+			for _, spec := range selected {
+				installErr = errors.Join(installErr, rollout.PublishGate(spec, s.Config.Host, r.Name, m.Commit))
+			}
+		}
 	}
+
 	if o.DryRun || o.Shadow || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}

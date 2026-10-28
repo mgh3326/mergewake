@@ -198,26 +198,26 @@ func Load(name string) (Config, error) {
 				if _, err := Duration(spec.Timeout); err != nil {
 					return c, err
 				}
-				if len(spec.Serial) > 0 || spec.Canary != "" {
-					if spec.ReceiptsDir == "" {
-						return c, errors.New("serial/canary requires receipts_dir")
-					}
-					names := append(append([]string{}, spec.Serial...), spec.Canary)
-					for _, host := range names {
-						if host != "" && (!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(host)) {
-							return c, errors.New("invalid serial/canary host label")
-						}
-					}
-					seenHosts := map[string]bool{}
-					for _, host := range spec.Serial {
-						if seenHosts[host] {
-							return c, errors.New("duplicate serial host")
-						}
-						seenHosts[host] = true
-					}
-				}
 			default:
 				return c, errors.New("install kind must be file, command or release")
+			}
+			if len(spec.Serial) > 0 || spec.Canary != "" {
+				if spec.ReceiptsDir == "" {
+					return c, errors.New("serial/canary requires receipts_dir")
+				}
+				names := append(append([]string{}, spec.Serial...), spec.Canary)
+				for _, host := range names {
+					if host != "" && (!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(host)) {
+						return c, errors.New("invalid serial/canary host label")
+					}
+				}
+				seenHosts := map[string]bool{}
+				for _, host := range spec.Serial {
+					if seenHosts[host] {
+						return c, errors.New("duplicate serial host")
+					}
+					seenHosts[host] = true
+				}
 			}
 		}
 		for _, g := range r.Deny {

@@ -69,7 +69,7 @@ func VerifyCommand(ctx context.Context, runner CommandRunner, s config.Install, 
 	}
 	return nil
 }
-func gate(s config.Install, host, repo, sha string) error {
+func CheckGate(s config.Install, host, repo, sha string) error {
 	before := []string{}
 	if s.Canary != "" && s.Canary != host {
 		before = append(before, s.Canary)
@@ -102,6 +102,16 @@ func gate(s config.Install, host, repo, sha string) error {
 		}
 	}
 	return nil
+}
+
+// PublishGate advertises only a successfully verified/smoked target. Callers
+// keep this after their durable installed receipt, including healthy retries.
+func PublishGate(s config.Install, host, repo, sha string) error {
+	if s.ReceiptsDir == "" {
+		return nil
+	}
+	name := filepath.Join(config.Expand(s.ReceiptsDir), sha, host, s.Target+".json")
+	return writeJSON(name, GateReceipt{host, repo, s.Target, sha, "success"})
 }
 
 // ApplyCommands journals every previous SHA before executing a trusted recipe.
@@ -326,17 +336,14 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			current = false
 		}
 		j.Targets[s.Target] = InstalledTarget{SHA: prior, Recipe: recipe(s)}
-		if err = gate(s, host, m.Repo, m.Commit); err != nil {
+		if err = CheckGate(s, host, m.Repo, m.Commit); err != nil {
 			return
 		}
 	}
 	publish := func() error {
 		for _, s := range selected {
-			if s.ReceiptsDir != "" {
-				name := filepath.Join(config.Expand(s.ReceiptsDir), m.Commit, host, s.Target+".json")
-				if e := writeJSON(name, GateReceipt{host, m.Repo, s.Target, m.Commit, "success"}); e != nil {
-					return e
-				}
+			if e := PublishGate(s, host, m.Repo, m.Commit); e != nil {
+				return e
 			}
 		}
 		return nil
