@@ -1,0 +1,63 @@
+package integrations
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
+
+type call struct {
+	command string
+	args    []string
+}
+type fakeRunner struct {
+	calls []call
+	fail  bool
+}
+
+func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) ([]byte, error) {
+	r.calls = append(r.calls, call{c, a})
+	if r.fail {
+		return nil, errors.New("offline")
+	}
+	return nil, nil
+}
+func TestAdaptersUseArgumentVectors(t *testing.T) {
+	r := &fakeRunner{}
+	p := Panewire{Runner: r, Command: "panewire", Lane: "operator-desk"}
+	text := "literal $(no-command) `no-command`"
+	if e := p.Notify(context.Background(), Event{ID: "event-a", Text: text}); e != nil {
+		t.Fatal(e)
+	}
+	if r.calls[0].args[len(r.calls[0].args)-1] != text {
+		t.Fatal("text changed")
+	}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "in_progress"}
+	if e := h.Reopen(context.Background(), "42", "CI red"); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(strings.Join(r.calls[1].args, " "), "tasks show 42") || !strings.Contains(strings.Join(r.calls[3].args, " "), "tasks transition 42 --to in_progress") {
+		t.Fatal(r.calls)
+	}
+	before := len(r.calls)
+	if e := h.Reopen(context.Background(), "42;cmd", "bad"); e == nil || len(r.calls) != before {
+		t.Fatal("invalid task accepted")
+	}
+	if e := h.Record(context.Background(), "mergewake/report-a", []byte(`{"status":"success"}`)); e != nil {
+		t.Fatal(e)
+	}
+	if r.calls[before].args[0] != "doc" {
+		t.Fatal(r.calls)
+	}
+}
+func TestAdapterErrorsPropagate(t *testing.T) {
+	r := &fakeRunner{fail: true}
+	if (Panewire{r, "panewire", "lane-a"}).Notify(context.Background(), Event{}) == nil {
+		t.Fatal("notify failure hidden")
+	}
+	h := Handoffkeep{r, "handoffkeep", "in_progress"}
+	if h.Reopen(context.Background(), "42", "note") == nil || len(r.calls) != 2 {
+		t.Fatal("show failure did not stop transition")
+	}
+}

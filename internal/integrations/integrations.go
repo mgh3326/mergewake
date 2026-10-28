@@ -4,6 +4,7 @@ package integrations
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,11 +101,30 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if !TaskID.MatchString(task) {
 		return errors.New("task ID must be a positive integer")
 	}
-	if _, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", ""); e != nil {
+
+	shown, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	if e != nil {
 		return e
 	}
-	_, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "transition", task, "--to", h.State, "--note", note}, "", "")
-	return e
+	if _, e = h.Runner.Run(ctx, h.Command, []string{"tasks", "comment", task, "--body", note}, "", ""); e != nil {
+		return e
+	}
+	var current struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(shown, &current)
+	if current.State == h.State {
+		return nil
+	}
+	args := []string{"tasks", "transition", task, "--to", h.State, "--note", note}
+	if h.State == "in_progress" || h.State == "claimed" {
+		args = append(args, "--no-job", "mergewake CI recovery; no agent session claimed")
+	}
+	_, e = h.Runner.Run(ctx, h.Command, args, "", "")
+	if e != nil {
+		return fmt.Errorf("recovery comment recorded, but task %s could not transition from %q to %q (terminal states may require upstream support): %w", task, current.State, h.State, e)
+	}
+	return nil
 }
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {
 	f, e := os.CreateTemp("", "mergewake-record-*.json")

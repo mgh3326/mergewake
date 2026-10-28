@@ -22,8 +22,10 @@ type Snapshot struct {
 	Backup string `json:"backup"`
 }
 type Journal struct {
-	Root  string     `json:"root"`
-	Files []Snapshot `json:"files"`
+	PreviousReceipt []byte     `json:"previous_receipt"`
+	ReceiptExisted  bool       `json:"receipt_existed"`
+	Root            string     `json:"root"`
+	Files           []Snapshot `json:"files"`
 }
 type Result struct {
 	Commit    string   `json:"commit"`
@@ -113,6 +115,16 @@ func rollback(dir string, j Journal) error {
 	}
 	if len(errs) > 0 {
 		return errors.Join(errs...)
+	}
+	receipt := filepath.Join(filepath.Dir(dir), "installed.json")
+	if j.ReceiptExisted {
+		if e := Atomic(receipt, j.PreviousReceipt, 0600); e != nil {
+			return e
+		}
+	} else {
+		if e := os.Remove(receipt); e != nil && !os.IsNotExist(e) {
+			return e
+		}
 	}
 	return os.RemoveAll(dir)
 }
@@ -231,6 +243,54 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 	if err = Recover(root, o.StateDir); err != nil {
 		return
 	}
+	rejectedPath := filepath.Join(o.StateDir, "rejected.json")
+	if b, re := os.ReadFile(rejectedPath); re == nil {
+		var rejected struct {
+			Commit string `json:"commit"`
+		}
+		if re = json.Unmarshal(b, &rejected); re != nil {
+			err = re
+			return
+		}
+		if rejected.Commit == m.Commit {
+			res.Status = "rejected"
+			err = errors.New("this release previously rolled back; inspect and remove rejected.json before retrying")
+			return
+		}
+	} else if !os.IsNotExist(re) {
+		err = re
+		return
+	}
+	// Recheck actual files, rather than trusting the receipt alone. Healthy polls
+	// do not rewrite files, rerun smoke commands, or emit duplicate reports.
+	if b, re := os.ReadFile(filepath.Join(o.StateDir, "installed.json")); re == nil {
+		var receipt struct {
+			Manifest manifest.Manifest `json:"manifest"`
+		}
+		if re = json.Unmarshal(b, &receipt); re != nil {
+			err = re
+			return
+		}
+		expected, _ := json.Marshal(m)
+		old, _ := json.Marshal(receipt.Manifest)
+		current := string(expected) == string(old)
+		if current {
+			for _, f := range selected {
+				b, mode, re := manifest.ReadRegular(root, f.Target)
+				if re != nil || manifest.Verify(f, b) != nil || uint32(mode) != f.Mode {
+					current = false
+					break
+				}
+			}
+		}
+		if current {
+			res.Status = "current"
+			return
+		}
+	} else if !os.IsNotExist(re) {
+		err = re
+		return
+	}
 	// Download and verify everything before taking a snapshot or mutating targets.
 	for _, f := range selected {
 		b, e := fetch(ctx, f.Source)
@@ -248,6 +308,14 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		return
 	}
 	j := Journal{Root: root}
+	j.PreviousReceipt, e = os.ReadFile(filepath.Join(o.StateDir, "installed.json"))
+	if e == nil {
+		j.ReceiptExisted = true
+	} else if !os.IsNotExist(e) {
+		err = e
+		_ = os.RemoveAll(dir)
+		return
+	}
 	for i, f := range selected {
 		s := Snapshot{Target: f.Target, Backup: strconv.Itoa(i) + ".bak"}
 		b, mode, e := manifest.ReadRegular(root, f.Target)
@@ -269,6 +337,13 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		return
 	}
 	undo := func(cause error) {
+		rejectErr := writeJSON(rejectedPath, struct {
+			Commit string `json:"commit"`
+			Error  string `json:"error"`
+		}{m.Commit, cause.Error()})
+		if rejectErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("persist rejected release: %w", rejectErr))
+		}
 		if re := rollback(dir, j); re != nil {
 			err = errors.Join(cause, fmt.Errorf("rollback failed: %w", re))
 			res.Status = "rollback-failed"

@@ -42,13 +42,18 @@ func SafePath(p string) bool {
 }
 func Sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 func (m Manifest) Validate() error {
-	if m.Version != 1 || !SHA.MatchString(m.Commit) || len(strings.Split(m.Repo, "/")) != 2 || len(m.Files) == 0 {
+	if m.Version != 1 || !SHA.MatchString(m.Commit) || !config.ValidRepo(m.Repo) || len(m.Files) == 0 {
 		return errors.New("invalid manifest identity or empty file list")
 	}
 	seen := map[string]bool{}
 	for _, f := range m.Files {
 		if !SafePath(f.Source) || !SafePath(f.Target) || !digest.MatchString(f.SHA256) || f.Size < 0 || f.Size > MaxFileSize || (f.Mode != 0644 && f.Mode != 0755) || seen[f.Target] {
 			return fmt.Errorf("invalid or duplicate manifest file %q", f.Target)
+		}
+		for target := range seen {
+			if strings.HasPrefix(target, f.Target+"/") || strings.HasPrefix(f.Target, target+"/") {
+				return errors.New("manifest file targets overlap as directories")
+			}
 		}
 		seen[f.Target] = true
 	}

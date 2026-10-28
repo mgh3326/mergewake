@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -123,7 +124,7 @@ func Load(name string) (Config, error) {
 	seen := map[string]bool{}
 	for i := range c.Repos {
 		r := &c.Repos[i]
-		if len(strings.Split(r.Name, "/")) != 2 || strings.ContainsAny(r.Name, " ?#%\\") || seen[r.Name] {
+		if !ValidRepo(r.Name) || seen[r.Name] {
 			return c, errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
@@ -159,7 +160,26 @@ func Load(name string) (Config, error) {
 		return c, errors.New("panewire notifier requires lane")
 	}
 	if c.Sink.ReopenState == "" {
-		c.Sink.ReopenState = "todo"
+		c.Sink.ReopenState = "in_progress"
+	}
+	for name, p := range c.Review.Profiles {
+		if name == "" || p.Family == "" || (filepath.Base(p.Command) != "pi" && filepath.Base(p.Command) != "cmd") {
+			return c, errors.New("review profiles require a name, family, and pi or cmd command")
+		}
+		if e := ValidateReviewArgs(p.Args); e != nil {
+			return c, e
+		}
+	}
+	for family, names := range c.Review.Pairings {
+		if family == "" || len(names) == 0 {
+			return c, errors.New("empty review pairing")
+		}
+		for _, name := range names {
+			p, ok := c.Review.Profiles[name]
+			if !ok || p.Family == family {
+				return c, errors.New("pairings must name configured profiles from a different family")
+			}
+		}
 	}
 	return c, nil
 }
@@ -186,4 +206,26 @@ func (c Config) Repo(name string) (Repo, error) {
 		}
 	}
 	return Repo{}, fmt.Errorf("repo %q is not configured", name)
+}
+
+var repoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$`)
+
+func ValidRepo(s string) bool {
+	return repoPattern.MatchString(s) && strings.Split(s, "/")[1] != "." && strings.Split(s, "/")[1] != ".."
+}
+
+// Model selection is configurable; context/tool/session options are controlled
+// by the diff-only adapter and cannot be overridden in a profile.
+func ValidateReviewArgs(args []string) error {
+	for i := 0; i < len(args); i += 2 {
+		if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+			return errors.New("review args must be model option/value pairs")
+		}
+		switch args[i] {
+		case "--model", "--provider", "--thinking", "--effort":
+		default:
+			return fmt.Errorf("review option %q is not a model-selection option", args[i])
+		}
+	}
+	return nil
 }
