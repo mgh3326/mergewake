@@ -48,7 +48,10 @@ type Service struct {
 	Notifier integrations.Notifier
 	Out      io.Writer
 }
-type Options struct{ DryRun, Shadow, Observed bool }
+type Options struct {
+	DryRun, Shadow, Observed bool
+	Digest, Adopt            string
+}
 
 func (s *Service) Print(v any) error        { return json.NewEncoder(s.Out).Encode(v) }
 func (s *Service) state(repo string) string { return filepath.Join(s.Config.StateDir, repo) }
@@ -252,8 +255,55 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	}
 	return s.GH.Publish(ctx, m)
 }
+
+// Adopt records a hand-started container as the current receipt so the first
+// managed deploy has a known previous digest.
+func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
+	var spec config.Install
+	found := false
+	for _, candidate := range r.Install {
+		if candidate.Target == o.Adopt {
+			spec, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("target %q is not in the host inventory", o.Adopt)
+	}
+	if spec.Kind != "container" {
+		return errors.New("--adopt requires a container install target")
+	}
+	state := filepath.Join(s.state(r.Name), "rollout")
+	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: o.DryRun || o.Shadow}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
+	if o.DryRun || o.Shadow {
+		return errors.Join(e, s.Print(result))
+	}
+	record := struct {
+		Host, Repo string
+		Result     rollout.Result
+		Error      string
+	}{Host: s.Config.Host, Repo: r.Name, Result: result}
+	if e != nil {
+		record.Error = e.Error()
+	}
+	return errors.Join(e, s.audit(r.Name, "adopt", record, false), s.Print(result))
+}
+
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
-	if r.Root == "" || r.Smoke.Command == "" {
+	containerOnly := len(r.Install) > 0
+	for _, spec := range r.Install {
+		containerOnly = containerOnly && spec.Kind == "container"
+	}
+	if o.Adopt != "" {
+		if !containerOnly {
+			return errors.New("--adopt requires a container install inventory")
+		}
+		if o.Digest != "" {
+			return errors.New("--adopt and --digest are separate operations")
+		}
+		return s.Adopt(ctx, r, o)
+	}
+	if !containerOnly && (r.Root == "" || r.Smoke.Command == "") {
 		return errors.New("rollout requires root and a smoke command")
 	}
 	var m manifest.Manifest
@@ -309,46 +359,83 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return errors.New("manifest commit CI is not green")
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
-	receiptName := "installed.json"
-	if len(m.Commands) > 0 {
-		receiptName = "command-installed.json"
+	if containerOnly {
+		b, re := os.ReadFile(filepath.Join(state, rollout.ContainerReceiptName))
+		if re == nil {
+			var receipt rollout.ContainerReceipt
+			if re = json.Unmarshal(b, &receipt); re != nil {
+				return re
+			}
+			if receipt.Repo != r.Name {
+				return errors.New("container receipt repo mismatch")
+			}
+			if receipt.Commit != "" {
+				ok, re = s.GH.Ancestor(ctx, r.Name, receipt.Commit, m.Commit)
+				if re != nil {
+					return re
+				}
+				if !ok {
+					return errors.New("automatic downgrade or divergent release refused")
+				}
+			}
+		} else if !os.IsNotExist(re) {
+			return re
+		}
 	}
-	b, e := os.ReadFile(filepath.Join(state, receiptName))
-	if e == nil {
-		var old struct {
-			Manifest manifest.Manifest `json:"manifest"`
+	if !containerOnly {
+		receiptName := "installed.json"
+		if len(m.Commands) > 0 {
+			receiptName = "command-installed.json"
 		}
-		if e = json.Unmarshal(b, &old); e != nil {
-			return e
+		b, re := os.ReadFile(filepath.Join(state, receiptName))
+		if re == nil {
+			var old struct {
+				Manifest manifest.Manifest `json:"manifest"`
+			}
+			if re = json.Unmarshal(b, &old); re != nil {
+				return re
+			}
+			if old.Manifest.Repo != r.Name {
+				return errors.New("installed receipt repo mismatch")
+			}
+			ok, re = s.GH.Ancestor(ctx, r.Name, old.Manifest.Commit, m.Commit)
+			if re != nil {
+				return re
+			}
+			if !ok {
+				return errors.New("automatic downgrade or divergent release refused")
+			}
+		} else if !os.IsNotExist(re) {
+			return re
 		}
-		if old.Manifest.Repo != r.Name {
-			return errors.New("installed receipt repo mismatch")
-		}
-		ok, e = s.GH.Ancestor(ctx, r.Name, old.Manifest.Commit, m.Commit)
+	}
+	var timeout time.Duration
+	if r.Smoke.Command != "" {
+		timeout, e = config.Duration(r.SmokeTimeout)
 		if e != nil {
 			return e
 		}
-		if !ok {
-			return errors.New("automatic downgrade or divergent release refused")
-		}
-	} else if !os.IsNotExist(e) {
-		return e
-	}
-	timeout, e := config.Duration(r.SmokeTimeout)
-	if e != nil {
-		return e
 	}
 	root := config.Expand(r.Root)
 	smoke := func(ctx context.Context) error {
+		if r.Smoke.Command == "" {
+			return nil
+		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
 		return err
 	}
-	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow}
+	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Digest: o.Digest}
 	var result rollout.Result
 	var installErr error
-	if len(m.Commands) > 0 {
+	switch {
+	case containerOnly:
+		runtimeFor := func(spec config.Install) rollout.Runtime {
+			return rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime}
+		}
+		result, installErr = rollout.ApplyContainer(ctx, m, installOptions, s.Config.Host, runtimeFor, rollout.CheckHealth)
+	case len(m.Commands) > 0:
 		result, installErr = rollout.ApplyCommands(ctx, m, installOptions, s.Config.Host, s.Runner, func(ctx context.Context, spec config.Install, sha string) error {
 			if spec.Kind == "release" {
 				source, ok := s.GH.(interface {
@@ -371,8 +458,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 			_, err := s.Runner.Run(ctx, command.Command, command.Args, "", root)
 			return err
 		}, smoke)
-
-	} else {
+	default:
 		selected := []config.Install{}
 		for _, file := range m.Files {
 			denied := false

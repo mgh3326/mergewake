@@ -1,0 +1,61 @@
+version: 1
+host: host-a
+state_dir: ~/.local/state/mergewake
+token_env: GITHUB_TOKEN
+poll_interval: 60s
+repos:
+  - name: example/project
+    branch: main
+    policy: .mergewake/policy.yaml
+    # Container inventories need no root or smoke command; the health URL below
+    # is the readiness gate. The image has no tag: the digest is pinned here for
+    # the release manifest, or supplied by `rollout --digest`.
+    install:
+      - kind: container
+        target: api
+        image: registry.example/api
+        name: fleet-api
+        digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        ports:
+          - "8080:8080"
+        env_file: /etc/fleet/api.env
+        volumes:
+          - /srv/fleet/api-data:/data
+        restart: unless-stopped
+        runtime: docker
+        user: "1000:1000"
+        keep: 2
+        health:
+          url: http://127.0.0.1:8080/healthz
+          status: 200
+          timeout: 5s
+          retries: 30
+    task: "42"
+review:
+  login: review-bot
+  timeout: 10m
+  quota: scopefuel
+  default_grade: B
+  profiles:
+    claude:
+      family: anthropic
+      command: pi
+      args: [--provider, anthropic, --model, claude-model-id]
+      gate_profile: example-claude-profile
+outcomes:
+  command: scopefuel
+  default_tier: T1
+notifier:
+  type: stdout
+  command: panewire
+  lane: operator-desk
+sink:
+  type: noop
+  command: handoffkeep
+  reopen_state: reopened
+daemon:
+  act: false
+  pr: {enabled: false, interval: 60s}
+  watch: {enabled: false, interval: 60s}
+  release: {enabled: false, interval: 2m}
+  rollout: {enabled: false, interval: 2m}

@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -360,6 +364,182 @@ type smokeRunner struct{}
 
 func (smokeRunner) Run(context.Context, string, []string, string, string) ([]byte, error) {
 	return nil, nil
+}
+
+// dockerCLI fakes only the docker/podman commands the container runtime uses.
+type dockerCLI struct {
+	containers map[string]string
+	running    map[string]bool
+	images     map[string]string
+}
+
+func newDockerCLI() *dockerCLI {
+	return &dockerCLI{containers: map[string]string{}, running: map[string]bool{}, images: map[string]string{}}
+}
+func (d *dockerCLI) add(ref string) string {
+	id := "img-" + ref
+	d.images[ref] = id
+	return id
+}
+func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
+	if command != "docker" || len(args) == 0 {
+		return nil, errors.New("unexpected runtime command")
+	}
+	switch args[0] {
+	case "pull":
+		d.add(args[1])
+		return nil, nil
+	case "run":
+		name, ref := args[2], args[len(args)-1]
+		if _, ok := d.containers[name]; ok {
+			return nil, errors.New("container name in use")
+		}
+		d.containers[name] = ref
+		d.running[name] = true
+		return nil, nil
+	case "stop":
+		d.running[args[len(args)-1]] = false
+		return nil, nil
+	case "start":
+		d.running[args[len(args)-1]] = true
+		return nil, nil
+	case "rename":
+		from, to := args[1], args[2]
+		if _, ok := d.containers[from]; !ok {
+			return nil, errors.New("no such container")
+		}
+		d.containers[to], d.running[to] = d.containers[from], d.running[from]
+		delete(d.containers, from)
+		delete(d.running, from)
+		return nil, nil
+	case "rm":
+		name := args[len(args)-1]
+		delete(d.containers, name)
+		delete(d.running, name)
+		return nil, nil
+	case "rmi":
+		delete(d.images, args[1])
+		return nil, nil
+	case "ps":
+		var names []string
+		for name := range d.containers {
+			names = append(names, name)
+		}
+		return []byte(strings.Join(names, "\n")), nil
+	case "images":
+		var ids []string
+		for _, id := range d.images {
+			ids = append(ids, id)
+		}
+		return []byte(strings.Join(ids, "\n")), nil
+	case "inspect":
+		name := args[len(args)-1]
+		for _, n := range args[3:] {
+			if _, ok := d.containers[n]; !ok {
+				continue
+			}
+			name = n
+		}
+		ref, ok := d.containers[name]
+		if !ok {
+			return nil, errors.New("no such object")
+		}
+		switch {
+		case strings.Contains(args[2], "State.Running"):
+			return []byte(fmt.Sprintf("%t\t%s\t%s", d.running[name], ref, d.images[ref])), nil
+		case strings.Contains(args[2], ".Image"):
+			var out []string
+			for _, n := range args[3:] {
+				if r, ok := d.containers[n]; ok {
+					out = append(out, d.images[r])
+				}
+			}
+			return []byte(strings.Join(out, "\n")), nil
+		}
+		return nil, errors.New("unexpected inspect format")
+	case "image":
+		id := args[len(args)-1]
+		for ref, imageID := range d.images {
+			if imageID != id {
+				continue
+			}
+			if strings.Contains(args[2], "RepoDigests") {
+				return []byte(ref), nil
+			}
+			return []byte(id + "\t2026-01-01T00:00:00Z\t" + ref + ","), nil
+		}
+		return nil, errors.New("no such image")
+	}
+	return nil, errors.New("unexpected runtime arguments")
+}
+
+func TestContainerRolloutAdoptAndDeploy(t *testing.T) {
+	s, g, sink, _, r := setup(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer server.Close()
+	old := "sha256:" + strings.Repeat("a", 64)
+	next := "sha256:" + strings.Repeat("b", 64)
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api",
+		Health: &config.Health{URL: server.URL, Status: 200, Timeout: "1s", Retries: 1}, Runtime: "docker"}
+	r.Install = []config.Install{spec}
+	r.Root, r.Smoke = "", config.Command{}
+	r.SmokeTimeout = "1s"
+	d := newDockerCLI()
+	ref := spec.Image + "@" + old
+	d.containers[spec.Name] = ref
+	d.running[spec.Name] = true
+	d.add(ref)
+	s.Runner = d
+	pinned := spec
+	pinned.Digest = next
+	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	if e = s.Rollout(context.Background(), r, Options{}); e == nil || !strings.Contains(e.Error(), "unmanaged") {
+		t.Fatalf("unmanaged container replaced: %v", e)
+	}
+	if e = s.Rollout(context.Background(), r, Options{Adopt: "api"}); e != nil {
+		t.Fatal(e)
+	}
+	records := sink.records
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if sink.records != records+1 {
+		t.Fatalf("container deploy not reported: %d", sink.records)
+	}
+	receipt, _, e := rollout.LoadContainerReceipt(filepath.Join(s.state(r.Name), "rollout"), "host-a", r.Name)
+	if e != nil || receipt.Targets["api"].Digest != next || !reflect.DeepEqual(receipt.Targets["api"].Previous, []string{old}) {
+		t.Fatalf("receipt %+v %v", receipt, e)
+	}
+	if e = s.Rollout(context.Background(), r, Options{DryRun: true}); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestContainerRolloutDryRunWritesNoState(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	digest := "sha256:" + strings.Repeat("c", 64)
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api",
+		Health: &config.Health{URL: "http://127.0.0.1:1/healthz", Status: 200, Timeout: "1s", Retries: 1}, Runtime: "docker"}
+	r.Install = []config.Install{spec}
+	r.Root, r.Smoke, r.SmokeTimeout = "", config.Command{}, "1s"
+	s.Runner = newDockerCLI()
+	pinned := spec
+	pinned.Digest = digest
+	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	if e = s.Rollout(context.Background(), r, Options{DryRun: true, Digest: spec.Image + "@" + digest}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = os.Stat(filepath.Join(s.state(r.Name), "rollout", rollout.ContainerReceiptName)); !os.IsNotExist(e) {
+		t.Fatal("dry-run wrote a container receipt")
+	}
 }
 
 func TestChangedHeadStopsReviewAndLand(t *testing.T) {

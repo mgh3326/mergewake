@@ -4,8 +4,9 @@ Each host has one operator-owned YAML file, normally
 `~/.config/mergewake/config.yaml`. Each repository has a policy at
 `.mergewake/policy.yaml`. Unknown keys, duplicate YAML keys, and multiple YAML
 documents are errors. There is no environment interpolation except expansion of
-a leading `~/` in local config, state, and install-root paths. Credentials belong
-in the environment or the external CLI's own credential store.
+a leading `~/` in local config, state, install-root and container `env_file`
+paths. Credentials belong in the environment or the external CLI's own credential
+store.
 
 Use [examples/host.yaml](../examples/host.yaml) and
 [examples/policy.yaml](../examples/policy.yaml) as starting points. Their repo,
@@ -35,10 +36,10 @@ Different hosts may use the same inventory and different deny lists.
 | `name` | Required | GitHub `owner/name`; commands cannot select an unconfigured repo. |
 | `branch` | `main` | Base branch for landing, CI watching, release ancestry, and recovery PRs. |
 | `policy` | `.mergewake/policy.yaml` | Clean relative policy path inside the repository. Loaded through GitHub at a trusted base commit. |
-| `root` | Required for rollout and agent | Explicit local installation directory; leading `~/` expands. Use a dedicated root per inventory. Filesystem root is refused. |
+| `root` | Required for file and command/release rollout | Explicit local installation directory; leading `~/` expands. Use a dedicated root per inventory. Filesystem root is refused. Container inventories do not use it. |
 | `deny` | Empty list | Per-host relative target globs. These override all manifest/install permissions. Example: `bin/relay-hub`, `bin/operator-daemon`, `protected/**`. |
 | `install` | Required for release and rollout | Authorized source/target inventory; see below. This is intent/configuration, not generated hashes. |
-| `smoke` | Required for rollout and agent | Operator-owned smoke command; see below. Never supplied by a manifest or PR. |
+| `smoke` | Required for file and command/release rollout | Operator-owned smoke command; see below. Never supplied by a manifest or PR. Container targets use `install[].health` instead. |
 | `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
 
@@ -46,9 +47,9 @@ Each `install[]` entry has:
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
-| `kind` | `file` | `file`, `command`, or `release`. A repo inventory cannot mix files with commands/releases. |
+| `kind` | `file` | `file`, `command`, `release`, or `container`. A repo inventory cannot mix these families. |
 | `source` | Required for file | Regular Git file at the release commit, relative to repo root. Symlinks, trees, submodules and files over 32 MiB are refused. |
-| `target` | Required | Clean relative path beneath `root`. Absolute paths, traversal, duplicate targets, and file/directory overlaps are refused. |
+| `target` | Required | Clean relative path beneath `root`, or the logical label for command/release/container targets. Absolute paths, traversal, duplicate targets, and file/directory overlaps are refused. |
 | `mode` | Quoted `"0644"` | Octal string: only `"0644"` and `"0755"`. Must agree with the manifest. |
 
 The published inventory can contain denied targets; hosts skip them. Other
@@ -339,6 +340,10 @@ For `example/project`, state resides beneath
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
 | `rollout/installed.json` | Last successful manifest and install result. Used with actual hashes, never trusted alone. |
 | `rollout/rejected.json` | Release that failed after mutation. Prevents repeated retries of that commit. |
+| `rollout/container-installed.json` | Current and previous digests per container target, with the last managed release commit. |
+| `rollout/container-journal.json` | In-flight container swap; replay restores the previous container before another attempt. |
+| `rollout/container-rollback-*.json` | Rollback audit for an interrupted or failed container deploy. |
+| `rollout/container-rejected.json` | Container digest that failed after mutation. Prevents repeated retries of that digest. |
 
 After an interrupted install, confirm no process still owns `rollout/lock`, inspect
 the journal, and remove only that stale lock. The next acting rollout restores the
@@ -407,6 +412,110 @@ bounded to 32 MiB and revalidated on every request; mutations invalidate them.
 SIGINT/SIGTERM cancel work; command process groups stop together and any rollback
 finishes with an independent timeout. Configure the supervisor's stop timeout
 above the total possible rollback duration for your inventory.
+
+## Container installs
+
+`kind: container` covers the small subset of Kubernetes this fleet needs: one
+immutable image per logical target, host-published ports, an operator-owned env
+file, optional volumes, a restart policy, and an HTTP health check. The runtime is
+the host's `docker` by default, or `podman` with the same CLI subset; mergewake
+never calls a registry API or a cluster.
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `target` | Required | Logical label used in the manifest, deny list and gate receipts. |
+| `image` | Required | Registry/repository without a tag or digest. |
+| `name` | Required | Runtime container name; the previous container is kept as `<name>.mergewake-prev`. |
+| `ports` | Empty | `host_ip:host_port:container_port`, or `host_port:container_port`. The host address defaults to `127.0.0.1`; a supplied address must be an IP literal. |
+| `env_file` | Empty | Absolute operator-owned path passed as `--env-file`. Its values are never read or printed. |
+| `volumes` | Empty | `source:destination[:ro\|rw]` entries passed as `--volume`. |
+| `restart` | `unless-stopped` | `no`, `always`, `unless-stopped`, or `on-failure[:N]`. |
+| `health` | Required | `url`, expected `status` (default 200), per-request `timeout` (default `5s`), and `retries` (default 20, one second apart). |
+| `keep` | `2` | Previous digests kept as history and spared by garbage collection. `0..100`. |
+| `runtime` | `docker` | `docker` or `podman`. |
+| `user` | Empty | Optional `--user` value. |
+| `digest` | Empty | `sha256:<64 hex>` pinned into the release manifest. Without it, `rollout --digest` must supply the deploy digest. |
+
+### Digest source
+
+A container deploy always names an immutable `repo@sha256:...`. mergewake takes
+the digest from the release manifest (`install[].digest`, published by `release`)
+or from `rollout --digest repo@sha256:...`. The explicit flag must name the same
+repository as `image`, and is accepted only when the inventory has exactly one
+container target. A tag, a missing digest, or a digest for another repository is
+refused before any pull. The manifest commit remains the release identity used for
+ancestry, CI and receipts.
+
+Image names are compared literally with the runtime's repository digests, so use
+the fully qualified form (`registry.example/api`, or `docker.io/library/nginx`
+rather than `nginx`); the daemon normalizes Docker Hub short names.
+
+The rollout still fetches the newest published manifest, so `--digest` supplies
+the payload while the manifest supplies the release identity (commit, ancestry and
+CI). Publish one with `mergewake release`; the host inventory may omit `digest`
+when the desk intends to pass it explicitly.
+
+### Deploy sequence and swap strategy
+
+The old and new container bind the same host ports, so they cannot overlap.
+mergewake therefore performs a short, explicit stop-and-swap rather than starting
+a temporary second container behind a proxy:
+
+1. Verify the release commit, CI, deny list, gates and receipt ancestry.
+2. Inspect the running container and refuse on drift: a missing or stopped
+   container, a digest mismatch, an unmanaged container, or a changed image
+   repository.
+3. Pull every new digest before touching a running container.
+4. Write `container-journal.json`, then stop and rename the old container to
+   `<name>.mergewake-prev`. Its writable layer is preserved for rollback.
+5. Start `<name>` from the new digest and poll `health` until it passes or its
+   retries are exhausted.
+6. Persist the receipt (the new digest becomes current; the old digest is
+   prepended to `previous`, capped at `keep`), remove the preserved container,
+   remove the journal, then garbage-collect images.
+
+On any failure between steps 4 and 6, the new container is removed, the preserved
+container is renamed back and started, its health is checked again, and a
+`container-rollback-*.json` audit plus `container-rejected.json` is written. The
+previous receipt is restored, so `status` matches the running container again. A
+digest that rolled back is refused until an operator inspects it and removes
+`container-rejected.json`. A crash is recovered from the journal on the next
+acting rollout; a journal whose receipt already records the new digest is treated
+as a completed deploy, so only the preserved container and journal are cleaned up.
+
+### Image garbage collection
+
+After a successful deploy mergewake lists images of that repository and removes
+every digest that is neither the current digest nor one of the newest `keep`
+previous digests, except that it never removes an image referenced by any
+container, stopped ones included. Removed digests are reported under
+`removed_images`; a failed removal becomes a warning and never rolls back a
+healthy deploy. Images pulled by a failed attempt are collected by a later
+successful deploy.
+
+### Adopt and status
+
+```sh
+mergewake rollout --config /path/to/host.yaml --repo example/project --adopt api
+```
+
+`--adopt <target>` records an already-running, hand-started container as the
+current receipt, including its resolved repository digest, so the first managed
+deploy has a known previous digest. The container must be running; a start from a
+tag is resolved through the image's `RepoDigests`, and adopt refuses when no
+repository digest can be resolved. A rollout refuses to replace a container that
+has no receipt and tells the operator to adopt it first. With `--dry-run` (or
+without `--apply`) adopt plans and prints the result without writing state.
+
+`mergewake status` prints one JSON line per container target with `running`,
+`digest`, `health`, `previous`, `images_kept`, and `status`. Drift or an unhealthy
+target is reported and returns a failing exit status.
+
+Container inventories use no `root`, `smoke`, `source`, or `mode`. They cannot be
+mixed with file or command/release entries in one repo inventory. `serial` and
+`canary` ordering, `receipts_dir` gate receipts, the deny list, `--dry-run`, and
+the installed receipt all apply unchanged. See
+[examples/container.yaml](../examples/container.yaml) for a template.
 
 ## Command installs and receipt ordering
 

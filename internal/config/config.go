@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +53,12 @@ type Sink struct {
 	Command     string `yaml:"command"`
 	ReopenState string `yaml:"reopen_state"`
 }
+type Health struct {
+	URL     string `yaml:"url" json:"url"`
+	Status  int    `yaml:"status" json:"status"`
+	Timeout string `yaml:"timeout" json:"timeout"`
+	Retries int    `yaml:"retries" json:"retries"`
+}
 type Install struct {
 	Kind         string   `yaml:"kind" json:"kind"`
 	Command      Command  `yaml:"command" json:"command"`
@@ -62,6 +72,17 @@ type Install struct {
 	Source       string   `yaml:"source"`
 	Target       string   `yaml:"target"`
 	Mode         string   `yaml:"mode"`
+	Image        string   `yaml:"image" json:"image"`
+	Name         string   `yaml:"name" json:"name"`
+	Ports        []string `yaml:"ports" json:"ports"`
+	EnvFile      string   `yaml:"env_file" json:"env_file"`
+	Volumes      []string `yaml:"volumes" json:"volumes"`
+	Restart      string   `yaml:"restart" json:"restart"`
+	Health       *Health  `yaml:"health" json:"health"`
+	Keep         *int     `yaml:"keep" json:"keep"`
+	Runtime      string   `yaml:"runtime" json:"runtime"`
+	User         string   `yaml:"user" json:"user"`
+	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
 	Name         string    `yaml:"name"`
@@ -209,6 +230,10 @@ func Load(name string) (Config, error) {
 			}
 			switch spec.Kind {
 			case "file":
+			case "container":
+				if e = validateContainer(spec); e != nil {
+					return c, e
+				}
 			case "command", "release":
 				if spec.Verify.Command == "" {
 					return c, errors.New("command/release installs require verify")
@@ -232,7 +257,7 @@ func Load(name string) (Config, error) {
 					return c, err
 				}
 			default:
-				return c, errors.New("install kind must be file, command or release")
+				return c, errors.New("install kind must be file, command, release or container")
 			}
 			if len(spec.Serial) > 0 || spec.Canary != "" {
 				if spec.ReceiptsDir == "" {
@@ -251,6 +276,15 @@ func Load(name string) (Config, error) {
 					}
 					seenHosts[host] = true
 				}
+			}
+		}
+		family := ""
+		for _, spec := range r.Install {
+			f := installFamily(spec.Kind)
+			if family == "" {
+				family = f
+			} else if family != f {
+				return c, errors.New("one repo inventory cannot mix file, command/release and container installs")
 			}
 		}
 		for _, g := range r.Deny {
@@ -321,6 +355,171 @@ func Duration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid positive duration %q", s)
 	}
 	return d, nil
+}
+
+func installFamily(kind string) string {
+	switch kind {
+	case "command", "release":
+		return "command"
+	case "container":
+		return "container"
+	}
+	return "file"
+}
+
+// Container inventories describe a runtime that the host already trusts. Values
+// are validated here so a bad host file fails before any journal or mutation.
+var (
+	containerName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	imageName      = regexp.MustCompile(`^(?:[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?(?::[0-9]{1,5})/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
+	imageDigest    = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+	restartPolicy  = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[0-9]+)?)$`)
+	containerUser  = regexp.MustCompile(`^[A-Za-z0-9_][-A-Za-z0-9_.:]*$`)
+	volumeValue    = regexp.MustCompile(`^[A-Za-z0-9_./@+-]+$`)
+	containerLabel = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*$`)
+)
+
+func validContainerTarget(p string) bool {
+	return p != "" && p != "." && !path.IsAbs(p) && path.Clean(p) == p && p != ".." &&
+		!strings.HasPrefix(p, "../") && !strings.ContainsAny(p, "\\\x00\r\n") && containerLabel.MatchString(p)
+}
+
+func validateContainer(spec *Install) error {
+	if !validContainerTarget(spec.Target) {
+		return errors.New("container install requires a clean relative target label")
+	}
+	if spec.Image == "" || strings.Contains(spec.Image, "@") || strings.Contains(path.Base(spec.Image), ":") || !imageName.MatchString(spec.Image) {
+		return errors.New("container image must be a registry/repository without a tag or digest")
+	}
+	if !containerName.MatchString(spec.Name) {
+		return errors.New("container name is invalid")
+	}
+	for i, p := range spec.Ports {
+		n, e := normalizePort(p)
+		if e != nil {
+			return e
+		}
+		spec.Ports[i] = n
+	}
+	if spec.EnvFile != "" {
+		env := Expand(spec.EnvFile)
+		if !filepath.IsAbs(env) || strings.ContainsAny(env, "\x00\r\n") {
+			return errors.New("container env_file must be an absolute operator-owned path")
+		}
+	}
+	for _, v := range spec.Volumes {
+		if e := validateVolume(v); e != nil {
+			return e
+		}
+	}
+	if spec.Restart == "" {
+		spec.Restart = "unless-stopped"
+	} else if !restartPolicy.MatchString(spec.Restart) {
+		return errors.New("container restart policy is invalid")
+	}
+	if spec.Health == nil {
+		return errors.New("container install requires health")
+	}
+	if e := validateHealth(spec.Health); e != nil {
+		return e
+	}
+	if spec.Keep == nil {
+		keep := 2
+		spec.Keep = &keep
+	} else if *spec.Keep < 0 || *spec.Keep > 100 {
+		return errors.New("container keep must be 0..100")
+	}
+	switch spec.Runtime {
+	case "":
+		spec.Runtime = "docker"
+	case "docker", "podman":
+	default:
+		return errors.New("container runtime must be docker or podman")
+	}
+	if spec.User != "" && !containerUser.MatchString(spec.User) {
+		return errors.New("container user is invalid")
+	}
+	if spec.Digest != "" && !imageDigest.MatchString(spec.Digest) {
+		return errors.New("container digest must be sha256:<64 hex>")
+	}
+	return nil
+}
+
+func validateHealth(h *Health) error {
+	u, e := url.Parse(h.URL)
+	if e != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return errors.New("container health URL must be an absolute http(s) URL without credentials")
+	}
+	if h.Status == 0 {
+		h.Status = 200
+	}
+	if h.Status < 100 || h.Status > 599 {
+		return errors.New("container health status must be 100..599")
+	}
+	if h.Timeout == "" {
+		h.Timeout = "5s"
+	}
+	if _, e = Duration(h.Timeout); e != nil {
+		return e
+	}
+	if h.Retries == 0 {
+		h.Retries = 20
+	}
+	if h.Retries < 1 || h.Retries > 1000 {
+		return errors.New("container health retries must be 1..1000")
+	}
+	return nil
+}
+
+func validateVolume(v string) error {
+	parts := strings.Split(v, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return errors.New("container volume must be source:destination[:ro|rw]")
+	}
+	for _, p := range parts {
+		if p == "" || !volumeValue.MatchString(p) {
+			return errors.New("container volume contains an empty or unsupported field")
+		}
+	}
+	if len(parts) == 3 && parts[2] != "ro" && parts[2] != "rw" {
+		return errors.New("container volume mode must be ro or rw")
+	}
+	return nil
+}
+
+// normalizePort accepts host_ip:host_port:container_port and host_port:container_port.
+// The omitted host address is loopback, so a default inventory exposes nothing else.
+func normalizePort(raw string) (string, error) {
+	host, rest := "127.0.0.1", raw
+	if strings.HasPrefix(raw, "[") {
+		end := strings.Index(raw, "]")
+		if end < 0 || end+1 >= len(raw) || raw[end+1] != ':' {
+			return "", errors.New("container port must be host_ip:host_port:container_port")
+		}
+		host, rest = raw[1:end], raw[end+2:]
+	} else {
+		switch parts := strings.Split(raw, ":"); len(parts) {
+		case 3:
+			host, rest = parts[0], parts[1]+":"+parts[2]
+		case 2:
+		default:
+			return "", errors.New("container port must be host_ip:host_port:container_port or host_port:container_port")
+		}
+	}
+	ports := strings.Split(rest, ":")
+	if len(ports) != 2 || host == "" {
+		return "", errors.New("container port must name host and container ports")
+	}
+	if net.ParseIP(host) == nil {
+		return "", errors.New("container port host must be an IP literal")
+	}
+	for _, p := range ports {
+		n, e := strconv.Atoi(p)
+		if e != nil || n < 1 || n > 65535 {
+			return "", errors.New("container port must be 1..65535")
+		}
+	}
+	return net.JoinHostPort(host, ports[0]) + ":" + ports[1], nil
 }
 func Expand(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {

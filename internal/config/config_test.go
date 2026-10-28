@@ -61,6 +61,20 @@ func TestExampleConfig(t *testing.T) {
 	}
 }
 
+func TestExampleContainerConfig(t *testing.T) {
+	c, e := Load("../../examples/container.yaml")
+	if e != nil {
+		t.Fatal(e)
+	}
+	spec := c.Repos[0].Install[0]
+	if spec.Kind != "container" || spec.Image != "registry.example/api" || spec.Name != "fleet-api" {
+		t.Fatalf("container example %+v", spec)
+	}
+	if len(spec.Ports) != 1 || spec.Ports[0] != "127.0.0.1:8080:8080" || spec.Health == nil || spec.Health.Retries != 30 {
+		t.Fatalf("container example ports/health %+v", spec)
+	}
+}
+
 func TestCommandAndDaemonValidation(t *testing.T) {
 	for _, tc := range []struct {
 		extra string
@@ -77,5 +91,84 @@ func TestCommandAndDaemonValidation(t *testing.T) {
 		if (err != nil) != tc.fail {
 			t.Fatalf("config %s err=%v", tc.extra, err)
 		}
+	}
+}
+
+func containerYAML(replacements ...string) string {
+	text := `version: 1
+host: host-a
+repos:
+  - name: example/project
+    install:
+      - kind: container
+        target: api
+        image: registry.example/api
+        name: fleet-api
+        ports: ["8080:8080"]
+        env_file: /etc/fleet/api.env
+        health:
+          url: http://127.0.0.1:8080/healthz
+`
+	for i := 0; i+1 < len(replacements); i += 2 {
+		text = strings.Replace(text, replacements[i], replacements[i+1], 1)
+	}
+	return text
+}
+
+func TestContainerConfigValidation(t *testing.T) {
+	const health = "        health:\n          url: http://127.0.0.1:8080/healthz\n"
+	for _, tt := range []struct {
+		name string
+		text string
+		fail bool
+	}{
+		{"minimal", containerYAML(), false},
+		{"image tag", containerYAML("        image: registry.example/api\n", "        image: registry.example/api:latest\n"), true},
+		{"missing health", containerYAML(health, ""), true},
+		{"relative health", containerYAML(health, "        health: {url: /healthz}\n"), true},
+		{"credential health", containerYAML(health, "        health: {url: 'http://user:pass@127.0.0.1/healthz'}\n"), true},
+		{"bad port", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['127.0.0.1:0:8080']"), true},
+		{"hostname port", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['localhost:8080:8080']"), true},
+		{"too many ports parts", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['1:2:3:4']"), true},
+		{"bad keep", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        keep: 101\n"), true},
+		{"bad runtime", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        runtime: lxc\n"), true},
+		{"bad restart", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        restart: sometimes\n"), true},
+		{"relative env", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: fleet.env\n"), true},
+		{"bad digest", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        digest: sha256:short\n"), true},
+		{"bad volume", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        volumes: ['data']\n"), true},
+		{"missing name", containerYAML("        name: fleet-api\n", ""), true},
+		{"mixed inventory", containerYAML() + "      - source: tool\n        target: bin/tool\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if e := os.WriteFile(path, []byte(tt.text), 0600); e != nil {
+				t.Fatal(e)
+			}
+			c, e := Load(path)
+			if (e != nil) != tt.fail {
+				t.Fatalf("%+v %v", c, e)
+			}
+		})
+	}
+}
+
+func TestContainerConfigDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if e := os.WriteFile(path, []byte(containerYAML()), 0600); e != nil {
+		t.Fatal(e)
+	}
+	c, e := Load(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	spec := c.Repos[0].Install[0]
+	if spec.Restart != "unless-stopped" || spec.Runtime != "docker" || spec.Keep == nil || *spec.Keep != 2 {
+		t.Fatalf("defaults %+v", spec)
+	}
+	if spec.Health.Status != 200 || spec.Health.Timeout != "5s" || spec.Health.Retries != 20 {
+		t.Fatalf("health defaults %+v", spec.Health)
+	}
+	if len(spec.Ports) != 1 || spec.Ports[0] != "127.0.0.1:8080:8080" {
+		t.Fatalf("ports %v", spec.Ports)
 	}
 }

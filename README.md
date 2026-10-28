@@ -62,7 +62,7 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 | `review --repo … --pr …` | Claim one PR head, select a different model family, review only the diff, post inline review comments. |
 | `watch --repo …` | Poll main CI, find a green-to-red boundary among squash commits using existing checks, open a revert PR, reopen the task when its API permits, and notify. `--once` inspects once. |
 | `release --repo …` | Verify green main ancestry and publish an immutable manifest as a GitHub Release asset. `--commit` accepts a full SHA. |
-| `rollout --repo …` | Pull the newest mergewake manifest, verify bytes, install permitted files, smoke-test, roll back on failure, and report. |
+| `rollout --repo …` | Pull the newest mergewake manifest, verify bytes, install permitted files or container digests, smoke/health-test, roll back on failure, and report. |
 | `daemon` | Run enabled PR, CI watch, green-main release and host rollout loops concurrently. Shadow by default; acting needs `daemon.act: true` and `--apply`. |
 | `status --daemon` | Show each role’s last run, last error, failure count and next run. |
 | `agent` | Poll all configured repositories for verified rollouts. `--once` runs a single poll; `--repo` selects one. |
@@ -110,6 +110,12 @@ installs download the same checksummed binaries as `install.sh`. Serial/canary
 ordering uses success receipts supplied through an operator-owned shared or
 replicated directory. See [docs/config.md](docs/config.md) for templates and
 remaining operating limits, and [DESIGN.md](DESIGN.md) for failure boundaries.
+
+Container installs deploy `repo@sha256:...` digests through `docker` or `podman`,
+stop-and-swap the previous container, poll an HTTP health check, restore the
+preserved container on failure, and garbage-collect old images. `rollout --adopt`
+records a hand-started container; `status` reports its digest and health. See
+[examples/container.yaml](examples/container.yaml).
 
 ## Development
 

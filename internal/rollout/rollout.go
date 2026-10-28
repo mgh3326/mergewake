@@ -28,16 +28,20 @@ type Journal struct {
 	Files           []Snapshot `json:"files"`
 }
 type Result struct {
-	Commit    string   `json:"commit"`
-	Status    string   `json:"status"`
-	Installed []string `json:"installed"`
-	Denied    []string `json:"denied"`
+	Commit    string              `json:"commit"`
+	Status    string              `json:"status"`
+	Installed []string            `json:"installed"`
+	Denied    []string            `json:"denied"`
+	Digests   map[string]string   `json:"digests,omitempty"`
+	Removed   map[string][]string `json:"removed_images,omitempty"`
+	Warnings  []string            `json:"warnings,omitempty"`
 }
 type Options struct {
 	Root, StateDir string
 	Allowed        []config.Install
 	Deny           []string
 	DryRun         bool
+	Digest         string
 }
 
 // Atomic writes beside the target, so rename never crosses filesystems.
