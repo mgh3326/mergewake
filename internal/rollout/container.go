@@ -317,6 +317,15 @@ func AdoptContainer(ctx context.Context, spec config.Install, host, repo string,
 		return
 	}
 	defer unlock()
+	// An unfinished swap owns the rollback state; adopting a container now would
+	// overwrite the receipt that recovery restores.
+	if _, e := os.Stat(filepath.Join(o.StateDir, containerJournalName)); e == nil {
+		err = errors.New("container journal present; recover the interrupted rollout before adopt")
+		return
+	} else if !os.IsNotExist(e) {
+		err = e
+		return
+	}
 	receipt, _, e := LoadContainerReceipt(o.StateDir, host, repo)
 	if e != nil {
 		err = e

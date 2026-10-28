@@ -279,6 +279,25 @@ func TestContainerDigestFlagRequiresSingleTarget(t *testing.T) {
 	}
 }
 
+func TestContainerAdoptRefusesPendingJournal(t *testing.T) {
+	spec := containerSpec()
+	state := t.TempDir()
+	rt := newFakeRuntime()
+	rt.containers[spec.Name] = &fakeContainer{digest: oldDigest, running: true, id: "img-" + oldDigest}
+	j := containerJournal{Repo: "example/project", Host: "host-a", Commit: strings.Repeat("e", 40), Order: []string{spec.Target}, Targets: map[string]containerMutation{
+		spec.Target: {Target: spec.Target, Name: spec.Name, PrevName: spec.Name + containerPreservedSuffix, Recipe: containerRecipe(spec), NewDigest: newDigest, PreviousDigest: oldDigest},
+	}}
+	if e := writeJSON(filepath.Join(state, containerJournalName), j); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := AdoptContainer(context.Background(), spec, "host-a", "example/project", Options{StateDir: state}, rt); e == nil || !strings.Contains(e.Error(), "journal") {
+		t.Fatalf("adopt accepted a pending journal: %v", e)
+	}
+	if _, e := os.Stat(filepath.Join(state, ContainerReceiptName)); !os.IsNotExist(e) {
+		t.Fatal("refused adopt wrote a receipt")
+	}
+}
+
 func TestContainerAdopt(t *testing.T) {
 	spec := containerSpec()
 	state := t.TempDir()
