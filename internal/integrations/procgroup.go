@@ -16,27 +16,64 @@ import (
 // SIGKILL.
 const DefaultGrace = 5 * time.Second
 
+// group is one command running as the leader of its own process group.
+type group struct {
+	*exec.Cmd
+	mu     sync.Mutex
+	reaped bool
+	kill   *time.Timer
+}
+
 // groupCommand starts command as the leader of its own process group. On
 // cancellation (timeout, caller cancel, or the parent's own SIGINT/SIGTERM/SIGHUP
-// via the main context) the whole group receives SIGTERM; after grace the
-// leader is killed by exec and finish SIGKILLs every survivor. reap marks
-// one-shot review processes, whose descendants must never outlive the call.
-func groupCommand(ctx context.Context, command string, args []string, grace time.Duration, reap bool) *exec.Cmd {
+// via the main context) the whole group receives SIGTERM, and a timer SIGKILLs
+// it after grace, independently of Wait: a caller still blocked reading the
+// process's output (RunDuplex) is released too. reap marks one-shot review
+// processes, whose descendants must never outlive the call.
+func groupCommand(ctx context.Context, command string, args []string, grace time.Duration, reap bool) *group {
 	if grace <= 0 {
 		grace = DefaultGrace
 	}
-	c := exec.CommandContext(ctx, command, args...)
-	c.SysProcAttr = groupAttr(reap)
-	c.Cancel = func() error { return signalGroup(c, syscall.SIGTERM) }
-	c.WaitDelay = grace
-	return c
+	g := &group{Cmd: exec.CommandContext(ctx, command, args...)}
+	g.SysProcAttr = groupAttr(reap)
+	g.Cancel = func() error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.reaped {
+			return nil
+		}
+		if g.kill == nil {
+			g.kill = time.AfterFunc(grace, func() { _ = g.signal(syscall.SIGKILL) })
+		}
+		return signalGroup(g.Cmd, syscall.SIGTERM)
+	}
+	g.WaitDelay = grace
+	return g
 }
 
-// finish runs after Wait has reaped the leader: a cancelled or one-shot group
-// loses every remaining member, so no child is left behind as an orphan.
-func finish(ctx context.Context, c *exec.Cmd, reap bool) {
+// signal reaches the group only while its leader is unreaped; the zombie
+// leader keeps the group ID from being reused before then.
+func (g *group) signal(sig syscall.Signal) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.reaped {
+		return nil
+	}
+	return signalGroup(g.Cmd, sig)
+}
+
+// finish runs after Wait has reaped the leader: it disarms the escalation
+// timer, and a cancelled or one-shot group loses every remaining member, so no
+// child is left behind as an orphan.
+func (g *group) finish(ctx context.Context, reap bool) {
+	g.mu.Lock()
+	g.reaped = true
+	if g.kill != nil {
+		g.kill.Stop()
+	}
+	g.mu.Unlock()
 	if reap || ctx.Err() != nil {
-		_ = signalGroup(c, syscall.SIGKILL)
+		_ = signalGroup(g.Cmd, syscall.SIGKILL)
 	}
 }
 

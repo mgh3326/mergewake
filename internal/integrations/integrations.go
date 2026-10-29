@@ -59,14 +59,14 @@ func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, 
 	var out, stderr limited
 	var e error
 	if x.ReapGroup {
-		e = runReaped(ctx, c, input, &out, &stderr, x.Grace)
+		e = runReaped(ctx, c.Cmd, input, &out, &stderr, x.Grace)
 	} else {
 		c.Stdin = strings.NewReader(input)
 		c.Stdout = &out
 		c.Stderr = &stderr
 		e = c.Run()
 	}
-	finish(ctx, c, x.ReapGroup)
+	c.finish(ctx, x.ReapGroup)
 	if e != nil {
 		return nil, stopped(ctx, command, e)
 	}
@@ -209,9 +209,9 @@ func (x Exec) RunDuplex(ctx context.Context, command string, args []string, dir 
 	b, exchangeErr := exchange(r, w)
 	_ = w.Close()
 	// The exchange is complete or failed: the server gets no grace period.
-	_ = signalGroup(c, syscall.SIGKILL)
+	_ = c.signal(syscall.SIGKILL)
 	_ = c.Wait()
-	finish(ctx, c, true)
+	c.finish(ctx, true)
 	if ctx.Err() != nil {
 		return nil, stopped(ctx, command, ctx.Err())
 	}

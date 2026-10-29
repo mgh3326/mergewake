@@ -142,3 +142,30 @@ func TestDuplexReapsGroup(t *testing.T) {
 		t.Fatalf("survivors %v", alive)
 	}
 }
+
+// A blocked exchange cannot rely on Wait's WaitDelay: cancellation must reach
+// a TERM-ignoring server on its own, or ReadAll below would never return.
+func TestDuplexCancelEscalatesWhileExchangeBlocks(t *testing.T) {
+	script, pids := fakeReviewer(t, "trap '' TERM; while :; do sleep 1; done")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelWhenReady(t, pids, cancel)
+	done := make(chan error, 1)
+	go func() {
+		_, err := (Exec{Grace: 300 * time.Millisecond}).RunDuplex(ctx, script, nil, "", func(r io.Reader, _ io.Writer) ([]byte, error) {
+			return io.ReadAll(r)
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "cancelled") {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("exchange still blocked after cancellation")
+	}
+	if alive := survivors(t, pids); len(alive) > 0 {
+		t.Fatalf("survivors %v", alive)
+	}
+}
