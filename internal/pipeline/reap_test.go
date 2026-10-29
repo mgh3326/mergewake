@@ -104,7 +104,7 @@ func repoConfig(dir string) config.Config {
 		StateDir: dir,
 		Daemon:   config.Daemon{Act: true},
 		Hosts:    []reap.Host{{Name: "local", Jobs: "/jobs"}},
-		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", Protect: []string{"*-integrator"}, Regenerable: config.DefaultReapRegenerable},
+		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", ScanAfter: "720h", Protect: []string{"*-integrator"}, Regenerable: config.DefaultReapRegenerable},
 		Repos:    []config.Repo{{Name: "example/project", Branch: "main"}},
 	}
 }
@@ -401,6 +401,57 @@ func (failPullGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error)
 	return github.Pull{}, fmt.Errorf("fetch %d failed", pr)
 }
 
+// spyGH counts follow-up calls: a candidate-less PR must not trigger either.
+type spyGH struct {
+	reapGH
+	pulls   int
+	reverts int
+}
+
+func (g *spyGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
+	g.pulls++
+	return github.Pull{}, fmt.Errorf("unexpected pull %d", pr)
+}
+
+func (g *spyGH) WatchRevert(context.Context, string, int, string) (*github.Pull, error) {
+	g.reverts++
+	return nil, nil
+}
+
+// listNoSHAGH mimics the real list endpoint: the pull carries no
+// merge_commit_sha, so it must be resolved via the single-PR endpoint.
+type listNoSHAGH struct{ reapGH }
+
+func (listNoSHAGH) MergedPulls(_ context.Context, repo, branch string, _ time.Time) ([]github.Pull, error) {
+	p := mergedPull
+	p.MergeCommitSHA = ""
+	return []github.Pull{p}, nil
+}
+
+func (listNoSHAGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
+	return mergedPull, nil
+}
+
+// stillNoSHAGH resolves nothing: the single-PR endpoint also lacks the SHA.
+type stillNoSHAGH struct{ listNoSHAGH }
+
+func (stillNoSHAGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
+	p := mergedPull
+	p.MergeCommitSHA = ""
+	return p, nil
+}
+
+// scanGH records the window handed to MergedPulls.
+type scanGH struct {
+	reapGH
+	since time.Time
+}
+
+func (g *scanGH) MergedPulls(ctx context.Context, repo, branch string, since time.Time) ([]github.Pull, error) {
+	g.since = since
+	return g.reapGH.MergedPulls(ctx, repo, branch, since)
+}
+
 func TestReapClosesOnlyIdleDone(t *testing.T) {
 	for _, st := range []string{"working", "blocked", "waiting", ""} {
 		outs := worktreeOuts("/repo")
@@ -566,6 +617,64 @@ func TestReapDryRunBoundsRefetch(t *testing.T) {
 	}
 	if err := s.Reap(context.Background(), testRepo, 0, Options{DryRun: true}); err != nil {
 		t.Fatalf("dry-run refetch should back off for a day: %v", err)
+	}
+}
+
+func TestReapNoCandidateNoRows(t *testing.T) {
+	// A merged PR naming no worktree on any host produces no rows and no
+	// follow-up GitHub calls — the listing alone already said all there is.
+	r := &scriptRunner{outs: map[string]string{
+		key("herdr", "agent", "list"): `{"result":{"agents":[]}}`,
+		key("herdr", "pane", "list"):  `{"result":{"panes":[]}}`,
+	}}
+	gh := &spyGH{}
+	s := svc(t, gh, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if gh.pulls != 0 || gh.reverts != 0 {
+		t.Fatalf("candidate-less PR triggered %d pulls, %d reverts", gh.pulls, gh.reverts)
+	}
+	if _, err := os.Stat(s.reapLog(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatal("candidate-less PR wrote rows")
+	}
+}
+
+func TestReapResolvesMergeCommit(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, &listNoSHAGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("merge_commit_sha was not resolved via the single-PR endpoint")
+	}
+
+	r = &scriptRunner{outs: worktreeOuts("/repo")}
+	s = svc(t, &stillNoSHAGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removal ran without a merge commit")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		saw = saw || row["reason"] == "merge-commit-unknown"
+	}
+	if !saw {
+		t.Fatal("unresolvable merge commit not recorded")
+	}
+}
+
+func TestReapScanAfterBound(t *testing.T) {
+	gh := &scanGH{}
+	s := svc(t, gh, &scriptRunner{outs: worktreeOuts("/repo")})
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(gh.since); d < 29*24*time.Hour || d > 31*24*time.Hour {
+		t.Fatalf("scan window = %v, want ~720h", d)
 	}
 }
 

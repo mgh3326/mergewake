@@ -46,6 +46,7 @@ func TestReapConfig(t *testing.T) {
 		{"act", "reap:\n  enabled: true\n  act: true\n", false},
 		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
+		{"bad scan", "reap:\n  scan_after: 0s\n", true},
 		{"bad glob", "reap:\n  protect: ['..']\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
@@ -74,6 +75,9 @@ func TestReapConfig(t *testing.T) {
 			if e == nil {
 				if c.Reap.WorktreeAfter != "168h" {
 					t.Fatal(c.Reap.WorktreeAfter)
+				}
+				if c.Reap.ScanAfter != "720h" {
+					t.Fatal(c.Reap.ScanAfter)
 				}
 				if len(c.Reap.Protect) == 0 {
 					t.Fatal("missing default protect list")

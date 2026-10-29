@@ -194,6 +194,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if e != nil {
 		return e
 	}
+	scan, e := config.Duration(s.Config.Reap.ScanAfter)
+	if e != nil {
+		return e
+	}
 	if len(s.Config.Hosts) == 0 {
 		return errors.New("reap requires configured hosts")
 	}
@@ -285,7 +289,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 		pulls = append(pulls, p)
 	} else {
-		batch, e := s.GH.MergedPulls(ctx, r.Name, r.Branch, now.Add(-2*after))
+		batch, e := s.GH.MergedPulls(ctx, r.Name, r.Branch, now.Add(-scan))
 		if e != nil {
 			return e
 		}
@@ -484,38 +488,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if mergedAt == nil || now.Sub(*mergedAt) < after {
 			continue
 		}
-		if p.MergeCommitSHA == "" {
-			note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "merge-commit-unknown"})
-			continue
-		}
-		watcher, ok := s.GH.(interface {
-			WatchRevert(context.Context, string, int, string) (*github.Pull, error)
-		})
-		if !ok {
-			note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "revert-check-unavailable"})
-			continue
-		}
-		recovery, e := watcher.WatchRevert(ctx, r.Name, p.Number, p.MergeCommitSHA)
-		if e != nil {
-			errs = append(errs, fmt.Errorf("PR %d revert check: %w", p.Number, e))
-			continue
-		}
-		if recovery != nil {
-			reason := ""
-			if recovery.MergedAt != nil {
-				// Same convention as the watch role and outcomes ledger: a
-				// recovery PR merged within seven days reverted this PR.
-				if at := parsedTime(*recovery.MergedAt); at != nil && !at.Before(*mergedAt) && !at.After(mergedAt.Add(7*24*time.Hour)) {
-					reason = "reverted"
-				}
-			} else if recovery.State == "open" {
-				reason = "recovery-open"
-			}
-			if reason != "" {
-				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: reason})
-				continue
-			}
-		}
 
 		type cand struct {
 			hs   *reapHost
@@ -557,6 +529,55 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 			add(byName[rec.Host], path)
 		}
+		// A PR with no discovered worktree on any host leaves no rows and
+		// costs no GitHub calls beyond the listing: the merge-commit and
+		// revert checks only run when there is real work to gate.
+		if len(cands) == 0 {
+			continue
+		}
+		if p.MergeCommitSHA == "" {
+			// The pulls list endpoint omits merge_commit_sha; resolve it for
+			// the few PRs that actually name work.
+			fp, e := s.GH.Pull(ctx, r.Name, p.Number)
+			if e != nil {
+				errs = append(errs, fmt.Errorf("PR %d merge commit: %w", p.Number, e))
+				continue
+			}
+			p.MergeCommitSHA = fp.MergeCommitSHA
+		}
+		if p.MergeCommitSHA == "" {
+			note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "merge-commit-unknown"})
+			continue
+		}
+		watcher, ok := s.GH.(interface {
+			WatchRevert(context.Context, string, int, string) (*github.Pull, error)
+		})
+		if !ok {
+			note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "revert-check-unavailable"})
+			continue
+		}
+		recovery, e := watcher.WatchRevert(ctx, r.Name, p.Number, p.MergeCommitSHA)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("PR %d revert check: %w", p.Number, e))
+			continue
+		}
+		if recovery != nil {
+			reason := ""
+			if recovery.MergedAt != nil {
+				// Same convention as the watch role and outcomes ledger: a
+				// recovery PR merged within seven days reverted this PR.
+				if at := parsedTime(*recovery.MergedAt); at != nil && !at.Before(*mergedAt) && !at.After(mergedAt.Add(7*24*time.Hour)) {
+					reason = "reverted"
+				}
+			} else if recovery.State == "open" {
+				reason = "recovery-open"
+			}
+			if reason != "" {
+				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: reason})
+				continue
+			}
+		}
+
 		for _, c := range cands {
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref}
 			w, e := c.hs.exec.Inspect(ctx, c.path)
