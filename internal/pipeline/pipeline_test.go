@@ -35,6 +35,7 @@ type fakeGH struct {
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
 	requiredBots                                                 []string
+	required                                                     []string
 	findings                                                     int
 	passes                                                       map[string][]github.PassReceipt
 	feedback                                                     github.ReviewFeedback
@@ -45,6 +46,8 @@ type fakeGH struct {
 	mergeCount, revertCount, postCount, claimCount, publishCount int
 	head                                                         string
 	checks                                                       map[string]github.CI
+	checkNames                                                   map[string]map[string]github.CI
+	messages                                                     map[string]string
 	parents                                                      map[string]string
 	parents2                                                     map[string][]string
 	commitPRs                                                    map[string][]github.Pull
@@ -77,7 +80,11 @@ func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
 func (g *fakeGH) ReadFile(_ context.Context, _, sha, name string) ([]byte, error) {
 	if name == ".mergewake/policy.yaml" {
 		g.policyReads = append(g.policyReads, sha)
-		text := "version: 1\nrequired_checks: [CI]\n"
+		checks := "CI"
+		if len(g.required) > 0 {
+			checks = strings.Join(g.required, ",")
+		}
+		text := "version: 1\nrequired_checks: [" + checks + "]\n"
 		if g.enabled {
 			text += "enabled: true\n"
 		}
@@ -106,6 +113,22 @@ func (g *fakeGH) Check(_ context.Context, _, sha string, _ []string) (github.CI,
 		return g.checks[sha], nil
 	}
 	return g.ci, nil
+}
+func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string) (map[string]github.CI, error) {
+	out := map[string]github.CI{}
+	for n, v := range g.checkNames[sha] {
+		out[n] = v
+	}
+	for _, n := range required {
+		if _, ok := out[n]; !ok {
+			if g.checks != nil {
+				out[n] = g.checks[sha]
+			} else {
+				out[n] = g.ci
+			}
+		}
+	}
+	return out, nil
 }
 func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string) ([]github.PassReceipt, error) {
 	if g.reviewed && sha == g.pull.Head.SHA {
@@ -157,6 +180,7 @@ func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 }
 func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
 	v := github.Commit{SHA: sha}
+	v.Commit.Message = g.messages[sha]
 	if ps := g.parents2[sha]; len(ps) > 0 {
 		for _, p := range ps {
 			v.Parents = append(v.Parents, github.Ref{SHA: p})
@@ -215,9 +239,29 @@ type fakeSink struct{ records, reopens int }
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }
 
-type fakeNotifier struct{ count int }
+type fakeNotifier struct {
+	count  int
+	events []integrations.Event
+}
 
-func (n *fakeNotifier) Notify(context.Context, integrations.Event) error { n.count++; return nil }
+func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
+	n.count++
+	n.events = append(n.events, e)
+	return nil
+}
+
+type fakeLaneSink struct {
+	fakeSink
+	lanes map[string]string
+	err   error
+}
+
+func (s *fakeLaneSink) Lane(_ context.Context, task string) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.lanes[task], nil
+}
 
 type fakeRunner struct {
 	calls     int

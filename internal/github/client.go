@@ -145,11 +145,14 @@ type Pull struct {
 	State          string  `json:"state"`
 	Draft          bool    `json:"draft"`
 	Merged         bool    `json:"merged"`
+	Title          string  `json:"title"`
 	Body           string  `json:"body"`
 	Head           Ref     `json:"head"`
 	Base           Ref     `json:"base"`
 	MergeCommitSHA string  `json:"merge_commit_sha"`
 	ChangedFiles   int     `json:"changed_files"`
+	Mergeable      *bool   `json:"mergeable"`
+	MergeableState string  `json:"mergeable_state"`
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
@@ -205,10 +208,7 @@ type status struct {
 	State   string `json:"state"`
 }
 
-func (c *Client) Check(ctx context.Context, repo, sha string, required []string) (CI, error) {
-	if len(required) == 0 {
-		return Pending, errors.New("no required checks configured")
-	}
+func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]CI, error) {
 	states := map[string]CI{}
 	ids := map[string]int64{}
 	for page := 1; page <= 100; page++ {
@@ -216,7 +216,7 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 			CheckRuns []checkRun `json:"check_runs"`
 		}
 		if e := c.json(ctx, "GET", fmt.Sprintf("%s/commits/%s/check-runs?filter=latest&per_page=100&page=%d", base(repo), sha, page), nil, &runs); e != nil {
-			return Pending, e
+			return nil, e
 		}
 		for _, r := range runs.CheckRuns {
 			if r.ID < ids[r.Name] {
@@ -241,12 +241,12 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 			break
 		}
 		if page == 100 {
-			return Pending, errors.New("check pagination limit")
+			return nil, errors.New("check pagination limit")
 		}
 	}
 	statuses, e := list[status](ctx, c, base(repo)+"/commits/"+sha+"/statuses")
 	if e != nil {
-		return Pending, e
+		return nil, e
 	}
 	latest := map[string]status{}
 	for _, s := range statuses {
@@ -263,9 +263,20 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 			v = Red
 		}
 		if old, ok := states[name]; ok && old != v {
-			return Pending, fmt.Errorf("ambiguous check and status named %q", name)
+			return nil, fmt.Errorf("ambiguous check and status named %q", name)
 		}
 		states[name] = v
+	}
+	return states, nil
+}
+
+func (c *Client) Check(ctx context.Context, repo, sha string, required []string) (CI, error) {
+	if len(required) == 0 {
+		return Pending, errors.New("no required checks configured")
+	}
+	states, e := c.checkStates(ctx, repo, sha)
+	if e != nil {
+		return Pending, e
 	}
 	result := Green
 	for _, n := range required {
@@ -278,6 +289,24 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 		}
 	}
 	return result, nil
+}
+
+// CheckStates resolves each required check name to green, red or pending.
+// Missing or unknown evidence is pending, matching Check's aggregate result.
+func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
+	states, e := c.checkStates(ctx, repo, sha)
+	if e != nil {
+		return nil, e
+	}
+	out := make(map[string]CI, len(required))
+	for _, n := range required {
+		v, ok := states[n]
+		if !ok {
+			v = Pending
+		}
+		out[n] = v
+	}
+	return out, nil
 }
 
 type Review struct {

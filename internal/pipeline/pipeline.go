@@ -29,6 +29,7 @@ type GitHub interface {
 	CreateRef(context.Context, string, string, string) error
 	RecoveryActive(context.Context, string) (bool, error)
 	Check(context.Context, string, string, []string) (github.CI, error)
+	CheckStates(context.Context, string, string, []string) (map[string]github.CI, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
 	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
 	ReviewClaimed(context.Context, string, int, string) (bool, error)

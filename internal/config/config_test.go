@@ -138,6 +138,8 @@ func TestCommandAndDaemonValidation(t *testing.T) {
 		fail  bool
 	}{
 		{"daemon:\n  pr: {enabled: true, interval: 0s}\n", true},
+		{"daemon:\n  pr: {enabled: true, notify: {enabled: false}}\n", false},
+		{"daemon:\n  watch: {enabled: true, notify: {enabled: false}}\n", true},
 		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: ['{sha}']}\n        verify: {command: verify}\n", false},
 		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: [main]}\n        verify: {command: verify}\n", true},
 		{"repos:\n  - name: example/project\n    install:\n      - kind: release\n        target: bin/mergewake\n        verify: {command: verify}\n        canary: host-a\n", true},
@@ -148,6 +150,18 @@ func TestCommandAndDaemonValidation(t *testing.T) {
 		if (err != nil) != tc.fail {
 			t.Fatalf("config %s err=%v", tc.extra, err)
 		}
+	}
+}
+
+func TestPRNotifyDefaults(t *testing.T) {
+	var n PRNotify
+	if !n.On() {
+		t.Fatal("absent notify defaults to enabled")
+	}
+	off := false
+	n.Enabled = &off
+	if n.On() {
+		t.Fatal("notify.enabled: false ignored")
 	}
 }
 

@@ -73,6 +73,7 @@ func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, 
 type Event struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
+	Lane string `json:"lane,omitempty"`
 }
 type Notifier interface {
 	Notify(context.Context, Event) error
@@ -100,7 +101,11 @@ type Panewire struct {
 }
 
 func (p Panewire) Notify(ctx context.Context, e Event) error {
-	_, err := p.Runner.Run(ctx, p.Command, []string{"emit", "--kind", "lane.event", "--lane", p.Lane, "--event-id", e.ID, "--text", e.Text}, "", "")
+	lane := e.Lane
+	if lane == "" {
+		lane = p.Lane
+	}
+	_, err := p.Runner.Run(ctx, p.Command, []string{"emit", "--kind", "lane.event", "--lane", lane, "--event-id", e.ID, "--text", e.Text}, "", "")
 	return err
 }
 
@@ -142,6 +147,24 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to reopened; server/CLI may lack explicit reopen support: %w", task, current.State, e)
 	}
 	return nil
+}
+// Lane reads the owning lane from `tasks show`; an absent field means the task
+// has no routing lane and the caller falls back, never guessing.
+func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
+	if !TaskID.MatchString(task) {
+		return "", errors.New("task ID must be a positive integer")
+	}
+	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	if e != nil {
+		return "", e
+	}
+	var shown struct {
+		Lane string `json:"lane"`
+	}
+	if e = json.Unmarshal(out, &shown); e != nil {
+		return "", e
+	}
+	return shown.Lane, nil
 }
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {
 	f, e := os.CreateTemp("", "mergewake-record-*.json")

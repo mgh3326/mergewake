@@ -31,7 +31,7 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 	for _, entry := range []struct {
 		role string
 		cfg  config.Loop
-	}{{"pr", s.Config.Daemon.PR}, {"watch", s.Config.Daemon.Watch}, {"release", s.Config.Daemon.Release}, {"rollout", s.Config.Daemon.Rollout},
+	}{{"pr", s.Config.Daemon.PR.Loop}, {"watch", s.Config.Daemon.Watch}, {"release", s.Config.Daemon.Release}, {"rollout", s.Config.Daemon.Rollout},
 		{"reap", config.Loop{Enabled: s.Config.Reap.Enabled, Interval: s.Config.PollInterval}}} {
 		if !entry.cfg.Enabled {
 			continue
@@ -129,6 +129,9 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 			} else {
 				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 			}
+		}
+		if e := s.NotifyPR(ctx, r, pr.Number, childOptions); e != nil {
+			errs = append(errs, fmt.Errorf("PR %d notify: %w", pr.Number, e))
 		}
 		if e = s.Land(ctx, r, pr.Number, childOptions); e != nil {
 			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))

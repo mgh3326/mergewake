@@ -350,6 +350,9 @@ The panewire adapter executes literal arguments equivalent to:
 panewire emit --kind lane.event --lane operator-desk --event-id EVENT_ID --text TEXT
 ```
 
+An event may carry its own lane (the `daemon.pr.notify` routing rules above);
+an explicit event lane overrides `notifier.lane` for that emit only.
+
 No-op emits nothing; stdout prints event ID and text. Review and landing produce
 local decision output; CI recovery and attempted installs also use the adapters.
 Healthy repeated agent polls do not emit a fresh installation notification.
@@ -466,11 +469,16 @@ Add these optional standalone lines to a PR body:
 ```text
 Mergewake-Author-Family: openai
 Mergewake-Task: 42
+Mergewake-Notify-Lane: worker-lane
 ```
 
 `--author-family` overrides the first line. A task trailer overrides `repos[].task`.
 Treat the family label as trusted automation metadata, not model provenance
 attestation. A handoffkeep-backed watcher refuses recovery with no valid task ID.
+`Mergewake-Notify-Lane` names the lane for `daemon.pr.notify` events when the
+task trailer cannot be resolved to a lane; the configured notifier lane is the
+last fallback. The task and notify-lane trailers are also read from the head
+commit message when absent from the body.
 
 Use `daemon` for complete polling, or invoke individual commands from optional
 webhook/scheduler adapters. The binary never installs or enables service units;
@@ -503,6 +511,7 @@ For `example/project`, state resides beneath
 | `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
+| `pr-notify-sent` | Most recent 256 `state PR head` keys already lane-notified by the pr role; a new head re-arms notification and restarts stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
@@ -556,7 +565,7 @@ fleet spawners can be wrapped around this protocol without importing their code.
 ```yaml
 daemon:
   act: false
-  pr: {enabled: true, interval: 60s}
+  pr: {enabled: true, interval: 60s, notify: {enabled: true}}
   watch: {enabled: true, interval: 60s}
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
@@ -569,6 +578,26 @@ Land/watch additionally require enabled repository policy. Standalone review,
 release, rollout and agent need `--apply` to mutate. `--shadow` forces the daemon
 back to observation, and `--dry-run` suppresses pipeline state too. The daemon
 still maintains its supervision locks and status in shadow/dry-run modes.
+
+`daemon.pr.notify` defaults to enabled and accepts only `enabled`. While the
+`pr` role runs, each poll recomputes the land decision for every open, non-draft
+PR at its current head and emits one lane event when that head becomes
+land-ready or blocked — the notify path observes rather than merges, so it also
+runs in shadow mode. `READY` requires green required checks, the review passes
+`land` demands for the change class, a clean review gate, no reported conflicts
+and green main; `BLOCKED` names the hold (`failing checks: <names>`,
+`open blocking findings: N`, `unanswered findings: N`, `needs review` /
+`needs 2nd review` / `needs N reviews`, `missing required reviews: <bots>`,
+`conflicts`, `main CI red`). Pending or missing check evidence emits nothing.
+Each `(PR, head, state)` emits at most once per the `pr-notify-sent` state
+file; a new head re-arms notification and a restart does not resend. The event
+lane is resolved in order — the choosing rule is recorded in the event text
+after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
+(`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
+configured `notifier.lane`. Both trailers are read from the PR body first and
+then the head commit message; a task-read error retries rather than rerouting.
+Set `notify: {enabled: false}` to silence the events; the key is rejected on
+other roles.
 
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,
