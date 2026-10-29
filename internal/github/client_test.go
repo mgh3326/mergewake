@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -39,6 +40,7 @@ func TestCheckEvidence(t *testing.T) {
 		{"success", `[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]`, `[]`, Green, false},
 		{"failure", `[{"id":1,"name":"CI","status":"completed","conclusion":"failure"}]`, `[]`, Red, false},
 		{"missing", `[]`, `[]`, Pending, false},
+		{"cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Pending, false},
 		{"skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Pending, false},
 		{"pending", `[{"id":1,"name":"CI","status":"in_progress"}]`, `[]`, Pending, false},
 		{"latest status", `[]`, `[{"id":2,"context":"CI","state":"success"},{"id":1,"context":"CI","state":"failure"}]`, Green, false},
@@ -388,5 +390,29 @@ func TestRecoveryTagSurvivesBranchDeletion(t *testing.T) {
 				t.Fatal("tag latch depended on branch")
 			}
 		})
+	}
+}
+func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
+	recent := time.Now().UTC().Format(time.RFC3339)
+	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	pages := 0
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if pages > 1 {
+			t.Fatal("scan did not stop at the first old updated_at")
+		}
+		reply(w, []Pull{
+			{Number: 1, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "main"}},
+			{Number: 2, State: "closed", UpdatedAt: recent, Base: Ref{Ref: "main"}},
+			{Number: 3, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "release"}},
+			{Number: 4, State: "closed", UpdatedAt: old, Merged: true, Base: Ref{Ref: "main"}},
+		})
+	})
+	pulls, e := c.MergedPulls(context.Background(), "example/project", "main", time.Now().Add(-time.Hour))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(pulls) != 2 || pulls[0].Number != 1 || pulls[1].Number != 4 {
+		t.Fatalf("%+v", pulls)
 	}
 }

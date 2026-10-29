@@ -129,11 +129,15 @@ func list[T any](ctx context.Context, c *Client, route string) ([]T, error) {
 }
 
 type Ref struct {
-	SHA string `json:"sha"`
-	Ref string `json:"ref"`
+	SHA  string `json:"sha"`
+	Ref  string `json:"ref"`
+	Repo struct {
+		FullName string `json:"full_name"`
+	} `json:"repo"`
 }
 type Pull struct {
 	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
 	ClosedAt       *string `json:"closed_at"`
 	HTMLURL        string  `json:"html_url"`
 	MergedAt       *string `json:"merged_at"`
@@ -224,10 +228,13 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 				switch r.Conclusion {
 				case "success":
 					state = Green
-				case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+				case "failure", "timed_out", "action_required", "startup_failure", "stale":
 					state = Red
 				}
 			}
+			// Cancelled and skipped conclusions stay unknown rather than red:
+			// they cannot mark a red boundary for culprit search or count as
+			// confirmed-green evidence.
 			states[r.Name] = state
 		}
 		if len(runs.CheckRuns) < 100 {
@@ -442,6 +449,33 @@ type Commit struct {
 			Date time.Time `json:"date"`
 		} `json:"committer"`
 	} `json:"commit"`
+}
+
+// MergedPulls lists recently updated closed PRs newest-first and keeps those
+// merged into branch. Pages stop once an item's updated_at predates since, so
+// the scan stays bounded on busy repositories.
+func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since time.Time) ([]Pull, error) {
+	var out []Pull
+	for page := 1; page <= 10; page++ {
+		var batch []Pull
+		route := fmt.Sprintf("%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d", base(repo), page)
+		if e := c.json(ctx, "GET", route, nil, &batch); e != nil {
+			return nil, e
+		}
+		stop := false
+		for _, p := range batch {
+			if t, err := time.Parse(time.RFC3339, p.UpdatedAt); err != nil || t.Before(since) {
+				stop = true
+			}
+			if (p.Merged || p.MergedAt != nil) && p.Base.Ref == branch {
+				out = append(out, p)
+			}
+		}
+		if len(batch) < 100 || stop {
+			return out, nil
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) Commit(ctx context.Context, repo, sha string) (Commit, error) {

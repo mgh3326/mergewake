@@ -39,6 +39,7 @@ type GitHub interface {
 	PostReview(context.Context, string, int, string, []github.Finding, github.PassReceipt) error
 	Commit(context.Context, string, string) (github.Commit, error)
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
+	MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error)
 	Ancestor(context.Context, string, string, string) (bool, error)
 	ReadFile(context.Context, string, string, string) ([]byte, error)
 	Revert(context.Context, string, string, string, string, int) (string, error)
@@ -212,6 +213,27 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	d := p.ClassifyGuarded(files, r.Policy)
 	d.Shadow = d.Shadow || o.Shadow
 	d.Action = "wait-for-ci"
+	// While main is red or its required evidence is unknown, ordinary landing
+	// pauses; only a recovery PR from the watch latch may still land.
+	watchChecks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		watchChecks = p.WatchChecks
+	}
+	mainCI, e := s.GH.Check(ctx, r.Name, head, watchChecks)
+	if e != nil {
+		return e
+	}
+	recovery := pr.Head.Ref == github.RecoveryBranch && pr.Head.Repo.FullName == r.Name
+	paused := mainCI != github.Green && !recovery
+	if paused {
+		d.Action = "pause-red-main"
+		if mainCI != github.Red {
+			d.Action = "pause-main-unknown"
+		}
+		if d.Shadow {
+			d.Action = "would-" + d.Action
+		}
+	}
 	ci, e := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {
 		return e
@@ -220,7 +242,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	var gap []string
 	var unresolved, reviewed *int
 	sameFamily := false
-	if ci == github.Green {
+	if !paused && ci == github.Green {
 		d.Action = "merge"
 		needed := 1
 		if d.Class == "blocking" {
@@ -255,13 +277,14 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		Head        string              `json:"head"`
 		Base        string              `json:"base"`
 		CI          github.CI           `json:"ci"`
+		Main        github.CI           `json:"main"`
 		Reviews     *int                `json:"review_passes,omitempty"`
 		Unresolved  *int                `json:"unresolved,omitempty"`
 		Findings    *policy.GateVerdict `json:"findings,omitempty"`
 		CoverageGap []string            `json:"coverage_gap,omitempty"`
 		SameFamily  bool                `json:"same_family,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, ci, reviewed, unresolved, verdict, gap, sameFamily, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, ci, mainCI, reviewed, unresolved, verdict, gap, sameFamily, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, sameFamily, o.DryRun); e != nil {

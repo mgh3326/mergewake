@@ -31,7 +31,8 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 	for _, entry := range []struct {
 		role string
 		cfg  config.Loop
-	}{{"pr", s.Config.Daemon.PR}, {"watch", s.Config.Daemon.Watch}, {"release", s.Config.Daemon.Release}, {"rollout", s.Config.Daemon.Rollout}} {
+	}{{"pr", s.Config.Daemon.PR}, {"watch", s.Config.Daemon.Watch}, {"release", s.Config.Daemon.Release}, {"rollout", s.Config.Daemon.Rollout},
+		{"reap", config.Loop{Enabled: s.Config.Reap.Enabled, Interval: s.Config.PollInterval}}} {
 		if !entry.cfg.Enabled {
 			continue
 		}
@@ -76,6 +77,8 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 					}
 				case "rollout":
 					err = s.Rollout(ctx, r, o)
+				case "reap":
+					err = s.Reap(ctx, r, 0, o)
 				}
 				if err != nil {
 					errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))

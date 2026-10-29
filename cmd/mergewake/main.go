@@ -37,6 +37,7 @@ Usage: mergewake <command> [flags]
   rollout    Pull and install the latest verified manifest once
   daemon     Run enabled pipeline roles (shadow by default)
   agent      Poll configured repositories and perform verified rollouts
+  reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
   outcomes   Report or sync the shadow-safe model outcomes ledger
   status     Read installed receipts and check local drift
   superfan   Print or launch an experimental resident monitor spec
@@ -71,14 +72,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	command := args[0]
 	switch command {
-	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "superfan":
+	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "superfan", "reap":
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg := fs.String("config", "~/.config/mergewake/config.yaml", "host YAML config")
-	apply := fs.Bool("apply", false, "allow acting review, release, rollout or daemon (daemon also needs daemon.act)")
+	apply := fs.Bool("apply", false, "allow acting review, release, rollout, reap or daemon (daemon also needs daemon.act; reap also needs reap.act)")
 	daemonStatus := fs.Bool("daemon", false, "read loop status (status only)")
 	dry := fs.Bool("dry-run", false, "print planned actions without mutations or model execution")
 	repo := fs.String("repo", "", "configured owner/name (required except agent, status, superfan)")
@@ -89,10 +90,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	var launch *bool
 	var digest, adopt *string
 	switch command {
-	case "land", "review":
-		pr = fs.Int("pr", 0, "pull request number")
+	case "land", "review", "reap":
+		pr = fs.Int("pr", 0, "pull request number (reap scans merged PRs when omitted)")
 		if command == "review" {
 			family = fs.String("author-family", "", "PR author model family (or PR body trailer)")
+		} else if command == "reap" {
+			shadow = fs.Bool("shadow", false, "force observation mode")
 		} else {
 			shadow = fs.Bool("shadow", false, "force decision-only mode")
 		}
@@ -163,7 +166,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if shadow != nil {
 		o.Shadow = o.Shadow || *shadow
 	}
-	if pr != nil && *pr <= 0 {
+	if pr != nil && (command == "reap" && *pr < 0 || command != "reap" && *pr <= 0) {
 		return errors.New("--pr must be positive")
 	}
 	switch command {
@@ -183,6 +186,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "watch":
 		o.Shadow = *shadow
 		return poll(ctx, c.PollInterval, *once || *dry, func() error { return s.Watch(ctx, r, o) }, stderr)
+	case "reap":
+		if !c.Reap.Enabled {
+			return errors.New("reap requires reap.enabled")
+		}
+		// reap.act (checked inside Reap) is the acting gate; daemon.act only
+		// applies when the daemon drives the role.
+		o.Shadow = o.Shadow || *shadow
+		return s.Reap(ctx, r, *pr, o)
 	case "agent":
 		if len(c.Repos) == 0 {
 			return errors.New("agent requires at least one configured repository")
