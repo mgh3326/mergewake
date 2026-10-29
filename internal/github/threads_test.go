@@ -36,7 +36,7 @@ func TestFeedbackActorTypesAndRechecks(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fs := fb.Findings((policy.ReviewGate{}).GateAuthors())
+			fs := fb.Findings((policy.ReviewGate{}).GateAuthors(), "review-bot")
 			if len(fs) != 1 || fs[0].Answered || !fs[0].ReviewerResolved || fs[0].Rechecked != current {
 				t.Fatalf("%+v", fs)
 			}
@@ -61,7 +61,7 @@ func TestOnlyNonAuthorHumansAnswer(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fb := ReviewFeedback{PRAuthor: "pr-author", Threads: []ReviewThread{{Path: "tool", Comments: []ReviewComment{{Author: "coderabbitai", AuthorType: "Bot", Body: "Major problem"}, {Author: tt.login, AuthorType: tt.kind, Body: "ok"}}}}}
-			fs := fb.Findings((policy.ReviewGate{}).GateAuthors())
+			fs := fb.Findings((policy.ReviewGate{}).GateAuthors(), "review-bot")
 			if len(fs) != 1 || fs[0].Answered != tt.want {
 				t.Fatalf("%+v", fs)
 			}
@@ -73,10 +73,65 @@ func TestResolverMustBeReviewingBot(t *testing.T) {
 	for _, who := range []string{"pr-author", "maintainer", "other-bot", "coderabbitai"} {
 		t.Run(who, func(t *testing.T) {
 			fb := ReviewFeedback{Threads: []ReviewThread{{IsResolved: true, ResolvedBy: who, ResolvedByType: "Bot", Comments: []ReviewComment{{Author: "coderabbitai", Body: "Critical"}}}}}
-			f := fb.Findings((policy.ReviewGate{}).GateAuthors())[0]
+			f := fb.Findings((policy.ReviewGate{}).GateAuthors(), "review-bot")[0]
 			v := (policy.ReviewGate{}).Evaluate([]policy.ReviewFinding{f}, "routine")
 			if (len(v.Blocking) == 0) != (who == "coderabbitai") {
 				t.Fatalf("resolver=%s verdict=%+v", who, v)
+			}
+		})
+	}
+}
+
+func TestResolverTypeAndReservedIdentities(t *testing.T) {
+	for _, tt := range []struct {
+		name, kind, prAuthor, ownLogin string
+		want                           bool
+	}{
+		{"reviewing Bot", "Bot", "pr-author", "review-bot", true},
+		{"User in gate bot list", "User", "pr-author", "review-bot", false},
+		{"PR author even if Bot", "Bot", "coderabbitai", "review-bot", false},
+		{"review login even if Bot", "Bot", "pr-author", "coderabbitai", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fb := ReviewFeedback{PRAuthor: tt.prAuthor, Threads: []ReviewThread{{IsResolved: true, ResolvedBy: "coderabbitai", ResolvedByType: tt.kind, Comments: []ReviewComment{{Author: "coderabbitai", Body: "Critical finding", CommitSHA: testSHA}}}}}
+			f := fb.Findings((policy.ReviewGate{}).GateAuthors(), tt.ownLogin)[0]
+			v := (policy.ReviewGate{}).Evaluate([]policy.ReviewFinding{f}, "routine")
+			if f.ReviewerResolved != tt.want || (len(v.Blocking) == 0) != tt.want {
+				t.Fatalf("%+v %+v", f, v)
+			}
+		})
+	}
+}
+
+func TestThreadCommitAndReviewHeadBinding(t *testing.T) {
+	old := strings.Repeat("b", 40)
+	for _, current := range []bool{false, true} {
+		t.Run(fmt.Sprint(current), func(t *testing.T) {
+			head := old
+			if current {
+				head = testSHA
+			}
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct{ Query string }
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(req.Query, "body commit{oid}") {
+					t.Fatal("thread commit not queried")
+				}
+				fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"headRefOid":%q,"reviews":{"nodes":[{"author":{"login":"coderabbitai","__typename":"Bot"},"state":"COMMENTED","commit":{"oid":%q}}]},"reviewThreads":{"nodes":[{"comments":{"nodes":[{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"Minor","commit":{"oid":%q}}]}}],"pageInfo":{"hasNextPage":false}}}}}}`, testSHA, head, head)
+			})
+			fb, err := c.ReviewFeedback(context.Background(), "example/project", 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs := fb.Findings((policy.ReviewGate{}).GateAuthors(), "review-bot")
+			if fs[0].CommitSHA != head {
+				t.Fatalf("%+v", fs)
+			}
+			gate := policy.ReviewGate{RequiredBots: []string{"coderabbitai"}}
+			if missing := gate.MissingRequiredBots(fs, fb.ReviewAuthors, testSHA); (len(missing) == 0) != current {
+				t.Fatalf("current=%v missing=%v reviews=%v", current, missing, fb.ReviewAuthors)
 			}
 		})
 	}

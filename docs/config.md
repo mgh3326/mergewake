@@ -372,7 +372,7 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `enabled` | `false` | Explicit opt-in for acting `land` and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
-| `review_gate` | Absent | Graded review-thread enforcement described below. Defaults apply even when absent; blocking PRs also retain the legacy unresolved-thread rule. |
+| `review_gate` | Absent | Graded review-thread enforcement described below. Defaults apply even when absent. CI bots are optional unless required_bots names them. |
 
 Each blocking rule has:
 
@@ -397,22 +397,40 @@ the thread's first comment, or prose conventions: `critical`, `major`, `minor`,
 *answered* when a known human other than the PR author and finding author replies.
 GraphQL `Bot` actors never count as humans, including logins without a bot suffix.
 Answers apply only to that thread's triage findings; they never clear a block.
-A block clears only when the reviewing bot resolves it (`resolvedBy`), or the
-finding's lines are outdated and that reviewer submits a recheck on the current
-head. `ignore_outdated` alone permits only routine Major findings to clear;
-`ignore_bot_resolved: false` disables the bot-resolution exemption.
-Unknown severity from a gate-listed author and ghost authors require triage on
-blocking paths. The configured `review.login`'s unresolved findings of any
-severity hold blocking paths, including medium, low and unspecified findings.
-Missing gate-bot coverage holds landing. Every PR also requires a completed
-mergewake review on its exact head, with two distinct passes for blocking paths.
+Only threads whose first finding comment belongs to the **current PR head SHA**
+participate in the decision. Old-head comments and reviews do not establish
+current-head bot evidence. On the current head, CodeRabbit Critical and Codex P1
+block, CodeRabbit Major and Codex P2 require a reply or fix, and CodeRabbit
+Minor/Nitpick and Codex P3 are ignored. A bot resolution clears a finding only
+when `resolvedBy.__typename` is `Bot`, it is the same reviewing bot, and it is
+neither the PR author nor `review.login`. `ignore_bot_resolved: false` disables
+that exemption. `ignore_outdated` permits Major findings to clear after their
+lines change; it never clears a current-head mergewake finding.
+
+The configured `review.login`'s current-head critical/high findings hold every
+PR. Its findings of any severity hold blocking paths, including medium, low and
+unspecified findings. Resolving or outdating these threads cannot clear them,
+even if that account has type `Bot`: clearing needs a **new head plus a new
+mergewake review**. Every PR requires a completed mergewake review on its exact
+head, with two distinct passes for blocking paths. Unknown severity from a
+gate-listed author or a ghost author still requires triage on blocking paths.
+
+CodeRabbit and the Codex connector are purely optional by default. Landing
+never waits for their absence and does not record or mention missing optional
+coverage. There is no grace timer. Current-head findings they do post retain
+the severity rules above. A repository may explicitly opt in with
+`review_gate.required_bots: [coderabbitai, chatgpt-codex-connector]` (default
+empty): only that list can cause `wait-for-required-bots`, and only reviews or
+threads on the current head satisfy it. Missing required bots appear as
+`missing_required_bots` in the decision receipt.
+
 Present-but-empty fields take these defaults:
 
 ```yaml
 review_gate:
+  required_bots: []
   block:
     - {author: coderabbitai, severity: [critical]}
-    - {author: coderabbitai, severity: [major], classes: [blocking]}
     - {author: chatgpt-codex-connector, severity: [p1]}
   triage:
     - {author: coderabbitai, severity: [major]}
@@ -421,6 +439,12 @@ review_gate:
   ignore_outdated: true
   ignore_bot_resolved: true
 ```
+
+Pass receipts trust the configured `review.login`, exact commit SHA, and the
+mergewake marker. They are not cryptographically signed or independently
+attested. If PR authors or other sessions can post as `review.login`, they can
+forge a matching pass. This shared-identity risk remains; use a dedicated review
+identity and protect its credentials where independent provenance is required.
 
 Older mergewake versions cannot parse `review_gate`; enable the section only
 after every landing host runs a release that understands it.

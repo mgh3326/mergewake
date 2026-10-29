@@ -33,6 +33,8 @@ type ReviewFinding struct {
 	Answered         bool   `json:"answered"`
 	ReviewerResolved bool   `json:"reviewer_resolved"`
 	Rechecked        bool   `json:"rechecked"`
+	OwnReview        bool   `json:"own_review"`
+	CommitSHA        string `json:"commit_sha"`
 }
 
 // ReviewGateRule grades findings by normalized author and severity; classes
@@ -44,8 +46,9 @@ type ReviewGateRule struct {
 }
 
 // ReviewGate replaces the raw unresolved-thread count with graded enforcement.
-// An absent section keeps the legacy all-unresolved-must-clear rule.
+// An absent section uses the default graded rules and requires no CI bots.
 type ReviewGate struct {
+	RequiredBots      []string         `yaml:"required_bots"`
 	Block             []ReviewGateRule `yaml:"block"`
 	Triage            []ReviewGateRule `yaml:"triage"`
 	IgnoreAuthors     []string         `yaml:"ignore_authors"`
@@ -72,7 +75,6 @@ func defaultReviewGate() ReviewGate {
 	return ReviewGate{
 		Block: []ReviewGateRule{
 			{Author: "coderabbitai", Severity: []string{"critical"}, Classes: []string{"blocking", "routine"}},
-			{Author: "coderabbitai", Severity: []string{"major"}, Classes: []string{"blocking"}},
 			{Author: "chatgpt-codex-connector", Severity: []string{"p1"}},
 		},
 		Triage: []ReviewGateRule{
@@ -86,7 +88,7 @@ func defaultReviewGate() ReviewGate {
 }
 
 // WithDefaults fills omitted fields of a present review_gate section. Explicit
-// empty lists stay empty; a nil section is the caller's legacy path.
+// empty lists stay empty. CI bots are optional unless required_bots names them.
 func (g ReviewGate) WithDefaults() ReviewGate {
 	d := defaultReviewGate()
 	if g.Block == nil {
@@ -178,18 +180,20 @@ func (g ReviewGate) Evaluate(fs []ReviewFinding, class string) GateVerdict {
 		if class == "blocking" && (f.Author == "" || (authors[f.Author] && !validSeverity(f.Severity))) {
 			triaged = true
 		}
-		botResolved := f.Resolved && f.ReviewerResolved && *g.IgnoreBotResolved
+		botResolved := f.Resolved && f.ReviewerResolved && !f.OwnReview && *g.IgnoreBotResolved
 		switch {
 		case blocked:
-			if botResolved || (g.ignoresOutdated() && f.Outdated && f.Rechecked) {
+			if botResolved || (!f.OwnReview && g.ignoresOutdated() && f.Outdated && f.Rechecked) {
 				v.Ignored++
 			} else {
 				v.Blocking = append(v.Blocking, f)
 			}
-		case botResolved || (f.Outdated && f.Severity == "major" && g.ignoresOutdated()):
+		case botResolved || (!f.OwnReview && f.Outdated && f.Severity == "major" && g.ignoresOutdated()):
 			v.Ignored++
 		case triaged && !f.Answered:
 			v.Triage = append(v.Triage, f)
+		case !triaged && !blocked && ((f.Author == "coderabbitai" && (f.Severity == "minor" || f.Severity == "nitpick")) || (f.Author == "chatgpt-codex-connector" && f.Severity == "p3")):
+			v.Ignored++
 		default:
 			v.Advisory++
 		}
@@ -198,27 +202,30 @@ func (g ReviewGate) Evaluate(fs []ReviewFinding, class string) GateVerdict {
 }
 
 // GateAuthors lists normalized bot logins the configured rules reference. The
-// caller uses it for coverage-gap records and bot reply detection.
+// caller uses it for grading and bot reply detection.
 func (g ReviewGate) GateAuthors() map[string]bool {
 	return g.WithDefaults().gateAuthors()
 }
 
-// CoverageGap names gate-referenced authors that left no review evidence at
-// all: no threads and no submitted reviews. A bot that never ran is a gap,
-// never a clean pass. The caller holds for this missing evidence.
-func (g ReviewGate) CoverageGap(fs []ReviewFinding, reviews map[string]int) []string {
+// MissingRequiredBots checks only the explicit opt-in list. Thread evidence
+// must come from this head, and reviews are prefiltered to the same head by the
+// GitHub adapter. Optional bots leave no missing-coverage record at all.
+func (g ReviewGate) MissingRequiredBots(fs []ReviewFinding, reviews map[string]int, head string) []string {
 	seen := map[string]bool{}
 	for _, f := range fs {
-		seen[f.Author] = true
-	}
-	var gap []string
-	for author := range g.GateAuthors() {
-		if !seen[author] && reviews[author] == 0 {
-			gap = append(gap, author)
+		if head != "" && f.CommitSHA == head {
+			seen[f.Author] = true
 		}
 	}
-	sort.Strings(gap)
-	return gap
+	var missing []string
+	for _, name := range g.RequiredBots {
+		author := NormalizeAuthor(name)
+		if !seen[author] && reviews[author] == 0 {
+			missing = append(missing, author)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 type Policy struct {
@@ -273,6 +280,14 @@ func (p Policy) Validate() error {
 		}
 	}
 	if p.ReviewGate != nil {
+		bots := map[string]bool{}
+		for _, name := range p.ReviewGate.RequiredBots {
+			author := NormalizeAuthor(name)
+			if strings.TrimSpace(author) == "" || strings.TrimSpace(author) != author || bots[author] {
+				return errors.New("review_gate required_bots must be nonempty and unique")
+			}
+			bots[author] = true
+		}
 		for _, rules := range [][]ReviewGateRule{p.ReviewGate.Block, p.ReviewGate.Triage} {
 			for _, r := range rules {
 				if strings.TrimSpace(r.Author) == "" || len(r.Severity) == 0 {

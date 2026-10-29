@@ -20,11 +20,11 @@ func TestReviewGateDisposition(t *testing.T) {
 		{name: "outdated P1 holds without recheck", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p1", Outdated: true}, block: 1},
 		{name: "outdated P2 needs reply", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p2", Outdated: true}, triage: 1},
 		{name: "outdated routine major clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
-		{name: "outdated blocking major needs recheck", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, block: 1},
+		{name: "outdated blocking major clears", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
 		{name: "unknown severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "surprise"}, triage: 1},
 		{name: "missing severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai"}, triage: 1},
 		{name: "ghost author holds blocking", class: "blocking", f: ReviewFinding{Severity: "critical"}, triage: 1},
-		{name: "known minor stays advisory", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "minor"}},
+		{name: "known minor ignored", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "minor"}, ignored: 1},
 		{name: "answered triage clears", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p2", Answered: true}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -45,5 +45,26 @@ func TestReviewGateNoCrossBotAnswer(t *testing.T) {
 	v := (ReviewGate{}).Evaluate(fs, "routine")
 	if len(v.Blocking) != 1 || len(v.Triage) != 1 {
 		t.Fatalf("%+v", v)
+	}
+}
+
+func TestRequiredBotsDefaultAndValidation(t *testing.T) {
+	if missing := (ReviewGate{}).WithDefaults().MissingRequiredBots(nil, nil, "head"); len(missing) != 0 {
+		t.Fatal(missing)
+	}
+	for _, tt := range []struct {
+		name    string
+		authors []string
+		fail    bool
+	}{
+		{"empty", []string{}, false}, {"configured", []string{"coderabbitai"}, false},
+		{"blank", []string{""}, true}, {"duplicate normalized", []string{"coderabbitai", "coderabbitai[bot]"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := Policy{Version: 1, RequiredChecks: []string{"CI"}, ReviewGate: &ReviewGate{RequiredBots: tt.authors}}
+			if err := p.Validate(); (err != nil) != tt.fail {
+				t.Fatal(err)
+			}
+		})
 	}
 }

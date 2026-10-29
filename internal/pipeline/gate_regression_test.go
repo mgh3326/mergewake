@@ -35,19 +35,19 @@ func TestRoutineRequiresExactHeadReview(t *testing.T) {
 	}
 }
 
-func TestLandMissingBotCoverageHolds(t *testing.T) {
+func TestLandOptionalBotsNeverHold(t *testing.T) {
 	for _, configured := range []bool{false, true} {
 		t.Run(map[bool]string{false: "absent gate", true: "configured gate"}[configured], func(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = true
 			g.reviewed = true
 			g.gate = configured
-			delete(g.feedback.ReviewAuthors, "coderabbitai")
+			g.feedback.ReviewAuthors = nil
 			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 				t.Fatal(err)
 			}
-			if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-review-coverage" {
-				t.Fatal("coverage gap landed")
+			if g.mergeCount != 1 || landAction(t, s, r.Name) != "merge" {
+				t.Fatal("optional bots held landing")
 			}
 		})
 	}
@@ -66,7 +66,7 @@ func TestOwnBlockingFindingsHold(t *testing.T) {
 				if severity != "" {
 					body = "<!-- mergewake-severity:" + severity + " --> finding"
 				}
-				g.feedback.Threads = []github.ReviewThread{{Path: "tool", Line: 1, Comments: []github.ReviewComment{{Author: "review-bot", Body: body}, {Author: "dev", AuthorType: "User", Body: "ok"}}}}
+				g.feedback.Threads = []github.ReviewThread{{Path: "tool", Line: 1, Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, Body: body}, {Author: "dev", AuthorType: "User", Body: "ok"}}}}
 				if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 					t.Fatal(err)
 				}
@@ -135,7 +135,7 @@ func TestBlockFindingsApplyWithoutGateSection(t *testing.T) {
 			g.reviewed = true
 			g.gate = configured
 			g.feedback.Threads = []github.ReviewThread{{Path: "tool", Line: 1, IsResolved: true, ResolvedBy: "pr-author", ResolvedByType: "User", Comments: []github.ReviewComment{
-				{Author: "chatgpt-codex-connector", AuthorType: "Bot", Body: "P1 concrete bug"},
+				{Author: "chatgpt-codex-connector", CommitSHA: shaA, AuthorType: "Bot", Body: "P1 concrete bug"},
 				{Author: "pr-author", AuthorType: "User", Body: "ok"},
 			}}}
 			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {

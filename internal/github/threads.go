@@ -19,6 +19,7 @@ type ReviewComment struct {
 	AuthorType string `json:"author_type"`
 	Author     string `json:"author"`
 	Body       string `json:"body"`
+	CommitSHA  string `json:"commit_sha"`
 }
 type ReviewThread struct {
 	ID             string          `json:"id"`
@@ -32,8 +33,9 @@ type ReviewThread struct {
 }
 
 // ReviewFeedback carries raw thread state plus who submitted reviews, so the
-// land gate can grade findings and record bot coverage gaps.
+// land gate can grade current-head findings and check explicitly required bots.
 type ReviewFeedback struct {
+	HeadSHA          string          `json:"head_sha"`
 	Threads          []ReviewThread  `json:"threads"`
 	ReviewAuthors    map[string]int  `json:"review_authors"`
 	RecheckedAuthors map[string]bool `json:"rechecked_authors"`
@@ -75,6 +77,9 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 									Nodes []struct {
 										Author *reviewActor `json:"author"`
 										Body   string       `json:"body"`
+										Commit *struct {
+											OID string `json:"oid"`
+										} `json:"commit"`
 									} `json:"nodes"`
 									PageInfo *struct {
 										HasNextPage bool `json:"hasNextPage"`
@@ -90,7 +95,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
 			return fb, e
 		}
@@ -98,6 +103,10 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			return fb, errors.New("GitHub review thread query failed")
 		}
 		pr := result.Data.Repository.PullRequest
+		if pr.HeadRefOid == "" || (fb.HeadSHA != "" && fb.HeadSHA != pr.HeadRefOid) {
+			return fb, errors.New("missing or changed PR head in review feedback")
+		}
+		fb.HeadSHA = pr.HeadRefOid
 		if pr.Author != nil {
 			fb.PRAuthor = pr.Author.Login
 		}
@@ -130,6 +139,9 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			// as unanswered, which fails closed rather than inventing a reply.
 			for _, cm := range t.Comments.Nodes {
 				c := ReviewComment{Body: cm.Body}
+				if cm.Commit != nil {
+					c.CommitSHA = cm.Commit.OID
+				}
 				if cm.Author != nil {
 					c.Author = cm.Author.Login
 					c.AuthorType = cm.Author.Type
@@ -179,22 +191,25 @@ func ThreadSeverity(author, body string) string {
 // Findings grades raw threads into gate findings. bots are normalized logins
 // whose replies never count as human answers. GraphQL actor types and the PR
 // author are checked independently of login suffixes.
-func (f ReviewFeedback) Findings(bots map[string]bool) []policy.ReviewFinding {
+func (f ReviewFeedback) Findings(bots map[string]bool, ownLogin string) []policy.ReviewFinding {
+	ownLogin = policy.NormalizeAuthor(ownLogin)
 	out := []policy.ReviewFinding{}
 	for _, t := range f.Threads {
 		if len(t.Comments) == 0 {
 			continue
 		}
 		finding := policy.ReviewFinding{
-			Author:   policy.NormalizeAuthor(t.Comments[0].Author),
-			Severity: ThreadSeverity(t.Comments[0].Author, t.Comments[0].Body),
-			Path:     t.Path,
-			Line:     t.Line,
-			Resolved: t.IsResolved,
-			Outdated: t.IsOutdated,
+			Author:    policy.NormalizeAuthor(t.Comments[0].Author),
+			CommitSHA: t.Comments[0].CommitSHA,
+			Severity:  ThreadSeverity(t.Comments[0].Author, t.Comments[0].Body),
+			Path:      t.Path,
+			Line:      t.Line,
+			Resolved:  t.IsResolved,
+			Outdated:  t.IsOutdated,
 		}
-		finding.Rechecked = f.RecheckedAuthors[finding.Author]
-		finding.ReviewerResolved = finding.Author != "" && policy.NormalizeAuthor(t.ResolvedBy) == finding.Author && (t.ResolvedByType == "Bot" || bots[finding.Author])
+		finding.OwnReview = ownLogin != "" && finding.Author == ownLogin
+		finding.Rechecked = !finding.OwnReview && f.RecheckedAuthors[finding.Author]
+		finding.ReviewerResolved = finding.Author != "" && t.ResolvedByType == "Bot" && policy.NormalizeAuthor(t.ResolvedBy) == finding.Author && finding.Author != policy.NormalizeAuthor(f.PRAuthor) && finding.Author != ownLogin
 		for _, c := range t.Comments[1:] {
 			author := policy.NormalizeAuthor(c.Author)
 			if f.PRAuthor != "" && c.AuthorType == "User" && author != policy.NormalizeAuthor(f.PRAuthor) && author != "" && author != finding.Author && !bots[author] && !strings.HasSuffix(c.Author, "[bot]") {

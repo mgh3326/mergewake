@@ -104,12 +104,16 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	return p, p.Validate()
 }
 
-// reviewGate enforces graded findings on every PR and holds on missing bot
-// coverage. Absent review_gate also retains the legacy blocking-thread rule.
-func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy) (string, *policy.GateVerdict, []string, *int, error) {
+// reviewGate grades only current-head findings. CI bots are optional unless
+// the trusted policy explicitly names them in required_bots. The caller has
+// already verified the mandatory exact-head mergewake passes.
+func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy, head string) (string, *policy.GateVerdict, []string, error) {
 	fb, e := s.GH.ReviewFeedback(ctx, r.Name, n)
 	if e != nil {
-		return "", nil, nil, nil, e
+		return "", nil, nil, e
+	}
+	if fb.HeadSHA != head {
+		return "", nil, nil, errors.New("review feedback is not bound to the decision head")
 	}
 	gate := policy.ReviewGate{}.WithDefaults()
 	if p.ReviewGate != nil {
@@ -125,28 +129,24 @@ func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class st
 	for _, a := range gate.IgnoreAuthors {
 		bots[policy.NormalizeAuthor(a)] = true
 	}
-	fs := fb.Findings(bots)
+	var fs []policy.ReviewFinding
+	for _, f := range fb.Findings(bots, login) {
+		if f.CommitSHA == head {
+			fs = append(fs, f)
+		}
+	}
 	v := gate.Evaluate(fs, class)
-	gap := gate.CoverageGap(fs, fb.ReviewAuthors)
+	missing := gate.MissingRequiredBots(fs, fb.ReviewAuthors, head)
 	switch {
 	case len(v.Blocking) > 0:
-		return "wait-for-blocking-findings", &v, gap, nil, nil
+		return "wait-for-blocking-findings", &v, missing, nil
 	case len(v.Triage) > 0:
-		return "wait-for-triage-reply", &v, gap, nil, nil
-	case len(gap) > 0:
-		return "wait-for-review-coverage", &v, gap, nil, nil
+		return "wait-for-triage-reply", &v, missing, nil
+	case len(missing) > 0:
+		return "wait-for-required-bots", &v, missing, nil
 	}
-	if p.ReviewGate == nil && class == "blocking" {
-		count, e := s.GH.Unresolved(ctx, r.Name, n)
-		if e != nil {
-			return "", nil, nil, nil, e
-		}
-		if count > 0 {
-			return "wait-for-findings", &v, gap, &count, nil
-		}
-		return "", &v, gap, &count, nil
-	}
-	return "", &v, gap, nil, nil
+
+	return "", &v, missing, nil
 }
 
 // distinctPasses validates numbered passes and independent lenses when the
@@ -239,8 +239,8 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		return e
 	}
 	var verdict *policy.GateVerdict
-	var gap []string
-	var unresolved, reviewed *int
+	var missingBots []string
+	var reviewed *int
 	sameFamily := false
 	if !paused && ci == github.Green {
 		d.Action = "merge"
@@ -262,11 +262,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		}
 
 		if d.Action == "merge" {
-			action, v, g, u, e := s.reviewGate(ctx, r, n, d.Class, p)
+			action, v, g, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
 			if e != nil {
 				return e
 			}
-			verdict, gap, unresolved = v, g, u
+			verdict, missingBots = v, g
 			if action != "" {
 				d.Action = action
 			}
@@ -279,12 +279,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		CI          github.CI           `json:"ci"`
 		Main        github.CI           `json:"main"`
 		Reviews     *int                `json:"review_passes,omitempty"`
-		Unresolved  *int                `json:"unresolved,omitempty"`
 		Findings    *policy.GateVerdict `json:"findings,omitempty"`
-		CoverageGap []string            `json:"coverage_gap,omitempty"`
+		MissingBots []string            `json:"missing_required_bots,omitempty"`
 		SameFamily  bool                `json:"same_family,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, ci, mainCI, reviewed, unresolved, verdict, gap, sameFamily, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, ci, mainCI, reviewed, verdict, missingBots, sameFamily, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, sameFamily, o.DryRun); e != nil {
@@ -327,7 +326,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		return errors.New("review passes changed during decision")
 	}
 
-	action, _, _, _, e := s.reviewGate(ctx, r, n, d.Class, p)
+	action, _, _, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
 	if e != nil {
 		return e
 	}

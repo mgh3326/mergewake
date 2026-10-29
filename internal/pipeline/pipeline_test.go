@@ -34,6 +34,7 @@ type fakeGH struct {
 	nextHead                                                     string
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
+	requiredBots                                                 []string
 	findings                                                     int
 	passes                                                       map[string][]github.PassReceipt
 	feedback                                                     github.ReviewFeedback
@@ -84,7 +85,11 @@ func (g *fakeGH) ReadFile(_ context.Context, _, sha, name string) ([]byte, error
 			text += "blocking:\n  - paths: ['**']\n    reason: irreversible effects\n"
 		}
 		if g.gate {
-			text += "review_gate: {}\n"
+			if g.requiredBots != nil {
+				text += "review_gate:\n  required_bots: [" + strings.Join(g.requiredBots, ",") + "]\n"
+			} else {
+				text += "review_gate: {}\n"
+			}
 		}
 		return []byte(text), nil
 	}
@@ -138,7 +143,9 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 	return true, nil
 }
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
-	return g.feedback, nil
+	fb := g.feedback
+	fb.HeadSHA = g.pull.Head.SHA
+	return fb, nil
 }
 func (g *fakeGH) Unresolved(context.Context, string, int) (int, error) { return g.findings, nil }
 func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
@@ -277,6 +284,9 @@ func TestLand(t *testing.T) {
 			g.blocking = tt.blocking
 			g.reviewed = tt.reviewed
 			g.findings = tt.findings
+			if tt.findings > 0 {
+				g.feedback.Threads = []github.ReviewThread{{Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, Body: "<!-- mergewake-severity:high --> bug"}}}}
+			}
 			g.ci = tt.ci
 			if e := s.Land(context.Background(), r, 7, Options{DryRun: tt.dry, Shadow: tt.shadow}); e != nil {
 				t.Fatal(e)
@@ -415,7 +425,7 @@ func TestLandSameFamilyReviewLands(t *testing.T) {
 // severity instead of the raw unresolved count.
 func TestLandReviewGateFindings(t *testing.T) {
 	thread := func(author, label string, resolved, answered bool) github.ReviewThread {
-		comments := []github.ReviewComment{{Author: author, Body: label + " problem here"}}
+		comments := []github.ReviewComment{{Author: author, CommitSHA: shaA, Body: label + " problem here"}}
 		if answered {
 			comments = append(comments, github.ReviewComment{Author: "dev", AuthorType: "User", Body: "fixed in the latest commit"})
 		}
@@ -430,7 +440,7 @@ func TestLandReviewGateFindings(t *testing.T) {
 		merges   int
 	}{
 		{"critical blocks routine", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Critical", false, false)}, "wait-for-blocking-findings", 0},
-		{"major blocks blocking", true, true, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-blocking-findings", 0},
+		{"major needs triage on blocking", true, true, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-triage-reply", 0},
 		{"p1 blocks blocking", true, true, []github.ReviewThread{thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "wait-for-blocking-findings", 0},
 		{"unanswered major holds routine", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-triage-reply", 0},
 		{"answered major lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true)}, "merge", 1},
