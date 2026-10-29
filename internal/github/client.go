@@ -128,8 +128,11 @@ func list[T any](ctx context.Context, c *Client, route string) ([]T, error) {
 }
 
 type Ref struct {
-	SHA string `json:"sha"`
-	Ref string `json:"ref"`
+	SHA  string `json:"sha"`
+	Ref  string `json:"ref"`
+	Repo struct {
+		FullName string `json:"full_name"`
+	} `json:"repo"`
 }
 type Pull struct {
 	CreatedAt      string  `json:"created_at"`
@@ -224,10 +227,13 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 				switch r.Conclusion {
 				case "success":
 					state = Green
-				case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+				case "failure", "timed_out", "action_required", "startup_failure", "stale":
 					state = Red
 				}
 			}
+			// Cancelled and skipped conclusions stay unknown rather than red:
+			// they cannot mark a red boundary for culprit search or count as
+			// confirmed-green evidence.
 			states[r.Name] = state
 		}
 		if len(runs.CheckRuns) < 100 {

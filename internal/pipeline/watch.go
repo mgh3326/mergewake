@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -19,12 +22,14 @@ import (
 var taskTrailer = regexp.MustCompile(`(?m)^Mergewake-Task: ([1-9][0-9]*)\s*$`)
 
 type watchResult struct {
-	Head    string `json:"head"`
-	Action  string `json:"action"`
-	Shadow  bool   `json:"shadow"`
-	Culprit string `json:"culprit,omitempty"`
-	PR      int    `json:"pr,omitempty"`
-	URL     string `json:"url,omitempty"`
+	Head       string `json:"head"`
+	Action     string `json:"action"`
+	Shadow     bool   `json:"shadow"`
+	Culprit    string `json:"culprit,omitempty"`
+	PR         int    `json:"pr,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Candidates []int  `json:"candidates,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // Bisect returns the first red candidate following a known green baseline.
@@ -115,6 +120,17 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	}
 	baseline := string(baselineBytes)
 	chain := []string{head}
+	green := ""
+	hold := func(reason string) error {
+		candidates, e := s.bracketCandidates(ctx, r, chain, green)
+		if e != nil {
+			return e
+		}
+		result.Candidates = candidates
+		result.Action = "hold"
+		result.Reason = reason
+		return s.reportWatch(ctx, r, result, head+":"+reason, o)
+	}
 	cache := map[string]github.CI{head: ci}
 	current := head
 	found := false
@@ -128,13 +144,15 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return v, e
 	}
+	// Only first parents walk mainline: a merge commit's second parent is the
+	// merged branch, and the merge commit itself is the integration unit.
 	for len(chain) < s.Config.WatchLimit {
 		c, e := s.GH.Commit(ctx, r.Name, current)
 		if e != nil {
 			return e
 		}
-		if len(c.Parents) != 1 {
-			return errors.New("main history is not linear squash history; operator required")
+		if len(c.Parents) == 0 {
+			return hold("reached history root without a green ancestor")
 		}
 		current = c.Parents[0].SHA
 		chain = append(chain, current)
@@ -149,64 +167,97 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 				return e
 			}
 			if v == github.Green {
+				green = current
 				found = true
 				break
 			}
 		}
 	}
 	if !found {
-		return errors.New("no green ancestor within watch_limit; operator required")
+		return hold("no green ancestor within watch_limit")
 	}
 	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
 		chain[i], chain[j] = chain[j], chain[i]
 	}
 	// A later green commit supersedes an older checkpoint. Inspect the interval
-	// before bisecting so an independent later regression cannot blame an older PR.
+	// before bisecting so an independent later regression cannot blame an older
+	// PR. Unknown evidence (missing, pending, cancelled or skipped runs) holds
+	// the search rather than assigning blame.
 	for i := len(chain) - 2; i >= 0; i-- {
 		v, e := check(chain[i])
 		if e != nil {
 			return e
 		}
 		if v == github.Green {
+			green = chain[i]
 			chain = chain[i:]
 			break
 		}
 		if v != github.Red {
-			return errors.New("incomplete CI evidence in recovery interval")
+			return hold("incomplete CI evidence in recovery interval")
 		}
 	}
 	index, e := Bisect(chain, check)
 	if e != nil {
-		return e
+		return hold("CI evidence inside the bracket is ambiguous: " + e.Error())
 	}
 	culprit := chain[index]
-	pulls, e := s.GH.PRsForCommit(ctx, r.Name, culprit)
-	if e != nil {
-		return e
-	}
-	var origin *github.Pull
-	for i := range pulls {
-		v := &pulls[i]
-		if (v.Merged || v.MergedAt != nil) && v.Base.Ref == r.Branch && v.MergeCommitSHA == culprit {
-			if origin != nil {
-				return errors.New("ambiguous culprit PR")
-			}
-			origin = v
-		}
-	}
-	if origin == nil {
-		return errors.New("culprit is not an identifiable squash-merged PR")
-	}
-	if e = s.ObservePR(ctx, r, *origin, o); e != nil {
-		return e
-	}
-	// The confirmed boundary must be one independently green parent and one red PR.
+	// The confirmed boundary must be the first parent of the first red commit,
+	// even when that commit is a merge commit.
 	parent, e := s.GH.Commit(ctx, r.Name, culprit)
 	if e != nil {
 		return e
 	}
-	if len(parent.Parents) != 1 || parent.Parents[0].SHA != chain[index-1] {
-		return errors.New("culprit parent mismatch")
+	if len(parent.Parents) == 0 || parent.Parents[0].SHA != chain[index-1] {
+		return hold("culprit parent mismatch")
+	}
+	pulls, e := s.GH.PRsForCommit(ctx, r.Name, culprit)
+	if e != nil {
+		return e
+	}
+	// A candidate is a merged PR whose recorded landing SHA sits inside the
+	// red bracket: a squash commit maps directly, a merge commit through its
+	// merge SHA, and a rebased chain through its final landing commit.
+	inBracket := map[string]bool{}
+	for _, sha := range chain[index:] {
+		inBracket[sha] = true
+	}
+	var origin *github.Pull
+	seen := map[int]bool{}
+	for i := range pulls {
+		v := &pulls[i]
+		if !(v.Merged || v.MergedAt != nil) || v.Base.Ref != r.Branch || !inBracket[v.MergeCommitSHA] || seen[v.Number] {
+			continue
+		}
+		seen[v.Number] = true
+		result.Candidates = append(result.Candidates, v.Number)
+		if origin == nil {
+			origin = v
+		}
+	}
+	if len(result.Candidates) != 1 || origin == nil {
+		result.Culprit = culprit
+		return hold("culprit is not a single identifiable merged PR")
+	}
+	if e = s.ObservePR(ctx, r, *origin, o); e != nil {
+		return e
+	}
+	result.Culprit = culprit
+	result.PR = origin.Number
+	// A culprit that touched a blocking path is reported, never auto-reverted.
+	files, e := s.GH.Files(ctx, r.Name, origin.Number)
+	if e != nil {
+		return e
+	}
+	if len(files) != origin.ChangedFiles {
+		return hold("culprit file list is incomplete")
+	}
+	if p.Classify(files).Class == "blocking" {
+		result.Action = "report-culprit"
+		return s.reportWatch(ctx, r, result, head+":"+culprit, o)
+	}
+	if len(parent.Parents) != 1 {
+		return hold("automatic revert requires a single-parent commit; merge-commit culprit needs a first-parent recovery change")
 	}
 	task := r.Task
 	if m := taskTrailer.FindStringSubmatch(origin.Body); len(m) == 2 {
@@ -216,8 +267,6 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return errors.New("origin task missing; add Mergewake-Task trailer or repo task")
 	}
 	result.Action = "open-revert-pr"
-	result.Culprit = culprit
-	result.PR = origin.Number
 	if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
@@ -258,4 +307,78 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		note += "; task reopen failed (recovery comment retained): " + reopen.Error()
 	}
 	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Text: note}))
+}
+
+// reportWatch audits a held or reported watch outcome once per head and key,
+// then notifies and records when the host is acting. Repeat polls on the same
+// head with the same key stay quiet.
+func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchResult, key string, o Options) error {
+	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
+		return e
+	}
+	if result.Shadow || o.DryRun {
+		return nil
+	}
+	file := filepath.Join(s.state(r.Name), "watch-reported")
+	b, e := os.ReadFile(file)
+	if e != nil && !os.IsNotExist(e) {
+		return e
+	}
+	if slices.Contains(strings.Split(string(b), "\n"), key) {
+		return nil
+	}
+	data, _ := json.Marshal(result)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	note := "mergewake: watch " + result.Action + " on " + r.Name + " " + result.Head
+	if result.Reason != "" {
+		note += ": " + result.Reason
+	}
+	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Text: note}))
+	if e != nil {
+		return e
+	}
+	// Keep only recent keys; exact line comparison avoids substring matches.
+	keys := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	if len(keys) > 127 {
+		keys = keys[len(keys)-127:]
+	}
+	if len(keys) == 1 && keys[0] == "" {
+		keys = nil
+	}
+	keys = append(keys, key)
+	return rollout.Atomic(file, []byte(strings.Join(keys, "\n")+"\n"), 0600)
+}
+
+// bracketCandidates lists merged PRs in the inspected interval, excluding a
+// confirmed-green boundary. It works before CI identifies one culprit.
+func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []string, green string) ([]int, error) {
+	inBracket := map[string]bool{}
+	for _, sha := range chain {
+		inBracket[sha] = true
+	}
+	delete(inBracket, green)
+
+	seen := map[int]bool{}
+	for _, sha := range chain {
+		if !inBracket[sha] {
+			continue
+		}
+		pulls, err := s.GH.PRsForCommit(ctx, r.Name, sha)
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range pulls {
+			if (pr.Merged || pr.MergedAt != nil) && pr.Base.Ref == r.Branch && inBracket[pr.MergeCommitSHA] {
+				seen[pr.Number] = true
+			}
+		}
+	}
+	out := []int{}
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out, nil
 }
