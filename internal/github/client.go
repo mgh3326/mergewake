@@ -128,8 +128,11 @@ func list[T any](ctx context.Context, c *Client, route string) ([]T, error) {
 }
 
 type Ref struct {
-	SHA string `json:"sha"`
-	Ref string `json:"ref"`
+	SHA  string `json:"sha"`
+	Ref  string `json:"ref"`
+	Repo struct {
+		FullName string `json:"full_name"`
+	} `json:"repo"`
 }
 type Pull struct {
 	CreatedAt      string  `json:"created_at"`

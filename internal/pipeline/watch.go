@@ -1,7 +1,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -117,12 +119,18 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	baseline := string(baselineBytes)
+	chain := []string{head}
+	green := ""
 	hold := func(reason string) error {
+		candidates, e := s.bracketCandidates(ctx, r, chain, green)
+		if e != nil {
+			return e
+		}
+		result.Candidates = candidates
 		result.Action = "hold"
 		result.Reason = reason
 		return s.reportWatch(ctx, r, result, head+":"+reason, o)
 	}
-	chain := []string{head}
 	cache := map[string]github.CI{head: ci}
 	current := head
 	found := false
@@ -159,6 +167,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 				return e
 			}
 			if v == github.Green {
+				green = current
 				found = true
 				break
 			}
@@ -180,6 +189,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 			return e
 		}
 		if v == github.Green {
+			green = chain[i]
 			chain = chain[i:]
 			break
 		}
@@ -246,6 +256,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		result.Action = "report-culprit"
 		return s.reportWatch(ctx, r, result, head+":"+culprit, o)
 	}
+	if len(parent.Parents) != 1 {
+		return hold("automatic revert requires a single-parent commit; merge-commit culprit needs a first-parent recovery change")
+	}
 	task := r.Task
 	if m := taskTrailer.FindStringSubmatch(origin.Body); len(m) == 2 {
 		task = m[1]
@@ -311,7 +324,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if e != nil && !os.IsNotExist(e) {
 		return e
 	}
-	if bytes.Contains(b, []byte(key+"\n")) {
+	if slices.Contains(strings.Split(string(b), "\n"), key) {
 		return nil
 	}
 	data, _ := json.Marshal(result)
@@ -326,5 +339,46 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if e != nil {
 		return e
 	}
-	return rollout.Atomic(file, append(b, []byte(key+"\n")...), 0600)
+	// Keep only recent keys; exact line comparison avoids substring matches.
+	keys := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	if len(keys) > 127 {
+		keys = keys[len(keys)-127:]
+	}
+	if len(keys) == 1 && keys[0] == "" {
+		keys = nil
+	}
+	keys = append(keys, key)
+	return rollout.Atomic(file, []byte(strings.Join(keys, "\n")+"\n"), 0600)
+}
+
+// bracketCandidates lists merged PRs in the inspected interval, excluding a
+// confirmed-green boundary. It works before CI identifies one culprit.
+func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []string, green string) ([]int, error) {
+	inBracket := map[string]bool{}
+	for _, sha := range chain {
+		inBracket[sha] = true
+	}
+	delete(inBracket, green)
+
+	seen := map[int]bool{}
+	for _, sha := range chain {
+		if !inBracket[sha] {
+			continue
+		}
+		pulls, err := s.GH.PRsForCommit(ctx, r.Name, sha)
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range pulls {
+			if (pr.Merged || pr.MergedAt != nil) && pr.Base.Ref == r.Branch && inBracket[pr.MergeCommitSHA] {
+				seen[pr.Number] = true
+			}
+		}
+	}
+	out := []int{}
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out, nil
 }

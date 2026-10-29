@@ -39,6 +39,7 @@ func TestCheckEvidence(t *testing.T) {
 		{"success", `[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]`, `[]`, Green, false},
 		{"failure", `[{"id":1,"name":"CI","status":"completed","conclusion":"failure"}]`, `[]`, Red, false},
 		{"missing", `[]`, `[]`, Pending, false},
+		{"cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Pending, false},
 		{"skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Pending, false},
 		{"pending", `[{"id":1,"name":"CI","status":"in_progress"}]`, `[]`, Pending, false},
 		{"latest status", `[]`, `[{"id":2,"context":"CI","state":"success"},{"id":1,"context":"CI","state":"failure"}]`, Green, false},

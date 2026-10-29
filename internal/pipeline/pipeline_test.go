@@ -118,7 +118,14 @@ func (g *fakeGH) PRsForCommit(_ context.Context, _, sha string) ([]github.Pull, 
 	}
 	return []github.Pull{g.pull}, nil
 }
-func (g *fakeGH) Revert(context.Context, string, string, string, string, int) (string, error) {
+func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string, pr int) (string, error) {
+	commit, err := g.Commit(ctx, repo, culprit)
+	if err != nil {
+		return "", err
+	}
+	if len(commit.Parents) != 1 {
+		return "", errors.New("automatic revert requires a squash commit")
+	}
 	g.revertCount++
 	g.latch = true
 	return "https://github.com/example/project/pull/9", nil
@@ -305,7 +312,7 @@ func TestWatchCulpritMergeCommitAndUnknownEvidence(t *testing.T) {
 		reports  int
 	}{
 		{"unknown evidence holds", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaB: github.Pending, shaA: github.Green}, false, "hold", 0, 1},
-		{"merge commit culprit reverts", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaA: github.Green}, false, "opened-revert-pr", 1, 0},
+		{"merge commit culprit holds", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaA: github.Green}, false, "hold", 0, 1},
 		{"blocking culprit reported", map[string]github.CI{shaD: github.Red, shaC: github.Red, shaA: github.Green}, true, "report-culprit", 0, 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -362,7 +369,7 @@ func TestLandRedMainPause(t *testing.T) {
 		merges   int
 	}{
 		{"red main pauses", github.Red, false, false, "pause-red-main", 0},
-		{"unknown main pauses", github.Pending, false, false, "pause-red-main", 0},
+		{"unknown main pauses", github.Pending, false, false, "pause-main-unknown", 0},
 		{"shadow records would-pause", github.Red, false, true, "would-pause-red-main", 0},
 		{"recovery lands on red main", github.Red, true, false, "merge", 1},
 	} {
@@ -372,6 +379,7 @@ func TestLandRedMainPause(t *testing.T) {
 			g.checks = map[string]github.CI{shaB: tt.mainCI, shaA: github.Green}
 			if tt.recovery {
 				g.pull.Head.Ref = github.RecoveryBranch
+				g.pull.Head.Repo.FullName = r.Name
 			}
 			if e := s.Land(context.Background(), r, 7, Options{Shadow: tt.shadow}); e != nil {
 				t.Fatal(e)

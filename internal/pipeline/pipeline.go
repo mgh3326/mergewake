@@ -143,11 +143,15 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
-	paused := mainCI != github.Green && pr.Head.Ref != github.RecoveryBranch
+	recovery := pr.Head.Ref == github.RecoveryBranch && pr.Head.Repo.FullName == r.Name
+	paused := mainCI != github.Green && !recovery
 	if paused {
 		d.Action = "pause-red-main"
+		if mainCI != github.Red {
+			d.Action = "pause-main-unknown"
+		}
 		if d.Shadow {
-			d.Action = "would-pause-red-main"
+			d.Action = "would-" + d.Action
 		}
 	}
 	ci, e := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)

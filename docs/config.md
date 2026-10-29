@@ -335,7 +335,7 @@ For `example/project`, state resides beneath
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
-| `watch-reported` | Heads plus hold/report keys already notified; repeat polls stay quiet. |
+| `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
@@ -427,14 +427,18 @@ Only a successful check run is green evidence. Missing, pending, skipped or
 cancelled runs are unknown, never green and never a red boundary. The search
 brackets the red head with the nearest confirmed-green ancestor for the same
 checks; if exactly one candidate PR remains it is the culprit, otherwise the
-watch holds and reports (`action: hold`) without reverting. A culprit that
+watch holds and reports (`action: hold`) without reverting, listing candidate
+PRs in the inspected bracket. Merge-commit culprits are held and reported because
+the current revert adapter supports only single-parent commits. A culprit that
 touched a blocking path is reported (`action: report-culprit`), never
 auto-reverted. Holds and reports notify once per head via the `watch-reported`
-state file.
+state file, which retains the most recent 128 report keys.
 
 While main is red or its watch evidence is unknown, ordinary `land` calls pause
-(`action: pause-red-main`, or `would-pause-red-main` in shadow). Recovery PRs
-opened from `mergewake/recovery` remain landable so the latch can close.
+(`action: pause-red-main`, or `would-pause-red-main` in shadow). Unknown main
+evidence uses `pause-main-unknown` / `would-pause-main-unknown`. Recovery PRs
+from `mergewake/recovery` in the base repository remain landable; a fork using
+that branch name does not qualify.
 Immediately before opening a revert PR the watch rechecks the current main head
 and its CI, and the recovery latch tag still serializes recovery attempts.
 
