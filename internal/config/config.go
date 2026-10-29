@@ -109,6 +109,7 @@ type Daemon struct {
 }
 type Reap struct {
 	Enabled       bool     `yaml:"enabled"`
+	Act           bool     `yaml:"act"`
 	WorktreeAfter string   `yaml:"worktree_after"`
 	Protect       []string `yaml:"protect"`
 }
@@ -186,6 +187,9 @@ func Load(name string) (Config, error) {
 		if _, err := Duration(loop.Interval); err != nil {
 			return c, err
 		}
+	}
+	if c.Reap.Act && !c.Reap.Enabled {
+		return c, errors.New("reap.act requires reap.enabled")
 	}
 	if c.Reap.WorktreeAfter == "" {
 		c.Reap.WorktreeAfter = "168h"

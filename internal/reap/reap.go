@@ -156,9 +156,21 @@ func (e Exec) Exists(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// DirExists reports whether path is an existing directory. The job dir is
+// proof the fleet spawned the pane, so it must predate the close: Capture
+// never creates it.
+func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
+	b, err := e.Run(ctx, "sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", path)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(b)) == "yes", nil
+}
+
 // Capture returns the report/log path that proves the pane's output survives
 // the close: an existing <dir>/report.md, or a freshly saved
-// <dir>/pane-screen.txt holding the pane's last screen.
+// <dir>/pane-screen.txt holding the pane's last screen. dir must already
+// exist; callers check DirExists first and skip missing dirs as not-a-job.
 func (e Exec) Capture(ctx context.Context, pane, dir string) (string, error) {
 	report := filepath.Join(dir, "report.md")
 	ok, err := e.Exists(ctx, report)
@@ -169,7 +181,7 @@ func (e Exec) Capture(ctx context.Context, pane, dir string) (string, error) {
 		return report, nil
 	}
 	screen := filepath.Join(dir, "pane-screen.txt")
-	_, err = e.Run(ctx, "sh", "-c", `mkdir -p -- "$1" && herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", dir, pane)
+	_, err = e.Run(ctx, "sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", dir, pane)
 	if err != nil {
 		return "", err
 	}
@@ -285,6 +297,23 @@ func (e Exec) Clean(ctx context.Context, path string) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(string(b)) == "", nil
+}
+
+// Ignored lists gitignored files inside the worktree. `git status --porcelain`
+// hides them, but `git worktree remove` deletes them anyway — callers refuse
+// the removal rather than silently lose an .env or notes file.
+func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "!! ") {
+			out = append(out, strings.TrimSpace(line[3:]))
+		}
+	}
+	return out, nil
 }
 
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {

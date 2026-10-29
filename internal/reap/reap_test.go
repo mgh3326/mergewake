@@ -146,9 +146,11 @@ func TestEntriesAndClean(t *testing.T) {
 	}
 
 	e, _ := testExec(map[string]string{
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):           "",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):        " M tool\n?? note.txt\n",
-		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}): list,
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                    "",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):                 " M tool\n?? note.txt\n",
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored"}):       "?? new.txt\n!! .env\n!! build/\n",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored"}):    " M tool\n",
+		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):          list,
 	}, nil)
 	for _, tt := range []struct {
 		path string
@@ -156,6 +158,15 @@ func TestEntriesAndClean(t *testing.T) {
 	}{{"/repo.wt", true}, {"/repo.dirty", false}} {
 		if clean, err := e.Clean(context.Background(), tt.path); err != nil || clean != tt.want {
 			t.Fatalf("%s: %v %v", tt.path, clean, err)
+		}
+	}
+	for _, tt := range []struct {
+		path string
+		want int
+	}{{"/repo.wt", 2}, {"/repo.dirty", 0}} {
+		got, err := e.Ignored(context.Background(), tt.path)
+		if err != nil || len(got) != tt.want {
+			t.Fatalf("%s: %v %v", tt.path, got, err)
 		}
 	}
 	got, err := e.WorktreeList(context.Background(), "/repo.wt")
@@ -173,11 +184,13 @@ func TestJoinQuoting(t *testing.T) {
 
 func TestExistsCaptureAndPushed(t *testing.T) {
 	report := "/jobs/wk-7/report.md"
-	screen := `mkdir -p -- "$1" && herdr pane read "$2" > "$1/pane-screen.txt"`
+	screen := `herdr pane read "$2" > "$1/pane-screen.txt"`
 	outs := map[string]string{
 		key("sh", []string{"-c", `test -f "$1" && echo yes || echo no`, "sh", report}):                       "yes\n",
 		key("sh", []string{"-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-8/report.md"}):       "no\n",
 		key("sh", []string{"-c", screen, "sh", "/jobs/wk-8", "w1:p2"}):                                       "",
+		key("sh", []string{"-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7"}):                 "yes\n",
+		key("sh", []string{"-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/stray"}):                "no\n",
 		key("git", []string{"-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"}):            "",
 		key("git", []string{"-C", "/repo", "rev-list", "--count", "--left-right", "wk/y...wk/y@{upstream}"}): "0\t2\n",
 	}
@@ -192,6 +205,14 @@ func TestExistsCaptureAndPushed(t *testing.T) {
 	e, _ := testExec(outs, errs)
 	if ok, err := e.Exists(context.Background(), report); err != nil || !ok {
 		t.Fatal("report should exist")
+	}
+	for _, tt := range []struct {
+		path string
+		want bool
+	}{{"/jobs/wk-7", true}, {"/jobs/stray", false}} {
+		if ok, err := e.DirExists(context.Background(), tt.path); err != nil || ok != tt.want {
+			t.Fatalf("%s: %v %v", tt.path, ok, err)
+		}
 	}
 	if saved, err := e.Capture(context.Background(), "w1:p1", "/jobs/wk-7"); err != nil || saved != report {
 		t.Fatalf("%q %v", saved, err)

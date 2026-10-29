@@ -170,22 +170,36 @@ and whose origin remote names the configured repository. URL and scp-style
 `git@host:owner/name` remotes both parse; a canonical clone, subdirectory
 checkout, detached head, foreign remote or reused branch tip never matches.
 
-A matching pane is closed only when it is not `working`, is named, misses the
-`reap.protect` globs, and its output was captured first: an existing
-`<jobs>/<name>/report.md` counts, otherwise `herdr pane read` saves the last
-screen to `<jobs>/<name>/pane-screen.txt`. The saved path lands in the
-receipt. A host without `jobs` configured cannot lose panes.
+A matching pane is closed only on an allowlist of `idle`/`done` states —
+`working`, `blocked`, `waiting`, empty and unknown states all keep it — when
+it is named, misses the `reap.protect` globs, and its `<jobs>/<name>`
+directory already exists, which is what proves the fleet spawned it: a named
+operator pane merely cd'd into a merged worktree is skipped as `not-a-job`.
+Its output is captured first: an existing `<jobs>/<name>/report.md` counts,
+otherwise `herdr pane read` saves the last screen to
+`<jobs>/<name>/pane-screen.txt`; the saved path lands in the receipt.
+Immediately before the real close the agent list is re-read and the pane must
+still be present with the same id, status, cwd and name — the discovery list
+is a stale snapshot and a pane that went back to work survives as
+`pane-changed` or `pane-gone`. A host without `jobs` configured cannot lose
+panes, and closing needs `reap.act` on top of `--apply`, a gate separate from
+`daemon.act`.
 
 Worktree removal is additive on top of the age gate: the merge must be older
 than `worktree_after`, the watch role's recovery convention must show neither
 an open recovery nor one merged within seven days, the worktree must still be
-registered, unlocked, clean and unattached, no live pane (from `herdr pane
-list`, which also sees plain shells) may use it, and the branch must carry no
-unpushed commits — merged into the base or fully pushed. Removal is `git
+registered, unlocked, clean and unattached, it must hold no gitignored files
+(`git status --porcelain --ignored`; removal refuses and names them rather
+than let `worktree remove` delete them silently), no live pane (from `herdr
+pane list`, re-read immediately before each removal, which also sees plain
+shells) may use it, and the branch must carry no unpushed commits — merged
+into the base or fully pushed. Removal is `git
 worktree remove` and `git branch -d`; the code has no force flags to reach
 for. Candidates come from live panes and from prior `reap.jsonl` rows so a
 worktree survives its pane's earlier close. Anything unknown or ambiguous is
-skipped with a reason rather than deleted.
+skipped with a reason rather than deleted. A receipt-named PR stops being
+refetched once every worktree its rows named reached `removed` or
+`worktree-gone`, and one PR's fetch failure never aborts the pass.
 
 ## Manifests and verified installs
 

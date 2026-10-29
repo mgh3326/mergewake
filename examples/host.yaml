@@ -73,5 +73,6 @@ hosts:
 # a linked worktree are always protected.
 reap:
   enabled: false
+  act: false # reap's own acting opt-in; needs enabled, plus --apply or daemon
   worktree_after: 168h
   protect: []

@@ -88,6 +88,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Gates the `reap` command and daemon role. |
+| `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
 
@@ -101,18 +102,27 @@ PR head SHA, and the worktree's origin remote names the configured
 repository. Titles and names are never used for matching; a reused branch
 whose tip moved on does not match.
 
-Before a matching pane is closed it must be reported as not `working` and its
-output must be captured: an existing `<jobs>/<name>/report.md` wins, otherwise
-the pane's last screen is saved to `<jobs>/<name>/pane-screen.txt` first. The
-saved path is recorded in the receipt. A pane is closed with `herdr pane
-close <pane_id>` only in acting mode.
+Before a matching pane is closed it must be reported as `idle` or `done` —
+an allowlist; `working`, `blocked`, `waiting`, empty and unknown states all
+keep the pane — and `<jobs>/<name>` must already exist, which is what proves
+the fleet spawned the pane: a named operator pane merely cd'd into a merged
+worktree is skipped as `not-a-job`. The pane's output must then be captured:
+an existing `<jobs>/<name>/report.md` wins, otherwise the pane's last screen
+is saved to `<jobs>/<name>/pane-screen.txt` first. The saved path is recorded
+in the receipt. Immediately before `herdr pane close <pane_id>` the agent list
+is re-read and the pane must still be present with the same id, status, cwd
+and name; a pane that changed or went back to work is skipped as
+`pane-changed` or `pane-gone`. Closing happens only in acting mode.
 
 After `worktree_after` with no revert, a merged PR's worktree is removed. The
 revert knowledge comes from the watch role's recovery-PR convention: a
 recovery merged within seven days of the PR's merge, or one still open, skips
 cleanup. Removal also requires the worktree to still exist in `git worktree
-list`, to be clean, to have no live pane (agent or plain shell, from `herdr
-pane list`) using it, and to have no unpushed commits — the branch must merge
+list`, to be clean, to contain no gitignored files (`git status --porcelain
+--ignored` — removal refuses and names them, since `worktree remove` would
+delete them silently), to have no live pane (agent or plain shell, from
+`herdr pane list`) using it — the pane list is re-read immediately before
+each removal — and to have no unpushed commits: the branch must merge
 into the base branch (remote-tracking `origin/<branch>` first, then local) or
 be fully pushed upstream. Anything dirty, unknown or ambiguous is skipped with
 the reason recorded; removal is `git worktree remove` without `--force` and the
@@ -122,7 +132,10 @@ a worktree whose pane already closed still gets cleaned.
 
 Every decision is appended to `<state_dir>/<repo>/reap.jsonl` — including
 shadow `would-*` rows, which is how a later pass still finds a worktree it
-planned earlier. Dry-run prints rows without writing the file.
+planned earlier. Dry-run prints rows without writing the file. A receipt-named
+PR is refetched each pass only while it still has pending work; once every
+worktree its rows named reached `removed` or `worktree-gone` it is skipped,
+and a single PR's fetch failure never aborts the pass.
 
 ### `review`
 

@@ -79,7 +79,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg := fs.String("config", "~/.config/mergewake/config.yaml", "host YAML config")
-	apply := fs.Bool("apply", false, "allow acting review, release, rollout, reap or daemon (daemon and reap also need daemon.act)")
+	apply := fs.Bool("apply", false, "allow acting review, release, rollout, reap or daemon (daemon also needs daemon.act; reap also needs reap.act)")
 	daemonStatus := fs.Bool("daemon", false, "read loop status (status only)")
 	dry := fs.Bool("dry-run", false, "print planned actions without mutations or model execution")
 	repo := fs.String("repo", "", "configured owner/name (required except agent, status, superfan)")
@@ -190,7 +190,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		if !c.Reap.Enabled {
 			return errors.New("reap requires reap.enabled")
 		}
-		o.Shadow = o.Shadow || *shadow || !c.Daemon.Act
+		// reap.act (checked inside Reap) is the acting gate; daemon.act only
+		// applies when the daemon drives the role.
+		o.Shadow = o.Shadow || *shadow
 		return s.Reap(ctx, r, *pr, o)
 	case "agent":
 		if len(c.Repos) == 0 {

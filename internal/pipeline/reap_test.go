@@ -19,6 +19,7 @@ import (
 
 type scriptRunner struct {
 	outs  map[string]string
+	queue map[string][]string // consumed in order before outs, for re-reads
 	errs  map[string]error
 	calls []string
 }
@@ -26,6 +27,10 @@ type scriptRunner struct {
 func (s *scriptRunner) Run(_ context.Context, name string, args []string, _ string, _ string) ([]byte, error) {
 	k := name + "\x00" + strings.Join(args, "\x00")
 	s.calls = append(s.calls, k)
+	if q := s.queue[k]; len(q) > 0 {
+		s.queue[k] = q[1:]
+		return []byte(q[0]), nil
+	}
 	if e, ok := s.errs[k]; ok {
 		return nil, e
 	}
@@ -92,7 +97,7 @@ func repoConfig(dir string) config.Config {
 		StateDir: dir,
 		Daemon:   config.Daemon{Act: true},
 		Hosts:    []reap.Host{{Name: "local", Jobs: "/jobs"}},
-		Reap:     config.Reap{Enabled: true, WorktreeAfter: "168h", Protect: []string{"*-integrator"}},
+		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", Protect: []string{"*-integrator"}},
 		Repos:    []config.Repo{{Name: "example/project", Branch: "main"}},
 	}
 }
@@ -127,9 +132,11 @@ func worktreeOuts(cwd2 string) map[string]string {
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                               "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD aaaa\nbranch refs/heads/wk/x\n",
 		key("git", "-C", "/repo.wt", "status", "--porcelain"):                                                  "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):                        "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "wk/x"):                                                      "",
+		key("sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7"):                             "yes\n",
 		key("sh", "-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-7/report.md"):                   "yes\n",
 	}
 }
@@ -196,7 +203,7 @@ func TestReapClosesPaneAndRemovesWorktree(t *testing.T) {
 func TestReapCapturesScreenBeforeClose(t *testing.T) {
 	outs := worktreeOuts("/repo")
 	outs[key("sh", "-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-7/report.md")] = "no\n"
-	outs[key("sh", "-c", `mkdir -p -- "$1" && herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", "/jobs/wk-7", "w1:p1")] = ""
+	outs[key("sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", "/jobs/wk-7", "w1:p1")] = ""
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -244,7 +251,7 @@ func TestReapGuards(t *testing.T) {
 	}
 	var sawWorking bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		sawWorking = sawWorking || row["result"] == "skipped" && row["reason"] == "working"
+		sawWorking = sawWorking || row["result"] == "skipped" && row["reason"] == "status:working"
 	}
 	if !sawWorking {
 		t.Fatal("working pane not guarded")
@@ -328,6 +335,7 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                                 "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/wk/x\n",
 		key("git", "-C", "/repo.gone", "status", "--porcelain"):                                                  "",
+		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):                          "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.gone"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "wk/x"):                                                        "",
@@ -346,5 +354,202 @@ func TestReapRejectsBadPRFlag(t *testing.T) {
 	s := svc(t, &reapGH{}, &scriptRunner{})
 	if err := s.Reap(context.Background(), testRepo, -1, Options{}); err == nil {
 		t.Fatal("negative pr accepted")
+	}
+}
+
+func seedReapRows(t *testing.T, s *Service, repo string, rows ...reapReceipt) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(s.reapLog(repo)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	for _, row := range rows {
+		b, _ := json.Marshal(row)
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(s.reapLog(repo), []byte(buf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// failPullGH makes any single-PR fetch fail, so tests prove a receipt-named
+// PR is never refetched once all its worktrees are terminal.
+type failPullGH struct{ reapGH }
+
+func (failPullGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
+	return github.Pull{}, fmt.Errorf("fetch %d failed", pr)
+}
+
+func TestReapClosesOnlyIdleDone(t *testing.T) {
+	for _, st := range []string{"working", "blocked", "waiting", ""} {
+		outs := worktreeOuts("/repo")
+		outs[key("herdr", "agent", "list")] = `{"result":{"agents":[` +
+			`{"pane_id":"w1:p1","name":"wk-7","agent_status":"` + st + `","cwd":"/repo.wt"},` +
+			`{"pane_id":"w1:p2","agent_status":"working","cwd":"/repo"}]}}`
+		r := &scriptRunner{outs: outs}
+		s := svc(t, &reapGH{}, r)
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatalf("status %q: %v", st, err)
+		}
+		if r.called("pane\x00close") {
+			t.Fatalf("status %q pane closed", st)
+		}
+		want := "status:" + st
+		if st == "" {
+			want = "status:unknown"
+		}
+		var saw bool
+		for _, row := range reapLogRows(t, s, "example/project") {
+			saw = saw || row["reason"] == want
+		}
+		if !saw {
+			t.Fatalf("status %q: no %s row", st, want)
+		}
+	}
+}
+
+func TestReapReverifiesBeforeClose(t *testing.T) {
+	agents, _ := paneJSON("/repo")
+	// The discovery list is a stale snapshot: re-read right before close and
+	// require the pane to be present and unchanged.
+	for name, second := range map[string]string{
+		"changed": strings.Replace(agents, `"idle"`, `"working"`, 1),
+		"gone":    `{"result":{"agents":[]}}`,
+	} {
+		r := &scriptRunner{outs: worktreeOuts("/repo"), queue: map[string][]string{
+			key("herdr", "agent", "list"): {agents, second},
+		}}
+		s := svc(t, &reapGH{}, r)
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatal(name, err)
+		}
+		if r.called("pane\x00close\x00w1:p1") {
+			t.Fatal(name, "stale pane closed")
+		}
+		want := "pane-" + name
+		var saw bool
+		for _, row := range reapLogRows(t, s, "example/project") {
+			saw = saw || row["reason"] == want
+		}
+		if !saw {
+			t.Fatalf("%s: no %s row", name, want)
+		}
+	}
+}
+
+func TestReapSkipsPaneWithoutJobDir(t *testing.T) {
+	outs := worktreeOuts("/repo")
+	outs[key("sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7")] = "no\n"
+	r := &scriptRunner{outs: outs}
+	s := svc(t, &reapGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("pane\x00close") || r.called("report.md") || r.called("pane\x00read") {
+		t.Fatal("non-job pane touched")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		saw = saw || row["reason"] == "not-a-job"
+	}
+	if !saw {
+		t.Fatal("not-a-job skip not recorded")
+	}
+}
+
+func TestReapRescansPanesBeforeRemoval(t *testing.T) {
+	_, panes := paneJSON("/repo")
+	// A worker spawned into the worktree after discovery must stop the removal.
+	fresh := `{"result":{"panes":[{"pane_id":"w1:p2","cwd":"/repo"},{"pane_id":"w1:p3","cwd":"/repo.wt"}]}}`
+	r := &scriptRunner{outs: worktreeOuts("/repo"), queue: map[string][]string{
+		key("herdr", "pane", "list"): {panes, fresh},
+	}}
+	s := svc(t, &reapGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("worktree removed under a fresh pane")
+	}
+	var closed, inUse bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		closed = closed || row["result"] == "closed"
+		inUse = inUse || row["action"] == "remove-worktree" && row["reason"] == "pane-in-use"
+	}
+	if !closed || !inUse {
+		t.Fatal("expected pane closed and fresh-pane removal skip")
+	}
+}
+
+func TestReapSkipsTerminalReceiptPRs(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, &failPullGH{}, r)
+	// PR 55's only named worktree already reached a terminal remove outcome:
+	// the pass must not refetch it from GitHub.
+	seedReapRows(t, s, "example/project",
+		reapReceipt{Action: "close-pane", Repo: "example/project", PR: 55, Host: "local", Worktree: "/done.wt", Result: "closed"},
+		reapReceipt{Action: "remove-worktree", Repo: "example/project", PR: 55, Host: "local", Worktree: "/done.wt", Result: "removed"},
+	)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReapFetchErrorPerPR(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, &failPullGH{}, r)
+	// PR 77 still has pending work (closed pane, no remove row): the fetch is
+	// attempted, fails, and only that PR is lost this pass.
+	seedReapRows(t, s, "example/project",
+		reapReceipt{Action: "close-pane", Repo: "example/project", PR: 77, Host: "local", Worktree: "/stale.wt", Result: "closed"},
+	)
+	err := s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "77") {
+		t.Fatalf("expected per-PR error, got %v", err)
+	}
+	var closed bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		closed = closed || row["result"] == "closed" && row["pr"] == 12.0
+	}
+	if !closed {
+		t.Fatal("PR 12 not processed after PR 77 fetch error")
+	}
+}
+
+func TestReapSkipsIgnoredFiles(t *testing.T) {
+	outs := worktreeOuts("/repo")
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .env\n!! notes.md\n"
+	r := &scriptRunner{outs: outs}
+	s := svc(t, &reapGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("gitignored files deleted with the worktree")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		saw = saw || strings.HasPrefix(fmt.Sprint(row["reason"]), "ignored-files:")
+	}
+	if !saw {
+		t.Fatal("ignored-files skip not recorded")
+	}
+}
+
+func TestReapActGate(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	c := repoConfig(t.TempDir())
+	c.Reap.Act = false
+	var buf strings.Builder
+	s := &Service{Config: c, GH: &reapGH{}, Runner: r, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &buf}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("pane\x00close") || r.called("worktree\x00remove") || r.called("branch\x00-d") || r.called("pane\x00read") {
+		t.Fatal("reap acted without reap.act")
+	}
+	if !strings.Contains(buf.String(), "would-close") || !strings.Contains(buf.String(), "would-remove") {
+		t.Fatalf("reap.act off should stay observational: %s", buf.String())
 	}
 }

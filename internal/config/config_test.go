@@ -43,6 +43,8 @@ func TestReapConfig(t *testing.T) {
 	}{
 		{"defaults", "", false},
 		{"enabled", "reap:\n  enabled: true\n", false},
+		{"act", "reap:\n  enabled: true\n  act: true\n", false},
+		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
 		{"bad glob", "reap:\n  protect: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
