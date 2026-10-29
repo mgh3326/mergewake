@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -296,20 +297,60 @@ type Finding struct {
 }
 
 func Marker(sha string) string { return "<!-- mergewake-review:" + sha + " -->" }
-func (c *Client) Reviewed(ctx context.Context, repo string, n int, sha, login string) (bool, error) {
+
+// PassReceipt is the durable per-pass record embedded in each posted review.
+type PassReceipt struct {
+	Pass       int    `json:"pass"`
+	Lens       string `json:"lens,omitempty"`
+	Reviewer   string `json:"reviewer,omitempty"`
+	Family     string `json:"family,omitempty"`
+	SameFamily bool   `json:"same_family"`
+}
+
+func PassMarker(r PassReceipt) string {
+	b, _ := json.Marshal(r)
+	return "<!-- mergewake-pass:" + string(b) + " -->"
+}
+
+var passMarker = regexp.MustCompile(`<!-- mergewake-pass:(\{.*?\}) -->`)
+
+// ReviewPasses lists the completed review passes recorded for an exact head,
+// oldest first. Pass numbers come from the posted meta marker; legacy reviews
+// without one count as sequential passes.
+func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, login string) ([]PassReceipt, error) {
+	var out []PassReceipt
 	if login == "" {
-		return false, errors.New("review.login is required")
+		return out, errors.New("review.login is required")
 	}
 	reviews, e := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
 	if e != nil {
-		return false, e
+		return out, e
 	}
+	next := 1
 	for _, r := range reviews {
-		if r.User.Login == login && r.CommitID == sha && strings.HasPrefix(r.Body, Marker(sha)+"\n") && (r.State == "COMMENTED" || r.State == "APPROVED" || r.State == "CHANGES_REQUESTED") {
-			return true, nil
+		if r.User.Login != login || r.CommitID != sha || !strings.HasPrefix(r.Body, Marker(sha)+"\n") {
+			continue
 		}
+		if r.State != "COMMENTED" && r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		var receipt PassReceipt
+		if m := passMarker.FindStringSubmatch(r.Body); len(m) == 2 {
+			if e := json.Unmarshal([]byte(m[1]), &receipt); e != nil {
+				return out, errors.New("unparseable mergewake pass marker")
+			}
+		}
+		if receipt.Pass <= 0 {
+			receipt.Pass = next
+		}
+		next = receipt.Pass + 1
+		out = append(out, receipt)
 	}
-	return false, nil
+	return out, nil
+}
+func (c *Client) Reviewed(ctx context.Context, repo string, n int, sha, login string) (bool, error) {
+	passes, e := c.ReviewPasses(ctx, repo, n, sha, login)
+	return len(passes) > 0, e
 }
 func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error) {
 	parts := strings.Split(repo, "/")
@@ -385,7 +426,7 @@ func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error
 	return 0, errors.New("review pagination limit")
 }
 
-func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string, findings []Finding) error {
+func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string, findings []Finding, meta PassReceipt) error {
 	comments := []map[string]any{}
 	for _, f := range findings {
 		body := f.Body
@@ -394,7 +435,7 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 		}
 		comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 	}
-	body := Marker(sha) + "\nOne independent diff-only pass. Findings are advisory except under blocking policy."
+	body := Marker(sha) + "\n" + PassMarker(meta) + "\nOne independent diff-only pass (lens: " + meta.Lens + "). Findings are advisory except under blocking policy."
 	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
 }
 
@@ -402,8 +443,11 @@ type Commit struct {
 	SHA     string `json:"sha"`
 	Parents []Ref  `json:"parents"`
 	Commit  struct {
-		Tree    Ref    `json:"tree"`
-		Message string `json:"message"`
+		Tree      Ref    `json:"tree"`
+		Message   string `json:"message"`
+		Committer struct {
+			Date time.Time `json:"date"`
+		} `json:"committer"`
 	} `json:"commit"`
 }
 

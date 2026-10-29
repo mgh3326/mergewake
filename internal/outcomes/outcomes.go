@@ -33,6 +33,7 @@ type Outcome struct {
 	Model        string                    `json:"model"`
 	Effort       string                    `json:"effort"`
 	Family       string                    `json:"family"`
+	SameFamily   bool                      `json:"same_family"`
 	Experiment   string                    `json:"experiment_id"`
 	Arm          string                    `json:"arm"`
 	Grade        string                    `json:"grade"`
@@ -243,7 +244,7 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	}
 	notes, err := json.Marshal(map[string]any{
 		"source": "mergewake", "schema": 1, "sample_key": v.Task, "outcome_id": v.ID, "revision": v.Revision, "supersedes": v.Supersedes,
-		"first_ci_green": v.FirstCIGreen, "findings_by_severity": wire.Findings, "reverted_within_7d": v.Reverted, "time_to_merge_s": v.TimeToMerge,
+		"first_ci_green": v.FirstCIGreen, "findings_by_severity": wire.Findings, "reverted_within_7d": v.Reverted, "time_to_merge_s": v.TimeToMerge, "same_family": v.SameFamily,
 		"experiment_id": v.Experiment, "arm": v.Arm, "evidence": v.Evidence(), "outcome_rule": "first-ci-green+no-critical-high+no-revert-7d/v1", "outcome": wire, "observed_findings_by_severity": v.Findings, "followup": v.Revision > 1,
 	})
 	if err != nil {

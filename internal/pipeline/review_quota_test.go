@@ -47,7 +47,7 @@ func TestRankedFallbackAndOptionalPairings(t *testing.T) {
 	if err := s.Review(context.Background(), repo, 7, "openai", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(runner.gates, ",") != "limited,good" || runner.reviews != 1 || g.claimCount != 1 {
+	if strings.Join(runner.gates, ",") != "limited,good" || runner.reviews != 1 || g.claimCount != 2 {
 		t.Fatal(runner.gates, runner.reviews, g.claimCount)
 	}
 	if !strings.Contains(strings.Join(runner.args, " "), "--safe-mode") {

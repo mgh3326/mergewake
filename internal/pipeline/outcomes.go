@@ -121,6 +121,16 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 				return e
 			}
 			if len(reviews) > 0 {
+				sameFamily := false
+				for head := range reviews {
+					passes, e := s.GH.ReviewPasses(ctx, r.Name, p.Number, head, s.Config.Review.Login)
+					if e != nil {
+						return e
+					}
+					for _, receipt := range passes {
+						sameFamily = sameFamily || receipt.SameFamily
+					}
+				}
 				if e = s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) {
 					if v.Reviews == nil {
 						v.Reviews = map[string]map[string]int{}
@@ -134,6 +144,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 							v.Findings[severity] += n
 						}
 					}
+					v.SameFamily = v.SameFamily || sameFamily
 				}); e != nil {
 					return e
 				}
@@ -207,7 +218,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 	}
 	return nil
 }
-func (s *Service) recordFindings(repo string, pr int, head string, findings []github.Finding, dry bool) error {
+func (s *Service) recordReview(repo string, pr int, head string, findings []github.Finding, receipt github.PassReceipt, dry bool) error {
 	if dry {
 		return nil
 	}
@@ -230,15 +241,17 @@ func (s *Service) recordFindings(repo string, pr int, head string, findings []gi
 				v.Findings[k] += n
 			}
 		}
+		v.SameFamily = v.SameFamily || receipt.SameFamily
 	})
 }
-func (s *Service) recordDecision(repo string, pr int, action string, shadow, dry bool) error {
+func (s *Service) recordDecision(repo string, pr int, action string, shadow, sameFamily, dry bool) error {
 	if dry {
 		return nil
 	}
 	return s.ledger().Update(repo, pr, func(v *outcomes.Outcome) {
 		v.Action = action
 		v.Shadow = shadow
+		v.SameFamily = v.SameFamily || sameFamily
 		if !v.Final {
 			if action == "merge" {
 				v.Decision = "eligible"

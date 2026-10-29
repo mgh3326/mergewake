@@ -125,6 +125,7 @@ func TestRecoveryPauseRequiresBaseRepository(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = true
+			g.reviewed = true
 			g.pull.Head.Ref = github.RecoveryBranch
 			g.pull.Head.Repo.FullName = tt.repo
 			g.checks = map[string]github.CI{shaB: tt.ci, shaA: github.Green}

@@ -30,8 +30,13 @@ type GitHub interface {
 	RecoveryActive(context.Context, string) (bool, error)
 	Check(context.Context, string, string, []string) (github.CI, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
+	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
+	ReviewClaimed(context.Context, string, int, string) (bool, error)
+	ReviewLease(context.Context, string, string, time.Duration) (string, bool, error)
+	ClaimReview(context.Context, string, string, string, time.Duration) (bool, error)
+	ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error)
 	Unresolved(context.Context, string, int) (int, error)
-	PostReview(context.Context, string, int, string, []github.Finding) error
+	PostReview(context.Context, string, int, string, []github.Finding, github.PassReceipt) error
 	Commit(context.Context, string, string) (github.Commit, error)
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
 	MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error)
@@ -98,6 +103,80 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	}
 	return p, p.Validate()
 }
+
+// reviewGate grades only current-head findings. CI bots are optional unless
+// the trusted policy explicitly names them in required_bots. The caller has
+// already verified the mandatory exact-head mergewake passes.
+func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy, head string) (string, *policy.GateVerdict, []string, error) {
+	fb, e := s.GH.ReviewFeedback(ctx, r.Name, n)
+	if e != nil {
+		return "", nil, nil, e
+	}
+	if fb.HeadSHA != head {
+		return "", nil, nil, errors.New("review feedback is not bound to the decision head")
+	}
+	gate := policy.ReviewGate{}.WithDefaults()
+	if p.ReviewGate != nil {
+		gate = p.ReviewGate.WithDefaults()
+	}
+	login := policy.NormalizeAuthor(s.Config.Review.Login)
+	if login != "" {
+		gate.Block = append(gate.Block,
+			policy.ReviewGateRule{Author: login, Severity: []string{"critical", "high", "blocking"}},
+			policy.ReviewGateRule{Author: login, Severity: []string{"major", "medium", "minor", "low", "unspecified", ""}, Classes: []string{"blocking"}})
+	}
+	bots := gate.GateAuthors()
+	for _, a := range gate.IgnoreAuthors {
+		bots[policy.NormalizeAuthor(a)] = true
+	}
+	var fs []policy.ReviewFinding
+	for _, f := range fb.Findings(bots, login) {
+		if f.CommitSHA == head {
+			fs = append(fs, f)
+		}
+	}
+	v := gate.Evaluate(fs, class)
+	missing := gate.MissingRequiredBots(fs, fb.ReviewAuthors, head)
+	switch {
+	case len(v.Blocking) > 0:
+		return "wait-for-blocking-findings", &v, missing, nil
+	case len(v.Triage) > 0:
+		return "wait-for-triage-reply", &v, missing, nil
+	case len(missing) > 0:
+		return "wait-for-required-bots", &v, missing, nil
+	}
+
+	return "", &v, missing, nil
+}
+
+// distinctPasses validates numbered passes and independent lenses when the
+// same reviewer family supplies both passes. Duplicates never add coverage.
+func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
+	passes := map[int]github.PassReceipt{}
+	for _, r := range receipts {
+		if r.Pass < 1 || r.Pass > needed {
+			continue
+		}
+		if prior, ok := passes[r.Pass]; ok && prior != r {
+			return len(passes), false
+		}
+		passes[r.Pass] = r
+	}
+	if len(passes) < needed {
+		return len(passes), false
+	}
+	if needed == 2 {
+		a, b := passes[1], passes[2]
+		if a.Family == "" || b.Family == "" {
+			return len(passes), false
+		}
+		if a.Family == b.Family && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
+			return len(passes), false
+		}
+	}
+	return len(passes), true
+}
+
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -131,7 +210,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if len(files) != pr.ChangedFiles {
 		return errors.New("incomplete PR file list")
 	}
-	d := p.Classify(files)
+	d := p.ClassifyGuarded(files, r.Policy)
 	d.Shadow = d.Shadow || o.Shadow
 	d.Action = "wait-for-ci"
 	// While main is red or its required evidence is unknown, ordinary landing
@@ -159,37 +238,55 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
+	var verdict *policy.GateVerdict
+	var missingBots []string
+	var reviewed *int
+	sameFamily := false
 	if !paused && ci == github.Green {
 		d.Action = "merge"
+		needed := 1
 		if d.Class == "blocking" {
-			done, e := s.GH.Reviewed(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+			needed = 2
+		}
+		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+		if e != nil {
+			return e
+		}
+		count, complete := distinctPasses(receipts, needed)
+		reviewed = &count
+		for _, receipt := range receipts {
+			sameFamily = sameFamily || receipt.SameFamily
+		}
+		if !complete {
+			d.Action = "wait-for-independent-review"
+		}
+
+		if d.Action == "merge" {
+			action, v, g, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
 			if e != nil {
 				return e
 			}
-			if !done {
-				d.Action = "wait-for-independent-review"
-			} else {
-				count, e := s.GH.Unresolved(ctx, r.Name, n)
-				if e != nil {
-					return e
-				}
-				if count > 0 {
-					d.Action = "wait-for-findings"
-				}
+			verdict, missingBots = v, g
+			if action != "" {
+				d.Action = action
 			}
 		}
 	}
 	if e = s.audit(r.Name, "land", struct {
-		PR   int       `json:"pr"`
-		Head string    `json:"head"`
-		Base string    `json:"base"`
-		CI   github.CI `json:"ci"`
-		Main github.CI `json:"main"`
+		PR          int                 `json:"pr"`
+		Head        string              `json:"head"`
+		Base        string              `json:"base"`
+		CI          github.CI           `json:"ci"`
+		Main        github.CI           `json:"main"`
+		Reviews     *int                `json:"review_passes,omitempty"`
+		Findings    *policy.GateVerdict `json:"findings,omitempty"`
+		MissingBots []string            `json:"missing_required_bots,omitempty"`
+		SameFamily  bool                `json:"same_family,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, ci, mainCI, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, ci, mainCI, reviewed, verdict, missingBots, sameFamily, d}, o.DryRun); e != nil {
 		return e
 	}
-	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, o.DryRun); e != nil {
+	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, sameFamily, o.DryRun); e != nil {
 		return e
 	}
 	if d.Action != "merge" || d.Shadow || o.DryRun {
@@ -217,14 +314,24 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft {
 		return errors.New("PR changed during decision")
 	}
+	needed := 1
 	if d.Class == "blocking" {
-		count, e := s.GH.Unresolved(ctx, r.Name, n)
-		if e != nil {
-			return e
-		}
-		if count > 0 {
-			return errors.New("review findings changed during decision")
-		}
+		needed = 2
+	}
+	receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	if e != nil {
+		return e
+	}
+	if _, complete := distinctPasses(receipts, needed); !complete {
+		return errors.New("review passes changed during decision")
+	}
+
+	action, _, _, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
+	if e != nil {
+		return e
+	}
+	if action != "" {
+		return errors.New("review findings changed during decision")
 	}
 	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
 		return e

@@ -167,14 +167,36 @@ Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
 refused. Codex effort becomes a TOML override; Kimi effort is set in its isolated
 model config from `gate_effort`. Use concrete model IDs from the installed CLI.
 
-Selection preserves the quota tool's ranked `rows` order, admits only
-`kind: candidate` rows, filters out the author's family, and tries quota gates
-in order. Unknown profiles are skipped. `gate_effort` must match an explicit
-recommended effort; it is also passed to the gate. Missing executables and failed
-gates fall through. A failed recommendation fails closed. After a head claim and
-model invocation, failures or invalid output retain the claim; there is no second
-model pass or output repair. Dry-run and shadow may read recommendations but
-never invoke a reviewer, gate, claim or post a review.
+Selection preserves the quota tool's ranked `rows` order and admits only
+`kind: candidate` rows. Routine changes need one diff-only pass on the exact PR
+head; blocking paths need two. For each pass the reviewer is chosen in this
+order: a different model family than the author, preferring `pairings` order and
+families not already used on this head; any different family; the author's
+family with a different model (from `Mergewake-Author-Model` or the configured
+author profile's `--model`); the author's family at all; and finally any
+admitted profile in a fresh diff-only call. Review never stops merely because
+no different-family reviewer has quota; only an empty eligible set fails.
+Unknown profiles are skipped. `gate_effort` must match an explicit recommended
+effort; it is also passed to the gate. Missing executables and failed gates
+fall through. A failed recommendation fails closed. After a head claim and
+model invocation, failures or invalid output retain a lease until the configured
+review timeout plus one minute. An expired claim can be reclaimed for a fresh
+call; there is no output repair or retry within the same lease. Dry-run and shadow may read recommendations
+but never invoke a reviewer, gate, claim or post a review.
+
+Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
+invoking the model. When every required pass is posted, the
+`mergewake/reviews/<pr>/<head>-done` marker is created and the daemon skips
+that head. An interrupted pass retains a timestamped empty-commit lease. After
+`review.timeout` plus one minute it is reclaimed automatically with a
+fast-forward ref update; competing renewals cannot both win. Legacy claims use
+their commit date for expiry. Unknown claim timestamps fail closed. Posted reviews embed a `mergewake-pass` JSON marker recording
+the pass number, lens, reviewer profile, family, and `same_family` flag;
+receipts and outcomes bind to the exact PR head, so a head change invalidates
+them. Blocking PRs use a correctness/regressions lens for pass 1 and a
+state/migration/security/deploy lens for pass 2, including after quota fallbacks.
+Landing counts distinct pass numbers and requires distinct lenses when the
+reviewer family is the same. Routine PRs use the default lens.
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
@@ -349,7 +371,8 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
-| `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. |
+| `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
+| `review_gate` | Absent | Graded review-thread enforcement described below. Defaults apply even when absent. CI bots are optional unless required_bots names them. |
 
 Each blocking rule has:
 
@@ -364,6 +387,67 @@ segment and spans zero or more components. Ordinary `*` never crosses `/`.
 Leading `/`, backslashes, empty segments and `..` are refused. Blocking rules
 combine with OR; there are no per-rule merge overrides, finding severity bypasses,
 or advisory rounds for blocking findings.
+
+Each `review_gate` rule has an `author` (a normalized bot login), a nonempty
+`severity` list, and an optional `classes` list (`blocking`, `routine`; empty
+means both). Severities come from a `<!-- mergewake-severity:... -->` marker in
+the thread's first comment, or prose conventions: `critical`, `major`, `minor`,
+`nitpick` for CodeRabbit; `p1`, `p2`, `p3` for the Codex connector; plus
+`blocking`, `high`, `medium`, `low` for mergewake's own review. A thread is
+*answered* when a known human other than the PR author and finding author replies.
+GraphQL `Bot` actors never count as humans, including logins without a bot suffix.
+Answers apply only to that thread's triage findings; they never clear a block.
+Only threads whose first finding comment belongs to the **current PR head SHA**
+participate in the decision. Old-head comments and reviews do not establish
+current-head bot evidence. On the current head, CodeRabbit Critical and Codex P1
+block, CodeRabbit Major and Codex P2 require a reply or fix, and CodeRabbit
+Minor/Nitpick and Codex P3 are ignored. A bot resolution clears a finding only
+when `resolvedBy.__typename` is `Bot`, it is the same reviewing bot, and it is
+neither the PR author nor `review.login`. `ignore_bot_resolved: false` disables
+that exemption. `ignore_outdated` permits Major findings to clear after their
+lines change; it never clears a current-head mergewake finding.
+
+The configured `review.login`'s current-head critical/high findings hold every
+PR. Its findings of any severity hold blocking paths, including medium, low and
+unspecified findings. Resolving or outdating these threads cannot clear them,
+even if that account has type `Bot`: clearing needs a **new head plus a new
+mergewake review**. Every PR requires a completed mergewake review on its exact
+head, with two distinct passes for blocking paths. Unknown severity from a
+gate-listed author or a ghost author still requires triage on blocking paths.
+
+CodeRabbit and the Codex connector are purely optional by default. Landing
+never waits for their absence and does not record or mention missing optional
+coverage. There is no grace timer. Current-head findings they do post retain
+the severity rules above. A repository may explicitly opt in with
+`review_gate.required_bots: [coderabbitai, chatgpt-codex-connector]` (default
+empty): only that list can cause `wait-for-required-bots`, and only reviews or
+threads on the current head satisfy it. Missing required bots appear as
+`missing_required_bots` in the decision receipt.
+
+Present-but-empty fields take these defaults:
+
+```yaml
+review_gate:
+  required_bots: []
+  block:
+    - {author: coderabbitai, severity: [critical]}
+    - {author: chatgpt-codex-connector, severity: [p1]}
+  triage:
+    - {author: coderabbitai, severity: [major]}
+    - {author: chatgpt-codex-connector, severity: [p2]}
+  ignore_authors: [qlty, commitcheck, wip, accesslint, codecov, gitguardian]
+  ignore_outdated: true
+  ignore_bot_resolved: true
+```
+
+Pass receipts trust the configured `review.login`, exact commit SHA, and the
+mergewake marker. They are not cryptographically signed or independently
+attested. If PR authors or other sessions can post as `review.login`, they can
+forge a matching pass. This shared-identity risk remains; use a dedicated review
+identity and protect its credentials where independent provenance is required.
+
+Older mergewake versions cannot parse `review_gate`; enable the section only
+after every landing host runs a release that understands it.
 
 The repository's policy should cover its own verification controls where changing
 them can admit irreversible actions. A PR cannot use its own new policy to grant
@@ -432,9 +516,13 @@ this avoids an immediate unintended retry. No dry run clears locks or recovers a
 journal.
 
 For a failed independent review, inspect
-`mergewake/reviews/<PR>/<full-head-SHA>` and GitHub reviews first. Only delete the
-claim if no reviewer remains active and no complete review was posted; then a
-rerun can attempt that head. Completed claims can remain as evidence.
+`mergewake/reviews/<PR>/<full-head-SHA>` (plus `-p2` for a second pass) and
+GitHub reviews first. Only delete a claim if no reviewer remains active and no
+complete review was posted; then a rerun can attempt that head. The
+`mergewake/reviews/<PR>/<full-head-SHA>-done` marker is created only when every required pass is
+posted; removing it makes the daemon re-check the head, while retained pass
+claims still prevent duplicate model invocation. Completed claims can remain as
+evidence.
 
 For CI recovery, inspect the revert PR, the fixed `mergewake-recovery-latch` tag,
 and any `mergewake/recovery` branch. After recovery is complete, an operator may
