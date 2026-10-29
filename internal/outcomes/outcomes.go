@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,7 +88,19 @@ type Event struct {
 	Outcome *Outcome  `json:"outcome,omitempty"`
 	Rep     string    `json:"rep,omitempty"`
 }
-type Ledger struct{ Dir string }
+type Ledger struct {
+	Dir string
+	// Now stamps events and outcome revisions; nil means time.Now.
+	Now func() time.Time
+}
+
+func (l Ledger) now() time.Time {
+	if l.Now != nil {
+		return l.Now()
+	}
+	return time.Now()
+}
+
 type State struct {
 	Latest    map[string]Outcome
 	Published map[string]string
@@ -170,7 +184,7 @@ func (l Ledger) Update(repo string, pr int, fn func(*Outcome)) error {
 			return nil
 		}
 		v.Revision++
-		v.UpdatedAt = time.Now().UTC()
+		v.UpdatedAt = l.now().UTC()
 		v.Supersedes = v.ID
 		v.ID = ""
 		data, _ := json.Marshal(v)
@@ -288,7 +302,7 @@ func (l Ledger) Flush(ctx context.Context, reps Reps) error {
 				errs = append(errs, fmt.Errorf("%s: %w", key, err))
 				continue
 			}
-			if err = appendEvent(f, Event{Version: 1, ID: v.ID, At: time.Now().UTC(), Kind: "published", Rep: rep}); err != nil {
+			if err = appendEvent(f, Event{Version: 1, ID: v.ID, At: l.now().UTC(), Kind: "published", Rep: rep}); err != nil {
 				return err
 			}
 		}
@@ -328,7 +342,8 @@ func Report(values []Outcome, since time.Time) []Aggregate {
 		}
 	}
 	groups := map[string]*Aggregate{}
-	for _, v := range latest {
+	for _, task := range slices.Sorted(maps.Keys(latest)) {
+		v := latest[task]
 		if !since.IsZero() && v.OpenedAt.Before(since) {
 			continue
 		}

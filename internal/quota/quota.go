@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -33,6 +34,8 @@ type Provider interface {
 type CLI struct {
 	Runner  integrations.Runner
 	Command string
+	// Now anchors pace projections; nil means time.Now.
+	Now func() time.Time
 }
 
 func (c CLI) Recommend(ctx context.Context, grade string) ([]Candidate, error) {

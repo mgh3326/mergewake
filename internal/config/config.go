@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -411,7 +413,8 @@ func Load(name string) (Config, error) {
 	if c.Sink.ReopenState != "reopened" {
 		return c, errors.New("sink.reopen_state must be reopened")
 	}
-	for name, p := range c.Review.Profiles {
+	for _, name := range slices.Sorted(maps.Keys(c.Review.Profiles)) {
+		p := c.Review.Profiles[name]
 		if name == "" || p.Family == "" || !ReviewerCommand(p.Command) {
 			return c, errors.New("review profiles require a name, family, and supported reviewer command")
 		}
@@ -422,7 +425,8 @@ func Load(name string) (Config, error) {
 	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
 		return c, errors.New("review.select must be pace or rank")
 	}
-	for family, names := range c.Review.Pairings {
+	for _, family := range slices.Sorted(maps.Keys(c.Review.Pairings)) {
+		names := c.Review.Pairings[family]
 		if family == "" || len(names) == 0 {
 			return c, errors.New("empty review pairing")
 		}

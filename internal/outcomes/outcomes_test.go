@@ -175,3 +175,26 @@ func TestRepMappingAndSuccessBeforeAck(t *testing.T) {
 		t.Fatal(err, r.calls)
 	}
 }
+
+func TestLedgerFixedClockIsReproducible(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	var ids []string
+	for range 2 {
+		ledger := Ledger{Dir: t.TempDir(), Now: func() time.Time { return at }}
+		if err := ledger.Update("example/project", 1, complete); err != nil {
+			t.Fatal(err)
+		}
+		state, err := ledger.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := state.Latest[Key("example/project", 1)]
+		if !v.UpdatedAt.Equal(at) {
+			t.Fatalf("updated_at %v, want %v", v.UpdatedAt, at)
+		}
+		ids = append(ids, v.ID)
+	}
+	if ids[0] == "" || ids[0] != ids[1] {
+		t.Fatalf("same input and clock gave different outcome IDs: %v", ids)
+	}
+}

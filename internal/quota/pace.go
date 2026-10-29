@@ -81,7 +81,11 @@ func (c CLI) Usage(ctx context.Context) (Usage, error) {
 	if err != nil {
 		return Usage{}, err
 	}
-	return ParseUsage(b, time.Now())
+	now := time.Now
+	if c.Now != nil {
+		now = c.Now
+	}
+	return ParseUsage(b, now())
 }
 
 func ParseUsage(b []byte, now time.Time) (Usage, error) {

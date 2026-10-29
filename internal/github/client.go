@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -254,7 +256,8 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 			latest[s.Context] = s
 		}
 	}
-	for name, s := range latest {
+	for _, name := range slices.Sorted(maps.Keys(latest)) {
+		s := latest[name]
 		v := Pending
 		switch s.State {
 		case "success":

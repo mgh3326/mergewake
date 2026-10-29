@@ -61,7 +61,7 @@ func (s *Service) reapReceipts(repo string) ([]reapReceipt, error) {
 }
 
 func (s *Service) reapNote(v reapReceipt, dry bool) error {
-	v.Time = time.Now().UTC()
+	v.Time = s.now().UTC()
 	if e := s.Print(v); e != nil {
 		return e
 	}
@@ -201,7 +201,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if len(s.Config.Hosts) == 0 {
 		return errors.New("reap requires configured hosts")
 	}
-	now := time.Now()
+	now := s.now()
 	// reap.act is the role's own acting gate, separate from daemon.act:
 	// without it every mode stays observational no matter what --apply says.
 	acting := !o.DryRun && !o.Shadow && s.Config.Reap.Act

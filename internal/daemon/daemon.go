@@ -127,24 +127,20 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, len(loops))
-	for _, loop := range loops {
+	// One slot per loop keeps the joined error in configuration order.
+	errs := make([]error, len(loops))
+	for i, loop := range loops {
 		wg.Add(1)
-		go func(l Loop) {
+		go func(i int, l Loop) {
 			defer wg.Done()
 			if err := d.runLoop(ctx, l); err != nil {
-				errs <- err
+				errs[i] = err
 				cancel()
 			}
-		}(loop)
+		}(i, loop)
 	}
 	wg.Wait()
-	close(errs)
-	var all []error
-	for err := range errs {
-		all = append(all, err)
-	}
-	return errors.Join(all...)
+	return errors.Join(errs...)
 }
 func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 	st := Status{Host: d.Host, Role: l.Role}
