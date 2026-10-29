@@ -49,7 +49,7 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	if !strings.Contains(text, "lane=config-lane via config") {
 		t.Fatal(text)
 	}
-	if n.events[0].ID != "mergewake-ready-example/project-7-aaaaaaa" || n.events[0].Lane != "config-lane" {
+	if n.events[0].ID != "mergewake-ready-example/project-7-"+shaA || n.events[0].Lane != "config-lane" {
 		t.Fatalf("%+v", n.events[0])
 	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
@@ -75,6 +75,27 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	}
 	if n.count != 2 || !strings.Contains(lastEvent(t, n), "head=ccccccc") {
 		t.Fatalf("new head not notified: %d", n.count)
+	}
+}
+
+// Event IDs carry the full head SHA: two heads sharing a seven-character
+// prefix are distinct events, matching the dedupe key's granularity.
+func TestNotifyEventIDUsesFullHead(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	// Same sha7 prefix as shaA, different tail — a new head must re-notify
+	// under a distinct event ID rather than colliding with the first.
+	g.pull.Head.SHA = shaA[:7] + strings.Repeat("d", 33)
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n.count != 2 {
+		t.Fatalf("prefix-colliding head not notified: %d", n.count)
+	}
+	if n.events[0].ID == n.events[1].ID || !strings.HasSuffix(n.events[1].ID, shaA[:7]+strings.Repeat("d", 33)) {
+		t.Fatalf("%+v", n.events)
 	}
 }
 

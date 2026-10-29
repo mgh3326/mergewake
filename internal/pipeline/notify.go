@@ -194,7 +194,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, n, sha7),
+		ID:   fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, n, pr.Head.SHA),
 		Text: text,
 		Lane: lane,
 	}); e != nil {
