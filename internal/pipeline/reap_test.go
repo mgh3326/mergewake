@@ -544,6 +544,31 @@ func TestReapReceiptRefetchBackoff(t *testing.T) {
 	}
 }
 
+func TestReapDryRunBoundsRefetch(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, &failPullGH{}, r)
+	// Even under --dry-run the check-pr stamp is written: it records a
+	// GitHub call that really happened, so repeated dry-run polls stay
+	// bounded like acting ones.
+	seedReapRows(t, s, "example/project",
+		reapReceipt{Action: "close-pane", Repo: "example/project", PR: 77, Host: "local", Worktree: "/stale.wt", Result: "closed", Time: time.Now().Add(-25 * time.Hour).UTC()},
+	)
+	err := s.Reap(context.Background(), testRepo, 0, Options{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "77") {
+		t.Fatalf("stale row should refetch even in dry-run: %v", err)
+	}
+	var stamped bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		stamped = stamped || row["action"] == "check-pr" && row["pr"] == float64(77)
+	}
+	if !stamped {
+		t.Fatal("dry-run refetch left no check-pr stamp")
+	}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{DryRun: true}); err != nil {
+		t.Fatalf("dry-run refetch should back off for a day: %v", err)
+	}
+}
+
 func TestReapFetchErrorPerPR(t *testing.T) {
 	r := &scriptRunner{outs: worktreeOuts("/repo")}
 	s := svc(t, &failPullGH{}, r)

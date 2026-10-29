@@ -304,7 +304,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			// Stamp the attempt before the call: identical outcomes are
 			// deduped and never write a row, so without this a persistent
 			// skip would refetch every pass once the newest row aged out.
-			if e := s.reapNote(reapReceipt{Action: "check-pr", Repo: r.Name, PR: rec.PR, Result: "checked"}, o.DryRun); e != nil {
+			// The stamp persists even under --dry-run — it is bookkeeping for
+			// the GitHub call that just happened, so repeated dry-run polls
+			// stay bounded too.
+			if e := s.reapNote(reapReceipt{Action: "check-pr", Repo: r.Name, PR: rec.PR, Result: "checked"}, false); e != nil {
 				errs = append(errs, e)
 			}
 			p, e := s.GH.Pull(ctx, r.Name, rec.PR)
