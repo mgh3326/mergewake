@@ -58,6 +58,12 @@ func TestPaceProjectsUseAtReset(t *testing.T) {
 	if p := u.Pace("burning", "model", false); !strings.Contains(p.Reason, "projected 200% at 7d reset") {
 		t.Fatal(p)
 	}
+	if got := u.Pace("credit", "model", false).String(); got != "credit 25% of credit" {
+		t.Fatal(got)
+	}
+	if got := u.Pace("waste", "model", false).String(); got != "waste 50% at 5h reset" {
+		t.Fatal(got)
+	}
 }
 
 func TestPaceSkipsUnknown(t *testing.T) {

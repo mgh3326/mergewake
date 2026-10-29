@@ -200,7 +200,7 @@ admitted profile is placed by the pool its recommendation row names (`pool`):
 
 The chosen reviewer's pool, tier and projection are recorded as `pace` in the
 review audit event (stdout and `decisions.jsonl`); dry-run prints the pace of
-every candidate. `pairings`, when set, fixes the order of other-family
+every candidate and lists skipped profiles with their reason (`pace_skipped`). `pairings`, when set, fixes the order of other-family
 reviewers ahead of pace but never admits a skipped pool. `select: rank` preserves the quota tool's ranked `rows` order
 instead, for quota tools without pools or a usage snapshot. Routine changes need one diff-only pass on the exact PR
 head; blocking paths need two. For each pass the reviewer is chosen in this

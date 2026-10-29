@@ -70,6 +70,9 @@ func (p Pace) String() string {
 	case TierSkip:
 		return fmt.Sprintf("%s skipped: %s", p.Pool, p.Reason)
 	}
+	if p.Window == "credit" {
+		return fmt.Sprintf("%s %.0f%% of credit", p.Pool, p.Projected)
+	}
 	return fmt.Sprintf("%s %.0f%% at %s reset", p.Pool, p.Projected, p.Window)
 }
 
@@ -159,6 +162,9 @@ func (u Usage) Pace(pool, model string, free bool) Pace {
 		}
 		if projected > out.Projected {
 			out.Projected, out.Window = projected, firstNonEmpty(b.Label, b.Window)
+			if b.Window == "credit" {
+				out.Window = "credit"
+			}
 		}
 		if tier > out.Tier {
 			out.Tier = tier

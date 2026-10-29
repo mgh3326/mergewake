@@ -108,7 +108,7 @@ func TestPaceKeepsFamilyRuleAboveWaste(t *testing.T) {
 	if runner.reviews != 0 || len(runner.gates) != 0 {
 		t.Fatal("dry run acted")
 	}
-	if !strings.Contains(s.Out.(*bytes.Buffer).String(), `"candidates":["other","same"]`) {
+	if out := s.Out.(*bytes.Buffer).String(); !strings.Contains(out, `"candidates":["other","same"]`) || !strings.Contains(out, `"other: busy 94% at 7d reset"`) {
 		t.Fatal(s.Out)
 	}
 }

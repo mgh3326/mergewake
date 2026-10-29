@@ -259,14 +259,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if byPace {
 		rankedOrder = quota.Order(rankedOrder, paces)
 	}
+	var tight []string
+	for _, name := range names {
+		if p, ok := paces[name]; ok && p.Tier == quota.TierSkip {
+			tight = append(tight, name+" ("+p.String()+")")
+		}
+	}
 	// unavailable explains an empty candidate list instead of a bare refusal.
 	unavailable := func() error {
-		var tight []string
-		for _, name := range names {
-			if p, ok := paces[name]; ok && p.Tier == quota.TierSkip {
-				tight = append(tight, name+" ("+p.String()+")")
-			}
-		}
 		if len(tight) > 0 {
 			return fmt.Errorf("%w: every admitted reviewer is projected to exhaust its pool or is unmeasured: %s", ErrReviewUnavailable, strings.Join(tight, ", "))
 		}
@@ -345,7 +345,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			out = append(out, row)
 		}
-		return s.Print(map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true})
+		plan := map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true}
+		if len(tight) > 0 {
+			plan["pace_skipped"] = tight
+		}
+		return s.Print(plan)
 	}
 	diff, e := s.GH.Diff(ctx, r.Name, n)
 	if e != nil {
