@@ -100,12 +100,27 @@ type Loop struct {
 	Enabled  bool   `yaml:"enabled"`
 	Interval string `yaml:"interval"`
 }
+
+// PRNotify gates the pr role's READY/BLOCKED lane events. Absent means enabled;
+// `notify: {enabled: false}` silences them.
+type PRNotify struct {
+	Enabled *bool `yaml:"enabled"`
+}
+
+func (n PRNotify) On() bool { return n.Enabled == nil || *n.Enabled }
+
+// PRLoop extends the shared loop keys with the notify gate; other roles reject
+// the key as an unknown field.
+type PRLoop struct {
+	Loop   `yaml:",inline"`
+	Notify PRNotify `yaml:"notify"`
+}
 type Daemon struct {
-	PR      Loop `yaml:"pr"`
-	Watch   Loop `yaml:"watch"`
-	Release Loop `yaml:"release"`
-	Rollout Loop `yaml:"rollout"`
-	Act     bool `yaml:"act"`
+	PR      PRLoop `yaml:"pr"`
+	Watch   Loop   `yaml:"watch"`
+	Release Loop   `yaml:"release"`
+	Rollout Loop   `yaml:"rollout"`
+	Act     bool   `yaml:"act"`
 }
 type Reap struct {
 	Enabled       bool     `yaml:"enabled"`
@@ -193,7 +208,7 @@ func Load(name string) (Config, error) {
 	if _, e = Duration(c.PollInterval); e != nil {
 		return c, e
 	}
-	for _, loop := range []*Loop{&c.Daemon.PR, &c.Daemon.Watch, &c.Daemon.Release, &c.Daemon.Rollout} {
+	for _, loop := range []*Loop{&c.Daemon.PR.Loop, &c.Daemon.Watch, &c.Daemon.Release, &c.Daemon.Rollout} {
 		if loop.Interval == "" {
 			loop.Interval = c.PollInterval
 		}

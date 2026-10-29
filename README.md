@@ -117,6 +117,47 @@ preserved container on failure, and garbage-collect old images. `rollout --adopt
 records a hand-started container; `status` reports its digest and health. See
 [examples/container.yaml](examples/container.yaml).
 
+## PR lane notifications
+
+While the `pr` role is enabled, each poll recomputes the land decision for every
+open PR at its current head and tells the owning lane once that head becomes
+mergeable or blocked — workers do not need to watch CI. Notification is
+observation, not merging, so it also runs while the daemon is in shadow mode;
+`--dry-run` only prints the decision.
+
+```text
+[mergewake] READY example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
+[mergewake] BLOCKED example/project#7 head=a1b2c3d | failing checks: vet,test | lane=worker-lane via task 2252
+[mergewake] BLOCKED example/project#7 head=a1b2c3d | needs 2nd review; open blocking findings: 1 | lane=operator-desk via config
+```
+
+READY means green required checks, the required independent review passes for
+the change class, a clean review gate, no merge conflicts, and green main —
+the same inputs `land` merges on. BLOCKED names the reason: `failing checks:
+<names>` when a required check fails, `open blocking findings: N` or
+`unanswered findings: N` for held review threads, `needs review` /
+`needs 2nd review` / `needs N reviews` for missing passes, `missing required
+reviews: <bots>` for opted-in bots that have not reviewed this head,
+`conflicts` when GitHub reports the PR unmergeable, and `main CI red` while
+the configured branch is failing. Pending or missing check evidence emits
+nothing. Each `(PR, head, state)` emits at most once; a new head re-arms the
+notification and sent keys persist across daemon restarts under
+`<state_dir>/<repo>/pr-notify-sent`.
+
+The lane is resolved, never guessed, in this order — the choosing rule is
+recorded in the event text after `via`:
+
+1. `Mergewake-Task: <id>` trailer — PR body first, then the head commit
+   message — read through the configured handoffkeep sink (`tasks show`); a
+   read error retries instead of rerouting.
+2. `Mergewake-Notify-Lane: <lane>` trailer, in the same order.
+3. The configured `notifier.lane`.
+
+Events go through the existing notifier (`panewire emit --kind lane.event
+--lane <lane> --event-id mergewake-<state>-<repo>-<n>-<sha7>`); per-event
+lanes override the configured one. Disable the feature with
+`daemon.pr.notify: {enabled: false}` — it defaults to on while the role runs.
+
 ## Development
 
 ```sh

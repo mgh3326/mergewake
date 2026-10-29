@@ -22,7 +22,7 @@ func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) (
 		return nil, errors.New("offline")
 	}
 	if len(a) > 1 && a[0] == "tasks" && a[1] == "show" {
-		return []byte(`{"state":"merged"}`), nil
+		return []byte(`{"state":"merged","lane":"task-lane"}`), nil
 	}
 	return nil, nil
 }
@@ -54,6 +54,45 @@ func TestAdaptersUseArgumentVectors(t *testing.T) {
 		t.Fatal(r.calls)
 	}
 }
+func TestNotifyLaneOverrideAndTaskLane(t *testing.T) {
+	r := &fakeRunner{}
+	p := Panewire{Runner: r, Command: "panewire", Lane: "config-lane"}
+	if e := p.Notify(context.Background(), Event{ID: "event-a", Text: "text", Lane: "task-lane"}); e != nil {
+		t.Fatal(e)
+	}
+	args := r.calls[0].args
+	lane := ""
+	for i, a := range args {
+		if a == "--lane" {
+			lane = args[i+1]
+		}
+	}
+	if lane != "task-lane" {
+		t.Fatalf("event lane ignored: %v", args)
+	}
+	if e := p.Notify(context.Background(), Event{ID: "event-b", Text: "text"}); e != nil {
+		t.Fatal(e)
+	}
+	args = r.calls[1].args
+	lane = ""
+	for i, a := range args {
+		if a == "--lane" {
+			lane = args[i+1]
+		}
+	}
+	if lane != "config-lane" {
+		t.Fatalf("config lane not used: %v", args)
+	}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
+	lane, e := h.Lane(context.Background(), "42")
+	if e != nil || lane != "task-lane" {
+		t.Fatalf("lane=%q err=%v", lane, e)
+	}
+	if e := func() error { _, e := h.Lane(context.Background(), "x"); return e }(); e == nil {
+		t.Fatal("invalid task accepted")
+	}
+}
+
 func TestAdapterErrorsPropagate(t *testing.T) {
 	r := &fakeRunner{fail: true}
 	if (Panewire{r, "panewire", "lane-a"}).Notify(context.Background(), Event{}) == nil {
