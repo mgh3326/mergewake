@@ -91,7 +91,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
-| `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches a path segment anywhere; one with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
+| `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role close merged-PR sessions, then clean their worktrees once they
@@ -138,7 +138,9 @@ a worktree whose pane already closed still gets cleaned.
 
 Every decision is appended to `<state_dir>/<repo>/reap.jsonl` — including
 shadow `would-*` rows, which is how a later pass still finds a worktree it
-planned earlier. Dry-run prints rows without writing the file. A receipt-named
+planned earlier. Dry-run prints rows without writing them — the one
+exception is the `check-pr` stamp, which records a GitHub call that really
+happened so repeated dry-run polls stay bounded too. A receipt-named
 PR is refetched only while it still has pending work and at most once a day —
 each attempt appends a `check-pr` row whose timestamp bounds the next try —
 so once every worktree its rows named reached `removed` or `worktree-gone` it

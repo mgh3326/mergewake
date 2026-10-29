@@ -192,7 +192,10 @@ an open recovery nor one merged within seven days, the worktree must still be
 registered, unlocked, clean and unattached, and every gitignored file it
 holds (`git status --porcelain --ignored`) must match the `reap.regenerable`
 allowlist — expendable build and cache output like `.venv`, `node_modules`
-or `dist`; anything else (`.env`, notes, unknown output) refuses removal
+or `dist`. A slash-free pattern matches only the ignored entry's last
+segment, so an ignored `bin/local.env` inside a tracked `bin/` cannot ride
+the `bin` name past the refusal; anything else (`.env`, notes, unknown
+output) refuses removal
 rather than let `worktree remove` delete it silently, with the refusing
 paths in the receipt's `files` field and a count-plus-hash
 `ignored-files:N-xxxxxxxx` reason. No live pane (from `herdr pane list`,
@@ -205,8 +208,9 @@ worktree survives its pane's earlier close. Anything unknown or ambiguous is
 skipped with a reason rather than deleted. A receipt-named PR stops being
 refetched once every worktree its rows named reached `removed` or
 `worktree-gone`; otherwise each refetch attempt stamps a `check-pr` row so
-persistent skips poll GitHub at most once a day, and one PR's fetch failure
-never aborts the pass.
+persistent skips poll GitHub at most once a day — the stamp is written even
+under `--dry-run`, since the GitHub call really happened — and one PR's
+fetch failure never aborts the pass.
 
 ## Manifests and verified installs
 

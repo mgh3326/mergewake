@@ -370,26 +370,28 @@ func Protected(name string, globs []string) bool {
 
 // Regenerable reports whether an ignored path inside a worktree matches the
 // regenerable allowlist — throwaway output that rebuilds on demand and is
-// safe to lose with the worktree. Gitignore semantics apply: a pattern
-// without a slash matches any single path segment (node_modules anywhere),
-// while a pattern containing a slash must match the whole path.
+// safe to lose with the worktree. A pattern containing a slash must match
+// the whole path; a slash-free pattern names a regenerable directory or
+// file and may match only the ignored entry's last segment — matching an
+// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file
+// like bin/local.env past the refusal.
 func Regenerable(globs []string, path string) bool {
 	p := strings.Trim(path, "/")
+	base := p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		base = p[i+1:]
+	}
 	for _, g := range globs {
 		g = strings.Trim(g, "/")
 		if g == "" {
 			continue
 		}
+		match := base
 		if strings.Contains(g, "/") {
-			if ok, _ := policy.Match(g, p); ok {
-				return true
-			}
-			continue
+			match = p
 		}
-		for _, seg := range strings.Split(p, "/") {
-			if ok, _ := policy.Match(g, seg); ok {
-				return true
-			}
+		if ok, _ := policy.Match(g, match); ok {
+			return true
 		}
 	}
 	return false

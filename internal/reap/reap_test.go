@@ -265,7 +265,11 @@ func TestRegenerable(t *testing.T) {
 		{"__pycache__/", true}, {".pytest_cache/", true}, {"dist/", true},
 		{"build/", true}, {"target/", true}, {"obj/", true}, {"bin/", true},
 		{"Library/", true}, {"Temp/", true}, {"Logs/", true}, {"UserSettings/", true},
-		{"a/dist", true}, {"pkg/build/x", true},
+		{"a/dist", true},
+		// Slash-free patterns match the last segment only: an ignored file
+		// inside a tracked dir is not regenerable just because an ancestor
+		// shares the name.
+		{"pkg/build/x", false}, {"bin/local.env", false}, {"Logs/notes.md", false},
 		{".env", false}, {".env.local", false}, {"notes.md", false},
 		{"src/bin.dat", false}, {"dist.env", false}, {"binary", false},
 	} {
