@@ -128,3 +128,14 @@ func TestReopenOlderServerFailsExplicitly(t *testing.T) {
 		t.Fatal("empty reason sent requests")
 	}
 }
+
+func TestFailedCommandKeepsStderrOutOfMessage(t *testing.T) {
+	_, err := Exec{}.Run(context.Background(), "sh", []string{"-c", "echo 'rate limit hit' >&2; exit 1"}, "", "")
+	var ce *CommandError
+	if !errors.As(err, &ce) || !strings.Contains(ce.Stderr, "rate limit hit") {
+		t.Fatalf("stderr not kept: %v", err)
+	}
+	if strings.Contains(err.Error(), "rate limit") || !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("message changed: %v", err)
+	}
+}

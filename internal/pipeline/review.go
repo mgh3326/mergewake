@@ -230,6 +230,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	sort.Strings(names)
 	rankedOrder := []string{}
 	eligible := map[string]bool{}
+	// freePool keys a profile that draws on a free-billed pool (CLI kind and
+	// pool), so one rate-limit failure rules out its siblings for this run.
+	freePool := map[string]string{}
 	for _, c := range ranked {
 		for _, name := range names {
 			p := profiles[name]
@@ -254,6 +257,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			rankedOrder = append(rankedOrder, name)
 			eligible[name] = true
+			if c.Billing == "free" && c.Pool != "" {
+				freePool[name] = filepath.Base(p.Command) + "|" + c.Pool
+			}
 		}
 	}
 	if byPace {
@@ -373,20 +379,41 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 	}
+	failed := map[string]bool{}    // profiles whose run failed earlier in this review
+	exhausted := map[string]bool{} // freePool keys that hit a quota failure
 	for _, plan := range plans {
-		selected := ""
+		var skips []reviewSkip
+		var findings []github.Finding
+		selected, claimed := "", false
 		for i, name := range plan.candidates {
+			skip := func(reason string, reset time.Time) {
+				sk := reviewSkip{Reviewer: name, Reason: reason}
+				if !reset.IsZero() {
+					sk.Reset = reset.UTC().Format(time.RFC3339)
+				}
+				skips = append(skips, sk)
+			}
 			p := profiles[name]
+			if failed[name] {
+				skip("failed earlier in this review", time.Time{})
+				continue
+			}
+			if key := freePool[name]; key != "" && exhausted[key] {
+				skip("free pool rate-limited earlier in this review", time.Time{})
+				continue
+			}
 			gate := p.GateProfile
 			if gate == "" {
 				gate = name
 			}
 			if available, ok := s.Runner.(interface{ Available(string) error }); ok {
 				if available.Available(config.Expand(p.Command)) != nil {
+					skip("reviewer CLI not installed", time.Time{})
 					continue
 				}
 			}
 			if e = provider.Gate(ctx, gate, p.GateEffort); e != nil {
+				skip("quota gate refused", time.Time{})
 				continue
 			}
 			candidateControl := filepath.Join(control, fmt.Sprintf("%d-%d", plan.pass, i))
@@ -395,49 +422,69 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			invocation, e := reviewer.Prepare(p, candidateControl)
 			if e != nil {
+				skip("reviewer profile rejected", time.Time{})
 				continue
 			}
-			selected = name
+			plan.name = name
+			plan.lens = lens(plan)
+			plan.sameFamily = fam(name) == family
 			plan.invocation = invocation
-			break
+			// A GitHub ref claims this PR head across hosts before invoking the
+			// model. One claim covers every candidate tried for the pass.
+			if !claimed {
+				claim := claimRef(n, pr.Head.SHA, plan.pass)
+				ttl, e := s.reviewLeaseTTL()
+				if e != nil {
+					return e
+				}
+				acquired, e := s.GH.ClaimReview(ctx, r.Name, claim, pr.Head.SHA, ttl)
+				if e != nil {
+					return e
+				}
+				if !acquired {
+					return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
+				}
+				claimed = true
+			}
+			if filepath.Base(p.Command) == "cmd" {
+				// The hook also denies control-flow tools that bypass permission deny lists.
+				if e = os.MkdirAll(filepath.Join(dir, ".commandcode"), 0700); e != nil {
+					return e
+				}
+				settings := `{"permissions":{"deny":["*"]},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Diff-only review: all tools disabled\"}}'"}]}]}}`
+				if e = os.WriteFile(filepath.Join(dir, ".commandcode", "settings.json"), []byte(settings), 0600); e != nil {
+					return e
+				}
+			}
+			output, runErr := reviewer.Run(ctx, s.Runner, plan.invocation, promptFor(plan.lens)+diff, dir, s.Config.TokenEnv)
+			if runErr == nil {
+				if findings, e = parseFindings(output, diff); e == nil {
+					selected = name
+					break
+				}
+				runErr = errors.New("invalid review output")
+			}
+			// The whole review shares one deadline: nothing is left for another reviewer.
+			if ctx.Err() != nil {
+				return errors.Join(runErr, ctx.Err())
+			}
+			failed[name] = true
+			failure := quota.Classify(runErr, time.Now())
+			if !failure.Quota {
+				skip("review failed", time.Time{})
+				continue
+			}
+			skip("quota exhausted", failure.Reset)
+			if key := freePool[name]; key != "" {
+				exhausted[key] = true
+			}
+			if note := s.observeExhausted(ctx, cli, p, failure, r.Name, n); note != "" {
+				skips[len(skips)-1].Note = note
+			}
 		}
 		if selected == "" {
-			return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
-		}
-		plan.name = selected
-		plan.lens = lens(plan)
-		plan.sameFamily = fam(selected) == family
-		profile := profiles[selected]
-		// A GitHub ref claims this PR head across hosts before invoking the model.
-		claim := claimRef(n, pr.Head.SHA, plan.pass)
-		ttl, e := s.reviewLeaseTTL()
-		if e != nil {
-			return e
-		}
-		acquired, e := s.GH.ClaimReview(ctx, r.Name, claim, pr.Head.SHA, ttl)
-		if e != nil {
-			return e
-		}
-		if !acquired {
-			return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
-		}
-		if filepath.Base(profile.Command) == "cmd" {
-			// The hook also denies control-flow tools that bypass permission deny lists.
-			if e = os.MkdirAll(filepath.Join(dir, ".commandcode"), 0700); e != nil {
-				return e
-			}
-			settings := `{"permissions":{"deny":["*"]},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Diff-only review: all tools disabled\"}}'"}]}]}}`
-			if e = os.WriteFile(filepath.Join(dir, ".commandcode", "settings.json"), []byte(settings), 0600); e != nil {
-				return e
-			}
-		}
-		output, e := reviewer.Run(ctx, s.Runner, plan.invocation, promptFor(plan.lens)+diff, dir, s.Config.TokenEnv)
-		if e != nil {
-			return e
-		}
-		findings, e := parseFindings(output, diff)
-		if e != nil {
-			return e
+			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
+			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
 		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: fam(selected), SameFamily: plan.sameFamily}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
@@ -457,6 +504,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if pace, ok := paces[selected]; ok {
 			event["pace"] = pace
 		}
+		if len(skips) > 0 {
+			event["skipped"] = skips
+		}
 		if e = s.audit(r.Name, "review", event, false); e != nil {
 			return e
 		}
@@ -465,6 +515,42 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
 	}
 	return nil
+}
+
+// reviewSkip records a candidate that did not produce the pass, and why.
+type reviewSkip struct {
+	Reviewer string `json:"reviewer"`
+	Reason   string `json:"reason"`
+	Reset    string `json:"reset,omitempty"`
+	Note     string `json:"note,omitempty"`
+}
+
+func describeSkips(skips []reviewSkip) string {
+	parts := make([]string, 0, len(skips))
+	for _, sk := range skips {
+		part := sk.Reviewer + ": " + sk.Reason
+		if sk.Reset != "" {
+			part += " until " + sk.Reset
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// observeExhausted records a SWE-2 free-bucket exceed with the quota tool so it
+// stops ranking the rung until reset. Other pools have no observe path and are
+// only skipped for this run. It returns a note for the skip record, or "".
+func (s *Service) observeExhausted(ctx context.Context, cli quota.CLI, p config.Reviewer, f quota.Failure, repo string, pr int) string {
+	if filepath.Base(p.Command) != "devin" || !strings.Contains(strings.ReplaceAll(strings.ToLower(profileModel(p)), "-", ""), "swe2") {
+		return ""
+	}
+	if f.Reset.IsZero() {
+		return "reset time not reported; not recorded"
+	}
+	if e := cli.ObserveDevinFreeLimit(ctx, f.Reset, time.Now(), "swe-2", fmt.Sprintf("mergewake:%s#%d", repo, pr)); e != nil {
+		return "recording the limit failed: " + e.Error()
+	}
+	return "limit recorded with the quota tool"
 }
 
 // markDone creates the completion ref once every required pass is posted; the
