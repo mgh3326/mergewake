@@ -212,11 +212,27 @@ admitted profile in a fresh diff-only call. Review never stops merely because
 no different-family reviewer has quota; only an empty eligible set fails.
 Unknown profiles are skipped. `gate_effort` must match an explicit recommended
 effort; it is also passed to the gate. Missing executables and failed gates
-fall through. A failed recommendation fails closed. After a head claim and
-model invocation, failures or invalid output retain a lease until the configured
-review timeout plus one minute. An expired claim can be reclaimed for a fresh
-call; there is no output repair or retry within the same lease. Dry-run and shadow may read recommendations
-but never invoke a reviewer, gate, claim or post a review.
+fall through. A failed recommendation fails closed. After a head claim, a
+reviewer that exits non-zero or returns invalid output falls through to the
+next candidate of the same pass, once each and never beyond the candidate
+list; nothing is posted from a failed run and there is no output repair. A
+failure whose stderr shows a rate limit or exhausted quota (`rate limit`,
+`429`, `Too Many Requests`, `quota`, `usage limit`, `reached … limit`) also rules
+out sibling profiles on the same free-billed pool for the rest of the review.
+For a free-billed Devin SWE-2 profile that reports when its limit lifts
+(`reset in 1 hour 2 minutes`, `(at 11:01 UTC)` or an RFC 3339 time), the reset
+is recorded through the quota tool, `<quota> observe devin-free-limit --reset
+<RFC3339> --observed <RFC3339> --rung swe-2 --source mergewake:<repo>#<pr>`, so
+later reviews stop ranking the rung; other pools have no observe path and are
+only skipped. Each skipped reviewer and its reason (`quota exhausted` with the
+`reset`, `review failed`, `quota gate refused`, `reviewer CLI not installed`)
+appears as `skipped` in the review audit event. When every candidate of a pass
+fails the review ends with `review unavailable: no reviewer produced pass N
+(<reviewer>: <reason>; …)` and an audit `review-skipped` record; a failed pass
+retains its lease until the configured review timeout plus one minute, after
+which it can be reclaimed for a fresh call. All candidates share the review
+timeout; once it expires no further reviewer is tried. Dry-run and shadow may
+read recommendations but never invoke a reviewer, gate, claim or post a review.
 
 Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
 invoking the model. When every required pass is posted, the

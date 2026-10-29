@@ -68,12 +68,38 @@ func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, 
 	}
 	c.finish(ctx, x.ReapGroup)
 	if e != nil {
-		return nil, stopped(ctx, command, e)
+		e = stopped(ctx, command, e)
+		if ctx.Err() == nil && stderr.Len() > 0 {
+			e = &CommandError{Command: command, Err: errors.Unwrap(e), Stderr: tail(stderr.String(), stderrTail)}
+		}
+		return nil, e
 	}
 	if out.overflow || stderr.overflow {
 		return nil, errors.New("command output exceeds limit")
 	}
 	return out.Bytes(), nil
+}
+
+// stderrTail bounds the stderr kept on a failed command.
+const stderrTail = 4 << 10
+
+// CommandError is a command that exited unsuccessfully. Its message is the
+// bare "<command> failed: <exit>"; Stderr keeps the tail of what it wrote so
+// callers can classify the failure (a rate limit, say) without logging it.
+type CommandError struct {
+	Command string
+	Err     error
+	Stderr  string
+}
+
+func (e *CommandError) Error() string { return e.Command + " failed: " + e.Err.Error() }
+func (e *CommandError) Unwrap() error { return e.Err }
+
+func tail(s string, n int) string {
+	if len(s) > n {
+		s = s[len(s)-n:]
+	}
+	return s
 }
 
 type Event struct {
@@ -154,6 +180,7 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	}
 	return nil
 }
+
 // Lane reads the owning lane from `tasks show`; an absent field means the task
 // has no routing lane and the caller falls back, never guessing.
 func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
