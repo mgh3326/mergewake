@@ -130,11 +130,11 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 			}
 		}
-		if e = s.Land(ctx, r, pr.Number, childOptions); e != nil {
-			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
-		}
 		if e := s.NotifyPR(ctx, r, pr.Number, childOptions); e != nil {
 			errs = append(errs, fmt.Errorf("PR %d notify: %w", pr.Number, e))
+		}
+		if e = s.Land(ctx, r, pr.Number, childOptions); e != nil {
+			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
 		}
 	}
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))

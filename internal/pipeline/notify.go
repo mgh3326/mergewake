@@ -148,10 +148,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		if (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty" {
 			reasons = append(reasons, "conflicts")
 		}
+		unknownMerge := pr.Mergeable == nil || pr.MergeableState == "unknown"
 		switch {
 		case len(reasons) > 0:
 			state = "blocked"
-		case unknownMain:
+		case unknownMain || unknownMerge:
 			record.State = "pending"
 			return s.audit(r.Name, "pr-notify", record, o.DryRun)
 		default:

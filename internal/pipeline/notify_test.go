@@ -17,6 +17,9 @@ func notifySetup(t *testing.T) (*Service, *fakeGH, *fakeNotifier, config.Repo) {
 	s, g, _, n, r := setup(t)
 	g.reviewed = true
 	g.pull.Title = "Add feature"
+	yes := true
+	g.pull.Mergeable = &yes
+	g.pull.MergeableState = "clean"
 	s.Config.Notifier.Lane = "config-lane"
 	return s, g, n, r
 }
@@ -243,6 +246,16 @@ func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	}
 	if n.count != 0 {
 		t.Fatal("disabled notify emitted")
+	}
+
+	s, g, n, r = notifySetup(t)
+	g.pull.Mergeable = nil
+	g.pull.MergeableState = ""
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n.count != 0 {
+		t.Fatal("uncomputed mergeable notified")
 	}
 
 	s, g, n, r = notifySetup(t)
