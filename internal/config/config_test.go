@@ -47,6 +47,8 @@ func TestReapConfig(t *testing.T) {
 		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
 		{"bad glob", "reap:\n  protect: ['..']\n", true},
+		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
+		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
 		{"ssh host", "hosts:\n  - {name: node, ssh: ops@node.example}\n", false},
 		{"local ssh", "hosts:\n  - {name: node, ssh: local}\n", false},
@@ -75,6 +77,12 @@ func TestReapConfig(t *testing.T) {
 				}
 				if len(c.Reap.Protect) == 0 {
 					t.Fatal("missing default protect list")
+				}
+				if len(c.Reap.Regenerable) == 0 {
+					t.Fatal("missing default regenerable list")
+				}
+				if tt.name == "regenerable" && c.Reap.Regenerable[1] != "vendor/**" {
+					t.Fatal("configured regenerable list did not replace defaults")
 				}
 			}
 		})

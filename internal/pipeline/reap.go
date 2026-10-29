@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ type reapReceipt struct {
 	Saved    string    `json:"saved,omitempty"` // report/log path captured before a pane close
 	Result   string    `json:"result"`          // closed, removed, deleted, would-*, skipped, error
 	Reason   string    `json:"reason,omitempty"`
+	Files    []string  `json:"files,omitempty"` // ignored paths named by a refusing removal skip
 }
 
 func (s *Service) reapLog(repo string) string { return filepath.Join(s.state(repo), "reap.jsonl") }
@@ -145,6 +147,16 @@ func (s *Service) reclose(ctx context.Context, hs *reapHost, pane reap.Pane) (st
 	return "closed", ""
 }
 
+// filesSig is a compact count-plus-hash identity for a set of paths, so a
+// receipt reason stays small and the row dedupe still fires only when the
+// refusing set actually changed.
+func filesSig(files []string) string {
+	sorted := append([]string(nil), files...)
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
+	return fmt.Sprintf("%d-%x", len(sorted), h[:4])
+}
+
 func (hs *reapHost) paneInUse(path string) bool {
 	clean := filepath.Clean(path)
 	for _, pane := range hs.all {
@@ -202,8 +214,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// worktree-gone forever, would otherwise grow reap.jsonl without bound.
 	rowKey := func(v reapReceipt) string {
 		path := v.Pane
-		if v.Action != "close-pane" && v.Worktree != "" {
-			path = v.Worktree
+		if v.Action != "close-pane" {
+			// Rows predating the Worktree field still name their path in Cwd.
+			switch {
+			case v.Worktree != "":
+				path = v.Worktree
+			case v.Cwd != "":
+				path = v.Cwd
+			}
 		}
 		return fmt.Sprintf("%s|%d|%s|%s", v.Action, v.PR, v.Host, path)
 	}
@@ -247,6 +265,17 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 		return true
 	}
+	// A receipt-named PR beyond the listing horizon is refetched at most once
+	// per day, measured from its newest row: each attempt appends a check-pr
+	// row, so a persistent skip like reverted, unpushed or refused ignored
+	// files stops costing a GitHub call every poll.
+	lastPRCheck := map[int]time.Time{}
+	for _, rec := range receipts {
+		if rec.Time.After(lastPRCheck[rec.PR]) {
+			lastPRCheck[rec.PR] = rec.Time
+		}
+	}
+	const refetchAfter = 24 * time.Hour
 
 	pulls := []github.Pull{}
 	if prNum > 0 {
@@ -268,10 +297,16 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Receipt-named PRs can be older than the listing horizon. A fetch
 		// failure only loses that PR this pass; it never aborts the rest.
 		for _, rec := range receipts {
-			if rec.PR == 0 || known[rec.PR] || prDone(rec.PR) {
+			if rec.PR == 0 || known[rec.PR] || prDone(rec.PR) || now.Sub(lastPRCheck[rec.PR]) < refetchAfter {
 				continue
 			}
 			known[rec.PR] = true
+			// Stamp the attempt before the call: identical outcomes are
+			// deduped and never write a row, so without this a persistent
+			// skip would refetch every pass once the newest row aged out.
+			if e := s.reapNote(reapReceipt{Action: "check-pr", Repo: r.Name, PR: rec.PR, Result: "checked"}, o.DryRun); e != nil {
+				errs = append(errs, e)
+			}
 			p, e := s.GH.Pull(ctx, r.Name, rec.PR)
 			if e != nil {
 				errs = append(errs, fmt.Errorf("PR %d: %w", rec.PR, e))
@@ -354,6 +389,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			continue
 		}
 		scanned++
+		var mergedAt *time.Time
+		if p.MergedAt != nil {
+			mergedAt = parsedTime(*p.MergedAt)
+		}
 		for _, hs := range hosts {
 			if hs.failed {
 				continue
@@ -396,21 +435,26 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					case !isJob:
 						rec.Result, rec.Reason = "skipped", "not-a-job"
 					default:
-						// The pane's report or last screen must be saved before
-						// the session can go. report.md wins; otherwise save
-						// the screen.
+						// The pane's output must be saved before the session
+						// can go. report.md counts only when it is newer than
+						// the merge — a stale file could belong to a reused
+						// job name — otherwise the last screen is saved.
 						report := filepath.Join(dir, "report.md")
 						exists, e := hs.exec.Exists(ctx, report)
+						fresh := false
+						if e == nil && exists && mergedAt != nil {
+							fresh, e = hs.exec.NewerThan(ctx, report, mergedAt.Unix())
+						}
 						switch {
 						case e != nil:
 							rec.Result, rec.Reason = "error", e.Error()
 							errs = append(errs, fmt.Errorf("%s pane %s: %w", hs.host.Name, pane.ID, e))
-						case exists:
+						case fresh:
 							rec.Saved = report
 						case !acting:
 							rec.Saved = filepath.Join(dir, "pane-screen.txt")
 						default:
-							if rec.Saved, e = hs.exec.Capture(ctx, pane.ID, dir); e != nil {
+							if rec.Saved, e = hs.exec.Screen(ctx, pane.ID, dir); e != nil {
 								rec.Result, rec.Reason = "error", e.Error()
 								errs = append(errs, fmt.Errorf("%s pane %s: %w", hs.host.Name, pane.ID, e))
 							}
@@ -434,10 +478,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 		}
 
-		var mergedAt *time.Time
-		if p.MergedAt != nil {
-			mergedAt = parsedTime(*p.MergedAt)
-		}
 		if mergedAt == nil || now.Sub(*mergedAt) < after {
 			continue
 		}
@@ -559,17 +599,24 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				if e == nil {
 					ignored, e = c.hs.exec.Ignored(ctx, w.Path)
 				}
+				var unsafe []string
+				for _, f := range ignored {
+					if !reap.Regenerable(s.Config.Reap.Regenerable, f) {
+						unsafe = append(unsafe, f)
+					}
+				}
 				switch {
 				case e != nil:
 					rec.Result, rec.Reason = "skipped", "status-check-failed"
 					errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, w.Path, e))
 				case !clean:
 					rec.Result, rec.Reason = "skipped", "dirty"
-				case len(ignored) > 0:
+				case len(unsafe) > 0:
 					// `status --porcelain` hides gitignored files but
-					// `worktree remove` deletes them: refuse, naming what
-					// would have been lost.
-					rec.Result, rec.Reason = "skipped", "ignored-files:"+strings.Join(ignored, ",")
+					// `worktree remove` deletes them: regenerable output is
+					// expendable, anything else refuses and is named in files.
+					rec.Files = unsafe
+					rec.Result, rec.Reason = "skipped", "ignored-files:"+filesSig(unsafe)
 				case c.hs.paneInUse(w.Path):
 					rec.Result, rec.Reason = "skipped", "pane-in-use"
 				case !c.hs.exec.Pushed(ctx, main, entry.Branch, r.Branch):

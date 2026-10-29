@@ -146,11 +146,11 @@ func TestEntriesAndClean(t *testing.T) {
 	}
 
 	e, _ := testExec(map[string]string{
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                    "",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):                 " M tool\n?? note.txt\n",
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored"}):       "?? new.txt\n!! .env\n!! build/\n",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored"}):    " M tool\n",
-		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):          list,
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                 "",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):              " M tool\n?? note.txt\n",
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored"}):    "?? new.txt\n!! .env\n!! build/\n",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored"}): " M tool\n",
+		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):       list,
 	}, nil)
 	for _, tt := range []struct {
 		path string
@@ -182,15 +182,18 @@ func TestJoinQuoting(t *testing.T) {
 	}
 }
 
-func TestExistsCaptureAndPushed(t *testing.T) {
+func TestExistsScreenAndPushed(t *testing.T) {
 	report := "/jobs/wk-7/report.md"
 	screen := `herdr pane read "$2" > "$1/pane-screen.txt"`
+	stat := `m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) && test "$m" -gt "$2" 2>/dev/null && echo yes || echo no`
 	outs := map[string]string{
 		key("sh", []string{"-c", `test -f "$1" && echo yes || echo no`, "sh", report}):                       "yes\n",
 		key("sh", []string{"-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-8/report.md"}):       "no\n",
 		key("sh", []string{"-c", screen, "sh", "/jobs/wk-8", "w1:p2"}):                                       "",
 		key("sh", []string{"-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7"}):                 "yes\n",
 		key("sh", []string{"-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/stray"}):                "no\n",
+		key("sh", []string{"-c", stat, "sh", report, "1000"}):                                                "yes\n",
+		key("sh", []string{"-c", stat, "sh", report, "9999999999"}):                                          "no\n",
 		key("git", []string{"-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"}):            "",
 		key("git", []string{"-C", "/repo", "rev-list", "--count", "--left-right", "wk/y...wk/y@{upstream}"}): "0\t2\n",
 	}
@@ -214,10 +217,13 @@ func TestExistsCaptureAndPushed(t *testing.T) {
 			t.Fatalf("%s: %v %v", tt.path, ok, err)
 		}
 	}
-	if saved, err := e.Capture(context.Background(), "w1:p1", "/jobs/wk-7"); err != nil || saved != report {
-		t.Fatalf("%q %v", saved, err)
+	if fresh, err := e.NewerThan(context.Background(), report, 1000); err != nil || !fresh {
+		t.Fatal("fresh report rejected")
 	}
-	if saved, err := e.Capture(context.Background(), "w1:p2", "/jobs/wk-8"); err != nil || saved != "/jobs/wk-8/pane-screen.txt" {
+	if fresh, err := e.NewerThan(context.Background(), report, 9999999999); err != nil || fresh {
+		t.Fatal("stale report accepted")
+	}
+	if saved, err := e.Screen(context.Background(), "w1:p2", "/jobs/wk-8"); err != nil || saved != "/jobs/wk-8/pane-screen.txt" {
 		t.Fatalf("%q %v", saved, err)
 	}
 	if !e.Pushed(context.Background(), "/repo", "wk/x", "main") {
@@ -246,6 +252,33 @@ func TestJobDirAndValidJobName(t *testing.T) {
 	}
 	if (Host{Name: "local"}).JobDir("wk-7") != "" {
 		t.Fatal("job dir without jobs base")
+	}
+}
+
+func TestRegenerable(t *testing.T) {
+	globs := []string{".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build", "target", "obj", "bin", "Library", "Temp", "Logs", "UserSettings"}
+	for _, tt := range []struct {
+		path string
+		want bool
+	}{
+		{".venv/", true}, {"node_modules/", true}, {"sub/node_modules/", true},
+		{"__pycache__/", true}, {".pytest_cache/", true}, {"dist/", true},
+		{"build/", true}, {"target/", true}, {"obj/", true}, {"bin/", true},
+		{"Library/", true}, {"Temp/", true}, {"Logs/", true}, {"UserSettings/", true},
+		{"a/dist", true}, {"pkg/build/x", true},
+		{".env", false}, {".env.local", false}, {"notes.md", false},
+		{"src/bin.dat", false}, {"dist.env", false}, {"binary", false},
+	} {
+		if got := Regenerable(globs, tt.path); got != tt.want {
+			t.Errorf("%q: %v != %v", tt.path, got, tt.want)
+		}
+	}
+	// Slash patterns match the full path, not a single segment.
+	if !Regenerable([]string{"vendor/**"}, "vendor/mod/x.go") {
+		t.Error("vendor/** not matched")
+	}
+	if Regenerable([]string{"vendor/**"}, "a/vendor/mod") {
+		t.Error("slash pattern matched a segment")
 	}
 }
 

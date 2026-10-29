@@ -112,12 +112,24 @@ type Reap struct {
 	Act           bool     `yaml:"act"`
 	WorktreeAfter string   `yaml:"worktree_after"`
 	Protect       []string `yaml:"protect"`
+	Regenerable   []string `yaml:"regenerable"`
 }
 
 // DefaultReapProtect names resident and desk panes that reap never closes. A
 // configured reap.protect list replaces this list; unnamed panes and panes
 // outside a linked worktree are always protected regardless of the list.
 var DefaultReapProtect = []string{"*-integrator", "director-*", "fleet-tooling-*", "consult-*", "cmd"}
+
+// DefaultReapRegenerable names gitignored paths whose loss is acceptable
+// because they rebuild on demand: language caches, build output, vendored
+// deps, and Unity's generated directories. A configured reap.regenerable
+// list replaces this list; anything else ignored — .env*, notes, unknown
+// files — still refuses worktree removal.
+var DefaultReapRegenerable = []string{
+	".venv", "node_modules", "__pycache__", ".pytest_cache",
+	"dist", "build", "target", "obj", "bin",
+	"Library", "Temp", "Logs", "UserSettings",
+}
 
 type Config struct {
 	Version      int         `yaml:"version"`
@@ -201,6 +213,14 @@ func Load(name string) (Config, error) {
 		c.Reap.Protect = DefaultReapProtect
 	}
 	for _, g := range c.Reap.Protect {
+		if _, e = policy.Match(g, "probe"); e != nil {
+			return c, e
+		}
+	}
+	if len(c.Reap.Regenerable) == 0 {
+		c.Reap.Regenerable = DefaultReapRegenerable
+	}
+	for _, g := range c.Reap.Regenerable {
 		if _, e = policy.Match(g, "probe"); e != nil {
 			return c, e
 		}

@@ -175,8 +175,9 @@ A matching pane is closed only on an allowlist of `idle`/`done` states —
 it is named, misses the `reap.protect` globs, and its `<jobs>/<name>`
 directory already exists, which is what proves the fleet spawned it: a named
 operator pane merely cd'd into a merged worktree is skipped as `not-a-job`.
-Its output is captured first: an existing `<jobs>/<name>/report.md` counts,
-otherwise `herdr pane read` saves the last screen to
+Its output is captured first: an existing `<jobs>/<name>/report.md` counts
+only when it is newer than the merge — a stale file could belong to a reused
+job name — otherwise `herdr pane read` saves the last screen to
 `<jobs>/<name>/pane-screen.txt`; the saved path lands in the receipt.
 Immediately before the real close the agent list is re-read and the pane must
 still be present with the same id, status, cwd and name — the discovery list
@@ -188,10 +189,14 @@ panes, and closing needs `reap.act` on top of `--apply`, a gate separate from
 Worktree removal is additive on top of the age gate: the merge must be older
 than `worktree_after`, the watch role's recovery convention must show neither
 an open recovery nor one merged within seven days, the worktree must still be
-registered, unlocked, clean and unattached, it must hold no gitignored files
-(`git status --porcelain --ignored`; removal refuses and names them rather
-than let `worktree remove` delete them silently), no live pane (from `herdr
-pane list`, re-read immediately before each removal, which also sees plain
+registered, unlocked, clean and unattached, and every gitignored file it
+holds (`git status --porcelain --ignored`) must match the `reap.regenerable`
+allowlist — expendable build and cache output like `.venv`, `node_modules`
+or `dist`; anything else (`.env`, notes, unknown output) refuses removal
+rather than let `worktree remove` delete it silently, with the refusing
+paths in the receipt's `files` field and a count-plus-hash
+`ignored-files:N-xxxxxxxx` reason. No live pane (from `herdr pane list`,
+re-read immediately before each removal, which also sees plain
 shells) may use it, and the branch must carry no unpushed commits — merged
 into the base or fully pushed. Removal is `git
 worktree remove` and `git branch -d`; the code has no force flags to reach
@@ -199,7 +204,9 @@ for. Candidates come from live panes and from prior `reap.jsonl` rows so a
 worktree survives its pane's earlier close. Anything unknown or ambiguous is
 skipped with a reason rather than deleted. A receipt-named PR stops being
 refetched once every worktree its rows named reached `removed` or
-`worktree-gone`, and one PR's fetch failure never aborts the pass.
+`worktree-gone`; otherwise each refetch attempt stamps a `check-pr` row so
+persistent skips poll GitHub at most once a day, and one PR's fetch failure
+never aborts the pass.
 
 ## Manifests and verified installs
 

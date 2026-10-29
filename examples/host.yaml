@@ -76,3 +76,6 @@ reap:
   act: false # reap's own acting opt-in; needs enabled, plus --apply or daemon
   worktree_after: 168h
   protect: []
+  regenerable: [] # gitignored paths safe to delete with a worktree (defaults:
+  # .venv, node_modules, __pycache__, .pytest_cache, dist, build, target, obj,
+  # bin, Library, Temp, Logs, UserSettings); anything else refuses removal

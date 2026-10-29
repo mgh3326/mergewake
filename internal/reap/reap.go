@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -157,7 +158,7 @@ func (e Exec) Exists(ctx context.Context, path string) (bool, error) {
 }
 
 // DirExists reports whether path is an existing directory. The job dir is
-// proof the fleet spawned the pane, so it must predate the close: Capture
+// proof the fleet spawned the pane, so it must predate the close: Screen
 // never creates it.
 func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
 	b, err := e.Run(ctx, "sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", path)
@@ -167,21 +168,23 @@ func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
-// Capture returns the report/log path that proves the pane's output survives
-// the close: an existing <dir>/report.md, or a freshly saved
-// <dir>/pane-screen.txt holding the pane's last screen. dir must already
-// exist; callers check DirExists first and skip missing dirs as not-a-job.
-func (e Exec) Capture(ctx context.Context, pane, dir string) (string, error) {
-	report := filepath.Join(dir, "report.md")
-	ok, err := e.Exists(ctx, report)
+// NewerThan reports whether path's mtime is later than epoch seconds. GNU
+// stat is tried first so a BSD -f flag can never be parsed as GNU's
+// --file-system mode; either failure is reported, not guessed.
+func (e Exec) NewerThan(ctx context.Context, path string, epoch int64) (bool, error) {
+	b, err := e.Run(ctx, "sh", "-c", `m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) && test "$m" -gt "$2" 2>/dev/null && echo yes || echo no`, "sh", path, strconv.FormatInt(epoch, 10))
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	if ok {
-		return report, nil
-	}
+	return strings.TrimSpace(string(b)) == "yes", nil
+}
+
+// Screen saves the pane's last screen to <dir>/pane-screen.txt and returns
+// the path. dir must already exist; callers check DirExists first and skip
+// missing dirs as not-a-job.
+func (e Exec) Screen(ctx context.Context, pane, dir string) (string, error) {
 	screen := filepath.Join(dir, "pane-screen.txt")
-	_, err = e.Run(ctx, "sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", dir, pane)
+	_, err := e.Run(ctx, "sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", dir, pane)
 	if err != nil {
 		return "", err
 	}
@@ -360,6 +363,33 @@ func Protected(name string, globs []string) bool {
 	for _, g := range globs {
 		if ok, _ := policy.Match(g, name); ok {
 			return true
+		}
+	}
+	return false
+}
+
+// Regenerable reports whether an ignored path inside a worktree matches the
+// regenerable allowlist — throwaway output that rebuilds on demand and is
+// safe to lose with the worktree. Gitignore semantics apply: a pattern
+// without a slash matches any single path segment (node_modules anywhere),
+// while a pattern containing a slash must match the whole path.
+func Regenerable(globs []string, path string) bool {
+	p := strings.Trim(path, "/")
+	for _, g := range globs {
+		g = strings.Trim(g, "/")
+		if g == "" {
+			continue
+		}
+		if strings.Contains(g, "/") {
+			if ok, _ := policy.Match(g, p); ok {
+				return true
+			}
+			continue
+		}
+		for _, seg := range strings.Split(p, "/") {
+			if ok, _ := policy.Match(g, seg); ok {
+				return true
+			}
 		}
 	}
 	return false
