@@ -47,7 +47,9 @@ func groupCommand(ctx context.Context, command string, args []string, grace time
 		}
 		return signalGroup(g.Cmd, syscall.SIGTERM)
 	}
-	g.WaitDelay = grace
+	// exec's own escalation (Kill of the leader, closing our pipe ends) is only
+	// a backstop for a descendant that escaped the group; the timer acts first.
+	g.WaitDelay = 2 * grace
 	return g
 }
 

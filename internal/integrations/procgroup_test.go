@@ -143,24 +143,43 @@ func TestDuplexReapsGroup(t *testing.T) {
 	}
 }
 
-// A blocked exchange cannot rely on Wait's WaitDelay: cancellation must reach
-// a TERM-ignoring server on its own, or ReadAll below would never return.
+// A blocked exchange cannot rely on Wait's WaitDelay: cancellation must SIGKILL
+// a TERM-ignoring reviewer blocked on stdin within grace on its own. A clean
+// EOF proves every writer of stdout died; exec's WaitDelay backstop (2×grace)
+// would instead close the pipe under the reader.
 func TestDuplexCancelEscalatesWhileExchangeBlocks(t *testing.T) {
-	script, pids := fakeReviewer(t, "trap '' TERM; while :; do sleep 1; done")
+	const grace = time.Second
+	// The leader ignores SIGTERM and blocks reading a stdin nobody closes; the
+	// grandchild ignores SIGTERM and holds stdout.
+	script, pids := fakeReviewer(t, "trap '' TERM; cat > /dev/null")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cancelWhenReady(t, pids, cancel)
-	done := make(chan error, 1)
+	var cancelled time.Time
+	cancelWhenReady(t, pids, func() { cancelled = time.Now(); cancel() })
+	type result struct {
+		err, read error
+		at        time.Time
+	}
+	done := make(chan result, 1)
 	go func() {
-		_, err := (Exec{Grace: 300 * time.Millisecond}).RunDuplex(ctx, script, nil, "", func(r io.Reader, _ io.Writer) ([]byte, error) {
-			return io.ReadAll(r)
+		var read error
+		_, err := (Exec{Grace: grace}).RunDuplex(ctx, script, nil, "", func(r io.Reader, _ io.Writer) ([]byte, error) {
+			var b []byte
+			b, read = io.ReadAll(r)
+			return b, read
 		})
-		done <- err
+		done <- result{err, read, time.Now()}
 	}()
 	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "cancelled") {
-			t.Fatalf("err=%v", err)
+	case got := <-done:
+		if got.err == nil || !strings.Contains(got.err.Error(), "cancelled") {
+			t.Fatalf("err=%v", got.err)
+		}
+		if got.read != nil {
+			t.Fatalf("exchange released by exec's pipe close, not the group SIGKILL: %v", got.read)
+		}
+		if elapsed := got.at.Sub(cancelled); elapsed >= 2*grace {
+			t.Fatalf("exited %v after cancel; grace is %v", elapsed, grace)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("exchange still blocked after cancellation")

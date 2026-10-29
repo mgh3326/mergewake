@@ -252,7 +252,7 @@ circumvent an underlying pool's subscription state.
 Every adapter receives the diff on stdin in an empty temporary working directory.
 Reviewer processes run in their own process group. On timeout, cancellation or
 mergewake's own SIGINT/SIGTERM/SIGHUP the whole group receives SIGTERM, then
-SIGKILL after a 5s grace; after every exit, including success, the group is
+SIGKILL from a timer after a 5s grace, independent of any read still in progress; after every exit, including success, the group is
 killed and reaped, so a child the CLI forked cannot outlive the call or hold the
 review open through an inherited stdout. On Linux the leader also gets
 `PDEATHSIG=SIGKILL` for a parent killed by SIGKILL; descendants that leave the
