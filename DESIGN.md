@@ -67,6 +67,7 @@ rollout likewise require `--apply`.
 | `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
+| `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |
 
 The command layer handles flags, signals, and polling. Tests replace each external
 boundary with a fake or a local HTTP test server. Mutating operations have no
@@ -153,6 +154,63 @@ fallback. The handoffkeep adapter uses show, comment, then the explicit reopen
 operation with a required reason, entering `reopened`. Unsupported older servers
 and protected authority refusals return a clear failure after the comment; the
 notification includes it and the recovery latch remains set.
+
+## Merged-PR reaping
+
+Agent panes and git worktrees accumulate on session hosts after their PRs
+merge. The `reap` role closes the pane that worked on a merged PR, and after
+`reap.worktree_after` (default seven days) with no revert it removes the
+worktree and local branch.
+
+Panes are matched by evidence, never by title or name alone: `herdr agent
+list` runs on each configured `hosts[]` entry (`ssh <ssh>` for remote hosts),
+and a pane's `cwd` must inspect as a linked git worktree whose current branch
+equals the PR head branch, whose checked-out commit equals the PR head SHA,
+and whose origin remote names the configured repository. URL and scp-style
+`git@host:owner/name` remotes both parse; a canonical clone, subdirectory
+checkout, detached head, foreign remote or reused branch tip never matches.
+
+A matching pane is closed only on an allowlist of `idle`/`done` states —
+`working`, `blocked`, `waiting`, empty and unknown states all keep it — when
+it is named, misses the `reap.protect` globs, and its `<jobs>/<name>`
+directory already exists, which is what proves the fleet spawned it: a named
+operator pane merely cd'd into a merged worktree is skipped as `not-a-job`.
+Its output is captured first: an existing `<jobs>/<name>/report.md` counts
+only when it is newer than the merge — a stale file could belong to a reused
+job name — otherwise `herdr pane read` saves the last screen to
+`<jobs>/<name>/pane-screen.txt`; the saved path lands in the receipt.
+Immediately before the real close the agent list is re-read and the pane must
+still be present with the same id, status, cwd and name — the discovery list
+is a stale snapshot and a pane that went back to work survives as
+`pane-changed` or `pane-gone`. A host without `jobs` configured cannot lose
+panes, and closing needs `reap.act` on top of `--apply`, a gate separate from
+`daemon.act`.
+
+Worktree removal is additive on top of the age gate: the merge must be older
+than `worktree_after`, the watch role's recovery convention must show neither
+an open recovery nor one merged within seven days, the worktree must still be
+registered, unlocked, clean and unattached, and every gitignored file it
+holds (`git status --porcelain --ignored`) must match the `reap.regenerable`
+allowlist — expendable build and cache output like `.venv`, `node_modules`
+or `dist`. A slash-free pattern matches only the ignored entry's last
+segment, so an ignored `bin/local.env` inside a tracked `bin/` cannot ride
+the `bin` name past the refusal; anything else (`.env`, notes, unknown
+output) refuses removal
+rather than let `worktree remove` delete it silently, with the refusing
+paths in the receipt's `files` field and a count-plus-hash
+`ignored-files:N-xxxxxxxx` reason. No live pane (from `herdr pane list`,
+re-read immediately before each removal, which also sees plain
+shells) may use it, and the branch must carry no unpushed commits — merged
+into the base or fully pushed. Removal is `git
+worktree remove` and `git branch -d`; the code has no force flags to reach
+for. Candidates come from live panes and from prior `reap.jsonl` rows so a
+worktree survives its pane's earlier close. Anything unknown or ambiguous is
+skipped with a reason rather than deleted. A receipt-named PR stops being
+refetched once every worktree its rows named reached `removed` or
+`worktree-gone`; otherwise each refetch attempt stamps a `check-pr` row so
+persistent skips poll GitHub at most once a day — the stamp is written even
+under `--dry-run`, since the GitHub call really happened — and one PR's
+fetch failure never aborts the pass.
 
 ## Manifests and verified installs
 

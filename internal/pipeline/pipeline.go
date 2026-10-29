@@ -34,6 +34,7 @@ type GitHub interface {
 	PostReview(context.Context, string, int, string, []github.Finding) error
 	Commit(context.Context, string, string) (github.Commit, error)
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
+	MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error)
 	Ancestor(context.Context, string, string, string) (bool, error)
 	ReadFile(context.Context, string, string, string) ([]byte, error)
 	Revert(context.Context, string, string, string, string, int) (string, error)

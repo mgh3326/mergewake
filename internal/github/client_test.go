@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -389,5 +390,29 @@ func TestRecoveryTagSurvivesBranchDeletion(t *testing.T) {
 				t.Fatal("tag latch depended on branch")
 			}
 		})
+	}
+}
+func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
+	recent := time.Now().UTC().Format(time.RFC3339)
+	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	pages := 0
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if pages > 1 {
+			t.Fatal("scan did not stop at the first old updated_at")
+		}
+		reply(w, []Pull{
+			{Number: 1, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "main"}},
+			{Number: 2, State: "closed", UpdatedAt: recent, Base: Ref{Ref: "main"}},
+			{Number: 3, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "release"}},
+			{Number: 4, State: "closed", UpdatedAt: old, Merged: true, Base: Ref{Ref: "main"}},
+		})
+	})
+	pulls, e := c.MergedPulls(context.Background(), "example/project", "main", time.Now().Add(-time.Hour))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(pulls) != 2 || pulls[0].Number != 1 || pulls[1].Number != 4 {
+		t.Fatalf("%+v", pulls)
 	}
 }
