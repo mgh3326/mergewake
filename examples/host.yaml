@@ -26,21 +26,38 @@ review:
   timeout: 10m
   quota: scopefuel
   default_grade: B
-  pairings:
-    openai: [claude, deepseek]
-    anthropic: [deepseek]
-    deepseek: [claude]
+  # pace (default): free models, then pools projected well under 100% at their
+  # reset (otherwise wasted), then the rest under 100%; tight or unmeasured
+  # pools are skipped. rank: keep the quota tool's recommendation order.
+  select: pace
+  # Optional fixed order for other-family reviewers; it takes precedence over
+  # pace order but never admits a skipped pool.
+  # pairings:
+  #   openai: [claude, deepseek]
   profiles:
     claude:
       family: anthropic
       command: pi
-      args: [--provider, anthropic, --model, claude-model-id]
+      args: [--provider, anthropic, --model, claude-model-id, --thinking, high]
       gate_profile: example-claude-profile
+      gate_effort: high
     deepseek:
       family: deepseek
       command: cmd
-      args: [--model, deepseek-model-id]
+      args: [--model, deepseek-model-id, --effort, high]
       gate_profile: example-deepseek-profile
+      gate_effort: high
+    gemini:
+      family: google
+      command: agy
+      args: [--model, gemini-model-id]
+      gate_profile: example-gemini-profile
+    grok:
+      family: xai
+      command: grok
+      args: [--model, grok-model-id, --effort, high]
+      gate_profile: example-grok-profile
+      gate_effort: high
 outcomes:
   command: scopefuel
   default_tier: T1

@@ -21,7 +21,13 @@ import (
 type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
-type Exec struct{ ReapGroup bool }
+
+// Exec runs each command as its own process group. ReapGroup kills the group
+// after every exit (one-shot reviewers); Grace bounds SIGTERM before SIGKILL.
+type Exec struct {
+	ReapGroup bool
+	Grace     time.Duration
+}
 type limited struct {
 	bytes.Buffer
 	overflow bool
@@ -45,24 +51,24 @@ func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, 
 	if command == "" {
 		return nil, errors.New("empty command")
 	}
-	c := exec.CommandContext(ctx, command, args...)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c := groupCommand(ctx, command, args, x.Grace, x.ReapGroup)
 	c.Dir = dir
 	if env != nil {
 		c.Env = env
 	}
-	c.Stdin = strings.NewReader(input)
-	c.WaitDelay = 2 * time.Second
 	var out, stderr limited
-	c.Stdout = &out
-	c.Stderr = &stderr
-	e := c.Run()
-	if x.ReapGroup && c.Process != nil {
-		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	var e error
+	if x.ReapGroup {
+		e = runReaped(ctx, c, input, &out, &stderr, x.Grace)
+	} else {
+		c.Stdin = strings.NewReader(input)
+		c.Stdout = &out
+		c.Stderr = &stderr
+		e = c.Run()
 	}
+	finish(ctx, c, x.ReapGroup)
 	if e != nil {
-		return nil, fmt.Errorf("%s failed: %w", command, e)
+		return nil, stopped(ctx, command, e)
 	}
 	if out.overflow || stderr.overflow {
 		return nil, errors.New("command output exceeds limit")
@@ -184,11 +190,8 @@ func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {
 
 // RunDuplex owns one foreground protocol session and always reaps its process
 // group after the single exchange, including errors and cancellation.
-func (Exec) RunDuplex(ctx context.Context, command string, args []string, dir string, exchange func(io.Reader, io.Writer) ([]byte, error)) ([]byte, error) {
-	c := exec.CommandContext(ctx, command, args...)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
-	c.WaitDelay = 2 * time.Second
+func (x Exec) RunDuplex(ctx context.Context, command string, args []string, dir string, exchange func(io.Reader, io.Writer) ([]byte, error)) ([]byte, error) {
+	c := groupCommand(ctx, command, args, x.Grace, true)
 	c.Dir = dir
 	var stderr limited
 	c.Stderr = &stderr
@@ -205,10 +208,12 @@ func (Exec) RunDuplex(ctx context.Context, command string, args []string, dir st
 	}
 	b, exchangeErr := exchange(r, w)
 	_ = w.Close()
-	_ = c.Cancel()
+	// The exchange is complete or failed: the server gets no grace period.
+	_ = signalGroup(c, syscall.SIGKILL)
 	_ = c.Wait()
+	finish(ctx, c, true)
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, stopped(ctx, command, ctx.Err())
 	}
 	if exchangeErr != nil {
 		return nil, exchangeErr
@@ -221,6 +226,6 @@ func (Exec) RunDuplex(ctx context.Context, command string, args []string, dir st
 
 func (Exec) Available(command string) error { _, err := exec.LookPath(command); return err }
 
-func (Exec) RunReview(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
-	return (Exec{ReapGroup: true}).Run(ctx, command, args, input, dir)
+func (x Exec) RunReview(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	return (Exec{ReapGroup: true, Grace: x.Grace}).Run(ctx, command, args, input, dir)
 }

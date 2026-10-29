@@ -47,7 +47,9 @@ Config defaults to ~/.config/mergewake/config.yaml.
 `
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// SIGHUP (a closed pane or terminal) cancels too: children run in their own
+	// process groups, so the terminal's signal would never reach them.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 	if e := run(ctx, os.Args[1:], os.Stdout, os.Stderr); e != nil {
 		fmt.Fprintln(os.Stderr, "mergewake:", e)

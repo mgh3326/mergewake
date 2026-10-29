@@ -229,13 +229,16 @@ type fakeRunner struct {
 
 func (r *fakeRunner) Run(_ context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if command == "scopefuel" {
+		if len(args) > 0 && args[0] == "--json" {
+			return []byte(idleUsage), nil
+		}
 		if len(args) > 0 && args[0] == "--recommend" {
 			if len(r.recommend) == 0 {
 				r.recommend = []string{"claude"}
 			}
 			rows := []string{}
 			for _, p := range r.recommend {
-				rows = append(rows, `{"profile":"`+p+`","kind":"candidate"}`)
+				rows = append(rows, `{"profile":"`+p+`","kind":"candidate","pool":"idle"}`)
 			}
 			return []byte(`{"rows":[` + strings.Join(rows, ",") + `]}`), nil
 		}

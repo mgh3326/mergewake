@@ -4,6 +4,7 @@ package reviewer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -41,6 +42,8 @@ func Prepare(p config.Reviewer, control string) (Invocation, error) {
 		return path, os.WriteFile(path, []byte(body), 0600)
 	}
 	switch v.Kind {
+	case "agy":
+		v.Args = append(v.Args, agyArgs...)
 	case "pi":
 		v.Args = append(v.Args, "--print", "--no-session", "--no-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files")
 	case "cmd":
@@ -80,7 +83,23 @@ func Prepare(p config.Reviewer, control string) (Invocation, error) {
 	return v, nil
 }
 
+// Run invokes one reviewer and names its CLI in any error, so a timeout reads
+// "agy reviewer: env timed out" rather than exec's bare "signal: killed".
 func Run(ctx context.Context, runner integrations.Runner, v Invocation, input, dir, tokenEnv string) ([]byte, error) {
+	b, err := run(ctx, runner, v, input, dir, tokenEnv)
+	if err != nil {
+		return nil, fmt.Errorf("%s reviewer: %w", v.Kind, err)
+	}
+	return b, nil
+}
+
+func run(ctx context.Context, runner integrations.Runner, v Invocation, input, dir, tokenEnv string) ([]byte, error) {
+	if v.Kind == "agy" {
+		var err error
+		if input, err = agyInput(input); err != nil {
+			return nil, err
+		}
+	}
 	args := []string{"-u", "GITHUB_TOKEN", "-u", "GH_TOKEN"}
 	if tokenEnv != "" && tokenEnv != "GITHUB_TOKEN" && tokenEnv != "GH_TOKEN" {
 		args = append(args, "-u", tokenEnv)
@@ -98,10 +117,17 @@ func Run(ctx context.Context, runner integrations.Runner, v Invocation, input, d
 		}
 		return duplex.RunDuplex(ctx, "env", args, dir, func(r io.Reader, w io.Writer) ([]byte, error) { return kimiProtocol(r, w, dir, v.Model, input) })
 	}
+	var b []byte
+	var err error
 	if isolated, ok := runner.(interface {
 		RunReview(context.Context, string, []string, string, string) ([]byte, error)
 	}); ok {
-		return isolated.RunReview(ctx, "env", args, input, dir)
+		b, err = isolated.RunReview(ctx, "env", args, input, dir)
+	} else {
+		b, err = runner.Run(ctx, "env", args, input, dir)
 	}
-	return runner.Run(ctx, "env", args, input, dir)
+	if err == nil && v.Kind == "agy" {
+		return agyOutput(b)
+	}
+	return b, err
 }

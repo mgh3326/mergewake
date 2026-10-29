@@ -59,7 +59,7 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 | Command | Behavior |
 | --- | --- |
 | `land --repo … --pr …` | Classify paths and change kinds using policy from the current base branch; squash-merge the exact reviewed head through GitHub. |
-| `review --repo … --pr …` | Claim one PR head, select a different model family, review only the diff, post inline review comments. |
+| `review --repo … --pr …` | Claim one PR head, select a different model family from the pool with the most quota left to burn before its reset, review only the diff, post inline review comments. |
 | `watch --repo …` | Poll main CI, find a green-to-red boundary among squash commits using existing checks, open a revert PR, reopen the task when its API permits, and notify. `--once` inspects once. |
 | `release --repo …` | Verify green main ancestry and publish an immutable manifest as a GitHub Release asset. `--commit` accepts a full SHA. |
 | `rollout --repo …` | Pull the newest mergewake manifest, verify bytes, install permitted files or container digests, smoke/health-test, roll back on failure, and report. |
@@ -91,7 +91,14 @@ Adapters use only APIs or CLI argument vectors:
 - `panewire emit` for notifications, with stdout and no-op alternatives.
 - `handoffkeep tasks show`, `comment`, `reopen`, and `doc put` for task recovery
   and rollout records; a no-op sink is available.
-- Quota-ranked independent reviewers with subscription/exclusion filtering and a gate before invocation.
+- Independent reviewers (Claude, Codex, Devin, Grok, Kimi, pi, Command Code,
+  agy) chosen by pace to reset: free models first, then pools projected to end
+  their window well under 100%, then any under 100%; tight or unmeasured pools
+  are never picked. Subscription/exclusion filtering and a gate still run
+  before invocation. See [review selection](docs/config.md#review).
+- One-shot reviewer processes run in their own process group, which is
+  terminated (SIGTERM, grace, SIGKILL) and reaped on exit, timeout,
+  cancellation or mergewake's own SIGINT/SIGTERM/SIGHUP.
 
 The handoffkeep sink uses explicit `tasks reopen ID --reason TEXT`, entering the
 separate `reopened` state. A recovery comment survives if an older CLI/server

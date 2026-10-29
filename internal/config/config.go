@@ -39,6 +39,10 @@ type Review struct {
 	Quota        string              `yaml:"quota"`
 	DefaultGrade string              `yaml:"default_grade"`
 	Timeout      string              `yaml:"timeout"`
+	// Select orders admitted reviewers: "pace" (default) by projected use at
+	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
+	// recommendation order without reading usage.
+	Select string `yaml:"select"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -400,6 +404,9 @@ func Load(name string) (Config, error) {
 			return c, e
 		}
 	}
+	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
+		return c, errors.New("review.select must be pace or rank")
+	}
 	for family, names := range c.Review.Pairings {
 		if family == "" || len(names) == 0 {
 			return c, errors.New("empty review pairing")
@@ -424,7 +431,7 @@ func ValidGrade(s string) bool {
 
 func ReviewerCommand(s string) bool {
 	switch filepath.Base(s) {
-	case "claude", "codex", "devin", "grok", "kimi", "pi", "cmd":
+	case "agy", "claude", "codex", "devin", "grok", "kimi", "pi", "cmd":
 		return true
 	}
 	return false
@@ -654,7 +661,7 @@ func ValidateReviewer(p Reviewer) error {
 		if kind == "pi" && (k == "--provider" || k == "--thinking") {
 			continue
 		}
-		if k == "--effort" && (kind == "claude" || kind == "codex" || kind == "grok" || kind == "cmd") {
+		if k == "--effort" && (kind == "agy" || kind == "claude" || kind == "codex" || kind == "grok" || kind == "cmd") {
 			continue
 		}
 		return fmt.Errorf("review option %s unsupported by %s", k, kind)

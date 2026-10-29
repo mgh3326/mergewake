@@ -20,6 +20,8 @@ type Candidate struct {
 	Effort     string `json:"effort"`
 	Reason     string `json:"reason"`
 	Source     string `json:"source"`
+	Pool       string `json:"pool"`
+	Billing    string `json:"billing"`
 }
 type Provider interface {
 	Recommend(context.Context, string) ([]Candidate, error)

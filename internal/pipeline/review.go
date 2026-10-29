@@ -206,11 +206,22 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if command == "" {
 		command = "scopefuel"
 	}
-	var provider quota.Provider = quota.CLI{Runner: s.Runner, Command: command}
+	cli := quota.CLI{Runner: s.Runner, Command: command}
+	var provider quota.Provider = cli
 	ranked, e := provider.Recommend(ctx, grade)
 	if e != nil {
 		return fmt.Errorf("quota recommendation: %w", e)
 	}
+	// Pace selection reads usage once per review; a profile whose pool is
+	// projected to reach 100% by its reset, or cannot be measured, is skipped.
+	byPace := s.Config.Review.Select != "rank"
+	var usage quota.Usage
+	if byPace {
+		if usage, e = cli.Usage(ctx); e != nil {
+			return fmt.Errorf("quota usage: %w", e)
+		}
+	}
+	paces := map[string]quota.Pace{}
 	profiles := s.Config.Review.Profiles
 	names := []string{}
 	for name := range profiles {
@@ -229,11 +240,37 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if gate == "" {
 				gate = name
 			}
-			if gate == c.Profile && p.Family != "" && !eligible[name] {
-				rankedOrder = append(rankedOrder, name)
-				eligible[name] = true
+			if gate != c.Profile || p.Family == "" || eligible[name] {
+				continue
+			}
+			if byPace {
+				if _, seen := paces[name]; seen {
+					continue
+				}
+				paces[name] = usage.Pace(c.Pool, profileModel(p), c.Billing == "free")
+				if paces[name].Tier == quota.TierSkip {
+					continue
+				}
+			}
+			rankedOrder = append(rankedOrder, name)
+			eligible[name] = true
+		}
+	}
+	if byPace {
+		rankedOrder = quota.Order(rankedOrder, paces)
+	}
+	// unavailable explains an empty candidate list instead of a bare refusal.
+	unavailable := func() error {
+		var tight []string
+		for _, name := range names {
+			if p, ok := paces[name]; ok && p.Tier == quota.TierSkip {
+				tight = append(tight, name+" ("+p.String()+")")
 			}
 		}
+		if len(tight) > 0 {
+			return fmt.Errorf("%w: every admitted reviewer is projected to exhaust its pool or is unmeasured: %s", ErrReviewUnavailable, strings.Join(tight, ", "))
+		}
+		return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
 	}
 	otherOrder := append([]string{}, s.Config.Review.Pairings[family]...)
 	if len(otherOrder) == 0 {
@@ -278,7 +315,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	for _, pass := range missing {
 		plans = append(plans, &passPlan{pass: pass, candidates: order()})
 		if len(plans[len(plans)-1].candidates) == 0 {
-			return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
+			return unavailable()
 		}
 		usedProfiles[plans[len(plans)-1].candidates[0]] = true
 		usedFamilies[fam(plans[len(plans)-1].candidates[0])] = true
@@ -298,7 +335,15 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		for _, plan := range plans {
 			plan.lens = lens(plan)
 			plan.sameFamily = fam(plan.candidates[0]) == family
-			out = append(out, map[string]any{"pass": plan.pass, "lens": plan.lens, "same_family": plan.sameFamily, "candidates": plan.candidates})
+			row := map[string]any{"pass": plan.pass, "lens": plan.lens, "same_family": plan.sameFamily, "candidates": plan.candidates}
+			if byPace {
+				pace := []string{}
+				for _, name := range plan.candidates {
+					pace = append(pace, name+": "+paces[name].String())
+				}
+				row["pace"] = pace
+			}
+			out = append(out, row)
 		}
 		return s.Print(map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true})
 	}
@@ -309,7 +354,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if len(diff) == 0 || len(diff) > 2<<20 {
 		return errors.New("empty or oversized diff; manual review required")
 	}
-	scratch, e := os.MkdirTemp("", "mergewake-review-*")
+	// Scratch left by a review whose process was SIGKILLed is older than any
+	// live review can be; removing it is best effort.
+	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, time.Now())
+	scratch, e := os.MkdirTemp("", reviewer.ScratchPattern)
 	if e != nil {
 		return e
 	}
@@ -401,7 +449,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			return e
 		}
-		if e = s.audit(r.Name, "review", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings)}, false); e != nil {
+		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings)}
+		if pace, ok := paces[selected]; ok {
+			event["pace"] = pace
+		}
+		if e = s.audit(r.Name, "review", event, false); e != nil {
 			return e
 		}
 	}
