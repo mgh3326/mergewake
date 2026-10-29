@@ -18,11 +18,14 @@ type rankingRunner struct {
 
 func (r *rankingRunner) Run(_ context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if command == "scopefuel" {
+		if args[0] == "--json" {
+			return []byte(idleUsage), nil
+		}
 		if args[0] == "--recommend" {
 			if args[1] != "A" {
 				return nil, errors.New("wrong grade")
 			}
-			return []byte(`{"rows":[{"profile":"same","kind":"candidate"},{"profile":"kimi","kind":"unsubscribed"},{"profile":"limited","kind":"candidate"},{"profile":"good","kind":"candidate"}]}`), nil
+			return []byte(`{"rows":[{"profile":"same","kind":"candidate","pool":"idle"},{"profile":"kimi","kind":"unsubscribed","pool":"idle"},{"profile":"limited","kind":"candidate","pool":"idle"},{"profile":"good","kind":"candidate","pool":"idle"}]}`), nil
 		}
 		r.gates = append(r.gates, args[2])
 		if args[2] == "limited" {

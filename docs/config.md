@@ -159,22 +159,50 @@ A single PR's fetch failure never aborts the pass.
 | --- | --- | --- |
 | `login` | Required | GitHub identity posting the independent exact-head review. |
 | `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
-| `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json` and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
+| `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
 | `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
+| `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths
-ending in `claude`, `codex`, `devin`, `grok`, `kimi`, `pi`, or `cmd`. Args are
-option/value pairs: `--model` for all adapters, `--effort` for Claude, Codex,
-Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
+ending in `agy`, `claude`, `codex`, `devin`, `grok`, `kimi`, `pi`, or `cmd`. Args are
+option/value pairs: `--model` for all adapters, `--effort` for agy, Claude,
+Codex, Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
 refused. Codex effort becomes a TOML override; Kimi effort is set in its isolated
 model config from `gate_effort`. Use concrete model IDs from the installed CLI.
 
-Selection preserves the quota tool's ranked `rows` order and admits only
-`kind: candidate` rows. Routine changes need one diff-only pass on the exact PR
+Only `kind: candidate` rows are admitted. With `select: pace` (the default) the
+quota tool's usage snapshot (`<quota> --json`) is read once per review and each
+admitted profile is placed by the pool its recommendation row names (`pool`):
+
+- **Projection.** For every window that applies, projected use at reset is
+  `used_pct ÷ elapsed fraction of the window`, where the elapsed fraction is
+  `1 − (resets_at − now) ÷ window` (floored at 5% so a window that just reset
+  does not turn a few percent into a large multiple). The worst window wins.
+  Account- and group-scoped buckets apply to every profile of the pool;
+  model-scoped buckets only to a profile whose `--model` contains the scope
+  name (ignoring case and punctuation). An unused window projects 0%. A
+  `credit` window has no reset: its `used_pct` is the projection, and it never
+  counts as waste.
+- **Order.** Free models first (recommendation `billing: free`, or a matching
+  model bucket noted *Free*), then pools projected under 70% (they would end
+  the window with quota unused) by lowest projection, then the remaining pools
+  under 100% by lowest projection. Ties keep the recommendation order.
+- **Skip.** A pool projected at or above 100%, an excluded or stale/degraded
+  pool, a missing pool, a bucket with unknown usage, an unknown window, a
+  missing reset (with usage above 0) or a reset already passed are never
+  picked. When every admitted profile is skipped the review fails with each
+  profile and the reason (`… projected 104% at 7d reset`, `… pool not
+  measured`), and nothing is gated, claimed or invoked.
+
+The chosen reviewer's pool, tier and projection are recorded as `pace` in the
+review audit event (stdout and `decisions.jsonl`); dry-run prints the pace of
+every candidate and lists skipped profiles with their reason (`pace_skipped`). `pairings`, when set, fixes the order of other-family
+reviewers ahead of pace but never admits a skipped pool. `select: rank` preserves the quota tool's ranked `rows` order
+instead, for quota tools without pools or a usage snapshot. Routine changes need one diff-only pass on the exact PR
 head; blocking paths need two. For each pass the reviewer is chosen in this
 order: a different model family than the author, preferring `pairings` order and
 families not already used on this head; any different family; the author's
@@ -222,13 +250,32 @@ mergewake code or config change is needed. Do not switch providers merely to
 circumvent an underlying pool's subscription state.
 
 Every adapter receives the diff on stdin in an empty temporary working directory.
+Reviewer processes run in their own process group. On timeout, cancellation or
+mergewake's own SIGINT/SIGTERM/SIGHUP the whole group receives SIGTERM, then
+SIGKILL from a timer after a 5s grace, independent of any read still in progress; after every exit, including success, the group is
+killed and reaped, so a child the CLI forked cannot outlive the call or hold the
+review open through an inherited stdout. On Linux the leader also gets
+`PDEATHSIG=SIGKILL` for a parent killed by SIGKILL; descendants that leave the
+process group (`setsid`) are outside this guarantee. A timeout is reported as
+`<cli> reviewer: env timed out; process group terminated`. The temporary
+directory (including private homes such as Kimi's) is removed on return, and
+each review removes this user's `mergewake-review-*` directories older than
+twice `review.timeout`, which only a SIGKILLed review leaves behind.
 Only adapter-owned control files may be present (Command Code's deny hook).
 GitHub credentials are removed from the review process environment. Claude uses
 safe/restricted print mode, no built-in tools, no MCP and no settings discovery;
 pi disables tools, MCP and context discovery; Command Code uses safe mode, deny
 permissions and a PreToolUse deny hook. Devin print mode receives a private deny
 configuration disabling file, shell, MCP, imports and subagents as far as its CLI
-supports. Grok uses an empty tool list, MCP deny, no web and no subagents. Codex
+supports. Grok uses an empty tool list, MCP deny, no web and no subagents. agy print mode
+takes its prompt only as an argv value, so the diff is sent as one stream-json
+user message on stdin (`--print= --input-format stream-json --output-format
+stream-json`); it runs with `--sandbox`, slash commands disabled, and
+session-only settings denying shell, file, URL and MCP tools and non-workspace
+access, on top of headless agy denying any tool permission it would prompt for.
+Any tool step in its event stream, a result other than one successful turn, or
+an empty response fails the pass. agy keeps its own conversation history; no
+flag disables it. Codex
 exec ignores user config/rules, disables shell, code mode, search, plugins, MCP,
 apps and delegation, and uses a read-only sandbox. These are CLI restrictions,
 not a uniform OS sandbox for the CLIs themselves; credentials remain owned by
