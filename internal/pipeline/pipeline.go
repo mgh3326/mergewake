@@ -54,20 +54,28 @@ type Service struct {
 	Sink     integrations.Sink
 	Notifier integrations.Notifier
 	Out      io.Writer
+	// Now is the clock for stamps and age decisions; nil means time.Now.
+	Now func() time.Time
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
 	Digest, Adopt            string
 }
 
-func (s *Service) Print(v any) error        { return json.NewEncoder(s.Out).Encode(v) }
+func (s *Service) Print(v any) error { return json.NewEncoder(s.Out).Encode(v) }
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
 func (s *Service) state(repo string) string { return filepath.Join(s.Config.StateDir, repo) }
 func (s *Service) audit(repo, command string, value any, dry bool) error {
 	record := struct {
 		Time    time.Time `json:"time"`
 		Command string    `json:"command"`
 		Value   any       `json:"value"`
-	}{time.Now().UTC(), command, value}
+	}{s.now().UTC(), command, value}
 	b, e := json.Marshal(record)
 	if e != nil {
 		return e
@@ -406,7 +414,7 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 		return errors.New("--adopt requires a container install target")
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
-	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: o.DryRun || o.Shadow}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
+	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Now: s.Now}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
 	if o.DryRun || o.Shadow {
 		return errors.Join(e, s.Print(result))
 	}
@@ -558,7 +566,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
 		return err
 	}
-	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Digest: o.Digest}
+	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Digest: o.Digest, Now: s.Now}
 	var result rollout.Result
 	var installErr error
 	switch {
@@ -640,7 +648,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		record.Error = installErr.Error()
 	}
 	data, _ := json.Marshal(record)
-	id := fmt.Sprintf("rollout-%s-%d", m.Commit[:8], time.Now().UnixNano())
+	id := fmt.Sprintf("rollout-%s-%d", m.Commit[:8], s.now().UnixNano())
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	return errors.Join(installErr, s.audit(r.Name, "rollout", record, false), s.Sink.Record(reportCtx, "mergewake/"+s.Config.Host+"/"+id, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: id, Text: fmt.Sprintf("mergewake %s %s %s %s", r.Name, s.Config.Host, m.Commit, result.Status)}))

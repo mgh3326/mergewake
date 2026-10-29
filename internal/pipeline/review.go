@@ -206,7 +206,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if command == "" {
 		command = "scopefuel"
 	}
-	cli := quota.CLI{Runner: s.Runner, Command: command}
+	cli := quota.CLI{Runner: s.Runner, Command: command, Now: s.Now}
 	var provider quota.Provider = cli
 	ranked, e := provider.Recommend(ctx, grade)
 	if e != nil {
@@ -366,7 +366,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	// Scratch left by a review whose process was SIGKILLed is old and its lock
 	// is free; a concurrent review's scratch stays locked. Best effort.
-	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, time.Now())
+	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, s.now())
 	scratch, release, e := reviewer.NewScratch()
 	if e != nil {
 		return e
@@ -469,7 +469,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				return errors.Join(runErr, ctx.Err())
 			}
 			failed[name] = true
-			failure := quota.Classify(runErr, time.Now())
+			failure := quota.Classify(runErr, s.now())
 			if !failure.Quota {
 				skip("review failed", time.Time{})
 				continue
@@ -547,7 +547,7 @@ func (s *Service) observeExhausted(ctx context.Context, cli quota.CLI, p config.
 	if f.Reset.IsZero() {
 		return "reset time not reported; not recorded"
 	}
-	if e := cli.ObserveDevinFreeLimit(ctx, f.Reset, time.Now(), "swe-2", fmt.Sprintf("mergewake:%s#%d", repo, pr)); e != nil {
+	if e := cli.ObserveDevinFreeLimit(ctx, f.Reset, s.now(), "swe-2", fmt.Sprintf("mergewake:%s#%d", repo, pr)); e != nil {
 		return "recording the limit failed: " + e.Error()
 	}
 	return "limit recorded with the quota tool"

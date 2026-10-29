@@ -247,7 +247,7 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			Status  string         `json:"status"`
 			Error   string         `json:"error"`
 		}{j, status, cause.Error()}
-		if e := writeJSON(filepath.Join(o.StateDir, fmt.Sprintf("command-rollback-%d.json", time.Now().UnixNano())), audit); e != nil {
+		if e := writeJSON(filepath.Join(o.StateDir, fmt.Sprintf("command-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
 			errs = append(errs, e)
 		}
 		if e := writeJSON(rejectPath, GateReceipt{host, m.Repo, "", j.Commit, status}); e != nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -42,6 +43,15 @@ type Options struct {
 	Deny           []string
 	DryRun         bool
 	Digest         string
+	// Now stamps receipts and audit names; nil means time.Now.
+	Now func() time.Time
+}
+
+func (o Options) now() time.Time {
+	if o.Now != nil {
+		return o.Now()
+	}
+	return time.Now()
 }
 
 // Atomic writes beside the target, so rename never crosses filesystems.

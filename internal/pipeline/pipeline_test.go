@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1113,5 +1114,18 @@ func TestFileRolloutCanaryGate(t *testing.T) {
 	}
 	if e = rollout.CheckGate(config.Install{Canary: "host-b", ReceiptsDir: spec.ReceiptsDir, Target: spec.Target}, "host-c", r.Name, m.Commit); e != nil {
 		t.Fatal("follower did not publish success receipt:", e)
+	}
+}
+
+func TestServiceClockStampsAudit(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	var buf bytes.Buffer
+	s := &Service{Out: &buf, Now: func() time.Time { return at }}
+	if e := s.audit("example/project", "land", map[string]int{"pr": 7}, true); e != nil {
+		t.Fatal(e)
+	}
+	want := `{"time":"2026-01-02T03:04:05Z","command":"land","value":{"pr":7}}` + "\n"
+	if buf.String() != want {
+		t.Fatalf("audit %q, want %q", buf.String(), want)
 	}
 }

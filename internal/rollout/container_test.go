@@ -2,6 +2,7 @@ package rollout
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -600,5 +601,49 @@ func TestRuntimeCLIArguments(t *testing.T) {
 	used, e := c.InUse(context.Background())
 	if e != nil || len(used) != 1 || used[0] != "img-a" {
 		t.Fatalf("%v %v", used, e)
+	}
+}
+
+func TestGarbageCollectRemovesEachDigestOnceSorted(t *testing.T) {
+	repo := containerSpec().Image
+	rt := newFakeRuntime()
+	// The runtime lists images newest first and may list a digest once per tag.
+	rt.images = []Image{
+		{ID: "img-stale", Digest: staleDigest, Ref: repo + "@" + staleDigest},
+		{ID: "img-older", Digest: olderDigest, Ref: repo + "@" + olderDigest},
+		{ID: "img-stale", Digest: staleDigest, Ref: repo + "@" + staleDigest},
+	}
+	removed, e := garbageCollect(context.Background(), rt, repo, map[string]bool{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if want := []string{olderDigest, staleDigest}; !reflect.DeepEqual(removed, want) {
+		t.Fatalf("removed %v, want %v", removed, want)
+	}
+	if len(rt.removals) != 2 {
+		t.Fatalf("removed a digest twice: %v", rt.removals)
+	}
+}
+
+func TestOptionsClockStampsReceipts(t *testing.T) {
+	spec := containerSpec()
+	state := t.TempDir()
+	rt := newFakeRuntime()
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	m := containerManifest(t, strings.Repeat("e", 40), newDigest)
+	o := Options{StateDir: state, Allowed: []config.Install{spec}, Now: func() time.Time { return at }}
+	if res, e := ApplyContainer(context.Background(), m, o, "host-a", runtimeFor(rt), healthy); e != nil || res.Status != "success" {
+		t.Fatalf("%+v %v", res, e)
+	}
+	var receipt ContainerReceipt
+	b, e := os.ReadFile(filepath.Join(state, ContainerReceiptName))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = json.Unmarshal(b, &receipt); e != nil {
+		t.Fatal(e)
+	}
+	if got := receipt.Targets[spec.Target].InstalledAt; !got.Equal(at) {
+		t.Fatalf("installed_at %v, want %v", got, at)
 	}
 }

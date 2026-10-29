@@ -345,7 +345,7 @@ func AdoptContainer(ctx context.Context, spec config.Install, host, repo string,
 		Digest:      c.Digest,
 		Previous:    deployHistory(prior, c.Digest, keepCount(spec)),
 		Adopted:     true,
-		InstalledAt: time.Now().UTC(),
+		InstalledAt: o.now().UTC(),
 	}
 	if e = writeJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
 		err = e
@@ -536,7 +536,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 	undo := func(cause error) {
 		rc, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 		defer cancel()
-		if re := rollbackContainerJournal(rc, j, cause, rtFor, health, specs, o.Deny, o.StateDir); re != nil {
+		if re := rollbackContainerJournal(rc, j, cause, rtFor, health, specs, o); re != nil {
 			res.Status = "rollback-failed"
 			err = errors.Join(cause, re)
 			return
@@ -602,7 +602,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 			Image:       s.Image,
 			Digest:      digests[s.Target],
 			Previous:    history,
-			InstalledAt: time.Now().UTC(),
+			InstalledAt: o.now().UTC(),
 		}
 		res.Installed = append(res.Installed, s.Target)
 	}
@@ -699,10 +699,12 @@ func garbageCollect(ctx context.Context, rt Runtime, repo string, keep map[strin
 		used[id] = true
 	}
 	var errs []error
+	seen := map[string]bool{}
 	for _, img := range images {
-		if img.Digest == "" || keep[img.Digest] || used[img.ID] {
+		if img.Digest == "" || keep[img.Digest] || used[img.ID] || seen[img.Digest] {
 			continue
 		}
+		seen[img.Digest] = true
 		ref := repo + "@" + img.Digest
 		if e := rt.RemoveImage(ctx, ref); e != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", ref, e))
@@ -710,6 +712,7 @@ func garbageCollect(ctx context.Context, rt Runtime, repo string, keep map[strin
 		}
 		removed = append(removed, img.Digest)
 	}
+	sort.Strings(removed)
 	return removed, errors.Join(errs...)
 }
 
@@ -752,7 +755,7 @@ func recoverContainerJournal(ctx context.Context, o Options, host, repo string, 
 		}
 		return false, os.Remove(journalPath)
 	}
-	if e = rollbackContainerJournal(ctx, j, errors.New("recover interrupted container rollout"), rtFor, health, specs, o.Deny, o.StateDir); e != nil {
+	if e = rollbackContainerJournal(ctx, j, errors.New("recover interrupted container rollout"), rtFor, health, specs, o); e != nil {
 		return true, e
 	}
 	return true, os.Remove(journalPath)
@@ -760,7 +763,7 @@ func recoverContainerJournal(ctx context.Context, o Options, host, repo string, 
 
 // rollbackContainerJournal restores every recorded target in reverse order and
 // keeps the journal when any restore fails, so an operator sees the evidence.
-func rollbackContainerJournal(ctx context.Context, j containerJournal, cause error, rtFor RuntimeFor, health HealthCheck, specs map[string]config.Install, deny []string, stateDir string) error {
+func rollbackContainerJournal(ctx context.Context, j containerJournal, cause error, rtFor RuntimeFor, health HealthCheck, specs map[string]config.Install, o Options) error {
 	var errs []error
 	for i := len(j.Order) - 1; i >= 0; i-- {
 		name := j.Order[i]
@@ -770,7 +773,7 @@ func rollbackContainerJournal(ctx context.Context, j containerJournal, cause err
 			errs = append(errs, fmt.Errorf("%s: journal target is no longer configured", name))
 			continue
 		}
-		denied, e := deniedTarget(deny, name)
+		denied, e := deniedTarget(o.Deny, name)
 		if e != nil {
 			errs = append(errs, e)
 			continue
@@ -796,20 +799,20 @@ func rollbackContainerJournal(ctx context.Context, j containerJournal, cause err
 		Status  string           `json:"status"`
 		Error   string           `json:"error"`
 	}{j, status, cause.Error()}
-	if e := writeJSON(filepath.Join(stateDir, fmt.Sprintf("container-rollback-%d.json", time.Now().UnixNano())), audit); e != nil {
+	if e := writeJSON(filepath.Join(o.StateDir, fmt.Sprintf("container-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
 		errs = append(errs, e)
 	}
 	rejection := containerRejection{Commit: j.Commit, Status: status, Error: cause.Error(), Digests: map[string]string{}}
 	for _, name := range j.Order {
 		rejection.Digests[name] = j.Targets[name].NewDigest
 	}
-	if e := writeJSON(filepath.Join(stateDir, containerRejectName), rejection); e != nil {
+	if e := writeJSON(filepath.Join(o.StateDir, containerRejectName), rejection); e != nil {
 		errs = append(errs, e)
 	}
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-	receiptPath := filepath.Join(stateDir, ContainerReceiptName)
+	receiptPath := filepath.Join(o.StateDir, ContainerReceiptName)
 	if j.ReceiptExisted {
 		if e := Atomic(receiptPath, j.PriorReceipt, 0600); e != nil {
 			return e

@@ -3,7 +3,9 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"maps"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +15,9 @@ import (
 	"github.com/mgh3326/mergewake/internal/outcomes"
 )
 
-func (s *Service) ledger() outcomes.Ledger { return outcomes.Ledger{Dir: s.Config.StateDir} }
+func (s *Service) ledger() outcomes.Ledger {
+	return outcomes.Ledger{Dir: s.Config.StateDir, Now: s.Now}
+}
 func trailer(body, key string) string {
 	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `: ([^\r\n]+?)[\t ]*$`)
 	matches := re.FindAllStringSubmatch(body, -1)
@@ -122,7 +126,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 			}
 			if len(reviews) > 0 {
 				sameFamily := false
-				for head := range reviews {
+				for _, head := range slices.Sorted(maps.Keys(reviews)) {
 					passes, e := s.GH.ReviewPasses(ctx, r.Name, p.Number, head, s.Config.Review.Login)
 					if e != nil {
 						return e
@@ -208,7 +212,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 				}
 			}
 		}
-		if reverted == nil && time.Now().After(v.MergedAt.Add(7*24*time.Hour)) {
+		if reverted == nil && s.now().After(v.MergedAt.Add(7*24*time.Hour)) {
 			no := false
 			reverted = &no
 		}
@@ -280,7 +284,8 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		return err
 	}
 	var errs []error
-	for _, v := range state.Latest {
+	for _, key := range slices.Sorted(maps.Keys(state.Latest)) {
+		v := state.Latest[key]
 		if v.Repo != r.Name || open[v.PR] {
 			continue
 		}
