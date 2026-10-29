@@ -187,8 +187,14 @@ panes, and closing needs `reap.act` on top of `--apply`, a gate separate from
 `daemon.act`.
 
 Worktree removal is additive on top of the age gate: the merge must be older
-than `worktree_after`, the watch role's recovery convention must show neither
-an open recovery nor one merged within seven days, the worktree must still be
+than `worktree_after`, and the PR must name a candidate worktree on some
+host — a matching pane cwd or a prior receipt row — before any per-PR row or
+GitHub call happens, so a busy repo's old merges stay silent. The list
+endpoint omits `merge_commit_sha`, resolved through the single-PR endpoint
+only for PRs with candidates. The watch role's recovery convention must show
+neither an open recovery nor one merged within seven days, and the listing
+itself is bounded to merges inside `reap.scan_after` (default 30 days). The
+worktree must still be
 registered, unlocked, clean and unattached, and every gitignored file it
 holds (`git status --porcelain --ignored`) must match the `reap.regenerable`
 allowlist — expendable build and cache output like `.venv`, `node_modules`

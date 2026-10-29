@@ -402,10 +402,14 @@ func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
 			t.Fatal("scan did not stop at the first old updated_at")
 		}
 		reply(w, []Pull{
-			{Number: 1, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "main"}},
+			{Number: 1, State: "closed", UpdatedAt: recent, Merged: true, MergedAt: &recent, Base: Ref{Ref: "main"}},
 			{Number: 2, State: "closed", UpdatedAt: recent, Base: Ref{Ref: "main"}},
-			{Number: 3, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "release"}},
-			{Number: 4, State: "closed", UpdatedAt: old, Merged: true, Base: Ref{Ref: "main"}},
+			{Number: 3, State: "closed", UpdatedAt: recent, Merged: true, MergedAt: &recent, Base: Ref{Ref: "release"}},
+			{Number: 4, State: "closed", UpdatedAt: old, Merged: true, MergedAt: &recent, Base: Ref{Ref: "main"}},
+			// Recently touched but merged long ago: merge recency, not update
+			// recency, is the bound.
+			{Number: 5, State: "closed", UpdatedAt: recent, Merged: true, MergedAt: &old, Base: Ref{Ref: "main"}},
+			{Number: 6, State: "closed", UpdatedAt: recent, Merged: true, Base: Ref{Ref: "main"}},
 		})
 	})
 	pulls, e := c.MergedPulls(context.Background(), "example/project", "main", time.Now().Add(-time.Hour))

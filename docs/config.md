@@ -90,6 +90,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `enabled` | `false` | Gates the `reap` command and daemon role. |
 | `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
+| `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
@@ -116,7 +117,12 @@ is re-read and the pane must still be present with the same id, status, cwd
 and name; a pane that changed or went back to work is skipped as
 `pane-changed` or `pane-gone`. Closing happens only in acting mode.
 
-After `worktree_after` with no revert, a merged PR's worktree is removed. The
+After `worktree_after` with no revert, a merged PR's worktree is removed —
+but only for PRs that name a candidate worktree on some configured host (a
+matching pane cwd or a prior `reap.jsonl` row); a merged PR with nothing to
+reap produces no rows and no follow-up GitHub calls. The pull list endpoint
+omits `merge_commit_sha`, so when candidates do exist it is resolved through
+the single-PR endpoint before the revert check. The
 revert knowledge comes from the watch role's recovery-PR convention: a
 recovery merged within seven days of the PR's merge, or one still open, skips
 cleanup. Removal also requires the worktree to still exist in `git worktree

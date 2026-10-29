@@ -111,6 +111,7 @@ type Reap struct {
 	Enabled       bool     `yaml:"enabled"`
 	Act           bool     `yaml:"act"`
 	WorktreeAfter string   `yaml:"worktree_after"`
+	ScanAfter     string   `yaml:"scan_after"`
 	Protect       []string `yaml:"protect"`
 	Regenerable   []string `yaml:"regenerable"`
 }
@@ -207,6 +208,12 @@ func Load(name string) (Config, error) {
 		c.Reap.WorktreeAfter = "168h"
 	}
 	if _, e = Duration(c.Reap.WorktreeAfter); e != nil {
+		return c, e
+	}
+	if c.Reap.ScanAfter == "" {
+		c.Reap.ScanAfter = "720h"
+	}
+	if _, e = Duration(c.Reap.ScanAfter); e != nil {
 		return c, e
 	}
 	if len(c.Reap.Protect) == 0 {

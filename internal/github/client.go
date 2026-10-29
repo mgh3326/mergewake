@@ -452,8 +452,12 @@ type Commit struct {
 }
 
 // MergedPulls lists recently updated closed PRs newest-first and keeps those
-// merged into branch. Pages stop once an item's updated_at predates since, so
-// the scan stays bounded on busy repositories.
+// merged into branch within the window: the bound is merge recency, so a
+// repo with hundreds of old merged PRs does not relist them every pass.
+// Pages stop once an item's updated_at predates since; merged_at never
+// postdates updated_at, so the page cut cannot drop a PR the window keeps.
+// List responses omit detail fields like merge_commit_sha — callers needing
+// them must follow up with Pull.
 func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since time.Time) ([]Pull, error) {
 	var out []Pull
 	for page := 1; page <= 10; page++ {
@@ -467,7 +471,13 @@ func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since tim
 			if t, err := time.Parse(time.RFC3339, p.UpdatedAt); err != nil || t.Before(since) {
 				stop = true
 			}
-			if (p.Merged || p.MergedAt != nil) && p.Base.Ref == branch {
+			recent := false
+			if p.MergedAt != nil {
+				if at, e := time.Parse(time.RFC3339, *p.MergedAt); e == nil && !at.Before(since) {
+					recent = true
+				}
+			}
+			if recent && p.Base.Ref == branch {
 				out = append(out, p)
 			}
 		}
