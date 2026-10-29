@@ -129,8 +129,8 @@ func (c *Client) OpenPulls(ctx context.Context, repo, branch string) ([]Pull, er
 	return list[Pull](ctx, c, base(repo)+"/pulls?state=open&base="+url.QueryEscape(branch)+"&sort=created&direction=asc")
 }
 
-// ReviewClaimed also recognizes interrupted passes: never repeatedly invoke a
-// model for an already claimed head. The retained claim requires inspection.
+// ReviewClaimed checks durable completion markers. In-flight passes use the
+// expiring ReviewLease instead.
 func (c *Client) ReviewClaimed(ctx context.Context, repo string, number int, sha string) (bool, error) {
 	var out any
 	err := c.json(ctx, "GET", fmt.Sprintf("%s/git/ref/heads/mergewake/reviews/%d/%s", base(repo), number, sha), nil, &out)

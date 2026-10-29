@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -22,16 +21,18 @@ type Rule struct {
 }
 
 // ReviewFinding is one review thread folded into the land decision. Severity
-// and authorship are normalized by the GitHub adapter; Answered means a human
-// reply exists on the thread.
+// and authorship are normalized by the GitHub adapter; Answered means a non-author human
+// reply exists on the thread. Rechecked binds a reviewer recheck to the current head.
 type ReviewFinding struct {
-	Author   string `json:"author"`
-	Severity string `json:"severity"`
-	Path     string `json:"path"`
-	Line     int    `json:"line"`
-	Resolved bool   `json:"resolved"`
-	Outdated bool   `json:"outdated"`
-	Answered bool   `json:"answered"`
+	Author           string `json:"author"`
+	Severity         string `json:"severity"`
+	Path             string `json:"path"`
+	Line             int    `json:"line"`
+	Resolved         bool   `json:"resolved"`
+	Outdated         bool   `json:"outdated"`
+	Answered         bool   `json:"answered"`
+	ReviewerResolved bool   `json:"reviewer_resolved"`
+	Rechecked        bool   `json:"rechecked"`
 }
 
 // ReviewGateRule grades findings by normalized author and severity; classes
@@ -72,7 +73,7 @@ func defaultReviewGate() ReviewGate {
 		Block: []ReviewGateRule{
 			{Author: "coderabbitai", Severity: []string{"critical"}, Classes: []string{"blocking", "routine"}},
 			{Author: "coderabbitai", Severity: []string{"major"}, Classes: []string{"blocking"}},
-			{Author: "chatgpt-codex-connector", Severity: []string{"p1"}, Classes: []string{"blocking"}},
+			{Author: "chatgpt-codex-connector", Severity: []string{"p1"}},
 		},
 		Triage: []ReviewGateRule{
 			{Author: "coderabbitai", Severity: []string{"major"}},
@@ -152,53 +153,42 @@ func (r ReviewGateRule) applies(f ReviewFinding, class string) bool {
 	return false
 }
 
-// Evaluate folds findings into block, triage, advisory and ignored buckets.
-// Resolved and outdated threads are addressed, not open. An answered thread
-// covers its cross-bot duplicate on the same path and line.
+// Evaluate grades before applying disposition. Replies never clear block rules;
+// an outdated block needs a recheck by that reviewer on the current head.
 func (g ReviewGate) Evaluate(fs []ReviewFinding, class string) GateVerdict {
 	g = g.WithDefaults()
 	v := GateVerdict{}
-	answeredAt := map[string]bool{}
+	authors := g.GateAuthors()
 	for _, f := range fs {
-		if f.Answered && f.Path != "" {
-			answeredAt[f.Path+"\x00"+strconv.Itoa(f.Line)] = true
-		}
-	}
-	for _, f := range fs {
-		switch {
-		case f.Resolved:
-			v.Ignored++
-			continue
-		case f.Outdated && g.ignoresOutdated():
-			v.Ignored++
-			continue
-		case g.ignoredAuthor(f.Author):
+		f.Author = NormalizeAuthor(f.Author)
+		f.Severity = strings.ToLower(f.Severity)
+		if g.ignoredAuthor(f.Author) {
 			v.Ignored++
 			continue
 		}
-		if !f.Answered && answeredAt[f.Path+"\x00"+strconv.Itoa(f.Line)] {
-			f.Answered = true
-		}
-		blocked := false
+		blocked, triaged := false, false
 		for _, r := range g.Block {
-			if r.applies(f, class) {
-				blocked = true
-				break
-			}
+			blocked = blocked || r.applies(f, class)
 		}
-		triaged := false
 		for _, r := range g.Triage {
-			if r.applies(f, class) {
-				triaged = true
-				break
-			}
+			triaged = triaged || r.applies(f, class)
 		}
+		// Missing authorship or unrecognized severity is unknown evidence on a
+		// blocking path, rather than an implicit clean pass.
+		if class == "blocking" && (f.Author == "" || (authors[f.Author] && !validSeverity(f.Severity))) {
+			triaged = true
+		}
+		botResolved := f.Resolved && f.ReviewerResolved && *g.IgnoreBotResolved
 		switch {
-		case f.Answered:
-			v.Advisory++
 		case blocked:
-			v.Blocking = append(v.Blocking, f)
-		case triaged:
+			if botResolved || (g.ignoresOutdated() && f.Outdated && f.Rechecked) {
+				v.Ignored++
+			} else {
+				v.Blocking = append(v.Blocking, f)
+			}
+		case botResolved || (f.Outdated && f.Severity == "major" && g.ignoresOutdated()):
+			v.Ignored++
+		case triaged && !f.Answered:
 			v.Triage = append(v.Triage, f)
 		default:
 			v.Advisory++
@@ -215,7 +205,7 @@ func (g ReviewGate) GateAuthors() map[string]bool {
 
 // CoverageGap names gate-referenced authors that left no review evidence at
 // all: no threads and no submitted reviews. A bot that never ran is a gap,
-// never a clean pass and never a block.
+// never a clean pass. The caller holds for this missing evidence.
 func (g ReviewGate) CoverageGap(fs []ReviewFinding, reviews map[string]int) []string {
 	seen := map[string]bool{}
 	for _, f := range fs {

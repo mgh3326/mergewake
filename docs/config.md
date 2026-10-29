@@ -103,20 +103,24 @@ no different-family reviewer has quota; only an empty eligible set fails.
 Unknown profiles are skipped. `gate_effort` must match an explicit recommended
 effort; it is also passed to the gate. Missing executables and failed gates
 fall through. A failed recommendation fails closed. After a head claim and
-model invocation, failures or invalid output retain the claim; there is no
-output repair or same-claim retry. Dry-run and shadow may read recommendations
+model invocation, failures or invalid output retain a lease until the configured
+review timeout plus one minute. An expired claim can be reclaimed for a fresh
+call; there is no output repair or retry within the same lease. Dry-run and shadow may read recommendations
 but never invoke a reviewer, gate, claim or post a review.
 
 Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
 invoking the model. When every required pass is posted, the
 `mergewake/reviews/<pr>/<head>-done` marker is created and the daemon skips
-that head. An interrupted pass retains its claim and is not retried
-automatically. Posted reviews embed a `mergewake-pass` JSON marker recording
+that head. An interrupted pass retains a timestamped empty-commit lease. After
+`review.timeout` plus one minute it is reclaimed automatically with a
+fast-forward ref update; competing renewals cannot both win. Legacy claims use
+their commit date for expiry. Unknown claim timestamps fail closed. Posted reviews embed a `mergewake-pass` JSON marker recording
 the pass number, lens, reviewer profile, family, and `same_family` flag;
 receipts and outcomes bind to the exact PR head, so a head change invalidates
-them. When both passes of a blocking PR fall back to the author's family, pass
-1 uses a correctness/regressions lens and pass 2 a state/migration/security/deploy
-lens; in every other case passes use the default lens.
+them. Blocking PRs use a correctness/regressions lens for pass 1 and a
+state/migration/security/deploy lens for pass 2, including after quota fallbacks.
+Landing counts distinct pass numbers and requires distinct lenses when the
+reviewer family is the same. Routine PRs use the default lens.
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
@@ -292,7 +296,7 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `enabled` | `false` | Explicit opt-in for acting `land` and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
-| `review_gate` | Absent | Graded review-thread enforcement described below. An absent section keeps the legacy rule: a blocking PR waits until every unresolved review thread is resolved. |
+| `review_gate` | Absent | Graded review-thread enforcement described below. Defaults apply even when absent; blocking PRs also retain the legacy unresolved-thread rule. |
 
 Each blocking rule has:
 
@@ -314,21 +318,26 @@ means both). Severities come from a `<!-- mergewake-severity:... -->` marker in
 the thread's first comment, or prose conventions: `critical`, `major`, `minor`,
 `nitpick` for CodeRabbit; `p1`, `p2`, `p3` for the Codex connector; plus
 `blocking`, `high`, `medium`, `low` for mergewake's own review. A thread is
-*answered* when a human (a non-bot author different from the finding's author)
-replies; an answered thread covers a different bot's duplicate on the same path
-and line. Resolved or outdated threads are ignored. `block` rules stop the merge
-until fixed; `triage` rules hold it until answered; everything else is
-advisory. A gate-referenced bot that left no evidence at all is recorded as a
-coverage gap — never a clean pass, never a block. Findings from the configured
-`review.login` block blocking paths at `critical`, `high`, `blocking`, or
-`major` severity. Present-but-empty fields take these defaults:
+*answered* when a known human other than the PR author and finding author replies.
+GraphQL `Bot` actors never count as humans, including logins without a bot suffix.
+Answers apply only to that thread's triage findings; they never clear a block.
+A block clears only when the reviewing bot resolves it (`resolvedBy`), or the
+finding's lines are outdated and that reviewer submits a recheck on the current
+head. `ignore_outdated` alone permits only routine Major findings to clear;
+`ignore_bot_resolved: false` disables the bot-resolution exemption.
+Unknown severity from a gate-listed author and ghost authors require triage on
+blocking paths. The configured `review.login`'s unresolved findings of any
+severity hold blocking paths, including medium, low and unspecified findings.
+Missing gate-bot coverage holds landing. Every PR also requires a completed
+mergewake review on its exact head, with two distinct passes for blocking paths.
+Present-but-empty fields take these defaults:
 
 ```yaml
 review_gate:
   block:
     - {author: coderabbitai, severity: [critical]}
     - {author: coderabbitai, severity: [major], classes: [blocking]}
-    - {author: chatgpt-codex-connector, severity: [p1], classes: [blocking]}
+    - {author: chatgpt-codex-connector, severity: [p1]}
   triage:
     - {author: coderabbitai, severity: [major]}
     - {author: chatgpt-codex-connector, severity: [p2]}

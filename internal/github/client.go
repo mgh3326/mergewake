@@ -436,8 +436,11 @@ type Commit struct {
 	SHA     string `json:"sha"`
 	Parents []Ref  `json:"parents"`
 	Commit  struct {
-		Tree    Ref    `json:"tree"`
-		Message string `json:"message"`
+		Tree      Ref    `json:"tree"`
+		Message   string `json:"message"`
+		Committer struct {
+			Date time.Time `json:"date"`
+		} `json:"committer"`
 	} `json:"commit"`
 }
 

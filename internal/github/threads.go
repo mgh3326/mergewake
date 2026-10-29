@@ -10,29 +10,40 @@ import (
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
+type reviewActor struct {
+	Login string `json:"login"`
+	Type  string `json:"__typename"`
+}
+
 type ReviewComment struct {
-	Author string `json:"author"`
-	Body   string `json:"body"`
+	AuthorType string `json:"author_type"`
+	Author     string `json:"author"`
+	Body       string `json:"body"`
 }
 type ReviewThread struct {
-	ID         string          `json:"id"`
-	Path       string          `json:"path"`
-	Line       int             `json:"line"`
-	IsResolved bool            `json:"resolved"`
-	IsOutdated bool            `json:"outdated"`
-	Comments   []ReviewComment `json:"comments"`
+	ID             string          `json:"id"`
+	Path           string          `json:"path"`
+	Line           int             `json:"line"`
+	IsResolved     bool            `json:"resolved"`
+	IsOutdated     bool            `json:"outdated"`
+	ResolvedBy     string          `json:"resolved_by"`
+	ResolvedByType string          `json:"resolved_by_type"`
+	Comments       []ReviewComment `json:"comments"`
 }
 
 // ReviewFeedback carries raw thread state plus who submitted reviews, so the
 // land gate can grade findings and record bot coverage gaps.
 type ReviewFeedback struct {
-	Threads       []ReviewThread `json:"threads"`
-	ReviewAuthors map[string]int `json:"review_authors"`
+	Threads          []ReviewThread  `json:"threads"`
+	ReviewAuthors    map[string]int  `json:"review_authors"`
+	RecheckedAuthors map[string]bool `json:"rechecked_authors"`
+	PRAuthor         string          `json:"pr_author"`
 }
 
 func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
 	var fb ReviewFeedback
 	fb.ReviewAuthors = map[string]int{}
+	fb.RecheckedAuthors = map[string]bool{}
 	parts := strings.Split(repo, "/")
 	cursor := (*string)(nil)
 	for page := 0; page < 100; page++ {
@@ -41,26 +52,29 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			Data   *struct {
 				Repository *struct {
 					PullRequest *struct {
-						Reviews *struct {
+						Author     *reviewActor `json:"author"`
+						HeadRefOid string       `json:"headRefOid"`
+						Reviews    *struct {
 							Nodes []struct {
-								Author *struct {
-									Login string `json:"login"`
-								} `json:"author"`
+								Author *reviewActor `json:"author"`
+								State  string       `json:"state"`
+								Commit *struct {
+									OID string `json:"oid"`
+								} `json:"commit"`
 							} `json:"nodes"`
 						} `json:"reviews"`
 						ReviewThreads *struct {
 							Nodes []struct {
-								ID         string `json:"id"`
-								Path       string `json:"path"`
-								Line       int    `json:"line"`
-								IsResolved bool   `json:"isResolved"`
-								IsOutdated bool   `json:"isOutdated"`
+								ID         string       `json:"id"`
+								Path       string       `json:"path"`
+								Line       int          `json:"line"`
+								IsResolved bool         `json:"isResolved"`
+								IsOutdated bool         `json:"isOutdated"`
+								ResolvedBy *reviewActor `json:"resolvedBy"`
 								Comments   *struct {
 									Nodes []struct {
-										Author *struct {
-											Login string `json:"login"`
-										} `json:"author"`
-										Body string `json:"body"`
+										Author *reviewActor `json:"author"`
+										Body   string       `json:"body"`
 									} `json:"nodes"`
 									PageInfo *struct {
 										HasNextPage bool `json:"hasNextPage"`
@@ -76,7 +90,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(last:100){nodes{author{login}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated comments(first:50){nodes{author{login} body} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
 			return fb, e
 		}
@@ -84,18 +98,31 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			return fb, errors.New("GitHub review thread query failed")
 		}
 		pr := result.Data.Repository.PullRequest
+		if pr.Author != nil {
+			fb.PRAuthor = pr.Author.Login
+		}
 		if pr.ReviewThreads == nil || pr.ReviewThreads.PageInfo == nil {
 			return fb, errors.New("GitHub returned incomplete review threads")
 		}
 		if page == 0 && pr.Reviews != nil {
 			for _, r := range pr.Reviews.Nodes {
 				if r.Author != nil {
-					fb.ReviewAuthors[policy.NormalizeAuthor(r.Author.Login)]++
+					if r.State == "COMMENTED" || r.State == "APPROVED" || r.State == "CHANGES_REQUESTED" {
+						author := policy.NormalizeAuthor(r.Author.Login)
+						if r.Commit != nil && r.Commit.OID != "" && r.Commit.OID == pr.HeadRefOid {
+							fb.ReviewAuthors[author]++
+							fb.RecheckedAuthors[author] = true
+						}
+					}
 				}
 			}
 		}
 		for _, t := range pr.ReviewThreads.Nodes {
 			thread := ReviewThread{ID: t.ID, Path: t.Path, Line: t.Line, IsResolved: t.IsResolved, IsOutdated: t.IsOutdated}
+			if t.ResolvedBy != nil {
+				thread.ResolvedBy = t.ResolvedBy.Login
+				thread.ResolvedByType = t.ResolvedBy.Type
+			}
 			if t.Comments == nil || len(t.Comments.Nodes) == 0 {
 				return fb, errors.New("review thread is missing its finding comment")
 			}
@@ -105,6 +132,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				c := ReviewComment{Body: cm.Body}
 				if cm.Author != nil {
 					c.Author = cm.Author.Login
+					c.AuthorType = cm.Author.Type
 				}
 				thread.Comments = append(thread.Comments, c)
 			}
@@ -127,8 +155,7 @@ var codeRabbitSeverity = regexp.MustCompile(`(?i)\b(critical|major|minor|nitpick
 var codexSeverity = regexp.MustCompile(`(?i)\bP([123])\b`)
 
 // ThreadSeverity reads the machine or prose severity label from a finding's
-// first comment. Unknown authors yield an empty severity, which no gate rule
-// matches.
+// first comment. Unknown severities stay empty and require triage on blocking paths.
 func ThreadSeverity(author, body string) string {
 	if len(body) > 400 {
 		body = body[:400]
@@ -150,8 +177,8 @@ func ThreadSeverity(author, body string) string {
 }
 
 // Findings grades raw threads into gate findings. bots are normalized logins
-// whose replies never count as a human answer; a raw login ending in [bot] or
-// the thread's own author is also treated as a bot.
+// whose replies never count as human answers. GraphQL actor types and the PR
+// author are checked independently of login suffixes.
 func (f ReviewFeedback) Findings(bots map[string]bool) []policy.ReviewFinding {
 	out := []policy.ReviewFinding{}
 	for _, t := range f.Threads {
@@ -166,9 +193,11 @@ func (f ReviewFeedback) Findings(bots map[string]bool) []policy.ReviewFinding {
 			Resolved: t.IsResolved,
 			Outdated: t.IsOutdated,
 		}
+		finding.Rechecked = f.RecheckedAuthors[finding.Author]
+		finding.ReviewerResolved = finding.Author != "" && policy.NormalizeAuthor(t.ResolvedBy) == finding.Author && (t.ResolvedByType == "Bot" || bots[finding.Author])
 		for _, c := range t.Comments[1:] {
 			author := policy.NormalizeAuthor(c.Author)
-			if author != "" && author != finding.Author && !bots[author] && !strings.HasSuffix(c.Author, "[bot]") {
+			if f.PRAuthor != "" && c.AuthorType == "User" && author != policy.NormalizeAuthor(f.PRAuthor) && author != "" && author != finding.Author && !bots[author] && !strings.HasSuffix(c.Author, "[bot]") {
 				finding.Answered = true
 				break
 			}

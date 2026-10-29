@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -53,12 +54,11 @@ func claimRef(n int, sha string, pass int) string {
 }
 func doneRef(n int, sha string) string { return fmt.Sprintf("mergewake/reviews/%d/%s-done", n, sha) }
 
-func (s *Service) claimed(ctx context.Context, repo string, n int, sha string, pass int) (bool, error) {
-	suffix := ""
-	if pass > 1 {
-		suffix = "-p" + strconv.Itoa(pass)
-	}
-	return s.GH.ReviewClaimed(ctx, repo, n, sha+suffix)
+// A minute beyond the configured invocation timeout allows posting/cleanup to
+// finish before another host may take over an interrupted pass.
+func (s *Service) reviewLeaseTTL() (time.Duration, error) {
+	timeout, err := config.Duration(s.Config.Review.Timeout)
+	return timeout + time.Minute, err
 }
 
 func profileModel(p config.Reviewer) string {
@@ -159,7 +159,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if _, ok := posted[i]; ok {
 			continue
 		}
-		claimed, e := s.claimed(ctx, r.Name, n, pr.Head.SHA, i)
+		ttl, e := s.reviewLeaseTTL()
+		if e != nil {
+			return e
+		}
+		_, claimed, e := s.GH.ReviewLease(ctx, r.Name, claimRef(n, pr.Head.SHA, i), ttl)
 		if e != nil {
 			return e
 		}
@@ -279,16 +283,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		usedProfiles[plans[len(plans)-1].candidates[0]] = true
 		usedFamilies[fam(plans[len(plans)-1].candidates[0])] = true
 	}
-	families := map[int]string{}
-	for pass, receipt := range posted {
-		families[pass] = receipt.Family
-	}
-	for _, plan := range plans {
-		families[plan.pass] = fam(plan.candidates[0])
-	}
-	lens := func(plan *passPlan, selected string) string {
-		families[plan.pass] = fam(selected)
-		if needed == 2 && families[1] != "" && families[1] == families[2] {
+	lens := func(plan *passPlan) string {
+		if needed == 2 {
 			if plan.pass == 1 {
 				return "correctness"
 			}
@@ -296,10 +292,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		return "default"
 	}
+
 	if o.DryRun || o.Shadow {
 		out := []map[string]any{}
 		for _, plan := range plans {
-			plan.lens = lens(plan, plan.candidates[0])
+			plan.lens = lens(plan)
 			plan.sameFamily = fam(plan.candidates[0]) == family
 			out = append(out, map[string]any{"pass": plan.pass, "lens": plan.lens, "same_family": plan.sameFamily, "candidates": plan.candidates})
 		}
@@ -356,13 +353,21 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return fmt.Errorf("%w: quota admitted no available reviewer", ErrReviewUnavailable)
 		}
 		plan.name = selected
-		plan.lens = lens(plan, selected)
+		plan.lens = lens(plan)
 		plan.sameFamily = fam(selected) == family
 		profile := profiles[selected]
 		// A GitHub ref claims this PR head across hosts before invoking the model.
 		claim := claimRef(n, pr.Head.SHA, plan.pass)
-		if e = s.GH.CreateRef(ctx, r.Name, claim, pr.Head.SHA); e != nil {
-			return fmt.Errorf("review claim unavailable; inspect existing claim before retrying: %w", e)
+		ttl, e := s.reviewLeaseTTL()
+		if e != nil {
+			return e
+		}
+		acquired, e := s.GH.ClaimReview(ctx, r.Name, claim, pr.Head.SHA, ttl)
+		if e != nil {
+			return e
+		}
+		if !acquired {
+			return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
 		}
 		if filepath.Base(profile.Command) == "cmd" {
 			// The hook also denies control-flow tools that bypass permission deny lists.

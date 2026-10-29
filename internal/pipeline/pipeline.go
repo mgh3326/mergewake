@@ -32,6 +32,8 @@ type GitHub interface {
 	Reviewed(context.Context, string, int, string, string) (bool, error)
 	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
 	ReviewClaimed(context.Context, string, int, string) (bool, error)
+	ReviewLease(context.Context, string, string, time.Duration) (string, bool, error)
+	ClaimReview(context.Context, string, string, string, time.Duration) (bool, error)
 	ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error)
 	Unresolved(context.Context, string, int) (int, error)
 	PostReview(context.Context, string, int, string, []github.Finding, github.PassReceipt) error
@@ -101,45 +103,26 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	return p, p.Validate()
 }
 
-// reviewGate folds review threads into the land decision. Without a
-// review_gate section, blocking PRs keep the legacy all-unresolved-must-clear
-// rule and routine PRs stay advisory. With the section, graded author+severity
-// rules decide: blocking findings stop the merge until fixed, triage findings
-// gate it until answered, and a missing gate bot is a recorded coverage gap,
-// never a pass or a block.
+// reviewGate enforces graded findings on every PR and holds on missing bot
+// coverage. Absent review_gate also retains the legacy blocking-thread rule.
 func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy) (string, *policy.GateVerdict, []string, *int, error) {
-	if p.ReviewGate == nil {
-		if class != "blocking" {
-			return "", nil, nil, nil, nil
-		}
-		count, e := s.GH.Unresolved(ctx, r.Name, n)
-		if e != nil {
-			return "", nil, nil, nil, e
-		}
-		if count > 0 {
-			return "wait-for-findings", nil, nil, &count, nil
-		}
-		return "", nil, nil, &count, nil
-	}
 	fb, e := s.GH.ReviewFeedback(ctx, r.Name, n)
 	if e != nil {
 		return "", nil, nil, nil, e
 	}
-	gate := p.ReviewGate.WithDefaults()
+	gate := policy.ReviewGate{}.WithDefaults()
+	if p.ReviewGate != nil {
+		gate = p.ReviewGate.WithDefaults()
+	}
 	login := policy.NormalizeAuthor(s.Config.Review.Login)
 	if login != "" {
-		// The independent review's own findings are graded like any gate author:
-		// critical/high always blocks; legacy blocking/major blocks stateful paths.
 		gate.Block = append(gate.Block,
-			policy.ReviewGateRule{Author: login, Severity: []string{"critical", "high"}},
-			policy.ReviewGateRule{Author: login, Severity: []string{"blocking", "major"}, Classes: []string{"blocking"}})
+			policy.ReviewGateRule{Author: login, Severity: []string{"critical", "high", "blocking"}},
+			policy.ReviewGateRule{Author: login, Severity: []string{"major", "medium", "minor", "low", "unspecified", ""}, Classes: []string{"blocking"}})
 	}
 	bots := gate.GateAuthors()
 	for _, a := range gate.IgnoreAuthors {
 		bots[policy.NormalizeAuthor(a)] = true
-	}
-	if login != "" {
-		bots[login] = true
 	}
 	fs := fb.Findings(bots)
 	v := gate.Evaluate(fs, class)
@@ -149,9 +132,50 @@ func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class st
 		return "wait-for-blocking-findings", &v, gap, nil, nil
 	case len(v.Triage) > 0:
 		return "wait-for-triage-reply", &v, gap, nil, nil
+	case len(gap) > 0:
+		return "wait-for-review-coverage", &v, gap, nil, nil
+	}
+	if p.ReviewGate == nil && class == "blocking" {
+		count, e := s.GH.Unresolved(ctx, r.Name, n)
+		if e != nil {
+			return "", nil, nil, nil, e
+		}
+		if count > 0 {
+			return "wait-for-findings", &v, gap, &count, nil
+		}
+		return "", &v, gap, &count, nil
 	}
 	return "", &v, gap, nil, nil
 }
+
+// distinctPasses validates numbered passes and independent lenses when the
+// same reviewer family supplies both passes. Duplicates never add coverage.
+func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
+	passes := map[int]github.PassReceipt{}
+	for _, r := range receipts {
+		if r.Pass < 1 || r.Pass > needed {
+			continue
+		}
+		if prior, ok := passes[r.Pass]; ok && prior != r {
+			return len(passes), false
+		}
+		passes[r.Pass] = r
+	}
+	if len(passes) < needed {
+		return len(passes), false
+	}
+	if needed == 2 {
+		a, b := passes[1], passes[2]
+		if a.Family == "" || b.Family == "" {
+			return len(passes), false
+		}
+		if a.Family == b.Family && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
+			return len(passes), false
+		}
+	}
+	return len(passes), true
+}
+
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -198,20 +222,23 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	sameFamily := false
 	if ci == github.Green {
 		d.Action = "merge"
+		needed := 1
 		if d.Class == "blocking" {
-			receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
-			if e != nil {
-				return e
-			}
-			count := len(receipts)
-			reviewed = &count
-			for _, receipt := range receipts {
-				sameFamily = sameFamily || receipt.SameFamily
-			}
-			if count < 2 {
-				d.Action = "wait-for-independent-review"
-			}
+			needed = 2
 		}
+		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+		if e != nil {
+			return e
+		}
+		count, complete := distinctPasses(receipts, needed)
+		reviewed = &count
+		for _, receipt := range receipts {
+			sameFamily = sameFamily || receipt.SameFamily
+		}
+		if !complete {
+			d.Action = "wait-for-independent-review"
+		}
+
 		if d.Action == "merge" {
 			action, v, g, u, e := s.reviewGate(ctx, r, n, d.Class, p)
 			if e != nil {
@@ -265,15 +292,18 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft {
 		return errors.New("PR changed during decision")
 	}
+	needed := 1
 	if d.Class == "blocking" {
-		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
-		if e != nil {
-			return e
-		}
-		if len(receipts) < 2 {
-			return errors.New("review passes changed during decision")
-		}
+		needed = 2
 	}
+	receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	if e != nil {
+		return e
+	}
+	if _, complete := distinctPasses(receipts, needed); !complete {
+		return errors.New("review passes changed during decision")
+	}
+
 	action, _, _, _, e := s.reviewGate(ctx, r, n, d.Class, p)
 	if e != nil {
 		return e

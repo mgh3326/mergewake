@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -37,6 +38,7 @@ type fakeGH struct {
 	passes                                                       map[string][]github.PassReceipt
 	feedback                                                     github.ReviewFeedback
 	refs                                                         map[string]bool
+	leaseTimes                                                   map[string]time.Time
 	files                                                        []policy.File
 	ci                                                           github.CI
 	mergeCount, revertCount, postCount, claimCount, publishCount int
@@ -100,7 +102,7 @@ func (g *fakeGH) Check(_ context.Context, _, sha string, _ []string) (github.CI,
 }
 func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string) ([]github.PassReceipt, error) {
 	if g.reviewed && sha == g.pull.Head.SHA {
-		return []github.PassReceipt{{Pass: 1}, {Pass: 2}}, nil
+		return []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}, nil
 	}
 	return g.passes[sha], nil
 }
@@ -110,6 +112,28 @@ func (g *fakeGH) Reviewed(ctx context.Context, repo string, n int, sha, login st
 }
 func (g *fakeGH) ReviewClaimed(_ context.Context, _ string, n int, sha string) (bool, error) {
 	return g.refs[fmt.Sprintf("mergewake/reviews/%d/%s", n, sha)], nil
+}
+func (g *fakeGH) ReviewLease(_ context.Context, _ string, branch string, ttl time.Duration) (string, bool, error) {
+	if !g.refs[branch] {
+		return "", false, nil
+	}
+	return shaA, time.Since(g.leaseTimes[branch]) < ttl, nil
+}
+func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl time.Duration) (bool, error) {
+	_, active, err := g.ReviewLease(ctx, repo, branch, ttl)
+	if err != nil || active {
+		return false, err
+	}
+	if g.refs == nil {
+		g.refs = map[string]bool{}
+	}
+	if g.leaseTimes == nil {
+		g.leaseTimes = map[string]time.Time{}
+	}
+	g.refs[branch] = true
+	g.leaseTimes[branch] = time.Now()
+	g.claimCount++
+	return true, nil
 }
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	return g.feedback, nil
@@ -212,7 +236,7 @@ func (r *fakeRunner) Run(_ context.Context, command string, args []string, input
 }
 func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
 	t.Helper()
-	g := &fakeGH{ci: github.Green}
+	g := &fakeGH{ci: github.Green, feedback: github.ReviewFeedback{PRAuthor: "pr-author", ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}}
 	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
 	sink := &fakeSink{}
 	n := &fakeNotifier{}
@@ -229,7 +253,7 @@ func TestLand(t *testing.T) {
 		dry, shadow                 bool
 		merges                      int
 	}{
-		{name: "shadow default", ci: github.Green}, {name: "routine enabled", enabled: true, ci: github.Green, merges: 1}, {name: "red never merges", enabled: true, ci: github.Red}, {name: "missing checks", enabled: true, ci: github.Pending}, {name: "blocking needs review", enabled: true, blocking: true, ci: github.Green}, {name: "blocking unresolved", enabled: true, blocking: true, reviewed: true, findings: 1, ci: github.Green}, {name: "blocking resolved", enabled: true, blocking: true, reviewed: true, ci: github.Green, merges: 1}, {name: "dry run", enabled: true, ci: github.Green, dry: true}, {name: "forced shadow", enabled: true, ci: github.Green, shadow: true},
+		{name: "shadow default", ci: github.Green}, {name: "routine enabled", enabled: true, reviewed: true, ci: github.Green, merges: 1}, {name: "red never merges", enabled: true, ci: github.Red}, {name: "missing checks", enabled: true, ci: github.Pending}, {name: "blocking needs review", enabled: true, blocking: true, ci: github.Green}, {name: "blocking unresolved", enabled: true, blocking: true, reviewed: true, findings: 1, ci: github.Green}, {name: "blocking resolved", enabled: true, blocking: true, reviewed: true, ci: github.Green, merges: 1}, {name: "dry run", enabled: true, ci: github.Green, dry: true}, {name: "forced shadow", enabled: true, ci: github.Green, shadow: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
@@ -277,14 +301,14 @@ func TestLandBlockingNeedsTwoPasses(t *testing.T) {
 	if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-independent-review" {
 		t.Fatalf("merged without reviews: %d", g.mergeCount)
 	}
-	g.passes = map[string][]github.PassReceipt{g.pull.Head.SHA: {{Pass: 1}}}
+	g.passes = map[string][]github.PassReceipt{g.pull.Head.SHA: {{Pass: 1, Family: "anthropic", Lens: "correctness"}}}
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if g.mergeCount != 0 {
 		t.Fatal("merged on a single pass")
 	}
-	g.passes[g.pull.Head.SHA] = append(g.passes[g.pull.Head.SHA], github.PassReceipt{Pass: 2})
+	g.passes[g.pull.Head.SHA] = append(g.passes[g.pull.Head.SHA], github.PassReceipt{Pass: 2, Family: "openai", Lens: "state-risk"})
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -326,7 +350,7 @@ func TestLandHeadChangeInvalidatesReviews(t *testing.T) {
 	g.enabled = true
 	g.blocking = true
 	old := g.pull.Head.SHA
-	g.passes = map[string][]github.PassReceipt{old: {{Pass: 1}, {Pass: 2}}}
+	g.passes = map[string][]github.PassReceipt{old: {{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}}
 	g.pull.Head.SHA = shaC
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
@@ -334,7 +358,7 @@ func TestLandHeadChangeInvalidatesReviews(t *testing.T) {
 	if g.mergeCount != 0 {
 		t.Fatal("stale-head reviews merged")
 	}
-	g.passes[shaC] = []github.PassReceipt{{Pass: 1}, {Pass: 2}}
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -377,9 +401,9 @@ func TestLandReviewGateFindings(t *testing.T) {
 	thread := func(author, label string, resolved, answered bool) github.ReviewThread {
 		comments := []github.ReviewComment{{Author: author, Body: label + " problem here"}}
 		if answered {
-			comments = append(comments, github.ReviewComment{Author: "dev", Body: "fixed in the latest commit"})
+			comments = append(comments, github.ReviewComment{Author: "dev", AuthorType: "User", Body: "fixed in the latest commit"})
 		}
-		return github.ReviewThread{ID: author + label, Path: "tool", Line: 1, IsResolved: resolved, Comments: comments}
+		return github.ReviewThread{ID: author + label, Path: "tool", Line: 1, IsResolved: resolved, ResolvedBy: author, ResolvedByType: "Bot", Comments: comments}
 	}
 	for _, tt := range []struct {
 		name     string
@@ -394,7 +418,7 @@ func TestLandReviewGateFindings(t *testing.T) {
 		{"p1 blocks blocking", true, true, []github.ReviewThread{thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "wait-for-blocking-findings", 0},
 		{"unanswered major holds routine", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-triage-reply", 0},
 		{"answered major lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true)}, "merge", 1},
-		{"answered cross-dup lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true), thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "merge", 1},
+		{"answer does not clear cross-bot P1", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true), thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "wait-for-blocking-findings", 0},
 		{"resolved critical lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Critical", true, false)}, "merge", 1},
 		{"ignored bot lands", false, false, []github.ReviewThread{thread("qlty[bot]", "Critical", false, false)}, "merge", 1},
 		{"minor advisory lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Minor", false, false)}, "merge", 1},
@@ -404,9 +428,9 @@ func TestLandReviewGateFindings(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = true
 			g.blocking = tt.blocking
-			g.reviewed = tt.reviewed
+			g.reviewed = true
 			g.gate = true
-			g.feedback = github.ReviewFeedback{Threads: tt.threads, ReviewAuthors: map[string]int{}}
+			g.feedback = github.ReviewFeedback{PRAuthor: "pr-author", Threads: tt.threads, ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}
 			if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
@@ -531,7 +555,7 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 				"gpt":    {Family: "openai", Command: "pi", Args: []string{"--model", "gpt-model"}},
 			},
 			recommend:  []string{"claude", "gpt"},
-			lenses:     []string{"default", "default"},
+			lenses:     []string{"correctness", "state-risk"},
 			sameFamily: []bool{false, true},
 		},
 	} {
@@ -842,6 +866,9 @@ func TestChangedHeadStopsReviewAndLand(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = true
 			g.nextHead = shaC
+			if command == "land" {
+				g.reviewed = true
+			}
 			var e error
 			if command == "review" {
 				e = s.Review(context.Background(), r, 7, "openai", Options{})
