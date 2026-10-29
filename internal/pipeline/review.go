@@ -358,14 +358,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if len(diff) == 0 || len(diff) > 2<<20 {
 		return errors.New("empty or oversized diff; manual review required")
 	}
-	// Scratch left by a review whose process was SIGKILLed is older than any
-	// live review can be; removing it is best effort.
+	// Scratch left by a review whose process was SIGKILLed is old and its lock
+	// is free; a concurrent review's scratch stays locked. Best effort.
 	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, time.Now())
-	scratch, e := os.MkdirTemp("", reviewer.ScratchPattern)
+	scratch, release, e := reviewer.NewScratch()
 	if e != nil {
 		return e
 	}
-	defer os.RemoveAll(scratch)
+	defer release()
 	dir := filepath.Join(scratch, "work")
 	control := filepath.Join(scratch, "control")
 	for _, path := range []string{dir, control} {
