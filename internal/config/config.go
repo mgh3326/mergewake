@@ -40,6 +40,10 @@ type Review struct {
 	Scopefuel    string              `yaml:"scopefuel"`
 	Quota        string              `yaml:"quota"`
 	DefaultGrade string              `yaml:"default_grade"`
+	// DefaultFamily is the reviewer family used when the PR carries no
+	// author-family trailer and the head commit identities yield no known
+	// model alias. Reviewed heads record that the family was inferred.
+	DefaultFamily string `yaml:"default_family"`
 	Timeout      string              `yaml:"timeout"`
 	// Select orders admitted reviewers: "pace" (default) by projected use at
 	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
@@ -54,6 +58,9 @@ type Notifier struct {
 	Type    string `yaml:"type"`
 	Command string `yaml:"command"`
 	Lane    string `yaml:"lane"`
+	// FallbackLane receives events for PRs with no owning lane; empty means
+	// Lane, the operator lane.
+	FallbackLane string `yaml:"fallback_lane"`
 }
 type Sink struct {
 	Type        string `yaml:"type"`
@@ -407,6 +414,9 @@ func Load(name string) (Config, error) {
 	if c.Notifier.Type == "panewire" && c.Notifier.Lane == "" {
 		return c, errors.New("panewire notifier requires lane")
 	}
+	if c.Notifier.FallbackLane == "" {
+		c.Notifier.FallbackLane = c.Notifier.Lane
+	}
 	if c.Sink.ReopenState == "" {
 		c.Sink.ReopenState = "reopened"
 	}
@@ -454,6 +464,19 @@ func Load(name string) (Config, error) {
 	if len(pairings) > 0 {
 		c.Review.Pairings = pairings
 	}
+	if c.Review.DefaultFamily != "" {
+		c.Review.DefaultFamily = CanonicalFamily(c.Review.DefaultFamily)
+		ok := false
+		for _, p := range c.Review.Profiles {
+			if p.Family == c.Review.DefaultFamily {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return c, errors.New("review.default_family must name a configured profile family")
+		}
+	}
 	return c, nil
 }
 
@@ -476,6 +499,13 @@ var familyAliases = map[string]string{
 	"google": "google", "gemini": "google", "agy": "google",
 	"moonshot": "moonshot", "kimi": "moonshot",
 	"deepseek": "deepseek",
+}
+
+// FamilyToken reports whether s is a listed model or CLI alias and returns
+// its canonical family, so commit identities can be classified.
+func FamilyToken(s string) (string, bool) {
+	f, ok := familyAliases[strings.ToLower(strings.TrimSpace(s))]
+	return f, ok
 }
 
 // CanonicalFamily normalises an author or reviewer family alias to its

@@ -40,6 +40,9 @@ Every role uses positive jitter and exponential backoff (capped at 30 minutes,
 or its configured interval when longer). The shared GitHub transport serializes
 requests, revalidates cached GET bodies with ETags, observes X-Poll-Interval,
 X-RateLimit-Remaining/Reset and Retry-After, and delays subsequent requests.
+Throttle waits never hold the serialiser: a polling GET inside its recorded
+poll window replays its cached representation or is skipped until the
+deadline, while requests for every other key proceed.
 Mutations are never implicitly retried and invalidate cached representations.
 
 OS advisory locks in the user's cache directory exclude duplicate host roles

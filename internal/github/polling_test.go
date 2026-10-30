@@ -3,6 +3,8 @@ package github
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -210,5 +212,56 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 	defer cancel()
 	if _, e := c.request(ctx, "GET", "/other", "application/json", nil); e == nil {
 		t.Fatal("polling client ignored Retry-After")
+	}
+}
+
+// A key inside its X-Poll-Interval window replays the cached response when one
+// is held and is skipped otherwise; either way requests for other keys are
+// not serialised behind the deadline.
+func TestPollIntervalServesCacheOrSkips(t *testing.T) {
+	gets := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets[r.URL.Path]++
+		switch r.URL.Path {
+		case "/cached":
+			w.Header().Set("ETag", `"e"`)
+			w.Header().Set("X-Poll-Interval", "300")
+			w.Write([]byte(`{"v":1}`))
+		case "/uncached":
+			w.Header().Set("X-Poll-Interval", "300")
+			w.Write([]byte(`{"v":2}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+
+	for _, path := range []string{"/cached", "/uncached"} {
+		if _, e := c.request(context.Background(), "GET", path, "application/json", nil); e != nil {
+			t.Fatal(path, e)
+		}
+	}
+	b, e := c.request(context.Background(), "GET", "/cached", "application/json", nil)
+	if e != nil || string(b) != `{"v":1}` {
+		t.Fatalf("%s %v", b, e)
+	}
+	if _, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); !errors.Is(e, ErrPollSkipped) {
+		t.Fatalf("skip = %v", e)
+	}
+	if _, e := c.request(context.Background(), "GET", "/other", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	if gets["/cached"] != 1 || gets["/uncached"] != 1 || gets["/other"] != 1 {
+		t.Fatalf("gets %v", gets)
+	}
+
+	// Without Polling the interval is still ignored for one-shot commands.
+	c.Polling = false
+	if _, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); e != nil {
+		t.Fatal(e)
 	}
 }

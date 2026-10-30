@@ -57,19 +57,48 @@ func waitUntil(ctx context.Context, until time.Time) error {
 		return nil
 	}
 }
-func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedResponse, error) {
-	p := &c.poll
+// ErrPollSkipped marks a GET dropped because its key still sits inside a
+// recorded X-Poll-Interval window with no cached representation to serve.
+// Polling callers treat it as "no data this round", never as a failure.
+var ErrPollSkipped = errors.New("GitHub request skipped: poll interval pending")
+
+func (p *pollingState) init() {
 	p.once.Do(func() {
 		p.gate = make(chan struct{}, 1)
 		p.cache = map[string]cachedResponse{}
 		p.polls = map[string]throttle{}
 	})
-	select {
-	case p.gate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, cachedResponse{}, ctx.Err()
+}
+
+// pollShortcut serves a throttled GET without touching the serializer: a key
+// inside its X-Poll-Interval window replays the cached response when one is
+// held and is skipped otherwise, so one endpoint's deadline cannot stall
+// requests for every other key.
+func (c *Client) pollShortcut(key string) (cachedResponse, error) {
+	if !c.Polling {
+		return cachedResponse{}, nil
 	}
-	release := func() { <-p.gate }
+	p := &c.poll
+	p.init()
+	p.mu.Lock()
+	deadline, throttled := p.polls[key]
+	cached, ok := p.cache[key]
+	p.mu.Unlock()
+	if !throttled || !deadline.until.After(time.Now()) {
+		return cachedResponse{}, nil
+	}
+	if d := time.Until(deadline.until); d > throttleLogThreshold {
+		c.logThrottle(deadline, d)
+	}
+	if ok {
+		return cached, nil
+	}
+	return cachedResponse{}, ErrPollSkipped
+}
+
+func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedResponse, error) {
+	p := &c.poll
+	p.init()
 	p.mu.Lock()
 	wait := p.rate
 	if c.Polling && p.polls[key].until.After(wait.until) {
@@ -77,14 +106,20 @@ func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedRe
 	}
 	old := p.cache[key]
 	p.mu.Unlock()
+	// Throttle waits happen before the gate is taken: a sleeping key never
+	// serialises requests for every other key behind it.
 	if d := time.Until(wait.until); d > throttleLogThreshold {
 		c.logThrottle(wait, d)
 	}
 	if err := waitUntil(ctx, wait.until); err != nil {
-		release()
-		return nil, old, err
+		return nil, cachedResponse{}, err
 	}
-	return release, old, nil
+	select {
+	case p.gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, cachedResponse{}, ctx.Err()
+	}
+	return func() { <-p.gate }, old, nil
 }
 
 // logThrottle reports one throttled wait: the reason, the HTTP status that

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -302,5 +303,39 @@ review:
 	}
 	if _, e = Load(p); e == nil {
 		t.Fatal("colliding canonical pairings accepted")
+	}
+}
+
+// fallback_lane defaults to the operator lane; default_family must name a
+// configured profile family and normalises like every other family key.
+func TestFallbackLaneAndDefaultFamily(t *testing.T) {
+	base := "version: 1\nhost: host-a\nnotifier:\n  type: panewire\n  lane: operator-desk\n"
+	load := func(extra string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(p, []byte(base+extra), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return Load(p)
+	}
+	c, e := load("")
+	if e != nil || c.Notifier.FallbackLane != "operator-desk" {
+		t.Fatalf("%+v %v", c.Notifier, e)
+	}
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\nnotifier:\n  type: panewire\n  lane: operator-desk\n  fallback_lane: desk-2\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	c, e = Load(p)
+	if e != nil || c.Notifier.FallbackLane != "desk-2" {
+		t.Fatalf("%+v %v", c.Notifier, e)
+	}
+
+	review := "review:\n  default_family: %s\n  profiles:\n    rev:\n      family: anthropic\n      command: pi\n      args: [--model, m]\n"
+	c, e = load(fmt.Sprintf(review, "claude"))
+	if e != nil || c.Review.DefaultFamily != "anthropic" {
+		t.Fatalf("%q %v", c.Review.DefaultFamily, e)
+	}
+	if _, e = load(fmt.Sprintf(review, "openai")); e == nil {
+		t.Fatal("default_family outside the configured profiles accepted")
 	}
 }

@@ -29,7 +29,7 @@ var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, s.audit(r.Name, "pr-notify-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
+			retErr = errors.Join(retErr, s.audit(r.Name, "pr-notify-error", map[string]any{"pr": n, "error": integrations.Detail(retErr)}, o.DryRun))
 		}
 	}()
 	if !s.Config.Daemon.PR.Notify.On() {
@@ -63,6 +63,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Via     string   `json:"via,omitempty"`
 		Sent    bool     `json:"sent"`
 		Deduped bool     `json:"deduped,omitempty"`
+		Error   string   `json:"error,omitempty"`
 	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons}
 	if v.State == "pending" || o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
@@ -73,17 +74,35 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	lane, via, sent, e := s.laneEvent(ctx, r, pr, v.State, summary)
 	if e != nil {
-		return e
+		if !errors.Is(e, errNotifyDelivery) {
+			return e
+		}
+		// The decision to stop retrying a failing delivery is logged once per
+		// (PR, head, verdict): laneEvent dedupes further attempts.
+		record.Via, record.Error = "delivery-failed", e.Error()
+		return s.audit(r.Name, "pr-notify", record, false)
+	}
+	if lane == "" && via == "" {
+		// A skip or failure decision for this verdict was already logged.
+		return nil
 	}
 	record.Lane, record.Via, record.Sent, record.Deduped = lane, via, sent, !sent
 	return s.audit(r.Name, "pr-notify", record, false)
 }
 
+// errNotifyDelivery marks a lane event the notifier refused. The first
+// failure is logged with the captured stderr and recorded so the loop does
+// not retry — and re-log — the same verdict every pass.
+var errNotifyDelivery = errors.New("notify delivery failed")
+
 // laneEvent resolves the owning lane and emits one deduped lane event for the
 // verdict: READY, BLOCKED or MERGED. The sent key covers the state, PR, head
 // and summary so a changed reason set re-notifies while an identical verdict
-// stays quiet. It returns the lane, the choosing rule and whether an event
-// went out.
+// stays quiet. A PR with no owning lane routes to the configured fallback
+// lane; a delivery the notifier fails is retried once on that lane, then
+// parked with one logged decision per (PR, head, verdict) instead of failing
+// every loop. An empty via means a decision was already logged and the
+// caller stays silent.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
 	lane, via, e := s.notifyLane(ctx, r, pr)
 	if e != nil {
@@ -93,12 +112,14 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	if len(sha7) > 7 {
 		sha7 = sha7[:7]
 	}
-	shown := lane
-	if shown == "" {
-		shown = "-"
+	textFor := func(l, v string) string {
+		shown := l
+		if shown == "" {
+			shown = "-"
+		}
+		return fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s | lane=%s via %s",
+			strings.ToUpper(state), r.Name, pr.Number, sha7, summary, shown, v)
 	}
-	text := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s | lane=%s via %s",
-		strings.ToUpper(state), r.Name, pr.Number, sha7, summary, shown, via)
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
 	if e != nil {
 		return "", "", false, e
@@ -112,6 +133,9 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	if sent.has(key) {
 		return lane, via, false, nil
 	}
+	if sent.has("decided "+key) {
+		return "", "", false, nil
+	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	// A changed BLOCKED reason set is a new verdict under the same head: fold
@@ -124,10 +148,28 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   id,
-		Text: text,
+		Text: textFor(lane, via),
 		Lane: lane,
 	}); e != nil {
-		return "", "", false, e
+		fallback := s.Config.Notifier.FallbackLane
+		if fallback != "" && fallback != lane {
+			// The resolved lane may not exist on this host; the fallback lane
+			// gets one try under a distinct ID before the verdict is parked.
+			if fb := s.Notifier.Notify(reportCtx, integrations.Event{
+				ID:   id + "-fallback",
+				Text: textFor(fallback, via+"+fallback"),
+				Lane: fallback,
+			}); fb == nil {
+				if ae := sent.add(key); ae != nil {
+					return "", "", false, ae
+				}
+				return fallback, via + "+fallback", true, nil
+			}
+		}
+		if ae := sent.add("decided " + key); ae != nil {
+			return "", "", false, errors.Join(e, ae)
+		}
+		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
 	}
 	if e = sent.add(key); e != nil {
 		return "", "", false, e
@@ -191,5 +233,12 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 	if laneName.MatchString(notify) {
 		return notify, "notify-lane trailer", nil
 	}
-	return s.Config.Notifier.Lane, "config", nil
+	fallback := s.Config.Notifier.FallbackLane
+	if fallback == "" {
+		fallback = s.Config.Notifier.Lane
+	}
+	if fallback != "" {
+		return fallback, "fallback", nil
+	}
+	return "", "no-lane", nil
 }
