@@ -177,10 +177,15 @@ func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
 	return rc
 }
 
-// withContext places the PR context ahead of the diff marker.
+// withContext places the PR context ahead of the diff marker, or ahead of the
+// whole prompt when the marker is absent, so the context is never dropped.
 func withContext(prompt, context string) string {
 	if context == "" {
 		return prompt
 	}
-	return strings.Replace(prompt, "UNTRUSTED DIFF:\n", context+"UNTRUSTED DIFF:\n", 1)
+	const marker = "UNTRUSTED DIFF:\n"
+	if !strings.Contains(prompt, marker) {
+		return context + prompt
+	}
+	return strings.Replace(prompt, marker, context+marker, 1)
 }

@@ -123,3 +123,15 @@ func TestReviewPromptUnchangedWithoutContext(t *testing.T) {
 		t.Fatal("context added to a PR with nothing answered")
 	}
 }
+
+func TestWithContextNeverDropsContext(t *testing.T) {
+	if got := withContext("head\nUNTRUSTED DIFF:\n", "CTX\n"); got != "head\nCTX\nUNTRUSTED DIFF:\n" {
+		t.Fatal(got)
+	}
+	if got := withContext("no marker", "CTX\n"); got != "CTX\nno marker" {
+		t.Fatal(got)
+	}
+	if got := withContext("p", ""); got != "p" {
+		t.Fatal(got)
+	}
+}
