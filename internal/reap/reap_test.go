@@ -103,6 +103,17 @@ func TestInspectLinkedCanonicalAndPlain(t *testing.T) {
 			t.Fatalf("%s: %+v %v", dir, w, err)
 		}
 	}
+	// git prints a relative common dir against the directory it ran in, not
+	// the toplevel: from /w/x/a/b, ../../repo/.git is /w/x/repo/.git.
+	rel, _ := testExec(map[string]string{
+		key("git", []string{"-C", "/w/x/a/b", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}): "/w/repo/.git/worktrees/x\n../../repo/.git\n/w/x\n",
+		key("git", []string{"-C", "/w/x/a/b", "branch", "--show-current"}):                                               "wk/x\n",
+		key("git", []string{"-C", "/w/x/a/b", "rev-parse", "HEAD"}):                                                      "dddd\n",
+		key("git", []string{"-C", "/w/x/a/b", "remote", "get-url", "origin"}):                                            "git@github.com:example/project.git\n",
+	}, nil)
+	if w, err = rel.Inspect(context.Background(), "/w/x/a/b"); err != nil || w == nil || w.Common != "/w/x/repo/.git" {
+		t.Fatalf("relative common dir: %+v %v", w, err)
+	}
 }
 
 func TestRepoFromRemote(t *testing.T) {

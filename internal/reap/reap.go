@@ -324,7 +324,8 @@ func (e Exec) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 	}
 	gitDir, common, top := lines[0], lines[1], lines[2]
 	if !filepath.IsAbs(common) {
-		common = filepath.Join(top, common)
+		// git prints a relative common dir against the directory it ran in.
+		common = filepath.Join(cwd, common)
 	}
 	// A linked worktree keeps its git dir under <main>/.git/worktrees; the
 	// canonical checkout's git dir is the common dir itself.
