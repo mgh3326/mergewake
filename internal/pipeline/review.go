@@ -434,7 +434,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// reviewer from re-flagging settled points. The context is best effort: a
 	// feedback read that fails costs the context, not the review.
 	var prContext reviewContext
-	feedback, contextErr := s.GH.ReviewFeedback(ctx, r.Name, n)
+	// The read runs on its own short deadline, a child of ctx, so a slow or
+	// paginating read cannot spend the time the gate and reviewer need.
+	feedbackCtx, cancelFeedback := context.WithTimeout(ctx, feedbackTimeout(timeout))
+	feedback, contextErr := s.GH.ReviewFeedback(feedbackCtx, r.Name, n)
+	cancelFeedback()
 	if contextErr == nil {
 		prContext = buildReviewContext(pr.Body, feedback)
 	} else {
@@ -600,6 +604,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
 	}
 	return nil
+}
+
+// feedbackReadLimit caps the optional thread read; a quarter of the review
+// timeout applies when that is shorter. A var so tests can shorten it.
+var feedbackReadLimit = 20 * time.Second
+
+func feedbackTimeout(review time.Duration) time.Duration {
+	return min(feedbackReadLimit, review/4)
 }
 
 // reviewSkip records a candidate that did not produce the pass, and why.

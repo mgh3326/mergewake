@@ -22,7 +22,7 @@ const (
 
 var (
 	headingLine    = regexp.MustCompile(`^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
-	fenceLine      = regexp.MustCompile("^ {0,3}(```|~~~)")
+	fenceLine      = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 	severityPrefix = regexp.MustCompile(`^<!-- mergewake-severity:[a-z]+ -->\s*`)
 )
 
@@ -34,6 +34,8 @@ type answeredItem struct {
 	resolved bool
 	finding  string
 	answer   string
+	// rebutted marks a latest comment written by the finding's own author.
+	rebutted bool
 }
 
 // reviewContext is the PR-specific text a reviewer sees ahead of the diff.
@@ -64,8 +66,10 @@ func clip(s string, n int) string {
 }
 
 // answeredFindings lists threads whose first comment has a reply from another
-// author, newest thread first. A thread holding only its finding, or only the
-// finding author's own follow-ups, is not an answered finding.
+// author, newest thread first, quoting the thread's latest nonempty comment so
+// a rebuttal by the finding's author is not hidden behind the older answer. A
+// thread holding only its finding, or only the finding author's own follow-ups,
+// is not an answered finding.
 func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 	var out []answeredItem
 	for i := len(fb.Threads) - 1; i >= 0; i-- {
@@ -74,14 +78,22 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 			continue
 		}
 		first := t.Comments[0]
-		var reply *github.ReviewComment
+		answered := false
+		var latest *github.ReviewComment
 		for j := len(t.Comments) - 1; j > 0; j-- {
-			if t.Comments[j].Author != first.Author && strings.TrimSpace(t.Comments[j].Body) != "" {
-				reply = &t.Comments[j]
+			c := &t.Comments[j]
+			if strings.TrimSpace(c.Body) == "" {
+				continue
+			}
+			if latest == nil {
+				latest = c
+			}
+			if c.Author != first.Author {
+				answered = true
 				break
 			}
 		}
-		if reply == nil {
+		if !answered {
 			continue
 		}
 		out = append(out, answeredItem{
@@ -89,7 +101,8 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 			line:     t.Line,
 			resolved: t.IsResolved,
 			finding:  excerpt(severityPrefix.ReplaceAllString(first.Body, ""), excerptLimit),
-			answer:   excerpt(reply.Body, excerptLimit),
+			answer:   excerpt(latest.Body, excerptLimit),
+			rebutted: latest.Author == first.Author,
 		})
 	}
 	return out
@@ -101,18 +114,21 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 func operatorDecisions(body string) string {
 	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
 	start, level := -1, 0
-	fence := "" // marker that opened the current code block
+	var open string // opening fence line's marker run; "" outside a code block
 	for i, l := range lines {
 		if m := fenceLine.FindStringSubmatch(l); m != nil {
-			switch fence {
-			case "":
-				fence = m[1]
-			case m[1]:
-				fence = ""
+			switch {
+			case open == "":
+				// A backtick fence's info string cannot hold a backtick.
+				if m[1][0] != '`' || !strings.Contains(m[2], "`") {
+					open = m[1]
+				}
+			case m[1][0] == open[0] && len(m[1]) >= len(open) && strings.TrimSpace(m[2]) == "":
+				open = ""
 			}
 			continue
 		}
-		if fence != "" {
+		if open != "" {
 			continue
 		}
 		m := headingLine.FindStringSubmatch(l)
@@ -160,7 +176,11 @@ func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
 			if it.resolved {
 				state = "resolved"
 			}
-			entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   answer: %s\n", i+1, it.path, it.line, state, it.finding, it.answer)
+			label := "latest reply"
+			if it.rebutted {
+				label = "latest reply (by the finding's author, disputing the answer)"
+			}
+			entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   %s: %s\n", i+1, it.path, it.line, state, it.finding, label, it.answer)
 			// Reserve room for the truncation notice so the bound holds with it.
 			if len(contextHeader)+b.Len()+len(entry)+120 > contextBudget {
 				break

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
 )
@@ -55,6 +56,9 @@ func TestOperatorDecisionsSection(t *testing.T) {
 		{"crlf", "## Operator decisions\r\nkeep\r\n## End\r\n", "## Operator decisions\nkeep"},
 		{"fenced heading is text", "```\n## Operator decisions\nfake\n```\n", ""},
 		{"other fence marker inside a block", "```\n~~~\n```\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
+		{"short fence inside a longer one", "````\n```\n## Operator decisions\nfake\n```\n````\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
+		{"tilde fence does not close a backtick fence", "```\n~~~\n## Operator decisions\nfake\n", ""},
+		{"closing fence may be longer", "```\ncode\n`````\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
 		{"absent", "no such section", ""},
 	} {
 		if got := operatorDecisions(tt.body); got != tt.want {
@@ -159,4 +163,61 @@ type feedbackFailGH struct{ *fakeGH }
 
 func (feedbackFailGH) ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error) {
 	return github.ReviewFeedback{}, fmt.Errorf("graphql down")
+}
+
+func TestReviewContextQuotesLatestReplyIncludingRebuttal(t *testing.T) {
+	fb := github.ReviewFeedback{Threads: []github.ReviewThread{
+		thread("a.go", 3, false, say("review-bot", "flag"), say("pr-author", "intended"), say("review-bot", "still wrong: the answer ignores X")),
+		thread("b.go", 4, false, say("review-bot", "flag"), say("pr-author", "intended"), say("pr-author", "   ")),
+	}}
+	rc := buildReviewContext("", fb)
+	if rc.answered != 2 {
+		t.Fatal(rc.answered)
+	}
+	// Newest thread first: b.go keeps the last nonempty comment (the answer).
+	b, a := strings.Index(rc.text, "b.go:4"), strings.Index(rc.text, "a.go:3")
+	if b < 0 || a < b {
+		t.Fatal(rc.text)
+	}
+	if !strings.Contains(rc.text, "latest reply (by the finding's author, disputing the answer): still wrong: the answer ignores X") {
+		t.Fatal(rc.text)
+	}
+	if strings.Contains(rc.text[b:a], "disputing") || !strings.Contains(rc.text[b:a], "latest reply: intended") {
+		t.Fatal(rc.text)
+	}
+}
+
+// slowFeedbackGH blocks the thread read until its context ends.
+type slowFeedbackGH struct{ *fakeGH }
+
+func (slowFeedbackGH) ReviewFeedback(ctx context.Context, _ string, _ int) (github.ReviewFeedback, error) {
+	<-ctx.Done()
+	return github.ReviewFeedback{}, ctx.Err()
+}
+
+func TestSlowFeedbackReadDoesNotSpendTheReviewDeadline(t *testing.T) {
+	old := feedbackReadLimit
+	feedbackReadLimit = 30 * time.Millisecond
+	defer func() { feedbackReadLimit = old }()
+	s, g, _, _, r := setup(t)
+	g.pull.Body = "## Operator decisions\nkeep quota_exclude"
+	s.GH = slowFeedbackGH{g}
+	var out strings.Builder
+	s.Out = &out
+	start := time.Now()
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if time.Since(start) > 3*time.Second || g.postCount != 1 {
+		t.Fatal(time.Since(start), g.postCount)
+	}
+	if !strings.Contains(out.String(), "context deadline exceeded") || !strings.Contains(s.Runner.(*fakeRunner).input, "keep quota_exclude") {
+		t.Fatal(out.String())
+	}
+}
+
+func TestFeedbackTimeoutIsBoundedByReviewTimeout(t *testing.T) {
+	if feedbackTimeout(time.Hour) != feedbackReadLimit || feedbackTimeout(8*time.Second) != 2*time.Second {
+		t.Fatal(feedbackTimeout(time.Hour), feedbackTimeout(8*time.Second))
+	}
 }
