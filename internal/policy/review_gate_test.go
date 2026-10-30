@@ -185,3 +185,12 @@ func TestReviewGateOutdatedCleared(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewGateLandModeValidation(t *testing.T) {
+	for mode, fail := range map[string]bool{"": false, "graded": false, "count": true, "Graded": true} {
+		p := Policy{Version: 1, RequiredChecks: []string{"CI"}, ReviewGate: &ReviewGate{Land: mode}}
+		if err := p.Validate(); (err != nil) != fail {
+			t.Fatalf("land %q: %v", mode, err)
+		}
+	}
+}

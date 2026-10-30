@@ -45,9 +45,14 @@ type ReviewGateRule struct {
 	Classes  []string `yaml:"classes"`
 }
 
-// ReviewGate replaces the raw unresolved-thread count with graded enforcement.
+// ReviewGate replaces the raw unresolved-thread count with graded enforcement
+// at the land gate when land is "graded".
 // An absent section uses the default graded rules and requires no CI bots.
 type ReviewGate struct {
+	// Land opts the land gate into graded enforcement: "graded". Empty keeps
+	// the raw unresolved-thread count, so a policy that already carries a
+	// review_gate section for other reasons does not change behaviour.
+	Land              string           `yaml:"land"`
 	RequiredBots      []string         `yaml:"required_bots"`
 	Block             []ReviewGateRule `yaml:"block"`
 	Triage            []ReviewGateRule `yaml:"triage"`
@@ -374,6 +379,9 @@ func (p Policy) Validate() error {
 		}
 	}
 	if p.ReviewGate != nil {
+		if p.ReviewGate.Land != "" && p.ReviewGate.Land != "graded" {
+			return fmt.Errorf("unknown review_gate land mode %q", p.ReviewGate.Land)
+		}
 		bots := map[string]bool{}
 		for _, name := range p.ReviewGate.RequiredBots {
 			author := NormalizeAuthor(name)

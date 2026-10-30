@@ -469,7 +469,7 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
-| `review_gate` | Absent | Grades review findings for the land gate instead of counting unresolved threads. See [Graded review findings](#graded-review-findings). Absent keeps the raw count. |
+| `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
 
 Each blocking rule has:
@@ -488,11 +488,12 @@ or advisory rounds for blocking findings.
 
 ### Graded review findings
 
-Without `review_gate` or `fast_lane`, the land gate holds on the raw count of
-unresolved review threads (`threads_open:<n>`), plus any review.login finding
-resolved without a new head. With a `review_gate` section — `review_gate: {}`
-takes all defaults — the gate grades each thread by the author and severity of
-its first comment instead:
+Without `review_gate.land: graded` or `fast_lane`, the land gate holds on the raw
+count of unresolved review threads (`threads_open:<n>`), plus any review.login
+finding resolved without a new head. A `review_gate` section alone changes
+nothing, so a policy that already carries one for other reasons keeps its
+behaviour. With `review_gate: {land: graded}` (all other keys optional) the gate
+grades each thread by the author and severity of its first comment instead:
 
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
@@ -519,7 +520,8 @@ and `low`). Rules are `{author, severity: [...], classes: [...]}` lists under
 though the `review.login` defaults are kept or replaced per list: naming the login
 in `block` replaces its default block rule, naming it in `triage` replaces its
 default triage rule, and the other list keeps its default.
-`ignore_authors` skips threads from the named bots. `ignore_outdated` (default
+Thread comments are read in full (paged past 50), since a late reply answers a
+finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
 true) clears an outdated finding by anyone but `review.login`: a block finding
 once its reviewer has reviewed the current head, a triage finding when it is a
 `major`. The other `review_gate` keys stay parseable but do not affect the land
@@ -530,14 +532,15 @@ routine and `additions + deletions` is at most `max_changed_lines`, triage
 findings stop holding the merge and only block-class findings (and requested
 changes) do; a `review.login` finding with an unreadable severity still needs
 an answer. Routine PRs already need a single review pass. The fast lane alone
-grades only the PRs it admits, with the default rules; larger PRs keep the raw
-count unless `review_gate` is present.
+grades only the PRs it admits, with the rules of the `review_gate` section (or the
+defaults); larger PRs keep the raw count unless `land: graded` is set.
 
 ```yaml
 version: 1
 enabled: true
 required_checks: [test]
-review_gate: {}            # block/triage/advisory grading with default rules
+review_gate:
+  land: graded             # block/triage/advisory grading with default rules
 fast_lane:
   max_changed_lines: 50    # small routine PRs: only block-class findings hold
 ```

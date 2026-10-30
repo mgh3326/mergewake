@@ -50,6 +50,74 @@ type ReviewFeedback struct {
 	ChangesRequested int `json:"changes_requested"`
 }
 
+type commentNode struct {
+	Author *reviewActor `json:"author"`
+	Body   string       `json:"body"`
+	Commit *struct {
+		OID string `json:"oid"`
+	} `json:"commit"`
+	OriginalCommit *struct {
+		OID string `json:"oid"`
+	} `json:"originalCommit"`
+}
+
+type commentPage struct {
+	Nodes    []commentNode `json:"nodes"`
+	PageInfo *struct {
+		HasNextPage bool   `json:"hasNextPage"`
+		EndCursor   string `json:"endCursor"`
+	} `json:"pageInfo"`
+}
+
+func (n commentNode) comment() ReviewComment {
+	c := ReviewComment{Body: n.Body}
+	if n.Commit != nil {
+		c.CommitSHA = n.Commit.OID
+	}
+	if n.OriginalCommit != nil {
+		c.OriginalCommitSHA = n.OriginalCommit.OID
+	}
+	if n.Author != nil {
+		c.Author = n.Author.Login
+		c.AuthorType = n.Author.Type
+	}
+	return c
+}
+
+// moreComments reads a thread's comments after cursor. Any gap in the paging
+// is an error: an unseen reply would otherwise read as an unanswered finding.
+func (c *Client) moreComments(ctx context.Context, thread, cursor string) ([]ReviewComment, error) {
+	var out []ReviewComment
+	for page := 0; page < 100; page++ {
+		if thread == "" || cursor == "" {
+			return nil, errors.New("missing review comment cursor")
+		}
+		var result struct {
+			Errors []json.RawMessage `json:"errors"`
+			Data   *struct {
+				Node *struct {
+					Comments *commentPage `json:"comments"`
+				} `json:"node"`
+			} `json:"data"`
+		}
+		query := `query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage endCursor}}}}}`
+		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"id": thread, "cursor": cursor}}, &result); e != nil {
+			return nil, e
+		}
+		if len(result.Errors) > 0 || result.Data == nil || result.Data.Node == nil || result.Data.Node.Comments == nil || result.Data.Node.Comments.PageInfo == nil {
+			return nil, errors.New("GitHub review comment query failed")
+		}
+		for _, n := range result.Data.Node.Comments.Nodes {
+			out = append(out, n.comment())
+		}
+		if !result.Data.Node.Comments.PageInfo.HasNextPage {
+			return out, nil
+		}
+		cursor = result.Data.Node.Comments.PageInfo.EndCursor
+	}
+	return nil, errors.New("review comment pagination limit")
+}
+
 func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
 	var fb ReviewFeedback
 	fb.ReviewAuthors = map[string]int{}
@@ -84,21 +152,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 								IsResolved bool         `json:"isResolved"`
 								IsOutdated bool         `json:"isOutdated"`
 								ResolvedBy *reviewActor `json:"resolvedBy"`
-								Comments   *struct {
-									Nodes []struct {
-										Author *reviewActor `json:"author"`
-										Body   string       `json:"body"`
-										Commit *struct {
-											OID string `json:"oid"`
-										} `json:"commit"`
-										OriginalCommit *struct {
-											OID string `json:"oid"`
-										} `json:"originalCommit"`
-									} `json:"nodes"`
-									PageInfo *struct {
-										HasNextPage bool `json:"hasNextPage"`
-									} `json:"pageInfo"`
-								} `json:"comments"`
+								Comments   *commentPage `json:"comments"`
 							} `json:"nodes"`
 							PageInfo *struct {
 								HasNextPage bool   `json:"hasNextPage"`
@@ -109,7 +163,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
 			return fb, e
 		}
@@ -156,21 +210,17 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			if t.Comments == nil || len(t.Comments.Nodes) == 0 {
 				return fb, errors.New("review thread is missing its finding comment")
 			}
-			// Comments beyond the first page stay unseen; the thread then counts
-			// as unanswered, which fails closed rather than inventing a reply.
 			for _, cm := range t.Comments.Nodes {
-				c := ReviewComment{Body: cm.Body}
-				if cm.Commit != nil {
-					c.CommitSHA = cm.Commit.OID
+				thread.Comments = append(thread.Comments, cm.comment())
+			}
+			// Replies past the first page decide whether the finding was
+			// answered, so they are read in full rather than assumed absent.
+			if t.Comments.PageInfo != nil && t.Comments.PageInfo.HasNextPage {
+				more, e := c.moreComments(ctx, t.ID, t.Comments.PageInfo.EndCursor)
+				if e != nil {
+					return fb, e
 				}
-				if cm.OriginalCommit != nil {
-					c.OriginalCommitSHA = cm.OriginalCommit.OID
-				}
-				if cm.Author != nil {
-					c.Author = cm.Author.Login
-					c.AuthorType = cm.Author.Type
-				}
-				thread.Comments = append(thread.Comments, c)
+				thread.Comments = append(thread.Comments, more...)
 			}
 			fb.Threads = append(fb.Threads, thread)
 		}

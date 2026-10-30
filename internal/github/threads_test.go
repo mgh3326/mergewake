@@ -165,3 +165,55 @@ func TestReviewFeedbackChangesRequested(t *testing.T) {
 		})
 	}
 }
+
+// Replies beyond a thread's first 50 comments are read through the thread's
+// own cursor, so a late human reply still answers the finding.
+func TestReviewFeedbackPagesLongThreads(t *testing.T) {
+	for _, tt := range []struct {
+		name, second string
+		wantReplies  int // comments in the thread, finding included
+		fail         bool
+	}{
+		{"second page read", `{"data":{"node":{"comments":{"nodes":[{"author":{"login":"dev","__typename":"User"},"body":"fixed"}],"pageInfo":{"hasNextPage":false}}}}}`, 2, false},
+		{"three pages", "", 3, false},
+		{"query error", `{"errors":[{"message":"boom"}]}`, 0, true},
+		{"missing node", `{"data":{"node":null}}`, 0, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query     string
+					Variables map[string]any
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(req.Query, "reviewThreads") {
+					fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"headRefOid":%q,"reviews":{"nodes":[]},"reviewThreads":{"nodes":[{"id":"T1","path":"tool","line":1,"comments":{"nodes":[{"author":{"login":"review-bot","__typename":"User"},"body":"finding"}],"pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}],"pageInfo":{"hasNextPage":false}}}}}}`, testSHA)
+					return
+				}
+				calls++
+				if req.Variables["id"] != "T1" {
+					t.Fatalf("variables %v", req.Variables)
+				}
+				if tt.name == "three pages" {
+					next := "false"
+					if calls == 1 {
+						next = "true"
+					}
+					fmt.Fprintf(w, `{"data":{"node":{"comments":{"nodes":[{"author":{"login":"dev","__typename":"User"},"body":"r%d"}],"pageInfo":{"hasNextPage":%s,"endCursor":"c2"}}}}}`, calls, next)
+					return
+				}
+				fmt.Fprint(w, tt.second)
+			})
+			fb, err := c.ReviewFeedback(context.Background(), "example/project", 7)
+			if (err != nil) != tt.fail {
+				t.Fatalf("err=%v", err)
+			}
+			if !tt.fail && len(fb.Threads[0].Comments) != tt.wantReplies {
+				t.Fatalf("comments=%d", len(fb.Threads[0].Comments))
+			}
+		})
+	}
+}

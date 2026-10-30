@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	gradedPolicy = "review_gate: {}\n"
+	gradedPolicy = "review_gate: {land: graded}\n"
 	fastLane     = "fast_lane: {max_changed_lines: 50}\n"
 )
 
@@ -133,6 +133,20 @@ func TestGateGradedKeepsChangesRequested(t *testing.T) {
 
 // Without review_gate or fast_lane the raw count decides, whatever the
 // severity of what is open, and a resolved own finding is still held.
+func TestGateReviewGateWithoutLandKeepsRawCount(t *testing.T) {
+	for _, extra := range []string{"review_gate: {}\n", "review_gate: {required_bots: [coderabbitai]}\n"} {
+		v := verdict(t, extra, 0, gradedThread("review-bot", "low", false, shaA))
+		if reasons(v) != "threads_open:1" {
+			t.Fatalf("%q: %+v", extra, v)
+		}
+	}
+	// A review_gate section still feeds the fast lane's rules once it applies.
+	v := verdict(t, "review_gate: {}\n"+fastLane, 10, gradedThread("review-bot", "medium", false, shaA))
+	if reasons(v) != "" {
+		t.Fatalf("%+v", v)
+	}
+}
+
 func TestGateUngradedPolicyKeepsRawCount(t *testing.T) {
 	v := verdict(t, "", 0, gradedThread("review-bot", "low", false, shaA))
 	if reasons(v) != "threads_open:1" {
@@ -238,7 +252,7 @@ func TestGateOutdatedFindings(t *testing.T) {
 	// ignore_outdated: false keeps every outdated finding.
 	s, g, _, _, r := setup(t)
 	g.enabled = true
-	g.policyExtra = "review_gate: {ignore_outdated: false}\n"
+	g.policyExtra = "review_gate: {land: graded, ignore_outdated: false}\n"
 	markReviewed(g)
 	g.feedback.RecheckedAuthors = map[string]bool{"coderabbitai": true}
 	g.feedback.Threads = []github.ReviewThread{outdated(gradedThread(cr, "critical", false, shaB))}

@@ -16,7 +16,7 @@ import (
 // Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale and
 // conflict. The two graded reasons replace threads_open when the policy has a
-// review_gate section or the PR takes the fast lane.
+// review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
 	Reasons    []string
@@ -74,7 +74,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	class := p.ClassifyGuarded(files, r.Policy).Class
 	fastLane := p.FastLaneEligible(class, pr.Additions+pr.Deletions)
-	if p.ReviewGate != nil || fastLane {
+	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
 		gate := policy.ReviewGate{}
 		if p.ReviewGate != nil {
