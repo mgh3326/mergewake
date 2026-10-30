@@ -142,14 +142,11 @@ func (s *Service) reapHub() (*reap.Hub, error) {
 	if err != nil {
 		return nil, err
 	}
-	creds, err := reap.ReadEnvFile(cfg.TokenFile)
+	client, token, err := reap.HubCredential(cfg.TokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("reap.hub.token_file: %w", err)
 	}
-	hub := &reap.Hub{URL: origin, Token: creds["HUB_TOKEN"]}
-	if hub.Token == "" {
-		return nil, errors.New("reap.hub.token_file has no HUB_TOKEN")
-	}
+	hub := &reap.Hub{URL: origin, Client: client, Token: token}
 	if cfg.CFFile != "" {
 		cf, err := reap.ReadEnvFile(cfg.CFFile)
 		if err != nil {
@@ -374,11 +371,20 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
 		}
 		hs.all = all
+	inspect:
 		for _, list := range [][]reap.Pane{panes, all} {
 			for _, p := range list {
 				if p.Cwd != "" {
 					if _, ok := hs.trees[p.Cwd]; !ok {
-						w, _ := hs.ops.Inspect(ctx, p.Cwd)
+						w, e := hs.ops.Inspect(ctx, p.Cwd)
+						// A hub that refuses the credential answers nothing
+						// about the worktree: fail the host instead of reading
+						// every pane as outside one.
+						if errors.Is(e, reap.ErrHubAuth) {
+							hs.failed = true
+							errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
+							break inspect
+						}
 						hs.trees[p.Cwd] = w
 					}
 				}

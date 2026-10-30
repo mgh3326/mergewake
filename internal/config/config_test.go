@@ -131,6 +131,39 @@ func TestReapConfig(t *testing.T) {
 	}
 }
 
+// The hub operator credential is refused when the config loads, so it cannot
+// come back to the daemon host through a config edit. A token file that does
+// not exist yet is left to the per-pass read.
+func TestReapHubRefusesOperatorCredential(t *testing.T) {
+	dir := t.TempDir()
+	for _, tt := range []struct {
+		name, token, want string
+	}{
+		{"service", "HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=tok\n", ""},
+		{"operator", "HUB_MACHINE_ID=operator\nHUB_TOKEN=tok\n", "hub operator credential"},
+		{"no machine id", "HUB_TOKEN=tok\n", "no HUB_MACHINE_ID"},
+		{"missing", "", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			token := filepath.Join(dir, strings.ReplaceAll(tt.name, " ", "-")+".env")
+			if tt.token != "" {
+				if e := os.WriteFile(token, []byte(tt.token), 0o600); e != nil {
+					t.Fatal(e)
+				}
+			}
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			body := "version: 1\nhost: host-a\nreap:\n  hub: {url: 'https://hub.example.invalid', token_file: '" + token + "'}\n"
+			if e := os.WriteFile(p, []byte(body), 0o600); e != nil {
+				t.Fatal(e)
+			}
+			_, e := Load(p)
+			if tt.want == "" && e != nil || tt.want != "" && (e == nil || !strings.Contains(e.Error(), "reap.hub.token_file") || !strings.Contains(e.Error(), tt.want)) {
+				t.Fatalf("err=%v, want %q", e, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepoAndHome(t *testing.T) {
 	for _, r := range []string{"../x", "a/..", "a/b/c", "a/b?query"} {
 		if ValidRepo(r) {

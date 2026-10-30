@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -22,6 +24,7 @@ type fakeReapHub struct {
 	agents   map[string]any // the node-a row of GET /v1/nodes/agents
 	capture  map[string]any
 	close    map[string]any
+	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
 	commands []map[string]any
 }
 
@@ -39,12 +42,21 @@ func (h *fakeReapHub) ops(op string) []map[string]any {
 
 func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer op-token" {
+		if r.Header.Get("Authorization") != "Bearer svc-token" || r.Header.Get("X-Panewire-Machine-ID") != "svc-mergewake" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		var body map[string]any
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		if op, _ := body["op"].(string); h.forbid[r.URL.Path] || h.forbid[op] {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "scope_forbidden"})
+			return
+		}
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/nodes/agents" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []any{h.agents}})
 			return
@@ -54,8 +66,6 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
 		h.commands = append(h.commands, body)
 		var result any
 		switch body["op"] {
@@ -92,8 +102,8 @@ func hubSvc(t *testing.T, hub *fakeReapHub, run *scriptRunner, hosts ...reap.Hos
 	t.Helper()
 	server := hub.serve(t)
 	dir := t.TempDir()
-	token := filepath.Join(dir, "operator.env")
-	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=operator\nHUB_TOKEN=op-token\n"), 0o600); err != nil {
+	token := filepath.Join(dir, "svc-mergewake.env")
+	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=svc-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c := repoConfig(dir)
@@ -232,5 +242,102 @@ func TestReapPanewireRejectsLooseTokenFile(t *testing.T) {
 	}
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err == nil || !strings.Contains(err.Error(), "token_file") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// The operator credential is refused when a pass reads the token file, so a
+// config edit cannot put it back on the daemon host; the hub is never called.
+func TestReapPanewireRefusesOperatorCredential(t *testing.T) {
+	hub := newFakeReapHub()
+	s, _ := hubSvc(t, hub, &scriptRunner{})
+	if err := os.WriteFile(s.Config.Reap.Hub.TokenFile, []byte("HUB_MACHINE_ID=operator\nHUB_TOKEN=svc-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "operator") || !strings.Contains(err.Error(), "token_file") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(hub.commands) != 0 {
+		t.Fatalf("hub called: %v", hub.commands)
+	}
+}
+
+// A 403 scope_forbidden is a scope error for that host, never a host with no
+// panes: discovery fails the host, and a refused node command is an error row.
+func TestReapPanewireScopeForbiddenIsAnError(t *testing.T) {
+	t.Run("agents", func(t *testing.T) {
+		hub := newFakeReapHub()
+		hub.forbid = map[string]bool{"/v1/nodes/agents": true}
+		s, out := hubSvc(t, hub, &scriptRunner{})
+		err := s.Reap(context.Background(), testRepo, 0, Options{})
+		if !errors.Is(err, reap.ErrHubAuth) || !strings.Contains(err.Error(), "node: hub scope/auth error") || !strings.Contains(err.Error(), "scope_forbidden") {
+			t.Fatalf("err=%v", err)
+		}
+		if len(hub.commands) != 0 {
+			t.Fatalf("commands sent after a refused discovery: %v", hub.commands)
+		}
+		if strings.Contains(out.String(), `"action":"close-pane"`) || strings.Contains(out.String(), `"action":"remove-worktree"`) {
+			t.Fatalf("refused host reaped as empty:\n%s", out.String())
+		}
+	})
+	t.Run("worktree.inspect", func(t *testing.T) {
+		hub := newFakeReapHub()
+		hub.forbid = map[string]bool{"worktree.inspect": true}
+		s, out := hubSvc(t, hub, &scriptRunner{})
+		err := s.Reap(context.Background(), testRepo, 0, Options{})
+		if !errors.Is(err, reap.ErrHubAuth) || !strings.Contains(err.Error(), "node: hub scope/auth error") {
+			t.Fatalf("err=%v", err)
+		}
+		if len(hub.ops("pane.capture")) != 0 || strings.Contains(out.String(), `"action":"close-pane"`) {
+			t.Fatalf("refused inspect read as panes outside a worktree:\n%s", out.String())
+		}
+	})
+	t.Run("pane.capture", func(t *testing.T) {
+		hub := newFakeReapHub()
+		hub.forbid = map[string]bool{"pane.capture": true}
+		s, _ := hubSvc(t, hub, &scriptRunner{})
+		// A row error reaches the pass error as its receipt reason text.
+		err := s.Reap(context.Background(), testRepo, 0, Options{})
+		if err == nil || !strings.Contains(err.Error(), "scope/auth error") || !strings.Contains(err.Error(), "scope_forbidden") {
+			t.Fatalf("err=%v", err)
+		}
+		if len(hub.ops("pane.close")) != 0 {
+			t.Fatal("closed without a capture")
+		}
+		var errored bool
+		for _, row := range reapLogRows(t, s, "example/project") {
+			errored = errored || row["action"] == "close-pane" && row["result"] == "error" && strings.Contains(row["reason"].(string), "scope/auth error")
+		}
+		if !errored {
+			t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
+		}
+	})
+}
+
+// Under panewire a remote host is archived over no transport at all, even
+// when it also has an ssh destination: reap writes a skipped archive row and
+// runs nothing locally or over ssh.
+func TestReapPanewireArchiveSkipsHubHostWithSSH(t *testing.T) {
+	hub := newFakeReapHub()
+	hub.agents = map[string]any{"machine_id": "node-a", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}
+	r := &scriptRunner{}
+	s, _ := hubSvc(t, hub, r)
+	s.Config.Hosts[0].Jobs = "/home/ops/jobs"
+	s.Config.Reap.Archive = config.Archive{Enabled: true, DriveDir: t.TempDir(), TextMaxBytes: 1 << 20, MinAge: "24h"}
+	b, _ := json.Marshal(reapReceipt{Time: time.Now().Add(-48 * time.Hour), Action: "close-pane", Repo: "example/project", PR: 12, Host: "node",
+		Pane: "w1:p1", Cwd: "/repo.wt", Saved: "/node/jobs/wk-7/report.md", Job: "wk-7", Result: "closed"})
+	writeFile(t, s.reapLog("example/project"), string(b)+"\n")
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("hub host reached over ssh or locally: %q", r.calls)
+	}
+	var skipped bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		skipped = skipped || row["action"] == "archive-job" && row["host"] == "node" && row["job"] == "wk-7" && row["result"] == "skipped" && row["reason"] == "archive-over-hub"
+	}
+	if !skipped {
+		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
 }

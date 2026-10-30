@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,8 @@ import (
 // pass: the fleet-wide agent list is fetched once and shared by every host.
 type Hub struct {
 	URL      string // origin only, e.g. https://hub.example.invalid
-	Token    string // operator bearer
+	Client   string // service client id, sent as X-Panewire-Machine-ID
+	Token    string // that client's bearer
 	CFID     string // optional Cloudflare Access service token pair
 	CFSecret string
 	HTTP     *http.Client
@@ -94,6 +96,35 @@ func ReadEnvFile(path string) (map[string]string, error) {
 	return values, scanner.Err()
 }
 
+// HubOperatorID is the hub's full-access client. Reap never runs as it: a
+// leaked daemon credential must be limited to the reap scopes.
+const HubOperatorID = "operator"
+
+var hubClientPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+
+// HubCredential reads a scoped hub service credential: HUB_MACHINE_ID names
+// the client (svc-mergewake) and HUB_TOKEN is its bearer. The operator
+// credential is refused, so it cannot come back to the daemon host through a
+// config edit.
+func HubCredential(path string) (client, token string, err error) {
+	values, err := ReadEnvFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	client, token = values["HUB_MACHINE_ID"], values["HUB_TOKEN"]
+	switch {
+	case client == HubOperatorID:
+		return "", "", fmt.Errorf("%s holds the hub operator credential (HUB_MACHINE_ID=operator); reap takes a scoped service credential such as svc-mergewake", path)
+	case client == "":
+		return "", "", fmt.Errorf("%s has no HUB_MACHINE_ID; reap takes a scoped service credential such as svc-mergewake", path)
+	case !hubClientPattern.MatchString(client):
+		return "", "", fmt.Errorf("%s: HUB_MACHINE_ID is not a hub client id", path)
+	case token == "":
+		return "", "", fmt.Errorf("%s has no HUB_TOKEN", path)
+	}
+	return client, token, nil
+}
+
 func (h *Hub) client() *http.Client {
 	if h.HTTP != nil {
 		return h.HTTP
@@ -102,13 +133,31 @@ func (h *Hub) client() *http.Client {
 	return &http.Client{Timeout: 45 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
+// ErrHubAuth matches a hub 401 or 403: the credential is unknown, or its
+// scopes do not cover the request (scope_forbidden). It says nothing about
+// the host's panes, so a caller must fail that host rather than read it empty.
+var ErrHubAuth = errors.New("hub refused the credential")
+
 // hubError is a non-200 hub answer, carrying the hub's or node's error code.
 type hubError struct {
 	Status int
 	Code   string
+	Client string
+	Path   string
 }
 
-func (e *hubError) Error() string { return fmt.Sprintf("hub %d %s", e.Status, e.Code) }
+func (e *hubError) auth() bool {
+	return e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden
+}
+
+func (e *hubError) Error() string {
+	if e.auth() {
+		return fmt.Sprintf("hub scope/auth error: %s for client %s on %s (%d %s)", ErrHubAuth, e.Client, e.Path, e.Status, e.Code)
+	}
+	return fmt.Sprintf("hub %d %s", e.Status, e.Code)
+}
+
+func (e *hubError) Is(target error) bool { return target == ErrHubAuth && e.auth() }
 
 func (h *Hub) do(ctx context.Context, method, path string, body any, out any) error {
 	var reader io.Reader
@@ -124,6 +173,9 @@ func (h *Hub) do(ctx context.Context, method, path string, body any, out any) er
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+h.Token)
+	if h.Client != "" {
+		req.Header.Set("X-Panewire-Machine-ID", h.Client)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -148,7 +200,7 @@ func (h *Hub) do(ctx context.Context, method, path string, body any, out any) er
 		if v.Error == "" {
 			v.Error = "unexpected-response"
 		}
-		return &hubError{Status: res.StatusCode, Code: v.Error}
+		return &hubError{Status: res.StatusCode, Code: v.Error, Client: h.Client, Path: path}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("hub %s: %w", path, err)
