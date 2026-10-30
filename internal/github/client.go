@@ -177,6 +177,8 @@ type Pull struct {
 	Base           Ref     `json:"base"`
 	MergeCommitSHA string  `json:"merge_commit_sha"`
 	ChangedFiles   int     `json:"changed_files"`
+	Additions      int     `json:"additions"`
+	Deletions      int     `json:"deletions"`
 	Mergeable      *bool   `json:"mergeable"`
 	MergeableState string  `json:"mergeable_state"`
 }

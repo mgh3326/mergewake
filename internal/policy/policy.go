@@ -13,6 +13,10 @@ type File struct {
 	Path     string `json:"filename"`
 	Previous string `json:"previous_filename"`
 	Kind     string `json:"status"`
+	// Additions and Deletions are GitHub's per-file line counts; the fast lane
+	// checks them against the PR totals before trusting either.
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
 }
 type Rule struct {
 	Paths  []string `yaml:"paths"`
@@ -45,15 +49,27 @@ type ReviewGateRule struct {
 	Classes  []string `yaml:"classes"`
 }
 
-// ReviewGate replaces the raw unresolved-thread count with graded enforcement.
+// ReviewGate replaces the raw unresolved-thread count with graded enforcement
+// at the land gate when land is "graded".
 // An absent section uses the default graded rules and requires no CI bots.
 type ReviewGate struct {
+	// Land opts the land gate into graded enforcement: "graded". Empty keeps
+	// the raw unresolved-thread count, so a policy that already carries a
+	// review_gate section for other reasons does not change behaviour.
+	Land              string           `yaml:"land"`
 	RequiredBots      []string         `yaml:"required_bots"`
 	Block             []ReviewGateRule `yaml:"block"`
 	Triage            []ReviewGateRule `yaml:"triage"`
 	IgnoreAuthors     []string         `yaml:"ignore_authors"`
 	IgnoreOutdated    *bool            `yaml:"ignore_outdated"`
 	IgnoreBotResolved *bool            `yaml:"ignore_bot_resolved"`
+}
+
+// FastLane relaxes the land gate for small routine PRs: one that touches no
+// blocking path and changes at most MaxChangedLines lines (additions plus
+// deletions) is held only by block-class findings.
+type FastLane struct {
+	MaxChangedLines int `yaml:"max_changed_lines"`
 }
 
 // GateVerdict is the graded outcome for one PR classification. Blocking
@@ -105,6 +121,34 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	}
 	if g.IgnoreBotResolved == nil {
 		g.IgnoreBotResolved = d.IgnoreBotResolved
+	}
+	return g
+}
+
+// WithOwnLogin adds default rules for the trusted review identity, each list
+// on its own: critical and high findings block, medium ones need an answer, low
+// ones are advisory. A list that already names the login keeps only the
+// policy's rules for it; the other list still gets its default. The reviewer
+// prompt also admits blocking, major and minor, graded like high, medium and low.
+func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
+	g = g.WithDefaults()
+	own := NormalizeAuthor(login)
+	if own == "" {
+		return g
+	}
+	names := func(rules []ReviewGateRule) bool {
+		for _, r := range rules {
+			if NormalizeAuthor(r.Author) == own {
+				return true
+			}
+		}
+		return false
+	}
+	if !names(g.Block) {
+		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
+	}
+	if !names(g.Triage) {
+		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}})
 	}
 	return g
 }
@@ -201,6 +245,64 @@ func (g ReviewGate) Evaluate(fs []ReviewFinding, class string) GateVerdict {
 	return v
 }
 
+// Grades a finding can receive from Grade.
+const (
+	GradeBlock    = "block"
+	GradeTriage   = "triage"
+	GradeAdvisory = "advisory"
+	GradeIgnored  = "ignored"
+)
+
+// Grade classifies one finding by the rules alone, before any disposition
+// (resolved, answered, outdated). Evidence the rules cannot read — a missing
+// author on a blocking path, an unrecognized severity from a graded author,
+// or any severity outside the known set on the trusted review identity's own
+// finding — needs an answer rather than passing silently.
+func (g ReviewGate) Grade(f ReviewFinding, class string) string {
+	g = g.WithDefaults()
+	f.Author = NormalizeAuthor(f.Author)
+	f.Severity = strings.ToLower(f.Severity)
+	if g.ignoredAuthor(f.Author) {
+		return GradeIgnored
+	}
+	blocked, triaged := false, false
+	for _, r := range g.Block {
+		blocked = blocked || r.applies(f, class)
+	}
+	for _, r := range g.Triage {
+		triaged = triaged || r.applies(f, class)
+	}
+	switch {
+	case blocked:
+		return GradeBlock
+	case triaged:
+		return GradeTriage
+	case class == "blocking" && (f.Author == "" || (g.gateAuthors()[f.Author] && !validSeverity(f.Severity))):
+		return GradeTriage
+	case f.OwnReview && !validSeverity(f.Severity):
+		return GradeTriage
+	}
+	return GradeAdvisory
+}
+
+// OutdatedCleared reports whether an outdated finding stops counting under
+// ignore_outdated, with the same limits Evaluate applies: never the trusted
+// review identity's own findings, a block finding only once its reviewer has
+// rechecked the current head, and a triage finding only when it is a CodeRabbit
+// style "major".
+func (g ReviewGate) OutdatedCleared(f ReviewFinding, grade string) bool {
+	if f.OwnReview || !f.Outdated || !g.WithDefaults().ignoresOutdated() {
+		return false
+	}
+	switch grade {
+	case GradeBlock:
+		return f.Rechecked
+	case GradeTriage:
+		return strings.ToLower(f.Severity) == "major"
+	}
+	return false
+}
+
 // GateAuthors lists normalized bot logins the configured rules reference. The
 // caller uses it for grading and bot reply detection.
 func (g ReviewGate) GateAuthors() map[string]bool {
@@ -235,6 +337,7 @@ type Policy struct {
 	WatchChecks    []string    `yaml:"watch_checks"`
 	Blocking       []Rule      `yaml:"blocking"`
 	ReviewGate     *ReviewGate `yaml:"review_gate"`
+	FastLane       *FastLane   `yaml:"fast_lane"`
 }
 type Decision struct {
 	Class   string   `json:"class"`
@@ -280,6 +383,9 @@ func (p Policy) Validate() error {
 		}
 	}
 	if p.ReviewGate != nil {
+		if p.ReviewGate.Land != "" && p.ReviewGate.Land != "graded" {
+			return fmt.Errorf("unknown review_gate land mode %q", p.ReviewGate.Land)
+		}
 		bots := map[string]bool{}
 		for _, name := range p.ReviewGate.RequiredBots {
 			author := NormalizeAuthor(name)
@@ -311,8 +417,20 @@ func (p Policy) Validate() error {
 			}
 		}
 	}
+	if p.FastLane != nil && p.FastLane.MaxChangedLines <= 0 {
+		return errors.New("fast_lane max_changed_lines must be positive")
+	}
 	return nil
 }
+
+// FastLaneEligible reports whether a PR of the given class and size takes the
+// fast lane: configured, routine, and no larger than max_changed_lines.
+func (p Policy) FastLaneEligible(class string, changedLines int) bool {
+	return p.FastLane != nil && class == "routine" && changedLines <= p.FastLane.MaxChangedLines
+}
+
+// KnownSeverity reports whether s is a severity label the gate can grade.
+func KnownSeverity(s string) bool { return validSeverity(strings.ToLower(s)) }
 func validSeverity(s string) bool {
 	switch s {
 	case "critical", "high", "medium", "low", "blocking", "major", "minor", "nitpick", "p1", "p2", "p3":

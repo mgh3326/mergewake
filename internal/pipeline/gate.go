@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -13,7 +14,9 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
-// review_missing, base_stale and conflict.
+// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale and
+// conflict. The two graded reasons replace threads_open when the policy has a
+// review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
 	Reasons    []string
@@ -21,7 +24,8 @@ type gateVerdict struct {
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
-// every required check green on H, zero unresolved review threads, the
+// every required check green on H, no unresolved review threads (or, under a
+// graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
 // base branch an ancestor of H, and the PR mergeable. A pending required
 // check waits silently unless a sibling already failed; mergeable unknown
@@ -51,14 +55,8 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		}
 		return v, nil
 	}
-	open, e := s.GH.Unresolved(ctx, r.Name, pr.Number)
-	if e != nil {
-		return v, e
-	}
-	// A review.login finding on the current head stays held while it was
-	// resolved without a new head: anyone who can click resolve — including
-	// the PR author — would otherwise clear the trusted review's findings.
-	// Clearing needs a new head and a new review pass.
+	// The decision-head review feedback and the file list come first: the
+	// PR's class and size decide whether findings are graded or counted.
 	fb, e := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
 	if e != nil {
 		return v, e
@@ -67,20 +65,6 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, errors.New("review feedback is not bound to the decision head")
 	}
 	login := policy.NormalizeAuthor(s.Config.Review.Login)
-	held := open
-	if login != "" {
-		for _, t := range fb.Threads {
-			if t.IsResolved && len(t.Comments) > 0 && postedOn(t.Comments[0]) == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
-				held++
-			}
-		}
-	}
-	if held > 0 {
-		v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(held))
-	}
-	// The -done marker alone is forgeable by anyone with push access, so the
-	// gate also requires the head-bound passes the trusted review identity
-	// posted: one for routine changes, two distinct passes for blocking ones.
 	files, e := s.GH.Files(ctx, r.Name, pr.Number)
 	if e != nil {
 		return v, e
@@ -88,8 +72,49 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if len(files) != pr.ChangedFiles {
 		return v, errors.New("incomplete PR file list")
 	}
+	class := p.ClassifyGuarded(files, r.Policy).Class
+	// The PR totals decide the fast lane only while the file list backs them:
+	// any mismatch is unverified size, so the lane is refused.
+	fastLane := linesVerified(files, pr) && p.FastLaneEligible(class, pr.Additions+pr.Deletions)
+	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
+		// Graded: findings are weighed by severity instead of counted.
+		gate := policy.ReviewGate{}
+		if p.ReviewGate != nil {
+			gate = *p.ReviewGate
+		}
+		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, pr.Head.SHA, fastLane)
+		if blocking > 0 {
+			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
+		}
+		if triage > 0 {
+			v.Reasons = append(v.Reasons, "triage_unanswered:"+strconv.Itoa(triage))
+		}
+	} else {
+		open, e := s.GH.Unresolved(ctx, r.Name, pr.Number)
+		if e != nil {
+			return v, e
+		}
+		// A review.login finding on the current head stays held while it was
+		// resolved without a new head: anyone who can click resolve — including
+		// the PR author — would otherwise clear the trusted review's findings.
+		// Clearing needs a new head and a new review pass.
+		held := open
+		if login != "" {
+			for _, t := range fb.Threads {
+				if t.IsResolved && len(t.Comments) > 0 && postedOn(t.Comments[0]) == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
+					held++
+				}
+			}
+		}
+		if held > 0 {
+			v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(held))
+		}
+	}
+	// The -done marker alone is forgeable by anyone with push access, so the
+	// gate also requires the head-bound passes the trusted review identity
+	// posted: one for routine changes, two distinct passes for blocking ones.
 	needed := 1
-	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+	if class == "blocking" {
 		needed = 2
 	}
 	receipts, e := s.GH.ReviewPasses(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login)
@@ -135,6 +160,17 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	return v, nil
 }
 
+// linesVerified reports whether the PR's additions and deletions equal the
+// sums over its file list.
+func linesVerified(files []policy.File, pr github.Pull) bool {
+	adds, dels := 0, 0
+	for _, f := range files {
+		adds += f.Additions
+		dels += f.Deletions
+	}
+	return adds == pr.Additions && dels == pr.Deletions
+}
+
 // postedOn is the head a review comment was written against. GitHub moves a
 // comment's commit forward to each new head while its line is unchanged, so a
 // finding resolved after a fix would otherwise stay held on every later head.
@@ -143,4 +179,75 @@ func postedOn(c github.ReviewComment) string {
 		return c.OriginalCommitSHA
 	}
 	return c.CommitSHA
+}
+
+// gradeThreads folds review threads into the two counts the graded gate holds
+// on. A block-class finding blocks until a new head resolves it, whoever wrote
+// it: unresolved counts, and so does one posted on this head that someone
+// resolved without a new head. A triage finding blocks until someone other than
+// its author replies; resolving or answering it needs no new head. Advisory
+// findings never block, and the fast lane drops triage except for unreadable
+// review.login evidence. Outdated findings clear as ReviewGate.OutdatedCleared
+// allows. Reviewers still requesting changes, and unresolved threads with no
+// comment to grade, count as blocking findings.
+func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, head string, fastLane bool) (blocking, triage int) {
+	blocking = fb.ChangesRequested
+	for _, t := range fb.Threads {
+		if len(t.Comments) == 0 {
+			if !t.IsResolved {
+				blocking++
+			}
+			continue
+		}
+		first := t.Comments[0]
+		author := policy.NormalizeAuthor(first.Author)
+		f := policy.ReviewFinding{
+			Author:    author,
+			Severity:  github.ThreadSeverity(first.Author, first.Body),
+			Path:      t.Path,
+			Line:      t.Line,
+			Resolved:  t.IsResolved,
+			Outdated:  t.IsOutdated,
+			OwnReview: login != "" && author == login,
+			CommitSHA: postedOn(first),
+		}
+		f.Rechecked = !f.OwnReview && fb.RecheckedAuthors[author]
+		grade := g.Grade(f, class)
+		if g.OutdatedCleared(f, grade) {
+			continue
+		}
+		switch grade {
+		case policy.GradeBlock:
+			if !f.Resolved || f.CommitSHA == head {
+				blocking++
+			}
+		case policy.GradeTriage:
+			// The fast lane drops rule-graded triage, but a trusted-review
+			// finding whose severity cannot be read still needs an answer.
+			unreadable := f.OwnReview && !policy.KnownSeverity(f.Severity)
+			if (!fastLane || unreadable) && !f.Resolved && !answered(t, f.OwnReview) {
+				triage++
+			}
+		}
+	}
+	return blocking, triage
+}
+
+// answered reports a human reply from someone other than the finding's author.
+// mergewake posts its own findings under review.login, which is usually the
+// operator's account, so for an own-review finding a reply from that same
+// login also counts when the reply is not itself a mergewake finding (it
+// carries no severity marker).
+func answered(t github.ReviewThread, ownReview bool) bool {
+	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	for _, c := range t.Comments[1:] {
+		who := policy.NormalizeAuthor(c.Author)
+		if who == "" || c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
+			continue
+		}
+		if who != author || (ownReview && !strings.Contains(c.Body, "<!-- mergewake-severity:")) {
+			return true
+		}
+	}
+	return false
 }
