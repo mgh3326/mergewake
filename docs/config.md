@@ -335,7 +335,7 @@ needs no GitHub token.
 | `runtug.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `runtug.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
-| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the PR-head-branch worktrees created from the repo's `root`; runtug names the remote worktree after the checkout. |
+| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; runtug names the remote worktree after the checkout. |
 | `runtug.lane` | `runtug.owner` | panewire lane the pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings. |
 | `runtug.panewire` | `panewire` | panewire executable for reading that lane; it takes the hub connection from `PANEWIRE_HUB_URL` and `PANEWIRE_HUB_TOKEN_ENV` in mergewake's environment. |
 | `runtug.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a runtug whose `spawn` has `--exclude-host`). Must not contain `runtug.host`. |
@@ -348,15 +348,13 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    through the handoffkeep sink; the task's `refs.job_id` is the author's
    runtug job and its title marker (`(grade A, T2)`) gives `--t`.
 2. A fork PR (head repository other than the repo) is not offered: runtug can
-   replicate only a branch origin carries. The pass claim is taken, then
-   `git -C <root> fetch --no-tags origin pull/<n>/head <base>
-   +refs/heads/<branch>:refs/remotes/origin/<branch>` and a worktree on the
-   PR head branch at the exact head SHA is added under `runtug.checkouts`
-   (`git worktree add -b <branch> <checkout> <sha>`). A local branch of that
-   name that already exists is used only when it points at the head, and is
-   never moved; at another commit the pass falls back. A branch mergewake
-   created is deleted with the worktree after the wait.
-3. mergewake writes a brief naming the PR, head SHA, branch, base, lens, the
+   replicate only a spec origin carries. The pass claim is taken, then
+   `git -C <root> fetch --no-tags origin pull/<n>/head <base>` and a worktree
+   detached at the exact head SHA is added under `runtug.checkouts`
+   (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
+   branch, and the author's branch being checked out in another worktree is no
+   obstacle. The worktree is removed after the wait.
+3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings, operator decisions) the headless prompt carries, then runs
    `runtug spawn -c <checkout> -m auto -p <brief> -l
@@ -364,12 +362,12 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
    --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
-   clones the repo under `$HOME/work` and adds a worktree tracking
-   `origin/<branch>`. Exit 77 (no admitted seat outside that family) retries
+   clones the repo under `$HOME/work` and adds a worktree detached at the same
+   head, fetched as `pull/<n>/head`. Exit 77 (no admitted seat outside that family) retries
    once with `--role worker`, which may pick the author's family; the receipt
    records that as `fallback`.
 4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
-   mismatch (the branch moved, or a stale remote worktree) it writes
+   mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass falls back. Otherwise
    it writes `{"findings":[…]}` to `findings.json` in its job directory
    (`<jobs>/<label>/` here, runtug's jobs root on another host). With a
@@ -391,9 +389,9 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    A pane on another host records its spawn there, so its family comes from
    the profile mapping. The checkout is removed after the wait.
 
-No task trailer, no bound job, no repo `root`, a fork PR, a failed checkout or
-a local branch at another commit, a runtug refusal or wait failure, a
-refusal by the pane, no findings or rejected findings all fall back to the
+No task trailer, no bound job, no repo `root`, a fork PR, a failed checkout,
+a runtug refusal or wait failure, a refusal by the pane, no findings or
+rejected findings all fall back to the
 headless executor for that pass under the same claim; its receipt records
 `"fallback":"runtug: <reason>"`. All executors share `review.timeout`, so a
 pane that used the whole deadline leaves nothing for the fallback. In runtug
@@ -401,10 +399,9 @@ mode a failing quota tool is not fatal: it only leaves the headless fallback
 without candidates. Passes of a blocking PR are separate panes; runtug
 enforces only the author-family exclusion between them.
 
-runtug fails closed when the remote host cannot hold the branch at the head:
-an existing local branch of that name there (for example the author's own
-worktree on that host) that is checked out or behind the head is a placement
-refusal for that pass, which falls back to headless.
+runtug fails closed when the remote host cannot stand at the head: an
+existing worktree there that is not detached at that commit or is dirty is a
+placement refusal for that pass, which falls back to headless.
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths

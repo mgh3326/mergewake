@@ -38,8 +38,8 @@ var findingsAttachment = regexp.MustCompile(`\battachment=([0-9a-f]{64})\b`)
 var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 
 // runtugExecutor spawns the pass as a visible reviewer pane through runtug.
-// runtug picks host and model; the pane reviews a worktree of the PR head
-// branch, which runtug replicates on a remote host, and returns its findings
+// runtug picks host and model; the pane reviews a worktree detached at the
+// PR head, which runtug replicates on a remote host, and returns its findings
 // as a handoffkeep attachment announced on a panewire lane (or, on this host,
 // as a file in the job directory). mergewake validates and posts them exactly
 // like a headless pass. The review job is a child of the PR author's job, so
@@ -137,45 +137,26 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		b, e := s.Runner.Run(c, "git", append([]string{"-C", root}, args...), "", "")
 		return strings.TrimSpace(string(b)), e
 	}
-	if _, e = git(ctx, "fetch", "--no-tags", "origin", fmt.Sprintf("pull/%d/head", pr.Number), pr.Base.Ref, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); e != nil {
+	// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
+	// exact reviewed head. C creates no local branch, and the author's branch
+	// checked out in another worktree is no obstacle.
+	if _, e = git(ctx, "fetch", "--no-tags", "origin", fmt.Sprintf("pull/%d/head", pr.Number), pr.Base.Ref); e != nil {
 		return skip("fetch PR head: %v", e)
 	}
-	// The worktree is on the head branch at the exact head: runtug resolves
-	// the branch and head from it and prepares the same branch remotely. A
-	// local branch mergewake did not create is used only at the head and
-	// never moved.
-	created := false
+	// runtug resolves the detached spec (origin, sha, fetch "pull/<n>/head")
+	// from this worktree and prepares the same detached worktree remotely.
 	cleanup := func() {
 		// The pane is finished or abandoned; the deadline may already be spent.
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		_, _ = git(c, "worktree", "remove", "--force", checkout)
-		if created {
-			_, _ = git(c, "branch", "-D", branch)
-		}
 	}
-	switch at, e := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); {
-	case e != nil:
-		// rev-parse failing is not proof the branch is absent, so the branch
-		// is ours to delete only when add -b succeeded, or when it failed and
-		// the branch now exists exactly at the head that add -b would create.
-		if _, e = git(ctx, "worktree", "add", "-b", branch, checkout, pr.Head.SHA); e != nil {
-			if at, re := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); re == nil && at == pr.Head.SHA && !strings.Contains(e.Error(), "already exists") {
-				created = true
-			}
-			cleanup()
-			return skip("checkout PR head branch %s: %v", branch, e)
-		}
-		created = true
-	case at == pr.Head.SHA:
-		if _, e = git(ctx, "worktree", "add", checkout, branch); e != nil {
-			return skip("checkout PR head branch %s: %v", branch, e)
-		}
-	default:
-		return skip("local branch %s is at %.7s, not the PR head; left untouched", branch, at)
+	if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
+		cleanup()
+		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
 	defer cleanup()
-	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, branch, jobDir)), 0600); e != nil {
+	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
 
@@ -380,7 +361,7 @@ func (x *runtugExecutor) reviewerFamily(jobDir, seat string) string {
 	return ""
 }
 
-func (x *runtugExecutor) brief(plan *passPlan, label, branch, jobDir string) string {
+func (x *runtugExecutor) brief(plan *passPlan, label, jobDir string) string {
 	focus := "concrete bugs"
 	if f, ok := lensFocus[plan.lens]; ok {
 		focus += "; this pass focuses on " + f
@@ -405,7 +386,7 @@ prints JSON with a "sha256"; announce it, then finish:
 You are the independent reviewer for pull request %[1]s#%[2]d. mergewake posts
 your findings to GitHub; you never post, comment, push or commit yourself.
 
-- Working directory: the worktree this pane started in, on branch %[5]s
+- Working directory: the worktree this pane started in, detached at the head
 - Head SHA: %[6]s
 - Base: %[7]s at %[8]s — review the changes in `+"`git diff %[8]s...%[6]s`"+`
 - Lens: %[4]s — %[9]s
@@ -446,7 +427,7 @@ Write a one-line summary to $J/report.md. %[13]s
 
 The review deadline is mergewake's review.timeout; findings returned after it
 are ignored.
-%[14]s`, x.repo.Name, x.pr.Number, plan.pass, plan.lens, branch, x.pr.Head.SHA, x.pr.Base.Ref, x.pr.Base.SHA, focus, x.authorFamily, shellQuote(jobDir), label, ret, prContext)
+%[14]s`, x.repo.Name, x.pr.Number, plan.pass, plan.lens, "", x.pr.Head.SHA, x.pr.Base.Ref, x.pr.Base.SHA, focus, x.authorFamily, shellQuote(jobDir), label, ret, prContext)
 }
 
 // shellQuote single-quotes s for a POSIX shell.
