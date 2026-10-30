@@ -361,6 +361,10 @@ type PassReceipt struct {
 	Reviewer   string `json:"reviewer,omitempty"`
 	Family     string `json:"family,omitempty"`
 	SameFamily bool   `json:"same_family"`
+	// Executor names a non-default pass executor ("runtug"); Fallback records
+	// why a configured runtug pass ran headless instead.
+	Executor string `json:"executor,omitempty"`
+	Fallback string `json:"fallback,omitempty"`
 }
 
 func PassMarker(r PassReceipt) string {

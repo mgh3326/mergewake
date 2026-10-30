@@ -166,6 +166,52 @@ A single PR's fetch failure never aborts the pass.
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
+| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `runtug` spawns a visible reviewer pane through runtug and keeps headless as the fallback. |
+| `runtug.command` | `runtug` | runtug executable. |
+| `runtug.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
+| `runtug.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
+| `runtug.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
+| `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root; the pane's brief, findings and report live in `<jobs>/<label>/`. |
+| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`. |
+
+#### Runtug executor
+
+With `executor: runtug` each missing pass is first offered to a reviewer pane:
+
+1. The PR's `Mergewake-Task` trailer (PR body, then head commit) is read
+   through the handoffkeep sink; the task's `refs.job_id` is the author's
+   runtug job and its title marker (`(grade A, T2)`) gives `--t`.
+2. The pass claim is taken, then `git -C <root> fetch origin pull/<n>/head
+   <base>` and `git worktree add --detach` create a checkout of the exact head
+   under `runtug.checkouts`.
+3. mergewake writes a brief naming the PR, head SHA, base, lens, the author
+   family and the output contract, then runs `runtug spawn -c <checkout> -m auto
+   -p <brief> -l mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --parent-job <author job>
+   --role reviewer --report <jobs>/<label>/report.md --wait --wait-timeout <rest
+   of review.timeout>`. runtug picks host and model and, for the reviewer
+   role, excludes the author job's family. Exit 77 (no admitted seat outside
+   that family) retries once with `--role worker`, which may pick the author's
+   family; the receipt records that as `fallback`.
+4. The pane writes `{"findings":[…]}` to `<jobs>/<label>/findings.json` and
+   runs `runtug done`. The file goes through the same validation as headless
+   output (new-side diff lines, severities, at most 50) and is posted with the
+   same receipt, claim and done marker. The receipt adds `"executor":"runtug"`,
+   the reviewer is `runtug:<seat>`, and the family is the one runtug recorded
+   on the job's `job.spawned` event (or the profile whose gate profile is the
+   seat); an unknown family counts as same-family. The checkout is removed
+   after the wait.
+
+No task trailer, no bound job, no repo `root`, a failed checkout, a runtug
+refusal or wait failure, a missing findings file or rejected findings all fall
+back to the headless executor for that pass under the same claim; its receipt
+records `"fallback":"runtug: <reason>"`. All executors share
+`review.timeout`, so a pane that used the whole deadline leaves nothing for
+the fallback. In runtug mode a failing quota tool is not fatal: it only
+leaves the headless fallback without candidates. Passes of a blocking PR are
+separate panes; runtug enforces only the author-family exclusion between them.
+The findings file is read from `runtug.jobs` on the host running mergewake,
+so a pane placed on another host must share that jobs directory (or pin
+`runtug.host`).
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths

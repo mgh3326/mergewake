@@ -263,17 +263,27 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	cli := quota.CLI{Runner: s.Runner, Command: command, Now: s.Now}
 	var provider quota.Provider = cli
+	// The runtug executor needs no local quota tool: runtug selects the
+	// reviewer, and headless candidates are only its fallback.
+	viaRuntug := s.Config.Review.Executor == "runtug"
+	var quotaErr error
 	ranked, e := provider.Recommend(ctx, grade)
 	if e != nil {
-		return fmt.Errorf("quota recommendation: %w", e)
+		if !viaRuntug {
+			return fmt.Errorf("quota recommendation: %w", e)
+		}
+		quotaErr, ranked = fmt.Errorf("quota recommendation: %w", e), nil
 	}
 	// Pace selection reads usage once per review; a profile whose pool is
 	// projected to reach 100% by its reset, or cannot be measured, is skipped.
 	byPace := s.Config.Review.Select != "rank"
 	var usage quota.Usage
-	if byPace {
+	if byPace && quotaErr == nil {
 		if usage, e = cli.Usage(ctx); e != nil {
-			return fmt.Errorf("quota usage: %w", e)
+			if !viaRuntug {
+				return fmt.Errorf("quota usage: %w", e)
+			}
+			quotaErr, ranked = fmt.Errorf("quota usage: %w", e), nil
 		}
 	}
 	paces := map[string]quota.Pace{}
@@ -328,6 +338,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	// unavailable explains an empty candidate list instead of a bare refusal.
 	unavailable := func() error {
+		if quotaErr != nil {
+			return fmt.Errorf("%w: %v", ErrReviewUnavailable, quotaErr)
+		}
 		if len(tight) > 0 {
 			return fmt.Errorf("%w: every admitted reviewer is projected to exhaust its pool or is unmeasured: %s", ErrReviewUnavailable, strings.Join(tight, ", "))
 		}
@@ -387,6 +400,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	for _, pass := range missing {
 		plans = append(plans, &passPlan{pass: pass, candidates: order()})
 		if len(plans[len(plans)-1].candidates) == 0 {
+			if viaRuntug {
+				continue
+			}
 			return unavailable()
 		}
 		usedProfiles[plans[len(plans)-1].candidates[0]] = true
@@ -406,8 +422,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		out := []map[string]any{}
 		for _, plan := range plans {
 			plan.lens = lens(plan)
-			plan.sameFamily = fam(plan.candidates[0]) == family
-			row := map[string]any{"pass": plan.pass, "lens": plan.lens, "same_family": plan.sameFamily, "candidates": plan.candidates}
+			row := map[string]any{"pass": plan.pass, "lens": plan.lens, "candidates": plan.candidates}
+			if len(plan.candidates) > 0 {
+				row["same_family"] = fam(plan.candidates[0]) == family
+			}
+			if viaRuntug {
+				row["executor"] = "runtug"
+			}
 			if byPace {
 				pace := []string{}
 				for _, name := range plan.candidates {
@@ -445,114 +466,62 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 	}
-	failed := map[string]bool{}    // profiles whose run failed earlier in this review
-	exhausted := map[string]bool{} // freePool keys that hit a quota failure
+	headless := &headlessExecutor{s: s, repo: r.Name, pr: n, diff: diff, dir: dir, control: control, provider: provider, cli: cli, freePool: freePool, family: fam, failed: map[string]bool{}, exhausted: map[string]bool{}, none: unavailable}
+	executors := []passExecutor{headless}
+	if viaRuntug {
+		executors = []passExecutor{&runtugExecutor{s: s, repo: r, pr: pr, diff: diff, authorFamily: family}, headless}
+	}
 	for _, plan := range plans {
-		var skips []reviewSkip
-		var findings []github.Finding
-		selected, claimed := "", false
-		for i, name := range plan.candidates {
-			skip := func(reason string, reset time.Time) {
-				sk := reviewSkip{Reviewer: name, Reason: reason}
-				if !reset.IsZero() {
-					sk.Reset = reset.UTC().Format(time.RFC3339)
-				}
-				skips = append(skips, sk)
+		plan.lens = lens(plan)
+		// A GitHub ref claims this PR head across hosts before any reviewer is
+		// invoked. One claim covers every executor and candidate of the pass.
+		claimed := false
+		claim := func() (bool, error) {
+			if claimed {
+				return true, nil
 			}
-			p := profiles[name]
-			if failed[name] {
-				skip("failed earlier in this review", time.Time{})
-				continue
-			}
-			if key := freePool[name]; key != "" && exhausted[key] {
-				skip("free pool rate-limited earlier in this review", time.Time{})
-				continue
-			}
-			gate := p.GateProfile
-			if gate == "" {
-				gate = name
-			}
-			if available, ok := s.Runner.(interface{ Available(string) error }); ok {
-				if available.Available(config.Expand(p.Command)) != nil {
-					skip("reviewer CLI not installed", time.Time{})
-					continue
-				}
-			}
-			if e = provider.Gate(ctx, gate, p.GateEffort); e != nil {
-				skip("quota gate refused: "+e.Error(), time.Time{})
-				continue
-			}
-			candidateControl := filepath.Join(control, fmt.Sprintf("%d-%d", plan.pass, i))
-			if e = os.Mkdir(candidateControl, 0700); e != nil {
-				return e
-			}
-			invocation, e := reviewer.Prepare(p, candidateControl)
+			ttl, e := s.reviewLeaseTTL()
 			if e != nil {
-				skip("reviewer profile rejected", time.Time{})
-				continue
+				return false, e
 			}
-			plan.name = name
-			plan.lens = lens(plan)
-			plan.sameFamily = fam(name) == family
-			plan.invocation = invocation
-			// A GitHub ref claims this PR head across hosts before invoking the
-			// model. One claim covers every candidate tried for the pass.
-			if !claimed {
-				claim := claimRef(n, pr.Head.SHA, plan.pass)
-				ttl, e := s.reviewLeaseTTL()
-				if e != nil {
-					return e
-				}
-				acquired, e := s.GH.ClaimReview(ctx, r.Name, claim, pr.Head.SHA, ttl)
-				if e != nil {
-					return e
-				}
-				if !acquired {
+			acquired, e := s.GH.ClaimReview(ctx, r.Name, claimRef(n, pr.Head.SHA, plan.pass), pr.Head.SHA, ttl)
+			claimed = acquired
+			return acquired, e
+		}
+		var skips []reviewSkip
+		var out passOutcome
+		fallback := ""
+		for _, x := range executors {
+			if out, e = x.runPass(ctx, plan, claim); e != nil {
+				if errors.Is(e, errPassPending) {
 					return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
 				}
-				claimed = true
+				return e
 			}
-			if filepath.Base(p.Command) == "cmd" {
-				// The hook also denies control-flow tools that bypass permission deny lists.
-				if e = os.MkdirAll(filepath.Join(dir, ".commandcode"), 0700); e != nil {
-					return e
-				}
-				settings := `{"permissions":{"deny":["*"]},"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Diff-only review: all tools disabled\"}}'"}]}]}}`
-				if e = os.WriteFile(filepath.Join(dir, ".commandcode", "settings.json"), []byte(settings), 0600); e != nil {
-					return e
-				}
+			skips = append(skips, out.skips...)
+			if out.reviewer != "" {
+				break
 			}
-			output, runErr := reviewer.Run(ctx, s.Runner, plan.invocation, promptFor(plan.lens)+diff, dir, s.Config.TokenEnv)
-			if runErr == nil {
-				if findings, e = parseFindings(output, diff); e == nil {
-					selected = name
-					break
-				}
-				runErr = errors.New("invalid review output")
-			}
-			// The whole review shares one deadline: nothing is left for another reviewer.
+			// The whole review shares one deadline: nothing is left for a fallback.
 			if ctx.Err() != nil {
-				return errors.Join(runErr, ctx.Err())
+				return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), ctx.Err())
 			}
-			failed[name] = true
-			failure := quota.Classify(runErr, s.now())
-			if !failure.Quota {
-				skip("review failed", time.Time{})
-				continue
-			}
-			skip("quota exhausted", failure.Reset)
-			if key := freePool[name]; key != "" {
-				exhausted[key] = true
-			}
-			if note := s.observeExhausted(ctx, cli, p, failure, r.Name, n); note != "" {
-				skips[len(skips)-1].Note = note
+			if len(out.skips) > 0 {
+				fallback = out.skips[len(out.skips)-1].Reason
 			}
 		}
+		selected := out.reviewer
 		if selected == "" {
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
 			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: fam(selected), SameFamily: plan.sameFamily}
+		findings := out.findings
+		plan.name = selected
+		plan.sameFamily = out.family == "" || out.family == family
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, Executor: out.executor, Fallback: out.fallback}
+		if viaRuntug && out.executor != "runtug" {
+			receipt.Fallback = "runtug: " + fallback
+		}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
 			return e
 		}
@@ -566,7 +535,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			return e
 		}
-		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings), "author_family": family}
+		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": out.family, "same_family": plan.sameFamily, "findings": len(findings), "author_family": family}
+		if out.executor != "" {
+			event["executor"] = out.executor
+		}
+		if receipt.Fallback != "" {
+			event["fallback"] = receipt.Fallback
+		}
 		if familySource == "commit" || familySource == "default" {
 			event["author_family_inferred"] = familySource
 		}
