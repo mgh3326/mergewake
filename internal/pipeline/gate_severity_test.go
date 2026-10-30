@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 const (
@@ -34,10 +35,18 @@ var human = [2]string{"dev", "User"}
 // number of unresolved threads, as GitHub would report it.
 func verdict(t *testing.T, extra string, lines int, threads ...github.ReviewThread) gateVerdict {
 	t.Helper()
+	return verdictSized(t, extra, lines, lines, threads...)
+}
+
+// verdictSized is verdict where the PR reports prLines changed lines while its
+// file list sums to fileLines.
+func verdictSized(t *testing.T, extra string, prLines, fileLines int, threads ...github.ReviewThread) gateVerdict {
+	t.Helper()
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	g.policyExtra = extra
-	g.pull.Additions, g.pull.Deletions = lines-lines/2, lines/2
+	g.pull.Additions, g.pull.Deletions = prLines-prLines/2, prLines/2
+	g.files = []policy.File{{Path: "tool", Kind: "modified", Additions: fileLines - fileLines/2, Deletions: fileLines / 2}}
 	markReviewed(g)
 	g.feedback.Threads = threads
 	for _, th := range threads {
@@ -180,6 +189,40 @@ func TestGateFastLane(t *testing.T) {
 				t.Fatalf("reasons=%q", got)
 			}
 		})
+	}
+}
+
+// The fast lane trusts the PR's line totals only when the file list sums to
+// the same additions and deletions; any mismatch refuses the lane.
+func TestGateFastLaneNeedsVerifiedLines(t *testing.T) {
+	medium := gradedThread("review-bot", "medium", false, shaB)
+	for _, tt := range []struct {
+		name, want         string
+		prLines, fileLines int
+	}{
+		{"totals match", "", 10, 10},
+		{"PR reports fewer lines than the files", "triage_unanswered:1", 10, 500},
+		{"PR reports more lines than the files", "triage_unanswered:1", 10, 4},
+		{"PR totals zero while files carry lines", "triage_unanswered:1", 0, 30},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reasons(verdictSized(t, fastLane+gradedPolicy, tt.prLines, tt.fileLines, medium)); got != tt.want {
+				t.Fatalf("reasons=%q", got)
+			}
+		})
+	}
+	// Additions and deletions are compared separately, not just their sum.
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	g.policyExtra = fastLane + gradedPolicy
+	g.pull.Additions, g.pull.Deletions = 6, 4
+	g.files = []policy.File{{Path: "tool", Kind: "modified", Additions: 4, Deletions: 6}}
+	markReviewed(g)
+	g.feedback.Threads = []github.ReviewThread{medium}
+	p, _ := s.Policy(context.Background(), r, shaB)
+	v, e := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+	if e != nil || reasons(v) != "triage_unanswered:1" {
+		t.Fatalf("%v %+v", e, v)
 	}
 }
 

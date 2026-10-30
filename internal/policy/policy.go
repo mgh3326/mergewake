@@ -13,6 +13,10 @@ type File struct {
 	Path     string `json:"filename"`
 	Previous string `json:"previous_filename"`
 	Kind     string `json:"status"`
+	// Additions and Deletions are GitHub's per-file line counts; the fast lane
+	// checks them against the PR totals before trusting either.
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
 }
 type Rule struct {
 	Paths  []string `yaml:"paths"`

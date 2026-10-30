@@ -73,7 +73,9 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, errors.New("incomplete PR file list")
 	}
 	class := p.ClassifyGuarded(files, r.Policy).Class
-	fastLane := p.FastLaneEligible(class, pr.Additions+pr.Deletions)
+	// The PR totals decide the fast lane only while the file list backs them:
+	// any mismatch is unverified size, so the lane is refused.
+	fastLane := linesVerified(files, pr) && p.FastLaneEligible(class, pr.Additions+pr.Deletions)
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
 		gate := policy.ReviewGate{}
@@ -156,6 +158,17 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// linesVerified reports whether the PR's additions and deletions equal the
+// sums over its file list.
+func linesVerified(files []policy.File, pr github.Pull) bool {
+	adds, dels := 0, 0
+	for _, f := range files {
+		adds += f.Additions
+		dels += f.Deletions
+	}
+	return adds == pr.Additions && dels == pr.Deletions
 }
 
 // postedOn is the head a review comment was written against. GitHub moves a
