@@ -172,7 +172,8 @@ func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
 	var b strings.Builder
 	decisions := operatorDecisions(body)
 	if len(decisions) > decisionsBudget {
-		decisions = clip(decisions, decisionsBudget) + "\n[Operator decisions truncated at the size bound.]"
+		const notice = "\n[Operator decisions truncated at the size bound.]"
+		decisions = clip(decisions, decisionsBudget-len(notice)) + notice
 		rc.truncated = true
 	}
 	if decisions != "" {

@@ -87,6 +87,10 @@ func TestReviewContextBounds(t *testing.T) {
 	if !strings.Contains(rc.text, "Operator decisions truncated") || !strings.Contains(rc.text, fmt.Sprintf("%d of 60 answered findings omitted", 60-rc.answered)) {
 		t.Fatal(rc.text[len(rc.text)-300:])
 	}
+	// The decisions section, notice included, stays within its own cap.
+	if at, end := strings.Index(rc.text, "## Operator decisions"), strings.Index(rc.text, "\n\nALREADY ANSWERED"); at < 0 || end < 0 || end-at > decisionsBudget {
+		t.Fatal(at, end)
+	}
 	// Newest first: the last thread leads, the oldest is the one dropped.
 	if !strings.Contains(rc.text, "f59.go:60") || strings.Contains(rc.text, "f00.go:1 ") {
 		t.Fatal("not newest first")
