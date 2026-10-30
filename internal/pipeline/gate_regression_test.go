@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/github"
 )
 
 // The review marker is head-bound: a marker for another head, or none at all,
@@ -93,6 +95,22 @@ func TestLandOpenThreadsBlock(t *testing.T) {
 	}
 	if g.mergeCount != 1 {
 		t.Fatal("resolved threads did not land")
+	}
+}
+
+// A review.login finding resolved on the same head stays held: only a new
+// head plus a new review clears it, so author-side resolve cannot land the
+// flagged code.
+func TestLandResolvedOwnFindingHolds(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.feedback.Threads = []github.ReviewThread{{IsResolved: true, Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, Body: "<!-- mergewake-severity:high --> finding"}, {Author: "dev", AuthorType: "User", Body: "ok"}}}}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("author-resolved review finding landed")
 	}
 }
 

@@ -55,8 +55,28 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if e != nil {
 		return v, e
 	}
-	if open > 0 {
-		v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(open))
+	// A review.login finding on the current head stays held while it was
+	// resolved without a new head: anyone who can click resolve — including
+	// the PR author — would otherwise clear the trusted review's findings.
+	// Clearing needs a new head and a new review pass.
+	fb, e := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if e != nil {
+		return v, e
+	}
+	if fb.HeadSHA != pr.Head.SHA {
+		return v, errors.New("review feedback is not bound to the decision head")
+	}
+	login := policy.NormalizeAuthor(s.Config.Review.Login)
+	held := open
+	if login != "" {
+		for _, t := range fb.Threads {
+			if t.IsResolved && len(t.Comments) > 0 && t.Comments[0].CommitSHA == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
+				held++
+			}
+		}
+	}
+	if held > 0 {
+		v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(held))
 	}
 	// The -done marker alone is forgeable by anyone with push access, so the
 	// gate also requires the head-bound passes the trusted review identity
