@@ -515,7 +515,9 @@ The defaults grade CodeRabbit `critical` and codex `P1` as block, CodeRabbit
 reviewer prompt's `blocking`, `major` and `minor` grade like `high`, `medium`
 and `low`). Rules are `{author, severity: [...], classes: [...]}` lists under
 `block` and `triage`; an explicit list replaces the default for those two keys,
-though rules the policy writes for `review.login` always win over its defaults.
+though the `review.login` defaults are kept or replaced per list: naming the login
+in `block` replaces its default block rule, naming it in `triage` replaces its
+default triage rule, and the other list keeps its default.
 `ignore_authors` skips threads from the named bots. The other `review_gate` keys
 stay parseable but do not affect the land gate.
 

@@ -116,18 +116,31 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	return g
 }
 
-// WithOwnLogin adds default rules for the trusted review identity unless the
-// policy already grades that author: critical and high findings block, medium
-// ones need an answer, low ones are advisory. The reviewer prompt also admits
-// blocking, major and minor, graded like high, medium and low.
+// WithOwnLogin adds default rules for the trusted review identity, each list
+// on its own: critical and high findings block, medium ones need an answer, low
+// ones are advisory. A list that already names the login keeps only the
+// policy's rules for it; the other list still gets its default. The reviewer
+// prompt also admits blocking, major and minor, graded like high, medium and low.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
 	own := NormalizeAuthor(login)
-	if own == "" || g.gateAuthors()[own] {
+	if own == "" {
 		return g
 	}
-	g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
-	g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}})
+	names := func(rules []ReviewGateRule) bool {
+		for _, r := range rules {
+			if NormalizeAuthor(r.Author) == own {
+				return true
+			}
+		}
+		return false
+	}
+	if !names(g.Block) {
+		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
+	}
+	if !names(g.Triage) {
+		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}})
+	}
 	return g
 }
 

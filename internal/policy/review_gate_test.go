@@ -111,6 +111,29 @@ func TestReviewGateOwnLoginDefaultsYieldToPolicy(t *testing.T) {
 	}
 }
 
+// Naming the login in one list replaces only that list's default for it.
+func TestReviewGateOwnLoginDefaultsPerList(t *testing.T) {
+	triageOnly := ReviewGate{Triage: []ReviewGateRule{{Author: "review-bot", Severity: []string{"low"}}}}.WithOwnLogin("review-bot")
+	blockOnly := ReviewGate{Block: []ReviewGateRule{{Author: "review-bot", Severity: []string{"critical"}}}}.WithOwnLogin("review-bot")
+	for _, tt := range []struct {
+		name, severity, want string
+		g                    ReviewGate
+	}{
+		{"triage-only policy keeps default block", "high", GradeBlock, triageOnly},
+		{"triage-only policy replaces default triage", "medium", GradeAdvisory, triageOnly},
+		{"triage-only policy uses its own triage rule", "low", GradeTriage, triageOnly},
+		{"block-only policy keeps default triage", "medium", GradeTriage, blockOnly},
+		{"block-only policy replaces default block", "high", GradeAdvisory, blockOnly},
+		{"block-only policy uses its own block rule", "critical", GradeBlock, blockOnly},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.g.Grade(ReviewFinding{Author: "review-bot", Severity: tt.severity, OwnReview: true}, "routine"); got != tt.want {
+				t.Fatalf("got %s want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFastLane(t *testing.T) {
 	p := Policy{Version: 1, RequiredChecks: []string{"CI"}}
 	if p.FastLaneEligible("routine", 1) {
