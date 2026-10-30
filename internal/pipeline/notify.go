@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -15,11 +17,12 @@ import (
 
 var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
-// NotifyPR emits one lane event when the land decision for a PR head becomes
-// ready or blocked: READY once required checks, review passes, the review gate
-// and mergeability all pass at that head, BLOCKED once a required check fails
-// or completed checks still leave the head held. Pending required checks emit
-// nothing. Each (PR, head, state) notifies at most once across restarts.
+// NotifyPR emits one lane event when the merge-gate verdict for a PR head
+// becomes ready or blocked: READY once every required check is green, no
+// review thread is unresolved, the review -done marker exists, the base is an
+// ancestor of the head, and the PR is mergeable; BLOCKED with the
+// closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
+// (PR, head, verdict) notifies at most once across restarts.
 //
 // The pr role notifies under shadow too — telling a lane is not merging — while
 // dry-run only prints the decision and writes no keys or events.
@@ -47,28 +50,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if e != nil {
 		return e
 	}
-	files, e := s.GH.Files(ctx, r.Name, n)
+	v, e := s.mergeGate(ctx, r, pr, p, head)
 	if e != nil {
 		return e
-	}
-	if len(files) != pr.ChangedFiles {
-		return errors.New("incomplete PR file list")
-	}
-	d := p.ClassifyGuarded(files, r.Policy)
-	states, e := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
-	if e != nil {
-		return e
-	}
-	var failing []string
-	pending := false
-	for _, name := range p.RequiredChecks {
-		switch states[name] {
-		case github.Red:
-			failing = append(failing, name)
-		case github.Green:
-		default:
-			pending = true
-		}
 	}
 	record := struct {
 		PR      int      `json:"pr"`
@@ -79,127 +63,76 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Via     string   `json:"via,omitempty"`
 		Sent    bool     `json:"sent"`
 		Deduped bool     `json:"deduped,omitempty"`
-	}{PR: n, Head: pr.Head.SHA}
-	state := ""
-	var reasons []string
-	switch {
-	case len(failing) > 0:
-		state, reasons = "blocked", []string{"failing checks: " + strings.Join(failing, ",")}
-	case pending:
-		record.State = "pending"
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons}
+	if v.State == "pending" || o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
-	default:
-		recovery := pr.Head.Ref == github.RecoveryBranch && pr.Head.Repo.FullName == r.Name
-		watchChecks := p.RequiredChecks
-		if len(p.WatchChecks) > 0 {
-			watchChecks = p.WatchChecks
-		}
-		mainCI, e := s.GH.Check(ctx, r.Name, head, watchChecks)
-		if e != nil {
-			return e
-		}
-		unknownMain := false
-		if !recovery {
-			switch mainCI {
-			case github.Red:
-				reasons = append(reasons, "main CI red")
-			case github.Green:
-			default:
-				unknownMain = true
-			}
-		}
-		needed := 1
-		if d.Class == "blocking" {
-			needed = 2
-		}
-		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
-		if e != nil {
-			return e
-		}
-		count, complete := distinctPasses(receipts, needed)
-		if !complete {
-			switch want := needed - count; {
-			case want == 1 && needed == 2:
-				reasons = append(reasons, "needs 2nd review")
-			case want == 1:
-				reasons = append(reasons, "needs review")
-			default:
-				reasons = append(reasons, fmt.Sprintf("needs %d reviews", want))
-			}
-		} else {
-			_, verdict, missing, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
-			if e != nil {
-				return e
-			}
-			if len(verdict.Blocking) > 0 {
-				reasons = append(reasons, fmt.Sprintf("open blocking findings: %d", len(verdict.Blocking)))
-			}
-			if len(verdict.Triage) > 0 {
-				reasons = append(reasons, fmt.Sprintf("unanswered findings: %d", len(verdict.Triage)))
-			}
-			if len(missing) > 0 {
-				reasons = append(reasons, "missing required reviews: "+strings.Join(missing, ","))
-			}
-		}
-		if (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty" {
-			reasons = append(reasons, "conflicts")
-		}
-		unknownMerge := pr.Mergeable == nil || pr.MergeableState == "unknown"
-		switch {
-		case len(reasons) > 0:
-			state = "blocked"
-		case unknownMain || unknownMerge:
-			record.State = "pending"
-			return s.audit(r.Name, "pr-notify", record, o.DryRun)
-		default:
-			state = "ready"
-		}
 	}
-	lane, via, e := s.notifyLane(ctx, r, pr)
+	summary := pr.Title
+	if v.State == "blocked" {
+		summary = strings.Join(v.Reasons, "; ")
+	}
+	lane, via, sent, e := s.laneEvent(ctx, r, pr, v.State, summary)
 	if e != nil {
 		return e
 	}
-	record.State, record.Reasons, record.Lane, record.Via = state, reasons, lane, via
+	record.Lane, record.Via, record.Sent, record.Deduped = lane, via, sent, !sent
+	return s.audit(r.Name, "pr-notify", record, false)
+}
+
+// laneEvent resolves the owning lane and emits one deduped lane event for the
+// verdict: READY, BLOCKED or MERGED. The sent key covers the state, PR, head
+// and summary so a changed reason set re-notifies while an identical verdict
+// stays quiet. It returns the lane, the choosing rule and whether an event
+// went out.
+func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
+	lane, via, e := s.notifyLane(ctx, r, pr)
+	if e != nil {
+		return "", "", false, e
+	}
 	sha7 := pr.Head.SHA
 	if len(sha7) > 7 {
 		sha7 = sha7[:7]
-	}
-	title := pr.Title
-	if state == "blocked" {
-		title = strings.Join(reasons, "; ")
 	}
 	shown := lane
 	if shown == "" {
 		shown = "-"
 	}
 	text := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s | lane=%s via %s",
-		strings.ToUpper(state), r.Name, n, sha7, title, shown, via)
-	if o.DryRun {
-		return s.audit(r.Name, "pr-notify", record, true)
-	}
+		strings.ToUpper(state), r.Name, pr.Number, sha7, summary, shown, via)
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
 	if e != nil {
-		return e
+		return "", "", false, e
 	}
-	key := fmt.Sprintf("%s %d %s", state, n, pr.Head.SHA)
+	// The verdict key dedupes per (PR, head, verdict): a BLOCKED reason set is
+	// part of the verdict, while a retitled READY is the same verdict.
+	key := fmt.Sprintf("%s %d %s", state, pr.Number, pr.Head.SHA)
+	if state == "blocked" {
+		key += " " + summary
+	}
 	if sent.has(key) {
-		record.Deduped = true
-		return s.audit(r.Name, "pr-notify", record, false)
+		return lane, via, false, nil
 	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
+	// A changed BLOCKED reason set is a new verdict under the same head: fold
+	// the summary into the event ID so a notifier deduping on ID cannot drop it
+	// while the sent key records delivery.
+	id := fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, pr.Number, pr.Head.SHA)
+	if state == "blocked" {
+		sum := sha256.Sum256([]byte(summary))
+		id += "-" + hex.EncodeToString(sum[:4])
+	}
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, n, pr.Head.SHA),
+		ID:   id,
 		Text: text,
 		Lane: lane,
 	}); e != nil {
-		return e
+		return "", "", false, e
 	}
-	record.Sent = true
 	if e = sent.add(key); e != nil {
-		return e
+		return "", "", false, e
 	}
-	return s.audit(r.Name, "pr-notify", record, false)
+	return lane, via, true, nil
 }
 
 // notifyLane resolves the destination lane without guessing: the handoffkeep

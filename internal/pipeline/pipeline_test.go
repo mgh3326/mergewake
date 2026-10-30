@@ -52,7 +52,7 @@ type fakeGH struct {
 	parents                                                      map[string]string
 	parents2                                                     map[string][]string
 	commitPRs                                                    map[string][]github.Pull
-	latch, headChanged                                           bool
+	latch, headChanged, stale                                    bool
 	policyReads                                                  []string
 	m                                                            manifest.Manifest
 }
@@ -231,9 +231,11 @@ func (g *fakeGH) PostReview(_ context.Context, _ string, _ int, sha string, f []
 	g.passes[sha] = append(g.passes[sha], meta)
 	return nil
 }
-func (g *fakeGH) Ancestor(context.Context, string, string, string) (bool, error) { return true, nil }
-func (g *fakeGH) Publish(context.Context, manifest.Manifest) error               { g.publishCount++; return nil }
-func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error)      { return g.m, nil }
+func (g *fakeGH) Ancestor(context.Context, string, string, string) (bool, error) {
+	return !g.stale, nil
+}
+func (g *fakeGH) Publish(context.Context, manifest.Manifest) error          { g.publishCount++; return nil }
+func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { return g.m, nil }
 
 type fakeSink struct{ records, reopens int }
 
@@ -242,10 +244,14 @@ func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; 
 
 type fakeNotifier struct {
 	count  int
+	err    error
 	events []integrations.Event
 }
 
 func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
+	if n.err != nil {
+		return n.err
+	}
 	n.count++
 	n.events = append(n.events, e)
 	return nil
@@ -308,32 +314,61 @@ func (r *fakeRunner) Run(_ context.Context, command string, args []string, input
 func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
 	t.Helper()
 	g := &fakeGH{ci: github.Green, feedback: github.ReviewFeedback{PRAuthor: "pr-author", ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}}
-	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
+	mergeable := true
+	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Mergeable: &mergeable, MergeableState: "clean", Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
 	sink := &fakeSink{}
 	n := &fakeNotifier{}
 	r := config.Repo{Name: "example/project", Branch: "main", Policy: ".mergewake/policy.yaml", SmokeTimeout: "5s"}
 	s := &Service{Config: config.Config{Version: 1, Host: "host-a", StateDir: filepath.Join(t.TempDir(), "state"), WatchLimit: 20, Review: config.Review{Login: "review-bot", Timeout: "5s", Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}}, GH: g, Runner: &fakeRunner{}, Sink: sink, Notifier: n, Out: io.Discard}
 	return s, g, sink, n, r
 }
+
+// markReviewed records the head's review completion marker, the durable ref
+// the merge gate requires for a reviewed head.
+func markReviewed(g *fakeGH) {
+	if g.refs == nil {
+		g.refs = map[string]bool{}
+	}
+	g.refs[doneRef(g.pull.Number, g.pull.Head.SHA)] = true
+	g.reviewed = true
+}
+
 func TestLand(t *testing.T) {
 	for _, tt := range []struct {
 		name                        string
 		enabled, blocking, reviewed bool
 		findings                    int
+		stale, conflict             bool
 		ci                          github.CI
 		dry, shadow                 bool
 		merges                      int
+		action                      string
 	}{
-		{name: "shadow default", ci: github.Green}, {name: "routine enabled", enabled: true, reviewed: true, ci: github.Green, merges: 1}, {name: "red never merges", enabled: true, ci: github.Red}, {name: "missing checks", enabled: true, ci: github.Pending}, {name: "blocking needs review", enabled: true, blocking: true, ci: github.Green}, {name: "blocking unresolved", enabled: true, blocking: true, reviewed: true, findings: 1, ci: github.Green}, {name: "blocking resolved", enabled: true, blocking: true, reviewed: true, ci: github.Green, merges: 1}, {name: "dry run", enabled: true, ci: github.Green, dry: true}, {name: "forced shadow", enabled: true, ci: github.Green, shadow: true},
+		{name: "shadow default", reviewed: true, ci: github.Green, action: "merge"},
+		{name: "opt-in merges", enabled: true, reviewed: true, ci: github.Green, merges: 1, action: "merge"},
+		{name: "red never merges", enabled: true, reviewed: true, ci: github.Red, action: "blocked"},
+		{name: "pending checks wait", enabled: true, reviewed: true, ci: github.Pending, action: "pending"},
+		{name: "review missing", enabled: true, ci: github.Green, action: "blocked"},
+		{name: "threads open", enabled: true, reviewed: true, findings: 2, ci: github.Green, action: "blocked"},
+		{name: "stale base", enabled: true, reviewed: true, stale: true, ci: github.Green, action: "blocked"},
+		{name: "conflict", enabled: true, reviewed: true, conflict: true, ci: github.Green, action: "blocked"},
+		{name: "blocking reviewed merges", enabled: true, blocking: true, reviewed: true, ci: github.Green, merges: 1, action: "merge"},
+		{name: "dry run", enabled: true, reviewed: true, ci: github.Green, dry: true},
+		{name: "forced shadow", enabled: true, reviewed: true, ci: github.Green, shadow: true, action: "merge"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = tt.enabled
 			g.blocking = tt.blocking
-			g.reviewed = tt.reviewed
+			g.stale = tt.stale
+			if tt.reviewed {
+				markReviewed(g)
+			}
 			g.findings = tt.findings
-			if tt.findings > 0 {
-				g.feedback.Threads = []github.ReviewThread{{Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, Body: "<!-- mergewake-severity:high --> bug"}}}}
+			if tt.conflict {
+				no := false
+				g.pull.Mergeable = &no
+				g.pull.MergeableState = "dirty"
 			}
 			g.ci = tt.ci
 			if e := s.Land(context.Background(), r, 7, Options{DryRun: tt.dry, Shadow: tt.shadow}); e != nil {
@@ -341,6 +376,9 @@ func TestLand(t *testing.T) {
 			}
 			if g.mergeCount != tt.merges {
 				t.Fatalf("merged %d times", g.mergeCount)
+			}
+			if !tt.dry && landAction(t, s, r.Name) != tt.action {
+				t.Fatalf("action=%s", landAction(t, s, r.Name))
 			}
 			for _, sha := range g.policyReads {
 				if sha != shaB {
@@ -364,85 +402,71 @@ func landAction(t *testing.T, s *Service, repo string) string {
 	return state.Latest["https://github.com/"+repo+"/pull/7"].Action
 }
 
-// An unreviewed blocking path stays held until two head-bound passes exist.
-func TestLandBlockingNeedsTwoPasses(t *testing.T) {
+// The -done marker is the only review evidence the gate trusts: no marker,
+// no merge; once the marker exists for the head the reviewed PR lands.
+func TestLandReviewMarkerRequired(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
-	g.blocking = true
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-independent-review" {
-		t.Fatalf("merged without reviews: %d", g.mergeCount)
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatalf("merged without review marker: %d", g.mergeCount)
 	}
-	g.passes = map[string][]github.PassReceipt{g.pull.Head.SHA: {{Pass: 1, Family: "anthropic", Lens: "correctness"}}}
-	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if g.mergeCount != 0 {
-		t.Fatal("merged on a single pass")
-	}
-	g.passes[g.pull.Head.SHA] = append(g.passes[g.pull.Head.SHA], github.PassReceipt{Pass: 2, Family: "openai", Lens: "state-risk"})
+	markReviewed(g)
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if g.mergeCount != 1 || landAction(t, s, r.Name) != "merge" {
-		t.Fatalf("two clean passes did not land: %d", g.mergeCount)
+		t.Fatalf("marked head did not land: %d", g.mergeCount)
 	}
 }
 
-// A PR editing its own policy file is judged under main's policy and counts
-// as a blocking path even when main names no blocking rules.
-func TestLandPolicyFileIsBlocking(t *testing.T) {
+// A PR editing its own policy file is still judged under main's policy: the
+// decision never reads the untrusted head revision.
+func TestLandPolicyFilePolicyFromBase(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
+	markReviewed(g)
 	g.pull.ChangedFiles = 1
 	g.files = []policy.File{{Path: ".mergewake/policy.yaml", Kind: "modified"}}
-	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-independent-review" {
-		t.Fatal("policy-file PR landed without two reviews")
-	}
-	for _, sha := range g.policyReads {
-		if sha != shaB {
-			t.Fatal("policy read from untrusted head")
-		}
-	}
-	g.reviewed = true
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if g.mergeCount != 1 {
 		t.Fatal("reviewed policy-file PR did not land")
 	}
+	for _, sha := range g.policyReads {
+		if sha != shaB {
+			t.Fatal("policy read from untrusted head")
+		}
+	}
 }
 
-// Reviews bound to an older head never count toward the current head.
+// A marker bound to an older head never counts toward the current head.
 func TestLandHeadChangeInvalidatesReviews(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
-	g.blocking = true
 	old := g.pull.Head.SHA
-	g.passes = map[string][]github.PassReceipt{old: {{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}}
+	g.refs = map[string]bool{doneRef(7, old): true}
 	g.pull.Head.SHA = shaC
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if g.mergeCount != 0 {
-		t.Fatal("stale-head reviews merged")
+		t.Fatal("stale-head review merged")
 	}
-	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}
+	markReviewed(g)
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if g.mergeCount != 1 {
-		t.Fatal("current-head reviews did not land")
+		t.Fatal("current-head review did not land")
 	}
 }
 
-// With no other-family quota the review still runs, records same_family, and
-// the blocking PR lands on the two head-bound passes.
+// With no other-family quota the review still runs and records same_family;
+// the -done marker it leaves is what lets the blocking PR land.
 func TestLandSameFamilyReviewLands(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
@@ -469,49 +493,69 @@ func TestLandSameFamilyReviewLands(t *testing.T) {
 	}
 }
 
-// review_gate folds bot threads into the decision graded by author and
-// severity instead of the raw unresolved count.
-func TestLandReviewGateFindings(t *testing.T) {
-	thread := func(author, label string, resolved, answered bool) github.ReviewThread {
-		comments := []github.ReviewComment{{Author: author, CommitSHA: shaA, Body: label + " problem here"}}
-		if answered {
-			comments = append(comments, github.ReviewComment{Author: "dev", AuthorType: "User", Body: "fixed in the latest commit"})
-		}
-		return github.ReviewThread{ID: author + label, Path: "tool", Line: 1, IsResolved: resolved, ResolvedBy: author, ResolvedByType: "Bot", Comments: comments}
+// A merged PR emits one MERGED event to the owning lane, deduped like the
+// other verdict events.
+func TestLandMergedEventOnce(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.pull.Title = "Add feature"
+	s.Config.Notifier.Lane = "config-lane"
+	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
 	}
-	for _, tt := range []struct {
-		name     string
-		blocking bool
-		reviewed bool
-		threads  []github.ReviewThread
-		action   string
-		merges   int
-	}{
-		{"critical blocks routine", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Critical", false, false)}, "wait-for-blocking-findings", 0},
-		{"major needs triage on blocking", true, true, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-triage-reply", 0},
-		{"p1 blocks blocking", true, true, []github.ReviewThread{thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "wait-for-blocking-findings", 0},
-		{"unanswered major holds routine", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, false)}, "wait-for-triage-reply", 0},
-		{"answered major lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true)}, "merge", 1},
-		{"answer does not clear cross-bot P1", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Major", false, true), thread("chatgpt-codex-connector[bot]", "P1", false, false)}, "wait-for-blocking-findings", 0},
-		{"resolved critical lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Critical", true, false)}, "merge", 1},
-		{"ignored bot lands", false, false, []github.ReviewThread{thread("qlty[bot]", "Critical", false, false)}, "merge", 1},
-		{"minor advisory lands", false, false, []github.ReviewThread{thread("coderabbitai[bot]", "Minor", false, false)}, "merge", 1},
-		{"blocking reviewed lands", true, true, []github.ReviewThread{thread("coderabbitai[bot]", "Minor", false, false)}, "merge", 1},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.blocking = tt.blocking
-			g.reviewed = true
-			g.gate = true
-			g.feedback = github.ReviewFeedback{PRAuthor: "pr-author", Threads: tt.threads, ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}
-			if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
-				t.Fatal(e)
-			}
-			if g.mergeCount != tt.merges || landAction(t, s, r.Name) != tt.action {
-				t.Fatalf("action=%s merges=%d", landAction(t, s, r.Name), g.mergeCount)
-			}
-		})
+	if g.mergeCount != 1 || n.count != 1 {
+		t.Fatalf("merges=%d events=%d", g.mergeCount, n.count)
+	}
+	text := n.events[0].Text
+	if !strings.HasPrefix(text, "[mergewake] MERGED example/project#7 head=aaaaaaa | Add feature") ||
+		!strings.Contains(text, "lane=config-lane via config") || n.events[0].Lane != "config-lane" {
+		t.Fatalf("%+v", n.events[0])
+	}
+	// A merged PR is closed on the next poll: nothing further happens.
+	g.pull.State = "closed"
+	if e := s.Land(context.Background(), r, 7, Options{}); e == nil {
+		t.Fatal("closed PR landed again")
+	}
+	if n.count != 1 {
+		t.Fatal("merged event re-emitted")
+	}
+}
+
+// A failed MERGED emit never strands the observation of an already-merged PR:
+// the error is audited and the outcome ledger still records the merge.
+func TestLandMergedNotifyFailureObserved(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	n.err = errors.New("notifier offline")
+	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if g.mergeCount != 1 {
+		t.Fatal("merge did not run")
+	}
+	state, e := s.ledger().Read()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if v := state.Latest["https://github.com/"+r.Name+"/pull/7"]; v.Action != "merge" {
+		t.Fatalf("action=%s", v.Action)
+	}
+}
+
+// Merging requires policy opt-in plus a gated head; a head that moved between
+// gate and merge is never merged.
+func TestLandHeadMovedBetweenGateAndMerge(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.nextHead = shaC
+	if e := s.Land(context.Background(), r, 7, Options{}); e == nil {
+		t.Fatal("moved head merged")
+	}
+	if g.mergeCount != 0 {
+		t.Fatal("merge ran on an ungated head")
 	}
 }
 
@@ -638,48 +682,6 @@ func TestWatchCulpritMergeCommitAndUnknownEvidence(t *testing.T) {
 				if sink.records != tt.reports || n.count != tt.reports {
 					t.Fatal("repeat report was not deduplicated")
 				}
-			}
-		})
-	}
-}
-
-// Red or unknown main pauses ordinary landing; a recovery PR from the watch
-// latch may still land, and shadow records the pause as would-pause.
-func TestLandRedMainPause(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		mainCI   github.CI
-		recovery bool
-		shadow   bool
-		action   string
-		merges   int
-	}{
-		{"red main pauses", github.Red, false, false, "pause-red-main", 0},
-		{"unknown main pauses", github.Pending, false, false, "pause-main-unknown", 0},
-		{"shadow records would-pause", github.Red, false, true, "would-pause-red-main", 0},
-		{"recovery lands on red main", github.Red, true, false, "merge", 1},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.reviewed = true
-			g.checks = map[string]github.CI{shaB: tt.mainCI, shaA: github.Green}
-			if tt.recovery {
-				g.pull.Head.Ref = github.RecoveryBranch
-				g.pull.Head.Repo.FullName = r.Name
-			}
-			if e := s.Land(context.Background(), r, 7, Options{Shadow: tt.shadow}); e != nil {
-				t.Fatal(e)
-			}
-			if g.mergeCount != tt.merges {
-				t.Fatalf("merges=%d", g.mergeCount)
-			}
-			state, e := s.ledger().Read()
-			if e != nil {
-				t.Fatal(e)
-			}
-			if v := state.Latest["https://github.com/"+r.Name+"/pull/7"]; v.Action != tt.action {
-				t.Fatalf("action=%s", v.Action)
 			}
 		})
 	}
@@ -1050,7 +1052,7 @@ func TestChangedHeadStopsReviewAndLand(t *testing.T) {
 			g.enabled = true
 			g.nextHead = shaC
 			if command == "land" {
-				g.reviewed = true
+				markReviewed(g)
 			}
 			var e error
 			if command == "review" {
@@ -1129,6 +1131,7 @@ func TestServiceClockStampsAudit(t *testing.T) {
 		t.Fatalf("audit %q, want %q", buf.String(), want)
 	}
 }
+
 // An author family given as an alias ("claude") normalises to the canonical
 // family ("anthropic"), so a same-family reviewer is never treated as
 // independent and pass 2 falls back to the remaining family.
