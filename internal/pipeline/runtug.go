@@ -45,6 +45,17 @@ type runtugExecutor struct {
 func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
 	s, cfg, pr := x.s, x.s.Config.Review.Runtug, x.pr
 	out := passOutcome{}
+	// Review bounds its context by review.timeout; a caller without a deadline
+	// gets the same bound, so the pane wait always has one.
+	if _, ok := ctx.Deadline(); !ok {
+		timeout, e := config.Duration(s.Config.Review.Timeout)
+		if e != nil {
+			return out, e
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	skip := func(format string, args ...any) (passOutcome, error) {
 		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fmt.Sprintf(format, args...)})
 		return out, nil
@@ -118,9 +129,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		return skip("write brief: %v", e)
 	}
 
-	deadline, ok := ctx.Deadline()
+	deadline, _ := ctx.Deadline()
 	wait := time.Until(deadline)
-	if !ok || wait < time.Second {
+	if wait < time.Second {
 		return skip("no time left to wait for a reviewer pane")
 	}
 	args := []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale,

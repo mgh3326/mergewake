@@ -239,3 +239,20 @@ func TestRuntugFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+// A pass run without a context deadline waits up to review.timeout instead of
+// skipping the pane for lack of time.
+func TestRuntugPassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	s.Config.Review.Timeout = "10m"
+	diff, _ := g.Diff(context.Background(), r.Name, 7)
+	x := &runtugExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
+	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	if e != nil || out.executor != "runtug" || len(out.skips) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("%+v %v %v", out, e, runner.spawns)
+	}
+	if w := arg(runner.spawns[0], "--wait-timeout"); w != "599" && w != "600" {
+		t.Fatalf("--wait-timeout %s", w)
+	}
+}
