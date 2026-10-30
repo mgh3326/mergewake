@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -23,7 +24,7 @@ import (
 // so a later pass can find it. Dry-run prints rows without writing the file.
 type reapReceipt struct {
 	Time     time.Time `json:"time"`
-	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch
+	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch, archive-job
 	Repo     string    `json:"repo"`
 	PR       int       `json:"pr"`
 	Host     string    `json:"host"`
@@ -35,6 +36,9 @@ type reapReceipt struct {
 	Result   string    `json:"result"`          // closed, removed, deleted, would-*, skipped, error
 	Reason   string    `json:"reason,omitempty"`
 	Files    []string  `json:"files,omitempty"` // ignored paths named by a refusing removal skip
+	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
+
+	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
 
 func (s *Service) reapLog(repo string) string { return filepath.Join(s.state(repo), "reap.jsonl") }
@@ -206,7 +210,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// worktree-gone forever, would otherwise grow reap.jsonl without bound.
 	rowKey := func(v reapReceipt) string {
 		path := v.Pane
-		if v.Action != "close-pane" {
+		if v.Action == "archive-job" {
+			path = v.Job
+		} else if v.Action != "close-pane" {
 			// Rows predating the Worktree field still name their path in Cwd.
 			switch {
 			case v.Worktree != "":
@@ -263,7 +269,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// files stops costing a GitHub call every poll.
 	lastPRCheck := map[int]time.Time{}
 	for _, rec := range receipts {
-		if rec.Time.After(lastPRCheck[rec.PR]) {
+		// Archive rows need no GitHub call and must not delay a refetch.
+		if rec.Action != "archive-job" && rec.Time.After(lastPRCheck[rec.PR]) {
 			lastPRCheck[rec.PR] = rec.Time
 		}
 	}
@@ -345,13 +352,15 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 
-	scanned, closed, planned, removed, deleted, skipped, failed := 0, 0, 0, 0, 0, 0, 0
+	scanned, closed, planned, removed, deleted, skipped, failed, archived := 0, 0, 0, 0, 0, 0, 0, 0
 	note := func(v reapReceipt) {
 		switch v.Result {
 		case "closed":
 			closed++
-		case "would-close", "would-remove", "would-delete":
+		case "would-close", "would-remove", "would-delete", "would-archive":
 			planned++
+		case "archived":
+			archived++
 		case "removed":
 			removed++
 		case "deleted":
@@ -362,7 +371,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			failed++
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
-		repeat := lastRow[rowKey(v)] == rowSig(v)
+		// A failed archive always appends: its time spaces the next retry.
+		repeat := lastRow[rowKey(v)] == rowSig(v) && !(v.Action == "archive-job" && v.Result == "error")
 		lastRow[rowKey(v)] = rowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)
@@ -430,6 +440,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					case !isJob:
 						rec.Result, rec.Reason = "skipped", "not-a-job"
 					default:
+						rec.Job = pane.Name
 						// The pane's output must be saved before the session
 						// can go. report.md counts only when it is newer than
 						// the merge — a stale file could belong to a reused
@@ -675,6 +686,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			note(brec)
 		}
 	}
+	if s.Config.Reap.Archive.Enabled {
+		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, acting, note)...)
+	}
 	result := struct {
 		Action   string `json:"action"`
 		Repo     string `json:"repo"`
@@ -684,8 +698,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		Planned  int    `json:"planned"`
 		Removed  int    `json:"removed"`
 		Deleted  int    `json:"branches_deleted"`
+		Archived int    `json:"jobs_archived"`
 		Skipped  int    `json:"skipped"`
 		ErrCount int    `json:"errors"`
-	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, skipped, failed + len(errs)}
+	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, skipped, failed + len(errs)}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }

@@ -92,6 +92,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
+| `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
@@ -152,6 +153,79 @@ each attempt appends a `check-pr` row whose timestamp bounds the next try —
 so once every worktree its rows named reached `removed` or `worktree-gone` it
 is skipped outright, and a persistent skip stops polling GitHub every pass.
 A single PR's fetch failure never aborts the pass.
+
+### `reap.archive`
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Gates the reap archive stage and `mergewake archive-jobs`. |
+| `drive_dir` | Required when enabled | Locally synced Google Drive folder on the archive host. Absolute; a leading `~/` expands only when the archive host is this machine. Never commit the real path. |
+| `archive_host` | Empty / `local` | Where `drive_dir` lives: empty or `local` is this machine, anything else a single `ssh(1)` destination reachable from this machine (options, whitespace and leading `-` are refused). |
+| `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
+| `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
+
+A runtug job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
+unit, never its worktree — that is in git and is cleaned by the worktree
+rules above. Archiving runs these steps in order, and any failure keeps the
+local job dir and reports the step:
+
+1. **Plan** (read-only): list every non-directory entry. Credential-like
+   paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
+   case-insensitively — are excluded from Drive and hk and named in the
+   record. Symlinks and special files are not copied (following a link could
+   archive a secret from outside the job dir). The hk task id comes from the
+   job's runtug events (`events/*-job.task_link.json`, falling back to
+   `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
+   destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
+   job's newest entry; one that already holds a `manifest.json` is skipped as
+   `drive-dir-exists`, and a job with its own top-level `manifest.json` as
+   `manifest-collision`.
+2. **Copy**: the remaining regular files are streamed as an uncompressed tar
+   from the job host and unpacked straight into the destination on the
+   archive host, relayed through this machine (`ssh` on either side as
+   configured); the Drive copy is a plain directory, not an archive file.
+3. **Verify**: every file's sha256 is computed on both sides and must match.
+4. **hk attachments**: each text file under `text_max_bytes` goes through
+   `handoffkeep attach put`; its returned sha256 must match. `attach put`
+   has no task reference, so the ids are tied to the task by the comment.
+5. **Manifest**: `manifest.json` (job, host, task, source, every file's path,
+   size and sha256, excluded and skipped paths, attachment ids) is written
+   beside the files and also attached to hk.
+6. **Record**: `handoffkeep tasks comment <task>` with the Drive directory,
+   file count, total bytes, the manifest's attachment id, every attachment
+   id, the excluded and skipped names, and the per-file sha256 list (the
+   first 200; the rest are in `manifest.json`).
+7. **Delete**: the job dir is listed again and must be unchanged — a file
+   added or modified since the plan was never archived, so the job is kept
+   as `job-changed` — then removed with `rm -rf`. Excluded credential files
+   go with it; their names stay in the record.
+
+The hk command is `sink.command` when the sink is `handoffkeep`, otherwise
+`handoffkeep`. The job host needs `find`, `stat`, `tar`, `xargs` and
+`sha256sum` or `shasum`; the archive host `tar` and the same hashing tools;
+this machine `bash`. A job dir whose listing exceeds the 4 MiB command
+output limit fails and is kept.
+
+In the reap role the stage runs after the PR loop, from `reap.jsonl`: each
+job whose pane reap `closed` (the row's `job`, or the directory of its saved
+report for older rows) is archived once that close is older than `min_age`.
+It needs no GitHub call. Acting needs `reap.act` and `--apply` like every
+reap mutation; otherwise the plan — what moves to Drive, what goes to hk,
+what is excluded and what would be deleted — is printed as an
+`archive-plan` line with a `would-archive` row (shadow `would-close` rows are
+planned too, once per job in the daemon). A job whose name is again a live
+pane is skipped as `pane-live`. Each outcome is an `archive-job` row in
+`reap.jsonl` with the Drive directory, hk ids and excluded names; `archived`
+and every refusal other than `pane-live`/`pane-scan-failed` are final, and a
+failed attempt is retried at most once an hour.
+
+`mergewake archive-jobs [--older-than 14d] [--host NAME] [--dry-run|--apply]`
+runs the same plan and apply over a host's existing backlog: every job dir in
+`hosts[].jobs` whose newest entry is older than `--older-than` (default
+`min_age`), skipping names that are a live pane or hold a pane's cwd — a host
+whose pane list cannot be read is skipped whole. Without `--apply` it only
+plans; rows go to `<state_dir>/archive-jobs.jsonl` unless `--dry-run`. It
+needs no GitHub token.
 
 ### `review`
 
@@ -655,7 +729,8 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
-| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
