@@ -421,21 +421,32 @@ func Load(name string) (Config, error) {
 		if e := ValidateReviewer(p); e != nil {
 			return c, e
 		}
+		p.Family = CanonicalFamily(p.Family)
+		c.Review.Profiles[name] = p
 	}
 	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
 		return c, errors.New("review.select must be pace or rank")
 	}
+	pairings := map[string][]string{}
 	for _, family := range slices.Sorted(maps.Keys(c.Review.Pairings)) {
 		names := c.Review.Pairings[family]
 		if family == "" || len(names) == 0 {
 			return c, errors.New("empty review pairing")
 		}
+		canonical := CanonicalFamily(family)
+		if _, dup := pairings[canonical]; dup {
+			return c, errors.New("review pairings collide after family normalisation")
+		}
+		pairings[canonical] = names
 		for _, name := range names {
 			p, ok := c.Review.Profiles[name]
-			if !ok || p.Family == family {
+			if !ok || p.Family == canonical {
 				return c, errors.New("pairings must name configured profiles from a different family")
 			}
 		}
+	}
+	if len(pairings) > 0 {
+		c.Review.Pairings = pairings
 	}
 	return c, nil
 }
@@ -446,6 +457,29 @@ func ValidGrade(s string) bool {
 		return true
 	}
 	return false
+}
+
+// familyAliases maps model and CLI names to one canonical model family, so an
+// author family like "claude" and a reviewer profile family like "anthropic"
+// compare equal and a same-family reviewer is never counted as independent.
+var familyAliases = map[string]string{
+	"anthropic": "anthropic", "claude": "anthropic", "sonnet": "anthropic", "opus": "anthropic", "haiku": "anthropic", "fable": "anthropic", "kiro": "anthropic",
+	"openai": "openai", "codex": "openai", "sol": "openai", "gpt": "openai",
+	"cognition": "cognition", "devin": "cognition", "swe": "cognition",
+	"xai": "xai", "grok": "xai",
+	"google": "google", "gemini": "google", "agy": "google",
+	"moonshot": "moonshot", "kimi": "moonshot",
+	"deepseek": "deepseek",
+}
+
+// CanonicalFamily normalises an author or reviewer family alias to its
+// canonical model family. Unlisted names are their own family.
+func CanonicalFamily(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if f, ok := familyAliases[s]; ok {
+		return f
+	}
+	return s
 }
 
 func ReviewerCommand(s string) bool {

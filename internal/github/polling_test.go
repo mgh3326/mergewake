@@ -1,9 +1,11 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,5 +72,78 @@ func TestRateLimitAndCancellation(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatal("requests continued while rate limited")
+	}
+}
+func TestThrottleWaitIsLogged(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/limited":
+			w.WriteHeader(403)
+		case "/paced":
+			w.Header().Set("X-RateLimit-Remaining", "3")
+			w.Header().Set("X-RateLimit-Reset", "4102444800")
+			w.Write([]byte(`{}`))
+		case "/interval":
+			w.Header().Set("X-Poll-Interval", "30")
+			w.Write([]byte(`{}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	c := New("")
+	c.BaseURL = server.URL
+	c.Stderr = buf
+
+	// A 403 with no headers backs off a minute; the next request logs the wait.
+	if _, e := c.request(context.Background(), "GET", "/limited", "application/json", nil); e == nil {
+		t.Fatal("403 hidden")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, _ = c.request(ctx, "GET", "/other", "application/json", nil)
+	cancel()
+	if line := buf.String(); !strings.Contains(line, "403-429 backoff") || !strings.Contains(line, "HTTP 403") || !strings.Contains(line, "until 2") {
+		t.Fatalf("log %q", line)
+	}
+
+	// Rate-limit pacing on a 2xx response logs its own reason and status.
+	buf.Reset()
+	c = New("")
+	c.BaseURL = server.URL
+	c.Stderr = buf
+	if _, e := c.request(context.Background(), "GET", "/paced", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, _ = c.request(ctx, "GET", "/other", "application/json", nil)
+	cancel()
+	if line := buf.String(); !strings.Contains(line, "rate-limit pacing") || !strings.Contains(line, "HTTP 200") {
+		t.Fatalf("log %q", line)
+	}
+
+	// Poll intervals throttle per request key and log the interval's status.
+	buf.Reset()
+	c = New("")
+	c.BaseURL = server.URL
+	c.Stderr = buf
+	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, _ = c.request(ctx, "GET", "/interval", "application/json", nil)
+	cancel()
+	if line := buf.String(); !strings.Contains(line, "poll interval") || !strings.Contains(line, "HTTP 200") {
+		t.Fatalf("log %q", line)
+	}
+	// A different key is not held back by another key's poll interval.
+	buf.Reset()
+	if _, e := c.request(context.Background(), "GET", "/free", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("log %q", buf.String())
 	}
 }

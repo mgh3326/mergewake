@@ -170,7 +170,7 @@ func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
 		if a.Family == "" || b.Family == "" {
 			return len(passes), false
 		}
-		if a.Family == b.Family && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
+		if config.CanonicalFamily(a.Family) == config.CanonicalFamily(b.Family) && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
 			return len(passes), false
 		}
 	}

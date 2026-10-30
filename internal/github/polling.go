@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -15,21 +16,32 @@ type cachedResponse struct {
 	ETag string
 	Body []byte
 }
+
+// throttle records a pending wait with the reason and HTTP status that caused
+// it, so beginRequest can log why it is sleeping. No URL, token or body.
+type throttle struct {
+	until  time.Time
+	reason string
+	code   int
+}
 type pollingState struct {
 	once  sync.Once
 	gate  chan struct{}
 	mu    sync.Mutex
 	cache map[string]cachedResponse
 	bytes int
-	until time.Time
-	polls map[string]time.Time
+	rate  throttle
+	polls map[string]throttle
 }
+
+// throttleLogThreshold is the shortest wait worth a stderr line.
+const throttleLogThreshold = 2 * time.Second
 
 // RateWait exposes the transport's current throttle to loop status/scheduling.
 func (c *Client) RateWait() time.Duration {
 	c.poll.mu.Lock()
 	defer c.poll.mu.Unlock()
-	return max(time.Duration(0), time.Until(c.poll.until))
+	return max(time.Duration(0), time.Until(c.poll.rate.until))
 }
 func waitUntil(ctx context.Context, until time.Time) error {
 	d := time.Until(until)
@@ -50,7 +62,7 @@ func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedRe
 	p.once.Do(func() {
 		p.gate = make(chan struct{}, 1)
 		p.cache = map[string]cachedResponse{}
-		p.polls = map[string]time.Time{}
+		p.polls = map[string]throttle{}
 	})
 	select {
 	case p.gate <- struct{}{}:
@@ -59,28 +71,49 @@ func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedRe
 	}
 	release := func() { <-p.gate }
 	p.mu.Lock()
-	until := p.until
-	if p.polls[key].After(until) {
-		until = p.polls[key]
+	wait := p.rate
+	if p.polls[key].until.After(wait.until) {
+		wait = p.polls[key]
 	}
 	old := p.cache[key]
 	p.mu.Unlock()
-	if err := waitUntil(ctx, until); err != nil {
+	if d := time.Until(wait.until); d > throttleLogThreshold {
+		c.logThrottle(wait, d)
+	}
+	if err := waitUntil(ctx, wait.until); err != nil {
 		release()
 		return nil, old, err
 	}
 	return release, old, nil
+}
+
+// logThrottle reports one throttled wait: the reason, the HTTP status that
+// caused it and the wake-up time. It never logs the token, URL query or any
+// response body.
+func (c *Client) logThrottle(w throttle, d time.Duration) {
+	out := c.Stderr
+	if out == nil {
+		out = os.Stderr
+	}
+	reason := w.reason
+	if reason == "" {
+		reason = "rate-limit wait"
+	}
+	fmt.Fprintf(out, "mergewake: GitHub request throttled: %s (HTTP %d); sleeping %s until %s\n",
+		reason, w.code, d.Round(time.Second), w.until.UTC().Format(time.RFC3339))
 }
 func (c *Client) observeHeaders(h http.Header, code int, key string) {
 	p := &c.poll
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	until := now
+	w := throttle{until: now, code: code}
 	if n, e := strconv.ParseInt(h.Get("Retry-After"), 10, 64); e == nil && n >= 0 {
-		until = now.Add(time.Duration(min(n, 86400)) * time.Second)
+		w.until = now.Add(time.Duration(min(n, 86400)) * time.Second)
+		w.reason = "Retry-After"
 	} else if t, e := http.ParseTime(h.Get("Retry-After")); e == nil {
-		until = t
+		w.until = t
+		w.reason = "Retry-After"
 	}
 	remaining, e := strconv.Atoi(h.Get("X-RateLimit-Remaining"))
 	if e == nil && remaining <= 100 {
@@ -88,20 +121,22 @@ func (c *Client) observeHeaders(h http.Header, code int, key string) {
 			reset := time.Unix(sec, 0).Add(time.Second)
 			if reset.After(now) {
 				delay := reset.Sub(now) / time.Duration(max(1, remaining))
-				if now.Add(delay).After(until) {
-					until = now.Add(delay)
+				if now.Add(delay).After(w.until) {
+					w.until = now.Add(delay)
+					w.reason = "rate-limit pacing"
 				}
 			}
 		}
 	}
-	if (code == 403 || code == 429) && !until.After(now) {
-		until = now.Add(time.Minute)
+	if (code == 403 || code == 429) && !w.until.After(now) {
+		w.until = now.Add(time.Minute)
+		w.reason = "403-429 backoff"
 	}
-	if until.After(p.until) {
-		p.until = until
+	if w.until.After(p.rate.until) {
+		p.rate = w
 	}
 	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); e == nil && seconds > 0 {
-		p.polls[key] = now.Add(time.Duration(min(seconds, 86400)) * time.Second)
+		p.polls[key] = throttle{until: now.Add(time.Duration(min(seconds, 86400)) * time.Second), reason: "poll interval", code: code}
 	}
 }
 func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
