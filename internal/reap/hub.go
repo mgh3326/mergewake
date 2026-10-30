@@ -179,6 +179,10 @@ func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error)
 		return hubNodeAgents{}, fmt.Errorf("hub: machine %s unknown", machine)
 	case row.Error != "":
 		return hubNodeAgents{}, fmt.Errorf("hub: machine %s %s", machine, row.Error)
+	case row.State != "connected":
+		// Only a connected node's list is current; never trust another
+		// state's rows even without an error code.
+		return hubNodeAgents{}, fmt.Errorf("hub: machine %s %s", machine, row.State)
 	case row.Agents == nil:
 		return hubNodeAgents{}, fmt.Errorf("hub: machine %s missing agents", machine)
 	}

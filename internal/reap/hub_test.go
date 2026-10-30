@@ -86,6 +86,7 @@ func TestHubAgentsFetchedOncePerPass(t *testing.T) {
 			map[string]any{"machine_id": "node-a", "state": "connected", "agents": []any{map[string]any{"pane_id": "w1:p1", "name": "job-a", "agent_status": "idle", "cwd": "/w"}}, "panes": []any{map[string]any{"pane_id": "w1:p1", "cwd": "/w"}}, "panes_ok": true},
 			map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": nil, "panes_ok": false},
 			map[string]any{"machine_id": "node-c", "state": "disconnected", "agents": nil, "error": "node_unavailable"},
+			map[string]any{"machine_id": "node-d", "state": "disconnected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
 		}}
 	})
 	a := HubHost{Hub: hub, Machine: "node-a"}
@@ -99,7 +100,7 @@ func TestHubAgentsFetchedOncePerPass(t *testing.T) {
 	if _, err := (HubHost{Hub: hub, Machine: "node-b"}).AllPanes(context.Background()); err == nil {
 		t.Fatal("unknown pane usage read as empty")
 	}
-	for _, machine := range []string{"node-c", "node-z"} {
+	for _, machine := range []string{"node-c", "node-d", "node-z"} {
 		if _, err := (HubHost{Hub: hub, Machine: machine}).Panes(context.Background()); err == nil {
 			t.Fatalf("%s read as a host with no panes", machine)
 		}
