@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,12 +120,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
 	if len(author) == 2 {
 		if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
-			if family != "" && family != profile.Family {
+			if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
 				return errors.New("author family conflicts with configured profile")
 			}
 			family = profile.Family
 		}
 	}
+	if family == "" {
+		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+	}
+	family = config.CanonicalFamily(family)
 	if family == "" {
 		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
 	}
@@ -280,11 +286,18 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	otherOrder := append([]string{}, s.Config.Review.Pairings[family]...)
 	if len(otherOrder) == 0 {
+		for _, k := range slices.Sorted(maps.Keys(s.Config.Review.Pairings)) {
+			if config.CanonicalFamily(k) == family {
+				otherOrder = append(otherOrder, s.Config.Review.Pairings[k]...)
+			}
+		}
+	}
+	if len(otherOrder) == 0 {
 		otherOrder = rankedOrder
 	}
 	authorModel := s.authorModel(r, pr.Body)
 	model := func(name string) string { return profileModel(profiles[name]) }
-	fam := func(name string) string { return profiles[name].Family }
+	fam := func(name string) string { return config.CanonicalFamily(profiles[name].Family) }
 	usedProfiles := map[string]bool{}
 	usedFamilies := map[string]bool{}
 	for _, receipt := range posted {
@@ -292,7 +305,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			usedProfiles[receipt.Reviewer] = true
 		}
 		if receipt.Family != "" {
-			usedFamilies[receipt.Family] = true
+			usedFamilies[config.CanonicalFamily(receipt.Family)] = true
 		}
 	}
 	// Preference order per pass: another family not yet used, another family,

@@ -1129,3 +1129,29 @@ func TestServiceClockStampsAudit(t *testing.T) {
 		t.Fatalf("audit %q, want %q", buf.String(), want)
 	}
 }
+// An author family given as an alias ("claude") normalises to the canonical
+// family ("anthropic"), so a same-family reviewer is never treated as
+// independent and pass 2 falls back to the remaining family.
+func TestReviewAuthorFamilyAlias(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.blocking = true
+	s.Config.Review.Profiles = map[string]config.Reviewer{
+		"sonnet": {Family: "anthropic", Command: "pi", Args: []string{"--model", "sonnet-model"}},
+		"gpt":    {Family: "openai", Command: "pi", Args: []string{"--model", "gpt-model"}},
+	}
+	runner := s.Runner.(*fakeRunner)
+	runner.recommend = []string{"sonnet", "gpt"}
+	if e := s.Review(context.Background(), r, 7, "claude", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	passes := g.passes[g.pull.Head.SHA]
+	if len(passes) != 2 || runner.calls != 2 {
+		t.Fatalf("%+v", passes)
+	}
+	if passes[0].Reviewer != "gpt" || passes[0].SameFamily {
+		t.Fatalf("pass 1 picked %+v", passes[0])
+	}
+	if passes[1].Reviewer != "sonnet" || !passes[1].SameFamily {
+		t.Fatalf("pass 2 picked %+v", passes[1])
+	}
+}

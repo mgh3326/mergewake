@@ -156,7 +156,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	exec := integrations.Exec{}
 	sink, notifier := integrations.New(c, exec, out)
-	gh := github.New(os.Getenv(c.TokenEnv))
+	token, e := resolveToken(ctx, exec, c.TokenEnv)
+	if e != nil {
+		return e
+	}
+	gh := github.New(token)
+	gh.Stderr = stderr
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
 	o := pipeline.Options{DryRun: *dry, Shadow: !*apply}
 	if digest != nil {

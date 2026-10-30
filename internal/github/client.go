@@ -25,6 +25,8 @@ import (
 type Client struct {
 	BaseURL, UploadURL, Token string
 	HTTP                      *http.Client
+	// Stderr receives throttle-wait log lines; nil means os.Stderr.
+	Stderr io.Writer
 	// Now stamps and ages review leases; nil means time.Now. Rate-limit waits
 	// are real sleeps and always use the wall clock.
 	Now  func() time.Time

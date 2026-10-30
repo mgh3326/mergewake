@@ -243,3 +243,64 @@ func TestContainerConfigDefaults(t *testing.T) {
 		t.Fatalf("ports %v", spec.Ports)
 	}
 }
+func TestCanonicalFamily(t *testing.T) {
+	for in, want := range map[string]string{
+		"claude": "anthropic", "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic", "haiku": "anthropic", "kiro": "anthropic",
+		"codex": "openai", "sol": "openai", "gpt": "openai",
+		"devin": "cognition", "swe": "cognition",
+		"grok": "xai",
+		"gemini": "google", "agy": "google",
+		"kimi": "moonshot",
+		" Claude ":   "anthropic",
+		"ANTHROPIC":  "anthropic",
+		"openai":     "openai",
+		"deepseek":   "deepseek",
+		"some-other": "some-other",
+	} {
+		if got := CanonicalFamily(in); got != want {
+			t.Errorf("CanonicalFamily(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+func TestFamilyAliasNormalisation(t *testing.T) {
+	yaml := `version: 1
+host: host-a
+review:
+  profiles:
+    sonnet: {family: sonnet, command: pi, args: [--model, m1]}
+    gpt: {family: codex, command: pi, args: [--model, m2]}
+  pairings:
+    claude: [gpt]
+`
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if e := os.WriteFile(p, []byte(yaml), 0600); e != nil {
+		t.Fatal(e)
+	}
+	c, e := Load(p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c.Review.Profiles["sonnet"].Family != "anthropic" || c.Review.Profiles["gpt"].Family != "openai" {
+		t.Fatalf("profiles %+v", c.Review.Profiles)
+	}
+	if len(c.Review.Pairings["anthropic"]) != 1 || c.Review.Pairings["anthropic"][0] != "gpt" {
+		t.Fatalf("pairings %+v", c.Review.Pairings)
+	}
+
+	yaml = `version: 1
+host: host-a
+review:
+  profiles:
+    gpt: {family: openai, command: pi, args: [--model, m2]}
+  pairings:
+    claude: [gpt]
+    anthropic: [gpt]
+`
+	p = filepath.Join(t.TempDir(), "config.yaml")
+	if e := os.WriteFile(p, []byte(yaml), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = Load(p); e == nil {
+		t.Fatal("colliding canonical pairings accepted")
+	}
+}

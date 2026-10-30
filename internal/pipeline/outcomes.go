@@ -43,7 +43,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 		if opened := parsedTime(p.CreatedAt); opened != nil {
 			v.OpenedAt = *opened
 		}
-		v.Family = trailer(p.Body, "Mergewake-Author-Family")
+		v.Family = config.CanonicalFamily(trailer(p.Body, "Mergewake-Author-Family"))
 		v.Profile = ""
 		v.Effort = ""
 		v.Experiment = ""
