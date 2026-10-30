@@ -46,7 +46,11 @@ type runtugRunner struct {
 	late     int // inbox looks that still show nothing
 	looks    int
 	addFails bool
-	afterRun func() // called once runtug returns
+	// branchAfterAdd is where a failed `worktree add -b` leaves the branch
+	// ("" = not created).
+	branchAfterAdd string
+	addTried       bool
+	afterRun       func() // called once runtug returns
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -54,9 +58,13 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 	case "git":
 		r.git = append(r.git, args)
 		if r.addFails && slices.Contains(args, "add") {
+			r.addTried = true
 			return nil, runtugExit(128)
 		}
 		if slices.Contains(args, "rev-parse") {
+			if r.addTried && r.branchAfterAdd != "" {
+				return []byte(r.branchAfterAdd + "\n"), nil
+			}
 			if r.branchAt == "" {
 				return nil, runtugExit(1)
 			}
@@ -266,13 +274,13 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 // A failed `worktree add -b` may already have created the branch; it is
 // deleted so later heads of the PR are not refused as "left untouched".
 func TestRuntugFailedCheckoutDeletesCreatedBranch(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true, branchAfterAdd: shaA}
 	s, g, r := runtugSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
 	got := gitCalls(runner, r.Root)
-	if len(got) != 5 || !strings.HasPrefix(got[2], "worktree add -b feat/thing ") || !strings.HasPrefix(got[3], "worktree remove --force ") || got[4] != "branch -D feat/thing" {
+	if len(got) != 6 || !strings.HasPrefix(got[2], "worktree add -b feat/thing ") || got[3] != "rev-parse --verify --quiet refs/heads/feat/thing" || !strings.HasPrefix(got[4], "worktree remove --force ") || got[5] != "branch -D feat/thing" {
 		t.Fatalf("%q", got)
 	}
 	if p := g.passes[shaA]; len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, "checkout PR head branch feat/thing") {
@@ -535,5 +543,20 @@ func TestRuntugUsageFailureKeepsRankedFallback(t *testing.T) {
 	got := g.passes[shaA]
 	if runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || !strings.Contains(got[0].Fallback, "runtug spawn exit 70") {
 		t.Fatalf("headless=%d %+v", runner.headless, got)
+	}
+}
+
+// A failed add -b that left no branch at the PR head never deletes a branch:
+// a rev-parse failure is not proof the branch was absent.
+func TestRuntugFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
+	s, _, r := runtugSetup(t, runner)
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	for _, c := range gitCalls(runner, r.Root) {
+		if strings.HasPrefix(c, "branch -D") {
+			t.Fatalf("deleted a branch it did not prove it created: %q", gitCalls(runner, r.Root))
+		}
 	}
 }

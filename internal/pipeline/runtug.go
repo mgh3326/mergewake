@@ -156,12 +156,17 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	}
 	switch at, e := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); {
 	case e != nil:
-		// The branch was absent, so whatever a failed add left is ours.
-		created = true
+		// rev-parse failing is not proof the branch is absent, so the branch
+		// is ours to delete only when add -b succeeded, or when it failed and
+		// the branch now exists exactly at the head that add -b would create.
 		if _, e = git(ctx, "worktree", "add", "-b", branch, checkout, pr.Head.SHA); e != nil {
+			if at, re := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); re == nil && at == pr.Head.SHA && !strings.Contains(e.Error(), "already exists") {
+				created = true
+			}
 			cleanup()
 			return skip("checkout PR head branch %s: %v", branch, e)
 		}
+		created = true
 	case at == pr.Head.SHA:
 		if _, e = git(ctx, "worktree", "add", checkout, branch); e != nil {
 			return skip("checkout PR head branch %s: %v", branch, e)
