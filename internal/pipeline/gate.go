@@ -15,8 +15,9 @@ import (
 // Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
 // review_missing, base_stale and conflict.
 type gateVerdict struct {
-	State   string
-	Reasons []string
+	State      string
+	Reasons    []string
+	SameFamily bool
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
@@ -76,6 +77,9 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	_, complete := distinctPasses(receipts, needed)
+	for _, receipt := range receipts {
+		v.SameFamily = v.SameFamily || receipt.SameFamily
+	}
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if e != nil {
 		return v, e

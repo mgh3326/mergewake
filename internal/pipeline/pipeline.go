@@ -172,15 +172,16 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		d.Action = "merge"
 	}
 	if e = s.audit(r.Name, "land", struct {
-		PR    int    `json:"pr"`
-		Head  string `json:"head"`
-		Base  string `json:"base"`
-		State string `json:"state"`
+		PR         int    `json:"pr"`
+		Head       string `json:"head"`
+		Base       string `json:"base"`
+		State      string `json:"state"`
+		SameFamily bool   `json:"same_family,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, v.State, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, v.State, v.SameFamily, d}, o.DryRun); e != nil {
 		return e
 	}
-	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, false, o.DryRun); e != nil {
+	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, v.SameFamily, o.DryRun); e != nil {
 		return e
 	}
 	if v.State != "ready" || d.Shadow || o.DryRun {
