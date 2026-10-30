@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -251,7 +252,9 @@ func (h HubHost) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 }
 
 func (h HubHost) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write bool) (Capture, error) {
-	args := map[string]any{"pane_id": pane.ID, "name": pane.Name, "cwd": pane.Cwd, "merged_after": int64(0), "write": write}
+	// Without a merge time no report.md is fresh, as in Exec.Capture: a cutoff
+	// past any mtime makes the node capture the screen.
+	args := map[string]any{"pane_id": pane.ID, "name": pane.Name, "cwd": pane.Cwd, "merged_after": int64(math.MaxInt64), "write": write}
 	if mergedAt != nil {
 		args["merged_after"] = mergedAt.Unix()
 	}

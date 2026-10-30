@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -166,7 +167,7 @@ func TestHubHostCommands(t *testing.T) {
 		}
 	}
 	reply = func(_ string, args map[string]any) (int, any) {
-		if args["merged_after"] != float64(0) || args["write"] != false {
+		if args["merged_after"] != float64(math.MaxInt64) || args["write"] != false {
 			t.Fatalf("%v", args)
 		}
 		return result(map[string]any{"outcome": "would-screen", "saved": "/jobs/job-a/pane-screen.txt"})
