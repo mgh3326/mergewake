@@ -267,7 +267,8 @@ decisions` (markdown heading of any level, up to the next heading of the same or
 higher level) is included verbatim, capped at 4 KB, as settled scope rather than
 defects. The added context is capped at 12 KB; the prompt says when answered
 findings or the decisions section were cut. If the thread read fails the review
-runs without this context and the audit event carries `context_error`. Each pass
+runs without the answered findings (the PR-body decisions still apply) and the
+audit event carries `context_error`. Each pass
 receipt and the `review` audit event record `answered_context: <n>`, the number
 of answered findings the prompt carried (`context_truncated` marks a cut).
 

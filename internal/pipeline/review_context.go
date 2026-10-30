@@ -101,13 +101,18 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 func operatorDecisions(body string) string {
 	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
 	start, level := -1, 0
-	fenced := false
+	fence := "" // marker that opened the current code block
 	for i, l := range lines {
-		if fenceLine.MatchString(l) {
-			fenced = !fenced
+		if m := fenceLine.FindStringSubmatch(l); m != nil {
+			switch fence {
+			case "":
+				fence = m[1]
+			case m[1]:
+				fence = ""
+			}
 			continue
 		}
-		if fenced {
+		if fence != "" {
 			continue
 		}
 		m := headingLine.FindStringSubmatch(l)

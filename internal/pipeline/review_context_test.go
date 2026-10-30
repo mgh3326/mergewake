@@ -54,6 +54,7 @@ func TestOperatorDecisionsSection(t *testing.T) {
 		{"subsections stay", "## Operator decisions\na\n### Detail\nb\n## After\nc", "## Operator decisions\na\n### Detail\nb"},
 		{"crlf", "## Operator decisions\r\nkeep\r\n## End\r\n", "## Operator decisions\nkeep"},
 		{"fenced heading is text", "```\n## Operator decisions\nfake\n```\n", ""},
+		{"other fence marker inside a block", "```\n~~~\n```\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
 		{"absent", "no such section", ""},
 	} {
 		if got := operatorDecisions(tt.body); got != tt.want {
@@ -134,4 +135,28 @@ func TestWithContextNeverDropsContext(t *testing.T) {
 	if got := withContext("p", ""); got != "p" {
 		t.Fatal(got)
 	}
+}
+
+func TestReviewContextKeepsDecisionsWhenThreadReadFails(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.pull.Body = "## Operator decisions\nkeep quota_exclude"
+	s.GH = &feedbackFailGH{g}
+	var out strings.Builder
+	s.Out = &out
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	in := s.Runner.(*fakeRunner).input
+	if !strings.Contains(in, "keep quota_exclude") || strings.Contains(in, "ALREADY ANSWERED") {
+		t.Fatal(in)
+	}
+	if !strings.Contains(out.String(), `"context_error"`) || !strings.Contains(out.String(), `"answered_context":0`) {
+		t.Fatal(out.String())
+	}
+}
+
+type feedbackFailGH struct{ *fakeGH }
+
+func (feedbackFailGH) ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error) {
+	return github.ReviewFeedback{}, fmt.Errorf("graphql down")
 }
