@@ -70,7 +70,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	held := open
 	if login != "" {
 		for _, t := range fb.Threads {
-			if t.IsResolved && len(t.Comments) > 0 && t.Comments[0].CommitSHA == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
+			if t.IsResolved && len(t.Comments) > 0 && postedOn(t.Comments[0]) == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
 				held++
 			}
 		}
@@ -133,4 +133,14 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// postedOn is the head a review comment was written against. GitHub moves a
+// comment's commit forward to each new head while its line is unchanged, so a
+// finding resolved after a fix would otherwise stay held on every later head.
+func postedOn(c github.ReviewComment) string {
+	if c.OriginalCommitSHA != "" {
+		return c.OriginalCommitSHA
+	}
+	return c.CommitSHA
 }
