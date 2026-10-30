@@ -136,3 +136,32 @@ func TestThreadCommitAndReviewHeadBinding(t *testing.T) {
 		})
 	}
 }
+
+// A reviewer's latest decisive review decides; a later approval or dismissal
+// withdraws an earlier request for changes, and COMMENTED reviews never do.
+func TestReviewFeedbackChangesRequested(t *testing.T) {
+	review := func(login, state string) string {
+		return fmt.Sprintf(`{"author":{"login":%q,"__typename":"User"},"state":%q}`, login, state)
+	}
+	for _, tt := range []struct {
+		name, reviews, decision string
+		want                    int
+	}{
+		{"none", review("a", "COMMENTED"), "", 0},
+		{"one reviewer", review("a", "CHANGES_REQUESTED"), "", 1},
+		{"commented after does not withdraw", review("a", "CHANGES_REQUESTED") + "," + review("a", "COMMENTED"), "", 1},
+		{"approved after withdraws", review("a", "CHANGES_REQUESTED") + "," + review("a", "APPROVED"), "", 0},
+		{"two reviewers", review("a", "CHANGES_REQUESTED") + "," + review("b", "CHANGES_REQUESTED"), "", 2},
+		{"decision alone counts once", review("a", "COMMENTED"), "CHANGES_REQUESTED", 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"headRefOid":%q,"reviewDecision":%q,"reviews":{"nodes":[%s]},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}`, testSHA, tt.decision, tt.reviews)
+			})
+			fb, err := c.ReviewFeedback(context.Background(), "example/project", 7)
+			if err != nil || fb.ChangesRequested != tt.want {
+				t.Fatalf("err=%v changes_requested=%d", err, fb.ChangesRequested)
+			}
+		})
+	}
+}

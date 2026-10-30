@@ -56,6 +56,13 @@ type ReviewGate struct {
 	IgnoreBotResolved *bool            `yaml:"ignore_bot_resolved"`
 }
 
+// FastLane relaxes the land gate for small routine PRs: one that touches no
+// blocking path and changes at most MaxChangedLines lines (additions plus
+// deletions) is held only by block-class findings.
+type FastLane struct {
+	MaxChangedLines int `yaml:"max_changed_lines"`
+}
+
 // GateVerdict is the graded outcome for one PR classification. Blocking
 // findings stop the merge until fixed; triage findings gate it until answered.
 type GateVerdict struct {
@@ -106,6 +113,21 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	if g.IgnoreBotResolved == nil {
 		g.IgnoreBotResolved = d.IgnoreBotResolved
 	}
+	return g
+}
+
+// WithOwnLogin adds default rules for the trusted review identity unless the
+// policy already grades that author: critical and high findings block, medium
+// ones need an answer, low ones are advisory. The reviewer prompt also admits
+// blocking, major and minor, graded like high, medium and low.
+func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
+	g = g.WithDefaults()
+	own := NormalizeAuthor(login)
+	if own == "" || g.gateAuthors()[own] {
+		return g
+	}
+	g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
+	g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}})
 	return g
 }
 
@@ -201,6 +223,46 @@ func (g ReviewGate) Evaluate(fs []ReviewFinding, class string) GateVerdict {
 	return v
 }
 
+// Grades a finding can receive from Grade.
+const (
+	GradeBlock    = "block"
+	GradeTriage   = "triage"
+	GradeAdvisory = "advisory"
+	GradeIgnored  = "ignored"
+)
+
+// Grade classifies one finding by the rules alone, before any disposition
+// (resolved, answered, outdated). Evidence the rules cannot read — a missing
+// author on a blocking path, an unrecognized severity from a graded author,
+// or any severity outside the known set on the trusted review identity's own
+// finding — needs an answer rather than passing silently.
+func (g ReviewGate) Grade(f ReviewFinding, class string) string {
+	g = g.WithDefaults()
+	f.Author = NormalizeAuthor(f.Author)
+	f.Severity = strings.ToLower(f.Severity)
+	if g.ignoredAuthor(f.Author) {
+		return GradeIgnored
+	}
+	blocked, triaged := false, false
+	for _, r := range g.Block {
+		blocked = blocked || r.applies(f, class)
+	}
+	for _, r := range g.Triage {
+		triaged = triaged || r.applies(f, class)
+	}
+	switch {
+	case blocked:
+		return GradeBlock
+	case triaged:
+		return GradeTriage
+	case class == "blocking" && (f.Author == "" || (g.gateAuthors()[f.Author] && !validSeverity(f.Severity))):
+		return GradeTriage
+	case f.OwnReview && !validSeverity(f.Severity):
+		return GradeTriage
+	}
+	return GradeAdvisory
+}
+
 // GateAuthors lists normalized bot logins the configured rules reference. The
 // caller uses it for grading and bot reply detection.
 func (g ReviewGate) GateAuthors() map[string]bool {
@@ -235,6 +297,7 @@ type Policy struct {
 	WatchChecks    []string    `yaml:"watch_checks"`
 	Blocking       []Rule      `yaml:"blocking"`
 	ReviewGate     *ReviewGate `yaml:"review_gate"`
+	FastLane       *FastLane   `yaml:"fast_lane"`
 }
 type Decision struct {
 	Class   string   `json:"class"`
@@ -311,7 +374,16 @@ func (p Policy) Validate() error {
 			}
 		}
 	}
+	if p.FastLane != nil && p.FastLane.MaxChangedLines <= 0 {
+		return errors.New("fast_lane max_changed_lines must be positive")
+	}
 	return nil
+}
+
+// FastLaneEligible reports whether a PR of the given class and size takes the
+// fast lane: configured, routine, and no larger than max_changed_lines.
+func (p Policy) FastLaneEligible(class string, changedLines int) bool {
+	return p.FastLane != nil && class == "routine" && changedLines <= p.FastLane.MaxChangedLines
 }
 func validSeverity(s string) bool {
 	switch s {

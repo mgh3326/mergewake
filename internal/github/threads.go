@@ -44,6 +44,10 @@ type ReviewFeedback struct {
 	ReviewAuthors    map[string]int  `json:"review_authors"`
 	RecheckedAuthors map[string]bool `json:"rechecked_authors"`
 	PRAuthor         string          `json:"pr_author"`
+	// ChangesRequested counts reviewers whose latest decisive review requests
+	// changes, or one when GitHub's overall decision does. The graded land gate
+	// treats each as a blocking finding, as the raw thread count does.
+	ChangesRequested int `json:"changes_requested"`
 }
 
 func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
@@ -52,15 +56,18 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 	fb.RecheckedAuthors = map[string]bool{}
 	parts := strings.Split(repo, "/")
 	cursor := (*string)(nil)
+	decisive := map[string]string{}
+	decision := false
 	for page := 0; page < 100; page++ {
 		var result struct {
 			Errors []json.RawMessage `json:"errors"`
 			Data   *struct {
 				Repository *struct {
 					PullRequest *struct {
-						Author     *reviewActor `json:"author"`
-						HeadRefOid string       `json:"headRefOid"`
-						Reviews    *struct {
+						Author         *reviewActor `json:"author"`
+						HeadRefOid     string       `json:"headRefOid"`
+						ReviewDecision string       `json:"reviewDecision"`
+						Reviews        *struct {
 							Nodes []struct {
 								Author *reviewActor `json:"author"`
 								State  string       `json:"state"`
@@ -102,7 +109,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
 			return fb, e
 		}
@@ -114,6 +121,9 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			return fb, errors.New("missing or changed PR head in review feedback")
 		}
 		fb.HeadSHA = pr.HeadRefOid
+		if page == 0 && pr.ReviewDecision == "CHANGES_REQUESTED" {
+			decision = true
+		}
 		if pr.Author != nil {
 			fb.PRAuthor = pr.Author.Login
 		}
@@ -123,6 +133,10 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 		if page == 0 && pr.Reviews != nil {
 			for _, r := range pr.Reviews.Nodes {
 				if r.Author != nil {
+					switch r.State {
+					case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+						decisive[strings.ToLower(r.Author.Login)] = r.State
+					}
 					if r.State == "COMMENTED" || r.State == "APPROVED" || r.State == "CHANGES_REQUESTED" {
 						author := policy.NormalizeAuthor(r.Author.Login)
 						if r.Commit != nil && r.Commit.OID != "" && r.Commit.OID == pr.HeadRefOid {
@@ -161,6 +175,14 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 			fb.Threads = append(fb.Threads, thread)
 		}
 		if !pr.ReviewThreads.PageInfo.HasNextPage {
+			for _, state := range decisive {
+				if state == "CHANGES_REQUESTED" {
+					fb.ChangesRequested++
+				}
+			}
+			if fb.ChangesRequested == 0 && decision {
+				fb.ChangesRequested = 1
+			}
 			return fb, nil
 		}
 		next := pr.ReviewThreads.PageInfo.EndCursor
