@@ -169,7 +169,9 @@ unit, never its worktree — that is in git and is cleaned by the worktree
 rules above. Archiving runs these steps in order, and any failure keeps the
 local job dir and reports the step:
 
-1. **Plan** (read-only): list every non-directory entry. Credential-like
+1. **Plan** (read-only): a job dir that is itself a symlink is refused as
+   `job-dir-symlink` (checked again right before the delete); otherwise
+   list every non-directory entry. Credential-like
    paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
    case-insensitively — are excluded from Drive and hk and named in the
    record. Symlinks and special files are not copied (following a link could
@@ -188,7 +190,8 @@ local job dir and reports the step:
    archive host, relayed through this machine (`ssh` on either side as
    configured); the Drive copy is a plain directory, not an archive file. A
    job with nothing but excluded or non-regular entries copies nothing.
-3. **Verify**: every file's sha256 is computed on both sides and must match.
+3. **Verify**: every file's sha256 is computed on both sides and must match;
+   a missing, duplicate or unexpected hash record fails the archive.
 4. **hk attachments**: each text file under `text_max_bytes` goes through
    `handoffkeep attach put`; its returned sha256 must match. `attach put`
    has no task reference, so the ids are tied to the task by the comment.

@@ -211,6 +211,23 @@ func (a *Archiver) task(ctx context.Context, h reap.Host, dir string, files []Fi
 	return "", nil
 }
 
+// jobDir reports whether p is a real directory. A symlinked job dir is
+// refused: cd and tar would follow it and archive, then the record would
+// describe, a directory outside the jobs tree.
+func (a *Archiver) jobDir(ctx context.Context, ssh, p string) (string, error) {
+	b, err := a.on(ctx, ssh, "", "sh", "-c", `if [ -L "$1" ]; then echo link; elif [ -d "$1" ]; then echo dir; else echo none; fi`, "sh", p)
+	if err != nil {
+		return "", err
+	}
+	switch k := strings.TrimSpace(string(b)); k {
+	case "link":
+		return "", &Skip{"job-dir-symlink"}
+	case "dir", "none":
+		return k, nil
+	}
+	return "", fmt.Errorf("check %s: unexpected output", p)
+}
+
 func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	b, err := a.on(ctx, ssh, "", "sh", "-c", `test -e "$1" && echo yes || echo no`, "sh", p)
 	if err != nil {
@@ -229,11 +246,11 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		return nil, &Skip{"job-name-invalid"}
 	}
 	dir := h.JobDir(job)
-	b, err := a.on(ctx, h.SSH, "", "sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", dir)
+	kind, err := a.jobDir(ctx, h.SSH, dir)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(string(b)) != "yes" {
+	if kind != "dir" {
 		return nil, &Skip{"job-gone"}
 	}
 	files, err := a.list(ctx, h, dir)
@@ -330,16 +347,30 @@ func (a *Archiver) hashes(ctx context.Context, ssh, dir string, paths []string) 
 	if err != nil {
 		return nil, fmt.Errorf("sha256 %s: %w", dir, err)
 	}
+	want := map[string]bool{}
+	for _, p := range paths {
+		want[p] = true
+	}
 	out := map[string]string{}
 	for _, rec := range strings.Split(string(b), "\x00") {
 		if rec == "" {
 			continue
 		}
 		sum, p, ok := strings.Cut(rec, " ")
-		if !ok || len(sum) != 64 {
+		p = strings.TrimPrefix(p, "./")
+		switch {
+		case !ok || len(sum) != 64:
 			return nil, fmt.Errorf("sha256 %s: malformed record", dir)
+		case !want[p]:
+			return nil, fmt.Errorf("sha256 %s: unexpected record for %s", dir, p)
+		case out[p] != "":
+			return nil, fmt.Errorf("sha256 %s: duplicate record for %s", dir, p)
 		}
-		out[strings.TrimPrefix(p, "./")] = sum
+		out[p] = sum
+	}
+	// Fail closed: every requested file must have exactly one hash.
+	if len(out) != len(want) {
+		return nil, fmt.Errorf("sha256 %s: %d of %d files hashed", dir, len(out), len(want))
 	}
 	return out, nil
 }
@@ -550,6 +581,9 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 // remove deletes the job dir only when a re-listing shows it unchanged: a
 // file written after the plan was never archived.
 func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, error) {
+	if _, err := a.jobDir(ctx, p.host.SSH, p.Dir); err != nil {
+		return res, err
+	}
 	again, err := a.list(ctx, p.host, p.Dir)
 	if err != nil {
 		return res, err
