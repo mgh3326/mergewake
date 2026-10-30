@@ -72,7 +72,7 @@ func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedRe
 	release := func() { <-p.gate }
 	p.mu.Lock()
 	wait := p.rate
-	if p.polls[key].until.After(wait.until) {
+	if c.Polling && p.polls[key].until.After(wait.until) {
 		wait = p.polls[key]
 	}
 	old := p.cache[key]

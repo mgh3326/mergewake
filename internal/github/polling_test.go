@@ -129,6 +129,7 @@ func TestThrottleWaitIsLogged(t *testing.T) {
 	c = New("")
 	c.BaseURL = server.URL
 	c.Stderr = buf
+	c.Polling = true
 	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
@@ -145,5 +146,69 @@ func TestThrottleWaitIsLogged(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("log %q", buf.String())
+	}
+}
+func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/interval":
+			w.Header().Set("X-Poll-Interval", "30")
+		case "/retry":
+			w.Header().Set("Retry-After", "30")
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	// A one-shot client records a poll interval but never waits on it.
+	c := New("")
+	c.BaseURL = server.URL
+	buf := &bytes.Buffer{}
+	c.Stderr = buf
+	for i := 0; i < 2; i++ {
+		if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("one-shot logged a throttle wait: %q", buf.String())
+	}
+
+	// A polling client waits on the same interval.
+	c = New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, e := c.request(ctx, "GET", "/interval", "application/json", nil); e == nil {
+		t.Fatal("polling client ignored poll interval")
+	}
+
+	// Retry-After still throttles one-shot clients.
+	c = New("")
+	c.BaseURL = server.URL
+	if _, e := c.request(context.Background(), "GET", "/retry", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, e := c.request(ctx, "GET", "/other", "application/json", nil); e == nil {
+		t.Fatal("one-shot client ignored Retry-After")
+	}
+
+	// And it throttles polling clients too.
+	c = New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	if _, e := c.request(context.Background(), "GET", "/retry", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, e := c.request(ctx, "GET", "/other", "application/json", nil); e == nil {
+		t.Fatal("polling client ignored Retry-After")
 	}
 }

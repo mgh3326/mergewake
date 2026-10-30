@@ -29,8 +29,13 @@ type Client struct {
 	Stderr io.Writer
 	// Now stamps and ages review leases; nil means time.Now. Rate-limit waits
 	// are real sleeps and always use the wall clock.
-	Now  func() time.Time
-	poll pollingState
+	Now func() time.Time
+	// Polling honours X-Poll-Interval waits between requests sharing a key.
+	// Polling loops (daemon, watch, agent) set it; one-shot commands leave it
+	// false so a recorded interval never stalls a single run. Retry-After,
+	// 403/429 backoff and rate-limit pacing apply either way.
+	Polling bool
+	poll    pollingState
 }
 
 func (c *Client) now() time.Time {

@@ -162,6 +162,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	gh := github.New(token)
 	gh.Stderr = stderr
+	// Only looping commands honour X-Poll-Interval; one-shot commands must not
+	// stall on an interval recorded by an earlier request.
+	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
 	o := pipeline.Options{DryRun: *dry, Shadow: !*apply}
 	if digest != nil {
