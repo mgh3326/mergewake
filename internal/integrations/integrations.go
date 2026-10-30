@@ -222,6 +222,28 @@ func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
 	}
 	return shown.Lane, nil
 }
+
+// TaskJob reads the runtug job bound to a task (`refs.job_id`) and the task
+// title, which carries the task's grade and T marker.
+func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, error) {
+	if !TaskID.MatchString(task) {
+		return "", "", errors.New("task ID must be a positive integer")
+	}
+	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	if e != nil {
+		return "", "", e
+	}
+	var shown struct {
+		Title string `json:"title"`
+		Refs  struct {
+			JobID string `json:"job_id"`
+		} `json:"refs"`
+	}
+	if e = json.Unmarshal(out, &shown); e != nil {
+		return "", "", e
+	}
+	return shown.Refs.JobID, shown.Title, nil
+}
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {
 	f, e := os.CreateTemp("", "mergewake-record-*.json")
 	if e != nil {

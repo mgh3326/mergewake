@@ -49,6 +49,23 @@ type Review struct {
 	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
 	// recommendation order without reading usage.
 	Select string `yaml:"select"`
+	// Executor runs each pass: "headless" (default) invokes a profile's CLI on
+	// the diff here; "runtug" spawns a reviewer pane through runtug in a
+	// checkout of the PR head and keeps headless as the fallback.
+	Executor string       `yaml:"executor"`
+	Runtug   RuntugReview `yaml:"runtug"`
+}
+
+// RuntugReview configures the runtug review executor. The reviewer pane writes
+// its findings into the job directory, so Jobs must be the inbox runtug uses on
+// the host that runs the pane.
+type RuntugReview struct {
+	Command   string `yaml:"command"`
+	Workspace string `yaml:"workspace"`
+	Owner     string `yaml:"owner"`
+	Host      string `yaml:"host"`
+	Jobs      string `yaml:"jobs"`
+	Checkouts string `yaml:"checkouts"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -349,6 +366,30 @@ func Load(name string) (Config, error) {
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return c, e
 	}
+	switch c.Review.Executor {
+	case "":
+		c.Review.Executor = "headless"
+	case "headless", "runtug":
+	default:
+		return c, errors.New("review.executor must be headless or runtug")
+	}
+	rt := &c.Review.Runtug
+	if rt.Command == "" {
+		rt.Command = "runtug"
+	}
+	if rt.Workspace == "" {
+		rt.Workspace = "reviews"
+	}
+	if rt.Host == "" {
+		rt.Host = "auto"
+	}
+	if rt.Jobs == "" {
+		rt.Jobs = "~/work/herdr-inbox/jobs"
+	}
+	if rt.Checkouts == "" {
+		rt.Checkouts = filepath.Join(c.StateDir, "review-checkouts")
+	}
+	rt.Command, rt.Jobs, rt.Checkouts = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts)
 	if c.Outcomes.Command == "" {
 		c.Outcomes.Command = c.Review.Quota
 	}
