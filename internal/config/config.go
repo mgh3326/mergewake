@@ -422,6 +422,9 @@ func Load(name string) (Config, error) {
 			return c, e
 		}
 		p.Family = CanonicalFamily(p.Family)
+		if p.Family == "" {
+			return c, errors.New("review profiles require a name, family, and supported reviewer command")
+		}
 		c.Review.Profiles[name] = p
 	}
 	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
@@ -434,6 +437,9 @@ func Load(name string) (Config, error) {
 			return c, errors.New("empty review pairing")
 		}
 		canonical := CanonicalFamily(family)
+		if canonical == "" {
+			return c, errors.New("empty review pairing")
+		}
 		if _, dup := pairings[canonical]; dup {
 			return c, errors.New("review pairings collide after family normalisation")
 		}

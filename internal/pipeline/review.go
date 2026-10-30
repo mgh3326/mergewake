@@ -130,6 +130,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
 	}
 	family = config.CanonicalFamily(family)
+	if family == "" {
+		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+	}
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e

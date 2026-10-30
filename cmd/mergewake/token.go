@@ -20,7 +20,9 @@ func resolveToken(ctx context.Context, x integrations.Runner, envName string) (s
 	if _, e := exec.LookPath("gh"); e != nil {
 		return "", fmt.Errorf("no GitHub token: %s is not set and gh is not installed; set %s or authenticate gh", envName, envName)
 	}
-	out, e := x.Run(ctx, "gh", []string{"auth", "token"}, "", "")
+	// --hostname pins github.com so a GH_HOST-selected Enterprise token is
+	// never sent to the hardcoded api.github.com endpoint.
+	out, e := x.Run(ctx, "gh", []string{"auth", "token", "--hostname", "github.com"}, "", "")
 	if e != nil {
 		return "", fmt.Errorf("no GitHub token: %s is not set and gh auth token failed; set %s or run gh auth login", envName, envName)
 	}
