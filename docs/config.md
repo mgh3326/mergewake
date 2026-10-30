@@ -516,7 +516,8 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
-| `review_gate` | Absent | Deprecated. Kept parseable for existing policies; the merge gate counts unresolved review threads directly and no longer grades findings. |
+| `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
+| `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
 
 Each blocking rule has:
 
@@ -531,6 +532,65 @@ segment and spans zero or more components. Ordinary `*` never crosses `/`.
 Leading `/`, backslashes, empty segments and `..` are refused. Blocking rules
 combine with OR; there are no per-rule merge overrides, finding severity bypasses,
 or advisory rounds for blocking findings.
+
+### Graded review findings
+
+Without `review_gate.land: graded` or `fast_lane`, the land gate holds on the raw
+count of unresolved review threads (`threads_open:<n>`), plus any review.login
+finding resolved without a new head. A `review_gate` section alone changes
+nothing, so a policy that already carries one for other reasons keeps its
+behaviour. With `review_gate: {land: graded}` (all other keys optional) the gate
+grades each thread by the author and severity of its first comment instead:
+
+| Grade | Holds the merge until | Reason |
+| --- | --- | --- |
+| block | the finding is fixed: its thread is resolved by a new head. A reply never clears it, and a finding posted on the current head stays held when resolved without a new head, whoever wrote it. | `blocking_findings:<n>` |
+| triage | someone other than the finding's author (and not a bot) replies on the thread. An answered triage finding needs no new head, and a resolved one no longer holds. | `triage_unanswered:<n>` |
+| advisory | never holds. Threads from authors no rule names are advisory. | none |
+
+Each reviewer whose latest review still requests changes adds one to the
+blocking count (at least one when GitHub's overall decision is changes
+requested), on top of any unresolved block-class threads. An unresolved
+thread with no comment to grade counts as a blocking finding. Severities come from the `<!-- mergewake-severity:... -->` marker on
+mergewake's own findings and from the prose labels CodeRabbit (`critical`,
+`major`, `minor`, `nitpick`) and codex (`P1`–`P3`) use. Evidence the rules cannot
+read still needs an answer: a finding by the `review.login` identity with a
+missing or unknown severity, and on a blocking-class PR an unknown severity from
+a graded author.
+
+The defaults grade CodeRabbit `critical` and codex `P1` as block, CodeRabbit
+`major` and codex `P2` as triage, and add rules for the configured
+`review.login`: `critical`/`high` block, `medium` triage, `low` advisory (the
+reviewer prompt's `blocking`, `major` and `minor` grade like `high`, `medium`
+and `low`). Rules are `{author, severity: [...], classes: [...]}` lists under
+`block` and `triage`; an explicit list replaces the default for those two keys,
+though the `review.login` defaults are kept or replaced per list: naming the login
+in `block` replaces its default block rule, naming it in `triage` replaces its
+default triage rule, and the other list keeps its default.
+Thread comments are read in full (paged past 50), since a late reply answers a
+finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
+true) clears an outdated finding by anyone but `review.login`: a block finding
+once its reviewer has reviewed the current head, a triage finding when it is a
+`major`. The other `review_gate` keys stay parseable but do not affect the land
+gate.
+
+`fast_lane` takes only the PR's class and size: when the PR classifies as
+routine and `additions + deletions` is at most `max_changed_lines`, triage
+findings stop holding the merge and only block-class findings (and requested
+changes) do; a `review.login` finding with an unreadable severity still needs
+an answer. Routine PRs already need a single review pass. The fast lane alone
+grades only the PRs it admits, with the rules of the `review_gate` section (or the
+defaults); larger PRs keep the raw count unless `land: graded` is set.
+
+```yaml
+version: 1
+enabled: true
+required_checks: [test]
+review_gate:
+  land: graded             # block/triage/advisory grading with default rules
+fast_lane:
+  max_changed_lines: 50    # small routine PRs: only block-class findings hold
+```
 
 Pass receipts trust the configured `review.login`, exact commit SHA, and the
 mergewake marker. They are not cryptographically signed or independently
@@ -675,7 +735,8 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the head-bound
 passes from `review.login` it attests, the base branch an ancestor of the
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
-`threads_open:<n>`, `review_missing`, `base_stale`, `conflict`. Pending or
+`threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
+`triage_unanswered:<n>`), `review_missing`, `base_stale`, `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits at most once per the `pr-notify-sent` state file; a changed
