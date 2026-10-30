@@ -358,8 +358,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 	}
 	// Preference order per pass: another family not yet used, another family,
+	// another family again on a profile an earlier pass used (a fresh call),
 	// same family with a different model, same family, then a fresh call on any
-	// admitted profile. An empty candidate list means quota admitted nobody.
+	// admitted profile. A pass stays off the author's family whenever quota
+	// admits any other family; the author's family is the fallback when it does
+	// not. An empty candidate list means quota admitted nobody.
 	order := func() []string {
 		var list []string
 		seen := map[string]bool{}
@@ -373,6 +376,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		emit(otherOrder, func(n string) bool { return fam(n) != family && !usedFamilies[fam(n)] && !usedProfiles[n] })
 		emit(otherOrder, func(n string) bool { return fam(n) != family && !usedProfiles[n] })
+		emit(rankedOrder, func(n string) bool { return fam(n) != family })
 		emit(rankedOrder, func(n string) bool { return fam(n) == family && model(n) != authorModel && !usedProfiles[n] })
 		emit(rankedOrder, func(n string) bool { return fam(n) == family && !usedProfiles[n] })
 		emit(rankedOrder, func(n string) bool { return !usedProfiles[n] })

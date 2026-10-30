@@ -745,7 +745,7 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 			},
 			recommend:  []string{"claude", "gpt"},
 			lenses:     []string{"correctness", "state-risk"},
-			sameFamily: []bool{false, true},
+			sameFamily: []bool{false, false},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -762,8 +762,10 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 			if len(passes) != 2 || runner.calls != 2 || g.claimCount != 3 {
 				t.Fatalf("passes=%d runs=%d claims=%d", len(passes), runner.calls, g.claimCount)
 			}
-			if passes[0].Reviewer == passes[1].Reviewer {
-				t.Fatal("one profile ran both passes")
+			// Pass 2 stays off the author's family while quota admits another
+			// family, even when that means a fresh call on the pass 1 profile.
+			if tt.sameFamily[1] && passes[0].Reviewer == passes[1].Reviewer {
+				t.Fatal("one profile ran both passes although a second same-family profile was admitted")
 			}
 			wantOutcome := false
 			for i, pass := range passes {
@@ -1158,7 +1160,7 @@ func TestReviewAuthorFamilyAlias(t *testing.T) {
 	if passes[0].Reviewer != "gpt" || passes[0].SameFamily {
 		t.Fatalf("pass 1 picked %+v", passes[0])
 	}
-	if passes[1].Reviewer != "sonnet" || !passes[1].SameFamily {
+	if passes[1].Reviewer != "gpt" || passes[1].SameFamily {
 		t.Fatalf("pass 2 picked %+v", passes[1])
 	}
 }

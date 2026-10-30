@@ -248,6 +248,10 @@ them. Blocking PRs use a correctness/regressions lens for pass 1 and a
 state/migration/security/deploy lens for pass 2, including after quota fallbacks.
 Landing counts distinct pass numbers and requires distinct lenses when the
 reviewer family is the same. Routine PRs use the default lens.
+Every pass prefers a reviewer family other than the PR author's. When quota
+admits only one other-family profile, pass 2 runs it again (a fresh call with
+the pass 2 lens) before falling back to the author's family; the author's
+family is used only when quota admits no other family.
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
