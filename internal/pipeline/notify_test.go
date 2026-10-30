@@ -246,6 +246,15 @@ func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	if n.count != 2 {
 		t.Fatal("repeated blocked state re-notified")
 	}
+	// A different BLOCKED reason set at the same head is a new verdict and a
+	// distinct event ID; the earlier READY key does not suppress it.
+	g.findings = 2
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n.count != 3 || n.events[2].ID == n.events[0].ID {
+		t.Fatalf("changed blocked verdict not re-notified: %+v", n.events)
+	}
 
 	s, g, n, r = notifySetup(t)
 	g.pull.Draft = true

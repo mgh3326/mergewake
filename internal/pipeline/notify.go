@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -112,8 +114,16 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
+	// A changed BLOCKED reason set is a new verdict under the same head: fold
+	// the summary into the event ID so a notifier deduping on ID cannot drop it
+	// while the sent key records delivery.
+	id := fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, pr.Number, pr.Head.SHA)
+	if state == "blocked" {
+		sum := sha256.Sum256([]byte(summary))
+		id += "-" + hex.EncodeToString(sum[:4])
+	}
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, pr.Number, pr.Head.SHA),
+		ID:   id,
 		Text: text,
 		Lane: lane,
 	}); e != nil {

@@ -244,10 +244,14 @@ func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; 
 
 type fakeNotifier struct {
 	count  int
+	err    error
 	events []integrations.Event
 }
 
 func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
+	if n.err != nil {
+		return n.err
+	}
 	n.count++
 	n.events = append(n.events, e)
 	return nil
@@ -514,6 +518,28 @@ func TestLandMergedEventOnce(t *testing.T) {
 	}
 	if n.count != 1 {
 		t.Fatal("merged event re-emitted")
+	}
+}
+
+// A failed MERGED emit never strands the observation of an already-merged PR:
+// the error is audited and the outcome ledger still records the merge.
+func TestLandMergedNotifyFailureObserved(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	n.err = errors.New("notifier offline")
+	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if g.mergeCount != 1 {
+		t.Fatal("merge did not run")
+	}
+	state, e := s.ledger().Read()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if v := state.Latest["https://github.com/"+r.Name+"/pull/7"]; v.Action != "merge" {
+		t.Fatalf("action=%s", v.Action)
 	}
 }
 
