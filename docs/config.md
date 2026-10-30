@@ -95,7 +95,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
 | `transport` | `panewire` when `hub.url` is set, else `ssh` | How remote hosts are reached: `panewire` sends every remote operation through the hub's node commands; `ssh` runs `herdr`/`git` over `ssh(1)`. Local hosts always run locally. |
 | `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
-| `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 operator env file holding `HUB_TOKEN`, the same file the panewire operator CLI takes. Read at the start of each pass; a file other users can read is refused. |
+| `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 env file of a scoped hub service credential: `HUB_MACHINE_ID=svc-mergewake` and its `HUB_TOKEN` (see "Hub credential" below). A file whose `HUB_MACHINE_ID` is `operator`, or that has none, is refused when the config loads and again when each pass reads it; a file other users can read is refused. |
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
@@ -151,13 +151,15 @@ a worktree whose pane already closed still gets cleaned.
 
 #### Panewire transport
 
-Under `transport: panewire` no remote operation uses ssh. Each remote host
-maps to panewire machine `machine` (default `name`) and goes through the hub's
-operator node commands (panewire `docs/node-commands.md`):
+Under `transport: panewire` no remote operation uses ssh, including archive
+on a host that also has `ssh`. Each remote host maps to panewire machine
+`machine` (default `name`) and goes through the hub's node commands (panewire
+`docs/node-commands.md`):
 
 - discovery reads that machine's row of `GET /v1/nodes/agents`; a machine
-  the hub does not know, is disconnected or does not answer fails that host
-  for the pass, never reads as a host with no panes;
+  the hub does not know, is not `connected` (even with an empty list and no
+  error code) or does not answer fails that host for the pass, never reads
+  as a host with no panes;
 - worktree matching uses `worktree.inspect`, which returns the same branch,
   head and origin the ssh path reads with git;
 - capture uses `pane.capture` with the merge time and, only in acting mode,
@@ -174,6 +176,49 @@ worktree is inspected (a removed or changed worktree still records
 `worktree-gone` / `worktree-changed`) and otherwise skipped with
 `cleanup-unsupported:panewire`; it is never removed over ssh. Hosts with
 empty `ssh` and no `machine` keep running every step locally.
+
+##### Hub credential
+
+Reap authenticates to the hub as the scoped service client `svc-mergewake`,
+never with the operator token (panewire `docs/hub-scopes.md`). It sends
+`X-Panewire-Machine-ID: <HUB_MACHINE_ID>` with `Authorization: Bearer
+<HUB_TOKEN>`. The hub's auth file grants it exactly the reap scopes, on every
+machine (operator decision D1):
+
+```sh
+HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:pane.capture@*,node.command:pane.close@*
+```
+
+| Scope | Reap uses it for |
+| --- | --- |
+| `nodes.agents.read` | discovery, `GET /v1/nodes/agents` |
+| `node.command:agents.list@*` | not sent by reap today (discovery uses the fleet-wide list); granted with D1 for a per-machine re-read |
+| `node.command:worktree.inspect@*` | worktree matching and the aged-out worktree check |
+| `node.command:pane.capture@*` | saving the report or screen before a close |
+| `node.command:pane.close@*` | the exact-match close |
+
+The operator mints the credential on the hub with
+`deploy/hub-token-mint.sh` (panewire) and copies the client env file, mode
+0600, to the daemon host. reap reads it through `reap.hub.token_file`:
+
+```yaml
+reap:
+  enabled: true
+  transport: panewire
+  hub:
+    url: https://hub.example.invalid
+    token_file: ~/.config/mergewake/svc-mergewake.env   # HUB_MACHINE_ID=svc-mergewake, HUB_TOKEN=...
+    cf_file: ~/.config/mergewake/hub-cf.env             # optional, behind Cloudflare Access
+hosts:
+  - {name: node-a, machine: node-a}
+```
+
+A hub answer of `401` (unknown credential) or `403` (`scope_forbidden`: the
+scopes do not cover the request) is a scope/auth error for that host. On
+discovery or `worktree.inspect` it fails the host for the pass; on a capture
+or close it is an `error` receipt for that pane. Either way the error reads
+`hub scope/auth error ... for client svc-mergewake on <route>`, and a refused
+host is never read as a host with no panes.
 
 Every decision is appended to `<state_dir>/<repo>/reap.jsonl` — including
 shadow `would-*` rows, which is how a later pass still finds a worktree it

@@ -59,16 +59,65 @@ func TestReadEnvFile(t *testing.T) {
 	}
 }
 
+func TestHubCredential(t *testing.T) {
+	dir := t.TempDir()
+	for name, tt := range map[string]struct {
+		body, want string
+	}{
+		"service":    {"HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=tok\n", ""},
+		"operator":   {"HUB_MACHINE_ID=operator\nHUB_TOKEN=tok\n", "hub operator credential"},
+		"no id":      {"HUB_TOKEN=tok\n", "no HUB_MACHINE_ID"},
+		"bad id":     {"HUB_MACHINE_ID=Svc Mergewake\nHUB_TOKEN=tok\n", "not a hub client id"},
+		"no token":   {"HUB_MACHINE_ID=svc-mergewake\n", "no HUB_TOKEN"},
+		"operator q": {"HUB_MACHINE_ID=\"operator\"\nHUB_TOKEN=tok\n", "hub operator credential"},
+	} {
+		path := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".env")
+		if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		client, token, err := HubCredential(path)
+		if tt.want == "" {
+			if err != nil || client != "svc-mergewake" || token != "tok" {
+				t.Errorf("%s: %q %q %v", name, client, token, err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), tt.want) || client != "" || token != "" {
+			t.Errorf("%s: %q %q %v, want error %q", name, client, token, err, tt.want)
+		}
+	}
+}
+
+// The hub's scoped routes answer 403 scope_forbidden for a service whose
+// scopes do not cover the request and 401 for an unknown credential. Either
+// is an auth error for the host, never a host with no panes.
+func TestHubScopeRefusalIsAnAuthError(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusUnauthorized} {
+		hub, _ := fakeHub(t, func(hubRequest) (int, any) {
+			return status, map[string]any{"error": "scope_forbidden"}
+		})
+		panes, err := (HubHost{Hub: hub, Machine: "node-a"}).Panes(context.Background())
+		if panes != nil || !errors.Is(err, ErrHubAuth) || !strings.Contains(err.Error(), "scope/auth error") || !strings.Contains(err.Error(), "svc-mergewake") {
+			t.Fatalf("%d: %v %v", status, panes, err)
+		}
+		if _, err := (HubHost{Hub: hub, Machine: "node-a"}).Inspect(context.Background(), "/w"); !errors.Is(err, ErrHubAuth) {
+			t.Fatalf("%d inspect: %v", status, err)
+		}
+	}
+	hub, _ := fakeHub(t, func(hubRequest) (int, any) { return http.StatusBadGateway, map[string]any{"error": "node_unavailable"} })
+	if _, err := (HubHost{Hub: hub, Machine: "node-a"}).Panes(context.Background()); err == nil || errors.Is(err, ErrHubAuth) {
+		t.Fatalf("502 read as an auth error: %v", err)
+	}
+}
+
 type hubRequest struct {
-	method, path, auth, cfID, cfSecret string
-	body                               map[string]any
+	method, path, auth, client, cfID, cfSecret string
+	body                                       map[string]any
 }
 
 func fakeHub(t *testing.T, answer func(hubRequest) (int, any)) (*Hub, *[]hubRequest) {
 	t.Helper()
 	var seen []hubRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req := hubRequest{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"), cfID: r.Header.Get("CF-Access-Client-Id"), cfSecret: r.Header.Get("CF-Access-Client-Secret")}
+		req := hubRequest{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"), client: r.Header.Get("X-Panewire-Machine-ID"), cfID: r.Header.Get("CF-Access-Client-Id"), cfSecret: r.Header.Get("CF-Access-Client-Secret")}
 		if r.Body != nil {
 			_ = json.NewDecoder(r.Body).Decode(&req.body)
 		}
@@ -78,7 +127,7 @@ func fakeHub(t *testing.T, answer func(hubRequest) (int, any)) (*Hub, *[]hubRequ
 		_ = json.NewEncoder(w).Encode(body)
 	}))
 	t.Cleanup(server.Close)
-	return &Hub{URL: server.URL, Token: "op-token", CFID: "cf-id", CFSecret: "cf-secret"}, &seen
+	return &Hub{URL: server.URL, Client: "svc-mergewake", Token: "svc-token", CFID: "cf-id", CFSecret: "cf-secret"}, &seen
 }
 
 func TestHubAgentsFetchedOncePerPass(t *testing.T) {
@@ -110,7 +159,7 @@ func TestHubAgentsFetchedOncePerPass(t *testing.T) {
 		t.Fatalf("agent list fetched %d times", len(*seen))
 	}
 	got := (*seen)[0]
-	if got.method != http.MethodGet || got.path != "/v1/nodes/agents" || got.auth != "Bearer op-token" || got.cfID != "cf-id" || got.cfSecret != "cf-secret" {
+	if got.method != http.MethodGet || got.path != "/v1/nodes/agents" || got.auth != "Bearer svc-token" || got.client != "svc-mergewake" || got.cfID != "cf-id" || got.cfSecret != "cf-secret" {
 		t.Fatalf("%+v", got)
 	}
 }

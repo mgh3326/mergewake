@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"math"
 	"net"
@@ -173,9 +174,10 @@ type Reap struct {
 	Archive   Archive `yaml:"archive"`
 }
 
-// ReapHub locates the panewire hub and the operator credential files reap
-// sends it. The files are the mode-0600 env files the panewire operator CLI
-// takes: HUB_TOKEN, and optionally CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET.
+// ReapHub locates the panewire hub and the credential files reap sends it.
+// TokenFile is a mode-0600 scoped service env file (HUB_MACHINE_ID, e.g.
+// svc-mergewake, and HUB_TOKEN); the operator credential is refused. CFFile
+// optionally holds CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET.
 type ReapHub struct {
 	URL       string `yaml:"url"`
 	TokenFile string `yaml:"token_file"`
@@ -341,6 +343,11 @@ func Load(name string) (Config, error) {
 		}
 		if !filepath.IsAbs(c.Reap.Hub.TokenFile) || (c.Reap.Hub.CFFile != "" && !filepath.IsAbs(c.Reap.Hub.CFFile)) {
 			return c, errors.New("reap.hub credential files must be absolute paths")
+		}
+		// Refuse the operator credential at load, not only when a pass first
+		// reads the file. A file not there yet is left to that per-pass read.
+		if _, _, e = reap.HubCredential(c.Reap.Hub.TokenFile); e != nil && !errors.Is(e, fs.ErrNotExist) {
+			return c, fmt.Errorf("reap.hub.token_file: %w", e)
 		}
 	default:
 		return c, errors.New("reap.transport must be panewire or ssh")
