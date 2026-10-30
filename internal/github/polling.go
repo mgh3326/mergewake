@@ -99,27 +99,40 @@ func (c *Client) pollShortcut(key string) (cachedResponse, error) {
 func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedResponse, error) {
 	p := &c.poll
 	p.init()
-	p.mu.Lock()
-	wait := p.rate
-	if c.Polling && p.polls[key].until.After(wait.until) {
-		wait = p.polls[key]
+	for {
+		p.mu.Lock()
+		wait := p.rate
+		if c.Polling && p.polls[key].until.After(wait.until) {
+			wait = p.polls[key]
+		}
+		old := p.cache[key]
+		p.mu.Unlock()
+		// Throttle waits happen before the gate is taken: a sleeping key never
+		// serialises requests for every other key behind it.
+		if d := time.Until(wait.until); d > throttleLogThreshold {
+			c.logThrottle(wait, d)
+		}
+		if err := waitUntil(ctx, wait.until); err != nil {
+			return nil, cachedResponse{}, err
+		}
+		select {
+		case p.gate <- struct{}{}:
+		case <-ctx.Done():
+			return nil, cachedResponse{}, ctx.Err()
+		}
+		// A request that landed a new throttle while this one slept or queued
+		// must not be passed: release the gate and wait out the new deadline.
+		p.mu.Lock()
+		again := p.rate
+		if c.Polling && p.polls[key].until.After(again.until) {
+			again = p.polls[key]
+		}
+		p.mu.Unlock()
+		if !again.until.After(time.Now()) {
+			return func() { <-p.gate }, old, nil
+		}
+		<-p.gate
 	}
-	old := p.cache[key]
-	p.mu.Unlock()
-	// Throttle waits happen before the gate is taken: a sleeping key never
-	// serialises requests for every other key behind it.
-	if d := time.Until(wait.until); d > throttleLogThreshold {
-		c.logThrottle(wait, d)
-	}
-	if err := waitUntil(ctx, wait.until); err != nil {
-		return nil, cachedResponse{}, err
-	}
-	select {
-	case p.gate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, cachedResponse{}, ctx.Err()
-	}
-	return func() { <-p.gate }, old, nil
 }
 
 // logThrottle reports one throttled wait: the reason, the HTTP status that
