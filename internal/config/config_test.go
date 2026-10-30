@@ -339,3 +339,27 @@ func TestFallbackLaneAndDefaultFamily(t *testing.T) {
 		t.Fatal("default_family outside the configured profiles accepted")
 	}
 }
+
+func TestReviewExecutor(t *testing.T) {
+	load := func(extra string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\nstate_dir: /state\n"+extra), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return Load(p)
+	}
+	c, e := load("")
+	rt := c.Review.Runtug
+	if e != nil || c.Review.Executor != "headless" || rt.Command != "runtug" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
+		t.Fatalf("%+v %v", c.Review, e)
+	}
+	c, e = load("review:\n  executor: runtug\n  runtug: {owner: review-desk, host: host-b, checkouts: /work/reviews}\n")
+	if e != nil || c.Review.Executor != "runtug" || c.Review.Runtug.Owner != "review-desk" || c.Review.Runtug.Host != "host-b" || c.Review.Runtug.Checkouts != "/work/reviews" {
+		t.Fatalf("%+v %v", c.Review, e)
+	}
+	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {lane: x}\n"} {
+		if _, e = load(bad); e == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
