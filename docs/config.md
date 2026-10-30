@@ -206,7 +206,8 @@ reviewers ahead of pace but never admits a skipped pool. `select: rank` preserve
 instead, for quota tools without pools or a usage snapshot. Routine changes need one diff-only pass on the exact PR
 head; blocking paths need two. For each pass the reviewer is chosen in this
 order: a different model family than the author, preferring `pairings` order and
-families not already used on this head; any different family; the author's
+families not already used on this head; any different family; a different
+family again on a profile an earlier pass used; the author's
 family with a different model (from `Mergewake-Author-Model` or the configured
 author profile's `--model`); the author's family at all; and finally any
 admitted profile in a fresh diff-only call. Review never stops merely because
@@ -251,7 +252,8 @@ reviewer family is the same. Routine PRs use the default lens.
 Every pass prefers a reviewer family other than the PR author's. When quota
 admits only one other-family profile, pass 2 runs it again (a fresh call with
 the pass 2 lens) before falling back to the author's family; the author's
-family is used only when quota admits no other family.
+family is used only when no usable other-family candidate remains (quota
+refusal, an unavailable CLI or a failed invocation all count).
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
