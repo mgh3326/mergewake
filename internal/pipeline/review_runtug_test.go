@@ -3,12 +3,15 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -20,9 +23,10 @@ type runtugExit int
 func (e runtugExit) Error() string { return "exit status" }
 func (e runtugExit) ExitCode() int { return int(e) }
 
-// runtugRunner fakes git, the quota tool, headless reviewers and runtug. A
-// spawn writes the configured findings file and spawn receipt into the job dir
-// named by its brief path, unless refuse lists its role.
+// runtugRunner fakes git, the quota tool, headless reviewers, panewire and
+// runtug. A spawn writes the configured findings file and spawn receipt into
+// the job dir named by its brief path, unless refuse lists its role; a remote
+// spawn instead uploads the findings to sink and announces them on the inbox.
 type runtugRunner struct {
 	fakeRunner
 	refuse   map[string]int // runtug --role → exit status
@@ -33,13 +37,39 @@ type runtugRunner struct {
 	spawns   [][]string
 	git      [][]string
 	headless int
+	branchAt string // local head branch tip; "" means the branch is absent
+	remote   *taskJobSink
+	inbox    []string // lane.event items, as panewire inbox list prints them
+	inboxErr error
+	acks     [][]string
+	late     int // inbox looks that still show nothing
+	looks    int
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	switch command {
 	case "git":
 		r.git = append(r.git, args)
+		if slices.Contains(args, "rev-parse") {
+			if r.branchAt == "" {
+				return nil, runtugExit(1)
+			}
+			return []byte(r.branchAt + "\n"), nil
+		}
 		return nil, nil
+	case "panewire":
+		if args[1] == "ack" {
+			r.acks = append(r.acks, args)
+			return []byte(`{"acked":1}`), nil
+		}
+		r.looks++
+		if r.inboxErr != nil {
+			return nil, r.inboxErr
+		}
+		if r.looks <= r.late {
+			return []byte("[]"), nil
+		}
+		return []byte("[" + strings.Join(r.inbox, ",") + "]"), nil
 	case "scopefuel":
 		if r.quotaErr != nil {
 			return nil, r.quotaErr
@@ -55,7 +85,15 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 			return nil, runtugExit(code)
 		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])
-		if r.findings != "" {
+		label := arg(args, "-l")
+		switch {
+		case r.findings == "":
+		case r.remote != nil:
+			sum := sha256.Sum256([]byte(r.findings))
+			sha := hex.EncodeToString(sum[:])
+			r.remote.files[sha] = []byte(r.findings)
+			r.inbox = append(r.inbox, `{"id":9,"kind":"lane.event","event":{"event_id":"`+label+`-findings","text":"[`+label+`] findings attachment=`+sha+`"}}`)
+		default:
 			if e := os.WriteFile(filepath.Join(job, "findings.json"), []byte(r.findings), 0600); e != nil {
 				return nil, e
 			}
@@ -75,22 +113,39 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 type taskJobSink struct {
 	fakeLaneSink
 	job, title string
+	files      map[string][]byte
 }
 
 func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
 	return s.job, s.title, nil
 }
 
+func (s *taskJobSink) Attachment(_ context.Context, sha string) ([]byte, error) {
+	if b, ok := s.files[sha]; ok {
+		return b, nil
+	}
+	return nil, errors.New("not_found")
+}
+
 func runtugSetup(t *testing.T, runner *runtugRunner) (*Service, *fakeGH, config.Repo) {
 	t.Helper()
 	s, g, _, _, r := setup(t)
 	s.Runner = runner
-	s.Sink = &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)"}
+	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}}
+	s.Sink = sink
+	if runner.remote != nil {
+		runner.remote = sink
+	}
+	grace := findingsGrace
+	findingsGrace = 0
+	t.Cleanup(func() { findingsGrace = grace })
 	s.Config.Review.Executor = "runtug"
 	dir := t.TempDir()
 	s.Config.Review.Runtug = config.RuntugReview{Command: "runtug", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(dir, "jobs"), Checkouts: filepath.Join(dir, "checkouts")}
 	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: anthropic\n"
 	g.pull.Base.Ref = "main"
+	g.pull.Head.Ref = "feat/thing"
+	g.pull.Head.Repo.FullName = "example/project"
 	r.Root = filepath.Join(dir, "repo")
 	return s, g, r
 }
@@ -125,27 +180,170 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	if !strings.HasPrefix(checkout, s.Config.Review.Runtug.Checkouts) {
 		t.Fatal(checkout)
 	}
-	// The checkout is fetched, added at the head, and removed afterwards.
-	gitCalls := []string{}
-	for _, c := range runner.git {
-		gitCalls = append(gitCalls, strings.Join(c, " "))
+	// The checkout is the head branch, created at the head and removed with
+	// its branch afterwards.
+	want := []string{
+		"fetch --no-tags origin pull/7/head main +refs/heads/feat/thing:refs/remotes/origin/feat/thing",
+		"rev-parse --verify --quiet refs/heads/feat/thing",
+		"worktree add -b feat/thing " + checkout + " " + shaA,
+		"worktree remove --force " + checkout,
+		"branch -D feat/thing",
 	}
-	want := []string{"-C " + r.Root + " fetch --no-tags origin pull/7/head main", "-C " + r.Root + " worktree add --detach " + checkout + " " + shaA, "-C " + r.Root + " worktree remove --force " + checkout}
-	if !slices.Equal(gitCalls, want) {
-		t.Fatalf("%q", gitCalls)
+	if got := gitCalls(runner, r.Root); !slices.Equal(got, want) {
+		t.Fatalf("%q", got)
 	}
 	brief, e := os.ReadFile(arg(sp, "-p"))
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, want := range []string{"example/project#7", shaA, "default lens", "Author model family: anthropic", filepath.Join(filepath.Dir(arg(sp, "-p")), "findings.json"), "runtug done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
+	for _, want := range []string{"example/project#7", shaA, "on branch feat/thing", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "runtug done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}
 	}
+	// Without a findings lane the pane is not told to upload anything.
+	if strings.Contains(string(brief), "attach put") || slices.Contains(sp, "--exclude-host") {
+		t.Fatalf("%v\n%s", sp, brief)
+	}
 	got := g.passes[shaA][0]
 	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug"}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// gitCalls lists the git invocations against root without the -C prefix.
+func gitCalls(r *runtugRunner, root string) []string {
+	out := []string{}
+	for _, c := range r.git {
+		out = append(out, strings.TrimPrefix(strings.Join(c, " "), "-C "+root+" "))
+	}
+	return out
+}
+
+// A pane on another host returns its findings as an attachment announced on
+// the findings lane; mergewake fetches, validates and posts them, and
+// acknowledges the event.
+func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
+	s, g, r := runtugSetup(t, runner)
+	s.Config.Review.Runtug.Lane = "review-desk"
+	s.Config.Review.Runtug.Panewire = "panewire"
+	s.Config.Review.Runtug.ExcludeHosts = []string{"slow-host", "other-host"}
+	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := g.passes[shaA]
+	if runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || got[0].Reviewer != "runtug:seat-x" || g.postCount != 1 {
+		t.Fatalf("headless=%d %+v", runner.headless, got)
+	}
+	sp := runner.spawns[0]
+	if arg(sp, "--exclude-host") != "slow-host,other-host" {
+		t.Fatal(sp)
+	}
+	if len(runner.acks) != 1 || strings.Join(runner.acks[0], " ") != "inbox ack 9 --lane review-desk --json" {
+		t.Fatal(runner.acks)
+	}
+	brief, _ := os.ReadFile(arg(sp, "-p"))
+	label := arg(sp, "-l")
+	for _, want := range []string{`handoffkeep attach put "$J/findings.json" --name ` + label + "-findings.json", "panewire emit --kind lane.event --lane review-desk --deliver inbox --type report --event-id " + label + "-findings --text '[" + label + "] findings attachment=<sha256>'"} {
+		if !strings.Contains(string(brief), want) {
+			t.Fatalf("brief lacks %q:\n%s", want, brief)
+		}
+	}
+}
+
+// An announcement that trails runtug's completion is waited for.
+func TestRuntugWaitsForLateAnnouncement(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", remote: &taskJobSink{}, late: 2}
+	s, g, r := runtugSetup(t, runner)
+	s.Config.Review.Runtug.Lane = "review-desk"
+	s.Config.Review.Runtug.Panewire = "panewire"
+	poll := findingsPoll
+	findingsGrace, findingsPoll = time.Minute, time.Millisecond
+	t.Cleanup(func() { findingsPoll = poll })
+	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if got := g.passes[shaA]; runner.looks != 3 || runner.headless != 0 || got[0].Executor != "runtug" {
+		t.Fatalf("looks=%d headless=%d %+v", runner.looks, runner.headless, got)
+	}
+}
+
+// With a findings lane configured, a pane on this host that left only the
+// local file is still read; a lane that cannot be read falls back to it too.
+func TestRuntugLocalFindingsFileStillRead(t *testing.T) {
+	for name, inboxErr := range map[string]error{"no event": nil, "inbox down": errors.New("hub unavailable")} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", inboxErr: inboxErr}
+			s, g, r := runtugSetup(t, runner)
+			s.Config.Review.Runtug.Lane = "review-desk"
+			s.Config.Review.Runtug.Panewire = "panewire"
+			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			if got := g.passes[shaA]; runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || len(runner.acks) != 0 {
+				t.Fatalf("headless=%d %+v", runner.headless, got)
+			}
+		})
+	}
+}
+
+// A pane whose worktree is not at the head refuses; the refusal is never
+// posted as a clean review.
+func TestRuntugHeadRefusalFallsBackToHeadless(t *testing.T) {
+	runner := &runtugRunner{findings: `{"refused":"HEAD is 1234567, expected ` + shaA + `"}`, family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := g.passes[shaA]
+	if runner.headless != 1 || len(got) != 1 || got[0].Executor != "" || !strings.Contains(got[0].Fallback, "refused: HEAD is 1234567") {
+		t.Fatalf("headless=%d %+v", runner.headless, got)
+	}
+}
+
+func TestRuntugCheckoutBranch(t *testing.T) {
+	for name, tc := range map[string]struct {
+		branchAt, fork string
+		want           []string
+		reason         string
+	}{
+		"local branch at head":   {branchAt: shaA, want: []string{"rev-parse --verify --quiet refs/heads/feat/thing", "worktree add <checkout> feat/thing", "worktree remove --force <checkout>"}},
+		"local branch elsewhere": {branchAt: shaB, want: []string{"rev-parse --verify --quiet refs/heads/feat/thing"}, reason: "local branch feat/thing is at " + shaB[:7] + ", not the PR head; left untouched"},
+		"fork":                   {fork: "someone/project", want: []string{}, reason: "head branch is not in example/project (fork PR)"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", branchAt: tc.branchAt}
+			s, g, r := runtugSetup(t, runner)
+			if tc.fork != "" {
+				g.pull.Head.Repo.FullName = tc.fork
+			}
+			if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			got := gitCalls(runner, r.Root)
+			if len(got) > 0 {
+				got = got[1:] // fetch
+			}
+			if len(runner.spawns) > 0 {
+				for i := range got {
+					got[i] = strings.ReplaceAll(got[i], arg(runner.spawns[0], "-c"), "<checkout>")
+				}
+			}
+			p := g.passes[shaA]
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("%q", got)
+			}
+			if tc.reason == "" {
+				if p[0].Executor != "runtug" {
+					t.Fatalf("%+v", p)
+				}
+				return
+			}
+			if len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, tc.reason) {
+				t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
+			}
+		})
 	}
 }
 

@@ -166,3 +166,23 @@ func TestFailedCommandKeepsStderrOutOfMessage(t *testing.T) {
 		t.Fatalf("message changed: %v", err)
 	}
 }
+
+func TestHandoffkeepAttachmentReadsBySHA(t *testing.T) {
+	r := &fakeRunner{}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep"}
+	sha := strings.Repeat("ab", 32)
+	if _, e := h.Attachment(context.Background(), sha); e != nil {
+		t.Fatal(e)
+	}
+	if got := strings.Join(r.calls[0].args, " "); got != "attach get "+sha {
+		t.Fatal(got)
+	}
+	for _, bad := range []string{"", "-o", strings.Repeat("AB", 32), sha + "0"} {
+		if _, e := h.Attachment(context.Background(), bad); e == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	if len(r.calls) != 1 {
+		t.Fatal(r.calls)
+	}
+}

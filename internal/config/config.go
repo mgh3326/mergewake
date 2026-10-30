@@ -56,9 +56,10 @@ type Review struct {
 	Runtug   RuntugReview `yaml:"runtug"`
 }
 
-// RuntugReview configures the runtug review executor. The reviewer pane writes
-// its findings into the job directory, so Jobs must be the inbox runtug uses on
-// the host that runs the pane.
+// RuntugReview configures the runtug review executor. A reviewer pane uploads
+// its findings to handoffkeep and announces the attachment on Lane, so it may
+// run on any host; a pane on this host also leaves them in Jobs, runtug's job
+// inbox here, which is read when no announcement arrives.
 type RuntugReview struct {
 	Command   string `yaml:"command"`
 	Workspace string `yaml:"workspace"`
@@ -66,6 +67,11 @@ type RuntugReview struct {
 	Host      string `yaml:"host"`
 	Jobs      string `yaml:"jobs"`
 	Checkouts string `yaml:"checkouts"`
+	// Lane receives the pane's findings event; empty means Owner, and with
+	// neither only a pane on this host can return findings.
+	Lane         string   `yaml:"lane"`
+	Panewire     string   `yaml:"panewire"`
+	ExcludeHosts []string `yaml:"exclude_hosts"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -340,7 +346,24 @@ func Load(name string) (Config, error) {
 	if rt.Checkouts == "" {
 		rt.Checkouts = filepath.Join(c.StateDir, "review-checkouts")
 	}
-	rt.Command, rt.Jobs, rt.Checkouts = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts)
+	if rt.Lane == "" {
+		rt.Lane = rt.Owner
+	}
+	if rt.Lane != "" && !laneName.MatchString(rt.Lane) {
+		return c, errors.New("invalid review.runtug.lane")
+	}
+	if rt.Panewire == "" {
+		rt.Panewire = "panewire"
+	}
+	for _, h := range rt.ExcludeHosts {
+		if !hostName.MatchString(h) {
+			return c, fmt.Errorf("invalid review.runtug.exclude_hosts entry %q", h)
+		}
+		if h == rt.Host {
+			return c, fmt.Errorf("review.runtug.host %s is also in exclude_hosts", h)
+		}
+	}
+	rt.Command, rt.Jobs, rt.Checkouts, rt.Panewire = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts), Expand(rt.Panewire)
 	if c.Outcomes.Command == "" {
 		c.Outcomes.Command = c.Review.Quota
 	}
@@ -594,6 +617,10 @@ var (
 	containerUser  = regexp.MustCompile(`^[A-Za-z0-9_][-A-Za-z0-9_.:]*$`)
 	volumeValue    = regexp.MustCompile(`^[A-Za-z0-9_./@+-]+$`)
 	containerLabel = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*$`)
+	// laneName and hostName bound the panewire lane and runtug host names
+	// passed as single arguments (runtug splits --exclude-host on commas).
+	laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	hostName = laneName
 )
 
 func validContainerTarget(p string) bool {
