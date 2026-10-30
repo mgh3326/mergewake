@@ -1,5 +1,5 @@
 version: 1
-enabled: false
+enabled: true
 required_checks:
   - vet
   - test
