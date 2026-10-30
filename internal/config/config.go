@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -44,7 +45,7 @@ type Review struct {
 	// author-family trailer and the head commit identities yield no known
 	// model alias. Reviewed heads record that the family was inferred.
 	DefaultFamily string `yaml:"default_family"`
-	Timeout      string              `yaml:"timeout"`
+	Timeout       string `yaml:"timeout"`
 	// Select orders admitted reviewers: "pace" (default) by projected use at
 	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
 	// recommendation order without reading usage.
@@ -56,9 +57,10 @@ type Review struct {
 	Runtug   RuntugReview `yaml:"runtug"`
 }
 
-// RuntugReview configures the runtug review executor. The reviewer pane writes
-// its findings into the job directory, so Jobs must be the inbox runtug uses on
-// the host that runs the pane.
+// RuntugReview configures the runtug review executor. A reviewer pane uploads
+// its findings to handoffkeep and announces the attachment on Lane, so it may
+// run on any host; a pane on this host also leaves them in Jobs, runtug's job
+// inbox here, which is read when no announcement arrives.
 type RuntugReview struct {
 	Command   string `yaml:"command"`
 	Workspace string `yaml:"workspace"`
@@ -66,6 +68,11 @@ type RuntugReview struct {
 	Host      string `yaml:"host"`
 	Jobs      string `yaml:"jobs"`
 	Checkouts string `yaml:"checkouts"`
+	// Lane receives the pane's findings event; empty means Owner, and with
+	// neither only a pane on this host can return findings.
+	Lane         string   `yaml:"lane"`
+	Panewire     string   `yaml:"panewire"`
+	ExcludeHosts []string `yaml:"exclude_hosts"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -163,6 +170,7 @@ type Reap struct {
 	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
 	Transport string  `yaml:"transport"`
 	Hub       ReapHub `yaml:"hub"`
+	Archive   Archive `yaml:"archive"`
 }
 
 // ReapHub locates the panewire hub and the operator credential files reap
@@ -178,6 +186,23 @@ const (
 	ReapTransportPanewire = "panewire"
 	ReapTransportSSH      = "ssh"
 )
+
+// Archive moves finished job dirs to a synced Drive folder on archive_host and
+// records them in hk before the local job dir is deleted.
+type Archive struct {
+	Enabled bool `yaml:"enabled"`
+	// DriveDir is the locally synced Google Drive folder on the archive host.
+	DriveDir string `yaml:"drive_dir"`
+	// ArchiveHost is an ssh destination reachable from this machine; empty or
+	// "local" means the Drive folder is on this machine.
+	ArchiveHost  string `yaml:"archive_host"`
+	TextMaxBytes int64  `yaml:"text_max_bytes"`
+	MinAge       string `yaml:"min_age"`
+}
+
+// ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
+// output limit, since each text file is read back through it.
+const ArchiveTextCap = 3 << 20
 
 // DefaultReapProtect names resident and desk panes that reap never closes. A
 // configured reap.protect list replaces this list; unnamed panes and panes
@@ -320,6 +345,9 @@ func Load(name string) (Config, error) {
 	default:
 		return c, errors.New("reap.transport must be panewire or ssh")
 	}
+	if e = validateArchive(&c.Reap.Archive); e != nil {
+		return c, e
+	}
 	seenHosts := map[string]bool{}
 	for i, h := range c.Hosts {
 		if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(h.Name) || seenHosts[h.Name] {
@@ -389,7 +417,24 @@ func Load(name string) (Config, error) {
 	if rt.Checkouts == "" {
 		rt.Checkouts = filepath.Join(c.StateDir, "review-checkouts")
 	}
-	rt.Command, rt.Jobs, rt.Checkouts = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts)
+	if rt.Lane == "" {
+		rt.Lane = rt.Owner
+	}
+	if rt.Lane != "" && !laneName.MatchString(rt.Lane) {
+		return c, errors.New("invalid review.runtug.lane")
+	}
+	if rt.Panewire == "" {
+		rt.Panewire = "panewire"
+	}
+	for _, h := range rt.ExcludeHosts {
+		if !hostName.MatchString(h) {
+			return c, fmt.Errorf("invalid review.runtug.exclude_hosts entry %q", h)
+		}
+		if h == rt.Host {
+			return c, fmt.Errorf("review.runtug.host %s is also in exclude_hosts", h)
+		}
+	}
+	rt.Command, rt.Jobs, rt.Checkouts, rt.Panewire = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts), Expand(rt.Panewire)
 	if c.Outcomes.Command == "" {
 		c.Outcomes.Command = c.Review.Quota
 	}
@@ -623,6 +668,47 @@ func Duration(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// Age parses a positive duration that also accepts whole days ("14d").
+func Age(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		d, e := strconv.ParseInt(n, 10, 64)
+		// Bound the day count so the multiplication cannot wrap.
+		if e != nil || d <= 0 || d > int64(math.MaxInt64/(24*time.Hour)) {
+			return 0, fmt.Errorf("invalid positive duration %q", s)
+		}
+		return time.Duration(d) * 24 * time.Hour, nil
+	}
+	return Duration(s)
+}
+
+func validateArchive(a *Archive) error {
+	if a.MinAge == "" {
+		a.MinAge = "24h"
+	}
+	if _, e := Age(a.MinAge); e != nil {
+		return e
+	}
+	if a.TextMaxBytes == 0 {
+		a.TextMaxBytes = 1 << 20
+	}
+	if a.TextMaxBytes < 0 || a.TextMaxBytes > ArchiveTextCap {
+		return fmt.Errorf("reap.archive.text_max_bytes must be 1..%d", ArchiveTextCap)
+	}
+	if strings.HasPrefix(a.ArchiveHost, "-") || strings.ContainsAny(a.ArchiveHost, " \t\r\n") {
+		return errors.New("reap.archive.archive_host must be empty, local, or an ssh destination")
+	}
+	if !a.Enabled {
+		return nil
+	}
+	if a.ArchiveHost == "" || a.ArchiveHost == "local" {
+		a.DriveDir = Expand(a.DriveDir)
+	}
+	if a.DriveDir == "" || !filepath.IsAbs(a.DriveDir) || filepath.Clean(a.DriveDir) == "/" {
+		return errors.New("reap.archive.drive_dir must be an absolute path; ~ expands only for a local archive host")
+	}
+	return nil
+}
+
 func installFamily(kind string) string {
 	switch kind {
 	case "command", "release":
@@ -643,6 +729,10 @@ var (
 	containerUser  = regexp.MustCompile(`^[A-Za-z0-9_][-A-Za-z0-9_.:]*$`)
 	volumeValue    = regexp.MustCompile(`^[A-Za-z0-9_./@+-]+$`)
 	containerLabel = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*$`)
+	// laneName and hostName bound the panewire lane and runtug host names
+	// passed as single arguments (runtug splits --exclude-host on commas).
+	laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	hostName = laneName
 )
 
 func validContainerTarget(p string) bool {

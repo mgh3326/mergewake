@@ -244,6 +244,16 @@ func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, 
 	}
 	return shown.Refs.JobID, shown.Title, nil
 }
+// Attachment reads one handoffkeep attachment by its sha256 id.
+func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error) {
+	if !attachmentID.MatchString(sha) {
+		return nil, errors.New("attachment ID must be a sha256 hex digest")
+	}
+	return h.Runner.Run(ctx, h.Command, []string{"attach", "get", sha}, "", "")
+}
+
+var attachmentID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {
 	f, e := os.CreateTemp("", "mergewake-record-*.json")
 	if e != nil {

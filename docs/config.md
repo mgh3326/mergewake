@@ -97,6 +97,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
 | `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 operator env file holding `HUB_TOKEN`, the same file the panewire operator CLI takes. Read at the start of each pass; a file other users can read is refused. |
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
+| `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
@@ -185,6 +186,91 @@ so once every worktree its rows named reached `removed` or `worktree-gone` it
 is skipped outright, and a persistent skip stops polling GitHub every pass.
 A single PR's fetch failure never aborts the pass.
 
+### `reap.archive`
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Gates the reap archive stage and `mergewake archive-jobs`. |
+| `drive_dir` | Required when enabled | Locally synced Google Drive folder on the archive host. Absolute; a leading `~/` expands only when the archive host is this machine. Never commit the real path. |
+| `archive_host` | Empty / `local` | Where `drive_dir` lives: empty or `local` is this machine, anything else a single `ssh(1)` destination reachable from this machine (options, whitespace and leading `-` are refused). |
+| `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
+| `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
+
+A runtug job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
+unit, never its worktree — that is in git and is cleaned by the worktree
+rules above. Archiving runs these steps in order, and any failure keeps the
+local job dir and reports the step:
+
+1. **Plan** (read-only): the jobs dir is resolved on its own host — a
+   leading `~/` is expanded with that host's `$HOME`, since quoted paths
+   never tilde-expand, and a relative one is refused as
+   `jobs-dir-not-absolute`. A job dir that is itself a symlink is refused as
+   `job-dir-symlink` (checked again right before the delete); otherwise
+   list every non-directory entry. Credential-like
+   paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
+   case-insensitively — are excluded from Drive and hk and named in the
+   record. Symlinks and special files are not copied (following a link could
+   archive a secret from outside the job dir). The hk task id comes from the
+   job's runtug events (`events/*-job.task_link.json`, falling back to
+   `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
+   destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
+   job's newest entry. A destination that already holds a `manifest.json` is
+   a finished archive: when that manifest names the same job, host and task
+   with the same files and sizes, the plan is a delete-only `resume` (the
+   files must still hash to the manifest); otherwise it is skipped as
+   `drive-dir-exists`. A job with its own top-level `manifest.json` is
+   skipped as `manifest-collision`.
+2. **Copy**: the remaining regular files are streamed as an uncompressed tar
+   from the job host and unpacked straight into the destination on the
+   archive host, relayed through this machine (`ssh` on either side as
+   configured); the Drive copy is a plain directory, not an archive file. A
+   job with nothing but excluded or non-regular entries copies nothing.
+3. **Verify**: every file's sha256 is computed on both sides and must match;
+   a missing, duplicate or unexpected hash record fails the archive.
+4. **hk attachments**: each text file under `text_max_bytes` goes through
+   `handoffkeep attach put`; its returned sha256 must match. `attach put`
+   has no task reference, so the ids are tied to the task by the comment.
+5. **Record**: `manifest.json` (job, host, task, source, every file's path,
+   size and sha256, excluded and skipped paths, attachment ids) is attached
+   to hk, then `handoffkeep tasks comment <task>` posts the Drive directory,
+   file count, total bytes, the manifest's attachment id, every attachment
+   id, the excluded and skipped names, and the per-file sha256 list (the
+   first 200; the rest are in `manifest.json`).
+6. **Manifest**: only then is `manifest.json` written beside the files, so a
+   failed upload or comment leaves no manifest and the job is retried in
+   full.
+7. **Delete**: the job dir is listed again and must be unchanged — a file
+   added or modified since the plan was never archived, so the job is kept
+   as `job-changed` — then removed with `rm -rf`. Excluded credential files
+   go with it; their names stay in the record.
+
+The hk command is `sink.command` when the sink is `handoffkeep`, otherwise
+`handoffkeep`. The job host needs `find`, `stat`, `tar`, `xargs` and
+`sha256sum` or `shasum`; the archive host `tar` and the same hashing tools;
+this machine `bash`. A job dir whose listing exceeds the 4 MiB command
+output limit fails and is kept.
+
+In the reap role the stage runs after the PR loop, from `reap.jsonl`: each
+job whose pane reap `closed` (the row's `job`, or the directory of its saved
+report for older rows) is archived once that close is older than `min_age`.
+It needs no GitHub call. Acting needs `reap.act` and `--apply` like every
+reap mutation; otherwise the plan — what moves to Drive, what goes to hk,
+what is excluded and what would be deleted — is printed as an
+`archive-plan` line with a `would-archive` row (shadow `would-close` rows are
+planned too, once per job in the daemon). A job whose name is again a live
+pane is skipped as `pane-live`. Each outcome is an `archive-job` row in
+`reap.jsonl` with the Drive directory, hk ids and excluded names; `archived`
+and every refusal other than `pane-live`/`pane-scan-failed` are final, and a
+failed attempt is retried at most once an hour.
+
+`mergewake archive-jobs [--older-than 14d] [--host NAME] [--dry-run|--apply]`
+runs the same plan and apply over a host's existing backlog: every job dir in
+`hosts[].jobs` whose newest entry is older than `--older-than` (default
+`min_age`), skipping names that are a live pane or hold a pane's cwd — a host
+whose pane list cannot be read is skipped whole. Without `--apply` it only
+plans; rows go to `<state_dir>/archive-jobs.jsonl` unless `--dry-run`. It
+needs no GitHub token.
+
 ### `review`
 
 | Key | Default | Meaning |
@@ -203,8 +289,11 @@ A single PR's fetch failure never aborts the pass.
 | `runtug.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
 | `runtug.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `runtug.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
-| `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root; the pane's brief, findings and report live in `<jobs>/<label>/`. |
-| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`. |
+| `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
+| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the PR-head-branch worktrees created from the repo's `root`; runtug names the remote worktree after the checkout. |
+| `runtug.lane` | `runtug.owner` | panewire lane the pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings. |
+| `runtug.panewire` | `panewire` | panewire executable for reading that lane; it takes the hub connection from `PANEWIRE_HUB_URL` and `PANEWIRE_HUB_TOKEN_ENV` in mergewake's environment. |
+| `runtug.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a runtug whose `spawn` has `--exclude-host`). Must not contain `runtug.host`. |
 
 #### Runtug executor
 
@@ -213,38 +302,64 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
 1. The PR's `Mergewake-Task` trailer (PR body, then head commit) is read
    through the handoffkeep sink; the task's `refs.job_id` is the author's
    runtug job and its title marker (`(grade A, T2)`) gives `--t`.
-2. The pass claim is taken, then `git -C <root> fetch origin pull/<n>/head
-   <base>` and `git worktree add --detach` create a checkout of the exact head
-   under `runtug.checkouts`.
-3. mergewake writes a brief naming the PR, head SHA, base, lens, the author
-   family, the output contract and the same PR context (answered findings,
-   operator decisions) the headless prompt carries, then runs `runtug spawn -c <checkout> -m auto
-   -p <brief> -l mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --parent-job <author job>
-   --role reviewer --report <jobs>/<label>/report.md --wait --wait-timeout <rest
-   of review.timeout>`. runtug picks host and model and, for the reviewer
-   role, excludes the author job's family. Exit 77 (no admitted seat outside
-   that family) retries once with `--role worker`, which may pick the author's
-   family; the receipt records that as `fallback`.
-4. The pane writes `{"findings":[…]}` to `<jobs>/<label>/findings.json` and
-   runs `runtug done`. The file goes through the same validation as headless
-   output (new-side diff lines, severities, at most 50) and is posted with the
-   same receipt, claim and done marker. The receipt adds `"executor":"runtug"`,
+2. A fork PR (head repository other than the repo) is not offered: runtug can
+   replicate only a branch origin carries. The pass claim is taken, then
+   `git -C <root> fetch --no-tags origin pull/<n>/head <base>
+   +refs/heads/<branch>:refs/remotes/origin/<branch>` and a worktree on the
+   PR head branch at the exact head SHA is added under `runtug.checkouts`
+   (`git worktree add -b <branch> <checkout> <sha>`). A local branch of that
+   name that already exists is used only when it points at the head, and is
+   never moved; at another commit the pass falls back. A branch mergewake
+   created is deleted with the worktree after the wait.
+3. mergewake writes a brief naming the PR, head SHA, branch, base, lens, the
+   author family, the output contract and the same PR context (answered
+   findings, operator decisions) the headless prompt carries, then runs
+   `runtug spawn -c <checkout> -m auto -p <brief> -l
+   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> --builder-job <author job> --builder-family <author family> --role
+   reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
+   --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
+   for the reviewer role, excludes the author job's family; on another host it
+   clones the repo under `$HOME/work` and adds a worktree tracking
+   `origin/<branch>`. Exit 77 (no admitted seat outside that family) retries
+   once with `--role worker`, which may pick the author's family; the receipt
+   records that as `fallback`.
+4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
+   mismatch (the branch moved, or a stale remote worktree) it writes
+   `{"refused":"…"}` instead of reviewing, and the pass falls back. Otherwise
+   it writes `{"findings":[…]}` to `findings.json` in its job directory
+   (`<jobs>/<label>/` here, runtug's jobs root on another host). With a
+   findings lane it uploads the file with `handoffkeep attach put` and emits
+   `panewire emit --kind lane.event --lane <lane> --deliver inbox --type report
+   --event-id <label>-findings --text '[<label>] findings attachment=<sha256>'`,
+   then runs `runtug done`.
+5. After the wait, mergewake looks for that event on the lane, fetches the
+   attachment with `handoffkeep attach get` (through the handoffkeep sink) and
+   acknowledges the inbox item; without an event it reads
+   `<jobs>/<label>/findings.json`, which exists only when the pane ran on this
+   host. Both are retried every 5s for up to 30s (at most half the remaining
+   deadline). The findings go through the same validation as headless output
+   (new-side diff lines, severities, at most 50) and are posted with the same
+   receipt, claim and done marker. The receipt adds `"executor":"runtug"`,
    the reviewer is `runtug:<seat>`, and the family is the one runtug recorded
-   on the job's `job.spawned` event (or the profile whose gate profile is the
-   seat); an unknown family counts as same-family. The checkout is removed
-   after the wait.
+   on the job's `job.spawned` event in `<jobs>/<label>/events` (or the profile
+   whose gate profile is the seat); an unknown family counts as same-family.
+   A pane on another host records its spawn there, so its family comes from
+   the profile mapping. The checkout is removed after the wait.
 
-No task trailer, no bound job, no repo `root`, a failed checkout, a runtug
-refusal or wait failure, a missing findings file or rejected findings all fall
-back to the headless executor for that pass under the same claim; its receipt
-records `"fallback":"runtug: <reason>"`. All executors share
-`review.timeout`, so a pane that used the whole deadline leaves nothing for
-the fallback. In runtug mode a failing quota tool is not fatal: it only
-leaves the headless fallback without candidates. Passes of a blocking PR are
-separate panes; runtug enforces only the author-family exclusion between them.
-The findings file is read from `runtug.jobs` on the host running mergewake,
-so a pane placed on another host must share that jobs directory (or pin
-`runtug.host`).
+No task trailer, no bound job, no repo `root`, a fork PR, a failed checkout or
+a local branch at another commit, a runtug refusal or wait failure, a
+refusal by the pane, no findings or rejected findings all fall back to the
+headless executor for that pass under the same claim; its receipt records
+`"fallback":"runtug: <reason>"`. All executors share `review.timeout`, so a
+pane that used the whole deadline leaves nothing for the fallback. In runtug
+mode a failing quota tool is not fatal: it only leaves the headless fallback
+without candidates. Passes of a blocking PR are separate panes; runtug
+enforces only the author-family exclusion between them.
+
+runtug fails closed when the remote host cannot hold the branch at the head:
+an existing local branch of that name there (for example the author's own
+worktree on that host) that is checked out or behind the head is a placement
+refusal for that pass, which falls back to headless.
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths
@@ -687,7 +802,8 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
-| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |

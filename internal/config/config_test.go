@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStrictConfig(t *testing.T) {
@@ -75,6 +77,16 @@ func TestReapConfig(t *testing.T) {
 		{"hub token rel", "reap:\n  hub: {url: 'https://hub.example.invalid', token_file: op.env}\n", true},
 		{"machine needs panewire", "hosts:\n  - {name: node, machine: node-a}\n", true},
 		{"bad machine", "reap:\n  hub: {url: 'https://hub.example.invalid', token_file: /etc/op.env}\nhosts:\n  - {name: node, machine: 'Node A'}\n", true},
+		{"archive off", "reap:\n  archive: {drive_dir: rel}\n", false},
+		{"archive local", "reap:\n  archive: {enabled: true, drive_dir: '~/Drive/jobs', min_age: 14d}\n", false},
+		{"archive ssh", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: /Users/ops/Drive/jobs, text_max_bytes: 4096}\n", false},
+		{"archive no dir", "reap:\n  archive: {enabled: true}\n", true},
+		{"archive ssh home", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: '~/Drive'}\n", true},
+		{"archive root", "reap:\n  archive: {enabled: true, drive_dir: /}\n", true},
+		{"archive ssh option", "reap:\n  archive: {enabled: true, archive_host: '-oProxy=x', drive_dir: /d}\n", true},
+		{"archive bad age", "reap:\n  archive: {min_age: 0d}\n", true},
+		{"archive text cap", "reap:\n  archive: {text_max_bytes: 4194304}\n", true},
+		{"archive unknown key", "reap:\n  archive: {drive: /d}\n", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "config.yaml")
@@ -107,6 +119,12 @@ func TestReapConfig(t *testing.T) {
 				}
 				if c.Reap.Transport != want {
 					t.Fatalf("transport %q, want %q", c.Reap.Transport, want)
+				}
+				if a := c.Reap.Archive; a.TextMaxBytes == 0 || a.MinAge == "" {
+					t.Fatalf("archive defaults missing: %+v", a)
+				}
+				if tt.name == "archive local" && !filepath.IsAbs(c.Reap.Archive.DriveDir) {
+					t.Fatal("local drive_dir did not expand")
 				}
 			}
 		})
@@ -268,9 +286,9 @@ func TestCanonicalFamily(t *testing.T) {
 		"claude": "anthropic", "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic", "haiku": "anthropic", "kiro": "anthropic",
 		"codex": "openai", "sol": "openai", "gpt": "openai",
 		"devin": "cognition", "swe": "cognition",
-		"grok": "xai",
+		"grok":   "xai",
 		"gemini": "google", "agy": "google",
-		"kimi": "moonshot",
+		"kimi":       "moonshot",
 		" Claude ":   "anthropic",
 		"ANTHROPIC":  "anthropic",
 		"openai":     "openai",
@@ -376,9 +394,29 @@ func TestReviewExecutor(t *testing.T) {
 	if e != nil || c.Review.Executor != "runtug" || c.Review.Runtug.Owner != "review-desk" || c.Review.Runtug.Host != "host-b" || c.Review.Runtug.Checkouts != "/work/reviews" {
 		t.Fatalf("%+v %v", c.Review, e)
 	}
-	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {lane: x}\n"} {
+	if rt := c.Review.Runtug; rt.Lane != "review-desk" || rt.Panewire != "panewire" || rt.ExcludeHosts != nil {
+		t.Fatalf("lane defaults to owner: %+v", rt)
+	}
+	c, e = load("review:\n  runtug: {owner: review-desk, lane: findings-desk, exclude_hosts: [host-a, host-b]}\n")
+	if rt := c.Review.Runtug; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
+		t.Fatalf("%+v %v", rt, e)
+	}
+	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {bogus: x}\n", "review:\n  runtug: {lane: 'a b'}\n", "review:\n  runtug: {exclude_hosts: ['a,b']}\n", "review:\n  runtug: {host: host-a, exclude_hosts: [host-a]}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
+
+func TestAge(t *testing.T) {
+	for in, want := range map[string]time.Duration{"14d": 14 * 24 * time.Hour, "36h": 36 * time.Hour, "1d": 24 * time.Hour} {
+		if got, e := Age(in); e != nil || got != want {
+			t.Errorf("Age(%q) = %v, %v", in, got, e)
+		}
+	}
+	for _, in := range []string{"", "0d", "-1d", "d", "1.5d", "0s", "10000000000d", "106752d"} {
+		if _, e := Age(in); e == nil {
+			t.Errorf("Age(%q) accepted", in)
 		}
 	}
 }
