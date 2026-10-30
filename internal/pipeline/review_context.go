@@ -21,7 +21,9 @@ const (
 )
 
 var (
-	headingLine    = regexp.MustCompile(`^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
+	headingLine    = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$`)
+	setextRule     = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
+	setextText     = regexp.MustCompile(`^ {0,3}[^ \t#>*+\-=` + "`~" + `]`)
 	fenceLine      = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 	severityPrefix = regexp.MustCompile(`^<!-- mergewake-severity:[a-z]+ -->\s*`)
 )
@@ -131,17 +133,28 @@ func operatorDecisions(body string) string {
 		if open != "" {
 			continue
 		}
-		m := headingLine.FindStringSubmatch(l)
-		if m == nil {
+		lv, text := 0, ""
+		if m := headingLine.FindStringSubmatch(l); m != nil {
+			lv, text = len(m[1]), m[2]
+		} else if setextText.MatchString(l) && i+1 < len(lines) {
+			// A text line over a === or --- rule is a level 1 or 2 heading.
+			if u := setextRule.FindStringSubmatch(lines[i+1]); u != nil {
+				lv, text = 1, l
+				if u[1][0] == '-' {
+					lv = 2
+				}
+			}
+		}
+		if lv == 0 {
 			continue
 		}
 		if start < 0 {
-			if strings.EqualFold(strings.TrimRight(strings.TrimSpace(m[2]), ":"), "operator decisions") {
-				start, level = i, len(m[1])
+			if strings.EqualFold(strings.TrimRight(strings.TrimSpace(text), ":"), "operator decisions") {
+				start, level = i, lv
 			}
 			continue
 		}
-		if len(m[1]) <= level {
+		if lv <= level {
 			return strings.TrimSpace(strings.Join(lines[start:i], "\n"))
 		}
 	}

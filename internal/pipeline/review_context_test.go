@@ -59,6 +59,12 @@ func TestOperatorDecisionsSection(t *testing.T) {
 		{"short fence inside a longer one", "````\n```\n## Operator decisions\nfake\n```\n````\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
 		{"tilde fence does not close a backtick fence", "```\n~~~\n## Operator decisions\nfake\n", ""},
 		{"closing fence may be longer", "```\ncode\n`````\n## Operator decisions\nkeep", "## Operator decisions\nkeep"},
+		{"bare empty heading ends the section", "## Operator decisions\nkeep\n##\nafter", "## Operator decisions\nkeep"},
+		{"hash without space is text", "## Operator decisions\nkeep\n#tag\nstill", "## Operator decisions\nkeep\n#tag\nstill"},
+		{"setext level 1", "Operator decisions\n=====\nkeep\nSub\n----\nmore\nNext\n====\nno", "Operator decisions\n=====\nkeep\nSub\n----\nmore"},
+		{"setext level 2 ends a level 2 section", "## Operator decisions\nkeep\nNext\n---\nno", "## Operator decisions\nkeep"},
+		{"rule after a blank line is not a heading", "## Operator decisions\nkeep\n\n---\nmore", "## Operator decisions\nkeep\n\n---\nmore"},
+		{"list item over a rule is not a heading", "## Operator decisions\n- keep\n---\nmore", "## Operator decisions\n- keep\n---\nmore"},
 		{"absent", "no such section", ""},
 	} {
 		if got := operatorDecisions(tt.body); got != tt.want {
