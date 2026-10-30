@@ -96,7 +96,7 @@ func TestGateTriageClass(t *testing.T) {
 	}{
 		{"unanswered medium", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaB)},
 		{"missing severity needs an answer", "triage_unanswered:1", gradedThread("review-bot", "", false, shaB)},
-		{"reply from the finding author does not answer", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaA, [2]string{"review-bot", "User"})},
+		{"operator reply under the review login answers its own finding", "", gradedThread("review-bot", "medium", false, shaA, [2]string{"review-bot", "User"})},
 		{"bot reply does not answer", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaA, [2]string{"ci[bot]", "Bot"})},
 		{"human reply answers without a new head", "", gradedThread("review-bot", "medium", false, shaA, human)},
 		{"resolved medium on the current head is not held", "", gradedThread("review-bot", "medium", true, shaA)},
@@ -314,5 +314,15 @@ func TestGateCommentlessThread(t *testing.T) {
 	}
 	if got := reasons(verdict(t, gradedPolicy, 0, github.ReviewThread{IsResolved: true})); got != "" {
 		t.Fatalf("resolved commentless thread: %q", got)
+	}
+}
+
+// A follow-up finding posted under the review login (it carries a severity
+// marker) is not an answer to the earlier own-review finding.
+func TestGateOwnFindingFollowUpFindingIsNotAnAnswer(t *testing.T) {
+	th := gradedThread("review-bot", "medium", false, shaA)
+	th.Comments = append(th.Comments, github.ReviewComment{Author: "review-bot", AuthorType: "User", Body: "<!-- mergewake-severity:low -->\nanother finding"})
+	if v := verdict(t, "review_gate:\n  land: graded\n", 400, th); reasons(v) != "triage_unanswered:1" {
+		t.Fatalf("reasons=%q", reasons(v))
 	}
 }
