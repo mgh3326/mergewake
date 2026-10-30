@@ -36,6 +36,7 @@ type fakeGH struct {
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
 	requiredBots                                                 []string
+	policyExtra                                                  string
 	required                                                     []string
 	findings                                                     int
 	passes                                                       map[string][]github.PassReceipt
@@ -101,7 +102,7 @@ func (g *fakeGH) ReadFile(_ context.Context, _, sha, name string) ([]byte, error
 				text += "review_gate: {}\n"
 			}
 		}
-		return []byte(text), nil
+		return []byte(text + g.policyExtra), nil
 	}
 	return []byte("payload"), nil
 }
