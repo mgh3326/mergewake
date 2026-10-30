@@ -15,7 +15,7 @@ import (
 func notifySetup(t *testing.T) (*Service, *fakeGH, *fakeNotifier, config.Repo) {
 	t.Helper()
 	s, g, _, n, r := setup(t)
-	g.reviewed = true
+	markReviewed(g)
 	g.pull.Title = "Add feature"
 	yes := true
 	g.pull.Mergeable = &yes
@@ -70,6 +70,7 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	}
 	// A new head resets: the next head notifies again.
 	g.pull.Head.SHA = shaC
+	markReviewed(g)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -88,6 +89,7 @@ func TestNotifyEventIDUsesFullHead(t *testing.T) {
 	// Same sha7 prefix as shaA, different tail — a new head must re-notify
 	// under a distinct event ID rather than colliding with the first.
 	g.pull.Head.SHA = shaA[:7] + strings.Repeat("d", 33)
+	markReviewed(g)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -119,7 +121,7 @@ func TestNotifyPendingSilentAndFailingNames(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 1 || !strings.Contains(lastEvent(t, n), "[mergewake] BLOCKED example/project#7 head=aaaaaaa | failing checks: vet") {
+	if n.count != 1 || !strings.Contains(lastEvent(t, n), "[mergewake] BLOCKED example/project#7 head=aaaaaaa | check_failed:vet") {
 		t.Fatalf("%+v", n.events)
 	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
@@ -130,33 +132,28 @@ func TestNotifyPendingSilentAndFailingNames(t *testing.T) {
 	}
 }
 
-// With checks green, a blocking-class head missing its second pass reports the
-// gap; open gate findings and conflicts report their own reasons.
+// With checks green, BLOCKED names the closed-vocabulary reason that holds the
+// head: missing review marker, open threads, a stale base or a conflict.
 func TestNotifyBlockedReasons(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		prepare func(*fakeGH)
 		reason  string
 	}{
-		{"needs 2nd review", func(g *fakeGH) {
-			g.blocking = true
-			g.reviewed = false
-			g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic", Lens: "correctness"}}}
-		}, "needs 2nd review"},
-		{"open blocking findings", func(g *fakeGH) {
-			g.feedback.Threads = []github.ReviewThread{{ID: "t1", Path: "tool", Comments: []github.ReviewComment{{Author: "coderabbitai[bot]", CommitSHA: shaA, Body: "Critical problem here"}}}}
-		}, "open blocking findings: 1"},
-		{"unanswered findings", func(g *fakeGH) {
-			g.feedback.Threads = []github.ReviewThread{{ID: "t1", Path: "tool", Comments: []github.ReviewComment{{Author: "coderabbitai[bot]", CommitSHA: shaA, Body: "Major problem here"}}}}
-		}, "unanswered findings: 1"},
-		{"conflicts", func(g *fakeGH) {
+		{"review missing", func(g *fakeGH) {
+			g.refs = map[string]bool{}
+		}, "review_missing"},
+		{"threads open", func(g *fakeGH) {
+			g.findings = 2
+		}, "threads_open:2"},
+		{"stale base", func(g *fakeGH) {
+			g.stale = true
+		}, "base_stale"},
+		{"conflict", func(g *fakeGH) {
 			no := false
 			g.pull.Mergeable = &no
 			g.pull.MergeableState = "dirty"
-		}, "conflicts"},
-		{"main CI red", func(g *fakeGH) {
-			g.checks = map[string]github.CI{shaA: github.Green, shaB: github.Red}
-		}, "main CI red"},
+		}, "conflict"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
@@ -228,21 +225,21 @@ func TestNotifyLaneRouting(t *testing.T) {
 // quiet, drafts and disabled notify emit nothing, and dry-run writes no keys.
 func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	s, g, n, r := notifySetup(t)
-	g.feedback.Threads = []github.ReviewThread{{ID: "t1", Path: "tool", Comments: []github.ReviewComment{{Author: "coderabbitai[bot]", CommitSHA: shaA, Body: "Critical problem here"}}}}
+	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if n.count != 1 || !strings.Contains(lastEvent(t, n), "BLOCKED") {
 		t.Fatalf("%+v", n.events)
 	}
-	g.feedback.Threads = nil
+	g.findings = 0
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if n.count != 2 || !strings.Contains(lastEvent(t, n), "READY") {
 		t.Fatal("recovery did not notify")
 	}
-	g.feedback.Threads = []github.ReviewThread{{ID: "t2", Path: "tool", Comments: []github.ReviewComment{{Author: "coderabbitai[bot]", CommitSHA: shaA, Body: "Critical again"}}}}
+	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}

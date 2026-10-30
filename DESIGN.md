@@ -82,18 +82,20 @@ and any listed kind; omitting kinds means all kinds. Blocking wins over routine.
 Renames test both the old and new names. Unknown kinds and empty change lists
 classify as blocking. A truncated file list stops landing.
 
-Every required named check must have an explicit successful result at the PR
-head. Missing, queued, skipped, neutral, and ambiguous check/status evidence
-cannot be green. A routine PR can merge before the advisory review finishes.
-A blocking PR needs the trusted independent-review marker for that head, zero
-unresolved review threads (including outdated ones), and no outstanding changes
-requests. Reviewing a subsequent head is another single pass, not a review round.
+The merge gate holds all of these for one head: every required named check
+succeeded at the head (missing, queued, skipped, neutral, and ambiguous
+check/status evidence cannot be green and waits silently), zero unresolved
+review threads, the `mergewake/reviews/<pr>/<head>-done` marker for a reviewed
+head, the base branch an ancestor of the head, and a mergeable PR. A blocking
+PR still needs its two review passes because the marker is only written once
+every required pass is posted. Reviewing a subsequent head is another single
+pass, not a review round.
 
-Before acting, landing rechecks base policy revision, CI, PR readiness, and
-blocking findings. GitHub's merge call includes the expected head SHA and squash
-method. GitHub handles concurrent main changes and conflicts. There is no global
-merge lock or forced rebase. Review resolution and the merge call cannot be one
-GitHub transaction; a new finding can still race the final check. Native branch
+Before acting, landing re-runs the whole gate on a fresh PR read, base head and
+policy revision, then merges through GitHub's SHA-bound squash call. A head
+that moved since the verdict is never merged. There is no global merge lock or
+forced rebase. Review resolution and the merge call cannot be one GitHub
+transaction; a new finding can still race the final check. Native branch
 rules remain available to a repository that requires stronger enforcement.
 
 ## Independent review

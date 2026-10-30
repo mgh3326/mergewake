@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mgh3326/mergewake/internal/github"
 )
 
-func TestRoutineRequiresExactHeadReview(t *testing.T) {
+// The review marker is head-bound: a marker for another head, or none at all,
+// blocks with review_missing; only the current head's -done ref merges.
+func TestLandMarkerBoundToHead(t *testing.T) {
 	for _, which := range []string{"missing", "stale", "current"} {
 		t.Run(which, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
@@ -19,7 +19,7 @@ func TestRoutineRequiresExactHeadReview(t *testing.T) {
 				head = g.pull.Head.SHA
 			}
 			if which != "missing" {
-				g.passes = map[string][]github.PassReceipt{head: {{Pass: 1}}}
+				g.refs = map[string]bool{doneRef(7, head): true}
 			}
 			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 				t.Fatal(err)
@@ -35,72 +35,92 @@ func TestRoutineRequiresExactHeadReview(t *testing.T) {
 	}
 }
 
-func TestLandOptionalBotsNeverHold(t *testing.T) {
-	for _, configured := range []bool{false, true} {
-		t.Run(map[bool]string{false: "absent gate", true: "configured gate"}[configured], func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.reviewed = true
-			g.gate = configured
-			g.feedback.ReviewAuthors = nil
-			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if g.mergeCount != 1 || landAction(t, s, r.Name) != "merge" {
-				t.Fatal("optional bots held landing")
-			}
-		})
+// A stale base is its own verdict even on an otherwise ready head: the worker
+// updates the branch, which produces a new head to gate.
+func TestLandStaleBaseBlocks(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.stale = true
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("stale-base head merged")
+	}
+	g.stale = false
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 1 {
+		t.Fatal("fresh base did not land")
 	}
 }
 
-func TestOwnBlockingFindingsHold(t *testing.T) {
-	for _, severity := range []string{"", "medium", "low"} {
-		for _, configured := range []bool{false, true} {
-			t.Run(severity+map[bool]string{false: " absent", true: " configured"}[configured], func(t *testing.T) {
-				s, g, _, _, r := setup(t)
-				g.enabled = true
-				g.blocking = true
-				g.reviewed = true
-				g.gate = configured
-				body := "finding"
-				if severity != "" {
-					body = "<!-- mergewake-severity:" + severity + " --> finding"
-				}
-				g.feedback.Threads = []github.ReviewThread{{Path: "tool", Line: 1, Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, Body: body}, {Author: "dev", AuthorType: "User", Body: "ok"}}}}
-				if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-					t.Fatal(err)
-				}
-				if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-blocking-findings" {
-					t.Fatal("unresolved own finding landed")
-				}
-			})
-		}
+// Any unresolved review thread holds the head regardless of who opened it;
+// resolving it releases the merge.
+func TestLandOpenThreadsBlock(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.findings = 3
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("unresolved threads landed")
+	}
+	g.findings = 0
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 1 {
+		t.Fatal("resolved threads did not land")
 	}
 }
 
-func TestDistinctPassesAndLenses(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		passes []github.PassReceipt
-		want   int
-	}{
-		{"duplicate pass one", []github.PassReceipt{{Pass: 1, Family: "openai", Lens: "correctness"}, {Pass: 1, Family: "openai", Lens: "correctness"}}, 0},
-		{"same family same lens", []github.PassReceipt{{Pass: 1, Family: "openai", Lens: "correctness", SameFamily: true}, {Pass: 2, Family: "openai", Lens: "correctness", SameFamily: true}}, 0},
-		{"same family distinct lenses", []github.PassReceipt{{Pass: 1, Family: "openai", Lens: "correctness", SameFamily: true}, {Pass: 2, Family: "openai", Lens: "state-risk", SameFamily: true}}, 1},
-		{"missing family unknown", []github.PassReceipt{{Pass: 1}, {Pass: 2}}, 0},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.blocking = true
-			g.passes = map[string][]github.PassReceipt{g.pull.Head.SHA: tt.passes}
-			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if g.mergeCount != tt.want {
-				t.Fatalf("merges=%d", g.mergeCount)
-			}
-		})
+// A conflicting PR is blocked; mergeable evidence GitHub has not computed yet
+// waits silently.
+func TestLandConflictAndUnknownMergeable(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	no := false
+	g.pull.Mergeable = &no
+	g.pull.MergeableState = "dirty"
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("conflicting PR merged")
+	}
+
+	s, g, _, _, r = setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.pull.Mergeable = nil
+	g.pull.MergeableState = "unknown"
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "pending" {
+		t.Fatal("uncomputed mergeable merged")
+	}
+}
+
+// The -done marker a review leaves is the gate's review evidence: a completed
+// review makes the head landable without further review bookkeeping.
+func TestReviewDoneMarkerLands(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 1 {
+		t.Fatal("reviewed head did not land")
 	}
 }
 
@@ -122,27 +142,6 @@ func TestReviewReclaimsExpiredClaim(t *testing.T) {
 			}
 			if g.postCount != want || s.Runner.(*fakeRunner).calls != want {
 				t.Fatalf("posts=%d output=%s", g.postCount, out.String())
-			}
-		})
-	}
-}
-
-func TestBlockFindingsApplyWithoutGateSection(t *testing.T) {
-	for _, configured := range []bool{false, true} {
-		t.Run(map[bool]string{false: "absent", true: "present"}[configured], func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.reviewed = true
-			g.gate = configured
-			g.feedback.Threads = []github.ReviewThread{{Path: "tool", Line: 1, IsResolved: true, ResolvedBy: "pr-author", ResolvedByType: "User", Comments: []github.ReviewComment{
-				{Author: "chatgpt-codex-connector", CommitSHA: shaA, AuthorType: "Bot", Body: "P1 concrete bug"},
-				{Author: "pr-author", AuthorType: "User", Body: "ok"},
-			}}}
-			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if g.mergeCount != 0 || landAction(t, s, r.Name) != "wait-for-blocking-findings" {
-				t.Fatal("answered, manually resolved P1 landed")
 			}
 		})
 	}

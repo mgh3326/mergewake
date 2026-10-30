@@ -1,5 +1,6 @@
 version: 1
-# Omission also means shadow. Opt in only after inspecting recorded decisions.
+# Omission also means shadow: no auto-merge, no recovery writes. Opt in only
+# after inspecting recorded decisions.
 enabled: false
 required_checks: [CI]
 blocking:

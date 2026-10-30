@@ -104,79 +104,10 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	return p, p.Validate()
 }
 
-// reviewGate grades only current-head findings. CI bots are optional unless
-// the trusted policy explicitly names them in required_bots. The caller has
-// already verified the mandatory exact-head mergewake passes.
-func (s *Service) reviewGate(ctx context.Context, r config.Repo, n int, class string, p policy.Policy, head string) (string, *policy.GateVerdict, []string, error) {
-	fb, e := s.GH.ReviewFeedback(ctx, r.Name, n)
-	if e != nil {
-		return "", nil, nil, e
-	}
-	if fb.HeadSHA != head {
-		return "", nil, nil, errors.New("review feedback is not bound to the decision head")
-	}
-	gate := policy.ReviewGate{}.WithDefaults()
-	if p.ReviewGate != nil {
-		gate = p.ReviewGate.WithDefaults()
-	}
-	login := policy.NormalizeAuthor(s.Config.Review.Login)
-	if login != "" {
-		gate.Block = append(gate.Block,
-			policy.ReviewGateRule{Author: login, Severity: []string{"critical", "high", "blocking"}},
-			policy.ReviewGateRule{Author: login, Severity: []string{"major", "medium", "minor", "low", "unspecified", ""}, Classes: []string{"blocking"}})
-	}
-	bots := gate.GateAuthors()
-	for _, a := range gate.IgnoreAuthors {
-		bots[policy.NormalizeAuthor(a)] = true
-	}
-	var fs []policy.ReviewFinding
-	for _, f := range fb.Findings(bots, login) {
-		if f.CommitSHA == head {
-			fs = append(fs, f)
-		}
-	}
-	v := gate.Evaluate(fs, class)
-	missing := gate.MissingRequiredBots(fs, fb.ReviewAuthors, head)
-	switch {
-	case len(v.Blocking) > 0:
-		return "wait-for-blocking-findings", &v, missing, nil
-	case len(v.Triage) > 0:
-		return "wait-for-triage-reply", &v, missing, nil
-	case len(missing) > 0:
-		return "wait-for-required-bots", &v, missing, nil
-	}
-
-	return "", &v, missing, nil
-}
-
-// distinctPasses validates numbered passes and independent lenses when the
-// same reviewer family supplies both passes. Duplicates never add coverage.
-func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
-	passes := map[int]github.PassReceipt{}
-	for _, r := range receipts {
-		if r.Pass < 1 || r.Pass > needed {
-			continue
-		}
-		if prior, ok := passes[r.Pass]; ok && prior != r {
-			return len(passes), false
-		}
-		passes[r.Pass] = r
-	}
-	if len(passes) < needed {
-		return len(passes), false
-	}
-	if needed == 2 {
-		a, b := passes[1], passes[2]
-		if a.Family == "" || b.Family == "" {
-			return len(passes), false
-		}
-		if config.CanonicalFamily(a.Family) == config.CanonicalFamily(b.Family) && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
-			return len(passes), false
-		}
-	}
-	return len(passes), true
-}
-
+// Land runs the merge gate once for a single PR (the same gate the pr role's
+// notice reports) and, when the verdict is ready and the repository policy
+// opted in with enabled, squash-merges pinned to the gated head. A dry run
+// prints the verdict only.
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -203,110 +134,32 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
-	files, e := s.GH.Files(ctx, r.Name, n)
+	v, e := s.mergeGate(ctx, r, pr, p, head)
 	if e != nil {
 		return e
 	}
-	if len(files) != pr.ChangedFiles {
-		return errors.New("incomplete PR file list")
-	}
-	d := p.ClassifyGuarded(files, r.Policy)
-	d.Shadow = d.Shadow || o.Shadow
-	d.Action = "wait-for-ci"
-	// While main is red or its required evidence is unknown, ordinary landing
-	// pauses; only a recovery PR from the watch latch may still land.
-	watchChecks := p.RequiredChecks
-	if len(p.WatchChecks) > 0 {
-		watchChecks = p.WatchChecks
-	}
-	mainCI, e := s.GH.Check(ctx, r.Name, head, watchChecks)
-	if e != nil {
-		return e
-	}
-	recovery := pr.Head.Ref == github.RecoveryBranch && pr.Head.Repo.FullName == r.Name
-	paused := mainCI != github.Green && !recovery
-	if paused {
-		d.Action = "pause-red-main"
-		if mainCI != github.Red {
-			d.Action = "pause-main-unknown"
-		}
-		if d.Shadow {
-			d.Action = "would-" + d.Action
-		}
-	}
-	ci, e := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
-	if e != nil {
-		return e
-	}
-	var verdict *policy.GateVerdict
-	var missingBots []string
-	var reviewed *int
-	sameFamily := false
-	if !paused && ci == github.Green {
+	d := policy.Decision{Reasons: v.Reasons, Shadow: !p.Enabled || o.Shadow}
+	d.Action = v.State
+	if v.State == "ready" {
 		d.Action = "merge"
-		needed := 1
-		if d.Class == "blocking" {
-			needed = 2
-		}
-		receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
-		if e != nil {
-			return e
-		}
-		count, complete := distinctPasses(receipts, needed)
-		reviewed = &count
-		for _, receipt := range receipts {
-			sameFamily = sameFamily || receipt.SameFamily
-		}
-		if !complete {
-			d.Action = "wait-for-independent-review"
-		}
-
-		if d.Action == "merge" {
-			action, v, g, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
-			if e != nil {
-				return e
-			}
-			verdict, missingBots = v, g
-			if action != "" {
-				d.Action = action
-			}
-		}
 	}
 	if e = s.audit(r.Name, "land", struct {
-		PR          int                 `json:"pr"`
-		Head        string              `json:"head"`
-		Base        string              `json:"base"`
-		CI          github.CI           `json:"ci"`
-		Main        github.CI           `json:"main"`
-		Reviews     *int                `json:"review_passes,omitempty"`
-		Findings    *policy.GateVerdict `json:"findings,omitempty"`
-		MissingBots []string            `json:"missing_required_bots,omitempty"`
-		SameFamily  bool                `json:"same_family,omitempty"`
+		PR    int    `json:"pr"`
+		Head  string `json:"head"`
+		Base  string `json:"base"`
+		State string `json:"state"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, ci, mainCI, reviewed, verdict, missingBots, sameFamily, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, v.State, d}, o.DryRun); e != nil {
 		return e
 	}
-	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, sameFamily, o.DryRun); e != nil {
+	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, false, o.DryRun); e != nil {
 		return e
 	}
-	if d.Action != "merge" || d.Shadow || o.DryRun {
+	if v.State != "ready" || d.Shadow || o.DryRun {
 		return nil
 	}
-	// Recheck CI and the trusted policy revision immediately before SHA-bound merge.
-	fresh, e := s.GH.Head(ctx, r.Name, r.Branch)
-	if e != nil {
-		return e
-	}
-	if fresh != head {
-		return errors.New("base changed during decision; rerun land with current policy")
-	}
-	ci, e = s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
-	if e != nil {
-		return e
-	}
-	if ci != github.Green {
-		return errors.New("CI changed during decision")
-	}
+	// Recheck everything immediately before the SHA-bound merge: the head must
+	// be unchanged and must still gate ready under the current base and policy.
 	freshPR, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
@@ -314,24 +167,23 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft {
 		return errors.New("PR changed during decision")
 	}
-	needed := 1
-	if d.Class == "blocking" {
-		needed = 2
-	}
-	receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	fresh, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
 	}
-	if _, complete := distinctPasses(receipts, needed); !complete {
-		return errors.New("review passes changed during decision")
-	}
-
-	action, _, _, e := s.reviewGate(ctx, r, n, d.Class, p, pr.Head.SHA)
+	p, e = s.Policy(ctx, r, fresh)
 	if e != nil {
 		return e
 	}
-	if action != "" {
-		return errors.New("review findings changed during decision")
+	if !p.Enabled {
+		return errors.New("landing policy changed during decision")
+	}
+	v, e = s.mergeGate(ctx, r, freshPR, p, fresh)
+	if e != nil {
+		return e
+	}
+	if v.State != "ready" {
+		return errors.New("gate changed during decision")
 	}
 	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
 		return e
@@ -339,6 +191,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	merged, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
+	}
+	if s.Config.Daemon.PR.Notify.On() {
+		if _, _, _, e = s.laneEvent(ctx, r, pr, "merged", pr.Title); e != nil {
+			return e
+		}
 	}
 	if e = s.ObservePR(ctx, r, merged, o); e != nil {
 		return e

@@ -108,41 +108,6 @@ func TestFakeRevertRefusesMergeCommit(t *testing.T) {
 	}
 }
 
-func TestRecoveryPauseRequiresBaseRepository(t *testing.T) {
-	for _, tt := range []struct {
-		name, repo string
-		ci         github.CI
-		shadow     bool
-		action     string
-		merges     int
-	}{
-		{"same repo recovery", "example/project", github.Red, false, "merge", 1},
-		{"fork recovery branch", "fork/project", github.Red, false, "pause-red-main", 0},
-		{"unknown repository", "", github.Red, false, "pause-red-main", 0},
-		{"fork unknown main", "fork/project", github.Pending, false, "pause-main-unknown", 0},
-		{"shadow unknown main", "fork/project", github.Pending, true, "would-pause-main-unknown", 0},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
-			g.enabled = true
-			g.reviewed = true
-			g.pull.Head.Ref = github.RecoveryBranch
-			g.pull.Head.Repo.FullName = tt.repo
-			g.checks = map[string]github.CI{shaB: tt.ci, shaA: github.Green}
-			if err := s.Land(context.Background(), r, 7, Options{Shadow: tt.shadow}); err != nil {
-				t.Fatal(err)
-			}
-			state, err := s.ledger().Read()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if g.mergeCount != tt.merges || state.Latest["https://github.com/"+r.Name+"/pull/7"].Action != tt.action {
-				t.Fatalf("merges=%d state=%+v", g.mergeCount, state)
-			}
-		})
-	}
-}
-
 func TestWatchReportedBounded(t *testing.T) {
 	s, _, sink, n, r := setup(t)
 	file := filepath.Join(s.state(r.Name), "watch-reported")

@@ -30,7 +30,7 @@ var commit = "unknown"
 const usage = `mergewake: the after-merge pipeline for your agent fleet
 
 Usage: mergewake <command> [flags]
-  land       Classify and squash-merge a PR (shadow until policy opts in)
+  land       Run the merge gate for a PR and squash-merge the gated head (shadow until policy opts in)
   review     Run one independent diff-only review per PR head
   watch      Watch main CI and open one recovery PR (shadow until opt in)
   release    Publish a verified manifest as a GitHub Release asset

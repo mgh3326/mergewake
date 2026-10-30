@@ -58,7 +58,7 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 
 | Command | Behavior |
 | --- | --- |
-| `land --repo … --pr …` | Classify paths and change kinds using policy from the current base branch; squash-merge the exact reviewed head through GitHub. |
+| `land --repo … --pr …` | Run the merge gate for one PR — `--dry-run` prints the verdict — and squash-merge the exact gated head through GitHub. |
 | `review --repo … --pr …` | Claim one PR head, select a different model family from the pool with the most quota left to burn before its reset, review only the diff, post inline review comments. |
 | `watch --repo …` | Poll main CI, find a green-to-red boundary among squash commits using existing checks, open a revert PR, reopen the task when its API permits, and notify. `--once` inspects once. |
 | `release --repo …` | Verify green main ancestry and publish an immutable manifest as a GitHub Release asset. `--commit` accepts a full SHA. |
@@ -134,22 +134,28 @@ observation, not merging, so it also runs while the daemon is in shadow mode;
 
 ```text
 [mergewake] READY example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
-[mergewake] BLOCKED example/project#7 head=a1b2c3d | failing checks: vet,test | lane=worker-lane via task 2252
-[mergewake] BLOCKED example/project#7 head=a1b2c3d | needs 2nd review; open blocking findings: 1 | lane=operator-desk via config
+[mergewake] BLOCKED example/project#7 head=a1b2c3d | check_failed:vet; check_failed:test | lane=worker-lane via task 2252
+[mergewake] BLOCKED example/project#7 head=a1b2c3d | threads_open:1; base_stale | lane=operator-desk via config
+[mergewake] MERGED example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
 ```
 
-READY means green required checks, the required independent review passes for
-the change class, a clean review gate, no merge conflicts, and green main —
-the same inputs `land` merges on. BLOCKED names the reason: `failing checks:
-<names>` when a required check fails, `open blocking findings: N` or
-`unanswered findings: N` for held review threads, `needs review` /
-`needs 2nd review` / `needs N reviews` for missing passes, `missing required
-reviews: <bots>` for opted-in bots that have not reviewed this head,
-`conflicts` when GitHub reports the PR unmergeable, and `main CI red` while
-the configured branch is failing. Pending or missing check evidence emits
-nothing. Each `(PR, head, state)` emits at most once; a new head re-arms the
-notification and sent keys persist across daemon restarts under
-`<state_dir>/<repo>/pr-notify-sent`.
+READY means the merge gate passed: every `required_checks` entry green on the
+head, zero unresolved review threads, the `mergewake/reviews/<pr>/<head>-done`
+marker present, the base branch an ancestor of the head, and no merge
+conflict — the same inputs `land` merges on. BLOCKED names the reason from a
+closed vocabulary: `check_failed:<name>` per failing required check,
+`threads_open:<n>` for unresolved review threads, `review_missing` when the
+review marker is absent, `base_stale` when the base moved ahead of the head,
+and `conflict` when GitHub reports the PR unmergeable. Pending or missing
+check evidence emits nothing. Each `(PR, head, verdict)` emits at most once; a
+new head re-arms the notification and sent keys persist across daemon restarts
+under `<state_dir>/<repo>/pr-notify-sent`.
+
+Auto-merge is opt-in per repository with `enabled: true` in
+`.mergewake/policy.yaml` (default off). While the daemon acts
+(`daemon.act` + `--apply`), a READY verdict merges exactly like the repo
+session — squash, pinned to the gated head — and emits MERGED. A head that
+moves between gate and merge is re-gated, never merged blind.
 
 The lane is resolved, never guessed, in this order — the choosing rule is
 recorded in the event text after `via`:
