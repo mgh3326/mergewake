@@ -387,7 +387,7 @@ func TestAge(t *testing.T) {
 			t.Errorf("Age(%q) = %v, %v", in, got, e)
 		}
 	}
-	for _, in := range []string{"", "0d", "-1d", "d", "1.5d", "0s"} {
+	for _, in := range []string{"", "0d", "-1d", "d", "1.5d", "0s", "10000000000d", "106752d"} {
 		if _, e := Age(in); e == nil {
 			t.Errorf("Age(%q) accepted", in)
 		}

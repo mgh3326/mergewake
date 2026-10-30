@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -598,8 +599,9 @@ func Duration(s string) (time.Duration, error) {
 // Age parses a positive duration that also accepts whole days ("14d").
 func Age(s string) (time.Duration, error) {
 	if n, ok := strings.CutSuffix(s, "d"); ok {
-		d, e := strconv.Atoi(n)
-		if e != nil || d <= 0 {
+		d, e := strconv.ParseInt(n, 10, 64)
+		// Bound the day count so the multiplication cannot wrap.
+		if e != nil || d <= 0 || d > int64(math.MaxInt64/(24*time.Hour)) {
 			return 0, fmt.Errorf("invalid positive duration %q", s)
 		}
 		return time.Duration(d) * 24 * time.Hour, nil
