@@ -520,6 +520,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if ctx.Err() != nil {
 				return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), ctx.Err())
 			}
+			// Only an executor that produced nothing gets here; a later one
+			// that succeeds breaks above, so this keeps the reason the
+			// preferred executor (runtug) gave up.
 			if len(out.skips) > 0 {
 				fallback = out.skips[len(out.skips)-1].Reason
 			}
