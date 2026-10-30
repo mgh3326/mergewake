@@ -24,6 +24,7 @@ type fakeRunner struct {
 	comments map[string]string // task -> body
 	failPut  string            // --name whose put fails
 	failNote bool
+	failRm   bool
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -48,6 +49,9 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input,
 			return []byte("{}"), nil
 		}
 		return nil, errors.New("unexpected handoffkeep call: " + strings.Join(args, " "))
+	}
+	if name == "rm" && f.failRm {
+		return nil, errors.New("rm failed")
 	}
 	c := exec.CommandContext(ctx, name, args...)
 	c.Stdin = strings.NewReader(input)
@@ -268,10 +272,11 @@ func TestApplyLocalMovesVerifiesAndDeletes(t *testing.T) {
 	if _, err := os.Stat(e.sshLog); !os.IsNotExist(err) {
 		t.Fatal("local archive used ssh")
 	}
-	// A rerun of the same job name in the same month never overwrites it.
+	// A byte-identical job dir under the same name is already archived: it
+	// resumes to a delete-only plan rather than copying over the archive.
 	job(t, e.jobs, "wk-7")
-	if _, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-7"); err == nil || err.Error() != "skipped: drive-dir-exists" {
-		t.Fatalf("rerun: %v", err)
+	if p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-7"); err != nil || !p.Resume {
+		t.Fatalf("rerun: %+v %v", p, err)
 	}
 }
 
@@ -317,6 +322,11 @@ func TestApplyFailuresKeepJobDir(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 				t.Fatalf("job dir lost after %s failure: %v", name, err)
 			}
+			// No manifest may mark the archive done, or the retry would be
+			// refused as drive-dir-exists and the hk record never written.
+			if _, err := os.Stat(filepath.Join(p.Dest, "manifest.json")); err == nil {
+				t.Fatalf("manifest.json published after %s failure", name)
+			}
 		})
 	}
 }
@@ -337,5 +347,67 @@ func TestApplyKeepsJobChangedAfterPlan(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "late.log")); err != nil {
 		t.Fatal("changed job dir was deleted")
+	}
+}
+
+// A delete that failed after the archive and hk record completed resumes to
+// a delete-only pass instead of being stuck as drive-dir-exists.
+func TestApplyResumesFailedDelete(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-11")
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, "wk-11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+		t.Fatal("delete failure not reported")
+	}
+	e.run.failRm = false
+	puts := len(e.run.puts)
+	p, err = a.Plan(context.Background(), h, "wk-11")
+	if err != nil || !p.Resume {
+		t.Fatalf("resume plan: %+v %v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || !res.Deleted {
+		t.Fatalf("resume: %+v %v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("job dir kept after resume")
+	}
+	if len(e.run.puts) != puts || len(e.run.comments) != 1 {
+		t.Fatal("resume uploaded or commented again")
+	}
+	// A different job under the same name and month never resumes.
+	job(t, e.jobs, "wk-11")
+	write(t, filepath.Join(e.jobs, "wk-11", "report.md"), "# a different, longer report\n")
+	if _, err := a.Plan(context.Background(), h, "wk-11"); err == nil || err.Error() != "skipped: drive-dir-exists" {
+		t.Fatalf("different job: %v", err)
+	}
+}
+
+// A job whose every file is excluded still records and deletes without a copy.
+func TestApplyNothingToMove(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-12")
+	write(t, filepath.Join(dir, "events", "00004-token-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	write(t, filepath.Join(dir, ".env"), "SECRET=1\n")
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-12")
+	if err != nil || len(p.Move) != 0 || p.Task != "9" {
+		t.Fatalf("plan: %+v %v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || !res.Deleted || res.Files != 0 {
+		t.Fatalf("apply: %+v %v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(res.Dest, "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.run.comments["9"], ".env") {
+		t.Fatal("excluded files not recorded")
 	}
 }
