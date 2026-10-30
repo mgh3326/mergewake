@@ -372,7 +372,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed archive always appends: its time spaces the next retry.
-		repeat := lastRow[rowKey(v)] == rowSig(v) && !(v.Action == "archive-job" && v.Result == "error")
+		// So does a completed one, which carries its own Drive and hk record.
+		repeat := lastRow[rowKey(v)] == rowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived"))
 		lastRow[rowKey(v)] = rowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)

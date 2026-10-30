@@ -258,3 +258,37 @@ func TestArchiveJobsBacklog(t *testing.T) {
 		t.Fatal("archive-jobs ran with archive disabled")
 	}
 }
+
+// A reused job name closed again restarts min_age: the stale first close and
+// the earlier job's archive row must not release the new job dir.
+func TestReapArchiveUsesNewestClose(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", time.Hour)
+	f.seedClose(t, "wk-7", "closed", time.Now().Add(-30*24*time.Hour))
+	old, _ := json.Marshal(reapReceipt{Time: time.Now().Add(-29 * 24 * time.Hour), Action: "archive-job", Repo: "example/project", PR: 12, Host: "local", Job: "wk-7", Result: "archived"})
+	recent, _ := json.Marshal(reapReceipt{Time: time.Now().Add(-time.Hour), Action: "close-pane", Repo: "example/project", PR: 12, Host: "local", Pane: "w1:p9", Job: "wk-7", Result: "closed"})
+	b, _ := os.ReadFile(f.s.reapLog("example/project"))
+	writeFile(t, f.s.reapLog("example/project"), string(b)+string(old)+"\n"+string(recent)+"\n")
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil || f.run.hkCalls != 0 {
+		t.Fatalf("job dir archived before min_age of its newest close: %v, hk=%d", err, f.run.hkCalls)
+	}
+	// Once the newest close ages out, the earlier job's row does not block it.
+	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("reused job not archived after its own min_age")
+	}
+}
+
+func TestArchiveJobsReportsUnreadableJobsDir(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{Shadow: true})
+	if err == nil || !strings.Contains(err.Error(), "list jobs") {
+		t.Fatalf("missing jobs dir reported as %v", err)
+	}
+}

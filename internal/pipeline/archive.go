@@ -123,8 +123,9 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			if !seen {
 				order = append(order, k)
 			}
-			// A real close supersedes an earlier shadow plan for the job.
-			if !seen || prev.Result == "would-close" && rec.Result == "closed" {
+			// The newest real close wins: a reused job name closed again
+			// restarts min_age. A shadow plan never replaces a real close.
+			if !seen || rec.Result == "closed" || prev.Result == "would-close" {
 				rec.Job = job
 				closes[k] = rec
 			}
@@ -136,6 +137,9 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 	for _, k := range order {
 		c, hs := closes[k], hosts[k.host]
 		prev, tried := last[k]
+		// An archive row older than the newest close belongs to an earlier
+		// job under the same name and decides nothing about this one.
+		tried = tried && !prev.Time.Before(c.Time)
 		switch {
 		case hs == nil || hs.failed:
 			continue
@@ -212,7 +216,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: pane scan: %w", h.Name, e))
 			continue
 		}
-		b, e := hs.exec.Run(ctx, "sh", "-c", `cd "$1" && for d in *; do [ -d "$d" ] && [ ! -L "$d" ] && printf '%s\0' "$d"; done; true`, "sh", h.Jobs)
+		b, e := hs.exec.Run(ctx, "sh", "-c", `cd "$1" || exit 1; for d in *; do if [ -d "$d" ] && [ ! -L "$d" ]; then printf '%s\0' "$d"; fi; done`, "sh", h.Jobs)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
