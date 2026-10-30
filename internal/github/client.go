@@ -607,8 +607,11 @@ func (c *Client) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, 
 	if e != nil {
 		return nil, e
 	}
+	if entry.SHA == "" {
+		return nil, fmt.Errorf("source %s not found in %s@%s", name, repo, sha)
+	}
 	if entry.Type != "blob" || (entry.Mode != "100644" && entry.Mode != "100755") {
-		return nil, errors.New("source must be a regular Git blob")
+		return nil, fmt.Errorf("source %s in %s@%s is a %s (mode %s); must be a regular Git blob", name, repo, sha, entry.Type, entry.Mode)
 	}
 	var b struct {
 		Content  string `json:"content"`

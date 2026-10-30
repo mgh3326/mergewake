@@ -14,10 +14,14 @@ type call struct {
 type fakeRunner struct {
 	calls []call
 	fail  bool
+	err   error
 }
 
 func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) ([]byte, error) {
 	r.calls = append(r.calls, call{c, a})
+	if r.err != nil {
+		return nil, r.err
+	}
 	if r.fail {
 		return nil, errors.New("offline")
 	}
@@ -126,6 +130,29 @@ func TestReopenOlderServerFailsExplicitly(t *testing.T) {
 	before := r.calls
 	if h.Reopen(context.Background(), "42", " ") == nil || r.calls != before {
 		t.Fatal("empty reason sent requests")
+	}
+}
+
+func TestPanewireDuplicateEventCountsAsDelivered(t *testing.T) {
+	r := &fakeRunner{err: &CommandError{Command: "panewire", Err: errors.New("exit status 2"), Stderr: "emit: duplicate event_id"}}
+	p := Panewire{Runner: r, Command: "panewire", Lane: "operator-desk"}
+	if err := p.Notify(context.Background(), Event{ID: "mergewake-ready-a-b-1-sha", Text: "x"}); err != nil {
+		t.Fatalf("duplicate event_id reported as failure: %v", err)
+	}
+	r.err = &CommandError{Command: "panewire", Err: errors.New("exit status 2"), Stderr: "emit: daemon unavailable"}
+	if err := p.Notify(context.Background(), Event{ID: "x", Text: "x"}); err == nil {
+		t.Fatal("other emit failure swallowed")
+	}
+}
+
+func TestDetailAddsStderrTail(t *testing.T) {
+	err := &CommandError{Command: "pacelever", Err: errors.New("exit status 2"), Stderr: "error: experiment_arm must be baseline or downshift\n"}
+	got := Detail(err)
+	if !strings.Contains(got, "exit status 2") || !strings.Contains(got, "experiment_arm") {
+		t.Fatalf("detail=%q", got)
+	}
+	if Detail(errors.New("plain")) != "plain" {
+		t.Fatal("non-command error changed")
 	}
 }
 

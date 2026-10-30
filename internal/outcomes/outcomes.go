@@ -282,7 +282,9 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 
 // Flush never deletes observations. A failed publish is retried with the exact
 // same event payload. A newer terminal snapshot supersedes older local revisions.
-func (l Ledger) Flush(ctx context.Context, reps Reps) error {
+// repo limits a flush to one repository's outcomes; an empty repo flushes all,
+// so a per-repo loop never publishes (or reports) another repo's records.
+func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
 	return l.locked(func(f *os.File, s State) error {
 		keys := make([]string, 0, len(s.Latest))
 		for key := range s.Latest {
@@ -292,6 +294,9 @@ func (l Ledger) Flush(ctx context.Context, reps Reps) error {
 		var errs []error
 		for _, key := range keys {
 			v := s.Latest[key]
+			if repo != "" && v.Repo != repo {
+				continue
+			}
 			if !v.Final || !v.Attributed() || s.Published[v.ID] != "" {
 				continue
 			}
@@ -299,7 +304,7 @@ func (l Ledger) Flush(ctx context.Context, reps Reps) error {
 			rep, err := reps.Publish(publishCtx, v)
 			cancel()
 			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", key, err))
+				errs = append(errs, fmt.Errorf("%s profile=%s effort=%s: %s", key, v.Profile, v.Effort, integrations.Detail(err)))
 				continue
 			}
 			if err = appendEvent(f, Event{Version: 1, ID: v.ID, At: l.now().UTC(), Kind: "published", Rep: rep}); err != nil {

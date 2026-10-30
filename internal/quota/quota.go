@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -87,10 +88,12 @@ func denied(c Candidate) bool {
 	return (c.Subscribed != nil && !*c.Subscribed) || strings.Contains(text, "subscribed=false") || strings.Contains(text, "unsubscribed")
 }
 func (c CLI) Gate(ctx context.Context, profile, effort string) error {
-	args := []string{"gate", "-m", profile}
+	args := []string{"gate", "-m", profile, "--role", "reviewer"}
 	if effort != "" {
 		args = append(args, "--effort", effort)
 	}
-	_, err := c.Runner.Run(ctx, c.Command, args, "", "")
-	return err
+	if _, err := c.Runner.Run(ctx, c.Command, args, "", ""); err != nil {
+		return fmt.Errorf("quota gate profile=%s effort=%s: %s", profile, effort, integrations.Detail(err))
+	}
+	return nil
 }

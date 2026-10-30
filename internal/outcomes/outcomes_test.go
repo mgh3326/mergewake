@@ -47,14 +47,14 @@ func TestOutboxRetryAndFollowup(t *testing.T) {
 		t.Fatal(err)
 	}
 	reps := &fakeReps{fail: true}
-	if ledger.Flush(context.Background(), reps) == nil {
+	if ledger.Flush(context.Background(), reps, "") == nil {
 		t.Fatal("lost failed publish")
 	}
 	reps.fail = false
-	if err := ledger.Flush(context.Background(), reps); err != nil {
+	if err := ledger.Flush(context.Background(), reps, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := ledger.Flush(context.Background(), reps); err != nil {
+	if err := ledger.Flush(context.Background(), reps, ""); err != nil {
 		t.Fatal(err)
 	}
 	if reps.calls != 2 || len(reps.values) != 1 {
@@ -63,7 +63,7 @@ func TestOutboxRetryAndFollowup(t *testing.T) {
 	if err := ledger.Update("example/project", 1, func(v *Outcome) { v.Reverted = boolp(true) }); err != nil {
 		t.Fatal(err)
 	}
-	if err := ledger.Flush(context.Background(), reps); err != nil {
+	if err := ledger.Flush(context.Background(), reps, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(reps.values) != 2 || reps.values[0].Evidence() != "clean_pass" || reps.values[1].Evidence() != "failure" {
@@ -80,6 +80,30 @@ func TestOutboxRetryAndFollowup(t *testing.T) {
 	info, _ := os.Stat(filepath.Join(ledger.Dir, "outcomes.jsonl"))
 	if info.Mode().Perm() != 0600 {
 		t.Fatal(info.Mode())
+	}
+}
+func TestFlushScopesToRepo(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Update("other/repo", 2, complete); err != nil {
+		t.Fatal(err)
+	}
+	reps := &fakeReps{fail: true}
+	err := ledger.Flush(context.Background(), reps, "example/project")
+	if err == nil || !strings.Contains(err.Error(), "example/project") || strings.Contains(err.Error(), "other/repo") {
+		t.Fatalf("flush error leaked another repo: %v", err)
+	}
+	if reps.calls != 1 {
+		t.Fatalf("publish calls=%d", reps.calls)
+	}
+	reps.fail = false
+	if err = ledger.Flush(context.Background(), reps, "other/repo"); err != nil {
+		t.Fatal(err)
+	}
+	if len(reps.values) != 1 || reps.values[0].Repo != "other/repo" {
+		t.Fatal(reps.values)
 	}
 }
 func TestConservativeEvidence(t *testing.T) {

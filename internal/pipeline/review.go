@@ -426,7 +426,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				}
 			}
 			if e = provider.Gate(ctx, gate, p.GateEffort); e != nil {
-				skip("quota gate refused", time.Time{})
+				skip("quota gate refused: "+e.Error(), time.Time{})
 				continue
 			}
 			candidateControl := filepath.Join(control, fmt.Sprintf("%d-%d", plan.pass, i))

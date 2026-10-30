@@ -231,7 +231,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 			_ = s.audit(r.Name, "land-notify-error", map[string]any{"pr": n, "error": e.Error()}, false)
 		}
 	}
-	return s.FlushOutcomes(ctx)
+	return s.FlushOutcomes(ctx, r.Name)
 }
 func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Options) error {
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)

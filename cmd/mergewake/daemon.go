@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
@@ -91,7 +95,36 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 		return errors.New("daemon requires configured repositories")
 	}
 	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: slog.New(slog.NewJSONHandler(stderr, nil)), RateWait: gh.RateWait}
+	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
+		d.Healthy = healthcheck(url)
+	}
 	return d.Run(ctx, loops)
+}
+// healthcheck returns the fail-open ping run after a clean loop. The request
+// is a bare GET with a bounded timeout; errors never embed the URL, which is a
+// secret (forge-able ping endpoint) that must not reach the daemon logs.
+func healthcheck(endpoint string) func(context.Context) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	return func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return errors.New("invalid healthcheck URL")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				return ue.Err
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("healthcheck ping: HTTP %d", resp.StatusCode)
+		}
+		return nil
+	}
 }
 func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options) error {
 	prs, err := gh.OpenPulls(ctx, r.Name, r.Branch)
