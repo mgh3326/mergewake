@@ -169,17 +169,21 @@ func postedOn(c github.ReviewComment) string {
 }
 
 // gradeThreads folds review threads into the two counts the graded gate holds
-// on. A block-class finding blocks until a new head resolves it: unresolved
-// counts, and so does one the trusted review login posted on this head and
-// someone resolved without a new head. A triage finding blocks until someone
-// other than its author replies; resolving or answering it needs no new head.
-// Advisory findings never block, and the fast lane drops triage except for
-// unreadable review.login evidence.
-// Reviewers still requesting changes count as blocking findings.
+// on. A block-class finding blocks until a new head resolves it, whoever wrote
+// it: unresolved counts, and so does one posted on this head that someone
+// resolved without a new head. A triage finding blocks until someone other than
+// its author replies; resolving or answering it needs no new head. Advisory
+// findings never block, and the fast lane drops triage except for unreadable
+// review.login evidence. Outdated findings clear as ReviewGate.OutdatedCleared
+// allows. Reviewers still requesting changes, and unresolved threads with no
+// comment to grade, count as blocking findings.
 func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, head string, fastLane bool) (blocking, triage int) {
 	blocking = fb.ChangesRequested
 	for _, t := range fb.Threads {
 		if len(t.Comments) == 0 {
+			if !t.IsResolved {
+				blocking++
+			}
 			continue
 		}
 		first := t.Comments[0]
@@ -194,9 +198,14 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, h
 			OwnReview: login != "" && author == login,
 			CommitSHA: postedOn(first),
 		}
-		switch g.Grade(f, class) {
+		f.Rechecked = !f.OwnReview && fb.RecheckedAuthors[author]
+		grade := g.Grade(f, class)
+		if g.OutdatedCleared(f, grade) {
+			continue
+		}
+		switch grade {
 		case policy.GradeBlock:
-			if !f.Resolved || (f.OwnReview && f.CommitSHA == head) {
+			if !f.Resolved || f.CommitSHA == head {
 				blocking++
 			}
 		case policy.GradeTriage:

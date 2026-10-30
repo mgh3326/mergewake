@@ -159,3 +159,29 @@ func TestFastLane(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewGateOutdatedCleared(t *testing.T) {
+	no := false
+	for _, tt := range []struct {
+		name  string
+		g     ReviewGate
+		f     ReviewFinding
+		grade string
+		want  bool
+	}{
+		{"block needs a recheck", ReviewGate{}, ReviewFinding{Outdated: true}, GradeBlock, false},
+		{"rechecked block clears", ReviewGate{}, ReviewFinding{Outdated: true, Rechecked: true}, GradeBlock, true},
+		{"own review never clears", ReviewGate{}, ReviewFinding{Outdated: true, Rechecked: true, OwnReview: true}, GradeBlock, false},
+		{"current finding never clears", ReviewGate{}, ReviewFinding{Rechecked: true}, GradeBlock, false},
+		{"major triage clears", ReviewGate{}, ReviewFinding{Outdated: true, Severity: "Major"}, GradeTriage, true},
+		{"other triage stays", ReviewGate{}, ReviewFinding{Outdated: true, Severity: "p2"}, GradeTriage, false},
+		{"ignore_outdated false keeps all", ReviewGate{IgnoreOutdated: &no}, ReviewFinding{Outdated: true, Rechecked: true}, GradeBlock, false},
+		{"advisory is not cleared", ReviewGate{}, ReviewFinding{Outdated: true, Rechecked: true}, GradeAdvisory, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.g.OutdatedCleared(tt.f, tt.grade); got != tt.want {
+				t.Fatalf("got %v", got)
+			}
+		})
+	}
+}

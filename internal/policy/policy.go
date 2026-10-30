@@ -276,6 +276,24 @@ func (g ReviewGate) Grade(f ReviewFinding, class string) string {
 	return GradeAdvisory
 }
 
+// OutdatedCleared reports whether an outdated finding stops counting under
+// ignore_outdated, with the same limits Evaluate applies: never the trusted
+// review identity's own findings, a block finding only once its reviewer has
+// rechecked the current head, and a triage finding only when it is a CodeRabbit
+// style "major".
+func (g ReviewGate) OutdatedCleared(f ReviewFinding, grade string) bool {
+	if f.OwnReview || !f.Outdated || !g.WithDefaults().ignoresOutdated() {
+		return false
+	}
+	switch grade {
+	case GradeBlock:
+		return f.Rechecked
+	case GradeTriage:
+		return strings.ToLower(f.Severity) == "major"
+	}
+	return false
+}
+
 // GateAuthors lists normalized bot logins the configured rules reference. The
 // caller uses it for grading and bot reply detection.
 func (g ReviewGate) GateAuthors() map[string]bool {

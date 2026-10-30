@@ -69,7 +69,8 @@ func TestGateBlockClass(t *testing.T) {
 		{"high resolved on the current head is held", "blocking_findings:1", gradedThread("review-bot", "high", true, shaA, human)},
 		{"high resolved after a new head is released", "", gradedThread("review-bot", "high", true, shaB, human)},
 		{"third-party unresolved critical", "blocking_findings:1", gradedThread("coderabbitai[bot]", "critical", false, shaB)},
-		{"third-party resolved critical is released", "", gradedThread("coderabbitai[bot]", "critical", true, shaA, human)},
+		{"third-party critical resolved on the current head is held", "blocking_findings:1", gradedThread("coderabbitai[bot]", "critical", true, shaA, human)},
+		{"third-party critical resolved after a new head is released", "", gradedThread("coderabbitai[bot]", "critical", true, shaB, human)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, gradedPolicy, 0, tt.th)); got != tt.want {
@@ -188,5 +189,73 @@ func TestLandGradedTriageAnswered(t *testing.T) {
 		if want := map[bool]int{false: 0, true: 1}[answered]; g.mergeCount != want {
 			t.Fatalf("answered=%v merges=%d", answered, g.mergeCount)
 		}
+	}
+}
+
+// outdated returns th marked outdated.
+func outdated(th github.ReviewThread) github.ReviewThread {
+	th.IsOutdated = true
+	return th
+}
+
+// verdictRechecked is verdict with the given authors having reviewed this head.
+func verdictRechecked(t *testing.T, rechecked map[string]bool, ths ...github.ReviewThread) gateVerdict {
+	t.Helper()
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	g.policyExtra = gradedPolicy
+	markReviewed(g)
+	g.feedback.Threads = ths
+	g.feedback.RecheckedAuthors = rechecked
+	p, _ := s.Policy(context.Background(), r, shaB)
+	v, e := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return v
+}
+
+func TestGateOutdatedFindings(t *testing.T) {
+	cr := "coderabbitai[bot]"
+	for _, tt := range []struct {
+		name, want string
+		rechecked  map[string]bool
+		th         github.ReviewThread
+	}{
+		{"own outdated block still holds", "blocking_findings:1", nil, outdated(gradedThread("review-bot", "high", false, shaB))},
+		{"own outdated triage still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("review-bot", "medium", false, shaB))},
+		{"third-party outdated block holds until its reviewer rechecks", "blocking_findings:1", nil, outdated(gradedThread(cr, "critical", false, shaB))},
+		{"third-party outdated block clears once rechecked", "", map[string]bool{"coderabbitai": true}, outdated(gradedThread(cr, "critical", false, shaB))},
+		{"third-party outdated major clears", "", nil, outdated(gradedThread(cr, "major", false, shaB))},
+		{"third-party outdated p2 still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reasons(verdictRechecked(t, tt.rechecked, tt.th)); got != tt.want {
+				t.Fatalf("reasons=%q", got)
+			}
+		})
+	}
+	// ignore_outdated: false keeps every outdated finding.
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	g.policyExtra = "review_gate: {ignore_outdated: false}\n"
+	markReviewed(g)
+	g.feedback.RecheckedAuthors = map[string]bool{"coderabbitai": true}
+	g.feedback.Threads = []github.ReviewThread{outdated(gradedThread(cr, "critical", false, shaB))}
+	p, _ := s.Policy(context.Background(), r, shaB)
+	v, e := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+	if e != nil || reasons(v) != "blocking_findings:1" {
+		t.Fatalf("%v %+v", e, v)
+	}
+}
+
+// A thread with no comment cannot be graded: unresolved it holds, as the raw
+// count would, and resolved it is ignored.
+func TestGateCommentlessThread(t *testing.T) {
+	if got := reasons(verdict(t, gradedPolicy, 0, github.ReviewThread{})); got != "blocking_findings:1" {
+		t.Fatalf("unresolved commentless thread: %q", got)
+	}
+	if got := reasons(verdict(t, gradedPolicy, 0, github.ReviewThread{IsResolved: true})); got != "" {
+		t.Fatalf("resolved commentless thread: %q", got)
 	}
 }

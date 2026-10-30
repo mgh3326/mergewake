@@ -496,13 +496,14 @@ its first comment instead:
 
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
-| block | the finding is fixed: its thread is resolved by a new head. A reply never clears it, and a finding the `review.login` identity posted on the current head stays held when resolved without a new head. | `blocking_findings:<n>` |
+| block | the finding is fixed: its thread is resolved by a new head. A reply never clears it, and a finding posted on the current head stays held when resolved without a new head, whoever wrote it. | `blocking_findings:<n>` |
 | triage | someone other than the finding's author (and not a bot) replies on the thread. An answered triage finding needs no new head, and a resolved one no longer holds. | `triage_unanswered:<n>` |
 | advisory | never holds. Threads from authors no rule names are advisory. | none |
 
 Each reviewer whose latest review still requests changes adds one to the
 blocking count (at least one when GitHub's overall decision is changes
-requested), on top of any unresolved block-class threads. Severities come from the `<!-- mergewake-severity:... -->` marker on
+requested), on top of any unresolved block-class threads. An unresolved
+thread with no comment to grade counts as a blocking finding. Severities come from the `<!-- mergewake-severity:... -->` marker on
 mergewake's own findings and from the prose labels CodeRabbit (`critical`,
 `major`, `minor`, `nitpick`) and codex (`P1`–`P3`) use. Evidence the rules cannot
 read still needs an answer: a finding by the `review.login` identity with a
@@ -518,8 +519,11 @@ and `low`). Rules are `{author, severity: [...], classes: [...]}` lists under
 though the `review.login` defaults are kept or replaced per list: naming the login
 in `block` replaces its default block rule, naming it in `triage` replaces its
 default triage rule, and the other list keeps its default.
-`ignore_authors` skips threads from the named bots. The other `review_gate` keys
-stay parseable but do not affect the land gate.
+`ignore_authors` skips threads from the named bots. `ignore_outdated` (default
+true) clears an outdated finding by anyone but `review.login`: a block finding
+once its reviewer has reviewed the current head, a triage finding when it is a
+`major`. The other `review_gate` keys stay parseable but do not affect the land
+gate.
 
 `fast_lane` takes only the PR's class and size: when the PR classifies as
 routine and `additions + deletions` is at most `max_changed_lines`, triage
