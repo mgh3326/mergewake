@@ -430,6 +430,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if len(diff) == 0 || len(diff) > 2<<20 {
 		return errors.New("empty or oversized diff; manual review required")
 	}
+	// Findings already answered on this PR, and its operator decisions, keep the
+	// reviewer from re-flagging settled points. The context is best effort: a
+	// feedback read that fails costs the context, not the review.
+	var prContext reviewContext
+	feedback, contextErr := s.GH.ReviewFeedback(ctx, r.Name, n)
+	if contextErr == nil {
+		prContext = buildReviewContext(pr.Body, feedback)
+	} else {
+		prContext = buildReviewContext(pr.Body, github.ReviewFeedback{})
+	}
 	// Scratch left by a review whose process was SIGKILLed is old and its lock
 	// is free; a concurrent review's scratch stays locked. Best effort.
 	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, s.now())
@@ -522,7 +532,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 					return e
 				}
 			}
-			output, runErr := reviewer.Run(ctx, s.Runner, plan.invocation, promptFor(plan.lens)+diff, dir, s.Config.TokenEnv)
+			output, runErr := reviewer.Run(ctx, s.Runner, plan.invocation, withContext(promptFor(plan.lens), prContext.text)+diff, dir, s.Config.TokenEnv)
 			if runErr == nil {
 				if findings, e = parseFindings(output, diff); e == nil {
 					selected = name
@@ -552,7 +562,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
 			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: fam(selected), SameFamily: plan.sameFamily}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: fam(selected), SameFamily: plan.sameFamily, AnsweredContext: prContext.answered}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
 			return e
 		}
@@ -566,7 +576,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			return e
 		}
-		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings), "author_family": family}
+		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": fam(selected), "same_family": plan.sameFamily, "findings": len(findings), "author_family": family, "answered_context": prContext.answered}
+		if prContext.truncated {
+			event["context_truncated"] = true
+		}
+		if contextErr != nil {
+			event["context_error"] = contextErr.Error()
+		}
 		if familySource == "commit" || familySource == "default" {
 			event["author_family_inferred"] = familySource
 		}

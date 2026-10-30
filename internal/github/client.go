@@ -361,6 +361,9 @@ type PassReceipt struct {
 	Reviewer   string `json:"reviewer,omitempty"`
 	Family     string `json:"family,omitempty"`
 	SameFamily bool   `json:"same_family"`
+	// AnsweredContext counts the already-answered findings the prompt carried,
+	// so the effect of that context can be measured later.
+	AnsweredContext int `json:"answered_context"`
 }
 
 func PassMarker(r PassReceipt) string {
