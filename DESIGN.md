@@ -71,6 +71,7 @@ rollout likewise require `--apply`.
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
 | `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |
+| `archive` | Job-dir plan, credential exclusion, verified copy to a synced Drive folder, hk attachments and comment, guarded delete. |
 
 The command layer handles flags, signals, and polling. Tests replace each external
 boundary with a fake or a local HTTP test server. Mutating operations have no
@@ -223,6 +224,16 @@ refetched once every worktree its rows named reached `removed` or
 persistent skips poll GitHub at most once a day — the stamp is written even
 under `--dry-run`, since the GitHub call really happened — and one PR's
 fetch failure never aborts the pass.
+
+With `reap.archive` enabled, a job dir whose pane reap closed is archived
+once the close is older than `min_age`, and `archive-jobs` does the same for
+a host's backlog. The job dir — never the worktree, which git already holds —
+is copied uncompressed into a synced Google Drive folder, sha256-verified
+file by file, described by a `manifest.json` beside it, its text files stored
+as hk attachments, and the hk task commented with all of it. Credential-like
+names are never copied or uploaded, only listed. Only after every step, and
+a re-listing that shows the job dir unchanged, is it deleted; any failure
+keeps it for the next pass.
 
 ## Manifests and verified installs
 
