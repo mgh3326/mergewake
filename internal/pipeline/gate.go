@@ -101,6 +101,15 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.SameFamily = v.SameFamily || receipt.SameFamily
 	}
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
+	if errors.Is(e, github.ErrPollSkipped) {
+		// The done-marker probe is inside its poll interval: hold the verdict
+		// quiet this round rather than erroring every loop.
+		v.State = "blocked"
+		if len(v.Reasons) == 0 {
+			v.State = "pending"
+		}
+		return v, nil
+	}
 	if e != nil {
 		return v, e
 	}

@@ -151,6 +151,11 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		// means all required passes finished. Landing stays independent so
 		// advisory review failures do not block routine policy decisions.
 		claimed, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
+		if errors.Is(e, github.ErrPollSkipped) {
+			// The marker probe sits inside its poll interval with nothing
+			// cached; every per-PR step rechecks next round.
+			continue
+		}
 		if e == nil && !claimed {
 			e = s.Review(ctx, r, pr.Number, "", childOptions)
 		}

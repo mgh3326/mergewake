@@ -49,6 +49,8 @@ type fakeGH struct {
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
 	messages                                                     map[string]string
+	authorName, authorEmail                                      string
+	committerName, committerEmail                                string
 	parents                                                      map[string]string
 	parents2                                                     map[string][]string
 	commitPRs                                                    map[string][]github.Pull
@@ -182,6 +184,8 @@ func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
 	v := github.Commit{SHA: sha}
 	v.Commit.Message = g.messages[sha]
+	v.Commit.Author.Name, v.Commit.Author.Email = g.authorName, g.authorEmail
+	v.Commit.Committer.Name, v.Commit.Committer.Email = g.committerName, g.committerEmail
 	if ps := g.parents2[sha]; len(ps) > 0 {
 		for _, p := range ps {
 			v.Parents = append(v.Parents, github.Ref{SHA: p})
@@ -509,7 +513,7 @@ func TestLandMergedEventOnce(t *testing.T) {
 	}
 	text := n.events[0].Text
 	if !strings.HasPrefix(text, "[mergewake] MERGED example/project#7 head=aaaaaaa | Add feature") ||
-		!strings.Contains(text, "lane=config-lane via config") || n.events[0].Lane != "config-lane" {
+		!strings.Contains(text, "lane=config-lane via fallback") || n.events[0].Lane != "config-lane" {
 		t.Fatalf("%+v", n.events[0])
 	}
 	// A merged PR is closed on the next poll: nothing further happens.
@@ -1156,5 +1160,67 @@ func TestReviewAuthorFamilyAlias(t *testing.T) {
 	}
 	if passes[1].Reviewer != "sonnet" || !passes[1].SameFamily {
 		t.Fatalf("pass 2 picked %+v", passes[1])
+	}
+}
+
+// The head commit's identities supply the author family when the PR carries
+// no trailer: agent co-authors and bot authors map to a family, humans stay
+// unknown and fall to review.default_family, and a pass records the source.
+func TestInferAuthorFamilyFromCommit(t *testing.T) {
+	for _, tt := range []struct {
+		name                            string
+		message, author, authorEmail    string
+		committer, committerEmail, want string
+	}{
+		{"claude co-author", "subject\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n", "mgh3326", "m@example.com", "GitHub", "noreply@github.com", "anthropic"},
+		{"codex author", "subject\n", "chatgpt-codex-connector[bot]", "noreply@openai.com", "GitHub", "noreply@github.com", "openai"},
+		{"devin author", "subject\n", "devin-ai-integration[bot]", "devin-ai-integration@users.noreply.github.com", "GitHub", "noreply@github.com", "cognition"},
+		{"gpt committer", "subject\n", "mgh3326", "m@example.com", "GPT-5", "gpt@openai.com", "openai"},
+		{"human unknown", "subject\n", "mgh3326", "m@example.com", "GitHub", "noreply@github.com", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, r := setup(t)
+			g.messages = map[string]string{shaA: tt.message}
+			g.authorName, g.authorEmail = tt.author, tt.authorEmail
+			g.committerName, g.committerEmail = tt.committer, tt.committerEmail
+			fam, e := s.inferAuthorFamily(context.Background(), r, shaA)
+			if e != nil || fam != tt.want {
+				t.Fatalf("%q %v", fam, e)
+			}
+		})
+	}
+}
+
+// A trailer-less PR authored by an agent commit still gets reviewed: the
+// inferred family chooses the reviewer pool exactly like a declared one.
+func TestReviewRunsWithInferredFamily(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.messages = map[string]string{shaA: "subject\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n"}
+	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	pass := g.passes[shaA]
+	if len(pass) != 1 || pass[0].Reviewer != "claude" || !pass[0].SameFamily {
+		t.Fatalf("%+v", pass)
+	}
+}
+
+// With no trailer and no recognisable identity, review.default_family still
+// lets the pass run; without one the PR stays review-unavailable.
+func TestReviewDefaultFamily(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	s.Config.Review.DefaultFamily = "anthropic"
+	g.authorName, g.authorEmail = "mgh3326", "m@example.com"
+	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(g.passes[shaA]) != 1 {
+		t.Fatal(g.passes)
+	}
+
+	s, g, _, _, r = setup(t)
+	g.authorName, g.authorEmail = "mgh3326", "m@example.com"
+	if e := s.Review(context.Background(), r, 7, "", Options{}); !errors.Is(e, ErrReviewUnavailable) {
+		t.Fatal(e)
 	}
 }

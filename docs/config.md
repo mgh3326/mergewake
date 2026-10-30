@@ -162,6 +162,7 @@ A single PR's fetch failure never aborts the pass.
 | `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
 | `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
+| `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
@@ -406,6 +407,7 @@ through the configured reps CLI, not other manual bench records.
 | `type` | `noop` (also empty) | `noop`, `stdout`, or `panewire`. |
 | `command` | `panewire` for that adapter | Executable path. Ignored for noop/stdout. |
 | `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. |
+| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. |
 
 The panewire adapter executes literal arguments equivalent to:
 
@@ -480,13 +482,20 @@ Mergewake-Task: 42
 Mergewake-Notify-Lane: worker-lane
 ```
 
-`--author-family` overrides the first line. A task trailer overrides `repos[].task`.
+`--author-family` overrides the first line. Without it or the trailer, the
+family is inferred from the head commit's `Co-Authored-By` trailers, then its
+author and committer identities (Claude → anthropic, Codex/GPT → openai,
+Devin → cognition, and the other listed aliases); `review.default_family`
+covers everything still unknown and the review record marks the family as
+inferred. A task trailer overrides `repos[].task`.
 Treat the family label as trusted automation metadata, not model provenance
 attestation. A handoffkeep-backed watcher refuses recovery with no valid task ID.
 `Mergewake-Notify-Lane` names the lane for `daemon.pr.notify` events when the
-task trailer cannot be resolved to a lane; the configured notifier lane is the
-last fallback. The task and notify-lane trailers are also read from the head
-commit message when absent from the body.
+task trailer cannot be resolved to a lane; the configured fallback lane
+(`notifier.fallback_lane`, defaulting to the operator lane) is the last
+resort, and a delivery the notifier refuses is retried there once before the
+verdict is parked with one logged decision. The task and notify-lane trailers
+are also read from the head commit message when absent from the body.
 
 Use `daemon` for complete polling, or invoke individual commands from optional
 webhook/scheduler adapters. The binary never installs or enables service units;
@@ -519,7 +528,7 @@ For `example/project`, state resides beneath
 | `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
-| `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role; a new head re-arms notification and restarts stay quiet. |
+| `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |

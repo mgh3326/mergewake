@@ -64,6 +64,13 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
 	key := method + " " + endpoint + " " + accept
+	if method == "GET" {
+		if hit, e := c.pollShortcut(key); e != nil {
+			return nil, e
+		} else if hit.ETag != "" {
+			return append([]byte(nil), hit.Body...), nil
+		}
+	}
 	release, cached, e := c.beginRequest(ctx, key)
 	if e != nil {
 		return nil, e
@@ -494,8 +501,14 @@ type Commit struct {
 	Commit  struct {
 		Tree      Ref    `json:"tree"`
 		Message   string `json:"message"`
+		Author    struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		} `json:"author"`
 		Committer struct {
-			Date time.Time `json:"date"`
+			Name  string    `json:"name"`
+			Email string    `json:"email"`
+			Date  time.Time `json:"date"`
 		} `json:"committer"`
 	} `json:"commit"`
 }

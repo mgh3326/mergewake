@@ -10,6 +10,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 func notifySetup(t *testing.T) (*Service, *fakeGH, *fakeNotifier, config.Repo) {
@@ -46,7 +47,7 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	if !strings.HasPrefix(text, "[mergewake] READY example/project#7 head=aaaaaaa | Add feature") {
 		t.Fatal(text)
 	}
-	if !strings.Contains(text, "lane=config-lane via config") {
+	if !strings.Contains(text, "lane=config-lane via fallback") {
 		t.Fatal(text)
 	}
 	if n.events[0].ID != "mergewake-ready-example/project-7-"+shaA || n.events[0].Lane != "config-lane" {
@@ -195,7 +196,7 @@ func TestNotifyLaneRouting(t *testing.T) {
 		{"no lane sink falls to trailer", func(s *Service, g *fakeGH) {
 			g.pull.Body = "Mergewake-Task: 42\nMergewake-Notify-Lane: notify-lane"
 		}, "notify-lane", "via notify-lane trailer", false},
-		{"config fallback", func(s *Service, g *fakeGH) {}, "config-lane", "via config", false},
+		{"config fallback", func(s *Service, g *fakeGH) {}, "config-lane", "via fallback", false},
 		{"sink read error retries", func(s *Service, g *fakeGH) {
 			g.pull.Body = "Mergewake-Task: 42"
 			s.Sink = &fakeLaneSink{err: errors.New("offline")}
@@ -294,5 +295,69 @@ func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	}
 	if _, e := os.Stat(filepath.Join(s.state(r.Name), "pr-notify-sent")); !os.IsNotExist(e) {
 		t.Fatal("dry-run wrote sent keys")
+	}
+}
+
+// laneFailNotifier fails deliveries per lane so fallback and parking can be
+// exercised without a real panewire.
+type laneFailNotifier struct {
+	fail   map[string]error
+	err    error
+	events []integrations.Event
+}
+
+func (n *laneFailNotifier) Notify(_ context.Context, e integrations.Event) error {
+	n.events = append(n.events, e)
+	if err, ok := n.fail[e.Lane]; ok {
+		return err
+	}
+	return n.err
+}
+
+// A PR whose resolved lane refuses the event is retried once on the fallback
+// lane; a verdict that still cannot be delivered is parked with one logged
+// decision instead of failing every loop.
+func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
+	s, g, _, r := notifySetup(t)
+	n := &laneFailNotifier{fail: map[string]error{"task-lane": errors.New("exit status 2: unknown lane")}}
+	s.Notifier = n
+	s.Config.Notifier.FallbackLane = "config-lane"
+	g.pull.Body = "Mergewake-Task: 42"
+	s.Sink = &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}}
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(n.events) != 2 || n.events[0].Lane != "task-lane" || n.events[1].Lane != "config-lane" {
+		t.Fatalf("%+v", n.events)
+	}
+	if !strings.Contains(n.events[1].Text, "+fallback") {
+		t.Fatal(n.events[1].Text)
+	}
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(n.events) != 2 {
+		t.Fatal("repeat poll re-delivered")
+	}
+
+	// When delivery cannot succeed anywhere the verdict is logged once and
+	// then stays quiet, never erroring every loop.
+	s, g, _, r = notifySetup(t)
+	n = &laneFailNotifier{err: errors.New("panewire failed: exit status 2")}
+	s.Notifier = n
+	for i := 0; i < 3; i++ {
+		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if len(n.events) != 1 {
+		t.Fatalf("events=%+v", n.events)
+	}
+	g.pull.Head.SHA = shaB
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(n.events) != 2 {
+		t.Fatal("new head re-armed notification")
 	}
 }
