@@ -63,6 +63,18 @@ func TestReapConfig(t *testing.T) {
 		{"ssh jobs abs", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: /home/ops/jobs}\n", false},
 		{"ssh jobs home", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: '~/jobs'}\n", true},
 		{"ssh jobs rel", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: 'jobs'}\n", true},
+		{"hub transport", "reap:\n  hub: {url: 'https://hub.example.invalid', token_file: /etc/op.env}\nhosts:\n  - {name: node, machine: node-a}\n", false},
+		{"explicit ssh with hub", "reap:\n  transport: ssh\n  hub: {url: 'https://hub.example.invalid', token_file: /etc/op.env}\n", false},
+		{"bad transport", "reap:\n  transport: telnet\n", true},
+		{"panewire no url", "reap:\n  transport: panewire\n", true},
+		{"panewire no token", "reap:\n  hub: {url: 'https://hub.example.invalid'}\n", true},
+		{"hub plain http", "reap:\n  hub: {url: 'http://hub.example.invalid', token_file: /etc/op.env}\n", true},
+		{"hub loopback http", "reap:\n  hub: {url: 'http://127.0.0.1:8080', token_file: /etc/op.env}\n", false},
+		{"hub url path", "reap:\n  hub: {url: 'https://hub.example.invalid/v1', token_file: /etc/op.env}\n", true},
+		{"hub url userinfo", "reap:\n  hub: {url: 'https://u:p@hub.example.invalid', token_file: /etc/op.env}\n", true},
+		{"hub token rel", "reap:\n  hub: {url: 'https://hub.example.invalid', token_file: op.env}\n", true},
+		{"machine needs panewire", "hosts:\n  - {name: node, machine: node-a}\n", true},
+		{"bad machine", "reap:\n  hub: {url: 'https://hub.example.invalid', token_file: /etc/op.env}\nhosts:\n  - {name: node, machine: 'Node A'}\n", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "config.yaml")
@@ -88,6 +100,13 @@ func TestReapConfig(t *testing.T) {
 				}
 				if tt.name == "regenerable" && c.Reap.Regenerable[1] != "vendor/**" {
 					t.Fatal("configured regenerable list did not replace defaults")
+				}
+				want := ReapTransportSSH
+				if tt.name == "hub transport" || tt.name == "hub loopback http" {
+					want = ReapTransportPanewire
+				}
+				if c.Reap.Transport != want {
+					t.Fatalf("transport %q, want %q", c.Reap.Transport, want)
 				}
 			}
 		})

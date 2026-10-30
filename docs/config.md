@@ -80,8 +80,9 @@ Session hosts where agent panes may run, used only by `reap`.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `name` | Required | Unique label for receipts; same alphabet as `host`. |
-| `ssh` | Empty / `local` | Empty or `local` runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`; options, whitespace and leading `-` are refused. |
-| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`). Needed before any pane on this host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. |
+| `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
+| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. |
+| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
 
 ### `reap`
 
@@ -92,13 +93,18 @@ Session hosts where agent panes may run, used only by `reap`.
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
 | `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
+| `transport` | `panewire` when `hub.url` is set, else `ssh` | How remote hosts are reached: `panewire` sends every remote operation through the hub's node commands; `ssh` runs `herdr`/`git` over `ssh(1)`. Local hosts always run locally. |
+| `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
+| `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 operator env file holding `HUB_TOKEN`, the same file the panewire operator CLI takes. Read at the start of each pass; a file other users can read is refused. |
+| `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role close merged-PR sessions, then clean their worktrees once they
 age out. For each merged PR on a configured repo's base branch, every host is
-scanned with `herdr agent list` (remote hosts over `ssh <ssh> herdr agent
-list`). A pane matches only when its `cwd` is a linked git worktree, its
+scanned with `herdr agent list` — remote hosts through the panewire hub (one
+`GET /v1/nodes/agents` per pass, see "Panewire transport" below) or, under
+the ssh transport, over `ssh <ssh> herdr agent list`. A pane matches only when its `cwd` is a linked git worktree, its
 current branch equals the PR head branch, its checked-out commit equals the
 PR head SHA, and the worktree's origin remote names the configured
 repository. Titles and names are never used for matching; a reused branch
@@ -141,6 +147,32 @@ the reason recorded; removal is `git worktree remove` without `--force` and the
 local branch is deleted with `git branch -d`, never `-D`. The remote branch
 stays. Worktrees are found from the panes and from prior `reap.jsonl` rows, so
 a worktree whose pane already closed still gets cleaned.
+
+#### Panewire transport
+
+Under `transport: panewire` no remote operation uses ssh. Each remote host
+maps to panewire machine `machine` (default `name`) and goes through the hub's
+operator node commands (panewire `docs/node-commands.md`):
+
+- discovery reads that machine's row of `GET /v1/nodes/agents`; a machine
+  the hub does not know, is disconnected or does not answer fails that host
+  for the pass, never reads as a host with no panes;
+- worktree matching uses `worktree.inspect`, which returns the same branch,
+  head and origin the ssh path reads with git;
+- capture uses `pane.capture` with the merge time and, only in acting mode,
+  `write: true`: the node applies the same job-directory, fresh-`report.md`
+  and `pane-screen.txt` rules against its own jobs inbox, and the receipt's
+  `saved` is the node's path;
+- the close uses `pane.close` with the discovered id, name, status and cwd;
+  the node re-reads herdr and closes only an exact match, answering
+  `pane-changed` or `pane-gone` otherwise, which become the same receipt
+  reasons as the ssh path.
+
+The hub has no worktree cleanup command yet, so a hub host's aged-out
+worktree is inspected (a removed or changed worktree still records
+`worktree-gone` / `worktree-changed`) and otherwise skipped with
+`cleanup-unsupported:panewire`; it is never removed over ssh. Hosts with
+empty `ssh` and no `machine` keep running every step locally.
 
 Every decision is appended to `<state_dir>/<repo>/reap.jsonl` — including
 shadow `would-*` rows, which is how a later pass still finds a worktree it

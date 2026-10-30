@@ -1,5 +1,6 @@
 // Package reap discovers herdr agent panes inside git worktrees and performs
-// the local/ssh command boundary for merged-PR session and worktree cleanup.
+// the local, ssh or panewire-hub command boundary for merged-PR session and
+// worktree cleanup.
 // A pane is never identified by its title or name alone: only an inspected
 // linked worktree whose checked-out branch equals the PR head branch, in a
 // clone whose origin remote is the configured repository, qualifies.
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -23,17 +25,55 @@ type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
 
-// Host is one configured session host. An empty or "local" SSH value means the
-// commands run directly on this machine; any other value is an ssh(1)
-// destination such as user@host. Jobs is the base directory holding one job
-// directory per named pane; it must be absolute on ssh hosts.
+// Host is one configured session host. An empty or "local" SSH value with no
+// Machine means the commands run directly on this machine; otherwise the host
+// is remote, reached by ssh(1) to SSH (a destination such as user@host) or,
+// under the panewire transport, through the hub as panewire machine Machine
+// (default Name). Jobs is the base directory holding one job directory per
+// named pane; it must be absolute on ssh hosts and is unused through the hub,
+// where the node owns its jobs directory.
 type Host struct {
-	Name string `yaml:"name" json:"name"`
-	SSH  string `yaml:"ssh" json:"ssh"`
-	Jobs string `yaml:"jobs" json:"jobs"`
+	Name    string `yaml:"name" json:"name"`
+	SSH     string `yaml:"ssh" json:"ssh"`
+	Machine string `yaml:"machine" json:"machine,omitempty"`
+	Jobs    string `yaml:"jobs" json:"jobs"`
 }
 
-func (h Host) Local() bool { return h.SSH == "" || h.SSH == "local" }
+func (h Host) Local() bool { return (h.SSH == "" || h.SSH == "local") && h.Machine == "" }
+
+// MachineID is the panewire machine a remote host is reached as.
+func (h Host) MachineID() string {
+	if h.Machine != "" {
+		return h.Machine
+	}
+	return h.Name
+}
+
+// Ops is one host's pane surface: discovery, worktree inspection, output
+// capture and the guarded close. Exec implements it locally or over ssh,
+// HubHost through the panewire hub.
+type Ops interface {
+	Panes(context.Context) ([]Pane, error)
+	AllPanes(context.Context) ([]Pane, error)
+	Inspect(context.Context, string) (*Worktree, error)
+	Capture(context.Context, Pane, *time.Time, bool) (Capture, error)
+	CloseExact(context.Context, Pane) (string, error)
+}
+
+// Capture and close outcomes. The skip values are receipt reasons verbatim.
+const (
+	CaptureNotAJob     = "not-a-job"
+	CapturePaneGone    = "pane-gone"
+	CapturePaneChanged = "pane-changed"
+	CloseClosed        = "closed"
+)
+
+// Capture is where a pane's output was (or would be) saved before a close,
+// or the reason the pane must be skipped instead.
+type Capture struct {
+	Saved string
+	Skip  string
+}
 
 // JobDir resolves the job directory for a named pane. Empty jobs config or an
 // unsafe name yields an empty result.
@@ -104,6 +144,67 @@ func (e Exec) Run(ctx context.Context, args ...string) ([]byte, error) {
 func (e Exec) Close(ctx context.Context, pane string) error {
 	_, err := e.Run(ctx, "herdr", "pane", "close", pane)
 	return err
+}
+
+// CloseExact re-reads the agent list immediately before closing and only
+// proceeds when the pane is still there, unchanged: the discovery list is a
+// stale snapshot, and a pane that went back to work since must survive.
+func (e Exec) CloseExact(ctx context.Context, pane Pane) (string, error) {
+	fresh, err := e.Panes(ctx)
+	if err != nil {
+		return "", err
+	}
+	var cur *Pane
+	for i := range fresh {
+		if fresh[i].ID == pane.ID {
+			cur = &fresh[i]
+		}
+	}
+	switch {
+	case cur == nil:
+		return CapturePaneGone, nil
+	case cur.Status != pane.Status || cur.Cwd != pane.Cwd || cur.Name != pane.Name:
+		return CapturePaneChanged, nil
+	}
+	if err := e.Close(ctx, pane.ID); err != nil {
+		return "", err
+	}
+	return CloseClosed, nil
+}
+
+// Capture saves a pane's output before it can close. Only a pane whose job
+// dir already exists counts as a fleet job: an operator pane merely cd'd into
+// a merged worktree must never be closed. report.md counts only when it is
+// newer than the merge — a stale file could belong to a reused job name —
+// otherwise the last screen is saved, or only named when write is false.
+func (e Exec) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write bool) (Capture, error) {
+	dir := e.Host.JobDir(pane.Name)
+	isJob, err := e.DirExists(ctx, dir)
+	if err != nil {
+		return Capture{}, err
+	}
+	if !isJob {
+		return Capture{Skip: CaptureNotAJob}, nil
+	}
+	report := filepath.Join(dir, "report.md")
+	exists, err := e.Exists(ctx, report)
+	fresh := false
+	if err == nil && exists && mergedAt != nil {
+		fresh, err = e.NewerThan(ctx, report, mergedAt.Unix())
+	}
+	switch {
+	case err != nil:
+		return Capture{}, err
+	case fresh:
+		return Capture{Saved: report}, nil
+	case !write:
+		return Capture{Saved: filepath.Join(dir, "pane-screen.txt")}, nil
+	}
+	saved, err := e.Screen(ctx, pane.ID, dir)
+	if err != nil {
+		return Capture{}, err
+	}
+	return Capture{Saved: saved}, nil
 }
 
 // Panes decodes the `herdr agent list` JSON envelope.
