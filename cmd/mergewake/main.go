@@ -379,7 +379,7 @@ func runOutcomes(ctx context.Context, args []string, out, stderr io.Writer) erro
 	ledger := outcomes.Ledger{Dir: c.StateDir}
 	reps := outcomes.CLI{Command: c.Outcomes.Command, Runner: integrations.Exec{}}
 	if args[0] == "sync" {
-		return ledger.Flush(ctx, reps)
+		return ledger.Flush(ctx, reps, "")
 	}
 	var since time.Time
 	if *sinceArg != "" {

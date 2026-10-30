@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -105,6 +106,51 @@ func TestTriggerSeamAndNextRun(t *testing.T) {
 	}
 }
 
+func TestHealthcheckRunsAfterCleanLoopOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	pings, runs := 0, 0
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a",
+		Healthy: func(context.Context) error { mu.Lock(); pings++; mu.Unlock(); return errors.New("pinger down") }}
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "watch", Interval: time.Hour, Run: func(context.Context) error {
+			mu.Lock()
+			runs++
+			n := runs
+			mu.Unlock()
+			if n == 1 {
+				return nil
+			}
+			cancel()
+			return errors.New("poll failed")
+		}}})
+	}()
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		mu.Lock()
+		n := pings
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no ping after clean loop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !d.Trigger("watch") {
+		t.Fatal("trigger lost")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if pings != 1 || runs != 2 {
+		t.Fatalf("pings=%d runs=%d after failing loop", pings, runs)
+	}
+}
 func TestFixedClockAndJitterPinStatus(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

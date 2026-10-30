@@ -102,6 +102,24 @@ func tail(s string, n int) string {
 	return s
 }
 
+// Detail describes an error for an operator-facing failure report: a failed
+// command's message plus the tail of its captured stderr. CommandError keeps
+// stderr out of its own message; callers add it back only at reporting
+// boundaries such as a daemon's last_error.
+func Detail(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ce *CommandError
+	if errors.As(err, &ce) && strings.TrimSpace(ce.Stderr) != "" {
+		return err.Error() + ": " + tail(strings.TrimSpace(ce.Stderr), reportTail)
+	}
+	return err.Error()
+}
+
+// reportTail bounds the stderr shown in an error report.
+const reportTail = 512
+
 type Event struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
@@ -138,6 +156,11 @@ func (p Panewire) Notify(ctx context.Context, e Event) error {
 		lane = p.Lane
 	}
 	_, err := p.Runner.Run(ctx, p.Command, []string{"emit", "--kind", "lane.event", "--lane", lane, "--event-id", e.ID, "--text", e.Text}, "", "")
+	var ce *CommandError
+	if err != nil && errors.As(err, &ce) && strings.Contains(ce.Stderr, "duplicate event_id") {
+		// The event reached the store under this ID before; delivery is done.
+		return nil
+	}
 	return err
 }
 

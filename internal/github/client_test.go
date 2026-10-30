@@ -247,6 +247,22 @@ func TestReadFileRejectsSymlink(t *testing.T) {
 		})
 	}
 }
+func TestReadFileMissingNamesPath(t *testing.T) {
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/commits/"):
+			reply(w, map[string]any{"sha": testSHA, "commit": map[string]any{"tree": Ref{SHA: "tree"}}})
+		case strings.Contains(r.URL.Path, "/git/trees/"):
+			reply(w, map[string]any{"tree": []TreeEntry{{Path: "other", Type: "blob", Mode: "100644", SHA: "blob"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	_, e := c.ReadFile(context.Background(), "example/project", testSHA, ".mergewake/policy.yaml")
+	if e == nil || !strings.Contains(e.Error(), "not found") || !strings.Contains(e.Error(), ".mergewake/policy.yaml") || !strings.Contains(e.Error(), "example/project") {
+		t.Fatalf("unhelpful missing-source error: %v", e)
+	}
+}
 func TestLatestRejectsWrongTagCommit(t *testing.T) {
 	m, _ := manifest.Build("example/project", testSHA, []config.Install{{Source: "tool", Target: "tool"}}, func(string) ([]byte, error) { return []byte("x"), nil })
 	c := api(t, func(w http.ResponseWriter, r *http.Request) {

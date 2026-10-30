@@ -343,7 +343,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e = s.ObservePR(ctx, r, merged, o); e != nil {
 		return e
 	}
-	return s.FlushOutcomes(ctx)
+	return s.FlushOutcomes(ctx, r.Name)
 }
 func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Options) error {
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)

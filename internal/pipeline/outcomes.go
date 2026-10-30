@@ -300,10 +300,10 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 			errs = append(errs, e)
 		}
 	}
-	errs = append(errs, s.FlushOutcomes(ctx))
+	errs = append(errs, s.FlushOutcomes(ctx, r.Name))
 	return errors.Join(errs...)
 }
-func (s *Service) FlushOutcomes(ctx context.Context) error {
+func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	command := s.Config.Outcomes.Command
 	if command == "" {
 		command = s.Config.Review.Quota
@@ -311,5 +311,5 @@ func (s *Service) FlushOutcomes(ctx context.Context) error {
 	if command == "" {
 		command = "scopefuel"
 	}
-	return s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command})
+	return s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
 }
