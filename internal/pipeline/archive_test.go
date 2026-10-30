@@ -24,6 +24,7 @@ type archiveRunner struct {
 	script   *scriptRunner
 	hkCalls  int
 	comments []string
+	failNote bool
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -41,6 +42,9 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 			return json.Marshal(map[string]string{"sha256": hex.EncodeToString(sum[:])})
 		}
 		if len(args) == 5 && args[0] == "tasks" && args[1] == "comment" {
+			if a.failNote {
+				return nil, errors.New("hk comment failed")
+			}
 			a.comments = append(a.comments, input)
 			return []byte("{}"), nil
 		}
@@ -290,5 +294,26 @@ func TestArchiveJobsReportsUnreadableJobsDir(t *testing.T) {
 	err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{Shadow: true})
 	if err == nil || !strings.Contains(err.Error(), "list jobs") {
 		t.Fatalf("missing jobs dir reported as %v", err)
+	}
+}
+
+// One failed archive is one error in the reap summary, kept for retry.
+func TestReapArchiveErrorCountedOnce(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.run.failNote = true
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.seedClose(t, "wk-7", "closed", time.Now().Add(-48*time.Hour))
+	err := f.s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "hk comment") {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"action":"reap"`) || !strings.Contains(f.out.String(), `"errors":1}`) {
+		t.Fatalf("summary does not count the archive error once:\n%s", f.out.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir lost")
+	}
+	if rows := f.rows(t); len(rows) != 1 || rows[0].Result != "error" {
+		t.Fatalf("rows = %+v", rows)
 	}
 }

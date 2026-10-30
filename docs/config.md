@@ -177,24 +177,30 @@ local job dir and reports the step:
    job's runtug events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
    destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
-   job's newest entry; one that already holds a `manifest.json` is skipped as
-   `drive-dir-exists`, and a job with its own top-level `manifest.json` as
-   `manifest-collision`.
+   job's newest entry. A destination that already holds a `manifest.json` is
+   a finished archive: when that manifest names the same job, host and task
+   with the same files and sizes, the plan is a delete-only `resume` (the
+   files must still hash to the manifest); otherwise it is skipped as
+   `drive-dir-exists`. A job with its own top-level `manifest.json` is
+   skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
    from the job host and unpacked straight into the destination on the
    archive host, relayed through this machine (`ssh` on either side as
-   configured); the Drive copy is a plain directory, not an archive file.
+   configured); the Drive copy is a plain directory, not an archive file. A
+   job with nothing but excluded or non-regular entries copies nothing.
 3. **Verify**: every file's sha256 is computed on both sides and must match.
 4. **hk attachments**: each text file under `text_max_bytes` goes through
    `handoffkeep attach put`; its returned sha256 must match. `attach put`
    has no task reference, so the ids are tied to the task by the comment.
-5. **Manifest**: `manifest.json` (job, host, task, source, every file's path,
-   size and sha256, excluded and skipped paths, attachment ids) is written
-   beside the files and also attached to hk.
-6. **Record**: `handoffkeep tasks comment <task>` with the Drive directory,
+5. **Record**: `manifest.json` (job, host, task, source, every file's path,
+   size and sha256, excluded and skipped paths, attachment ids) is attached
+   to hk, then `handoffkeep tasks comment <task>` posts the Drive directory,
    file count, total bytes, the manifest's attachment id, every attachment
    id, the excluded and skipped names, and the per-file sha256 list (the
    first 200; the rest are in `manifest.json`).
+6. **Manifest**: only then is `manifest.json` written beside the files, so a
+   failed upload or comment leaves no manifest and the job is retried in
+   full.
 7. **Delete**: the job dir is listed again and must be unchanged — a file
    added or modified since the plan was never archived, so the job is kept
    as `job-changed` — then removed with `rm -rf`. Excluded credential files

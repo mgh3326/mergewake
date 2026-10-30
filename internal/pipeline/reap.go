@@ -352,7 +352,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 
-	scanned, closed, planned, removed, deleted, skipped, failed, archived := 0, 0, 0, 0, 0, 0, 0, 0
+	// Errors are counted once, from errs: every "error" row also lands there.
+	scanned, closed, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0, 0
 	note := func(v reapReceipt) {
 		switch v.Result {
 		case "closed":
@@ -367,8 +368,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			deleted++
 		case "skipped":
 			skipped++
-		case "error":
-			failed++
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed archive always appends: its time spaces the next retry.
@@ -702,6 +701,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		Archived int    `json:"jobs_archived"`
 		Skipped  int    `json:"skipped"`
 		ErrCount int    `json:"errors"`
-	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, skipped, failed + len(errs)}
+	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, skipped, len(errs)}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }

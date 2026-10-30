@@ -71,8 +71,13 @@ type Plan struct {
 	Skipped  []string `json:"skipped"`
 	Delete   string   `json:"delete"`
 	Newest   int64    `json:"newest_mtime"`
-	host     reap.Host
-	entries  []File
+	// Resume marks a job whose Drive copy and hk record already completed
+	// but whose local delete did not: applying it only deletes.
+	Resume  bool `json:"resume,omitempty"`
+	host    reap.Host
+	entries []File
+	done    *manifest
+	doneRaw []byte
 }
 
 // Attachment is one handoffkeep attachment id and the job path it holds.
@@ -272,14 +277,42 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	// work happened and a rerun lands in the same place.
 	month := time.Unix(p.Newest, 0).UTC().Format("2006-01")
 	p.Dest = path.Join(a.DriveDir, h.Name, month, job)
-	done, err := a.exists(ctx, a.SSH, path.Join(p.Dest, "manifest.json"))
+	mpath := path.Join(p.Dest, "manifest.json")
+	done, err := a.exists(ctx, a.SSH, mpath)
 	if err != nil {
 		return nil, err
 	}
 	if done {
-		return nil, &Skip{"drive-dir-exists"}
+		// manifest.json is written last, after the hk comment, so it marks a
+		// finished archive. Only the same job with the same files may resume
+		// to the delete; anything else never overwrites it.
+		raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
+		if err != nil {
+			return nil, err
+		}
+		var m manifest
+		if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
+			return nil, &Skip{"drive-dir-exists"}
+		}
+		p.Resume, p.done, p.doneRaw = true, &m, raw
 	}
 	return p, nil
+}
+
+func (m *manifest) matches(p *Plan) bool {
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) {
+		return false
+	}
+	size := map[string]int64{}
+	for _, f := range p.entries {
+		size[f.Path] = f.Size
+	}
+	for i, f := range m.Files {
+		if f.Path != p.Move[i] || f.Size != size[f.Path] || len(f.SHA256) != 64 {
+			return false
+		}
+	}
+	return true
 }
 
 func listInput(paths []string) string {
@@ -426,12 +459,19 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	if err != nil {
 		return nil, err
 	}
-	if err := a.copy(ctx, p); err != nil {
-		return nil, err
+	if p.done != nil {
+		return a.resume(ctx, p, src)
 	}
-	dst, err := a.hashes(ctx, a.SSH, p.Dest, p.Move)
-	if err != nil {
-		return nil, err
+	dst := map[string]string{}
+	// Nothing but excluded or non-regular entries: there is nothing to copy,
+	// and an empty tar is not something every tar will create.
+	if len(p.Move) > 0 {
+		if err := a.copy(ctx, p); err != nil {
+			return nil, err
+		}
+		if dst, err = a.hashes(ctx, a.SSH, p.Dest, p.Move); err != nil {
+			return nil, err
+		}
 	}
 	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
 		Files: []File{}, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
@@ -476,10 +516,6 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		return nil, err
 	}
 	mb = append(mb, '\n')
-	mpath := path.Join(p.Dest, "manifest.json")
-	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", mpath); err != nil {
-		return nil, fmt.Errorf("write manifest: %w", err)
-	}
 	mid, err := a.put(ctx, tmp, "manifest.json", mb)
 	if err != nil {
 		return nil, err
@@ -487,10 +523,33 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	if _, err := a.Runner.Run(ctx, a.HK, []string{"tasks", "comment", p.Task, "--file", "-"}, comment(p, m, mid), ""); err != nil {
 		return nil, fmt.Errorf("hk comment: %w", err)
 	}
+	// Published last: Plan treats a dest holding manifest.json as archived
+	// and recorded, so a failed put or comment must leave none behind.
+	mpath := path.Join(p.Dest, "manifest.json")
+	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", mpath, p.Dest); err != nil {
+		return nil, fmt.Errorf("write manifest: %w", err)
+	}
 	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: mid, Attachments: m.Attachments, Excluded: p.Excluded}
+	return a.remove(ctx, p, res)
+}
 
-	// A file written after the plan was never archived: re-list and delete
-	// only an identical job dir.
+// resume finishes an archive whose Drive copy and hk record completed but
+// whose delete did not: the job's files must still hash to the manifest.
+func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (*Result, error) {
+	m := p.done
+	for _, f := range m.Files {
+		if src[f.Path] != f.SHA256 {
+			return nil, &Skip{"drive-dir-exists"}
+		}
+	}
+	sum := sha256.Sum256(p.doneRaw)
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Attachments: m.Attachments, Excluded: m.Excluded}
+	return a.remove(ctx, p, res)
+}
+
+// remove deletes the job dir only when a re-listing shows it unchanged: a
+// file written after the plan was never archived.
+func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, error) {
 	again, err := a.list(ctx, p.host, p.Dir)
 	if err != nil {
 		return res, err
