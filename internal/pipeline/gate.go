@@ -173,7 +173,8 @@ func postedOn(c github.ReviewComment) string {
 // counts, and so does one the trusted review login posted on this head and
 // someone resolved without a new head. A triage finding blocks until someone
 // other than its author replies; resolving or answering it needs no new head.
-// Advisory findings never block, and the fast lane drops triage entirely.
+// Advisory findings never block, and the fast lane drops triage except for
+// unreadable review.login evidence.
 // Reviewers still requesting changes count as blocking findings.
 func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, head string, fastLane bool) (blocking, triage int) {
 	blocking = fb.ChangesRequested
@@ -199,7 +200,10 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, h
 				blocking++
 			}
 		case policy.GradeTriage:
-			if !fastLane && !f.Resolved && !answered(t) {
+			// The fast lane drops rule-graded triage, but a trusted-review
+			// finding whose severity cannot be read still needs an answer.
+			unreadable := f.OwnReview && !policy.KnownSeverity(f.Severity)
+			if (!fastLane || unreadable) && !f.Resolved && !answered(t) {
 				triage++
 			}
 		}

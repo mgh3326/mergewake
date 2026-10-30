@@ -153,6 +153,8 @@ func TestGateFastLane(t *testing.T) {
 		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("review-bot", "medium", false, shaB)},
 		{"small PR is still stopped by block-class", fastLane, "blocking_findings:1", 50, gradedThread("review-bot", "high", false, shaB)},
 		{"small PR holds a block-class finding resolved on the head", fastLane, "blocking_findings:1", 5, gradedThread("review-bot", "high", true, shaA, human)},
+		{"small PR still needs an answer for an unreadable own severity", fastLane, "triage_unanswered:1", 10, gradedThread("review-bot", "", false, shaB)},
+		{"small PR accepts an answer for an unreadable own severity", fastLane, "", 10, gradedThread("review-bot", "", false, shaB, human)},
 		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("review-bot", "medium", false, shaB)},
 		{"over the limit without review_gate keeps the raw count", fastLane, "threads_open:1", 51, gradedThread("review-bot", "low", false, shaB)},
 		{"no fast_lane keeps triage", gradedPolicy, "triage_unanswered:1", 10, gradedThread("review-bot", "medium", false, shaB)},

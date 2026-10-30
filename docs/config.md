@@ -500,8 +500,9 @@ its first comment instead:
 | triage | someone other than the finding's author (and not a bot) replies on the thread. An answered triage finding needs no new head, and a resolved one no longer holds. | `triage_unanswered:<n>` |
 | advisory | never holds. Threads from authors no rule names are advisory. | none |
 
-A reviewer whose latest review still requests changes counts as one blocking
-finding. Severities come from the `<!-- mergewake-severity:... -->` marker on
+Each reviewer whose latest review still requests changes adds one to the
+blocking count (at least one when GitHub's overall decision is changes
+requested), on top of any unresolved block-class threads. Severities come from the `<!-- mergewake-severity:... -->` marker on
 mergewake's own findings and from the prose labels CodeRabbit (`critical`,
 `major`, `minor`, `nitpick`) and codex (`P1`–`P3`) use. Evidence the rules cannot
 read still needs an answer: a finding by the `review.login` identity with a
@@ -521,7 +522,8 @@ stay parseable but do not affect the land gate.
 `fast_lane` takes only the PR's class and size: when the PR classifies as
 routine and `additions + deletions` is at most `max_changed_lines`, triage
 findings stop holding the merge and only block-class findings (and requested
-changes) do. Routine PRs already need a single review pass. The fast lane alone
+changes) do; a `review.login` finding with an unreadable severity still needs
+an answer. Routine PRs already need a single review pass. The fast lane alone
 grades only the PRs it admits, with the default rules; larger PRs keep the raw
 count unless `review_gate` is present.
 

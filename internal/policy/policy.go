@@ -385,6 +385,9 @@ func (p Policy) Validate() error {
 func (p Policy) FastLaneEligible(class string, changedLines int) bool {
 	return p.FastLane != nil && class == "routine" && changedLines <= p.FastLane.MaxChangedLines
 }
+
+// KnownSeverity reports whether s is a severity label the gate can grade.
+func KnownSeverity(s string) bool { return validSeverity(strings.ToLower(s)) }
 func validSeverity(s string) bool {
 	switch s {
 	case "critical", "high", "medium", "low", "blocking", "major", "minor", "nitpick", "p1", "p2", "p3":
