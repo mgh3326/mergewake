@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -217,5 +218,23 @@ func TestHeadlessExecutorUnchangedWithoutRuntug(t *testing.T) {
 	}
 	if len(runner.spawns) != 0 || runner.headless != 1 || g.passes[shaA][0].Fallback != "" || g.passes[shaA][0].Executor != "" {
 		t.Fatal(runner.spawns, g.passes)
+	}
+}
+
+// A headless skip before the fallback succeeds must not replace the runtug
+// reason recorded in the receipt.
+func TestRuntugFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
+	runner := &runtugRunner{fakeRunner: fakeRunner{recommend: []string{"bad", "claude"}}, refuse: map[string]int{"reviewer": 70}}
+	s, g, r := runtugSetup(t, runner)
+	s.Config.Review.Pairings = map[string][]string{"openai": {"bad", "claude"}}
+	s.Config.Review.Profiles["bad"] = config.Reviewer{Family: "xai", Command: "grok", Args: []string{"--unknown", "x"}}
+	out := &bytes.Buffer{}
+	s.Out = out
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := g.passes[shaA][0]
+	if !strings.Contains(out.String(), `"reviewer":"bad","reason":"reviewer profile rejected"`) || got.Reviewer != "claude" || got.Fallback != "runtug: runtug spawn exit 70: exit status" {
+		t.Fatalf("%+v", got)
 	}
 }
