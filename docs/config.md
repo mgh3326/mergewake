@@ -255,6 +255,23 @@ the pass 2 lens) before falling back to the author's family; the author's
 family is used only when no usable other-family candidate remains (quota
 refusal, an unavailable CLI or a failed invocation all count).
 
+Before invoking a reviewer, the review adds PR context ahead of the diff so a
+settled point is not re-flagged on every new head. It lists this PR's review
+threads whose finding has a reply from someone other than its author (resolved
+or not): path, line, the first ~300 characters of the finding and of the latest
+reply, newest first, under "Already answered on this PR". The reviewer is told
+not to repeat a matching finding unless it gives a new, concrete reason the
+answer is wrong, and to quote the answer it disputes. A thread holding only its
+author's own comments is not included. A PR-body section headed `Operator
+decisions` (markdown heading of any level, up to the next heading of the same or
+higher level) is included verbatim, capped at 4 KB, as settled scope rather than
+defects. The added context is capped at 12 KB; the prompt says when answered
+findings or the decisions section were cut. If the thread read fails the review
+runs without the answered findings (the PR-body decisions still apply) and the
+audit event carries `context_error`. Each pass
+receipt and the `review` audit event record `answered_context: <n>`, the number
+of answered findings the prompt carried (`context_truncated` marks a cut).
+
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
 are ineligible, including through `pairings`. The quota tool remains the policy
