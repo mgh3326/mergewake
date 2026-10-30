@@ -598,9 +598,10 @@ head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>`, `review_missing`, `base_stale`, `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
-`enabled` repository policy merges the gated head and emits `MERGED`. Each
-`(PR, head, verdict)` emits at most once per the `pr-notify-sent` state
-file; a new head re-arms notification and a restart does not resend. The event
+`enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
+verdict)` emits at most once per the `pr-notify-sent` state file; a changed
+BLOCKED reason set is a new verdict that emits again for the same head, a new
+head re-arms notification, and a restart does not resend. The event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
 (`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the

@@ -148,9 +148,10 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` for unresolved review threads, `review_missing` when the
 marker or passes are absent, `base_stale` when the base moved ahead of the
 head, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
-check evidence emits nothing. Each `(PR, head, verdict)` emits at most once; a
-new head re-arms the notification and sent keys persist across daemon restarts
-under `<state_dir>/<repo>/pr-notify-sent`.
+check evidence emits nothing. Each `(PR, head, verdict)` emits at most once — a
+changed BLOCKED reason set counts as a new verdict and emits again for the
+same head — while a new head re-arms the notification and sent keys persist
+across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`.
 
 Auto-merge is opt-in per repository with `enabled: true` in
 `.mergewake/policy.yaml` (default off). While the daemon acts
