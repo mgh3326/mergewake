@@ -283,7 +283,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if !viaRuntug {
 				return fmt.Errorf("quota usage: %w", e)
 			}
-			quotaErr, ranked = fmt.Errorf("quota usage: %w", e), nil
+			// The headless fallback keeps the recommendation, in rank order.
+			byPace = false
 		}
 	}
 	paces := map[string]quota.Pace{}

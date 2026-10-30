@@ -29,6 +29,7 @@ type runtugRunner struct {
 	findings string         // "" writes no findings file
 	family   string
 	quotaErr error
+	usageErr error
 	spawns   [][]string
 	git      [][]string
 	headless int
@@ -42,6 +43,9 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 	case "scopefuel":
 		if r.quotaErr != nil {
 			return nil, r.quotaErr
+		}
+		if r.usageErr != nil && args[0] == "--json" {
+			return nil, r.usageErr
 		}
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "runtug":
@@ -252,7 +256,22 @@ func TestRuntugPassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	if e != nil || out.executor != "runtug" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}
-	if w := arg(runner.spawns[0], "--wait-timeout"); w != "599" && w != "600" {
+	// A minute of the ten is kept back for posting.
+	if w := arg(runner.spawns[0], "--wait-timeout"); w != "539" && w != "540" {
 		t.Fatalf("--wait-timeout %s", w)
+	}
+}
+
+// In runtug mode a failed usage read keeps the recommendation: the headless
+// fallback still has its ranked candidates, ordered without pace.
+func TestRuntugUsageFailureKeepsRankedFallback(t *testing.T) {
+	runner := &runtugRunner{usageErr: errors.New("usage snapshot unavailable"), refuse: map[string]int{"reviewer": 70}}
+	s, g, r := runtugSetup(t, runner)
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := g.passes[shaA]
+	if runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || !strings.Contains(got[0].Fallback, "runtug spawn exit 70") {
+		t.Fatalf("headless=%d %+v", runner.headless, got)
 	}
 }

@@ -21,6 +21,10 @@ import (
 // means no admitted seat outside the builder's family remained.
 const runtugRefused = 77
 
+// postReserve is the most of the review deadline kept back from the pane wait
+// for validating and posting its findings.
+const postReserve = time.Minute
+
 var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
 
 var spawnedSeat = regexp.MustCompile(`(?m)^OK pane=\S+ model=(\S+)`)
@@ -129,8 +133,11 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		return skip("write brief: %v", e)
 	}
 
+	// The pane wait leaves time to validate and post the findings: a minute,
+	// or a quarter of what is left when that is shorter.
 	deadline, _ := ctx.Deadline()
-	wait := time.Until(deadline)
+	left := time.Until(deadline)
+	wait := left - min(postReserve, left/4)
 	if wait < time.Second {
 		return skip("no time left to wait for a reviewer pane")
 	}
