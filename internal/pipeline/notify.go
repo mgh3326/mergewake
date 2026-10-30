@@ -4,17 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
-	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
 var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
@@ -181,17 +177,16 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, true)
 	}
-	file := filepath.Join(s.state(r.Name), "pr-notify-sent")
-	b, e := os.ReadFile(file)
-	if e != nil && !os.IsNotExist(e) {
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
+	if e != nil {
 		return e
 	}
 	key := fmt.Sprintf("%s %d %s", state, n, pr.Head.SHA)
-	if slices.Contains(strings.Split(string(b), "\n"), key) {
+	if sent.has(key) {
 		record.Deduped = true
 		return s.audit(r.Name, "pr-notify", record, false)
 	}
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, n, pr.Head.SHA),
@@ -201,15 +196,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return e
 	}
 	record.Sent = true
-	keys := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
-	if len(keys) > 255 {
-		keys = keys[len(keys)-255:]
-	}
-	if len(keys) == 1 && keys[0] == "" {
-		keys = nil
-	}
-	keys = append(keys, key)
-	if e = rollout.Atomic(file, []byte(strings.Join(keys, "\n")+"\n"), 0600); e != nil {
+	if e = sent.add(key); e != nil {
 		return e
 	}
 	return s.audit(r.Name, "pr-notify", record, false)

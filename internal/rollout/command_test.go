@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
@@ -136,7 +137,7 @@ func TestCommandCrashRecovery(t *testing.T) {
 	o := Options{Root: t.TempDir(), StateDir: t.TempDir(), Allowed: []config.Install{s}}
 	root, _ := manifest.CanonicalRoot(o.Root)
 	j := commandJournal{Repo: m.Repo, Root: root, Commit: newSHA, Targets: map[string]InstalledTarget{s.Target: {SHA: oldSHA, Recipe: recipe(s)}}, Order: []string{s.Target}}
-	if e := writeJSON(filepath.Join(o.StateDir, "command-journal.json"), j); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(o.StateDir, "command-journal.json"), j); e != nil {
 		t.Fatal(e)
 	}
 	r := &versionRunner{newSHA}

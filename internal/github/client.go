@@ -25,7 +25,17 @@ import (
 type Client struct {
 	BaseURL, UploadURL, Token string
 	HTTP                      *http.Client
-	poll                      pollingState
+	// Now stamps and ages review leases; nil means time.Now. Rate-limit waits
+	// are real sleeps and always use the wall clock.
+	Now  func() time.Time
+	poll pollingState
+}
+
+func (c *Client) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
 }
 
 func New(token string) *Client {

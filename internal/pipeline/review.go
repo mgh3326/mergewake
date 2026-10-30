@@ -336,7 +336,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return "default"
 	}
 
-	if o.DryRun || o.Shadow {
+	if !o.Acting() {
 		out := []map[string]any{}
 		for _, plan := range plans {
 			plan.lens = lens(plan)

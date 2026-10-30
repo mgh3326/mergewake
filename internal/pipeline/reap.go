@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -68,24 +69,11 @@ func (s *Service) reapNote(v reapReceipt, dry bool) error {
 	if dry {
 		return nil
 	}
-	dir := s.state(v.Repo)
-	if e := os.MkdirAll(dir, 0700); e != nil {
-		return e
-	}
-	f, e := os.OpenFile(s.reapLog(v.Repo), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if e != nil {
-		return e
-	}
-	defer f.Close()
 	b, e := json.Marshal(v)
 	if e != nil {
 		return e
 	}
-	_, e = f.Write(append(b, '\n'))
-	if e == nil {
-		e = f.Sync()
-	}
-	return e
+	return fsutil.AppendLine(s.reapLog(v.Repo), b)
 }
 
 // reapHost caches one host's agent list, full pane list and per-cwd worktree
@@ -204,7 +192,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	now := s.now()
 	// reap.act is the role's own acting gate, separate from daemon.act:
 	// without it every mode stays observational no matter what --apply says.
-	acting := !o.DryRun && !o.Shadow && s.Config.Reap.Act
+	acting := o.Acting() && s.Config.Reap.Act
 	var errs []error
 
 	receipts, e := s.reapReceipts(r.Name)

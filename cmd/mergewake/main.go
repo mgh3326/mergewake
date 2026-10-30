@@ -323,10 +323,9 @@ func status(c config.Config, repo string, out io.Writer) error {
 		}
 		files := []map[string]any{}
 		for _, f := range receipt.Manifest.Files {
-			denied := false
-			for _, g := range r.Deny {
-				match, _ := policy.Match(g, f.Target)
-				denied = denied || match
+			denied, e := policy.MatchAny(r.Deny, f.Target)
+			if e != nil {
+				return e
 			}
 			if denied {
 				files = append(files, map[string]any{"target": f.Target, "status": "denied"})

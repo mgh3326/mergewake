@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -238,18 +240,6 @@ func trimHistory(history []string, keep int) []string {
 	return history
 }
 
-func deniedTarget(deny []string, target string) (bool, error) {
-	denied := false
-	for _, g := range deny {
-		match, e := policy.Match(g, target)
-		if e != nil {
-			return false, e
-		}
-		denied = denied || match
-	}
-	return denied, nil
-}
-
 func runSpec(spec config.Install, digest string) RunSpec {
 	restart := spec.Restart
 	if restart == "" {
@@ -278,7 +268,7 @@ func AdoptContainer(ctx context.Context, spec config.Install, host, repo string,
 		err = errors.New("container install requires health")
 		return
 	}
-	denied, e := deniedTarget(o.Deny, spec.Target)
+	denied, e := policy.MatchAny(o.Deny, spec.Target)
 	if e != nil {
 		err = e
 		return
@@ -347,7 +337,7 @@ func AdoptContainer(ctx context.Context, spec config.Install, host, repo string,
 		Adopted:     true,
 		InstalledAt: o.now().UTC(),
 	}
-	if e = writeJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
+	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
 		err = e
 		return
 	}
@@ -390,7 +380,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 			err = fmt.Errorf("container rollout cannot mix install kind %q", t.Kind)
 			return
 		}
-		denied, e := deniedTarget(o.Deny, t.Target)
+		denied, e := policy.MatchAny(o.Deny, t.Target)
 		if e != nil {
 			err = e
 			return
@@ -446,11 +436,11 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 		return
 	}
 	rejectPath := filepath.Join(o.StateDir, containerRejectName)
-	if b, e := os.ReadFile(rejectPath); e == nil {
-		var rejected containerRejection
-		if err = json.Unmarshal(b, &rejected); err != nil {
-			return
-		}
+	var rejected containerRejection
+	if found, e := fsutil.ReadJSON(rejectPath, &rejected); e != nil {
+		err = e
+		return
+	} else if found {
 		for _, s := range selected {
 			if rejected.Digests[s.Target] == digests[s.Target] {
 				res.Status = "rejected"
@@ -458,9 +448,6 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 				return
 			}
 		}
-	} else if !os.IsNotExist(e) {
-		err = e
-		return
 	}
 	prior, priorBytes, e := LoadContainerReceipt(o.StateDir, host, m.Repo)
 	if e != nil {
@@ -501,7 +488,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 	if current {
 		if prior.Commit != m.Commit {
 			prior.Commit = m.Commit
-			if err = writeJSON(filepath.Join(o.StateDir, ContainerReceiptName), prior); err != nil {
+			if err = fsutil.WriteJSON(filepath.Join(o.StateDir, ContainerReceiptName), prior); err != nil {
 				return
 			}
 		}
@@ -529,7 +516,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 	}
 	journalPath := filepath.Join(o.StateDir, containerJournalName)
 	j := containerJournal{Repo: m.Repo, Host: host, Commit: m.Commit, PriorReceipt: priorBytes, ReceiptExisted: priorBytes != nil, Targets: map[string]containerMutation{}}
-	if e = writeJSON(journalPath, j); e != nil {
+	if e = fsutil.WriteJSON(journalPath, j); e != nil {
 		err = e
 		return
 	}
@@ -558,7 +545,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 		}
 		j.Order = append(j.Order, s.Target)
 		j.Targets[s.Target] = mut
-		if e = writeJSON(journalPath, j); e != nil {
+		if e = fsutil.WriteJSON(journalPath, j); e != nil {
 			err = e
 			return
 		}
@@ -606,7 +593,7 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 		}
 		res.Installed = append(res.Installed, s.Target)
 	}
-	if e = writeJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
+	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
 		undo(e)
 		return
 	}
@@ -718,15 +705,8 @@ func garbageCollect(ctx context.Context, rt Runtime, repo string, keep map[strin
 
 func recoverContainerJournal(ctx context.Context, o Options, host, repo string, rtFor RuntimeFor, health HealthCheck, specs map[string]config.Install) (bool, error) {
 	journalPath := filepath.Join(o.StateDir, containerJournalName)
-	b, e := os.ReadFile(journalPath)
-	if os.IsNotExist(e) {
-		return false, nil
-	}
-	if e != nil {
-		return false, e
-	}
 	var j containerJournal
-	if e = json.Unmarshal(b, &j); e != nil {
+	if found, e := fsutil.ReadJSON(journalPath, &j); !found || e != nil {
 		return false, e
 	}
 	if j.Repo != repo || j.Host != host {
@@ -773,7 +753,7 @@ func rollbackContainerJournal(ctx context.Context, j containerJournal, cause err
 			errs = append(errs, fmt.Errorf("%s: journal target is no longer configured", name))
 			continue
 		}
-		denied, e := deniedTarget(o.Deny, name)
+		denied, e := policy.MatchAny(o.Deny, name)
 		if e != nil {
 			errs = append(errs, e)
 			continue
@@ -799,14 +779,14 @@ func rollbackContainerJournal(ctx context.Context, j containerJournal, cause err
 		Status  string           `json:"status"`
 		Error   string           `json:"error"`
 	}{j, status, cause.Error()}
-	if e := writeJSON(filepath.Join(o.StateDir, fmt.Sprintf("container-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(o.StateDir, fmt.Sprintf("container-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
 		errs = append(errs, e)
 	}
 	rejection := containerRejection{Commit: j.Commit, Status: status, Error: cause.Error(), Digests: map[string]string{}}
 	for _, name := range j.Order {
 		rejection.Digests[name] = j.Targets[name].NewDigest
 	}
-	if e := writeJSON(filepath.Join(o.StateDir, containerRejectName), rejection); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(o.StateDir, containerRejectName), rejection); e != nil {
 		errs = append(errs, e)
 	}
 	if len(errs) > 0 {
@@ -814,7 +794,7 @@ func rollbackContainerJournal(ctx context.Context, j containerJournal, cause err
 	}
 	receiptPath := filepath.Join(o.StateDir, ContainerReceiptName)
 	if j.ReceiptExisted {
-		if e := Atomic(receiptPath, j.PriorReceipt, 0600); e != nil {
+		if e := fsutil.Atomic(receiptPath, j.PriorReceipt, 0600); e != nil {
 			return e
 		}
 	} else if e := os.Remove(receiptPath); e != nil && !os.IsNotExist(e) {
@@ -937,7 +917,7 @@ func InspectContainerStatus(ctx context.Context, spec config.Install, rec Contai
 
 // RuntimeCLI drives the docker CLI subset that podman also implements.
 type RuntimeCLI struct {
-	Runner  CommandRunner
+	Runner  integrations.Runner
 	Runtime string
 }
 

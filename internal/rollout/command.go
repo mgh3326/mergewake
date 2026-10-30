@@ -11,13 +11,12 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
-type CommandRunner interface {
-	Run(context.Context, string, []string, string, string) ([]byte, error)
-}
 type InstalledTarget struct {
 	SHA         string `json:"sha"`
 	PreviousSHA string `json:"previous_sha"`
@@ -53,7 +52,7 @@ func ExpandCommand(c config.Command, repo, sha, root, target string) config.Comm
 	}
 	return config.Command{Command: c.Command, Args: args}
 }
-func VerifyCommand(ctx context.Context, runner CommandRunner, s config.Install, repo, sha, root string) error {
+func VerifyCommand(ctx context.Context, runner integrations.Runner, s config.Install, repo, sha, root string) error {
 	c := ExpandCommand(s.Verify, repo, sha, root, s.Target)
 	out, err := runner.Run(ctx, c.Command, c.Args, "", root)
 	if err != nil {
@@ -111,13 +110,13 @@ func PublishGate(s config.Install, host, repo, sha string) error {
 		return nil
 	}
 	name := filepath.Join(config.Expand(s.ReceiptsDir), sha, host, s.Target+".json")
-	return writeJSON(name, GateReceipt{host, repo, s.Target, sha, "success"})
+	return fsutil.WriteJSON(name, GateReceipt{host, repo, s.Target, sha, "success"})
 }
 
 // ApplyCommands journals every previous SHA before executing a trusted recipe.
 // The same recipe installs and verifies the previous SHA on failure or recovery.
 // install supplies the pinned command or checksummed release-binary operation.
-func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host string, runner CommandRunner, install func(context.Context, config.Install, string) error, smoke func(context.Context) error) (res Result, err error) {
+func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host string, runner integrations.Runner, install func(context.Context, config.Install, string) error, smoke func(context.Context) error) (res Result, err error) {
 	res = Result{Commit: m.Commit, Status: "failed", Installed: []string{}, Denied: []string{}}
 	if err = m.Validate(); err != nil {
 		return
@@ -141,14 +140,10 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 	}
 	selected := []config.Install{}
 	for _, t := range m.Commands {
-		denied := false
-		for _, g := range o.Deny {
-			match, e := policy.Match(g, t.Target)
-			if e != nil {
-				err = e
-				return
-			}
-			denied = denied || match
+		denied, e := policy.MatchAny(o.Deny, t.Target)
+		if e != nil {
+			err = e
+			return
 		}
 		if denied {
 			res.Denied = append(res.Denied, t.Target)
@@ -214,14 +209,10 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			name := j.Order[i]
 			prior := j.Targets[name]
 			s, ok := specs[name]
-			denied := false
-			for _, g := range o.Deny {
-				match, e := policy.Match(g, name)
-				if e != nil {
-					errs = append(errs, e)
-					denied = true
-				}
-				denied = denied || match
+			denied, e := policy.MatchAny(o.Deny, name)
+			if e != nil {
+				errs = append(errs, e)
+				denied = true
 			}
 			if denied || !ok || recipe(s) != prior.Recipe || !manifest.SHA.MatchString(prior.SHA) {
 				errs = append(errs, errors.New("rollback recipe changed or previous SHA missing"))
@@ -247,10 +238,10 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			Status  string         `json:"status"`
 			Error   string         `json:"error"`
 		}{j, status, cause.Error()}
-		if e := writeJSON(filepath.Join(o.StateDir, fmt.Sprintf("command-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
+		if e := fsutil.WriteJSON(filepath.Join(o.StateDir, fmt.Sprintf("command-rollback-%d.json", o.now().UnixNano())), audit); e != nil {
 			errs = append(errs, e)
 		}
-		if e := writeJSON(rejectPath, GateReceipt{host, m.Repo, "", j.Commit, status}); e != nil {
+		if e := fsutil.WriteJSON(rejectPath, GateReceipt{host, m.Repo, "", j.Commit, status}); e != nil {
 			errs = append(errs, e)
 		}
 		if len(errs) > 0 {
@@ -258,7 +249,7 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 			return errors.Join(errs...)
 		}
 		if len(j.Previous) > 0 {
-			if e := Atomic(receiptPath, j.Previous, 0600); e != nil {
+			if e := fsutil.Atomic(receiptPath, j.Previous, 0600); e != nil {
 				return e
 			}
 		} else if e := os.Remove(receiptPath); e != nil && !os.IsNotExist(e) {
@@ -267,32 +258,24 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		res.Status = "rolled-back"
 		return os.Remove(journalPath)
 	}
-	if b, e := os.ReadFile(journalPath); e == nil {
-		var j commandJournal
-		if err = json.Unmarshal(b, &j); err != nil {
-			return
-		}
-		if err = restore(j, errors.New("recover interrupted install")); err != nil {
+	var interrupted commandJournal
+	if found, e := fsutil.ReadJSON(journalPath, &interrupted); e != nil {
+		err = e
+		return
+	} else if found {
+		if err = restore(interrupted, errors.New("recover interrupted install")); err != nil {
 			return
 		}
 		err = errors.New("interrupted command install rolled back; inspect rejection receipt")
 		return
-	} else if !os.IsNotExist(e) {
+	}
+	var rejected GateReceipt
+	if found, e := fsutil.ReadJSON(rejectPath, &rejected); e != nil {
 		err = e
 		return
-	}
-	if b, e := os.ReadFile(rejectPath); e == nil {
-		var rejected GateReceipt
-		if err = json.Unmarshal(b, &rejected); err != nil {
-			return
-		}
-		if rejected.Commit == m.Commit {
-			res.Status = "rejected"
-			err = errors.New("command release rejected; inspect before retry")
-			return
-		}
-	} else if !os.IsNotExist(e) {
-		err = e
+	} else if found && rejected.Commit == m.Commit {
+		res.Status = "rejected"
+		err = errors.New("command release rejected; inspect before retry")
 		return
 	}
 	previous, e := os.ReadFile(receiptPath)
@@ -353,14 +336,14 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		err = publish()
 		return
 	}
-	if err = writeJSON(journalPath, j); err != nil {
+	if err = fsutil.WriteJSON(journalPath, j); err != nil {
 		return
 	}
 	undo := func(cause error) { err = errors.Join(cause, restore(j, cause)) }
 	for _, s := range selected {
 		// Include even a failing installer in rollback: it may have partially mutated.
 		j.Order = append(j.Order, s.Target)
-		if e = writeJSON(journalPath, j); e != nil {
+		if e = fsutil.WriteJSON(journalPath, j); e != nil {
 			undo(e)
 			return
 		}
@@ -400,7 +383,7 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		}
 		receipt.Targets[s.Target] = InstalledTarget{SHA: m.Commit, PreviousSHA: j.Targets[s.Target].SHA, Recipe: recipe(s)}
 	}
-	if e = writeJSON(receiptPath, receipt); e != nil {
+	if e = fsutil.WriteJSON(receiptPath, receipt); e != nil {
 		undo(e)
 		return
 	}
