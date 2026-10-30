@@ -86,9 +86,10 @@ The merge gate holds all of these for one head: every required named check
 succeeded at the head (missing, queued, skipped, neutral, and ambiguous
 check/status evidence cannot be green and waits silently), zero unresolved
 review threads, the `mergewake/reviews/<pr>/<head>-done` marker for a reviewed
-head, the base branch an ancestor of the head, and a mergeable PR. A blocking
-PR still needs its two review passes because the marker is only written once
-every required pass is posted. Reviewing a subsequent head is another single
+head together with the head-bound passes `review.login` posted (a bare ref is
+forgeable; the receipts are the trust anchor), the base branch an ancestor of
+the head, and a mergeable PR. A blocking PR still needs its two distinct
+passes because the marker is only written once every required pass posts. Reviewing a subsequent head is another single
 pass, not a review round.
 
 Before acting, landing re-runs the whole gate on a fresh PR read, base head and

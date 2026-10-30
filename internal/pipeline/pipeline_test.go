@@ -330,6 +330,7 @@ func markReviewed(g *fakeGH) {
 		g.refs = map[string]bool{}
 	}
 	g.refs[doneRef(g.pull.Number, g.pull.Head.SHA)] = true
+	g.reviewed = true
 }
 
 func TestLand(t *testing.T) {

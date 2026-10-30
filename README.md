@@ -141,12 +141,13 @@ observation, not merging, so it also runs while the daemon is in shadow mode;
 
 READY means the merge gate passed: every `required_checks` entry green on the
 head, zero unresolved review threads, the `mergewake/reviews/<pr>/<head>-done`
-marker present, the base branch an ancestor of the head, and no merge
+marker plus the head-bound passes from the trusted `review.login` (the marker
+alone is forgeable), the base branch an ancestor of the head, and no merge
 conflict — the same inputs `land` merges on. BLOCKED names the reason from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` for unresolved review threads, `review_missing` when the
-review marker is absent, `base_stale` when the base moved ahead of the head,
-and `conflict` when GitHub reports the PR unmergeable. Pending or missing
+marker or passes are absent, `base_stale` when the base moved ahead of the
+head, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
 check evidence emits nothing. Each `(PR, head, verdict)` emits at most once; a
 new head re-arms the notification and sent keys persist across daemon restarts
 under `<state_dir>/<repo>/pr-notify-sent`.

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -56,11 +57,30 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if open > 0 {
 		v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(open))
 	}
+	// The -done marker alone is forgeable by anyone with push access, so the
+	// gate also requires the head-bound passes the trusted review identity
+	// posted: one for routine changes, two distinct passes for blocking ones.
+	files, e := s.GH.Files(ctx, r.Name, pr.Number)
+	if e != nil {
+		return v, e
+	}
+	if len(files) != pr.ChangedFiles {
+		return v, errors.New("incomplete PR file list")
+	}
+	needed := 1
+	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+		needed = 2
+	}
+	receipts, e := s.GH.ReviewPasses(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login)
+	if e != nil {
+		return v, e
+	}
+	_, complete := distinctPasses(receipts, needed)
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if e != nil {
 		return v, e
 	}
-	if !done {
+	if !done || !complete {
 		v.Reasons = append(v.Reasons, "review_missing")
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)

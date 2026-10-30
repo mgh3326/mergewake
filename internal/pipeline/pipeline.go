@@ -104,6 +104,34 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	return p, p.Validate()
 }
 
+// distinctPasses validates numbered passes and independent lenses when the
+// same reviewer family supplies both passes. Duplicates never add coverage.
+func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
+	passes := map[int]github.PassReceipt{}
+	for _, r := range receipts {
+		if r.Pass < 1 || r.Pass > needed {
+			continue
+		}
+		if prior, ok := passes[r.Pass]; ok && prior != r {
+			return len(passes), false
+		}
+		passes[r.Pass] = r
+	}
+	if len(passes) < needed {
+		return len(passes), false
+	}
+	if needed == 2 {
+		a, b := passes[1], passes[2]
+		if a.Family == "" || b.Family == "" {
+			return len(passes), false
+		}
+		if config.CanonicalFamily(a.Family) == config.CanonicalFamily(b.Family) && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
+			return len(passes), false
+		}
+	}
+	return len(passes), true
+}
+
 // Land runs the merge gate once for a single PR (the same gate the pr role's
 // notice reports) and, when the verdict is ready and the repository policy
 // opted in with enabled, squash-merges pinned to the gated head. A dry run

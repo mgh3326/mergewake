@@ -592,8 +592,9 @@ still maintains its supervision locks and status in shadow/dry-run modes.
 its current head and emits one lane event for that head's verdict — the notify
 path observes rather than merges, so it also runs in shadow mode. `READY`
 requires every required check green on the head, zero unresolved review
-threads, the `mergewake/reviews/<pr>/<head>-done` marker, the base branch an
-ancestor of the head, and a mergeable PR; `BLOCKED` names the hold from a
+threads, the `mergewake/reviews/<pr>/<head>-done` marker and the head-bound
+passes from `review.login` it attests, the base branch an ancestor of the
+head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>`, `review_missing`, `base_stale`, `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with

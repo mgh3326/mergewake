@@ -21,6 +21,9 @@ func TestLandMarkerBoundToHead(t *testing.T) {
 			if which != "missing" {
 				g.refs = map[string]bool{doneRef(7, head): true}
 			}
+			if which == "current" {
+				g.reviewed = true
+			}
 			if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 				t.Fatal(err)
 			}
@@ -32,6 +35,20 @@ func TestLandMarkerBoundToHead(t *testing.T) {
 				t.Fatalf("merges=%d action=%s", g.mergeCount, landAction(t, s, r.Name))
 			}
 		})
+	}
+}
+
+// The marker alone is not trusted: a hand-created -done ref without the
+// review identity's head-bound passes still reports review_missing.
+func TestLandForgedMarkerNeedsPasses(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	g.refs = map[string]bool{doneRef(7, g.pull.Head.SHA): true}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("forged marker merged")
 	}
 }
 
