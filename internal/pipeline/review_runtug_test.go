@@ -186,7 +186,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 		t.Fatal(runner.spawns, runner.headless, g.postCount)
 	}
 	sp := runner.spawns[0]
-	for flag, want := range map[string]string{"-m": "auto", "--parent-job": "author-job", "--role": "reviewer", "--t": "T2", "--host": "auto", "-w": "reviews"} {
+	for flag, want := range map[string]string{"-m": "auto", "--builder-job": "author-job", "--builder-family": "anthropic", "--task": "42", "--role": "reviewer", "--t": "T2", "--host": "auto", "-w": "reviews"} {
 		if arg(sp, flag) != want {
 			t.Fatalf("%s=%q in %v", flag, arg(sp, flag), sp)
 		}

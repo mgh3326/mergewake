@@ -283,7 +283,7 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    author family, the output contract and the same PR context (answered
    findings, operator decisions) the headless prompt carries, then runs
    `runtug spawn -c <checkout> -m auto -p <brief> -l
-   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --parent-job <author job> --role
+   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> --builder-job <author job> --builder-family <author family> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
    --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
