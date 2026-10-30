@@ -145,20 +145,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	// local branch mergewake did not create is used only at the head and
 	// never moved.
 	created := false
-	switch at, e := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); {
-	case e != nil:
-		if _, e = git(ctx, "worktree", "add", "-b", branch, checkout, pr.Head.SHA); e != nil {
-			return skip("checkout PR head branch %s: %v", branch, e)
-		}
-		created = true
-	case at == pr.Head.SHA:
-		if _, e = git(ctx, "worktree", "add", checkout, branch); e != nil {
-			return skip("checkout PR head branch %s: %v", branch, e)
-		}
-	default:
-		return skip("local branch %s is at %.7s, not the PR head; left untouched", branch, at)
-	}
-	defer func() {
+	cleanup := func() {
 		// The pane is finished or abandoned; the deadline may already be spent.
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -166,7 +153,23 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		if created {
 			_, _ = git(c, "branch", "-D", branch)
 		}
-	}()
+	}
+	switch at, e := git(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); {
+	case e != nil:
+		// The branch was absent, so whatever a failed add left is ours.
+		created = true
+		if _, e = git(ctx, "worktree", "add", "-b", branch, checkout, pr.Head.SHA); e != nil {
+			cleanup()
+			return skip("checkout PR head branch %s: %v", branch, e)
+		}
+	case at == pr.Head.SHA:
+		if _, e = git(ctx, "worktree", "add", checkout, branch); e != nil {
+			return skip("checkout PR head branch %s: %v", branch, e)
+		}
+	default:
+		return skip("local branch %s is at %.7s, not the PR head; left untouched", branch, at)
+	}
+	defer cleanup()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, branch, jobDir)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -205,7 +208,10 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	b, e := x.collect(ctx, label, findingsPath)
 	if e != nil {
 		if ctx.Err() != nil {
-			return out, fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err()))
+			if !errors.Is(e, ctx.Err()) {
+				e = errors.Join(e, ctx.Err())
+			}
+			return out, fmt.Errorf("runtug reviewer %s: %w", label, e)
 		}
 		return skip("reviewer pane %s: %v", label, e)
 	}
@@ -295,13 +301,20 @@ func (x *runtugExecutor) announced(ctx context.Context, lane, label string) ([]b
 	if e = json.Unmarshal(raw, &items); e != nil {
 		return nil, fmt.Errorf("inbox: %v", e)
 	}
+	ack := func(id int64) {
+		// Read is enough; acknowledging keeps the item out of the lane's
+		// unread digest.
+		_, _ = s.Runner.Run(ctx, s.Config.Review.Runtug.Panewire, []string{"inbox", "ack", strconv.FormatInt(id, 10), "--lane", lane, "--json"}, "", "")
+	}
 	for _, it := range items {
 		if it.Kind != "lane.event" || it.Event.EventID != label+"-findings" {
 			continue
 		}
 		m := findingsAttachment.FindStringSubmatch(it.Event.Text)
 		if m == nil {
-			return nil, fmt.Errorf("event %s names no attachment", it.Event.EventID)
+			// A malformed announcement is consumed, not retried.
+			ack(it.ID)
+			continue
 		}
 		files, ok := s.Sink.(interface {
 			Attachment(context.Context, string) ([]byte, error)
@@ -313,9 +326,7 @@ func (x *runtugExecutor) announced(ctx context.Context, lane, label string) ([]b
 		if e != nil {
 			return nil, fmt.Errorf("attachment %.12s: %v", m[1], integrations.Detail(e))
 		}
-		// Read is enough; acknowledging keeps the item out of the lane's
-		// unread digest.
-		_, _ = s.Runner.Run(ctx, s.Config.Review.Runtug.Panewire, []string{"inbox", "ack", strconv.FormatInt(it.ID, 10), "--lane", lane, "--json"}, "", "")
+		ack(it.ID)
 		return b, nil
 	}
 	return nil, nil

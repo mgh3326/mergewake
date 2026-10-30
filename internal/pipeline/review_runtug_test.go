@@ -45,12 +45,17 @@ type runtugRunner struct {
 	acks     [][]string
 	late     int // inbox looks that still show nothing
 	looks    int
+	addFails bool
+	afterRun func() // called once runtug returns
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	switch command {
 	case "git":
 		r.git = append(r.git, args)
+		if r.addFails && slices.Contains(args, "add") {
+			return nil, runtugExit(128)
+		}
 		if slices.Contains(args, "rev-parse") {
 			if r.branchAt == "" {
 				return nil, runtugExit(1)
@@ -93,6 +98,7 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 			sum := sha256.Sum256([]byte(r.findings))
 			sha := hex.EncodeToString(sum[:])
 			r.remote.files[sha] = []byte(r.findings)
+			r.inbox = append(r.inbox, `{"id":8,"kind":"lane.event","event":{"event_id":"`+label+`-findings","text":"[`+label+`] findings"}}`)
 			r.inbox = append(r.inbox, `{"id":9,"kind":"lane.event","event":{"event_id":"`+label+`-findings","text":"[`+label+`] findings attachment=`+sha+`"}}`)
 		default:
 			if e := os.WriteFile(filepath.Join(job, "findings.json"), []byte(r.findings), 0600); e != nil {
@@ -104,6 +110,9 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 		}
 		if e := os.WriteFile(filepath.Join(job, "events", "0002-spawned.json"), []byte(`{"kind":"job.spawned","payload":{"family":"`+r.family+`"}}`), 0600); e != nil {
 			return nil, e
+		}
+		if r.afterRun != nil {
+			r.afterRun()
 		}
 		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool\nwait job=l outcome=completed report= pane=p1\n"), nil
 	}
@@ -241,7 +250,8 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 	if arg(sp, "--exclude-host") != "slow-host,other-host" {
 		t.Fatal(sp)
 	}
-	if len(runner.acks) != 1 || strings.Join(runner.acks[0], " ") != "inbox ack 9 --lane review-desk --json" {
+	// A malformed announcement ahead of the real one is consumed and skipped.
+	if len(runner.acks) != 2 || strings.Join(runner.acks[0], " ") != "inbox ack 8 --lane review-desk --json" || strings.Join(runner.acks[1], " ") != "inbox ack 9 --lane review-desk --json" {
 		t.Fatal(runner.acks)
 	}
 	brief, _ := os.ReadFile(arg(sp, "-p"))
@@ -250,6 +260,40 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}
+	}
+}
+
+// A failed `worktree add -b` may already have created the branch; it is
+// deleted so later heads of the PR are not refused as "left untouched".
+func TestRuntugFailedCheckoutDeletesCreatedBranch(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
+	s, g, r := runtugSetup(t, runner)
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := gitCalls(runner, r.Root)
+	if len(got) != 5 || !strings.HasPrefix(got[2], "worktree add -b feat/thing ") || !strings.HasPrefix(got[3], "worktree remove --force ") || got[4] != "branch -D feat/thing" {
+		t.Fatalf("%q", got)
+	}
+	if p := g.passes[shaA]; len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, "checkout PR head branch feat/thing") {
+		t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
+	}
+}
+
+// A review cancelled while the findings are awaited ends with the context
+// error once, not joined with itself.
+func TestRuntugCancelWhileCollectingWrapsOnce(t *testing.T) {
+	runner := &runtugRunner{family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	findingsGrace = time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	runner.afterRun = cancel
+	diff, _ := g.Diff(ctx, r.Name, 7)
+	x := &runtugExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
+	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	if !errors.Is(e, context.Canceled) || strings.Count(e.Error(), context.Canceled.Error()) != 1 {
+		t.Fatalf("%v", e)
 	}
 }
 
