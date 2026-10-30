@@ -236,6 +236,29 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// Jobs returns h.Jobs as an absolute path on its own host. Every path is
+// passed to the host shell quoted, and a quoted ~ never expands, so a leading
+// ~/ is replaced with that host's $HOME here. config.Load already refuses ~
+// for ssh hosts; this keeps callers that build a Host themselves safe too.
+func (a *Archiver) Jobs(ctx context.Context, h reap.Host) (string, error) {
+	j := h.Jobs
+	if j == "~" || strings.HasPrefix(j, "~/") {
+		b, err := a.on(ctx, h.SSH, "", "sh", "-c", `printf '%s' "$HOME"`)
+		if err != nil {
+			return "", fmt.Errorf("%s: resolve $HOME: %w", h.Name, err)
+		}
+		home := strings.TrimSpace(string(b))
+		if !path.IsAbs(home) {
+			return "", fmt.Errorf("%s: $HOME is not an absolute path", h.Name)
+		}
+		j = path.Join(home, strings.TrimPrefix(j, "~"))
+	}
+	if !path.IsAbs(j) || path.Clean(j) == "/" {
+		return "", &Skip{"jobs-dir-not-absolute"}
+	}
+	return path.Clean(j), nil
+}
+
 // Plan lists one job dir read-only and decides what moves where. A refusal is
 // returned as *Skip.
 func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, error) {
@@ -245,7 +268,11 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	case !reap.ValidJobName(job):
 		return nil, &Skip{"job-name-invalid"}
 	}
-	dir := h.JobDir(job)
+	jobs, err := a.Jobs(ctx, h)
+	if err != nil {
+		return nil, err
+	}
+	dir := path.Join(jobs, job)
 	kind, err := a.jobDir(ctx, h.SSH, dir)
 	if err != nil {
 		return nil, err
@@ -591,7 +618,12 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, e
 	if !same(again, p.entries) {
 		return res, &Skip{"job-changed"}
 	}
-	if _, err := a.on(ctx, p.host.SSH, "", "rm", "-rf", "--", p.Dir); err != nil {
+	// p.Dir is absolute (Jobs), so it can never be read as an rm option and
+	// no "--" is needed.
+	if !path.IsAbs(p.Dir) {
+		return res, fmt.Errorf("delete %s: not an absolute path", p.Dir)
+	}
+	if _, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `rm -rf "$1"`, "sh", p.Dir); err != nil {
 		return res, fmt.Errorf("delete %s: %w", p.Dir, err)
 	}
 	res.Deleted = true

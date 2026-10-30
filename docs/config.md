@@ -169,7 +169,10 @@ unit, never its worktree — that is in git and is cleaned by the worktree
 rules above. Archiving runs these steps in order, and any failure keeps the
 local job dir and reports the step:
 
-1. **Plan** (read-only): a job dir that is itself a symlink is refused as
+1. **Plan** (read-only): the jobs dir is resolved on its own host — a
+   leading `~/` is expanded with that host's `$HOME`, since quoted paths
+   never tilde-expand, and a relative one is refused as
+   `jobs-dir-not-absolute`. A job dir that is itself a symlink is refused as
    `job-dir-symlink` (checked again right before the delete); otherwise
    list every non-directory entry. Credential-like
    paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,

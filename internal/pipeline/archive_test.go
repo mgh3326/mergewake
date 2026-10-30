@@ -334,3 +334,22 @@ func TestReapSummaryCountsEveryErrorRow(t *testing.T) {
 		t.Fatalf("summary does not count the error row once:\n%s", out.String())
 	}
 }
+
+func TestJobFromSaved(t *testing.T) {
+	for _, tc := range []struct{ jobs, saved, want string }{
+		{"/jobs", "/jobs/wk-7/report.md", "wk-7"},
+		{"/jobs", "/jobs/wk-7/pane-screen.txt", "wk-7"},
+		{"~/jobs", "~/jobs/wk-7/report.md", "wk-7"},
+		{"~/jobs", "/home/ops/jobs/wk-7/report.md", "wk-7"},
+		{"~/jobs", "/home/ops/other/wk-7/report.md", ""},
+		{"~/jobs", "/home/ops/myjobs/wk-7/report.md", ""},
+		{"/jobs", "/jobs/a/wk-7/report.md", ""},
+		{"/jobs", "/jobs/.hidden/report.md", ""},
+		{"", "/jobs/wk-7/report.md", ""},
+	} {
+		hs := &reapHost{host: reap.Host{Name: "h", Jobs: tc.jobs}}
+		if got := jobFromSaved(hs, tc.saved); got != tc.want {
+			t.Errorf("jobFromSaved(%q, %q) = %q, want %q", tc.jobs, tc.saved, got, tc.want)
+		}
+	}
+}

@@ -25,6 +25,7 @@ type fakeRunner struct {
 	failPut  string            // --name whose put fails
 	failNote bool
 	failRm   bool
+	rms      [][]string // delete argv, recorded
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -50,8 +51,11 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input,
 		}
 		return nil, errors.New("unexpected handoffkeep call: " + strings.Join(args, " "))
 	}
-	if name == "rm" && f.failRm {
-		return nil, errors.New("rm failed")
+	if name == "sh" && len(args) > 1 && strings.HasPrefix(args[1], "rm ") {
+		f.rms = append(f.rms, args)
+		if f.failRm {
+			return nil, errors.New("rm failed")
+		}
 	}
 	c := exec.CommandContext(ctx, name, args...)
 	c.Stdin = strings.NewReader(input)
@@ -272,6 +276,10 @@ func TestApplyLocalMovesVerifiesAndDeletes(t *testing.T) {
 	if _, err := os.Stat(e.sshLog); !os.IsNotExist(err) {
 		t.Fatal("local archive used ssh")
 	}
+	// The delete takes the absolute job dir as a quoted argument, no "--".
+	if len(e.run.rms) != 1 || strings.Join(e.run.rms[0], "|") != `-c|rm -rf "$1"|sh|`+dir {
+		t.Fatalf("delete argv = %q", e.run.rms)
+	}
 	// A byte-identical job dir under the same name is already archived: it
 	// resumes to a delete-only plan rather than copying over the archive.
 	job(t, e.jobs, "wk-7")
@@ -458,5 +466,33 @@ func TestHashesFailClosed(t *testing.T) {
 		if (err == nil) != tc.ok || tc.ok && len(got) != 2 {
 			t.Errorf("%s: %v %v", name, got, err)
 		}
+	}
+}
+
+// A ~/ jobs dir is expanded with the job host's own $HOME before any quoted
+// path reaches its shell; a relative one is refused.
+func TestTildeJobsExpandOnJobHost(t *testing.T) {
+	e := setup(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := job(t, filepath.Join(home, "jobs"), "wk-14")
+	a := archiver(e, "archive-mac")
+	h := reap.Host{Name: "h2", SSH: "node-b", Jobs: "~/jobs"}
+	if got, err := a.Jobs(context.Background(), h); err != nil || got != filepath.Join(home, "jobs") {
+		t.Fatalf("Jobs = %q, %v", got, err)
+	}
+	p, err := a.Plan(context.Background(), h, "wk-14")
+	if err != nil || p.Dir != dir {
+		t.Fatalf("plan dir = %+v, %v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || !res.Deleted {
+		t.Fatalf("apply: %+v %v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("job dir kept")
+	}
+	if _, err := a.Plan(context.Background(), reap.Host{Name: "h3", Jobs: "jobs"}, "wk-14"); err == nil || err.Error() != "skipped: jobs-dir-not-absolute" {
+		t.Fatalf("relative jobs: %v", err)
 	}
 }

@@ -43,13 +43,20 @@ func archiveTerminal(v reapReceipt) bool {
 }
 
 // jobFromSaved recovers a job name from a close row written before rows named
-// their job: the saved report or screen sits directly in <jobs>/<job>.
+// their job: the saved report or screen sits directly in <jobs>/<job>. The
+// saved path may spell the jobs dir as configured (~/jobs) or expanded
+// (/home/ops/jobs), so a ~/ jobs dir matches on its expanded suffix.
 func jobFromSaved(hs *reapHost, saved string) string {
 	if hs == nil || hs.host.Jobs == "" || saved == "" {
 		return ""
 	}
 	dir := filepath.Dir(saved)
-	if filepath.Dir(dir) != filepath.Clean(hs.host.Jobs) || !reap.ValidJobName(filepath.Base(dir)) {
+	parent, jobs := filepath.Dir(dir), filepath.Clean(hs.host.Jobs)
+	match := parent == jobs
+	if rest, ok := strings.CutPrefix(jobs, "~/"); ok && !match {
+		match = filepath.IsAbs(parent) && strings.HasSuffix(parent, string(filepath.Separator)+rest)
+	}
+	if !match || !reap.ValidJobName(filepath.Base(dir)) {
 		return ""
 	}
 	return filepath.Base(dir)
@@ -212,14 +219,19 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: pane scan: %w", h.Name, e))
 			continue
 		}
-		b, e := hs.exec.Run(ctx, "sh", "-c", `cd "$1" || exit 1; for d in *; do if [ -d "$d" ] && [ ! -L "$d" ]; then printf '%s\0' "$d"; fi; done`, "sh", h.Jobs)
+		a := s.archiver()
+		root, e := a.Jobs(ctx, h)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
+			continue
+		}
+		b, e := hs.exec.Run(ctx, "sh", "-c", `cd "$1" || exit 1; for d in *; do if [ -d "$d" ] && [ ! -L "$d" ]; then printf '%s\0' "$d"; fi; done`, "sh", root)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
 		}
 		jobs := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
 		sort.Strings(jobs)
-		a := s.archiver()
 		for _, job := range jobs {
 			if e := ctx.Err(); e != nil {
 				return errors.Join(append(errs, e)...)
@@ -230,7 +242,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			row := archiveRow{Action: "archive-job", Host: h.Name, Job: job}
 			if !reap.ValidJobName(job) {
 				row.Result, row.Reason = "skipped", "job-name-invalid"
-			} else if liveName(hs, job) || hs.paneInUse(h.JobDir(job)) {
+			} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 				row.Result, row.Reason = "skipped", "pane-live"
 			} else if p, e := a.Plan(ctx, h, job); e != nil {
 				row.Result, row.Reason = archive.Reason(e)
