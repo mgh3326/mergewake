@@ -12,3 +12,7 @@ blocking:
     reason: Installation writes may damage files before a revert lands
   - paths: [internal/policy/**, .mergewake/**, .github/workflows/**]
     reason: Verification controls can admit unsafe actions before recovery
+review_gate:
+  land: graded
+fast_lane:
+  max_changed_lines: 50
