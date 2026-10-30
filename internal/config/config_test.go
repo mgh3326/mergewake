@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -374,7 +375,14 @@ func TestReviewExecutor(t *testing.T) {
 	if e != nil || c.Review.Executor != "runtug" || c.Review.Runtug.Owner != "review-desk" || c.Review.Runtug.Host != "host-b" || c.Review.Runtug.Checkouts != "/work/reviews" {
 		t.Fatalf("%+v %v", c.Review, e)
 	}
-	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {lane: x}\n"} {
+	if rt := c.Review.Runtug; rt.Lane != "review-desk" || rt.Panewire != "panewire" || rt.ExcludeHosts != nil {
+		t.Fatalf("lane defaults to owner: %+v", rt)
+	}
+	c, e = load("review:\n  runtug: {owner: review-desk, lane: findings-desk, exclude_hosts: [host-a, host-b]}\n")
+	if rt := c.Review.Runtug; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
+		t.Fatalf("%+v %v", rt, e)
+	}
+	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {bogus: x}\n", "review:\n  runtug: {lane: 'a b'}\n", "review:\n  runtug: {exclude_hosts: ['a,b']}\n", "review:\n  runtug: {host: host-a, exclude_hosts: [host-a]}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
 		}
