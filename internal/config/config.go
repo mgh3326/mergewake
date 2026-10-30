@@ -142,7 +142,25 @@ type Reap struct {
 	ScanAfter     string   `yaml:"scan_after"`
 	Protect       []string `yaml:"protect"`
 	Regenerable   []string `yaml:"regenerable"`
+	Archive       Archive  `yaml:"archive"`
 }
+
+// Archive moves finished job dirs to a synced Drive folder on archive_host and
+// records them in hk before the local job dir is deleted.
+type Archive struct {
+	Enabled bool `yaml:"enabled"`
+	// DriveDir is the locally synced Google Drive folder on the archive host.
+	DriveDir string `yaml:"drive_dir"`
+	// ArchiveHost is an ssh destination reachable from this machine; empty or
+	// "local" means the Drive folder is on this machine.
+	ArchiveHost  string `yaml:"archive_host"`
+	TextMaxBytes int64  `yaml:"text_max_bytes"`
+	MinAge       string `yaml:"min_age"`
+}
+
+// ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
+// output limit, since each text file is read back through it.
+const ArchiveTextCap = 3 << 20
 
 // DefaultReapProtect names resident and desk panes that reap never closes. A
 // configured reap.protect list replaces this list; unnamed panes and panes
@@ -259,6 +277,9 @@ func Load(name string) (Config, error) {
 		if _, e = policy.Match(g, "probe"); e != nil {
 			return c, e
 		}
+	}
+	if e = validateArchive(&c.Reap.Archive); e != nil {
+		return c, e
 	}
 	seenHosts := map[string]bool{}
 	for i, h := range c.Hosts {
@@ -531,6 +552,46 @@ func Duration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid positive duration %q", s)
 	}
 	return d, nil
+}
+
+// Age parses a positive duration that also accepts whole days ("14d").
+func Age(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		d, e := strconv.Atoi(n)
+		if e != nil || d <= 0 {
+			return 0, fmt.Errorf("invalid positive duration %q", s)
+		}
+		return time.Duration(d) * 24 * time.Hour, nil
+	}
+	return Duration(s)
+}
+
+func validateArchive(a *Archive) error {
+	if a.MinAge == "" {
+		a.MinAge = "24h"
+	}
+	if _, e := Age(a.MinAge); e != nil {
+		return e
+	}
+	if a.TextMaxBytes == 0 {
+		a.TextMaxBytes = 1 << 20
+	}
+	if a.TextMaxBytes < 0 || a.TextMaxBytes > ArchiveTextCap {
+		return fmt.Errorf("reap.archive.text_max_bytes must be 1..%d", ArchiveTextCap)
+	}
+	if strings.HasPrefix(a.ArchiveHost, "-") || strings.ContainsAny(a.ArchiveHost, " \t\r\n") {
+		return errors.New("reap.archive.archive_host must be empty, local, or an ssh destination")
+	}
+	if !a.Enabled {
+		return nil
+	}
+	if a.ArchiveHost == "" || a.ArchiveHost == "local" {
+		a.DriveDir = Expand(a.DriveDir)
+	}
+	if a.DriveDir == "" || !filepath.IsAbs(a.DriveDir) || filepath.Clean(a.DriveDir) == "/" {
+		return errors.New("reap.archive.drive_dir must be an absolute path; ~ expands only for a local archive host")
+	}
+	return nil
 }
 
 func installFamily(kind string) string {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStrictConfig(t *testing.T) {
@@ -63,6 +64,16 @@ func TestReapConfig(t *testing.T) {
 		{"ssh jobs abs", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: /home/ops/jobs}\n", false},
 		{"ssh jobs home", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: '~/jobs'}\n", true},
 		{"ssh jobs rel", "hosts:\n  - {name: node, ssh: ops@node.example, jobs: 'jobs'}\n", true},
+		{"archive off", "reap:\n  archive: {drive_dir: rel}\n", false},
+		{"archive local", "reap:\n  archive: {enabled: true, drive_dir: '~/Drive/jobs', min_age: 14d}\n", false},
+		{"archive ssh", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: /Users/ops/Drive/jobs, text_max_bytes: 4096}\n", false},
+		{"archive no dir", "reap:\n  archive: {enabled: true}\n", true},
+		{"archive ssh home", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: '~/Drive'}\n", true},
+		{"archive root", "reap:\n  archive: {enabled: true, drive_dir: /}\n", true},
+		{"archive ssh option", "reap:\n  archive: {enabled: true, archive_host: '-oProxy=x', drive_dir: /d}\n", true},
+		{"archive bad age", "reap:\n  archive: {min_age: 0d}\n", true},
+		{"archive text cap", "reap:\n  archive: {text_max_bytes: 4194304}\n", true},
+		{"archive unknown key", "reap:\n  archive: {drive: /d}\n", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "config.yaml")
@@ -88,6 +99,12 @@ func TestReapConfig(t *testing.T) {
 				}
 				if tt.name == "regenerable" && c.Reap.Regenerable[1] != "vendor/**" {
 					t.Fatal("configured regenerable list did not replace defaults")
+				}
+				if a := c.Reap.Archive; a.TextMaxBytes == 0 || a.MinAge == "" {
+					t.Fatalf("archive defaults missing: %+v", a)
+				}
+				if tt.name == "archive local" && !filepath.IsAbs(c.Reap.Archive.DriveDir) {
+					t.Fatal("local drive_dir did not expand")
 				}
 			}
 		})
@@ -337,5 +354,18 @@ func TestFallbackLaneAndDefaultFamily(t *testing.T) {
 	}
 	if _, e = load(fmt.Sprintf(review, "openai")); e == nil {
 		t.Fatal("default_family outside the configured profiles accepted")
+	}
+}
+
+func TestAge(t *testing.T) {
+	for in, want := range map[string]time.Duration{"14d": 14 * 24 * time.Hour, "36h": 36 * time.Hour, "1d": 24 * time.Hour} {
+		if got, e := Age(in); e != nil || got != want {
+			t.Errorf("Age(%q) = %v, %v", in, got, e)
+		}
+	}
+	for _, in := range []string{"", "0d", "-1d", "d", "1.5d", "0s"} {
+		if _, e := Age(in); e == nil {
+			t.Errorf("Age(%q) accepted", in)
+		}
 	}
 }
