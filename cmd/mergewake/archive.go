@@ -30,6 +30,9 @@ func runArchiveJobs(ctx context.Context, args []string, out, stderr io.Writer) e
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
+	if *dry && *apply {
+		return errors.New("--dry-run and --apply are mutually exclusive")
+	}
 	c, e := config.Load(config.Expand(*cfg))
 	if e != nil {
 		return e
