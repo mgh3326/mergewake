@@ -1,0 +1,8 @@
+# The image stamps the commit through ldflags, so .git stays out of the
+# context (a linked worktree's .git is only a pointer file anyway).
+.git
+.env
+.env.*
+dist/
+**/*.test
+**/*.out

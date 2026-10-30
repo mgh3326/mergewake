@@ -1,0 +1,77 @@
+name: image
+# Builds the mergewake daemon container image. Pull requests and manual runs
+# build and smoke-test only; pushes to main additionally push to GHCR with tags
+# <full commit sha> and `main`. No deploy step lives here — rollout is the
+# mergewake agent's job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build linux/amd64 image (load)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: mergewake:ci
+          build-args: |
+            VERSION=${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test image
+        env:
+          WANT: ${{ github.sha }}
+        run: |
+          set -eu
+          user=$(docker image inspect mergewake:ci --format '{{.Config.User}}')
+          [ "$user" = "65532:65532" ] || { echo "image runs as unexpected user: '$user'" >&2; exit 1; }
+          got=$(timeout 60 docker run --rm mergewake:ci commit)
+          [ "$got" = "$WANT" ] || { echo "commit stamp '$got', want '$WANT'" >&2; exit 1; }
+          for tool in git ssh sh; do
+            timeout 60 docker run --rm --entrypoint sh mergewake:ci -c "command -v $tool"
+          done
+          # The default command is the daemon; without a mounted config it
+          # must fail on the config path under the image's HOME.
+          out=$(timeout 60 docker run --rm mergewake:ci 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q '/home/mergewake/.config/mergewake/config.yaml'
+      - name: Build and push multi-arch image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          cache-from: type=gha

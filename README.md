@@ -108,7 +108,8 @@ remain enforced.
 
 Polling needs no public ingress. Conditional GitHub requests, rate headers,
 jitter, bounded backoff, role locks and local status support supervision; examples
-are in [deploy/](deploy/). An optional in-process trigger seam can wake roles from
+are in [deploy/](deploy/); the daemon also ships as a container image
+([docs/container.md](docs/container.md)). An optional in-process trigger seam can wake roles from
 trusted webhook adapters without changing the pipeline.
 
 Command installs use host-owned recipes with `{sha}` arguments, exact-output
