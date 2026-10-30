@@ -225,7 +225,7 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, h
 			// The fast lane drops rule-graded triage, but a trusted-review
 			// finding whose severity cannot be read still needs an answer.
 			unreadable := f.OwnReview && !policy.KnownSeverity(f.Severity)
-			if (!fastLane || unreadable) && !f.Resolved && !answered(t) {
+			if (!fastLane || unreadable) && !f.Resolved && !answered(t, f.OwnReview) {
 				triage++
 			}
 		}
@@ -234,11 +234,18 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, h
 }
 
 // answered reports a human reply from someone other than the finding's author.
-func answered(t github.ReviewThread) bool {
+// mergewake posts its own findings under review.login, which is usually the
+// operator's account, so for an own-review finding a reply from that same
+// login also counts when the reply is not itself a mergewake finding (it
+// carries no severity marker).
+func answered(t github.ReviewThread, ownReview bool) bool {
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
 	for _, c := range t.Comments[1:] {
 		who := policy.NormalizeAuthor(c.Author)
-		if who != "" && who != author && c.AuthorType != "Bot" && !strings.HasSuffix(c.Author, "[bot]") {
+		if who == "" || c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
+			continue
+		}
+		if who != author || (ownReview && !strings.Contains(c.Body, "<!-- mergewake-severity:")) {
 			return true
 		}
 	}
