@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -38,7 +39,6 @@ type runtugRunner struct {
 	spawns   [][]string
 	git      [][]string
 	headless int
-	branchAt string // local head branch tip; "" means the branch is absent
 	remote   *taskJobSink
 	inbox    []string // lane.event items, as panewire inbox list prints them
 	inboxErr error
@@ -46,29 +46,23 @@ type runtugRunner struct {
 	late     int // inbox looks that still show nothing
 	looks    int
 	addFails bool
-	// branchAfterAdd is where a failed `worktree add -b` leaves the branch
-	// ("" = not created).
-	branchAfterAdd string
-	addTried       bool
-	afterRun       func() // called once runtug returns
+	realGit  bool   // run git for real (against a test repository)
+	afterRun func() // called once runtug returns
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	switch command {
 	case "git":
 		r.git = append(r.git, args)
-		if r.addFails && slices.Contains(args, "add") {
-			r.addTried = true
-			return nil, runtugExit(128)
+		if r.realGit {
+			b, e := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+			if e != nil {
+				return b, runtugExit(1)
+			}
+			return b, nil
 		}
-		if slices.Contains(args, "rev-parse") {
-			if r.addTried && r.branchAfterAdd != "" {
-				return []byte(r.branchAfterAdd + "\n"), nil
-			}
-			if r.branchAt == "" {
-				return nil, runtugExit(1)
-			}
-			return []byte(r.branchAt + "\n"), nil
+		if r.addFails && slices.Contains(args, "add") {
+			return nil, runtugExit(128)
 		}
 		return nil, nil
 	case "panewire":
@@ -198,14 +192,12 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	if !strings.HasPrefix(checkout, s.Config.Review.Runtug.Checkouts) {
 		t.Fatal(checkout)
 	}
-	// The checkout is the head branch, created at the head and removed with
-	// its branch afterwards.
+	// The checkout is detached at the reviewed head from pull/7/head; no
+	// branch is created and the worktree is removed afterwards.
 	want := []string{
-		"fetch --no-tags origin pull/7/head main +refs/heads/feat/thing:refs/remotes/origin/feat/thing",
-		"rev-parse --verify --quiet refs/heads/feat/thing",
-		"worktree add -b feat/thing " + checkout + " " + shaA,
+		"fetch --no-tags origin pull/7/head main",
+		"worktree add --detach " + checkout + " " + shaA,
 		"worktree remove --force " + checkout,
-		"branch -D feat/thing",
 	}
 	if got := gitCalls(runner, r.Root); !slices.Equal(got, want) {
 		t.Fatalf("%q", got)
@@ -214,7 +206,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, want := range []string{"example/project#7", shaA, "on branch feat/thing", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "runtug done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
+	for _, want := range []string{"example/project#7", shaA, "detached at the head", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "runtug done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}
@@ -271,19 +263,19 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 	}
 }
 
-// A failed `worktree add -b` may already have created the branch; it is
-// deleted so later heads of the PR are not refused as "left untouched".
-func TestRuntugFailedCheckoutDeletesCreatedBranch(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true, branchAfterAdd: shaA}
+// A failed `worktree add --detach` is cleaned up and falls back; nothing
+// ever touches a local branch.
+func TestRuntugFailedCheckoutFallsBack(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
 	s, g, r := runtugSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
 	got := gitCalls(runner, r.Root)
-	if len(got) != 6 || !strings.HasPrefix(got[2], "worktree add -b feat/thing ") || got[3] != "rev-parse --verify --quiet refs/heads/feat/thing" || !strings.HasPrefix(got[4], "worktree remove --force ") || got[5] != "branch -D feat/thing" {
+	if len(got) != 3 || !strings.HasPrefix(got[1], "worktree add --detach ") || !strings.HasPrefix(got[2], "worktree remove --force ") {
 		t.Fatalf("%q", got)
 	}
-	if p := g.passes[shaA]; len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, "checkout PR head branch feat/thing") {
+	if p := g.passes[shaA]; len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, "checkout PR head "+shaA[:7]) {
 		t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
 	}
 }
@@ -374,18 +366,20 @@ func TestRuntugHeadRefusalFallsBackToHeadless(t *testing.T) {
 	}
 }
 
-func TestRuntugCheckoutBranch(t *testing.T) {
+// The detached checkout never names the author's branch, so a host where
+// that branch is checked out in another worktree is not refused. A fork PR
+// still falls back: runtug replicates only a spec on the repo's origin.
+func TestRuntugCheckoutDetached(t *testing.T) {
 	for name, tc := range map[string]struct {
-		branchAt, fork string
-		want           []string
-		reason         string
+		fork   string
+		want   []string
+		reason string
 	}{
-		"local branch at head":   {branchAt: shaA, want: []string{"rev-parse --verify --quiet refs/heads/feat/thing", "worktree add <checkout> feat/thing", "worktree remove --force <checkout>"}},
-		"local branch elsewhere": {branchAt: shaB, want: []string{"rev-parse --verify --quiet refs/heads/feat/thing"}, reason: "local branch feat/thing is at " + shaB[:7] + ", not the PR head; left untouched"},
-		"fork":                   {fork: "someone/project", want: []string{}, reason: "head branch is not in example/project (fork PR)"},
+		"same repo": {want: []string{"worktree add --detach <checkout> " + shaA, "worktree remove --force <checkout>"}},
+		"fork":      {fork: "someone/project", want: []string{}, reason: "head branch is not in example/project (fork PR)"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", branchAt: tc.branchAt}
+			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
 			s, g, r := runtugSetup(t, runner)
 			if tc.fork != "" {
 				g.pull.Head.Repo.FullName = tc.fork
@@ -416,6 +410,71 @@ func TestRuntugCheckoutBranch(t *testing.T) {
 				t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
 			}
 		})
+	}
+}
+
+// Against a real repository the pane's worktree is detached at the reviewed
+// head fetched from pull/<n>/head — no local branch appears before, during or
+// after the pass, and the worktree is gone once the wait ends. The author's
+// branch checked out in the clone's own worktree does not refuse the pass.
+func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
+	gitRun := func(dir string, args ...string) string {
+		t.Helper()
+		b, e := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if e != nil {
+			t.Fatalf("git %v: %v\n%s", args, e, b)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	src := filepath.Join(t.TempDir(), "src")
+	if e := os.MkdirAll(src, 0700); e != nil {
+		t.Fatal(e)
+	}
+	gitRun(src, "init", "-b", "main")
+	gitRun(src, "config", "user.email", "t@t")
+	gitRun(src, "config", "user.name", "t")
+	if e := os.WriteFile(filepath.Join(src, "f"), []byte("x"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	gitRun(src, "add", ".")
+	gitRun(src, "commit", "-m", "c")
+	head := gitRun(src, "rev-parse", "HEAD")
+	gitRun(src, "update-ref", "refs/pull/7/head", "HEAD")
+	root := filepath.Join(t.TempDir(), "repo")
+	if b, e := exec.Command("git", "clone", src, root).CombinedOutput(); e != nil {
+		t.Fatalf("%v\n%s", e, b)
+	}
+	// The author's branch, checked out in the clone's only worktree.
+	gitRun(root, "checkout", "-b", "feat/thing")
+	branches := gitRun(root, "branch", "--list")
+
+	var during []string
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", realGit: true}
+	runner.afterRun = func() {
+		checkout := arg(runner.spawns[0], "-c")
+		during = append(during,
+			gitRun(root, "worktree", "list", "--porcelain"),
+			gitRun(checkout, "rev-parse", "HEAD"),
+			gitRun(root, "branch", "--list"),
+		)
+	}
+	s, g, r := runtugSetup(t, runner)
+	r.Root = root
+	g.pull.Head.SHA = head
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if p := g.passes[head]; len(p) != 1 || p[0].Executor != "runtug" {
+		t.Fatalf("%+v", p)
+	}
+	if len(during) != 3 || !strings.Contains(during[0], arg(runner.spawns[0], "-c")) || during[1] != head || during[2] != branches {
+		t.Fatalf("%q", during)
+	}
+	if w := gitRun(root, "worktree", "list", "--porcelain"); strings.Count(w, "worktree ") != 1 {
+		t.Fatalf("worktree left on the host:\n%s", w)
+	}
+	if b := gitRun(root, "branch", "--list"); b != branches {
+		t.Fatalf("branches changed: %q -> %q", branches, b)
 	}
 }
 
