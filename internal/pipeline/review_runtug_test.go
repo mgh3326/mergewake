@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -249,6 +250,25 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}
+	}
+}
+
+// GitHub reports a deleted fork's head as "repo": null; the pass falls back to
+// headless before the claim, without touching git or runtug.
+func TestRuntugDeletedForkFallsBackToHeadless(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	var pull github.Pull
+	if e := json.Unmarshal([]byte(`{"number":7,"state":"open","head":{"sha":"`+shaA+`","ref":"feat/thing","repo":null},"base":{"sha":"`+shaB+`","ref":"main","repo":{"full_name":"example/project"}}}`), &pull); e != nil {
+		t.Fatal(e)
+	}
+	g.pull.Head = pull.Head
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	got := g.passes[shaA]
+	if len(runner.git) != 0 || len(runner.spawns) != 0 || runner.headless != 1 || len(got) != 1 || !strings.Contains(got[0].Fallback, "deleted fork") {
+		t.Fatalf("git=%v spawns=%d headless=%d %+v", runner.git, len(runner.spawns), runner.headless, got)
 	}
 }
 

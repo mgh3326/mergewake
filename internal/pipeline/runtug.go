@@ -105,8 +105,12 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	scale := strings.ToUpper(m[1])
 	// runtug replicates a checkout on another host only as a worktree of a
 	// branch that origin carries, so a fork's head cannot be placed there.
-	branch := pr.Head.Ref
-	if branch == "" || !strings.EqualFold(pr.Head.Repo.FullName, x.repo.Name) {
+	// A deleted fork has "head.repo": null, which decodes to an empty name.
+	branch, headRepo := pr.Head.Ref, pr.Head.Repo.FullName
+	if headRepo == "" {
+		return skip("head repository is gone (deleted fork); runtug cannot replicate it")
+	}
+	if branch == "" || !strings.EqualFold(headRepo, x.repo.Name) {
 		return skip("head branch is not in %s (fork PR); runtug cannot replicate it", x.repo.Name)
 	}
 	acquired, e := claim()
