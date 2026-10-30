@@ -83,9 +83,13 @@ func (s *Service) reapNote(v reapReceipt, dry bool) error {
 // reapHost caches one host's agent list, full pane list and per-cwd worktree
 // inspection for a single pass; closed records panes this pass closed or would
 // close, and usageUnknown blocks removals when the full pane scan failed.
+// ops reaches the host's panes; exec runs worktree cleanup and is unused when
+// viaHub, since the hub carries no cleanup command yet.
 type reapHost struct {
 	host         reap.Host
+	ops          reap.Ops
 	exec         reap.Exec
+	viaHub       bool
 	panes        []reap.Pane
 	all          []reap.Pane
 	trees        map[string]*reap.Worktree
@@ -97,7 +101,7 @@ type reapHost struct {
 // refreshPanes re-reads the full pane list so an in-use check runs on current
 // state, not the discovery snapshot, and inspects any newly seen cwds.
 func (hs *reapHost) refreshPanes(ctx context.Context) error {
-	all, err := hs.exec.AllPanes(ctx)
+	all, err := hs.ops.AllPanes(ctx)
 	if err != nil {
 		return err
 	}
@@ -105,7 +109,7 @@ func (hs *reapHost) refreshPanes(ctx context.Context) error {
 	for _, p := range all {
 		if p.Cwd != "" {
 			if _, ok := hs.trees[p.Cwd]; !ok {
-				w, _ := hs.exec.Inspect(ctx, p.Cwd)
+				w, _ := hs.ops.Inspect(ctx, p.Cwd)
 				hs.trees[p.Cwd] = w
 			}
 		}
@@ -113,30 +117,50 @@ func (hs *reapHost) refreshPanes(ctx context.Context) error {
 	return nil
 }
 
-// reclose re-reads the agent list immediately before a real close and only
-// proceeds when the pane is still there, unchanged: the discovery list is a
-// stale snapshot, and a pane that went back to work since must survive.
+// reclose closes a pane only when a fresh re-read still shows it unchanged:
+// the discovery list is a stale snapshot, and a pane that went back to work
+// since must survive. Over the hub the node itself re-reads and compares.
 func (s *Service) reclose(ctx context.Context, hs *reapHost, pane reap.Pane) (string, string) {
-	fresh, err := hs.exec.Panes(ctx)
-	if err != nil {
-		return "error", err.Error()
-	}
-	var cur *reap.Pane
-	for i := range fresh {
-		if fresh[i].ID == pane.ID {
-			cur = &fresh[i]
-		}
-	}
+	outcome, err := hs.ops.CloseExact(ctx, pane)
 	switch {
-	case cur == nil:
-		return "skipped", "pane-gone"
-	case cur.Status != pane.Status || cur.Cwd != pane.Cwd || cur.Name != pane.Name:
-		return "skipped", "pane-changed"
-	}
-	if err := hs.exec.Close(ctx, pane.ID); err != nil {
+	case err != nil:
 		return "error", err.Error()
+	case outcome != reap.CloseClosed:
+		return "skipped", outcome
 	}
 	return "closed", ""
+}
+
+// reapHub builds the pass's panewire hub client from reap.hub, or nil when
+// the transport is ssh.
+func (s *Service) reapHub() (*reap.Hub, error) {
+	if s.Config.Reap.Transport != config.ReapTransportPanewire {
+		return nil, nil
+	}
+	cfg := s.Config.Reap.Hub
+	origin, err := reap.HubOrigin(cfg.URL)
+	if err != nil {
+		return nil, err
+	}
+	creds, err := reap.ReadEnvFile(cfg.TokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("reap.hub.token_file: %w", err)
+	}
+	hub := &reap.Hub{URL: origin, Token: creds["HUB_TOKEN"]}
+	if hub.Token == "" {
+		return nil, errors.New("reap.hub.token_file has no HUB_TOKEN")
+	}
+	if cfg.CFFile != "" {
+		cf, err := reap.ReadEnvFile(cfg.CFFile)
+		if err != nil {
+			return nil, fmt.Errorf("reap.hub.cf_file: %w", err)
+		}
+		hub.CFID, hub.CFSecret = cf["CF_ACCESS_CLIENT_ID"], cf["CF_ACCESS_CLIENT_SECRET"]
+		if hub.CFID == "" || hub.CFSecret == "" {
+			return nil, errors.New("reap.hub.cf_file needs CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET")
+		}
+	}
+	return hub, nil
 }
 
 // filesSig is a compact count-plus-hash identity for a set of paths, so a
@@ -319,13 +343,23 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	sort.Slice(pulls, func(i, j int) bool { return pulls[i].Number < pulls[j].Number })
 
+	hub, e := s.reapHub()
+	if e != nil {
+		return errors.Join(append(errs, e)...)
+	}
 	hosts := []*reapHost{}
 	byName := map[string]*reapHost{}
 	for _, h := range s.Config.Hosts {
 		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
+		hs.ops = hs.exec
+		// Under the panewire transport every remote host goes through the
+		// hub; this machine's own panes still run locally.
+		if hub != nil && !h.Local() {
+			hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
+		}
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
-		panes, e := hs.exec.Panes(ctx)
+		panes, e := hs.ops.Panes(ctx)
 		if e != nil {
 			hs.failed = true
 			errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
@@ -334,7 +368,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		hs.panes = panes
 		// The full pane list also covers non-agent shells and jobs: without it
 		// the usage check is unknown and removals must skip.
-		all, e := hs.exec.AllPanes(ctx)
+		all, e := hs.ops.AllPanes(ctx)
 		if e != nil {
 			hs.usageUnknown = true
 			errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
@@ -344,7 +378,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			for _, p := range list {
 				if p.Cwd != "" {
 					if _, ok := hs.trees[p.Cwd]; !ok {
-						w, _ := hs.exec.Inspect(ctx, p.Cwd)
+						w, _ := hs.ops.Inspect(ctx, p.Cwd)
 						hs.trees[p.Cwd] = w
 					}
 				}
@@ -433,45 +467,25 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					rec.Result, rec.Reason = "skipped", "unnamed"
 				case reap.Protected(pane.Name, s.Config.Reap.Protect):
 					rec.Result, rec.Reason = "skipped", "protected:"+pane.Name
-				case hs.host.Jobs == "":
+				case hs.host.Jobs == "" && !hs.viaHub:
+					// Through the hub the node owns its jobs directory.
 					rec.Result, rec.Reason = "skipped", "jobs-dir-unset"
 				case !reap.ValidJobName(pane.Name):
 					rec.Result, rec.Reason = "skipped", "job-name-invalid"
 				default:
-					// Only a pane whose job dir already exists counts as a
-					// fleet job: an operator pane merely cd'd into a merged
-					// worktree must never be closed.
-					dir := hs.host.JobDir(pane.Name)
-					isJob, e := hs.exec.DirExists(ctx, dir)
+					// The pane's output must be saved before the session can
+					// go, and only a pane whose job dir already exists is a
+					// fleet job (reap.Exec.Capture has the rules). Shadow and
+					// dry runs only name the screen path.
+					saved, e := hs.ops.Capture(ctx, pane, mergedAt, acting)
 					switch {
 					case e != nil:
 						rec.Result, rec.Reason = "error", e.Error()
-					case !isJob:
-						rec.Result, rec.Reason = "skipped", "not-a-job"
+					case saved.Skip != "":
+						rec.Result, rec.Reason = "skipped", saved.Skip
 					default:
 						rec.Job = pane.Name
-						// The pane's output must be saved before the session
-						// can go. report.md counts only when it is newer than
-						// the merge — a stale file could belong to a reused
-						// job name — otherwise the last screen is saved.
-						report := filepath.Join(dir, "report.md")
-						exists, e := hs.exec.Exists(ctx, report)
-						fresh := false
-						if e == nil && exists && mergedAt != nil {
-							fresh, e = hs.exec.NewerThan(ctx, report, mergedAt.Unix())
-						}
-						switch {
-						case e != nil:
-							rec.Result, rec.Reason = "error", e.Error()
-						case fresh:
-							rec.Saved = report
-						case !acting:
-							rec.Saved = filepath.Join(dir, "pane-screen.txt")
-						default:
-							if rec.Saved, e = hs.exec.Screen(ctx, pane.ID, dir); e != nil {
-								rec.Result, rec.Reason = "error", e.Error()
-							}
-						}
+						rec.Saved = saved.Saved
 					}
 					if rec.Result == "" {
 						if !acting {
@@ -584,7 +598,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 
 		for _, c := range cands {
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref}
-			w, e := c.hs.exec.Inspect(ctx, c.path)
+			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
 			case e != nil:
 				rec.Result, rec.Reason = "skipped", "worktree-inspect-error"
@@ -593,6 +607,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				rec.Result, rec.Reason = "skipped", "worktree-gone"
 			case w.Branch != p.Head.Ref || w.Head != p.Head.SHA || !strings.EqualFold(w.Repo, r.Name):
 				rec.Result, rec.Reason = "skipped", "worktree-changed"
+			case c.hs.viaHub:
+				// The hub has no worktree cleanup command: the worktree
+				// stays until one exists, and is never reached over ssh.
+				rec.Result, rec.Reason = "skipped", "cleanup-unsupported:panewire"
 			}
 			if rec.Result != "" {
 				note(rec)

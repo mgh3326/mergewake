@@ -74,6 +74,13 @@ func liveName(hs *reapHost, job string) bool {
 }
 
 // archiveJob plans one job, prints the plan, and applies it when acting.
+// viaHub reports a remote host reap reaches through the panewire hub. Archive
+// moves files over ssh, so such a host is not archived: under panewire no
+// remote operation uses ssh, and an empty destination would mean this machine.
+func (s *Service) viaHub(h reap.Host) bool {
+	return s.Config.Reap.Transport == config.ReapTransportPanewire && !h.Local()
+}
+
 func (s *Service) archiveJob(ctx context.Context, h reap.Host, job string, acting bool, rec *reapReceipt) {
 	a := s.archiver()
 	p, e := a.Plan(ctx, h, job)
@@ -164,6 +171,8 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 		}
 		rec := reapReceipt{Action: "archive-job", Repo: r.Name, PR: c.PR, Host: k.host, Job: k.job}
 		switch {
+		case hs.viaHub:
+			rec.Result, rec.Reason = "skipped", "archive-over-hub"
 		case hs.usageUnknown:
 			rec.Result, rec.Reason = "skipped", "pane-scan-failed"
 		case liveName(hs, k.job):
@@ -208,6 +217,10 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		found = true
 		if h.Jobs == "" {
 			errs = append(errs, fmt.Errorf("%s: hosts[].jobs is unset", h.Name))
+			continue
+		}
+		if s.viaHub(h) {
+			errs = append(errs, fmt.Errorf("%s: archive does not run over reap.transport panewire", h.Name))
 			continue
 		}
 		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, closed: map[string]bool{}}

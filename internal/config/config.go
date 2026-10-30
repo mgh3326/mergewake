@@ -45,7 +45,7 @@ type Review struct {
 	// author-family trailer and the head commit identities yield no known
 	// model alias. Reviewed heads record that the family was inferred.
 	DefaultFamily string `yaml:"default_family"`
-	Timeout      string              `yaml:"timeout"`
+	Timeout       string `yaml:"timeout"`
 	// Select orders admitted reviewers: "pace" (default) by projected use at
 	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
 	// recommendation order without reading usage.
@@ -166,8 +166,26 @@ type Reap struct {
 	ScanAfter     string   `yaml:"scan_after"`
 	Protect       []string `yaml:"protect"`
 	Regenerable   []string `yaml:"regenerable"`
-	Archive       Archive  `yaml:"archive"`
+	// Transport reaches remote hosts: panewire (the hub's node commands) or
+	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
+	Transport string  `yaml:"transport"`
+	Hub       ReapHub `yaml:"hub"`
+	Archive   Archive `yaml:"archive"`
 }
+
+// ReapHub locates the panewire hub and the operator credential files reap
+// sends it. The files are the mode-0600 env files the panewire operator CLI
+// takes: HUB_TOKEN, and optionally CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET.
+type ReapHub struct {
+	URL       string `yaml:"url"`
+	TokenFile string `yaml:"token_file"`
+	CFFile    string `yaml:"cf_file"`
+}
+
+const (
+	ReapTransportPanewire = "panewire"
+	ReapTransportSSH      = "ssh"
+)
 
 // Archive moves finished job dirs to a synced Drive folder on archive_host and
 // records them in hk before the local job dir is deleted.
@@ -302,6 +320,31 @@ func Load(name string) (Config, error) {
 			return c, e
 		}
 	}
+	if c.Reap.Transport == "" {
+		c.Reap.Transport = ReapTransportSSH
+		if c.Reap.Hub.URL != "" {
+			c.Reap.Transport = ReapTransportPanewire
+		}
+	}
+	switch c.Reap.Transport {
+	case ReapTransportSSH:
+	case ReapTransportPanewire:
+		if _, e = reap.HubOrigin(c.Reap.Hub.URL); e != nil {
+			return c, e
+		}
+		if c.Reap.Hub.TokenFile == "" {
+			return c, errors.New("reap.transport panewire requires reap.hub.token_file")
+		}
+		c.Reap.Hub.TokenFile = Expand(c.Reap.Hub.TokenFile)
+		if c.Reap.Hub.CFFile != "" {
+			c.Reap.Hub.CFFile = Expand(c.Reap.Hub.CFFile)
+		}
+		if !filepath.IsAbs(c.Reap.Hub.TokenFile) || (c.Reap.Hub.CFFile != "" && !filepath.IsAbs(c.Reap.Hub.CFFile)) {
+			return c, errors.New("reap.hub credential files must be absolute paths")
+		}
+	default:
+		return c, errors.New("reap.transport must be panewire or ssh")
+	}
 	if e = validateArchive(&c.Reap.Archive); e != nil {
 		return c, e
 	}
@@ -313,6 +356,12 @@ func Load(name string) (Config, error) {
 		seenHosts[h.Name] = true
 		if strings.HasPrefix(h.SSH, "-") || strings.ContainsAny(h.SSH, " \t\r\n") {
 			return c, errors.New("hosts[].ssh must be empty, local, or an ssh destination")
+		}
+		if h.Machine != "" && !regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`).MatchString(h.Machine) {
+			return c, errors.New("hosts[].machine must be a panewire machine id")
+		}
+		if c.Reap.Transport == ReapTransportSSH && !h.Local() && (h.SSH == "" || h.SSH == "local") {
+			return c, errors.New("hosts[].machine without ssh requires reap.transport panewire")
 		}
 		if h.Jobs == "" {
 			continue

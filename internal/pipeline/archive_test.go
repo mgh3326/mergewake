@@ -353,3 +353,20 @@ func TestJobFromSaved(t *testing.T) {
 		}
 	}
 }
+
+// Under reap.transport panewire a remote host is reached through the hub, so
+// archive, which moves files over ssh, must leave it alone even when it also
+// has an ssh destination.
+func TestArchiveJobsSkipsHubHost(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "old-1", 20*24*time.Hour)
+	f.s.Config.Reap.Transport = config.ReapTransportPanewire
+	f.s.Config.Hosts[0].SSH, f.s.Config.Hosts[0].Machine = "ops@node.example", "node-a"
+	err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{})
+	if err == nil || !strings.Contains(err.Error(), "panewire") {
+		t.Fatalf("hub host archived: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir touched")
+	}
+}
