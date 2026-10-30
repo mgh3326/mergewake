@@ -39,9 +39,10 @@ type Daemon struct {
 	LockDir        string
 	Log            *slog.Logger
 	RateWait       func() time.Duration
-	// Healthy runs once after a loop iteration with zero failures, e.g. an
-	// external healthcheck ping. It is fail-open: its error is logged and
-	// never counted as a loop failure; nil means off.
+	// Healthy runs after a loop iteration when no loop has a recorded failure,
+	// e.g. an external healthcheck ping: one shared URL must not be kept alive
+	// by a healthy role while another fails every iteration. It is fail-open:
+	// its error is logged and never counted as a loop failure; nil means off.
 	Healthy func(ctx context.Context) error
 	// Now stamps status times and Jitter returns a fraction in [0, 1) for the
 	// retry delay; nil means time.Now and math/rand.
@@ -49,6 +50,7 @@ type Daemon struct {
 	Jitter func() float64
 	mu     sync.Mutex
 	wake   map[string]chan struct{}
+	failed map[string]int
 }
 
 // Trigger wakes a role after a trusted adapter receives an event. It coalesces
@@ -107,6 +109,7 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	}
 	d.mu.Lock()
 	d.wake = map[string]chan struct{}{}
+	d.failed = map[string]int{}
 	d.mu.Unlock()
 	lockDir := d.LockDir
 	if lockDir == "" {
@@ -183,10 +186,17 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 			st.Failures++
 		} else {
 			st.Failures = 0
-			if d.Healthy != nil && ctx.Err() == nil {
-				if e := d.Healthy(ctx); e != nil {
-					d.Log.Warn("healthcheck ping failed", "role", l.Role, "error", e)
-				}
+		}
+		d.mu.Lock()
+		d.failed[l.Role] = st.Failures
+		healthy := st.Failures == 0
+		for _, n := range d.failed {
+			healthy = healthy && n == 0
+		}
+		d.mu.Unlock()
+		if healthy && d.Healthy != nil && ctx.Err() == nil {
+			if e := d.Healthy(ctx); e != nil {
+				d.Log.Warn("healthcheck ping failed", "role", l.Role, "error", e)
 			}
 		}
 		rate := time.Duration(0)

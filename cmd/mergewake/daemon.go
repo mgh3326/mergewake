@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -100,23 +101,27 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 	return d.Run(ctx, loops)
 }
 // healthcheck returns the fail-open ping run after a clean loop. The request
-// is a bare GET with a bounded timeout; any non-2xx response or transport
-// error is reported so the caller can log it, never fail the loop.
-func healthcheck(url string) func(context.Context) error {
+// is a bare GET with a bounded timeout; errors never embed the URL, which is a
+// secret (forge-able ping endpoint) that must not reach the daemon logs.
+func healthcheck(endpoint string) func(context.Context) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	return func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
-			return err
+			return errors.New("invalid healthcheck URL")
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				return ue.Err
+			}
 			return err
 		}
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("healthcheck %s: HTTP %d", url, resp.StatusCode)
+			return fmt.Errorf("healthcheck ping: HTTP %d", resp.StatusCode)
 		}
 		return nil
 	}

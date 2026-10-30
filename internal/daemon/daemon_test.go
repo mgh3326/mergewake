@@ -151,6 +151,68 @@ func TestHealthcheckRunsAfterCleanLoopOnly(t *testing.T) {
 		t.Fatalf("pings=%d runs=%d after failing loop", pings, runs)
 	}
 }
+
+func TestHealthcheckMaskedByFailingLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	proceed := make(chan struct{})
+	var mu sync.Mutex
+	pings, cleanRuns, prRuns := 0, 0, 0
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a",
+		Healthy: func(context.Context) error { mu.Lock(); pings++; mu.Unlock(); return nil }}
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{
+			{Role: "watch", Interval: time.Hour, Run: func(context.Context) error {
+				select {
+				case <-proceed:
+					mu.Lock()
+					cleanRuns++
+					mu.Unlock()
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}},
+			{Role: "pr", Interval: time.Hour, Run: func(context.Context) error {
+				mu.Lock()
+				prRuns++
+				n := prRuns
+				mu.Unlock()
+				if n == 1 {
+					return errors.New("poll failed")
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}},
+		})
+	}()
+	// A healthy sibling must not keep the shared ping alive while another
+	// loop's last iteration carries a recorded failure.
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		d.mu.Lock()
+		f := d.failed["pr"]
+		d.mu.Unlock()
+		if f > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pr failure never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(proceed)
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if cleanRuns != 1 || pings != 0 {
+		t.Fatalf("cleanRuns=%d pings=%d; failing loop was masked by a healthy sibling", cleanRuns, pings)
+	}
+}
 func TestFixedClockAndJitterPinStatus(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
