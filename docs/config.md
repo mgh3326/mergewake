@@ -441,10 +441,10 @@ Structured reports use `doc put --key KEY --kind note --file FILE`.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
-| `enabled` | `false` | Explicit opt-in for acting `land` and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
+| `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
-| `review_gate` | Absent | Graded review-thread enforcement described below. Defaults apply even when absent. CI bots are optional unless required_bots names them. |
+| `review_gate` | Absent | Deprecated. Kept parseable for existing policies; the merge gate counts unresolved review threads directly and no longer grades findings. |
 
 Each blocking rule has:
 
@@ -460,66 +460,11 @@ Leading `/`, backslashes, empty segments and `..` are refused. Blocking rules
 combine with OR; there are no per-rule merge overrides, finding severity bypasses,
 or advisory rounds for blocking findings.
 
-Each `review_gate` rule has an `author` (a normalized bot login), a nonempty
-`severity` list, and an optional `classes` list (`blocking`, `routine`; empty
-means both). Severities come from a `<!-- mergewake-severity:... -->` marker in
-the thread's first comment, or prose conventions: `critical`, `major`, `minor`,
-`nitpick` for CodeRabbit; `p1`, `p2`, `p3` for the Codex connector; plus
-`blocking`, `high`, `medium`, `low` for mergewake's own review. A thread is
-*answered* when a known human other than the PR author and finding author replies.
-GraphQL `Bot` actors never count as humans, including logins without a bot suffix.
-Answers apply only to that thread's triage findings; they never clear a block.
-Only threads whose first finding comment belongs to the **current PR head SHA**
-participate in the decision. Old-head comments and reviews do not establish
-current-head bot evidence. On the current head, CodeRabbit Critical and Codex P1
-block, CodeRabbit Major and Codex P2 require a reply or fix, and CodeRabbit
-Minor/Nitpick and Codex P3 are ignored. A bot resolution clears a finding only
-when `resolvedBy.__typename` is `Bot`, it is the same reviewing bot, and it is
-neither the PR author nor `review.login`. `ignore_bot_resolved: false` disables
-that exemption. `ignore_outdated` permits Major findings to clear after their
-lines change; it never clears a current-head mergewake finding.
-
-The configured `review.login`'s current-head critical/high findings hold every
-PR. Its findings of any severity hold blocking paths, including medium, low and
-unspecified findings. Resolving or outdating these threads cannot clear them,
-even if that account has type `Bot`: clearing needs a **new head plus a new
-mergewake review**. Every PR requires a completed mergewake review on its exact
-head, with two distinct passes for blocking paths. Unknown severity from a
-gate-listed author or a ghost author still requires triage on blocking paths.
-
-CodeRabbit and the Codex connector are purely optional by default. Landing
-never waits for their absence and does not record or mention missing optional
-coverage. There is no grace timer. Current-head findings they do post retain
-the severity rules above. A repository may explicitly opt in with
-`review_gate.required_bots: [coderabbitai, chatgpt-codex-connector]` (default
-empty): only that list can cause `wait-for-required-bots`, and only reviews or
-threads on the current head satisfy it. Missing required bots appear as
-`missing_required_bots` in the decision receipt.
-
-Present-but-empty fields take these defaults:
-
-```yaml
-review_gate:
-  required_bots: []
-  block:
-    - {author: coderabbitai, severity: [critical]}
-    - {author: chatgpt-codex-connector, severity: [p1]}
-  triage:
-    - {author: coderabbitai, severity: [major]}
-    - {author: chatgpt-codex-connector, severity: [p2]}
-  ignore_authors: [qlty, commitcheck, wip, accesslint, codecov, gitguardian]
-  ignore_outdated: true
-  ignore_bot_resolved: true
-```
-
 Pass receipts trust the configured `review.login`, exact commit SHA, and the
 mergewake marker. They are not cryptographically signed or independently
 attested. If PR authors or other sessions can post as `review.login`, they can
 forge a matching pass. This shared-identity risk remains; use a dedicated review
 identity and protect its credentials where independent provenance is required.
-
-Older mergewake versions cannot parse `review_gate`; enable the section only
-after every landing host runs a release that understands it.
 
 The repository's policy should cover its own verification controls where changing
 them can admit irreversible actions. A PR cannot use its own new policy to grant
@@ -574,7 +519,7 @@ For `example/project`, state resides beneath
 | `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
-| `pr-notify-sent` | Most recent 256 `state PR head` keys already lane-notified by the pr role; a new head re-arms notification and restarts stay quiet. |
+| `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role; a new head re-arms notification and restarts stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
@@ -643,17 +588,20 @@ back to observation, and `--dry-run` suppresses pipeline state too. The daemon
 still maintains its supervision locks and status in shadow/dry-run modes.
 
 `daemon.pr.notify` defaults to enabled and accepts only `enabled`. While the
-`pr` role runs, each poll recomputes the land decision for every open, non-draft
-PR at its current head and emits one lane event when that head becomes
-land-ready or blocked — the notify path observes rather than merges, so it also
-runs in shadow mode. `READY` requires green required checks, the review passes
-`land` demands for the change class, a clean review gate, no reported conflicts
-and green main; `BLOCKED` names the hold (`failing checks: <names>`,
-`open blocking findings: N`, `unanswered findings: N`, `needs review` /
-`needs 2nd review` / `needs N reviews`, `missing required reviews: <bots>`,
-`conflicts`, `main CI red`). Pending or missing check evidence emits nothing.
-Each `(PR, head, state)` emits at most once per the `pr-notify-sent` state
-file; a new head re-arms notification and a restart does not resend. The event
+`pr` role runs, each poll runs the merge gate for every open, non-draft PR at
+its current head and emits one lane event for that head's verdict — the notify
+path observes rather than merges, so it also runs in shadow mode. `READY`
+requires every required check green on the head, zero unresolved review
+threads, the `mergewake/reviews/<pr>/<head>-done` marker and the head-bound
+passes from `review.login` it attests, the base branch an ancestor of the
+head, and a mergeable PR; `BLOCKED` names the hold from a
+closed vocabulary: `check_failed:<name>` per failing required check,
+`threads_open:<n>`, `review_missing`, `base_stale`, `conflict`. Pending or
+missing check evidence emits nothing. A READY verdict under acting mode with
+`enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
+verdict)` emits at most once per the `pr-notify-sent` state file; a changed
+BLOCKED reason set is a new verdict that emits again for the same head, a new
+head re-arms notification, and a restart does not resend. The event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
 (`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
@@ -697,11 +645,6 @@ touched a blocking path is reported (`action: report-culprit`), never
 auto-reverted. Holds and reports notify once per head via the `watch-reported`
 state file, which retains the most recent 128 report keys.
 
-While main is red or its watch evidence is unknown, ordinary `land` calls pause
-(`action: pause-red-main`, or `would-pause-red-main` in shadow). Unknown main
-evidence uses `pause-main-unknown` / `would-pause-main-unknown`. Recovery PRs
-from `mergewake/recovery` in the base repository remain landable; a fork using
-that branch name does not qualify.
 Immediately before opening a revert PR the watch rechecks the current main head
 and its CI, and the recovery latch tag still serializes recovery attempts.
 

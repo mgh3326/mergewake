@@ -32,7 +32,7 @@ func TestSubscriptionsAndExcludes(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatal(rows, err)
 	}
-	if err = c.Gate(context.Background(), "kimi", "high"); err != nil || len(f.args) != 5 {
+	if err = c.Gate(context.Background(), "kimi", "high"); err != nil || len(f.args) != 7 {
 		t.Fatal(f.args, err)
 	}
 }
