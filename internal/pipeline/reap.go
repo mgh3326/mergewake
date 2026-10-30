@@ -352,7 +352,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 
-	// Errors are counted once, from errs: every "error" row also lands there.
+	// Errors are counted once, from errs: note itself appends every "error"
+	// row, so no row-level failure can be missing from the summary.
 	scanned, closed, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0, 0
 	note := func(v reapReceipt) {
 		switch v.Result {
@@ -368,6 +369,15 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			deleted++
 		case "skipped":
 			skipped++
+		case "error":
+			subject := v.Worktree
+			switch v.Action {
+			case "close-pane":
+				subject = "pane " + v.Pane
+			case "archive-job":
+				subject = "job " + v.Job
+			}
+			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed archive always appends: its time spaces the next retry.
@@ -436,7 +446,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					switch {
 					case e != nil:
 						rec.Result, rec.Reason = "error", e.Error()
-						errs = append(errs, fmt.Errorf("%s pane %s: %w", hs.host.Name, pane.ID, e))
 					case !isJob:
 						rec.Result, rec.Reason = "skipped", "not-a-job"
 					default:
@@ -454,7 +463,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 						switch {
 						case e != nil:
 							rec.Result, rec.Reason = "error", e.Error()
-							errs = append(errs, fmt.Errorf("%s pane %s: %w", hs.host.Name, pane.ID, e))
 						case fresh:
 							rec.Saved = report
 						case !acting:
@@ -462,7 +470,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 						default:
 							if rec.Saved, e = hs.exec.Screen(ctx, pane.ID, dir); e != nil {
 								rec.Result, rec.Reason = "error", e.Error()
-								errs = append(errs, fmt.Errorf("%s pane %s: %w", hs.host.Name, pane.ID, e))
 							}
 						}
 					}
@@ -474,8 +481,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 							rec.Result, rec.Reason = s.reclose(ctx, hs, pane)
 							if rec.Result == "closed" {
 								hs.closed[pane.ID] = true
-							} else if rec.Result == "error" {
-								errs = append(errs, fmt.Errorf("%s pane %s: %s", hs.host.Name, pane.ID, rec.Reason))
 							}
 						}
 					}
@@ -660,7 +665,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					default:
 						if e := c.hs.exec.RemoveWorktree(ctx, main, w.Path); e != nil {
 							rec.Result, rec.Reason = "error", e.Error()
-							errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, w.Path, e))
 						} else {
 							rec.Result = "removed"
 							remove = true

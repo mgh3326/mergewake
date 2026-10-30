@@ -133,7 +133,6 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			last[jobRef{rec.Host, rec.Job}] = rec
 		}
 	}
-	var errs []error
 	for _, k := range order {
 		c, hs := closes[k], hosts[k.host]
 		prev, tried := last[k]
@@ -166,12 +165,9 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 		default:
 			s.archiveJob(ctx, hs.host, k.job, acting, &rec)
 		}
-		if rec.Result == "error" {
-			errs = append(errs, fmt.Errorf("%s job %s: %s", k.host, k.job, rec.Reason))
-		}
 		note(rec)
 	}
-	return errs
+	return nil
 }
 
 // archiveRow is one durable row of <state_dir>/archive-jobs.jsonl.

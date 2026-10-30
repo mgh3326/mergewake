@@ -317,3 +317,20 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
+
+// Every error row is counted once in the reap summary, archive or not.
+func TestReapSummaryCountsEveryErrorRow(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo"), errs: map[string]error{
+		key("herdr", "pane", "close", "w1:p1"): errors.New("close failed"),
+	}}
+	s := svc(t, &reapGH{}, r)
+	var out bytes.Buffer
+	s.Out = &out
+	err := s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "close-pane pane w1:p1: close failed") {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(out.String(), `"errors":1}`) {
+		t.Fatalf("summary does not count the error row once:\n%s", out.String())
+	}
+}

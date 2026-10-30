@@ -411,3 +411,52 @@ func TestApplyNothingToMove(t *testing.T) {
 		t.Fatal("excluded files not recorded")
 	}
 }
+
+// A job dir that is itself a symlink is refused: archiving would follow it
+// out of the jobs tree.
+func TestPlanRefusesSymlinkedJobDir(t *testing.T) {
+	e := setup(t)
+	outside := job(t, filepath.Join(filepath.Dir(e.jobs), "elsewhere"), "real")
+	if err := os.MkdirAll(e.jobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(e.jobs, "wk-13")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-13")
+	var s *Skip
+	if !errors.As(err, &s) || s.Reason != "job-dir-symlink" {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "report.md")); err != nil {
+		t.Fatal("symlink target touched")
+	}
+}
+
+type stubRunner string
+
+func (s stubRunner) Run(context.Context, string, []string, string, string) ([]byte, error) {
+	return []byte(s), nil
+}
+
+// hashes fails closed unless every requested file has exactly one record.
+func TestHashesFailClosed(t *testing.T) {
+	sum := strings.Repeat("a", 64)
+	for name, tc := range map[string]struct {
+		out string
+		ok  bool
+	}{
+		"complete":  {sum + " ./a\x00" + sum + " ./b\x00", true},
+		"missing":   {sum + " ./a\x00", false},
+		"duplicate": {sum + " ./a\x00" + sum + " ./a\x00", false},
+		"extra":     {sum + " ./a\x00" + sum + " ./b\x00" + sum + " ./c\x00", false},
+		"swapped":   {sum + " ./a\x00" + sum + " ./c\x00", false},
+		"malformed": {"abc ./a\x00" + sum + " ./b\x00", false},
+	} {
+		a := &Archiver{Runner: stubRunner(tc.out)}
+		got, err := a.hashes(context.Background(), "", "/x", []string{"a", "b"})
+		if (err == nil) != tc.ok || tc.ok && len(got) != 2 {
+			t.Errorf("%s: %v %v", name, got, err)
+		}
+	}
+}
