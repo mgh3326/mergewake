@@ -188,7 +188,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		return skip("no time left to wait for a reviewer pane")
 	}
 	args := []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale,
-		"--parent-job", parent, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds()))}
+		"--task", task, "--builder-job", parent, "--builder-family", x.authorFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds()))}
 	if cfg.Owner != "" {
 		args = append(args, "--owner", cfg.Owner)
 	}
