@@ -33,7 +33,7 @@ func (c *Client) ReviewLease(ctx context.Context, repo, branch string, ttl time.
 	if started.IsZero() {
 		return "", false, errors.New("missing review claim timestamp")
 	}
-	return sha, time.Since(started) < ttl, nil
+	return sha, c.now().Sub(started) < ttl, nil
 }
 
 // ClaimReview uses a timestamped empty commit as a renewable ref lease. An
@@ -54,7 +54,7 @@ func (c *Client) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 	}
 	var lease Ref
 	err = c.json(ctx, "POST", base(repo)+"/git/commits", map[string]any{
-		"message": leasePrefix + time.Now().UTC().Format(time.RFC3339Nano),
+		"message": leasePrefix + c.now().UTC().Format(time.RFC3339Nano),
 		"tree":    commit.Commit.Tree.SHA, "parents": []string{parent},
 	}, &lease)
 	if err != nil {

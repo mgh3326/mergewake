@@ -57,3 +57,16 @@ func TestInvalidPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchAnyChecksEveryGlob(t *testing.T) {
+	if ok, e := MatchAny([]string{"docs/**", "*.md"}, "README.md"); !ok || e != nil {
+		t.Fatalf("ok=%v err=%v", ok, e)
+	}
+	if ok, e := MatchAny(nil, "README.md"); ok || e != nil {
+		t.Fatalf("empty globs: ok=%v err=%v", ok, e)
+	}
+	// An invalid glob fails even after an earlier glob matched.
+	if _, e := MatchAny([]string{"*.md", "/abs"}, "README.md"); e == nil {
+		t.Fatal("invalid glob accepted")
+	}
+}

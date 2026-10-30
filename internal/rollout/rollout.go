@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -54,47 +55,6 @@ func (o Options) now() time.Time {
 	return time.Now()
 }
 
-// Atomic writes beside the target, so rename never crosses filesystems.
-func Atomic(name string, data []byte, mode os.FileMode) error {
-	if e := os.MkdirAll(filepath.Dir(name), 0700); e != nil {
-		return e
-	}
-	f, e := os.CreateTemp(filepath.Dir(name), ".mergewake-*")
-	if e != nil {
-		return e
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if e = f.Chmod(mode); e == nil {
-		_, e = f.Write(data)
-	}
-	if e == nil {
-		e = f.Sync()
-	}
-	ce := f.Close()
-	if e == nil {
-		e = ce
-	}
-	if e != nil {
-		return e
-	}
-	if e = os.Rename(tmp, name); e != nil {
-		return e
-	}
-	d, e := os.Open(filepath.Dir(name))
-	if e != nil {
-		return e
-	}
-	defer d.Close()
-	return d.Sync()
-}
-func writeJSON(name string, v any) error {
-	b, e := json.MarshalIndent(v, "", "  ")
-	if e != nil {
-		return e
-	}
-	return Atomic(name, b, 0600)
-}
 func Lock(dir string) (func(), error) {
 	if e := os.MkdirAll(filepath.Dir(dir), 0700); e != nil {
 		return nil, e
@@ -114,7 +74,7 @@ func rollback(dir string, j Journal) error {
 				var b []byte
 				b, e = os.ReadFile(filepath.Join(dir, s.Backup))
 				if e == nil {
-					e = Atomic(target, b, os.FileMode(s.Mode))
+					e = fsutil.Atomic(target, b, os.FileMode(s.Mode))
 				}
 			} else {
 				e = os.Remove(target)
@@ -132,7 +92,7 @@ func rollback(dir string, j Journal) error {
 	}
 	receipt := filepath.Join(filepath.Dir(dir), "installed.json")
 	if j.ReceiptExisted {
-		if e := Atomic(receipt, j.PreviousReceipt, 0600); e != nil {
+		if e := fsutil.Atomic(receipt, j.PreviousReceipt, 0600); e != nil {
 			return e
 		}
 	} else {
@@ -204,15 +164,10 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 	selected := []manifest.File{}
 	contents := map[string][]byte{}
 	for _, f := range m.Files {
-		denied := false
-		for _, g := range o.Deny {
-			var match bool
-			match, e = policy.Match(g, f.Target)
-			if e != nil {
-				err = e
-				return
-			}
-			denied = denied || match
+		denied, e := policy.MatchAny(o.Deny, f.Target)
+		if e != nil {
+			err = e
+			return
 		}
 		if denied {
 			res.Denied = append(res.Denied, f.Target)
@@ -258,33 +213,26 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		return
 	}
 	rejectedPath := filepath.Join(o.StateDir, "rejected.json")
-	if b, re := os.ReadFile(rejectedPath); re == nil {
-		var rejected struct {
-			Commit string `json:"commit"`
-		}
-		if re = json.Unmarshal(b, &rejected); re != nil {
-			err = re
-			return
-		}
-		if rejected.Commit == m.Commit {
-			res.Status = "rejected"
-			err = errors.New("this release previously rolled back; inspect and remove rejected.json before retrying")
-			return
-		}
-	} else if !os.IsNotExist(re) {
+	var rejected struct {
+		Commit string `json:"commit"`
+	}
+	if found, re := fsutil.ReadJSON(rejectedPath, &rejected); re != nil {
 		err = re
+		return
+	} else if found && rejected.Commit == m.Commit {
+		res.Status = "rejected"
+		err = errors.New("this release previously rolled back; inspect and remove rejected.json before retrying")
 		return
 	}
 	// Recheck actual files, rather than trusting the receipt alone. Healthy polls
 	// do not rewrite files, rerun smoke commands, or emit duplicate reports.
-	if b, re := os.ReadFile(filepath.Join(o.StateDir, "installed.json")); re == nil {
-		var receipt struct {
-			Manifest manifest.Manifest `json:"manifest"`
-		}
-		if re = json.Unmarshal(b, &receipt); re != nil {
-			err = re
-			return
-		}
+	var receipt struct {
+		Manifest manifest.Manifest `json:"manifest"`
+	}
+	if found, re := fsutil.ReadJSON(filepath.Join(o.StateDir, "installed.json"), &receipt); re != nil {
+		err = re
+		return
+	} else if found {
 		expected, _ := json.Marshal(m)
 		old, _ := json.Marshal(receipt.Manifest)
 		current := string(expected) == string(old)
@@ -301,9 +249,6 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 			res.Status = "current"
 			return
 		}
-	} else if !os.IsNotExist(re) {
-		err = re
-		return
 	}
 	// Download and verify everything before taking a snapshot or mutating targets.
 	for _, f := range selected {
@@ -336,7 +281,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		if e == nil {
 			s.Exists = true
 			s.Mode = uint32(mode)
-			e = Atomic(filepath.Join(dir, s.Backup), b, 0600)
+			e = fsutil.Atomic(filepath.Join(dir, s.Backup), b, 0600)
 		} else if os.IsNotExist(e) {
 			e = nil
 		}
@@ -347,11 +292,11 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		}
 		j.Files = append(j.Files, s)
 	}
-	if err = writeJSON(filepath.Join(dir, "journal.json"), j); err != nil {
+	if err = fsutil.WriteJSON(filepath.Join(dir, "journal.json"), j); err != nil {
 		return
 	}
 	undo := func(cause error) {
-		rejectErr := writeJSON(rejectedPath, struct {
+		rejectErr := fsutil.WriteJSON(rejectedPath, struct {
 			Commit string `json:"commit"`
 			Error  string `json:"error"`
 		}{m.Commit, cause.Error()})
@@ -374,7 +319,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		var target string
 		target, e = manifest.Resolve(root, f.Target)
 		if e == nil {
-			e = Atomic(target, contents[f.Target], os.FileMode(f.Mode))
+			e = fsutil.Atomic(target, contents[f.Target], os.FileMode(f.Mode))
 		}
 		if e != nil {
 			undo(e)
@@ -401,7 +346,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 	}
 	// Persist the receipt while rollback remains possible.
 	res.Status = "success"
-	if e = writeJSON(filepath.Join(o.StateDir, "installed.json"), struct {
+	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, "installed.json"), struct {
 		Manifest manifest.Manifest `json:"manifest"`
 		Result   Result            `json:"result"`
 	}{m, res}); e != nil {

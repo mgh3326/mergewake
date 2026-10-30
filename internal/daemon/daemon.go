@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mgh3326/mergewake/internal/rollout"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 type Loop struct {
@@ -39,8 +39,12 @@ type Daemon struct {
 	LockDir        string
 	Log            *slog.Logger
 	RateWait       func() time.Duration
-	mu             sync.Mutex
-	wake           map[string]chan struct{}
+	// Now stamps status times and Jitter returns a fraction in [0, 1) for the
+	// retry delay; nil means time.Now and math/rand.
+	Now    func() time.Time
+	Jitter func() float64
+	mu     sync.Mutex
+	wake   map[string]chan struct{}
 }
 
 // Trigger wakes a role after a trusted adapter receives an event. It coalesces
@@ -72,14 +76,23 @@ func lock(name string) (*os.File, error) {
 	}
 	return f, nil
 }
-func Delay(interval time.Duration, failures int, rate time.Duration) time.Duration {
+func (d *Daemon) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
+}
+
+// Delay backs off exponentially from interval, waits at least rate, and adds
+// jitter (a fraction in [0, 1)) of up to 20% of the backed-off interval.
+func Delay(interval time.Duration, failures int, rate time.Duration, jitter float64) time.Duration {
 	n := min(failures, 8)
 	base := interval
 	for i := 0; i < n && base < 30*time.Minute; i++ {
 		base = min(base*2, 30*time.Minute)
 	}
 	// Positive jitter never wakes before a rate-limit reset.
-	return max(base, rate) + time.Duration(rand.Float64()*0.2*float64(base))
+	return max(base, rate) + time.Duration(jitter*0.2*float64(base))
 }
 func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	if len(loops) == 0 {
@@ -145,25 +158,21 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 	st := Status{Host: d.Host, Role: l.Role}
 	save := func() error {
-		b, err := json.MarshalIndent(st, "", "  ")
-		if err != nil {
-			return err
-		}
-		return rollout.Atomic(filepath.Join(d.StateDir, "daemon", l.Role+".json"), b, 0600)
+		return fsutil.WriteJSON(filepath.Join(d.StateDir, "daemon", l.Role+".json"), st)
 	}
 	d.mu.Lock()
 	ch := d.wake[l.Role]
 	d.mu.Unlock()
 	for ctx.Err() == nil {
 		st.Running = true
-		st.LastRun = time.Now().UTC()
+		st.LastRun = d.now().UTC()
 		st.NextRun = time.Time{}
 		if err := save(); err != nil {
 			return err
 		}
 		err := l.Run(ctx)
 		st.Running = false
-		st.LastFinish = time.Now().UTC()
+		st.LastFinish = d.now().UTC()
 		st.LastError = ""
 		if err != nil {
 			st.LastError = err.Error()
@@ -175,9 +184,13 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		if d.RateWait != nil {
 			rate = d.RateWait()
 		}
-		delay := Delay(l.Interval, st.Failures, rate)
+		jitter := rand.Float64
+		if d.Jitter != nil {
+			jitter = d.Jitter
+		}
+		delay := Delay(l.Interval, st.Failures, rate, jitter())
 		if ctx.Err() == nil {
-			st.NextRun = time.Now().UTC().Add(delay)
+			st.NextRun = d.now().UTC().Add(delay)
 		}
 		if e := save(); e != nil {
 			return e

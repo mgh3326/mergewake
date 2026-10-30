@@ -8,11 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -62,6 +62,10 @@ type Options struct {
 	Digest, Adopt            string
 }
 
+// Acting reports whether a command may write remotely or mutate the host:
+// dry runs decide only, and shadow mode observes without acting.
+func (o Options) Acting() bool { return !o.DryRun && !o.Shadow }
+
 func (s *Service) Print(v any) error { return json.NewEncoder(s.Out).Encode(v) }
 func (s *Service) now() time.Time {
 	if s.Now != nil {
@@ -86,20 +90,7 @@ func (s *Service) audit(repo, command string, value any, dry bool) error {
 	if dry {
 		return nil
 	}
-	dir := s.state(repo)
-	if e = os.MkdirAll(dir, 0700); e != nil {
-		return e
-	}
-	f, e := os.OpenFile(filepath.Join(dir, "decisions.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if e != nil {
-		return e
-	}
-	defer f.Close()
-	_, e = f.Write(append(b, '\n'))
-	if e == nil {
-		e = f.Sync()
-	}
-	return e
+	return fsutil.AppendLine(filepath.Join(s.state(repo), "decisions.jsonl"), b)
 }
 func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy.Policy, error) {
 	var p policy.Policy
@@ -390,7 +381,7 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if e = s.Print(m); e != nil {
 		return e
 	}
-	if o.DryRun || o.Shadow {
+	if !o.Acting() {
 		return nil
 	}
 	return s.GH.Publish(ctx, m)
@@ -414,8 +405,8 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 		return errors.New("--adopt requires a container install target")
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
-	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Now: s.Now}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
-	if o.DryRun || o.Shadow {
+	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: !o.Acting(), Now: s.Now}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
+	if !o.Acting() {
 		return errors.Join(e, s.Print(result))
 	}
 	record := struct {
@@ -500,12 +491,12 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
 	if containerOnly {
-		b, re := os.ReadFile(filepath.Join(state, rollout.ContainerReceiptName))
-		if re == nil {
-			var receipt rollout.ContainerReceipt
-			if re = json.Unmarshal(b, &receipt); re != nil {
-				return re
-			}
+		var receipt rollout.ContainerReceipt
+		found, re := fsutil.ReadJSON(filepath.Join(state, rollout.ContainerReceiptName), &receipt)
+		if re != nil {
+			return re
+		}
+		if found {
 			if receipt.Repo != r.Name {
 				return errors.New("container receipt repo mismatch")
 			}
@@ -518,8 +509,6 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 					return errors.New("automatic downgrade or divergent release refused")
 				}
 			}
-		} else if !os.IsNotExist(re) {
-			return re
 		}
 	}
 	if !containerOnly {
@@ -527,14 +516,14 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		if len(m.Commands) > 0 {
 			receiptName = "command-installed.json"
 		}
-		b, re := os.ReadFile(filepath.Join(state, receiptName))
-		if re == nil {
-			var old struct {
-				Manifest manifest.Manifest `json:"manifest"`
-			}
-			if re = json.Unmarshal(b, &old); re != nil {
-				return re
-			}
+		var old struct {
+			Manifest manifest.Manifest `json:"manifest"`
+		}
+		found, re := fsutil.ReadJSON(filepath.Join(state, receiptName), &old)
+		if re != nil {
+			return re
+		}
+		if found {
 			if old.Manifest.Repo != r.Name {
 				return errors.New("installed receipt repo mismatch")
 			}
@@ -545,8 +534,6 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 			if !ok {
 				return errors.New("automatic downgrade or divergent release refused")
 			}
-		} else if !os.IsNotExist(re) {
-			return re
 		}
 	}
 	var timeout time.Duration
@@ -566,7 +553,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
 		return err
 	}
-	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: o.DryRun || o.Shadow, Digest: o.Digest, Now: s.Now}
+	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: !o.Acting(), Digest: o.Digest, Now: s.Now}
 	var result rollout.Result
 	var installErr error
 	switch {
@@ -592,7 +579,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 				if err != nil {
 					return err
 				}
-				return rollout.Atomic(target, b, 0755)
+				return fsutil.Atomic(target, b, 0755)
 			}
 			command := rollout.ExpandCommand(spec.Command, r.Name, sha, root, spec.Target)
 			_, err := s.Runner.Run(ctx, command.Command, command.Args, "", root)
@@ -619,7 +606,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 				}
 			}
 		}
-		if !o.DryRun && !o.Shadow {
+		if o.Acting() {
 			for _, spec := range selected {
 				if err := rollout.CheckGate(spec, s.Config.Host, r.Name, m.Commit); err != nil {
 					return err
@@ -629,14 +616,14 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		result, installErr = rollout.Apply(ctx, m, installOptions, func(ctx context.Context, name string) ([]byte, error) {
 			return s.GH.ReadFile(ctx, r.Name, m.Commit, name)
 		}, smoke)
-		if !o.DryRun && !o.Shadow && installErr == nil && (result.Status == "success" || result.Status == "current") {
+		if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
 			for _, spec := range selected {
 				installErr = errors.Join(installErr, rollout.PublishGate(spec, s.Config.Host, r.Name, m.Commit))
 			}
 		}
 	}
 
-	if o.DryRun || o.Shadow || result.Status == "current" || result.Status == "rejected" {
+	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}
 	record := struct {
@@ -649,7 +636,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 	data, _ := json.Marshal(record)
 	id := fmt.Sprintf("rollout-%s-%d", m.Commit[:8], s.now().UnixNano())
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	return errors.Join(installErr, s.audit(r.Name, "rollout", record, false), s.Sink.Record(reportCtx, "mergewake/"+s.Config.Host+"/"+id, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: id, Text: fmt.Sprintf("mergewake %s %s %s %s", r.Name, s.Config.Host, m.Commit, result.Status)}))
 }

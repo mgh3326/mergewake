@@ -65,13 +65,15 @@ func TestRolesLockShutdownAndStatus(t *testing.T) {
 }
 func TestBackoffAndJitter(t *testing.T) {
 	for failures := 0; failures < 12; failures++ {
-		delay := Delay(time.Second, failures, 0)
 		base := time.Second * time.Duration(1<<min(failures, 8))
-		if delay < base || delay > base+base/5 {
-			t.Fatalf("delay=%s base=%s", delay, base)
+		if delay := Delay(time.Second, failures, 0, 0); delay != base {
+			t.Fatalf("no jitter: delay=%s base=%s", delay, base)
+		}
+		if delay := Delay(time.Second, failures, 0, 0.5); delay != base+base/10 {
+			t.Fatalf("half jitter: delay=%s base=%s", delay, base)
 		}
 	}
-	if Delay(time.Second, 0, time.Hour) < time.Hour {
+	if Delay(time.Second, 0, time.Hour, 0.99) < time.Hour {
 		t.Fatal("jitter bypassed rate limit")
 	}
 }
@@ -96,6 +98,35 @@ func TestTriggerSeamAndNextRun(t *testing.T) {
 	case <-called:
 	case <-time.After(3 * time.Second):
 		t.Fatal("trigger did not wake role")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFixedClockAndJitterPinStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	state := t.TempDir()
+	d := Daemon{StateDir: state, LockDir: t.TempDir(), Host: "host-a", Now: func() time.Time { return at }, Jitter: func() float64 { return 0 }}
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "release", Interval: time.Hour, Run: func(context.Context) error { return nil }}})
+	}()
+	var s Status
+	for deadline := time.Now().Add(3 * time.Second); s.NextRun.IsZero(); {
+		if time.Now().After(deadline) {
+			t.Fatal("next run never recorded")
+		}
+		if b, err := os.ReadFile(filepath.Join(state, "daemon", "release.json")); err == nil {
+			_ = json.Unmarshal(b, &s)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !s.LastRun.Equal(at) || !s.NextRun.Equal(at.Add(time.Hour)) {
+		t.Fatalf("status=%+v", s)
 	}
 	cancel()
 	if err := <-done; err != nil {

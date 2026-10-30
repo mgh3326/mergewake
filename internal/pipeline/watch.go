@@ -8,15 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"sort"
-	"strings"
-	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
 var taskTrailer = regexp.MustCompile(`(?m)^Mergewake-Task: ([1-9][0-9]*)\s*$`)
@@ -97,7 +94,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if ci == github.Green {
 		result.Action = "healthy"
 		if !o.DryRun {
-			if e = rollout.Atomic(checkpoint, []byte(head), 0600); e != nil {
+			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {
 				return e
 			}
 		}
@@ -296,7 +293,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	}
 	result.Action = "opened-revert-pr"
 	data, _ := json.Marshal(result)
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	note := fmt.Sprintf("mergewake: main CI failed after PR #%d; revert PR %s", origin.Number, result.URL)
 	var reopen error
@@ -319,16 +316,15 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Shadow || o.DryRun {
 		return nil
 	}
-	file := filepath.Join(s.state(r.Name), "watch-reported")
-	b, e := os.ReadFile(file)
-	if e != nil && !os.IsNotExist(e) {
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
+	if e != nil {
 		return e
 	}
-	if slices.Contains(strings.Split(string(b), "\n"), key) {
+	if sent.has(key) {
 		return nil
 	}
 	data, _ := json.Marshal(result)
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	note := "mergewake: watch " + result.Action + " on " + r.Name + " " + result.Head
 	if result.Reason != "" {
@@ -339,16 +335,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if e != nil {
 		return e
 	}
-	// Keep only recent keys; exact line comparison avoids substring matches.
-	keys := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
-	if len(keys) > 127 {
-		keys = keys[len(keys)-127:]
-	}
-	if len(keys) == 1 && keys[0] == "" {
-		keys = nil
-	}
-	keys = append(keys, key)
-	return rollout.Atomic(file, []byte(strings.Join(keys, "\n")+"\n"), 0600)
+	return sent.add(key)
 }
 
 // bracketCandidates lists merged PRs in the inspected interval, excluding a

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
@@ -164,7 +165,7 @@ func seedPrior(t *testing.T, state string, commit string) []byte {
 	prior := ContainerReceipt{Host: "host-a", Repo: "example/project", Commit: commit, Targets: map[string]ContainerTargetState{
 		spec.Target: {Image: spec.Image, Digest: oldDigest, Previous: []string{olderDigest}},
 	}}
-	if e := writeJSON(filepath.Join(state, ContainerReceiptName), prior); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, ContainerReceiptName), prior); e != nil {
 		t.Fatal(e)
 	}
 	b, e := os.ReadFile(filepath.Join(state, ContainerReceiptName))
@@ -238,7 +239,7 @@ func TestContainerGarbageCollectionKeepsUnselectedTargetDigests(t *testing.T) {
 		spec.Target: {Image: spec.Image, Digest: oldDigest, Previous: []string{olderDigest}},
 		"worker":    {Image: spec.Image, Digest: staleDigest},
 	}}
-	if e := writeJSON(filepath.Join(state, ContainerReceiptName), prior); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, ContainerReceiptName), prior); e != nil {
 		t.Fatal(e)
 	}
 	m := containerManifest(t, strings.Repeat("e", 40), newDigest)
@@ -318,7 +319,7 @@ func TestContainerAdoptRefusesPendingJournal(t *testing.T) {
 	j := containerJournal{Repo: "example/project", Host: "host-a", Commit: strings.Repeat("e", 40), Order: []string{spec.Target}, Targets: map[string]containerMutation{
 		spec.Target: {Target: spec.Target, Name: spec.Name, PrevName: spec.Name + containerPreservedSuffix, Recipe: containerRecipe(spec), NewDigest: newDigest, PreviousDigest: oldDigest},
 	}}
-	if e := writeJSON(filepath.Join(state, containerJournalName), j); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, containerJournalName), j); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := AdoptContainer(context.Background(), spec, "host-a", "example/project", Options{StateDir: state}, rt); e == nil || !strings.Contains(e.Error(), "journal") {
@@ -426,7 +427,7 @@ func TestContainerCrashRecovery(t *testing.T) {
 	j := containerJournal{Repo: m.Repo, Host: "host-a", Commit: m.Commit, Order: []string{spec.Target}, Targets: map[string]containerMutation{
 		spec.Target: {Target: spec.Target, Name: spec.Name, PrevName: spec.Name + containerPreservedSuffix, Recipe: containerRecipe(spec), NewDigest: newDigest, PreviousDigest: oldDigest},
 	}}
-	if e := writeJSON(filepath.Join(state, containerJournalName), j); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, containerJournalName), j); e != nil {
 		t.Fatal(e)
 	}
 	res, e := ApplyContainer(context.Background(), m, Options{StateDir: state, Allowed: []config.Install{spec}}, "host-a", runtimeFor(rt), healthy)
@@ -452,13 +453,13 @@ func TestContainerCompletedJournalIsCleanedNotRolledBack(t *testing.T) {
 	receipt := ContainerReceipt{Host: "host-a", Repo: m.Repo, Commit: m.Commit, Targets: map[string]ContainerTargetState{
 		spec.Target: {Image: spec.Image, Digest: newDigest, Previous: []string{oldDigest}},
 	}}
-	if e := writeJSON(filepath.Join(state, ContainerReceiptName), receipt); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, ContainerReceiptName), receipt); e != nil {
 		t.Fatal(e)
 	}
 	j := containerJournal{Repo: m.Repo, Host: "host-a", Commit: m.Commit, ReceiptExisted: true, Order: []string{spec.Target}, Targets: map[string]containerMutation{
 		spec.Target: {Target: spec.Target, Name: spec.Name, PrevName: spec.Name + containerPreservedSuffix, Recipe: containerRecipe(spec), NewDigest: newDigest, PreviousDigest: oldDigest},
 	}}
-	if e := writeJSON(filepath.Join(state, containerJournalName), j); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(state, containerJournalName), j); e != nil {
 		t.Fatal(e)
 	}
 	res, e := ApplyContainer(context.Background(), m, Options{StateDir: state, Allowed: []config.Install{spec}}, "host-a", runtimeFor(rt), healthy)

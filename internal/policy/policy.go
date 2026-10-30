@@ -328,6 +328,20 @@ func validKind(k string) bool {
 	return false
 }
 
+// MatchAny reports whether name matches any glob. Every glob is checked, so
+// an invalid one fails even when an earlier glob matched.
+func MatchAny(globs []string, name string) (bool, error) {
+	matched := false
+	for _, g := range globs {
+		ok, e := Match(g, name)
+		if e != nil {
+			return false, e
+		}
+		matched = matched || ok
+	}
+	return matched, nil
+}
+
 // Match supports slash-aware glob syntax plus ** as a whole path segment.
 func Match(glob, name string) (bool, error) {
 	if glob == "" || strings.HasPrefix(glob, "/") || strings.Contains(glob, "\\") {

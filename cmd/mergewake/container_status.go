@@ -38,13 +38,9 @@ func containerStatus(c config.Config, r config.Repo, out io.Writer) error {
 	}
 	var errs []error
 	for _, s := range r.Install {
-		denied := false
-		for _, g := range r.Deny {
-			match, e := policy.Match(g, s.Target)
-			if e != nil {
-				return e
-			}
-			denied = denied || match
+		denied, e := policy.MatchAny(r.Deny, s.Target)
+		if e != nil {
+			return e
 		}
 		line := containerStatusLine{Host: c.Host, Repo: r.Name, ContainerStatus: rollout.ContainerStatus{Target: s.Target, Image: s.Image, Health: "unknown", Status: "denied"}}
 		if denied {

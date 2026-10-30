@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
@@ -173,7 +174,7 @@ func TestInterruptedReceiptRestoresPriorReceipt(t *testing.T) {
 		t.Fatal(e)
 	}
 	j := Journal{Root: root, PreviousReceipt: previous, ReceiptExisted: true}
-	if e := writeJSON(filepath.Join(dir, "journal.json"), j); e != nil {
+	if e := fsutil.WriteJSON(filepath.Join(dir, "journal.json"), j); e != nil {
 		t.Fatal(e)
 	}
 	if e := Recover(root, state); e != nil {
