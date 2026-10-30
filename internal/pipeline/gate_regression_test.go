@@ -181,3 +181,33 @@ func TestReviewReclaimsExpiredClaim(t *testing.T) {
 		})
 	}
 }
+
+// GitHub moves a comment's commit to each new head while its line is
+// unchanged. A finding posted on an older head and resolved after the fix must
+// not stay held: only a finding posted on this head blocks a resolve.
+func TestLandResolvedFindingFromOlderHeadDoesNotHold(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.feedback.Threads = []github.ReviewThread{{IsResolved: true, Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, OriginalCommitSHA: shaB, Body: "<!-- mergewake-severity:high --> finding"}, {Author: "dev", AuthorType: "User", Body: "fixed"}}}}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if landAction(t, s, r.Name) == "blocked" {
+		t.Fatalf("finding resolved on an older head was held: %s", landAction(t, s, r.Name))
+	}
+}
+
+// The same finding posted on the current head still holds after a resolve.
+func TestLandResolvedFindingPostedOnHeadHolds(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.feedback.Threads = []github.ReviewThread{{IsResolved: true, Comments: []github.ReviewComment{{Author: "review-bot", CommitSHA: shaA, OriginalCommitSHA: shaA, Body: "<!-- mergewake-severity:high --> finding"}, {Author: "dev", AuthorType: "User", Body: "ok"}}}}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
+		t.Fatal("author-resolved finding posted on the current head landed")
+	}
+}

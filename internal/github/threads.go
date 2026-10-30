@@ -20,6 +20,10 @@ type ReviewComment struct {
 	Author     string `json:"author"`
 	Body       string `json:"body"`
 	CommitSHA  string `json:"commit_sha"`
+	// OriginalCommitSHA is the head the comment was posted on. CommitSHA
+	// follows the PR head while the commented line is unchanged, so it cannot
+	// tell a finding posted on this head from an older one that still applies.
+	OriginalCommitSHA string `json:"original_commit_sha,omitempty"`
 }
 type ReviewThread struct {
 	ID             string          `json:"id"`
@@ -80,6 +84,9 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 										Commit *struct {
 											OID string `json:"oid"`
 										} `json:"commit"`
+										OriginalCommit *struct {
+											OID string `json:"oid"`
+										} `json:"originalCommit"`
 									} `json:"nodes"`
 									PageInfo *struct {
 										HasNextPage bool `json:"hasNextPage"`
@@ -95,7 +102,7 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
 			return fb, e
 		}
@@ -141,6 +148,9 @@ func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (Review
 				c := ReviewComment{Body: cm.Body}
 				if cm.Commit != nil {
 					c.CommitSHA = cm.Commit.OID
+				}
+				if cm.OriginalCommit != nil {
+					c.OriginalCommitSHA = cm.OriginalCommit.OID
 				}
 				if cm.Author != nil {
 					c.Author = cm.Author.Login

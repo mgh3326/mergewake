@@ -116,7 +116,7 @@ func TestThreadCommitAndReviewHeadBinding(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 					t.Fatal(err)
 				}
-				if !strings.Contains(req.Query, "body commit{oid}") {
+				if !strings.Contains(req.Query, "body commit{oid} originalCommit{oid}") {
 					t.Fatal("thread commit not queried")
 				}
 				fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"headRefOid":%q,"reviews":{"nodes":[{"author":{"login":"coderabbitai","__typename":"Bot"},"state":"COMMENTED","commit":{"oid":%q}}]},"reviewThreads":{"nodes":[{"comments":{"nodes":[{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"Minor","commit":{"oid":%q}}]}}],"pageInfo":{"hasNextPage":false}}}}}}`, testSHA, head, head)
