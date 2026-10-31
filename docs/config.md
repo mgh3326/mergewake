@@ -1115,6 +1115,11 @@ event goes to the operator lane (`notifier.lane`):
 [mergewake] STALLED review <repo>#<pr> head=<sha7> | no review started for 47m0s (threshold 30m0s); …
 ```
 
+`daemon.pr.skip_bots: true` leaves PRs opened by bot accounts (GitHub user type
+`Bot`, e.g. Renovate) out of the pr role: no review, notify, landing or stall
+alarm. They carry no author family, so a review could never start and the
+alarm would only repeat. They still count as open for outcome reconciliation.
+
 Each `(PR, head)` alarms once, recorded in `review-stall-sent` (the newest 256
 keys) and as a `review-stall` audit record; a delivery the notifier refuses is
 not recorded and is retried on the next poll, and counts as a failed loop run.

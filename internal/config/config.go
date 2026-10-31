@@ -159,6 +159,10 @@ type PRLoop struct {
 	// StallAfter is how long a ready PR head may wait with no review started
 	// before the stall alarm fires. Empty means 30m; "off" disables the alarm.
 	StallAfter string `yaml:"stall_after"`
+	// SkipBots leaves PRs opened by bot accounts (GitHub user type "Bot", e.g.
+	// Renovate) out of review, notify, landing and the stall alarm: they carry
+	// no author family, so a review can never start and the alarm only nags.
+	SkipBots bool `yaml:"skip_bots"`
 }
 
 // DefaultStallAfter is the review-stall threshold when stall_after is unset.
