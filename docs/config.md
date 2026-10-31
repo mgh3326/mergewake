@@ -44,6 +44,7 @@ Different hosts may use the same inventory and different deny lists.
 | `smoke` | Required for file and command/release rollout | Operator-owned smoke command; see below. Never supplied by a manifest or PR. Container targets use `install[].health` instead. |
 | `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
+| `lane` | Empty | Lane for this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one; checked before `notifier.fallback_lane`. |
 
 Each `install[]` entry has:
 
@@ -927,7 +928,7 @@ inferred. A task trailer overrides `repos[].task`.
 Treat the family label as trusted automation metadata, not model provenance
 attestation. A handoffkeep-backed watcher refuses recovery with no valid task ID.
 `Mergewake-Notify-Lane` names the lane for `daemon.pr.notify` events when the
-task trailer cannot be resolved to a lane; the configured fallback lane
+task trailer cannot be resolved to a lane; then the repo's `repos[].lane`; the configured fallback lane
 (`notifier.fallback_lane`, defaulting to the operator lane) is the last
 resort, and a delivery the notifier refuses is retried there once before the
 verdict is parked with one logged decision. The task and notify-lane trailers

@@ -137,6 +137,9 @@ type Repo struct {
 	Smoke        Command   `yaml:"smoke"`
 	SmokeTimeout string    `yaml:"smoke_timeout"`
 	Task         string    `yaml:"task"`
+	// Lane receives this repo's PR events when neither the task trailer nor a
+	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
+	Lane string `yaml:"lane"`
 }
 type Loop struct {
 	Enabled  bool   `yaml:"enabled"`
@@ -507,6 +510,9 @@ func Load(name string) (Config, error) {
 			return c, errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
+		if r.Lane != "" && !laneName.MatchString(r.Lane) {
+			return c, fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
+		}
 		if r.Branch == "" {
 			r.Branch = "main"
 		}

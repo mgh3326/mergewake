@@ -361,3 +361,32 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 		t.Fatal("new head re-armed notification")
 	}
 }
+
+// A repo lane takes PRs no trailer routes, ahead of the global fallback; a
+// task lane or a Mergewake-Notify-Lane trailer still wins over it.
+func TestNotifyLaneRepoLane(t *testing.T) {
+	for _, tt := range []struct {
+		name, body, lane, via string
+		sink                  map[string]string
+	}{
+		{"no trailer uses the repo lane", "", "repo-lane", "via repo lane", nil},
+		{"unresolved task uses the repo lane", "Mergewake-Task: 44", "repo-lane", "via repo lane", map[string]string{}},
+		{"notify-lane trailer wins", "Mergewake-Notify-Lane: notify-lane", "notify-lane", "via notify-lane trailer", nil},
+		{"task lane wins", "Mergewake-Task: 42", "task-lane", "via task 42", map[string]string{"42": "task-lane"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, n, r := notifySetup(t)
+			r.Lane = "repo-lane"
+			g.pull.Body = tt.body
+			if tt.sink != nil {
+				s.Sink = &fakeLaneSink{lanes: tt.sink}
+			}
+			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+				t.Fatal(e)
+			}
+			if n.count != 1 || n.events[0].Lane != tt.lane || !strings.Contains(lastEvent(t, n), tt.via) {
+				t.Fatalf("%+v", n.events)
+			}
+		})
+	}
+}
