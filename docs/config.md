@@ -945,7 +945,7 @@ lost, late or forged delivery changes nothing but timing.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Serve the receiver next to the daemon loops; it shuts down with the daemon. |
-| `listen` | Required when enabled | Loopback `host:port` only: `localhost`, any `127.0.0.0/8` address or `::1`. Other hostnames and wildcard binds are refused, so remote delivery needs an operator-run tunnel (for example a reverse SSH forward or a cloudflared/smee-style relay) terminating on loopback. |
+| `listen` | Required when enabled | Loopback `host:port` only: `localhost`, any `127.0.0.0/8` address or `::1`. Other hostnames and wildcard binds are refused, and `localhost` is rewritten to a `127.0.0.1` literal so resolution can never steer the bind off loopback. Remote delivery needs an operator-run tunnel (for example a reverse SSH forward or a cloudflared/smee-style relay) terminating on loopback. |
 | `path` | `/github` | Exact request path; other paths return 404. |
 | `secret_env` | Required when enabled | Name of the environment variable holding the GitHub webhook shared secret. The daemon refuses to start while it is unset or empty; the value never appears in config or logs. |
 

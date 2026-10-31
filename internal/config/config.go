@@ -923,13 +923,17 @@ func validateWebhook(w *Webhook) error {
 		return errors.New("daemon.webhook.listen port must be 1..65535")
 	}
 	// Only localhost, 127.0.0.0/8 and ::1: any other hostname or a wildcard
-	// bind would expose the receiver beyond this host.
+	// bind would expose the receiver beyond this host. localhost is rewritten
+	// to a literal so name resolution can never steer the bind off loopback.
 	loopback := host == "localhost"
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		loopback = true
 	}
 	if !loopback {
 		return errors.New("daemon.webhook.listen must be a loopback address")
+	}
+	if host == "localhost" {
+		w.Listen = net.JoinHostPort("127.0.0.1", port)
 	}
 	if w.SecretEnv == "" {
 		return errors.New("daemon.webhook requires secret_env")

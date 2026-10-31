@@ -473,9 +473,17 @@ func TestWebhookConfig(t *testing.T) {
 		t.Fatalf("loopback webhook: %+v %v", c.Daemon.Webhook, e)
 	}
 	for _, listen := range []string{"localhost:9000", "127.0.0.2:9000", "[::1]:9000"} {
-		if _, e = load("daemon:\n  webhook: {enabled: true, listen: '" + listen + "', secret_env: MW_TEST_WH_SECRET}\n"); e != nil {
+		if c, e = load("daemon:\n  webhook: {enabled: true, listen: '" + listen + "', secret_env: MW_TEST_WH_SECRET}\n"); e != nil {
 			t.Fatalf("listen %s: %v", listen, e)
 		}
+	}
+	if c.Daemon.Webhook.Listen != "[::1]:9000" {
+		t.Fatalf("loopback literal rewritten: %s", c.Daemon.Webhook.Listen)
+	}
+	c, e = load("daemon:\n  webhook: {enabled: true, listen: 'localhost:9000', secret_env: MW_TEST_WH_SECRET}\n")
+	// localhost normalises to a literal bind; resolution can never reroute it.
+	if e != nil || c.Daemon.Webhook.Listen != "127.0.0.1:9000" {
+		t.Fatalf("localhost normalisation: %+v %v", c.Daemon.Webhook, e)
 	}
 	for _, listen := range []string{"0.0.0.0:9000", ":9000", "10.0.0.1:9000", "example.invalid:9000", "127.0.0.1", "127.0.0.1:notaport", "127.0.0.1:0"} {
 		if _, e = load("daemon:\n  webhook: {enabled: true, listen: '" + listen + "', secret_env: MW_TEST_WH_SECRET}\n"); e == nil {
