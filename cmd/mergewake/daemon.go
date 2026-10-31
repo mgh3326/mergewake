@@ -95,11 +95,23 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 		return errors.New("daemon requires configured repositories")
 	}
 	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: slog.New(slog.NewJSONHandler(stderr, nil)), RateWait: gh.RateWait}
+	if wc := s.Config.Daemon.Webhook; wc.Enabled {
+		repos := map[string]bool{}
+		for _, r := range s.Config.Repos {
+			repos[r.Name] = true
+		}
+		secret := os.Getenv(wc.SecretEnv)
+		if secret == "" {
+			return errors.New("daemon.webhook.secret_env is unset or empty")
+		}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos}
+	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
 	}
 	return d.Run(ctx, loops)
 }
+
 // healthcheck returns the fail-open ping run after a clean loop. The request
 // is a bare GET with a bounded timeout; errors never embed the URL, which is a
 // secret (forge-able ping endpoint) that must not reach the daemon logs.

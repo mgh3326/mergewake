@@ -926,6 +926,44 @@ release, rollout and agent need `--apply` to mutate. `--shadow` forces the daemo
 back to observation, and `--dry-run` suppresses pipeline state too. The daemon
 still maintains its supervision locks and status in shadow/dry-run modes.
 
+### `daemon.webhook`
+
+```yaml
+daemon:
+  webhook:
+    enabled: true
+    listen: 127.0.0.1:9477
+    path: /github
+    secret_env: MERGEWAKE_WEBHOOK_SECRET
+```
+
+The optional in-process receiver accepts GitHub webhook deliveries and wakes
+the matching roles early. Polling remains complete: a delivery only shortens
+the wait until the next poll, every decision still re-reads GitHub, and a
+lost, late or forged delivery changes nothing but timing.
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Serve the receiver next to the daemon loops; it shuts down with the daemon. |
+| `listen` | Required when enabled | Loopback `host:port` only: `localhost`, any `127.0.0.0/8` address or `::1`. Other hostnames and wildcard binds are refused, and `localhost` is rewritten to a `127.0.0.1` literal so resolution can never steer the bind off loopback. Remote delivery needs an operator-run tunnel (for example a reverse SSH forward or a cloudflared/smee-style relay) terminating on loopback. |
+| `path` | `/github` | Exact request path; other paths return 404. |
+| `secret_env` | Required when enabled | Name of the environment variable holding the GitHub webhook shared secret. The daemon refuses to start while it is unset or empty (other commands load the config without it); the value never appears in config or logs. Deliveries may use either content type (`application/json` or the form `payload` field); `application/json` is recommended. |
+
+Requests must `POST` the exact path with a body of at most 5 MiB and a valid
+`X-Hub-Signature-256` (HMAC-SHA256 over the raw body). Bad or missing
+signatures get 401 and trigger nothing; verified deliveries get 202 whether
+or not anything was triggered. One log line per delivery records the
+`X-GitHub-Event`, the `X-GitHub-Delivery` id, `repository.full_name` and the
+roles woken — never the body, the signature or other headers.
+
+| `X-GitHub-Event` | Roles woken |
+| --- | --- |
+| `pull_request`, `pull_request_review`, `pull_request_review_thread`, `check_suite`, `check_run`, `status` | `pr`, `watch` |
+| `release`, `workflow_run`, `push` | `release`, `rollout` |
+| `ping`, any other event | none |
+
+Only enabled roles wake, and only for repositories in `repos`.
+
 `daemon.pr.notify` defaults to enabled and accepts only `enabled`. While the
 `pr` role runs, each poll runs the merge gate for every open, non-draft PR at
 its current head and emits one lane event for that head's verdict — the notify

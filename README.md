@@ -108,8 +108,9 @@ remain enforced.
 
 Polling needs no public ingress. Conditional GitHub requests, rate headers,
 jitter, bounded backoff, role locks and local status support supervision; examples
-are in [deploy/](deploy/). An optional in-process trigger seam can wake roles from
-trusted webhook adapters without changing the pipeline.
+are in [deploy/](deploy/). An optional in-process receiver (`daemon.webhook`)
+serves HMAC-signed GitHub deliveries on loopback and wakes matching roles
+early; polling remains complete.
 
 Command installs use host-owned recipes with `{sha}` arguments, exact-output
 verification, smoke checks, prior-SHA journals and rollback receipts. `release`
