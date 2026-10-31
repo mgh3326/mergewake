@@ -3,7 +3,6 @@ package github
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,7 +150,9 @@ func TestThrottleWaitIsLogged(t *testing.T) {
 	}
 }
 func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
+	hits := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[r.URL.Path]++
 		switch r.URL.Path {
 		case "/interval":
 			w.Header().Set("X-Poll-Interval", "30")
@@ -176,17 +177,20 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 		t.Fatalf("one-shot logged a throttle wait: %q", buf.String())
 	}
 
-	// A polling client waits on the same interval.
+	// A polling client honours the same interval: the second read inside it
+	// is served from the last body and never reaches the server.
 	c = New("")
 	c.BaseURL = server.URL
 	c.Polling = true
+	hits["/interval"] = 0
 	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, e := c.request(ctx, "GET", "/interval", "application/json", nil); e == nil {
-		t.Fatal("polling client ignored poll interval")
+	if b, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil || string(b) != `{}` {
+		t.Fatalf("polling replay = %s %v", b, e)
+	}
+	if hits["/interval"] != 1 {
+		t.Fatalf("polling client ignored poll interval: %d server hits", hits["/interval"])
 	}
 
 	// Retry-After still throttles one-shot clients.
@@ -195,7 +199,7 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 	if _, e := c.request(context.Background(), "GET", "/retry", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, e := c.request(ctx, "GET", "/other", "application/json", nil); e == nil {
 		t.Fatal("one-shot client ignored Retry-After")
@@ -249,8 +253,10 @@ func TestPollIntervalServesCacheOrSkips(t *testing.T) {
 	if e != nil || string(b) != `{"v":1}` {
 		t.Fatalf("%s %v", b, e)
 	}
-	if _, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); !errors.Is(e, ErrPollSkipped) {
-		t.Fatalf("skip = %v", e)
+	// An uncached key inside its poll window replays its last body instead of
+	// being skipped: a skip here left PR reviews unstarted round after round.
+	if b, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); e != nil || string(b) != `{"v":2}` {
+		t.Fatalf("replay = %s %v", b, e)
 	}
 	if _, e := c.request(context.Background(), "GET", "/other", "application/json", nil); e != nil {
 		t.Fatal(e)

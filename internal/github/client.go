@@ -67,7 +67,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	if method == "GET" {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
-		} else if hit.ETag != "" {
+		} else if hit.ETag != "" || hit.Replay {
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
