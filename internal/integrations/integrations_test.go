@@ -102,7 +102,7 @@ func TestAdapterErrorsPropagate(t *testing.T) {
 	if (Panewire{r, "panewire", "lane-a"}).Notify(context.Background(), Event{}) == nil {
 		t.Fatal("notify failure hidden")
 	}
-	h := Handoffkeep{r, "handoffkeep", "in_progress"}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "in_progress"}
 	if h.Reopen(context.Background(), "42", "note") == nil || len(r.calls) != 2 {
 		t.Fatal("show failure did not stop transition")
 	}
@@ -122,7 +122,7 @@ func (r *oldServerRunner) Run(_ context.Context, _ string, args []string, _, _ s
 }
 func TestReopenOlderServerFailsExplicitly(t *testing.T) {
 	r := &oldServerRunner{}
-	h := Handoffkeep{r, "handoffkeep", "reopened"}
+	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
 	err := h.Reopen(context.Background(), "42", "reverted")
 	if err == nil || !strings.Contains(err.Error(), "comment recorded") || !strings.Contains(err.Error(), "lack explicit reopen support") || r.calls != 3 {
 		t.Fatalf("calls=%d err=%v", r.calls, err)

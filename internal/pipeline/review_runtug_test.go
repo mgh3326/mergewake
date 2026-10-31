@@ -17,6 +17,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // runtugExit is a command error carrying an exit status, like exec.ExitError.
@@ -48,6 +49,7 @@ type runtugRunner struct {
 	addFails bool
 	realGit  bool   // run git for real (against a test repository)
 	afterRun func() // called once runtug returns
+	sink     *taskJobSink
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -126,10 +128,28 @@ type taskJobSink struct {
 	fakeLaneSink
 	job, title string
 	files      map[string][]byte
+	jobs       map[string]integrations.JobRecord // per-id records
+	missing    *integrations.JobRecord           // record for any unlisted id
+	jobErr     error
+	gets       []string
 }
 
 func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
 	return s.job, s.title, nil
+}
+
+func (s *taskJobSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+	s.gets = append(s.gets, id)
+	if s.jobErr != nil {
+		return integrations.JobRecord{}, s.jobErr
+	}
+	if rec, ok := s.jobs[id]; ok {
+		return rec, nil
+	}
+	if s.missing != nil {
+		return *s.missing, nil
+	}
+	return integrations.JobRecord{}, integrations.ErrJobNotFound
 }
 
 func (s *taskJobSink) Attachment(_ context.Context, sha string) ([]byte, error) {
@@ -143,8 +163,9 @@ func runtugSetup(t *testing.T, runner *runtugRunner) (*Service, *fakeGH, config.
 	t.Helper()
 	s, g, _, _, r := setup(t)
 	s.Runner = runner
-	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}}
+	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}, jobs: map[string]integrations.JobRecord{}}
 	s.Sink = sink
+	runner.sink = sink
 	if runner.remote != nil {
 		runner.remote = sink
 	}
@@ -216,8 +237,40 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 		t.Fatalf("%v\n%s", sp, brief)
 	}
 	got := g.passes[shaA][0]
-	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug"}) {
+	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)"}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// The builder's hk job record supplies --builder-family; a builder without a
+// record (pre-records spawn) falls back to the trailer/commit inference.
+func TestRuntugBuilderFamilyFromRecord(t *testing.T) {
+	for name, tc := range map[string]struct {
+		record *integrations.JobRecord
+		want   string
+	}{
+		"record family":       {&integrations.JobRecord{State: "completed", Family: "google"}, "google"},
+		"no record":           {nil, "anthropic"},
+		"no family on record": {&integrations.JobRecord{State: "completed"}, "anthropic"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
+			s, _, r := runtugSetup(t, runner)
+			if tc.record != nil {
+				runner.sink.jobs["author-job"] = *tc.record
+			}
+			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			sp := runner.spawns[0]
+			if arg(sp, "--builder-family") != tc.want || arg(sp, "--builder-job") != "author-job" {
+				t.Fatal(sp)
+			}
+			brief, _ := os.ReadFile(arg(sp, "-p"))
+			if !strings.Contains(string(brief), "Author model family: "+tc.want) {
+				t.Fatalf("brief lacks family %q:\n%s", tc.want, brief)
+			}
+		})
 	}
 }
 
@@ -230,36 +283,61 @@ func gitCalls(r *runtugRunner, root string) []string {
 	return out
 }
 
-// A pane on another host returns its findings as an attachment announced on
-// the findings lane; mergewake fetches, validates and posts them, and
-// acknowledges the event.
+// A pane on another host returns its findings on its hk job record. A pane
+// from before `runtug done --result` leaves a record without one and its
+// findings still arrive as an attachment announced on the findings lane:
+// mergewake fetches, validates and posts them through the legacy fallback,
+// counts the use and acknowledges the event.
 func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
-	s, g, r := runtugSetup(t, runner)
-	s.Config.Review.Runtug.Lane = "review-desk"
-	s.Config.Review.Runtug.Panewire = "panewire"
-	s.Config.Review.Runtug.ExcludeHosts = []string{"slow-host", "other-host"}
-	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	got := g.passes[shaA]
-	if runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || got[0].Reviewer != "runtug:seat-x" || g.postCount != 1 {
-		t.Fatalf("headless=%d %+v", runner.headless, got)
-	}
-	sp := runner.spawns[0]
-	if arg(sp, "--exclude-host") != "slow-host,other-host" {
-		t.Fatal(sp)
-	}
-	// A malformed announcement ahead of the real one is consumed and skipped.
-	if len(runner.acks) != 2 || strings.Join(runner.acks[0], " ") != "inbox ack 8 --lane review-desk --json" || strings.Join(runner.acks[1], " ") != "inbox ack 9 --lane review-desk --json" {
-		t.Fatal(runner.acks)
-	}
-	brief, _ := os.ReadFile(arg(sp, "-p"))
-	label := arg(sp, "-l")
-	for _, want := range []string{`handoffkeep attach put "$J/findings.json" --name ` + label + "-findings.json", "panewire emit --kind lane.event --lane review-desk --deliver inbox --type report --event-id " + label + "-findings --text '[" + label + "] findings attachment=<sha256>'"} {
-		if !strings.Contains(string(brief), want) {
-			t.Fatalf("brief lacks %q:\n%s", want, brief)
-		}
+	for name, record := range map[string]integrations.JobRecord{
+		"record result":      {State: "completed", Family: "google", Result: json.RawMessage(`{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`)},
+		"legacy inbox reply": {State: "completed", Family: "google"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
+			s, g, r := runtugSetup(t, runner)
+			s.Config.Review.Runtug.Lane = "review-desk"
+			s.Config.Review.Runtug.Panewire = "panewire"
+			s.Config.Review.Runtug.ExcludeHosts = []string{"slow-host", "other-host"}
+			runner.sink.missing = &record
+			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			got := g.passes[shaA]
+			if runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || got[0].Reviewer != "runtug:seat-x" || g.postCount != 1 {
+				t.Fatalf("headless=%d %+v", runner.headless, got)
+			}
+			// The record's family wins over the guessed remote family.
+			if got[0].Family != "google" {
+				t.Fatalf("receipt family %+v", got[0])
+			}
+			sp := runner.spawns[0]
+			if arg(sp, "--exclude-host") != "slow-host,other-host" {
+				t.Fatal(sp)
+			}
+			label := arg(sp, "-l")
+			brief, _ := os.ReadFile(arg(sp, "-p"))
+			if !strings.Contains(string(brief), "runtug done "+label+` --result "$J/findings.json"`) {
+				t.Fatalf("brief lacks runtug done --result:\n%s", brief)
+			}
+			if strings.Contains(string(brief), "attach put") || strings.Contains(string(brief), "panewire emit") {
+				t.Fatalf("brief still teaches the lane return:\n%s", brief)
+			}
+			if name == "record result" {
+				if runner.looks != 0 || s.inboxFallbacks != 0 || got[0].Fallback != "" {
+					t.Fatalf("looks=%d fallbacks=%d receipt=%+v", runner.looks, s.inboxFallbacks, got[0])
+				}
+				return
+			}
+			// A malformed announcement ahead of the real one is consumed and
+			// skipped, and the fallback use is counted.
+			if len(runner.acks) != 2 || strings.Join(runner.acks[0], " ") != "inbox ack 8 --lane review-desk --json" || strings.Join(runner.acks[1], " ") != "inbox ack 9 --lane review-desk --json" {
+				t.Fatal(runner.acks)
+			}
+			if s.inboxFallbacks != 1 || !strings.Contains(got[0].Fallback, "inbox fallback 1") {
+				t.Fatalf("count=%d fallback=%q", s.inboxFallbacks, got[0].Fallback)
+			}
+		})
 	}
 }
 
@@ -322,6 +400,7 @@ func TestRuntugWaitsForLateAnnouncement(t *testing.T) {
 	s, g, r := runtugSetup(t, runner)
 	s.Config.Review.Runtug.Lane = "review-desk"
 	s.Config.Review.Runtug.Panewire = "panewire"
+	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	poll := findingsPoll
 	findingsGrace, findingsPoll = time.Minute, time.Millisecond
 	t.Cleanup(func() { findingsPoll = poll })
@@ -538,7 +617,7 @@ func TestRuntugNeedsNoQuotaTool(t *testing.T) {
 	runner = &runtugRunner{quotaErr: errors.New("scopefuel: not found")}
 	s, g, r = runtugSetup(t, runner)
 	e := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "runtug: reviewer pane") || !strings.Contains(e.Error(), "headless: review unavailable: quota recommendation") || g.postCount != 0 {
+	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "runtug: no findings") || !strings.Contains(e.Error(), "headless: review unavailable: quota recommendation") || g.postCount != 0 {
 		t.Fatal(e, g.postCount)
 	}
 }
@@ -579,6 +658,7 @@ func TestRuntugPassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := runtugSetup(t, runner)
 	s.Config.Review.Timeout = "10m"
+	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	diff, _ := g.Diff(context.Background(), r.Name, 7)
 	x := &runtugExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
 	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
@@ -617,5 +697,65 @@ func TestRuntugFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 		if strings.HasPrefix(c, "branch -D") {
 			t.Fatalf("deleted a branch it did not prove it created: %q", gitCalls(runner, r.Root))
 		}
+	}
+}
+
+// The W4 rule decides what a finished reviewer pane's hk record means:
+// completed with a result uses it; completed without one, a pending or
+// missing record, and an unreadable hk fall back after the bounded poll;
+// escalated and lost fall back immediately and the receipt keeps the state.
+func TestRuntugJobRecordResultW4(t *testing.T) {
+	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
+	for name, tc := range map[string]struct {
+		record   *integrations.JobRecord
+		jobErr   error
+		result   string
+		executor string // pass executor: "runtug" or "" (headless)
+		reason   string
+		polled   bool // the record was asked for more than once
+	}{
+		"completed with result":    {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "runtug"},
+		"refusal in the result":    {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
+		"completed without result": {record: &integrations.JobRecord{State: "completed"}, reason: "completed without a result"},
+		"escalated":                {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
+		"lost":                     {record: &integrations.JobRecord{State: "lost"}, reason: "reviewer job record lost"},
+		"still spawned":            {record: &integrations.JobRecord{State: "spawned"}, reason: "job record state spawned", polled: true},
+		"no record":                {reason: "no job record", polled: true},
+		"hk unreadable":            {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{family: "openai"}
+			s, g, r := runtugSetup(t, runner)
+			findingsGrace, findingsPoll = 30*time.Millisecond, time.Millisecond
+			if tc.record != nil {
+				runner.sink.missing = tc.record
+			}
+			runner.sink.jobErr = tc.jobErr
+			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			got := g.passes[shaA]
+			if len(got) != 1 || got[0].Executor != tc.executor {
+				t.Fatalf("%+v", got)
+			}
+			if tc.executor == "runtug" {
+				if got[0].Family != "google" || runner.headless != 0 {
+					t.Fatalf("%+v headless=%d", got[0], runner.headless)
+				}
+				return
+			}
+			if runner.headless != 1 || !strings.Contains(got[0].Fallback, tc.reason) {
+				t.Fatalf("headless=%d %+v", runner.headless, got[0])
+			}
+			reads := 0
+			for _, id := range runner.sink.gets {
+				if id != "author-job" {
+					reads++
+				}
+			}
+			if tc.polled && reads < 2 {
+				t.Fatalf("record reads=%d, want a poll loop", reads)
+			}
+		})
 	}
 }
