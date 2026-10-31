@@ -902,6 +902,7 @@ func normalizePort(raw string) (string, error) {
 	}
 	return net.JoinHostPort(host, ports[0]) + ":" + ports[1], nil
 }
+
 // validateWebhook gates the optional delivery receiver: it binds loopback
 // only, and the shared secret must be present before the daemon starts.
 // Errors name the config key, never the listen value or the secret.
@@ -938,9 +939,8 @@ func validateWebhook(w *Webhook) error {
 	if w.SecretEnv == "" {
 		return errors.New("daemon.webhook requires secret_env")
 	}
-	if os.Getenv(w.SecretEnv) == "" {
-		return errors.New("daemon.webhook.secret_env is unset or empty")
-	}
+	// The secret's presence is checked when the daemon starts: other commands
+	// load this config without needing it.
 	return nil
 }
 

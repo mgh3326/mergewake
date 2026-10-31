@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -245,5 +246,30 @@ func TestWebhookLogRedaction(t *testing.T) {
 		if strings.Contains(out, marker) {
 			t.Fatalf("log leaks %s: %s", marker, out)
 		}
+	}
+}
+
+// The form content type carries the JSON in the payload field; the signature
+// still covers the raw body.
+func TestWebhookFormEncodedPayload(t *testing.T) {
+	var triggered []string
+	d := webhookDaemon(&triggered)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
+	defer srv.Close()
+	body := []byte("payload=" + url.QueryEscape(`{"repository":{"full_name":"o/r"}}`))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/github", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Hub-Signature-256", sign(body, testSecret))
+	req.Header.Set("X-GitHub-Event", "push")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted || !slices.Equal(triggered, []string{"release", "rollout"}) {
+		t.Fatalf("form delivery: status=%d triggered=%v", resp.StatusCode, triggered)
 	}
 }

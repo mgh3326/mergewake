@@ -947,7 +947,7 @@ lost, late or forged delivery changes nothing but timing.
 | `enabled` | `false` | Serve the receiver next to the daemon loops; it shuts down with the daemon. |
 | `listen` | Required when enabled | Loopback `host:port` only: `localhost`, any `127.0.0.0/8` address or `::1`. Other hostnames and wildcard binds are refused, and `localhost` is rewritten to a `127.0.0.1` literal so resolution can never steer the bind off loopback. Remote delivery needs an operator-run tunnel (for example a reverse SSH forward or a cloudflared/smee-style relay) terminating on loopback. |
 | `path` | `/github` | Exact request path; other paths return 404. |
-| `secret_env` | Required when enabled | Name of the environment variable holding the GitHub webhook shared secret. The daemon refuses to start while it is unset or empty; the value never appears in config or logs. |
+| `secret_env` | Required when enabled | Name of the environment variable holding the GitHub webhook shared secret. The daemon refuses to start while it is unset or empty (other commands load the config without it); the value never appears in config or logs. Deliveries may use either content type (`application/json` or the form `payload` field); `application/json` is recommended. |
 
 Requests must `POST` the exact path with a body of at most 5 MiB and a valid
 `X-Hub-Signature-256` (HMAC-SHA256 over the raw body). Bad or missing

@@ -499,9 +499,9 @@ func TestWebhookConfig(t *testing.T) {
 	if e == nil || !strings.Contains(e.Error(), "daemon.webhook") {
 		t.Fatalf("missing secret_env: %v", e)
 	}
-	_, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', secret_env: MW_TEST_UNSET_MARKER}\n")
-	if e == nil || !strings.Contains(e.Error(), "daemon.webhook.secret_env") || strings.Contains(e.Error(), "MW_TEST_UNSET_MARKER") {
-		t.Fatalf("unset secret error: %v", e)
+	// An unset secret is the daemon's startup error, not every command's.
+	if _, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', secret_env: MW_TEST_UNSET_MARKER}\n"); e != nil {
+		t.Fatalf("unset secret must not fail Load: %v", e)
 	}
 	if _, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', path: '../escape', secret_env: MW_TEST_WH_SECRET}\n"); e == nil {
 		t.Fatal("accepted non-absolute path")

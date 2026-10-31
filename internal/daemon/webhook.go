@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -56,7 +58,9 @@ func (d *Daemon) serveWebhook(ctx context.Context, wg *sync.WaitGroup) error {
 	if err != nil {
 		return fmt.Errorf("webhook listen: %w", err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(d.handleDelivery), ReadHeaderTimeout: 10 * time.Second}
+	// ReadTimeout bounds the whole request, body included, so a dripped body
+	// cannot hold a connection open.
+	srv := &http.Server{Handler: http.HandlerFunc(d.handleDelivery), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -103,7 +107,18 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
 	}
-	_ = json.Unmarshal(body, &delivery)
+	// GitHub sends JSON either raw or, for the form content type, in the
+	// payload field; both are read after the signature over the raw body.
+	payload := body
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "application/x-www-form-urlencoded" {
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			http.Error(w, "bad form body", http.StatusBadRequest)
+			return
+		}
+		payload = []byte(form.Get("payload"))
+	}
+	_ = json.Unmarshal(payload, &delivery)
 	trigger := wh.Trigger
 	if trigger == nil {
 		trigger = d.Trigger
