@@ -187,6 +187,10 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
 		}
 	}
+	// The alarm is the pr role's own heartbeat: it fires when this loop is
+	// alive yet has begun no review of a ready head, which a healthcheck ping
+	// alone cannot tell from a healthy idle loop.
+	errs = append(errs, s.CheckStalls(ctx, r, prs, o))
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
 }

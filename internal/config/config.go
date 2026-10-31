@@ -56,6 +56,10 @@ type Review struct {
 	// checkout of the PR head and keeps headless as the fallback.
 	Executor string       `yaml:"executor"`
 	Runtug   RuntugReview `yaml:"runtug"`
+	// BudgetRounds is the number of review rounds a PR gets before later rounds
+	// report only critical and high findings. 0 means 3; a negative value turns
+	// the budget off.
+	BudgetRounds int `yaml:"budget_rounds"`
 }
 
 // RuntugReview configures the runtug review executor. A reviewer pane uploads
@@ -152,7 +156,26 @@ func (n PRNotify) On() bool { return n.Enabled == nil || *n.Enabled }
 type PRLoop struct {
 	Loop   `yaml:",inline"`
 	Notify PRNotify `yaml:"notify"`
+	// StallAfter is how long a ready PR head may wait with no review started
+	// before the stall alarm fires. Empty means 30m; "off" disables the alarm.
+	StallAfter string `yaml:"stall_after"`
 }
+
+// DefaultStallAfter is the review-stall threshold when stall_after is unset.
+const DefaultStallAfter = 30 * time.Minute
+
+// StallWindow is the review-stall threshold; zero means the alarm is off.
+func (l PRLoop) StallWindow() time.Duration {
+	if l.StallAfter == "" {
+		return DefaultStallAfter
+	}
+	d, e := Duration(l.StallAfter)
+	if e != nil {
+		return 0
+	}
+	return d
+}
+
 type Daemon struct {
 	PR      PRLoop  `yaml:"pr"`
 	Watch   Loop    `yaml:"watch"`
@@ -304,6 +327,11 @@ func Load(name string) (Config, error) {
 		}
 		if _, err := Duration(loop.Interval); err != nil {
 			return c, err
+		}
+	}
+	if v := c.Daemon.PR.StallAfter; v != "" && v != "off" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("daemon.pr.stall_after: %w", e)
 		}
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {

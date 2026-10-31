@@ -352,7 +352,15 @@ type Finding struct {
 	Path     string `json:"path"`
 	Line     int    `json:"line"`
 	Body     string `json:"body"`
+	// Advisory is the reviewer's claim that the finding lies outside the PR's
+	// Acceptance contract. It is honoured only when a contract was supplied.
+	Advisory bool `json:"advisory,omitempty"`
 }
+
+// AdvisoryMarker tags a posted finding that lies outside the PR's Acceptance
+// contract; ThreadSeverity grades such a finding as low, so it never holds a
+// merge.
+const AdvisoryMarker = "<!-- mergewake-advisory -->"
 
 func Marker(sha string) string { return "<!-- mergewake-review:" + sha + " -->" }
 
@@ -370,6 +378,14 @@ type PassReceipt struct {
 	// why a configured runtug pass ran headless instead.
 	Executor string `json:"executor,omitempty"`
 	Fallback string `json:"fallback,omitempty"`
+	// Round is the review round of this head: 1 for the first reviewed head,
+	// then one more for each later head that carried changed lines. Delta names
+	// the previously reviewed head whose interdiff this pass reviewed; empty
+	// means the whole diff. Quiet marks a pass limited to critical and high
+	// findings (the round budget was spent, or nothing changed).
+	Round int    `json:"round,omitempty"`
+	Delta string `json:"delta,omitempty"`
+	Quiet bool   `json:"quiet,omitempty"`
 }
 
 func PassMarker(r PassReceipt) string {
@@ -417,6 +433,60 @@ func (c *Client) Reviewed(ctx context.Context, repo string, n int, sha, login st
 	passes, e := c.ReviewPasses(ctx, repo, n, sha, login)
 	return len(passes) > 0, e
 }
+
+// ReviewedHead is one head of a PR that mergewake has posted a review on.
+type ReviewedHead struct {
+	SHA string
+	// Round is the round recorded on the head's first pass; 0 for a review that
+	// predates round counting.
+	Round int
+}
+
+// ReviewedHeads lists the distinct heads login has reviewed on the PR, oldest
+// first. A head counts from its first posted pass.
+func (c *Client) ReviewedHeads(ctx context.Context, repo string, n int, login string) ([]ReviewedHead, error) {
+	if login == "" {
+		return nil, errors.New("review.login is required")
+	}
+	reviews, e := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
+	if e != nil {
+		return nil, e
+	}
+	var out []ReviewedHead
+	seen := map[string]bool{}
+	for _, r := range reviews {
+		if r.User.Login != login || r.CommitID == "" || seen[r.CommitID] || !strings.HasPrefix(r.Body, Marker(r.CommitID)+"\n") {
+			continue
+		}
+		if r.State != "COMMENTED" && r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		seen[r.CommitID] = true
+		head := ReviewedHead{SHA: r.CommitID}
+		if m := passMarker.FindStringSubmatch(r.Body); len(m) == 2 {
+			var receipt PassReceipt
+			if json.Unmarshal([]byte(m[1]), &receipt) == nil {
+				head.Round = receipt.Round
+			}
+		}
+		out = append(out, head)
+	}
+	return out, nil
+}
+
+// CompareDiff returns the unified diff from the merge base of base and head to
+// head: the PR-only patch head carries against base.
+func (c *Client) CompareDiff(ctx context.Context, repo, baseRef, head string) (string, error) {
+	b, e := c.request(ctx, "GET", base(repo)+"/compare/"+url.PathEscape(baseRef)+"..."+url.PathEscape(head), "application/vnd.github.diff", nil)
+	return string(b), e
+}
+
+// CIStarted reports whether any check run or status exists for sha.
+func (c *Client) CIStarted(ctx context.Context, repo, sha string) (bool, error) {
+	states, e := c.checkStates(ctx, repo, sha)
+	return len(states) > 0, e
+}
+
 func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error) {
 	parts := strings.Split(repo, "/")
 	cursor := (*string)(nil)
@@ -491,13 +561,23 @@ func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error
 	return 0, errors.New("review pagination limit")
 }
 
+// FindingBody is the comment text posted for f: the severity and advisory
+// markers the merge gate reads, then the finding.
+func FindingBody(f Finding) string {
+	body := f.Body
+	if f.Advisory {
+		body = AdvisoryMarker + "\n**Advisory** (outside the PR's Acceptance contract; does not block).\n\n" + body
+	}
+	if f.Severity != "" {
+		body = "<!-- mergewake-severity:" + f.Severity + " -->\n" + body
+	}
+	return body
+}
+
 func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string, findings []Finding, meta PassReceipt) error {
 	comments := []map[string]any{}
 	for _, f := range findings {
-		body := f.Body
-		if f.Severity != "" {
-			body = "<!-- mergewake-severity:" + f.Severity + " -->\n" + body
-		}
+		body := FindingBody(f)
 		comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 	}
 	body := Marker(sha) + "\n" + PassMarker(meta) + "\nOne independent diff-only pass (lens: " + meta.Lens + "). Findings are advisory except under blocking policy."
