@@ -347,3 +347,39 @@ func TestPollReplayOnlyInsideLiveWindowForPollingClients(t *testing.T) {
 		t.Fatalf("expired window served a replay: %s", got)
 	}
 }
+
+// An unclaimed review ref answers 404 with a poll window. The daemon reads it
+// twice per round; the second read must replay the 404, not skip, or the
+// review never starts. A mutation drops the replay.
+func TestPollReplaysNotFoundInsideWindow(t *testing.T) {
+	n := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			n++
+			w.Header().Set("X-Poll-Interval", "60")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+	for i := 0; i < 2; i++ {
+		_, e := c.request(context.Background(), "GET", "/repos/o/r/git/ref/heads/x", "application/json", nil)
+		if !NotFound(e) {
+			t.Fatalf("read %d: want a 404, got %v", i+1, e)
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the window was not honoured: %d server hits", n)
+	}
+	if _, e := c.request(context.Background(), "POST", "/repos/o/r/git/refs", "application/json", []byte(`{}`)); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := c.request(context.Background(), "GET", "/repos/o/r/git/ref/heads/x", "application/json", nil); !NotFound(e) || n != 2 {
+		t.Fatalf("after a mutation the ref must be read again: %v, %d hits", e, n)
+	}
+}

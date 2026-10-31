@@ -67,6 +67,8 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	if method == "GET" {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
+		} else if hit.Replay && hit.Code == http.StatusNotFound {
+			return nil, &APIError{http.StatusNotFound, method, strings.Split(route, "?")[0]}
 		} else if hit.ETag != "" || hit.Replay {
 			return append([]byte(nil), hit.Body...), nil
 		}
@@ -105,6 +107,9 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		return append([]byte(nil), cached.Body...), nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if method == "GET" && resp.StatusCode == http.StatusNotFound && c.Polling {
+			c.cacheNotFound(key)
+		}
 		return nil, &APIError{resp.StatusCode, method, strings.Split(route, "?")[0]}
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, manifest.MaxFileSize*2+1))

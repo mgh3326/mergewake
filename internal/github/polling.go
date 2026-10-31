@@ -18,6 +18,8 @@ type cachedResponse struct {
 	// Replay marks a body kept without an ETag only because its response set
 	// a poll window: it is served inside that window and never revalidated.
 	Replay bool
+	// Code is 404 for a replayed not-found answer, 0 for a body.
+	Code int
 }
 
 // throttle records a pending wait with the reason and HTTP status that caused
@@ -224,7 +226,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 		p.bytes = 0
 	}
 	p.bytes -= len(p.cache[key].Body)
-	p.cache[key] = cachedResponse{tag, body, replay}
+	p.cache[key] = cachedResponse{ETag: tag, Body: body, Replay: replay}
 	p.bytes += len(body)
 }
 
@@ -244,3 +246,25 @@ func (c *Client) ReviewClaimed(ctx context.Context, repo string, number int, sha
 }
 
 var errUncached304 = errors.New("GitHub returned 304 without a cached representation")
+
+// cacheNotFound keeps a 404 answer while its key's poll window runs. A
+// not-found GET (an unclaimed review ref) is read twice in one daemon round;
+// without a replay the second read was skipped every round and the review
+// never started. Only the window's own response is replayed, and any mutation
+// wipes it with the rest of the cache.
+func (c *Client) cacheNotFound(key string) {
+	p := &c.poll
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.polls[key]; !ok || !w.until.After(time.Now()) {
+		return
+	}
+	if len(p.cache) >= 512 {
+		p.cache = map[string]cachedResponse{}
+		p.polls = map[string]throttle{}
+		p.bytes = 0
+		return
+	}
+	p.bytes -= len(p.cache[key].Body)
+	p.cache[key] = cachedResponse{Replay: true, Code: http.StatusNotFound}
+}
