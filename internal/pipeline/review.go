@@ -201,9 +201,30 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
 		needed = 2
 	}
-	receipts, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+	history, e := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
 	if e != nil {
 		return e
+	}
+	receipts := passesFor(history, pr.Head.SHA)
+	// A review covers a patch, not a SHA. A head whose patch id equals a
+	// reviewed head's, such as the same patch after the base was merged into it,
+	// inherits that review: it gets its completion marker and no pass is
+	// scheduled. An unreadable diff leaves the patch unknown, which equals
+	// nothing, so the head is reviewed on its own.
+	var diff, patch string
+	if _, own := distinctPasses(receipts, needed); !own {
+		var diffErr error
+		if diff, diffErr = s.GH.Diff(ctx, r.Name, n); diffErr == nil && diff != "" {
+			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), patchID(diff))
+		}
+		if from, _, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
+			if o.Acting() {
+				if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
+					return e
+				}
+			}
+			return s.Print(map[string]any{"action": "inherited-review", "head": pr.Head.SHA, "inherited_from": from, "patch_id": patch, "needed": needed})
+		}
 	}
 	posted := map[int]github.PassReceipt{}
 	for _, receipt := range receipts {
@@ -445,9 +466,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		return s.Print(plan)
 	}
-	diff, e := s.GH.Diff(ctx, r.Name, n)
-	if e != nil {
-		return e
+	if diff == "" {
+		if diff, e = s.GH.Diff(ctx, r.Name, n); e != nil {
+			return e
+		}
+		if diff != "" {
+			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), patchID(diff))
+		}
 	}
 	if len(diff) == 0 || len(diff) > 2<<20 {
 		return errors.New("empty or oversized diff; manual review required")
@@ -536,7 +561,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		findings := out.findings
 		plan.name = selected
 		plan.sameFamily = out.family == "" || out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Patch: patch}
 		if viaRuntug && out.executor != "runtug" {
 			receipt.Fallback = "runtug: " + fallback
 		}

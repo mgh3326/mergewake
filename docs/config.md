@@ -490,7 +490,8 @@ read recommendations but never invoke a reviewer, gate, claim or post a review.
 Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
 invoking the model. When every required pass is posted, the
 `mergewake/reviews/<pr>/<head>-done` marker is created and the daemon skips
-that head. An interrupted pass retains a timestamped empty-commit lease. After
+that head. A head whose patch id equals a reviewed head's inherits that review
+and gets the marker without a pass (see [Patch-id review verdicts](#patch-id-review-verdicts)). An interrupted pass retains a timestamped empty-commit lease. After
 `review.timeout` plus one minute it is reclaimed automatically with a
 fast-forward ref update; competing renewals cannot both win. Legacy claims use
 their commit date for expiry. Unknown claim timestamps fail closed. Posted reviews embed a `mergewake-pass` JSON marker recording
@@ -740,16 +741,16 @@ or advisory rounds for blocking findings.
 ### Graded review findings
 
 Without `review_gate.land: graded` or `fast_lane`, the land gate holds on the raw
-count of unresolved review threads (`threads_open:<n>`), plus any review.login
-finding resolved without a new head. A `review_gate` section alone changes
+count of unresolved review threads (`threads_open:<n>`); a resolved thread is
+resolved at any severity. A `review_gate` section alone changes
 nothing, so a policy that already carries one for other reasons keeps its
 behaviour. With `review_gate: {land: graded}` (all other keys optional) the gate
 grades each thread by the author and severity of its first comment instead:
 
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
-| block | the finding is fixed: its thread is resolved by a new head. A reply never clears it, and a finding posted on the current head stays held when resolved without a new head, whoever wrote it. | `blocking_findings:<n>` |
-| triage | someone other than the finding's author (and not a bot) replies on the thread. An answered triage finding needs no new head, and a resolved one no longer holds. | `triage_unanswered:<n>` |
+| block | the thread is resolved. A reply never clears it. Resolving it is its disposition at any severity and needs no new head. | `blocking_findings:<n>` |
+| triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason or a follow-up task reference, or the thread is resolved. Neither needs a new head. | `triage_unanswered:<n>` |
 | advisory | never holds. Threads from authors no rule names are advisory. | none |
 
 Each reviewer whose latest review still requests changes adds one to the
@@ -764,9 +765,10 @@ a graded author.
 
 The defaults grade CodeRabbit `critical` and codex `P1` as block, CodeRabbit
 `major` and codex `P2` as triage, and add rules for the configured
-`review.login`: `critical`/`high` block, `medium` triage, `low` advisory (the
+`review.login`: `critical`/`high` block, `medium`/`low` triage (the
 reviewer prompt's `blocking`, `major` and `minor` grade like `high`, `medium`
-and `low`). Rules are `{author, severity: [...], classes: [...]}` lists under
+and `low`). Only critical and high findings need a fix; a medium or low one
+needs a disposition, not a fix. Rules are `{author, severity: [...], classes: [...]}` lists under
 `block` and `triage`; an explicit list replaces the default for those two keys,
 though the `review.login` defaults are kept or replaced per list: naming the login
 in `block` replaces its default block rule, naming it in `triage` replaces its
@@ -777,6 +779,40 @@ true) clears an outdated finding by anyone but `review.login`: a block finding
 once its reviewer has reviewed the current head, a triage finding when it is a
 `major`. The other `review_gate` keys stay parseable but do not affect the land
 gate.
+
+### Patch-id review verdicts
+
+A review verdict covers a patch, not a SHA. mergewake computes the patch id of
+the PR diff (`merge-base..head`, as GitHub serves it) the way
+`git patch-id --stable` does: a hash of each file's diff with whitespace and
+hunk line numbers left out, summed over the files so their order does not
+matter. Merging the base into the head, or rebasing it, changes the head SHA and
+the diff's `index` and hunk-offset lines but not the patch id.
+
+- Each posted review pass records the patch id it reviewed in its
+  `mergewake-pass` marker (`patch`). The marker is posted under `review.login`,
+  so a pushed ref cannot stand in for it.
+- A head whose patch id equals a reviewed head's inherits that head's passes:
+  `mergewake review` schedules nothing, prints `action: inherited-review` with
+  `inherited_from`, and creates the new head's `-done` marker (not under
+  `--dry-run`); the gate accepts the inherited passes without a new review. The
+  inherited head must have all the passes the PR's class needs.
+- A changed patch id schedules a review as before. A diff that cannot be read
+  gives no patch id, and an unknown id equals nothing: that head is reviewed on
+  its own. Passes recorded before patch ids existed inherit nothing.
+- `base_stale` never asks for a review. A stale head keeps the review it has;
+  once the base is merged in, the new head gets a fresh CI run and, with an
+  unchanged patch, no new review, so landing waits on CI alone.
+- Finding dispositions live on the PR's review threads, not on a head, so they
+  carry across heads. A resolved thread is resolved at any severity; no new head
+  is needed to release a resolved high.
+
+`mergewake land --dry-run` (and every `land` audit record) carries a `review`
+object: `patch_id` of the head, `rounds` (the number of distinct patch ids
+reviewed; a round is one patch), `reviewed_patch_ids`, `inherited_from` (the head
+whose passes the gate used, when it is not the head itself) and `dispositions`:
+`open_blocking`, `open_triage`, `answered`, `resolved` and `advisory` thread
+counts.
 
 `fast_lane` takes only the PR's class and size: when the PR classifies as
 routine and `additions + deletions` is at most `max_changed_lines`, triage
@@ -974,8 +1010,8 @@ Only enabled roles wake, and only for repositories in `repos`.
 its current head and emits one lane event for that head's verdict — the notify
 path observes rather than merges, so it also runs in shadow mode. `READY`
 requires every required check green on the head, zero unresolved review
-threads, the `mergewake/reviews/<pr>/<head>-done` marker and the head-bound
-passes from `review.login` it attests, the base branch an ancestor of the
+threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
+`review.login` it attests (on the head, or on a head with the same patch id), the base branch an ancestor of the
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and

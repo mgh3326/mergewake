@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +60,8 @@ type fakeGH struct {
 	latch, headChanged, stale                                    bool
 	policyReads                                                  []string
 	m                                                            manifest.Manifest
+	// diffs holds the PR diff by head SHA; heads without one share the default.
+	diffs map[string]string
 }
 
 func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
@@ -140,6 +144,20 @@ func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string)
 	}
 	return g.passes[sha], nil
 }
+func (g *fakeGH) ReviewHistory(_ context.Context, _ string, _ int, _ string) ([]github.ReviewedPass, error) {
+	var out []github.ReviewedPass
+	for _, sha := range slices.Sorted(maps.Keys(g.passes)) {
+		for _, p := range g.passes[sha] {
+			out = append(out, github.ReviewedPass{Head: sha, PassReceipt: p})
+		}
+	}
+	if g.reviewed && len(g.passes[g.pull.Head.SHA]) == 0 {
+		for _, p := range []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}} {
+			out = append(out, github.ReviewedPass{Head: g.pull.Head.SHA, PassReceipt: p})
+		}
+	}
+	return out, nil
+}
 func (g *fakeGH) Reviewed(ctx context.Context, repo string, n int, sha, login string) (bool, error) {
 	passes, e := g.ReviewPasses(ctx, repo, n, sha, login)
 	return len(passes) > 0, e
@@ -215,6 +233,9 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	return "https://github.com/example/project/pull/9", nil
 }
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
+	if d, ok := g.diffs[g.pull.Head.SHA]; ok {
+		return d, nil
+	}
 	return "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+new\n", nil
 }
 func (g *fakeGH) CreateRef(_ context.Context, _, branch, _ string) error {

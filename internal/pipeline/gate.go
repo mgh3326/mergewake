@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,13 +22,60 @@ type gateVerdict struct {
 	State      string
 	Reasons    []string
 	SameFamily bool
+	Review     reviewRecord
+}
+
+// reviewRecord is what the gate knows about a PR's review, printed by
+// `land --dry-run` and in the land audit record: the patch the head carries,
+// the patches reviewed so far, how many review rounds that took, where this
+// head's review came from when it did not run on this head, and how the
+// findings stand.
+type reviewRecord struct {
+	PatchID   string       `json:"patch_id,omitempty"`
+	Rounds    int          `json:"rounds"`
+	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
+	Inherited string       `json:"inherited_from,omitempty"`
+	Findings  dispositions `json:"dispositions"`
+}
+
+// dispositions counts the PR's review threads by how they stand: blocking and
+// triage findings still holding the gate, findings answered by a reply,
+// findings resolved, and advisory ones that never hold it.
+type dispositions struct {
+	OpenBlocking int `json:"open_blocking"`
+	OpenTriage   int `json:"open_triage"`
+	Answered     int `json:"answered"`
+	Resolved     int `json:"resolved"`
+	Advisory     int `json:"advisory"`
+}
+
+// reviewRounds counts the distinct patches reviewed: a round is one patch, so
+// a head that inherits a review adds none. Passes recorded before patch ids
+// existed count by head.
+func reviewRounds(history []github.ReviewedPass) (rounds int, patches []string) {
+	seen := map[string]bool{}
+	for _, p := range history {
+		key := p.Patch
+		if key == "" {
+			key = "head:" + p.Head
+		} else if !slices.Contains(patches, p.Patch) {
+			patches = append(patches, p.Patch)
+		}
+		if !seen[key] {
+			seen[key] = true
+			rounds++
+		}
+	}
+	return rounds, patches
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
 // every required check green on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
-// base branch an ancestor of H, and the PR mergeable. A pending required
+// base branch an ancestor of H, and the PR mergeable. A review covers a patch,
+// not a SHA: a head whose patch id equals a reviewed head's inherits that
+// head's passes, so merging the base into a head costs a CI run, not a review. A pending required
 // check waits silently unless a sibling already failed; mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
@@ -53,6 +101,12 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
 		}
+		// The review record stays readable while CI runs; a failed read costs
+		// only the record.
+		if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
+			v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
+			v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
+		}
 		return v, nil
 	}
 	// The decision-head review feedback and the file list come first: the
@@ -76,13 +130,14 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	// The PR totals decide the fast lane only while the file list backs them:
 	// any mismatch is unverified size, so the lane is refused.
 	fastLane := linesVerified(files, pr) && p.FastLaneEligible(class, pr.Additions+pr.Deletions)
+	gate := policy.ReviewGate{}
+	if p.ReviewGate != nil {
+		gate = *p.ReviewGate
+	}
+	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane)
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		gate := policy.ReviewGate{}
-		if p.ReviewGate != nil {
-			gate = *p.ReviewGate
-		}
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, pr.Head.SHA, fastLane)
+		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane)
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
 		}
@@ -94,18 +149,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		if e != nil {
 			return v, e
 		}
-		// A review.login finding on the current head stays held while it was
-		// resolved without a new head: anyone who can click resolve — including
-		// the PR author — would otherwise clear the trusted review's findings.
-		// Clearing needs a new head and a new review pass.
 		held := open
-		if login != "" {
-			for _, t := range fb.Threads {
-				if t.IsResolved && len(t.Comments) > 0 && postedOn(t.Comments[0]) == pr.Head.SHA && policy.NormalizeAuthor(t.Comments[0].Author) == login {
-					held++
-				}
-			}
-		}
 		if held > 0 {
 			v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(held))
 		}
@@ -117,14 +161,17 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if class == "blocking" {
 		needed = 2
 	}
-	receipts, e := s.GH.ReviewPasses(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login)
+	history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login)
 	if e != nil {
 		return v, e
 	}
+	receipts := passesFor(history, pr.Head.SHA)
 	_, complete := distinctPasses(receipts, needed)
 	for _, receipt := range receipts {
 		v.SameFamily = v.SameFamily || receipt.SameFamily
 	}
+	v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
+	v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if errors.Is(e, github.ErrPollSkipped) {
 		// The done-marker probe is inside its poll interval: hold the verdict
@@ -138,7 +185,20 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if e != nil {
 		return v, e
 	}
-	if !done || !complete {
+	reviewed := done && complete
+	if !reviewed {
+		// A verdict covers a patch: an earlier head with the same patch id, such
+		// as this head before the base was merged into it, already carries the
+		// review.
+		if from, inherited, ok := inheritedPasses(history, v.Review.PatchID, pr.Head.SHA, needed); ok {
+			reviewed = true
+			v.Review.Inherited = from
+			for _, receipt := range inherited {
+				v.SameFamily = v.SameFamily || receipt.SameFamily
+			}
+		}
+	}
+	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)
@@ -182,20 +242,29 @@ func postedOn(c github.ReviewComment) string {
 }
 
 // gradeThreads folds review threads into the two counts the graded gate holds
-// on. A block-class finding blocks until a new head resolves it, whoever wrote
-// it: unresolved counts, and so does one posted on this head that someone
-// resolved without a new head. A triage finding blocks until someone other than
-// its author replies; resolving or answering it needs no new head. Advisory
-// findings never block, and the fast lane drops triage except for unreadable
-// review.login evidence. Outdated findings clear as ReviewGate.OutdatedCleared
-// allows. Reviewers still requesting changes, and unresolved threads with no
-// comment to grade, count as blocking findings.
-func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, head string, fastLane bool) (blocking, triage int) {
+// on. Only an unresolved block-class finding blocks, whoever wrote it and at
+// any age: resolving it is its disposition, and it needs no new head. A triage
+// finding holds until it has a disposition: a reply from someone other than its
+// author (a fix SHA, a dismissal with its reason, a follow-up task) or a
+// resolution. Advisory findings never block, and the fast lane drops triage
+// except for unreadable review.login evidence. Outdated findings clear as
+// ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
+// unresolved threads with no comment to grade, count as blocking findings.
+func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool) (blocking, triage int) {
+	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane)
+	return blocking, triage
+}
+
+// gradeThreadsDetailed is gradeThreads together with how every graded thread
+// stands, for the review record.
+func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool) (blocking, triage int, d dispositions) {
 	blocking = fb.ChangesRequested
+	d.OpenBlocking = fb.ChangesRequested
 	for _, t := range fb.Threads {
 		if len(t.Comments) == 0 {
 			if !t.IsResolved {
 				blocking++
+				d.OpenBlocking++
 			}
 			continue
 		}
@@ -218,19 +287,30 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class, h
 		}
 		switch grade {
 		case policy.GradeBlock:
-			if !f.Resolved || f.CommitSHA == head {
+			if !f.Resolved {
 				blocking++
+				d.OpenBlocking++
+			} else {
+				d.Resolved++
 			}
 		case policy.GradeTriage:
 			// The fast lane drops rule-graded triage, but a trusted-review
 			// finding whose severity cannot be read still needs an answer.
 			unreadable := f.OwnReview && !policy.KnownSeverity(f.Severity)
-			if (!fastLane || unreadable) && !f.Resolved && !answered(t, f.OwnReview) {
+			switch {
+			case f.Resolved:
+				d.Resolved++
+			case answered(t, f.OwnReview):
+				d.Answered++
+			case !fastLane || unreadable:
 				triage++
+				d.OpenTriage++
 			}
+		case policy.GradeAdvisory:
+			d.Advisory++
 		}
 	}
-	return blocking, triage
+	return blocking, triage, d
 }
 
 // answered reports a human reply from someone other than the finding's author.

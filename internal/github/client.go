@@ -370,6 +370,15 @@ type PassReceipt struct {
 	// why a configured runtug pass ran headless instead.
 	Executor string `json:"executor,omitempty"`
 	Fallback string `json:"fallback,omitempty"`
+	// Patch is the `git patch-id --stable` of the PR diff the pass reviewed. A
+	// later head with the same patch inherits the pass.
+	Patch string `json:"patch,omitempty"`
+}
+
+// ReviewedPass is one posted pass together with the head it reviewed.
+type ReviewedPass struct {
+	Head string
+	PassReceipt
 }
 
 func PassMarker(r PassReceipt) string {
@@ -383,7 +392,21 @@ var passMarker = regexp.MustCompile(`<!-- mergewake-pass:(\{.*?\}) -->`)
 // oldest first. Pass numbers come from the posted meta marker; legacy reviews
 // without one count as sequential passes.
 func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, login string) ([]PassReceipt, error) {
+	history, e := c.ReviewHistory(ctx, repo, n, login)
 	var out []PassReceipt
+	for _, p := range history {
+		if p.Head == sha {
+			out = append(out, p.PassReceipt)
+		}
+	}
+	return out, e
+}
+
+// ReviewHistory lists every completed pass the trusted review identity posted
+// on the PR, across all heads, oldest first. A review counts only when its body
+// carries the marker of the commit it was posted on.
+func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
+	var out []ReviewedPass
 	if login == "" {
 		return out, errors.New("review.login is required")
 	}
@@ -391,9 +414,9 @@ func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, logi
 	if e != nil {
 		return out, e
 	}
-	next := 1
+	next := map[string]int{}
 	for _, r := range reviews {
-		if r.User.Login != login || r.CommitID != sha || !strings.HasPrefix(r.Body, Marker(sha)+"\n") {
+		if r.User.Login != login || r.CommitID == "" || !strings.HasPrefix(r.Body, Marker(r.CommitID)+"\n") {
 			continue
 		}
 		if r.State != "COMMENTED" && r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
@@ -406,10 +429,10 @@ func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, logi
 			}
 		}
 		if receipt.Pass <= 0 {
-			receipt.Pass = next
+			receipt.Pass = next[r.CommitID] + 1
 		}
-		next = receipt.Pass + 1
-		out = append(out, receipt)
+		next[r.CommitID] = receipt.Pass
+		out = append(out, ReviewedPass{Head: r.CommitID, PassReceipt: receipt})
 	}
 	return out, nil
 }

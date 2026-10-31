@@ -98,10 +98,9 @@ func TestLandOpenThreadsBlock(t *testing.T) {
 	}
 }
 
-// A review.login finding resolved on the same head stays held: only a new
-// head plus a new review clears it, so author-side resolve cannot land the
-// flagged code.
-func TestLandResolvedOwnFindingHolds(t *testing.T) {
+// A resolved review.login finding is resolved: resolving is its disposition,
+// at any severity, and needs no new head.
+func TestLandResolvedOwnFindingLands(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	markReviewed(g)
@@ -109,8 +108,8 @@ func TestLandResolvedOwnFindingHolds(t *testing.T) {
 	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
-		t.Fatal("author-resolved review finding landed")
+	if g.mergeCount != 1 {
+		t.Fatalf("a resolved review finding held the merge: %s", landAction(t, s, r.Name))
 	}
 }
 
@@ -198,8 +197,8 @@ func TestLandResolvedFindingFromOlderHeadDoesNotHold(t *testing.T) {
 	}
 }
 
-// The same finding posted on the current head still holds after a resolve.
-func TestLandResolvedFindingPostedOnHeadHolds(t *testing.T) {
+// The same finding posted on the current head is released by a resolve too.
+func TestLandResolvedFindingPostedOnHeadLands(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	markReviewed(g)
@@ -207,7 +206,7 @@ func TestLandResolvedFindingPostedOnHeadHolds(t *testing.T) {
 	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
-		t.Fatal("author-resolved finding posted on the current head landed")
+	if g.mergeCount != 1 {
+		t.Fatalf("a resolved finding posted on the head held the merge: %s", landAction(t, s, r.Name))
 	}
 }
