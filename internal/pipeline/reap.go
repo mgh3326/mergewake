@@ -41,6 +41,19 @@ type reapReceipt struct {
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
 
+func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
+	switch v.Outcome {
+	case "removed":
+		return "removed", ""
+	case "worktree-gone", "worktree-changed", "outside-work-root", "unregistered", "locked", "detached", "status-check-failed", "dirty", "unmerged-or-unpushed", "pane-in-use", "pane-scan-failed", "git_too_old", "busy", "git-failed":
+		return "skipped", v.Outcome
+	case "ignored-files":
+		return "skipped", "ignored-files:" + filesSig(v.Files)
+	default:
+		return "skipped", "cleanup-unknown:" + v.Outcome
+	}
+}
+
 func (s *Service) reapLog(repo string) string { return filepath.Join(s.state(repo), "reap.jsonl") }
 
 func (s *Service) reapReceipts(repo string) ([]reapReceipt, error) {
@@ -614,9 +627,32 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			case w.Branch != p.Head.Ref || w.Head != p.Head.SHA || !strings.EqualFold(w.Repo, r.Name):
 				rec.Result, rec.Reason = "skipped", "worktree-changed"
 			case c.hs.viaHub:
-				// The hub has no worktree cleanup command: the worktree
-				// stays until one exists, and is never reached over ssh.
-				rec.Result, rec.Reason = "skipped", "cleanup-unsupported:panewire"
+				if !acting {
+					rec.Result = "would-remove"
+					note(rec)
+					brec := reapReceipt{Action: "delete-branch", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Worktree: w.Path, Branch: w.Branch, Result: "would-delete"}
+					note(brec)
+					continue
+				}
+				remover, ok := c.hs.ops.(interface {
+					WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
+				})
+				if !ok {
+					rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
+				} else {
+					result, err := remover.WorktreeRemove(ctx, w.Path, p.Head.SHA, r.Branch, s.Config.Reap.Regenerable)
+					if err != nil {
+						rec.Result, rec.Reason = "error", err.Error()
+					} else {
+						rec.Files = result.Files
+						rec.Result, rec.Reason = worktreeRemoveVerdict(result)
+					}
+				}
+				note(rec)
+				if rec.Result == "removed" {
+					note(reapReceipt{Action: "delete-branch", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Worktree: w.Path, Branch: w.Branch, Result: "deleted"})
+				}
+				continue
 			}
 			if rec.Result != "" {
 				note(rec)

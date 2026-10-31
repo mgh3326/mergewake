@@ -303,6 +303,21 @@ func (h HubHost) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 	return &Worktree{Path: w.Path, Branch: w.Branch, Head: w.Head, Repo: RepoFromRemote(w.OriginURL), Common: w.Common}, nil
 }
 
+// WorktreeRemove asks the node to apply the same guarded cleanup checks used
+// by Exec before removing a merged worktree.
+func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base string, regenerable []string) (WorktreeRemoveResult, error) {
+	var v struct {
+		Outcome     string   `json:"outcome"`
+		Files       []string `json:"files"`
+		RetryAfterS int      `json:"retry_after_s"`
+	}
+	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable}
+	if err := h.Hub.Command(ctx, h.Machine, "worktree.remove", args, &v); err != nil {
+		return WorktreeRemoveResult{}, err
+	}
+	return WorktreeRemoveResult{Outcome: v.Outcome, Files: v.Files, RetryAfterS: v.RetryAfterS}, nil
+}
+
 func (h HubHost) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write bool) (Capture, error) {
 	// Without a merge time no report.md is fresh, as in Exec.Capture: a cutoff
 	// past any mtime makes the node capture the screen.

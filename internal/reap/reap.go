@@ -112,6 +112,13 @@ type Worktree struct {
 	Common string // absolute git common dir, <main>/.git
 }
 
+// WorktreeRemoveResult is the node's worktree.remove verdict.
+type WorktreeRemoveResult struct {
+	Outcome     string
+	Files       []string
+	RetryAfterS int
+}
+
 // Exec runs herdr/git commands for one host, locally or over ssh.
 type Exec struct {
 	Runner Runner

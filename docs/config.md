@@ -171,10 +171,14 @@ on a host that also has `ssh`. Each remote host maps to panewire machine
   `pane-changed` or `pane-gone` otherwise, which become the same receipt
   reasons as the ssh path.
 
-The hub has no worktree cleanup command yet, so a hub host's aged-out
-worktree is inspected (a removed or changed worktree still records
-`worktree-gone` / `worktree-changed`) and otherwise skipped with
-`cleanup-unsupported:panewire`; it is never removed over ssh. Hosts with
+The hub host's aged-out worktree is removed through node command
+`worktree.remove`, with the inspected PR head, base branch and configured
+`reap.regenerable` list. Its refusal outcomes become the same receipt reasons
+as the ssh path (`dirty`, `pane-in-use`, `unmerged-or-unpushed`, etc.);
+ignored paths retain the `ignored-files:<count-hash>` reason and `files` list.
+An unrecognized node outcome is skipped as `cleanup-unknown:<outcome>`.
+Shadow mode records `would-remove` without calling the removal command. The
+hub path never falls back to ssh. Hosts with
 empty `ssh` and no `machine` keep running every step locally.
 
 ##### Hub credential
@@ -186,7 +190,7 @@ never with the operator token (panewire `docs/hub-scopes.md`). It sends
 machine (operator decision D1):
 
 ```sh
-HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:pane.capture@*,node.command:pane.close@*
+HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.close@*
 ```
 
 | Scope | Reap uses it for |
@@ -194,6 +198,7 @@ HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.comma
 | `nodes.agents.read` | discovery, `GET /v1/nodes/agents` |
 | `node.command:agents.list@*` | not sent by reap today (discovery uses the fleet-wide list); granted with D1 for a per-machine re-read |
 | `node.command:worktree.inspect@*` | worktree matching and the aged-out worktree check |
+| `node.command:worktree.remove@*` | guarded cleanup of merged PR worktrees |
 | `node.command:pane.capture@*` | saving the report or screen before a close |
 | `node.command:pane.close@*` | the exact-match close |
 
