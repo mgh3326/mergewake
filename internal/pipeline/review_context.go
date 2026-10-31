@@ -21,11 +21,10 @@ const (
 )
 
 var (
-	headingLine    = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$`)
-	setextRule     = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
-	setextText     = regexp.MustCompile(`^ {0,3}[^ \t#>*+\-=` + "`~" + `]`)
-	fenceLine      = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
-	severityPrefix = regexp.MustCompile(`^<!-- mergewake-severity:[a-z]+ -->\s*`)
+	headingLine = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$`)
+	setextRule  = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
+	setextText  = regexp.MustCompile(`^ {0,3}[^ \t#>*+\-=` + "`~" + `]`)
+	fenceLine   = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 )
 
 // answeredItem is a review thread whose finding someone other than its author
@@ -38,12 +37,14 @@ type answeredItem struct {
 	answer   string
 	// rebutted marks a latest comment written by the finding's own author.
 	rebutted bool
+	author   string
 }
 
 // reviewContext is the PR-specific text a reviewer sees ahead of the diff.
 type reviewContext struct {
 	text      string
 	answered  int // answered findings included in text
+	prior     int // earlier-round findings included in text
 	truncated bool
 }
 
@@ -102,9 +103,10 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 			path:     t.Path,
 			line:     t.Line,
 			resolved: t.IsResolved,
-			finding:  excerpt(severityPrefix.ReplaceAllString(first.Body, ""), excerptLimit),
+			finding:  excerpt(stripFinding(first.Body), excerptLimit),
 			answer:   excerpt(latest.Body, excerptLimit),
 			rebutted: latest.Author == first.Author,
+			author:   first.Author,
 		})
 	}
 	return out
@@ -114,6 +116,14 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 // (any heading level, case-insensitive) up to the next heading of the same or a
 // higher level, heading line included. Headings inside code fences are text.
 func operatorDecisions(body string) string {
+	return markdownSection(body, func(h string) bool {
+		return strings.EqualFold(strings.TrimRight(strings.TrimSpace(h), ":"), "operator decisions")
+	})
+}
+
+// markdownSection returns the first section whose heading text match accepts,
+// up to the next heading of the same or a higher level, heading included.
+func markdownSection(body string, match func(heading string) bool) string {
 	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
 	start, level := -1, 0
 	var open string // opening fence line's marker run; "" outside a code block
@@ -149,7 +159,7 @@ func operatorDecisions(body string) string {
 			continue
 		}
 		if start < 0 {
-			if strings.EqualFold(strings.TrimRight(strings.TrimSpace(text), ":"), "operator decisions") {
+			if match(text) {
 				start, level = i, lv
 			}
 			continue
@@ -168,8 +178,20 @@ func operatorDecisions(body string) string {
 // precede the diff, within contextBudget. Answered findings fill what the
 // decisions leave, newest first; whatever does not fit is reported as omitted.
 func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
+	return buildRoundContext(body, fb, roundPlan{}, "")
+}
+
+// buildRoundContext is buildReviewContext for a review round: the round and
+// budget instructions lead, the Acceptance contract follows the operator
+// decisions, and from round two the review login's own earlier findings are
+// listed with their dispositions ahead of the other answered findings.
+func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own string) reviewContext {
 	var rc reviewContext
 	var b strings.Builder
+	b.WriteString(rp.notes())
+	if b.Len() > 0 {
+		b.WriteString("\n")
+	}
 	decisions := operatorDecisions(body)
 	if len(decisions) > decisionsBudget {
 		const notice = "\n[Operator decisions truncated at the size bound.]"
@@ -181,7 +203,45 @@ func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
 		b.WriteString(decisions)
 		b.WriteString("\n\n")
 	}
-	items := answeredFindings(fb)
+	if rp.contract != "" {
+		fmt.Fprintf(&b, "ACCEPTANCE CONTRACT (from the %s, verbatim; the closed list of what this change must do). Judge the change against it. Add \"advisory\": true to every finding that falls outside this contract, unless it is critical (a security flaw, data loss, or a defect in the stated change itself). Never mark a critical finding advisory.\n%s\n\n", rp.contractSource, rp.contract)
+	}
+	// fits reserves room for the truncation notice so the bound holds with it.
+	fits := func(entry string) bool { return len(contextHeader)+b.Len()+len(entry)+120 <= contextBudget }
+	if rp.round > 1 && own != "" {
+		items := priorFindings(fb, own)
+		if len(items) > 0 {
+			fmt.Fprintf(&b, "PRIOR FINDINGS (rounds 1-%d of this PR, newest first), each with its disposition. Do not reopen, restate or re-rank any of them. Raise one again only if a line changed in the diff below gives new evidence, and then quote the disposition you dispute. A finding marked \"none yet\" is still open: do not repeat it.\n", rp.round-1)
+			used := 0
+			for i, it := range items {
+				label := it.severity
+				if label == "" {
+					label = "unrated"
+				}
+				if it.advisory {
+					label += ", advisory"
+				}
+				entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   disposition: %s\n", i+1, it.path, it.line, label, it.finding, it.disposition)
+				if !fits(entry) {
+					break
+				}
+				b.WriteString(entry)
+				used++
+			}
+			rc.prior = used
+			if used < len(items) {
+				rc.truncated = true
+				fmt.Fprintf(&b, "[Truncated at the size bound: %d of %d prior findings omitted.]\n", len(items)-used, len(items))
+			}
+			b.WriteString("\n")
+		}
+	}
+	var items []answeredItem
+	for _, it := range answeredFindings(fb) {
+		if !(rc.prior > 0 && strings.EqualFold(it.author, own)) {
+			items = append(items, it)
+		}
+	}
 	if len(items) > 0 {
 		b.WriteString("ALREADY ANSWERED ON THIS PR (newest first). Do not repeat a finding that matches one of these unless you give a new, concrete reason the answer is wrong; if you do, quote the answer you dispute in the finding body.\n")
 		used := 0
@@ -195,8 +255,7 @@ func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
 				label = "latest reply (by the finding's author, disputing the answer)"
 			}
 			entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   %s: %s\n", i+1, it.path, it.line, state, it.finding, label, it.answer)
-			// Reserve room for the truncation notice so the bound holds with it.
-			if len(contextHeader)+b.Len()+len(entry)+120 > contextBudget {
+			if !fits(entry) {
 				break
 			}
 			b.WriteString(entry)

@@ -507,3 +507,28 @@ func TestWebhookConfig(t *testing.T) {
 		t.Fatal("accepted non-absolute path")
 	}
 }
+
+func TestStallAfterAndBudgetConfig(t *testing.T) {
+	for _, tc := range []struct {
+		extra string
+		fail  bool
+		stall time.Duration
+	}{
+		{"", false, DefaultStallAfter},
+		{"daemon:\n  pr: {enabled: true, stall_after: 45m}\n", false, 45 * time.Minute},
+		{"daemon:\n  pr: {enabled: true, stall_after: off}\n", false, 0},
+		{"daemon:\n  pr: {enabled: true, stall_after: soon}\n", true, 0},
+		{"daemon:\n  pr: {enabled: true, stall_after: 0s}\n", true, 0},
+		{"daemon:\n  watch: {enabled: true, stall_after: 5m}\n", true, 0},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
+		c, err := Load(path)
+		if (err != nil) != tc.fail {
+			t.Fatalf("config %q err=%v", tc.extra, err)
+		}
+		if err == nil && c.Daemon.PR.StallWindow() != tc.stall {
+			t.Fatalf("config %q: stall window %v, want %v", tc.extra, c.Daemon.PR.StallWindow(), tc.stall)
+		}
+	}
+}

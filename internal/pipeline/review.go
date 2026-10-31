@@ -481,16 +481,26 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// reviewer from re-flagging settled points. The context is best effort: a
 	// feedback read that fails costs the context, not the review.
 	var prContext reviewContext
+	// The round decides what the reviewer sees: the whole diff in round one, the
+	// interdiff since the last reviewed head afterwards.
+	rp := s.planRound(ctx, r, pr, diff)
+	var contractErr error
+	if rp.contract, rp.contractSource, contractErr = s.acceptance(ctx, r, pr); contractErr != nil {
+		// Without the contract every finding stays in scope, as before.
+		rp.contract, rp.contractSource = "", ""
+	}
 	// The read runs on its own short deadline, a child of ctx, so a slow or
 	// paginating read cannot spend the time the gate and reviewer need.
 	feedbackCtx, cancelFeedback := context.WithTimeout(ctx, feedbackTimeout(timeout))
 	feedback, contextErr := s.GH.ReviewFeedback(feedbackCtx, r.Name, n)
 	cancelFeedback()
-	if contextErr == nil {
-		prContext = buildReviewContext(pr.Body, feedback)
-	} else {
-		prContext = buildReviewContext(pr.Body, github.ReviewFeedback{})
+	if contextErr != nil {
+		feedback = github.ReviewFeedback{}
 	}
+	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login)
+	// Findings already on the PR, and those posted by earlier passes of this
+	// run, are never posted again.
+	known := knownThreads(feedback)
 	// Scratch left by a review whose process was SIGKILLed is old and its lock
 	// is free; a concurrent review's scratch stays locked. Best effort.
 	_ = reviewer.SweepScratch(os.TempDir(), 2*timeout, s.now())
@@ -506,10 +516,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 	}
-	headless := &headlessExecutor{s: s, repo: r.Name, pr: n, diff: diff, context: prContext.text, dir: dir, control: control, provider: provider, cli: cli, freePool: freePool, family: fam, failed: map[string]bool{}, exhausted: map[string]bool{}, none: unavailable}
+	headless := &headlessExecutor{s: s, repo: r.Name, pr: n, diff: rp.diff, context: prContext.text, dir: dir, control: control, provider: provider, cli: cli, freePool: freePool, family: fam, failed: map[string]bool{}, exhausted: map[string]bool{}, none: unavailable}
 	executors := []passExecutor{headless}
 	if viaRuntug {
-		executors = []passExecutor{&runtugExecutor{s: s, repo: r, pr: pr, diff: diff, context: prContext.text, authorFamily: family}, headless}
+		executors = []passExecutor{&runtugExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}, headless}
 	}
 	for _, plan := range plans {
 		plan.lens = lens(plan)
@@ -558,10 +568,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
 			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
-		findings := out.findings
+		shape := shapeFindings(out.findings, rp, known)
+		findings := shape.kept
+		known = append(known, knownFromFindings(findings)...)
 		plan.name = selected
 		plan.sameFamily = out.family == "" || out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Patch: patch}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch}
 		if viaRuntug && out.executor != "runtug" {
 			receipt.Fallback = "runtug: " + fallback
 		}
@@ -581,6 +593,34 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": out.family, "same_family": plan.sameFamily, "findings": len(findings), "author_family": family, "answered_context": prContext.answered}
 		if prContext.truncated {
 			event["context_truncated"] = true
+		}
+		event["round"] = rp.round
+		if rp.base != "" {
+			event["delta_base"] = rp.base
+		}
+		if rp.quiet {
+			event["quiet"] = true
+		}
+		if rp.note != "" {
+			event["round_note"] = rp.note
+		}
+		if prContext.prior > 0 {
+			event["prior_context"] = prContext.prior
+		}
+		if rp.contract != "" {
+			event["contract"] = rp.contractSource
+		}
+		if contractErr != nil {
+			event["contract_error"] = contractErr.Error()
+		}
+		if shape.duplicates > 0 {
+			event["duplicates_dropped"] = shape.duplicates
+		}
+		if shape.advisory > 0 {
+			event["advisory"] = shape.advisory
+		}
+		if shape.budget > 0 {
+			event["budget_dropped"] = shape.budget
 		}
 		if contextErr != nil {
 			event["context_error"] = contextErr.Error()

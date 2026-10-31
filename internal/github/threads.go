@@ -255,6 +255,11 @@ func ThreadSeverity(author, body string) string {
 		body = body[:400]
 	}
 	if m := severityMarker.FindStringSubmatch(body); len(m) == 2 {
+		// A finding outside the PR's Acceptance contract never gates, whatever
+		// severity it was posted with; critical findings are never marked.
+		if m[1] != "critical" && strings.Contains(body, AdvisoryMarker) {
+			return "advisory"
+		}
 		return m[1]
 	}
 	switch policy.NormalizeAuthor(author) {

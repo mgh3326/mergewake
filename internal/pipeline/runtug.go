@@ -54,6 +54,8 @@ type runtugExecutor struct {
 	repo         config.Repo
 	pr           github.Pull
 	diff         string
+	delta        bool // diff is the interdiff since the last reviewed head
+	round        int
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
 }
@@ -496,7 +498,7 @@ func (x *runtugExecutor) brief(plan *passPlan, label, jobDir, authorFamily strin
 	// the same PUT as `completed`, so mergewake reads them back through the
 	// record on any host — no attachment, lane event or inbox read.
 	ret := "Then run `runtug done " + label + " --result \"$J/findings.json\" --report \"$J/report.md\"`."
-	return fmt.Sprintf(`# Review — %[1]s#%[2]d pass %[3]d (%[4]s lens)
+	text := fmt.Sprintf(`# Review — %[1]s#%[2]d pass %[3]d (%[4]s lens)
 
 You are the independent reviewer for pull request %[1]s#%[2]d. mergewake posts
 your findings to GitHub; you never post, comment, push or commit yourself.
@@ -543,6 +545,17 @@ Write a one-line summary to $J/report.md. %[13]s
 The review deadline is mergewake's review.timeout; findings returned after it
 are ignored.
 %[14]s`, x.repo.Name, x.pr.Number, plan.pass, plan.lens, "", x.pr.Head.SHA, x.pr.Base.Ref, x.pr.Base.SHA, focus, authorFamily, shellQuote(jobDir), label, ret, prContext)
+	if strings.Contains(x.context, "ACCEPTANCE CONTRACT") {
+		text = strings.Replace(text, "No other keys.", "No other keys except the optional boolean `advisory` the PR context asks for.", 1)
+	}
+	if x.delta {
+		// Round two onwards reviews the interdiff, which a checkout cannot
+		// reproduce (a base merge pollutes `git diff`), so the patch is inline.
+		text = strings.Replace(text, fmt.Sprintf("review the changes in `git diff %s...%s`", x.pr.Base.SHA, x.pr.Head.SHA),
+			fmt.Sprintf("this is review round %d: review only the delta patch at the end of this brief, not `git diff`", x.round), 1)
+		text += "\n## Delta to review (hunks changed since the last reviewed head)\n\n~~~~~~~~diff\n" + strings.TrimRight(x.diff, "\n") + "\n~~~~~~~~\n"
+	}
+	return text
 }
 
 // shellQuote single-quotes s for a POSIX shell.

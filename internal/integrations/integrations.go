@@ -226,6 +226,29 @@ func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
 	return shown.Lane, nil
 }
 
+// TaskBody reads the task's free text (`body`, else `description`) from `tasks
+// show`; a task record without either yields "".
+func (h Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
+	if !TaskID.MatchString(task) {
+		return "", errors.New("task ID must be a positive integer")
+	}
+	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	if e != nil {
+		return "", e
+	}
+	var shown struct {
+		Body        string `json:"body"`
+		Description string `json:"description"`
+	}
+	if e = json.Unmarshal(out, &shown); e != nil {
+		return "", e
+	}
+	if shown.Body != "" {
+		return shown.Body, nil
+	}
+	return shown.Description, nil
+}
+
 // TaskJob reads the runtug job bound to a task (`refs.job_id`) and the task
 // title, which carries the task's grade and T marker.
 func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, error) {
