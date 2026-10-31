@@ -154,11 +154,26 @@ type PRLoop struct {
 	Notify PRNotify `yaml:"notify"`
 }
 type Daemon struct {
-	PR      PRLoop `yaml:"pr"`
-	Watch   Loop   `yaml:"watch"`
-	Release Loop   `yaml:"release"`
-	Rollout Loop   `yaml:"rollout"`
-	Act     bool   `yaml:"act"`
+	PR      PRLoop  `yaml:"pr"`
+	Watch   Loop    `yaml:"watch"`
+	Release Loop    `yaml:"release"`
+	Rollout Loop    `yaml:"rollout"`
+	Act     bool    `yaml:"act"`
+	Webhook Webhook `yaml:"webhook"`
+}
+
+// Webhook configures the optional in-process GitHub delivery receiver. A
+// delivery only wakes a role early; the timer still supplies complete polling.
+type Webhook struct {
+	Enabled bool `yaml:"enabled"`
+	// Listen is a loopback host:port; the receiver never binds a routable
+	// address itself, so remote delivery needs an operator-run tunnel.
+	Listen string `yaml:"listen"`
+	// Path is the exact request path, default /github.
+	Path string `yaml:"path"`
+	// SecretEnv names the environment variable holding the shared secret.
+	// Its value is never a config key.
+	SecretEnv string `yaml:"secret_env"`
 }
 type Reap struct {
 	Enabled       bool     `yaml:"enabled"`
@@ -290,6 +305,9 @@ func Load(name string) (Config, error) {
 		if _, err := Duration(loop.Interval); err != nil {
 			return c, err
 		}
+	}
+	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
+		return c, e
 	}
 	if c.Reap.Act && !c.Reap.Enabled {
 		return c, errors.New("reap.act requires reap.enabled")
@@ -884,6 +902,44 @@ func normalizePort(raw string) (string, error) {
 	}
 	return net.JoinHostPort(host, ports[0]) + ":" + ports[1], nil
 }
+// validateWebhook gates the optional delivery receiver: it binds loopback
+// only, and the shared secret must be present before the daemon starts.
+// Errors name the config key, never the listen value or the secret.
+func validateWebhook(w *Webhook) error {
+	if !w.Enabled {
+		return nil
+	}
+	if w.Path == "" {
+		w.Path = "/github"
+	}
+	if !strings.HasPrefix(w.Path, "/") || w.Path != path.Clean(w.Path) {
+		return errors.New("daemon.webhook.path must be an absolute path")
+	}
+	host, port, e := net.SplitHostPort(w.Listen)
+	if e != nil {
+		return errors.New("daemon.webhook.listen must be host:port")
+	}
+	if n, e := strconv.Atoi(port); e != nil || n < 1 || n > 65535 {
+		return errors.New("daemon.webhook.listen port must be 1..65535")
+	}
+	// Only localhost, 127.0.0.0/8 and ::1: any other hostname or a wildcard
+	// bind would expose the receiver beyond this host.
+	loopback := host == "localhost"
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		loopback = true
+	}
+	if !loopback {
+		return errors.New("daemon.webhook.listen must be a loopback address")
+	}
+	if w.SecretEnv == "" {
+		return errors.New("daemon.webhook requires secret_env")
+	}
+	if os.Getenv(w.SecretEnv) == "" {
+		return errors.New("daemon.webhook.secret_env is unset or empty")
+	}
+	return nil
+}
+
 func Expand(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
 		h, e := os.UserHomeDir()

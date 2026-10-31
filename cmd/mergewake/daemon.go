@@ -95,6 +95,13 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 		return errors.New("daemon requires configured repositories")
 	}
 	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: slog.New(slog.NewJSONHandler(stderr, nil)), RateWait: gh.RateWait}
+	if wc := s.Config.Daemon.Webhook; wc.Enabled {
+		repos := map[string]bool{}
+		for _, r := range s.Config.Repos {
+			repos[r.Name] = true
+		}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(os.Getenv(wc.SecretEnv)), Repos: repos}
+	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
 	}

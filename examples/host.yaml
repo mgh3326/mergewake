@@ -78,6 +78,10 @@ daemon:
   watch: {enabled: false, interval: 60s}
   release: {enabled: false, interval: 2m}
   rollout: {enabled: false, interval: 2m}
+  # Optional GitHub webhook receiver: signed deliveries wake roles early while
+  # polling stays complete. Loopback listen only — put an operator-run tunnel
+  # in front for real deliveries. The secret lives in the named env var.
+  webhook: {enabled: false, listen: 127.0.0.1:9477, path: /github, secret_env: MERGEWAKE_WEBHOOK_SECRET}
 # Session hosts scanned by `mergewake reap`. An empty/local ssh value means this
 # machine; `jobs` is the base directory of per-pane job dirs and must be
 # absolute on ssh hosts.

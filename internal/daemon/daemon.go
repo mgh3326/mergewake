@@ -48,9 +48,12 @@ type Daemon struct {
 	// retry delay; nil means time.Now and math/rand.
 	Now    func() time.Time
 	Jitter func() float64
-	mu     sync.Mutex
-	wake   map[string]chan struct{}
-	failed map[string]int
+	// Webhook, when set, is the GitHub delivery receiver served next to the
+	// loops; it shuts down with the daemon context. nil means off.
+	Webhook *Webhook
+	mu      sync.Mutex
+	wake    map[string]chan struct{}
+	failed  map[string]int
 }
 
 // Trigger wakes a role after a trusted adapter receives an event. It coalesces
@@ -147,6 +150,11 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
+	if d.Webhook != nil {
+		if err := d.serveWebhook(ctx, &wg); err != nil {
+			return err
+		}
+	}
 	// One slot per loop keeps the joined error in configuration order.
 	errs := make([]error, len(loops))
 	for i, loop := range loops {

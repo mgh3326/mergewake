@@ -453,3 +453,49 @@ func TestAge(t *testing.T) {
 		}
 	}
 }
+
+func TestWebhookConfig(t *testing.T) {
+	load := func(extra string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\n"+extra), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return Load(p)
+	}
+	// Disabled by default: a webhook block only validates when enabled.
+	c, e := load("daemon:\n  webhook: {enabled: false, listen: '0.0.0.0:9'}\n")
+	if e != nil || c.Daemon.Webhook.Enabled {
+		t.Fatalf("disabled webhook: %+v %v", c.Daemon.Webhook, e)
+	}
+	t.Setenv("MW_TEST_WH_SECRET", "x")
+	c, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', secret_env: MW_TEST_WH_SECRET}\n")
+	if e != nil || c.Daemon.Webhook.Path != "/github" {
+		t.Fatalf("loopback webhook: %+v %v", c.Daemon.Webhook, e)
+	}
+	for _, listen := range []string{"localhost:9000", "127.0.0.2:9000", "[::1]:9000"} {
+		if _, e = load("daemon:\n  webhook: {enabled: true, listen: '" + listen + "', secret_env: MW_TEST_WH_SECRET}\n"); e != nil {
+			t.Fatalf("listen %s: %v", listen, e)
+		}
+	}
+	for _, listen := range []string{"0.0.0.0:9000", ":9000", "10.0.0.1:9000", "example.invalid:9000", "127.0.0.1", "127.0.0.1:notaport", "127.0.0.1:0"} {
+		if _, e = load("daemon:\n  webhook: {enabled: true, listen: '" + listen + "', secret_env: MW_TEST_WH_SECRET}\n"); e == nil {
+			t.Fatalf("accepted listen %s", listen)
+		}
+	}
+	// The refusal names the key, never the listen value or the env var name.
+	_, e = load("daemon:\n  webhook: {enabled: true, listen: '203.0.113.9:9000', secret_env: MW_TEST_WH_SECRET}\n")
+	if e == nil || !strings.Contains(e.Error(), "daemon.webhook.listen") || strings.Contains(e.Error(), "203.0.113.9") {
+		t.Fatalf("listen error: %v", e)
+	}
+	_, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000'}\n")
+	if e == nil || !strings.Contains(e.Error(), "daemon.webhook") {
+		t.Fatalf("missing secret_env: %v", e)
+	}
+	_, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', secret_env: MW_TEST_UNSET_MARKER}\n")
+	if e == nil || !strings.Contains(e.Error(), "daemon.webhook.secret_env") || strings.Contains(e.Error(), "MW_TEST_UNSET_MARKER") {
+		t.Fatalf("unset secret error: %v", e)
+	}
+	if _, e = load("daemon:\n  webhook: {enabled: true, listen: '127.0.0.1:9000', path: '../escape', secret_env: MW_TEST_WH_SECRET}\n"); e == nil {
+		t.Fatal("accepted non-absolute path")
+	}
+}
