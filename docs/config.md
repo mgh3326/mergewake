@@ -331,6 +331,7 @@ needs no GitHub token.
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
 | `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
+| `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
@@ -522,6 +523,61 @@ runs without the answered findings (the PR-body decisions still apply) and the
 audit event carries `context_error`. Each pass
 receipt and the `review` audit event record `answered_context: <n>`, the number
 of answered findings the prompt carried (`context_truncated` marks a cut).
+
+#### Review rounds, contract and budget
+
+A review converges when each round reads less than the one before. The
+**round** of a head is read from the reviews mergewake already posted on the PR
+(each pass embeds `round` in its `mergewake-pass` marker), so every host agrees
+on it.
+
+- **Round one reviews the whole diff.** Every later round reviews only the
+  *interdiff*: the hunks of the new PR diff whose added and removed lines the
+  previous reviewed head's PR diff (`compare <base>...<last reviewed head>`) does
+  not already carry, per file. Both are PR-only patches, so a clean base merge
+  or a rebase that only moves line numbers or context adds nothing. A hunk that
+  mixes old and new changes counts as changed and is kept whole. The prompt
+  says it is a delta round and that findings outside the shown hunks are not
+  wanted; a finding on any other line fails the same new-side-line check as
+  before. The runtug brief carries the delta patch inline instead of `git diff`.
+  When the previous patch cannot be read, the round reviews the whole diff and
+  the audit event says why (`round_note`). When nothing changed at all, the round
+  does not count, reviews the whole diff for reference only, and reports only a
+  new critical or high finding.
+- **Prior findings stay settled.** From round two the prompt lists every finding
+  the review login posted in earlier rounds with its disposition (`resolved`,
+  `answered: <latest reply>`, or `none yet (still open)`), and tells the reviewer
+  not to reopen or repeat any of them unless a changed line gives new evidence,
+  in which case it quotes the disposition it disputes. These replace the
+  review login's own entries in "Already answered on this PR". The 12 KB context
+  cap still holds.
+- **No duplicate is posted.** A finding with the same path as an existing review
+  thread (any author) and substantially the same words (word-set overlap of at
+  least a half, or a short finding almost contained in a longer one) is dropped
+  before posting, as is a finding repeating one an earlier pass of the same run
+  posted. The `review` audit event counts them as `duplicates_dropped`.
+- **Closed contract.** A PR-body section headed `Acceptance` (`Acceptance
+  criteria`, `Acceptance (…)`; any heading level, up to the next heading of the
+  same or higher level), else the same section in the body of the task named by
+  the `Mergewake-Task` trailer when the sink can read task text (`tasks show`
+  `body`, else `description`), is capped at 4 KB and passed to the reviewer as
+  the closed list of what the change must do. The reviewer marks a finding
+  outside it with `"advisory": true`. mergewake then caps the finding at
+  `medium` (unrated becomes `low`), posts it with an `<!-- mergewake-advisory -->`
+  marker and an "Advisory" label, and the merge gate grades it as advisory: it
+  needs no answer and never blocks. A `critical` finding (security, data loss, or
+  a defect in the stated change) keeps its severity and is never advisory. Without
+  an Acceptance section the flag is ignored and every finding is in scope; the
+  `review` event records `contract: <source>`.
+- **Budget.** After `review.budget_rounds` rounds (default 3; negative turns it
+  off) later rounds are *quiet*: the prompt asks for critical and high findings
+  only and mergewake drops medium and low ones (`budget_dropped`). A quiet pass
+  receipt carries `quiet: true`, and every pass records `round` and, for a delta
+  round, `delta` (the previous reviewed head). Reviews posted before round
+  counting count one round per reviewed head.
+
+Round, `delta_base`, `quiet`, `prior_context`, `advisory` and the drop counts
+are on the `review` audit event.
 
 Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
 `subscribed=false`, excluded pool classes, and matching recommendation exclusions
@@ -863,6 +919,8 @@ For `example/project`, state resides beneath
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
+| `review-wait.json` | When this host first saw each ready head waiting for a review (the stall alarm's clock). |
+| `review-stall-sent` | Most recent 256 `PR head` keys already alarmed as stalled. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
@@ -917,7 +975,7 @@ fleet spawners can be wrapped around this protocol without importing their code.
 ```yaml
 daemon:
   act: false
-  pr: {enabled: true, interval: 60s, notify: {enabled: true}}
+  pr: {enabled: true, interval: 60s, notify: {enabled: true}, stall_after: 30m}
   watch: {enabled: true, interval: 60s}
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
@@ -992,6 +1050,30 @@ configured `notifier.lane`. Both trailers are read from the PR body first and
 then the head commit message; a task-read error retries rather than rerouting.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
 other roles.
+
+#### Review-stall alarm
+
+The healthcheck ping (`MERGEWAKE_HEALTHCHECK_URL`) proves the loops finish
+without error; it cannot tell a loop that is reviewing from one that is idling
+past a ready PR (a quota refusal, a skipped head). The `pr` role therefore also
+raises a **stall alarm**. A head is *waiting* while its PR is open, not a
+draft, CI has started (any check run or status exists: running or done) and no
+review pass has been claimed for it (`mergewake/reviews/<pr>/<head>` absent).
+The clock starts when this host first sees the head waiting and is kept across
+restarts in `<state_dir>/<repo>/review-wait.json`; a claimed review, a draft, a
+head without CI or a new head ends or restarts it. Once a head has waited
+longer than `daemon.pr.stall_after` (default `30m`, `off` disables) one lane
+event goes to the operator lane (`notifier.lane`):
+
+```
+[mergewake] STALLED review <repo>#<pr> head=<sha7> | no review started for 47m0s (threshold 30m0s); …
+```
+
+Each `(PR, head)` alarms once, recorded in `review-stall-sent` (the newest 256
+keys) and as a `review-stall` audit record; a delivery the notifier refuses is
+not recorded and is retried on the next poll, and counts as a failed loop run.
+The alarm runs in shadow mode like the other lane events; `--dry-run` skips it.
+The healthcheck ping stays as it was.
 
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,

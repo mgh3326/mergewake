@@ -15,6 +15,7 @@ type fakeRunner struct {
 	calls []call
 	fail  bool
 	err   error
+	shown string // overrides the `tasks show` reply
 }
 
 func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) ([]byte, error) {
@@ -26,6 +27,9 @@ func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) (
 		return nil, errors.New("offline")
 	}
 	if len(a) > 1 && a[0] == "tasks" && a[1] == "show" {
+		if r.shown != "" {
+			return []byte(r.shown), nil
+		}
 		return []byte(`{"state":"merged","lane":"task-lane"}`), nil
 	}
 	return nil, nil
@@ -184,5 +188,22 @@ func TestHandoffkeepAttachmentReadsBySHA(t *testing.T) {
 	}
 	if len(r.calls) != 1 {
 		t.Fatal(r.calls)
+	}
+}
+
+func TestTaskBodyReadsBodyThenDescription(t *testing.T) {
+	for _, tc := range []struct{ shown, want string }{
+		{`{"id":42,"body":"## Acceptance\n- x"}`, "## Acceptance\n- x"},
+		{`{"id":42,"description":"from description"}`, "from description"},
+		{`{"id":42,"title":"no text"}`, ""},
+	} {
+		h := Handoffkeep{Runner: &fakeRunner{shown: tc.shown}, Command: "handoffkeep"}
+		got, e := h.TaskBody(context.Background(), "42")
+		if e != nil || got != tc.want {
+			t.Fatalf("%s: %q %v", tc.shown, got, e)
+		}
+	}
+	if _, e := (Handoffkeep{Runner: &fakeRunner{}}).TaskBody(context.Background(), "x"); e == nil {
+		t.Fatal("invalid task accepted")
 	}
 }

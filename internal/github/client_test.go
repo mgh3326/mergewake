@@ -436,3 +436,71 @@ func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
 		t.Fatalf("%+v", pulls)
 	}
 }
+
+func TestAdvisoryFindingGradesLowAndCriticalNever(t *testing.T) {
+	advisory := FindingBody(Finding{Severity: "medium", Body: "style nit", Advisory: true})
+	if !strings.Contains(advisory, AdvisoryMarker) || !strings.Contains(advisory, "<!-- mergewake-severity:medium -->") || !strings.Contains(advisory, "**Advisory**") {
+		t.Fatal(advisory)
+	}
+	if got := ThreadSeverity("review-bot", advisory); got != "low" {
+		t.Fatalf("advisory medium reads %q", got)
+	}
+	if got := ThreadSeverity("review-bot", FindingBody(Finding{Severity: "medium", Body: "x"})); got != "medium" {
+		t.Fatalf("plain medium reads %q", got)
+	}
+	// A critical finding is never softened, even if the marker is present.
+	if got := ThreadSeverity("review-bot", FindingBody(Finding{Severity: "critical", Body: "x", Advisory: true})); got != "critical" {
+		t.Fatalf("critical reads %q", got)
+	}
+}
+
+func TestReviewedHeadsListsDistinctHeadsWithRounds(t *testing.T) {
+	shaB := strings.Repeat("b", 40)
+	mark := func(sha, receipt string) string {
+		return Marker(sha) + "\n<!-- mergewake-pass:" + receipt + " -->\nbody"
+	}
+	reviews := []Review{
+		{ID: 1, CommitID: testSHA, State: "COMMENTED", Body: mark(testSHA, `{"pass":1,"round":1}`)},
+		{ID: 2, CommitID: testSHA, State: "COMMENTED", Body: mark(testSHA, `{"pass":2,"round":1}`)},
+		{ID: 3, CommitID: shaB, State: "COMMENTED", Body: mark(shaB, `{"pass":1,"round":2}`)},
+		{ID: 4, CommitID: strings.Repeat("c", 40), State: "COMMENTED", Body: "someone else's review"},
+		{ID: 5, CommitID: strings.Repeat("d", 40), State: "COMMENTED", Body: mark(strings.Repeat("d", 40), `{"pass":1}`)},
+	}
+	for i := range reviews {
+		reviews[i].User.Login = "review-bot"
+	}
+	reviews[3].User.Login = "someone"
+	c := api(t, func(w http.ResponseWriter, r *http.Request) { reply(w, reviews) })
+	got, e := c.ReviewedHeads(context.Background(), "example/project", 7, "review-bot")
+	if e != nil || len(got) != 3 || got[0] != (ReviewedHead{testSHA, 1}) || got[1] != (ReviewedHead{shaB, 2}) || got[2].Round != 0 {
+		t.Fatalf("%+v %v", got, e)
+	}
+	if _, e = c.ReviewedHeads(context.Background(), "example/project", 7, ""); e == nil {
+		t.Fatal("login is required")
+	}
+}
+
+func TestCompareDiffAndCIStarted(t *testing.T) {
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/compare/main..."+testSHA):
+			if r.Header.Get("Accept") != "application/vnd.github.diff" {
+				t.Error("diff media type missing")
+			}
+			fmt.Fprint(w, "diff --git a/x b/x\n")
+		case strings.HasSuffix(r.URL.Path, "/check-runs"):
+			fmt.Fprint(w, `{"check_runs":[{"id":1,"name":"CI","status":"queued"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/statuses"):
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	d, e := c.CompareDiff(context.Background(), "example/project", "main", testSHA)
+	if e != nil || d != "diff --git a/x b/x\n" {
+		t.Fatalf("%q %v", d, e)
+	}
+	if ok, e := c.CIStarted(context.Background(), "example/project", testSHA); e != nil || !ok {
+		t.Fatal(ok, e)
+	}
+}
