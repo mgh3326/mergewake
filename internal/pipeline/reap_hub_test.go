@@ -78,6 +78,8 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			result = h.capture
 		case "pane.close":
 			result = h.close
+		case "worktree.remove":
+			result = map[string]any{"outcome": "removed"}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "cmd-1", "machine": "node-a", "op": body["op"], "result": result})
 	}))
@@ -133,13 +135,17 @@ func TestReapPanewireClosesThroughHub(t *testing.T) {
 	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p1" || closes[0]["name"] != "wk-7" || closes[0]["agent_status"] != "idle" || closes[0]["cwd"] != "/repo.wt" {
 		t.Fatalf("close args %v", closes)
 	}
-	var closed, cleanup bool
+	var closed, removed bool
 	for _, row := range reapLogRows(t, s, "example/project") {
 		closed = closed || row["action"] == "close-pane" && row["result"] == "closed" && row["host"] == "node" && row["pane"] == "w1:p1" && row["saved"] == "/node/jobs/wk-7/report.md" && row["worktree"] == "/repo.wt" && row["branch"] == "wk/x"
-		cleanup = cleanup || row["action"] == "remove-worktree" && row["result"] == "skipped" && row["reason"] == "cleanup-unsupported:panewire"
+		removed = removed || row["action"] == "remove-worktree" && row["result"] == "removed"
 	}
-	if !closed || !cleanup {
+	if !closed || !removed {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
+	}
+	removes := hub.ops("worktree.remove")
+	if len(removes) != 1 || len(removes[0]) != 4 || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
+		t.Fatalf("remove args: %#v", removes)
 	}
 }
 
@@ -155,6 +161,16 @@ func TestReapPanewireShadowNeverActs(t *testing.T) {
 	}
 	if closes := hub.ops("pane.close"); len(closes) != 0 {
 		t.Fatalf("shadow closed %v", closes)
+	}
+	if removes := hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("shadow removed %v", removes)
+	}
+	var wouldRemove bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		wouldRemove = wouldRemove || row["action"] == "remove-worktree" && row["result"] == "would-remove"
+	}
+	if !wouldRemove {
+		t.Fatalf("missing would-remove row: %v", reapLogRows(t, s, "example/project"))
 	}
 	if !strings.Contains(out.String(), `"result":"would-close"`) || !strings.Contains(out.String(), `"saved":"/node/jobs/wk-7/pane-screen.txt"`) {
 		t.Fatal(out.String())
