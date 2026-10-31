@@ -12,50 +12,68 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 )
 
-// patchID is `git patch-id --stable` over a unified diff: a SHA-1 of each
-// file's diff with whitespace removed and hunk line numbers left out, the
-// per-file digests summed so file order does not matter. A base merged into
-// the head leaves the PR diff (merge-base..head) text unchanged, so the id
-// names the patch rather than the commit.
-//
-// It follows git's state machine, except that an unexpected line after a
-// hunk's counts are exhausted (git stops reading there) is hashed instead, so
-// a diff is never silently truncated into a shorter, equal id.
-func patchID(diff string) string {
-	var (
-		total  [sha1.Size]byte
-		ctx    hash.Hash = sha1.New()
-		hashed bool
-	)
-	flush := func() {
-		if !hashed {
-			return
-		}
-		sum := ctx.Sum(nil)
-		carry := 0
-		for i := range total {
-			carry += int(total[i]) + int(sum[i])
-			total[i] = byte(carry)
-			carry >>= 8
-		}
-		ctx.Reset()
-		hashed = false
+// summedHash is a SHA-1 per file, summed byte-wise with carry the way
+// `git patch-id --stable` does, so the order of the files does not matter.
+type summedHash struct {
+	ctx   hash.Hash
+	total [sha1.Size]byte
+	open  bool
+}
+
+func newSummedHash() *summedHash { return &summedHash{ctx: sha1.New()} }
+
+func (h *summedHash) write(b []byte) { h.ctx.Write(b); h.open = true }
+
+// flush folds the file in progress into the total and starts the next one.
+func (h *summedHash) flush() {
+	if !h.open {
+		return
 	}
+	sum := h.ctx.Sum(nil)
+	carry := 0
+	for i := range h.total {
+		carry += int(h.total[i]) + int(sum[i])
+		h.total[i] = byte(carry)
+		carry >>= 8
+	}
+	h.ctx.Reset()
+	h.open = false
+}
+
+// patchHashes reads a unified diff once and returns two ids. loose is
+// `git patch-id --stable`: each file's diff with all whitespace removed and
+// hunk line numbers left out. strict is the same sum over the exact text of
+// every changed line and file header (context lines left out, so changes near
+// the patch that a merged base brings in do not count), which a whitespace-only
+// edit changes.
+//
+// It follows git's state machine, with two deliberate differences: a file
+// always ends at the next "diff" line (git folds a hunkless rename or mode
+// change into the following file, which makes the id depend on file order), and
+// an unexpected line after a hunk's counts are exhausted is hashed instead of
+// ending the read, so a diff is never silently truncated into a shorter id.
+func patchHashes(diff string) (loose, strict string) {
+	l, x := newSummedHash(), newSummedHash()
 	before, after := -1, -1
 	patchlen := 0
 	blobs := ""
-	found := false
-	for _, line := range strings.Split(diff, "\n") {
-		line = strings.TrimSuffix(line, "\r")
+	for _, raw := range strings.Split(diff, "\n") {
+		line := strings.TrimSuffix(raw, "\r")
 		if patchlen == 0 && !strings.HasPrefix(line, "diff ") {
 			continue
+		}
+		if strings.HasPrefix(line, "diff ") {
+			l.flush()
+			x.flush()
+			before, after = -1, -1
+			blobs = ""
 		}
 		if before == -1 {
 			switch {
 			case strings.HasPrefix(line, "GIT binary patch"), strings.HasPrefix(line, "Binary files"):
 				before, after = 0, 0
 				// A binary diff carries no content, so its blob ids stand for it.
-				ctx.Write([]byte(blobs))
+				l.write([]byte(blobs))
 			case strings.HasPrefix(line, "index "):
 				blobs = blobIDs(line)
 				continue
@@ -63,16 +81,9 @@ func patchID(diff string) string {
 				before, after = 1, 1
 			}
 		}
-		if before == 0 && after == 0 {
-			if strings.HasPrefix(line, "@@ -") {
-				before, after = hunkCounts(line)
-				continue
-			}
-			if strings.HasPrefix(line, "diff ") {
-				flush()
-				before, after = -1, -1
-				blobs = ""
-			}
+		if before == 0 && after == 0 && strings.HasPrefix(line, "@@ -") {
+			before, after = hunkCounts(line)
+			continue
 		}
 		if line != "" {
 			if c := line[0]; c == '-' || c == ' ' {
@@ -89,14 +100,36 @@ func patchID(diff string) string {
 			return r
 		}, line)
 		patchlen += len(clean)
-		ctx.Write([]byte(clean))
-		hashed, found = true, true
+		l.write([]byte(clean))
+		if !strings.HasPrefix(line, " ") {
+			x.write([]byte(raw + "\n"))
+		}
 	}
-	flush()
-	if !found {
+	l.flush()
+	x.flush()
+	if patchlen == 0 {
+		return "", ""
+	}
+	return fmt.Sprintf("%x", l.total), fmt.Sprintf("%x", x.total)
+}
+
+// patchID is `git patch-id --stable` of the diff, or "" for no diff.
+func patchID(diff string) string {
+	loose, _ := patchHashes(diff)
+	return loose
+}
+
+// reviewPatchID names the patch a review covers: the stable patch id, then a
+// digest of the exact changed text. Merging a base into the head leaves both
+// alone, but a whitespace-only edit, which `git patch-id` ignores and which can
+// change behaviour (indentation, a Makefile recipe), is a different patch and
+// gets its own review.
+func reviewPatchID(diff string) string {
+	loose, strict := patchHashes(diff)
+	if loose == "" {
 		return ""
 	}
-	return fmt.Sprintf("%x", total)
+	return loose + ":" + strict[:12]
 }
 
 // blobIDs is the pre- and post-image blob ids of an "index a..b mode" line,
@@ -157,7 +190,7 @@ func (s *Service) patchIDOf(ctx context.Context, repo string, n int, head string
 	if e != nil {
 		return ""
 	}
-	return s.rememberPatch(key, patchID(diff))
+	return s.rememberPatch(key, reviewPatchID(diff))
 }
 
 func (s *Service) rememberPatch(key, id string) string {
@@ -182,8 +215,10 @@ func passesFor(history []github.ReviewedPass, head string) []github.PassReceipt 
 }
 
 // inheritedPasses finds an earlier head with the same patch id whose recorded
-// passes satisfy needed. The passes that count are the trusted identity's
-// receipts, so a pushed ref or a forged head cannot stand in for a review.
+// passes satisfy needed. Only the passes recorded for this patch count: a
+// receipt with another patch id, or none, is not verified for it. The passes
+// are the trusted identity's receipts, so a pushed ref or a forged head cannot
+// stand in for a review.
 func inheritedPasses(history []github.ReviewedPass, patch, head string, needed int) (string, []github.PassReceipt, bool) {
 	if patch == "" {
 		return "", nil, false
@@ -194,7 +229,12 @@ func inheritedPasses(history []github.ReviewedPass, patch, head string, needed i
 			continue
 		}
 		seen[p.Head] = true
-		receipts := passesFor(history, p.Head)
+		var receipts []github.PassReceipt
+		for _, q := range history {
+			if q.Head == p.Head && q.Patch == patch {
+				receipts = append(receipts, q.PassReceipt)
+			}
+		}
 		if _, ok := distinctPasses(receipts, needed); ok {
 			return p.Head, receipts, true
 		}

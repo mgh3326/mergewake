@@ -215,7 +215,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if _, own := distinctPasses(receipts, needed); !own {
 		var diffErr error
 		if diff, diffErr = s.GH.Diff(ctx, r.Name, n); diffErr == nil && diff != "" {
-			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), patchID(diff))
+			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
 		if from, _, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
 			if o.Acting() {
@@ -471,7 +471,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 		if diff != "" {
-			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), patchID(diff))
+			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
 	}
 	if len(diff) == 0 || len(diff) > 2<<20 {

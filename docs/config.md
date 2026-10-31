@@ -789,6 +789,15 @@ hunk line numbers left out, summed over the files so their order does not
 matter. Merging the base into the head, or rebasing it, changes the head SHA and
 the diff's `index` and hunk-offset lines but not the patch id.
 
+The id mergewake records and compares is that value, a colon, and twelve hex
+characters of a second digest over the exact text of the changed lines and file
+headers (context lines excluded). `git patch-id` ignores whitespace, so on its
+own a whitespace-only edit, which can change behaviour (indentation, a Makefile
+recipe), would inherit a review; with the digest it is a different patch and is
+reviewed. The one other difference from git: a file ends at the next `diff`
+line, so a hunkless rename or mode change is not folded into the following file
+and file order never changes the id. Binary diffs hash their blob ids.
+
 - Each posted review pass records the patch id it reviewed in its
   `mergewake-pass` marker (`patch`). The marker is posted under `review.login`,
   so a pushed ref cannot stand in for it.
@@ -796,7 +805,8 @@ the diff's `index` and hunk-offset lines but not the patch id.
   `mergewake review` schedules nothing, prints `action: inherited-review` with
   `inherited_from`, and creates the new head's `-done` marker (not under
   `--dry-run`); the gate accepts the inherited passes without a new review. The
-  inherited head must have all the passes the PR's class needs.
+  inherited head must have all the passes the PR's class needs, each recorded
+  for this patch id: a pass with another patch id, or none, does not count.
 - A changed patch id schedules a review as before. A diff that cannot be read
   gives no patch id, and an unknown id equals nothing: that head is reviewed on
   its own. Passes recorded before patch ids existed inherit nothing.

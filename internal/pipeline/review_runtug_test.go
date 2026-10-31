@@ -238,7 +238,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	}
 	got := g.passes[shaA][0]
 	diff, _ := g.Diff(context.Background(), "", 0)
-	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Patch: patchID(diff)}) {
+	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
 	}
 }

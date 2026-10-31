@@ -80,6 +80,60 @@ func TestPatchIDBinaryUsesBlobIDs(t *testing.T) {
 	}
 }
 
+// A whitespace-only edit keeps the git patch id but is a different reviewed
+// patch; a base merged in keeps both.
+func TestReviewPatchIDSeesWhitespace(t *testing.T) {
+	a := toolDiff("1111111..2222222", 1, "\tnew")
+	b := toolDiff("1111111..2222222", 1, "    new")
+	if patchID(a) != patchID(b) {
+		t.Fatal("git patch id must ignore whitespace")
+	}
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("a whitespace-only edit inherited the review")
+	}
+	if reviewPatchID(a) != reviewPatchID(toolDiff("aaaaaaa..bbbbbbb", 41, "\tnew")) {
+		t.Fatal("a base merged in changed the review patch id")
+	}
+	if reviewPatchID("") != "" {
+		t.Fatal("no diff must give no patch id")
+	}
+}
+
+// A rename with no hunk ends at the next file: reordering files keeps the id.
+func TestPatchIDHunklessFilesStayOrderIndependent(t *testing.T) {
+	rename := "diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\n"
+	mode := "diff --git a/run b/run\nold mode 100644\nnew mode 100755\n"
+	text := toolDiff("1111111..2222222", 1, "new")
+	want := patchID(rename + mode + text)
+	for _, order := range []string{rename + text + mode, mode + rename + text, text + mode + rename} {
+		if got := patchID(order); got != want {
+			t.Fatalf("file order changed the id: %s != %s\n%s", got, want, order)
+		}
+	}
+}
+
+// Only the passes recorded for this patch count toward inheriting it.
+func TestInheritedPassesNeedMatchingReceipts(t *testing.T) {
+	pass := func(head string, n int, family, patch string) github.ReviewedPass {
+		return github.ReviewedPass{Head: head, PassReceipt: github.PassReceipt{Pass: n, Family: family, Lens: map[int]string{1: "correctness", 2: "state-risk"}[n], Patch: patch}}
+	}
+	history := []github.ReviewedPass{pass(shaA, 1, "anthropic", "p1"), pass(shaA, 2, "openai", "")}
+	if _, _, ok := inheritedPasses(history, "p1", shaB, 2); ok {
+		t.Fatal("a pass without this patch id completed the required pair")
+	}
+	history = []github.ReviewedPass{pass(shaA, 1, "anthropic", "p1"), pass(shaA, 2, "openai", "p2")}
+	if _, _, ok := inheritedPasses(history, "p1", shaB, 2); ok {
+		t.Fatal("a pass for another patch completed the required pair")
+	}
+	history = []github.ReviewedPass{pass(shaA, 1, "anthropic", "p1"), pass(shaA, 2, "openai", "p1")}
+	if from, _, ok := inheritedPasses(history, "p1", shaB, 2); !ok || from != shaA {
+		t.Fatalf("both passes carry the patch: %v %s", ok, from)
+	}
+	if _, _, ok := inheritedPasses(history, "", shaB, 2); ok {
+		t.Fatal("an unknown patch id inherited a review")
+	}
+}
+
 // reviewedAtA reviews head A of PR 7 for real, then moves the PR to head B whose
 // diff is diffB, as if the base had been merged into it.
 func reviewedAtA(t *testing.T, diffB string) (*Service, *fakeGH, *fakeRunner, func(Options) error, string) {
@@ -94,12 +148,12 @@ func reviewedAtA(t *testing.T, diffB string) (*Service, *fakeGH, *fakeRunner, fu
 	if g.postCount != 1 || runner.calls != 1 {
 		t.Fatalf("first head not reviewed: posts=%d calls=%d", g.postCount, runner.calls)
 	}
-	if got := g.passes[shaA][0].Patch; got != patchID(diffA) {
+	if got := g.passes[shaA][0].Patch; got != reviewPatchID(diffA) {
 		t.Fatalf("the pass did not record its patch id: %q", got)
 	}
 	g.pull.Head.SHA = shaB
 	g.pull.Base.SHA = shaC
-	return s, g, runner, func(o Options) error { return s.Review(context.Background(), r, 7, "openai", o) }, patchID(diffA)
+	return s, g, runner, func(o Options) error { return s.Review(context.Background(), r, 7, "openai", o) }, reviewPatchID(diffA)
 }
 
 func TestReviewInheritsEqualPatch(t *testing.T) {
@@ -196,7 +250,7 @@ func TestLandDryRunPrintsReviewRecord(t *testing.T) {
 	diff := toolDiff("1111111..2222222", 1, "new")
 	g.diffs = map[string]string{shaA: diff}
 	markReviewed(g)
-	g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic", Patch: patchID(diff)}}}
+	g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic", Patch: reviewPatchID(diff)}}}
 	g.feedback.Threads = []github.ReviewThread{
 		gradedThread("review-bot", "medium", false, shaA),
 		gradedThread("review-bot", "low", false, shaA, human),
@@ -223,7 +277,7 @@ func TestLandDryRunPrintsReviewRecord(t *testing.T) {
 		found = true
 		got := rec.Value.Review
 		want := dispositions{OpenBlocking: 1, OpenTriage: 1, Answered: 1, Resolved: 1}
-		if got.PatchID != patchID(diff) || got.Rounds != 1 || len(got.Reviewed) != 1 || got.Findings != want {
+		if got.PatchID != reviewPatchID(diff) || got.Rounds != 1 || len(got.Reviewed) != 1 || got.Findings != want {
 			t.Fatalf("%+v want dispositions %+v", got, want)
 		}
 	}
