@@ -32,6 +32,7 @@ type GitHub interface {
 	CheckStates(context.Context, string, string, []string) (map[string]github.CI, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
 	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
+	ReviewHistory(context.Context, string, int, string) ([]github.ReviewedPass, error)
 	ReviewClaimed(context.Context, string, int, string) (bool, error)
 	ReviewLease(context.Context, string, string, time.Duration) (string, bool, error)
 	ClaimReview(context.Context, string, string, string, time.Duration) (bool, error)
@@ -60,6 +61,9 @@ type Service struct {
 	// path while the reviewer job record carried no result (MW-3); the count
 	// rides on each review-inbox-fallback audit record for one release.
 	inboxFallbacks int
+	// patches caches each PR head's patch id (see patchIDOf), guarded by
+	// patchMu.
+	patches map[string]string
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
@@ -181,8 +185,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		Base       string `json:"base"`
 		State      string `json:"state"`
 		SameFamily bool   `json:"same_family,omitempty"`
+		// Review is the patch id, the review rounds and how the findings
+		// stand, so `land --dry-run` shows why a head is or is not ready.
+		Review reviewRecord `json:"review"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, v.State, v.SameFamily, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, v.State, v.SameFamily, v.Review, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, v.SameFamily, o.DryRun); e != nil {

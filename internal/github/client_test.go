@@ -437,12 +437,12 @@ func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
 	}
 }
 
-func TestAdvisoryFindingGradesLowAndCriticalNever(t *testing.T) {
+func TestAdvisoryFindingGradesAdvisoryAndCriticalNever(t *testing.T) {
 	advisory := FindingBody(Finding{Severity: "medium", Body: "style nit", Advisory: true})
 	if !strings.Contains(advisory, AdvisoryMarker) || !strings.Contains(advisory, "<!-- mergewake-severity:medium -->") || !strings.Contains(advisory, "**Advisory**") {
 		t.Fatal(advisory)
 	}
-	if got := ThreadSeverity("review-bot", advisory); got != "low" {
+	if got := ThreadSeverity("review-bot", advisory); got != "advisory" {
 		t.Fatalf("advisory medium reads %q", got)
 	}
 	if got := ThreadSeverity("review-bot", FindingBody(Finding{Severity: "medium", Body: "x"})); got != "medium" {

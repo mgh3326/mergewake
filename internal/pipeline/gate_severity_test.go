@@ -75,11 +75,12 @@ func TestGateBlockClass(t *testing.T) {
 		{"unresolved high", "blocking_findings:1", gradedThread("review-bot", "high", false, shaB)},
 		{"unresolved critical", "blocking_findings:1", gradedThread("review-bot", "critical", false, shaB)},
 		{"reply does not clear high", "blocking_findings:1", gradedThread("review-bot", "high", false, shaB, human)},
-		{"high resolved on the current head is held", "blocking_findings:1", gradedThread("review-bot", "high", true, shaA, human)},
-		{"high resolved after a new head is released", "", gradedThread("review-bot", "high", true, shaB, human)},
+		{"resolved high is resolved on the current head", "", gradedThread("review-bot", "high", true, shaA, human)},
+		{"resolved high is resolved after a new head", "", gradedThread("review-bot", "high", true, shaB, human)},
+		{"resolved critical is resolved", "", gradedThread("review-bot", "critical", true, shaB)},
 		{"third-party unresolved critical", "blocking_findings:1", gradedThread("coderabbitai[bot]", "critical", false, shaB)},
-		{"third-party critical resolved on the current head is held", "blocking_findings:1", gradedThread("coderabbitai[bot]", "critical", true, shaA, human)},
-		{"third-party critical resolved after a new head is released", "", gradedThread("coderabbitai[bot]", "critical", true, shaB, human)},
+		{"third-party critical resolved on the current head is resolved", "", gradedThread("coderabbitai[bot]", "critical", true, shaA, human)},
+		{"third-party critical resolved after a new head is resolved", "", gradedThread("coderabbitai[bot]", "critical", true, shaB, human)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, gradedPolicy, 0, tt.th)); got != tt.want {
@@ -100,6 +101,10 @@ func TestGateTriageClass(t *testing.T) {
 		{"bot reply does not answer", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaA, [2]string{"ci[bot]", "Bot"})},
 		{"human reply answers without a new head", "", gradedThread("review-bot", "medium", false, shaA, human)},
 		{"resolved medium on the current head is not held", "", gradedThread("review-bot", "medium", true, shaA)},
+		{"unanswered low needs a disposition", "triage_unanswered:1", gradedThread("review-bot", "low", false, shaB)},
+		{"low with a reply has a disposition", "", gradedThread("review-bot", "low", false, shaA, human)},
+		{"resolved low has a disposition", "", gradedThread("review-bot", "low", true, shaA)},
+		{"medium with a reply (fix SHA, dismissal or follow-up) has a disposition", "", gradedThread("review-bot", "medium", false, shaA, human)},
 		{"third-party major needs an answer", "triage_unanswered:1", gradedThread("coderabbitai[bot]", "major", false, shaB)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -111,7 +116,7 @@ func TestGateTriageClass(t *testing.T) {
 }
 
 func TestGateAdvisoryNeverBlocks(t *testing.T) {
-	v := verdict(t, gradedPolicy, 0, gradedThread("review-bot", "low", false, shaA), gradedThread("someone-else", "", false, shaA))
+	v := verdict(t, gradedPolicy, 0, gradedThread("someone-else", "", false, shaA), gradedThread("someone-else", "high", false, shaA))
 	if v.State != "ready" || reasons(v) != "" {
 		t.Fatalf("%+v", v)
 	}
@@ -141,7 +146,7 @@ func TestGateGradedKeepsChangesRequested(t *testing.T) {
 }
 
 // Without review_gate or fast_lane the raw count decides, whatever the
-// severity of what is open, and a resolved own finding is still held.
+// severity of what is open.
 func TestGateReviewGateWithoutLandKeepsRawCount(t *testing.T) {
 	for _, extra := range []string{"review_gate: {}\n", "review_gate: {required_bots: [coderabbitai]}\n"} {
 		v := verdict(t, extra, 0, gradedThread("review-bot", "low", false, shaA))
@@ -162,8 +167,8 @@ func TestGateUngradedPolicyKeepsRawCount(t *testing.T) {
 		t.Fatalf("%+v", v)
 	}
 	v = verdict(t, "", 0, gradedThread("review-bot", "low", true, shaA))
-	if reasons(v) != "threads_open:1" {
-		t.Fatalf("resolved own finding not held: %+v", v)
+	if reasons(v) != "" {
+		t.Fatalf("a resolved own finding is resolved: %+v", v)
 	}
 }
 
@@ -176,7 +181,7 @@ func TestGateFastLane(t *testing.T) {
 		{"small PR ignores unanswered triage", fastLane + gradedPolicy, "", 50, gradedThread("review-bot", "medium", false, shaB)},
 		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("review-bot", "medium", false, shaB)},
 		{"small PR is still stopped by block-class", fastLane, "blocking_findings:1", 50, gradedThread("review-bot", "high", false, shaB)},
-		{"small PR holds a block-class finding resolved on the head", fastLane, "blocking_findings:1", 5, gradedThread("review-bot", "high", true, shaA, human)},
+		{"small PR accepts a block-class finding resolved on the head", fastLane, "", 5, gradedThread("review-bot", "high", true, shaA, human)},
 		{"small PR still needs an answer for an unreadable own severity", fastLane, "triage_unanswered:1", 10, gradedThread("review-bot", "", false, shaB)},
 		{"small PR accepts an answer for an unreadable own severity", fastLane, "", 10, gradedThread("review-bot", "", false, shaB, human)},
 		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("review-bot", "medium", false, shaB)},

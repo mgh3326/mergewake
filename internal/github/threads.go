@@ -258,7 +258,7 @@ func ThreadSeverity(author, body string) string {
 		// A finding outside the PR's Acceptance contract never gates, whatever
 		// severity it was posted with; critical findings are never marked.
 		if m[1] != "critical" && strings.Contains(body, AdvisoryMarker) {
-			return "low"
+			return "advisory"
 		}
 		return m[1]
 	}

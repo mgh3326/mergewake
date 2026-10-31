@@ -126,9 +126,9 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 }
 
 // WithOwnLogin adds default rules for the trusted review identity, each list
-// on its own: critical and high findings block, medium ones need an answer, low
-// ones are advisory. A list that already names the login keeps only the
-// policy's rules for it; the other list still gets its default. The reviewer
+// on its own: critical and high findings block, medium and low ones need a
+// disposition (a reply or a resolution). A list that already names the login
+// keeps only the policy's rules for it; the other list still gets its default. The reviewer
 // prompt also admits blocking, major and minor, graded like high, medium and low.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
@@ -148,7 +148,7 @@ func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
 	}
 	if !names(g.Triage) {
-		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}})
+		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major", "low", "minor"}})
 	}
 	return g
 }
@@ -264,6 +264,11 @@ func (g ReviewGate) Grade(f ReviewFinding, class string) string {
 	f.Severity = strings.ToLower(f.Severity)
 	if g.ignoredAuthor(f.Author) {
 		return GradeIgnored
+	}
+	// A finding outside the PR's Acceptance contract is advisory: it never
+	// gates and needs no disposition.
+	if f.Severity == "advisory" {
+		return GradeAdvisory
 	}
 	blocked, triaged := false, false
 	for _, r := range g.Block {
