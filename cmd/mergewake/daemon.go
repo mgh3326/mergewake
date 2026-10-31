@@ -147,6 +147,9 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	seen := map[int]bool{}
 	for _, pr := range prs {
 		seen[pr.Number] = true
+	}
+	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots)
+	for _, pr := range prs {
 		observationErr := s.ObservePR(ctx, r, pr, o)
 		childOptions := o
 		childOptions.Observed = observationErr == nil
@@ -193,4 +196,19 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	errs = append(errs, s.CheckStalls(ctx, r, prs, o))
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
+}
+
+// skipBotPulls drops PRs opened by bot accounts when skip is set; they stay in
+// the open set for outcome reconciliation.
+func skipBotPulls(prs []github.Pull, skip bool) []github.Pull {
+	if !skip {
+		return prs
+	}
+	out := make([]github.Pull, 0, len(prs))
+	for _, pr := range prs {
+		if pr.User.Type != "Bot" {
+			out = append(out, pr)
+		}
+	}
+	return out
 }

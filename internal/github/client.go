@@ -167,25 +167,26 @@ type Ref struct {
 	} `json:"repo"`
 }
 type Pull struct {
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	ClosedAt       *string `json:"closed_at"`
-	HTMLURL        string  `json:"html_url"`
-	MergedAt       *string `json:"merged_at"`
-	Number         int     `json:"number"`
-	State          string  `json:"state"`
-	Draft          bool    `json:"draft"`
-	Merged         bool    `json:"merged"`
-	Title          string  `json:"title"`
-	Body           string  `json:"body"`
-	Head           Ref     `json:"head"`
-	Base           Ref     `json:"base"`
-	MergeCommitSHA string  `json:"merge_commit_sha"`
-	ChangedFiles   int     `json:"changed_files"`
-	Additions      int     `json:"additions"`
-	Deletions      int     `json:"deletions"`
-	Mergeable      *bool   `json:"mergeable"`
-	MergeableState string  `json:"mergeable_state"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
+	ClosedAt       *string  `json:"closed_at"`
+	HTMLURL        string   `json:"html_url"`
+	MergedAt       *string  `json:"merged_at"`
+	Number         int      `json:"number"`
+	State          string   `json:"state"`
+	Draft          bool     `json:"draft"`
+	Merged         bool     `json:"merged"`
+	Title          string   `json:"title"`
+	Body           string   `json:"body"`
+	Head           Ref      `json:"head"`
+	Base           Ref      `json:"base"`
+	User           PullUser `json:"user"`
+	MergeCommitSHA string   `json:"merge_commit_sha"`
+	ChangedFiles   int      `json:"changed_files"`
+	Additions      int      `json:"additions"`
+	Deletions      int      `json:"deletions"`
+	Mergeable      *bool    `json:"mergeable"`
+	MergeableState string   `json:"mergeable_state"`
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
@@ -759,4 +760,11 @@ func (c *Client) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, 
 		e = errors.New("Git blob size mismatch")
 	}
 	return data, e
+}
+
+// PullUser is a PR's author account; Type is "Bot" for app accounts such as
+// Renovate.
+type PullUser struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
 }
