@@ -336,7 +336,7 @@ needs no GitHub token.
 | `runtug.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
 | `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; runtug names the remote worktree after the checkout. |
-| `runtug.lane` | `runtug.owner` | panewire lane the pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings. |
+| `runtug.lane` | `runtug.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
 | `runtug.panewire` | `panewire` | panewire executable for reading that lane; it takes the hub connection from `PANEWIRE_HUB_URL` and `PANEWIRE_HUB_TOKEN_ENV` in mergewake's environment. |
 | `runtug.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a runtug whose `spawn` has `--exclude-host`). Must not contain `runtug.host`. |
 
@@ -346,7 +346,11 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
 
 1. The PR's `Mergewake-Task` trailer (PR body, then head commit) is read
    through the handoffkeep sink; the task's `refs.job_id` is the author's
-   runtug job and its title marker (`(grade A, T2)`) gives `--t`.
+   runtug job and its title marker (`(grade A, T2)`) gives `--t`. The
+   author's hk job record (`GET /v1/jobs/<author job>`, read through the same
+   handoffkeep endpoint and credentials the sink's CLI uses) supplies
+   `--builder-family`; a builder spawned before job records have no record,
+   and the trailer/commit inference answers instead.
 2. A fork PR (head repository other than the repo) is not offered: runtug can
    replicate only a spec origin carries. The pass claim is taken, then
    `git -C <root> fetch --no-tags origin pull/<n>/head <base>` and a worktree
@@ -358,7 +362,7 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    author family, the output contract and the same PR context (answered
    findings, operator decisions) the headless prompt carries, then runs
    `runtug spawn -c <checkout> -m auto -p <brief> -l
-   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> --builder-job <author job> --builder-family <author family> --role
+   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> --builder-job <author job> --builder-family <family from the author's job record, else inferred> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
    --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
@@ -370,24 +374,30 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass falls back. Otherwise
    it writes `{"findings":[…]}` to `findings.json` in its job directory
-   (`<jobs>/<label>/` here, runtug's jobs root on another host). With a
-   findings lane it uploads the file with `handoffkeep attach put` and emits
-   `panewire emit --kind lane.event --lane <lane> --deliver inbox --type report
-   --event-id <label>-findings --text '[<label>] findings attachment=<sha256>'`,
-   then runs `runtug done`.
-5. After the wait, mergewake looks for that event on the lane, fetches the
-   attachment with `handoffkeep attach get` (through the handoffkeep sink) and
-   acknowledges the inbox item; without an event it reads
-   `<jobs>/<label>/findings.json`, which exists only when the pane ran on this
-   host. Both are retried every 5s for up to 30s (at most half the remaining
-   deadline). The findings go through the same validation as headless output
-   (new-side diff lines, severities, at most 50) and are posted with the same
-   receipt, claim and done marker. The receipt adds `"executor":"runtug"`,
-   the reviewer is `runtug:<seat>`, and the family is the one runtug recorded
-   on the job's `job.spawned` event in `<jobs>/<label>/events` (or the profile
-   whose gate profile is the seat); an unknown family counts as same-family.
-   A pane on another host records its spawn there, so its family comes from
-   the profile mapping. The checkout is removed after the wait.
+   (`<jobs>/<label>/` here, runtug's jobs root on another host) and runs
+   `runtug done <label> --result "$J/findings.json" --report "$J/report.md"`,
+   which stores the findings on the pane's hk job record in the same write
+   as `state: completed`.
+5. After the wait, mergewake reads `GET /v1/jobs/<label>` (same endpoint and
+   credential convention as above) and applies the W4 rule: a completed
+   record's `result` is used; a completed record without a result, an
+   `escalated` or `lost` record (the receipt records the state), a still
+   pending or missing record, and an unreadable hk all fall back — the last
+   three after polling every 5s for up to 30s (at most half the remaining
+   deadline), an unreadable hk reporting reason `hk-unavailable`. A pane
+   spawned before `runtug done --result` has no result on its record, so for
+   one release the lane announcement + `handoffkeep attach get` (or, on this
+   host, `<jobs>/<label>/findings.json`) is still tried and each use is
+   counted: the receipt's `fallback` notes it and a
+   `review-inbox-fallback` audit record carries the running count. The
+   findings go through the same validation as headless output (new-side
+   diff lines, severities, at most 50) and are posted with the same receipt,
+   claim and done marker. The receipt adds `"executor":"runtug"`, the
+   reviewer is `runtug:<seat>`, and the family is the one on the reviewer's
+   job record — a remote pane's spawn events live on its own host — with the
+   local `job.spawned` event (or the profile whose gate profile is the seat)
+   as the fallback when the record has none; an unknown family counts as
+   same-family. The checkout is removed after the wait.
 
 No task trailer, no bound job, no repo `root`, a fork PR, a failed checkout,
 a runtug refusal or wait failure, a refusal by the pane, no findings or

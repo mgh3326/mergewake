@@ -56,6 +56,10 @@ type Service struct {
 	Out      io.Writer
 	// Now is the clock for stamps and age decisions; nil means time.Now.
 	Now func() time.Time
+	// inboxFallbacks counts findings returned through the legacy lane/file
+	// path while the reviewer job record carried no result (MW-3); the count
+	// rides on each review-inbox-fallback audit record for one release.
+	inboxFallbacks int
 }
 type Options struct {
 	DryRun, Shadow, Observed bool

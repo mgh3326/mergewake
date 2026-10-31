@@ -167,6 +167,9 @@ func (p Panewire) Notify(ctx context.Context, e Event) error {
 type Handoffkeep struct {
 	Runner         Runner
 	Command, State string
+	// Jobs, when set, reads job records (tests inject it); nil resolves the
+	// handoffkeep HTTP endpoint from the CLI's own credential convention.
+	Jobs JobReader
 }
 
 var TaskID = regexp.MustCompile(`^[1-9][0-9]*$`)
@@ -244,6 +247,7 @@ func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, 
 	}
 	return shown.Refs.JobID, shown.Title, nil
 }
+
 // Attachment reads one handoffkeep attachment by its sha256 id.
 func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error) {
 	if !attachmentID.MatchString(sha) {
@@ -278,7 +282,7 @@ func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {
 		if cmd == "" {
 			cmd = "handoffkeep"
 		}
-		s = Handoffkeep{r, cmd, c.Sink.ReopenState}
+		s = Handoffkeep{Runner: r, Command: cmd, State: c.Sink.ReopenState}
 	}
 	switch c.Notifier.Type {
 	case "stdout":
