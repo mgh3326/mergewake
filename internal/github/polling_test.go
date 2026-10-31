@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -301,5 +302,48 @@ func TestMutationDropsPollWindows(t *testing.T) {
 	}
 	if gets != 2 {
 		t.Fatalf("gets = %d, want 2 (refetch after mutation)", gets)
+	}
+}
+
+// A replayed no-ETag body is served only to a polling client inside the
+// key's live poll window: one-shot clients and expired windows fetch fresh.
+func TestPollReplayOnlyInsideLiveWindowForPollingClients(t *testing.T) {
+	n := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("X-Poll-Interval", "60")
+		fmt.Fprintf(w, `{"n":%d}`, n)
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+	get := func() string {
+		b, e := c.request(context.Background(), "GET", "/k", "application/json", nil)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return string(b)
+	}
+	if got := get(); got != `{"n":1}` {
+		t.Fatal(got)
+	}
+	if got := get(); got != `{"n":1}` || n != 1 {
+		t.Fatalf("inside the window: %s after %d hits", got, n)
+	}
+	c.Polling = false
+	if got := get(); got != `{"n":2}` {
+		t.Fatalf("one-shot client got a replay: %s", got)
+	}
+	c.Polling = true
+	c.poll.mu.Lock()
+	for k, w := range c.poll.polls {
+		w.until = time.Now().Add(-time.Second)
+		c.poll.polls[k] = w
+	}
+	c.poll.mu.Unlock()
+	if got := get(); got != `{"n":3}` {
+		t.Fatalf("expired window served a replay: %s", got)
 	}
 }
