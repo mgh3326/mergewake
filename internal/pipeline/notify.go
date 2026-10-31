@@ -233,6 +233,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 	if laneName.MatchString(notify) {
 		return notify, "notify-lane trailer", nil
 	}
+	if laneName.MatchString(r.Lane) {
+		return r.Lane, "repo lane", nil
+	}
 	fallback := s.Config.Notifier.FallbackLane
 	if fallback == "" {
 		fallback = s.Config.Notifier.Lane
