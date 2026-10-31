@@ -35,6 +35,7 @@ type runtugRunner struct {
 	refuse   map[string]int // runtug --role → exit status
 	findings string         // "" writes no findings file
 	family   string
+	noEvents bool // the pane ran on another host: no spawn events in the local job dir
 	quotaErr error
 	usageErr error
 	spawns   [][]string
@@ -109,11 +110,13 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 				return nil, e
 			}
 		}
-		if e := os.MkdirAll(filepath.Join(job, "events"), 0700); e != nil {
-			return nil, e
-		}
-		if e := os.WriteFile(filepath.Join(job, "events", "0002-spawned.json"), []byte(`{"kind":"job.spawned","payload":{"family":"`+r.family+`"}}`), 0600); e != nil {
-			return nil, e
+		if !r.noEvents {
+			if e := os.MkdirAll(filepath.Join(job, "events"), 0700); e != nil {
+				return nil, e
+			}
+			if e := os.WriteFile(filepath.Join(job, "events", "0002-spawned.json"), []byte(`{"kind":"job.spawned","payload":{"family":"`+r.family+`"}}`), 0600); e != nil {
+				return nil, e
+			}
 		}
 		if r.afterRun != nil {
 			r.afterRun()
@@ -216,7 +219,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	// The checkout is detached at the reviewed head from pull/7/head; no
 	// branch is created and the worktree is removed afterwards.
 	want := []string{
-		"fetch --no-tags origin pull/7/head main",
+		"fetch --no-tags origin +pull/7/head:refs/remotes/origin/pull/7/head main",
 		"worktree add --detach " + checkout + " " + shaA,
 		"worktree remove --force " + checkout,
 	}
@@ -553,6 +556,11 @@ func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
 	if w := gitRun(root, "worktree", "list", "--porcelain"); strings.Count(w, "worktree ") != 1 {
 		t.Fatalf("worktree left on the host:\n%s", w)
 	}
+	// The fetch leaves the head in the ref runtug reads to build the
+	// detached checkout spec for another host.
+	if got := gitRun(root, "rev-parse", "refs/remotes/origin/pull/7/head"); got != head {
+		t.Fatalf("refs/remotes/origin/pull/7/head=%s want %s", got, head)
+	}
 	if b := gitRun(root, "branch", "--list"); b != branches {
 		t.Fatalf("branches changed: %q -> %q", branches, b)
 	}
@@ -756,6 +764,62 @@ func TestRuntugJobRecordResultW4(t *testing.T) {
 			}
 			if tc.polled && reads < 2 {
 				t.Fatalf("record reads=%d, want a poll loop", reads)
+			}
+		})
+	}
+}
+
+// A task whose author did not run through runtug has no bound job. The pass
+// still runs, as a top-level reviewer: no --builder-job, but the author's
+// family is kept so runtug's reviewer role excludes it.
+func TestRuntugTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	runner.sink.job = ""
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(runner.spawns) != 1 || runner.headless != 0 {
+		t.Fatalf("spawns=%d headless=%d", len(runner.spawns), runner.headless)
+	}
+	sp := runner.spawns[0]
+	if slices.Contains(sp, "--builder-job") || arg(sp, "--builder-family") != "openai" || arg(sp, "--task") != "42" || arg(sp, "--role") != "reviewer" {
+		t.Fatal(sp)
+	}
+	if p := g.passes[shaA]; len(p) != 1 || p[0].Executor != "runtug" {
+		t.Fatalf("%+v", p)
+	}
+	for _, get := range runner.sink.gets {
+		if get == "" {
+			t.Fatal("job record read for an empty job id")
+		}
+	}
+}
+
+// The reviewer's family comes from its hk job record when the pane ran on
+// another host and left no spawn events in the local job directory.
+func TestRuntugReviewerFamilyFromRecordWithoutLocalEvents(t *testing.T) {
+	for name, tc := range map[string]struct {
+		record integrations.JobRecord
+		want   string
+	}{
+		"record family":    {integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(`{"findings":[]}`)}, "google"},
+		"no record family": {integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"findings":[]}`)}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &runtugRunner{family: "openai", noEvents: true}
+			s, g, r := runtugSetup(t, runner)
+			runner.sink.missing = &tc.record
+			if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			label := arg(runner.spawns[0], "-l")
+			if _, e := os.Stat(filepath.Join(s.Config.Review.Runtug.Jobs, label, "events")); !os.IsNotExist(e) {
+				t.Fatalf("local events dir exists: %v", e)
+			}
+			p := g.passes[shaA]
+			if len(p) != 1 || p[0].Executor != "runtug" || p[0].Family != tc.want {
+				t.Fatalf("%+v", p)
 			}
 		})
 	}

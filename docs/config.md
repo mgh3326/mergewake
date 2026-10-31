@@ -357,10 +357,16 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    author's hk job record (`GET /v1/jobs/<author job>`, read through the same
    handoffkeep endpoint and credentials the sink's CLI uses) supplies
    `--builder-family`; a builder spawned before job records have no record,
-   and the trailer/commit inference answers instead.
+   and the trailer/commit inference answers instead. A task with no bound job
+   (the author did not run through runtug) is not skipped: the pass runs as a
+   top-level reviewer job, `--builder-job` is omitted, and `--builder-family`
+   still carries the author's family (trailer/commit inference) so the
+   reviewer excludes it.
 2. A fork PR (head repository other than the repo) is not offered: runtug can
    replicate only a spec origin carries. The pass claim is taken, then
-   `git -C <root> fetch --no-tags origin pull/<n>/head <base>` and a worktree
+   `git -C <root> fetch --no-tags origin +pull/<n>/head:refs/remotes/origin/pull/<n>/head <base>`
+   (runtug builds the detached spec for another host from that ref, not from
+   `FETCH_HEAD`) and a worktree
    detached at the exact head SHA is added under `runtug.checkouts`
    (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
    branch, and the author's branch being checked out in another worktree is no
@@ -369,7 +375,7 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    author family, the output contract and the same PR context (answered
    findings, operator decisions) the headless prompt carries, then runs
    `runtug spawn -c <checkout> -m auto -p <brief> -l
-   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> --builder-job <author job> --builder-family <family from the author's job record, else inferred> --role
+   mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> [--builder-job <author job>] --builder-family <family from the author's job record, else inferred> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
    --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
@@ -403,10 +409,10 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    reviewer is `runtug:<seat>`, and the family is the one on the reviewer's
    job record — a remote pane's spawn events live on its own host — with the
    local `job.spawned` event (or the profile whose gate profile is the seat)
-   as the fallback when the record has none; an unknown family counts as
+   as the fallback only when the record has none; an unknown family counts as
    same-family. The checkout is removed after the wait.
 
-No task trailer, no bound job, no repo `root`, a fork PR, a failed checkout,
+No task trailer, no repo `root`, a fork PR, a failed checkout,
 a runtug refusal or wait failure, a refusal by the pane, no findings or
 rejected findings all fall back to the
 headless executor for that pass under the same claim; its receipt records

@@ -99,9 +99,6 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	if e != nil {
 		return skip("task %s unreadable: %v", task, e)
 	}
-	if parent == "" {
-		return skip("task %s has no bound runtug job", task)
-	}
 	m := taskScale.FindStringSubmatch(title)
 	if m == nil {
 		return skip("task %s title has no grade/T marker", task)
@@ -109,7 +106,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	scale := strings.ToUpper(m[1])
 	// The builder's hk job record carries the family runtug actually launched
 	// with; a builder from before job records leaves none, and the
-	// trailer/commit inference still answers.
+	// trailer/commit inference still answers. A task with no bound job (a
+	// builder that was not launched through runtug) is still reviewed: the
+	// pass runs as a top-level job and keeps the author's family.
 	builderFamily := x.builderFamily(ctx, parent)
 	// runtug replicates a checkout on another host only as a worktree of a
 	// branch that origin carries, so a fork's head cannot be placed there.
@@ -147,8 +146,12 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	}
 	// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
 	// exact reviewed head. C creates no local branch, and the author's branch
-	// checked out in another worktree is no obstacle.
-	if _, e = git(ctx, "fetch", "--no-tags", "origin", fmt.Sprintf("pull/%d/head", pr.Number), pr.Base.Ref); e != nil {
+	// checked out in another worktree is no obstacle. The head lands in a
+	// real ref: runtug builds the detached spec for another host only from a
+	// local refs/remotes/origin/pull/<n>/head that points at the checkout's
+	// HEAD, and FETCH_HEAD is not one. The leading "+" lets a force-pushed
+	// PR move the ref.
+	if _, e = git(ctx, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref); e != nil {
 		return skip("fetch PR head: %v", e)
 	}
 	// runtug resolves the detached spec (origin, sha, fetch "pull/<n>/head")
@@ -176,8 +179,11 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	if wait < time.Second {
 		return skip("no time left to wait for a reviewer pane")
 	}
-	args := []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale,
-		"--task", task, "--builder-job", parent, "--builder-family", builderFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds()))}
+	args := []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task}
+	if parent != "" {
+		args = append(args, "--builder-job", parent)
+	}
+	args = append(args, "--builder-family", builderFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
 	if cfg.Owner != "" {
 		args = append(args, "--owner", cfg.Owner)
 	}
@@ -249,15 +255,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	if seat != "" {
 		out.reviewer = "runtug:" + seat
 	}
-	// The receipt family comes from the reviewer's hk job record — a remote
-	// pane's spawn events live on its own host, so the local record read is
-	// the only truthful source. The job-dir event and profile mapping stay
-	// as the fallback for a pane whose record could not be read.
-	family := res.rec.Family
-	if family == "" {
-		family = x.reviewerFamily(jobDir, seat)
-	}
-	out.family = config.CanonicalFamily(family)
+	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	return out, nil
 }
@@ -281,10 +279,19 @@ func (x *runtugExecutor) job(ctx context.Context, id string) (integrations.JobRe
 // back to the trailer/commit inference, which still answers for a builder
 // spawned before job records existed.
 func (x *runtugExecutor) builderFamily(ctx context.Context, parent string) string {
+	if parent == "" {
+		return x.authorFamily
+	}
 	if rec, e := x.job(ctx, parent); e == nil && rec.Family != "" {
 		return rec.Family
 	}
 	return x.authorFamily
+}
+
+// prHeadRefspec fetches a PR head into the remote-tracking ref runtug looks
+// for when it builds the detached checkout spec.
+func prHeadRefspec(number int) string {
+	return fmt.Sprintf("+pull/%[1]d/head:refs/remotes/origin/pull/%[1]d/head", number)
 }
 
 // jobOutcome is one W4 reading of the reviewer's hk record: the record as
@@ -457,10 +464,16 @@ func (x *runtugExecutor) task(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-// reviewerFamily reads the family runtug recorded on the job's spawn receipt,
-// falling back to a configured profile whose gate profile is the seat. An
-// unknown family returns "" and the pass counts as same-family.
-func (x *runtugExecutor) reviewerFamily(jobDir, seat string) string {
+// reviewerFamily names the family the reviewer ran as. The reviewer's hk job
+// record comes first: a remote pane's spawn events live on its own host, so
+// the record is the only truthful source there. The local job-dir spawn
+// receipt answers for a pane on this host whose record carries no family,
+// then a configured profile whose gate profile is the seat. An unknown
+// family returns "" and the pass counts as same-family.
+func (x *runtugExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat string) string {
+	if rec.Family != "" {
+		return rec.Family
+	}
 	entries, _ := os.ReadDir(filepath.Join(jobDir, "events"))
 	for _, ent := range entries {
 		b, e := os.ReadFile(filepath.Join(jobDir, "events", ent.Name()))
