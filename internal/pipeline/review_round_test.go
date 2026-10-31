@@ -600,3 +600,14 @@ func TestStallWindowConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestRepeatPassOverAnUnchangedHeadKeepsItsRecordedRound(t *testing.T) {
+	heads := []github.ReviewedHead{{SHA: shaB, Round: 1}, {SHA: shaA, Round: 3}}
+	s, g, _, r := roundSetup(t, heads, patchTwo, patchTwo, fsjson())
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if got := g.passes[g.pull.Head.SHA]; got[0].Round != 3 || !got[0].Quiet {
+		t.Fatal(got)
+	}
+}

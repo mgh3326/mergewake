@@ -128,7 +128,10 @@ func (s *Service) planRound(ctx context.Context, r config.Repo, pr github.Pull, 
 	if delta == "" {
 		// Nothing changed (a clean base merge or rebase): the round does not
 		// count, and only a critical or high finding is worth reporting.
-		rp.round, rp.empty, rp.quiet, rp.base = priorRound, true, true, last
+		rp.empty, rp.quiet, rp.base = true, true, last
+		if curRound == 0 {
+			rp.round = priorRound
+		}
 		return rp
 	}
 	rp.base, rp.diff = last, delta
