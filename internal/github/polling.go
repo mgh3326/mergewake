@@ -15,6 +15,9 @@ import (
 type cachedResponse struct {
 	ETag string
 	Body []byte
+	// Replay marks a body kept without an ETag only because its response set
+	// a poll window: it is served inside that window and never revalidated.
+	Replay bool
 }
 
 // throttle records a pending wait with the reason and HTTP status that caused
@@ -57,6 +60,7 @@ func waitUntil(ctx context.Context, until time.Time) error {
 		return nil
 	}
 }
+
 // ErrPollSkipped marks a GET dropped because its key still sits inside a
 // recorded X-Poll-Interval window with no cached representation to serve.
 // Polling callers treat it as "no data this round", never as a failure.
@@ -200,8 +204,19 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 		p.bytes = 0
 		return
 	}
-	if tag == "" || len(body) > 4<<20 {
+	if len(body) > 4<<20 {
 		return
+	}
+	// A response without an ETag is kept only while its poll window runs:
+	// without it, a second read of the key in the same round would be skipped
+	// every round and the caller (a PR review) would never get its data.
+	replay := false
+	if tag == "" {
+		w, ok := p.polls[key]
+		if !ok || !w.until.After(time.Now()) {
+			return
+		}
+		replay = true
 	}
 	if p.bytes+len(body) > 32<<20 || len(p.cache) >= 512 {
 		p.cache = map[string]cachedResponse{}
@@ -209,7 +224,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 		p.bytes = 0
 	}
 	p.bytes -= len(p.cache[key].Body)
-	p.cache[key] = cachedResponse{tag, body}
+	p.cache[key] = cachedResponse{tag, body, replay}
 	p.bytes += len(body)
 }
 
