@@ -191,8 +191,12 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 	p := &c.poll
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Dropping cached representations also drops their poll windows: a key
+	// inside its window with nothing cached is skipped, so a wipe that kept
+	// the windows would skip every key a round re-reads after a mutation.
 	if mutation {
 		p.cache = map[string]cachedResponse{}
+		p.polls = map[string]throttle{}
 		p.bytes = 0
 		return
 	}
@@ -201,6 +205,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 	}
 	if p.bytes+len(body) > 32<<20 || len(p.cache) >= 512 {
 		p.cache = map[string]cachedResponse{}
+		p.polls = map[string]throttle{}
 		p.bytes = 0
 	}
 	p.bytes -= len(p.cache[key].Body)
