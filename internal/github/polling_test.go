@@ -265,3 +265,35 @@ func TestPollIntervalServesCacheOrSkips(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+// A mutation wipes the cache; the cached key's poll window must go with it, or
+// the daemon's next read of that key in the same round is skipped forever.
+func TestMutationDropsPollWindows(t *testing.T) {
+	gets := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			gets++
+			w.Header().Set("ETag", `"e"`)
+			w.Header().Set("X-Poll-Interval", "300")
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+	ctx := context.Background()
+	if _, e := c.request(ctx, "GET", "/pr", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := c.request(ctx, "POST", "/comment", "application/json", []byte(`{}`)); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := c.request(ctx, "GET", "/pr", "application/json", nil); e != nil {
+		t.Fatalf("read after mutation = %v", e)
+	}
+	if gets != 2 {
+		t.Fatalf("gets = %d, want 2 (refetch after mutation)", gets)
+	}
+}
