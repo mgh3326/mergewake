@@ -186,7 +186,10 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{8,}`),
 	regexp.MustCompile(`\b(AKIA|ASIA)[0-9A-Z]{16}\b`),
 	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}`),
-	regexp.MustCompile(`(?i)[a-z0-9_.-]*(api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd|credential|dsn)[a-z0-9_.-]*["']?\s*[:=]\s*["']?[^\s"',;&]{6,}`),
+	// A NAME=value whose name holds a credential word: a double- or single-
+	// quoted value through its closing quote (escapes and spaces included,
+	// or to the end when the tail cut the quote off), else the bare word.
+	regexp.MustCompile(`(?i)[a-z0-9_.-]*(api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd|credential|dsn)[a-z0-9_.-]*["']?\s*[:=]\s*("(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s"',;&]+)`),
 	regexp.MustCompile(`(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b`),
 }
 

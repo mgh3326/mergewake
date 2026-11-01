@@ -98,3 +98,25 @@ func TestRedactCoversKeyAssignmentsPEMBlobsAndEmails(t *testing.T) {
 		t.Fatalf("a commit SHA and plain fields must survive: %q", got)
 	}
 }
+
+func TestRedactQuotedSpacedAndShortCredentialValues(t *testing.T) {
+	cases := map[string]string{
+		`password="abc def"`:                   "abc def",
+		`password="abc def`:                    "abc def", // the tail bound cut the closing quote
+		`token='open sesame now'`:              "open sesame",
+		`secret="a \"quoted\" word"`:           "quoted",
+		`password=abc`:                         "abc",
+		`api_key: "k"`:                         `"k"`,
+		`{"client_secret": "s3 cr3t"}`:         "s3 cr3t",
+		`DB_PASSWORD = "two words" next=field`: "two words",
+	}
+	for input, secret := range cases {
+		got := Redact(input)
+		if strings.Contains(got, secret) || !strings.Contains(got, "[redacted]") {
+			t.Fatalf("%s kept %q: %s", input, secret, got)
+		}
+	}
+	if got := Redact(`DB_PASSWORD = "two words" next=field`); !strings.Contains(got, "next=field") {
+		t.Fatalf("redaction must stop at the closing quote: %s", got)
+	}
+}
