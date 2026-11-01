@@ -32,25 +32,27 @@ func (e runtugExit) ExitCode() int { return int(e) }
 // spawn instead uploads the findings to sink and announces them on the inbox.
 type runtugRunner struct {
 	fakeRunner
-	refuse   map[string]int // runtug --role → exit status
-	findings string         // "" writes no findings file
-	family   string
-	noEvents bool // the pane ran on another host: no spawn events in the local job dir
-	quotaErr error
-	usageErr error
-	spawns   [][]string
-	git      [][]string
-	headless int
-	remote   *taskJobSink
-	inbox    []string // lane.event items, as panewire inbox list prints them
-	inboxErr error
-	acks     [][]string
-	late     int // inbox looks that still show nothing
-	looks    int
-	addFails bool
-	realGit  bool   // run git for real (against a test repository)
-	afterRun func() // called once runtug returns
-	sink     *taskJobSink
+	refuse map[string]int // runtug --role → exit status
+	// refuseStderr, when set, is the stderr a refused spawn wrote.
+	refuseStderr string
+	findings     string // "" writes no findings file
+	family       string
+	noEvents     bool // the pane ran on another host: no spawn events in the local job dir
+	quotaErr     error
+	usageErr     error
+	spawns       [][]string
+	git          [][]string
+	headless     int
+	remote       *taskJobSink
+	inbox        []string // lane.event items, as panewire inbox list prints them
+	inboxErr     error
+	acks         [][]string
+	late         int // inbox looks that still show nothing
+	looks        int
+	addFails     bool
+	realGit      bool   // run git for real (against a test repository)
+	afterRun     func() // called once runtug returns
+	sink         *taskJobSink
 }
 
 func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -93,6 +95,9 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 		r.spawns = append(r.spawns, args)
 		role := args[slices.Index(args, "--role")+1]
 		if code, ok := r.refuse[role]; ok {
+			if r.refuseStderr != "" {
+				return nil, &integrations.CommandError{Command: "runtug", Err: runtugExit(code), Stderr: r.refuseStderr}
+			}
 			return nil, runtugExit(code)
 		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])

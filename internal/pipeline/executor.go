@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
@@ -65,7 +66,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profiles := s.Config.Review.Profiles
 	for i, name := range plan.candidates {
 		skip := func(reason string, reset time.Time) {
-			sk := reviewSkip{Reviewer: name, Reason: reason, Host: s.Config.Host}
+			sk := reviewSkip{Reviewer: name, Reason: fleetevent.Redact(reason), Host: s.Config.Host}
 			if !reset.IsZero() {
 				sk.Reset = reset.UTC().Format(time.RFC3339)
 			}

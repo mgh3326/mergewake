@@ -150,3 +150,38 @@ func TestSkipReasonCodes(t *testing.T) {
 		}
 	}
 }
+
+// A refused runtug reviewer spawn records its exit code, a redacted stderr
+// tail and the requested host in the decision log and as one event, and the
+// review still completes headless.
+func TestRuntugSpawnFailureRecordsCause(t *testing.T) {
+	runner := &runtugRunner{refuse: map[string]int{"reviewer": 70}, refuseStderr: "runtug: quota gate refused " + fakeSecretText + "\n"}
+	s, _, r := runtugSetup(t, runner)
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	logRaw, rows := readLines(t, filepath.Join(s.Config.StateDir, r.Name, "decisions.jsonl"))
+	var skip map[string]any
+	for _, row := range rows {
+		value, _ := row["value"].(map[string]any)
+		skipped, _ := value["skipped"].([]any)
+		for _, raw := range skipped {
+			if sk, _ := raw.(map[string]any); sk["reviewer"] == "runtug" {
+				skip = sk
+			}
+		}
+	}
+	tail, _ := skip["stderr_tail"].(string)
+	if skip == nil || skip["exit_code"] != float64(70) || skip["host"] != s.Config.Review.Runtug.Host || !strings.Contains(tail, "runtug: quota gate refused") {
+		t.Fatalf("runtug skip lacks its cause: %v\n%s", skip, logRaw)
+	}
+	evRaw, events := readLines(t, filepath.Join(s.Config.StateDir, "events", "fleet-events.jsonl"))
+	if len(events) != 1 || events[0]["kind"] != "reviewer" || events[0]["outcome"] != "failed" || events[0]["reason"] != "runtug_spawn_exit" {
+		t.Fatalf("events: %s", evRaw)
+	}
+	for _, secret := range fakeSecrets {
+		if strings.Contains(logRaw, secret) || strings.Contains(evRaw, secret) {
+			t.Fatalf("secret %q leaked", secret)
+		}
+	}
+}
