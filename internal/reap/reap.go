@@ -56,9 +56,14 @@ type Ops interface {
 	Panes(context.Context) ([]Pane, error)
 	AllPanes(context.Context) ([]Pane, error)
 	Inspect(context.Context, string) (*Worktree, error)
-	Capture(context.Context, Pane, *time.Time, bool) (Capture, error)
+	Capture(context.Context, Pane, string, *time.Time, bool) (Capture, error)
+	Composer(context.Context, Pane) (string, error)
 	CloseExact(context.Context, Pane) (string, error)
+	JobDone(context.Context, string, string) error
 }
+
+// ErrUnsupported is an operation the host's transport cannot perform yet.
+var ErrUnsupported = errors.New("not supported on this host's transport")
 
 // Capture and close outcomes. The skip values are receipt reasons verbatim.
 const (
@@ -95,12 +100,14 @@ func ValidJobName(name string) bool {
 
 // Pane is one row of `herdr agent list`. cwd is the pane's working directory
 // and agent_status is the reported lifecycle state (working, idle, done).
+// Focused is herdr's own flag for the pane the operator has in front of them.
 type Pane struct {
-	ID     string `json:"pane_id"`
-	Name   string `json:"name"`
-	Status string `json:"agent_status"`
-	Agent  string `json:"agent"`
-	Cwd    string `json:"cwd"`
+	ID      string `json:"pane_id"`
+	Name    string `json:"name"`
+	Status  string `json:"agent_status"`
+	Agent   string `json:"agent"`
+	Cwd     string `json:"cwd"`
+	Focused bool   `json:"focused"`
 }
 
 // Worktree describes a pane cwd resolved to its linked worktree.
@@ -179,13 +186,14 @@ func (e Exec) CloseExact(ctx context.Context, pane Pane) (string, error) {
 	return CloseClosed, nil
 }
 
-// Capture saves a pane's output before it can close. Only a pane whose job
-// dir already exists counts as a fleet job: an operator pane merely cd'd into
-// a merged worktree must never be closed. report.md counts only when it is
-// newer than the merge — a stale file could belong to a reused job name —
-// otherwise the last screen is saved, or only named when write is false.
-func (e Exec) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write bool) (Capture, error) {
-	dir := e.Host.JobDir(pane.Name)
+// Capture saves a pane's output into the job's directory before it can
+// close. Only a job whose dir already exists counts as a fleet job: an
+// operator pane merely cd'd into a merged worktree must never be closed.
+// report.md counts only when it is newer than the merge — a stale file could
+// belong to a reused job name — otherwise the last screen is saved, or only
+// named when write is false.
+func (e Exec) Capture(ctx context.Context, pane Pane, job string, mergedAt *time.Time, write bool) (Capture, error) {
+	dir := e.Host.JobDir(job)
 	isJob, err := e.DirExists(ctx, dir)
 	if err != nil {
 		return Capture{}, err
@@ -212,6 +220,91 @@ func (e Exec) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write
 		return Capture{}, err
 	}
 	return Capture{Saved: saved}, nil
+}
+
+// Composer outcomes: whether a pane's input line holds text nobody sent.
+const (
+	ComposerEmpty   = "empty"
+	ComposerText    = "composer-text"
+	ComposerUnknown = "composer-unknown"
+)
+
+// Composer reads the pane's visible screen and classifies its input line.
+func (e Exec) Composer(ctx context.Context, pane Pane) (string, error) {
+	b, err := e.Run(ctx, "herdr", "pane", "read", pane.ID, "--source", "visible")
+	if err != nil {
+		return "", err
+	}
+	return ComposerState(pane.Agent, string(b)), nil
+}
+
+// ComposerState classifies the input line of a claude or codex screen. Claude
+// draws its composer between the last two horizontal divider lines behind a
+// ❯ prompt; codex prefixes its input with ›, followed by a blank line before
+// its footer. Anything else, or a screen
+// without that shape, is unknown — and unknown never reads as empty. A dim
+// placeholder reads as text: that keeps a pane, never closes one.
+func ComposerState(agent, screen string) string {
+	lines := strings.Split(strings.ReplaceAll(screen, "\r", ""), "\n")
+	switch strings.ToLower(agent) {
+	case "claude":
+		var dividers []int
+		for i, line := range lines {
+			if strings.Contains(line, "─") && strings.Trim(line, " \t─") == "" {
+				dividers = append(dividers, i)
+			}
+		}
+		if len(dividers) < 2 {
+			return ComposerUnknown
+		}
+		// Only the first line carries the prompt glyph; every other
+		// character in the box is input.
+		for i, line := range lines[dividers[len(dividers)-2]+1 : dividers[len(dividers)-1]] {
+			line = strings.TrimSpace(line)
+			if i == 0 {
+				line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "❯"), ">"))
+			}
+			if line != "" {
+				return ComposerText
+			}
+		}
+		return ComposerEmpty
+	case "codex":
+		// The input starts on the last › line and runs, wrapped or
+		// multi-line, until the first blank line above the footer.
+		for i := len(lines) - 1; i >= 0; i-- {
+			rest, ok := strings.CutPrefix(strings.TrimSpace(lines[i]), "›")
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(rest) != "" {
+				return ComposerText
+			}
+			for _, next := range lines[i+1:] {
+				if strings.TrimSpace(next) == "" {
+					break
+				}
+				return ComposerText
+			}
+			return ComposerEmpty
+		}
+	}
+	return ComposerUnknown
+}
+
+// JobDone marks a job finished the way its lead would: `runtug done` on the
+// job's host, with the report or screen reap just saved. runtug records the
+// completed state in hk and treats a repeat with the same report as done.
+func (e Exec) JobDone(ctx context.Context, job, report string) error {
+	if !ValidJobName(job) {
+		return errors.New("job name invalid")
+	}
+	args := []string{"runtug", "done", job}
+	if report != "" {
+		args = append(args, "--report", report)
+	}
+	_, err := e.Run(ctx, args...)
+	return err
 }
 
 // Panes decodes the `herdr agent list` JSON envelope.

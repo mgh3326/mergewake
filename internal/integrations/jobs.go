@@ -29,6 +29,10 @@ type JobRecord struct {
 	Role      string `json:"role"`
 	Label     string `json:"label"`
 	OwnerLane string `json:"owner_lane"`
+	// Host is the panewire machine the job runs on and PaneID its herdr
+	// pane there, as runtug recorded them at spawn.
+	Host   string `json:"host"`
+	PaneID string `json:"pane_id"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist

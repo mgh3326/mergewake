@@ -211,7 +211,7 @@ func TestHubHostCommands(t *testing.T) {
 			}
 			return result(v)
 		}
-		if got, err := host.Capture(ctx, pane, &merged, true); err != nil || got != want {
+		if got, err := host.Capture(ctx, pane, pane.Name, &merged, true); err != nil || got != want {
 			t.Fatalf("%s: %+v %v", outcome, got, err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestHubHostCommands(t *testing.T) {
 		}
 		return result(map[string]any{"outcome": "would-screen", "saved": "/jobs/job-a/pane-screen.txt"})
 	}
-	if got, err := host.Capture(ctx, pane, nil, false); err != nil || got.Saved != "/jobs/job-a/pane-screen.txt" {
+	if got, err := host.Capture(ctx, pane, pane.Name, nil, false); err != nil || got.Saved != "/jobs/job-a/pane-screen.txt" {
 		t.Fatalf("%+v %v", got, err)
 	}
 

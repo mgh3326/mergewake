@@ -16,6 +16,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -37,6 +38,8 @@ type reapReceipt struct {
 	Reason   string    `json:"reason,omitempty"`
 	Files    []string  `json:"files,omitempty"` // ignored paths named by a refusing removal skip
 	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
+	Task     string    `json:"task,omitempty"`  // Mergewake-Task of a job-bound row
+	Open     []string  `json:"open,omitempty"`  // open PRs (owner/name#N) keeping a job's pane
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
@@ -244,7 +247,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// worktree-gone forever, would otherwise grow reap.jsonl without bound.
 	rowKey := func(v reapReceipt) string {
 		path := v.Pane
-		if v.Action == "archive-job" {
+		if v.Action == "archive-job" || v.Action == "job-done" {
 			path = v.Job
 		} else if v.Action != "close-pane" {
 			// Rows predating the Worktree field still name their path in Cwd.
@@ -259,8 +262,23 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	rowSig := func(v reapReceipt) string { return v.Result + "|" + v.Reason }
 	lastRow := map[string]string{}
+	// jobClosed is the newest job-bound close per job, so its done can still
+	// follow a close whose done failed; prFinished a PR whose job reap
+	// already marked done.
+	jobClosed := map[string]reapReceipt{}
+	prFinished := map[int]bool{}
+	jobDone := map[string]bool{}
 	for _, rec := range receipts {
 		lastRow[rowKey(rec)] = rowSig(rec)
+		if rec.Action == "job-done" && rec.Result == "done" {
+			jobDone[rec.Job] = true
+		}
+		switch {
+		case rec.Action == "close-pane" && rec.Task != "" && rec.Result == "closed":
+			jobClosed[rec.Job] = rec
+		case rec.Action == "job-done" && (rec.Result == "done" || strings.HasPrefix(rec.Reason, "already-")):
+			prFinished[rec.PR] = true
+		}
 	}
 	// prDone reports whether every worktree a PR's receipts ever named already
 	// reached a terminal remove outcome. A closed pane alone is not done —
@@ -283,10 +301,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 		prPaths[rec.PR][rec.Host+"\x00"+path] = true
 	}
+	// A job reap already marked done needs no retry, whatever hk shows.
+	for job := range jobDone {
+		delete(jobClosed, job)
+	}
 	prDone := func(pr int) bool {
 		paths := prPaths[pr]
 		if len(paths) == 0 {
-			return false
+			return prFinished[pr]
 		}
 		for hp := range paths {
 			host, path, _ := strings.Cut(hp, "\x00")
@@ -407,12 +429,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 
 	// Errors are counted once, from errs: note itself appends every "error"
 	// row, so no row-level failure can be missing from the summary.
-	scanned, closed, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0, 0
+	scanned, closed, planned, removed, deleted, skipped, archived, jobsDone := 0, 0, 0, 0, 0, 0, 0, 0
 	note := func(v reapReceipt) {
 		switch v.Result {
 		case "closed":
 			closed++
-		case "would-close", "would-remove", "would-delete", "would-archive":
+		case "done":
+			jobsDone++
+		case "would-close", "would-remove", "would-delete", "would-archive", "would-done":
 			planned++
 		case "archived":
 			archived++
@@ -427,7 +451,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			switch v.Action {
 			case "close-pane":
 				subject = "pane " + v.Pane
-			case "archive-job":
+			case "archive-job", "job-done":
 				subject = "job " + v.Job
 			}
 			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
@@ -441,6 +465,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, e)
 		}
 	}
+	jobSeen := map[string]bool{}
 	matches := func(w *reap.Worktree, p github.Pull) bool {
 		return w != nil && w.Branch != "" && w.Branch == p.Head.Ref &&
 			p.Head.SHA != "" && w.Head == p.Head.SHA && strings.EqualFold(w.Repo, r.Name)
@@ -461,8 +486,22 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if p.MergedAt != nil {
 			mergedAt = parsedTime(*p.MergedAt)
 		}
+		// A PR bound to a job reaps that job's pane, once per job per pass;
+		// worktree matching is the fallback for a PR with no bound job. A
+		// binding read error closes nothing this pass.
+		bound, bindErr := s.reapBind(ctx, r, p)
+		switch {
+		case bindErr != nil:
+			errs = append(errs, fmt.Errorf("PR %d job binding: %s", p.Number, integrations.Detail(bindErr)))
+		case bound.Job != "":
+			if !jobSeen[bound.Job] {
+				jobSeen[bound.Job] = true
+				match := func(w *reap.Worktree) bool { return matches(w, p) }
+				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, jobClosed, note)
+			}
+		}
 		for _, hs := range hosts {
-			if hs.failed {
+			if hs.failed || bindErr != nil || bound.Job != "" {
 				continue
 			}
 			for _, pane := range hs.panes {
@@ -491,32 +530,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					rec.Result, rec.Reason = "skipped", "jobs-dir-unset"
 				case !reap.ValidJobName(pane.Name):
 					rec.Result, rec.Reason = "skipped", "job-name-invalid"
+				case pane.Focused:
+					rec.Result, rec.Reason = "skipped", "operator-owned"
 				default:
-					// The pane's output must be saved before the session can
-					// go, and only a pane whose job dir already exists is a
-					// fleet job (reap.Exec.Capture has the rules). Shadow and
-					// dry runs only name the screen path.
-					saved, e := hs.ops.Capture(ctx, pane, mergedAt, acting)
-					switch {
-					case e != nil:
-						rec.Result, rec.Reason = "error", e.Error()
-					case saved.Skip != "":
-						rec.Result, rec.Reason = "skipped", saved.Skip
-					default:
-						rec.Job = pane.Name
-						rec.Saved = saved.Saved
-					}
-					if rec.Result == "" {
-						if !acting {
-							rec.Result = "would-close"
-							hs.closed[pane.ID] = true
-						} else {
-							rec.Result, rec.Reason = s.reclose(ctx, hs, pane)
-							if rec.Result == "closed" {
-								hs.closed[pane.ID] = true
-							}
-						}
-					}
+					// A PR whose task has no bound job still waits for the
+					// task's other open PRs; then the composer, capture and
+					// close rules of the job path apply (reapPaneClose).
+					s.reapPaneClose(ctx, &rec, hs, pane, pane.Name, bound.Task, mergedAt, acting)
 				}
 				note(rec)
 			}
@@ -763,8 +783,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		Removed  int    `json:"removed"`
 		Deleted  int    `json:"branches_deleted"`
 		Archived int    `json:"jobs_archived"`
+		JobsDone int    `json:"jobs_done"`
 		Skipped  int    `json:"skipped"`
 		ErrCount int    `json:"errors"`
-	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, skipped, len(errs)}
+	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, jobsDone, skipped, len(errs)}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }

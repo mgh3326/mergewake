@@ -191,7 +191,17 @@ still be present with the same id, status, cwd and name — the discovery list
 is a stale snapshot and a pane that went back to work survives as
 `pane-changed` or `pane-gone`. A host without `jobs` configured cannot lose
 panes, and closing needs `reap.act` on top of `--apply`, a gate separate from
-`daemon.act`.
+`daemon.act`. A pane herdr reports `focused` is the operator's, and a pane
+whose composer holds unsent text — or whose composer cannot be read — is
+kept.
+
+A PR carrying `Mergewake-Task` is matched by its job instead: a lead owns
+several PRs, often across repos, from one worktree, so the cwd match misses
+it. The binding the findings router trusts — hk task → bound job → the host,
+label and pane id runtug recorded — names the pane, and the job, not the PR,
+is the unit: the pane closes only when no open PR in a configured repo still
+carries the task, and the job is then marked done with `runtug done`. The
+cwd match stays the fallback for PRs without a bound job.
 
 Worktree removal is additive on top of the age gate: the merge must be older
 than `worktree_after`, and the PR must name a candidate worktree on some

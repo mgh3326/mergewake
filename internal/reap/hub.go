@@ -318,7 +318,12 @@ func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base strin
 	return WorktreeRemoveResult{Outcome: v.Outcome, Files: v.Files, RetryAfterS: v.RetryAfterS}, nil
 }
 
-func (h HubHost) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, write bool) (Capture, error) {
+// Capture saves into the node's <inbox>/jobs/<pane name>; a job whose dir is
+// named otherwise cannot be captured through the hub.
+func (h HubHost) Capture(ctx context.Context, pane Pane, job string, mergedAt *time.Time, write bool) (Capture, error) {
+	if job != pane.Name {
+		return Capture{}, fmt.Errorf("hub pane.capture: job %s is not the pane name: %w", job, ErrUnsupported)
+	}
 	// Without a merge time no report.md is fresh, as in Exec.Capture: a cutoff
 	// past any mtime makes the node capture the screen.
 	args := map[string]any{"pane_id": pane.ID, "name": pane.Name, "cwd": pane.Cwd, "merged_after": int64(math.MaxInt64), "write": write}
@@ -342,6 +347,15 @@ func (h HubHost) Capture(ctx context.Context, pane Pane, mergedAt *time.Time, wr
 		return Capture{Skip: v.Outcome}, nil
 	}
 	return Capture{}, fmt.Errorf("hub pane.capture: unknown outcome %q", v.Outcome)
+}
+
+// Composer is unknown through the hub: no node command reads a pane's screen
+// back, and an unread composer must keep the pane.
+func (h HubHost) Composer(context.Context, Pane) (string, error) { return ComposerUnknown, nil }
+
+// JobDone has no node command yet; runtug done runs on the job's host.
+func (h HubHost) JobDone(context.Context, string, string) error {
+	return fmt.Errorf("hub job done: %w", ErrUnsupported)
 }
 
 // CloseExact asks the node to re-read herdr and close the pane only when its
