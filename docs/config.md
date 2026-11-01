@@ -990,7 +990,8 @@ in any daemon goroutine is written to `<state_dir>/crash/`. The next daemon
 start sends it to Sentry as one fatal event and then deletes the file. The
 event carries the panic line and a redacted traceback in which the home
 directory is replaced with `~`. A host sends at most three crash reports in
-any 24 hours, counted in `<state_dir>/crash/sent` across restarts, so a
+any 24 hours, counted in `<state_dir>/crash/sent` across restarts (only reports Sentry
+accepted count, so an outage keeps the files for the next start), so a
 restart loop cannot exhaust the Sentry free tier. Reports over that budget are
 dropped. Mergewake sends no other errors, traces, breadcrumbs
 or user data to Sentry. When the variable is unset, nothing is written or sent.

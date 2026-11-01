@@ -85,7 +85,7 @@ func TestCrashReportUploadIsScrubbedAndDeletesTheFile(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	dir := t.TempDir()
 	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom "+fleetEventFakeSecretText+"\n\ngoroutine 7 [running]:\nmain.f()\n\t"+home+"/work/x/main.go:10 +0x1d\n")
-	if err := uploadCrashReports(dsn, "mergewake", "v-test", []string{path}); err != nil {
+	if _, err := uploadCrashReports(dsn, "mergewake", "v-test", []string{path}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -137,19 +137,18 @@ func TestCrashOutputCapturesAGoroutinePanic(t *testing.T) {
 	}
 }
 
-func TestCrashBudgetCapsReportsPerDayAcrossStarts(t *testing.T) {
+func TestCrashBudgetCountsOnlyAcceptedReports(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
-	if got := takeCrashBudget(dir, start, 2); got != 2 {
-		t.Fatalf("first start: %d", got)
+	recordCrashSends(dir, start, 2)
+	if got := crashBudgetLeft(dir, start.Add(time.Minute)); got != 1 {
+		t.Fatalf("one report left: %d", got)
 	}
-	if got := takeCrashBudget(dir, start.Add(time.Minute), 2); got != 1 {
-		t.Fatalf("second start must get the one left: %d", got)
-	}
-	if got := takeCrashBudget(dir, start.Add(2*time.Minute), 1); got != 0 {
+	recordCrashSends(dir, start.Add(time.Minute), 1)
+	if got := crashBudgetLeft(dir, start.Add(2*time.Minute)); got != 0 {
 		t.Fatalf("a crash loop must be cut off: %d", got)
 	}
-	if got := takeCrashBudget(dir, start.Add(25*time.Hour), 3); got != 3 {
+	if got := crashBudgetLeft(dir, start.Add(25*time.Hour)); got != crashReportDailyBudget {
 		t.Fatalf("the budget renews after 24 hours: %d", got)
 	}
 }
@@ -157,12 +156,24 @@ func TestCrashBudgetCapsReportsPerDayAcrossStarts(t *testing.T) {
 func TestReportPendingCrashesDropsWhatTheBudgetRefuses(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
-	takeCrashBudget(dir, now, crashReportDailyBudget)
+	recordCrashSends(dir, now, crashReportDailyBudget)
 	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
-	// No budget left: nothing is sent (the DSN is unreachable) and the file goes.
 	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, []string{path}, now)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("a crash over budget must be dropped")
+	}
+}
+
+func TestUnreachableSentryKeepsFileAndBudget(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
+	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, []string{path}, now)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("an undelivered crash must stay for the next start: %v", err)
+	}
+	if got := crashBudgetLeft(dir, now); got != crashReportDailyBudget {
+		t.Fatalf("an undelivered crash must not spend the budget: %d left", got)
 	}
 }
 
@@ -173,7 +184,7 @@ func TestCrashReportRejectedBySentryIsKept(t *testing.T) {
 	defer server.Close()
 	dsn := strings.Replace(server.URL, "http://", "http://publickey@", 1) + "/42"
 	path := writeCrashFile(t, t.TempDir(), 1, deadPID(t), "panic: boom\n")
-	if err := uploadCrashReports(dsn, "tool", "v-test", []string{path}); err == nil {
+	if _, err := uploadCrashReports(dsn, "tool", "v-test", []string{path}); err == nil {
 		t.Fatal("a rejected report must be an error")
 	}
 	if _, err := os.Stat(path); err != nil {

@@ -136,22 +136,24 @@ func crashProcessAlive(pid int) bool {
 }
 
 // reportPendingCrashes sends what the daily budget allows and drops the rest.
+// Only reports Sentry accepted consume the budget, so an outage leaves the
+// unsent files for the next start instead of spending the day's budget.
 func reportPendingCrashes(dsn, tool, version, dir string, pending []string, now time.Time) {
-	allowed := takeCrashBudget(dir, now, len(pending))
+	allowed := min(len(pending), crashBudgetLeft(dir, now))
 	for _, path := range pending[allowed:] {
 		_ = os.Remove(path)
 	}
 	if allowed > 0 {
-		_ = uploadCrashReports(dsn, tool, version, pending[:allowed])
+		sent, _ := uploadCrashReports(dsn, tool, version, pending[:allowed])
+		recordCrashSends(dir, now, sent)
 	}
 }
 
-// takeCrashBudget returns how many of n reports may be sent at now and
-// records them in <dir>/sent (one unix second per report, last 24 hours).
-func takeCrashBudget(dir string, now time.Time, n int) int {
-	path := filepath.Join(dir, "sent")
+// crashSendLog reads <dir>/sent: one unix second per accepted report, kept
+// for the last 24 hours.
+func crashSendLog(dir string, now time.Time) []string {
 	var kept []string
-	if raw, err := os.ReadFile(path); err == nil {
+	if raw, err := os.ReadFile(filepath.Join(dir, "sent")); err == nil {
 		for _, field := range strings.Fields(string(raw)) {
 			sec, err := strconv.ParseInt(field, 10, 64)
 			if err == nil && now.Sub(time.Unix(sec, 0)) < 24*time.Hour {
@@ -159,18 +161,27 @@ func takeCrashBudget(dir string, now time.Time, n int) int {
 			}
 		}
 	}
-	allowed := max(0, min(n, crashReportDailyBudget-len(kept)))
-	for range allowed {
+	return kept
+}
+
+// crashBudgetLeft is how many more reports this host may send at now.
+func crashBudgetLeft(dir string, now time.Time) int {
+	return max(0, crashReportDailyBudget-len(crashSendLog(dir, now)))
+}
+
+// recordCrashSends appends n accepted reports at now to the send log.
+func recordCrashSends(dir string, now time.Time, n int) {
+	kept := crashSendLog(dir, now)
+	for range n {
 		kept = append(kept, strconv.FormatInt(now.Unix(), 10))
 	}
-	_ = os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
-	return allowed
+	_ = os.WriteFile(filepath.Join(dir, "sent"), []byte(strings.Join(kept, "\n")+"\n"), 0o600)
 }
 
 // uploadCrashReports sends one Sentry event per crash file and deletes a file
 // only after Sentry answered its event with a 2xx; a rejected or failed
 // delivery keeps the file for the next start.
-func uploadCrashReports(dsn, tool, version string, paths []string) error {
+func uploadCrashReports(dsn, tool, version string, paths []string) (sent int, err error) {
 	delivery := &crashDelivery{base: http.DefaultTransport}
 	client, err := sentry.NewClient(sentry.ClientOptions{
 		Dsn:              dsn,
@@ -190,7 +201,7 @@ func uploadCrashReports(dsn, tool, version string, paths []string) error {
 		},
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var failed error
 	for _, path := range paths {
@@ -205,8 +216,9 @@ func uploadCrashReports(dsn, tool, version string, paths []string) error {
 			continue
 		}
 		_ = os.Remove(path)
+		sent++
 	}
-	return failed
+	return sent, failed
 }
 
 // crashDelivery records Sentry's HTTP answers: sentry-go's Flush reports a
