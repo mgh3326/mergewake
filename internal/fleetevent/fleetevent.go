@@ -102,11 +102,13 @@ func (w *Writer) Emit(kind, job, outcome, reason, detail string) bool {
 	line = append(line, '\n')
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if os.MkdirAll(filepath.Dir(w.Path), 0o700) != nil {
+	// Group-readable (0750 dir, 0640 file): on Linux the alloy system user
+	// tails these through a group or ACL grant. Every field is redacted.
+	if os.MkdirAll(filepath.Dir(w.Path), 0o750) != nil {
 		return false
 	}
 	w.rotate(int64(len(line)))
-	f, err := os.OpenFile(w.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(w.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o640)
 	if err != nil {
 		return false
 	}

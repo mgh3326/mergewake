@@ -36,7 +36,7 @@ func TestEmitWritesOneBoundedRedactedLine(t *testing.T) {
 		t.Fatalf("detail: %q", ev.Detail)
 	}
 	info, err := os.Stat(filepath.Join(dir, "events", FileName))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || info.Mode().Perm()&^0o640 != 0 || info.Mode().Perm()&0o600 != 0o600 {
 		t.Fatalf("mode: %v %v", info, err)
 	}
 }
