@@ -188,6 +188,27 @@ Events go through the existing notifier (`panewire emit --kind lane.event
 lanes override the configured one. Disable the feature with
 `daemon.pr.notify: {enabled: false}` — it defaults to on while the role runs.
 
+## Reaping finished work
+
+With `reap.enabled`, the `reap` role closes the panes of merged work and
+cleans its worktrees. A merged PR carrying `Mergewake-Task` is reaped through
+its job — `Mergewake-Task` → hk task → bound job → the pane runtug recorded
+(host and label) — so a lead is found wherever it was launched, even in
+another repo's worktree. The lead closes only when the whole job is finished:
+no open PR in any configured repo carries the task, the pane is `idle` or
+`done`, its job dir exists, and its composer is empty. Its last screen is
+saved to `<job dir>/pane-screen.txt` (or a fresh `report.md` is kept), the
+pane closes, and mergewake runs `runtug done <job>`, so nobody has to tell the
+lead to finish. Protected labels, panes the operator has focused or that the
+job record does not name, panes without a job dir and panes with unsent
+composer text are never closed. A PR without the trailer keeps the worktree
+match. Every decision lands in `<state_dir>/<repo>/reap.jsonl`.
+
+Rollout is the desk's: deploy, run `mergewake reap --repo <repo> --dry-run`
+once per repo and compare the plan with the panes you expect to close, then
+set `reap.act: true`. Rollback is `reap.act: false`. See
+[docs/config.md](docs/config.md#reap).
+
 ## Development
 
 ```sh

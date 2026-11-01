@@ -82,8 +82,8 @@ Session hosts where agent panes may run, used only by `reap`.
 | --- | --- | --- |
 | `name` | Required | Unique label for receipts; same alphabet as `host`. |
 | `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
-| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. |
-| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
+| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for on the host whose `name` or `machine` equals its hk job record's `host` (runtug's `HUB_MACHINE_ID`), so name a local host after its machine id. |
+| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
 
 ### `reap`
 
@@ -124,6 +124,54 @@ is recorded in the receipt. Immediately before `herdr pane close <pane_id>` the 
 is re-read and the pane must still be present with the same id, status, cwd
 and name; a pane that changed or went back to work is skipped as
 `pane-changed` or `pane-gone`. Closing happens only in acting mode.
+Two more guards apply to every close: a pane herdr reports `focused` is the
+operator's (`operator-owned`), and a pane whose input line holds text nobody
+sent is kept. The composer is read with `herdr pane read <id> --source
+visible` — claude's input line between its last two dividers, codex's `›`
+line — and anything else reads as `composer-unknown`, which also keeps the
+pane; a dim placeholder reads as text and keeps it too.
+
+#### Job-bound leads
+
+A merged PR whose body or head commit carries `Mergewake-Task: <id>` is
+reaped through its job instead of its worktree: the same binding the findings
+router uses — hk task → bound job (`refs.job_id`) → the job record runtug
+wrote at spawn (`host`, `label`, `pane_id`). The pane is the one named after
+the label on the configured host whose `name` or `machine` equals the
+record's `host` (every host is searched when none does; more than one match
+is `job-pane-ambiguous`). Its cwd does not matter, so a lead that launched in
+one repo's worktree and owns PRs across repos is still found. The binding is
+read once per merged PR per daemon process. A PR without the trailer, or
+whose task has no bound job, keeps the worktree match above; an hk read error
+closes nothing that pass.
+
+The lead closes only when the whole job is finished, checked in this order:
+
+1. idle or done, not protected, `<jobs>/<job>` resolvable (`jobs-dir-unset`,
+   `job-name-invalid`), not focused and the pane the record names
+   (`operator-owned`);
+2. no open PR — against any base, in any configured repo, trailer in the body
+   or head commit — carries the task; otherwise `job_has_open_pr`, with the
+   open PRs (`owner/name#N`) in the row's `open`. A repo mergewake does not
+   configure is not seen;
+3. an empty composer (`composer-text`, `composer-unknown`);
+4. the job dir exists (`not-a-job`) and the output is saved first, by the
+   same capture rule as above, into the job's directory `<jobs>/<job id>`;
+5. the same re-read before `herdr pane close`.
+
+After the close, mergewake marks the job done the way the lead would:
+`runtug done <job> --report <saved>` on the job's host, a `job-done` row with
+`done` (`would-done` in shadow). A job hk already holds terminal is skipped as
+`already-<state>`. If the done fails, the next pass retries it once the pane
+is gone, until hk shows the job terminal. Each job is decided once per pass,
+on the first of its merged PRs. Job-bound rows carry `task` and `job` and no
+`cwd` or `worktree`, so worktree cleanup still comes only from worktree
+matches.
+
+Rollout (the desk): deploy, run `mergewake reap --repo <repo> --dry-run`
+once per configured repo and compare the planned `would-close` and
+`job_has_open_pr` rows with the panes you expect, then set `reap.act: true`.
+Rollback: `reap.act: false`.
 
 After `worktree_after` with no revert, a merged PR's worktree is removed —
 but only for PRs that name a candidate worktree on some configured host (a
@@ -170,7 +218,11 @@ on a host that also has `ssh`. Each remote host maps to panewire machine
 - the close uses `pane.close` with the discovered id, name, status and cwd;
   the node re-reads herdr and closes only an exact match, answering
   `pane-changed` or `pane-gone` otherwise, which become the same receipt
-  reasons as the ssh path.
+  reasons as the ssh path;
+- no node command reads a pane's screen back or runs `runtug done` yet, so a
+  hub host's composer is `composer-unknown` and its panes are kept, never
+  closed, until panewire adds those commands. Capture and close above are the
+  path they will take.
 
 The hub host's aged-out worktree is removed through node command
 `worktree.remove`, with the inspected PR head, base branch and configured
@@ -1018,7 +1070,7 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
-| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `runtug done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |

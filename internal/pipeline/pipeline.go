@@ -64,6 +64,9 @@ type Service struct {
 	// patches caches each PR head's patch id (see patchIDOf), guarded by
 	// patchMu.
 	patches map[string]string
+	// reapBinds caches each merged PR's task/job binding for reap (see
+	// reapBinding), guarded by reapBindMu.
+	reapBinds map[string]reapBinding
 }
 type Options struct {
 	DryRun, Shadow, Observed bool

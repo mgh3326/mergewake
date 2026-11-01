@@ -230,8 +230,14 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 	p.bytes += len(body)
 }
 
+// OpenPulls lists open PRs against branch, or against any base when branch
+// is empty.
 func (c *Client) OpenPulls(ctx context.Context, repo, branch string) ([]Pull, error) {
-	return list[Pull](ctx, c, base(repo)+"/pulls?state=open&base="+url.QueryEscape(branch)+"&sort=created&direction=asc")
+	route := base(repo) + "/pulls?state=open&sort=created&direction=asc"
+	if branch != "" {
+		route += "&base=" + url.QueryEscape(branch)
+	}
+	return list[Pull](ctx, c, route)
 }
 
 // ReviewClaimed checks durable completion markers. In-flight passes use the

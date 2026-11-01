@@ -116,7 +116,10 @@ func hubSvc(t *testing.T, hub *fakeReapHub, run *scriptRunner, hosts ...reap.Hos
 	return &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}, &out
 }
 
-func TestReapPanewireClosesThroughHub(t *testing.T) {
+// No node command reads a pane back, so a hub pane's composer is unknown and
+// the pane is kept: nothing is captured or closed, while the worktree cleanup
+// still goes through the node.
+func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 	hub := newFakeReapHub()
 	r := &scriptRunner{}
 	s, _ := hubSvc(t, hub, r)
@@ -126,21 +129,15 @@ func TestReapPanewireClosesThroughHub(t *testing.T) {
 	if len(r.calls) != 0 {
 		t.Fatalf("hub host ran local or ssh commands: %q", r.calls)
 	}
-	captures := hub.ops("pane.capture")
-	merged := parsedTime(*mergedPull.MergedAt).Unix()
-	if len(captures) != 1 || captures[0]["pane_id"] != "w1:p1" || captures[0]["name"] != "wk-7" || captures[0]["cwd"] != "/repo.wt" || captures[0]["merged_after"] != float64(merged) || captures[0]["write"] != true {
-		t.Fatalf("capture args %v", captures)
+	if captures, closes := hub.ops("pane.capture"), hub.ops("pane.close"); len(captures)+len(closes) != 0 {
+		t.Fatalf("captured %v closed %v", captures, closes)
 	}
-	closes := hub.ops("pane.close")
-	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p1" || closes[0]["name"] != "wk-7" || closes[0]["agent_status"] != "idle" || closes[0]["cwd"] != "/repo.wt" {
-		t.Fatalf("close args %v", closes)
-	}
-	var closed, removed bool
+	var kept, removed bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["action"] == "close-pane" && row["result"] == "closed" && row["host"] == "node" && row["pane"] == "w1:p1" && row["saved"] == "/node/jobs/wk-7/report.md" && row["worktree"] == "/repo.wt" && row["branch"] == "wk/x"
+		kept = kept || row["action"] == "close-pane" && row["result"] == "skipped" && row["reason"] == "composer-unknown" && row["host"] == "node" && row["pane"] == "w1:p1"
 		removed = removed || row["action"] == "remove-worktree" && row["result"] == "removed"
 	}
-	if !closed || !removed {
+	if !kept || !removed {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
 	removes := hub.ops("worktree.remove")
@@ -151,19 +148,14 @@ func TestReapPanewireClosesThroughHub(t *testing.T) {
 
 func TestReapPanewireShadowNeverActs(t *testing.T) {
 	hub := newFakeReapHub()
-	hub.capture = map[string]any{"outcome": "would-screen", "saved": "/node/jobs/wk-7/pane-screen.txt"}
 	s, out := hubSvc(t, hub, &scriptRunner{})
 	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
-	if captures := hub.ops("pane.capture"); len(captures) != 1 || captures[0]["write"] != false {
-		t.Fatalf("shadow capture args %v", captures)
-	}
-	if closes := hub.ops("pane.close"); len(closes) != 0 {
-		t.Fatalf("shadow closed %v", closes)
-	}
-	if removes := hub.ops("worktree.remove"); len(removes) != 0 {
-		t.Fatalf("shadow removed %v", removes)
+	for _, op := range []string{"pane.capture", "pane.close", "worktree.remove"} {
+		if sent := hub.ops(op); len(sent) != 0 {
+			t.Fatalf("shadow sent %s %v", op, sent)
+		}
 	}
 	var wouldRemove bool
 	for _, row := range reapLogRows(t, s, "example/project") {
@@ -172,46 +164,8 @@ func TestReapPanewireShadowNeverActs(t *testing.T) {
 	if !wouldRemove {
 		t.Fatalf("missing would-remove row: %v", reapLogRows(t, s, "example/project"))
 	}
-	if !strings.Contains(out.String(), `"result":"would-close"`) || !strings.Contains(out.String(), `"saved":"/node/jobs/wk-7/pane-screen.txt"`) {
+	if !strings.Contains(out.String(), `"reason":"composer-unknown"`) {
 		t.Fatal(out.String())
-	}
-}
-
-func TestReapPanewireNodeVerdictsSkip(t *testing.T) {
-	for _, tt := range []struct {
-		name           string
-		capture, close map[string]any
-		reason         string
-		closeCalls     int
-	}{
-		{"not a job", map[string]any{"outcome": "not-a-job"}, nil, "not-a-job", 0},
-		{"gone before capture", map[string]any{"outcome": "pane-gone"}, nil, "pane-gone", 0},
-		{"changed at close", nil, map[string]any{"outcome": "pane-changed"}, "pane-changed", 1},
-		{"gone at close", nil, map[string]any{"outcome": "pane-gone"}, "pane-gone", 1},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			hub := newFakeReapHub()
-			if tt.capture != nil {
-				hub.capture = tt.capture
-			}
-			if tt.close != nil {
-				hub.close = tt.close
-			}
-			s, _ := hubSvc(t, hub, &scriptRunner{})
-			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if got := len(hub.ops("pane.close")); got != tt.closeCalls {
-				t.Fatalf("close calls %d", got)
-			}
-			var skipped bool
-			for _, row := range reapLogRows(t, s, "example/project") {
-				skipped = skipped || row["action"] == "close-pane" && row["result"] == "skipped" && row["reason"] == tt.reason
-			}
-			if !skipped {
-				t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
-			}
-		})
 	}
 }
 
@@ -245,7 +199,7 @@ func TestReapPanewireKeepsLocalHostLocal(t *testing.T) {
 			t.Fatalf("ssh used: %q", c)
 		}
 	}
-	if !r.called("herdr\x00agent\x00list") || len(hub.ops("pane.close")) != 1 {
+	if !r.called("herdr\x00agent\x00list") || len(hub.ops("pane.close")) != 0 || len(hub.ops("worktree.remove")) != 1 {
 		t.Fatalf("local calls %q hub closes %v", r.calls, hub.ops("pane.close"))
 	}
 }
@@ -306,26 +260,6 @@ func TestReapPanewireScopeForbiddenIsAnError(t *testing.T) {
 		}
 		if len(hub.ops("pane.capture")) != 0 || strings.Contains(out.String(), `"action":"close-pane"`) {
 			t.Fatalf("refused inspect read as panes outside a worktree:\n%s", out.String())
-		}
-	})
-	t.Run("pane.capture", func(t *testing.T) {
-		hub := newFakeReapHub()
-		hub.forbid = map[string]bool{"pane.capture": true}
-		s, _ := hubSvc(t, hub, &scriptRunner{})
-		// A row error reaches the pass error as its receipt reason text.
-		err := s.Reap(context.Background(), testRepo, 0, Options{})
-		if err == nil || !strings.Contains(err.Error(), "scope/auth error") || !strings.Contains(err.Error(), "scope_forbidden") {
-			t.Fatalf("err=%v", err)
-		}
-		if len(hub.ops("pane.close")) != 0 {
-			t.Fatal("closed without a capture")
-		}
-		var errored bool
-		for _, row := range reapLogRows(t, s, "example/project") {
-			errored = errored || row["action"] == "close-pane" && row["result"] == "error" && strings.Contains(row["reason"].(string), "scope/auth error")
-		}
-		if !errored {
-			t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 		}
 	})
 }

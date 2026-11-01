@@ -127,9 +127,16 @@ func svc(t *testing.T, gh GitHub, run *scriptRunner) *Service {
 	return &Service{Config: repoConfig(t.TempDir()), GH: gh, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: io.Discard}
 }
 
+// emptyComposer and draftComposer are claude screens whose input line, between
+// the last two dividers, is empty or holds an unsent draft.
+const (
+	emptyComposer = "⏺ Done.\n\n────────\n❯ \n────────\n  ? for shortcuts\n"
+	draftComposer = "⏺ Done.\n\n────────\n❯ also fix the docs\n────────\n  ? for shortcuts\n"
+)
+
 func paneJSON(cwd2 string) (agents, panes string) {
 	agents = `{"result":{"agents":[` +
-		`{"pane_id":"w1:p1","name":"wk-7","agent_status":"idle","cwd":"/repo.wt"},` +
+		`{"pane_id":"w1:p1","name":"wk-7","agent_status":"idle","agent":"claude","cwd":"/repo.wt"},` +
 		`{"pane_id":"w1:p2","agent_status":"working","cwd":"` + cwd2 + `"}]}}`
 	panes = `{"result":{"panes":[` +
 		`{"pane_id":"w1:p1","cwd":"/repo.wt"},` +
@@ -140,9 +147,10 @@ func paneJSON(cwd2 string) (agents, panes string) {
 func worktreeOuts(cwd2 string) map[string]string {
 	agents, panes := paneJSON(cwd2)
 	return map[string]string{
-		key("herdr", "agent", "list"):          agents,
-		key("herdr", "pane", "list"):           panes,
-		key("herdr", "pane", "close", "w1:p1"): "",
+		key("herdr", "agent", "list"):                                agents,
+		key("herdr", "pane", "list"):                                 panes,
+		key("herdr", "pane", "close", "w1:p1"):                       "",
+		key("herdr", "pane", "read", "w1:p1", "--source", "visible"): emptyComposer,
 		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
 		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
 		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",

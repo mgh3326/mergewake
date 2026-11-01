@@ -310,3 +310,27 @@ func TestProtected(t *testing.T) {
 		}
 	}
 }
+
+func TestComposerState(t *testing.T) {
+	claude := func(input string) string {
+		return "⏺ Done.\n\n────────────\n" + input + "\n────────────\n  ? for shortcuts\n"
+	}
+	for _, tt := range []struct {
+		name, agent, screen, want string
+	}{
+		{"claude empty", "claude", claude("❯ "), ComposerEmpty},
+		{"claude draft", "claude", claude("❯ also fix the docs"), ComposerText},
+		{"claude multi-line draft", "claude", claude("❯ \n  second line"), ComposerText},
+		// An echoed prompt above the dividers is history, not a draft.
+		{"claude echo above", "claude", "❯ fix it\n" + claude("❯ "), ComposerEmpty},
+		{"claude no dividers", "claude", "❯ \n", ComposerUnknown},
+		{"codex empty", "codex", "• Done\n\n› \n", ComposerEmpty},
+		{"codex draft", "codex", "• Done\n\n› run the tests\n", ComposerText},
+		{"codex no prompt", "codex", "• Done\n", ComposerUnknown},
+		{"other agent", "other", claude("❯ "), ComposerUnknown},
+	} {
+		if got := ComposerState(tt.agent, tt.screen); got != tt.want {
+			t.Errorf("%s: got %s want %s", tt.name, got, tt.want)
+		}
+	}
+}
