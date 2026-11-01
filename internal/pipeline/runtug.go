@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -75,7 +76,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		defer cancel()
 	}
 	skip := func(format string, args ...any) (passOutcome, error) {
-		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fmt.Sprintf(format, args...)})
+		// Reasons can carry a command's stderr and reach the decision log
+		// and the posted receipt's fallback: redact them here.
+		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host})
 		return out, nil
 	}
 	root := config.Expand(x.repo.Root)
@@ -201,9 +204,13 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	}
 	if e != nil {
 		if ctx.Err() != nil {
-			return out, fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err()))
+			res, skipErr := skip("runtug reviewer deadline")
+			res.skips[len(res.skips)-1].withCause(e)
+			return res, errors.Join(fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
 		}
-		return skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
+		res, skipErr := skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
+		res.skips[len(res.skips)-1].withCause(e)
+		return res, skipErr
 	}
 	res, e := x.recordResult(ctx, label)
 	if e != nil {

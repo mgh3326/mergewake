@@ -960,6 +960,42 @@ The source of trust is GitHub and operator-owned host config; manifests are not
 cryptographically signed. Protect local config/state permissions and do not share
 an install root between inventories or competing writers.
 
+## Fleet events and crash reports
+
+Every reviewer that is skipped or fails in a review pass is recorded with its
+cause. The skip entries in the `review` and `review-skipped` decisions
+(`<state_dir>/<repo>/decisions.jsonl`) carry:
+
+- `reviewer` and `reason`;
+- `host`, which is the configured host for headless reviewers, or the
+  `review.runtug.host` value for runtug panes;
+- for a failed process, `exit_code` and `stderr_tail`, the last 512 bytes of
+  stderr after redaction;
+- otherwise `cause`, the bounded error text.
+
+The same facts are appended as fleet-event v1 lines to
+`<state_dir>/events/fleet-events.jsonl`. The file rotates to `.1` at 4 MiB, and
+every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
+
+| `kind` | `outcome` | `reason` | `detail` |
+| --- | --- | --- | --- |
+| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `runtug_spawn_exit`, ...) | `pass= reviewer= host= exit= reason="..."` then `stderr:` or `cause:` |
+| `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
+
+The shipping config, dashboard and alerts are in panewire `deploy/alloy` and
+`deploy/grafana`.
+
+When `SENTRY_DSN_MERGEWAKE` is set in the daemon's environment, a fatal panic
+in any daemon goroutine is written to `<state_dir>/crash/`. The next daemon
+start sends it to Sentry as one fatal event and then deletes the file. The
+event carries the panic line and a redacted traceback in which the home
+directory is replaced with `~`. A host sends at most three crash reports in
+any 24 hours, counted in `<state_dir>/crash/sent` across restarts (only reports Sentry
+accepted count, so an outage keeps the files for the next start), so a
+restart loop cannot exhaust the Sentry free tier. Reports over that budget are
+dropped. Mergewake sends no other errors, traces, breadcrumbs
+or user data to Sentry. When the variable is unset, nothing is written or sent.
+
 ## Local state and operator recovery
 
 For `example/project`, state resides beneath

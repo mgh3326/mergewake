@@ -425,7 +425,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if viaRuntug {
 				continue
 			}
-			return unavailable()
+			err := unavailable()
+			s.reviewMissingEvent(r.Name, n, pass, "no_candidate", nil, err.Error())
+			return err
 		}
 		usedProfiles[plans[len(plans)-1].candidates[0]] = true
 		usedFamilies[fam(plans[len(plans)-1].candidates[0])] = true
@@ -543,6 +545,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		fallback := ""
 		for _, x := range executors {
 			if out, e = x.runPass(ctx, plan, claim); e != nil {
+				// A reviewer cut off by the review deadline is recorded like a
+				// pass nobody produced.
+				if ctx.Err() != nil {
+					all := append(slices.Clone(skips), out.skips...)
+					s.reviewerEvents(r.Name, n, plan.pass, all)
+					s.reviewMissingEvent(r.Name, n, plan.pass, "review_deadline", all, "")
+				}
 				if errors.Is(e, errPassPending) {
 					return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
 				}
@@ -554,6 +563,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			// The whole review shares one deadline: nothing is left for a fallback.
 			if ctx.Err() != nil {
+				s.reviewerEvents(r.Name, n, plan.pass, skips)
+				s.reviewMissingEvent(r.Name, n, plan.pass, "review_deadline", skips, "")
 				return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), ctx.Err())
 			}
 			// Only an executor that produced nothing gets here; a later one
@@ -563,8 +574,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				fallback = out.skips[len(out.skips)-1].Reason
 			}
 		}
+		s.reviewerEvents(r.Name, n, plan.pass, skips)
 		selected := out.reviewer
 		if selected == "" {
+			s.reviewMissingEvent(r.Name, n, plan.pass, "review_missing", skips, "")
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
 			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
@@ -664,6 +677,13 @@ type reviewSkip struct {
 	Reason   string `json:"reason"`
 	Reset    string `json:"reset,omitempty"`
 	Note     string `json:"note,omitempty"`
+	// Host is where the reviewer ran (headless) or was asked to run (runtug).
+	Host string `json:"host,omitempty"`
+	// ExitCode, StderrTail and Cause say why a reviewer process failed; see
+	// withCause. StderrTail is redacted and bounded.
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
+	Cause      string `json:"cause,omitempty"`
 }
 
 func describeSkips(skips []reviewSkip) string {

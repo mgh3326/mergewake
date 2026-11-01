@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
@@ -65,7 +66,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profiles := s.Config.Review.Profiles
 	for i, name := range plan.candidates {
 		skip := func(reason string, reset time.Time) {
-			sk := reviewSkip{Reviewer: name, Reason: reason}
+			sk := reviewSkip{Reviewer: name, Reason: fleetevent.Redact(reason), Host: s.Config.Host}
 			if !reset.IsZero() {
 				sk.Reset = reset.UTC().Format(time.RFC3339)
 			}
@@ -101,6 +102,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		invocation, e := reviewer.Prepare(p, candidateControl)
 		if e != nil {
 			skip("reviewer profile rejected", time.Time{})
+			out.skips[len(out.skips)-1].withCause(e)
 			continue
 		}
 		plan.invocation = invocation
@@ -132,15 +134,19 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// The whole review shares one deadline: nothing is left for another reviewer.
 		if ctx.Err() != nil {
+			skip("review deadline", time.Time{})
+			out.skips[len(out.skips)-1].withCause(runErr)
 			return out, errors.Join(runErr, ctx.Err())
 		}
 		h.failed[name] = true
 		failure := quota.Classify(runErr, s.now())
 		if !failure.Quota {
 			skip("review failed", time.Time{})
+			out.skips[len(out.skips)-1].withCause(runErr)
 			continue
 		}
 		skip("quota exhausted", failure.Reset)
+		out.skips[len(out.skips)-1].withCause(runErr)
 		if key := h.freePool[name]; key != "" {
 			h.exhausted[key] = true
 		}
