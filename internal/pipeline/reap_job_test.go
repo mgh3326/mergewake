@@ -243,6 +243,11 @@ func TestReapLeadProtections(t *testing.T) {
 			run.outs[key("herdr", "pane", "read", "w2:p1", "--source", "visible")] = draftComposer
 		}, "composer-text"},
 		{"composer unreadable", leadPane(`,"agent":"other"`), nil, "composer-unknown"},
+		{"pane id unrecorded", leadPane(""), func(_ *Service, sink *jobSink, _ *scriptRunner) {
+			rec := sink.recs["lead-a"]
+			rec.PaneID, rec.Host = "", ""
+			sink.recs["lead-a"] = rec
+		}, "pane-id-unrecorded"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _, sink, run := leadFixture(t, tt.pane)
@@ -307,6 +312,102 @@ func TestReapWithoutTrailerKeepsWorktreeMatch(t *testing.T) {
 		t.Fatalf("worktree match marked a job done: %q", r.calls)
 	}
 	if leadRow(t, s, "remove-worktree")["result"] != "removed" {
+		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
+	}
+}
+
+// hk may never show the job terminal; reap's own done receipt still ends the
+// retries.
+func TestReapJobDoneRunsOnceWhenHKLags(t *testing.T) {
+	s, _, _, run := leadFixture(t, leadPane(""))
+	doneKey := key("runtug", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
+	run.fn = func(k string) (string, bool) { return "", k == doneKey }
+	agents := run.outs[key("herdr", "agent", "list")]
+	run.queue = map[string][]string{key("herdr", "agent", "list"): {agents, agents}}
+	run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
+	for i := 0; i < 3; i++ {
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := callCount(run, doneKey); n != 1 {
+		t.Fatalf("runtug done ran %d times", n)
+	}
+}
+
+// A lead sitting in its merged PR's own worktree records that worktree, so
+// the worktree is still removed once the merge ages out and the pane is gone.
+func TestReapJobBoundLeadKeepsWorktreeCleanup(t *testing.T) {
+	outs := worktreeOuts("/repo")
+	outs[key("herdr", "pane", "read", "w1:p1", "--source", "visible")] = emptyComposer
+	outs[key("runtug", "done", "wk-7", "--report", "/jobs/wk-7/report.md")] = ""
+	r := &scriptRunner{outs: outs}
+	agents, panes := outs[key("herdr", "agent", "list")], outs[key("herdr", "pane", "list")]
+	empty := `{"result":{"agents":[],"panes":[]}}`
+	r.queue = map[string][]string{
+		key("herdr", "agent", "list"): {agents, agents, empty},
+		key("herdr", "pane", "list"):  {panes, empty, empty},
+	}
+	pr := mergedPull
+	pr.Body = "Mergewake-Task: 2497\n"
+	gh := &jobGH{merged: map[string][]github.Pull{"example/project": {pr}}}
+	s := svc(t, gh, r)
+	s.Sink = &jobSink{
+		jobs: map[string]string{"2497": "wk-7"},
+		recs: map[string]integrations.JobRecord{"wk-7": {State: "spawned", Label: "wk-7", Host: "local", PaneID: "w1:p1"}},
+	}
+	merged := *parsedTime(*pr.MergedAt)
+	s.Now = func() time.Time { return merged.Add(time.Hour) }
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if row := leadRow(t, s, "close-pane"); row["result"] != "closed" || row["task"] != "2497" || row["worktree"] != "/repo.wt" {
+		t.Fatalf("close row %v", row)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removed before worktree_after")
+	}
+	s.Now = nil
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called(key("git", "-C", "/repo", "worktree", "remove", "/repo.wt")) {
+		t.Fatalf("worktree never removed: %v", reapLogRows(t, s, "example/project"))
+	}
+}
+
+// countingSink counts TaskJob reads.
+type countingSink struct {
+	jobSink
+	taskReads int
+}
+
+func (s *countingSink) TaskJob(ctx context.Context, task string) (string, string, error) {
+	s.taskReads++
+	return s.jobSink.TaskJob(ctx, task)
+}
+
+// A task with no bound job yet is asked again each pass, and its worktree
+// match still waits for the task's other open PRs.
+func TestReapTaskWithoutJobWaitsForOpenPRs(t *testing.T) {
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	pr := mergedPull
+	pr.Body = "Mergewake-Task: 2497\n"
+	gh := &jobGH{merged: map[string][]github.Pull{"example/project": {pr}}, open: map[string][]github.Pull{
+		"example/project": {{Number: 40, State: "open", Body: "Mergewake-Task: 2497\n", Base: github.Ref{Ref: "main"}}},
+	}}
+	s := svc(t, gh, r)
+	sink := &countingSink{jobSink: jobSink{jobs: map[string]string{}}}
+	s.Sink = sink
+	for i := 0; i < 2; i++ {
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sink.taskReads != 2 {
+		t.Fatalf("task read %d times", sink.taskReads)
+	}
+	if row := leadRow(t, s, "close-pane"); row["reason"] != "job_has_open_pr" || row["cwd"] != "/repo.wt" || r.called("herdr\x00pane\x00close") {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
 }

@@ -324,8 +324,12 @@ func TestComposerState(t *testing.T) {
 		// An echoed prompt above the dividers is history, not a draft.
 		{"claude echo above", "claude", "❯ fix it\n" + claude("❯ "), ComposerEmpty},
 		{"claude no dividers", "claude", "❯ \n", ComposerUnknown},
+		{"claude glyph-only draft", "claude", claude("❯ \n  >>"), ComposerText},
+		{"claude draft starting with >", "claude", claude("❯ > quote"), ComposerText},
 		{"codex empty", "codex", "• Done\n\n› \n", ComposerEmpty},
 		{"codex draft", "codex", "• Done\n\n› run the tests\n", ComposerText},
+		{"codex empty with footer", "codex", "• Done\n\n› \n\n  ⏎ send\n", ComposerEmpty},
+		{"codex draft on second line", "codex", "• Done\n\n›\n  please also fix docs\n\n  ⏎ send\n", ComposerText},
 		{"codex no prompt", "codex", "• Done\n", ComposerUnknown},
 		{"other agent", "other", claude("❯ "), ComposerUnknown},
 	} {

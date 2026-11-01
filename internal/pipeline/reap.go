@@ -267,8 +267,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// already marked done.
 	jobClosed := map[string]reapReceipt{}
 	prFinished := map[int]bool{}
+	jobDone := map[string]bool{}
 	for _, rec := range receipts {
 		lastRow[rowKey(rec)] = rowSig(rec)
+		if rec.Action == "job-done" && rec.Result == "done" {
+			jobDone[rec.Job] = true
+		}
 		switch {
 		case rec.Action == "close-pane" && rec.Task != "" && rec.Result == "closed":
 			jobClosed[rec.Job] = rec
@@ -296,6 +300,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			prPaths[rec.PR] = map[string]bool{}
 		}
 		prPaths[rec.PR][rec.Host+"\x00"+path] = true
+	}
+	// A job reap already marked done needs no retry, whatever hk shows.
+	for job := range jobDone {
+		delete(jobClosed, job)
 	}
 	prDone := func(pr int) bool {
 		paths := prPaths[pr]
@@ -488,7 +496,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		case bound.Job != "":
 			if !jobSeen[bound.Job] {
 				jobSeen[bound.Job] = true
-				s.reapJobPane(ctx, r, p, bound, hosts, byName, mergedAt, acting, jobClosed, note)
+				match := func(w *reap.Worktree) bool { return matches(w, p) }
+				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, jobClosed, note)
 			}
 		}
 		for _, hs := range hosts {
@@ -524,39 +533,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				case pane.Focused:
 					rec.Result, rec.Reason = "skipped", "operator-owned"
 				default:
-					// The pane's output must be saved before the session can
-					// go, and only a pane whose job dir already exists is a
-					// fleet job (reap.Exec.Capture has the rules). Shadow and
-					// dry runs only name the screen path.
-					saved, e := reap.Capture{}, error(nil)
-					c, ce := hs.ops.Composer(ctx, pane)
-					if ce == nil && c == reap.ComposerEmpty {
-						saved, e = hs.ops.Capture(ctx, pane, pane.Name, mergedAt, acting)
-					}
-					switch {
-					case ce != nil:
-						rec.Result, rec.Reason = "error", ce.Error()
-					case c != reap.ComposerEmpty:
-						rec.Result, rec.Reason = "skipped", c
-					case e != nil:
-						rec.Result, rec.Reason = "error", e.Error()
-					case saved.Skip != "":
-						rec.Result, rec.Reason = "skipped", saved.Skip
-					default:
-						rec.Job = pane.Name
-						rec.Saved = saved.Saved
-					}
-					if rec.Result == "" {
-						if !acting {
-							rec.Result = "would-close"
-							hs.closed[pane.ID] = true
-						} else {
-							rec.Result, rec.Reason = s.reclose(ctx, hs, pane)
-							if rec.Result == "closed" {
-								hs.closed[pane.ID] = true
-							}
-						}
-					}
+					// A PR whose task has no bound job still waits for the
+					// task's other open PRs; then the composer, capture and
+					// close rules of the job path apply (reapPaneClose).
+					s.reapPaneClose(ctx, &rec, hs, pane, pane.Name, bound.Task, mergedAt, acting)
 				}
 				note(rec)
 			}

@@ -38,8 +38,8 @@ var reapBindMu sync.Mutex
 // reapBind resolves a merged PR to its task and bound job once per process: a
 // merged PR's trailer and binding do not change, so neither the head commit
 // nor hk is read again for it on later passes. A read error is not cached
-// and retries next pass; without an hk jobs reader nothing is cached, so a
-// later config with one still binds the PR.
+// and retries next pass, and neither is a task with no job yet or one read
+// without an hk jobs reader.
 func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (reapBinding, error) {
 	k := fmt.Sprintf("%s#%d", r.Name, p.Number)
 	reapBindMu.Lock()
@@ -58,8 +58,12 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 			return reapBinding{Task: task}, nil
 		}
 		job, _, e := jobs.TaskJob(ctx, task)
-		if e != nil {
+		switch {
+		case e != nil:
 			return b, e
+		case job == "":
+			// A job may still be bound to the task later: ask again.
+			return reapBinding{Task: task}, nil
 		}
 		b = reapBinding{Task: task, Job: job}
 	}
@@ -73,9 +77,11 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 }
 
 // reapJobPane closes the pane of PR p's bound job when the whole job is
-// finished, then marks the job done. closed names jobs an earlier pass
-// closed, so a job whose pane is already gone still gets its done.
-func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull, b reapBinding, hosts []*reapHost, byName map[string]*reapHost, mergedAt *time.Time, acting bool, closed map[string]reapReceipt, note func(reapReceipt)) {
+// finished, then marks the job done. closed names jobs an earlier pass closed
+// and reap has not marked done, so a job whose pane is already gone still
+// gets its done. match reports whether a worktree is PR p's own: a lead
+// sitting in it records the worktree, which later cleanup reads.
+func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull, b reapBinding, hosts []*reapHost, byName map[string]*reapHost, match func(*reap.Worktree) bool, mergedAt *time.Time, acting bool, closed map[string]reapReceipt, note func(reapReceipt)) {
 	rec := reapReceipt{Action: "close-pane", Repo: r.Name, PR: p.Number, Task: b.Task, Job: b.Job}
 	job, e := s.Sink.(reapJobs).Job(ctx, b.Job)
 	switch {
@@ -101,6 +107,9 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		return
 	}
 	rec.Host, rec.Pane = hs.host.Name, pane.ID
+	if w := hs.trees[pane.Cwd]; match(w) {
+		rec.Cwd, rec.Worktree, rec.Branch = pane.Cwd, w.Path, w.Branch
+	}
 	switch {
 	case pane.ID == "":
 		rec.Result, rec.Reason = "skipped", "pane-id-missing"
@@ -116,12 +125,15 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		rec.Result, rec.Reason = "skipped", "jobs-dir-unset"
 	case !reap.ValidJobName(b.Job):
 		rec.Result, rec.Reason = "skipped", "job-name-invalid"
-	case pane.Focused || (job.PaneID != "" && job.PaneID != pane.ID):
+	case job.PaneID == "":
+		// Without the recorded pane any pane wearing the label could match.
+		rec.Result, rec.Reason = "skipped", "pane-id-unrecorded"
+	case pane.Focused || job.PaneID != pane.ID:
 		// The operator has the pane in front of them, or the label now
 		// belongs to a pane the job record does not name.
 		rec.Result, rec.Reason = "skipped", "operator-owned"
 	default:
-		s.reapJobClose(ctx, &rec, hs, pane, mergedAt, acting)
+		s.reapPaneClose(ctx, &rec, hs, pane, b.Job, b.Task, mergedAt, acting)
 	}
 	note(rec)
 	if rec.Result == "closed" || rec.Result == "would-close" {
@@ -129,17 +141,22 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 	}
 }
 
-// reapJobClose runs the whole-job, composer and capture checks in that order
-// and closes the pane when they all pass.
-func (s *Service) reapJobClose(ctx context.Context, rec *reapReceipt, hs *reapHost, pane reap.Pane, mergedAt *time.Time, acting bool) {
-	open, e := s.jobOpenPRs(ctx, rec.Task)
-	if e != nil {
-		rec.Result, rec.Reason = "error", "open PRs: "+integrations.Detail(e)
-		return
-	}
-	if len(open) > 0 {
-		rec.Result, rec.Reason, rec.Open = "skipped", "job_has_open_pr", open
-		return
+// reapPaneClose runs the whole-task, composer and capture checks in that
+// order and closes the pane when they all pass. task may be empty (a PR
+// without the trailer); the pane's output is saved into job's directory, and
+// only a job whose dir already exists is a fleet job (reap.Exec.Capture has
+// the rules). Shadow and dry runs only name the screen path.
+func (s *Service) reapPaneClose(ctx context.Context, rec *reapReceipt, hs *reapHost, pane reap.Pane, job, task string, mergedAt *time.Time, acting bool) {
+	if task != "" {
+		open, e := s.jobOpenPRs(ctx, task)
+		if e != nil {
+			rec.Result, rec.Reason = "error", "open PRs: "+integrations.Detail(e)
+			return
+		}
+		if len(open) > 0 {
+			rec.Result, rec.Reason, rec.Open = "skipped", "job_has_open_pr", open
+			return
+		}
 	}
 	switch c, e := hs.ops.Composer(ctx, pane); {
 	case e != nil:
@@ -149,7 +166,7 @@ func (s *Service) reapJobClose(ctx context.Context, rec *reapReceipt, hs *reapHo
 		rec.Result, rec.Reason = "skipped", c
 		return
 	}
-	saved, e := hs.ops.Capture(ctx, pane, rec.Job, mergedAt, acting)
+	saved, e := hs.ops.Capture(ctx, pane, job, mergedAt, acting)
 	switch {
 	case e != nil:
 		rec.Result, rec.Reason = "error", e.Error()
@@ -158,7 +175,7 @@ func (s *Service) reapJobClose(ctx context.Context, rec *reapReceipt, hs *reapHo
 		rec.Result, rec.Reason = "skipped", saved.Skip
 		return
 	}
-	rec.Saved = saved.Saved
+	rec.Job, rec.Saved = job, saved.Saved
 	if !acting {
 		rec.Result = "would-close"
 		hs.closed[pane.ID] = true

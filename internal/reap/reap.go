@@ -240,7 +240,8 @@ func (e Exec) Composer(ctx context.Context, pane Pane) (string, error) {
 
 // ComposerState classifies the input line of a claude or codex screen. Claude
 // draws its composer between the last two horizontal divider lines behind a
-// ❯ prompt; codex prefixes its input line with ›. Anything else, or a screen
+// ❯ prompt; codex prefixes its input with ›, followed by a blank line before
+// its footer. Anything else, or a screen
 // without that shape, is unknown — and unknown never reads as empty. A dim
 // placeholder reads as text: that keeps a pane, never closes one.
 func ComposerState(agent, screen string) string {
@@ -256,20 +257,36 @@ func ComposerState(agent, screen string) string {
 		if len(dividers) < 2 {
 			return ComposerUnknown
 		}
-		for _, line := range lines[dividers[len(dividers)-2]+1 : dividers[len(dividers)-1]] {
-			if strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "❯>")) != "" {
+		// Only the first line carries the prompt glyph; every other
+		// character in the box is input.
+		for i, line := range lines[dividers[len(dividers)-2]+1 : dividers[len(dividers)-1]] {
+			line = strings.TrimSpace(line)
+			if i == 0 {
+				line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "❯"), ">"))
+			}
+			if line != "" {
 				return ComposerText
 			}
 		}
 		return ComposerEmpty
 	case "codex":
+		// The input starts on the last › line and runs, wrapped or
+		// multi-line, until the first blank line above the footer.
 		for i := len(lines) - 1; i >= 0; i-- {
-			if rest, ok := strings.CutPrefix(strings.TrimSpace(lines[i]), "›"); ok {
-				if strings.TrimSpace(rest) != "" {
-					return ComposerText
-				}
-				return ComposerEmpty
+			rest, ok := strings.CutPrefix(strings.TrimSpace(lines[i]), "›")
+			if !ok {
+				continue
 			}
+			if strings.TrimSpace(rest) != "" {
+				return ComposerText
+			}
+			for _, next := range lines[i+1:] {
+				if strings.TrimSpace(next) == "" {
+					break
+				}
+				return ComposerText
+			}
+			return ComposerEmpty
 		}
 	}
 	return ComposerUnknown

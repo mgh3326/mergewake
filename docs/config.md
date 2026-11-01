@@ -141,15 +141,16 @@ the label on the configured host whose `name` or `machine` equals the
 record's `host` (every host is searched when none does; more than one match
 is `job-pane-ambiguous`). Its cwd does not matter, so a lead that launched in
 one repo's worktree and owns PRs across repos is still found. The binding is
-read once per merged PR per daemon process. A PR without the trailer, or
-whose task has no bound job, keeps the worktree match above; an hk read error
-closes nothing that pass.
+read once per merged PR per daemon process (a task with no job yet is asked
+again each pass). A PR without the trailer, or whose task has no bound job,
+keeps the worktree match above — the latter still behind the open-PR rule
+below; an hk read error closes nothing that pass.
 
 The lead closes only when the whole job is finished, checked in this order:
 
 1. idle or done, not protected, `<jobs>/<job>` resolvable (`jobs-dir-unset`,
-   `job-name-invalid`), not focused and the pane the record names
-   (`operator-owned`);
+   `job-name-invalid`), a record that names its pane (`pane-id-unrecorded`),
+   not focused and that very pane (`operator-owned`);
 2. no open PR — against any base, in any configured repo, trailer in the body
    or head commit — carries the task; otherwise `job_has_open_pr`, with the
    open PRs (`owner/name#N`) in the row's `open`. A repo mergewake does not
@@ -163,10 +164,10 @@ After the close, mergewake marks the job done the way the lead would:
 `runtug done <job> --report <saved>` on the job's host, a `job-done` row with
 `done` (`would-done` in shadow). A job hk already holds terminal is skipped as
 `already-<state>`. If the done fails, the next pass retries it once the pane
-is gone, until hk shows the job terminal. Each job is decided once per pass,
-on the first of its merged PRs. Job-bound rows carry `task` and `job` and no
-`cwd` or `worktree`, so worktree cleanup still comes only from worktree
-matches.
+is gone, until a `done` row or a terminal hk state ends it. Each job is decided once per pass,
+on the first of its merged PRs. Job-bound rows carry `task` and `job`; they
+carry `cwd` and `worktree` only when the lead sits in that PR's own
+worktree, which worktree cleanup then picks up as before.
 
 Rollout (the desk): deploy, run `mergewake reap --repo <repo> --dry-run`
 once per configured repo and compare the planned `would-close` and
