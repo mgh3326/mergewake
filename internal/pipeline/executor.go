@@ -133,6 +133,8 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// The whole review shares one deadline: nothing is left for another reviewer.
 		if ctx.Err() != nil {
+			skip("review deadline", time.Time{})
+			out.skips[len(out.skips)-1].withCause(runErr)
 			return out, errors.Join(runErr, ctx.Err())
 		}
 		h.failed[name] = true

@@ -10,12 +10,14 @@ package crashreport
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -165,9 +167,11 @@ func takeCrashBudget(dir string, now time.Time, n int) int {
 	return allowed
 }
 
-// uploadCrashReports sends one Sentry event per crash file and deletes the
-// files once Sentry's transport has flushed them.
+// uploadCrashReports sends one Sentry event per crash file and deletes a file
+// only after Sentry answered its event with a 2xx; a rejected or failed
+// delivery keeps the file for the next start.
 func uploadCrashReports(dsn, tool, version string, paths []string) error {
+	delivery := &crashDelivery{base: http.DefaultTransport}
 	client, err := sentry.NewClient(sentry.ClientOptions{
 		Dsn:              dsn,
 		Release:          tool + "@" + version,
@@ -177,6 +181,7 @@ func uploadCrashReports(dsn, tool, version string, paths []string) error {
 		TracesSampleRate: 0,
 		SendDefaultPII:   false,
 		ServerName:       fleetevent.ShortHost(),
+		HTTPTransport:    delivery,
 		BeforeSend: func(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 			event.User = sentry.User{}
 			event.Request = nil
@@ -187,20 +192,50 @@ func uploadCrashReports(dsn, tool, version string, paths []string) error {
 	if err != nil {
 		return err
 	}
+	var failed error
 	for _, path := range paths {
 		event := crashReportEvent(tool, path)
 		if event == nil {
 			continue
 		}
 		client.CaptureEvent(event, nil, sentry.NewScope())
-	}
-	if !client.Flush(crashReportFlush) {
-		return errors.New("crash reports not flushed")
-	}
-	for _, path := range paths {
+		client.Flush(crashReportFlush)
+		if accepted, rejected := delivery.take(); accepted == 0 || rejected > 0 {
+			failed = errors.New("sentry did not accept a crash report")
+			continue
+		}
 		_ = os.Remove(path)
 	}
-	return nil
+	return failed
+}
+
+// crashDelivery records Sentry's HTTP answers: sentry-go's Flush reports a
+// drained queue, not an accepted event.
+type crashDelivery struct {
+	base               http.RoundTripper
+	mu                 sync.Mutex
+	accepted, rejected int
+}
+
+func (d *crashDelivery) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := d.base.RoundTrip(request)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil || response.StatusCode < 200 || response.StatusCode > 299 {
+		d.rejected++
+	} else {
+		d.accepted++
+	}
+	return response, err
+}
+
+// take returns and resets the counts since the last take.
+func (d *crashDelivery) take() (accepted, rejected int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	accepted, rejected = d.accepted, d.rejected
+	d.accepted, d.rejected = 0, 0
+	return accepted, rejected
 }
 
 // crashReportEvent builds the event for one crash file: the panic line as the

@@ -165,3 +165,24 @@ func TestReportPendingCrashesDropsWhatTheBudgetRefuses(t *testing.T) {
 		t.Fatal("a crash over budget must be dropped")
 	}
 }
+
+func TestCrashReportRejectedBySentryIsKept(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	dsn := strings.Replace(server.URL, "http://", "http://publickey@", 1) + "/42"
+	path := writeCrashFile(t, t.TempDir(), 1, deadPID(t), "panic: boom\n")
+	if err := uploadCrashReports(dsn, "tool", "v-test", []string{path}); err == nil {
+		t.Fatal("a rejected report must be an error")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a rejected report's file must stay for the next start: %v", err)
+	}
+}
+
+func TestCrashReportScrubRemovesEmails(t *testing.T) {
+	if got := crashReportScrub("panic: user alice@example.org not found"); strings.Contains(got, "alice@example.org") {
+		t.Fatalf("email reached the report: %q", got)
+	}
+}

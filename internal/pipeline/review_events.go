@@ -41,7 +41,7 @@ func (s *Service) reviewerEvents(repo string, pr, pass int, skips []reviewSkip) 
 	job := fmt.Sprintf("%s#%d", repo, pr)
 	for _, sk := range skips {
 		outcome := "skipped"
-		if sk.ExitCode != nil || sk.StderrTail != "" || sk.Reason == "review failed" || sk.Reason == "quota exhausted" {
+		if sk.ExitCode != nil || sk.StderrTail != "" || sk.Cause != "" || sk.Reason == "review failed" || sk.Reason == "quota exhausted" {
 			outcome = "failed"
 		}
 		detail := fmt.Sprintf("pass=%d reviewer=%s host=%s", pass, sk.Reviewer, sk.Host)
@@ -61,15 +61,20 @@ func (s *Service) reviewerEvents(repo string, pr, pass int, skips []reviewSkip) 
 
 // reviewMissingEvent records a pass no reviewer produced: the cause behind a
 // lasting review_missing gate reason.
-func (s *Service) reviewMissingEvent(repo string, pr, pass int, reason string, skips []reviewSkip) {
+func (s *Service) reviewMissingEvent(repo string, pr, pass int, reason string, skips []reviewSkip, why string) {
 	detail := fmt.Sprintf("pass=%d skipped=%d %s", pass, len(skips), describeSkips(skips))
+	if why != "" {
+		detail += " " + why
+	}
 	fleetevent.New(s.Config.StateDir, "mergewake", s.now).Emit("review", fmt.Sprintf("%s#%d", repo, pr), "missing", reason, detail)
 }
 
-var digitWord = regexp.MustCompile(`\b\d+\b`)
+// digitWord matches any word holding a digit: task ids, exit codes and pane
+// labels such as mwr-<pr>-<head>, which would make every reason code unique.
+var digitWord = regexp.MustCompile(`[^\s:]*[0-9][^\s:]*`)
 
 // skipReasonCode turns a skip reason into a short code: the text before the
-// first colon, without numbers (task ids, exit codes stay in the detail).
+// first colon, without words that hold digits (those stay in the detail).
 func skipReasonCode(reason string) string {
 	head, _, _ := strings.Cut(reason, ":")
 	code := fleetevent.Code(digitWord.ReplaceAllString(head, ""))

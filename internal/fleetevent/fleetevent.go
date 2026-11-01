@@ -170,9 +170,13 @@ func Tail(s string, limit int) string {
 }
 
 // secretPatterns matches credential-shaped substrings. It mirrors panewire's
-// stall redaction set and adds URL userinfo and Grafana/Sentry token shapes.
+// fleet-event redaction set: URL userinfo, bearer/basic credentials, provider
+// token shapes, any NAME=value whose name holds key/token/secret/password,
+// whole PEM private-key blocks (or a truncated tail of one), and email
+// addresses.
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+(:[^/\s@]*)?@`),
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)`),
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}`),
 	regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/=]{8,}`),
 	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`),
@@ -180,14 +184,20 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`),
 	regexp.MustCompile(`\bgl(c|sa)_[A-Za-z0-9_=+/-]{16,}`),
 	regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{8,}`),
-	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+	regexp.MustCompile(`\b(AKIA|ASIA)[0-9A-Z]{16}\b`),
 	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}`),
-	regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|passwd|dsn)\s*[:=]\s*["']?[^\s"',;&]{6,}`),
-	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)[a-z0-9_.-]*(api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd|credential|dsn)[a-z0-9_.-]*["']?\s*[:=]\s*["']?[^\s"',;&]{6,}`),
+	regexp.MustCompile(`(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b`),
 }
 
-// Redact replaces credential-shaped substrings with [redacted]. URL userinfo
-// keeps its scheme so the line still reads as a URL.
+// longBlob matches a long base64-alphabet run: a key or token body that no
+// named pattern caught. Pure hex runs (commit SHAs, digests) are kept.
+var longBlob = regexp.MustCompile(`[A-Za-z0-9+/_-]{48,}={0,2}`)
+
+var hexOnly = regexp.MustCompile(`^[0-9a-fA-F]+$`)
+
+// Redact replaces credential-shaped substrings and email addresses with
+// [redacted]. URL userinfo keeps its scheme so the line still reads as a URL.
 func Redact(s string) string {
 	for i, p := range secretPatterns {
 		if i == 0 {
@@ -196,5 +206,10 @@ func Redact(s string) string {
 		}
 		s = p.ReplaceAllString(s, "[redacted]")
 	}
-	return s
+	return longBlob.ReplaceAllStringFunc(s, func(m string) string {
+		if hexOnly.MatchString(m) {
+			return m
+		}
+		return "[redacted]"
+	})
 }

@@ -201,6 +201,8 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	}
 	if e != nil {
 		if ctx.Err() != nil {
+			out, _ = skip("runtug reviewer deadline")
+			out.skips[len(out.skips)-1].withCause(e)
 			return out, fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err()))
 		}
 		out, _ = skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
