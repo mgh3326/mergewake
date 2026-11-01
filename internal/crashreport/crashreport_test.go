@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var fleetEventFakeSecrets = []string{"ghp_FAKEfakeFAKEfakeFAKEfake0123456789", "hunter2pass", "tok3nVALUEfake99"}
@@ -133,5 +134,34 @@ func TestCrashOutputCapturesAGoroutinePanic(t *testing.T) {
 	raw, err := os.ReadFile(pending[0])
 	if err != nil || !strings.Contains(string(raw), "panic: crash-child-boom") || !strings.Contains(string(raw), "goroutine") {
 		t.Fatalf("crash file: %q %v", raw, err)
+	}
+}
+
+func TestCrashBudgetCapsReportsPerDayAcrossStarts(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	if got := takeCrashBudget(dir, start, 2); got != 2 {
+		t.Fatalf("first start: %d", got)
+	}
+	if got := takeCrashBudget(dir, start.Add(time.Minute), 2); got != 1 {
+		t.Fatalf("second start must get the one left: %d", got)
+	}
+	if got := takeCrashBudget(dir, start.Add(2*time.Minute), 1); got != 0 {
+		t.Fatalf("a crash loop must be cut off: %d", got)
+	}
+	if got := takeCrashBudget(dir, start.Add(25*time.Hour), 3); got != 3 {
+		t.Fatalf("the budget renews after 24 hours: %d", got)
+	}
+}
+
+func TestReportPendingCrashesDropsWhatTheBudgetRefuses(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	takeCrashBudget(dir, now, crashReportDailyBudget)
+	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
+	// No budget left: nothing is sent (the DSN is unreachable) and the file goes.
+	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, []string{path}, now)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a crash over budget must be dropped")
 	}
 }

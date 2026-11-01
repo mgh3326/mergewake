@@ -26,10 +26,13 @@ import (
 
 const (
 	DSNEnv = "SENTRY_DSN_MERGEWAKE"
-	// crashReportMaxPerStart samples a crash loop: each start sends at most
-	// this many reports and drops the older rest, which keeps a restart loop
-	// inside Sentry's free tier.
+	// crashReportMaxPerStart and crashReportDailyBudget sample a crash loop:
+	// a start considers at most the newest three crash files, and the host
+	// sends at most three reports in any 24 hours (counted in crash/sent
+	// across restarts). A launchd/systemd restart loop therefore costs at
+	// most ~90 events a month, well inside Sentry's free tier.
 	crashReportMaxPerStart = 3
+	crashReportDailyBudget = 3
 	crashReportMaxBytes    = 16 << 10
 	crashReportFlush       = 10 * time.Second
 )
@@ -48,9 +51,7 @@ func Start(stateDir, tool, version string) (stop func()) {
 		return func() {}
 	}
 	if pending := collectCrashFiles(dir); len(pending) > 0 {
-		go func() {
-			_ = uploadCrashReports(dsn, tool, version, pending)
-		}()
+		go reportPendingCrashes(dsn, tool, version, dir, pending, time.Now())
 	}
 	name := filepath.Join(dir, fmt.Sprintf("crash-%d-%d.log", time.Now().UnixNano(), os.Getpid()))
 	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -130,6 +131,38 @@ func crashProcessAlive(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// reportPendingCrashes sends what the daily budget allows and drops the rest.
+func reportPendingCrashes(dsn, tool, version, dir string, pending []string, now time.Time) {
+	allowed := takeCrashBudget(dir, now, len(pending))
+	for _, path := range pending[allowed:] {
+		_ = os.Remove(path)
+	}
+	if allowed > 0 {
+		_ = uploadCrashReports(dsn, tool, version, pending[:allowed])
+	}
+}
+
+// takeCrashBudget returns how many of n reports may be sent at now and
+// records them in <dir>/sent (one unix second per report, last 24 hours).
+func takeCrashBudget(dir string, now time.Time, n int) int {
+	path := filepath.Join(dir, "sent")
+	var kept []string
+	if raw, err := os.ReadFile(path); err == nil {
+		for _, field := range strings.Fields(string(raw)) {
+			sec, err := strconv.ParseInt(field, 10, 64)
+			if err == nil && now.Sub(time.Unix(sec, 0)) < 24*time.Hour {
+				kept = append(kept, field)
+			}
+		}
+	}
+	allowed := max(0, min(n, crashReportDailyBudget-len(kept)))
+	for range allowed {
+		kept = append(kept, strconv.FormatInt(now.Unix(), 10))
+	}
+	_ = os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+	return allowed
 }
 
 // uploadCrashReports sends one Sentry event per crash file and deletes the
