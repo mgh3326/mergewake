@@ -545,9 +545,11 @@ on it.
   not already carry, per file. Both are PR-only patches, so a clean base merge
   or a rebase that only moves line numbers or context adds nothing. A hunk that
   mixes old and new changes counts as changed and is kept whole. The prompt
-  says it is a delta round and that findings outside the shown hunks are not
-  wanted; a finding on any other line fails the same new-side-line check as
-  before. The runtug brief carries the delta patch inline instead of `git diff`.
+  says it is a delta round, not a fresh full review: the reviewer checks the
+  changed lines and their impact paths (callers, config and data they feed) and
+  reports a defect outside the shown hunks only when a changed line causes it,
+  anchored on that changed line (`fleet-review` §Rounds); a finding on any other
+  line fails the same new-side-line check as before. The runtug brief carries the delta patch inline instead of `git diff`.
   When the previous patch cannot be read, the round reviews the whole diff and
   the audit event says why (`round_note`). When nothing changed at all, the round
   does not count, reviews the whole diff for reference only, and reports only a
@@ -556,9 +558,12 @@ on it.
   the review login posted in earlier rounds with its disposition (`resolved`,
   `answered: <latest reply>`, or `none yet (still open)`), and tells the reviewer
   not to reopen or repeat any of them unless a changed line gives new evidence,
-  in which case it quotes the disposition it disputes. These replace the
-  review login's own entries in "Already answered on this PR". The 12 KB context
-  cap still holds.
+  in which case it quotes the disposition it disputes. A reply by the review
+  login itself counts as a disposition when it is not itself a finding:
+  mergewake usually posts under the operator account the PR's author also
+  replies from. These replace the review login's own entries in "Already
+  answered on this PR", and `answered_context` counts the prior findings
+  carried with a disposition. The 12 KB context cap still holds.
 - **No duplicate is posted.** A finding with the same path as an existing review
   thread (any author) and substantially the same words (word-set overlap of at
   least a half, or a short finding almost contained in a longer one) is dropped
@@ -812,9 +817,15 @@ grades each thread by the author and severity of its first comment instead:
 
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
-| block | the thread is resolved. A reply never clears it. Resolving it is its disposition at any severity and needs no new head. | `blocking_findings:<n>` |
+| block | the thread is resolved, or a human reply (not the finding's author, not a bot; for a `review.login` finding, that login's own reply that is not itself a finding) carries a block disposition: it opens with `Fix`/`Fixed`/`Fixes` and names the fixing commit SHA, or opens with `Dismiss`/`Dismissed`/`Dismissal` followed by its reason. An acknowledgement, a defer or a bare "Dismissed." does not clear it. Neither needs a new head. | `blocking_findings:<n>` |
 | triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason or a follow-up task reference, or the thread is resolved. Neither needs a new head. | `triage_unanswered:<n>` |
-| advisory | never holds. Threads from authors no rule names are advisory. | none |
+| advisory | never holds and is not counted as unanswered. Threads from authors no rule names are advisory. | none |
+
+A thread answered with a disposition counts as answered whether or not it is
+resolved. A dismissed critical/high no longer holds the gate; the land record
+counts it as `dismissed_blocking`, and the READY event says
+`<n> critical/high dismissed: check the evidence` so the desk checks the
+dismissal before merging (`fleet-review` §Triage rubric).
 
 Each reviewer whose latest review still requests changes adds one to the
 blocking count (at least one when GitHub's overall decision is changes
@@ -827,15 +838,17 @@ missing or unknown severity, and on a blocking-class PR an unknown severity from
 a graded author.
 
 The defaults grade CodeRabbit `critical` and codex `P1` as block, CodeRabbit
-`major` and codex `P2` as triage, and add rules for the configured
-`review.login`: `critical`/`high` block, `medium`/`low` triage (the
-reviewer prompt's `blocking`, `major` and `minor` grade like `high`, `medium`
-and `low`). Only critical and high findings need a fix; a medium or low one
-needs a disposition, not a fix. Rules are `{author, severity: [...], classes: [...]}` lists under
-`block` and `triage`; an explicit list replaces the default for those two keys,
-though the `review.login` defaults are kept or replaced per list: naming the login
-in `block` replaces its default block rule, naming it in `triage` replaces its
-default triage rule, and the other list keeps its default.
+`major` and codex `P2` as triage, CodeRabbit `minor`/`nitpick` and codex `P3`
+as advisory, and add one rule for the configured `review.login`:
+`critical`/`high` block (the reviewer prompt's `blocking` grades like `high`).
+Its `medium`/`low` findings (and `major`/`minor`, graded like them) are
+advisory: the author still gives each a disposition (fix, dismiss with a
+reason, or defer to a task), but they never hold the gate and are not counted
+in `triage_unanswered`. Only critical and high findings need a fix. Rules are
+`{author, severity: [...], classes: [...]}` lists under `block` and `triage`;
+an explicit list replaces the default for those two keys. Naming the
+`review.login` in `block` replaces its default block rule; naming it in
+`triage` makes those of its severities triage again.
 Thread comments are read in full (paged past 50), since a late reply answers a
 finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
 true) clears an outdated finding by anyone but `review.login`: a block finding
@@ -1011,6 +1024,8 @@ For `example/project`, state resides beneath
 | `review-wait.json` | When this host first saw each ready head waiting for a review (the stall alarm's clock). |
 | `review-stall-sent` | Most recent 256 `PR head` keys already alarmed as stalled. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
+| `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
+| `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
@@ -1064,7 +1079,7 @@ fleet spawners can be wrapped around this protocol without importing their code.
 ```yaml
 daemon:
   act: false
-  pr: {enabled: true, interval: 60s, notify: {enabled: true}, stall_after: 30m}
+  pr: {enabled: true, interval: 60s, notify: {enabled: true, renotify_after: 30m, renotify_max: 3}, findings: {enabled: true, ack_after: 15m}, stall_after: 30m}
   watch: {enabled: true, interval: 60s}
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
@@ -1116,7 +1131,8 @@ roles woken — never the body, the signature or other headers.
 
 Only enabled roles wake, and only for repositories in `repos`.
 
-`daemon.pr.notify` defaults to enabled and accepts only `enabled`. While the
+`daemon.pr.notify` defaults to enabled and accepts `enabled`, `renotify_after`
+and `renotify_max`. While the
 `pr` role runs, each poll runs the merge gate for every open, non-draft PR at
 its current head and emits one lane event for that head's verdict — the notify
 path observes rather than merges, so it also runs in shadow mode. `READY`
@@ -1129,9 +1145,19 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `triage_unanswered:<n>`), `review_missing`, `base_stale`, `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
-verdict)` emits at most once per the `pr-notify-sent` state file; a changed
+verdict)` emits once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
-head re-arms notification, and a restart does not resend. The event
+head re-arms notification, and a restart does not resend. READY and BLOCKED are
+declared with `panewire emit --type ready|blocked`, so they stay unread on the
+receiving lane until it runs `panewire inbox ack` (panewire
+`docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
+event untyped). A READY PR that stays open and READY on the same head is not
+deduped forever: it is notified again `renotify_after` (default `30m`, `off`
+disables) after the last send, at most `renotify_max` times (default 3), with
+`reminder <k>/<max>, unmerged for <d>` after `via` and event id
+`…-reminder-<k>`. The clock is `<state_dir>/<repo>/pr-ready-renotify.json`; a
+READY sent before it existed starts its clock on the next poll. A merged or
+closed PR gets no reminder. The event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
 (`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
@@ -1139,6 +1165,38 @@ configured `notifier.lane`. Both trailers are read from the PR body first and
 then the head commit message; a task-read error retries rather than rerouting.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
 other roles.
+
+#### Findings delivery
+
+`daemon.pr.findings` (default enabled; `{enabled: false}` turns it off) sends
+review findings straight to the PR's author instead of through the desk. Each
+`pr` poll collects the open PR's unresolved, unanswered findings that no
+delivery named yet: mergewake's own (once the head's `-done` marker exists, so
+a review round goes out whole) and CodeRabbit `critical`/`major` threads.
+CodeRabbit `minor`/`nitpick` threads are not delivered. They go out as **one
+lane event per delivery**, declared `--type findings`, naming each finding's
+severity, `path:line` and comment link, what is required (fix every
+critical/high/Major with `Fixed in <sha>` or `Dismiss: <evidence>`; a
+disposition for every other) and how to acknowledge.
+
+The author lane is resolved without guessing: the `Mergewake-Task` trailer →
+the hk task → its bound job (`refs.job_id`) → the job's hub lane (a worker's
+lane is its `label`; a builder's lane is not recorded, so it falls through).
+A job in a terminal state (`completed`, `escalated`, `lost`) has no author left:
+its findings go to the owner, and mergewake never respawns a worker. Without a
+bound job the event goes to `repos[].lane`, then the desk
+(`notifier.fallback_lane`). The owner is the job's `owner_lane`, else the lane
+READY/BLOCKED go to. A read error retries next poll rather than rerouting.
+
+The author acknowledges with `panewire inbox ack <id>`. A delivery with no ACK —
+and no disposition on every thread it names — after `ack_after` (default
+`15m`) is re-sent once (`…-resend`); after another `ack_after` it is escalated
+once to the owner lane as `[mergewake] ESC …` (`--type decision`). Findings
+the reviewer marked outside the Acceptance contract go to the owner once as
+`OUT-OF-SCOPE` and are not followed up. Deliveries are kept in
+`<state_dir>/<repo>/findings-deliveries.json` (30 days); the audit log records
+`findings-delivered`, `findings-acked`, `findings-resent` and
+`findings-escalated`.
 
 #### Review-stall alarm
 

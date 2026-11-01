@@ -25,7 +25,7 @@ func TestReviewContextIncludesAnsweredFindingsAndDecisions(t *testing.T) {
 		thread("b.go", 9, false, say("review-bot", "only the bot spoke here")),
 		thread("c.go", 4, false, say("review-bot", "first"), say("review-bot", "second by the same bot")),
 	}}
-	rc := buildReviewContext(body, fb)
+	rc := buildReviewContext(body, fb, "")
 	if rc.answered != 1 || rc.truncated {
 		t.Fatal(rc.answered, rc.truncated)
 	}
@@ -43,7 +43,7 @@ func TestReviewContextIncludesAnsweredFindingsAndDecisions(t *testing.T) {
 
 func TestReviewContextEmptyWithoutAnswersOrDecisions(t *testing.T) {
 	fb := github.ReviewFeedback{Threads: []github.ReviewThread{thread("a.go", 1, false, say("review-bot", "alone"))}}
-	if rc := buildReviewContext("plain body\n## Operator notes\nx", fb); rc.text != "" || rc.answered != 0 {
+	if rc := buildReviewContext("plain body\n## Operator notes\nx", fb, ""); rc.text != "" || rc.answered != 0 {
 		t.Fatal(rc)
 	}
 }
@@ -80,7 +80,7 @@ func TestReviewContextBounds(t *testing.T) {
 			say("review-bot", strings.Repeat("finding ", 100)), say("pr-author", strings.Repeat("answer ", 100))))
 	}
 	body := "## Operator decisions\n" + strings.Repeat("settled ", 2000)
-	rc := buildReviewContext(body, fb)
+	rc := buildReviewContext(body, fb, "")
 	if len(rc.text) > contextBudget || !rc.truncated || rc.answered == 0 || rc.answered >= 60 {
 		t.Fatal(len(rc.text), rc.truncated, rc.answered)
 	}
@@ -180,7 +180,7 @@ func TestReviewContextQuotesLatestReplyIncludingRebuttal(t *testing.T) {
 		thread("a.go", 3, false, say("review-bot", "flag"), say("pr-author", "intended"), say("review-bot", "still wrong: the answer ignores X")),
 		thread("b.go", 4, false, say("review-bot", "flag"), say("pr-author", "intended"), say("pr-author", "   ")),
 	}}
-	rc := buildReviewContext("", fb)
+	rc := buildReviewContext("", fb, "")
 	if rc.answered != 2 {
 		t.Fatal(rc.answered)
 	}

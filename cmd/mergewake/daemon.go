@@ -192,6 +192,11 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 			}
 		}
+		// Findings go to the author lane before the verdict: the author fixes
+		// them without the desk relaying anything.
+		if e := s.DeliverFindings(ctx, r, pr.Number, childOptions); e != nil {
+			errs = append(errs, fmt.Errorf("PR %d findings: %w", pr.Number, e))
+		}
 		if e := s.NotifyPR(ctx, r, pr.Number, childOptions); e != nil {
 			errs = append(errs, fmt.Errorf("PR %d notify: %w", pr.Number, e))
 		}

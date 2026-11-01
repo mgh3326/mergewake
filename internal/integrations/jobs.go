@@ -24,6 +24,11 @@ type JobRecord struct {
 	Family  string          `json:"family"`
 	Profile string          `json:"profile"`
 	Result  json.RawMessage `json:"result"`
+	// Role, Label and OwnerLane are what runtug records at spawn: a worker's
+	// hub lane is its label, and owner_lane is the lane that owns its work.
+	Role      string `json:"role"`
+	Label     string `json:"label"`
+	OwnerLane string `json:"owner_lane"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist

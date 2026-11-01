@@ -68,12 +68,29 @@ func clip(s string, n int) string {
 	return s[:n]
 }
 
-// answeredFindings lists threads whose first comment has a reply from another
-// author, newest thread first, quoting the thread's latest nonempty comment so
-// a rebuttal by the finding's author is not hidden behind the older answer. A
-// thread holding only its finding, or only the finding author's own follow-ups,
-// is not an answered finding.
-func answeredFindings(fb github.ReviewFeedback) []answeredItem {
+// disposes reports whether reply c answers the finding first opened: a
+// nonempty comment by anyone other than the finding's author or, for a finding
+// posted under the review login own, a comment by that same login that is not
+// itself a mergewake finding. mergewake posts under review.login, usually the
+// operator account the PR's author also replies from, so a worker's "Fixed in
+// <sha>" on a mergewake finding carries the finding's own login.
+func disposes(first, c github.ReviewComment, own string) bool {
+	if strings.TrimSpace(c.Body) == "" {
+		return false
+	}
+	if c.Author != first.Author {
+		return true
+	}
+	const marker = "<!-- mergewake-severity:"
+	return own != "" && strings.EqualFold(first.Author, own) && strings.Contains(first.Body, marker) && !strings.Contains(c.Body, marker)
+}
+
+// answeredFindings lists threads whose first comment has a disposing reply
+// (disposes), newest thread first, quoting the thread's latest nonempty comment
+// so a rebuttal by the finding's author is not hidden behind the older answer.
+// A thread holding only its finding, or only the finding author's own
+// follow-ups that are findings themselves, is not an answered finding.
+func answeredFindings(fb github.ReviewFeedback, own string) []answeredItem {
 	var out []answeredItem
 	for i := len(fb.Threads) - 1; i >= 0; i-- {
 		t := fb.Threads[i]
@@ -91,7 +108,7 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 			if latest == nil {
 				latest = c
 			}
-			if c.Author != first.Author {
+			if disposes(first, *c, own) {
 				answered = true
 				break
 			}
@@ -105,7 +122,7 @@ func answeredFindings(fb github.ReviewFeedback) []answeredItem {
 			resolved: t.IsResolved,
 			finding:  excerpt(stripFinding(first.Body), excerptLimit),
 			answer:   excerpt(latest.Body, excerptLimit),
-			rebutted: latest.Author == first.Author,
+			rebutted: latest.Author == first.Author && !disposes(first, *latest, own),
 			author:   first.Author,
 		})
 	}
@@ -177,8 +194,8 @@ func markdownSection(body string, match func(heading string) bool) string {
 // buildReviewContext renders the operator decisions and answered findings that
 // precede the diff, within contextBudget. Answered findings fill what the
 // decisions leave, newest first; whatever does not fit is reported as omitted.
-func buildReviewContext(body string, fb github.ReviewFeedback) reviewContext {
-	return buildRoundContext(body, fb, roundPlan{}, "")
+func buildReviewContext(body string, fb github.ReviewFeedback, own string) reviewContext {
+	return buildRoundContext(body, fb, roundPlan{}, own)
 }
 
 // buildRoundContext is buildReviewContext for a review round: the round and
@@ -212,7 +229,7 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 		items := priorFindings(fb, own)
 		if len(items) > 0 {
 			fmt.Fprintf(&b, "PRIOR FINDINGS (rounds 1-%d of this PR, newest first), each with its disposition. Do not reopen, restate or re-rank any of them. Raise one again only if a line changed in the diff below gives new evidence, and then quote the disposition you dispute. A finding marked \"none yet\" is still open: do not repeat it.\n", rp.round-1)
-			used := 0
+			used, disposed := 0, 0
 			for i, it := range items {
 				label := it.severity
 				if label == "" {
@@ -227,8 +244,14 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 				}
 				b.WriteString(entry)
 				used++
+				if it.disposition != priorOpen {
+					disposed++
+				}
 			}
 			rc.prior = used
+			// A prior finding carried with its disposition is an answered
+			// finding the reviewer sees, so answered_context counts it.
+			rc.answered = disposed
 			if used < len(items) {
 				rc.truncated = true
 				fmt.Fprintf(&b, "[Truncated at the size bound: %d of %d prior findings omitted.]\n", len(items)-used, len(items))
@@ -237,7 +260,7 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 		}
 	}
 	var items []answeredItem
-	for _, it := range answeredFindings(fb) {
+	for _, it := range answeredFindings(fb, own) {
 		if !(rc.prior > 0 && strings.EqualFold(it.author, own)) {
 			items = append(items, it)
 		}
@@ -261,7 +284,7 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 			b.WriteString(entry)
 			used++
 		}
-		rc.answered = used
+		rc.answered += used
 		if used < len(items) {
 			rc.truncated = true
 			fmt.Fprintf(&b, "[Truncated at the size bound: %d of %d answered findings omitted.]\n", len(items)-used, len(items))

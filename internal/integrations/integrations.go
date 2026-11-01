@@ -120,10 +120,14 @@ func Detail(err error) string {
 // reportTail bounds the stderr shown in an error report.
 const reportTail = 512
 
+// Event is one lane event. Type is the declared panewire notification type
+// (`emit --type`); ready, blocked, decision and findings stay unread on the
+// receiving lane until it runs `panewire inbox ack`.
 type Event struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
 	Lane string `json:"lane,omitempty"`
+	Type string `json:"type,omitempty"`
 }
 type Notifier interface {
 	Notify(context.Context, Event) error
@@ -155,13 +159,49 @@ func (p Panewire) Notify(ctx context.Context, e Event) error {
 	if lane == "" {
 		lane = p.Lane
 	}
-	_, err := p.Runner.Run(ctx, p.Command, []string{"emit", "--kind", "lane.event", "--lane", lane, "--event-id", e.ID, "--text", e.Text}, "", "")
+	args := []string{"emit", "--kind", "lane.event", "--lane", lane, "--event-id", e.ID, "--text", e.Text}
+	if e.Type != "" {
+		args = append(args, "--type", e.Type)
+	}
+	_, err := p.Runner.Run(ctx, p.Command, args, "", "")
 	var ce *CommandError
+	if err != nil && e.Type != "" && errors.As(err, &ce) && strings.Contains(ce.Stderr, "invalid --type") {
+		// A panewire older than this type refuses it as a usage error before
+		// recording anything; the untyped event still reaches the lane, by
+		// its text tags, as before.
+		_, err = p.Runner.Run(ctx, p.Command, args[:len(args)-2], "", "")
+	}
 	if err != nil && errors.As(err, &ce) && strings.Contains(ce.Stderr, "duplicate event_id") {
 		// The event reached the store under this ID before; delivery is done.
 		return nil
 	}
 	return err
+}
+
+// AckedEvents reads lane's inbox and maps each lane event's id to whether its
+// receiver acknowledged it (`panewire inbox ack`). An id the hub has no item
+// for is absent.
+func (p Panewire) AckedEvents(ctx context.Context, lane string) (map[string]bool, error) {
+	raw, err := p.Runner.Run(ctx, p.Command, []string{"inbox", "list", "--lane", lane, "--json"}, "", "")
+	if err != nil {
+		return nil, err
+	}
+	var items []struct {
+		AckedAt int64 `json:"acked_at_ms"`
+		Event   struct {
+			EventID string `json:"event_id"`
+		} `json:"event"`
+	}
+	if err = json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("inbox list: %v", err)
+	}
+	out := map[string]bool{}
+	for _, it := range items {
+		if it.Event.EventID != "" {
+			out[it.Event.EventID] = out[it.Event.EventID] || it.AckedAt > 0
+		}
+	}
+	return out, nil
 }
 
 type Handoffkeep struct {

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,13 +41,16 @@ type reviewRecord struct {
 
 // dispositions counts the PR's review threads by how they stand: blocking and
 // triage findings still holding the gate, findings answered by a reply,
-// findings resolved, and advisory ones that never hold it.
+// findings resolved, and advisory ones that never hold it. DismissedBlocking
+// counts the critical/high findings among Answered that were dismissed rather
+// than fixed: they no longer hold the gate, and the desk checks their evidence.
 type dispositions struct {
-	OpenBlocking int `json:"open_blocking"`
-	OpenTriage   int `json:"open_triage"`
-	Answered     int `json:"answered"`
-	Resolved     int `json:"resolved"`
-	Advisory     int `json:"advisory"`
+	OpenBlocking      int `json:"open_blocking"`
+	OpenTriage        int `json:"open_triage"`
+	Answered          int `json:"answered"`
+	Resolved          int `json:"resolved"`
+	Advisory          int `json:"advisory"`
+	DismissedBlocking int `json:"dismissed_blocking,omitempty"`
 }
 
 // reviewRounds counts the distinct patches reviewed: a round is one patch, so
@@ -242,11 +246,13 @@ func postedOn(c github.ReviewComment) string {
 }
 
 // gradeThreads folds review threads into the two counts the graded gate holds
-// on. Only an unresolved block-class finding blocks, whoever wrote it and at
-// any age: resolving it is its disposition, and it needs no new head. A triage
-// finding holds until it has a disposition: a reply from someone other than its
-// author (a fix SHA, a dismissal with its reason, a follow-up task) or a
-// resolution. Advisory findings never block, and the fast lane drops triage
+// on. A block-class finding (mergewake critical/high, CodeRabbit Critical)
+// blocks, whoever wrote it and at any age, until it is resolved or carries a
+// block disposition: a reply that names the fixing commit or dismisses it with
+// a reason (blockDisposition). Neither needs a new head. A triage finding
+// (CodeRabbit Major) holds until it has a disposition: a reply from someone
+// other than its author (a fix SHA, a dismissal with its reason, a follow-up
+// task) or a resolution. Answered counts either whether or not it is resolved. Advisory findings never block, and the fast lane drops triage
 // except for unreadable review.login evidence. Outdated findings clear as
 // ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
 // unresolved threads with no comment to grade, count as blocking findings.
@@ -287,11 +293,17 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 		}
 		switch grade {
 		case policy.GradeBlock:
-			if !f.Resolved {
+			switch kind := blockDisposition(t, f.OwnReview); {
+			case f.Resolved:
+				d.Resolved++
+			case kind != "":
+				d.Answered++
+				if kind == "dismiss" {
+					d.DismissedBlocking++
+				}
+			default:
 				blocking++
 				d.OpenBlocking++
-			} else {
-				d.Resolved++
 			}
 		case policy.GradeTriage:
 			// The fast lane drops rule-graded triage, but a trusted-review
@@ -313,6 +325,37 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 	return blocking, triage, d
 }
 
+var (
+	// fixReply opens with a fix and names the fixing commit.
+	fixReply = regexp.MustCompile(`(?is)^\W*fix(?:ed|es)?\b.*\b[0-9a-f]{7,40}\b`)
+	// dismissReply opens with a dismissal and gives a reason after it.
+	dismissReply = regexp.MustCompile(`(?is)^\W*dismiss(?:ed|al)?\b\W*\w`)
+)
+
+// blockDisposition returns "fix" or "dismiss" when a reply that counts as an
+// answer (answeredBy) carries one of the two dispositions fleet-review allows
+// a critical/high finding: a fix naming its commit SHA, or a dismissal with a
+// reason. Anything else — an acknowledgement, a defer, a bare "dismissed" —
+// leaves the finding blocking. The latest answer decides: a later reply that
+// is not a disposition (say, "that fix is wrong") supersedes an earlier fix.
+func blockDisposition(t github.ReviewThread, ownReview bool) string {
+	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	for i := len(t.Comments) - 1; i > 0; i-- {
+		c := t.Comments[i]
+		if !answeredBy(c, author, ownReview) {
+			continue
+		}
+		switch {
+		case fixReply.MatchString(c.Body):
+			return "fix"
+		case dismissReply.MatchString(c.Body):
+			return "dismiss"
+		}
+		return ""
+	}
+	return ""
+}
+
 // answered reports a human reply from someone other than the finding's author.
 // mergewake posts its own findings under review.login, which is usually the
 // operator's account, so for an own-review finding a reply from that same
@@ -321,13 +364,19 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 func answered(t github.ReviewThread, ownReview bool) bool {
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
 	for _, c := range t.Comments[1:] {
-		who := policy.NormalizeAuthor(c.Author)
-		if who == "" || c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
-			continue
-		}
-		if who != author || (ownReview && !strings.Contains(c.Body, "<!-- mergewake-severity:")) {
+		if answeredBy(c, author, ownReview) {
 			return true
 		}
 	}
 	return false
+}
+
+// answeredBy reports whether reply c, on a finding by author, is a human
+// answer under the rules of answered.
+func answeredBy(c github.ReviewComment, author string, ownReview bool) bool {
+	who := policy.NormalizeAuthor(c.Author)
+	if who == "" || c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
+		return false
+	}
+	return who != author || (ownReview && !strings.Contains(c.Body, "<!-- mergewake-severity:"))
 }

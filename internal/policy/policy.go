@@ -125,11 +125,14 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	return g
 }
 
-// WithOwnLogin adds default rules for the trusted review identity, each list
-// on its own: critical and high findings block, medium and low ones need a
-// disposition (a reply or a resolution). A list that already names the login
-// keeps only the policy's rules for it; the other list still gets its default. The reviewer
-// prompt also admits blocking, major and minor, graded like high, medium and low.
+// WithOwnLogin adds the default block rule for the trusted review identity:
+// its critical and high findings block until fixed or dismissed with a reason.
+// Its medium and low findings are advisory — they get a disposition from the
+// author (fleet-review §Triage rubric) but never hold the gate and are not
+// counted as unanswered. A block list that already names the login keeps only
+// the policy's rules for it, and a policy may still add the login to its triage
+// list. The reviewer prompt also admits blocking, major and minor, graded like
+// high, medium and low.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
 	own := NormalizeAuthor(login)
@@ -146,9 +149,6 @@ func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	}
 	if !names(g.Block) {
 		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
-	}
-	if !names(g.Triage) {
-		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major", "low", "minor"}})
 	}
 	return g
 }

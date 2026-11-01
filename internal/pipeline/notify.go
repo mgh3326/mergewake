@@ -4,13 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -22,7 +27,10 @@ var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 // review thread is unresolved, the review -done marker exists, the base is an
 // ancestor of the head, and the PR is mergeable; BLOCKED with the
 // closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
-// (PR, head, verdict) notifies at most once across restarts.
+// (PR, head, verdict) notifies once across restarts, except that a READY PR
+// still open and READY on the same head is notified again every
+// daemon.pr.notify.renotify_after, at most renotify_max times: a READY nobody
+// merged must not vanish. A merged or closed PR is never notified here.
 //
 // The pr role notifies under shadow too — telling a lane is not merging — while
 // dry-run only prints the decision and writes no keys or events.
@@ -71,6 +79,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	summary := pr.Title
 	if v.State == "blocked" {
 		summary = strings.Join(v.Reasons, "; ")
+	}
+	if n := v.Review.Findings.DismissedBlocking; v.State == "ready" && n > 0 {
+		// A dismissed critical/high no longer holds the gate; the desk still
+		// checks the dismissal's evidence before merging.
+		summary += fmt.Sprintf(" | %d critical/high dismissed: check the evidence", n)
 	}
 	lane, via, sent, e := s.laneEvent(ctx, r, pr, v.State, summary)
 	if e != nil {
@@ -131,9 +144,12 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		key += " " + summary
 	}
 	if sent.has(key) {
+		if state == "ready" {
+			return s.renotifyReady(ctx, r, pr, key, lane, via, textFor)
+		}
 		return lane, via, false, nil
 	}
-	if sent.has("decided "+key) {
+	if sent.has("decided " + key) {
 		return "", "", false, nil
 	}
 	reportCtx, cancel := reportContext(ctx)
@@ -150,6 +166,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
+		Type: eventType(state),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
 		if fallback != "" && fallback != lane {
@@ -159,9 +176,15 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
+				Type: eventType(state),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
+				}
+				if state == "ready" {
+					if ae := s.startReadyClock(r, key, fallback); ae != nil {
+						return "", "", false, ae
+					}
 				}
 				return fallback, via + "+fallback", true, nil
 			}
@@ -174,7 +197,120 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	if e = sent.add(key); e != nil {
 		return "", "", false, e
 	}
+	if state == "ready" {
+		if e = s.startReadyClock(r, key, lane); e != nil {
+			return "", "", false, e
+		}
+	}
 	return lane, via, true, nil
+}
+
+// eventType is the panewire notification type a verdict is declared with, so
+// a READY or BLOCKED stays unread on the receiving lane until it is acked.
+func eventType(state string) string {
+	switch state {
+	case "ready", "blocked":
+		return state
+	}
+	return ""
+}
+
+// readyClock is when a READY verdict was last sent, to which lane, and how
+// many reminders followed it.
+type readyClock struct {
+	Lane    string    `json:"lane"`
+	First   time.Time `json:"first"`
+	Last    time.Time `json:"last"`
+	Repeats int       `json:"repeats"`
+}
+
+func (s *Service) readyClocksFile(repo string) string {
+	return filepath.Join(s.state(repo), "pr-ready-renotify.json")
+}
+
+func (s *Service) loadReadyClocks(repo string) (map[string]readyClock, error) {
+	clocks := map[string]readyClock{}
+	b, e := os.ReadFile(s.readyClocksFile(repo))
+	if errors.Is(e, fs.ErrNotExist) {
+		return clocks, nil
+	}
+	if e != nil {
+		return nil, e
+	}
+	if e = json.Unmarshal(b, &clocks); e != nil {
+		return nil, fmt.Errorf("%s: %w", s.readyClocksFile(repo), e)
+	}
+	return clocks, nil
+}
+
+// saveReadyClocks keeps the clocks touched in the last week.
+func (s *Service) saveReadyClocks(repo string, clocks map[string]readyClock) error {
+	cutoff := s.now().Add(-7 * 24 * time.Hour)
+	for k, c := range clocks {
+		if c.Last.Before(cutoff) {
+			delete(clocks, k)
+		}
+	}
+	b, e := json.Marshal(clocks)
+	if e != nil {
+		return e
+	}
+	return fsutil.Atomic(s.readyClocksFile(repo), b, 0600)
+}
+
+// startReadyClock records a first READY send for key.
+func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
+	clocks, e := s.loadReadyClocks(r.Name)
+	if e != nil {
+		return e
+	}
+	now := s.now().UTC()
+	clocks[key] = readyClock{Lane: lane, First: now, Last: now}
+	return s.saveReadyClocks(r.Name, clocks)
+}
+
+// renotifyReady repeats an already sent READY for a PR that is still open and
+// READY on the same head, once renotify_after has passed since the last send
+// and at most renotify_max times. A READY sent before the clock existed
+// starts its clock now, so an upgrade does not burst reminders. A failed
+// reminder counts against the bound, so delivery trouble cannot loop.
+func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pull, key, lane, via string, textFor func(l, v string) string) (string, string, bool, error) {
+	every, max := s.Config.Daemon.PR.Notify.Renotify()
+	if every <= 0 || max <= 0 {
+		return lane, via, false, nil
+	}
+	clocks, e := s.loadReadyClocks(r.Name)
+	if e != nil {
+		return "", "", false, e
+	}
+	now := s.now().UTC()
+	c, ok := clocks[key]
+	if !ok {
+		clocks[key] = readyClock{Lane: lane, First: now, Last: now}
+		return lane, via, false, s.saveReadyClocks(r.Name, clocks)
+	}
+	if c.Repeats >= max || now.Sub(c.Last) < every {
+		return lane, via, false, nil
+	}
+	c.Repeats++
+	c.Last = now
+	clocks[key] = c
+	if e = s.saveReadyClocks(r.Name, clocks); e != nil {
+		return "", "", false, e
+	}
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	rvia := fmt.Sprintf("%s; reminder %d/%d, unmerged for %s", via, c.Repeats, max, now.Sub(c.First).Round(time.Minute))
+	e = s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   fmt.Sprintf("mergewake-ready-%s-%d-%s-reminder-%d", r.Name, pr.Number, pr.Head.SHA, c.Repeats),
+		Text: textFor(lane, rvia),
+		Lane: lane,
+		Type: "ready",
+	})
+	if e != nil {
+		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
+	}
+	return lane, rvia, true, nil
 }
 
 // notifyLane resolves the destination lane without guessing: the handoffkeep

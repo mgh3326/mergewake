@@ -95,17 +95,16 @@ func TestGateTriageClass(t *testing.T) {
 		name, want string
 		th         github.ReviewThread
 	}{
-		{"unanswered medium", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaB)},
+		{"own medium never holds", "", gradedThread("review-bot", "medium", false, shaB)},
+		{"own low never holds", "", gradedThread("review-bot", "low", false, shaB)},
 		{"missing severity needs an answer", "triage_unanswered:1", gradedThread("review-bot", "", false, shaB)},
-		{"operator reply under the review login answers its own finding", "", gradedThread("review-bot", "medium", false, shaA, [2]string{"review-bot", "User"})},
-		{"bot reply does not answer", "triage_unanswered:1", gradedThread("review-bot", "medium", false, shaA, [2]string{"ci[bot]", "Bot"})},
-		{"human reply answers without a new head", "", gradedThread("review-bot", "medium", false, shaA, human)},
-		{"resolved medium on the current head is not held", "", gradedThread("review-bot", "medium", true, shaA)},
-		{"unanswered low needs a disposition", "triage_unanswered:1", gradedThread("review-bot", "low", false, shaB)},
-		{"low with a reply has a disposition", "", gradedThread("review-bot", "low", false, shaA, human)},
-		{"resolved low has a disposition", "", gradedThread("review-bot", "low", true, shaA)},
-		{"medium with a reply (fix SHA, dismissal or follow-up) has a disposition", "", gradedThread("review-bot", "medium", false, shaA, human)},
+		{"operator reply under the review login answers its own finding", "", gradedThread("review-bot", "", false, shaA, [2]string{"review-bot", "User"})},
+		{"bot reply does not answer", "triage_unanswered:1", gradedThread("review-bot", "", false, shaA, [2]string{"ci[bot]", "Bot"})},
+		{"human reply answers without a new head", "", gradedThread("review-bot", "", false, shaA, human)},
+		{"resolved unrated finding on the current head is not held", "", gradedThread("review-bot", "", true, shaA)},
 		{"third-party major needs an answer", "triage_unanswered:1", gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"third-party major with a reply (fix SHA, dismissal or follow-up) has a disposition", "", gradedThread("coderabbitai[bot]", "major", false, shaA, human)},
+		{"resolved third-party major has a disposition", "", gradedThread("coderabbitai[bot]", "major", true, shaA)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, gradedPolicy, 0, tt.th)); got != tt.want {
@@ -126,7 +125,7 @@ func TestGateReportsBothGradedReasons(t *testing.T) {
 	v := verdict(t, gradedPolicy, 0,
 		gradedThread("review-bot", "high", false, shaB),
 		gradedThread("review-bot", "critical", false, shaB),
-		gradedThread("review-bot", "medium", false, shaB))
+		gradedThread("coderabbitai[bot]", "major", false, shaB))
 	if v.State != "blocked" || reasons(v) != "blocking_findings:2;triage_unanswered:1" {
 		t.Fatalf("%+v", v)
 	}
@@ -178,16 +177,16 @@ func TestGateFastLane(t *testing.T) {
 		lines             int
 		th                github.ReviewThread
 	}{
-		{"small PR ignores unanswered triage", fastLane + gradedPolicy, "", 50, gradedThread("review-bot", "medium", false, shaB)},
-		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("review-bot", "medium", false, shaB)},
+		{"small PR ignores unanswered triage", fastLane + gradedPolicy, "", 50, gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("coderabbitai[bot]", "major", false, shaB)},
 		{"small PR is still stopped by block-class", fastLane, "blocking_findings:1", 50, gradedThread("review-bot", "high", false, shaB)},
 		{"small PR accepts a block-class finding resolved on the head", fastLane, "", 5, gradedThread("review-bot", "high", true, shaA, human)},
 		{"small PR still needs an answer for an unreadable own severity", fastLane, "triage_unanswered:1", 10, gradedThread("review-bot", "", false, shaB)},
 		{"small PR accepts an answer for an unreadable own severity", fastLane, "", 10, gradedThread("review-bot", "", false, shaB, human)},
-		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("review-bot", "medium", false, shaB)},
+		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("coderabbitai[bot]", "major", false, shaB)},
 		{"over the limit without review_gate keeps the raw count", fastLane, "threads_open:1", 51, gradedThread("review-bot", "low", false, shaB)},
-		{"no fast_lane keeps triage", gradedPolicy, "triage_unanswered:1", 10, gradedThread("review-bot", "medium", false, shaB)},
-		{"a blocking path never takes the lane", fastLane + gradedPolicy + "blocking:\n  - paths: ['**']\n    reason: effects\n", "triage_unanswered:1", 10, gradedThread("review-bot", "medium", false, shaB)},
+		{"no fast_lane keeps triage", gradedPolicy, "triage_unanswered:1", 10, gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"a blocking path never takes the lane", fastLane + gradedPolicy + "blocking:\n  - paths: ['**']\n    reason: effects\n", "triage_unanswered:1", 10, gradedThread("coderabbitai[bot]", "major", false, shaB)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, tt.extra, tt.lines, tt.th)); got != tt.want {
@@ -200,7 +199,7 @@ func TestGateFastLane(t *testing.T) {
 // The fast lane trusts the PR's line totals only when the file list sums to
 // the same additions and deletions; any mismatch refuses the lane.
 func TestGateFastLaneNeedsVerifiedLines(t *testing.T) {
-	medium := gradedThread("review-bot", "medium", false, shaB)
+	medium := gradedThread("coderabbitai[bot]", "major", false, shaB)
 	for _, tt := range []struct {
 		name, want         string
 		prLines, fileLines int
@@ -243,7 +242,7 @@ func TestLandGradedTriageAnswered(t *testing.T) {
 		if answered {
 			replies = append(replies, human)
 		}
-		g.feedback.Threads = []github.ReviewThread{gradedThread("review-bot", "medium", false, shaA, replies...)}
+		g.feedback.Threads = []github.ReviewThread{gradedThread("coderabbitai[bot]", "major", false, shaA, replies...)}
 		g.findings = 1
 		if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 			t.Fatal(err)
@@ -285,7 +284,7 @@ func TestGateOutdatedFindings(t *testing.T) {
 		th         github.ReviewThread
 	}{
 		{"own outdated block still holds", "blocking_findings:1", nil, outdated(gradedThread("review-bot", "high", false, shaB))},
-		{"own outdated triage still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("review-bot", "medium", false, shaB))},
+		{"own outdated unrated finding still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("review-bot", "", false, shaB))},
 		{"third-party outdated block holds until its reviewer rechecks", "blocking_findings:1", nil, outdated(gradedThread(cr, "critical", false, shaB))},
 		{"third-party outdated block clears once rechecked", "", map[string]bool{"coderabbitai": true}, outdated(gradedThread(cr, "critical", false, shaB))},
 		{"third-party outdated major clears", "", nil, outdated(gradedThread(cr, "major", false, shaB))},
@@ -325,9 +324,71 @@ func TestGateCommentlessThread(t *testing.T) {
 // A follow-up finding posted under the review login (it carries a severity
 // marker) is not an answer to the earlier own-review finding.
 func TestGateOwnFindingFollowUpFindingIsNotAnAnswer(t *testing.T) {
-	th := gradedThread("review-bot", "medium", false, shaA)
+	th := gradedThread("review-bot", "", false, shaA)
 	th.Comments = append(th.Comments, github.ReviewComment{Author: "review-bot", AuthorType: "User", Body: "<!-- mergewake-severity:low -->\nanother finding"})
 	if v := verdict(t, "review_gate:\n  land: graded\n", 400, th); reasons(v) != "triage_unanswered:1" {
 		t.Fatalf("reasons=%q", reasons(v))
+	}
+}
+
+// crBody is a CodeRabbit inline finding as CodeRabbit posts it: the severity
+// badge and label ahead of the title, no mergewake marker.
+func crBody(icon, label string) string {
+	return "<!-- coderabbit-ai-generated:v1 -->\n\n**<picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/" + icon + "-16.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> " + label + "** · **Functional Correctness** · **Quick win**\n\n**Classify the failure.**\n\nDetails."
+}
+
+// thread is an unresolved review thread opened by author with body on head,
+// followed by (author, body) replies from human accounts.
+func gateThread(author, body string, resolved bool, replies ...[2]string) github.ReviewThread {
+	cs := []github.ReviewComment{{Author: author, CommitSHA: shaB, OriginalCommitSHA: shaB, Body: body}}
+	for _, r := range replies {
+		cs = append(cs, github.ReviewComment{Author: r[0], AuthorType: "User", Body: r[1]})
+	}
+	return github.ReviewThread{IsResolved: resolved, Comments: cs}
+}
+
+// The severity-aware gate table (hk 2481 acceptance 4): mergewake
+// critical/high and CodeRabbit Critical/Major hold until fixed or answered with
+// a reasoned disposition; mergewake medium/low and CodeRabbit Minor/Nitpick
+// never hold and are not counted as unanswered; an answered-but-unresolved
+// high with a disposition is answered, not unanswered.
+func TestGateSeverityTable(t *testing.T) {
+	const cr = "coderabbitai[bot]"
+	own := func(sev string) string { return "<!-- mergewake-severity:" + sev + " -->\nthe finding" }
+	for _, tt := range []struct {
+		name, want                                    string
+		th                                            github.ReviewThread
+		openBlocking, openTriage, answered, dismissed int
+	}{
+		{"own high unanswered blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false), 1, 0, 0, 0},
+		{"own critical unanswered blocks", "blocking_findings:1", gateThread("review-bot", own("critical"), false), 1, 0, 0, 0},
+		{"CodeRabbit Critical unanswered blocks", "blocking_findings:1", gateThread(cr, crBody("critical", "Critical"), false), 1, 0, 0, 0},
+		{"CodeRabbit Major unanswered holds", "triage_unanswered:1", gateThread(cr, crBody("major", "Major"), false), 0, 1, 0, 0},
+		{"CodeRabbit Minor unanswered neither blocks nor counts", "", gateThread(cr, crBody("amber", "Minor"), false), 0, 0, 0, 0},
+		{"CodeRabbit Nitpick unanswered neither blocks nor counts", "", gateThread(cr, crBody("nitpick", "Nitpick"), false), 0, 0, 0, 0},
+		{"own medium unanswered neither blocks nor counts", "", gateThread("review-bot", own("medium"), false), 0, 0, 0, 0},
+		{"own low unanswered neither blocks nor counts", "", gateThread("review-bot", own("low"), false), 0, 0, 0, 0},
+		{"answered-but-unresolved high with a fix is answered", "", gateThread("review-bot", own("high"), false, [2]string{"review-bot", "Fixed in 81149ea: the budget is spent after delivery."}), 0, 0, 1, 0},
+		{"answered-but-unresolved high with a reasoned dismissal is answered", "", gateThread("review-bot", own("high"), false, [2]string{"dev", "Dismiss: the path is test-only; see config_test.go:41."}), 0, 0, 1, 1},
+		{"CodeRabbit Critical fixed by the author is answered", "", gateThread(cr, crBody("critical", "Critical"), false, [2]string{"dev", "Fixed in 6d7d76d."}), 0, 0, 1, 0},
+		{"CodeRabbit Major answered by the author is answered unresolved", "", gateThread(cr, crBody("major", "Major"), false, [2]string{"dev", "Deferred to hk 2490."}), 0, 0, 1, 0},
+		{"high acknowledged without a disposition still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Looking into it."}), 1, 0, 0, 0},
+		{"high dismissed without a reason still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Dismissed."}), 1, 0, 0, 0},
+		{"high fixed without a commit still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Fixed."}), 1, 0, 0, 0},
+		{"high deferred still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Deferred to hk 2490."}), 1, 0, 0, 0},
+		{"high disposition from a bot does not count", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"ci[bot]", "Fixed in 81149ea."}), 1, 0, 0, 0},
+		{"a later non-disposition answer supersedes a fix", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Fixed in 81149ea."}, [2]string{"qa", "That fix is wrong: the bug is still there."}), 1, 0, 0, 0},
+		{"a later fix supersedes an acknowledgement", "", gateThread("review-bot", own("high"), false, [2]string{"dev", "Looking into it."}, [2]string{"dev", "Fixed in 81149ea."}), 0, 0, 1, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			v := verdict(t, gradedPolicy, 0, tt.th)
+			if got := reasons(v); got != tt.want {
+				t.Fatalf("reasons=%q want %q", got, tt.want)
+			}
+			d := v.Review.Findings
+			if d.OpenBlocking != tt.openBlocking || d.OpenTriage != tt.openTriage || d.Answered != tt.answered || d.DismissedBlocking != tt.dismissed {
+				t.Fatalf("dispositions %+v", d)
+			}
+		})
 	}
 }

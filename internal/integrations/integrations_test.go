@@ -207,3 +207,63 @@ func TestTaskBodyReadsBodyThenDescription(t *testing.T) {
 		t.Fatal("invalid task accepted")
 	}
 }
+
+// typeRunner refuses --type the way a panewire older than the type does, and
+// serves an inbox list.
+type typeRunner struct {
+	calls  [][]string
+	oldCLI bool
+	inbox  string
+}
+
+func (r *typeRunner) Run(_ context.Context, _ string, a []string, _, _ string) ([]byte, error) {
+	r.calls = append(r.calls, a)
+	if a[0] == "inbox" {
+		return []byte(r.inbox), nil
+	}
+	for i, arg := range a {
+		if arg == "--type" && r.oldCLI {
+			return nil, &CommandError{Command: "panewire", Err: errors.New("exit status 2"), Stderr: "emit: invalid --type " + a[i+1]}
+		}
+	}
+	return nil, nil
+}
+
+func TestPanewireDeclaresTheEventType(t *testing.T) {
+	r := &typeRunner{}
+	p := Panewire{Runner: r, Command: "panewire", Lane: "desk"}
+	if err := p.Notify(context.Background(), Event{ID: "e1", Text: "x", Lane: "w-7", Type: "findings"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(r.calls[0], " "); got != "emit --kind lane.event --lane w-7 --event-id e1 --text x --type findings" {
+		t.Fatal(got)
+	}
+	if err := p.Notify(context.Background(), Event{ID: "e2", Text: "x"}); err != nil || strings.Contains(strings.Join(r.calls[1], " "), "--type") {
+		t.Fatalf("untyped event declared a type: %v %v", err, r.calls[1])
+	}
+	// A panewire older than the type refuses it before recording anything;
+	// the event is sent again untyped.
+	old := &typeRunner{oldCLI: true}
+	p.Runner = old
+	if err := p.Notify(context.Background(), Event{ID: "e3", Text: "x", Type: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(old.calls) != 2 || strings.Contains(strings.Join(old.calls[1], " "), "--type") {
+		t.Fatalf("calls %v", old.calls)
+	}
+}
+
+func TestPanewireAckedReadsTheLaneInbox(t *testing.T) {
+	r := &typeRunner{inbox: `[{"id":4,"acked_at_ms":1700,"event":{"event_id":"done"}},{"id":3,"event":{"event_id":"open"}}]`}
+	p := Panewire{Runner: r, Command: "panewire"}
+	got, err := p.AckedEvents(context.Background(), "w-7")
+	if err != nil || len(got) != 2 || !got["done"] || got["open"] {
+		t.Fatalf("%v %v", got, err)
+	}
+	if _, ok := got["absent"]; ok {
+		t.Fatal("absent event reported")
+	}
+	if got := strings.Join(r.calls[0], " "); got != "inbox list --lane w-7 --json" {
+		t.Fatal(got)
+	}
+}
