@@ -43,7 +43,9 @@ func TestEmitWritesOneBoundedRedactedLine(t *testing.T) {
 
 func TestEmitRotatesAtMaxBytes(t *testing.T) {
 	dir := t.TempDir()
-	w := New(dir, "mergewake", nil)
+	// Pin host and time so every line has the same size on any machine.
+	w := New(dir, "mergewake", func() time.Time { return time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC) })
+	w.Host = "host-a"
 	w.MaxBytes = 600
 	for i := 0; i < 5; i++ {
 		w.Emit("spawn", "job", "refused", "usage", strings.Repeat("x ", 50))
