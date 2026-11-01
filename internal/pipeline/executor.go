@@ -65,7 +65,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profiles := s.Config.Review.Profiles
 	for i, name := range plan.candidates {
 		skip := func(reason string, reset time.Time) {
-			sk := reviewSkip{Reviewer: name, Reason: reason}
+			sk := reviewSkip{Reviewer: name, Reason: reason, Host: s.Config.Host}
 			if !reset.IsZero() {
 				sk.Reset = reset.UTC().Format(time.RFC3339)
 			}
@@ -101,6 +101,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		invocation, e := reviewer.Prepare(p, candidateControl)
 		if e != nil {
 			skip("reviewer profile rejected", time.Time{})
+			out.skips[len(out.skips)-1].withCause(e)
 			continue
 		}
 		plan.invocation = invocation
@@ -138,9 +139,11 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		failure := quota.Classify(runErr, s.now())
 		if !failure.Quota {
 			skip("review failed", time.Time{})
+			out.skips[len(out.skips)-1].withCause(runErr)
 			continue
 		}
 		skip("quota exhausted", failure.Reset)
+		out.skips[len(out.skips)-1].withCause(runErr)
 		if key := h.freePool[name]; key != "" {
 			h.exhausted[key] = true
 		}

@@ -75,7 +75,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		defer cancel()
 	}
 	skip := func(format string, args ...any) (passOutcome, error) {
-		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fmt.Sprintf(format, args...)})
+		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fmt.Sprintf(format, args...), Host: cfg.Host})
 		return out, nil
 	}
 	root := config.Expand(x.repo.Root)
@@ -203,7 +203,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		if ctx.Err() != nil {
 			return out, fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err()))
 		}
-		return skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
+		out, _ = skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
+		out.skips[len(out.skips)-1].withCause(e)
+		return out, nil
 	}
 	res, e := x.recordResult(ctx, label)
 	if e != nil {

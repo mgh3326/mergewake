@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/crashreport"
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/pipeline"
@@ -30,6 +31,8 @@ func (w *lockedWriter) Write(b []byte) (int, error) {
 }
 
 func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
+	// Fatal panics in any loop goroutine reach Sentry on the next start.
+	defer crashreport.Start(s.Config.StateDir, "mergewake", version)()
 	loops := []daemon.Loop{}
 	// Each role owns one goroutine; repositories within it run in config order.
 	for _, entry := range []struct {
