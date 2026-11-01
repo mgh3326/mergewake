@@ -150,10 +150,23 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `triage_unanswered:<n>` instead when the repo policy grades findings), `review_missing` when the
 marker or passes are absent, `base_stale` when the base moved ahead of the
 head, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
-check evidence emits nothing. Each `(PR, head, verdict)` emits at most once — a
+check evidence emits nothing. Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
-across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`.
+across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY and
+BLOCKED are declared `--type ready|blocked`, so they stay unread on the lane
+until `panewire inbox ack`, and a READY PR nobody merged is notified again every
+`daemon.pr.notify.renotify_after` (default 30m), at most `renotify_max` times
+(default 3).
+
+Review findings go straight to the PR's author lane (`Mergewake-Task` → hk task
+→ bound job → its lane; else the repo lane, then the desk), one event per
+delivery naming every finding and what it needs. With no `panewire inbox ack`
+within `daemon.pr.findings.ack_after` (default 15m) the event is re-sent once,
+then escalated to the owner. Under a graded policy only mergewake
+critical/high and CodeRabbit Critical/Major hold the gate, until fixed (a
+reply naming a commit in the PR after the finding) or dismissed with a reason; medium/low and Minor/Nitpick never do. See
+[docs/config.md](docs/config.md#findings-delivery).
 
 Auto-merge is opt-in per repository with `enabled: true` in
 `.mergewake/policy.yaml` (default off). While the daemon acts

@@ -124,6 +124,42 @@ func TestRoundTwoPromptHasOnlyTheInterdiffAndPriorFindings(t *testing.T) {
 	}
 }
 
+// The worker replies from the operator account mergewake also posts under, so
+// its dispositions carry the finding's own login. A second round still shows
+// them as dispositions — not "none yet" — and the pass receipt counts them in
+// answered_context; the reviewer is told to review the delta and its impact
+// paths, not to run a fresh full hunt.
+func TestRoundTwoCarriesSameLoginDispositions(t *testing.T) {
+	fixed := thread("tool", 1, false,
+		say("review-bot", "<!-- mergewake-severity:high -->\nThe old line is wrong"),
+		say("review-bot", "Fixed in abc1234: the line now validates its input"))
+	dismissed := thread("tool", 2, false,
+		say("review-bot", "<!-- mergewake-severity:medium -->\nkeep line is brittle"),
+		say("review-bot", "Dismiss: keep is a fixed fixture string"))
+	s, g, run, r := roundSetup(t, priorHeads, patchOne, patchTwo, fsjson())
+	g.feedback.Threads = []github.ReviewThread{fixed, dismissed}
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	ctx := run.prompt[:strings.Index(run.prompt, "UNTRUSTED DIFF:")]
+	for _, want := range []string{
+		"PRIOR FINDINGS (rounds 1-1", "tool:1 (high)", "disposition: answered: Fixed in abc1234",
+		"tool:2 (medium)", "disposition: answered: Dismiss: keep is a fixed fixture string",
+		"their impact paths", "not a fresh full review",
+	} {
+		if !strings.Contains(ctx, want) {
+			t.Fatalf("missing %q in:\n%s", want, ctx)
+		}
+	}
+	if strings.Contains(ctx, "disposition: none yet") {
+		t.Fatalf("a same-login disposition read as unanswered:\n%s", ctx)
+	}
+	got := g.passes[g.pull.Head.SHA]
+	if len(got) != 1 || got[0].Round != 2 || got[0].AnsweredContext != 2 {
+		t.Fatalf("receipt %+v, want round 2 with answered_context 2", got)
+	}
+}
+
 func TestDuplicateOfAnExistingThreadIsNotPosted(t *testing.T) {
 	prior := thread("tool", 1, true,
 		say("review-bot", "<!-- mergewake-severity:high -->\nThe old line is wrong and leaks a file handle"),
@@ -188,8 +224,9 @@ func TestContractMakesOutsideFindingsAdvisory(t *testing.T) {
 		t.Fatalf("in-contract finding is untouched: %+v", got[3])
 	}
 	// As posted, the advisory medium grades advisory at the merge gate (no
-	// answer needed), while the critical still blocks and an in-contract medium
-	// would still need an answer.
+	// answer needed), the critical and the in-contract high still block, and an
+	// in-contract medium never holds the gate either: the author answers it,
+	// but it is not counted as unanswered.
 	gate := (policy.ReviewGate{}).WithOwnLogin("review-bot")
 	grade := func(f github.Finding) string {
 		return gate.Grade(policy.ReviewFinding{Author: "review-bot", OwnReview: true, Severity: github.ThreadSeverity("review-bot", github.FindingBody(f))}, "routine")
@@ -200,7 +237,10 @@ func TestContractMakesOutsideFindingsAdvisory(t *testing.T) {
 	if g := grade(got[2]); g != policy.GradeBlock {
 		t.Fatalf("critical graded %s", g)
 	}
-	if g := grade(github.Finding{Severity: "medium", Body: "x"}); g != policy.GradeTriage {
+	if g := grade(got[3]); g != policy.GradeBlock {
+		t.Fatalf("in-contract high graded %s", g)
+	}
+	if g := grade(github.Finding{Severity: "medium", Body: "x"}); g != policy.GradeAdvisory {
 		t.Fatalf("in-contract medium graded %s", g)
 	}
 }

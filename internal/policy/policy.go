@@ -89,12 +89,13 @@ func NormalizeAuthor(login string) string {
 func defaultReviewGate() ReviewGate {
 	yes := true
 	return ReviewGate{
+		// CodeRabbit Critical and Major rank with a mergewake high (operator
+		// 2026-11-01): fixed, or dismissed with a reason; never deferred.
 		Block: []ReviewGateRule{
-			{Author: "coderabbitai", Severity: []string{"critical"}, Classes: []string{"blocking", "routine"}},
+			{Author: "coderabbitai", Severity: []string{"critical", "major"}, Classes: []string{"blocking", "routine"}},
 			{Author: "chatgpt-codex-connector", Severity: []string{"p1"}},
 		},
 		Triage: []ReviewGateRule{
-			{Author: "coderabbitai", Severity: []string{"major"}},
 			{Author: "chatgpt-codex-connector", Severity: []string{"p2"}},
 		},
 		IgnoreAuthors:     []string{"qlty", "commitcheck", "wip", "accesslint", "codecov", "gitguardian"},
@@ -125,11 +126,14 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	return g
 }
 
-// WithOwnLogin adds default rules for the trusted review identity, each list
-// on its own: critical and high findings block, medium and low ones need a
-// disposition (a reply or a resolution). A list that already names the login
-// keeps only the policy's rules for it; the other list still gets its default. The reviewer
-// prompt also admits blocking, major and minor, graded like high, medium and low.
+// WithOwnLogin adds the default block rule for the trusted review identity:
+// its critical and high findings block until fixed or dismissed with a reason.
+// Its medium and low findings are advisory — they get a disposition from the
+// author (fleet-review §Triage rubric) but never hold the gate and are not
+// counted as unanswered. A block list that already names the login keeps only
+// the policy's rules for it, and a policy may still add the login to its triage
+// list. The reviewer prompt also admits blocking, major and minor, graded like
+// high, medium and low.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
 	own := NormalizeAuthor(login)
@@ -146,9 +150,6 @@ func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	}
 	if !names(g.Block) {
 		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
-	}
-	if !names(g.Triage) {
-		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major", "low", "minor"}})
 	}
 	return g
 }

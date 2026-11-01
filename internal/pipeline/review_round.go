@@ -289,7 +289,7 @@ func (rp roundPlan) notes() string {
 	case rp.empty:
 		fmt.Fprintf(&b, "REVIEW ROUND %d. No hunk changed since the last reviewed head %s (a base merge or rebase). The diff below is the whole PR, for reference only.\n", rp.round, short7(rp.base))
 	case rp.base != "":
-		fmt.Fprintf(&b, "REVIEW ROUND %d (delta). The diff below is NOT the whole PR: it holds only the hunks changed since the last reviewed head %s. Review only these changed lines and report nothing about code outside them.\n", rp.round, short7(rp.base))
+		fmt.Fprintf(&b, "REVIEW ROUND %d (delta). The diff below is NOT the whole PR: it holds only the hunks changed since the last reviewed head %s. Review these changed lines and their impact paths (the callers, config and data they feed); this is not a fresh full review. Report a defect outside the shown hunks only when a changed line causes it, anchor it on that changed line and say so; do not hunt for anything else.\n", rp.round, short7(rp.base))
 	case rp.round > 1:
 		fmt.Fprintf(&b, "REVIEW ROUND %d. The diff below is the whole PR (the interdiff could not be built: %s).\n", rp.round, rp.note)
 	}
@@ -310,6 +310,9 @@ var (
 
 // stripFinding removes the marker lines mergewake adds to a posted finding.
 func stripFinding(body string) string { return findingMarkers.ReplaceAllString(body, "") }
+
+// priorOpen is the disposition of a prior finding nobody has answered.
+const priorOpen = "none yet (still open)"
 
 // priorItem is a finding mergewake posted in an earlier round, with its
 // disposition.
@@ -338,8 +341,7 @@ func priorFindings(fb github.ReviewFeedback, own string) []priorItem {
 		}
 		reply := ""
 		for j := len(t.Comments) - 1; j > 0; j-- {
-			c := t.Comments[j]
-			if strings.TrimSpace(c.Body) != "" && c.Author != first.Author {
+			if c := t.Comments[j]; disposes(first, c, own) {
 				reply = excerpt(c.Body, excerptLimit)
 				break
 			}
@@ -352,7 +354,7 @@ func priorFindings(fb github.ReviewFeedback, own string) []priorItem {
 		case reply != "":
 			it.disposition = "answered: " + reply
 		default:
-			it.disposition = "none yet (still open)"
+			it.disposition = priorOpen
 		}
 		out = append(out, it)
 	}

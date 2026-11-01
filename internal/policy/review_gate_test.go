@@ -19,8 +19,9 @@ func TestReviewGateDisposition(t *testing.T) {
 		{name: "outdated critical rechecked clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "critical", Outdated: true, Rechecked: true}, ignored: 1},
 		{name: "outdated P1 holds without recheck", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p1", Outdated: true}, block: 1},
 		{name: "outdated P2 needs reply", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p2", Outdated: true}, triage: 1},
-		{name: "outdated routine major clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
-		{name: "outdated blocking major clears", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
+		{name: "Major ranks with critical: outdated routine major holds without recheck", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, block: 1},
+		{name: "outdated blocking major holds without recheck", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, block: 1},
+		{name: "outdated major rechecked clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true, Rechecked: true}, ignored: 1},
 		{name: "unknown severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "surprise"}, triage: 1},
 		{name: "missing severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai"}, triage: 1},
 		{name: "ghost author holds blocking", class: "blocking", f: ReviewFinding{Severity: "critical"}, triage: 1},
@@ -38,12 +39,12 @@ func TestReviewGateDisposition(t *testing.T) {
 
 func TestReviewGateNoCrossBotAnswer(t *testing.T) {
 	fs := []ReviewFinding{
-		{Author: "coderabbitai", Severity: "major", Path: "tool", Line: 1, Answered: true},
+		{Author: "chatgpt-codex-connector", Severity: "p2", Path: "tool", Line: 1, Answered: true},
 		{Author: "chatgpt-codex-connector", Severity: "p1", Path: "tool", Line: 1},
-		{Author: "chatgpt-codex-connector", Severity: "p2", Path: "tool", Line: 1},
+		{Author: "coderabbitai", Severity: "major", Path: "tool", Line: 1},
 	}
 	v := (ReviewGate{}).Evaluate(fs, "routine")
-	if len(v.Blocking) != 1 || len(v.Triage) != 1 {
+	if len(v.Blocking) != 2 || len(v.Triage) != 0 {
 		t.Fatalf("%+v", v)
 	}
 }
@@ -78,10 +79,10 @@ func TestReviewGateGradeOwnLogin(t *testing.T) {
 		{"critical blocks", "critical", "routine", GradeBlock, true},
 		{"high blocks", "high", "routine", GradeBlock, true},
 		{"blocking alias blocks", "blocking", "routine", GradeBlock, true},
-		{"medium triages", "medium", "routine", GradeTriage, true},
-		{"major alias triages", "major", "routine", GradeTriage, true},
-		{"low needs a disposition", "low", "routine", GradeTriage, true},
-		{"minor alias needs a disposition", "minor", "blocking", GradeTriage, true},
+		{"medium is advisory", "medium", "routine", GradeAdvisory, true},
+		{"major alias is advisory", "major", "routine", GradeAdvisory, true},
+		{"low is advisory", "low", "routine", GradeAdvisory, true},
+		{"minor alias is advisory on a blocking path", "minor", "blocking", GradeAdvisory, true},
 		{"missing severity needs an answer", "", "routine", GradeTriage, true},
 		{"unknown severity needs an answer", "surprise", "routine", GradeTriage, true},
 		{"other author without rule is advisory", "high", "routine", GradeAdvisory, false},
@@ -111,7 +112,8 @@ func TestReviewGateOwnLoginDefaultsYieldToPolicy(t *testing.T) {
 	}
 }
 
-// Naming the login in one list replaces only that list's default for it.
+// Naming the login in the block list replaces its default block rule; a
+// policy may still put the login's lower severities on its triage list.
 func TestReviewGateOwnLoginDefaultsPerList(t *testing.T) {
 	triageOnly := ReviewGate{Triage: []ReviewGateRule{{Author: "review-bot", Severity: []string{"low"}}}}.WithOwnLogin("review-bot")
 	blockOnly := ReviewGate{Block: []ReviewGateRule{{Author: "review-bot", Severity: []string{"critical"}}}}.WithOwnLogin("review-bot")
@@ -122,7 +124,7 @@ func TestReviewGateOwnLoginDefaultsPerList(t *testing.T) {
 		{"triage-only policy keeps default block", "high", GradeBlock, triageOnly},
 		{"triage-only policy replaces default triage", "medium", GradeAdvisory, triageOnly},
 		{"triage-only policy uses its own triage rule", "low", GradeTriage, triageOnly},
-		{"block-only policy keeps default triage", "medium", GradeTriage, blockOnly},
+		{"block-only policy leaves medium advisory", "medium", GradeAdvisory, blockOnly},
 		{"block-only policy replaces default block", "high", GradeAdvisory, blockOnly},
 		{"block-only policy uses its own block rule", "critical", GradeBlock, blockOnly},
 	} {

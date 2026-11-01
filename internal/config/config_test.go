@@ -532,3 +532,35 @@ func TestStallAfterAndBudgetConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestRenotifyAndFindingsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		extra       string
+		fail        bool
+		every       time.Duration
+		max         int
+		ack         time.Duration
+		findingsOff bool
+	}{
+		{"", false, DefaultRenotifyAfter, DefaultRenotifyMax, DefaultFindingsAckAfter, false},
+		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: 1h, renotify_max: 5}, findings: {ack_after: 5m}}\n", false, time.Hour, 5, 5 * time.Minute, false},
+		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: off}, findings: {enabled: false}}\n", false, 0, 0, DefaultFindingsAckAfter, true},
+		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: soon}}\n", true, 0, 0, 0, false},
+		{"daemon:\n  pr: {enabled: true, notify: {renotify_max: -1}}\n", true, 0, 0, 0, false},
+		{"daemon:\n  pr: {enabled: true, findings: {ack_after: never}}\n", true, 0, 0, 0, false},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
+		c, err := Load(path)
+		if (err != nil) != tc.fail {
+			t.Fatalf("config %q err=%v", tc.extra, err)
+		}
+		if err != nil {
+			continue
+		}
+		every, max := c.Daemon.PR.Notify.Renotify()
+		if every != tc.every || max != tc.max || c.Daemon.PR.Findings.AckWindow() != tc.ack || c.Daemon.PR.Findings.On() == tc.findingsOff {
+			t.Fatalf("config %q: renotify %v/%d ack %v on=%v", tc.extra, every, max, c.Daemon.PR.Findings.AckWindow(), c.Daemon.PR.Findings.On())
+		}
+	}
+}

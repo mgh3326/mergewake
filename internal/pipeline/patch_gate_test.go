@@ -252,8 +252,8 @@ func TestLandDryRunPrintsReviewRecord(t *testing.T) {
 	markReviewed(g)
 	g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic", Patch: reviewPatchID(diff)}}}
 	g.feedback.Threads = []github.ReviewThread{
-		gradedThread("review-bot", "medium", false, shaA),
-		gradedThread("review-bot", "low", false, shaA, human),
+		gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaA),
+		gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaA, human),
 		gradedThread("review-bot", "high", true, shaA, human),
 		gradedThread("review-bot", "high", false, shaA),
 	}

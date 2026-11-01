@@ -150,15 +150,75 @@ type Loop struct {
 // `notify: {enabled: false}` silences them.
 type PRNotify struct {
 	Enabled *bool `yaml:"enabled"`
+	// RenotifyAfter is how long after the last READY event a PR that is still
+	// open and READY on the same head is notified again. Empty means 30m;
+	// "off" keeps one READY per head.
+	RenotifyAfter string `yaml:"renotify_after"`
+	// RenotifyMax bounds those repeats per head. 0 means 3.
+	RenotifyMax int `yaml:"renotify_max"`
 }
 
 func (n PRNotify) On() bool { return n.Enabled == nil || *n.Enabled }
 
+// DefaultRenotifyAfter and DefaultRenotifyMax apply when the keys are unset.
+const (
+	DefaultRenotifyAfter = 30 * time.Minute
+	DefaultRenotifyMax   = 3
+)
+
+// Renotify is the READY repeat interval and the repeat bound; a zero interval
+// means no repeats.
+func (n PRNotify) Renotify() (time.Duration, int) {
+	max := n.RenotifyMax
+	if max == 0 {
+		max = DefaultRenotifyMax
+	}
+	switch n.RenotifyAfter {
+	case "":
+		return DefaultRenotifyAfter, max
+	case "off":
+		return 0, 0
+	}
+	d, e := Duration(n.RenotifyAfter)
+	if e != nil {
+		return 0, 0
+	}
+	return d, max
+}
+
+// PRFindings configures delivering review findings to the PR author's lane.
+// Absent means enabled; `findings: {enabled: false}` stops the deliveries.
+type PRFindings struct {
+	Enabled *bool `yaml:"enabled"`
+	// AckAfter is how long a delivery waits for the author lane's
+	// `panewire inbox ack` before it is re-sent once, and again before it is
+	// escalated to the owning lane. Empty means 15m.
+	AckAfter string `yaml:"ack_after"`
+}
+
+func (f PRFindings) On() bool { return f.Enabled == nil || *f.Enabled }
+
+// DefaultFindingsAckAfter applies when ack_after is unset.
+const DefaultFindingsAckAfter = 15 * time.Minute
+
+// AckWindow is the bounded wait for an author ACK.
+func (f PRFindings) AckWindow() time.Duration {
+	if f.AckAfter == "" {
+		return DefaultFindingsAckAfter
+	}
+	d, e := Duration(f.AckAfter)
+	if e != nil {
+		return DefaultFindingsAckAfter
+	}
+	return d
+}
+
 // PRLoop extends the shared loop keys with the notify gate; other roles reject
 // the key as an unknown field.
 type PRLoop struct {
-	Loop   `yaml:",inline"`
-	Notify PRNotify `yaml:"notify"`
+	Loop     `yaml:",inline"`
+	Notify   PRNotify   `yaml:"notify"`
+	Findings PRFindings `yaml:"findings"`
 	// StallAfter is how long a ready PR head may wait with no review started
 	// before the stall alarm fires. Empty means 30m; "off" disables the alarm.
 	StallAfter string `yaml:"stall_after"`
@@ -339,6 +399,19 @@ func Load(name string) (Config, error) {
 	if v := c.Daemon.PR.StallAfter; v != "" && v != "off" {
 		if _, e = Duration(v); e != nil {
 			return c, fmt.Errorf("daemon.pr.stall_after: %w", e)
+		}
+	}
+	if v := c.Daemon.PR.Notify.RenotifyAfter; v != "" && v != "off" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("daemon.pr.notify.renotify_after: %w", e)
+		}
+	}
+	if c.Daemon.PR.Notify.RenotifyMax < 0 {
+		return c, errors.New("daemon.pr.notify.renotify_max must not be negative")
+	}
+	if v := c.Daemon.PR.Findings.AckAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("daemon.pr.findings.ack_after: %w", e)
 		}
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {

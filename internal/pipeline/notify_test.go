@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -388,5 +389,80 @@ func TestNotifyLaneRepoLane(t *testing.T) {
 				t.Fatalf("%+v", n.events)
 			}
 		})
+	}
+}
+
+// A READY PR that stays open and READY on the same head is notified again
+// after daemon.pr.notify.renotify_after and stops after renotify_max repeats;
+// every READY is declared --type ready so it stays unread until acked. A
+// merged PR gets no reminder.
+func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	poll := func(d time.Duration) {
+		t.Helper()
+		now = now.Add(d)
+		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	poll(0)
+	if n.count != 1 || n.events[0].Type != "ready" {
+		t.Fatalf("first READY: %+v", n.events)
+	}
+	poll(29 * time.Minute)
+	if n.count != 1 {
+		t.Fatal("re-notified inside the interval")
+	}
+	poll(time.Minute)
+	if n.count != 2 {
+		t.Fatalf("no reminder after 30m: %d events", n.count)
+	}
+	e := n.events[1]
+	if e.Type != "ready" || e.ID != "mergewake-ready-example/project-7-"+shaA+"-reminder-1" || !strings.Contains(e.Text, "[mergewake] READY example/project#7") || !strings.Contains(e.Text, "reminder 1/3, unmerged for 30m0s") {
+		t.Fatalf("reminder %+v", e)
+	}
+	for i := 0; i < 5; i++ {
+		poll(30 * time.Minute)
+	}
+	if n.count != 4 {
+		t.Fatalf("reminders not bounded at 3: %d events", n.count)
+	}
+
+	// A merged PR gets none, however long it has been.
+	s2, g2, n2, r2 := notifySetup(t)
+	s2.Now = func() time.Time { return now }
+	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil || n2.count != 1 {
+		t.Fatal(e, n2.count)
+	}
+	g2.pull.State = "closed"
+	now = now.Add(2 * time.Hour)
+	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil || n2.count != 1 {
+		t.Fatalf("merged PR re-notified: %v %d", e, n2.count)
+	}
+	_ = g
+}
+
+// renotify_after: off keeps one READY per head; renotify_max bounds repeats.
+func TestNotifyReadyRenotifyConfig(t *testing.T) {
+	for _, tt := range []struct {
+		after string
+		max   int
+		want  int
+	}{{"off", 0, 1}, {"10m", 1, 2}, {"", 0, 4}} {
+		s, _, n, r := notifySetup(t)
+		s.Config.Daemon.PR.Notify.RenotifyAfter, s.Config.Daemon.PR.Notify.RenotifyMax = tt.after, tt.max
+		now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+		s.Now = func() time.Time { return now }
+		for i := 0; i < 8; i++ {
+			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+				t.Fatal(e)
+			}
+			now = now.Add(time.Hour)
+		}
+		if n.count != tt.want {
+			t.Fatalf("%+v: %d events", tt, n.count)
+		}
 	}
 }
