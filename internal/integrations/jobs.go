@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -100,18 +100,30 @@ func hkJobEndpoint() (*hkJobs, error) {
 	if e != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("invalid handoffkeep endpoint")
 	}
-	if u.Scheme == "http" {
-		host := u.Hostname()
-		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return nil, errors.New("handoffkeep endpoint requires HTTPS off loopback")
-		}
-	} else if u.Scheme != "https" {
+	if u.Scheme == "http" && !plainHTTPAllowed(u.Hostname()) {
+		return nil, errors.New("handoffkeep endpoint requires HTTPS off loopback and tailnet")
+	} else if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, errors.New("invalid handoffkeep endpoint scheme")
 	}
 	if (cfID == "") != (cfSecret == "") {
 		return nil, errors.New("CF Access credential pair incomplete")
 	}
 	return &hkJobs{base: strings.TrimRight(u.String(), "/"), token: token, cfID: cfID, cfSecret: cfSecret}, nil
+}
+
+// tailnetPrefix is the Tailscale CGNAT range. Traffic to it rides the
+// WireGuard tunnel, so plain HTTP there is encrypted on the wire like loopback
+// is local; anything else off-host must be HTTPS because the bearer token
+// travels with every request.
+var tailnetPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+func plainHTTPAllowed(host string) bool {
+	host = strings.ToLower(host)
+	if host == "localhost" || strings.HasSuffix(host, ".ts.net") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && (ip.IsLoopback() || tailnetPrefix.Contains(ip.Unmap()))
 }
 
 // hkJobs reads the jobs API. Redirects are refused so the credential never
@@ -125,6 +137,13 @@ func (c *hkJobs) get(ctx context.Context, id string) (JobRecord, error) {
 	client := c.HTTP
 	if client == nil {
 		client = &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		if strings.HasPrefix(c.base, "http://") {
+			// Plain HTTP is allowed only to loopback or the tailnet; an
+			// HTTP_PROXY must not receive the bearer token outside it.
+			t := http.DefaultTransport.(*http.Transport).Clone()
+			t.Proxy = nil
+			client.Transport = t
+		}
 	}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id), nil)
 	if e != nil {
