@@ -245,9 +245,21 @@ func TestReapLeadProtections(t *testing.T) {
 		{"composer unreadable", leadPane(`,"agent":"other"`), nil, "composer-unknown"},
 		{"pane id unrecorded", leadPane(""), func(_ *Service, sink *jobSink, _ *scriptRunner) {
 			rec := sink.recs["lead-a"]
-			rec.PaneID, rec.Host = "", ""
+			rec.PaneID = ""
 			sink.recs["lead-a"] = rec
 		}, "pane-id-unrecorded"},
+		// herdr pane ids are host-local: a record naming an unconfigured
+		// host is never matched on another host, even by label and id.
+		{"host not configured", leadPane(""), func(_ *Service, sink *jobSink, _ *scriptRunner) {
+			rec := sink.recs["lead-a"]
+			rec.Host = "node-z"
+			sink.recs["lead-a"] = rec
+		}, "job-host-unconfigured"},
+		{"host unrecorded", leadPane(""), func(_ *Service, sink *jobSink, _ *scriptRunner) {
+			rec := sink.recs["lead-a"]
+			rec.Host = ""
+			sink.recs["lead-a"] = rec
+		}, "job-host-unconfigured"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _, sink, run := leadFixture(t, tt.pane)

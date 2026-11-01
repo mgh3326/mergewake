@@ -82,7 +82,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | --- | --- | --- |
 | `name` | Required | Unique label for receipts; same alphabet as `host`. |
 | `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
-| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for on the host whose `name` or `machine` equals its hk job record's `host` (runtug's `HUB_MACHINE_ID`), so name a local host after its machine id. |
+| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (runtug's `HUB_MACHINE_ID`), so name a local host after its machine id; otherwise its leads are skipped as `job-host-unconfigured`. |
 | `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
 
 ### `reap`
@@ -138,8 +138,9 @@ reaped through its job instead of its worktree: the same binding the findings
 router uses — hk task → bound job (`refs.job_id`) → the job record runtug
 wrote at spawn (`host`, `label`, `pane_id`). The pane is the one named after
 the label on the configured host whose `name` or `machine` equals the
-record's `host` (every host is searched when none does; more than one match
-is `job-pane-ambiguous`). Its cwd does not matter, so a lead that launched in
+record's `host`. herdr pane ids are host-local, so no other host is searched:
+a record whose host is missing or not configured is `job-host-unconfigured`,
+and more than one match is `job-pane-ambiguous`. Its cwd does not matter, so a lead that launched in
 one repo's worktree and owns PRs across repos is still found. The binding is
 read once per merged PR per daemon process (a task with no job yet is asked
 again each pass). A PR without the trailer, or whose task has no bound job,

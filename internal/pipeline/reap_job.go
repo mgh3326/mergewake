@@ -94,8 +94,12 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		note(rec)
 		return
 	}
-	hs, pane, n := jobPane(hosts, job, b.Job)
+	hs, pane, n, ok := jobPane(hosts, job, b.Job)
 	switch {
+	case !ok:
+		rec.Result, rec.Reason = "skipped", "job-host-unconfigured"
+		note(rec)
+		return
 	case n == 0:
 		if prior, ok := closed[b.Job]; ok && !terminalJob(job.State) {
 			s.reapJobDone(ctx, prior, byName[prior.Host], job, acting, note)
@@ -208,30 +212,21 @@ func (s *Service) reapJobDone(ctx context.Context, closed reapReceipt, hs *reapH
 	note(v)
 }
 
-// jobPane finds the job's pane by its label on the host runtug recorded — a
-// host whose name or machine is the record's host; when no configured host
-// is, every host is searched. n counts matches: only exactly one is used.
-func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (*reapHost, reap.Pane, int) {
+// jobPane finds the job's pane by its label on the host runtug recorded: a
+// configured host whose name or machine is the record's host. herdr pane ids
+// are host-local, so no other host is searched; a record whose host is not
+// configured resolves no host (ok false). n counts label matches: only
+// exactly one is used.
+func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reapHost, found reap.Pane, n int, ok bool) {
 	label := job.Label
 	if label == "" {
 		label = id
 	}
-	scope := hosts
-	if job.Host != "" {
-		var named []*reapHost
-		for _, hs := range hosts {
-			if hs.host.Name == job.Host || hs.host.MachineID() == job.Host {
-				named = append(named, hs)
-			}
+	for _, hs := range hosts {
+		if job.Host == "" || (hs.host.Name != job.Host && hs.host.MachineID() != job.Host) {
+			continue
 		}
-		if len(named) > 0 {
-			scope = named
-		}
-	}
-	var at *reapHost
-	var found reap.Pane
-	n := 0
-	for _, hs := range scope {
+		ok = true
 		if hs.failed {
 			continue
 		}
@@ -242,7 +237,7 @@ func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (*reapHos
 			}
 		}
 	}
-	return at, found, n
+	return at, found, n, ok
 }
 
 // jobOpenPRs lists the open PRs, against any base in every configured repo,
