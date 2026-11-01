@@ -115,8 +115,11 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	}
 	// A follow-up that cannot read an ACK or send is reported after this
 	// pass's new deliveries, so an unreachable hub never holds new findings.
-	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o)
-	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done)
+	// A fix claim GitHub could not check reads as not yet disposed: the author
+	// still gets (or keeps being followed up on) that finding.
+	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
+	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
+	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
 	if len(inScope)+len(outScope) > 0 {
 		route, e := s.findingsRoute(ctx, r, pr)
 		if e != nil {
@@ -151,7 +154,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 // undeliveredFindings lists the unresolved, unanswered findings no delivery
 // has named yet. mergewake's own findings on the current head wait for the
 // head's -done marker, so one review round goes out as one event.
-func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, ledger []findingsDelivery, headDone bool) (inScope, outScope []pendingFinding) {
+func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, ledger []findingsDelivery, headDone bool, verify fixCheck) (inScope, outScope []pendingFinding) {
 	named := map[string]bool{}
 	for _, d := range ledger {
 		if d.PR == pr.Number {
@@ -181,7 +184,7 @@ func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, 
 		default:
 			continue
 		}
-		if disposed(t, own) {
+		if disposed(t, own, verify) {
 			continue
 		}
 		if severity == "advisory" {
@@ -195,9 +198,9 @@ func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, 
 
 // disposed reports whether finding thread t no longer needs the author: it
 // is resolved, or answered by the gate's own rule — a blocking finding
-// (mergewake critical/high, CodeRabbit Critical/Major) only by a fix naming
-// its commit or a reasoned dismissal, any other by any human answer.
-func disposed(t github.ReviewThread, own string) bool {
+// (mergewake critical/high, CodeRabbit Critical/Major) only by a verified fix
+// commit or a reasoned dismissal, any other by any human answer.
+func disposed(t github.ReviewThread, own string, verify fixCheck) bool {
 	if t.IsResolved {
 		return true
 	}
@@ -207,7 +210,7 @@ func disposed(t github.ReviewThread, own string) bool {
 	first := t.Comments[0]
 	isOwn := own != "" && policy.NormalizeAuthor(first.Author) == own
 	if mustFix(github.ThreadSeverity(first.Author, first.Body)) {
-		return blockDisposition(t, isOwn) != ""
+		return blockDisposition(t, isOwn, verify) != ""
 	}
 	return answered(t, isOwn)
 }
@@ -419,7 +422,7 @@ type ackReader interface {
 // ACK or a disposition on every named thread closes one; past ack_after it is
 // re-sent once; past another window it is escalated to the owner once. A
 // notifier that cannot read ACKs leaves deliveries as sent.
-func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, ledger []findingsDelivery, o Options) (bool, error) {
+func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, ledger []findingsDelivery, o Options, verify fixCheck) (bool, error) {
 	reader, canRead := s.Notifier.(ackReader)
 	window := s.Config.Daemon.PR.Findings.AckWindow()
 	now := s.now().UTC()
@@ -440,7 +443,7 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 		}
 		done := true
 		for _, id := range d.Threads {
-			if t, ok := threads[id]; ok && !disposed(t, own) {
+			if t, ok := threads[id]; ok && !disposed(t, own, verify) {
 				done = false
 				break
 			}

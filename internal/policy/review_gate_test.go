@@ -19,8 +19,9 @@ func TestReviewGateDisposition(t *testing.T) {
 		{name: "outdated critical rechecked clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "critical", Outdated: true, Rechecked: true}, ignored: 1},
 		{name: "outdated P1 holds without recheck", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p1", Outdated: true}, block: 1},
 		{name: "outdated P2 needs reply", class: "routine", f: ReviewFinding{Author: "chatgpt-codex-connector", Severity: "p2", Outdated: true}, triage: 1},
-		{name: "outdated routine major clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
-		{name: "outdated blocking major clears", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, ignored: 1},
+		{name: "Major ranks with critical: outdated routine major holds without recheck", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, block: 1},
+		{name: "outdated blocking major holds without recheck", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true}, block: 1},
+		{name: "outdated major rechecked clears", class: "routine", f: ReviewFinding{Author: "coderabbitai", Severity: "major", Outdated: true, Rechecked: true}, ignored: 1},
 		{name: "unknown severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai", Severity: "surprise"}, triage: 1},
 		{name: "missing severity holds blocking", class: "blocking", f: ReviewFinding{Author: "coderabbitai"}, triage: 1},
 		{name: "ghost author holds blocking", class: "blocking", f: ReviewFinding{Severity: "critical"}, triage: 1},
@@ -38,12 +39,12 @@ func TestReviewGateDisposition(t *testing.T) {
 
 func TestReviewGateNoCrossBotAnswer(t *testing.T) {
 	fs := []ReviewFinding{
-		{Author: "coderabbitai", Severity: "major", Path: "tool", Line: 1, Answered: true},
+		{Author: "chatgpt-codex-connector", Severity: "p2", Path: "tool", Line: 1, Answered: true},
 		{Author: "chatgpt-codex-connector", Severity: "p1", Path: "tool", Line: 1},
-		{Author: "chatgpt-codex-connector", Severity: "p2", Path: "tool", Line: 1},
+		{Author: "coderabbitai", Severity: "major", Path: "tool", Line: 1},
 	}
 	v := (ReviewGate{}).Evaluate(fs, "routine")
-	if len(v.Blocking) != 1 || len(v.Triage) != 1 {
+	if len(v.Blocking) != 2 || len(v.Triage) != 0 {
 		t.Fatalf("%+v", v)
 	}
 }

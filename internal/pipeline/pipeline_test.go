@@ -62,6 +62,10 @@ type fakeGH struct {
 	m                                                            manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
+	// commitErr answers Commit for the named SHAs; notAncestor lists the
+	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
+	commitErr   map[string]error
+	notAncestor map[[2]string]bool
 }
 
 func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
@@ -201,7 +205,16 @@ func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 	return nil
 }
 func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
+	if e := g.commitErr[sha]; e != nil {
+		return github.Commit{}, e
+	}
 	v := github.Commit{SHA: sha}
+	// GitHub expands an abbreviated SHA to the full one it names.
+	for _, full := range []string{shaA, shaB, shaC} {
+		if len(sha) >= 7 && strings.HasPrefix(full, sha) {
+			v.SHA = full
+		}
+	}
 	v.Commit.Message = g.messages[sha]
 	v.Commit.Author.Name, v.Commit.Author.Email = g.authorName, g.authorEmail
 	v.Commit.Committer.Name, v.Commit.Committer.Email = g.committerName, g.committerEmail
@@ -257,7 +270,10 @@ func (g *fakeGH) PostReview(_ context.Context, _ string, _ int, sha string, f []
 	g.passes[sha] = append(g.passes[sha], meta)
 	return nil
 }
-func (g *fakeGH) Ancestor(context.Context, string, string, string) (bool, error) {
+func (g *fakeGH) Ancestor(_ context.Context, _, older, newer string) (bool, error) {
+	if g.notAncestor[[2]string{older, newer}] {
+		return false, nil
+	}
 	return !g.stale, nil
 }
 func (g *fakeGH) Publish(context.Context, manifest.Manifest) error          { g.publishCount++; return nil }

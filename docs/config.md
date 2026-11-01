@@ -817,7 +817,7 @@ grades each thread by the author and severity of its first comment instead:
 
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
-| block | the thread is resolved, or a human reply (not the finding's author, not a bot; for a `review.login` finding, that login's own reply that is not itself a finding) carries a block disposition: it opens with `Fix`/`Fixed`/`Fixes` and names the fixing commit SHA, or opens with `Dismiss`/`Dismissed`/`Dismissal` followed by its reason. An acknowledgement, a defer or a bare "Dismissed." does not clear it. Neither needs a new head. | `blocking_findings:<n>` |
+| block | the thread is resolved, or a human reply (not the finding's author, not a bot; for a `review.login` finding, that login's own reply that is not itself a finding) carries a block disposition: it opens with `Fix`/`Fixed`/`Fixes` and names a commit that GitHub knows, that comes after the head the finding was posted on, and that is in the PR head's history; or it opens with `Dismiss`/`Dismissed`/`Dismissal` followed by its reason. The latest answer decides. An acknowledgement, a defer, a bare "Dismissed.", or a fix naming an unknown commit or one outside the PR does not clear it. A commit lookup GitHub cannot answer holds the verdict (an error) rather than passing or blocking it. Neither needs a new head. | `blocking_findings:<n>` |
 | triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason or a follow-up task reference, or the thread is resolved. Neither needs a new head. | `triage_unanswered:<n>` |
 | advisory | never holds and is not counted as unanswered. Threads from authors no rule names are advisory. | none |
 
@@ -837,9 +837,10 @@ read still needs an answer: a finding by the `review.login` identity with a
 missing or unknown severity, and on a blocking-class PR an unknown severity from
 a graded author.
 
-The defaults grade CodeRabbit `critical` and codex `P1` as block, CodeRabbit
-`major` and codex `P2` as triage, CodeRabbit `minor`/`nitpick` and codex `P3`
-as advisory, and add one rule for the configured `review.login`:
+The defaults grade CodeRabbit `critical` and `major` and codex `P1` as block
+(operator 2026-11-01: a CodeRabbit Major ranks with a high, fixed or dismissed
+with a reason, never deferred), codex `P2` as triage, CodeRabbit
+`minor`/`nitpick` and codex `P3` as advisory, and add one rule for the configured `review.login`:
 `critical`/`high` block (the reviewer prompt's `blocking` grades like `high`).
 Its `medium`/`low` findings (and `major`/`minor`, graded like them) are
 advisory: the author still gives each a disposition (fix, dismiss with a
@@ -852,8 +853,8 @@ an explicit list replaces the default for those two keys. Naming the
 Thread comments are read in full (paged past 50), since a late reply answers a
 finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
 true) clears an outdated finding by anyone but `review.login`: a block finding
-once its reviewer has reviewed the current head, a triage finding when it is a
-`major`. The other `review_gate` keys stay parseable but do not affect the land
+(a CodeRabbit `major` included) once its reviewer has reviewed the current
+head. The other `review_gate` keys stay parseable but do not affect the land
 gate.
 
 ### Patch-id review verdicts

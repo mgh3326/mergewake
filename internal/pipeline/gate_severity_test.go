@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -102,9 +103,10 @@ func TestGateTriageClass(t *testing.T) {
 		{"bot reply does not answer", "triage_unanswered:1", gradedThread("review-bot", "", false, shaA, [2]string{"ci[bot]", "Bot"})},
 		{"human reply answers without a new head", "", gradedThread("review-bot", "", false, shaA, human)},
 		{"resolved unrated finding on the current head is not held", "", gradedThread("review-bot", "", true, shaA)},
-		{"third-party major needs an answer", "triage_unanswered:1", gradedThread("coderabbitai[bot]", "major", false, shaB)},
-		{"third-party major with a reply (fix SHA, dismissal or follow-up) has a disposition", "", gradedThread("coderabbitai[bot]", "major", false, shaA, human)},
-		{"resolved third-party major has a disposition", "", gradedThread("coderabbitai[bot]", "major", true, shaA)},
+		{"third-party P2 needs an answer", "triage_unanswered:1", gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
+		{"third-party P2 with a reply (fix SHA, dismissal or follow-up) has a disposition", "", gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaA, human)},
+		{"resolved third-party P2 has a disposition", "", gradedThread("chatgpt-codex-connector[bot]", "p2", true, shaA)},
+		{"third-party Major ranks with high: an answer alone does not clear it", "blocking_findings:1", gradedThread("coderabbitai[bot]", "major", false, shaA, human)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, gradedPolicy, 0, tt.th)); got != tt.want {
@@ -125,7 +127,7 @@ func TestGateReportsBothGradedReasons(t *testing.T) {
 	v := verdict(t, gradedPolicy, 0,
 		gradedThread("review-bot", "high", false, shaB),
 		gradedThread("review-bot", "critical", false, shaB),
-		gradedThread("coderabbitai[bot]", "major", false, shaB))
+		gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB))
 	if v.State != "blocked" || reasons(v) != "blocking_findings:2;triage_unanswered:1" {
 		t.Fatalf("%+v", v)
 	}
@@ -177,16 +179,16 @@ func TestGateFastLane(t *testing.T) {
 		lines             int
 		th                github.ReviewThread
 	}{
-		{"small PR ignores unanswered triage", fastLane + gradedPolicy, "", 50, gradedThread("coderabbitai[bot]", "major", false, shaB)},
-		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"small PR ignores unanswered triage", fastLane + gradedPolicy, "", 50, gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
+		{"small PR without a review_gate section", fastLane, "", 50, gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
 		{"small PR is still stopped by block-class", fastLane, "blocking_findings:1", 50, gradedThread("review-bot", "high", false, shaB)},
 		{"small PR accepts a block-class finding resolved on the head", fastLane, "", 5, gradedThread("review-bot", "high", true, shaA, human)},
 		{"small PR still needs an answer for an unreadable own severity", fastLane, "triage_unanswered:1", 10, gradedThread("review-bot", "", false, shaB)},
 		{"small PR accepts an answer for an unreadable own severity", fastLane, "", 10, gradedThread("review-bot", "", false, shaB, human)},
-		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"over the limit keeps triage", fastLane + gradedPolicy, "triage_unanswered:1", 51, gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
 		{"over the limit without review_gate keeps the raw count", fastLane, "threads_open:1", 51, gradedThread("review-bot", "low", false, shaB)},
-		{"no fast_lane keeps triage", gradedPolicy, "triage_unanswered:1", 10, gradedThread("coderabbitai[bot]", "major", false, shaB)},
-		{"a blocking path never takes the lane", fastLane + gradedPolicy + "blocking:\n  - paths: ['**']\n    reason: effects\n", "triage_unanswered:1", 10, gradedThread("coderabbitai[bot]", "major", false, shaB)},
+		{"no fast_lane keeps triage", gradedPolicy, "triage_unanswered:1", 10, gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
+		{"a blocking path never takes the lane", fastLane + gradedPolicy + "blocking:\n  - paths: ['**']\n    reason: effects\n", "triage_unanswered:1", 10, gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := reasons(verdict(t, tt.extra, tt.lines, tt.th)); got != tt.want {
@@ -199,7 +201,7 @@ func TestGateFastLane(t *testing.T) {
 // The fast lane trusts the PR's line totals only when the file list sums to
 // the same additions and deletions; any mismatch refuses the lane.
 func TestGateFastLaneNeedsVerifiedLines(t *testing.T) {
-	medium := gradedThread("coderabbitai[bot]", "major", false, shaB)
+	medium := gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB)
 	for _, tt := range []struct {
 		name, want         string
 		prLines, fileLines int
@@ -242,7 +244,7 @@ func TestLandGradedTriageAnswered(t *testing.T) {
 		if answered {
 			replies = append(replies, human)
 		}
-		g.feedback.Threads = []github.ReviewThread{gradedThread("coderabbitai[bot]", "major", false, shaA, replies...)}
+		g.feedback.Threads = []github.ReviewThread{gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaA, replies...)}
 		g.findings = 1
 		if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 			t.Fatal(err)
@@ -287,7 +289,8 @@ func TestGateOutdatedFindings(t *testing.T) {
 		{"own outdated unrated finding still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("review-bot", "", false, shaB))},
 		{"third-party outdated block holds until its reviewer rechecks", "blocking_findings:1", nil, outdated(gradedThread(cr, "critical", false, shaB))},
 		{"third-party outdated block clears once rechecked", "", map[string]bool{"coderabbitai": true}, outdated(gradedThread(cr, "critical", false, shaB))},
-		{"third-party outdated major clears", "", nil, outdated(gradedThread(cr, "major", false, shaB))},
+		{"third-party outdated major holds until its reviewer rechecks", "blocking_findings:1", nil, outdated(gradedThread(cr, "major", false, shaB))},
+		{"third-party outdated major clears once rechecked", "", map[string]bool{"coderabbitai": true}, outdated(gradedThread(cr, "major", false, shaB))},
 		{"third-party outdated p2 still needs an answer", "triage_unanswered:1", nil, outdated(gradedThread("chatgpt-codex-connector[bot]", "p2", false, shaB))},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -363,7 +366,7 @@ func TestGateSeverityTable(t *testing.T) {
 		{"own high unanswered blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false), 1, 0, 0, 0},
 		{"own critical unanswered blocks", "blocking_findings:1", gateThread("review-bot", own("critical"), false), 1, 0, 0, 0},
 		{"CodeRabbit Critical unanswered blocks", "blocking_findings:1", gateThread(cr, crBody("critical", "Critical"), false), 1, 0, 0, 0},
-		{"CodeRabbit Major unanswered holds", "triage_unanswered:1", gateThread(cr, crBody("major", "Major"), false), 0, 1, 0, 0},
+		{"CodeRabbit Major unanswered blocks", "blocking_findings:1", gateThread(cr, crBody("major", "Major"), false), 1, 0, 0, 0},
 		{"CodeRabbit Minor unanswered neither blocks nor counts", "", gateThread(cr, crBody("amber", "Minor"), false), 0, 0, 0, 0},
 		{"CodeRabbit Nitpick unanswered neither blocks nor counts", "", gateThread(cr, crBody("nitpick", "Nitpick"), false), 0, 0, 0, 0},
 		{"own medium unanswered neither blocks nor counts", "", gateThread("review-bot", own("medium"), false), 0, 0, 0, 0},
@@ -371,7 +374,9 @@ func TestGateSeverityTable(t *testing.T) {
 		{"answered-but-unresolved high with a fix is answered", "", gateThread("review-bot", own("high"), false, [2]string{"review-bot", "Fixed in 81149ea: the budget is spent after delivery."}), 0, 0, 1, 0},
 		{"answered-but-unresolved high with a reasoned dismissal is answered", "", gateThread("review-bot", own("high"), false, [2]string{"dev", "Dismiss: the path is test-only; see config_test.go:41."}), 0, 0, 1, 1},
 		{"CodeRabbit Critical fixed by the author is answered", "", gateThread(cr, crBody("critical", "Critical"), false, [2]string{"dev", "Fixed in 6d7d76d."}), 0, 0, 1, 0},
-		{"CodeRabbit Major answered by the author is answered unresolved", "", gateThread(cr, crBody("major", "Major"), false, [2]string{"dev", "Deferred to hk 2490."}), 0, 0, 1, 0},
+		{"CodeRabbit Major fixed by the author is answered unresolved", "", gateThread(cr, crBody("major", "Major"), false, [2]string{"dev", "Fixed in 81149ea."}), 0, 0, 1, 0},
+		{"CodeRabbit Major dismissed with a reason is answered unresolved", "", gateThread(cr, crBody("major", "Major"), false, [2]string{"dev", "Dismiss: the field is never user input; see parse.go:12."}), 0, 0, 1, 1},
+		{"CodeRabbit Major deferred still blocks", "blocking_findings:1", gateThread(cr, crBody("major", "Major"), false, [2]string{"dev", "Deferred to hk 2490."}), 1, 0, 0, 0},
 		{"high acknowledged without a disposition still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Looking into it."}), 1, 0, 0, 0},
 		{"high dismissed without a reason still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Dismissed."}), 1, 0, 0, 0},
 		{"high fixed without a commit still blocks", "blocking_findings:1", gateThread("review-bot", own("high"), false, [2]string{"dev", "Fixed."}), 1, 0, 0, 0},
@@ -388,6 +393,72 @@ func TestGateSeverityTable(t *testing.T) {
 			d := v.Review.Findings
 			if d.OpenBlocking != tt.openBlocking || d.OpenTriage != tt.openTriage || d.Answered != tt.answered || d.DismissedBlocking != tt.dismissed {
 				t.Fatalf("dispositions %+v", d)
+			}
+		})
+	}
+}
+
+// A fix reply clears a block finding only when the commit it names exists,
+// comes after the head the finding was posted on, and is in the PR head's
+// history: "Fixed in deadbee" is not a fix. A lookup GitHub cannot answer
+// holds the verdict instead of passing it.
+func TestGateFixClaimMustBeARealCommitInThePR(t *testing.T) {
+	own := "<!-- mergewake-severity:high -->\nthe finding"
+	const fix = "81149ea"
+	for _, tt := range []struct {
+		name, reply, want string
+		tweak             func(*fakeGH)
+		fails             bool
+	}{
+		{"a commit after the finding, in the head, clears", "Fixed in " + fix + ".", "", nil, false},
+		{"a commit GitHub does not know still blocks", "Fixed in deadbee.", "blocking_findings:1", func(g *fakeGH) {
+			g.commitErr = map[string]error{"deadbee": &github.APIError{Code: 422, Method: "GET", Path: "/commits"}}
+		}, false},
+		{"a 404 commit still blocks", "Fixed in deadbee.", "blocking_findings:1", func(g *fakeGH) {
+			g.commitErr = map[string]error{"deadbee": &github.APIError{Code: 404, Method: "GET", Path: "/commits"}}
+		}, false},
+		{"a commit outside the PR head's history still blocks", "Fixed in " + fix + ".", "blocking_findings:1", func(g *fakeGH) {
+			g.notAncestor = map[[2]string]bool{{fix, shaA}: true}
+		}, false},
+		{"a commit from before the finding still blocks", "Fixed in " + fix + ".", "blocking_findings:1", func(g *fakeGH) {
+			g.notAncestor = map[[2]string]bool{{shaB, fix}: true}
+		}, false},
+		{"the head the finding was posted on is no fix", "Fixed in " + shaB[:12] + ".", "blocking_findings:1", func(g *fakeGH) {
+			g.commitErr = nil
+		}, false},
+		{"any one real commit among several tokens clears", "Fixed in deadbee, then " + fix + ".", "", func(g *fakeGH) {
+			g.commitErr = map[string]error{"deadbee": &github.APIError{Code: 422}}
+		}, false},
+		{"a GitHub outage holds the verdict", "Fixed in " + fix + ".", "", func(g *fakeGH) {
+			g.commitErr = map[string]error{fix: errors.New("GitHub GET /commits: HTTP 502")}
+		}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, r := setup(t)
+			g.enabled = true
+			g.policyExtra = gradedPolicy
+			markReviewed(g)
+			g.feedback.Threads = []github.ReviewThread{gateThread("review-bot", own, false, [2]string{"dev", tt.reply})}
+			g.findings = 1
+			if tt.tweak != nil {
+				tt.tweak(g)
+			}
+			p, e := s.Policy(context.Background(), r, shaB)
+			if e != nil {
+				t.Fatal(e)
+			}
+			v, e := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+			if tt.fails {
+				if e == nil {
+					t.Fatalf("an unverifiable fix passed: %+v", v)
+				}
+				return
+			}
+			if e != nil {
+				t.Fatal(e)
+			}
+			if got := reasons(v); got != tt.want {
+				t.Fatalf("reasons=%q want %q", got, tt.want)
 			}
 		})
 	}

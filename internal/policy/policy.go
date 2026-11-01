@@ -89,12 +89,13 @@ func NormalizeAuthor(login string) string {
 func defaultReviewGate() ReviewGate {
 	yes := true
 	return ReviewGate{
+		// CodeRabbit Critical and Major rank with a mergewake high (operator
+		// 2026-11-01): fixed, or dismissed with a reason; never deferred.
 		Block: []ReviewGateRule{
-			{Author: "coderabbitai", Severity: []string{"critical"}, Classes: []string{"blocking", "routine"}},
+			{Author: "coderabbitai", Severity: []string{"critical", "major"}, Classes: []string{"blocking", "routine"}},
 			{Author: "chatgpt-codex-connector", Severity: []string{"p1"}},
 		},
 		Triage: []ReviewGateRule{
-			{Author: "coderabbitai", Severity: []string{"major"}},
 			{Author: "chatgpt-codex-connector", Severity: []string{"p2"}},
 		},
 		IgnoreAuthors:     []string{"qlty", "commitcheck", "wip", "accesslint", "codecov", "gitguardian"},

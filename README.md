@@ -164,8 +164,8 @@ Review findings go straight to the PR's author lane (`Mergewake-Task` → hk tas
 delivery naming every finding and what it needs. With no `panewire inbox ack`
 within `daemon.pr.findings.ack_after` (default 15m) the event is re-sent once,
 then escalated to the owner. Under a graded policy only mergewake
-critical/high and CodeRabbit Critical/Major hold the gate, until fixed or
-answered with a reasoned dismissal; medium/low and Minor/Nitpick never do. See
+critical/high and CodeRabbit Critical/Major hold the gate, until fixed (a
+reply naming a commit in the PR after the finding) or dismissed with a reason; medium/low and Minor/Nitpick never do. See
 [docs/config.md](docs/config.md#findings-delivery).
 
 Auto-merge is opt-in per repository with `enabled: true` in

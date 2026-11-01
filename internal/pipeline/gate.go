@@ -138,10 +138,16 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if p.ReviewGate != nil {
 		gate = *p.ReviewGate
 	}
-	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane)
+	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified)
+	if fixes.err != nil {
+		// A fix claim GitHub could not check holds the verdict; it neither
+		// passes nor blocks on a guess.
+		return v, fixes.err
+	}
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane)
+		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified)
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
 		}
@@ -256,14 +262,14 @@ func postedOn(c github.ReviewComment) string {
 // except for unreadable review.login evidence. Outdated findings clear as
 // ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
 // unresolved threads with no comment to grade, count as blocking findings.
-func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool) (blocking, triage int) {
-	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane)
+func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck) (blocking, triage int) {
+	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify)
 	return blocking, triage
 }
 
 // gradeThreadsDetailed is gradeThreads together with how every graded thread
 // stands, for the review record.
-func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool) (blocking, triage int, d dispositions) {
+func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck) (blocking, triage int, d dispositions) {
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
 	for _, t := range fb.Threads {
@@ -293,7 +299,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 		}
 		switch grade {
 		case policy.GradeBlock:
-			switch kind := blockDisposition(t, f.OwnReview); {
+			switch kind := blockDisposition(t, f.OwnReview, verify); {
 			case f.Resolved:
 				d.Resolved++
 			case kind != "":
@@ -326,20 +332,29 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 }
 
 var (
-	// fixReply opens with a fix and names the fixing commit.
-	fixReply = regexp.MustCompile(`(?is)^\W*fix(?:ed|es)?\b.*\b[0-9a-f]{7,40}\b`)
+	// fixReply opens with a fix.
+	fixReply = regexp.MustCompile(`(?is)^\W*fix(?:ed|es)?\b`)
+	// commitToken is a commit SHA, abbreviated or full, named in a reply.
+	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*dismiss(?:ed|al)?\b\W*\w`)
 )
 
+// fixCheck reports whether sha, named in a fix reply, is a real fix for a
+// finding posted on head posted (fixVerifier.verified).
+type fixCheck func(sha, posted string) bool
+
 // blockDisposition returns "fix" or "dismiss" when a reply that counts as an
 // answer (answeredBy) carries one of the two dispositions fleet-review allows
-// a critical/high finding: a fix naming its commit SHA, or a dismissal with a
-// reason. Anything else — an acknowledgement, a defer, a bare "dismissed" —
-// leaves the finding blocking. The latest answer decides: a later reply that
-// is not a disposition (say, "that fix is wrong") supersedes an earlier fix.
-func blockDisposition(t github.ReviewThread, ownReview bool) string {
+// a critical/high finding: a fix naming a commit that verify accepts, or a
+// dismissal with a reason. Anything else — an acknowledgement, a defer, a bare
+// "dismissed", a fix naming no commit or one that is not in the PR after the
+// finding — leaves the finding blocking. The latest answer decides: a later
+// reply that is not a disposition (say, "that fix is wrong") supersedes an
+// earlier fix.
+func blockDisposition(t github.ReviewThread, ownReview bool, verify fixCheck) string {
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	posted := postedOn(t.Comments[0])
 	for i := len(t.Comments) - 1; i > 0; i-- {
 		c := t.Comments[i]
 		if !answeredBy(c, author, ownReview) {
@@ -347,13 +362,75 @@ func blockDisposition(t github.ReviewThread, ownReview bool) string {
 		}
 		switch {
 		case fixReply.MatchString(c.Body):
-			return "fix"
+			for _, sha := range commitToken.FindAllString(c.Body, 8) {
+				if verify != nil && verify(sha, posted) {
+					return "fix"
+				}
+			}
 		case dismissReply.MatchString(c.Body):
 			return "dismiss"
 		}
 		return ""
 	}
 	return ""
+}
+
+// fixVerifier checks fix claims against GitHub for one PR head. A named
+// commit counts only when it exists, comes after the head the finding was
+// posted on (that head is its strict ancestor) and is in the PR head's
+// history. A commit GitHub does not know is no fix; any other lookup failure
+// is kept in err, for the caller to hold its decision rather than guess.
+// Answers are cached for the pass.
+type fixVerifierState struct {
+	ctx        context.Context
+	gh         GitHub
+	repo, head string
+	cache      map[[2]string]bool
+	err        error
+}
+
+func (s *Service) fixVerifier(ctx context.Context, repo, head string) *fixVerifierState {
+	return &fixVerifierState{ctx: ctx, gh: s.GH, repo: repo, head: head, cache: map[[2]string]bool{}}
+}
+
+func (v *fixVerifierState) verified(sha, posted string) bool {
+	key := [2]string{sha, posted}
+	if ok, seen := v.cache[key]; seen {
+		return ok
+	}
+	ok, e := v.check(sha, posted)
+	if e != nil {
+		v.err = errors.Join(v.err, e)
+		return false
+	}
+	v.cache[key] = ok
+	return ok
+}
+
+func (v *fixVerifierState) check(sha, posted string) (bool, error) {
+	if posted == "" || v.head == "" {
+		return false, nil
+	}
+	c, e := v.gh.Commit(v.ctx, v.repo, sha)
+	var api *github.APIError
+	if errors.As(e, &api) && (api.Code == 404 || api.Code == 422) {
+		return false, nil
+	}
+	if e != nil {
+		return false, e
+	}
+	full := c.SHA
+	if full == "" || full == posted || !strings.HasPrefix(full, sha) {
+		return false, nil
+	}
+	after, e := v.gh.Ancestor(v.ctx, v.repo, posted, full)
+	if e != nil || !after {
+		return false, e
+	}
+	if full == v.head {
+		return true, nil
+	}
+	return v.gh.Ancestor(v.ctx, v.repo, full, v.head)
 }
 
 // answered reports a human reply from someone other than the finding's author.
