@@ -10,12 +10,14 @@
    git tag vMAJOR.MINOR.PATCH origin/main
    git push origin vMAJOR.MINOR.PATCH
    ```
-3. `.github/workflows/release.yml` builds static (`CGO_ENABLED=0`,
-   `-trimpath`) binaries named `mergewake-<os>-<arch>`. It builds four targets: linux/amd64,
+3. `.github/workflows/release.yml` builds CGO-disabled (`CGO_ENABLED=0`, `-trimpath`) binaries named `mergewake-<os>-<arch>`. It builds four targets: linux/amd64,
    linux/arm64, darwin/amd64 and darwin/arm64. It stamps the tag as the
    version and writes `SHA256SUMS`. It checks that `mergewake --version`
    prints the tag. It runs the tests. Then it publishes the GitHub Release
    with `GITHUB_TOKEN`.
+
+Pushing a test tag `v0.0.0-<anything>` (for example `v0.0.0-test.1`) runs
+the same build and checks on a real tag and publishes nothing.
 
 Every pull request runs the same build and checks for the dry-run tag
 `v0.0.0-dryrun.<run>`, and publishes nothing. To run the same check locally:
@@ -44,6 +46,14 @@ the version or service check fails, it restores `mergewake.prev`.
 - **Roll back the fleet:** pin the previous good tag. Alternatively, mark the
   bad release as a pre-release or delete it, so that `latest` points to the
   previous release on the next run.
-- **Roll back one host now:** copy `mergewake.prev` over `mergewake`, restart the
-  service, then pin the tag so that the next run does not reinstall the bad
-  release.
+- **Roll back one host now:** copy the previous binary to a temporary file in
+  the same directory and rename it over `mergewake`. A rename works while the
+  service still runs the old file, whereas copying onto a running executable
+  fails on Linux with `ETXTBSY`:
+  ```sh
+  cp -p ~/.local/bin/mergewake.prev ~/.local/bin/mergewake.new
+  mv -f ~/.local/bin/mergewake.new ~/.local/bin/mergewake
+  ```
+  Restart the owning service and check that it is active and that the
+  version command prints the old tag. Then pin that tag, so that the next
+  run does not reinstall the bad release.
