@@ -39,6 +39,17 @@ const (
 	crashReportFlush       = 10 * time.Second
 )
 
+// Run runs main with this process's crash output armed under stateDir. It
+// disarms only after a normal return: a deferred disarm would run while a
+// panic on main's goroutine unwinds, and the runtime would then write the
+// traceback to stderr only.
+func Run(stateDir, tool, version string, main func() error) error {
+	stop := Start(stateDir, tool, version)
+	err := main()
+	stop()
+	return err
+}
+
 // Start arms this process's crash file under <stateDir>/crash and uploads
 // earlier crashes in the background. The returned stop disarms it and removes
 // the file when nothing crashed.
@@ -52,9 +63,7 @@ func Start(stateDir, tool, version string) (stop func()) {
 	if os.MkdirAll(dir, 0o700) != nil {
 		return func() {}
 	}
-	if pending := collectCrashFiles(dir); len(pending) > 0 {
-		go reportPendingCrashes(dsn, tool, version, dir, pending, time.Now())
-	}
+	go reportPendingCrashes(dsn, tool, version, dir, time.Now())
 	name := filepath.Join(dir, fmt.Sprintf("crash-%d-%d.log", time.Now().UnixNano(), os.Getpid()))
 	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -137,16 +146,44 @@ func crashProcessAlive(pid int) bool {
 
 // reportPendingCrashes sends what the daily budget allows and drops the rest.
 // Only reports Sentry accepted consume the budget, so an outage leaves the
-// unsent files for the next start instead of spending the day's budget.
-func reportPendingCrashes(dsn, tool, version, dir string, pending []string, now time.Time) {
+// unsent files for the next start instead of spending the day's budget. The
+// daemon and the hub share crash/, so collection, the budget check, the
+// upload and the send log run under one exclusive lock.
+func reportPendingCrashes(dsn, tool, version, dir string, now time.Time) {
+	unlock, ok := lockCrashDir(dir)
+	if !ok {
+		return
+	}
+	defer unlock()
+	pending := collectCrashFiles(dir)
 	allowed := min(len(pending), crashBudgetLeft(dir, now))
 	for _, path := range pending[allowed:] {
 		_ = os.Remove(path)
 	}
-	if allowed > 0 {
-		sent, _ := uploadCrashReports(dsn, tool, version, pending[:allowed])
-		recordCrashSends(dir, now, sent)
+	// Fail closed: a send log that cannot be written could not enforce the
+	// daily cap, so nothing is sent until it can.
+	if allowed == 0 || writeCrashSendLog(dir, crashSendLog(dir, now)) != nil {
+		return
 	}
+	sent, _ := uploadCrashReports(dsn, tool, version, pending[:allowed])
+	_ = recordCrashSends(dir, now, sent)
+}
+
+// lockCrashDir takes an exclusive lock on crash/lock, waiting for the other
+// process (another mergewake) when it holds it.
+func lockCrashDir(dir string) (unlock func(), ok bool) {
+	file, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, false
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, true
 }
 
 // crashSendLog reads <dir>/sent: one unix second per accepted report, kept
@@ -170,12 +207,16 @@ func crashBudgetLeft(dir string, now time.Time) int {
 }
 
 // recordCrashSends appends n accepted reports at now to the send log.
-func recordCrashSends(dir string, now time.Time, n int) {
+func recordCrashSends(dir string, now time.Time, n int) error {
 	kept := crashSendLog(dir, now)
 	for range n {
 		kept = append(kept, strconv.FormatInt(now.Unix(), 10))
 	}
-	_ = os.WriteFile(filepath.Join(dir, "sent"), []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+	return writeCrashSendLog(dir, kept)
+}
+
+func writeCrashSendLog(dir string, kept []string) error {
+	return os.WriteFile(filepath.Join(dir, "sent"), []byte(strings.Join(kept, "\n")+"\n"), 0o600)
 }
 
 // uploadCrashReports sends one Sentry event per crash file and deletes a file
@@ -210,7 +251,12 @@ func uploadCrashReports(dsn, tool, version string, paths []string) (sent int, er
 			continue
 		}
 		client.CaptureEvent(event, nil, sentry.NewScope())
-		client.Flush(crashReportFlush)
+		if !client.Flush(crashReportFlush) {
+			// A late answer could otherwise be credited to the next file:
+			// stop, and leave this and the rest for the next start.
+			failed = errors.New("crash report delivery timed out")
+			break
+		}
 		if accepted, rejected := delivery.take(); accepted == 0 || rejected > 0 {
 			failed = errors.New("sentry did not accept a crash report")
 			continue

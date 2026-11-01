@@ -111,6 +111,11 @@ func TestCrashReportUploadIsScrubbedAndDeletesTheFile(t *testing.T) {
 // reporting and panics off the main goroutine; the runtime must leave the
 // traceback in the child's crash file for the next start to send.
 func TestCrashOutputCapturesAGoroutinePanic(t *testing.T) {
+	if state := os.Getenv("MERGEWAKE_CRASH_MAIN_CHILD"); state != "" {
+		// The production entry: a panic on the goroutine that called Run.
+		_ = Run(state, "mergewake", "v-test", func() error { panic("crash-child-main-boom") })
+		return
+	}
 	if state := os.Getenv("MERGEWAKE_CRASH_CHILD"); state != "" {
 		Start(state, "mergewake", "v-test")
 		done := make(chan struct{})
@@ -158,7 +163,7 @@ func TestReportPendingCrashesDropsWhatTheBudgetRefuses(t *testing.T) {
 	now := time.Now()
 	recordCrashSends(dir, now, crashReportDailyBudget)
 	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
-	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, []string{path}, now)
+	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, now)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("a crash over budget must be dropped")
 	}
@@ -168,7 +173,7 @@ func TestUnreachableSentryKeepsFileAndBudget(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
-	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, []string{path}, now)
+	reportPendingCrashes("http://publickey@127.0.0.1:9/1", "tool", "v-test", dir, now)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("an undelivered crash must stay for the next start: %v", err)
 	}
@@ -195,5 +200,45 @@ func TestCrashReportRejectedBySentryIsKept(t *testing.T) {
 func TestCrashReportScrubRemovesEmails(t *testing.T) {
 	if got := crashReportScrub("panic: user alice@example.org not found"); strings.Contains(got, "alice@example.org") {
 		t.Fatalf("email reached the report: %q", got)
+	}
+}
+
+func TestRunCapturesAPanicOnItsOwnGoroutine(t *testing.T) {
+	state := t.TempDir()
+	command := exec.Command(os.Args[0], "-test.run=^TestCrashOutputCapturesAGoroutinePanic$")
+	command.Env = append(os.Environ(), "MERGEWAKE_CRASH_MAIN_CHILD="+state, DSNEnv+"=http://publickey@127.0.0.1:9/1")
+	if err := command.Run(); err == nil {
+		t.Fatal("the child must crash")
+	}
+	pending := collectCrashFiles(filepath.Join(state, "crash"))
+	if len(pending) != 1 {
+		t.Fatalf("pending crash files: %v", pending)
+	}
+	raw, err := os.ReadFile(pending[0])
+	if err != nil || !strings.Contains(string(raw), "panic: crash-child-main-boom") {
+		t.Fatalf("crash file: %q %v", raw, err)
+	}
+}
+
+func TestCrashReportSendLogUnwritableSendsNothing(t *testing.T) {
+	var requests int
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	path := writeCrashFile(t, dir, 1, deadPID(t), "panic: boom\n")
+	if err := os.Mkdir(filepath.Join(dir, "sent"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dsn := strings.Replace(server.URL, "http://", "http://publickey@", 1) + "/42"
+	reportPendingCrashes(dsn, "tool", "v-test", dir, time.Now())
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := os.Stat(path); err != nil || requests != 0 {
+		t.Fatalf("nothing may be sent while the cap cannot be recorded: requests=%d %v", requests, err)
 	}
 }
