@@ -51,6 +51,7 @@ func TestHKJobEndpoint(t *testing.T) {
 		"http loopback":     {env: map[string]string{"HANDOFFKEEP_URL": "http://127.0.0.1:9", "HANDOFFKEEP_TOKEN": "t"}},
 		"http tailnet ip":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.64.0.1:8800", "HANDOFFKEEP_TOKEN": "t"}},
 		"http tailnet name": {env: map[string]string{"HANDOFFKEEP_URL": "http://hk.example.ts.net:8800", "HANDOFFKEEP_TOKEN": "t"}},
+		"http LOCALHOST":    {env: map[string]string{"HANDOFFKEEP_URL": "http://LOCALHOST:9", "HANDOFFKEEP_TOKEN": "t"}},
 		"http past cgnat":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.128.0.1:8800", "HANDOFFKEEP_TOKEN": "t"}, err: "HTTPS"},
 		"userinfo":          {env: map[string]string{"HANDOFFKEEP_URL": "https://u:p@hk.example.invalid", "HANDOFFKEEP_TOKEN": "t"}, err: "invalid"},
 		"cf half pair":      {env: map[string]string{"HANDOFFKEEP_URL": "https://hk.example.invalid", "HANDOFFKEEP_TOKEN": "t", "HANDOFFKEEP_CF_ACCESS_CLIENT_ID": "id"}, err: "pair"},

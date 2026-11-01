@@ -114,7 +114,8 @@ func hkJobEndpoint() (*hkJobs, error) {
 var tailnetPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 func plainHTTPAllowed(host string) bool {
-	if host == "localhost" || strings.HasSuffix(strings.ToLower(host), ".ts.net") {
+	host = strings.ToLower(host)
+	if host == "localhost" || strings.HasSuffix(host, ".ts.net") {
 		return true
 	}
 	ip, err := netip.ParseAddr(host)
@@ -132,6 +133,13 @@ func (c *hkJobs) get(ctx context.Context, id string) (JobRecord, error) {
 	client := c.HTTP
 	if client == nil {
 		client = &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		if strings.HasPrefix(c.base, "http://") {
+			// Plain HTTP is allowed only to loopback or the tailnet; an
+			// HTTP_PROXY must not receive the bearer token outside it.
+			t := http.DefaultTransport.(*http.Transport).Clone()
+			t.Proxy = nil
+			client.Transport = t
+		}
 	}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id), nil)
 	if e != nil {
