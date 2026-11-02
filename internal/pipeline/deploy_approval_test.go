@@ -43,6 +43,7 @@ func TestRolloutDeployApproval(t *testing.T) {
 		approved, rangeError, wantDeploy, wantQuestion bool
 	}{
 		{"auto", "observability/log.go", shaA, false, false, true, false},
+		{"explicit empty", "observability/log.go", shaA, false, false, true, false},
 		{"hold", "orders/live.go", shaA, false, false, false, true},
 		{"answered", "orders/live.go", shaA, true, false, true, true},
 		{"unknown receipt", "observability/log.go", "", false, false, false, true},
@@ -56,6 +57,9 @@ func TestRolloutDeployApproval(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.policyExtra = "deploy_approval:\n  - paths: ['orders/**']\n    reason: Live orders\n"
+			if tc.name == "explicit empty" {
+				g.policyExtra = "deploy_approval: []\n"
+			}
 			s.GH = deployGH{fakeGH: g, paths: []policy.File{{Path: tc.path, Kind: "modified"}}}
 			if tc.rangeError {
 				s.GH = deployGH{fakeGH: g, rangeErr: errors.New("unknown")}
