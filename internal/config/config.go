@@ -194,13 +194,26 @@ type PRFindings struct {
 	// AckAfter is how long a delivery waits for the author lane's
 	// `panewire inbox ack` before it is re-sent once, and again before it is
 	// escalated to the owning lane. Empty means 15m.
-	AckAfter string `yaml:"ack_after"`
+	AckAfter       string `yaml:"ack_after"`
+	EscalateAfter  string `yaml:"escalate_after"`
+	EscalateRounds int    `yaml:"escalate_rounds"`
 }
 
 func (f PRFindings) On() bool { return f.Enabled == nil || *f.Enabled }
 
 // DefaultFindingsAckAfter applies when ack_after is unset.
 const DefaultFindingsAckAfter = 15 * time.Minute
+const DefaultFindingsEscalateAfter = 2 * time.Hour
+const DefaultFindingsEscalateRounds = 3
+
+func (f PRFindings) EscalationWindow() time.Duration {
+	if d, err := Duration(f.EscalateAfter); err == nil {
+		return d
+	}
+	return DefaultFindingsEscalateAfter
+}
+
+func (f PRFindings) EscalationRounds() int { return f.EscalateRounds }
 
 // AckWindow is the bounded wait for an author ACK.
 func (f PRFindings) AckWindow() time.Duration {
@@ -495,6 +508,7 @@ func Decode(r io.Reader, v any) error {
 }
 func Load(name string) (Config, error) {
 	var c Config
+	c.Daemon.PR.Findings.EscalateRounds = DefaultFindingsEscalateRounds
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e
@@ -550,6 +564,14 @@ func Load(name string) (Config, error) {
 		if _, e = Duration(v); e != nil {
 			return c, fmt.Errorf("daemon.pr.findings.ack_after: %w", e)
 		}
+	}
+	if v := c.Daemon.PR.Findings.EscalateAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("daemon.pr.findings.escalate_after: %w", e)
+		}
+	}
+	if c.Daemon.PR.Findings.EscalateRounds < 0 {
+		return c, errors.New("daemon.pr.findings.escalate_rounds must not be negative")
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
 		return c, e
