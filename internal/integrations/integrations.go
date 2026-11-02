@@ -319,6 +319,9 @@ func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error)
 	return h.Runner.Run(ctx, h.Command, []string{"attach", "get", sha}, "", "")
 }
 
+// AttachmentCommand names the CLI reviewers use to retrieve an attachment.
+func (h Handoffkeep) AttachmentCommand() string { return h.Command }
+
 // PutAttachment publishes a file for a reviewer on any host.
 func (h Handoffkeep) PutAttachment(ctx context.Context, path string) (string, error) {
 	out, e := h.Runner.Run(ctx, h.Command, []string{"attach", "put", path}, "", "")
