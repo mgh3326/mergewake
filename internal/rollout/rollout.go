@@ -39,6 +39,7 @@ type Result struct {
 	Warnings  []string            `json:"warnings,omitempty"`
 }
 type Options struct {
+	BeforeDeploy   func(context.Context, config.Install, string) error
 	Root, StateDir string
 	Allowed        []config.Install
 	Deny           []string
@@ -46,6 +47,8 @@ type Options struct {
 	Digest         string
 	// Now stamps receipts and audit names; nil means time.Now.
 	Now func() time.Time
+	// VerifyForward checks approval identity before a success receipt, never during rollback.
+	VerifyForward func(context.Context) error
 }
 
 func (o Options) now() time.Time {
@@ -340,6 +343,12 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 			e = errors.New("installed mode mismatch")
 		}
 		if e != nil {
+			undo(e)
+			return
+		}
+	}
+	if o.VerifyForward != nil {
+		if e = o.VerifyForward(ctx); e != nil {
 			undo(e)
 			return
 		}

@@ -54,12 +54,15 @@ func TestCommandSuccessCurrentAndPreviousSHA(t *testing.T) {
 	}
 }
 func TestCommandFailureAndCancelledInstallRollback(t *testing.T) {
-	for _, failure := range []string{"install", "verify", "smoke", "cancel"} {
+	for _, failure := range []string{"install", "verify", "smoke", "cancel", "identity"} {
 		t.Run(failure, func(t *testing.T) {
 			s := commandSpec()
 			m := commandManifest(t, s)
 			o := Options{Root: t.TempDir(), StateDir: t.TempDir(), Allowed: []config.Install{s}}
 			r := &versionRunner{oldSHA}
+			if failure == "identity" {
+				o.VerifyForward = func(context.Context) error { return errors.New("environment drift") }
+			}
 			var installed []string
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
