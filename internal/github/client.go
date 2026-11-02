@@ -422,6 +422,13 @@ type PassReceipt struct {
 	Round int    `json:"round,omitempty"`
 	Delta string `json:"delta,omitempty"`
 	Quiet bool   `json:"quiet,omitempty"`
+	// DiffSource names how the pass obtained a diff the GitHub API refused:
+	// "local" is the checkout fallback built after HTTP 406. DiffSummarized
+	// lists, one path per line, every file whose content that diff left out (a
+	// pure rename, or a block elided for the reviewer budget), so no file is
+	// silently dropped. A string keeps PassReceipt comparable.
+	DiffSource     string `json:"diff_source,omitempty"`
+	DiffSummarized string `json:"diff_summarized,omitempty"`
 }
 
 // ReviewedPass is one posted pass together with the head it reviewed.
@@ -640,6 +647,12 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 		comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 	}
 	body := Marker(sha) + "\n" + PassMarker(meta) + "\nOne independent diff-only pass (lens: " + meta.Lens + "). Findings are advisory except under blocking policy."
+	if meta.DiffSource != "" {
+		body += "\n\nDiff source: " + meta.DiffSource + " checkout fallback; GitHub refused the PR diff, so the patch was built from the reviewed head and base locally."
+	}
+	if meta.DiffSummarized != "" {
+		body += "\n\nListed without content (pure renames or over the local diff budget):\n" + meta.DiffSummarized
+	}
 	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
 }
 
