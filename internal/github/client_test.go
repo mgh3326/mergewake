@@ -43,6 +43,10 @@ func TestCheckEvidence(t *testing.T) {
 		{"cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Pending, false},
 		{"skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Pending, false},
 		{"pending", `[{"id":1,"name":"CI","status":"in_progress"}]`, `[]`, Pending, false},
+		{"skipped sibling after success", `[{"id":1,"name":"CI","status":"completed","conclusion":"success"},{"id":2,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Green, false},
+		{"skipped sibling before success", `[{"id":2,"name":"CI","status":"completed","conclusion":"skipped"},{"id":1,"name":"CI","status":"completed","conclusion":"success"}]`, `[]`, Green, false},
+		{"skipped sibling of a failure", `[{"id":1,"name":"CI","status":"completed","conclusion":"failure"},{"id":2,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Red, false},
+		{"neutral sibling of a pending run", `[{"id":1,"name":"CI","status":"in_progress"},{"id":2,"name":"CI","status":"completed","conclusion":"neutral"}]`, `[]`, Pending, false},
 		{"latest status", `[]`, `[{"id":2,"context":"CI","state":"success"},{"id":1,"context":"CI","state":"failure"}]`, Green, false},
 		{"ambiguous", `[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]`, `[{"id":2,"context":"CI","state":"failure"}]`, Pending, true},
 	} {
