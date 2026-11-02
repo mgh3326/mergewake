@@ -401,52 +401,10 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return errors.New("manifest commit CI is not green")
 	}
 	state := filepath.Join(s.state(r.Name), "rollout")
-	if containerOnly {
-		var receipt rollout.ContainerReceipt
-		found, re := fsutil.ReadJSON(filepath.Join(state, rollout.ContainerReceiptName), &receipt)
-		if re != nil {
-			return re
-		}
-		if found {
-			if receipt.Repo != r.Name {
-				return errors.New("container receipt repo mismatch")
-			}
-			if receipt.Commit != "" {
-				ok, re = s.GH.Ancestor(ctx, r.Name, receipt.Commit, m.Commit)
-				if re != nil {
-					return re
-				}
-				if !ok {
-					return errors.New("automatic downgrade or divergent release refused")
-				}
-			}
-		}
+	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
+		return err
 	}
-	if !containerOnly {
-		receiptName := "installed.json"
-		if len(m.Commands) > 0 {
-			receiptName = "command-installed.json"
-		}
-		var old struct {
-			Manifest manifest.Manifest `json:"manifest"`
-		}
-		found, re := fsutil.ReadJSON(filepath.Join(state, receiptName), &old)
-		if re != nil {
-			return re
-		}
-		if found {
-			if old.Manifest.Repo != r.Name {
-				return errors.New("installed receipt repo mismatch")
-			}
-			ok, re = s.GH.Ancestor(ctx, r.Name, old.Manifest.Commit, m.Commit)
-			if re != nil {
-				return re
-			}
-			if !ok {
-				return errors.New("automatic downgrade or divergent release refused")
-			}
-		}
-	}
+
 	var timeout time.Duration
 	if r.Smoke.Command != "" {
 		timeout, e = config.Duration(r.SmokeTimeout)

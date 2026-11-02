@@ -291,6 +291,9 @@ func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { re
 
 type fakeSink struct{ records, reopens int }
 
+// Existing installer tests explicitly approve the bootstrap deployment.
+func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
+
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }
 
