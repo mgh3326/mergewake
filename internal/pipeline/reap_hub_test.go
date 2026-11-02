@@ -169,7 +169,9 @@ func TestReapPanewireCodexComposerGuard(t *testing.T) {
 			}
 			r := &scriptRunner{}
 			s, _ := hubSvc(t, hub, r)
-			_ = s.Reap(context.Background(), testRepo, 0, Options{})
+			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
 			closes, captures := hub.ops("pane.close"), hub.ops("pane.capture")
 			want := 0
 			if test.close {
@@ -184,6 +186,31 @@ func TestReapPanewireCodexComposerGuard(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReapPanewireComposerErrorKeepsPaneAndContinues(t *testing.T) {
+	hub := newFakeReapHub()
+	hub.forbid = map[string]bool{"pane.read": true}
+	r := &scriptRunner{outs: worktreeOuts("/repo"), fn: statAnswer("yes\n")}
+	s, _ := hubSvc(t, hub, r, reap.Host{Name: "local", Jobs: "/jobs"})
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hub.ops("pane.capture"))+len(hub.ops("pane.close")) != 0 {
+		t.Fatal("acted on the pane with an unreadable composer")
+	}
+	if !r.called(key("herdr", "pane", "close", "w1:p1")) ||
+		!r.called(key("git", "-C", "/repo", "worktree", "remove", "/repo.wt")) ||
+		len(hub.ops("worktree.remove")) != 1 {
+		t.Fatalf("other pane or worktree cleanup skipped: local=%q hub=%v", r.calls, hub.ops("worktree.remove"))
+	}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["action"] == "close-pane" && row["host"] == "node" && row["pane"] == "w1:p1" &&
+			row["result"] == "skipped" && row["reason"] == reap.ComposerUnknown {
+			return
+		}
+	}
+	t.Fatal("missing keep receipt for the unreadable composer")
 }
 
 func TestReapPanewireShadowNeverActs(t *testing.T) {

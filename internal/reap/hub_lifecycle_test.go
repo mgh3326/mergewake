@@ -54,3 +54,16 @@ func TestHubJobDoneOutcomes(t *testing.T) {
 		}
 	}
 }
+
+func TestHubJobDoneOmitsEmptyReport(t *testing.T) {
+	hub, _ := fakeHub(t, func(r hubRequest) (int, any) {
+		args := r.body["args"].(map[string]any)
+		if r.body["op"] != "job.done" || args["job"] != "job-a" || len(args) != 1 {
+			t.Errorf("request=%v", r.body)
+		}
+		return 200, map[string]any{"result": map[string]any{"outcome": "done"}}
+	})
+	if err := (HubHost{Hub: hub, Machine: "node-a"}).JobDone(context.Background(), "job-a", ""); err != nil {
+		t.Fatal(err)
+	}
+}

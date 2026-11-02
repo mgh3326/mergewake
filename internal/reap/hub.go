@@ -382,7 +382,11 @@ func (h HubHost) JobDone(ctx context.Context, job, report string) error {
 	var v struct {
 		Outcome string `json:"outcome"`
 	}
-	if err := h.Hub.Command(ctx, h.Machine, "job.done", map[string]string{"job": job, "report": report}, &v); err != nil {
+	args := map[string]string{"job": job}
+	if report != "" {
+		args["report"] = report
+	}
+	if err := h.Hub.Command(ctx, h.Machine, "job.done", args, &v); err != nil {
 		return err
 	}
 	switch v.Outcome {

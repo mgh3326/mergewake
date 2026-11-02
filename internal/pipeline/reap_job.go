@@ -164,7 +164,7 @@ func (s *Service) reapPaneClose(ctx context.Context, rec *reapReceipt, hs *reapH
 	}
 	switch c, e := hs.ops.Composer(ctx, pane); {
 	case e != nil:
-		rec.Result, rec.Reason = "error", e.Error()
+		rec.Result, rec.Reason = "skipped", reap.ComposerUnknown
 		return
 	case c != reap.ComposerEmpty:
 		rec.Result, rec.Reason = "skipped", c

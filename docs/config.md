@@ -403,6 +403,20 @@ needs no GitHub token.
 | `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 
+#### Large PRs
+
+GitHub answers HTTP 406 to the diff media type for very large PRs. Only on that
+status does review build the same patch locally from the repo's `root`: it
+fetches the PR base ref and `pull/<n>/head`, then diffs the merge base to the
+head with rename detection (`git diff -M`), so moved code is listed as a rename
+instead of repeated content. The local path applies the same 2 MiB reviewer
+budget as the API path. When the patch is still larger, complete file blocks are
+kept in their stable diff order while they fit, and each later block is replaced
+by its header and a digest of the omitted text. Every summarized or purely
+renamed file is listed in the review body, and the pass marker records
+`diff_source: local` with `diff_summarized`, so no file disappears silently. Any
+other HTTP error fails the review as before.
+
 #### Panewire executor
 
 With `executor: panewire` each missing pass is first offered to a reviewer pane:

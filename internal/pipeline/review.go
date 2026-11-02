@@ -212,9 +212,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// scheduled. An unreadable diff leaves the patch unknown, which equals
 	// nothing, so the head is reviewed on its own.
 	var diff, patch string
+	var src diffResult
 	if _, own := distinctPasses(receipts, needed); !own {
 		var diffErr error
-		if diff, diffErr = s.GH.Diff(ctx, r.Name, n); diffErr == nil && diff != "" {
+		if src, diffErr = s.reviewDiff(ctx, r, pr); diffErr == nil && src.text != "" {
+			diff = src.text
 			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
 		if from, _, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
@@ -469,14 +471,15 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.Print(plan)
 	}
 	if diff == "" {
-		if diff, e = s.GH.Diff(ctx, r.Name, n); e != nil {
+		if src, e = s.reviewDiff(ctx, r, pr); e != nil {
 			return e
 		}
+		diff = src.text
 		if diff != "" {
 			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
 	}
-	if len(diff) == 0 || len(diff) > 2<<20 {
+	if len(diff) == 0 || len(diff) > reviewDiffBudget {
 		return errors.New("empty or oversized diff; manual review required")
 	}
 	// Findings already answered on this PR, and its operator decisions, keep the
@@ -586,7 +589,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		known = append(known, knownFromFindings(findings)...)
 		plan.name = selected
 		plan.sameFamily = out.family == "" || out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
 		if viaPanewire && out.executor != "panewire" {
 			receipt.Fallback = "panewire: " + fallback
 		}
@@ -643,6 +646,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		if receipt.Fallback != "" {
 			event["fallback"] = receipt.Fallback
+		}
+		if src.source != "" {
+			event["diff_source"] = src.source
+		}
+		if len(src.summarized) > 0 {
+			event["diff_summarized"] = len(src.summarized)
 		}
 		if familySource == "commit" || familySource == "default" {
 			event["author_family_inferred"] = familySource
