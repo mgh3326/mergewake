@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -76,6 +77,20 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if v.State == "pending" || o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
+	if o.Acting() && v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
+		status, attempted, err := s.updateStaleBranch(ctx, r, pr, head)
+		if err != nil {
+			return err
+		}
+		if status == "ok" {
+			if attempted {
+				return s.audit(r.Name, "base_updated", map[string]any{"pr": n, "from": pr.Head.SHA}, false)
+			}
+			return nil
+		}
+		v.Reasons = append(v.Reasons, "update_failed:"+status)
+		record.Reasons = v.Reasons
+	}
 	summary := pr.Title
 	if v.State == "blocked" {
 		summary = strings.Join(v.Reasons, "; ")
@@ -101,6 +116,48 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	record.Lane, record.Via, record.Sent, record.Deduped = lane, via, sent, !sent
 	return s.audit(r.Name, "pr-notify", record, false)
+}
+
+// updateStaleBranch reserves each PR/base pair before the network call. A
+// crash or a transport error is ambiguous, so it is never retried blindly.
+func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr github.Pull, baseSHA string) (string, bool, error) {
+	dir := filepath.Join(s.state(r.Name), "base-updates")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", false, err
+	}
+	key := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", pr.Number, baseSHA)))
+	path := filepath.Join(dir, hex.EncodeToString(key[:]))
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", false, err
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return "", false, err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return string(data), false, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", false, err
+	}
+	if err = fsutil.Atomic(path, []byte("unknown"), 0600); err != nil {
+		return "", false, err
+	}
+	status := "ok"
+	if err = s.GH.UpdateBranch(ctx, r.Name, pr.Number, pr.Head.SHA); err != nil {
+		status = "unknown"
+		var api *github.APIError
+		if errors.As(err, &api) {
+			status = fmt.Sprint(api.Code)
+		}
+	}
+	if err = fsutil.Atomic(path, []byte(status), 0600); err != nil {
+		return "", true, err
+	}
+	return status, true, nil
 }
 
 // errNotifyDelivery marks a lane event the notifier refused. The first

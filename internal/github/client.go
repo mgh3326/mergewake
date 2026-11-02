@@ -222,6 +222,9 @@ func (c *Client) Merge(ctx context.Context, repo string, n int, sha string) erro
 	}
 	return e
 }
+func (c *Client) UpdateBranch(ctx context.Context, repo string, n int, head string) error {
+	return c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/update-branch", base(repo), n), map[string]string{"expected_head_sha": head}, nil)
+}
 func (c *Client) Head(ctx context.Context, repo, branch string) (string, error) {
 	var r struct {
 		Object Ref `json:"object"`

@@ -34,6 +34,8 @@ var shaD = strings.Repeat("d", 40)
 type fakeGH struct {
 	GitHub
 	pullCalls                                                    int
+	updateHeads                                                  []string
+	updateErr                                                    error
 	nextHead                                                     string
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
@@ -75,6 +77,10 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 		p.Head.SHA = g.nextHead
 	}
 	return p, nil
+}
+func (g *fakeGH) UpdateBranch(_ context.Context, _ string, _ int, head string) error {
+	g.updateHeads = append(g.updateHeads, head)
+	return g.updateErr
 }
 func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
