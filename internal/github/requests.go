@@ -34,7 +34,117 @@ func CountRequests(ctx context.Context, role string) (context.Context, *RequestC
 }
 
 var numericSegment = regexp.MustCompile(`^[0-9]+$`)
-var shaSegment = regexp.MustCompile(`(?i)[0-9a-f]{40,64}`)
+var shaSegment = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}package github
+
+import (
+	"context"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+)
+
+type RequestCount struct {
+	Role   string `json:"role"`
+	Method string `json:"method"`
+	Route  string `json:"route"`
+	Status int    `json:"status"`
+	Count  int    `json:"count"`
+}
+type requestKey struct {
+	method, route string
+	status        int
+}
+type RequestCounts struct {
+	mu     sync.Mutex
+	role   string
+	counts map[requestKey]int
+}
+type requestCountsKey struct{}
+
+// CountRequests attributes all HTTP responses under ctx to this pass.
+func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
+	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
+	return context.WithValue(ctx, requestCountsKey{}, c), c
+}
+
+var numericSegment = regexp.MustCompile(`^[0-9]+$`)
+)
+var shaComparison = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}\.\.\.[0-9a-f]{40,64}package github
+
+import (
+	"context"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+)
+
+type RequestCount struct {
+	Role   string `json:"role"`
+	Method string `json:"method"`
+	Route  string `json:"route"`
+	Status int    `json:"status"`
+	Count  int    `json:"count"`
+}
+type requestKey struct {
+	method, route string
+	status        int
+}
+type RequestCounts struct {
+	mu     sync.Mutex
+	role   string
+	counts map[requestKey]int
+}
+type requestCountsKey struct{}
+
+// CountRequests attributes all HTTP responses under ctx to this pass.
+func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
+	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
+	return context.WithValue(ctx, requestCountsKey{}, c), c
+}
+
+var numericSegment = regexp.MustCompile(`^[0-9]+$`)
+)
+var doneMarker = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}-donepackage github
+
+import (
+	"context"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+)
+
+type RequestCount struct {
+	Role   string `json:"role"`
+	Method string `json:"method"`
+	Route  string `json:"route"`
+	Status int    `json:"status"`
+	Count  int    `json:"count"`
+}
+type requestKey struct {
+	method, route string
+	status        int
+}
+type RequestCounts struct {
+	mu     sync.Mutex
+	role   string
+	counts map[requestKey]int
+}
+type requestCountsKey struct{}
+
+// CountRequests attributes all HTTP responses under ctx to this pass.
+func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
+	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
+	return context.WithValue(ctx, requestCountsKey{}, c), c
+}
+
+var numericSegment = regexp.MustCompile(`^[0-9]+$`)
+)
 
 func routeTemplate(route string) string {
 	u, err := url.Parse(strings.TrimPrefix(route, "UPLOAD "))
@@ -43,10 +153,15 @@ func routeTemplate(route string) string {
 	}
 	parts := strings.Split(u.Path, "/")
 	for i, part := range parts {
-		if shaSegment.MatchString(part) {
-			parts[i] = shaSegment.ReplaceAllString(part, "{sha}")
-		} else if numericSegment.MatchString(part) {
+		switch {
+		case numericSegment.MatchString(part):
 			parts[i] = "{number}"
+		case shaSegment.MatchString(part):
+			parts[i] = "{sha}"
+		case i > 0 && parts[i-1] == "compare" && shaComparison.MatchString(part):
+			parts[i] = "{sha}...{sha}"
+		case i > 1 && parts[i-2] == "reviews" && doneMarker.MatchString(part):
+			parts[i] = "{sha}-done"
 		}
 	}
 	return strings.Join(parts, "/")

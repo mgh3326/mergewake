@@ -422,7 +422,7 @@ func TestRequestCountsAttributeStatusAndRole(t *testing.T) {
 	c := New("")
 	c.BaseURL = server.URL
 	ctx, counts := CountRequests(context.Background(), "watch")
-	path := "/repos/o/r/pulls/42/commits/0123456789012345678901234567890123456789?per_page=100"
+	path := "/repos/o/r/pulls/42/commits/a123456789012345678901234567890123456789?per_page=100"
 	for i := 0; i < 2; i++ {
 		if _, err := c.request(ctx, "GET", path, "application/json", nil); err != nil {
 			t.Fatal(err)
@@ -492,6 +492,52 @@ func TestCommentInvalidatesItsPullAndList(t *testing.T) {
 		}
 		if len(seen[path]) != 2 || seen[path][1] != "" {
 			t.Fatalf("%s was not invalidated: %v", path, seen[path])
+		}
+	}
+}
+
+func TestGraphQLMutationClearsPollWindow(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			calls++
+			w.Header().Set("X-Poll-Interval", "3600")
+			fmt.Fprintf(w, "{%q:%d}", "version", calls)
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+	ctx := context.Background()
+	first, err := c.request(ctx, "POST", "/graphql", "application/json", []byte("{}"))
+	if err != nil || string(first) != "{\"version\":1}" {
+		t.Fatalf("first query: %s, %v", first, err)
+	}
+	if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	limited, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	second, err := c.request(limited, "POST", "/graphql", "application/json", []byte("{}"))
+	if err != nil || string(second) != "{\"version\":2}" || calls != 2 {
+		t.Fatalf("query after mutation: %s, %v, calls=%d", second, err, calls)
+	}
+}
+
+func TestRouteTemplateKeepsEmbeddedHexAndLabelsNumbers(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	for _, tt := range []struct{ route, want string }{
+		{"/repos/o/r/git/ref/heads/foo" + sha + "bar", "/repos/o/r/git/ref/heads/foo" + sha + "bar"},
+		{"/repos/o/r/issues/" + strings.Repeat("7", 40), "/repos/o/r/issues/{number}"},
+		{"/repos/o/r/compare/" + sha + "..." + strings.Repeat("b", 40), "/repos/o/r/compare/{sha}...{sha}"},
+		{"/repos/o/r/git/ref/heads/mergewake/reviews/7/" + sha + "-done", "/repos/o/r/git/ref/heads/mergewake/reviews/{number}/{sha}-done"},
+	} {
+		if got := routeTemplate(tt.route); got != tt.want {
+			t.Errorf("routeTemplate(%q) = %q; want %q", tt.route, got, tt.want)
 		}
 	}
 }

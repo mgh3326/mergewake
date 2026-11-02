@@ -219,6 +219,11 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 			}
 		}
 		touches := func(k string) bool {
+			// GraphQL is a shared POST key, so a repository prefix cannot
+			// identify its poll window or cached response.
+			if strings.HasPrefix(k, "POST "+c.BaseURL+"/graphql ") {
+				return true
+			}
 			if prefix == "" {
 				return true
 			}

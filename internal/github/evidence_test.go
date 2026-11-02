@@ -169,3 +169,29 @@ func TestEvidenceExpiresDespitePollWindow(t *testing.T) {
 		t.Fatalf("expired read did not refresh, requests=%d", requests)
 	}
 }
+
+func TestMutationInvalidatesRepositoryEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{}")) }))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	key := evidenceKey{"o/r", "feedback", "1"}
+	calls := 0
+	read := func() (int, error) { calls++; return calls, nil }
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := cachedEvidence(ctx, c, key, read); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("reads before mutation = %d", calls)
+	}
+	if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := cachedEvidence(ctx, c, key, read); err != nil || value != 2 {
+		t.Fatalf("after mutation value=%d error=%v", value, err)
+	}
+}
