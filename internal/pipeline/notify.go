@@ -51,15 +51,15 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if pr.State != "open" || pr.Draft || pr.Base.Ref != r.Branch {
 		return nil
 	}
-	head, e := s.GH.Head(ctx, r.Name, r.Branch)
+	baseSHA, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
 	}
-	p, e := s.Policy(ctx, r, head)
+	p, e := s.Policy(ctx, r, baseSHA)
 	if e != nil {
 		return e
 	}
-	v, e := s.mergeGate(ctx, r, pr, p, head)
+	v, e := s.mergeGate(ctx, r, pr, p, baseSHA)
 	if e != nil {
 		return e
 	}
@@ -78,9 +78,12 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
 	if o.Acting() && v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
-		status, attempted, err := s.updateStaleBranch(ctx, r, pr, head)
+		status, attempted, err := s.updateStaleBranch(ctx, r, pr, baseSHA)
 		if err != nil {
 			return err
+		}
+		if status == "recheck" {
+			return nil
 		}
 		if status == "ok" {
 			if attempted {
@@ -119,7 +122,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 }
 
 // updateStaleBranch reserves each PR/base pair before the network call. A
-// crash or a transport error is ambiguous, so it is never retried blindly.
+// unknown outcome is retried only after fresh PR, base and gate checks.
 func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr github.Pull, baseSHA string) (string, bool, error) {
 	dir := filepath.Join(s.state(r.Name), "base-updates")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -137,10 +140,37 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	data, err := os.ReadFile(path)
-	if err == nil {
+	if err == nil && string(data) != "unknown" {
 		return string(data), false, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if err == nil {
+		fresh := github.FreshEvidence(ctx)
+		current, e := s.GH.Pull(fresh, r.Name, pr.Number)
+		if e != nil {
+			return "", false, e
+		}
+		base, e := s.GH.Head(fresh, r.Name, r.Branch)
+		if e != nil {
+			return "", false, e
+		}
+		if current.State != "open" || current.Draft || current.Base.Ref != r.Branch || current.Head.SHA != pr.Head.SHA || base != baseSHA {
+			return "recheck", false, nil
+		}
+		p, e := s.Policy(fresh, r, base)
+		if e != nil {
+			return "", false, e
+		}
+		if !p.AutoUpdateBranchEnabled() {
+			return "recheck", false, nil
+		}
+		v, e := s.mergeGate(fresh, r, current, p, base)
+		if e != nil {
+			return "", false, e
+		}
+		if v.State != "blocked" || len(v.Reasons) != 1 || v.Reasons[0] != "base_stale" {
+			return "recheck", false, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", false, err
 	}
 	if err = fsutil.Atomic(path, []byte("unknown"), 0600); err != nil {
@@ -155,7 +185,7 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 		}
 	}
 	if err = fsutil.Atomic(path, []byte(status), 0600); err != nil {
-		return "", true, err
+		_ = s.audit(r.Name, "base-update-marker-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, false)
 	}
 	return status, true, nil
 }
