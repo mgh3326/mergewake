@@ -23,16 +23,18 @@ type Loop struct {
 	Role     string
 	Interval time.Duration
 	Run      func(context.Context) error
+	Requests func() any
 }
 type Status struct {
-	Host       string    `json:"host"`
-	Role       string    `json:"role"`
-	Running    bool      `json:"running"`
-	LastRun    time.Time `json:"last_run"`
-	LastFinish time.Time `json:"last_finish"`
-	LastError  string    `json:"last_error"`
-	NextRun    time.Time `json:"next_run"`
-	Failures   int       `json:"failures"`
+	Host           string    `json:"host"`
+	Role           string    `json:"role"`
+	Running        bool      `json:"running"`
+	LastRun        time.Time `json:"last_run"`
+	LastFinish     time.Time `json:"last_finish"`
+	LastError      string    `json:"last_error"`
+	NextRun        time.Time `json:"next_run"`
+	Failures       int       `json:"failures"`
+	GitHubRequests any       `json:"github_requests,omitempty"`
 }
 type Daemon struct {
 	StateDir, Host string
@@ -186,6 +188,9 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 			return err
 		}
 		err := l.Run(ctx)
+		if l.Requests != nil {
+			st.GitHubRequests = l.Requests()
+		}
 		st.Running = false
 		st.LastFinish = d.now().UTC()
 		st.LastError = ""

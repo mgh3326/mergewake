@@ -253,7 +253,7 @@ type Daemon struct {
 }
 
 // Webhook configures the optional in-process GitHub delivery receiver. A
-// delivery only wakes a role early; the timer still supplies complete polling.
+// delivery invalidates cached evidence and wakes roles; the timer still polls.
 type Webhook struct {
 	Enabled bool `yaml:"enabled"`
 	// Listen is a loopback host:port; the receiver never binds a routable

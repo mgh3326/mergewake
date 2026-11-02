@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,13 +103,13 @@ func (c *Client) pollShortcut(key string) (cachedResponse, error) {
 	return cachedResponse{}, ErrPollSkipped
 }
 
-func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedResponse, error) {
+func (c *Client) beginRequest(ctx context.Context, key string, fresh bool) (func(), cachedResponse, error) {
 	p := &c.poll
 	p.init()
 	for {
 		p.mu.Lock()
 		wait := p.rate
-		if c.Polling && p.polls[key].until.After(wait.until) {
+		if c.Polling && !fresh && p.polls[key].until.After(wait.until) {
 			wait = p.polls[key]
 		}
 		old := p.cache[key]
@@ -130,7 +131,7 @@ func (c *Client) beginRequest(ctx context.Context, key string) (func(), cachedRe
 		// must not be passed: release the gate and wait out the new deadline.
 		p.mu.Lock()
 		again := p.rate
-		if c.Polling && p.polls[key].until.After(again.until) {
+		if c.Polling && !fresh && p.polls[key].until.After(again.until) {
 			again = p.polls[key]
 		}
 		p.mu.Unlock()
@@ -197,13 +198,55 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 	p := &c.poll
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Dropping cached representations also drops their poll windows: a key
-	// inside its window with nothing cached is skipped, so a wipe that kept
-	// the windows would skip every key a round re-reads after a mutation.
 	if mutation {
-		p.cache = map[string]cachedResponse{}
-		p.polls = map[string]throttle{}
-		p.bytes = 0
+		// Unknown endpoints can affect arbitrary resources; known repository
+		// mutations invalidate that repository, including its poll windows.
+		endpoint := strings.TrimPrefix(key, strings.Fields(key)[0]+" ")
+		endpoint = strings.SplitN(endpoint, " ", 2)[0]
+		u, err := url.Parse(endpoint)
+		prefix := ""
+		var parts []string
+		if err == nil {
+			parts = strings.Split(strings.Trim(u.Path, "/"), "/")
+		}
+		if err == nil && len(parts) >= 3 && parts[0] == "repos" {
+			prefix = "GET " + u.Scheme + "://" + u.Host + "/repos/" + parts[1] + "/" + parts[2]
+		}
+		var pullNumber string
+		if len(parts) >= 5 && (parts[3] == "issues" && parts[4] != "comments" || parts[3] == "pulls") && len(parts) >= 6 && (parts[5] == "comments" || parts[5] == "reviews") {
+			if _, err := strconv.Atoi(parts[4]); err == nil {
+				pullNumber = parts[4]
+			}
+		}
+		touches := func(k string) bool {
+			if prefix == "" {
+				return true
+			}
+			if !(strings.HasPrefix(k, prefix+"/") || strings.HasPrefix(k, prefix+"?") || strings.HasPrefix(k, prefix+" ")) {
+				return false
+			}
+			if pullNumber == "" {
+				return true
+			}
+			target := strings.TrimPrefix(k, prefix)
+			return strings.HasPrefix(target, " ") || strings.HasPrefix(target, "?") ||
+				strings.HasPrefix(target, "/pulls?") || strings.HasPrefix(target, "/pulls ") || strings.HasPrefix(target, "/issues?") || strings.HasPrefix(target, "/issues ") ||
+				strings.HasPrefix(target, "/pulls/"+pullNumber+"/") || strings.HasPrefix(target, "/pulls/"+pullNumber+"?") || strings.HasPrefix(target, "/pulls/"+pullNumber+" ") ||
+				strings.HasPrefix(target, "/issues/"+pullNumber+"/") || strings.HasPrefix(target, "/issues/"+pullNumber+"?") || strings.HasPrefix(target, "/issues/"+pullNumber+" ")
+		}
+		for k, v := range p.cache {
+			if touches(k) {
+				p.bytes -= len(v.Body)
+				delete(p.cache, k)
+				delete(p.polls, k)
+			}
+		}
+		for k := range p.polls {
+			if touches(k) {
+				delete(p.polls, k)
+			}
+		}
+
 		return
 	}
 	if len(body) > 4<<20 {

@@ -39,6 +39,7 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 }
 
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	loops := []daemon.Loop{}
 	// Each role owns one goroutine; repositories within it run in config order.
 	for _, entry := range []struct {
@@ -54,7 +55,17 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			return err
 		}
 		role := entry.role
-		loops = append(loops, daemon.Loop{Role: role, Interval: interval, Run: func(ctx context.Context) error {
+		var requests []github.RequestCount
+		loops = append(loops, daemon.Loop{Role: role, Interval: interval, Requests: func() any { return requests }, Run: func(ctx context.Context) error {
+			ctx, counts := github.CountRequests(ctx, role)
+			defer func() {
+				requests = counts.Snapshot()
+				total := 0
+				for _, request := range requests {
+					total += request.Count
+				}
+				log.Info("github requests", "role", role, "total", total, "routes", requests[:min(len(requests), 10)])
+			}()
 			var errs []error
 			for _, r := range s.Config.Repos {
 				if repo != "" && r.Name != repo {
@@ -103,7 +114,6 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	if len(s.Config.Repos) == 0 {
 		return errors.New("daemon requires configured repositories")
 	}
-	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
 	if s.Config.Discord.Enabled {
 		s.Feed = pipeline.NewFeed(s.Config, log)
@@ -127,7 +137,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		if secret == "" {
 			return errors.New("daemon.webhook.secret_env is unset or empty")
 		}
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence}
 	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)

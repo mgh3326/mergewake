@@ -273,3 +273,23 @@ func TestWebhookFormEncodedPayload(t *testing.T) {
 		t.Fatalf("form delivery: status=%d triggered=%v", resp.StatusCode, triggered)
 	}
 }
+
+func TestWebhookInvalidatesEvidenceBeforeWake(t *testing.T) {
+	var triggered []string
+	d := webhookDaemon(&triggered)
+	invalidated := ""
+	d.Webhook.Invalidate = func(repo string) { invalidated = repo }
+	d.Webhook.Trigger = func(role string) bool {
+		if invalidated != "o/r" {
+			t.Error("wake preceded invalidation")
+		}
+		return true
+	}
+	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
+	defer srv.Close()
+	resp := post(t, srv.Client(), srv.URL+"/github", "check_run", "evidence", []byte(`{"repository":{"full_name":"o/r"}}`), testSecret)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted || invalidated != "o/r" {
+		t.Fatalf("status=%d invalidated=%q", resp.StatusCode, invalidated)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -122,6 +123,9 @@ func (c *Client) moreComments(ctx context.Context, thread, cursor string) ([]Rev
 }
 
 func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
+	return cachedEvidence(ctx, c, evidenceKey{repo, "feedback", strconv.Itoa(n)}, func() (ReviewFeedback, error) { return c.reviewFeedback(freshRequest(ctx), repo, n) })
+}
+func (c *Client) reviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
 	var fb ReviewFeedback
 	fb.ReviewAuthors = map[string]int{}
 	fb.RecheckedAuthors = map[string]bool{}

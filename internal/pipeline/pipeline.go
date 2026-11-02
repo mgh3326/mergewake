@@ -150,6 +150,7 @@ func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
 // opted in with enabled, squash-merges pinned to the gated head. A dry run
 // prints the verdict only.
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
+	ctx = github.FreshEvidence(ctx)
 	defer func() {
 		if retErr != nil {
 			retErr = errors.Join(retErr, s.audit(r.Name, "land-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
