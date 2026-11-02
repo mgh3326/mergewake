@@ -514,6 +514,16 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 			return
 		}
 	}
+	// Backup hooks run only for a real change, after image pulls and before
+	// any container journal/stop/rename/run. Failure leaves the old service intact.
+	if o.BeforeDeploy != nil {
+		for _, spec := range selected {
+			if e = o.BeforeDeploy(ctx, spec, m.Commit); e != nil {
+				err = fmt.Errorf("pre-deploy %s: %w", spec.Target, e)
+				return
+			}
+		}
+	}
 	journalPath := filepath.Join(o.StateDir, containerJournalName)
 	j := containerJournal{Repo: m.Repo, Host: host, Commit: m.Commit, PriorReceipt: priorBytes, ReceiptExisted: priorBytes != nil, Targets: map[string]containerMutation{}}
 	if e = fsutil.WriteJSON(journalPath, j); e != nil {

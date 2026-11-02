@@ -103,6 +103,7 @@ type Health struct {
 	Retries int    `yaml:"retries" json:"retries"`
 }
 type Install struct {
+	PreDeploy    Command  `yaml:"pre_deploy" json:"pre_deploy"`
 	Kind         string   `yaml:"kind" json:"kind"`
 	Command      Command  `yaml:"command" json:"command"`
 	Verify       Command  `yaml:"verify" json:"verify"`
@@ -128,15 +129,16 @@ type Install struct {
 	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
-	Name         string    `yaml:"name"`
-	Root         string    `yaml:"root"`
-	Branch       string    `yaml:"branch"`
-	Policy       string    `yaml:"policy"`
-	Deny         []string  `yaml:"deny"`
-	Install      []Install `yaml:"install"`
-	Smoke        Command   `yaml:"smoke"`
-	SmokeTimeout string    `yaml:"smoke_timeout"`
-	Task         string    `yaml:"task"`
+	FollowRelease bool      `yaml:"follow_release"`
+	Name          string    `yaml:"name"`
+	Root          string    `yaml:"root"`
+	Branch        string    `yaml:"branch"`
+	Policy        string    `yaml:"policy"`
+	Deny          []string  `yaml:"deny"`
+	Install       []Install `yaml:"install"`
+	Smoke         Command   `yaml:"smoke"`
+	SmokeTimeout  string    `yaml:"smoke_timeout"`
+	Task          string    `yaml:"task"`
 	// Lane receives this repo's PR events when neither the task trailer nor a
 	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
 	Lane string `yaml:"lane"`
@@ -745,6 +747,9 @@ func Load(name string) (Config, error) {
 			spec := &r.Install[j]
 			if spec.Kind == "" {
 				spec.Kind = "file"
+			}
+			if spec.PreDeploy.Command != "" && spec.Kind != "container" {
+				return c, errors.New("pre_deploy is only supported for container installs")
 			}
 			switch spec.Kind {
 			case "file":

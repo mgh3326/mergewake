@@ -39,6 +39,7 @@ type Result struct {
 	Warnings  []string            `json:"warnings,omitempty"`
 }
 type Options struct {
+	BeforeDeploy   func(context.Context, config.Install, string) error
 	Root, StateDir string
 	Allowed        []config.Install
 	Deny           []string
