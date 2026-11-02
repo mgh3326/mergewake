@@ -168,6 +168,18 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if e != nil {
 		return e
 	}
+	if command != "daemon" {
+		var counts *github.RequestCounts
+		ctx, counts = github.CountRequests(ctx, command)
+		defer func() {
+			requests := counts.Snapshot()
+			total := 0
+			for _, request := range requests {
+				total += request.Count
+			}
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "routes": requests})
+		}()
+	}
 	gh := github.New(token)
 	gh.Stderr = stderr
 	// Only looping commands honour X-Poll-Interval; one-shot commands must not

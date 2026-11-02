@@ -193,4 +193,7 @@ func TestDaemonPostsToDiscord(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the daemon did not stop; the sender must end with it")
 	}
+	if !strings.Contains(stderr.String(), `"msg":"github requests"`) {
+		t.Fatalf("missing request summary: %s", stderr.String())
+	}
 }

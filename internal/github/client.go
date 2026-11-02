@@ -34,8 +34,9 @@ type Client struct {
 	// Polling loops (daemon, watch, agent) set it; one-shot commands leave it
 	// false so a recorded interval never stalls a single run. Retry-After,
 	// 403/429 backoff and rate-limit pacing apply either way.
-	Polling bool
-	poll    pollingState
+	Polling  bool
+	poll     pollingState
+	evidence evidenceCache
 }
 
 func (c *Client) now() time.Time {
@@ -64,7 +65,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
 	key := method + " " + endpoint + " " + accept
-	if method == "GET" {
+	if method == "GET" && ctx.Value(freshRequestKey{}) == nil {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
 		} else if hit.Replay && hit.Code == http.StatusNotFound {
@@ -73,7 +74,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
-	release, cached, e := c.beginRequest(ctx, key)
+	release, cached, e := c.beginRequest(ctx, key, ctx.Value(freshRequestKey{}) != nil)
 	if e != nil {
 		return nil, e
 	}
@@ -96,9 +97,11 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	}
 	resp, e := c.HTTP.Do(req)
 	if e != nil {
+		recordRequest(ctx, method, route, 0)
 		return nil, fmt.Errorf("GitHub %s request failed", method)
 	}
 	defer resp.Body.Close()
+	recordRequest(ctx, method, route, resp.StatusCode)
 	c.observeHeaders(resp.Header, resp.StatusCode, key)
 	if resp.StatusCode == http.StatusNotModified && method == "GET" {
 		if cached.ETag == "" {
@@ -112,12 +115,20 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		}
 		return nil, &APIError{resp.StatusCode, method, strings.Split(route, "?")[0]}
 	}
+	mutation := method != "GET" && route != "/graphql"
+	if mutation {
+		parts := strings.Split(strings.TrimPrefix(route, "/"), "/")
+		if len(parts) >= 3 && parts[0] == "repos" {
+			c.InvalidateEvidence(parts[1] + "/" + parts[2])
+		}
+		c.cacheResponse(key, "", nil, true)
+	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, manifest.MaxFileSize*2+1))
 	if len(b) > manifest.MaxFileSize*2 {
 		return nil, errors.New("GitHub response too large")
 	}
-	if e == nil {
-		c.cacheResponse(key, resp.Header.Get("ETag"), b, method != "GET" && route != "/graphql")
+	if e == nil && !mutation {
+		c.cacheResponse(key, resp.Header.Get("ETag"), b, false)
 	}
 	return b, e
 }
@@ -342,7 +353,7 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 // CheckStates resolves each required check name to green, red or pending.
 // Missing or unknown evidence is pending, matching Check's aggregate result.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
-	states, e := c.checkStates(ctx, repo, sha)
+	states, e := cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (map[string]CI, error) { return c.checkStates(freshRequest(ctx), repo, sha) })
 	if e != nil {
 		return nil, e
 	}
@@ -530,6 +541,9 @@ func (c *Client) CIStarted(ctx context.Context, repo, sha string) (bool, error) 
 }
 
 func (c *Client) Unresolved(ctx context.Context, repo string, n int) (int, error) {
+	return cachedEvidence(ctx, c, evidenceKey{repo, "unresolved", strconv.Itoa(n)}, func() (int, error) { return c.unresolved(freshRequest(ctx), repo, n) })
+}
+func (c *Client) unresolved(ctx context.Context, repo string, n int) (int, error) {
 	parts := strings.Split(repo, "/")
 	cursor := (*string)(nil)
 	total := 0

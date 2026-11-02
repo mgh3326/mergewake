@@ -1299,9 +1299,15 @@ daemon:
 ```
 
 The optional in-process receiver accepts GitHub webhook deliveries and wakes
-the matching roles early. Polling remains complete: a delivery only shortens
-the wait until the next poll, every decision still re-reads GitHub, and a
-lost, late or forged delivery changes nothing but timing.
+the matching roles early. Check and review evidence expires after ten minutes
+and refreshes on the next read. Relevant signed deliveries invalidate cached
+evidence for the repository immediately. A landing decision reads the checks
+and review threads for its pinned head from GitHub. Without a delivery, other
+observations can use evidence up to ten minutes old.
+
+Each daemon pass logs `github requests` with its total and busiest routes. The
+role's status file also records counts by method, route and response status.
+An HTTP status of `0` counts a request that received no response.
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
@@ -1320,7 +1326,7 @@ roles woken — never the body, the signature or other headers.
 
 | `X-GitHub-Event` | Roles woken |
 | --- | --- |
-| `pull_request`, `pull_request_review`, `pull_request_review_thread`, `check_suite`, `check_run`, `status` | `pr`, `watch` |
+| `pull_request`, `pull_request_review`, `pull_request_review_thread`, `pull_request_review_comment`, `check_suite`, `check_run`, `status` | `pr`, `watch` |
 | `release`, `workflow_run`, `push` | `release`, `rollout` |
 | `ping`, any other event | none |
 

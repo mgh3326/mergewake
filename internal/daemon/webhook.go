@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,11 +21,9 @@ import (
 // MaxWebhookBody caps a delivery at 5 MiB.
 const MaxWebhookBody = 5 << 20
 
-// Webhook is the optional GitHub delivery receiver Run serves next to the
-// loops. A signed delivery only wakes a role early: polling stays complete
-// and every decision re-reads GitHub, so a lost, late or forged delivery
-// changes nothing but timing. Listen, Path and Secret arrive pre-validated
-// from daemon.webhook config.
+// Webhook receives signed GitHub deliveries, invalidates cached evidence, and
+// wakes roles early. Polling bounds missed deliveries and landing reads fresh
+// evidence. Listen, Path and Secret arrive pre-validated from configuration.
 type Webhook struct {
 	Listen string
 	Path   string
@@ -33,21 +32,23 @@ type Webhook struct {
 	// repository are accepted and trigger nothing.
 	Repos map[string]bool
 	// Trigger wakes a role; nil means Daemon.Trigger.
-	Trigger func(role string) bool
+	Trigger    func(role string) bool
+	Invalidate func(repo string)
 }
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping
 // and unlisted events wake none.
 var webhookEventRoles = map[string][]string{
-	"pull_request":               {"pr", "watch"},
-	"pull_request_review":        {"pr", "watch"},
-	"pull_request_review_thread": {"pr", "watch"},
-	"check_suite":                {"pr", "watch"},
-	"check_run":                  {"pr", "watch"},
-	"status":                     {"pr", "watch"},
-	"release":                    {"release", "rollout"},
-	"workflow_run":               {"release", "rollout"},
-	"push":                       {"release", "rollout"},
+	"pull_request":                {"pr", "watch"},
+	"pull_request_review":         {"pr", "watch"},
+	"pull_request_review_thread":  {"pr", "watch"},
+	"pull_request_review_comment": {"pr", "watch"},
+	"check_suite":                 {"pr", "watch"},
+	"check_run":                   {"pr", "watch"},
+	"status":                      {"pr", "watch"},
+	"release":                     {"release", "rollout"},
+	"workflow_run":                {"release", "rollout"},
+	"push":                        {"release", "rollout"},
 }
 
 // serve runs the receiver until ctx ends. The listener opens first so a bad
@@ -125,7 +126,13 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	}
 	triggered := []string{}
 	if wh.Repos[delivery.Repository.FullName] {
-		for _, role := range webhookEventRoles[r.Header.Get("X-GitHub-Event")] {
+		event := r.Header.Get("X-GitHub-Event")
+		if event == "pull_request" || strings.HasPrefix(event, "pull_request_review") || event == "check_suite" || event == "check_run" || event == "status" {
+			if wh.Invalidate != nil {
+				wh.Invalidate(delivery.Repository.FullName)
+			}
+		}
+		for _, role := range webhookEventRoles[event] {
 			if trigger(role) {
 				triggered = append(triggered, role)
 			}

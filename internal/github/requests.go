@@ -1,0 +1,101 @@
+package github
+
+import (
+	"context"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+)
+
+type RequestCount struct {
+	Role   string `json:"role"`
+	Method string `json:"method"`
+	Route  string `json:"route"`
+	Status int    `json:"status"`
+	Count  int    `json:"count"`
+}
+type requestKey struct {
+	method, route string
+	status        int
+}
+type RequestCounts struct {
+	mu     sync.Mutex
+	role   string
+	counts map[requestKey]int
+}
+type requestCountsKey struct{}
+
+// CountRequests attributes all HTTP responses under ctx to this pass.
+func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
+	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
+	return context.WithValue(ctx, requestCountsKey{}, c), c
+}
+
+var numericSegment = regexp.MustCompile(`^[0-9]+$`)
+var shaSegment = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}$`)
+var doneMarker = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}-done$`)
+
+func routeTemplate(route string) string {
+	u, err := url.Parse(strings.TrimPrefix(route, "UPLOAD "))
+	if err != nil {
+		return "<invalid>"
+	}
+	parts := strings.Split(u.EscapedPath(), "/")
+	for i, part := range parts {
+		switch {
+		case numericSegment.MatchString(part):
+			parts[i] = "{number}"
+		case shaSegment.MatchString(part):
+			parts[i] = "{sha}"
+		case i > 0 && parts[i-1] == "compare":
+			left, right, ok := strings.Cut(part, "...")
+			if ok && left != "" && right != "" {
+				template := func(ref string) string {
+					if shaSegment.MatchString(ref) {
+						return "{sha}"
+					}
+					return "{ref}"
+				}
+				parts[i] = template(left) + "..." + template(right)
+			}
+		case i > 0 && parts[i-1] == "commits" && strings.HasPrefix(part, "mergewake-") && shaSegment.MatchString(strings.TrimPrefix(part, "mergewake-")):
+			parts[i] = "mergewake-{sha}"
+		case i > 1 && parts[i-2] == "reviews" && doneMarker.MatchString(part):
+			parts[i] = "{sha}-done"
+		}
+	}
+	return strings.Join(parts, "/")
+}
+func recordRequest(ctx context.Context, method, route string, status int) {
+	c, ok := ctx.Value(requestCountsKey{}).(*RequestCounts)
+	if !ok {
+		return
+	}
+	k := requestKey{method, routeTemplate(route), status}
+	c.mu.Lock()
+	c.counts[k]++
+	c.mu.Unlock()
+}
+func (c *RequestCounts) Snapshot() []RequestCount {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]RequestCount, 0, len(c.counts))
+	for k, n := range c.counts {
+		out = append(out, RequestCount{c.role, k.method, k.route, k.status, n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if out[i].Route != out[j].Route {
+			return out[i].Route < out[j].Route
+		}
+		if out[i].Method != out[j].Method {
+			return out[i].Method < out[j].Method
+		}
+		return out[i].Status < out[j].Status
+	})
+	return out
+}

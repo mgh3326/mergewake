@@ -383,3 +383,169 @@ func TestPollReplaysNotFoundInsideWindow(t *testing.T) {
 		t.Fatalf("after a mutation the ref must be read again: %v, %d hits", e, n)
 	}
 }
+
+func TestMutationPreservesOtherRepositoryETag(t *testing.T) {
+	var conditional bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/repos/o/other/pulls" && r.Header.Get("If-None-Match") == `"e"` {
+			conditional = true
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"e"`)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	ctx := context.Background()
+	for _, req := range []struct{ method, route string }{{"GET", "/repos/o/other/pulls"}, {"POST", "/repos/o/changed/issues/1/comments"}, {"GET", "/repos/o/other/pulls"}} {
+		if _, err := c.request(ctx, req.method, req.route, "application/json", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !conditional {
+		t.Fatal("unrelated repository was fetched without its ETag after mutation")
+	}
+}
+
+func TestRequestCountsAttributeStatusAndRole(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"e"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	ctx, counts := CountRequests(context.Background(), "watch")
+	path := "/repos/o/r/pulls/42/commits/a123456789012345678901234567890123456789?per_page=100"
+	for i := 0; i < 2; i++ {
+		if _, err := c.request(ctx, "GET", path, "application/json", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := counts.Snapshot()
+	if len(got) != 2 {
+		t.Fatalf("counts = %+v", got)
+	}
+	for _, count := range got {
+		if count.Role != "watch" || count.Method != "GET" || count.Route != "/repos/o/r/pulls/{number}/commits/{sha}" || count.Count != 1 || (count.Status != 200 && count.Status != 304) {
+			t.Fatalf("unexpected count: %+v", count)
+		}
+	}
+}
+
+func TestCommentPreservesOtherPullETag(t *testing.T) {
+	conditional := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/repos/o/r/pulls/2" && r.Header.Get("If-None-Match") != "" {
+			conditional = true
+			w.WriteHeader(304)
+			return
+		}
+		w.Header().Set("ETag", `"e"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := New("")
+	c.BaseURL = srv.URL
+	ctx := context.Background()
+	for _, v := range []struct{ method, path string }{{"GET", "/repos/o/r/pulls/2"}, {"POST", "/repos/o/r/issues/1/comments"}, {"GET", "/repos/o/r/pulls/2"}} {
+		if _, err := c.request(ctx, v.method, v.path, "application/json", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !conditional {
+		t.Fatal("comment on PR 1 discarded PR 2 ETag")
+	}
+}
+
+func TestCommentInvalidatesItsPullAndList(t *testing.T) {
+	seen := map[string][]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			seen[r.URL.Path] = append(seen[r.URL.Path], r.Header.Get("If-None-Match"))
+		}
+		w.Header().Set("ETag", `"e"`)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := New("")
+	c.BaseURL = srv.URL
+	ctx := context.Background()
+	paths := []string{"/repos/o/r/pulls/1", "/repos/o/r/pulls", "/repos/o/r/issues/1/comments"}
+	for _, path := range paths {
+		if _, e := c.request(ctx, "GET", path, "application/json", nil); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if _, e := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", nil); e != nil {
+		t.Fatal(e)
+	}
+	for _, path := range paths {
+		if _, e := c.request(ctx, "GET", path, "application/json", nil); e != nil {
+			t.Fatal(e)
+		}
+		if len(seen[path]) != 2 || seen[path][1] != "" {
+			t.Fatalf("%s was not invalidated: %v", path, seen[path])
+		}
+	}
+}
+
+func TestGraphQLPostIsNotReplayedAfterMutation(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			calls++
+			w.Header().Set("ETag", `"same"`)
+			w.Header().Set("X-Poll-Interval", "3600")
+			fmt.Fprintf(w, `{"version":%d}`, calls)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	c := New("")
+	c.BaseURL = server.URL
+	c.Polling = true
+	c.Stderr = io.Discard
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if i == 2 {
+			if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		b, err := c.request(queryCtx, "POST", "/graphql", "application/json", []byte(`{}`))
+		cancel()
+		if err != nil || string(b) != fmt.Sprintf(`{"version":%d}`, i) {
+			t.Fatalf("query %d returned %s, %v", i, b, err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("GraphQL server requests = %d, want 2", calls)
+	}
+}
+
+func TestRouteTemplateKeepsEmbeddedHexAndLabelsNumbers(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	for _, tt := range []struct{ route, want string }{
+		{"/repos/o/r/git/ref/heads/foo" + sha + "bar", "/repos/o/r/git/ref/heads/foo" + sha + "bar"},
+		{"/repos/o/r/issues/" + strings.Repeat("7", 40), "/repos/o/r/issues/{number}"},
+		{"/repos/o/r/compare/" + sha + "..." + strings.Repeat("b", 40), "/repos/o/r/compare/{sha}...{sha}"},
+		{"/repos/o/r/compare/main..." + sha, "/repos/o/r/compare/{ref}...{sha}"},
+		{"/repos/o/r/compare/release%2F1.2..." + sha, "/repos/o/r/compare/{ref}...{sha}"},
+		{"/repos/o/r/commits/mergewake-" + sha, "/repos/o/r/commits/mergewake-{sha}"},
+		{"/repos/o/r/git/ref/heads/mergewake-" + sha, "/repos/o/r/git/ref/heads/mergewake-" + sha},
+		{"/repos/o/r/git/ref/heads/mergewake/reviews/7/" + sha + "-done", "/repos/o/r/git/ref/heads/mergewake/reviews/{number}/{sha}-done"},
+	} {
+		if got := routeTemplate(tt.route); got != tt.want {
+			t.Errorf("routeTemplate(%q) = %q; want %q", tt.route, got, tt.want)
+		}
+	}
+}
