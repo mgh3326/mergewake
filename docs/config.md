@@ -1363,8 +1363,8 @@ missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
-head re-arms notification, and a restart does not resend. READY and BLOCKED are
-declared with `panewire emit --type ready|blocked`, so they stay unread on the
+head re-arms notification, and a restart does not resend. READY, BLOCKED, and MERGED are
+declared with `panewire emit --type ready|blocked|merged`, so they stay unread on the
 receiving lane until it runs `panewire inbox ack` (panewire
 `docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
 event untyped). A READY PR that stays open and READY on the same head is not
@@ -1395,53 +1395,75 @@ severity, `path:line` and comment link, what is required (fix every
 critical/high/Major with `Fixed in <sha>` or `Dismiss: <evidence>`; a
 disposition for every other) and how to acknowledge.
 
-The author lane is resolved without guessing: the `Mergewake-Task` trailer →
-the hk task → its bound job (`refs.job_id`) → the job's hub lane (a worker's
-lane is its `label`; a builder's lane is not recorded, so it falls through).
-A job in a terminal state (`completed`, `escalated`, `lost`) has no author left:
-its findings go to the owner, and mergewake never respawns a worker. Without a
-bound job the event goes to `repos[].lane`, then the desk
-(`notifier.fallback_lane`). The owner is the job's `owner_lane`, else the lane
-READY/BLOCKED go to. A read error retries next poll rather than rerouting.
+The author lane uses the same binding as reap: `Mergewake-Task`, the task's
+`refs.job_id`, then the job's `hub_lane`, `lane`, or `label`. Worker and builder
+jobs keep their recorded author lane after completion. An explicit
+`Mergewake-Notify-Lane` trailer also identifies the author. Without either
+binding, the event goes to `notifier.fallback_lane`, or `notifier.lane`, as a
+`decision`. A task or job read error retries without rerouting.
 
-The author acknowledges with `panewire inbox ack <id>`. A delivery with no ACK —
-and no disposition on every thread it names — after `ack_after` (default
-`15m`) is re-sent once (`…-resend`); after another `ack_after` it is escalated
-once to the owner lane as `[mergewake] ESC …` (`--type decision`). Findings
-the reviewer marked outside the Acceptance contract go to the owner once as
-`OUT-OF-SCOPE` and are not followed up. Deliveries are kept in
-`<state_dir>/<repo>/findings-deliveries.json` (30 days); the audit log records
-`findings-delivered`, `findings-acked`, `findings-resent` and
-`findings-escalated`.
+`BLOCKED` notices for `blocking_findings`, `triage_unanswered`, or `check_failed`
+use this author route too. They do not use the task's operator lane. An author
+delivery failure does not create an immediate desk copy.
 
-#### Review-stall alarm
+`ack_after` defaults to `15m`. An unacknowledged delivery is resent once after
+that interval. An inbox acknowledgment stops reminders. A verified disposition
+stops both reminders and aging. `review.fleet_authors` lists additional GitHub
+logins whose replies count, including bot logins. Login matching is case
+insensitive and ignores the `[bot]` suffix. Fix replies still require a commit
+in the PR after the finding. Allowlisting an account does not let it dispose
+its own findings. The existing same-login exception for mergewake's own review
+identity remains.
 
-The healthcheck ping (`MERGEWAKE_HEALTHCHECK_URL`) proves the loops finish
-without error; it cannot tell a loop that is reviewing from one that is idling
-past a ready PR (a quota refusal, a skipped head). The `pr` role therefore also
-raises a **stall alarm**. A head is *waiting* while its PR is open, not a
-draft, CI has started (any check run or status exists: running or done) and no
-review pass has been claimed for it (`mergewake/reviews/<pr>/<head>` absent).
-The clock starts when this host first sees the head waiting and is kept across
-restarts in `<state_dir>/<repo>/review-wait.json`; a claimed review, a draft, a
-head without CI or a new head ends or restarts it. Once a head has waited
-longer than `daemon.pr.stall_after` (default `30m`, `off` disables) one lane
-event goes to the operator lane (`notifier.lane`):
+The desk gets one `decision` copy when an unresolved finding reaches
+`daemon.pr.findings.escalate_after` (default `2h`) or `escalate_rounds` (default
+`3`). A round is a distinct observed PR head, not a poll. Zero rounds disables
+the round threshold. Acknowledged but unresolved findings keep aging. Named
+failed checks use the same thresholds across heads and reset when that check
+stops failing. Advisory findings go to the author once and do not escalate.
 
+```yaml
+review:
+  fleet_authors: [example-fleet-author]
+daemon:
+  pr:
+    findings:
+      ack_after: 15m
+      escalate_after: 2h
+      escalate_rounds: 3
+    review_retry:
+      initial: 1m
+      maximum: 30m
+      failures: 3
 ```
-[mergewake] STALLED review <repo>#<pr> head=<sha7> | no review started for 47m0s (threshold 30m0s); …
-```
 
-`daemon.pr.skip_bots: true` leaves PRs opened by bot accounts (GitHub user type
-`Bot`, e.g. Renovate) out of the pr role: no review, notify, landing or stall
-alarm. They carry no author family, so a review could never start and the
-alarm would only repeat. They still count as open for outcome reconciliation.
+Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. READY,
+BLOCKED, and MERGED declare `ready`, `blocked`, and `merged`. Watch holds declare
+`watch-hold`; culprit recovery declares `culprit-hold`. Deployment decisions
+continue through the handoffkeep approval adapter. Panewire's reviewed desk
+policy keeps routine events in its inbox and decision events as interrupts.
 
-Each `(PR, head)` alarms once, recorded in `review-stall-sent` (the newest 256
-keys) and as a `review-stall` audit record; a delivery the notifier refuses is
-not recorded and is retried on the next poll, and counts as a failed loop run.
-The alarm runs in shadow mode like the other lane events; `--dry-run` skips it.
-The healthcheck ping stays as it was.
+#### Review recovery
+
+Every acting PR poll checks review receipts, including heads with a `-done`
+marker. A marker without trusted pass receipts cannot skip the review. Expired
+leases are reclaimed. A live review lease waits for completion or expiry.
+The existing HTTP 406 fallback reads the local Git diff when GitHub cannot
+supply the diff.
+
+`daemon.pr.review_retry` sets the first delay, maximum delay, and failure
+threshold. Failed attempts back off exponentially and persist per PR head in
+`<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
+`3` failures. A new head resets the counter. At the threshold, one
+`automation-failed` event interrupts `notifier.lane`; later attempts keep the
+bounded backoff. These counters are per host. GitHub review leases still
+prevent simultaneous claims of a pass across hosts.
+
+The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
+`stall_after` remains readable for compatibility and no longer controls daemon
+escalation. Shadow and dry-run modes do not retry reviews or write retry state.
+`daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
+and landing. They still count as open for outcome reconciliation.
 
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,

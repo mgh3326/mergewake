@@ -27,6 +27,8 @@ type JobRecord struct {
 	// Role, Label and OwnerLane are what runtug records at spawn: a worker's
 	// hub lane is its label, and owner_lane is the lane that owns its work.
 	Role      string `json:"role"`
+	Lane      string `json:"lane"`
+	HubLane   string `json:"hub_lane"`
 	Label     string `json:"label"`
 	OwnerLane string `json:"owner_lane"`
 	// Host is the panewire machine the job runs on and PaneID its herdr

@@ -74,8 +74,14 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Deduped bool     `json:"deduped,omitempty"`
 		Error   string   `json:"error,omitempty"`
 	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons}
-	if v.State == "pending" || o.DryRun {
+	if o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
+	}
+	if e := s.ageCheckFailures(ctx, r, pr, v.Reasons); e != nil {
+		return e
+	}
+	if v.State == "pending" {
+		return s.audit(r.Name, "pr-notify", record, false)
 	}
 	if o.Acting() && v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
 		status, attempted, err := s.updateStaleBranch(ctx, r, pr, baseSHA)
@@ -204,7 +210,17 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // every loop. An empty via means a decision was already logged and the
 // caller stays silent.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
-	lane, via, e := s.notifyLane(ctx, r, pr)
+	var lane, via string
+	var e error
+	if state == "blocked" && authorAction(summary) {
+		route, err := s.findingsRoute(ctx, r, pr)
+		if err != nil {
+			return "", "", false, err
+		}
+		lane, via = route.lane, route.via
+	} else {
+		lane, via, e = s.notifyLane(ctx, r, pr)
+	}
 	if e != nil {
 		return "", "", false, e
 	}
@@ -253,17 +269,17 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
-		Type: eventType(state),
+		Type: verdictType(state, via),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
-		if fallback != "" && fallback != lane {
+		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
 			// The resolved lane may not exist on this host; the fallback lane
 			// gets one try under a distinct ID before the verdict is parked.
 			if fb := s.Notifier.Notify(reportCtx, integrations.Event{
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
-				Type: eventType(state),
+				Type: verdictType(state, via),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
@@ -296,7 +312,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 // a READY or BLOCKED stays unread on the receiving lane until it is acked.
 func eventType(state string) string {
 	switch state {
-	case "ready", "blocked":
+	case "ready", "blocked", "merged":
 		return state
 	}
 	return ""
@@ -467,4 +483,21 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 		return fallback, "fallback", nil
 	}
 	return "", "no-lane", nil
+}
+
+func authorAction(summary string) bool {
+	for _, reason := range strings.Split(summary, "; ") {
+		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:"} {
+			if strings.HasPrefix(reason, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+func verdictType(state, via string) string {
+	if state == "blocked" && via == "unknown author; desk" {
+		return "decision"
+	}
+	return eventType(state)
 }
