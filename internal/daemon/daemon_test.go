@@ -285,3 +285,26 @@ func TestTriggerDoesNotCutRateWait(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestWakeNeverPostponesScheduledPoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", WakeGap: time.Hour, Jitter: func() float64 { return 0 }}
+	runs := make(chan time.Time, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "pr", Interval: 300 * time.Millisecond, Run: func(context.Context) error { runs <- time.Now(); return nil }}})
+	}()
+	first := <-runs
+	d.Trigger("pr")
+	select {
+	case second := <-runs:
+		if gap := second.Sub(first); gap > 2*time.Second {
+			t.Fatalf("scheduled poll ran %v later, a wake postponed it", gap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a wake inside the gap postponed the scheduled poll")
+	}
+	cancel()
+	<-done
+}

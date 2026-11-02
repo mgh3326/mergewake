@@ -229,27 +229,52 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		if ctx.Err() != nil {
 			break
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-		case <-timer.C:
-		case <-ch:
-			timer.Stop()
-			wait := max(rate, d.WakeGap-d.now().Sub(st.LastFinish))
-			if wait > 0 {
-				gap := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					gap.Stop()
-				case <-gap.C:
-				}
-			}
-		}
+		d.wait(ctx, ch, delay, st.LastFinish)
 	}
 	st.Running = false
 	st.NextRun = time.Time{}
 	return save()
+}
+
+// wait sleeps until the scheduled poll, or earlier when a wake arrives. A woken
+// pass starts no sooner than WakeGap after lastFinish and never inside a
+// rate-limit wait, read again at each wake because another role may have moved
+// it. A wake never pushes the scheduled poll later. Cancellation returns at
+// once; the caller's loop condition then stops.
+func (d *Daemon) wait(ctx context.Context, ch <-chan struct{}, delay time.Duration, lastFinish time.Time) {
+	due := d.now().Add(delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-ch:
+			now := d.now()
+			at := lastFinish.Add(d.WakeGap)
+			if d.RateWait != nil {
+				if r := now.Add(d.RateWait()); r.After(at) {
+					at = r
+				}
+			}
+			if at.Before(now) {
+				at = now
+			}
+			if !at.Before(due) {
+				continue
+			}
+			due = at
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(at.Sub(now))
+		}
+	}
 }
 
 func ReadStatus(state string, out io.Writer) error {
