@@ -17,9 +17,11 @@ class AutoTagTests(unittest.TestCase):
         self.assertEqual(auto.next_tag(['v1.9.9', 'v2.0.3', 'v9.0.0-rc1', 'junk']), 'v2.0.4')
 
     def test_not_main(self):
-        with patch.dict(os.environ, {'GITHUB_REF': 'refs/pull/1/merge', 'GITHUB_EVENT_NAME': 'pull_request'}):
-            with self.assertRaises(SystemExit):
-                auto.main()
+        for ref,event in [('refs/pull/1/merge','pull_request'),('refs/heads/feature','push')]:
+            with self.subTest(ref=ref,event=event), patch.dict(os.environ, {'GITHUB_REF':ref,'GITHUB_EVENT_NAME':event}), patch.object(auto,'run') as git:
+                with self.assertRaises(SystemExit):
+                    auto.main()
+                git.assert_not_called()
 
     def test_tag_dispatch_retry_and_docs(self):
         with tempfile.TemporaryDirectory() as d:
