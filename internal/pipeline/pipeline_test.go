@@ -291,6 +291,9 @@ func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { re
 
 type fakeSink struct{ records, reopens int }
 
+// Existing installer tests explicitly approve the bootstrap deployment.
+func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
+
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }
 
@@ -947,7 +950,7 @@ func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ s
 		d.add(args[1])
 		return nil, nil
 	case "run":
-		name, ref := args[2], args[len(args)-1]
+		name, ref := args[3], args[len(args)-1]
 		if _, ok := d.containers[name]; ok {
 			return nil, errors.New("container name in use")
 		}

@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"runtime"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
-func binaryName() string { return "mergewake-" + runtime.GOOS + "-" + runtime.GOARCH }
+func binaryName(repo string) string {
+	return path.Base(repo) + "-" + runtime.GOOS + "-" + runtime.GOARCH
+}
 func (c *Client) BinaryHead(ctx context.Context, repo string) (string, error) {
 	releases, err := list[Release](ctx, c, base(repo)+"/releases")
 	if err != nil {
@@ -22,7 +25,7 @@ func (c *Client) BinaryHead(ctx context.Context, repo string) (string, error) {
 		}
 		binary, sums := false, false
 		for _, a := range r.Assets {
-			binary = binary || a.Name == binaryName()
+			binary = binary || a.Name == binaryName(repo)
 			sums = sums || a.Name == "SHA256SUMS"
 		}
 		if binary && sums {
@@ -56,7 +59,7 @@ func (c *Client) BinaryAtCommit(ctx context.Context, repo, sha string) ([]byte, 
 		}
 		var binary, checksums Asset
 		for _, a := range r.Assets {
-			if a.Name == binaryName() {
+			if a.Name == binaryName(repo) {
 				binary = a
 			}
 			if a.Name == "SHA256SUMS" {

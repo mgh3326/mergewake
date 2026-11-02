@@ -1,0 +1,125 @@
+version: 1
+host: host-a
+state_dir: ~/.local/state/mergewake
+token_env: GITHUB_TOKEN
+poll_interval: 60s
+watch_limit: 100
+repos:
+  - name: mgh3326/mergewake
+    branch: main
+    policy: .mergewake/policy.yaml
+    root: /opt/fleet
+    install:
+      - kind: release
+        target: bin/mergewake
+        verify: {command: /opt/fleet/bin/mergewake, args: [commit]}
+        initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    smoke: {command: /opt/fleet/bin/mergewake, args: [--help]}
+    smoke_timeout: 30s
+  - name: mgh3326/pacelever
+    branch: main
+    policy: .mergewake/policy.yaml
+    root: /opt/fleet
+    install:
+      - kind: release
+        target: bin/pacelever
+        verify:
+          command: /opt/fleet/libexec/verify-pacelever-commit.sh
+          args: [/opt/fleet/bin/pacelever]
+        initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    smoke: {command: /opt/fleet/bin/pacelever, args: [--help]}
+    smoke_timeout: 30s
+
+review:
+  login: review-bot
+  timeout: 10m
+  quota: scopefuel
+  default_grade: B
+  # pace (default): free models, then pools projected well under 100% at their
+  # reset (otherwise wasted), then the rest under 100%; tight or unmeasured
+  # pools are skipped. rank: keep the quota tool's recommendation order.
+  select: pace
+  # Optional fixed order for other-family reviewers; it takes precedence over
+  # pace order but never admits a skipped pool.
+  # pairings:
+  #   openai: [claude, deepseek]
+  profiles:
+    claude:
+      family: anthropic
+      command: pi
+      args: [--provider, anthropic, --model, claude-model-id, --thinking, high]
+      gate_profile: example-claude-profile
+      gate_effort: high
+    deepseek:
+      family: deepseek
+      command: cmd
+      args: [--model, deepseek-model-id, --effort, high]
+      gate_profile: example-deepseek-profile
+      gate_effort: high
+    gemini:
+      family: google
+      command: agy
+      args: [--model, gemini-model-id]
+      gate_profile: example-gemini-profile
+    grok:
+      family: xai
+      command: grok
+      args: [--model, grok-model-id, --effort, high]
+      gate_profile: example-grok-profile
+      gate_effort: high
+outcomes:
+  command: scopefuel
+  default_tier: T1
+notifier:
+  type: stdout
+  command: panewire
+  lane: operator-desk
+sink:
+  type: handoffkeep
+  command: handoffkeep
+  reopen_state: reopened
+# All daemon roles are optional and shadow by default. Opting into action also
+# needs --apply; land/watch still obey the repository policy.
+daemon:
+  act: false
+  # notify defaults to enabled; READY/BLOCKED lane events fire even in shadow.
+  pr: {enabled: false, interval: 60s, notify: {enabled: true}}
+  watch: {enabled: false, interval: 60s}
+  release: {enabled: false, interval: 2m}
+  rollout: {enabled: false, interval: 2m}
+  # Optional GitHub webhook receiver: signed deliveries wake roles early while
+  # polling stays complete. Loopback listen only — put an operator-run tunnel
+  # in front for real deliveries. The secret lives in the named env var.
+  webhook: {enabled: false, listen: 127.0.0.1:9477, path: /github, secret_env: MERGEWAKE_WEBHOOK_SECRET}
+# Optional Discord feed: PR, CI, deploy and revert events for every repo above.
+# webhooks_file is a mode-0600 env file of KEY=URL lines; kinds name its keys.
+# A URL inline here is refused. See docs/config.md.
+discord:
+  enabled: false
+  webhooks_file: ~/.config/mergewake/discord-webhooks.env
+  kinds:
+    pr: DISCORD_WEBHOOK_PR_LOG
+    ci: DISCORD_WEBHOOK_GITHUB_ACTION
+    deploy: DISCORD_WEBHOOK_DEPLOY_LOG
+    revert: DISCORD_WEBHOOK_DEPLOY_LOG
+  opt_out: []
+# Session hosts scanned by `mergewake reap`. An empty/local ssh value means this
+# machine; `jobs` is the base directory of per-pane job dirs and must be
+# absolute on ssh hosts.
+hosts:
+  - {name: desk, jobs: ~/work/herdr-inbox/jobs}
+  - {name: node, ssh: ops@node.example, jobs: /home/ops/herdr-inbox/jobs}
+# Close panes that worked on merged PRs (their report.md or last screen is
+# saved under jobs first), then remove the worktree and local branch after
+# worktree_after with no revert. Default protect list: *-integrator,
+# director-*, fleet-tooling-*, consult-*, cmd. Unnamed panes and panes outside
+# a linked worktree are always protected.
+reap:
+  enabled: false
+  act: false # reap's own acting opt-in; needs enabled, plus --apply or daemon
+  worktree_after: 168h
+  scan_after: 720h # merged-PR discovery window; older PRs arrive via receipts
+  protect: []
+  regenerable: [] # gitignored paths safe to delete with a worktree (defaults:
+  # .venv, node_modules, __pycache__, .pytest_cache, dist, build, target, obj,
+  # bin, Library, Temp, Logs, UserSettings); anything else refuses removal

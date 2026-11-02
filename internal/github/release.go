@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/manifest"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 const AssetName = "mergewake-manifest.json"
@@ -155,4 +156,22 @@ func (c *Client) ContainerReleaseHead(ctx context.Context, repo string) (string,
 		}
 	}
 	return "", errors.New("no stable container release")
+}
+
+// ChangedPaths compares every commit in an ancestor range. GitHub truncates the
+// file list at 300 entries; that boundary is unknown evidence, never a clean diff.
+func (c *Client) ChangedPaths(ctx context.Context, repo, older, newer string) ([]policy.File, error) {
+	var r struct {
+		Status    string        `json:"status"`
+		MergeBase Ref           `json:"merge_base_commit"`
+		Files     []policy.File `json:"files"`
+	}
+	e := c.json(ctx, "GET", base(repo)+"/compare/"+older+"..."+newer, nil, &r)
+	if e != nil {
+		return nil, e
+	}
+	if r.Status != "ahead" || r.MergeBase.SHA != older || r.Files == nil || len(r.Files) >= 300 {
+		return nil, errors.New("unknown or truncated deployment range")
+	}
+	return r.Files, nil
 }

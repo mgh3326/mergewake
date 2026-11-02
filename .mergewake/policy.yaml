@@ -16,3 +16,7 @@ review_gate:
   land: graded
 fast_lane:
   max_changed_lines: 50
+
+deploy_approval:
+  - paths: [internal/rollout/**, internal/pipeline/deploy_approval.go, internal/integrations/deploy_decision.go, internal/config/**]
+    reason: Deployment and approval controls

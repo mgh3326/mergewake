@@ -129,6 +129,7 @@ type Install struct {
 	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
+	DeployTask    string    `yaml:"deploy_task"`
 	RolloutGroup  string    `yaml:"rollout_group"`
 	FollowRelease bool      `yaml:"follow_release"`
 	Name          string    `yaml:"name"`
