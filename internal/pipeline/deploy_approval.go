@@ -53,7 +53,7 @@ func (s *Service) deploymentIdentity(r config.Repo, m manifest.Manifest, o Optio
 	}
 	b, _ := json.Marshal(struct {
 		Host, Repo, Policy, Root string
-		Environment              map[string]string
+		Environment              map[string]string `json:"Environment,omitempty"`
 		Deny                     []string
 		Install                  []config.Install
 		Smoke                    config.Command

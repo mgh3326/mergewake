@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -247,5 +248,23 @@ func TestEnvContentDriftNeedsApproval(t *testing.T) {
 	}
 	if d.containers[spec.Name] != spec.Image+"@"+old || len(sink.questions) == 0 {
 		t.Fatalf("unapproved replacement=%q questions=%v", d.containers[spec.Name], sink.questions)
+	}
+}
+
+func TestNoEnvInventoryIdentityCompatibility(t *testing.T) {
+	s, _, _, _, r := setup(t)
+	b, e := json.Marshal(struct {
+		Host, Repo, Policy, Root string
+		Deny                     []string
+		Install                  []config.Install
+		Smoke                    config.Command
+		Timeout                  string
+	}{s.Config.Host, r.Name, r.Policy, r.Root, r.Deny, r.Install, r.Smoke, r.SmokeTimeout})
+	if e != nil {
+		t.Fatal(e)
+	}
+	got := s.deploymentIdentity(r, manifest.Manifest{}, Options{})
+	if got.Config != manifest.Sum(b) || !got.EnvironmentKnown {
+		t.Fatal("no-env upgrade changed deployed inventory identity")
 	}
 }
