@@ -18,7 +18,7 @@ func TestPinnedReleaseBinaryAndChecksum(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/example/project/releases":
-			fmt.Fprintf(w, `[{"tag_name":"v1.0.0","assets":[{"id":1,"name":%q,"size":%d},{"id":2,"name":"SHA256SUMS","size":100}]}]`, binaryName(), len(data))
+			fmt.Fprintf(w, `[{"tag_name":"v1.0.0","assets":[{"id":1,"name":%q,"size":%d},{"id":2,"name":"SHA256SUMS","size":100}]}]`, binaryName("example/project"), len(data))
 		case "/repos/example/project/commits/v1.0.0":
 			fmt.Fprintf(w, `{"sha":%q}`, sha)
 		case "/repos/example/project/releases/assets/1":
@@ -28,7 +28,7 @@ func TestPinnedReleaseBinaryAndChecksum(t *testing.T) {
 				w.Write(data)
 			}
 		case "/repos/example/project/releases/assets/2":
-			fmt.Fprintf(w, "%s  %s\n", manifest.Sum(data), binaryName())
+			fmt.Fprintf(w, "%s  %s\n", manifest.Sum(data), binaryName("example/project"))
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -51,5 +51,14 @@ func TestPinnedReleaseBinaryAndChecksum(t *testing.T) {
 	}
 	if _, e = c.BinaryAtCommit(context.Background(), "example/project", strings.Repeat("b", 40)); e == nil {
 		t.Fatal("unpinned release accepted")
+	}
+}
+
+func TestBinaryNameUsesRepository(t *testing.T) {
+	if !strings.HasPrefix(binaryName("mgh3326/pacelever"), "pacelever-") {
+		t.Fatal("pacelever asset name hardcoded")
+	}
+	if !strings.HasPrefix(binaryName("mgh3326/mergewake"), "mergewake-") {
+		t.Fatal("self release asset changed")
 	}
 }
