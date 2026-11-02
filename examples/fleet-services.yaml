@@ -8,6 +8,7 @@ repos:
     branch: main
     policy: .mergewake/policy.yaml
     follow_release: true
+    rollout_group: control-plane
     # deploy_task: '123' # Dedicated private hk task, requires approval-gate PR.
     install:
       - kind: container
@@ -27,6 +28,7 @@ repos:
     branch: main
     policy: .mergewake/policy.yaml
     follow_release: true
+    rollout_group: control-plane
     # deploy_task: '123' # Dedicated private hk task, requires approval-gate PR.
     install:
       - kind: container

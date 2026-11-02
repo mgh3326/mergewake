@@ -129,6 +129,7 @@ type Install struct {
 	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
+	RolloutGroup  string    `yaml:"rollout_group"`
 	FollowRelease bool      `yaml:"follow_release"`
 	Name          string    `yaml:"name"`
 	Root          string    `yaml:"root"`
@@ -143,6 +144,16 @@ type Repo struct {
 	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
 	Lane string `yaml:"lane"`
 }
+
+// RolloutWindowGroup keeps the fleet control-plane peers in one mandatory
+// availability window, independent of which caller constructs the inventory.
+func (r Repo) RolloutWindowGroup() string {
+	if r.Name == "mgh3326/handoffkeep" || r.Name == "mgh3326/panewire" {
+		return "control-plane"
+	}
+	return r.RolloutGroup
+}
+
 type Loop struct {
 	Enabled  bool   `yaml:"enabled"`
 	Interval string `yaml:"interval"`
@@ -728,6 +739,10 @@ func Load(name string) (Config, error) {
 			return c, errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
+		if r.RolloutGroup != "" && !laneName.MatchString(r.RolloutGroup) {
+			return c, errors.New("rollout_group must be a safe lane-style identifier")
+		}
+
 		if r.Lane != "" && !laneName.MatchString(r.Lane) {
 			return c, fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
 		}

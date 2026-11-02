@@ -332,6 +332,17 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 }
 
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
+	var window *rolloutWindow
+	if o.Acting() {
+		var unlock func()
+		var err error
+		window, unlock, err = lockRolloutWindow(s.Config.StateDir, r.RolloutWindowGroup(), r.Name)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+
 	containerOnly := len(r.Install) > 0
 	for _, spec := range r.Install {
 		containerOnly = containerOnly && spec.Kind == "container"
@@ -478,7 +489,13 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return e
 	}
 	var result rollout.Result
+
 	var installErr error
+	if o.Acting() {
+		if e = window.begin(m.Commit); e != nil {
+			return e
+		}
+	}
 	switch {
 	case containerOnly:
 		runtimeFor := func(spec config.Install) rollout.Runtime {
@@ -546,6 +563,21 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		}
 	}
 
+	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
+		if window != nil && result.Status == "current" && containerOnly {
+			for _, spec := range r.Install {
+				if spec.Health != nil {
+					if e = rollout.CheckHealth(ctx, *spec.Health); e != nil {
+						installErr = e
+						break
+					}
+				}
+			}
+		}
+		if installErr == nil {
+			installErr = window.healthy()
+		}
+	}
 	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}

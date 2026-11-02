@@ -90,3 +90,19 @@ whether automatic rollback completed, and use the recorded previous immutable
 image to restore the service through the desk procedure. Never clear a rejection
 or journal merely to force a retry. If schema is incompatible, stop and use the
 operator's approved database recovery plan.
+
+## Shared control-plane window
+
+The task service and panewire hub must never restart in the same window. Both
+repository identities always resolve to the reserved `control-plane` rollout
+group; the example explicitly records it. Use one controller and one shared
+state_dir for both services on a host. Do not run a second updater against either.
+A shared lock spans reconciliation, install, health and reporting. Before mutation
+an active.json intent identifies the owning repository/commit. Only success or a
+verified healthy current service clears it. A returned failure retains the intent,
+blocking the other service until the first is verified healthy. A crash can also
+leave a stale directory lock; inspect the process/journal before clearing it.
+A recovered current container receives an explicit health check before releasing
+the window. Never delete active.json merely to unblock the other service; first
+recover the named service and verify its readiness. If rollback fails, keep the
+other service running and escalate to the desk.
