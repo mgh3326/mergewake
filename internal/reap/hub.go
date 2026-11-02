@@ -349,13 +349,47 @@ func (h HubHost) Capture(ctx context.Context, pane Pane, job string, mergedAt *t
 	return Capture{}, fmt.Errorf("hub pane.capture: unknown outcome %q", v.Outcome)
 }
 
-// Composer is unknown through the hub: no node command reads a pane's screen
-// back, and an unread composer must keep the pane.
-func (h HubHost) Composer(context.Context, Pane) (string, error) { return ComposerUnknown, nil }
+// Composer uses the node's identity-checked visible read. Only a recognized
+// empty composer permits closing; transport failures preserve unknown.
+func (h HubHost) Composer(ctx context.Context, pane Pane) (string, error) {
+	var v struct {
+		Outcome  string `json:"outcome"`
+		Composer string `json:"composer"`
+	}
+	args := map[string]any{"pane_id": pane.ID, "name": pane.Name, "cwd": pane.Cwd, "tail_lines": 0}
+	if err := h.Hub.Command(ctx, h.Machine, "pane.read", args, &v); err != nil {
+		return ComposerUnknown, err
+	}
+	if v.Outcome != "read" {
+		return ComposerUnknown, nil
+	}
+	switch v.Composer {
+	case "empty":
+		return ComposerEmpty, nil
+	case "has_text":
+		return ComposerText, nil
+	default:
+		return ComposerUnknown, nil
+	}
+}
 
-// JobDone has no node command yet; runtug done runs on the job's host.
-func (h HubHost) JobDone(context.Context, string, string) error {
-	return fmt.Errorf("hub job done: %w", ErrUnsupported)
+// JobDone invokes runtug on the job's host. The node confines report access to
+// the two paths pane.capture can return and deduplicates completed reports.
+func (h HubHost) JobDone(ctx context.Context, job, report string) error {
+	if !ValidJobName(job) {
+		return errors.New("job name invalid")
+	}
+	var v struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := h.Hub.Command(ctx, h.Machine, "job.done", map[string]string{"job": job, "report": report}, &v); err != nil {
+		return err
+	}
+	switch v.Outcome {
+	case "done", "already-done":
+		return nil
+	}
+	return fmt.Errorf("hub job.done: refused outcome %q", v.Outcome)
 }
 
 // CloseExact asks the node to re-read herdr and close the pane only when its

@@ -22,6 +22,7 @@ import (
 type fakeReapHub struct {
 	mu       sync.Mutex
 	agents   map[string]any // the node-a row of GET /v1/nodes/agents
+	composer map[string]any
 	capture  map[string]any
 	close    map[string]any
 	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
@@ -74,6 +75,10 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			if body["args"].(map[string]any)["cwd"] == "/repo.wt" {
 				result = map[string]any{"worktree": map[string]any{"path": "/repo.wt", "branch": "wk/x", "head": headSHA, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
 			}
+		case "pane.read":
+			result = h.composer
+		case "job.done":
+			result = map[string]any{"outcome": "done"}
 		case "pane.capture":
 			result = h.capture
 		case "pane.close":
@@ -116,9 +121,7 @@ func hubSvc(t *testing.T, hub *fakeReapHub, run *scriptRunner, hosts ...reap.Hos
 	return &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}, &out
 }
 
-// No node command reads a pane back, so a hub pane's composer is unknown and
-// the pane is kept: nothing is captured or closed, while the worktree cleanup
-// still goes through the node.
+// A missing composer answer keeps the pane while worktree cleanup still uses the node.
 func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 	hub := newFakeReapHub()
 	r := &scriptRunner{}
@@ -143,6 +146,43 @@ func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 	removes := hub.ops("worktree.remove")
 	if len(removes) != 1 || len(removes[0]) != 4 || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
 		t.Fatalf("remove args: %#v", removes)
+	}
+}
+
+func TestReapPanewireCodexComposerGuard(t *testing.T) {
+	for _, test := range []struct {
+		name, composer string
+		fail, close    bool
+	}{
+		{"empty", "empty", false, true},
+		{"draft", "has_text", false, false},
+		{"unknown", "unknown", false, false},
+		{"missing", "", false, false},
+		{"hub error", "empty", true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := newFakeReapHub()
+			hub.agents["agents"].([]any)[0].(map[string]any)["agent"] = "codex"
+			hub.composer = map[string]any{"outcome": "read", "composer": test.composer}
+			if test.fail {
+				hub.forbid = map[string]bool{"pane.read": true}
+			}
+			r := &scriptRunner{}
+			s, _ := hubSvc(t, hub, r)
+			_ = s.Reap(context.Background(), testRepo, 0, Options{})
+			closes, captures := hub.ops("pane.close"), hub.ops("pane.capture")
+			want := 0
+			if test.close {
+				want = 1
+			}
+			if len(closes) != want || len(captures) != want || len(r.calls) != 0 {
+				t.Fatalf("closes=%v captures=%v local=%v", closes, captures, r.calls)
+			}
+			reads := hub.ops("pane.read")
+			if !test.fail && (len(reads) != 1 || reads[0]["tail_lines"] != float64(0) || reads[0]["name"] != "wk-7") {
+				t.Fatalf("read=%v", reads)
+			}
+		})
 	}
 }
 

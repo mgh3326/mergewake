@@ -246,7 +246,7 @@ never with the operator token (panewire `docs/hub-scopes.md`). It sends
 machine (operator decision D1):
 
 ```sh
-HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.close@*
+HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.read@*,node.command:job.done@*,node.command:pane.close@*
 ```
 
 | Scope | Reap uses it for |
@@ -255,6 +255,8 @@ HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.comma
 | `node.command:agents.list@*` | not sent by reap today (discovery uses the fleet-wide list); granted with D1 for a per-machine re-read |
 | `node.command:worktree.inspect@*` | worktree matching and the aged-out worktree check |
 | `node.command:worktree.remove@*` | guarded cleanup of merged PR worktrees |
+| `node.command:pane.read@*` | identity-checked visible composer classification before a close |
+| `node.command:job.done@*` | host-local guarded `runtug done` after closing a job pane |
 | `node.command:pane.capture@*` | saving the report or screen before a close |
 | `node.command:pane.close@*` | the exact-match close |
 
@@ -1675,3 +1677,11 @@ read-only, and install scripts must be safe to repeat at the same commit.
 from PR merge checks. Omission reuses `required_checks`. For example a project
 with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
 without weakening the PR gate. First-PR CI measurement always uses required_checks.
+
+The hub reap transport reads composers with `pane.read`: only `empty` permits
+closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone panes
+and hub errors keep the pane. Codex placeholder text remains nonempty unless the
+node can prove it is an accepted placeholder. After closure, `job.done` runs on
+the job host with the saved report path; only `done` and `already-done` succeed.
+Grant both scopes before enabling this caller; older hubs fail safely and keep
+panes. The operator credential cannot substitute for these service-only ops.
