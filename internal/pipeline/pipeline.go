@@ -564,6 +564,10 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 
 	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
+
+		if window != nil && result.Status == "current" && !containerOnly {
+			installErr = smoke(ctx)
+		}
 		if window != nil && result.Status == "current" && containerOnly {
 			for _, spec := range r.Install {
 				if spec.Health != nil {
