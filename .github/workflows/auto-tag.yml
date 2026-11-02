@@ -1,7 +1,10 @@
+# GitHub App/PAT main merges trigger push normally. If an Actions workflow
+# merges using GITHUB_TOKEN, explicitly dispatch this workflow at main afterward.
 name: Auto tag
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 permissions:
   contents: write
   actions: write

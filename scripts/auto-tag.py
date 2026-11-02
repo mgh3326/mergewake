@@ -16,8 +16,8 @@ def next_tag(tags):
 
 
 def main():
-    if os.environ.get('GITHUB_REF') != 'refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') != 'push':
-        raise SystemExit('auto-tag requires a push to main')
+    if os.environ.get('GITHUB_REF') != 'refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch'):
+        raise SystemExit('auto-tag requires main and a push or explicit dispatch')
     sha = os.environ['GITHUB_SHA']
     if run('git', 'rev-parse', 'HEAD') != sha:
         raise SystemExit('checkout does not match push commit')

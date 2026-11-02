@@ -45,7 +45,10 @@ class AutoTagTests(unittest.TestCase):
                         return ''
                     return real_run(*args)
                 with patch.dict(os.environ, {'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_SHA': sha, 'BEFORE_SHA': '0' * 40}), patch.object(auto, 'run', run):
-                    auto.main(); auto.main()
+                    auto.main()
+                    os.environ['GITHUB_EVENT_NAME'] = 'workflow_dispatch'
+                    auto.main()
+                    os.environ['GITHUB_EVENT_NAME'] = 'push'
                     self.assertEqual(git('tag', '--list'), 'v0.0.1')
                     self.assertIn('refs/tags/v0.0.1', git('ls-remote', 'origin', 'refs/tags/v0.0.1'))
                     self.assertEqual(calls, [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.1', '-f', 'publish=true')] * 2)
