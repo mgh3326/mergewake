@@ -23,13 +23,14 @@ class RepairReleaseTests(unittest.TestCase):
             root = Path(d)
             assets = root / 'built'; assets.mkdir()
             remote = root / 'remote'; remote.mkdir()
-            names = ['tool-linux-amd64', 'tool-linux-arm64']
+            names = ['tool-linux-amd64', 'tool-linux-arm64', 'expected']
             for name in names:
                 (assets / name).write_bytes(name.encode())
             (assets / 'SHA256SUMS').write_text(''.join(
                 hashlib.sha256((assets / name).read_bytes()).hexdigest() + '  ' + name + '\n'
                 for name in names))
             (remote / 'tool-linux-amd64').write_bytes(b'tool-linux-amd64')
+            (remote / 'expected').write_bytes(b'expected')
             (root / 'draft').write_text('draft')
             fake = root / 'gh'
             fake.write_text('#!' + sys.executable + '\n' + '''import os, sys, shutil
@@ -43,6 +44,8 @@ if args[:2] == ['release', 'view']:
         print('\\n'.join(p.name for p in remote.iterdir()))
 elif args[:2] == ['release', 'edit']:
     if '--draft=false' not in args: raise SystemExit('unexpected edit')
+    expected_flag = '--prerelease=' + os.environ.get('FAKE_PRERELEASE', 'false')
+    if expected_flag not in args: raise SystemExit('wrong prerelease metadata')
     (remote.parent / 'draft').unlink()
 elif args[:2] == ['release', 'download']:
     name = args[args.index('--pattern') + 1]
@@ -82,6 +85,11 @@ else: raise SystemExit('unexpected gh command')
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((remote / 'tool-linux-amd64').read_bytes(), b'corrupt')
             self.assertEqual(len((root / 'uploads').read_text().splitlines()), 2)
+            (remote / 'tool-linux-amd64').write_bytes(b'tool-linux-amd64')
+            (root / 'draft').write_text('draft')
+            subprocess.run(['sh', script, 'v1.0.1-rc.1', str(assets)],
+                           env=dict(env, FAKE_PRERELEASE='true'), check=True)
+            self.assertFalse((root / 'draft').exists())
 
 
 if __name__ == '__main__':

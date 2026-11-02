@@ -5,6 +5,7 @@ tag=$1
 dir=$2
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+mkdir "$tmp/downloads"
 # Treat the build manifest as the complete immutable artifact contract.
 python3 - "$dir" > "$tmp/expected" <<'PYASSETS'
 import hashlib
@@ -36,8 +37,8 @@ done
 for file in "$dir"/*; do
   name=${file##*/}
   if printf '%s\n' "$existing" | grep -Fxq "$name"; then
-    gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$tmp"
-    cmp -s "$file" "$tmp/$name" || { echo "existing release asset differs: $name" >&2; exit 1; }
+    gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$tmp/downloads"
+    cmp -s "$file" "$tmp/downloads/$name" || { echo "existing release asset differs: $name" >&2; exit 1; }
   fi
 done
 # Checksums appear only after every binary exists. Existing assets are immutable.
@@ -62,7 +63,11 @@ cmp -s "$tmp/sorted-expected" "$tmp/actual" || { echo "release asset set is inco
 # complete expected asset set has been verified or uploaded successfully.
 draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
 case "$draft" in
-  true) gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false ;;
+  true)
+    prerelease=false
+    case "$tag" in *-*) prerelease=true ;; esac
+    gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease="$prerelease"
+    ;;
   false) ;;
   *) echo "release draft state is unavailable" >&2; exit 1 ;;
 esac
