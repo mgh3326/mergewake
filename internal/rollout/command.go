@@ -383,6 +383,12 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		}
 		receipt.Targets[s.Target] = InstalledTarget{SHA: m.Commit, PreviousSHA: j.Targets[s.Target].SHA, Recipe: recipe(s)}
 	}
+	if o.VerifyForward != nil {
+		if e = o.VerifyForward(ctx); e != nil {
+			undo(e)
+			return
+		}
+	}
 	if e = fsutil.WriteJSON(receiptPath, receipt); e != nil {
 		undo(e)
 		return

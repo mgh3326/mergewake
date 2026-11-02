@@ -324,6 +324,12 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 	if !o.Acting() {
 		return errors.Join(e, s.Print(result))
 	}
+	// --adopt --apply is the operator's attestation of the configured host
+	// recipe. Source ancestry remains unknown until the first approved rollout.
+	if e == nil && result.Status == "adopted" {
+		e = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), s.deploymentIdentity(r, manifest.Manifest{Repo: r.Name}, Options{}))
+	}
+
 	record := struct {
 		Host, Repo string
 		Result     rollout.Result
@@ -337,10 +343,19 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	state := filepath.Join(s.state(r.Name), "rollout")
-	// Serialize receipt/range approval through installation and identity commit.
-	// Installers retain their own recovery locks; dry runs remain read-only.
+	// Keep range approval and receipt installation in one per-repository operation.
 	if o.Acting() {
 		unlock, err := rollout.Lock(filepath.Join(state, "decision-lock"))
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	var window *rolloutWindow
+	if o.Acting() {
+		var unlock func()
+		var err error
+		window, unlock, err = lockRolloutWindow(s.Config.StateDir, r.RolloutWindowGroup(), r.Name)
 		if err != nil {
 			return err
 		}
@@ -381,6 +396,8 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 			return err
 		}
 		m, e = manifest.Build(r.Name, sha, r.Install, nil)
+	} else if containerOnly && r.FollowRelease {
+		m, e = s.containerRelease(ctx, r)
 	} else {
 		m, e = s.GH.Latest(ctx, r.Name)
 	}
@@ -419,10 +436,15 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if ci != github.Green {
 		return errors.New("manifest commit CI is not green")
 	}
+
+	approvedIdentity := s.deploymentIdentity(r, m, o)
 	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
 		return err
 	}
 
+	if approvedIdentity != s.deploymentIdentity(r, m, o) {
+		return errors.New("deployment inventory changed during approval")
+	}
 	var timeout time.Duration
 	if r.Smoke.Command != "" {
 		timeout, e = config.Duration(r.SmokeTimeout)
@@ -441,8 +463,30 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		return err
 	}
 	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: !o.Acting(), Digest: o.Digest, Now: s.Now}
+	installOptions.BeforeDeploy = func(ctx context.Context, spec config.Install, sha string) error {
+		if spec.PreDeploy == nil || spec.PreDeploy.Command == "" {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		command := rollout.ExpandCommand(*spec.PreDeploy, r.Name, sha, root, spec.Target)
+		_, e := s.Runner.Run(ctx, command.Command, command.Args, "", root)
+		return e
+	}
+	installOptions.VerifyForward = func(context.Context) error {
+		if approvedIdentity != s.deploymentIdentity(r, m, o) {
+			return errors.New("deployment environment changed during forward verification")
+		}
+		return nil
+	}
 	var result rollout.Result
+
 	var installErr error
+	if o.Acting() {
+		if e = window.begin(m.Commit); e != nil {
+			return e
+		}
+	}
 	switch {
 	case containerOnly:
 		runtimeFor := func(spec config.Install) rollout.Runtime {
@@ -511,15 +555,38 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 
 	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
-		identity := s.deploymentIdentity(r, m, o)
-		var prior deployIdentity
-		found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
-		if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
-			installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
-		} else {
-			installErr = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), identity)
+		if window != nil && result.Status == "current" {
+			if containerOnly {
+				for _, spec := range r.Install {
+					if spec.Health != nil {
+						if err := rollout.CheckHealth(ctx, *spec.Health); err != nil {
+							installErr = err
+							break
+						}
+					}
+				}
+			} else {
+				installErr = smoke(ctx)
+			}
+		}
+		if installErr == nil && approvedIdentity != s.deploymentIdentity(r, m, o) {
+			installErr = errors.New("deployment inventory changed before receipt approval")
+		}
+		if installErr == nil {
+			identity := approvedIdentity
+			var prior deployIdentity
+			found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
+			if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
+				installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
+			} else {
+				installErr = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), identity)
+			}
+		}
+		if installErr == nil {
+			installErr = window.healthy()
 		}
 	}
+
 	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}

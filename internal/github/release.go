@@ -142,6 +142,22 @@ func (c *Client) Latest(ctx context.Context, repo string) (manifest.Manifest, er
 	return manifest.Manifest{}, errors.New("no mergewake release manifest found")
 }
 
+// ContainerReleaseHead follows stable semver releases; images are selected by
+// the full commit tag, never a mutable main/latest tag.
+func (c *Client) ContainerReleaseHead(ctx context.Context, repo string) (string, error) {
+	releases, e := list[Release](ctx, c, base(repo)+"/releases")
+	if e != nil {
+		return "", e
+	}
+	for _, r := range releases {
+		if !r.Draft && !r.Prerelease && strings.HasPrefix(r.Tag, "v") {
+			commit, e := c.Commit(ctx, repo, r.Tag)
+			return commit.SHA, e
+		}
+	}
+	return "", errors.New("no stable container release")
+}
+
 // ChangedPaths compares every commit in an ancestor range. GitHub truncates the
 // file list at 300 entries; that boundary is unknown evidence, never a clean diff.
 func (c *Client) ChangedPaths(ctx context.Context, repo, older, newer string) ([]policy.File, error) {
