@@ -50,7 +50,7 @@ func (h Handoffkeep) DeployDecision(ctx context.Context, task, question string) 
 	}
 
 	args := []string{"decisions", "ask", task, "--question", question, "--option", "A|Approve this deployment", "--option", "B|Keep the current version", "--default-action", "Hold; keep the current version", "--human-only"}
-	if expired && r.ID != "" {
+	if expired && r.ID != "" && r.Status == "open" {
 		args = append(args, "--supersedes", r.ID)
 	}
 	_, e = h.Runner.Run(ctx, h.Command, args, "", "")
