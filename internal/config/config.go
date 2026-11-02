@@ -148,7 +148,7 @@ type Repo struct {
 // RolloutWindowGroup keeps the fleet control-plane peers in one mandatory
 // availability window, independent of which caller constructs the inventory.
 func (r Repo) RolloutWindowGroup() string {
-	if r.Name == "mgh3326/handoffkeep" || r.Name == "mgh3326/panewire" {
+	if strings.EqualFold(r.Name, "mgh3326/handoffkeep") || strings.EqualFold(r.Name, "mgh3326/panewire") {
 		return "control-plane"
 	}
 	return r.RolloutGroup

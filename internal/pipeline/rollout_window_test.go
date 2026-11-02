@@ -133,3 +133,11 @@ func TestRolloutWindowCurrentMustSmoke(t *testing.T) {
 		t.Fatal("peer admitted after unhealthy current service")
 	}
 }
+
+func TestRolloutWindowCaseInsensitivePeers(t *testing.T) {
+	for _, repo := range []string{"mgh3326/handoffkeep", "mgh3326/Handoffkeep", "MGH3326/panewire", "mgh3326/PANEWIRE"} {
+		if got := (config.Repo{Name: repo, RolloutGroup: "other"}).RolloutWindowGroup(); got != "control-plane" {
+			t.Fatalf("%s bypassed reserved group: %q", repo, got)
+		}
+	}
+}
