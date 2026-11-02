@@ -103,7 +103,7 @@ type Health struct {
 	Retries int    `yaml:"retries" json:"retries"`
 }
 type Install struct {
-	PreDeploy    Command  `yaml:"pre_deploy" json:"pre_deploy"`
+	PreDeploy    *Command `yaml:"pre_deploy" json:"pre_deploy,omitempty"`
 	Kind         string   `yaml:"kind" json:"kind"`
 	Command      Command  `yaml:"command" json:"command"`
 	Verify       Command  `yaml:"verify" json:"verify"`
@@ -748,8 +748,8 @@ func Load(name string) (Config, error) {
 			if spec.Kind == "" {
 				spec.Kind = "file"
 			}
-			if spec.PreDeploy.Command != "" && spec.Kind != "container" {
-				return c, errors.New("pre_deploy is only supported for container installs")
+			if spec.PreDeploy != nil && (spec.Kind != "container" || spec.PreDeploy.Command == "") {
+				return c, errors.New("pre_deploy requires a container install and a command")
 			}
 			switch spec.Kind {
 			case "file":

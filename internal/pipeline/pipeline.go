@@ -468,12 +468,12 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: !o.Acting(), Digest: o.Digest, Now: s.Now}
 	installOptions.BeforeDeploy = func(ctx context.Context, spec config.Install, sha string) error {
-		if spec.PreDeploy.Command == "" {
+		if spec.PreDeploy == nil || spec.PreDeploy.Command == "" {
 			return nil
 		}
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
-		command := rollout.ExpandCommand(spec.PreDeploy, r.Name, sha, root, spec.Target)
+		command := rollout.ExpandCommand(*spec.PreDeploy, r.Name, sha, root, spec.Target)
 		_, e := s.Runner.Run(ctx, command.Command, command.Args, "", root)
 		return e
 	}
