@@ -1,0 +1,38 @@
+{
+  "embeds": [
+    {
+      "title": "⏪ Revert PR opened: example/project@ccccccc",
+      "url": "https://github.com/example/project/pull/9",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "Head",
+          "value": "`ccccccc`",
+          "inline": true
+        },
+        {
+          "name": "Culprit",
+          "value": "`bbbbbbb`",
+          "inline": true
+        },
+        {
+          "name": "PR",
+          "value": "#7",
+          "inline": true
+        },
+        {
+          "name": "Candidates",
+          "value": "#7",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

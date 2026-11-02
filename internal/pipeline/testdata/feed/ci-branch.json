@@ -1,0 +1,29 @@
+{
+  "embeds": [
+    {
+      "title": "❌ CI failed: example/project@bbbbbbb on main",
+      "url": "https://github.com/example/project/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "description": "fix: the subject line",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "Author",
+          "value": "A Committer",
+          "inline": true
+        },
+        {
+          "name": "Failed",
+          "value": "`test`",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

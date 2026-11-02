@@ -5,8 +5,9 @@ Each host has one operator-owned YAML file, normally
 `.mergewake/policy.yaml`. Unknown keys, duplicate YAML keys, and multiple YAML
 documents are errors. There is no environment interpolation except expansion of
 a leading `~/` in local config, state, install-root and container `env_file`
-paths. Credentials belong in the environment or the external CLI's own credential
-store.
+paths. Credentials belong in the environment, the external CLI's own credential
+store, or a mode-0600 file the config names (`reap.hub.token_file`,
+`discord.webhooks_file`).
 
 Use [examples/host.yaml](../examples/host.yaml) and
 [examples/policy.yaml](../examples/policy.yaml) as starting points. Their repo,
@@ -835,6 +836,141 @@ is retained and the watch notification reports the failure. Protected upstream
 authority fences remain enforced. No fallback generic transition is attempted.
 Structured reports use `doc put --key KEY --kind note --file FILE`.
 
+### `discord`
+
+Posts the events of every watched repo to Discord from the daemon, so no repo
+needs its own workflow or webhook secret. Only `mergewake daemon` and
+`mergewake notify deploy` post; other commands do not.
+
+```yaml
+discord:
+  enabled: true
+  webhooks_file: ~/.config/mergewake/discord-webhooks.env
+  kinds:
+    pr: DISCORD_WEBHOOK_PR_LOG
+    ci: DISCORD_WEBHOOK_GITHUB_ACTION
+    deploy: DISCORD_WEBHOOK_DEPLOY_LOG
+    revert: DISCORD_WEBHOOK_DEPLOY_LOG
+  opt_out: [example/keeps-its-own-workflows]
+```
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Turns the feed on. |
+| `webhooks_file` | Required when enabled | Absolute or `~/` path to a mode-0600 env file of `KEY=URL` lines. |
+| `kinds` | Required when enabled | Maps an event kind to a key in that file. A kind left out posts nothing. Keys are `pr`, `ci`, `deploy` and `revert`. |
+| `opt_out` | empty | `owner/name` repos that post nothing, through any path. |
+| `max_failures` | `5` | Failed posts a message gets before it drops to a log line. |
+
+A webhook URL is a credential. A URL inline in the YAML is refused at load, even
+with the feed off, with the error `discord: inline webhook URL refused`. Errors
+and logs name the kind and the key, never the URL. A URL must be `https`; plain
+`http` is accepted only to a loopback address.
+
+A group- or world-readable file, or a kind whose key is missing from the file,
+fails config load. A file that does not exist yet does not: messages stay queued
+until it appears. The file is reread while messages are queued, so a rotated URL
+takes effect without a restart.
+
+#### Point the three channels
+
+1. In each Discord channel (`#pr-log`, `#github-action`, `#deploy-log`), open
+   **Edit Channel > Integrations > Webhooks** and create a webhook. Copy its URL.
+2. Write the URLs to the file, and restrict it:
+
+   ```sh
+   cat > ~/.config/mergewake/discord-webhooks.env <<'ENV'
+   DISCORD_WEBHOOK_PR_LOG=<#pr-log webhook URL>
+   DISCORD_WEBHOOK_GITHUB_ACTION=<#github-action webhook URL>
+   DISCORD_WEBHOOK_DEPLOY_LOG=<#deploy-log webhook URL>
+   ENV
+   chmod 600 ~/.config/mergewake/discord-webhooks.env
+   ```
+
+3. Add the `discord` section above to the host config, with `opt_out` listing any
+   repo that keeps its own workflows until they are retired.
+4. Restart the daemon. The first pass for each repo records a baseline.
+
+#### What posts
+
+| Kind | Event | Posted by | Dedupe key |
+| --- | --- | --- | --- |
+| `pr` | PR opened; a draft counts once it is ready for review | `pr` role | PR |
+| `pr` | PR merged or closed | `pr` role | PR, head |
+| `ci` | Required check failed on an open PR's head | `pr` role | PR, head |
+| `ci` | Required or `watch_checks` check failed on the default branch | `watch` role | head |
+| `deploy` | Release published, or publishing failed | `release` role | commit, result |
+| `deploy` | Rollout finished or failed | `rollout` role | commit, result |
+| `deploy` | Another deployer's report | `mergewake notify deploy` | commit, result |
+| `revert` | Revert PR opened, culprit reported, or watch hold | `watch` role | head, action |
+
+Each event posts one message, and restarts stay quiet. Some consequences:
+
+- A force push is not a new PR, so it does not post again. A new red head does.
+- `ci` posts the checks that have failed when the head is first seen red. A
+  sibling check that fails later on the same head does not post again.
+- A failed deploy that later succeeds on the same commit posts both. A failure
+  repeated every pass posts once.
+- A PR older than the repo's baseline does not post, so turning the feed on does
+  not replay history. A merged or closed PR also has to be under 72 hours old. A
+  `ci` failure has no such limit: heads already red when the feed turns on post
+  once. So does the head the `release` role publishes next.
+- PRs left out by `daemon.pr.skip_bots` stay out of the feed.
+- A reopened PR does not post.
+
+A kind only posts while its role runs: enable `daemon.watch` for default-branch
+`ci` and for `revert`. Shadow mode still posts PR and `ci` events, because
+reporting is not acting. It posts no `deploy` or `revert`, because shadow mode
+deploys nothing and opens no revert. `--dry-run` posts nothing and writes no feed
+state.
+
+#### Delivery
+
+A role writes each message to a local outbox and moves on; one sender goroutine
+posts them. A slow or down webhook therefore never holds up a poll, and a feed
+problem never counts as a role failure: a GitHub read that fails is logged in
+`decisions.jsonl` as `discord-feed-error` and retried on the next pass.
+
+| Response | What the sender does |
+| --- | --- |
+| 2xx | Done. If the rate-limit bucket is spent, the webhook waits for it to reset. |
+| 429 | Waits for `Retry-After` (or the body's `retry_after`) and retries. It is not a failure. |
+| Network error, 408 or 5xx | Backs off from 5s to at most 5m. After `max_failures`, drops to a log line. |
+| Any other 4xx | Cannot succeed on retry, so drops to a log line at once. |
+
+A dropped message is logged to stderr as `discord message dropped` with the repo,
+the key and the reason, and does not post again. Messages for other webhooks keep
+flowing. Past 1000 queued messages, a new one drops the same way. A crash between
+a successful post and recording it can post that message once more.
+
+#### `mergewake notify deploy`
+
+Deployers the daemon does not run report through this command. It needs no GitHub
+token, and the repo does not have to be in `repos`.
+
+```sh
+mergewake notify deploy --repo owner/name --sha "$SHA" --status ok|failed \
+  [--text "pull deploy finished"] [--config PATH]
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--repo` | `owner/name` that was deployed. |
+| `--sha` | Deployed commit, 7 to 64 lowercase hex characters. |
+| `--status` | `ok` or `failed`. |
+| `--text` | Optional message text. Credential-shaped substrings are redacted. |
+
+It posts before it returns and prints one JSON line. `"posted": false` with exit
+status 0 means the repo is opted out, `deploy` has no channel, or this repo,
+commit and status was already posted from this host, so a retrying deployer posts
+once. It exits non-zero if `discord.enabled` is off or the post fails, and a later
+call can then retry. One call takes at most 2 minutes, so a deployer should not
+fail a deploy on it:
+
+```sh
+mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
+```
+
 ## Per-repo policy
 
 | Key | Required / default | Meaning |
@@ -1081,6 +1217,9 @@ For `example/project`, state resides beneath
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
+| `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
+| `discord-baseline` | When the feed first ran for this repo. Older PRs do not post. |
+| `../discord/outbox/` | `<state_dir>/discord/outbox/`, host-wide: messages waiting to post, one JSON file each. They hold no webhook URL. |
 | `rollout/lock/` | Local install exclusion; never stolen automatically. |
 | `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
 | `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |

@@ -103,6 +103,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if ci != github.Red {
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
+	s.feedBranchCI(ctx, r, head, checks, o)
 	active, e := s.GH.RecoveryActive(ctx, r.Name)
 	if e != nil {
 		return e
@@ -292,6 +293,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	result.Action = "opened-revert-pr"
+	s.feedWatch(r, result, o)
 	data, _ := json.Marshal(result)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
@@ -316,6 +318,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Shadow || o.DryRun {
 		return nil
 	}
+	s.feedWatch(r, result, o)
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e

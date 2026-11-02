@@ -1,0 +1,34 @@
+{
+  "embeds": [
+    {
+      "title": "❌ Deploy failed: example/project@aaaaaaa",
+      "url": "https://github.com/example/project/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "description": "smoke failed; [redacted]",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "Source",
+          "value": "rollout",
+          "inline": true
+        },
+        {
+          "name": "Host",
+          "value": "host-a",
+          "inline": true
+        },
+        {
+          "name": "Status",
+          "value": "rolled-back",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

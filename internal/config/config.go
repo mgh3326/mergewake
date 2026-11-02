@@ -327,9 +327,140 @@ var DefaultReapRegenerable = []string{
 	"Library", "Temp", "Logs", "UserSettings",
 }
 
+// Discord feed event kinds, the keys of discord.kinds.
+const (
+	DiscordPR     = "pr"
+	DiscordCI     = "ci"
+	DiscordDeploy = "deploy"
+	DiscordRevert = "revert"
+)
+
+// DefaultDiscordMaxFailures applies when discord.max_failures is unset.
+const DefaultDiscordMaxFailures = 5
+
+// ErrDiscordInlineURL refuses a webhook URL in the config file. A webhook URL
+// is a credential, and config files get copied and committed; it belongs in
+// discord.webhooks_file. The error never repeats the value.
+var ErrDiscordInlineURL = errors.New("discord: inline webhook URL refused: put the URL in discord.webhooks_file and name its key here")
+
+// Discord configures the daemon's event feed. WebhooksFile is a mode-0600 env
+// file of KEY=URL lines; Kinds maps each event kind to a key in it, and a kind
+// left out posts nothing. OptOut lists repos that post nothing.
+type Discord struct {
+	Enabled      bool              `yaml:"enabled"`
+	WebhooksFile string            `yaml:"webhooks_file"`
+	Kinds        map[string]string `yaml:"kinds"`
+	OptOut       []string          `yaml:"opt_out"`
+	// MaxFailures is how many failed posts a message gets before it drops to a
+	// log line. 0 means DefaultDiscordMaxFailures.
+	MaxFailures int `yaml:"max_failures"`
+}
+
+// OptedOut reports whether repo posts nothing.
+func (d Discord) OptedOut(repo string) bool { return slices.Contains(d.OptOut, repo) }
+
+// Limit is the failed-post bound with its default applied.
+func (d Discord) Limit() int {
+	if d.MaxFailures == 0 {
+		return DefaultDiscordMaxFailures
+	}
+	return d.MaxFailures
+}
+
+// Webhooks reads the webhooks file and returns each configured kind's URL. Its
+// errors name the kind and key, never a URL.
+func (d Discord) Webhooks() (map[string]string, error) {
+	values, e := reap.ReadEnvFile(d.WebhooksFile)
+	if e != nil {
+		return nil, e
+	}
+	out := make(map[string]string, len(d.Kinds))
+	for _, kind := range slices.Sorted(maps.Keys(d.Kinds)) {
+		key := d.Kinds[kind]
+		value, ok := values[key]
+		if !ok || value == "" {
+			return nil, fmt.Errorf("discord.kinds.%s: %s is not in discord.webhooks_file", kind, key)
+		}
+		if !validWebhookURL(value) {
+			return nil, fmt.Errorf("discord.kinds.%s: %s is not an https URL", kind, key)
+		}
+		out[kind] = value
+	}
+	return out, nil
+}
+
+// validWebhookURL takes https, and plain http only to a loopback address, which
+// is a local relay or a test server. Anything else would send the credential in
+// the clear.
+func validWebhookURL(raw string) bool {
+	u, e := url.Parse(raw)
+	if e != nil || u.Host == "" || u.User != nil {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	ip := net.ParseIP(u.Hostname())
+	return u.Scheme == "http" && ip != nil && ip.IsLoopback()
+}
+
+var discordKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validateDiscord refuses an inline URL even with the feed off: the file is
+// where the credential would leak from, whether or not it is in use yet.
+func validateDiscord(d *Discord) error {
+	if strings.Contains(d.WebhooksFile, "://") {
+		return ErrDiscordInlineURL
+	}
+	for _, kind := range slices.Sorted(maps.Keys(d.Kinds)) {
+		switch kind {
+		case DiscordPR, DiscordCI, DiscordDeploy, DiscordRevert:
+		default:
+			return errors.New("discord.kinds keys must be pr, ci, deploy or revert")
+		}
+		key := d.Kinds[kind]
+		if strings.ContainsAny(key, ":/") {
+			return ErrDiscordInlineURL
+		}
+		if !discordKey.MatchString(key) {
+			return fmt.Errorf("discord.kinds.%s must name a key in discord.webhooks_file", kind)
+		}
+	}
+	for _, repo := range d.OptOut {
+		if strings.Contains(repo, "://") {
+			return ErrDiscordInlineURL
+		}
+		if !ValidRepo(repo) {
+			return errors.New("discord.opt_out entries must be owner/name")
+		}
+	}
+	if d.MaxFailures < 0 {
+		return errors.New("discord.max_failures must not be negative")
+	}
+	if d.WebhooksFile != "" {
+		d.WebhooksFile = Expand(d.WebhooksFile)
+	}
+	if !d.Enabled {
+		return nil
+	}
+	if d.WebhooksFile == "" || !filepath.IsAbs(d.WebhooksFile) {
+		return errors.New("discord.enabled requires discord.webhooks_file as an absolute path")
+	}
+	if len(d.Kinds) == 0 {
+		return errors.New("discord.enabled requires discord.kinds")
+	}
+	// A bad mode or a missing key fails now, not on the first event. A file not
+	// there yet is left to the sender, which keeps messages queued for it.
+	if _, e := d.Webhooks(); e != nil && !errors.Is(e, fs.ErrNotExist) {
+		return fmt.Errorf("discord.webhooks_file: %w", e)
+	}
+	return nil
+}
+
 type Config struct {
 	Version      int         `yaml:"version"`
 	Daemon       Daemon      `yaml:"daemon"`
+	Discord      Discord     `yaml:"discord"`
 	Host         string      `yaml:"host"`
 	StateDir     string      `yaml:"state_dir"`
 	TokenEnv     string      `yaml:"token_env"`
@@ -415,6 +546,9 @@ func Load(name string) (Config, error) {
 		}
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
+		return c, e
+	}
+	if e = validateDiscord(&c.Discord); e != nil {
 		return c, e
 	}
 	if c.Reap.Act && !c.Reap.Enabled {

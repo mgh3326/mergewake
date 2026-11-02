@@ -188,6 +188,19 @@ Events go through the existing notifier (`panewire emit --kind lane.event
 lanes override the configured one. Disable the feature with
 `daemon.pr.notify: {enabled: false}` — it defaults to on while the role runs.
 
+## Discord feed
+
+With a `discord` section in the host config, the daemon posts every watched
+repo's events to Discord, so no repo needs its own workflow or webhook secret:
+PRs opened, merged and closed, required checks that failed, releases and
+rollouts, and watch reverts and holds. Other deployers report through
+`mergewake notify deploy --repo R --sha S --status ok|failed --text T`.
+
+Webhook URLs stay in a mode-0600 file; a URL inline in the config is refused. A
+slow or down webhook never holds up a poll. See
+[the `discord` reference](docs/config.md#discord) for the config, the delivery
+rules, and how to point the three channels.
+
 ## Reaping finished work
 
 With `reap.enabled`, the `reap` role closes the panes of merged work and

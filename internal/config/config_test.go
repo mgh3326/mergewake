@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -562,5 +563,116 @@ func TestRenotifyAndFindingsConfig(t *testing.T) {
 		if every != tc.every || max != tc.max || c.Daemon.PR.Findings.AckWindow() != tc.ack || c.Daemon.PR.Findings.On() == tc.findingsOff {
 			t.Fatalf("config %q: renotify %v/%d ack %v on=%v", tc.extra, every, max, c.Daemon.PR.Findings.AckWindow(), c.Daemon.PR.Findings.On())
 		}
+	}
+}
+
+func writeDiscordEnv(t *testing.T, mode os.FileMode, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "discord.env")
+	if e := os.WriteFile(p, []byte(body), mode); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.Chmod(p, mode); e != nil {
+		t.Fatal(e)
+	}
+	return p
+}
+
+func loadDiscord(t *testing.T, section string) (Config, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\n"+section), 0600); e != nil {
+		t.Fatal(e)
+	}
+	return Load(p)
+}
+
+func TestDiscordConfig(t *testing.T) {
+	const hook = "https://chat.example/api/webhooks/1/secret-token"
+	env := writeDiscordEnv(t, 0600, "# channels\nHOOK_PR="+hook+"\nHOOK_CI=\"https://chat.example/api/webhooks/2/x\"\n")
+	c, e := loadDiscord(t, fmt.Sprintf("discord:\n  enabled: true\n  webhooks_file: %s\n  kinds: {pr: HOOK_PR, ci: HOOK_CI}\n  opt_out: [example/auto]\n  max_failures: 2\n", env))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !c.Discord.OptedOut("example/auto") || c.Discord.OptedOut("example/other") || c.Discord.Limit() != 2 {
+		t.Fatalf("%+v", c.Discord)
+	}
+	urls, e := c.Discord.Webhooks()
+	if e != nil || urls["pr"] != hook || urls["ci"] != "https://chat.example/api/webhooks/2/x" || len(urls) != 2 {
+		t.Fatalf("%v %v", urls, e)
+	}
+	if (Discord{}).Limit() != DefaultDiscordMaxFailures {
+		t.Fatal("default limit")
+	}
+	// The section is optional and off when absent.
+	if c, e = loadDiscord(t, ""); e != nil || c.Discord.Enabled {
+		t.Fatalf("%+v %v", c.Discord, e)
+	}
+	// A file not there yet is left to the sender.
+	missing := filepath.Join(t.TempDir(), "absent.env")
+	if _, e = loadDiscord(t, fmt.Sprintf("discord: {enabled: true, webhooks_file: %s, kinds: {pr: HOOK_PR}}\n", missing)); e != nil {
+		t.Fatal(e)
+	}
+}
+
+// A URL inline in the YAML is refused by name, wherever it is put and with the
+// feed off too, and no error repeats it.
+func TestDiscordRefusesInlineURL(t *testing.T) {
+	const secret = "secret-token"
+	const hook = "https://chat.example/api/webhooks/1/" + secret
+	env := writeDiscordEnv(t, 0600, "HOOK_PR="+hook+"\n")
+	for name, section := range map[string]string{
+		"kind":          "discord: {enabled: true, webhooks_file: " + env + ", kinds: {pr: " + hook + "}}\n",
+		"kind, off":     "discord: {kinds: {pr: " + hook + "}}\n",
+		"no scheme":     "discord: {kinds: {pr: chat.example/api/webhooks/1/" + secret + "}}\n",
+		"webhooks_file": "discord: {enabled: true, webhooks_file: " + hook + ", kinds: {pr: HOOK_PR}}\n",
+		"opt_out":       "discord: {opt_out: [\"" + hook + "\"]}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, e := loadDiscord(t, section)
+			if !errors.Is(e, ErrDiscordInlineURL) {
+				t.Fatalf("%v", e)
+			}
+			if strings.Contains(e.Error(), secret) {
+				t.Fatalf("error repeats the URL: %v", e)
+			}
+		})
+	}
+	// An invented key is refused by the strict decoder without repeating it.
+	_, e := loadDiscord(t, "discord: {url: "+hook+"}\n")
+	if e == nil || strings.Contains(e.Error(), secret) {
+		t.Fatalf("%v", e)
+	}
+}
+
+func TestDiscordConfigRefusals(t *testing.T) {
+	const secret = "secret-token"
+	good := writeDiscordEnv(t, 0600, "HOOK_PR=https://chat.example/h/"+secret+"\n")
+	for name, tt := range map[string]struct {
+		section, want string
+	}{
+		"unknown kind":     {"discord: {kinds: {chat: HOOK_PR}}\n", "pr, ci, deploy or revert"},
+		"bad key name":     {"discord: {kinds: {pr: 'not a key'}}\n", "must name a key"},
+		"bad opt_out":      {"discord: {opt_out: [nope]}\n", "owner/name"},
+		"negative failure": {"discord: {max_failures: -1}\n", "must not be negative"},
+		"no file":          {"discord: {enabled: true, kinds: {pr: HOOK_PR}}\n", "absolute path"},
+		"relative file":    {"discord: {enabled: true, webhooks_file: discord.env, kinds: {pr: HOOK_PR}}\n", "absolute path"},
+		"no kinds":         {"discord: {enabled: true, webhooks_file: " + good + "}\n", "discord.kinds"},
+		"key not in file":  {"discord: {enabled: true, webhooks_file: " + good + ", kinds: {ci: HOOK_CI}}\n", "HOOK_CI is not in"},
+		"group readable":   {"discord: {enabled: true, webhooks_file: " + writeDiscordEnv(t, 0640, "HOOK_PR=https://chat.example/h/"+secret+"\n") + ", kinds: {pr: HOOK_PR}}\n", "mode 0600"},
+		"plain http":       {"discord: {enabled: true, webhooks_file: " + writeDiscordEnv(t, 0600, "HOOK_PR=http://chat.example/h/"+secret+"\n") + ", kinds: {pr: HOOK_PR}}\n", "not an https URL"},
+		"not a url":        {"discord: {enabled: true, webhooks_file: " + writeDiscordEnv(t, 0600, "HOOK_PR="+secret+"\n") + ", kinds: {pr: HOOK_PR}}\n", "not an https URL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, e := loadDiscord(t, tt.section)
+			if e == nil || !strings.Contains(e.Error(), tt.want) || strings.Contains(e.Error(), secret) {
+				t.Fatalf("%v", e)
+			}
+		})
+	}
+	// Loopback http is a local relay or a test server.
+	loop := writeDiscordEnv(t, 0600, "HOOK_PR=http://127.0.0.1:9/h\n")
+	if _, e := loadDiscord(t, "discord: {enabled: true, webhooks_file: "+loop+", kinds: {pr: HOOK_PR}}\n"); e != nil {
+		t.Fatal(e)
 	}
 }

@@ -82,6 +82,18 @@ daemon:
   # polling stays complete. Loopback listen only — put an operator-run tunnel
   # in front for real deliveries. The secret lives in the named env var.
   webhook: {enabled: false, listen: 127.0.0.1:9477, path: /github, secret_env: MERGEWAKE_WEBHOOK_SECRET}
+# Optional Discord feed: PR, CI, deploy and revert events for every repo above.
+# webhooks_file is a mode-0600 env file of KEY=URL lines; kinds name its keys.
+# A URL inline here is refused. See docs/config.md.
+discord:
+  enabled: false
+  webhooks_file: ~/.config/mergewake/discord-webhooks.env
+  kinds:
+    pr: DISCORD_WEBHOOK_PR_LOG
+    ci: DISCORD_WEBHOOK_GITHUB_ACTION
+    deploy: DISCORD_WEBHOOK_DEPLOY_LOG
+    revert: DISCORD_WEBHOOK_DEPLOY_LOG
+  opt_out: []
 # Session hosts scanned by `mergewake reap`. An empty/local ssh value means this
 # machine; `jobs` is the base directory of per-pane job dirs and must be
 # absolute on ssh hosts.
