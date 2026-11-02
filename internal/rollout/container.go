@@ -603,6 +603,12 @@ func ApplyContainer(ctx context.Context, m manifest.Manifest, o Options, host st
 		}
 		res.Installed = append(res.Installed, s.Target)
 	}
+	if o.VerifyForward != nil {
+		if e = o.VerifyForward(ctx); e != nil {
+			undo(e)
+			return
+		}
+	}
 	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, ContainerReceiptName), receipt); e != nil {
 		undo(e)
 		return

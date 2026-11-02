@@ -436,10 +436,15 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if ci != github.Green {
 		return errors.New("manifest commit CI is not green")
 	}
+
+	approvedIdentity := s.deploymentIdentity(r, m, o)
 	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
 		return err
 	}
 
+	if approvedIdentity != s.deploymentIdentity(r, m, o) {
+		return errors.New("deployment inventory changed during approval")
+	}
 	var timeout time.Duration
 	if r.Smoke.Command != "" {
 		timeout, e = config.Duration(r.SmokeTimeout)
@@ -467,6 +472,12 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		command := rollout.ExpandCommand(*spec.PreDeploy, r.Name, sha, root, spec.Target)
 		_, e := s.Runner.Run(ctx, command.Command, command.Args, "", root)
 		return e
+	}
+	installOptions.VerifyForward = func(context.Context) error {
+		if approvedIdentity != s.deploymentIdentity(r, m, o) {
+			return errors.New("deployment environment changed during forward verification")
+		}
+		return nil
 	}
 	var result rollout.Result
 
@@ -558,8 +569,11 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 				installErr = smoke(ctx)
 			}
 		}
+		if installErr == nil && approvedIdentity != s.deploymentIdentity(r, m, o) {
+			installErr = errors.New("deployment inventory changed before receipt approval")
+		}
 		if installErr == nil {
-			identity := s.deploymentIdentity(r, m, o)
+			identity := approvedIdentity
 			var prior deployIdentity
 			found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
 			if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
