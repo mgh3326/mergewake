@@ -1,0 +1,72 @@
+version: 1
+host: host-a
+state_dir: ~/.local/state/mergewake
+token_env: GITHUB_TOKEN
+poll_interval: 60s
+repos:
+  - name: mgh3326/handoffkeep
+    branch: main
+    policy: .mergewake/policy.yaml
+    follow_release: true
+    rollout_group: control-plane
+    # deploy_task: '123' # Dedicated private hk task, requires approval-gate PR.
+    install:
+      - kind: container
+        target: handoffkeep
+        image: ghcr.io/mgh3326/handoffkeep
+        name: fleet-handoffkeep
+        runtime: docker
+        restart: unless-stopped
+        user: '65532:65532'
+        env_file: /etc/fleet/handoffkeep.env
+        ports: ['127.0.0.1:8080:8080']
+        pre_deploy:
+          command: systemctl
+          args: [start, fleet-database-backup.service]
+        health: {url: 'http://127.0.0.1:8080/healthz', status: 200, timeout: 5s, retries: 30}
+  - name: mgh3326/panewire
+    branch: main
+    policy: .mergewake/policy.yaml
+    follow_release: true
+    rollout_group: control-plane
+    # deploy_task: '123' # Dedicated private hk task, requires approval-gate PR.
+    install:
+      - kind: container
+        target: panewire
+        image: ghcr.io/mgh3326/panewire
+        name: fleet-panewire
+        runtime: docker
+        restart: unless-stopped
+        user: '65532:65532'
+        env_file: /etc/fleet/panewire.env
+        ports: ['127.0.0.1:8081:8080']
+        health: {url: 'http://127.0.0.1:8081/healthz', status: 200, timeout: 5s, retries: 30}
+
+review:
+  login: review-bot
+  timeout: 10m
+  quota: scopefuel
+  default_grade: B
+  profiles:
+    claude:
+      family: anthropic
+      command: pi
+      args: [--provider, anthropic, --model, claude-model-id]
+      gate_profile: example-claude-profile
+outcomes:
+  command: scopefuel
+  default_tier: T1
+notifier:
+  type: stdout
+  command: panewire
+  lane: operator-desk
+sink:
+  type: handoffkeep
+  command: handoffkeep
+  reopen_state: reopened
+daemon:
+  act: false
+  pr: {enabled: false, interval: 60s}
+  watch: {enabled: false, interval: 60s}
+  release: {enabled: false, interval: 2m}
+  rollout: {enabled: false, interval: 2m}

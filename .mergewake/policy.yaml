@@ -18,5 +18,5 @@ fast_lane:
   max_changed_lines: 50
 
 deploy_approval:
-  - paths: [internal/rollout/**, internal/pipeline/deploy_approval.go, internal/integrations/deploy_decision.go, internal/config/**]
+  - paths: [internal/rollout/**, internal/pipeline/deploy_approval.go, internal/pipeline/pipeline.go, internal/pipeline/rollout_window.go, internal/pipeline/container_release.go, internal/integrations/deploy_decision.go, internal/config/**]
     reason: Deployment and approval controls

@@ -44,9 +44,15 @@ func (h Handoffkeep) DeployDecision(ctx context.Context, task, question string) 
 	}
 	// Refuse to supersede another open request. A dedicated task per target/host
 	// prevents one rollout from replacing another rollout's pending question.
-	if r.ID != "" && r.Status == "open" {
+	expired := r.Due != nil && !time.Now().Before(*r.Due)
+	if r.ID != "" && r.Status == "open" && !expired {
 		return false, errors.New("another deployment decision is open")
 	}
-	_, e = h.Runner.Run(ctx, h.Command, []string{"decisions", "ask", task, "--question", question, "--option", "A|Approve this deployment", "--option", "B|Keep the current version", "--default-action", "Hold; keep the current version", "--human-only"}, "", "")
+
+	args := []string{"decisions", "ask", task, "--question", question, "--option", "A|Approve this deployment", "--option", "B|Keep the current version", "--default-action", "Hold; keep the current version", "--human-only"}
+	if expired && r.ID != "" && r.Status == "open" {
+		args = append(args, "--supersedes", r.ID)
+	}
+	_, e = h.Runner.Run(ctx, h.Command, args, "", "")
 	return false, e
 }

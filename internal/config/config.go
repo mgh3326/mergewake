@@ -104,6 +104,7 @@ type Health struct {
 	Retries int    `yaml:"retries" json:"retries"`
 }
 type Install struct {
+	PreDeploy    *Command `yaml:"pre_deploy" json:"pre_deploy,omitempty"`
 	Kind         string   `yaml:"kind" json:"kind"`
 	Command      Command  `yaml:"command" json:"command"`
 	Verify       Command  `yaml:"verify" json:"verify"`
@@ -129,20 +130,32 @@ type Install struct {
 	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
-	DeployTask   string    `yaml:"deploy_task"`
-	Name         string    `yaml:"name"`
-	Root         string    `yaml:"root"`
-	Branch       string    `yaml:"branch"`
-	Policy       string    `yaml:"policy"`
-	Deny         []string  `yaml:"deny"`
-	Install      []Install `yaml:"install"`
-	Smoke        Command   `yaml:"smoke"`
-	SmokeTimeout string    `yaml:"smoke_timeout"`
-	Task         string    `yaml:"task"`
+	DeployTask    string    `yaml:"deploy_task"`
+	RolloutGroup  string    `yaml:"rollout_group"`
+	FollowRelease bool      `yaml:"follow_release"`
+	Name          string    `yaml:"name"`
+	Root          string    `yaml:"root"`
+	Branch        string    `yaml:"branch"`
+	Policy        string    `yaml:"policy"`
+	Deny          []string  `yaml:"deny"`
+	Install       []Install `yaml:"install"`
+	Smoke         Command   `yaml:"smoke"`
+	SmokeTimeout  string    `yaml:"smoke_timeout"`
+	Task          string    `yaml:"task"`
 	// Lane receives this repo's PR events when neither the task trailer nor a
 	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
 	Lane string `yaml:"lane"`
 }
+
+// RolloutWindowGroup keeps the fleet control-plane peers in one mandatory
+// availability window, independent of which caller constructs the inventory.
+func (r Repo) RolloutWindowGroup() string {
+	if strings.EqualFold(r.Name, "mgh3326/handoffkeep") || strings.EqualFold(r.Name, "mgh3326/panewire") {
+		return "control-plane"
+	}
+	return r.RolloutGroup
+}
+
 type Loop struct {
 	Enabled  bool   `yaml:"enabled"`
 	Interval string `yaml:"interval"`
@@ -789,6 +802,10 @@ func Load(name string) (Config, error) {
 			return c, errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
+		if r.RolloutGroup != "" && !laneName.MatchString(r.RolloutGroup) {
+			return c, errors.New("rollout_group must be a safe lane-style identifier")
+		}
+
 		if r.Lane != "" && !laneName.MatchString(r.Lane) {
 			return c, fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
 		}
@@ -808,6 +825,9 @@ func Load(name string) (Config, error) {
 			spec := &r.Install[j]
 			if spec.Kind == "" {
 				spec.Kind = "file"
+			}
+			if spec.PreDeploy != nil && (spec.Kind != "container" || spec.PreDeploy.Command == "") {
+				return c, errors.New("pre_deploy requires a container install and a command")
 			}
 			switch spec.Kind {
 			case "file":
