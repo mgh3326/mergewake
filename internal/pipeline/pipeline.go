@@ -25,6 +25,7 @@ type GitHub interface {
 	Files(context.Context, string, int) ([]policy.File, error)
 	Diff(context.Context, string, int) (string, error)
 	Merge(context.Context, string, int, string) error
+	UpdateBranch(context.Context, string, int, string) error
 	Head(context.Context, string, string) (string, error)
 	CreateRef(context.Context, string, string, string) error
 	RecoveryActive(context.Context, string) (bool, error)
@@ -272,7 +273,11 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if e != nil {
 		return e
 	}
-	ci, e := s.GH.Check(ctx, r.Name, sha, p.RequiredChecks)
+	checks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		checks = p.WatchChecks
+	}
+	ci, e := s.GH.Check(ctx, r.Name, sha, checks)
 	if e != nil {
 		return e
 	}
@@ -331,6 +336,17 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 }
 
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
+	state := filepath.Join(s.state(r.Name), "rollout")
+	// Serialize receipt/range approval through installation and identity commit.
+	// Installers retain their own recovery locks; dry runs remain read-only.
+	if o.Acting() {
+		unlock, err := rollout.Lock(filepath.Join(state, "decision-lock"))
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+
 	containerOnly := len(r.Install) > 0
 	for _, spec := range r.Install {
 		containerOnly = containerOnly && spec.Kind == "container"
@@ -392,60 +408,21 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if e != nil {
 		return e
 	}
-	ci, e := s.GH.Check(ctx, r.Name, m.Commit, p.RequiredChecks)
+	checks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		checks = p.WatchChecks
+	}
+	ci, e := s.GH.Check(ctx, r.Name, m.Commit, checks)
 	if e != nil {
 		return e
 	}
 	if ci != github.Green {
 		return errors.New("manifest commit CI is not green")
 	}
-	state := filepath.Join(s.state(r.Name), "rollout")
-	if containerOnly {
-		var receipt rollout.ContainerReceipt
-		found, re := fsutil.ReadJSON(filepath.Join(state, rollout.ContainerReceiptName), &receipt)
-		if re != nil {
-			return re
-		}
-		if found {
-			if receipt.Repo != r.Name {
-				return errors.New("container receipt repo mismatch")
-			}
-			if receipt.Commit != "" {
-				ok, re = s.GH.Ancestor(ctx, r.Name, receipt.Commit, m.Commit)
-				if re != nil {
-					return re
-				}
-				if !ok {
-					return errors.New("automatic downgrade or divergent release refused")
-				}
-			}
-		}
+	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
+		return err
 	}
-	if !containerOnly {
-		receiptName := "installed.json"
-		if len(m.Commands) > 0 {
-			receiptName = "command-installed.json"
-		}
-		var old struct {
-			Manifest manifest.Manifest `json:"manifest"`
-		}
-		found, re := fsutil.ReadJSON(filepath.Join(state, receiptName), &old)
-		if re != nil {
-			return re
-		}
-		if found {
-			if old.Manifest.Repo != r.Name {
-				return errors.New("installed receipt repo mismatch")
-			}
-			ok, re = s.GH.Ancestor(ctx, r.Name, old.Manifest.Commit, m.Commit)
-			if re != nil {
-				return re
-			}
-			if !ok {
-				return errors.New("automatic downgrade or divergent release refused")
-			}
-		}
-	}
+
 	var timeout time.Duration
 	if r.Smoke.Command != "" {
 		timeout, e = config.Duration(r.SmokeTimeout)
@@ -533,6 +510,16 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		}
 	}
 
+	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
+		identity := s.deploymentIdentity(r, m, o)
+		var prior deployIdentity
+		found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
+		if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
+			installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
+		} else {
+			installErr = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), identity)
+		}
+	}
 	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}

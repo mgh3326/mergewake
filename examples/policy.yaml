@@ -13,3 +13,8 @@ blocking:
     reason: Removed installation or recovery files can break rollback
   - paths: [.mergewake/**, .github/workflows/**]
     reason: Changed verification controls can admit unsafe actions before recovery
+
+# Explicit [] permits routine code changes; absence holds every deployment.
+deploy_approval:
+  - paths: [migrations/**, deploy/**]
+    reason: Production state or service enablement changes

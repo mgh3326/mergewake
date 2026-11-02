@@ -508,3 +508,19 @@ func TestCompareDiffAndCIStarted(t *testing.T) {
 		t.Fatal(ok, e)
 	}
 }
+
+func TestUpdateBranch(t *testing.T) {
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/repos/example/project/pulls/7/update-branch" {
+			t.Errorf("request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 1 || body["expected_head_sha"] != testSHA {
+			t.Errorf("body=%v err=%v", body, err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if err := c.UpdateBranch(context.Background(), "example/project", 7, testSHA); err != nil {
+		t.Fatal(err)
+	}
+}

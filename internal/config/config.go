@@ -127,6 +127,7 @@ type Install struct {
 	Digest       string   `yaml:"digest" json:"digest"`
 }
 type Repo struct {
+	DeployTask   string    `yaml:"deploy_task"`
 	Name         string    `yaml:"name"`
 	Root         string    `yaml:"root"`
 	Branch       string    `yaml:"branch"`

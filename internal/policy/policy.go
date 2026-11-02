@@ -337,14 +337,22 @@ func (g ReviewGate) MissingRequiredBots(fs []ReviewFinding, reviews map[string]i
 }
 
 type Policy struct {
-	Version        int         `yaml:"version"`
-	Enabled        bool        `yaml:"enabled"`
-	RequiredChecks []string    `yaml:"required_checks"`
-	WatchChecks    []string    `yaml:"watch_checks"`
-	Blocking       []Rule      `yaml:"blocking"`
-	ReviewGate     *ReviewGate `yaml:"review_gate"`
-	FastLane       *FastLane   `yaml:"fast_lane"`
+	DeployApproval   []Rule      `yaml:"deploy_approval"`
+	AutoUpdateBranch *bool       `yaml:"auto_update_branch"`
+	Version          int         `yaml:"version"`
+	Enabled          bool        `yaml:"enabled"`
+	RequiredChecks   []string    `yaml:"required_checks"`
+	WatchChecks      []string    `yaml:"watch_checks"`
+	Blocking         []Rule      `yaml:"blocking"`
+	ReviewGate       *ReviewGate `yaml:"review_gate"`
+	FastLane         *FastLane   `yaml:"fast_lane"`
 }
+
+// AutoUpdateBranchEnabled defaults branch updates on when the key is absent.
+func (p Policy) AutoUpdateBranchEnabled() bool {
+	return p.AutoUpdateBranch == nil || *p.AutoUpdateBranch
+}
+
 type Decision struct {
 	Class   string   `json:"class"`
 	Reasons []string `json:"reasons"`
@@ -373,7 +381,7 @@ func (p Policy) Validate() error {
 		}
 		watchSeen[n] = true
 	}
-	for _, r := range p.Blocking {
+	for _, r := range append(append([]Rule{}, p.Blocking...), p.DeployApproval...) {
 		if len(r.Paths) == 0 || strings.TrimSpace(r.Reason) == "" {
 			return errors.New("blocking rules require paths and reason")
 		}

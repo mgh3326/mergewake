@@ -34,6 +34,9 @@ var shaD = strings.Repeat("d", 40)
 type fakeGH struct {
 	GitHub
 	pullCalls                                                    int
+	updateHeads                                                  []string
+	updateErr                                                    error
+	updateHook                                                   func()
 	nextHead                                                     string
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
@@ -75,6 +78,13 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 		p.Head.SHA = g.nextHead
 	}
 	return p, nil
+}
+func (g *fakeGH) UpdateBranch(_ context.Context, _ string, _ int, head string) error {
+	g.updateHeads = append(g.updateHeads, head)
+	if g.updateHook != nil {
+		g.updateHook()
+	}
+	return g.updateErr
 }
 func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
@@ -280,6 +290,9 @@ func (g *fakeGH) Publish(context.Context, manifest.Manifest) error          { g.
 func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { return g.m, nil }
 
 type fakeSink struct{ records, reopens int }
+
+// Existing installer tests explicitly approve the bootstrap deployment.
+func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
 
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }
@@ -937,7 +950,7 @@ func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ s
 		d.add(args[1])
 		return nil, nil
 	case "run":
-		name, ref := args[2], args[len(args)-1]
+		name, ref := args[3], args[len(args)-1]
 		if _, ok := d.containers[name]; ok {
 			return nil, errors.New("container name in use")
 		}
