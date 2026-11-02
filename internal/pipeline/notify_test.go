@@ -539,3 +539,17 @@ func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
 		t.Fatalf("new base: calls=%v events=%v", g.updateHeads, n.events)
 	}
 }
+
+func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	g.stale = true
+	if err := s.NotifyPR(context.Background(), r, 7, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 0 || n.count != 1 || !strings.Contains(lastEvent(t, n), "BLOCKED example/project#7 head=aaaaaaa | base_stale") {
+		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
+	}
+	if _, err := os.Stat(filepath.Join(s.state(r.Name), "base-updates")); !os.IsNotExist(err) {
+		t.Fatalf("shadow reserved update: %v", err)
+	}
+}

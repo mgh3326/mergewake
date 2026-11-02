@@ -77,7 +77,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if v.State == "pending" || o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
-	if v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
+	if o.Acting() && v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
 		status, attempted, err := s.updateStaleBranch(ctx, r, pr, head)
 		if err != nil {
 			return err
