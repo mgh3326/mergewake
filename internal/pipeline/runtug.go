@@ -283,6 +283,7 @@ func (x *runtugExecutor) spawnBrief(ctx context.Context, path, jobDir string) (s
 	}
 	files, ok := x.s.Sink.(interface {
 		PutAttachment(context.Context, string) (string, error)
+		AttachmentCommand() string
 	})
 	if !ok {
 		return "", errors.New("task sink cannot publish a large review brief")
@@ -294,7 +295,7 @@ func (x *runtugExecutor) spawnBrief(ctx context.Context, path, jobDir string) (s
 	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
 		return "", errors.New("uploaded review brief sha256 mismatch")
 	}
-	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `handoffkeep attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal. The local source copy is %s.\n", id, len(body), id, path)
+	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal. The local source copy is %s.\n", id, len(body), shellQuote(files.AttachmentCommand()), id, path)
 	pointer := filepath.Join(jobDir, "review-prompt.md")
 	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
 }

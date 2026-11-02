@@ -161,7 +161,7 @@ func (s *Service) inheritedStallReview(ctx context.Context, r config.Repo, pr gi
 		return false, e
 	}
 	if len(files) != pr.ChangedFiles {
-		return false, errors.New("incomplete PR file list")
+		return false, nil
 	}
 	needed := 1
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {

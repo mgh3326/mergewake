@@ -165,6 +165,8 @@ func (s *taskJobSink) PutAttachment(_ context.Context, path string) (string, err
 	return id, nil
 }
 
+func (s *taskJobSink) AttachmentCommand() string { return "handoffkeep" }
+
 func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
 	return s.job, s.title, nil
 }
@@ -297,7 +299,7 @@ func TestRuntugLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 			t.Fatal(e)
 		}
 		id := fmt.Sprintf("%x", sha256.Sum256(body))
-		if len(body) <= 64<<10 || len(prompt) > 2048 || !strings.Contains(string(prompt), "handoffkeep attach get "+id) || !bytes.Equal(runner.sink.files[id], body) {
+		if len(body) <= 64<<10 || len(prompt) > 2048 || !strings.Contains(string(prompt), "'handoffkeep' attach get "+id) || !bytes.Equal(runner.sink.files[id], body) {
 			t.Fatalf("brief=%d prompt=%d attachment preserved=%v", len(body), len(prompt), bytes.Equal(runner.sink.files[id], body))
 		}
 		for _, want := range []string{"review round 2", "## Delta to review", strings.TrimSpace(large), "runtug done " + arg(sp, "-l")} {
@@ -318,6 +320,42 @@ func TestRuntugLargeBriefUploadFailureIsExplicit(t *testing.T) {
 	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (bool, error) { return true, nil })
 	if e != nil || len(runner.spawns) != 0 || len(out.skips) != 1 || !strings.Contains(out.skips[0].Reason, "publish brief: attachment service unavailable") {
 		t.Fatalf("spawns=%d outcome=%+v error=%v", len(runner.spawns), out, e)
+	}
+}
+
+func TestRuntugLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
+	for _, name := range []string{"custom-hk", "custom hk's"} {
+		t.Run(name, func(t *testing.T) {
+			job := t.TempDir()
+			path := filepath.Join(job, "review-brief.md")
+			body := []byte(strings.Repeat("complete brief\n", 5000))
+			if e := os.WriteFile(path, body, 0600); e != nil {
+				t.Fatal(e)
+			}
+			id := fmt.Sprintf("%x", sha256.Sum256(body))
+			command := filepath.Join(job, name)
+			script := fmt.Sprintf("#!/bin/sh\ncase \"$1 $2\" in\n'attach put') printf '%%s\\n' '{\"sha256\":\"%s\"}';;\n'attach get') test \"$3\" = '%s' && cat %s;;\n*) exit 1;;\nesac\n", id, id, shellQuote(path))
+			if e := os.WriteFile(command, []byte(script), 0700); e != nil {
+				t.Fatal(e)
+			}
+			x := &runtugExecutor{s: &Service{Sink: integrations.Handoffkeep{Runner: integrations.Exec{}, Command: command}}}
+			pointer, e := x.spawnBrief(context.Background(), path, job)
+			if e != nil {
+				t.Fatal(e)
+			}
+			prompt, e := os.ReadFile(pointer)
+			if e != nil {
+				t.Fatal(e)
+			}
+			parts := strings.Split(string(prompt), "`")
+			if len(parts) < 3 || parts[1] != shellQuote(command)+" attach get "+id {
+				t.Fatalf("prompt does not use the configured command: %s", prompt)
+			}
+			got, e := exec.Command("sh", "-c", parts[1]).Output()
+			if e != nil || !bytes.Equal(got, body) {
+				t.Fatalf("retrieved brief differs: error=%v bytes=%d", e, len(got))
+			}
+		})
 	}
 }
 

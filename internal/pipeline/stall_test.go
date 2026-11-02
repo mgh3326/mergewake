@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,6 +80,28 @@ func TestStallSkipsOnlyCompleteInheritedVerdicts(t *testing.T) {
 			var waiting map[string]time.Time
 			if _, e := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-wait.json"), &waiting); e != nil || (tc.want == 0 && len(waiting) != 0) {
 				t.Fatalf("waiting=%v error=%v", waiting, e)
+			}
+		})
+	}
+}
+
+func TestStallFileCountMismatchDoesNotSuppressAlarm(t *testing.T) {
+	for _, count := range []int{0, 2} {
+		t.Run(fmt.Sprintf("snapshot-count-%d", count), func(t *testing.T) {
+			s, g, n, c, r := stallSetup(t)
+			s.GH = g
+			g.full = patchOne
+			g.pull.ChangedFiles = count
+			g.passes = map[string][]github.PassReceipt{shaB: {{Pass: 1, Family: "anthropic", Patch: reviewPatchID(patchOne)}}}
+			prs := []github.Pull{g.pull}
+			for i := range 3 {
+				if e := s.CheckStalls(context.Background(), r, prs, Options{}); e != nil {
+					t.Fatal(e)
+				}
+				if want := min(i, 1); n.count != want {
+					t.Fatalf("poll=%d alarms=%d want=%d", i, n.count, want)
+				}
+				c.t = c.t.Add(time.Hour)
 			}
 		})
 	}
