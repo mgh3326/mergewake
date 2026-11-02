@@ -2,8 +2,12 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,23 +20,50 @@ import (
 )
 
 type deployIdentity struct {
-	Config  string `json:"config"`
-	Payload string `json:"payload"`
+	EnvironmentKnown bool   `json:"environment_known"`
+	Config           string `json:"config"`
+	Payload          string `json:"payload"`
 }
 
 func (s *Service) deploymentIdentity(r config.Repo, m manifest.Manifest, o Options) deployIdentity {
+	// Hash locally without exposing values. A changed env file must require a
+	// new human answer even when its path and the release commit are unchanged.
+	environment := map[string]string{}
+	known := true
+	for _, spec := range r.Install {
+		if spec.EnvFile == "" {
+			continue
+		}
+		name := config.Expand(spec.EnvFile)
+		f, e := os.Open(name)
+		if e != nil {
+			known = false
+			environment[name] = "unavailable"
+			continue
+		}
+		h := sha256.New()
+		n, e := io.Copy(h, io.LimitReader(f, (1<<20)+1))
+		closeErr := f.Close()
+		if e != nil || closeErr != nil || n > 1<<20 {
+			known = false
+			environment[name] = "unavailable"
+			continue
+		}
+		environment[name] = hex.EncodeToString(h.Sum(nil))
+	}
 	b, _ := json.Marshal(struct {
 		Host, Repo, Policy, Root string
+		Environment              map[string]string
 		Deny                     []string
 		Install                  []config.Install
 		Smoke                    config.Command
 		Timeout                  string
-	}{s.Config.Host, r.Name, r.Policy, r.Root, r.Deny, r.Install, r.Smoke, r.SmokeTimeout})
+	}{s.Config.Host, r.Name, r.Policy, r.Root, environment, r.Deny, r.Install, r.Smoke, r.SmokeTimeout})
 	payload, _ := json.Marshal(struct {
 		Manifest manifest.Manifest
 		Override string
 	}{m, o.Digest})
-	return deployIdentity{manifest.Sum(b), manifest.Sum(payload)}
+	return deployIdentity{known, manifest.Sum(b), manifest.Sum(payload)}
 }
 
 type deployReview struct {
@@ -48,6 +79,9 @@ type deployReview struct {
 func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.Manifest, state string, container bool, o Options) (bool, error) {
 	identity := s.deploymentIdentity(r, m, o)
 	review := deployReview{Identity: identity, Host: s.Config.Host, Repo: r.Name, Release: m.Commit, Paths: []string{}, Reasons: []string{}}
+	if !identity.EnvironmentKnown {
+		review.Reasons = append(review.Reasons, "environment file identity unavailable")
+	}
 	var priorIdentity deployIdentity
 	identityFound, identityErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &priorIdentity)
 	if identityErr != nil || !identityFound || priorIdentity.Config != identity.Config {
