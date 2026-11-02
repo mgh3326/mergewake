@@ -30,6 +30,8 @@ func TestDeployDecision(t *testing.T) {
 		{"expired", "answered", "release", "A", true, true, false},
 		{"other release", "answered", "old release", "A", true, false, false},
 		{"new release after expiry", "open", "old release", "A", true, true, false},
+		{"new release after answered expiry", "answered", "old release", "A", true, true, false},
+		{"new release after withdrawn expiry", "withdrawn", "old release", "A", true, true, false},
 		{"not human", "answered", "release", "A", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,6 +45,9 @@ func TestDeployDecision(t *testing.T) {
 			got, e := h.DeployDecision(context.Background(), "1", "release")
 			if e != nil || got != tc.want {
 				t.Fatalf("got %v %v", got, e)
+			}
+			if tc.question != "release" && tc.expired && slices.Contains(r.calls[len(r.calls)-1], "--supersedes") != (tc.status == "open") {
+				t.Fatalf("wrong supersession of %s: %v", tc.status, r.calls)
 			}
 			if tc.question != "release" || !tc.human {
 				if len(r.calls) != 2 || r.calls[1][0] != "decisions" || !slices.Contains(r.calls[1], "--human-only") {
