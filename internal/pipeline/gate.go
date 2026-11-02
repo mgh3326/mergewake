@@ -457,7 +457,7 @@ func answeredBy(c github.ReviewComment, author string, ownReview bool, fleet ...
 	}
 	for _, authors := range fleet {
 		for _, login := range authors {
-			if who == policy.NormalizeAuthor(login) {
+			if who == policy.NormalizeAuthor(login) && (who != author || ownReview) {
 				return true
 			}
 		}

@@ -207,3 +207,31 @@ func TestRetryReviewWaitsForLiveLeaseThenRecovers(t *testing.T) {
 		t.Fatalf("expired lease not recovered: %d %d", g.postCount, n.count)
 	}
 }
+
+func TestFleetAuthorSelfReply(t *testing.T) {
+	for _, account := range []struct{ first, reply, kind string }{
+		{"FLEET-AUTHOR", "fleet-author", "User"},
+		{"fleet-author[bot]", "FLEET-AUTHOR[bot]", "Bot"},
+	} {
+		t.Run(account.kind, func(t *testing.T) {
+			thread := github.ReviewThread{Comments: []github.ReviewComment{
+				{Author: account.first, Body: "finding requires a disposition"},
+				{Author: account.reply, AuthorType: account.kind, Body: "Dismiss: already covered by a focused test"},
+			}}
+			fleet := []string{"fleet-author"}
+			if got := blockDisposition(thread, false, nil, fleet); got != "" {
+				t.Fatalf("own finding accepted a disposition: got %q, want empty", got)
+			}
+			if answered(thread, false, fleet) {
+				t.Fatal("own finding accepted its author's answer")
+			}
+			// Mergewake's review identity deliberately permits same-login dispositions.
+			if got := blockDisposition(thread, true, nil, fleet); got != "dismiss" {
+				t.Fatalf("own-review exception lost: got %q", got)
+			}
+			if !answered(thread, true, fleet) {
+				t.Fatal("own-review exception lost its answer")
+			}
+		})
+	}
+}

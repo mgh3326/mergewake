@@ -732,3 +732,26 @@ func TestReviewRetryConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewRecoveryDurationsRejectNonPositive(t *testing.T) {
+	for _, setting := range []struct{ field, section, key string }{
+		{"daemon.pr.review_retry.initial", "review_retry", "initial"},
+		{"daemon.pr.review_retry.maximum", "review_retry", "maximum"},
+		{"daemon.pr.findings.escalate_after", "findings", "escalate_after"},
+	} {
+		for _, value := range []string{"0s", "-1s"} {
+			t.Run(setting.field+"/"+value, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				body := "version: 1\nhost: host-a\ndaemon:\n  pr:\n    " + setting.section + ": {" + setting.key + ": " + value + "}\n"
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := Load(path)
+				want := setting.field + ": invalid positive duration \"" + value + "\""
+				if err == nil || err.Error() != want {
+					t.Fatalf("Load(%s=%s): got %v, want %q", setting.field, value, err, want)
+				}
+			})
+		}
+	}
+}

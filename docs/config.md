@@ -1411,8 +1411,9 @@ that interval. An inbox acknowledgment stops reminders. A verified disposition
 stops both reminders and aging. `review.fleet_authors` lists additional GitHub
 logins whose replies count, including bot logins. Login matching is case
 insensitive and ignores the `[bot]` suffix. Fix replies still require a commit
-in the PR after the finding. Findings posted by an allowed account do not count
-as their own dispositions.
+in the PR after the finding. Allowlisting an account does not let it dispose
+its own findings. The existing same-login exception for mergewake's own review
+identity remains.
 
 The desk gets one `decision` copy when an unresolved finding reaches
 `daemon.pr.findings.escalate_after` (default `2h`) or `escalate_rounds` (default
