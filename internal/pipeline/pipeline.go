@@ -419,10 +419,15 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if ci != github.Green {
 		return errors.New("manifest commit CI is not green")
 	}
+
+	approvedIdentity := s.deploymentIdentity(r, m, o)
 	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
 		return err
 	}
 
+	if approvedIdentity != s.deploymentIdentity(r, m, o) {
+		return errors.New("deployment inventory changed during approval")
+	}
 	var timeout time.Duration
 	if r.Smoke.Command != "" {
 		timeout, e = config.Duration(r.SmokeTimeout)
@@ -438,6 +443,9 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
+		if err == nil && approvedIdentity != s.deploymentIdentity(r, m, o) {
+			return errors.New("deployment environment changed during smoke")
+		}
 		return err
 	}
 	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: !o.Acting(), Digest: o.Digest, Now: s.Now}
@@ -448,7 +456,15 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		runtimeFor := func(spec config.Install) rollout.Runtime {
 			return rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime}
 		}
-		result, installErr = rollout.ApplyContainer(ctx, m, installOptions, s.Config.Host, runtimeFor, rollout.CheckHealth)
+		result, installErr = rollout.ApplyContainer(ctx, m, installOptions, s.Config.Host, runtimeFor, func(ctx context.Context, h config.Health) error {
+			if err := rollout.CheckHealth(ctx, h); err != nil {
+				return err
+			}
+			if approvedIdentity != s.deploymentIdentity(r, m, o) {
+				return errors.New("deployment environment changed during health check")
+			}
+			return nil
+		})
 	case len(m.Commands) > 0:
 		result, installErr = rollout.ApplyCommands(ctx, m, installOptions, s.Config.Host, s.Runner, func(ctx context.Context, spec config.Install, sha string) error {
 			if spec.Kind == "release" {
@@ -511,7 +527,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	}
 
 	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
-		identity := s.deploymentIdentity(r, m, o)
+		identity := approvedIdentity
 		var prior deployIdentity
 		found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
 		if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {

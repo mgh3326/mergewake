@@ -3,6 +3,7 @@ package integrations
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 )
@@ -28,6 +29,7 @@ func TestDeployDecision(t *testing.T) {
 		{"withdrawn", "withdrawn", "release", "A", true, false, false},
 		{"expired", "answered", "release", "A", true, true, false},
 		{"other release", "answered", "old release", "A", true, false, false},
+		{"new release after expiry", "open", "old release", "A", true, true, false},
 		{"not human", "answered", "release", "A", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,7 +45,7 @@ func TestDeployDecision(t *testing.T) {
 				t.Fatalf("got %v %v", got, e)
 			}
 			if tc.question != "release" || !tc.human {
-				if len(r.calls) != 2 || r.calls[1][0] != "decisions" || r.calls[1][len(r.calls[1])-1] != "--human-only" {
+				if len(r.calls) != 2 || r.calls[1][0] != "decisions" || !slices.Contains(r.calls[1], "--human-only") {
 					t.Fatalf("missing mirrored human request: %v", r.calls)
 				}
 			}

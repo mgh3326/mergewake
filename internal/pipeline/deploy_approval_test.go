@@ -205,3 +205,43 @@ func TestRolloutSerializesApprovalRange(t *testing.T) {
 		t.Fatalf("first=%v concurrent=%v", first, second)
 	}
 }
+func TestEnvContentDriftNeedsApproval(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	old := "sha256:" + strings.Repeat("a", 64)
+	envPath := filepath.Join(t.TempDir(), "service.env")
+	if e := os.WriteFile(envPath, []byte("SETTING=one\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", EnvFile: envPath, Health: &config.Health{URL: srv.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	r.Install = []config.Install{spec}
+	r.Root = ""
+	r.Smoke = config.Command{}
+	r.DeployTask = "1"
+	pinned := spec
+	pinned.Digest = old
+	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	d := newDockerCLI()
+	s.Runner = d
+	sink := &deploySink{approved: true}
+	s.Sink = sink
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	sink.approved = false
+	sink.questions = nil
+	if e := os.WriteFile(envPath, []byte("SETTING=two\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if d.containers[spec.Name] != spec.Image+"@"+old || len(sink.questions) == 0 {
+		t.Fatalf("unapproved replacement=%q questions=%v", d.containers[spec.Name], sink.questions)
+	}
+}
