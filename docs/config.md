@@ -402,6 +402,20 @@ needs no GitHub token.
 | `runtug.panewire` | `panewire` | panewire executable for reading that lane; it takes the hub connection from `PANEWIRE_HUB_URL` and `PANEWIRE_HUB_TOKEN_ENV` in mergewake's environment. |
 | `runtug.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a runtug whose `spawn` has `--exclude-host`). Must not contain `runtug.host`. |
 
+#### Large PRs
+
+GitHub answers HTTP 406 to the diff media type for very large PRs. Only on that
+status does review build the same patch locally from the repo's `root`: it
+fetches the PR base ref and `pull/<n>/head`, then diffs the merge base to the
+head with rename detection (`git diff -M`), so moved code is listed as a rename
+instead of repeated content. The local path applies the same 2 MiB reviewer
+budget as the API path. When the patch is still larger, complete file blocks are
+kept in their stable diff order while they fit, and each later block is replaced
+by its header and a digest of the omitted text. Every summarized or purely
+renamed file is listed in the review body, and the pass marker records
+`diff_source: local` with `diff_summarized`, so no file disappears silently. Any
+other HTTP error fails the review as before.
+
 #### Runtug executor
 
 With `executor: runtug` each missing pass is first offered to a reviewer pane:

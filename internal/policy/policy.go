@@ -337,6 +337,7 @@ func (g ReviewGate) MissingRequiredBots(fs []ReviewFinding, reviews map[string]i
 }
 
 type Policy struct {
+	DeployApproval   []Rule      `yaml:"deploy_approval"`
 	AutoUpdateBranch *bool       `yaml:"auto_update_branch"`
 	Version          int         `yaml:"version"`
 	Enabled          bool        `yaml:"enabled"`
@@ -380,7 +381,7 @@ func (p Policy) Validate() error {
 		}
 		watchSeen[n] = true
 	}
-	for _, r := range p.Blocking {
+	for _, r := range append(append([]Rule{}, p.Blocking...), p.DeployApproval...) {
 		if len(r.Paths) == 0 || strings.TrimSpace(r.Reason) == "" {
 			return errors.New("blocking rules require paths and reason")
 		}

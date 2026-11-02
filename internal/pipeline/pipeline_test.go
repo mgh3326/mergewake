@@ -65,6 +65,9 @@ type fakeGH struct {
 	m                                                            manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
+	// diffErr, when set, answers every Diff call instead of a patch (for
+	// example the HTTP 406 GitHub returns for a very large PR).
+	diffErr error
 	// commitErr answers Commit for the named SHAs; notAncestor lists the
 	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
 	commitErr   map[string]error
@@ -256,6 +259,9 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	return "https://github.com/example/project/pull/9", nil
 }
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
+	if g.diffErr != nil {
+		return "", g.diffErr
+	}
 	if d, ok := g.diffs[g.pull.Head.SHA]; ok {
 		return d, nil
 	}
@@ -290,6 +296,9 @@ func (g *fakeGH) Publish(context.Context, manifest.Manifest) error          { g.
 func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { return g.m, nil }
 
 type fakeSink struct{ records, reopens int }
+
+// Existing installer tests explicitly approve the bootstrap deployment.
+func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
 
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }
@@ -947,7 +956,7 @@ func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ s
 		d.add(args[1])
 		return nil, nil
 	case "run":
-		name, ref := args[2], args[len(args)-1]
+		name, ref := args[3], args[len(args)-1]
 		if _, ok := d.containers[name]; ok {
 			return nil, errors.New("container name in use")
 		}
