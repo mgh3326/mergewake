@@ -65,6 +65,9 @@ type fakeGH struct {
 	m                                                            manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
+	// diffErr, when set, answers every Diff call instead of a patch (for
+	// example the HTTP 406 GitHub returns for a very large PR).
+	diffErr error
 	// commitErr answers Commit for the named SHAs; notAncestor lists the
 	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
 	commitErr   map[string]error
@@ -256,6 +259,9 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	return "https://github.com/example/project/pull/9", nil
 }
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
+	if g.diffErr != nil {
+		return "", g.diffErr
+	}
 	if d, ok := g.diffs[g.pull.Head.SHA]; ok {
 		return d, nil
 	}
