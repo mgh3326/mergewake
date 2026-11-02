@@ -950,7 +950,7 @@ func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ s
 		d.add(args[1])
 		return nil, nil
 	case "run":
-		name, ref := args[2], args[len(args)-1]
+		name, ref := args[3], args[len(args)-1]
 		if _, ok := d.containers[name]; ok {
 			return nil, errors.New("container name in use")
 		}

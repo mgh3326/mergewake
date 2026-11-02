@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +48,8 @@ func TestRolloutDeployApproval(t *testing.T) {
 		{"unknown range", "observability/log.go", shaA, false, true, false, true},
 		{"env", "deploy/.env.production", shaA, false, false, false, true},
 		{"secret", "deploy/secrets/key", shaA, false, false, false, true},
+		{"secret file", "config/secrets.yaml", shaA, false, false, false, true},
+		{"env file", "config/env.yaml", shaA, false, false, false, true},
 		{"policy", ".mergewake/policy.yaml", shaA, false, false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -70,6 +74,12 @@ func TestRolloutDeployApproval(t *testing.T) {
 			g.m = m
 			s.Runner = smokeRunner{}
 			state := filepath.Join(s.state(r.Name), "rollout")
+
+			if tc.previous != "" {
+				if e := fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), s.deploymentIdentity(r, m, Options{})); e != nil {
+					t.Fatal(e)
+				}
+			}
 			if tc.previous != "" {
 				if e := fsutil.WriteJSON(filepath.Join(state, "installed.json"), map[string]any{"manifest": manifest.Manifest{Repo: r.Name, Commit: tc.previous}}); e != nil {
 					t.Fatal(e)
@@ -89,5 +99,41 @@ func TestRolloutDeployApproval(t *testing.T) {
 				t.Fatal("unbound question")
 			}
 		})
+	}
+}
+
+func TestSameCommitDigestAndEnvDriftNeedsApproval(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	old := "sha256:" + strings.Repeat("a", 64)
+	next := "sha256:" + strings.Repeat("b", 64)
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", EnvFile: "/operator/old.env", Health: &config.Health{URL: srv.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	r.Install = []config.Install{spec}
+	r.Root = ""
+	r.Smoke = config.Command{}
+	r.DeployTask = "1"
+	pinned := spec
+	pinned.Digest = old
+	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	d := newDockerCLI()
+	s.Runner = d
+	sink := &deploySink{approved: true}
+	s.Sink = sink
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	sink.approved = false
+	sink.questions = nil
+	r.Install[0].EnvFile = "/operator/changed.env"
+	if e = s.Rollout(context.Background(), r, Options{Digest: spec.Image + "@" + next}); e != nil {
+		t.Fatal(e)
+	}
+	if d.containers[spec.Name] != spec.Image+"@"+old || len(sink.questions) == 0 {
+		t.Fatalf("unapproved replacement=%q questions=%v", d.containers[spec.Name], sink.questions)
 	}
 }

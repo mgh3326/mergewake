@@ -492,6 +492,16 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		}
 	}
 
+	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
+		identity := s.deploymentIdentity(r, m, o)
+		var prior deployIdentity
+		found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
+		if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
+			installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
+		} else {
+			installErr = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), identity)
+		}
+	}
 	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
 		return errors.Join(installErr, s.Print(result))
 	}

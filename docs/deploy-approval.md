@@ -47,3 +47,12 @@ Rollback: disable the rollout role first. Restore the previous mergewake binary
 and private inventory, preserving receipts and decision history. A deployment
 rollback uses the installer's recorded previous SHA/digest and smoke checks;
 never delete receipts merely to bypass a hold.
+
+The gate also fingerprints host, repository, policy path, deny list, install
+recipes (including env-file paths and mounts), smoke command, and selected
+manifest/digest. Missing or changed inventory approval holds; a changed payload
+at the same commit also holds. It writes the fingerprint only after successful
+installation. A `current` result cannot attest changed or legacy unrecorded
+configuration: operator bootstrap is required. It never reads env-file contents.
+For long path lists, the complete evidence is written to a content-addressed hk
+document referenced by the question, preserving hk's notification size limit.

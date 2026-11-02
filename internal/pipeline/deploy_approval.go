@@ -15,17 +15,44 @@ import (
 	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
+type deployIdentity struct {
+	Config  string `json:"config"`
+	Payload string `json:"payload"`
+}
+
+func (s *Service) deploymentIdentity(r config.Repo, m manifest.Manifest, o Options) deployIdentity {
+	b, _ := json.Marshal(struct {
+		Host, Repo, Policy, Root string
+		Deny                     []string
+		Install                  []config.Install
+		Smoke                    config.Command
+		Timeout                  string
+	}{s.Config.Host, r.Name, r.Policy, r.Root, r.Deny, r.Install, r.Smoke, r.SmokeTimeout})
+	payload, _ := json.Marshal(struct {
+		Manifest manifest.Manifest
+		Override string
+	}{m, o.Digest})
+	return deployIdentity{manifest.Sum(b), manifest.Sum(payload)}
+}
+
 type deployReview struct {
-	Host     string   `json:"host"`
-	Repo     string   `json:"repo"`
-	Previous string   `json:"previous"`
-	Release  string   `json:"release"`
-	Paths    []string `json:"paths"`
-	Reasons  []string `json:"reasons"`
+	Identity deployIdentity `json:"identity"`
+	Host     string         `json:"host"`
+	Repo     string         `json:"repo"`
+	Previous string         `json:"previous"`
+	Release  string         `json:"release"`
+	Paths    []string       `json:"paths"`
+	Reasons  []string       `json:"reasons"`
 }
 
 func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.Manifest, state string, container bool, o Options) (bool, error) {
-	review := deployReview{Host: s.Config.Host, Repo: r.Name, Release: m.Commit, Paths: []string{}, Reasons: []string{}}
+	identity := s.deploymentIdentity(r, m, o)
+	review := deployReview{Identity: identity, Host: s.Config.Host, Repo: r.Name, Release: m.Commit, Paths: []string{}, Reasons: []string{}}
+	var priorIdentity deployIdentity
+	identityFound, identityErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &priorIdentity)
+	if identityErr != nil || !identityFound || priorIdentity.Config != identity.Config {
+		review.Reasons = append(review.Reasons, "host inventory approval missing or changed")
+	}
 	receiptName := "installed.json"
 	if container {
 		receiptName = rollout.ContainerReceiptName
@@ -53,7 +80,9 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 	} else if review.Previous == m.Commit {
 		// An existing receipt is not approval to change host recipes or secrets.
 		// The installers independently enforce recipe identity and current bytes.
-		return true, nil
+		if priorIdentity.Payload != identity.Payload {
+			review.Reasons = append(review.Reasons, "release payload changed at the deployed commit")
+		}
 	} else {
 		source, ok := s.GH.(interface {
 			ChangedPaths(context.Context, string, string, string) ([]policy.File, error)
@@ -76,7 +105,8 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 							if name == "" {
 								continue
 							}
-							protected := name == r.Policy || name == ".env" || strings.HasPrefix(filepath.Base(name), ".env.")
+							base := strings.ToLower(filepath.Base(name))
+							protected := name == r.Policy || strings.HasPrefix(base, ".env") || strings.HasPrefix(base, "env.") || strings.HasSuffix(base, ".env") || strings.HasPrefix(base, "secret") || strings.HasPrefix(base, "credential") || strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key")
 							lower := strings.ToLower(name)
 							for _, segment := range strings.Split(lower, "/") {
 								protected = protected || segment == "secrets" || segment == "secret" || segment == "env" || segment == ".env"
@@ -111,6 +141,17 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 	sort.Strings(review.Reasons)
 	data, _ := json.Marshal(review)
 	question := "Approve deployment " + string(data)
+	// hk's lane mirror caps question plus options at 2048 bytes. Preserve
+	// the complete matched-path evidence in a content-addressed document.
+	if len(question) > 1400 {
+		key := "mergewake/deploy-approval/" + manifest.Sum(data)
+		if o.Acting() {
+			if err := s.Sink.Record(ctx, key, data); err != nil {
+				return false, err
+			}
+		}
+		question = fmt.Sprintf("Approve deployment host=%s repo=%s range=%s..%s release=%s evidence=hk:doc %s", review.Host, review.Repo, review.Previous, review.Release, review.Release, key)
+	}
 	if !o.Acting() {
 		return false, s.Print(struct {
 			Status string       `json:"status"`
