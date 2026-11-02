@@ -524,3 +524,28 @@ func TestUpdateBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The posted review names the local fallback and every file left without
+// content, so the record survives outside the pass marker too.
+func TestPostReviewNamesLocalDiffFallback(t *testing.T) {
+	var sent map[string]any
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/example/project/pulls/7/reviews" {
+			t.Errorf("request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			t.Error(err)
+		}
+		fmt.Fprint(w, `{}`)
+	})
+	meta := PassReceipt{Pass: 1, Lens: "default", DiffSource: "local", DiffSummarized: "a.go\nold.go"}
+	if err := c.PostReview(context.Background(), "example/project", 7, testSHA, nil, meta); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := sent["body"].(string)
+	for _, want := range []string{"Diff source: local", "a.go\nold.go", PassMarker(meta)} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q:\n%s", want, body)
+		}
+	}
+}
