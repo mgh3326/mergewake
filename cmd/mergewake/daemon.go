@@ -202,18 +202,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		if pr.Draft {
 			continue
 		}
-		// A failed retained claim is not a retry signal; only the -done marker
-		// means all required passes finished. Landing stays independent so
-		// advisory review failures do not block routine policy decisions.
-		claimed, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
-		if errors.Is(e, github.ErrPollSkipped) {
-			// The marker probe sits inside its poll interval with nothing
-			// cached; every per-PR step rechecks next round.
-			continue
-		}
-		if e == nil && !claimed {
-			e = s.Review(ctx, r, pr.Number, "", childOptions)
-		}
+		e := s.RetryReview(ctx, r, pr, childOptions)
 		if e != nil {
 			if errors.Is(e, pipeline.ErrReviewUnavailable) {
 				if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
@@ -235,10 +224,6 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
 		}
 	}
-	// The alarm is the pr role's own heartbeat: it fires when this loop is
-	// alive yet has begun no review of a ready head, which a healthcheck ping
-	// alone cannot tell from a healthy idle loop.
-	errs = append(errs, s.CheckStalls(ctx, r, prs, o))
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
 }
