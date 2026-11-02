@@ -336,6 +336,17 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 }
 
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
+	state := filepath.Join(s.state(r.Name), "rollout")
+	// Serialize receipt/range approval through installation and identity commit.
+	// Installers retain their own recovery locks; dry runs remain read-only.
+	if o.Acting() {
+		unlock, err := rollout.Lock(filepath.Join(state, "decision-lock"))
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+
 	containerOnly := len(r.Install) > 0
 	for _, spec := range r.Install {
 		containerOnly = containerOnly && spec.Kind == "container"
@@ -408,7 +419,6 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if ci != github.Green {
 		return errors.New("manifest commit CI is not green")
 	}
-	state := filepath.Join(s.state(r.Name), "rollout")
 	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
 		return err
 	}

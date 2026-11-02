@@ -171,3 +171,37 @@ func TestRolloutUsesMainChecks(t *testing.T) {
 		t.Fatal("red CI mutated target")
 	}
 }
+
+type approvalLockGH struct {
+	*fakeGH
+	entered, proceed chan struct{}
+}
+
+func (g approvalLockGH) Latest(context.Context, string) (manifest.Manifest, error) {
+	close(g.entered)
+	<-g.proceed
+	return g.m, nil
+}
+func TestRolloutSerializesApprovalRange(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	r.Root = t.TempDir()
+	r.Smoke.Command = "smoke"
+	r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}
+	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	s.Runner = smokeRunner{}
+	adapter := approvalLockGH{g, make(chan struct{}), make(chan struct{})}
+	s.GH = adapter
+	done := make(chan error, 1)
+	go func() { done <- s.Rollout(context.Background(), r, Options{}) }()
+	<-adapter.entered
+	second := s.Rollout(context.Background(), r, Options{})
+	close(adapter.proceed)
+	first := <-done
+	if second == nil || first != nil {
+		t.Fatalf("first=%v concurrent=%v", first, second)
+	}
+}
