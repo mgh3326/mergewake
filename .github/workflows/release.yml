@@ -1,4 +1,13 @@
 name: Release
+
+# A v* tag builds the four CGO-disabled release binaries (linux/darwin x
+# amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
+# with GITHUB_TOKEN. A test tag v0.0.0* (e.g. v0.0.0-test.1) runs the same
+# build and checks on the tag but is never published.
+# Pull requests and manual runs build the same assets for a
+# dry-run tag (v0.0.0-dryrun.<run>) and check checksums and `mergewake --version`
+# without publishing anything. Hosts pull published assets themselves; this
+# workflow never reaches a host.
 on:
   push:
     tags: ['v*']
@@ -9,45 +18,97 @@ on:
         description: Publish assets for the selected tag
         type: boolean
         default: false
-permissions:
-  contents: write
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+permissions:
+  contents: read
+
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.27.x'
+          cache: true
       - name: Resolve release tag
         env:
+          EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          tag=v0.0.0
-          if [ "$REF_TYPE" = tag ]; then tag=$REF_NAME; fi
-          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          if [ "$REF_TYPE" = tag ]; then
+            echo "RELEASE_TAG=$REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=v0.0.0-dryrun.$RUN_NUMBER" >> "$GITHUB_ENV"
+          fi
+      - name: Build release assets
+        run: sh scripts/build-release.sh "$RELEASE_TAG" dist/release
+      - name: Verify assets, SHA256SUMS and version output
+        run: |
+          sh scripts/verify-release.sh "$RELEASE_TAG" dist/release
+          cat dist/release/SHA256SUMS
+      - name: Keep assets for publish
+        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
       - run: go vet ./...
       - run: go test -race ./...
-      - name: Cross-build and verify release assets
-        env:
-          CGO_ENABLED: '0'
-        run: |
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath \
-              -ldflags="-s -w -X main.version=$RELEASE_TAG -X main.commit=$GITHUB_SHA" \
-              -o "dist/mergewake-${target%/*}-${target#*/}" ./cmd/mergewake
-          done
-          cd dist
-          sha256sum mergewake-* > SHA256SUMS
-          sha256sum -c SHA256SUMS
-      - name: Publish release assets
-        if: github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+
+  publish:
+    needs: [build, test]
+    if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+      # The checkouts above use github.sha; refuse if the tag was moved since.
+      - name: Check the tag still points at the built commit
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" dist/mergewake-* dist/SHA256SUMS --verify-tag --generate-notes
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "tag $TAG now points at $tagged, but the assets were built from $GITHUB_SHA" >&2
+            exit 1
+          fi
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        # A -suffix tag (v1.2.3-rc.1) is a pre-release: never "Latest", so
+        # hosts that follow the latest release do not pick it up.
+        run: |
+          set --
+          case "$RELEASE_TAG" in *-*) set -- --prerelease ;; esac
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exit 0
+          gh release create "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "$@"
