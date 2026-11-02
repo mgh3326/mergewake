@@ -222,10 +222,10 @@ on a host that also has `ssh`. Each remote host maps to panewire machine
   the node re-reads herdr and closes only an exact match, answering
   `pane-changed` or `pane-gone` otherwise, which become the same receipt
   reasons as the ssh path;
-- no node command reads a pane's screen back or runs `runtug done` yet, so a
-  hub host's composer is `composer-unknown` and its panes are kept, never
-  closed, until panewire adds those commands. Capture and close above are the
-  path they will take.
+- composer checks use identity-checked `pane.read`; only recognized `empty`
+  permits closing, and hub errors or unknown composers keep the pane;
+- after closing a job pane, `job.done` runs the guarded host-local completion
+  command using the report saved by capture.
 
 The hub host's aged-out worktree is removed through node command
 `worktree.remove`, with the inspected PR head, base branch and configured
