@@ -245,6 +245,7 @@ type status struct {
 func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]CI, error) {
 	states := map[string]CI{}
 	ids := map[string]int64{}
+	ran := map[string]bool{}
 	for page := 1; page <= 100; page++ {
 		var runs struct {
 			CheckRuns []checkRun `json:"check_runs"`
@@ -253,6 +254,18 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 			return nil, e
 		}
 		for _, r := range runs.CheckRuns {
+			// Two workflows can define a job with the same name (a CI "test" and a
+			// release "test" that skips on PRs). A skipped or neutral run never
+			// overrides a sibling that actually ran; it only counts when it is the
+			// sole run of that name.
+			idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral")
+			if idle && ran[r.Name] {
+				continue
+			}
+			if !idle && !ran[r.Name] {
+				ran[r.Name] = true
+				ids[r.Name] = 0
+			}
 			if r.ID < ids[r.Name] {
 				continue
 			}
