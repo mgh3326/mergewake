@@ -12,10 +12,11 @@ type call struct {
 	args    []string
 }
 type fakeRunner struct {
-	calls []call
-	fail  bool
-	err   error
-	shown string // overrides the `tasks show` reply
+	calls  []call
+	fail   bool
+	err    error
+	shown  string // overrides the `tasks show` reply
+	upload string // attachment upload reply
 }
 
 func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) ([]byte, error) {
@@ -25,6 +26,9 @@ func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) (
 	}
 	if r.fail {
 		return nil, errors.New("offline")
+	}
+	if len(a) > 1 && a[0] == "attach" && a[1] == "put" {
+		return []byte(r.upload), nil
 	}
 	if len(a) > 1 && a[0] == "tasks" && a[1] == "show" {
 		if r.shown != "" {
@@ -188,6 +192,33 @@ func TestHandoffkeepAttachmentReadsBySHA(t *testing.T) {
 	}
 	if len(r.calls) != 1 {
 		t.Fatal(r.calls)
+	}
+}
+
+func TestHandoffkeepAttachmentUploadValidatesReceipt(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		name, reply string
+		err         error
+		want        string
+	}{
+		{"uploaded", `{"sha256":"` + sha + `","size_bytes":70000}`, nil, sha},
+		{"missing digest", `{}`, nil, ""},
+		{"invalid digest", `{"sha256":"-o"}`, nil, ""},
+		{"malformed reply", `not json`, nil, ""},
+		{"upload failed", "", errors.New("offline"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &fakeRunner{upload: tc.reply, err: tc.err}
+			h := Handoffkeep{Runner: r, Command: "custom-hk"}
+			id, e := h.PutAttachment(context.Background(), "/tmp/brief with spaces.md")
+			if id != tc.want || (e == nil) != (tc.want != "") {
+				t.Fatalf("id=%q error=%v", id, e)
+			}
+			if len(r.calls) != 1 || r.calls[0].command != "custom-hk" || strings.Join(r.calls[0].args, "|") != "attach|put|/tmp/brief with spaces.md" {
+				t.Fatal(r.calls)
+			}
+		})
 	}
 }
 

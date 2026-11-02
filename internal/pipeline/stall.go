@@ -48,7 +48,7 @@ func (s *Service) CheckStalls(ctx context.Context, r config.Repo, prs []github.P
 	next := map[string]time.Time{}
 	var errs []error
 	for _, pr := range prs {
-		if pr.Draft || (pr.Base.Ref != "" && pr.Base.Ref != r.Branch) {
+		if pr.Merged || pr.State == "closed" || pr.Draft || (pr.Base.Ref != "" && pr.Base.Ref != r.Branch) {
 			continue
 		}
 		key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
@@ -81,12 +81,33 @@ func (s *Service) CheckStalls(ctx context.Context, r config.Repo, prs []github.P
 		if claimed {
 			continue
 		}
+		covered, e := s.inheritedStallReview(ctx, r, pr)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("PR %d stall review: %w", pr.Number, e))
+			keep()
+			continue
+		}
+		if covered {
+			continue
+		}
 		if !known {
 			since = now
 		}
 		next[key] = since
 		waited := now.Sub(since)
 		if waited <= window || sent.has(key) {
+			continue
+		}
+		// The poll's open-PR snapshot predates review/land. Recheck before
+		// alarming, bypassing the evidence cache that served that snapshot.
+		fresh, e := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("PR %d stall refresh: %w", pr.Number, e))
+			keep()
+			continue
+		}
+		if fresh.Merged || fresh.State == "closed" || fresh.Draft || fresh.Head.SHA != pr.Head.SHA {
+			delete(next, key)
 			continue
 		}
 		sha := short7(pr.Head.SHA)
@@ -114,4 +135,38 @@ func (s *Service) CheckStalls(ctx context.Context, r config.Repo, prs []github.P
 		errs = append(errs, e)
 	}
 	return errors.Join(errs...)
+}
+
+// Use the same patch-id and policy pass requirements as Review: an inherited
+// verdict needs no new claim and must not start a stall clock.
+func (s *Service) inheritedStallReview(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
+	history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login)
+	if e != nil || len(history) == 0 {
+		return false, e
+	}
+	patch := s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
+	if _, _, ok := inheritedPasses(history, patch, pr.Head.SHA, 1); !ok {
+		return false, nil
+	}
+	head, e := s.GH.Head(ctx, r.Name, r.Branch)
+	if e != nil {
+		return false, e
+	}
+	p, e := s.Policy(ctx, r, head)
+	if e != nil {
+		return false, e
+	}
+	files, e := s.GH.Files(ctx, r.Name, pr.Number)
+	if e != nil {
+		return false, e
+	}
+	if len(files) != pr.ChangedFiles {
+		return false, errors.New("incomplete PR file list")
+	}
+	needed := 1
+	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+		needed = 2
+	}
+	_, _, covered := inheritedPasses(history, patch, pr.Head.SHA, needed)
+	return covered, nil
 }

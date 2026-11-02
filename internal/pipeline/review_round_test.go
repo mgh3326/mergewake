@@ -531,6 +531,7 @@ func TestStalledPRAlarmsOnce(t *testing.T) {
 	}
 	// A new head starts a new clock.
 	prs[0].Head.SHA = shaC
+	g.pull.Head.SHA = shaC
 	poll()
 	c.t = c.t.Add(31 * time.Minute)
 	poll()
@@ -566,6 +567,7 @@ func TestReviewedOrNotReadyPRsDoNotAlarm(t *testing.T) {
 	// CI that has not started keeps the clock stopped.
 	g.ciUp = &started
 	prs = []github.Pull{noCI}
+	g.pull = noCI
 	poll()
 	c.t = c.t.Add(5 * time.Hour)
 	poll()
