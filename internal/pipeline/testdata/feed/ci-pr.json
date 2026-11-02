@@ -1,0 +1,43 @@
+{
+  "embeds": [
+    {
+      "title": "❌ CI failed: example/project#7 Add feature",
+      "url": "https://github.com/example/project/pull/7/checks",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "Author",
+          "value": "pr-author",
+          "inline": true
+        },
+        {
+          "name": "Branch",
+          "value": "`feature/thing` → `main`",
+          "inline": true
+        },
+        {
+          "name": "Changes",
+          "value": "3 files  |  +40 / -2",
+          "inline": false
+        },
+        {
+          "name": "Failed",
+          "value": "`test`, `build`",
+          "inline": true
+        },
+        {
+          "name": "Head",
+          "value": "`aaaaaaa`",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

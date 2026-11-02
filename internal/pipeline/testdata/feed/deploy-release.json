@@ -1,0 +1,33 @@
+{
+  "embeds": [
+    {
+      "title": "🚀 Deploy ok: example/project@bbbbbbb",
+      "url": "https://github.com/example/project/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "color": 5763719,
+      "fields": [
+        {
+          "name": "Source",
+          "value": "release",
+          "inline": true
+        },
+        {
+          "name": "Host",
+          "value": "host-a",
+          "inline": true
+        },
+        {
+          "name": "Status",
+          "value": "published",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

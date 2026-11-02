@@ -40,6 +40,7 @@ Usage: mergewake <command> [flags]
   reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   outcomes   Report or sync the shadow-safe model outcomes ledger
+  notify     Post a deploy from another deployer to the Discord feed (needs discord.enabled)
   status     Read installed receipts and check local drift
   superfan   Print or launch an experimental resident monitor spec
 
@@ -75,6 +76,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	if args[0] == "archive-jobs" {
 		return runArchiveJobs(ctx, args[1:], out, stderr)
+	}
+	if args[0] == "notify" {
+		return runNotify(ctx, args[1:], out, stderr)
 	}
 	command := args[0]
 	switch command {

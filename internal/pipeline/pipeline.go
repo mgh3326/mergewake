@@ -55,6 +55,8 @@ type Service struct {
 	Sink     integrations.Sink
 	Notifier integrations.Notifier
 	Out      io.Writer
+	// Feed posts events to Discord; nil means off. Only the daemon sets it.
+	Feed *Feed
 	// Now is the clock for stamps and age decisions; nil means time.Now.
 	Now func() time.Time
 	// inboxFallbacks counts findings returned through the legacy lane/file
@@ -286,7 +288,12 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if !o.Acting() {
 		return nil
 	}
-	return s.GH.Publish(ctx, m)
+	if e = s.GH.Publish(ctx, m); e != nil {
+		s.feedDeploy(r.Name, sha, "release", "failed", false, e, o)
+		return e
+	}
+	s.feedDeploy(r.Name, sha, "release", "published", true, nil, o)
+	return nil
 }
 
 // Adopt records a hand-started container as the current receipt so the first
@@ -536,6 +543,7 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if installErr != nil {
 		record.Error = installErr.Error()
 	}
+	s.feedDeploy(r.Name, m.Commit, "rollout", result.Status, installErr == nil && result.Status == "success", installErr, o)
 	data, _ := json.Marshal(record)
 	id := fmt.Sprintf("rollout-%s-%d", m.Commit[:8], s.now().UnixNano())
 	reportCtx, cancel := reportContext(ctx)

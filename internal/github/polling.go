@@ -240,6 +240,14 @@ func (c *Client) OpenPulls(ctx context.Context, repo, branch string) ([]Pull, er
 	return list[Pull](ctx, c, route)
 }
 
+// ClosedPulls lists the most recently updated closed PRs against branch: one
+// page, which the Discord feed reads every pass for merges and closures.
+func (c *Client) ClosedPulls(ctx context.Context, repo, branch string) ([]Pull, error) {
+	var out []Pull
+	route := base(repo) + "/pulls?state=closed&sort=updated&direction=desc&per_page=100&base=" + url.QueryEscape(branch)
+	return out, c.json(ctx, "GET", route, nil, &out)
+}
+
 // ReviewClaimed checks durable completion markers. In-flight passes use the
 // expiring ReviewLease instead.
 func (c *Client) ReviewClaimed(ctx context.Context, repo string, number int, sha string) (bool, error) {

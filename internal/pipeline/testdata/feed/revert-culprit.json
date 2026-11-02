@@ -1,0 +1,33 @@
+{
+  "embeds": [
+    {
+      "title": "🎯 Culprit reported: example/project@bbbbbbb",
+      "url": "https://github.com/example/project/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "Head",
+          "value": "`bbbbbbb`",
+          "inline": true
+        },
+        {
+          "name": "Culprit",
+          "value": "`aaaaaaa`",
+          "inline": true
+        },
+        {
+          "name": "PR",
+          "value": "#7",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

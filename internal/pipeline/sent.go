@@ -44,6 +44,12 @@ func (l *sentKeys) add(key string) error {
 	return fsutil.Atomic(l.file, []byte(strings.Join(l.keys, "\n")+"\n"), 0600)
 }
 
+// remove forgets a key, for a claim whose delivery failed.
+func (l *sentKeys) remove(key string) error {
+	l.keys = slices.DeleteFunc(l.keys, func(k string) bool { return k == key })
+	return fsutil.Atomic(l.file, []byte(strings.Join(l.keys, "\n")+"\n"), 0600)
+}
+
 // reportContext bounds a sink or notifier report and lets it finish even when
 // the poll that triggered it is being cancelled.
 func reportContext(ctx context.Context) (context.Context, context.CancelFunc) {

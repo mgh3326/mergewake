@@ -65,10 +65,11 @@ rollout likewise require `--apply`.
 | `policy` | Slash-aware path globs, previous names on renames, change-kind matching. |
 | `github` | Bounded HTTP requests and pagination, CI evidence, PR operations, inverse trees, release assets. |
 | `daemon` | Independent role scheduling, advisory locks, status, backoff and optional triggers. |
-| `pipeline` | Landing, one-pass review, CI diagnosis, release and rollout orchestration. |
+| `pipeline` | Landing, one-pass review, CI diagnosis, release and rollout orchestration, the Discord feed's events, outbox and sender. |
 | `manifest` | Deterministic inventories, SHA256 and size validation, safe relative paths. |
 | `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
+| `discord` | Webhook message types and limits, one post attempt, rate-limit parsing; never exposes a webhook URL. |
 | `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
 | `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |
 | `archive` | Job-dir plan, credential exclusion, verified copy to a synced Drive folder, hk attachments and comment, guarded delete. |

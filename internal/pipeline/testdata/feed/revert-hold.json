@@ -1,0 +1,29 @@
+{
+  "embeds": [
+    {
+      "title": "⏸️ Watch hold: example/project@bbbbbbb",
+      "url": "https://github.com/example/project/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "description": "culprit is not a single identifiable merged PR",
+      "color": 15844367,
+      "fields": [
+        {
+          "name": "Head",
+          "value": "`bbbbbbb`",
+          "inline": true
+        },
+        {
+          "name": "Candidates",
+          "value": "#7, #8",
+          "inline": true
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

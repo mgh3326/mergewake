@@ -1,0 +1,33 @@
+{
+  "embeds": [
+    {
+      "title": "✅ PR merged: example/project#7 Add feature",
+      "url": "https://github.com/example/project/pull/7",
+      "color": 5763719,
+      "fields": [
+        {
+          "name": "Author",
+          "value": "pr-author",
+          "inline": true
+        },
+        {
+          "name": "Branch",
+          "value": "`feature/thing` → `main`",
+          "inline": true
+        },
+        {
+          "name": "Changes",
+          "value": "3 files  |  +40 / -2",
+          "inline": false
+        }
+      ],
+      "footer": {
+        "text": "example/project"
+      },
+      "timestamp": "2026-01-02T03:04:05Z"
+    }
+  ],
+  "allowed_mentions": {
+    "parse": []
+  }
+}

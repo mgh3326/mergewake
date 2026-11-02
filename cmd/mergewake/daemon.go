@@ -103,7 +103,21 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	if len(s.Config.Repos) == 0 {
 		return errors.New("daemon requires configured repositories")
 	}
-	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: slog.New(slog.NewJSONHandler(stderr, nil)), RateWait: gh.RateWait}
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
+	if s.Config.Discord.Enabled {
+		s.Feed = pipeline.NewFeed(s.Config, log)
+		feedCtx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.Feed.Run(feedCtx)
+		}()
+		defer func() {
+			stop()
+			<-done
+		}()
+	}
 	if wc := s.Config.Daemon.Webhook; wc.Enabled {
 		repos := map[string]bool{}
 		for _, r := range s.Config.Repos {
@@ -158,6 +172,8 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		seen[pr.Number] = true
 	}
 	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots)
+	// Before the per-PR work: a review can hold this pass for minutes.
+	s.FeedPRs(ctx, r, prs, o)
 	for _, pr := range prs {
 		observationErr := s.ObservePR(ctx, r, pr, o)
 		childOptions := o
