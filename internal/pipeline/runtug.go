@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ const runtugRefused = 77
 // postReserve is the most of the review deadline kept back from the pane wait
 // for validating and posting its findings.
 const postReserve = time.Minute
+
+// Leave room for runtug's policy preamble below the hub's 64 KiB limit.
+const inlineBriefLimit = 48 << 10
 
 var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
 
@@ -173,6 +177,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
+	if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
+		return skip("publish brief: %v", e)
+	}
 
 	// The pane wait leaves time to validate and post the findings: a minute,
 	// or a quarter of what is left when that is shorter.
@@ -265,6 +272,31 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	return out, nil
+}
+
+// spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
+// A local path alone would strand reviewers placed on a different host.
+func (x *runtugExecutor) spawnBrief(ctx context.Context, path, jobDir string) (string, error) {
+	body, e := os.ReadFile(path)
+	if e != nil || len(body) <= inlineBriefLimit {
+		return path, e
+	}
+	files, ok := x.s.Sink.(interface {
+		PutAttachment(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", errors.New("task sink cannot publish a large review brief")
+	}
+	id, e := files.PutAttachment(ctx, path)
+	if e != nil {
+		return "", e
+	}
+	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
+		return "", errors.New("uploaded review brief sha256 mismatch")
+	}
+	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `handoffkeep attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal. The local source copy is %s.\n", id, len(body), id, path)
+	pointer := filepath.Join(jobDir, "review-prompt.md")
+	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
 }
 
 // errJobRecords means the configured sink cannot read hk job records at all

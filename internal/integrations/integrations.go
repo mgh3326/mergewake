@@ -319,6 +319,24 @@ func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error)
 	return h.Runner.Run(ctx, h.Command, []string{"attach", "get", sha}, "", "")
 }
 
+// PutAttachment publishes a file for a reviewer on any host.
+func (h Handoffkeep) PutAttachment(ctx context.Context, path string) (string, error) {
+	out, e := h.Runner.Run(ctx, h.Command, []string{"attach", "put", path}, "", "")
+	if e != nil {
+		return "", e
+	}
+	var uploaded struct {
+		SHA string `json:"sha256"`
+	}
+	if e = json.Unmarshal(out, &uploaded); e != nil {
+		return "", e
+	}
+	if !attachmentID.MatchString(uploaded.SHA) {
+		return "", errors.New("attachment upload returned an invalid sha256")
+	}
+	return uploaded.SHA, nil
+}
+
 var attachmentID = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {

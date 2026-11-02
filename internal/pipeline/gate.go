@@ -333,11 +333,11 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 
 var (
 	// fixReply opens with a fix.
-	fixReply = regexp.MustCompile(`(?is)^\W*fix(?:ed|es)?\b`)
+	fixReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?fix(?:ed|es)?\b`)
 	// commitToken is a commit SHA, abbreviated or full, named in a reply.
 	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
-	dismissReply = regexp.MustCompile(`(?is)^\W*dismiss(?:ed|al)?\b\W*\w`)
+	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
 )
 
 // fixCheck reports whether sha, named in a fix reply, is a real fix for a

@@ -116,6 +116,7 @@ func TestFindingsRoundIsOneAuthorLaneEvent(t *testing.T) {
 		"[mergewake] FINDINGS example/project#7 head=aaaaaaa", "2 finding(s) for lane w-7",
 		"1) high [blocks merge] tool:9 https://github.example/pr/7#discussion_T2", "2) medium tool:3 https://github.example/pr/7#discussion_T1",
 		"fix every critical/high/Major", "panewire inbox ack",
+		"Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", "Disposition: defer <hk task>", "defer only for nonblocking findings",
 	} {
 		if !strings.Contains(e.Text, want) {
 			t.Fatalf("missing %q in %q", want, e.Text)

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,13 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "runtug":
 		r.spawns = append(r.spawns, args)
+		brief, e := os.ReadFile(arg(args, "-p"))
+		if e != nil {
+			return nil, e
+		}
+		if len(brief) > 64<<10 {
+			return nil, errors.New("brief for hub spawn must be valid UTF-8 of at most 65536 bytes")
+		}
 		role := args[slices.Index(args, "--role")+1]
 		if code, ok := r.refuse[role]; ok {
 			if r.refuseStderr != "" {
@@ -140,6 +148,21 @@ type taskJobSink struct {
 	missing    *integrations.JobRecord           // record for any unlisted id
 	jobErr     error
 	gets       []string
+	uploadErr  error
+}
+
+func (s *taskJobSink) PutAttachment(_ context.Context, path string) (string, error) {
+	if s.uploadErr != nil {
+		return "", s.uploadErr
+	}
+	body, e := os.ReadFile(path)
+	if e != nil {
+		return "", e
+	}
+	sum := sha256.Sum256(body)
+	id := hex.EncodeToString(sum[:])
+	s.files[id] = body
+	return id, nil
 }
 
 func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
@@ -248,6 +271,53 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	diff, _ := g.Diff(context.Background(), "", 0)
 	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRuntugLargeDeltaBriefCompletesBothPasses(t *testing.T) {
+	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	g.blocking = true
+	large := "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+" + strings.Repeat("large delta 한글 ", 6000) + "\n"
+	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}
+	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(runner.spawns) != 2 || runner.headless != 0 || g.postCount != 2 || !g.refs[doneRef(7, shaA)] {
+		t.Fatalf("spawns=%d headless=%d posts=%d done=%v", len(runner.spawns), runner.headless, g.postCount, g.refs)
+	}
+	for _, sp := range runner.spawns {
+		prompt, e := os.ReadFile(arg(sp, "-p"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		job := filepath.Dir(arg(sp, "-p"))
+		body, e := os.ReadFile(filepath.Join(job, "review-brief.md"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		id := fmt.Sprintf("%x", sha256.Sum256(body))
+		if len(body) <= 64<<10 || len(prompt) > 2048 || !strings.Contains(string(prompt), "handoffkeep attach get "+id) || !bytes.Equal(runner.sink.files[id], body) {
+			t.Fatalf("brief=%d prompt=%d attachment preserved=%v", len(body), len(prompt), bytes.Equal(runner.sink.files[id], body))
+		}
+		for _, want := range []string{"review round 2", "## Delta to review", strings.TrimSpace(large), "runtug done " + arg(sp, "-l")} {
+			if !strings.Contains(string(body), want) {
+				t.Fatalf("complete brief lost %q", want[:min(len(want), 80)])
+			}
+		}
+	}
+}
+
+func TestRuntugLargeBriefUploadFailureIsExplicit(t *testing.T) {
+	runner := &runtugRunner{family: "openai"}
+	s, g, r := runtugSetup(t, runner)
+	runner.sink.uploadErr = errors.New("attachment service unavailable")
+	x := &runtugExecutor{s: s, repo: r, pr: g.pull, context: strings.Repeat("context ", 10000)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (bool, error) { return true, nil })
+	if e != nil || len(runner.spawns) != 0 || len(out.skips) != 1 || !strings.Contains(out.skips[0].Reason, "publish brief: attachment service unavailable") {
+		t.Fatalf("spawns=%d outcome=%+v error=%v", len(runner.spawns), out, e)
 	}
 }
 
