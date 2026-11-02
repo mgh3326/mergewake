@@ -273,7 +273,11 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if e != nil {
 		return e
 	}
-	ci, e := s.GH.Check(ctx, r.Name, sha, p.RequiredChecks)
+	checks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		checks = p.WatchChecks
+	}
+	ci, e := s.GH.Check(ctx, r.Name, sha, checks)
 	if e != nil {
 		return e
 	}
@@ -393,7 +397,11 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if e != nil {
 		return e
 	}
-	ci, e := s.GH.Check(ctx, r.Name, m.Commit, p.RequiredChecks)
+	checks := p.RequiredChecks
+	if len(p.WatchChecks) > 0 {
+		checks = p.WatchChecks
+	}
+	ci, e := s.GH.Check(ctx, r.Name, m.Commit, checks)
 	if e != nil {
 		return e
 	}

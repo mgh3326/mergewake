@@ -12,6 +12,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -135,5 +136,38 @@ func TestSameCommitDigestAndEnvDriftNeedsApproval(t *testing.T) {
 	}
 	if d.containers[spec.Name] != spec.Image+"@"+old || len(sink.questions) == 0 {
 		t.Fatalf("unapproved replacement=%q questions=%v", d.containers[spec.Name], sink.questions)
+	}
+}
+
+type deployCheckGH struct {
+	*fakeGH
+	names []string
+}
+
+func (g *deployCheckGH) Check(_ context.Context, _, _ string, names []string) (github.CI, error) {
+	g.names = names
+	return github.Red, nil
+}
+func TestRolloutUsesMainChecks(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.policyExtra = "watch_checks: [main-full-suite]\n"
+	adapter := &deployCheckGH{fakeGH: g}
+	s.GH = adapter
+	r.Root = t.TempDir()
+	r.Smoke.Command = "smoke"
+	r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}
+	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	if e = s.Rollout(context.Background(), r, Options{}); e == nil {
+		t.Fatal("red release CI admitted")
+	}
+	if len(adapter.names) != 1 || adapter.names[0] != "main-full-suite" {
+		t.Fatalf("checks=%v", adapter.names)
+	}
+	if _, e = os.Stat(filepath.Join(r.Root, "bin/tool")); !os.IsNotExist(e) {
+		t.Fatal("red CI mutated target")
 	}
 }

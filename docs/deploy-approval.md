@@ -56,3 +56,8 @@ installation. A `current` result cannot attest changed or legacy unrecorded
 configuration: operator bootstrap is required. It never reads env-file contents.
 For long path lists, the complete evidence is written to a content-addressed hk
 document referenced by the question, preserving hk's notification size limit.
+
+For repositories with different PR and main check names, release/rollout use
+`watch_checks` when present, otherwise `required_checks`. This preserves full
+main/exact-release CI requirements for applications whose PR gate is selective.
+Approval never overrides a failing release CI check.
