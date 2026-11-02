@@ -53,6 +53,9 @@ type Daemon struct {
 	// Webhook, when set, is the GitHub delivery receiver served next to the
 	// loops; it shuts down with the daemon context. nil means off.
 	Webhook *Webhook
+	// WakeGap is the shortest time from the end of a pass to a pass a Trigger
+	// wakes. A wake also never cuts short a rate-limit wait.
+	WakeGap time.Duration
 	mu      sync.Mutex
 	wake    map[string]chan struct{}
 	failed  map[string]int
@@ -231,18 +234,52 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		if ctx.Err() != nil {
 			break
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-		case <-timer.C:
-		case <-ch:
-			timer.Stop()
-		}
+		d.wait(ctx, ch, delay, st.LastFinish)
 	}
 	st.Running = false
 	st.NextRun = time.Time{}
 	return save()
+}
+
+// wait sleeps until the scheduled poll, or earlier when a wake arrives. A woken
+// pass starts no sooner than WakeGap after lastFinish and never inside a
+// rate-limit wait, read again at each wake because another role may have moved
+// it. A wake never pushes the scheduled poll later. Cancellation returns at
+// once; the caller's loop condition then stops.
+func (d *Daemon) wait(ctx context.Context, ch <-chan struct{}, delay time.Duration, lastFinish time.Time) {
+	due := d.now().Add(delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-ch:
+			now := d.now()
+			at := lastFinish.Add(d.WakeGap)
+			if d.RateWait != nil {
+				if r := now.Add(d.RateWait()); r.After(at) {
+					at = r
+				}
+			}
+			if at.Before(now) {
+				at = now
+			}
+			if !at.Before(due) {
+				continue
+			}
+			due = at
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(at.Sub(now))
+		}
+	}
 }
 
 func ReadStatus(state string, out io.Writer) error {

@@ -138,6 +138,11 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			return errors.New("daemon.webhook.secret_env is unset or empty")
 		}
 		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence}
+		gap, err := config.Duration(wc.MinGap)
+		if err != nil {
+			return err
+		}
+		d.WakeGap = gap
 	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
