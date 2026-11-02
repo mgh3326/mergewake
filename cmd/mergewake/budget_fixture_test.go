@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -120,5 +122,13 @@ func TestBudgetPassFixture(t *testing.T) {
 		if err := s.Watch(context.Background(), repo, opts); err != nil {
 			t.Fatalf("dry-run watch %s: %v", repo.Name, err)
 		}
+	}
+	// The fixture returns an existing review ref but no review receipts. A real
+	// acting poll must still attempt review and persist the failure for retry.
+	if err := pollPRs(context.Background(), s, gh, repos[0], pipeline.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "o/one", "review-retry-1.json")); err != nil {
+		t.Fatalf("poll did not schedule review: %v", err)
 	}
 }

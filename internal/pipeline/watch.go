@@ -305,7 +305,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if reopen != nil {
 		note += "; task reopen failed (recovery comment retained): " + reopen.Error()
 	}
-	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Text: note}))
+	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Type: "culprit-hold", Text: note}))
 }
 
 // reportWatch audits a held or reported watch outcome once per head and key,
@@ -334,7 +334,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		note += ": " + result.Reason
 	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Text: note}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note}))
 	if e != nil {
 		return e
 	}

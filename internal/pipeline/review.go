@@ -147,41 +147,6 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if pr.State != "open" || pr.Draft {
 		return errors.New("review requires an open, ready PR")
 	}
-	familySource := "flag"
-	if family == "" {
-		m := familyTrailer.FindStringSubmatch(pr.Body)
-		if len(m) == 2 {
-			family, familySource = m[1], "trailer"
-		}
-	}
-	author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
-	if len(author) == 2 {
-		if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
-			if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
-				return errors.New("author family conflicts with configured profile")
-			}
-			family, familySource = profile.Family, "profile"
-		}
-	}
-	if family == "" {
-		inferred, e := s.inferAuthorFamily(ctx, r, pr.Head.SHA)
-		if e != nil {
-			return e
-		}
-		if inferred != "" {
-			family, familySource = inferred, "commit"
-		}
-	}
-	if family == "" && s.Config.Review.DefaultFamily != "" {
-		family, familySource = s.Config.Review.DefaultFamily, "default"
-	}
-	if family == "" {
-		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
-	}
-	family = config.CanonicalFamily(family)
-	if family == "" {
-		return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
-	}
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
@@ -228,6 +193,44 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return s.Print(map[string]any{"action": "inherited-review", "head": pr.Head.SHA, "inherited_from": from, "patch_id": patch, "needed": needed})
 		}
 	}
+	familySource := "flag"
+	// A completed head needs no author identity; missing passes do.
+	if _, complete := distinctPasses(receipts, needed); !complete {
+		if family == "" {
+			m := familyTrailer.FindStringSubmatch(pr.Body)
+			if len(m) == 2 {
+				family, familySource = m[1], "trailer"
+			}
+		}
+		author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
+		if len(author) == 2 {
+			if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
+				if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
+					return errors.New("author family conflicts with configured profile")
+				}
+				family, familySource = profile.Family, "profile"
+			}
+		}
+		if family == "" {
+			inferred, e := s.inferAuthorFamily(ctx, r, pr.Head.SHA)
+			if e != nil {
+				return e
+			}
+			if inferred != "" {
+				family, familySource = inferred, "commit"
+			}
+		}
+		if family == "" && s.Config.Review.DefaultFamily != "" {
+			family, familySource = s.Config.Review.DefaultFamily, "default"
+		}
+		if family == "" {
+			return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+		}
+		family = config.CanonicalFamily(family)
+		if family == "" {
+			return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+		}
+	}
 	posted := map[int]github.PassReceipt{}
 	for _, receipt := range receipts {
 		posted[receipt.Pass] = receipt
@@ -255,8 +258,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		action := "review-pending"
 		if len(pending) == 0 {
 			action = "already-reviewed"
-			if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
-				return e
+			if o.Acting() {
+				if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
+					return e
+				}
 			}
 		}
 		return s.Print(map[string]any{"action": action, "head": pr.Head.SHA, "passes": len(posted), "needed": needed})

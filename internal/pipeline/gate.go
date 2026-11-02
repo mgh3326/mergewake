@@ -139,7 +139,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		gate = *p.ReviewGate
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
-	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified)
+	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -147,7 +147,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified)
+		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
 		}
@@ -262,14 +262,14 @@ func postedOn(c github.ReviewComment) string {
 // except for unreadable review.login evidence. Outdated findings clear as
 // ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
 // unresolved threads with no comment to grade, count as blocking findings.
-func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck) (blocking, triage int) {
-	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify)
+func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int) {
+	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify, fleet...)
 	return blocking, triage
 }
 
 // gradeThreadsDetailed is gradeThreads together with how every graded thread
 // stands, for the review record.
-func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck) (blocking, triage int, d dispositions) {
+func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions) {
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
 	for _, t := range fb.Threads {
@@ -299,7 +299,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 		}
 		switch grade {
 		case policy.GradeBlock:
-			switch kind := blockDisposition(t, f.OwnReview, verify); {
+			switch kind := blockDisposition(t, f.OwnReview, verify, fleet...); {
 			case f.Resolved:
 				d.Resolved++
 			case kind != "":
@@ -318,7 +318,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			switch {
 			case f.Resolved:
 				d.Resolved++
-			case answered(t, f.OwnReview):
+			case answered(t, f.OwnReview, fleet...):
 				d.Answered++
 			case !fastLane || unreadable:
 				triage++
@@ -352,12 +352,12 @@ type fixCheck func(sha, posted string) bool
 // finding — leaves the finding blocking. The latest answer decides: a later
 // reply that is not a disposition (say, "that fix is wrong") supersedes an
 // earlier fix.
-func blockDisposition(t github.ReviewThread, ownReview bool, verify fixCheck) string {
+func blockDisposition(t github.ReviewThread, ownReview bool, verify fixCheck, fleet ...[]string) string {
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
 	posted := postedOn(t.Comments[0])
 	for i := len(t.Comments) - 1; i > 0; i-- {
 		c := t.Comments[i]
-		if !answeredBy(c, author, ownReview) {
+		if !answeredBy(c, author, ownReview, fleet...) {
 			continue
 		}
 		switch {
@@ -438,10 +438,10 @@ func (v *fixVerifierState) check(sha, posted string) (bool, error) {
 // operator's account, so for an own-review finding a reply from that same
 // login also counts when the reply is not itself a mergewake finding (it
 // carries no severity marker).
-func answered(t github.ReviewThread, ownReview bool) bool {
+func answered(t github.ReviewThread, ownReview bool, fleet ...[]string) bool {
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
 	for _, c := range t.Comments[1:] {
-		if answeredBy(c, author, ownReview) {
+		if answeredBy(c, author, ownReview, fleet...) {
 			return true
 		}
 	}
@@ -450,9 +450,19 @@ func answered(t github.ReviewThread, ownReview bool) bool {
 
 // answeredBy reports whether reply c, on a finding by author, is a human
 // answer under the rules of answered.
-func answeredBy(c github.ReviewComment, author string, ownReview bool) bool {
+func answeredBy(c github.ReviewComment, author string, ownReview bool, fleet ...[]string) bool {
 	who := policy.NormalizeAuthor(c.Author)
-	if who == "" || c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
+	if who == "" || strings.Contains(c.Body, "<!-- mergewake-severity:") {
+		return false
+	}
+	for _, authors := range fleet {
+		for _, login := range authors {
+			if who == policy.NormalizeAuthor(login) && (who != author || ownReview) {
+				return true
+			}
+		}
+	}
+	if c.AuthorType == "Bot" || strings.HasSuffix(c.Author, "[bot]") {
 		return false
 	}
 	return who != author || (ownReview && !strings.Contains(c.Body, "<!-- mergewake-severity:"))
