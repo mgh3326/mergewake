@@ -6,8 +6,11 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/manifest"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -139,5 +142,39 @@ func TestRolloutWindowCaseInsensitivePeers(t *testing.T) {
 		if got := (config.Repo{Name: repo, RolloutGroup: "other"}).RolloutWindowGroup(); got != "control-plane" {
 			t.Fatalf("%s bypassed reserved group: %q", repo, got)
 		}
+	}
+}
+
+func TestAdoptCurrentContainerEstablishesReviewedInventory(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer server.Close()
+	digest := "sha256:" + strings.Repeat("b", 64)
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", Health: &config.Health{URL: server.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	r.Install = []config.Install{spec}
+	r.Root = ""
+	r.Smoke = config.Command{}
+	r.RolloutGroup = "control-plane"
+	pinned := spec
+	pinned.Digest = digest
+	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	g.m = m
+	runtime := newDockerCLI()
+	ref := spec.Image + "@" + digest
+	runtime.containers[spec.Name] = ref
+	runtime.running[spec.Name] = true
+	runtime.add(ref)
+	s.Runner = runtime
+	if e = s.Rollout(context.Background(), r, Options{Adopt: "api"}); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
+		t.Fatalf("approved already-current adoption could not bootstrap: %v", e)
+	}
+	if _, e = os.Stat(filepath.Join(s.Config.StateDir, "rollout-windows/control-plane/active.json")); !os.IsNotExist(e) {
+		t.Fatal("healthy adoption retained availability window")
 	}
 }

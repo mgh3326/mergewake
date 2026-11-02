@@ -106,3 +106,11 @@ A recovered current container receives an explicit health check before releasing
 the window. Never delete active.json merely to unblock the other service; first
 recover the named service and verify its readiness. If rollback fails, keep the
 other service running and escalate to the desk.
+
+An explicit `--adopt --apply` also records the operator-reviewed inventory
+identity after comparing the configured recipe with the running service. It does
+not invent source ancestry: the first managed range still requires a human hk
+answer. This lets an already-current image establish a healthy receipt without
+pretending an automatic no-op attested a changed recipe. Dry-run adoption writes
+neither receipt nor identity. The environment-content follow-up (#66) must land
+before host enablement.

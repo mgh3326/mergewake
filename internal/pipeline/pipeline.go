@@ -324,6 +324,12 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 	if !o.Acting() {
 		return errors.Join(e, s.Print(result))
 	}
+	// --adopt --apply is the operator's attestation of the configured host
+	// recipe. Source ancestry remains unknown until the first approved rollout.
+	if e == nil && result.Status == "adopted" {
+		e = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), s.deploymentIdentity(r, manifest.Manifest{Repo: r.Name}, Options{}))
+	}
+
 	record := struct {
 		Host, Repo string
 		Result     rollout.Result
