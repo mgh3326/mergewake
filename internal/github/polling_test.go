@@ -502,6 +502,7 @@ func TestGraphQLPostIsNotReplayedAfterMutation(t *testing.T) {
 		if r.URL.Path == "/graphql" {
 			calls++
 			w.Header().Set("ETag", `"same"`)
+			w.Header().Set("X-Poll-Interval", "3600")
 			fmt.Fprintf(w, `{"version":%d}`, calls)
 			return
 		}
@@ -519,7 +520,9 @@ func TestGraphQLPostIsNotReplayedAfterMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		b, err := c.request(ctx, "POST", "/graphql", "application/json", []byte(`{}`))
+		queryCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		b, err := c.request(queryCtx, "POST", "/graphql", "application/json", []byte(`{}`))
+		cancel()
 		if err != nil || string(b) != fmt.Sprintf(`{"version":%d}`, i) {
 			t.Fatalf("query %d returned %s, %v", i, b, err)
 		}
@@ -535,6 +538,10 @@ func TestRouteTemplateKeepsEmbeddedHexAndLabelsNumbers(t *testing.T) {
 		{"/repos/o/r/git/ref/heads/foo" + sha + "bar", "/repos/o/r/git/ref/heads/foo" + sha + "bar"},
 		{"/repos/o/r/issues/" + strings.Repeat("7", 40), "/repos/o/r/issues/{number}"},
 		{"/repos/o/r/compare/" + sha + "..." + strings.Repeat("b", 40), "/repos/o/r/compare/{sha}...{sha}"},
+		{"/repos/o/r/compare/main..." + sha, "/repos/o/r/compare/{ref}...{sha}"},
+		{"/repos/o/r/compare/release%2F1.2..." + sha, "/repos/o/r/compare/{ref}...{sha}"},
+		{"/repos/o/r/commits/mergewake-" + sha, "/repos/o/r/commits/mergewake-{sha}"},
+		{"/repos/o/r/git/ref/heads/mergewake-" + sha, "/repos/o/r/git/ref/heads/mergewake-" + sha},
 		{"/repos/o/r/git/ref/heads/mergewake/reviews/7/" + sha + "-done", "/repos/o/r/git/ref/heads/mergewake/reviews/{number}/{sha}-done"},
 	} {
 		if got := routeTemplate(tt.route); got != tt.want {

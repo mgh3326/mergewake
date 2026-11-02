@@ -35,7 +35,6 @@ func CountRequests(ctx context.Context, role string) (context.Context, *RequestC
 
 var numericSegment = regexp.MustCompile(`^[0-9]+$`)
 var shaSegment = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}$`)
-var shaComparison = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}\.\.\.[0-9a-f]{40,64}$`)
 var doneMarker = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}-done$`)
 
 func routeTemplate(route string) string {
@@ -43,15 +42,26 @@ func routeTemplate(route string) string {
 	if err != nil {
 		return "<invalid>"
 	}
-	parts := strings.Split(u.Path, "/")
+	parts := strings.Split(u.EscapedPath(), "/")
 	for i, part := range parts {
 		switch {
 		case numericSegment.MatchString(part):
 			parts[i] = "{number}"
 		case shaSegment.MatchString(part):
 			parts[i] = "{sha}"
-		case i > 0 && parts[i-1] == "compare" && shaComparison.MatchString(part):
-			parts[i] = "{sha}...{sha}"
+		case i > 0 && parts[i-1] == "compare":
+			left, right, ok := strings.Cut(part, "...")
+			if ok && left != "" && right != "" {
+				template := func(ref string) string {
+					if shaSegment.MatchString(ref) {
+						return "{sha}"
+					}
+					return "{ref}"
+				}
+				parts[i] = template(left) + "..." + template(right)
+			}
+		case i > 0 && parts[i-1] == "commits" && strings.HasPrefix(part, "mergewake-") && shaSegment.MatchString(strings.TrimPrefix(part, "mergewake-")):
+			parts[i] = "mergewake-{sha}"
 		case i > 1 && parts[i-2] == "reviews" && doneMarker.MatchString(part):
 			parts[i] = "{sha}-done"
 		}
