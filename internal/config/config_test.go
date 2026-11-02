@@ -702,3 +702,33 @@ func TestDiscordConfigRefusals(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestReviewRetryConfig(t *testing.T) {
+	for _, tc := range []struct {
+		yaml             string
+		invalid          bool
+		initial, maximum time.Duration
+		failures         int
+	}{
+		{"", false, time.Minute, 30 * time.Minute, 3},
+		{"initial: 2m, maximum: 8m, failures: 4", false, 2 * time.Minute, 8 * time.Minute, 4},
+		{"initial: 0s", true, 0, 0, 0},
+		{"initial: 2h, maximum: 1h", true, 0, 0, 0},
+		{"failures: -1", true, 0, 0, 0},
+	} {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\ndaemon:\n  pr:\n    review_retry: {"+tc.yaml+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(p)
+		if (err != nil) != tc.invalid {
+			t.Fatalf("%q: %v", tc.yaml, err)
+		}
+		if err == nil {
+			a, b, k := c.Daemon.PR.ReviewRetry.Settings()
+			if a != tc.initial || b != tc.maximum || k != tc.failures {
+				t.Fatalf("%q: %v %v %d", tc.yaml, a, b, k)
+			}
+		}
+	}
+}
