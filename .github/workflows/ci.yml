@@ -51,3 +51,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/test-auto-tag.py
+      - run: python3 scripts/test-repair-release.py

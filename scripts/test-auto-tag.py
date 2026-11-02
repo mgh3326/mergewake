@@ -47,6 +47,7 @@ class AutoTagTests(unittest.TestCase):
                 with patch.dict(os.environ, {'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_SHA': sha, 'BEFORE_SHA': '0' * 40}), patch.object(auto, 'run', run):
                     auto.main(); auto.main()
                     self.assertEqual(git('tag', '--list'), 'v0.0.1')
+                    self.assertIn('refs/tags/v0.0.1', git('ls-remote', 'origin', 'refs/tags/v0.0.1'))
                     self.assertEqual(calls, [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.1', '-f', 'publish=true')] * 2)
                     Path('README.md').write_text('docs')
                     git('add', '.'); git('commit', '-m', 'docs')
@@ -54,8 +55,30 @@ class AutoTagTests(unittest.TestCase):
                     os.environ['GITHUB_SHA'] = git('rev-parse', 'HEAD')
                     auto.main()
                     self.assertEqual(len(calls), 2)
+                    self.assertEqual(git('tag', '--list'), 'v0.0.1')
             finally:
                 os.chdir(old)
+
+    def test_concurrent_reservation_retries_without_force(self):
+        sha = 'a' * 40
+        calls = []
+        collided = False
+        def run(*args):
+            nonlocal collided
+            calls.append(args)
+            if args == ('git', 'rev-parse', 'HEAD'): return sha
+            if args[:3] == ('git', 'tag', '--list'): return 'v0.0.1' if collided else ''
+            if args[:3] == ('git', 'rev-list', '-n'): return 'b' * 40
+            if args[:3] == ('git', 'push', 'origin') and args[-1] == 'refs/tags/v0.0.1':
+                collided = True
+                raise subprocess.CalledProcessError(1, args)
+            return ''
+        with patch.dict(os.environ, {'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_SHA': sha, 'BEFORE_SHA': '0' * 40}), patch.object(auto, 'run', run):
+            auto.main()
+        self.assertIn(('git', 'tag', '--delete', 'v0.0.1'), calls)
+        self.assertIn(('git', 'push', 'origin', 'refs/tags/v0.0.2'), calls)
+        self.assertIn(('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.2', '-f', 'publish=true'), calls)
+        self.assertFalse(any('--force' in c for c in calls))
 
 
 if __name__ == '__main__':

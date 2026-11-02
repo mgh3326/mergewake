@@ -6,7 +6,7 @@ permissions:
   contents: write
   actions: write
 concurrency:
-  group: auto-tag
+  group: auto-tag-${{ github.sha }}
   cancel-in-progress: false
 jobs:
   tag:
