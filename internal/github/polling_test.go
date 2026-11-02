@@ -496,16 +496,16 @@ func TestCommentInvalidatesItsPullAndList(t *testing.T) {
 	}
 }
 
-func TestGraphQLMutationClearsPollWindow(t *testing.T) {
+func TestGraphQLPostIsNotReplayedAfterMutation(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/graphql" {
 			calls++
-			w.Header().Set("X-Poll-Interval", "3600")
-			fmt.Fprintf(w, "{%q:%d}", "version", calls)
+			w.Header().Set("ETag", `"same"`)
+			fmt.Fprintf(w, `{"version":%d}`, calls)
 			return
 		}
-		_, _ = w.Write([]byte("{}"))
+		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
 	c := New("")
@@ -513,18 +513,19 @@ func TestGraphQLMutationClearsPollWindow(t *testing.T) {
 	c.Polling = true
 	c.Stderr = io.Discard
 	ctx := context.Background()
-	first, err := c.request(ctx, "POST", "/graphql", "application/json", []byte("{}"))
-	if err != nil || string(first) != "{\"version\":1}" {
-		t.Fatalf("first query: %s, %v", first, err)
+	for i := 1; i <= 2; i++ {
+		if i == 2 {
+			if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b, err := c.request(ctx, "POST", "/graphql", "application/json", []byte(`{}`))
+		if err != nil || string(b) != fmt.Sprintf(`{"version":%d}`, i) {
+			t.Fatalf("query %d returned %s, %v", i, b, err)
+		}
 	}
-	if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte("{}")); err != nil {
-		t.Fatal(err)
-	}
-	limited, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	second, err := c.request(limited, "POST", "/graphql", "application/json", []byte("{}"))
-	if err != nil || string(second) != "{\"version\":2}" || calls != 2 {
-		t.Fatalf("query after mutation: %s, %v, calls=%d", second, err, calls)
+	if calls != 2 {
+		t.Fatalf("GraphQL server requests = %d, want 2", calls)
 	}
 }
 

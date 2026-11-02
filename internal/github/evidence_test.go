@@ -171,7 +171,7 @@ func TestEvidenceExpiresDespitePollWindow(t *testing.T) {
 }
 
 func TestMutationInvalidatesRepositoryEvidence(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{}")) }))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
 	defer server.Close()
 	c := New("")
 	c.BaseURL = server.URL
@@ -188,7 +188,7 @@ func TestMutationInvalidatesRepositoryEvidence(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("reads before mutation = %d", calls)
 	}
-	if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte("{}")); err != nil {
+	if _, err := c.request(ctx, "POST", "/repos/o/r/issues/1/comments", "application/json", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
 	if value, err := cachedEvidence(ctx, c, key, read); err != nil || value != 2 {
