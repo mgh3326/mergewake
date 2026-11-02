@@ -271,8 +271,12 @@ func (f *Feed) drain(ctx context.Context) time.Duration {
 			return 0
 		}
 		url := urls[feedChannel(ent.Kind)]
-		if url == "" || f.Config.OptedOut(ent.Repo) {
-			f.finish(ent, "")
+		if url == "" {
+			f.finish(ent, "channel unconfigured")
+			continue
+		}
+		if f.Config.OptedOut(ent.Repo) {
+			f.finish(ent, "repo opted out")
 			continue
 		}
 		if at := f.notBefore[url]; at.After(time.Now()) {

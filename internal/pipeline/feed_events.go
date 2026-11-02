@@ -220,7 +220,7 @@ func (s *Service) feedBranchCI(ctx context.Context, r config.Repo, head string, 
 		return
 	}
 	failed, e := s.failedChecks(ctx, r.Name, head, checks)
-	if e == nil {
+	if e == nil && len(failed) > 0 {
 		var c github.Commit
 		if c, e = s.GH.Commit(ctx, r.Name, head); e == nil {
 			e = s.Feed.Emit(feedEvent{Repo: r.Name, Head: head, Kind: "ci", Message: branchCheckMessage(r, c, head, failed, s.now())})
