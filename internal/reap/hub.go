@@ -373,7 +373,7 @@ func (h HubHost) Composer(ctx context.Context, pane Pane) (string, error) {
 	}
 }
 
-// JobDone invokes runtug on the job's host. The node confines report access to
+// JobDone invokes panewire on the job's host. The node confines report access to
 // the two paths pane.capture can return and deduplicates completed reports.
 func (h HubHost) JobDone(ctx context.Context, job, report string) error {
 	if !ValidJobName(job) {

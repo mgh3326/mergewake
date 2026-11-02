@@ -205,13 +205,13 @@ rules, and how to point the three channels.
 
 With `reap.enabled`, the `reap` role closes the panes of merged work and
 cleans its worktrees. A merged PR carrying `Mergewake-Task` is reaped through
-its job — `Mergewake-Task` → hk task → bound job → the pane runtug recorded
+its job — `Mergewake-Task` → hk task → bound job → the pane panewire recorded
 (host and label) — so a lead is found wherever it was launched, even in
 another repo's worktree. The lead closes only when the whole job is finished:
 no open PR in any configured repo carries the task, the pane is `idle` or
 `done`, its job dir exists, and its composer is empty. Its last screen is
 saved to `<job dir>/pane-screen.txt` (or a fresh `report.md` is kept), the
-pane closes, and mergewake runs `runtug done <job>`, so nobody has to tell the
+pane closes, and mergewake runs `panewire done <job>`, so nobody has to tell the
 lead to finish. Protected labels, panes the operator has focused or that the
 job record does not name, panes without a job dir and panes with unsent
 composer text are never closed. A PR without the trailer keeps the worktree

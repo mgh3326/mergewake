@@ -52,21 +52,21 @@ type Review struct {
 	// recommendation order without reading usage.
 	Select string `yaml:"select"`
 	// Executor runs each pass: "headless" (default) invokes a profile's CLI on
-	// the diff here; "runtug" spawns a reviewer pane through runtug in a
+	// the diff here; "panewire" spawns a reviewer pane through panewire in a
 	// checkout of the PR head and keeps headless as the fallback.
-	Executor string       `yaml:"executor"`
-	Runtug   RuntugReview `yaml:"runtug"`
+	Executor string         `yaml:"executor"`
+	Panewire PanewireReview `yaml:"panewire"`
 	// BudgetRounds is the number of review rounds a PR gets before later rounds
 	// report only critical and high findings. 0 means 3; a negative value turns
 	// the budget off.
 	BudgetRounds int `yaml:"budget_rounds"`
 }
 
-// RuntugReview configures the runtug review executor. A reviewer pane uploads
+// PanewireReview configures the panewire review executor. A reviewer pane uploads
 // its findings to handoffkeep and announces the attachment on Lane, so it may
-// run on any host; a pane on this host also leaves them in Jobs, runtug's job
+// run on any host; a pane on this host also leaves them in Jobs, panewire's job
 // inbox here, which is read when no announcement arrives.
-type RuntugReview struct {
+type PanewireReview struct {
 	Command   string `yaml:"command"`
 	Workspace string `yaml:"workspace"`
 	Owner     string `yaml:"owner"`
@@ -76,7 +76,6 @@ type RuntugReview struct {
 	// Lane receives the pane's findings event; empty means Owner, and with
 	// neither only a pane on this host can return findings.
 	Lane         string   `yaml:"lane"`
-	Panewire     string   `yaml:"panewire"`
 	ExcludeHosts []string `yaml:"exclude_hosts"`
 }
 type Outcomes struct {
@@ -669,13 +668,13 @@ func Load(name string) (Config, error) {
 	switch c.Review.Executor {
 	case "":
 		c.Review.Executor = "headless"
-	case "headless", "runtug":
+	case "headless", "panewire":
 	default:
-		return c, errors.New("review.executor must be headless or runtug")
+		return c, errors.New("review.executor must be headless or panewire")
 	}
-	rt := &c.Review.Runtug
+	rt := &c.Review.Panewire
 	if rt.Command == "" {
-		rt.Command = "runtug"
+		rt.Command = "panewire"
 	}
 	if rt.Workspace == "" {
 		rt.Workspace = "reviews"
@@ -693,20 +692,17 @@ func Load(name string) (Config, error) {
 		rt.Lane = rt.Owner
 	}
 	if rt.Lane != "" && !laneName.MatchString(rt.Lane) {
-		return c, errors.New("invalid review.runtug.lane")
-	}
-	if rt.Panewire == "" {
-		rt.Panewire = "panewire"
+		return c, errors.New("invalid review.panewire.lane")
 	}
 	for _, h := range rt.ExcludeHosts {
 		if !hostName.MatchString(h) {
-			return c, fmt.Errorf("invalid review.runtug.exclude_hosts entry %q", h)
+			return c, fmt.Errorf("invalid review.panewire.exclude_hosts entry %q", h)
 		}
 		if h == rt.Host {
-			return c, fmt.Errorf("review.runtug.host %s is also in exclude_hosts", h)
+			return c, fmt.Errorf("review.panewire.host %s is also in exclude_hosts", h)
 		}
 	}
-	rt.Command, rt.Jobs, rt.Checkouts, rt.Panewire = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts), Expand(rt.Panewire)
+	rt.Command, rt.Jobs, rt.Checkouts = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts)
 	if c.Outcomes.Command == "" {
 		c.Outcomes.Command = c.Review.Quota
 	}
@@ -1004,8 +1000,8 @@ var (
 	containerUser  = regexp.MustCompile(`^[A-Za-z0-9_][-A-Za-z0-9_.:]*$`)
 	volumeValue    = regexp.MustCompile(`^[A-Za-z0-9_./@+-]+$`)
 	containerLabel = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*$`)
-	// laneName and hostName bound the panewire lane and runtug host names
-	// passed as single arguments (runtug splits --exclude-host on commas).
+	// laneName and hostName bound the panewire lane and panewire host names
+	// passed as single arguments (panewire splits --exclude-host on commas).
 	laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	hostName = laneName
 )

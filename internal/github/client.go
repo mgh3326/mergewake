@@ -404,8 +404,8 @@ type PassReceipt struct {
 	// AnsweredContext counts the already-answered findings the prompt carried,
 	// so the effect of that context can be measured later.
 	AnsweredContext int `json:"answered_context"`
-	// Executor names a non-default pass executor ("runtug"); Fallback records
-	// why a configured runtug pass ran headless instead.
+	// Executor names a non-default pass executor ("panewire"); Fallback records
+	// why a configured panewire pass ran headless instead.
 	Executor string `json:"executor,omitempty"`
 	Fallback string `json:"fallback,omitempty"`
 	// Patch is the `git patch-id --stable` of the PR diff the pass reviewed. A
