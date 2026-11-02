@@ -1,4 +1,6 @@
+import hashlib
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -7,13 +9,26 @@ import unittest
 
 
 class RepairReleaseTests(unittest.TestCase):
+    def test_publish_job_checks_out_recovery_script(self):
+        workflow = Path(__file__).resolve().parents[1] / '.github/workflows/release.yml'
+        publish = workflow.read_text().split('\n  publish:\n', 1)[1]
+        checkout = re.search(r'      - uses: actions/checkout@[^\n]+\n        with:\n((?:          [^\n]+\n)+)', publish)
+        self.assertIsNotNone(checkout, 'publish job must acquire the recovery script')
+        self.assertIn('ref: ${{ github.sha }}', checkout[1])
+        self.assertIn('persist-credentials: false', checkout[1])
+        self.assertLess(checkout.end(), publish.index('sh scripts/repair-release-assets.sh'))
+
     def test_partial_retry_is_immutable_and_complete(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             assets = root / 'built'; assets.mkdir()
             remote = root / 'remote'; remote.mkdir()
-            for name in ['tool-linux-amd64', 'tool-linux-arm64', 'SHA256SUMS']:
+            names = ['tool-linux-amd64', 'tool-linux-arm64']
+            for name in names:
                 (assets / name).write_bytes(name.encode())
+            (assets / 'SHA256SUMS').write_text(''.join(
+                hashlib.sha256((assets / name).read_bytes()).hexdigest() + '  ' + name + '\n'
+                for name in names))
             (remote / 'tool-linux-amd64').write_bytes(b'tool-linux-amd64')
             (root / 'draft').write_text('draft')
             fake = root / 'gh'
@@ -43,6 +58,20 @@ else: raise SystemExit('unexpected gh command')
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        FAKE_REMOTE=str(remote), FAKE_LOG=str(root / 'uploads'), GITHUB_REPOSITORY='example/tool')
             script = str(Path(__file__).with_name('repair-release-assets.sh').resolve())
+            # Missing local artifacts and unexpected remote assets must leave the draft untouched.
+            missing = assets / 'tool-linux-arm64'
+            content = missing.read_bytes(); missing.unlink()
+            result = subprocess.run(['sh', script, 'v1.0.0', str(assets)], env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((root / 'draft').exists())
+            self.assertFalse((root / 'uploads').exists())
+            missing.write_bytes(content)
+            (remote / 'unexpected').write_bytes(b'extra')
+            result = subprocess.run(['sh', script, 'v1.0.0', str(assets)], env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((root / 'draft').exists())
+            self.assertFalse((root / 'uploads').exists())
+            (remote / 'unexpected').unlink()
             subprocess.run(['sh', script, 'v1.0.0', str(assets)], env=env, check=True)
             self.assertEqual((root / 'uploads').read_text().splitlines(), ['tool-linux-arm64', 'SHA256SUMS'])
             self.assertFalse((root / 'draft').exists(), 'repaired draft was not published')
