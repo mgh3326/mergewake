@@ -566,6 +566,32 @@ func TestRenotifyAndFindingsConfig(t *testing.T) {
 	}
 }
 
+func TestFindingsEscalationConfig(t *testing.T) {
+	for _, tc := range []struct {
+		settings string
+		window   time.Duration
+		rounds   int
+		invalid  bool
+	}{
+		{"", 2 * time.Hour, 3, false},
+		{"escalate_after: 5m, escalate_rounds: 0", 5 * time.Minute, 0, false},
+		{"escalate_after: 0s", 0, 0, true},
+		{"escalate_rounds: -1", 0, 0, true},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nhost: host-a\ndaemon:\n  pr:\n    findings: {"+tc.settings+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if (err != nil) != tc.invalid {
+			t.Fatalf("%q: %v", tc.settings, err)
+		}
+		if err == nil && (c.Daemon.PR.Findings.EscalationWindow() != tc.window || c.Daemon.PR.Findings.EscalationRounds() != tc.rounds) {
+			t.Fatalf("%q: got %v, %d", tc.settings, c.Daemon.PR.Findings.EscalationWindow(), c.Daemon.PR.Findings.EscalationRounds())
+		}
+	}
+}
+
 func writeDiscordEnv(t *testing.T, mode os.FileMode, body string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "discord.env")
