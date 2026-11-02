@@ -25,3 +25,12 @@ done
 if ! printf '%s\n' "$existing" | grep -Fxq SHA256SUMS; then
   gh release upload "$tag" "$dir/SHA256SUMS" --repo "$GITHUB_REPOSITORY"
 fi
+
+# An interrupted gh release create may leave a draft. Publish only after the
+# complete expected asset set has been verified or uploaded successfully.
+draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+case "$draft" in
+  true) gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false ;;
+  false) ;;
+  *) echo "release draft state is unavailable" >&2; exit 1 ;;
+esac

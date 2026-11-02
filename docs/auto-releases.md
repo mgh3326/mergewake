@@ -27,3 +27,17 @@ serialized by tag, existing assets are verified byte-for-byte, and only missing
 assets are uploaded. Different existing bytes fail without replacement. Checksums
 are uploaded after missing binaries. Initial/zero before SHA may create a release
 because docs-only skipping is optional when the range is unavailable.
+
+## Recover an interrupted publication
+
+Re-run only the failed publish job first: it reuses the original successful build
+artifact, avoiding a rebuild with a newer Go patch. The repair verifies existing
+bytes before uploading missing files, then publishes a completed draft. Do not
+clobber assets or move a release tag to make a retry pass.
+
+If the artifact has expired and a rebuild differs, use the original run's Go
+version, dependency lockfiles, source commit, release tag and build flags, and
+require the existing-asset comparisons to pass. If exact reproduction is not
+possible, the operator must quarantine the incomplete release as a draft and
+publish a fresh patch tag with a complete build. Preserve the old bytes and
+receipts for audit; do not teach automatic retries to replace them silently.
