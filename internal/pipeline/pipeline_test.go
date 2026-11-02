@@ -36,6 +36,7 @@ type fakeGH struct {
 	pullCalls                                                    int
 	updateHeads                                                  []string
 	updateErr                                                    error
+	updateHook                                                   func()
 	nextHead                                                     string
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
@@ -80,6 +81,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 }
 func (g *fakeGH) UpdateBranch(_ context.Context, _ string, _ int, head string) error {
 	g.updateHeads = append(g.updateHeads, head)
+	if g.updateHook != nil {
+		g.updateHook()
+	}
 	return g.updateErr
 }
 func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }

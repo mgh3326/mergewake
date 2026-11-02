@@ -535,8 +535,12 @@ func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
 	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.updateHeads) != 2 || n.count != 0 {
-		t.Fatalf("new base: calls=%v events=%v", g.updateHeads, n.events)
+	g.head = shaD
+	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 3 || g.updateHeads[1] != shaA || g.updateHeads[2] != shaA || n.count != 0 {
+		t.Fatalf("two base moves: calls=%v events=%v", g.updateHeads, n.events)
 	}
 }
 
@@ -551,5 +555,59 @@ func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.state(r.Name), "base-updates")); !os.IsNotExist(err) {
 		t.Fatalf("shadow reserved update: %v", err)
+	}
+}
+
+func TestAutoUpdateMarkerWriteFailureRecovers(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	g.stale = true
+	var marker string
+	g.updateHook = func() {
+		entries, err := os.ReadDir(filepath.Join(s.state(r.Name), "base-updates"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".lock") {
+				marker = filepath.Join(s.state(r.Name), "base-updates", e.Name())
+			}
+		}
+		if err := os.Rename(marker, marker+".saved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(marker, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 1 || n.count != 0 {
+		t.Fatalf("calls=%v events=%v", g.updateHeads, n.events)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(marker+".saved", marker); err != nil {
+		t.Fatal(err)
+	}
+	g.updateHook = nil
+	g.nextHead = shaC
+	status, _, err := s.updateStaleBranch(context.Background(), r, g.pull, shaB)
+	if err != nil || status != "recheck" || len(g.updateHeads) != 1 {
+		t.Fatalf("changed head: status=%s err=%v calls=%v", status, err, g.updateHeads)
+	}
+	g.nextHead = ""
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 2 || n.count != 0 {
+		t.Fatalf("calls=%v events=%v", g.updateHeads, n.events)
+	}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 2 {
+		t.Fatalf("completed update retried: %v", g.updateHeads)
 	}
 }
