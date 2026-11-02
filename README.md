@@ -153,20 +153,23 @@ head, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
 check evidence emits nothing. When acting and `base_stale` is the only blocker, `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
-across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY and
-BLOCKED are declared `--type ready|blocked`, so they stay unread on the lane
+across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY, BLOCKED, and MERGED are declared `--type ready|blocked|merged`, so they stay unread on the lane
 until `panewire inbox ack`, and a READY PR nobody merged is notified again every
 `daemon.pr.notify.renotify_after` (default 30m), at most `renotify_max` times
 (default 3).
 
-Review findings go straight to the PR's author lane (`Mergewake-Task` → hk task
-→ bound job → its lane; else the repo lane, then the desk), one event per
-delivery naming every finding and what it needs. With no `panewire inbox ack`
-within `daemon.pr.findings.ack_after` (default 15m) the event is re-sent once,
-then escalated to the owner. Under a graded policy only mergewake
-critical/high and CodeRabbit Critical/Major hold the gate, until fixed (a
-reply naming a commit in the PR after the finding) or dismissed with a reason; medium/low and Minor/Nitpick never do. See
-[docs/config.md](docs/config.md#findings-delivery).
+Review findings and author-actionable BLOCKED notices use the task's bound
+worker or lead job lane. A completed job keeps that route. Missing author
+ownership goes to the desk as a decision. Unresolved findings reach the desk
+only after `daemon.pr.findings.escalate_after` (default 2h) or
+`escalate_rounds` (default 3 distinct heads). Inbox ACKs stop reminders;
+verified dispositions stop aging too. `review.fleet_authors` accepts configured
+fleet-account replies under the same fix and dismissal checks.
+
+The daemon retries missing or stalled reviews with persistent exponential
+backoff. It rechecks trusted review receipts even when a done marker exists,
+uses the local-diff fallback, and interrupts the desk only after the configured
+failure threshold. See [review recovery](docs/config.md#review-recovery).
 
 Auto-merge is opt-in per repository with `enabled: true` in
 `.mergewake/policy.yaml` (default off). While the daemon acts

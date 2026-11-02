@@ -117,7 +117,7 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	}
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
-	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.Config.Notifier.Lane, Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA))})
+	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.Config.Notifier.Lane, Type: "automation-failed", Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA))})
 	return err == nil, err
 }
 

@@ -79,6 +79,7 @@ func deliverSetup(t *testing.T) (*Service, *fakeGH, *ackNotifier, *jobSink, conf
 	n := &ackNotifier{acked: map[string]bool{}}
 	s.Sink, s.Notifier = sink, n
 	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
+	s.Config.Daemon.PR.Findings.EscalateRounds = 3
 	now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 	s.Now = func() time.Time { return now }
 	return s, g, n, sink, r, &now
@@ -173,12 +174,12 @@ func TestFindingsUnackedResendThenEscalate(t *testing.T) {
 	if n.count != 2 {
 		t.Fatal("escalated early")
 	}
-	step(time.Minute)
+	step(91 * time.Minute)
 	if n.count != 3 {
 		t.Fatalf("no escalation: %+v", n.events)
 	}
 	esc := n.events[2]
-	if esc.Lane != "integrator" || esc.Type != "decision" || !strings.Contains(esc.Text, "[mergewake] ESC example/project#7") || !strings.Contains(esc.Text, "never respawns a worker") {
+	if esc.Lane != "operator-desk" || esc.Type != "decision" || !strings.Contains(esc.Text, "[mergewake] ESC example/project#7") || !strings.Contains(esc.Text, "findings still open") {
 		t.Fatalf("escalation %+v", esc)
 	}
 	for i := 0; i < 4; i++ {
@@ -221,7 +222,7 @@ func TestFindingsWithoutBoundJobFallBack(t *testing.T) {
 	r.Lane = "repo-lane"
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
 	deliver(t, s, r)
-	if n.count != 1 || n.events[0].Lane != "repo-lane" {
+	if n.count != 1 || n.events[0].Lane != "operator-desk" || n.events[0].Type != "decision" {
 		t.Fatalf("%+v", n.events)
 	}
 
@@ -236,19 +237,19 @@ func TestFindingsWithoutBoundJobFallBack(t *testing.T) {
 
 // A job that is already terminal has no author attempt to fix anything: its
 // findings go to the owner, and nothing is respawned.
-func TestFindingsForATerminalJobGoToTheOwner(t *testing.T) {
+func TestFindingsForATerminalJobKeepAuthorLane(t *testing.T) {
 	s, g, n, sink, r, _ := deliverSetup(t)
 	sink.recs["w-7"] = integrations.JobRecord{State: "completed", Role: "worker", Label: "w-7", OwnerLane: "integrator"}
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
 	deliver(t, s, r)
-	if n.count != 1 || n.events[0].Lane != "integrator" {
+	if n.count != 1 || n.events[0].Lane != "w-7" {
 		t.Fatalf("%+v", n.events)
 	}
 }
 
 // Findings the reviewer marked outside the Acceptance contract go back to the
 // owner once and are never re-sent or escalated.
-func TestFindingsOutOfScopeGoToTheOwnerOnce(t *testing.T) {
+func TestFindingsOutOfScopeGoToAuthorOnce(t *testing.T) {
 	s, g, n, _, r, now := deliverSetup(t)
 	g.feedback.Threads = []github.ReviewThread{
 		finding("T1", "review-bot", "<!-- mergewake-severity:medium -->\n<!-- mergewake-advisory -->\n**Advisory** outside the contract\nstyle", 3),
@@ -257,6 +258,7 @@ func TestFindingsOutOfScopeGoToTheOwnerOnce(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		deliver(t, s, r)
 		n.acked[n.events[0].ID] = true
+		g.feedback.Threads[1].IsResolved = true
 		*now = now.Add(time.Hour)
 	}
 	var author, owner int
@@ -264,7 +266,7 @@ func TestFindingsOutOfScopeGoToTheOwnerOnce(t *testing.T) {
 		switch {
 		case e.Lane == "w-7" && strings.Contains(e.Text, "T2") && !strings.Contains(e.Text, "T1"):
 			author++
-		case e.Lane == "integrator" && strings.Contains(e.Text, "OUT-OF-SCOPE") && strings.Contains(e.Text, "T1"):
+		case e.Lane == "w-7" && strings.Contains(e.Text, "OUT-OF-SCOPE") && strings.Contains(e.Text, "T1"):
 			owner++
 		default:
 			t.Fatalf("unexpected event %+v", e)

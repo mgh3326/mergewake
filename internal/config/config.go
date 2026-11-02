@@ -193,8 +193,8 @@ func (n PRNotify) Renotify() (time.Duration, int) {
 type PRFindings struct {
 	Enabled *bool `yaml:"enabled"`
 	// AckAfter is how long a delivery waits for the author lane's
-	// `panewire inbox ack` before it is re-sent once, and again before it is
-	// escalated to the owning lane. Empty means 15m.
+	// `panewire inbox ack` before it is re-sent once. Unresolved age and
+	// distinct heads control desk escalation separately. Empty means 15m.
 	AckAfter       string `yaml:"ack_after"`
 	EscalateAfter  string `yaml:"escalate_after"`
 	EscalateRounds int    `yaml:"escalate_rounds"`

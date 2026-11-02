@@ -22,18 +22,9 @@ import (
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
-// Review findings go straight to the PR's author, not through the desk. Each
-// pass of the pr loop collects the PR's findings no delivery has named yet —
-// mergewake's own once the head's review is complete, and CodeRabbit's
-// Critical and Major threads — and sends them as one lane event to the author
-// lane: the PR's Mergewake-Task → hk task → bound job → that job's lane. A PR
-// with no bound job falls back to the repo lane, then the desk. The author
-// acknowledges with `panewire inbox ack`; with no ACK (and no disposition on
-// the named threads) within daemon.pr.findings.ack_after the event is re-sent
-// once, and after another window it is escalated to the owning lane. Findings
-// the reviewer marked outside the PR's Acceptance contract go to the owner
-// once. mergewake never respawns a worker: a job that is already terminal has
-// its findings sent to the owner, who decides.
+// Review findings go to the job-bound author lane. An unresolved delivery
+// reaches the desk only after its configured age or number of distinct heads.
+// Inbox acknowledgment stops reminders, while a disposition stops aging.
 
 // findingsLaneText bounds the event text: panewire refuses a lane.event over
 // 2048 bytes.
@@ -58,7 +49,8 @@ type findingsDelivery struct {
 	AckedAt     time.Time `json:"acked_at,omitzero"`
 	// AckBy is "inbox" for a `panewire inbox ack`, "disposition" when every
 	// named thread was answered or resolved first.
-	AckBy string `json:"ack_by,omitempty"`
+	AckBy string   `json:"ack_by,omitempty"`
+	Heads []string `json:"heads,omitempty"`
 }
 
 // pendingFinding is one thread a delivery names.
@@ -184,7 +176,7 @@ func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, 
 		default:
 			continue
 		}
-		if disposed(t, own, verify) {
+		if disposed(t, own, verify, s.Config.Review.FleetAuthors) {
 			continue
 		}
 		if severity == "advisory" {
@@ -200,7 +192,7 @@ func (s *Service) undeliveredFindings(pr github.Pull, fb github.ReviewFeedback, 
 // is resolved, or answered by the gate's own rule — a blocking finding
 // (mergewake critical/high, CodeRabbit Critical/Major) only by a verified fix
 // commit or a reasoned dismissal, any other by any human answer.
-func disposed(t github.ReviewThread, own string, verify fixCheck) bool {
+func disposed(t github.ReviewThread, own string, verify fixCheck, fleet ...[]string) bool {
 	if t.IsResolved {
 		return true
 	}
@@ -210,9 +202,9 @@ func disposed(t github.ReviewThread, own string, verify fixCheck) bool {
 	first := t.Comments[0]
 	isOwn := own != "" && policy.NormalizeAuthor(first.Author) == own
 	if mustFix(github.ThreadSeverity(first.Author, first.Body)) {
-		return blockDisposition(t, isOwn, verify) != ""
+		return blockDisposition(t, isOwn, verify, fleet...) != ""
 	}
-	return answered(t, isOwn)
+	return answered(t, isOwn, fleet...)
 }
 
 // mustFix is a severity the author must fix or dismiss with evidence
@@ -242,65 +234,51 @@ func terminalJob(state string) bool {
 	return state == "completed" || state == "escalated" || state == "lost"
 }
 
-// findingsRoute resolves the author lane without guessing: Mergewake-Task →
-// hk task → its bound job (refs.job_id) → the job's hub lane (a worker's lane
-// is its label). The owner is the job's owner_lane, else the lane READY and
-// BLOCKED go to. A terminal job sends its findings to the owner; a PR with no
-// bound job, or a job whose lane is not recorded, falls back to the repo lane,
-// then the desk. A read error retries next pass rather than rerouting.
+// findingsRoute uses the same task/job binding as reap, without caching an
+// open PR's binding. A worker or lead keeps its author lane after completion.
+// Missing ownership routes to the desk; a read error retries without guessing.
 func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pull) (findingsRoute, error) {
-	var rt findingsRoute
-	owner, oVia, e := s.notifyLane(ctx, r, pr)
-	if e != nil {
-		return rt, e
+	desk := s.Config.Notifier.FallbackLane
+	if desk == "" {
+		desk = s.Config.Notifier.Lane
 	}
-	rt.owner, rt.oVia = owner, oVia
+	rt := findingsRoute{owner: desk, oVia: "desk"}
+	// Open PR bindings may change, so share the reap binding interface without
+	// its merged-PR cache.
 	task, e := s.prTask(ctx, r, pr)
 	if e != nil {
 		return rt, e
 	}
-	jobs, ok := s.Sink.(interface {
-		TaskJob(context.Context, string) (string, string, error)
-		Job(context.Context, string) (integrations.JobRecord, error)
-	})
-	if task != "" && ok {
+	if jobs, ok := s.Sink.(reapJobs); task != "" && ok {
 		job, _, e := jobs.TaskJob(ctx, task)
 		if e != nil {
 			return rt, e
 		}
 		if job != "" {
 			rec, e := jobs.Job(ctx, job)
-			switch {
-			case errors.Is(e, integrations.ErrJobNotFound):
-			case e != nil:
+			if e != nil && !errors.Is(e, integrations.ErrJobNotFound) {
 				return rt, e
-			default:
-				if laneName.MatchString(rec.OwnerLane) {
-					rt.owner, rt.oVia = rec.OwnerLane, "job "+job+" owner"
-				}
-				switch {
-				case terminalJob(rec.State):
-					rt.lane, rt.via = rt.owner, fmt.Sprintf("job %s is %s; owner (%s)", job, rec.State, rt.oVia)
-					return rt, nil
-				case rec.Role != "builder" && laneName.MatchString(rec.Label):
-					rt.lane, rt.via = rec.Label, "task "+task+" job "+job
-					return rt, nil
+			}
+			if e == nil {
+				for _, lane := range []string{rec.HubLane, rec.Lane, rec.Label} {
+					if laneName.MatchString(lane) {
+						rt.lane, rt.via = lane, "task "+task+" job "+job
+						return rt, nil
+					}
 				}
 			}
 		}
 	}
-	if laneName.MatchString(r.Lane) {
-		rt.lane, rt.via = r.Lane, "repo lane"
+	// Explicit PR routing is evidence of ownership; a repo/desk default is not.
+	lane, via, e := s.notifyLane(ctx, r, pr)
+	if e != nil {
+		return rt, e
+	}
+	if via == "notify-lane trailer" {
+		rt.lane, rt.via = lane, via
 		return rt, nil
 	}
-	desk := s.Config.Notifier.FallbackLane
-	if desk == "" {
-		desk = s.Config.Notifier.Lane
-	}
-	rt.lane, rt.via = desk, "desk"
-	if rt.owner == "" {
-		rt.owner, rt.oVia = desk, "desk"
-	}
+	rt.lane, rt.via = desk, "unknown author; desk"
 	return rt, nil
 }
 
@@ -383,9 +361,6 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	}
 	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
 	lane, via := rt.lane, rt.via
-	if scope == "owner" {
-		lane, via = rt.owner, rt.oVia
-	}
 	d := findingsDelivery{
 		ID:      fmt.Sprintf("mergewake-%s-%s-%d-%s", map[string]string{"author": "findings", "owner": "out-of-scope"}[scope], r.Name, pr.Number, hex.EncodeToString(sum[:6])),
 		PR:      pr.Number,
@@ -397,10 +372,14 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 		Owner:   rt.owner,
 		Text:    findingsText(r, pr, scope, lane, fs),
 		SentAt:  s.now().UTC(),
+		Heads:   []string{pr.Head.SHA},
 	}
 	typ := "findings"
 	if scope == "owner" {
 		typ = "info"
+	}
+	if rt.via == "unknown author; desk" {
+		typ = "decision"
 	}
 	if !o.DryRun {
 		reportCtx, cancel := reportContext(ctx)
@@ -418,10 +397,8 @@ type ackReader interface {
 	AckedEvents(ctx context.Context, lane string) (map[string]bool, error)
 }
 
-// followUpDeliveries advances this PR's unacknowledged author deliveries: an
-// ACK or a disposition on every named thread closes one; past ack_after it is
-// re-sent once; past another window it is escalated to the owner once. A
-// notifier that cannot read ACKs leaves deliveries as sent.
+// followUpDeliveries resends an unacknowledged delivery once. Every unresolved
+// delivery keeps aging, including one acknowledged in the inbox.
 func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, ledger []findingsDelivery, o Options, verify fixCheck) (bool, error) {
 	reader, canRead := s.Notifier.(ackReader)
 	window := s.Config.Daemon.PR.Findings.AckWindow()
@@ -438,12 +415,12 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 	inboxErr := map[string]error{}
 	for i := range ledger {
 		d := &ledger[i]
-		if d.PR != pr.Number || d.Scope != "author" || !d.AckedAt.IsZero() || !d.EscalatedAt.IsZero() {
+		if d.PR != pr.Number || d.Scope != "author" || d.AckBy == "disposition" || !d.EscalatedAt.IsZero() {
 			continue
 		}
 		done := true
 		for _, id := range d.Threads {
-			if t, ok := threads[id]; ok && !disposed(t, own, verify) {
+			if t, ok := threads[id]; ok && !disposed(t, own, verify, s.Config.Review.FleetAuthors) {
 				done = false
 				break
 			}
@@ -452,7 +429,39 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			d.AckedAt, d.AckBy, changed = now, "disposition", true
 			continue
 		}
-		if !canRead {
+		desk := s.Config.Notifier.FallbackLane
+		if desk == "" {
+			desk = s.Config.Notifier.Lane
+		}
+		if d.Owner != desk {
+			d.Owner = desk
+			changed = true
+		}
+		if len(d.Heads) == 0 {
+			d.Heads = []string{d.Head}
+			changed = true
+		}
+		if !slices.Contains(d.Heads, pr.Head.SHA) {
+			d.Heads = append(d.Heads, pr.Head.SHA)
+			changed = true
+		}
+		aged := now.Sub(d.SentAt) >= s.Config.Daemon.PR.Findings.EscalationWindow() || (s.Config.Daemon.PR.Findings.EscalationRounds() > 0 && len(d.Heads) >= s.Config.Daemon.PR.Findings.EscalationRounds())
+		if aged {
+			text := fmt.Sprintf("[mergewake] ESC %s#%d | findings still open after %d head rounds and %s | %s", r.Name, pr.Number, len(d.Heads), now.Sub(d.SentAt).Round(time.Minute), d.Text)
+			if !o.DryRun && d.Owner != "" && d.Owner != d.Lane {
+				nctx, cancel := reportContext(ctx)
+				e := s.Notifier.Notify(nctx, integrations.Event{ID: d.ID + "-escalated", Text: clip(text, findingsLaneText), Lane: d.Owner, Type: "decision"})
+				cancel()
+				if e != nil {
+					errs = append(errs, e)
+					continue
+				}
+			}
+			d.EscalatedAt, changed = now, true
+			errs = append(errs, s.audit(r.Name, "findings-escalated", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane, "owner": d.Owner}, o.DryRun))
+			continue
+		}
+		if !d.AckedAt.IsZero() || !canRead {
 			continue
 		}
 		inbox, read := inboxes[d.Lane]
@@ -486,20 +495,6 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			}
 			d.ResentAt, changed = now, true
 			errs = append(errs, s.audit(r.Name, "findings-resent", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
-		case !d.ResentAt.IsZero() && now.Sub(d.ResentAt) >= window:
-			text := fmt.Sprintf("[mergewake] ESC %s#%d head=%s | findings event %s to lane %s has no ACK (sent %s, re-sent %s) | the owner decides: relay, hand off or re-scope; mergewake never respawns a worker",
-				r.Name, pr.Number, short7(d.Head), d.ID, d.Lane, d.SentAt.Format(time.RFC3339), d.ResentAt.Format(time.RFC3339))
-			if !o.DryRun && d.Owner != "" {
-				reportCtx, cancel := reportContext(ctx)
-				e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID + "-escalated", Text: text, Lane: d.Owner, Type: "decision"})
-				cancel()
-				if e != nil {
-					errs = append(errs, fmt.Errorf("findings escalation to %s: %w", d.Owner, e))
-					continue
-				}
-			}
-			d.EscalatedAt, changed = now, true
-			errs = append(errs, s.audit(r.Name, "findings-escalated", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane, "owner": d.Owner}, o.DryRun))
 		}
 	}
 	return changed, errors.Join(errs...)
