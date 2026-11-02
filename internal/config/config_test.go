@@ -435,6 +435,15 @@ func TestReviewExecutor(t *testing.T) {
 	if rt := c.Review.Panewire; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
 		t.Fatalf("%+v %v", rt, e)
 	}
+	c, e = load("review:\n  executor: panewire\n  panewire:\n    command: /usr/local/bin/panewire\n    workspace: reviews\n    owner: review-desk\n    host: auto\n")
+	if e != nil || c.Review.Panewire.Command != "/usr/local/bin/panewire" {
+		t.Fatalf("documented launcher migration: %+v %v", c.Review, e)
+	}
+	for _, retired := range []string{"review:\n  executor: runtug\n", "review:\n  runtug: {command: runtug, panewire: panewire}\n", "review:\n  executor: panewire\n  panewire: {panewire: panewire}\n"} {
+		if _, e := load(retired); e == nil {
+			t.Fatalf("retired launcher settings accepted: %s", retired)
+		}
+	}
 	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  panewire: {bogus: x}\n", "review:\n  panewire: {lane: 'a b'}\n", "review:\n  panewire: {exclude_hosts: ['a,b']}\n", "review:\n  panewire: {host: host-a, exclude_hosts: [host-a]}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)

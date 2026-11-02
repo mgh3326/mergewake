@@ -1695,8 +1695,36 @@ closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone pane
 and hub errors keep the pane. Codex placeholder text remains nonempty unless the
 node can prove it is an accepted placeholder. After closure, `job.done` runs on
 the job host with the saved report path; only `done` and `already-done` succeed.
+The node-side `pane.close` rechecks the visible composer before and after its
+settle interval; text, an unreadable composer or an unknown composer keeps the
+pane even if its name, status and cwd did not change after capture.
 Grant both scopes before enabling this caller; older hubs fail safely and keep
 panes. The operator credential cannot substitute for these service-only ops.
 
 
-Launcher cutover: use `review.executor: panewire` and move the former `review.runtug` settings to `review.panewire`. The old executor key is refused. `review.panewire.command` supplies the single binary for both spawn and inbox calls. Spawn needs the fleet hosts config (`FLEET_HOSTS_CONFIG`) with its hub operator credential. The default CLI returns ACCEPTED after a durable reservation; mergewake keeps `--wait`, which observes spawn completion and then the existing job completion contract. A reconciling attempt is never retried on another host.
+Launcher cutover: set `review.executor: panewire`. Remove the former
+`review.runtug.command` (the runtug executable) and `review.runtug.panewire`
+(the separate inbox executable) before moving the remaining settings to
+`review.panewire`; remove the old `review.runtug` block. Set
+`review.panewire.command` to the panewire executable, or omit it for the
+`panewire` PATH default. Do not copy the old executable settings: strict decoding
+rejects the retired nested `panewire` field, and the old `command` would still
+launch runtug. The old executor key is refused.
+
+For example, after retaining the desired workspace/owner/host settings:
+
+```yaml
+review:
+  executor: panewire
+  panewire:
+    command: /usr/local/bin/panewire
+    workspace: reviews
+    owner: review-desk
+    host: auto
+```
+
+The single binary supplies both spawn and inbox calls. Spawn needs the fleet
+hosts config (`FLEET_HOSTS_CONFIG`) with its hub operator credential. The default
+CLI returns ACCEPTED after a durable reservation; mergewake keeps `--wait`,
+which observes spawn completion and then the existing job completion contract.
+A reconciling attempt is never retried on another host.
