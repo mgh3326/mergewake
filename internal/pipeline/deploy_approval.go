@@ -202,7 +202,7 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 	if e != nil {
 		return false, fmt.Errorf("deployment held: %w", e)
 	}
-	if !approved {
+	if !approved || !identity.EnvironmentKnown {
 		return false, s.Print(struct {
 			Status string       `json:"status"`
 			Review deployReview `json:"review"`

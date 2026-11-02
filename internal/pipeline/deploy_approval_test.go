@@ -114,7 +114,10 @@ func TestSameCommitDigestAndEnvDriftNeedsApproval(t *testing.T) {
 	defer srv.Close()
 	old := "sha256:" + strings.Repeat("a", 64)
 	next := "sha256:" + strings.Repeat("b", 64)
-	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", EnvFile: "/operator/old.env", Health: &config.Health{URL: srv.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", EnvFile: filepath.Join(t.TempDir(), "old.env"), Health: &config.Health{URL: srv.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	if e := os.WriteFile(spec.EnvFile, []byte("SETTING=one\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
 	r.Install = []config.Install{spec}
 	r.Root = ""
 	r.Smoke = config.Command{}
@@ -135,7 +138,10 @@ func TestSameCommitDigestAndEnvDriftNeedsApproval(t *testing.T) {
 	}
 	sink.approved = false
 	sink.questions = nil
-	r.Install[0].EnvFile = "/operator/changed.env"
+	r.Install[0].EnvFile = filepath.Join(t.TempDir(), "changed.env")
+	if e := os.WriteFile(r.Install[0].EnvFile, []byte("SETTING=two\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
 	if e = s.Rollout(context.Background(), r, Options{Digest: spec.Image + "@" + next}); e != nil {
 		t.Fatal(e)
 	}
@@ -266,5 +272,89 @@ func TestNoEnvInventoryIdentityCompatibility(t *testing.T) {
 	got := s.deploymentIdentity(r, manifest.Manifest{}, Options{})
 	if got.Config != manifest.Sum(b) || !got.EnvironmentKnown {
 		t.Fatal("no-env upgrade changed deployed inventory identity")
+	}
+}
+
+func TestUnknownEnvIdentityCannotUseAnsweredApproval(t *testing.T) {
+	for _, kind := range []string{"missing", "oversized"} {
+		t.Run(kind, func(t *testing.T) {
+			s, _, _, _, r := setup(t)
+			envPath := filepath.Join(t.TempDir(), "service.env")
+			if kind == "oversized" {
+				if err := os.WriteFile(envPath, make([]byte, (1<<20)+1), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r.Install = []config.Install{{EnvFile: envPath}}
+			sink := &deploySink{approved: true}
+			s.Sink = sink
+			for i := 0; i < 2; i++ {
+				allowed, err := s.approveDeploy(context.Background(), r, manifest.Manifest{Commit: shaB}, t.TempDir(), false, Options{})
+				if err != nil || allowed {
+					t.Fatalf("unknown env admitted=%v err=%v", allowed, err)
+				}
+			}
+			if len(sink.questions) != 2 {
+				t.Fatal("missing hold decision request")
+			}
+		})
+	}
+}
+
+func TestEnvDriftDuringHealthRestoresPriorContainer(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	envPath := filepath.Join(t.TempDir(), "service.env")
+	if err := os.WriteFile(envPath, []byte("SETTING=one\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	drift := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if drift {
+			if err := os.WriteFile(envPath, []byte("SETTING=two\n"), 0600); err != nil {
+				t.Error(err)
+			}
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	old := "sha256:" + strings.Repeat("a", 64)
+	next := "sha256:" + strings.Repeat("b", 64)
+	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api", Runtime: "docker", EnvFile: envPath, Health: &config.Health{URL: srv.URL, Status: 200, Timeout: "1s", Retries: 1}}
+	r.Install = []config.Install{spec}
+	r.Root = ""
+	r.Smoke = config.Command{}
+	r.DeployTask = "1"
+	pinned := spec
+	pinned.Digest = old
+	var err error
+	g.m, err = manifest.Build(r.Name, shaA, []config.Install{pinned}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newDockerCLI()
+	s.Runner = d
+	s.Sink = &deploySink{approved: true}
+	if err = s.Rollout(context.Background(), r, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	drift = true
+	pinned.Digest = next
+	g.m, err = manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Rollout(context.Background(), r, Options{}); err == nil {
+		t.Fatal("environment drift accepted")
+	}
+	if d.containers[spec.Name] != spec.Image+"@"+old {
+		t.Fatalf("prior container not restored: %v", d.containers)
+	}
+	state := filepath.Join(s.state(r.Name), "rollout")
+	if _, err = os.Stat(filepath.Join(state, "container-journal.json")); !os.IsNotExist(err) {
+		t.Fatalf("rollback journal remains: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(state, "container-installed.json"))
+	if err != nil || !strings.Contains(string(b), shaA) {
+		t.Fatalf("prior receipt not restored: %s %v", b, err)
 	}
 }
