@@ -25,6 +25,7 @@ type GitHub interface {
 	Files(context.Context, string, int) ([]policy.File, error)
 	Diff(context.Context, string, int) (string, error)
 	Merge(context.Context, string, int, string) error
+	UpdateBranch(context.Context, string, int, string) error
 	Head(context.Context, string, string) (string, error)
 	CreateRef(context.Context, string, string, string) error
 	RecoveryActive(context.Context, string) (bool, error)

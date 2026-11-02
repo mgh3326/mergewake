@@ -160,6 +160,7 @@ func TestNotifyBlockedReasons(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
 			tt.prepare(g)
+			g.policyExtra = "auto_update_branch: false\n"
 			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
@@ -464,5 +465,77 @@ func TestNotifyReadyRenotifyConfig(t *testing.T) {
 		if n.count != tt.want {
 			t.Fatalf("%+v: %d events", tt, n.count)
 		}
+	}
+}
+
+func TestNotifyAutoUpdateBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		extra     string
+		findings  int
+		updateErr error
+		wantCalls int
+		reason    string
+	}{
+		{"stale only", "", 0, nil, 1, ""},
+		{"other blocker", "", 1, nil, 0, "threads_open:1; base_stale"},
+		{"update fails", "", 0, &github.APIError{Code: 422}, 1, "base_stale; update_failed:422"},
+		{"disabled", "auto_update_branch: false\n", 0, nil, 0, "base_stale"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, n, r := notifySetup(t)
+			g.stale, g.policyExtra, g.findings, g.updateErr = true, tc.extra, tc.findings, tc.updateErr
+			for i := 0; i < 2; i++ {
+				if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(g.updateHeads) != tc.wantCalls {
+				t.Fatalf("update calls: %v", g.updateHeads)
+			}
+			if tc.wantCalls > 0 && g.updateHeads[0] != shaA {
+				t.Fatalf("expected head: %v", g.updateHeads)
+			}
+			if tc.reason == "" {
+				if n.count != 0 {
+					t.Fatalf("unexpected event: %v", n.events)
+				}
+			} else if n.count != 1 || !strings.Contains(lastEvent(t, n), tc.reason) {
+				t.Fatalf("events: %v", n.events)
+			}
+		})
+	}
+}
+
+func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	g.stale = true
+	if err := s.NotifyPR(context.Background(), r, 7, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	g.pull.Draft = true
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 0 {
+		t.Fatal("dry-run or draft updated branch")
+	}
+	g.pull.Draft = false
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	restarted := *s
+	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 1 {
+		t.Fatalf("restart retried: %v", g.updateHeads)
+	}
+	g.head = shaC
+	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.updateHeads) != 2 || n.count != 0 {
+		t.Fatalf("new base: calls=%v events=%v", g.updateHeads, n.events)
 	}
 }
