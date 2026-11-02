@@ -241,3 +241,70 @@ func TestFixedClockAndJitterPinStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTriggerWaitsForWakeGap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", WakeGap: 400 * time.Millisecond}
+	runs := make(chan time.Time, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "pr", Interval: time.Hour, Run: func(context.Context) error { runs <- time.Now(); return nil }}})
+	}()
+	first := <-runs
+	d.Trigger("pr")
+	select {
+	case second := <-runs:
+		if gap := second.Sub(first); gap < 350*time.Millisecond {
+			t.Fatalf("woken pass ran %v after the previous one, want at least the wake gap", gap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("trigger did not wake role after the gap")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTriggerDoesNotCutRateWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", RateWait: func() time.Duration { return 400 * time.Millisecond }}
+	runs := make(chan time.Time, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "pr", Interval: time.Millisecond, Run: func(context.Context) error { runs <- time.Now(); return nil }}})
+	}()
+	first := <-runs
+	d.Trigger("pr")
+	second := <-runs
+	if gap := second.Sub(first); gap < 350*time.Millisecond {
+		t.Fatalf("woken pass ran %v after the previous one inside a rate-limit wait", gap)
+	}
+	cancel()
+	<-done
+}
+
+func TestWakeNeverPostponesScheduledPoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", WakeGap: time.Hour, Jitter: func() float64 { return 0 }}
+	runs := make(chan time.Time, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "pr", Interval: 300 * time.Millisecond, Run: func(context.Context) error { runs <- time.Now(); return nil }}})
+	}()
+	first := <-runs
+	d.Trigger("pr")
+	select {
+	case second := <-runs:
+		if gap := second.Sub(first); gap > 2*time.Second {
+			t.Fatalf("scheduled poll ran %v later, a wake postponed it", gap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a wake inside the gap postponed the scheduled poll")
+	}
+	cancel()
+	<-done
+}

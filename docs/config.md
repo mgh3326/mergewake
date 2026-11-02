@@ -1309,6 +1309,7 @@ lost, late or forged delivery changes nothing but timing.
 | `listen` | Required when enabled | Loopback `host:port` only: `localhost`, any `127.0.0.0/8` address or `::1`. Other hostnames and wildcard binds are refused, and `localhost` is rewritten to a `127.0.0.1` literal so resolution can never steer the bind off loopback. Remote delivery needs an operator-run tunnel (for example a reverse SSH forward or a cloudflared/smee-style relay) terminating on loopback. |
 | `path` | `/github` | Exact request path; other paths return 404. |
 | `secret_env` | Required when enabled | Name of the environment variable holding the GitHub webhook shared secret. The daemon refuses to start while it is unset or empty (other commands load the config without it); the value never appears in config or logs. Deliveries may use either content type (`application/json` or the form `payload` field); `application/json` is recommended. |
+| `min_gap` | `60s` | Shortest time from the end of a role's pass to a pass a delivery wakes. Every pass reads all repos and a CI run sends dozens of check deliveries, so without a gap the roles run back to back and spend the GitHub rate limit. A delivery also never cuts short a rate-limit wait. |
 
 Requests must `POST` the exact path with a body of at most 5 MiB and a valid
 `X-Hub-Signature-256` (HMAC-SHA256 over the raw body). Bad or missing
