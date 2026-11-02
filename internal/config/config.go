@@ -264,6 +264,11 @@ type Webhook struct {
 	// SecretEnv names the environment variable holding the shared secret.
 	// Its value is never a config key.
 	SecretEnv string `yaml:"secret_env"`
+	// MinGap is the shortest time between the end of a role's pass and a pass
+	// a delivery wakes, default 60s. Every pass reads all repos, and a CI run
+	// sends dozens of check deliveries, so without it the roles run back to
+	// back and spend the GitHub rate limit.
+	MinGap string `yaml:"min_gap"`
 }
 type Reap struct {
 	Enabled       bool     `yaml:"enabled"`
@@ -1157,6 +1162,12 @@ func validateWebhook(w *Webhook) error {
 	}
 	if w.Path == "" {
 		w.Path = "/github"
+	}
+	if w.MinGap == "" {
+		w.MinGap = "60s"
+	}
+	if d, e := Duration(w.MinGap); e != nil || d < 0 {
+		return errors.New("daemon.webhook.min_gap must be a non-negative duration")
 	}
 	if !strings.HasPrefix(w.Path, "/") || w.Path != path.Clean(w.Path) {
 		return errors.New("daemon.webhook.path must be an absolute path")

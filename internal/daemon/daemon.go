@@ -51,6 +51,9 @@ type Daemon struct {
 	// Webhook, when set, is the GitHub delivery receiver served next to the
 	// loops; it shuts down with the daemon context. nil means off.
 	Webhook *Webhook
+	// WakeGap is the shortest time from the end of a pass to a pass a Trigger
+	// wakes. A wake also never cuts short a rate-limit wait.
+	WakeGap time.Duration
 	mu      sync.Mutex
 	wake    map[string]chan struct{}
 	failed  map[string]int
@@ -233,6 +236,15 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		case <-timer.C:
 		case <-ch:
 			timer.Stop()
+			wait := max(rate, d.WakeGap-d.now().Sub(st.LastFinish))
+			if wait > 0 {
+				gap := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					gap.Stop()
+				case <-gap.C:
+				}
+			}
 		}
 	}
 	st.Running = false
