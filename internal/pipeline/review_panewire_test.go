@@ -21,19 +21,19 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// runtugExit is a command error carrying an exit status, like exec.ExitError.
-type runtugExit int
+// panewireExit is a command error carrying an exit status, like exec.ExitError.
+type panewireExit int
 
-func (e runtugExit) Error() string { return "exit status" }
-func (e runtugExit) ExitCode() int { return int(e) }
+func (e panewireExit) Error() string { return "exit status" }
+func (e panewireExit) ExitCode() int { return int(e) }
 
-// runtugRunner fakes git, the quota tool, headless reviewers, panewire and
-// runtug. A spawn writes the configured findings file and spawn receipt into
+// panewireRunner fakes git, the quota tool, headless reviewers, panewire and
+// panewire. A spawn writes the configured findings file and spawn receipt into
 // the job dir named by its brief path, unless refuse lists its role; a remote
 // spawn instead uploads the findings to sink and announces them on the inbox.
-type runtugRunner struct {
+type panewireRunner struct {
 	fakeRunner
-	refuse map[string]int // runtug --role → exit status
+	refuse map[string]int // panewire --role → exit status
 	// refuseStderr, when set, is the stderr a refused spawn wrote.
 	refuseStderr string
 	findings     string // "" writes no findings file
@@ -52,26 +52,12 @@ type runtugRunner struct {
 	looks        int
 	addFails     bool
 	realGit      bool   // run git for real (against a test repository)
-	afterRun     func() // called once runtug returns
+	afterRun     func() // called once panewire returns
 	sink         *taskJobSink
 }
 
-func (r *runtugRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
-	switch command {
-	case "git":
-		r.git = append(r.git, args)
-		if r.realGit {
-			b, e := exec.CommandContext(ctx, "git", args...).CombinedOutput()
-			if e != nil {
-				return b, runtugExit(1)
-			}
-			return b, nil
-		}
-		if r.addFails && slices.Contains(args, "add") {
-			return nil, runtugExit(128)
-		}
-		return nil, nil
-	case "panewire":
+func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && len(args) > 1 && args[0] == "inbox" {
 		if args[1] == "ack" {
 			r.acks = append(r.acks, args)
 			return []byte(`{"acked":1}`), nil
@@ -84,6 +70,21 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 			return []byte("[]"), nil
 		}
 		return []byte("[" + strings.Join(r.inbox, ",") + "]"), nil
+	}
+	switch command {
+	case "git":
+		r.git = append(r.git, args)
+		if r.realGit {
+			b, e := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+			if e != nil {
+				return b, panewireExit(1)
+			}
+			return b, nil
+		}
+		if r.addFails && slices.Contains(args, "add") {
+			return nil, panewireExit(128)
+		}
+		return nil, nil
 	case "scopefuel":
 		if r.quotaErr != nil {
 			return nil, r.quotaErr
@@ -92,7 +93,7 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 			return nil, r.usageErr
 		}
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
-	case "runtug":
+	case "panewire":
 		r.spawns = append(r.spawns, args)
 		brief, e := os.ReadFile(arg(args, "-p"))
 		if e != nil {
@@ -104,9 +105,9 @@ func (r *runtugRunner) Run(ctx context.Context, command string, args []string, i
 		role := args[slices.Index(args, "--role")+1]
 		if code, ok := r.refuse[role]; ok {
 			if r.refuseStderr != "" {
-				return nil, &integrations.CommandError{Command: "runtug", Err: runtugExit(code), Stderr: r.refuseStderr}
+				return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(code), Stderr: r.refuseStderr}
 			}
-			return nil, runtugExit(code)
+			return nil, panewireExit(code)
 		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])
 		label := arg(args, "-l")
@@ -192,7 +193,7 @@ func (s *taskJobSink) Attachment(_ context.Context, sha string) ([]byte, error) 
 	return nil, errors.New("not_found")
 }
 
-func runtugSetup(t *testing.T, runner *runtugRunner) (*Service, *fakeGH, config.Repo) {
+func panewireSetup(t *testing.T, runner *panewireRunner) (*Service, *fakeGH, config.Repo) {
 	t.Helper()
 	s, g, _, _, r := setup(t)
 	s.Runner = runner
@@ -205,9 +206,9 @@ func runtugSetup(t *testing.T, runner *runtugRunner) (*Service, *fakeGH, config.
 	grace := findingsGrace
 	findingsGrace = 0
 	t.Cleanup(func() { findingsGrace = grace })
-	s.Config.Review.Executor = "runtug"
+	s.Config.Review.Executor = "panewire"
 	dir := t.TempDir()
-	s.Config.Review.Runtug = config.RuntugReview{Command: "runtug", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(dir, "jobs"), Checkouts: filepath.Join(dir, "checkouts")}
+	s.Config.Review.Panewire = config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(dir, "jobs"), Checkouts: filepath.Join(dir, "checkouts")}
 	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: anthropic\n"
 	g.pull.Base.Ref = "main"
 	g.pull.Head.Ref = "feat/thing"
@@ -223,9 +224,9 @@ func arg(args []string, flag string) string {
 	return ""
 }
 
-func TestRuntugPassPostsPaneFindings(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewirePassPostsPaneFindings(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	g.pull.Body += "\n## Operator decisions\n\n- Headless stays the default executor.\n"
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
@@ -243,7 +244,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 		t.Fatal(sp)
 	}
 	checkout := arg(sp, "-c")
-	if !strings.HasPrefix(checkout, s.Config.Review.Runtug.Checkouts) {
+	if !strings.HasPrefix(checkout, s.Config.Review.Panewire.Checkouts) {
 		t.Fatal(checkout)
 	}
 	// The checkout is detached at the reviewed head from pull/7/head; no
@@ -260,7 +261,7 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, want := range []string{"example/project#7", shaA, "detached at the head", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "runtug done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
+	for _, want := range []string{"example/project#7", shaA, "detached at the head", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "panewire done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}
@@ -271,14 +272,14 @@ func TestRuntugPassPostsPaneFindings(t *testing.T) {
 	}
 	got := g.passes[shaA][0]
 	diff, _ := g.Diff(context.Background(), "", 0)
-	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "runtug:seat-x", Family: "openai", Executor: "runtug", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1, Patch: reviewPatchID(diff)}) {
+	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", Executor: "panewire", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
 	}
 }
 
-func TestRuntugLargeDeltaBriefCompletesBothPasses(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
 	large := "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+" + strings.Repeat("large delta 한글 ", 6000) + "\n"
 	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}
@@ -302,7 +303,7 @@ func TestRuntugLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 		if len(body) <= 64<<10 || len(prompt) > 2048 || !strings.Contains(string(prompt), "'handoffkeep' attach get "+id) || !bytes.Equal(runner.sink.files[id], body) {
 			t.Fatalf("brief=%d prompt=%d attachment preserved=%v", len(body), len(prompt), bytes.Equal(runner.sink.files[id], body))
 		}
-		for _, want := range []string{"review round 2", "## Delta to review", strings.TrimSpace(large), "runtug done " + arg(sp, "-l")} {
+		for _, want := range []string{"review round 2", "## Delta to review", strings.TrimSpace(large), "panewire done " + arg(sp, "-l")} {
 			if !strings.Contains(string(body), want) {
 				t.Fatalf("complete brief lost %q", want[:min(len(want), 80)])
 			}
@@ -310,11 +311,11 @@ func TestRuntugLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	}
 }
 
-func TestRuntugLargeBriefUploadFailureIsExplicit(t *testing.T) {
-	runner := &runtugRunner{family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	runner.sink.uploadErr = errors.New("attachment service unavailable")
-	x := &runtugExecutor{s: s, repo: r, pr: g.pull, context: strings.Repeat("context ", 10000)}
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, context: strings.Repeat("context ", 10000)}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (bool, error) { return true, nil })
@@ -323,7 +324,7 @@ func TestRuntugLargeBriefUploadFailureIsExplicit(t *testing.T) {
 	}
 }
 
-func TestRuntugLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
+func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 	for _, name := range []string{"custom-hk", "custom hk's"} {
 		t.Run(name, func(t *testing.T) {
 			job := t.TempDir()
@@ -338,7 +339,7 @@ func TestRuntugLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 			if e := os.WriteFile(command, []byte(script), 0700); e != nil {
 				t.Fatal(e)
 			}
-			x := &runtugExecutor{s: &Service{Sink: integrations.Handoffkeep{Runner: integrations.Exec{}, Command: command}}}
+			x := &panewireExecutor{s: &Service{Sink: integrations.Handoffkeep{Runner: integrations.Exec{}, Command: command}}}
 			pointer, e := x.spawnBrief(context.Background(), path, job)
 			if e != nil {
 				t.Fatal(e)
@@ -361,7 +362,7 @@ func TestRuntugLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 
 // The builder's hk job record supplies --builder-family; a builder without a
 // record (pre-records spawn) falls back to the trailer/commit inference.
-func TestRuntugBuilderFamilyFromRecord(t *testing.T) {
+func TestPanewireBuilderFamilyFromRecord(t *testing.T) {
 	for name, tc := range map[string]struct {
 		record *integrations.JobRecord
 		want   string
@@ -371,8 +372,8 @@ func TestRuntugBuilderFamilyFromRecord(t *testing.T) {
 		"no family on record": {&integrations.JobRecord{State: "completed"}, "anthropic"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-			s, _, r := runtugSetup(t, runner)
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+			s, _, r := panewireSetup(t, runner)
 			if tc.record != nil {
 				runner.sink.jobs["author-job"] = *tc.record
 			}
@@ -392,7 +393,7 @@ func TestRuntugBuilderFamilyFromRecord(t *testing.T) {
 }
 
 // gitCalls lists the git invocations against root without the -C prefix.
-func gitCalls(r *runtugRunner, root string) []string {
+func gitCalls(r *panewireRunner, root string) []string {
 	out := []string{}
 	for _, c := range r.git {
 		out = append(out, strings.TrimPrefix(strings.Join(c, " "), "-C "+root+" "))
@@ -401,27 +402,27 @@ func gitCalls(r *runtugRunner, root string) []string {
 }
 
 // A pane on another host returns its findings on its hk job record. A pane
-// from before `runtug done --result` leaves a record without one and its
+// from before `panewire done --result` leaves a record without one and its
 // findings still arrive as an attachment announced on the findings lane:
 // mergewake fetches, validates and posts them through the legacy fallback,
 // counts the use and acknowledges the event.
-func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
+func TestPanewireRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 	for name, record := range map[string]integrations.JobRecord{
 		"record result":      {State: "completed", Family: "google", Result: json.RawMessage(`{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`)},
 		"legacy inbox reply": {State: "completed", Family: "google"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
-			s, g, r := runtugSetup(t, runner)
-			s.Config.Review.Runtug.Lane = "review-desk"
-			s.Config.Review.Runtug.Panewire = "panewire"
-			s.Config.Review.Runtug.ExcludeHosts = []string{"slow-host", "other-host"}
+			runner := &panewireRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
+			s, g, r := panewireSetup(t, runner)
+			s.Config.Review.Panewire.Lane = "review-desk"
+			s.Config.Review.Panewire.Command = "panewire"
+			s.Config.Review.Panewire.ExcludeHosts = []string{"slow-host", "other-host"}
 			runner.sink.missing = &record
 			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 				t.Fatal(e)
 			}
 			got := g.passes[shaA]
-			if runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || got[0].Reviewer != "runtug:seat-x" || g.postCount != 1 {
+			if runner.headless != 0 || len(got) != 1 || got[0].Executor != "panewire" || got[0].Reviewer != "panewire:seat-x" || g.postCount != 1 {
 				t.Fatalf("headless=%d %+v", runner.headless, got)
 			}
 			// The record's family wins over the guessed remote family.
@@ -434,8 +435,8 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 			}
 			label := arg(sp, "-l")
 			brief, _ := os.ReadFile(arg(sp, "-p"))
-			if !strings.Contains(string(brief), "runtug done "+label+` --result "$J/findings.json"`) {
-				t.Fatalf("brief lacks runtug done --result:\n%s", brief)
+			if !strings.Contains(string(brief), "panewire done "+label+` --result "$J/findings.json"`) {
+				t.Fatalf("brief lacks panewire done --result:\n%s", brief)
 			}
 			if strings.Contains(string(brief), "attach put") || strings.Contains(string(brief), "panewire emit") {
 				t.Fatalf("brief still teaches the lane return:\n%s", brief)
@@ -460,9 +461,9 @@ func TestRuntugRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 
 // A failed `worktree add --detach` is cleaned up and falls back; nothing
 // ever touches a local branch.
-func TestRuntugFailedCheckoutFallsBack(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireFailedCheckoutFallsBack(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
+	s, g, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -477,15 +478,15 @@ func TestRuntugFailedCheckoutFallsBack(t *testing.T) {
 
 // A review cancelled while the findings are awaited ends with the context
 // error once, not joined with itself.
-func TestRuntugCancelWhileCollectingWrapsOnce(t *testing.T) {
-	runner := &runtugRunner{family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireCancelWhileCollectingWrapsOnce(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	findingsGrace = time.Minute
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	runner.afterRun = cancel
 	diff, _ := g.Diff(ctx, r.Name, 7)
-	x := &runtugExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
 	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
 	if !errors.Is(e, context.Canceled) || strings.Count(e.Error(), context.Canceled.Error()) != 1 {
 		t.Fatalf("%v", e)
@@ -493,10 +494,10 @@ func TestRuntugCancelWhileCollectingWrapsOnce(t *testing.T) {
 }
 
 // GitHub reports a deleted fork's head as "repo": null; the pass falls back to
-// headless before the claim, without touching git or runtug.
-func TestRuntugDeletedForkFallsBackToHeadless(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+// headless before the claim, without touching git or panewire.
+func TestPanewireDeletedForkFallsBackToHeadless(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	var pull github.Pull
 	if e := json.Unmarshal([]byte(`{"number":7,"state":"open","head":{"sha":"`+shaA+`","ref":"feat/thing","repo":null},"base":{"sha":"`+shaB+`","ref":"main","repo":{"full_name":"example/project"}}}`), &pull); e != nil {
 		t.Fatal(e)
@@ -511,12 +512,12 @@ func TestRuntugDeletedForkFallsBackToHeadless(t *testing.T) {
 	}
 }
 
-// An announcement that trails runtug's completion is waited for.
-func TestRuntugWaitsForLateAnnouncement(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", remote: &taskJobSink{}, late: 2}
-	s, g, r := runtugSetup(t, runner)
-	s.Config.Review.Runtug.Lane = "review-desk"
-	s.Config.Review.Runtug.Panewire = "panewire"
+// An announcement that trails panewire's completion is waited for.
+func TestPanewireWaitsForLateAnnouncement(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", remote: &taskJobSink{}, late: 2}
+	s, g, r := panewireSetup(t, runner)
+	s.Config.Review.Panewire.Lane = "review-desk"
+	s.Config.Review.Panewire.Command = "panewire"
 	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	poll := findingsPoll
 	findingsGrace, findingsPoll = time.Minute, time.Millisecond
@@ -524,24 +525,24 @@ func TestRuntugWaitsForLateAnnouncement(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if got := g.passes[shaA]; runner.looks != 3 || runner.headless != 0 || got[0].Executor != "runtug" {
+	if got := g.passes[shaA]; runner.looks != 3 || runner.headless != 0 || got[0].Executor != "panewire" {
 		t.Fatalf("looks=%d headless=%d %+v", runner.looks, runner.headless, got)
 	}
 }
 
 // With a findings lane configured, a pane on this host that left only the
 // local file is still read; a lane that cannot be read falls back to it too.
-func TestRuntugLocalFindingsFileStillRead(t *testing.T) {
+func TestPanewireLocalFindingsFileStillRead(t *testing.T) {
 	for name, inboxErr := range map[string]error{"no event": nil, "inbox down": errors.New("hub unavailable")} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", inboxErr: inboxErr}
-			s, g, r := runtugSetup(t, runner)
-			s.Config.Review.Runtug.Lane = "review-desk"
-			s.Config.Review.Runtug.Panewire = "panewire"
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", inboxErr: inboxErr}
+			s, g, r := panewireSetup(t, runner)
+			s.Config.Review.Panewire.Lane = "review-desk"
+			s.Config.Review.Panewire.Command = "panewire"
 			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 				t.Fatal(e)
 			}
-			if got := g.passes[shaA]; runner.headless != 0 || len(got) != 1 || got[0].Executor != "runtug" || len(runner.acks) != 0 {
+			if got := g.passes[shaA]; runner.headless != 0 || len(got) != 1 || got[0].Executor != "panewire" || len(runner.acks) != 0 {
 				t.Fatalf("headless=%d %+v", runner.headless, got)
 			}
 		})
@@ -550,9 +551,9 @@ func TestRuntugLocalFindingsFileStillRead(t *testing.T) {
 
 // A pane whose worktree is not at the head refuses; the refusal is never
 // posted as a clean review.
-func TestRuntugHeadRefusalFallsBackToHeadless(t *testing.T) {
-	runner := &runtugRunner{findings: `{"refused":"HEAD is 1234567, expected ` + shaA + `"}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireHeadRefusalFallsBackToHeadless(t *testing.T) {
+	runner := &panewireRunner{findings: `{"refused":"HEAD is 1234567, expected ` + shaA + `"}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -564,8 +565,8 @@ func TestRuntugHeadRefusalFallsBackToHeadless(t *testing.T) {
 
 // The detached checkout never names the author's branch, so a host where
 // that branch is checked out in another worktree is not refused. A fork PR
-// still falls back: runtug replicates only a spec on the repo's origin.
-func TestRuntugCheckoutDetached(t *testing.T) {
+// still falls back: panewire replicates only a spec on the repo's origin.
+func TestPanewireCheckoutDetached(t *testing.T) {
 	for name, tc := range map[string]struct {
 		fork   string
 		want   []string
@@ -575,8 +576,8 @@ func TestRuntugCheckoutDetached(t *testing.T) {
 		"fork":      {fork: "someone/project", want: []string{}, reason: "head branch is not in example/project (fork PR)"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-			s, g, r := runtugSetup(t, runner)
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+			s, g, r := panewireSetup(t, runner)
 			if tc.fork != "" {
 				g.pull.Head.Repo.FullName = tc.fork
 			}
@@ -597,7 +598,7 @@ func TestRuntugCheckoutDetached(t *testing.T) {
 				t.Fatalf("%q", got)
 			}
 			if tc.reason == "" {
-				if p[0].Executor != "runtug" {
+				if p[0].Executor != "panewire" {
 					t.Fatalf("%+v", p)
 				}
 				return
@@ -613,7 +614,7 @@ func TestRuntugCheckoutDetached(t *testing.T) {
 // head fetched from pull/<n>/head — no local branch appears before, during or
 // after the pass, and the worktree is gone once the wait ends. The author's
 // branch checked out in the clone's own worktree does not refuse the pass.
-func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
+func TestPanewireDetachedCheckoutRealRepo(t *testing.T) {
 	gitRun := func(dir string, args ...string) string {
 		t.Helper()
 		b, e := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -645,7 +646,7 @@ func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
 	branches := gitRun(root, "branch", "--list")
 
 	var during []string
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", realGit: true}
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", realGit: true}
 	runner.afterRun = func() {
 		checkout := arg(runner.spawns[0], "-c")
 		during = append(during,
@@ -654,13 +655,13 @@ func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
 			gitRun(root, "branch", "--list"),
 		)
 	}
-	s, g, r := runtugSetup(t, runner)
+	s, g, r := panewireSetup(t, runner)
 	r.Root = root
 	g.pull.Head.SHA = head
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if p := g.passes[head]; len(p) != 1 || p[0].Executor != "runtug" {
+	if p := g.passes[head]; len(p) != 1 || p[0].Executor != "panewire" {
 		t.Fatalf("%+v", p)
 	}
 	if len(during) != 3 || !strings.Contains(during[0], arg(runner.spawns[0], "-c")) || during[1] != head || during[2] != branches {
@@ -669,7 +670,7 @@ func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
 	if w := gitRun(root, "worktree", "list", "--porcelain"); strings.Count(w, "worktree ") != 1 {
 		t.Fatalf("worktree left on the host:\n%s", w)
 	}
-	// The fetch leaves the head in the ref runtug reads to build the
+	// The fetch leaves the head in the ref panewire reads to build the
 	// detached checkout spec for another host.
 	if got := gitRun(root, "rev-parse", "refs/remotes/origin/pull/7/head"); got != head {
 		t.Fatalf("refs/remotes/origin/pull/7/head=%s want %s", got, head)
@@ -679,9 +680,9 @@ func TestRuntugDetachedCheckoutRealRepo(t *testing.T) {
 	}
 }
 
-func TestRuntugFamilyRefusalRetriesAsWorker(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "anthropic", refuse: map[string]int{"reviewer": runtugRefused}}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireFamilyRefusalRetriesAsWorker(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "anthropic", refuse: map[string]int{"reviewer": panewireRefused}}
+	s, g, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -689,25 +690,25 @@ func TestRuntugFamilyRefusalRetriesAsWorker(t *testing.T) {
 		t.Fatal(runner.spawns, runner.headless)
 	}
 	got := g.passes[shaA][0]
-	if got.Executor != "runtug" || !got.SameFamily || got.Family != "anthropic" || !strings.Contains(got.Fallback, "outside the author family") {
+	if got.Executor != "panewire" || !got.SameFamily || got.Family != "anthropic" || !strings.Contains(got.Fallback, "outside the author family") {
 		t.Fatalf("%+v", got)
 	}
 }
 
-func TestRuntugFallsBackToHeadless(t *testing.T) {
+func TestPanewireFallsBackToHeadless(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body   string
-		runner *runtugRunner
+		runner *panewireRunner
 		reason string
 	}{
-		"no task trailer":   {"Mergewake-Author-Family: openai\n", &runtugRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
-		"spawn refused":     {"", &runtugRunner{refuse: map[string]int{"reviewer": 70}}, "runtug spawn exit 70"},
-		"refused twice":     {"", &runtugRunner{refuse: map[string]int{"reviewer": runtugRefused, "worker": runtugRefused}}, "runtug spawn exit 77"},
-		"no findings file":  {"", &runtugRunner{}, "wrote no findings file"},
-		"findings off diff": {"", &runtugRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x"}]}`}, "findings rejected"},
+		"no task trailer":   {"Mergewake-Author-Family: openai\n", &panewireRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
+		"spawn refused":     {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
+		"refused twice":     {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
+		"no findings file":  {"", &panewireRunner{}, "wrote no findings file"},
+		"findings off diff": {"", &panewireRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x"}]}`}, "findings rejected"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, g, r := runtugSetup(t, tc.runner)
+			s, g, r := panewireSetup(t, tc.runner)
 			if tc.body != "" {
 				g.pull.Body = tc.body
 			}
@@ -715,7 +716,7 @@ func TestRuntugFallsBackToHeadless(t *testing.T) {
 				t.Fatal(e)
 			}
 			got := g.passes[shaA]
-			if tc.runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || got[0].Executor != "" || !strings.HasPrefix(got[0].Fallback, "runtug: ") || !strings.Contains(got[0].Fallback, tc.reason) {
+			if tc.runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || got[0].Executor != "" || !strings.HasPrefix(got[0].Fallback, "panewire: ") || !strings.Contains(got[0].Fallback, tc.reason) {
 				t.Fatalf("headless=%d %+v", tc.runner.headless, got)
 			}
 			// One lease covers both executors of the pass.
@@ -726,27 +727,27 @@ func TestRuntugFallsBackToHeadless(t *testing.T) {
 	}
 }
 
-func TestRuntugNeedsNoQuotaTool(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", quotaErr: errors.New("scopefuel: not found")}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireNeedsNoQuotaTool(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", quotaErr: errors.New("scopefuel: not found")}
+	s, g, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if g.postCount != 1 || g.passes[shaA][0].Executor != "runtug" {
+	if g.postCount != 1 || g.passes[shaA][0].Executor != "panewire" {
 		t.Fatal(g.passes)
 	}
 	// Without quota or a working pane the pass fails with both reasons.
-	runner = &runtugRunner{quotaErr: errors.New("scopefuel: not found")}
-	s, g, r = runtugSetup(t, runner)
+	runner = &panewireRunner{quotaErr: errors.New("scopefuel: not found")}
+	s, g, r = panewireSetup(t, runner)
 	e := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "runtug: no findings") || !strings.Contains(e.Error(), "headless: review unavailable: quota recommendation") || g.postCount != 0 {
+	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "panewire: no findings") || !strings.Contains(e.Error(), "headless: review unavailable: quota recommendation") || g.postCount != 0 {
 		t.Fatal(e, g.postCount)
 	}
 }
 
-func TestHeadlessExecutorUnchangedWithoutRuntug(t *testing.T) {
-	runner := &runtugRunner{}
-	s, g, r := runtugSetup(t, runner)
+func TestHeadlessExecutorUnchangedWithoutPanewire(t *testing.T) {
+	runner := &panewireRunner{}
+	s, g, r := panewireSetup(t, runner)
 	s.Config.Review.Executor = "headless"
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
@@ -756,11 +757,11 @@ func TestHeadlessExecutorUnchangedWithoutRuntug(t *testing.T) {
 	}
 }
 
-// A headless skip before the fallback succeeds must not replace the runtug
+// A headless skip before the fallback succeeds must not replace the panewire
 // reason recorded in the receipt.
-func TestRuntugFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
-	runner := &runtugRunner{fakeRunner: fakeRunner{recommend: []string{"bad", "claude"}}, refuse: map[string]int{"reviewer": 70}}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
+	runner := &panewireRunner{fakeRunner: fakeRunner{recommend: []string{"bad", "claude"}}, refuse: map[string]int{"reviewer": 70}}
+	s, g, r := panewireSetup(t, runner)
 	s.Config.Review.Pairings = map[string][]string{"openai": {"bad", "claude"}}
 	s.Config.Review.Profiles["bad"] = config.Reviewer{Family: "xai", Command: "grok", Args: []string{"--unknown", "x"}}
 	out := &bytes.Buffer{}
@@ -769,22 +770,22 @@ func TestRuntugFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
 		t.Fatal(e)
 	}
 	got := g.passes[shaA][0]
-	if !strings.Contains(out.String(), `"reviewer":"bad","reason":"reviewer profile rejected"`) || got.Reviewer != "claude" || got.Fallback != "runtug: runtug spawn exit 70: exit status" {
+	if !strings.Contains(out.String(), `"reviewer":"bad","reason":"reviewer profile rejected"`) || got.Reviewer != "claude" || got.Fallback != "panewire: panewire spawn exit 70: exit status" {
 		t.Fatalf("%+v", got)
 	}
 }
 
 // A pass run without a context deadline waits up to review.timeout instead of
 // skipping the pane for lack of time.
-func TestRuntugPassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	s.Config.Review.Timeout = "10m"
 	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	diff, _ := g.Diff(context.Background(), r.Name, 7)
-	x := &runtugExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
 	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
-	if e != nil || out.executor != "runtug" || len(out.skips) != 0 || len(runner.spawns) != 1 {
+	if e != nil || out.executor != "panewire" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}
 	// A minute of the ten is kept back for posting.
@@ -793,25 +794,25 @@ func TestRuntugPassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	}
 }
 
-// In runtug mode a failed usage read keeps the recommendation: the headless
+// In panewire mode a failed usage read keeps the recommendation: the headless
 // fallback still has its ranked candidates, ordered without pace.
-func TestRuntugUsageFailureKeepsRankedFallback(t *testing.T) {
-	runner := &runtugRunner{usageErr: errors.New("usage snapshot unavailable"), refuse: map[string]int{"reviewer": 70}}
-	s, g, r := runtugSetup(t, runner)
+func TestPanewireUsageFailureKeepsRankedFallback(t *testing.T) {
+	runner := &panewireRunner{usageErr: errors.New("usage snapshot unavailable"), refuse: map[string]int{"reviewer": 70}}
+	s, g, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
 	got := g.passes[shaA]
-	if runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || !strings.Contains(got[0].Fallback, "runtug spawn exit 70") {
+	if runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || !strings.Contains(got[0].Fallback, "panewire spawn exit 70") {
 		t.Fatalf("headless=%d %+v", runner.headless, got)
 	}
 }
 
 // A failed add -b that left no branch at the PR head never deletes a branch:
 // a rev-parse failure is not proof the branch was absent.
-func TestRuntugFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
-	s, _, r := runtugSetup(t, runner)
+func TestPanewireFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
+	s, _, r := panewireSetup(t, runner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -826,17 +827,17 @@ func TestRuntugFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 // completed with a result uses it; completed without one, a pending or
 // missing record, and an unreadable hk fall back after the bounded poll;
 // escalated and lost fall back immediately and the receipt keeps the state.
-func TestRuntugJobRecordResultW4(t *testing.T) {
+func TestPanewireJobRecordResultW4(t *testing.T) {
 	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
 	for name, tc := range map[string]struct {
 		record   *integrations.JobRecord
 		jobErr   error
 		result   string
-		executor string // pass executor: "runtug" or "" (headless)
+		executor string // pass executor: "panewire" or "" (headless)
 		reason   string
 		polled   bool // the record was asked for more than once
 	}{
-		"completed with result":    {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "runtug"},
+		"completed with result":    {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "panewire"},
 		"refusal in the result":    {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
 		"completed without result": {record: &integrations.JobRecord{State: "completed"}, reason: "completed without a result"},
 		"escalated":                {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
@@ -846,8 +847,8 @@ func TestRuntugJobRecordResultW4(t *testing.T) {
 		"hk unreadable":            {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{family: "openai"}
-			s, g, r := runtugSetup(t, runner)
+			runner := &panewireRunner{family: "openai"}
+			s, g, r := panewireSetup(t, runner)
 			findingsGrace, findingsPoll = 30*time.Millisecond, time.Millisecond
 			if tc.record != nil {
 				runner.sink.missing = tc.record
@@ -860,7 +861,7 @@ func TestRuntugJobRecordResultW4(t *testing.T) {
 			if len(got) != 1 || got[0].Executor != tc.executor {
 				t.Fatalf("%+v", got)
 			}
-			if tc.executor == "runtug" {
+			if tc.executor == "panewire" {
 				if got[0].Family != "google" || runner.headless != 0 {
 					t.Fatalf("%+v headless=%d", got[0], runner.headless)
 				}
@@ -882,12 +883,12 @@ func TestRuntugJobRecordResultW4(t *testing.T) {
 	}
 }
 
-// A task whose author did not run through runtug has no bound job. The pass
+// A task whose author did not run through panewire has no bound job. The pass
 // still runs, as a top-level reviewer: no --builder-job, but the author's
-// family is kept so runtug's reviewer role excludes it.
-func TestRuntugTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
-	runner := &runtugRunner{findings: `{"findings":[]}`, family: "openai"}
-	s, g, r := runtugSetup(t, runner)
+// family is kept so panewire's reviewer role excludes it.
+func TestPanewireTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
 	runner.sink.job = ""
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
@@ -899,7 +900,7 @@ func TestRuntugTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
 	if slices.Contains(sp, "--builder-job") || arg(sp, "--builder-family") != "openai" || arg(sp, "--task") != "42" || arg(sp, "--role") != "reviewer" {
 		t.Fatal(sp)
 	}
-	if p := g.passes[shaA]; len(p) != 1 || p[0].Executor != "runtug" {
+	if p := g.passes[shaA]; len(p) != 1 || p[0].Executor != "panewire" {
 		t.Fatalf("%+v", p)
 	}
 	for _, get := range runner.sink.gets {
@@ -911,7 +912,7 @@ func TestRuntugTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
 
 // The reviewer's family comes from its hk job record when the pane ran on
 // another host and left no spawn events in the local job directory.
-func TestRuntugReviewerFamilyFromRecordWithoutLocalEvents(t *testing.T) {
+func TestPanewireReviewerFamilyFromRecordWithoutLocalEvents(t *testing.T) {
 	for name, tc := range map[string]struct {
 		record integrations.JobRecord
 		want   string
@@ -920,18 +921,18 @@ func TestRuntugReviewerFamilyFromRecordWithoutLocalEvents(t *testing.T) {
 		"no record family": {integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"findings":[]}`)}, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &runtugRunner{family: "openai", noEvents: true}
-			s, g, r := runtugSetup(t, runner)
+			runner := &panewireRunner{family: "openai", noEvents: true}
+			s, g, r := panewireSetup(t, runner)
 			runner.sink.missing = &tc.record
 			if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 				t.Fatal(e)
 			}
 			label := arg(runner.spawns[0], "-l")
-			if _, e := os.Stat(filepath.Join(s.Config.Review.Runtug.Jobs, label, "events")); !os.IsNotExist(e) {
+			if _, e := os.Stat(filepath.Join(s.Config.Review.Panewire.Jobs, label, "events")); !os.IsNotExist(e) {
 				t.Fatalf("local events dir exists: %v", e)
 			}
 			p := g.passes[shaA]
-			if len(p) != 1 || p[0].Executor != "runtug" || p[0].Family != tc.want {
+			if len(p) != 1 || p[0].Executor != "panewire" || p[0].Family != tc.want {
 				t.Fatalf("%+v", p)
 			}
 		})
