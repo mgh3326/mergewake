@@ -24,13 +24,14 @@ import (
 // fakeReapHub answers the panewire hub's node-command endpoints for one
 // machine, node-a, whose only agent sits in the merged PR's worktree.
 type fakeReapHub struct {
-	mu       sync.Mutex
-	agents   map[string]any // the node-a row of GET /v1/nodes/agents
-	composer map[string]any
-	capture  map[string]any
-	close    map[string]any
-	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
-	commands []map[string]any
+	mu          sync.Mutex
+	agents      map[string]any // the node-a row of GET /v1/nodes/agents
+	composer    map[string]any
+	capture     map[string]any
+	close       map[string]any
+	forbid      map[string]bool // paths or ops answered 403 scope_forbidden
+	commands    []map[string]any
+	beforeClose func()
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -72,12 +73,15 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		h.commands = append(h.commands, body)
+		if body["op"] == "pane.close" && h.beforeClose != nil {
+			h.beforeClose()
+		}
 		var result any
 		switch body["op"] {
 		case "worktree.inspect":
 			result = map[string]any{"worktree": nil}
 			cwd, _ := body["args"].(map[string]any)["cwd"].(string)
-			if cwd == "/repo.wt" || cwd == "/repo/wk-7" {
+			if cwd == "/repo.wt" || cwd == "/repo/wk-7" || strings.HasPrefix(cwd, "/repo/mwr-") {
 				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": "wk/x", "head": headSHA, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
 			}
 		case "pane.read":

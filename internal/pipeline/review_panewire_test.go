@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,7 +40,8 @@ type panewireRunner struct {
 	refuseStderr string
 	findings     string // "" writes no findings file
 	family       string
-	noEvents     bool // the pane ran on another host: no spawn events in the local job dir
+	noEvents     bool   // the pane ran on another host: no spawn events in the local job dir
+	placement    string // optional base64url spawn placement receipt
 	quotaErr     error
 	usageErr     error
 	spawns       [][]string
@@ -135,7 +138,7 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		if r.afterRun != nil {
 			r.afterRun()
 		}
-		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool\nwait job=l outcome=completed report= pane=p1\n"), nil
+		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool" + r.placement + "\nwait job=l outcome=completed report= pane=p1\n"), nil
 	}
 	r.headless++
 	return r.fakeRunner.Run(ctx, command, args, input, dir)
@@ -149,6 +152,7 @@ type taskJobSink struct {
 	missing    *integrations.JobRecord           // record for any unlisted id
 	jobErr     error
 	gets       []string
+	jobHook    func(string)
 	uploadErr  error
 }
 
@@ -174,6 +178,9 @@ func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
 
 func (s *taskJobSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
 	s.gets = append(s.gets, id)
+	if s.jobHook != nil {
+		s.jobHook(id)
+	}
 	if s.jobErr != nil {
 		return integrations.JobRecord{}, s.jobErr
 	}
@@ -274,6 +281,53 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	diff, _ := g.Diff(context.Background(), "", 0)
 	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", Executor: "panewire", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestPanewireCleanupFollowsRecordedResult(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	hub := newFakeReapHub()
+	hub.composer = map[string]any{"outcome": "read", "composer": "empty"}
+	server := hub.serve(t)
+	token := filepath.Join(t.TempDir(), "hub.env")
+	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=svc-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Config.Reap.Transport = config.ReapTransportPanewire
+	s.Config.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
+	g.pull.Head.SHA = headSHA
+	var reviewerReads atomic.Int32
+	var closeBeforeRecorded atomic.Bool
+	runner.sink.jobHook = func(id string) {
+		if strings.HasPrefix(id, "mwr-") {
+			reviewerReads.Add(1)
+		}
+	}
+	hub.beforeClose = func() {
+		if reviewerReads.Load() < 2 {
+			closeBeforeRecorded.Store(true)
+		}
+	}
+	runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
+	runner.afterRun = func() {
+		label := arg(runner.spawns[0], "-l")
+		cwd := "/repo/" + label
+		runner.sink.jobs[label] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`), Host: "node-a", PaneID: "w1:p1", Cwd: cwd}
+		pane := map[string]any{"pane_id": "w1:p1", "name": label, "agent_status": "idle", "agent": "claude", "cwd": cwd}
+		hub.agents["agents"] = []any{pane}
+		hub.agents["panes"] = []any{pane}
+	}
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: "diff --git a/tool b/tool\n+new\n"}
+	out, err := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	if err != nil || out.executor != "panewire" || len(out.findings) != 0 {
+		t.Fatalf("outcome=%+v error=%v", out, err)
+	}
+	if reviewerReads.Load() < 2 || closeBeforeRecorded.Load() {
+		t.Fatalf("cleanup preceded completed job result: reads=%d commands=%#v", reviewerReads.Load(), hub.commands)
+	}
+	if len(hub.ops("pane.close")) != 1 || len(hub.ops("worktree.remove")) != 1 {
+		t.Fatalf("cleanup commands: %#v", hub.commands)
 	}
 }
 
