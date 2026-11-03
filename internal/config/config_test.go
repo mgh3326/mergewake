@@ -435,6 +435,15 @@ func TestReviewExecutor(t *testing.T) {
 	if rt := c.Review.Panewire; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
 		t.Fatalf("%+v %v", rt, e)
 	}
+	c, e = load("review:\n  executor: panewire\n  panewire:\n    command: /usr/local/bin/panewire\n    workspace: reviews\n    owner: review-desk\n    host: auto\n")
+	if e != nil || c.Review.Panewire.Command != "/usr/local/bin/panewire" {
+		t.Fatalf("documented launcher migration: %+v %v", c.Review, e)
+	}
+	for _, retired := range []string{"review:\n  executor: runtug\n", "review:\n  runtug: {command: runtug, panewire: panewire}\n", "review:\n  executor: panewire\n  panewire: {panewire: panewire}\n"} {
+		if _, e := load(retired); e == nil {
+			t.Fatalf("retired launcher settings accepted: %s", retired)
+		}
+	}
 	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  panewire: {bogus: x}\n", "review:\n  panewire: {lane: 'a b'}\n", "review:\n  panewire: {exclude_hosts: ['a,b']}\n", "review:\n  panewire: {host: host-a, exclude_hosts: [host-a]}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
@@ -566,6 +575,32 @@ func TestRenotifyAndFindingsConfig(t *testing.T) {
 	}
 }
 
+func TestFindingsEscalationConfig(t *testing.T) {
+	for _, tc := range []struct {
+		settings string
+		window   time.Duration
+		rounds   int
+		invalid  bool
+	}{
+		{"", 2 * time.Hour, 3, false},
+		{"escalate_after: 5m, escalate_rounds: 0", 5 * time.Minute, 0, false},
+		{"escalate_after: 0s", 0, 0, true},
+		{"escalate_rounds: -1", 0, 0, true},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nhost: host-a\ndaemon:\n  pr:\n    findings: {"+tc.settings+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if (err != nil) != tc.invalid {
+			t.Fatalf("%q: %v", tc.settings, err)
+		}
+		if err == nil && (c.Daemon.PR.Findings.EscalationWindow() != tc.window || c.Daemon.PR.Findings.EscalationRounds() != tc.rounds) {
+			t.Fatalf("%q: got %v, %d", tc.settings, c.Daemon.PR.Findings.EscalationWindow(), c.Daemon.PR.Findings.EscalationRounds())
+		}
+	}
+}
+
 func writeDiscordEnv(t *testing.T, mode os.FileMode, body string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "discord.env")
@@ -674,5 +709,58 @@ func TestDiscordConfigRefusals(t *testing.T) {
 	loop := writeDiscordEnv(t, 0600, "HOOK_PR=http://127.0.0.1:9/h\n")
 	if _, e := loadDiscord(t, "discord: {enabled: true, webhooks_file: "+loop+", kinds: {pr: HOOK_PR}}\n"); e != nil {
 		t.Fatal(e)
+	}
+}
+
+func TestReviewRetryConfig(t *testing.T) {
+	for _, tc := range []struct {
+		yaml             string
+		invalid          bool
+		initial, maximum time.Duration
+		failures         int
+	}{
+		{"", false, time.Minute, 30 * time.Minute, 3},
+		{"initial: 2m, maximum: 8m, failures: 4", false, 2 * time.Minute, 8 * time.Minute, 4},
+		{"initial: 0s", true, 0, 0, 0},
+		{"initial: 2h, maximum: 1h", true, 0, 0, 0},
+		{"failures: -1", true, 0, 0, 0},
+	} {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\ndaemon:\n  pr:\n    review_retry: {"+tc.yaml+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(p)
+		if (err != nil) != tc.invalid {
+			t.Fatalf("%q: %v", tc.yaml, err)
+		}
+		if err == nil {
+			a, b, k := c.Daemon.PR.ReviewRetry.Settings()
+			if a != tc.initial || b != tc.maximum || k != tc.failures {
+				t.Fatalf("%q: %v %v %d", tc.yaml, a, b, k)
+			}
+		}
+	}
+}
+
+func TestReviewRecoveryDurationsRejectNonPositive(t *testing.T) {
+	for _, setting := range []struct{ field, section, key string }{
+		{"daemon.pr.review_retry.initial", "review_retry", "initial"},
+		{"daemon.pr.review_retry.maximum", "review_retry", "maximum"},
+		{"daemon.pr.findings.escalate_after", "findings", "escalate_after"},
+	} {
+		for _, value := range []string{"0s", "-1s"} {
+			t.Run(setting.field+"/"+value, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				body := "version: 1\nhost: host-a\ndaemon:\n  pr:\n    " + setting.section + ": {" + setting.key + ": " + value + "}\n"
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := Load(path)
+				want := setting.field + ": invalid positive duration \"" + value + "\""
+				if err == nil || err.Error() != want {
+					t.Fatalf("Load(%s=%s): got %v, want %q", setting.field, value, err, want)
+				}
+			})
+		}
 	}
 }

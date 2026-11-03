@@ -37,6 +37,7 @@ type Reviewer struct {
 }
 type Review struct {
 	Login        string              `yaml:"login"`
+	FleetAuthors []string            `yaml:"fleet_authors"`
 	Pairings     map[string][]string `yaml:"pairings"`
 	Profiles     map[string]Reviewer `yaml:"profiles"`
 	Scopefuel    string              `yaml:"scopefuel"`
@@ -204,15 +205,28 @@ func (n PRNotify) Renotify() (time.Duration, int) {
 type PRFindings struct {
 	Enabled *bool `yaml:"enabled"`
 	// AckAfter is how long a delivery waits for the author lane's
-	// `panewire inbox ack` before it is re-sent once, and again before it is
-	// escalated to the owning lane. Empty means 15m.
-	AckAfter string `yaml:"ack_after"`
+	// `panewire inbox ack` before it is re-sent once. Unresolved age and
+	// distinct heads control desk escalation separately. Empty means 15m.
+	AckAfter       string `yaml:"ack_after"`
+	EscalateAfter  string `yaml:"escalate_after"`
+	EscalateRounds int    `yaml:"escalate_rounds"`
 }
 
 func (f PRFindings) On() bool { return f.Enabled == nil || *f.Enabled }
 
 // DefaultFindingsAckAfter applies when ack_after is unset.
 const DefaultFindingsAckAfter = 15 * time.Minute
+const DefaultFindingsEscalateAfter = 2 * time.Hour
+const DefaultFindingsEscalateRounds = 3
+
+func (f PRFindings) EscalationWindow() time.Duration {
+	if d, err := Duration(f.EscalateAfter); err == nil {
+		return d
+	}
+	return DefaultFindingsEscalateAfter
+}
+
+func (f PRFindings) EscalationRounds() int { return f.EscalateRounds }
 
 // AckWindow is the bounded wait for an author ACK.
 func (f PRFindings) AckWindow() time.Duration {
@@ -234,11 +248,35 @@ type PRLoop struct {
 	Findings PRFindings `yaml:"findings"`
 	// StallAfter is how long a ready PR head may wait with no review started
 	// before the stall alarm fires. Empty means 30m; "off" disables the alarm.
-	StallAfter string `yaml:"stall_after"`
+	StallAfter  string      `yaml:"stall_after"`
+	ReviewRetry ReviewRetry `yaml:"review_retry"`
 	// SkipBots leaves PRs opened by bot accounts (GitHub user type "Bot", e.g.
 	// Renovate) out of review, notify, landing and the stall alarm: they carry
 	// no author family, so a review can never start and the alarm only nags.
 	SkipBots bool `yaml:"skip_bots"`
+}
+
+// ReviewRetry bounds retries and the number of failures before escalation.
+type ReviewRetry struct {
+	Initial  string `yaml:"initial"`
+	Maximum  string `yaml:"maximum"`
+	Failures int    `yaml:"failures"`
+}
+
+func (r ReviewRetry) Settings() (time.Duration, time.Duration, int) {
+	initial, err := Duration(r.Initial)
+	if err != nil {
+		initial = time.Minute
+	}
+	maximum, err := Duration(r.Maximum)
+	if err != nil {
+		maximum = 30 * time.Minute
+	}
+	failures := r.Failures
+	if failures <= 0 {
+		failures = 3
+	}
+	return initial, maximum, failures
 }
 
 // DefaultStallAfter is the review-stall threshold when stall_after is unset.
@@ -507,6 +545,7 @@ func Decode(r io.Reader, v any) error {
 }
 func Load(name string) (Config, error) {
 	var c Config
+	c.Daemon.PR.Findings.EscalateRounds = DefaultFindingsEscalateRounds
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e
@@ -550,6 +589,21 @@ func Load(name string) (Config, error) {
 			return c, fmt.Errorf("daemon.pr.stall_after: %w", e)
 		}
 	}
+	retry := c.Daemon.PR.ReviewRetry
+	for name, value := range map[string]string{"initial": retry.Initial, "maximum": retry.Maximum} {
+		if value != "" {
+			if _, err := Duration(value); err != nil {
+				return c, fmt.Errorf("daemon.pr.review_retry.%s: %w", name, err)
+			}
+		}
+	}
+	initial, maximum, _ := retry.Settings()
+	if initial > maximum {
+		return c, errors.New("daemon.pr.review_retry.initial exceeds maximum")
+	}
+	if retry.Failures < 0 {
+		return c, errors.New("daemon.pr.review_retry.failures must not be negative")
+	}
 	if v := c.Daemon.PR.Notify.RenotifyAfter; v != "" && v != "off" {
 		if _, e = Duration(v); e != nil {
 			return c, fmt.Errorf("daemon.pr.notify.renotify_after: %w", e)
@@ -562,6 +616,14 @@ func Load(name string) (Config, error) {
 		if _, e = Duration(v); e != nil {
 			return c, fmt.Errorf("daemon.pr.findings.ack_after: %w", e)
 		}
+	}
+	if v := c.Daemon.PR.Findings.EscalateAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("daemon.pr.findings.escalate_after: %w", e)
+		}
+	}
+	if c.Daemon.PR.Findings.EscalateRounds < 0 {
+		return c, errors.New("daemon.pr.findings.escalate_rounds must not be negative")
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
 		return c, e
