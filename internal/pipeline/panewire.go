@@ -17,6 +17,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // panewireRefused is panewire's role/seat/family refusal: with --role reviewer it
@@ -33,6 +34,7 @@ const inlineBriefLimit = 48 << 10
 var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
 
 var spawnedSeat = regexp.MustCompile(`(?m)^OK pane=\S+ model=(\S+)`)
+var spawnedLocation = regexp.MustCompile(`(?m)^OK pane=(\S+).*\bhost=(\S+)`)
 
 // findingsAttachment is the handoffkeep attachment id a pane announces.
 var findingsAttachment = regexp.MustCompile(`\battachment=([0-9a-f]{64})\b`)
@@ -174,6 +176,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
 	defer cleanup()
+	var stdout []byte
+	// Resolve the remote pane and worktree from the job record after spawn.
+	// This defer also runs when spawn wait or result collection times out.
+	defer func() { x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, string(stdout)) }()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -204,7 +210,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
 	}
 	note := ""
-	stdout, e := s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
+	stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
 	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 		note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
@@ -272,6 +278,167 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	return out, nil
+}
+
+// cleanupReviewer closes only the pane recorded for this pass, after checking
+// the live pane row still has this pass's name and cwd. It writes failures to
+// the reap-style receipt and never changes the review outcome.
+func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head, spawnOutput string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+	defer cancel()
+	job, err := x.job(ctx, label)
+	if m := spawnedLocation.FindStringSubmatch(spawnOutput); m != nil {
+		if job.PaneID == "" {
+			job.PaneID = m[1]
+		}
+		if job.Host == "" {
+			job.Host = m[2]
+		}
+	}
+	row := reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: job.Host, Pane: job.PaneID, Worktree: checkout}
+	record := func(result, reason string) {
+		row.Result, row.Reason = result, fleetevent.Redact(reason)
+		_ = x.s.reapNote(row, false)
+	}
+	if err != nil && (job.Host == "" || job.PaneID == "") {
+		record("error", "job record: "+err.Error())
+		return
+	}
+	row.Host, row.Pane = job.Host, job.PaneID
+	if job.Host == "" {
+		record("skipped", "job record has no host")
+		return
+	}
+	if job.PaneID == "" {
+		record("skipped", "job record has no pane id")
+		return
+	}
+	if job.Host == "local" || x.localReviewerHost(job.Host) {
+		x.cleanupLocalReviewer(ctx, &row, label, checkout, job.PaneID, record)
+		return
+	}
+	hub, err := x.s.reapHub()
+	if err != nil || hub == nil {
+		if err == nil {
+			err = errors.New("hub transport is not configured")
+		}
+		record("error", "hub: "+err.Error())
+		return
+	}
+	host := reap.HubHost{Hub: hub, Machine: job.Host}
+	panes, err := host.AllPanes(ctx)
+	if err != nil {
+		record("error", "pane list: "+err.Error())
+		return
+	}
+	var pane *reap.Pane
+	for i := range panes {
+		if panes[i].ID == job.PaneID {
+			pane = &panes[i]
+			break
+		}
+	}
+	if pane == nil {
+		record("skipped", "pane already gone")
+		return
+	}
+	row.Cwd = pane.Cwd
+	if pane.Name != label || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != label {
+		record("skipped", "pane name/cwd mismatch")
+		return
+	}
+	composer, err := host.Composer(ctx, *pane)
+	if err != nil {
+		record("error", "composer read: "+err.Error())
+		return
+	}
+	if composer != reap.ComposerEmpty {
+		row.Kept = 1
+		record("kept", "composer is not empty or could not be confirmed empty")
+		return
+	}
+	outcome, err := host.CloseExact(ctx, *pane)
+	if err != nil {
+		record("error", "pane close: "+err.Error())
+		return
+	}
+	if outcome != reap.CloseClosed && outcome != reap.CapturePaneGone {
+		row.Kept = 1
+		record("kept", "pane close recheck: "+outcome)
+		return
+	}
+	tree, err := host.Inspect(ctx, pane.Cwd)
+	if err != nil || tree == nil || tree.Path != pane.Cwd || tree.Head != head {
+		if err == nil {
+			err = errors.New("worktree identity changed")
+		}
+		record("error", "worktree inspect: "+err.Error())
+		return
+	}
+	removed, err := host.WorktreeRemove(ctx, tree.Path, head, x.pr.Base.Ref, nil)
+	if err != nil {
+		record("error", "worktree remove: "+err.Error())
+		return
+	}
+	result, reason := worktreeRemoveVerdict(removed)
+	record(result, reason)
+}
+
+func (x *panewireExecutor) cleanupLocalReviewer(ctx context.Context, row *reapReceipt, label, checkout, paneID string, record func(string, string)) {
+	row.Worktree = checkout
+	ops := reap.Exec{Runner: x.s.Runner, Host: reap.Host{}}
+	panes, err := ops.AllPanes(ctx)
+	if err != nil {
+		record("error", "local pane list: "+err.Error())
+		return
+	}
+	var pane *reap.Pane
+	for i := range panes {
+		if panes[i].ID == paneID {
+			pane = &panes[i]
+			break
+		}
+	}
+	if pane == nil {
+		record("skipped", "pane already gone")
+		return
+	}
+	row.Cwd = pane.Cwd
+	if pane.Name != label || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != label {
+		record("skipped", "pane name/cwd mismatch")
+		return
+	}
+	composer, err := ops.Composer(ctx, *pane)
+	if err != nil {
+		record("error", "local composer read: "+err.Error())
+		return
+	}
+	if composer != reap.ComposerEmpty {
+		row.Kept = 1
+		record("kept", "composer is not empty or could not be confirmed empty")
+		return
+	}
+	outcome, err := ops.CloseExact(ctx, *pane)
+	if err != nil {
+		record("error", "local pane close: "+err.Error())
+		return
+	}
+	if outcome != reap.CloseClosed && outcome != reap.CapturePaneGone {
+		row.Kept = 1
+		record("kept", "pane close recheck: "+outcome)
+		return
+	}
+	// The deferred git worktree cleanup below removes this local checkout.
+	record("closed", "local checkout cleanup applies")
+}
+
+func (x *panewireExecutor) localReviewerHost(machine string) bool {
+	for _, host := range x.s.Config.Hosts {
+		if host.Local() && (host.Name == machine || host.MachineID() == machine) {
+			return true
+		}
+	}
+	return false
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
