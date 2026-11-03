@@ -62,6 +62,10 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	if ctx.Err() != nil {
 		return errors.Join(err, ctx.Err())
 	}
+	if errors.Is(err, ErrReviewBlocked) {
+		// The author acts next, not a reviewer: no failure, backoff or escalation.
+		return fsutil.WriteJSON(file, reviewRetryState{Head: pr.Head.SHA})
+	}
 	if err == nil {
 		var complete, pending bool
 		complete, pending, err = s.retryReviewStatus(ctx, r, pr)

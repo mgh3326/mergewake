@@ -55,6 +55,9 @@ type Outcome struct {
 	RevertPR     int                       `json:"revert_pr,omitempty"`
 	RevertURL    string                    `json:"revert_url,omitempty"`
 	UpdatedAt    time.Time                 `json:"updated_at"`
+	// ReviewBlocked holds, by head, why that head's review cannot start, such
+	// as "blocked: missing-task-trailer". A blocked head has no review.
+	ReviewBlocked map[string]string `json:"review_blocked_by_head,omitempty"`
 }
 
 func (v Outcome) Attributed() bool {

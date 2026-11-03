@@ -11,6 +11,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 )
 
 // ciStarter is an optional GitHub capability: whether any check or status
@@ -44,11 +45,19 @@ func (s *Service) CheckStalls(ctx context.Context, r config.Repo, prs []github.P
 	if e != nil {
 		return e
 	}
+	ledger, e := s.ledger().Read()
+	if e != nil {
+		return e
+	}
 	now := s.now()
 	next := map[string]time.Time{}
 	var errs []error
 	for _, pr := range prs {
 		if pr.Merged || pr.State == "closed" || pr.Draft || (pr.Base.Ref != "" && pr.Base.Ref != r.Branch) {
+			continue
+		}
+		// A blocked head waits on its author, and the desk has already been told.
+		if ledger.Latest[outcomes.Key(r.Name, pr.Number)].ReviewBlocked[pr.Head.SHA] != "" {
 			continue
 		}
 		key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
