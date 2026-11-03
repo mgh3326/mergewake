@@ -101,7 +101,10 @@ only a separate validated gate fact can do so.
 
 `ConfirmAbsent` persists exponential backoff with positive jitter. Three
 consecutive failures block the operation and queue one escalation. Confirmed
-success resets the PR's consecutive failure counter. Capacity and CI waits
+success of eligible PR work resets the PR's consecutive failure counter;
+cancellation acknowledgments never clear failures accumulated by that work.
+Cancellation completions cannot carry PR transition facts, and their persisted
+job kind determines this rule. Capacity and CI waits
 do not call the failure operation. An authorized resume resets the cycle;
 ordinary new heads cannot reset exhausted fix rounds.
 

@@ -334,8 +334,11 @@ func (s *Store) Complete(ctx context.Context, f Fence, c Claim, event *state.Eve
 		}
 		var k Key
 		var generation uint64
-		if err = tx.QueryRowContext(ctx, `SELECT repository,number,generation,class FROM mw_jobs WHERE id=?`, c.ID).Scan(&k.Repository, &k.Number, &generation, &c.Class); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT repository,number,generation,class,kind FROM mw_jobs WHERE id=?`, c.ID).Scan(&k.Repository, &k.Number, &generation, &c.Class, &c.Kind); err != nil {
 			return false, err
+		}
+		if c.Kind == state.Cancel && event != nil {
+			return false, state.ErrTransition
 		}
 		snap, seq, err := readPR(ctx, tx, k, true)
 		if err != nil {
@@ -343,7 +346,7 @@ func (s *Store) Complete(ctx context.Context, f Fence, c Claim, event *state.Eve
 		}
 		jobStatus := "complete"
 		completionEvent := event
-		if completionEvent == nil && snap.Failures > 0 && snap.Stage != state.SystemBlocked {
+		if c.Kind != state.Cancel && completionEvent == nil && snap.Failures > 0 && snap.Stage != state.SystemBlocked {
 			completionEvent = &state.Event{Kind: state.Recovered, Head: snap.Head, Generation: snap.Generation}
 		}
 		if snap.Generation != generation || snap.Stage == state.Closed || snap.Stage == state.Merged {
