@@ -217,11 +217,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		defer cancel()
 		_, _ = git(c, "worktree", "remove", "--force", checkout)
 	}
+	keepCheckout := false
 	if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
 		cleanup()
 		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
-	defer cleanup()
+	defer func() {
+		if !keepCheckout {
+			cleanup()
+		}
+	}()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -257,7 +262,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// id belongs to this pass.
 	defer func() {
 		placement, confirmed := spawnPlacement(string(stdout))
-		x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, placement, confirmed)
+		x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, placement, confirmed, &keepCheckout)
 	}()
 	stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
 	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
@@ -332,7 +337,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 // cleanupReviewer closes only the pane recorded for this pass, after checking
 // the live pane row still has this pass's name and cwd. It writes failures to
 // the reap-style receipt and never changes the review outcome.
-func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head string, placement integrations.JobRecord, confirmed bool) {
+func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head string, placement integrations.JobRecord, confirmed bool, keepLocalCheckout *bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 	defer cancel()
 	if !confirmed {
@@ -362,7 +367,7 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 		return
 	}
 	if placement.Host == "local" || x.localReviewerHost(placement.Host) {
-		x.cleanupLocalReviewer(ctx, &row, label, checkout, placement.PaneID, record)
+		x.cleanupLocalReviewer(ctx, reap.Exec{Runner: x.s.Runner}, keepLocalCheckout, &row, label, checkout, placement.PaneID, record)
 		return
 	}
 	hub, err := x.s.reapHub()
@@ -424,7 +429,7 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 }
 
 func (x *panewireExecutor) removeReviewerWorktree(ctx context.Context, host reap.HubHost, row *reapReceipt, cwd, head string, record func(string, string)) {
-	row.Cwd = cwd
+	row.Worktree, row.Cwd = cwd, cwd
 	tree, err := host.Inspect(ctx, cwd)
 	if err != nil || tree == nil || tree.Path != cwd || tree.Head != head || !strings.EqualFold(tree.Repo, x.repo.Name) {
 		if err == nil {
@@ -439,14 +444,23 @@ func (x *panewireExecutor) removeReviewerWorktree(ctx context.Context, host reap
 		return
 	}
 	result, reason := worktreeRemoveVerdict(removed)
+	if result == "skipped" && (reason == "detached" || reason == "unmerged-or-unpushed") {
+		result, reason = "pending-cleanup", "hub guarded removal refused: "+reason
+	}
 	record(result, reason)
 }
 
-func (x *panewireExecutor) cleanupLocalReviewer(ctx context.Context, row *reapReceipt, label, checkout, paneID string, record func(string, string)) {
+type localReviewerPaneOps interface {
+	AllPanes(context.Context) ([]reap.Pane, error)
+	Composer(context.Context, reap.Pane) (string, error)
+	CloseExact(context.Context, reap.Pane) (string, error)
+}
+
+func (x *panewireExecutor) cleanupLocalReviewer(ctx context.Context, ops localReviewerPaneOps, keepCheckout *bool, row *reapReceipt, label, checkout, paneID string, record func(string, string)) {
 	row.Worktree = checkout
-	ops := reap.Exec{Runner: x.s.Runner, Host: reap.Host{}}
 	panes, err := ops.AllPanes(ctx)
 	if err != nil {
+		*keepCheckout = true
 		record("error", "local pane list: "+err.Error())
 		return
 	}
@@ -463,25 +477,31 @@ func (x *panewireExecutor) cleanupLocalReviewer(ctx context.Context, row *reapRe
 	}
 	row.Cwd = pane.Cwd
 	if pane.Name != label || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != label {
-		record("skipped", "pane name/cwd mismatch")
+		*keepCheckout = true
+		row.Kept = 1
+		record("kept", "pane name/cwd mismatch; local checkout retained")
 		return
 	}
 	composer, err := ops.Composer(ctx, *pane)
 	if err != nil {
+		*keepCheckout = true
 		record("error", "local composer read: "+err.Error())
 		return
 	}
 	if composer != reap.ComposerEmpty {
+		*keepCheckout = true
 		row.Kept = 1
 		record("kept", "composer is not empty or could not be confirmed empty")
 		return
 	}
 	outcome, err := ops.CloseExact(ctx, *pane)
 	if err != nil {
+		*keepCheckout = true
 		record("error", "local pane close: "+err.Error())
 		return
 	}
 	if outcome != reap.CloseClosed && outcome != reap.CapturePaneGone {
+		*keepCheckout = true
 		row.Kept = 1
 		record("kept", "pane close recheck: "+outcome)
 		return
