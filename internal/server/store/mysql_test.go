@@ -350,3 +350,29 @@ func TestMySQLUnreachableFailsClosed(t *testing.T) {
 		t.Fatal("unreachable DB conferred authority", err)
 	}
 }
+
+func TestMySQLResumeRetiresFailedEscalation(t *testing.T) {
+	s := mysqlStore(t)
+	f := fence(t, s)
+	ctx := context.Background()
+	k := Key{"example/project", 1}
+	apply(t, s, f, k, state.Observe, head(1), Automatic)
+	for _, kind := range []state.EffectKind{state.Refresh, state.Escalate} {
+		for i := 0; i < 3; i++ {
+			c, err := s.Claim(ctx, f, kind, Automatic)
+			if err != nil {
+				t.Fatal(kind, err)
+			}
+			if err = s.ConfirmAbsent(ctx, f, c); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.db.Exec(`UPDATE mw_jobs SET available_at=UTC_TIMESTAMP(6) WHERE id=?`, c.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	apply(t, s, f, k, state.Resume, head(1), Automatic)
+	if _, err := s.Claim(ctx, f, state.Refresh, Automatic); err != nil {
+		t.Fatal("failed escalation blocked authorized resume", err)
+	}
+}

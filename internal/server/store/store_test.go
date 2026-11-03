@@ -1,11 +1,25 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestConnectRefusesUnverifiedTLSBeforeDial(t *testing.T) {
+	t.Setenv("MERGEWAKE_MYSQL_DSN_FILE", "")
+	for _, options := range []string{"", "?tls=false", "?tls=skip-verify", "?tls=preferred", "?tls=true&allowFallbackToPlaintext=true"} {
+		t.Run(options, func(t *testing.T) {
+			t.Setenv("MERGEWAKE_MYSQL_DSN", "fixture:fixture@tcp(127.0.0.1:1)/fixture"+options)
+			if _, err := Connect(context.Background()); !errors.Is(err, ErrConfig) {
+				t.Fatal("unverified TLS was not refused before dialing", err)
+			}
+		})
+	}
+}
 
 func TestMigrationDefinitions(t *testing.T) {
 	ms := migrations()
