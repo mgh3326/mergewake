@@ -289,7 +289,7 @@ func (h Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) 
 	return shown.Description, nil
 }
 
-// TaskJob reads the runtug job bound to a task (`refs.job_id`) and the task
+// TaskJob reads the panewire job bound to a task (`refs.job_id`) and the task
 // title, which carries the task's grade and T marker.
 func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, error) {
 	if !TaskID.MatchString(task) {

@@ -28,7 +28,7 @@ func (r crashRunner) Run(ctx context.Context, command string, args []string, inp
 	if command != "scopefuel" && slices.Contains(args, "swe-2") {
 		r.reviewed = append(r.reviewed, "devin")
 		stderr := strings.Repeat("noise line\n", 200) + "panic: reviewer crashed " + fakeSecretText + "\n"
-		return nil, &integrations.CommandError{Command: "env", Err: runtugExit(3), Stderr: stderr}
+		return nil, &integrations.CommandError{Command: "env", Err: panewireExit(3), Stderr: stderr}
 	}
 	return r.fallbackRunner.Run(ctx, command, args, input, dir)
 }
@@ -141,7 +141,7 @@ func TestSkipReasonCodes(t *testing.T) {
 	for reason, want := range map[string]string{
 		"review failed":                      "review_failed",
 		"quota gate refused: pool exhausted": "quota_gate_refused",
-		"runtug spawn exit 70: boom":         "runtug_spawn_exit",
+		"panewire spawn exit 70: boom":       "panewire_spawn_exit",
 		"task 2478 unreadable: x":            "task_unreadable",
 		"":                                   "unknown",
 	} {
@@ -151,12 +151,12 @@ func TestSkipReasonCodes(t *testing.T) {
 	}
 }
 
-// A refused runtug reviewer spawn records its exit code, a redacted stderr
+// A refused panewire reviewer spawn records its exit code, a redacted stderr
 // tail and the requested host in the decision log and as one event, and the
 // review still completes headless.
-func TestRuntugSpawnFailureRecordsCause(t *testing.T) {
-	runner := &runtugRunner{refuse: map[string]int{"reviewer": 70}, refuseStderr: "runtug: quota gate refused " + fakeSecretText + "\n"}
-	s, _, r := runtugSetup(t, runner)
+func TestPanewireSpawnFailureRecordsCause(t *testing.T) {
+	runner := &panewireRunner{refuse: map[string]int{"reviewer": 70}, refuseStderr: "panewire: quota gate refused " + fakeSecretText + "\n"}
+	s, _, r := panewireSetup(t, runner)
 	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -166,17 +166,17 @@ func TestRuntugSpawnFailureRecordsCause(t *testing.T) {
 		value, _ := row["value"].(map[string]any)
 		skipped, _ := value["skipped"].([]any)
 		for _, raw := range skipped {
-			if sk, _ := raw.(map[string]any); sk["reviewer"] == "runtug" {
+			if sk, _ := raw.(map[string]any); sk["reviewer"] == "panewire" {
 				skip = sk
 			}
 		}
 	}
 	tail, _ := skip["stderr_tail"].(string)
-	if skip == nil || skip["exit_code"] != float64(70) || skip["host"] != s.Config.Review.Runtug.Host || !strings.Contains(tail, "runtug: quota gate refused") {
-		t.Fatalf("runtug skip lacks its cause: %v\n%s", skip, logRaw)
+	if skip == nil || skip["exit_code"] != float64(70) || skip["host"] != s.Config.Review.Panewire.Host || !strings.Contains(tail, "panewire: quota gate refused") {
+		t.Fatalf("panewire skip lacks its cause: %v\n%s", skip, logRaw)
 	}
 	evRaw, events := readLines(t, filepath.Join(s.Config.StateDir, "events", "fleet-events.jsonl"))
-	if len(events) != 1 || events[0]["kind"] != "reviewer" || events[0]["outcome"] != "failed" || events[0]["reason"] != "runtug_spawn_exit" {
+	if len(events) != 1 || events[0]["kind"] != "reviewer" || events[0]["outcome"] != "failed" || events[0]["reason"] != "panewire_spawn_exit" {
 		t.Fatalf("events: %s", evRaw)
 	}
 	for _, secret := range fakeSecrets {

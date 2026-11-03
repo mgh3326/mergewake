@@ -420,22 +420,31 @@ func TestReviewExecutor(t *testing.T) {
 		return Load(p)
 	}
 	c, e := load("")
-	rt := c.Review.Runtug
-	if e != nil || c.Review.Executor != "headless" || rt.Command != "runtug" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
+	rt := c.Review.Panewire
+	if e != nil || c.Review.Executor != "headless" || rt.Command != "panewire" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
 		t.Fatalf("%+v %v", c.Review, e)
 	}
-	c, e = load("review:\n  executor: runtug\n  runtug: {owner: review-desk, host: host-b, checkouts: /work/reviews}\n")
-	if e != nil || c.Review.Executor != "runtug" || c.Review.Runtug.Owner != "review-desk" || c.Review.Runtug.Host != "host-b" || c.Review.Runtug.Checkouts != "/work/reviews" {
+	c, e = load("review:\n  executor: panewire\n  panewire: {owner: review-desk, host: host-b, checkouts: /work/reviews}\n")
+	if e != nil || c.Review.Executor != "panewire" || c.Review.Panewire.Owner != "review-desk" || c.Review.Panewire.Host != "host-b" || c.Review.Panewire.Checkouts != "/work/reviews" {
 		t.Fatalf("%+v %v", c.Review, e)
 	}
-	if rt := c.Review.Runtug; rt.Lane != "review-desk" || rt.Panewire != "panewire" || rt.ExcludeHosts != nil {
+	if rt := c.Review.Panewire; rt.Lane != "review-desk" || rt.Command != "panewire" || rt.ExcludeHosts != nil {
 		t.Fatalf("lane defaults to owner: %+v", rt)
 	}
-	c, e = load("review:\n  runtug: {owner: review-desk, lane: findings-desk, exclude_hosts: [host-a, host-b]}\n")
-	if rt := c.Review.Runtug; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
+	c, e = load("review:\n  panewire: {owner: review-desk, lane: findings-desk, exclude_hosts: [host-a, host-b]}\n")
+	if rt := c.Review.Panewire; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
 		t.Fatalf("%+v %v", rt, e)
 	}
-	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  runtug: {bogus: x}\n", "review:\n  runtug: {lane: 'a b'}\n", "review:\n  runtug: {exclude_hosts: ['a,b']}\n", "review:\n  runtug: {host: host-a, exclude_hosts: [host-a]}\n"} {
+	c, e = load("review:\n  executor: panewire\n  panewire:\n    command: /usr/local/bin/panewire\n    workspace: reviews\n    owner: review-desk\n    host: auto\n")
+	if e != nil || c.Review.Panewire.Command != "/usr/local/bin/panewire" {
+		t.Fatalf("documented launcher migration: %+v %v", c.Review, e)
+	}
+	for _, retired := range []string{"review:\n  executor: runtug\n", "review:\n  runtug: {command: runtug, panewire: panewire}\n", "review:\n  executor: panewire\n  panewire: {panewire: panewire}\n"} {
+		if _, e := load(retired); e == nil {
+			t.Fatalf("retired launcher settings accepted: %s", retired)
+		}
+	}
+	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  panewire: {bogus: x}\n", "review:\n  panewire: {lane: 'a b'}\n", "review:\n  panewire: {exclude_hosts: ['a,b']}\n", "review:\n  panewire: {host: host-a, exclude_hosts: [host-a]}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
 		}

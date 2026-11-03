@@ -465,8 +465,8 @@ func TestSameSubstance(t *testing.T) {
 	}
 }
 
-func TestRuntugBriefCarriesTheDelta(t *testing.T) {
-	x := &runtugExecutor{repo: config.Repo{Name: "example/project"}, pr: github.Pull{Number: 7, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}, diff: "diff --git a/tool b/tool\n+x\n", delta: true, round: 2, context: "ACCEPTANCE CONTRACT"}
+func TestPanewireBriefCarriesTheDelta(t *testing.T) {
+	x := &panewireExecutor{repo: config.Repo{Name: "example/project"}, pr: github.Pull{Number: 7, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}, diff: "diff --git a/tool b/tool\n+x\n", delta: true, round: 2, context: "ACCEPTANCE CONTRACT"}
 	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	for _, want := range []string{"this is review round 2: review only the delta patch", "## Delta to review", "+x", "optional boolean `advisory`"} {
 		if !strings.Contains(got, want) {
