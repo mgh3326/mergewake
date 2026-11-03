@@ -26,7 +26,24 @@ type Snapshot struct {
 	Stage               Stage
 	FixRounds, Failures int
 	Reviewed            bool
+	IsDraft             bool
+	// Lifecycle is the receipt namespace; reopen and explicit resume invalidate it.
+	Lifecycle uint64
+	CI        CIStatus
 }
+
+type CIStatus string
+
+const (
+	CIPending   CIStatus = "pending"
+	CISuccess   CIStatus = "success"
+	CIFailure   CIStatus = "failure"
+	CICancelled CIStatus = "cancelled"
+	CITimedOut  CIStatus = "timed_out"
+)
+
+func (c CIStatus) valid() bool  { return c == CIPending || c == CISuccess || c.failed() }
+func (c CIStatus) failed() bool { return c == CIFailure || c == CICancelled || c == CITimedOut }
 
 type EventKind string
 
@@ -47,6 +64,9 @@ const (
 	Resume          EventKind = "resume"
 	Failure         EventKind = "failure"
 	Recovered       EventKind = "recovered"
+	Reopen          EventKind = "reopened"
+	ReadyForReview  EventKind = "ready_for_review"
+	CIChanged       EventKind = "ci_changed"
 )
 
 // Events are validated facts from trusted adapters, never webhook instructions.
@@ -55,6 +75,8 @@ type Event struct {
 	Kind       EventKind
 	Head, Base string
 	Generation uint64
+	Draft      bool     `json:",omitempty"`
+	CI         CIStatus `json:",omitempty"`
 }
 
 type EffectKind string
@@ -65,6 +87,7 @@ const (
 	Gate         EffectKind = "gate"
 	NotifyAuthor EffectKind = "notify_author"
 	Escalate     EffectKind = "escalate"
+	Cancel       EffectKind = "cancel"
 )
 
 type Transition struct {
@@ -79,7 +102,13 @@ func (s Snapshot) Valid() bool {
 	if s == (Snapshot{}) {
 		return true
 	}
-	if s.Head == "" || s.Base == "" || s.Generation == 0 || s.Version == 0 || s.FixRounds < 0 || s.FixRounds > 2 || s.Failures < 0 || s.Failures > 3 || (!s.Reviewed && s.FixRounds > 0) {
+	if s.Head == "" || s.Base == "" || s.Generation == 0 || s.Version == 0 || s.FixRounds < 0 || s.FixRounds > 2 || s.Failures < 0 || s.Failures > 3 || (s.CI != "" && !s.CI.valid()) {
+		return false
+	}
+	if s.Stage == Draft && !s.IsDraft {
+		return false
+	}
+	if s.IsDraft && s.Stage != Draft && s.Stage != BlockedAuthor && s.Stage != SystemBlocked && s.Stage != Closed && s.Stage != Merged {
 		return false
 	}
 	switch s.Stage {
@@ -104,32 +133,121 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 		}
 		n.Head, n.Base = e.Head, e.Base
 		n.Generation++
+		n.CI = ""
+		if s.Generation == 0 {
+			n.Lifecycle = 1
+		} else {
+			effects = append(effects, Cancel)
+		}
 		// Observation cannot erase exhausted fix cycles or operational failures.
 		if s.Stage != BlockedAuthor && s.Stage != SystemBlocked {
-			n.Stage = Observing
-			effects = []EffectKind{Refresh}
+			if s.IsDraft {
+				n.Stage = Draft
+			} else {
+				n.Stage = Observing
+				effects = append(effects, Refresh)
+			}
 		}
 	} else {
-		if s.Generation == 0 || e.Generation != s.Generation || e.Head != s.Head {
+		if s.Generation == 0 || e.Generation != s.Generation || (e.Kind != Reopen && e.Head != s.Head) {
 			return Transition{}, ErrStale
 		}
-		if s.Stage == Merged || s.Stage == Closed {
+		if s.Stage == Merged && e.Kind == ConfirmMerged {
+			return Transition{Next: s}, nil
+		}
+		if s.Stage == Closed && e.Kind == ConfirmClosed {
+			return Transition{Next: s}, nil
+		}
+		if s.Stage == Merged || (s.Stage == Closed && e.Kind != Reopen && e.Kind != ConfirmMerged) {
 			return Transition{}, ErrTransition
 		}
 		switch e.Kind {
+		case Reopen:
+			if s.Stage != Closed || e.Head == "" || e.Base == "" {
+				return Transition{}, ErrTransition
+			}
+			n.Head, n.Base = e.Head, e.Base
+			n.Generation++
+			n.Lifecycle++
+			n.Reviewed = false
+			n.IsDraft = e.Draft
+			n.CI = ""
+			n.Stage = Observing
+			effects = []EffectKind{Cancel}
+			if s.Failures >= 3 {
+				n.Stage = SystemBlocked
+			} else if s.FixRounds >= 2 {
+				n.Stage = BlockedAuthor
+			} else if n.IsDraft {
+				n.Stage = Draft
+			} else {
+				effects = append(effects, Refresh)
+			}
+		case MarkDraft:
+			if s.IsDraft {
+				return Transition{Next: s}, nil
+			}
+			n.IsDraft = true
+			n.Generation++
+			effects = []EffectKind{Cancel}
+			if s.Stage != BlockedAuthor && s.Stage != SystemBlocked {
+				n.Stage = Draft
+			}
+		case ReadyForReview:
+			if !s.IsDraft {
+				return Transition{Next: s}, nil
+			}
+			n.IsDraft = false
+			n.Generation++
+			effects = []EffectKind{Cancel}
+			if s.Stage != BlockedAuthor && s.Stage != SystemBlocked {
+				n.Stage = Observing
+				effects = append(effects, Refresh)
+			}
+		case CIChanged:
+			if !e.CI.valid() {
+				return Transition{}, ErrTransition
+			}
+			if e.CI == s.CI {
+				return Transition{Next: s}, nil
+			}
+			n.CI = e.CI
+			// CI changes do not cancel an independent code review or clear holds.
+			if s.IsDraft || s.Stage == BlockedAuthor || s.Stage == SystemBlocked || s.Stage == Reviewing || s.Stage == ReviewQueued {
+				break
+			}
+			n.Generation++
+			effects = []EffectKind{Cancel}
+			if e.CI == CIPending {
+				n.Stage = WaitingCI
+			} else if e.CI.failed() {
+				n.Stage = AwaitingAuthor
+				effects = append(effects, NotifyAuthor)
+			} else {
+				n.Stage = Observing
+				effects = append(effects, Refresh)
+			}
 		case ConfirmClosed:
 			n.Stage = Closed
+			effects = []EffectKind{Cancel}
 		case ConfirmMerged:
 			// GitHub can confirm an external merge regardless of the local stage.
 			n.Stage = Merged
+			effects = []EffectKind{Cancel}
 		case Resume:
 			if s.Stage != BlockedAuthor && s.Stage != SystemBlocked {
 				return Transition{}, ErrTransition
 			}
 			n.Stage, n.FixRounds, n.Failures = Observing, 0, 0
 			n.Generation++
+			n.Lifecycle++
 			n.Reviewed = false
-			effects = []EffectKind{Refresh}
+			effects = []EffectKind{Cancel}
+			if n.IsDraft {
+				n.Stage = Draft
+			} else {
+				effects = append(effects, Refresh)
+			}
 		case Failure:
 			if s.Stage == SystemBlocked {
 				return Transition{Next: s}, nil
@@ -145,20 +263,20 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 			}
 			n.Failures = 0
 		default:
-			if s.Stage == BlockedAuthor || s.Stage == SystemBlocked {
+			if s.IsDraft || s.Stage == BlockedAuthor || s.Stage == SystemBlocked {
 				return Transition{}, ErrTransition
 			}
 			switch e.Kind {
-			case MarkDraft:
-				if s.Stage != Observing {
-					return Transition{}, ErrTransition
-				}
-				n.Stage = Draft
 			case WaitCI:
-				if s.Stage != Observing && s.Stage != GatePending {
+				if s.Stage != Observing && s.Stage != GatePending && s.Stage != Ready && s.Stage != AwaitingAuthor && s.Stage != WaitingCI {
 					return Transition{}, ErrTransition
 				}
 				n.Stage = WaitingCI
+				n.CI = CIPending
+				if s.Stage != WaitingCI || s.CI != CIPending {
+					n.Generation++
+					effects = []EffectKind{Cancel}
+				}
 			case QueueReview, FixPatch:
 				if s.Stage != Observing && s.Stage != WaitingCI && s.Stage != Draft {
 					if e.Kind != FixPatch || s.Stage != AwaitingAuthor {
@@ -189,7 +307,14 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 				}
 				n.Stage, n.Failures = GatePending, 0
 				n.Reviewed = true
-				effects = []EffectKind{Gate}
+				if s.CI == CIPending {
+					n.Stage = WaitingCI
+				} else if s.CI.failed() {
+					n.Stage = AwaitingAuthor
+					effects = []EffectKind{NotifyAuthor}
+				} else {
+					effects = []EffectKind{Gate}
+				}
 			case Findings:
 				if s.Stage != Reviewing {
 					return Transition{}, ErrTransition
@@ -201,19 +326,19 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 				}
 				effects = []EffectKind{NotifyAuthor}
 			case EquivalentPatch:
-				if s.Stage != Observing && s.Stage != AwaitingAuthor {
+				if !s.Reviewed || (s.Stage != Observing && s.Stage != AwaitingAuthor) {
 					return Transition{}, ErrTransition
 				}
 				n.Stage = GatePending
 				effects = []EffectKind{Gate}
 			case GatePassed:
-				if s.Stage != GatePending && s.Stage != WaitingCI {
+				if (s.CI != "" && s.CI != CISuccess) || (s.Stage != GatePending && s.Stage != WaitingCI) {
 					return Transition{}, ErrTransition
 				}
 				n.Stage, n.Failures = Ready, 0
 				effects = []EffectKind{NotifyAuthor}
 			case GateFailed:
-				if s.Stage != GatePending && s.Stage != Ready {
+				if s.Stage != GatePending && s.Stage != Ready && s.Stage != WaitingCI {
 					return Transition{}, ErrTransition
 				}
 				n.Stage = AwaitingAuthor

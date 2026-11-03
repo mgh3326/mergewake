@@ -48,6 +48,7 @@ type Claim struct {
 	Kind                  state.EffectKind
 	Class                 Class
 	RequestID             string
+	CancelThrough         uint64
 }
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -186,16 +187,25 @@ func saveTransition(ctx context.Context, tx *sql.Tx, k Key, old state.Snapshot, 
 	}
 	if t.Next.Generation != old.Generation || t.Next.Stage == state.Merged || t.Next.Stage == state.Closed {
 		// Running attempts stay in the ledger and capacity count until confirmed.
-		if _, err := tx.ExecContext(ctx, `UPDATE mw_jobs SET status='superseded' WHERE repository=? AND number=? AND (kind<>'escalate' OR ?) AND status IN ('queued','running','uncertain','system_blocked')`, k.Repository, k.Number, event == state.Resume); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE mw_jobs SET status='superseded' WHERE repository=? AND number=? AND (kind NOT IN ('escalate','cancel') OR ?) AND status IN ('queued','running','uncertain','system_blocked')`, k.Repository, k.Number, event == state.Resume); err != nil {
 			return err
 		}
 	}
 	for _, effect := range t.Effects {
 		seq++
 		scope := sha256.Sum256([]byte(fmt.Sprintf("%d/%s", t.Next.Version, effect)))
-		_, err := tx.ExecContext(ctx, `INSERT INTO mw_jobs (repository,number,sequence,generation,scope,kind,class,status,available_at,epoch,lease_until,failures) VALUES (?,?,?,?,?,?,?,'queued',UTC_TIMESTAMP(6),0,'1970-01-01',0)`, k.Repository, k.Number, seq, t.Next.Generation, hex.EncodeToString(scope[:]), effect, class)
+		result, err := tx.ExecContext(ctx, `INSERT INTO mw_jobs (repository,number,sequence,generation,scope,kind,class,status,available_at,epoch,lease_until,failures) VALUES (?,?,?,?,?,?,?,'queued',UTC_TIMESTAMP(6),0,'1970-01-01',0)`, k.Repository, k.Number, seq, t.Next.Generation, hex.EncodeToString(scope[:]), effect, class)
 		if err != nil {
 			return err
+		}
+		if effect == state.Cancel {
+			id, err := result.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO mw_cancellations VALUES (?,?)`, id, old.Generation); err != nil {
+				return err
+			}
 		}
 	}
 	raw, err := json.Marshal(t.Next)
@@ -215,7 +225,7 @@ func (s *Store) Claim(ctx context.Context, f Fence, kind state.EffectKind, class
 	if class != Automatic && class != Operator {
 		return Claim{}, ErrConfig
 	}
-	if kind != state.Refresh && kind != state.Review && kind != state.Gate && kind != state.NotifyAuthor && kind != state.Escalate && kind != "fix" {
+	if kind != state.Refresh && kind != state.Review && kind != state.Gate && kind != state.NotifyAuthor && kind != state.Escalate && kind != state.Cancel && kind != "fix" {
 		return Claim{}, ErrConfig
 	}
 	return transaction(ctx, s, func(tx *sql.Tx) (Claim, error) {
@@ -243,7 +253,7 @@ func (s *Store) Claim(ctx context.Context, f Fence, kind state.EffectKind, class
 		}
 		var c Claim
 		c.Kind, c.Class = kind, class
-		err := tx.QueryRowContext(ctx, `SELECT j.id,j.repository,j.number,j.generation,j.epoch FROM mw_jobs j WHERE j.status='queued' AND j.kind=? AND j.class=? AND j.available_at<=UTC_TIMESTAMP(6) AND (j.kind='escalate' OR NOT EXISTS (SELECT 1 FROM mw_jobs earlier WHERE earlier.repository=j.repository AND earlier.number=j.number AND earlier.sequence<j.sequence AND earlier.status IN ('queued','running','uncertain','system_blocked'))) ORDER BY j.id LIMIT 1 FOR UPDATE SKIP LOCKED`, kind, class).Scan(&c.ID, &c.Key.Repository, &c.Key.Number, &c.Generation, &c.Epoch)
+		err := tx.QueryRowContext(ctx, `SELECT j.id,j.repository,j.number,j.generation,j.epoch FROM mw_jobs j WHERE j.status='queued' AND j.kind=? AND j.class=? AND j.available_at<=UTC_TIMESTAMP(6) AND (j.kind IN ('escalate','cancel') OR NOT EXISTS (SELECT 1 FROM mw_jobs earlier WHERE earlier.repository=j.repository AND earlier.number=j.number AND earlier.sequence<j.sequence AND earlier.kind NOT IN ('escalate','cancel') AND earlier.status IN ('queued','running','uncertain','system_blocked'))) ORDER BY j.id LIMIT 1 FOR UPDATE SKIP LOCKED`, kind, class).Scan(&c.ID, &c.Key.Repository, &c.Key.Number, &c.Generation, &c.Epoch)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Claim{}, ErrNoJob
 		}
@@ -252,6 +262,11 @@ func (s *Store) Claim(ctx context.Context, f Fence, kind state.EffectKind, class
 		}
 		c.Epoch++
 		c.RequestID = uuid()
+		if kind == state.Cancel {
+			if err = tx.QueryRowContext(ctx, `SELECT through_generation FROM mw_cancellations WHERE job_id=?`, c.ID).Scan(&c.CancelThrough); err != nil {
+				return Claim{}, err
+			}
+		}
 		if kind == state.Review {
 			snap, seq, err := readPR(ctx, tx, c.Key, true)
 			if err != nil {
@@ -456,7 +471,7 @@ func (s *Store) Outstanding(ctx context.Context, f Fence, after uint64, limit in
 		if err := checkFence(ctx, tx, f); err != nil {
 			return nil, err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT j.id,a.epoch,j.repository,j.number,j.generation,j.kind,j.class,a.request_uuid FROM mw_attempts a JOIN mw_jobs j ON j.id=a.job_id WHERE a.status IN ('running','uncertain') AND j.id>? ORDER BY j.id LIMIT ?`, after, limit)
+		rows, err := tx.QueryContext(ctx, `SELECT j.id,a.epoch,j.repository,j.number,j.generation,j.kind,j.class,a.request_uuid,COALESCE(c.through_generation,0) FROM mw_attempts a JOIN mw_jobs j ON j.id=a.job_id LEFT JOIN mw_cancellations c ON c.job_id=j.id WHERE a.status IN ('running','uncertain') AND j.id>? ORDER BY j.id LIMIT ?`, after, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -464,7 +479,7 @@ func (s *Store) Outstanding(ctx context.Context, f Fence, after uint64, limit in
 		var result []Claim
 		for rows.Next() {
 			var c Claim
-			if err = rows.Scan(&c.ID, &c.Epoch, &c.Key.Repository, &c.Key.Number, &c.Generation, &c.Kind, &c.Class, &c.RequestID); err != nil {
+			if err = rows.Scan(&c.ID, &c.Epoch, &c.Key.Repository, &c.Key.Number, &c.Generation, &c.Kind, &c.Class, &c.RequestID, &c.CancelThrough); err != nil {
 				return nil, err
 			}
 			result = append(result, c)

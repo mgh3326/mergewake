@@ -49,7 +49,35 @@ jobs, while preserving active remote attempts for reconciliation.
 also advances `review_queued` to `reviewing` atomically. Jobs are ordered within
 each PR; independent PRs can run concurrently. Escalation bypasses blocked work.
 An authorized resume starts a new generation and retires prior blocked effects,
-including failed escalation deliveries.
+including failed escalation deliveries. Cancellation and escalation are durable
+control jobs: they bypass blocked work and do not prevent current-generation
+refreshes from progressing.
+
+`Reopen` requires a verified current GitHub open fact for a closed PR. It advances
+generation and the receipt `Lifecycle`, clears prior review qualification and
+preserves fix-round/operational holds. Future receipt adapters must include that
+lifecycle in reuse checks; equal patch-id cannot reuse a closed lifecycle's
+receipt. `Merged` remains final.
+
+`MarkDraft` and `ReadyForReview` change eligibility at the same SHA and advance
+generation. They retain blocked-author/system holds independently of the draft
+flag. Superseded attempts remain reserved and recoverable. A cancellation claim
+includes `CancelThrough`, the persisted inclusive cutoff for older remote review/
+fix jobs belonging to that PR; a
+delayed cancellation must not target generations above that cutoff. Completing
+the cancellation request alone never confirms the original remote job terminal.
+
+`CIChanged` classifies pending, success, failure, cancelled and timed_out. Waiting
+CI failures go to the author, reruns wait, and success refreshes eligibility.
+Expected CI outcomes do not increment system failures or fix rounds. Independent
+queued/running code review may finish, but observes current CI eligibility before
+requesting a gate. Pending or failed CI cannot become READY.
+
+Ingress captures `ExpectedVersion` before reading GitHub, then commits the fresh
+normalized fact with that version. Late reads lose the CAS; old generations
+cannot apply a close, draft or result after reopening/readiness changes. Raw
+webhook payloads are not reducer commands. These are contracts for unit 2;
+no event adapters are wired in this unit.
 
 Initial durable budgets are six reviews (at most five automatic) and four fix
 workers. The operator class is an internal capability granted by a future

@@ -88,7 +88,7 @@ func TestEquivalentPatchAndDuplicateObservation(t *testing.T) {
 		t.Fatal(s)
 	}
 }
-func TestStaleCompletionAndTerminalRefusal(t *testing.T) {
+func TestStaleCompletionAndMergedFinality(t *testing.T) {
 	s := observed(t)
 	old := s
 	r, _ := Reduce(s, Event{Kind: Observe, Head: "new", Base: s.Base})
@@ -96,7 +96,7 @@ func TestStaleCompletionAndTerminalRefusal(t *testing.T) {
 	if _, err := Reduce(s, Event{Kind: ReviewPassed, Head: old.Head, Generation: old.Generation}); !errors.Is(err, ErrStale) {
 		t.Fatal(err)
 	}
-	s = advance(t, s, ConfirmClosed)
+	s = advance(t, s, ConfirmMerged)
 	if _, err := Reduce(s, Event{Kind: Observe, Head: "reopen", Base: s.Base}); !errors.Is(err, ErrTransition) {
 		t.Fatal(err)
 	}

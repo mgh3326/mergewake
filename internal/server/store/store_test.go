@@ -23,7 +23,7 @@ func TestConnectRefusesUnverifiedTLSBeforeDial(t *testing.T) {
 
 func TestMigrationDefinitions(t *testing.T) {
 	ms := migrations()
-	if len(ms) != 7 {
+	if len(ms) != 8 {
 		t.Fatal(len(ms))
 	}
 	for _, m := range ms {
