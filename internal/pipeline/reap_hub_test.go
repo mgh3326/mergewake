@@ -153,10 +153,17 @@ func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 	}
 }
 
-type reviewerCleanupJobs struct{ fakeSink }
+type reviewerCleanupJobs struct {
+	fakeSink
+	record integrations.JobRecord
+	err    error
+}
 
-func (reviewerCleanupJobs) Job(context.Context, string) (integrations.JobRecord, error) {
-	return integrations.JobRecord{Host: "node-a", PaneID: "w1:p1"}, nil
+func (s *reviewerCleanupJobs) Job(context.Context, string) (integrations.JobRecord, error) {
+	if s.record.Host == "" && s.err == nil {
+		return integrations.JobRecord{Host: "node-a", PaneID: "w1:p1"}, nil
+	}
+	return s.record, s.err
 }
 
 func TestReviewerCleanupHubClosesThenRemoves(t *testing.T) {
@@ -165,7 +172,7 @@ func TestReviewerCleanupHubClosesThenRemoves(t *testing.T) {
 	s, _ := hubSvc(t, hub, &scriptRunner{})
 	s.Sink = &reviewerCleanupJobs{}
 	x := &panewireExecutor{s: s, repo: testRepo, pr: github.Pull{Number: 7, Head: github.Ref{SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
-	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "")
+	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "", true)
 	commands := hub.commands
 	closeAt, removeAt := -1, -1
 	for i, c := range commands {
@@ -206,7 +213,7 @@ func TestReviewerCleanupKeepsComposerAndRejectsMismatch(t *testing.T) {
 			s, _ := hubSvc(t, hub, &scriptRunner{})
 			s.Sink = &reviewerCleanupJobs{}
 			x := &panewireExecutor{s: s, repo: testRepo, pr: github.Pull{Number: 7, Head: github.Ref{SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
-			x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "")
+			x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "", true)
 			if len(hub.ops("pane.close")) != 0 || len(hub.ops("worktree.remove")) != 0 {
 				t.Fatalf("unsafe commands: %#v", hub.commands)
 			}
@@ -231,7 +238,7 @@ func TestReviewerCleanupHubErrorOnlyWritesReceipt(t *testing.T) {
 	// Cleanup has no return value by design, so this pass outcome remains intact.
 	want := passOutcome{reviewer: "panewire", findings: []github.Finding{}}
 	got := want
-	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "")
+	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "", true)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pass result changed: got %#v want %#v", got, want)
 	}
@@ -252,9 +259,37 @@ func TestReviewerCleanupRunsAfterReviewDeadline(t *testing.T) {
 	x := &panewireExecutor{s: s, repo: testRepo, pr: github.Pull{Number: 7, Head: github.Ref{SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	x.cleanupReviewer(ctx, "wk-7", "/local/wk-7", headSHA, "")
+	x.cleanupReviewer(ctx, "wk-7", "/local/wk-7", headSHA, "", true)
 	if len(hub.ops("pane.close")) != 1 || len(hub.ops("worktree.remove")) != 1 {
 		t.Fatalf("expired review context prevented cleanup: %#v", hub.commands)
+	}
+}
+
+func TestReviewerCleanupDoesNotUseOldJobWhenSpawnUnconfirmed(t *testing.T) {
+	hub := newFakeReapHub()
+	s, _ := hubSvc(t, hub, &scriptRunner{})
+	s.Sink = &reviewerCleanupJobs{record: integrations.JobRecord{Host: "node-a", PaneID: "w1:p1"}}
+	x := &panewireExecutor{s: s, repo: testRepo, pr: github.Pull{Number: 7, Head: github.Ref{SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
+	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "", false)
+	if len(hub.commands) != 0 {
+		t.Fatalf("acted on stale placement: %#v", hub.commands)
+	}
+	rows, err := s.reapReceipts(testRepo.Name)
+	if err != nil || len(rows) != 1 || rows[0].Result != "skipped" || rows[0].Reason != "spawn was not confirmed" {
+		t.Fatalf("receipt: %#v, %v", rows, err)
+	}
+}
+
+func TestReviewerCleanupUsesFreshSpawnIdentityAfterJobReadError(t *testing.T) {
+	hub := newFakeReapHub()
+	hub.composer = map[string]any{"outcome": "read", "composer": "empty"}
+	s, _ := hubSvc(t, hub, &scriptRunner{})
+	s.Sink = &reviewerCleanupJobs{record: integrations.JobRecord{Host: "stale-machine", PaneID: "stale-pane"}, err: errors.New("job endpoint unavailable")}
+	x := &panewireExecutor{s: s, repo: testRepo, pr: github.Pull{Number: 7, Head: github.Ref{SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
+	x.cleanupReviewer(context.Background(), "wk-7", "/local/wk-7", headSHA, "OK pane=w1:p1 model=seat host=node-a", true)
+	closes := hub.ops("pane.close")
+	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p1" {
+		t.Fatalf("did not use fresh placement: %#v", hub.commands)
 	}
 }
 

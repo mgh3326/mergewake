@@ -176,10 +176,6 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
 	defer cleanup()
-	var stdout []byte
-	// Resolve the remote pane and worktree from the job record after spawn.
-	// This defer also runs when spawn wait or result collection times out.
-	defer func() { x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, string(stdout)) }()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -210,11 +206,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
 	}
 	note := ""
+	var stdout []byte
+	spawnSucceeded := false
+	// Do not consult a potentially old job record for failures that happened
+	// before the spawn command was attempted. On a failed spawn, cleanup also
+	// requires this invocation's own OK placement line.
+	defer func() {
+		confirmed := spawnSucceeded || spawnedLocation.Match(stdout)
+		x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, string(stdout), confirmed)
+	}()
 	stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
 	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 		note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
 	}
+	spawnSucceeded = e == nil
 	if e != nil {
 		if ctx.Err() != nil {
 			res, skipErr := skip("panewire reviewer deadline")
@@ -283,26 +289,39 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 // cleanupReviewer closes only the pane recorded for this pass, after checking
 // the live pane row still has this pass's name and cwd. It writes failures to
 // the reap-style receipt and never changes the review outcome.
-func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head, spawnOutput string) {
+func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head, spawnOutput string, confirmed bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 	defer cancel()
+	if !confirmed {
+		x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: checkout, Result: "skipped", Reason: "spawn was not confirmed"}, false)
+		return
+	}
 	job, err := x.job(ctx, label)
-	if m := spawnedLocation.FindStringSubmatch(spawnOutput); m != nil {
+	location := spawnedLocation.FindStringSubmatch(spawnOutput)
+	if err != nil {
+		if location == nil {
+			x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: checkout, Result: "error", Reason: fleetevent.Redact("job record: " + err.Error())}, false)
+			return
+		}
+		// A failed job lookup contributes no identity. Use only the placement
+		// returned by this invocation's spawn command.
+		job = integrations.JobRecord{Label: label, PaneID: location[1], Host: location[2]}
+	} else if location != nil {
+		if job.PaneID != "" && job.PaneID != location[1] || job.Host != "" && job.Host != location[2] {
+			x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: job.Host, Pane: job.PaneID, Worktree: checkout, Result: "skipped", Reason: "job record and spawn placement disagree"}, false)
+			return
+		}
 		if job.PaneID == "" {
-			job.PaneID = m[1]
+			job.PaneID = location[1]
 		}
 		if job.Host == "" {
-			job.Host = m[2]
+			job.Host = location[2]
 		}
 	}
 	row := reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: job.Host, Pane: job.PaneID, Worktree: checkout}
 	record := func(result, reason string) {
 		row.Result, row.Reason = result, fleetevent.Redact(reason)
 		_ = x.s.reapNote(row, false)
-	}
-	if err != nil && (job.Host == "" || job.PaneID == "") {
-		record("error", "job record: "+err.Error())
-		return
 	}
 	row.Host, row.Pane = job.Host, job.PaneID
 	if job.Host == "" {
