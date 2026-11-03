@@ -299,10 +299,12 @@ func TestReviewerCleanupUsesFreshSpawnIdentityAfterJobReadError(t *testing.T) {
 }
 
 func TestSpawnPlacementDecodesCurrentPanewireReceipt(t *testing.T) {
-	encoded := base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
-	got, ok := spawnPlacement("OK pane=w1:p1 session=s model=m label=wk-7 status=working placement=" + encoded)
-	if !ok || got.Host != "node-a" || got.PaneID != "w1:p1" {
-		t.Fatalf("placement: %#v, %v", got, ok)
+	body := []byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`)
+	for _, encoded := range []string{base64.URLEncoding.EncodeToString(body), base64.RawURLEncoding.EncodeToString(body)} {
+		got, ok := spawnPlacement("OK pane=w1:p1 session=s model=m label=wk-7 status=working placement=" + encoded)
+		if !ok || got.Host != "node-a" || got.PaneID != "w1:p1" {
+			t.Fatalf("placement for %q: %#v, %v", encoded, got, ok)
+		}
 	}
 }
 

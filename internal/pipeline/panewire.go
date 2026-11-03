@@ -53,7 +53,11 @@ func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
 			case strings.HasPrefix(field, "cwd="):
 				v.Cwd = strings.TrimPrefix(field, "cwd=")
 			case strings.HasPrefix(field, "placement="):
-				raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(field, "placement="))
+				encoded := strings.TrimPrefix(field, "placement=")
+				raw, err := base64.URLEncoding.DecodeString(encoded)
+				if err != nil {
+					raw, err = base64.RawURLEncoding.DecodeString(encoded)
+				}
 				if err != nil {
 					continue
 				}
