@@ -19,7 +19,7 @@ import (
 // wherever it was launched. The pane closes only when no open PR in any
 // configured repo still carries the task, the pane is idle or done and
 // nobody owns it, its composer is empty and its job dir exists; the screen
-// is saved first and the job is then marked done with `runtug done`. A PR
+// is saved first and the job is then marked done with `panewire done`. A PR
 // without the trailer, or whose task has no bound job, keeps the worktree
 // match.
 
@@ -164,7 +164,7 @@ func (s *Service) reapPaneClose(ctx context.Context, rec *reapReceipt, hs *reapH
 	}
 	switch c, e := hs.ops.Composer(ctx, pane); {
 	case e != nil:
-		rec.Result, rec.Reason = "error", e.Error()
+		rec.Result, rec.Reason = "skipped", reap.ComposerUnknown
 		return
 	case c != reap.ComposerEmpty:
 		rec.Result, rec.Reason = "skipped", c
@@ -192,7 +192,7 @@ func (s *Service) reapPaneClose(ctx context.Context, rec *reapReceipt, hs *reapH
 }
 
 // reapJobDone marks the job of a closed pane done, unless hk already holds it
-// terminal (a lead that ran runtug done itself).
+// terminal (a lead that ran panewire done itself).
 func (s *Service) reapJobDone(ctx context.Context, closed reapReceipt, hs *reapHost, job integrations.JobRecord, acting bool, note func(reapReceipt)) {
 	v := reapReceipt{Action: "job-done", Repo: closed.Repo, PR: closed.PR, Host: closed.Host, Pane: closed.Pane, Task: closed.Task, Job: closed.Job, Saved: closed.Saved}
 	switch {
@@ -212,7 +212,7 @@ func (s *Service) reapJobDone(ctx context.Context, closed reapReceipt, hs *reapH
 	note(v)
 }
 
-// jobPane finds the job's pane by its label on the host runtug recorded: a
+// jobPane finds the job's pane by its label on the host panewire recorded: a
 // configured host whose name or machine is the record's host. herdr pane ids
 // are host-local, so no other host is searched; a record whose host is not
 // configured resolves no host (ok false). n counts label matches: only

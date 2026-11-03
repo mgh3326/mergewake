@@ -19,15 +19,15 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// runtugRefused is runtug's role/seat/family refusal: with --role reviewer it
+// panewireRefused is panewire's role/seat/family refusal: with --role reviewer it
 // means no admitted seat outside the builder's family remained.
-const runtugRefused = 77
+const panewireRefused = 77
 
 // postReserve is the most of the review deadline kept back from the pane wait
 // for validating and posting its findings.
 const postReserve = time.Minute
 
-// Leave room for runtug's policy preamble below the hub's 64 KiB limit.
+// Leave room for panewire's policy preamble below the hub's 64 KiB limit.
 const inlineBriefLimit = 48 << 10
 
 var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
@@ -38,23 +38,23 @@ var spawnedSeat = regexp.MustCompile(`(?m)^OK pane=\S+ model=(\S+)`)
 var findingsAttachment = regexp.MustCompile(`\battachment=([0-9a-f]{64})\b`)
 
 // findingsGrace bounds how long a finished pane's findings are looked for:
-// the announcement can trail runtug's completion signal through the hub.
+// the announcement can trail panewire's completion signal through the hub.
 // findingsPoll is the pause between looks.
 var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 
-// runtugExecutor spawns the pass as a visible reviewer pane through runtug.
-// runtug picks host and model; the pane reviews a worktree detached at the
-// PR head, which runtug replicates on a remote host, and returns its findings
-// as the `result` of its hk job record (`runtug done --result`), read back by
+// panewireExecutor spawns the pass as a visible reviewer pane through panewire.
+// panewire picks host and model; the pane reviews a worktree detached at the
+// PR head, which panewire replicates on a remote host, and returns its findings
+// as the `result` of its hk job record (`panewire done --result`), read back by
 // the W4 rule. A pane without a result still answers through the legacy lane
 // announcement or job-dir file for one release. mergewake validates and posts
 // them exactly
 // like a headless pass. The review job is a child of the PR author's job, so
-// runtug's reviewer role excludes the author's family; when runtug refuses
+// panewire's reviewer role excludes the author's family; when panewire refuses
 // every other family the pass runs once more as a worker seat, which may be
 // the author's family. Anything that stops the pane from producing findings
 // is a skip, and the next executor (headless) runs the pass.
-type runtugExecutor struct {
+type panewireExecutor struct {
 	s            *Service
 	repo         config.Repo
 	pr           github.Pull
@@ -65,8 +65,8 @@ type runtugExecutor struct {
 	authorFamily string
 }
 
-func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
-	s, cfg, pr := x.s, x.s.Config.Review.Runtug, x.pr
+func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
+	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
 	out := passOutcome{}
 	// Review bounds its context by review.timeout; a caller without a deadline
 	// gets the same bound, so the pane wait always has one.
@@ -82,7 +82,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	skip := func(format string, args ...any) (passOutcome, error) {
 		// Reasons can carry a command's stderr and reach the decision log
 		// and the posted receipt's fallback: redact them here.
-		out.skips = append(out.skips, reviewSkip{Reviewer: "runtug", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host})
+		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host})
 		return out, nil
 	}
 	root := config.Expand(x.repo.Root)
@@ -111,21 +111,21 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		return skip("task %s title has no grade/T marker", task)
 	}
 	scale := strings.ToUpper(m[1])
-	// The builder's hk job record carries the family runtug actually launched
+	// The builder's hk job record carries the family panewire actually launched
 	// with; a builder from before job records leaves none, and the
 	// trailer/commit inference still answers. A task with no bound job (a
-	// builder that was not launched through runtug) is still reviewed: the
+	// builder that was not launched through panewire) is still reviewed: the
 	// pass runs as a top-level job and keeps the author's family.
 	builderFamily := x.builderFamily(ctx, parent)
-	// runtug replicates a checkout on another host only as a worktree of a
+	// panewire replicates a checkout on another host only as a worktree of a
 	// branch that origin carries, so a fork's head cannot be placed there.
 	// A deleted fork has "head.repo": null, which decodes to an empty name.
 	branch, headRepo := pr.Head.Ref, pr.Head.Repo.FullName
 	if headRepo == "" {
-		return skip("head repository is gone (deleted fork); runtug cannot replicate it")
+		return skip("head repository is gone (deleted fork); panewire cannot replicate it")
 	}
 	if branch == "" || !strings.EqualFold(headRepo, x.repo.Name) {
-		return skip("head branch is not in %s (fork PR); runtug cannot replicate it", x.repo.Name)
+		return skip("head branch is not in %s (fork PR); panewire cannot replicate it", x.repo.Name)
 	}
 	acquired, e := claim()
 	if e != nil {
@@ -154,14 +154,14 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
 	// exact reviewed head. C creates no local branch, and the author's branch
 	// checked out in another worktree is no obstacle. The head lands in a
-	// real ref: runtug builds the detached spec for another host only from a
+	// real ref: panewire builds the detached spec for another host only from a
 	// local refs/remotes/origin/pull/<n>/head that points at the checkout's
 	// HEAD, and FETCH_HEAD is not one. The leading "+" lets a force-pushed
 	// PR move the ref.
 	if _, e = git(ctx, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref); e != nil {
 		return skip("fetch PR head: %v", e)
 	}
-	// runtug resolves the detached spec (origin, sha, fetch "pull/<n>/head")
+	// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head")
 	// from this worktree and prepares the same detached worktree remotely.
 	cleanup := func() {
 		// The pane is finished or abandoned; the deadline may already be spent.
@@ -198,24 +198,24 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		args = append(args, "--owner", cfg.Owner)
 	}
 	if cfg.Host != "auto" {
-		args = append(args, "--override-reason", "mergewake review: configured review.runtug.host")
+		args = append(args, "--override-reason", "mergewake review: configured review.panewire.host")
 	}
 	if len(cfg.ExcludeHosts) > 0 {
 		args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
 	}
 	note := ""
 	stdout, e := s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
-	if e != nil && exitStatus(e) == runtugRefused && ctx.Err() == nil {
-		note = "runtug admitted no reviewer outside the author family; ran as a worker seat"
+	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
+		note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
 	}
 	if e != nil {
 		if ctx.Err() != nil {
-			res, skipErr := skip("runtug reviewer deadline")
+			res, skipErr := skip("panewire reviewer deadline")
 			res.skips[len(res.skips)-1].withCause(e)
-			return res, errors.Join(fmt.Errorf("runtug reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
+			return res, errors.Join(fmt.Errorf("panewire reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
 		}
-		res, skipErr := skip("runtug spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
+		res, skipErr := skip("panewire spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
 		res.skips[len(res.skips)-1].withCause(e)
 		return res, skipErr
 	}
@@ -224,7 +224,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		if !errors.Is(e, ctx.Err()) {
 			e = errors.Join(e, ctx.Err())
 		}
-		return out, fmt.Errorf("runtug reviewer %s: %w", label, e)
+		return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 	}
 	var b []byte
 	switch {
@@ -234,7 +234,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 		return skip("reviewer job record %s", res.reason)
 	default:
 		// The record answered without findings — a pane spawned before
-		// `runtug done --result` still returns them through the lane
+		// `panewire done --result` still returns them through the lane
 		// announcement or, on this host, the job-dir file. Kept for one
 		// release; each use is counted on the receipt and audited.
 		b, e = x.collect(ctx, label, findingsPath)
@@ -243,7 +243,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 				if !errors.Is(e, ctx.Err()) {
 					e = errors.Join(e, ctx.Err())
 				}
-				return out, fmt.Errorf("runtug reviewer %s: %w", label, e)
+				return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 			}
 			return skip("no findings: job record %s; %v", res.reason, e)
 		}
@@ -265,9 +265,9 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 	if m := spawnedSeat.FindSubmatch(stdout); m != nil {
 		seat = string(m[1])
 	}
-	out.reviewer, out.executor, out.findings = "runtug", "runtug", findings
+	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
 	if seat != "" {
-		out.reviewer = "runtug:" + seat
+		out.reviewer = "panewire:" + seat
 	}
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
@@ -276,7 +276,7 @@ func (x *runtugExecutor) runPass(ctx context.Context, plan *passPlan, claim func
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
 // A local path alone would strand reviewers placed on a different host.
-func (x *runtugExecutor) spawnBrief(ctx context.Context, path, jobDir string) (string, error) {
+func (x *panewireExecutor) spawnBrief(ctx context.Context, path, jobDir string) (string, error) {
 	body, e := os.ReadFile(path)
 	if e != nil || len(body) <= inlineBriefLimit {
 		return path, e
@@ -305,7 +305,7 @@ func (x *runtugExecutor) spawnBrief(ctx context.Context, path, jobDir string) (s
 // spending the poll bound.
 var errJobRecords = errors.New("sink cannot read job records")
 
-func (x *runtugExecutor) job(ctx context.Context, id string) (integrations.JobRecord, error) {
+func (x *panewireExecutor) job(ctx context.Context, id string) (integrations.JobRecord, error) {
 	jr, ok := x.s.Sink.(interface {
 		Job(context.Context, string) (integrations.JobRecord, error)
 	})
@@ -318,7 +318,7 @@ func (x *runtugExecutor) job(ctx context.Context, id string) (integrations.JobRe
 // builderFamily prefers the family on the builder's hk job record and falls
 // back to the trailer/commit inference, which still answers for a builder
 // spawned before job records existed.
-func (x *runtugExecutor) builderFamily(ctx context.Context, parent string) string {
+func (x *panewireExecutor) builderFamily(ctx context.Context, parent string) string {
 	if parent == "" {
 		return x.authorFamily
 	}
@@ -328,7 +328,7 @@ func (x *runtugExecutor) builderFamily(ctx context.Context, parent string) strin
 	return x.authorFamily
 }
 
-// prHeadRefspec fetches a PR head into the remote-tracking ref runtug looks
+// prHeadRefspec fetches a PR head into the remote-tracking ref panewire looks
 // for when it builds the detached checkout spec.
 func prHeadRefspec(number int) string {
 	return fmt.Sprintf("+pull/%[1]d/head:refs/remotes/origin/pull/%[1]d/head", number)
@@ -346,10 +346,10 @@ type jobOutcome struct {
 // §5.2): a completed record's result is used; completed without a result,
 // escalated and lost answer immediately; a still-pending or missing record
 // and an unreadable hk are polled every findingsPoll for up to
-// min(findingsGrace, half the remaining deadline). Because `runtug done`
+// min(findingsGrace, half the remaining deadline). Because `panewire done`
 // writes the result with `completed` before it announces, the polling row
 // only fires while hk itself is slow.
-func (x *runtugExecutor) recordResult(ctx context.Context, label string) (jobOutcome, error) {
+func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobOutcome, error) {
 	out := jobOutcome{reason: "no job record"}
 	grace := findingsGrace
 	if deadline, ok := ctx.Deadline(); ok {
@@ -399,8 +399,8 @@ func (x *runtugExecutor) recordResult(ctx context.Context, label string) (jobOut
 // findings lane, else the file in the local job directory, which exists only
 // when the pane ran on this host. Both are
 // looked for until findingsGrace (bounded by half the remaining deadline).
-func (x *runtugExecutor) collect(ctx context.Context, label, findingsPath string) ([]byte, error) {
-	lane := x.s.Config.Review.Runtug.Lane
+func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath string) ([]byte, error) {
+	lane := x.s.Config.Review.Panewire.Lane
 	grace := findingsGrace
 	if deadline, ok := ctx.Deadline(); ok {
 		grace = min(grace, time.Until(deadline)/2)
@@ -441,9 +441,9 @@ func (x *runtugExecutor) collect(ctx context.Context, label, findingsPath string
 
 // announced looks for the pane's findings event on lane and fetches the
 // attachment it names. No event yet is (nil, nil).
-func (x *runtugExecutor) announced(ctx context.Context, lane, label string) ([]byte, error) {
+func (x *panewireExecutor) announced(ctx context.Context, lane, label string) ([]byte, error) {
 	s := x.s
-	raw, e := s.Runner.Run(ctx, s.Config.Review.Runtug.Panewire, []string{"inbox", "list", "--lane", lane, "--json"}, "", "")
+	raw, e := s.Runner.Run(ctx, s.Config.Review.Panewire.Command, []string{"inbox", "list", "--lane", lane, "--json"}, "", "")
 	if e != nil {
 		return nil, fmt.Errorf("inbox: %v", integrations.Detail(e))
 	}
@@ -461,7 +461,7 @@ func (x *runtugExecutor) announced(ctx context.Context, lane, label string) ([]b
 	ack := func(id int64) {
 		// Read is enough; acknowledging keeps the item out of the lane's
 		// unread digest.
-		_, _ = s.Runner.Run(ctx, s.Config.Review.Runtug.Panewire, []string{"inbox", "ack", strconv.FormatInt(id, 10), "--lane", lane, "--json"}, "", "")
+		_, _ = s.Runner.Run(ctx, s.Config.Review.Panewire.Command, []string{"inbox", "ack", strconv.FormatInt(id, 10), "--lane", lane, "--json"}, "", "")
 	}
 	for _, it := range items {
 		if it.Kind != "lane.event" || it.Event.EventID != label+"-findings" {
@@ -490,7 +490,7 @@ func (x *runtugExecutor) announced(ctx context.Context, lane, label string) ([]b
 }
 
 // task reads the Mergewake-Task trailer: PR body first, then the head commit.
-func (x *runtugExecutor) task(ctx context.Context) (string, error) {
+func (x *panewireExecutor) task(ctx context.Context) (string, error) {
 	if t := trailer(x.pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
 		return t, nil
 	}
@@ -510,7 +510,7 @@ func (x *runtugExecutor) task(ctx context.Context) (string, error) {
 // receipt answers for a pane on this host whose record carries no family,
 // then a configured profile whose gate profile is the seat. An unknown
 // family returns "" and the pass counts as same-family.
-func (x *runtugExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat string) string {
+func (x *panewireExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat string) string {
 	if rec.Family != "" {
 		return rec.Family
 	}
@@ -538,7 +538,7 @@ func (x *runtugExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat
 	return ""
 }
 
-func (x *runtugExecutor) brief(plan *passPlan, label, jobDir, authorFamily string) string {
+func (x *panewireExecutor) brief(plan *passPlan, label, jobDir, authorFamily string) string {
 	focus := "concrete bugs"
 	if f, ok := lensFocus[plan.lens]; ok {
 		focus += "; this pass focuses on " + f
@@ -547,10 +547,10 @@ func (x *runtugExecutor) brief(plan *passPlan, label, jobDir, authorFamily strin
 	if x.context != "" {
 		prContext = "\n## PR context\n\n" + strings.TrimRight(x.context, "\n") + "\n"
 	}
-	// `runtug done --result` stores the findings on the job's hk record in
+	// `panewire done --result` stores the findings on the job's hk record in
 	// the same PUT as `completed`, so mergewake reads them back through the
 	// record on any host — no attachment, lane event or inbox read.
-	ret := "Then run `runtug done " + label + " --result \"$J/findings.json\" --report \"$J/report.md\"`."
+	ret := "Then run `panewire done " + label + " --result \"$J/findings.json\" --report \"$J/report.md\"`."
 	text := fmt.Sprintf(`# Review — %[1]s#%[2]d pass %[3]d (%[4]s lens)
 
 You are the independent reviewer for pull request %[1]s#%[2]d. mergewake posts

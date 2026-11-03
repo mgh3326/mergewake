@@ -292,14 +292,14 @@ func ComposerState(agent, screen string) string {
 	return ComposerUnknown
 }
 
-// JobDone marks a job finished the way its lead would: `runtug done` on the
-// job's host, with the report or screen reap just saved. runtug records the
+// JobDone marks a job finished the way its lead would: `panewire done` on the
+// job's host, with the report or screen reap just saved. panewire records the
 // completed state in hk and treats a repeat with the same report as done.
 func (e Exec) JobDone(ctx context.Context, job, report string) error {
 	if !ValidJobName(job) {
 		return errors.New("job name invalid")
 	}
-	args := []string{"runtug", "done", job}
+	args := []string{"panewire", "done", job}
 	if report != "" {
 		args = append(args, "--report", report)
 	}

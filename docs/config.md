@@ -83,7 +83,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | --- | --- | --- |
 | `name` | Required | Unique label for receipts; same alphabet as `host`. |
 | `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
-| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (runtug's `HUB_MACHINE_ID`), so name a local host after its machine id; otherwise its leads are skipped as `job-host-unconfigured`. |
+| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (panewire's `HUB_MACHINE_ID`), so name a local host after its machine id; otherwise its leads are skipped as `job-host-unconfigured`. |
 | `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
 
 ### `reap`
@@ -136,7 +136,7 @@ pane; a dim placeholder reads as text and keeps it too.
 
 A merged PR whose body or head commit carries `Mergewake-Task: <id>` is
 reaped through its job instead of its worktree: the same binding the findings
-router uses — hk task → bound job (`refs.job_id`) → the job record runtug
+router uses — hk task → bound job (`refs.job_id`) → the job record panewire
 wrote at spawn (`host`, `label`, `pane_id`). The pane is the one named after
 the label on the configured host whose `name` or `machine` equals the
 record's `host`. herdr pane ids are host-local, so no other host is searched:
@@ -163,7 +163,7 @@ The lead closes only when the whole job is finished, checked in this order:
 5. the same re-read before `herdr pane close`.
 
 After the close, mergewake marks the job done the way the lead would:
-`runtug done <job> --report <saved>` on the job's host, a `job-done` row with
+`panewire done <job> --report <saved>` on the job's host, a `job-done` row with
 `done` (`would-done` in shadow). A job hk already holds terminal is skipped as
 `already-<state>`. If the done fails, the next pass retries it once the pane
 is gone, until a `done` row or a terminal hk state ends it. Each job is decided once per pass,
@@ -222,10 +222,10 @@ on a host that also has `ssh`. Each remote host maps to panewire machine
   the node re-reads herdr and closes only an exact match, answering
   `pane-changed` or `pane-gone` otherwise, which become the same receipt
   reasons as the ssh path;
-- no node command reads a pane's screen back or runs `runtug done` yet, so a
-  hub host's composer is `composer-unknown` and its panes are kept, never
-  closed, until panewire adds those commands. Capture and close above are the
-  path they will take.
+- composer checks use identity-checked `pane.read`; only recognized `empty`
+  permits closing, and hub errors or unknown composers keep the pane;
+- after closing a job pane, `job.done` runs the guarded host-local completion
+  command using the report saved by capture.
 
 The hub host's aged-out worktree is removed through node command
 `worktree.remove`, with the inspected PR head, base branch and configured
@@ -246,7 +246,7 @@ never with the operator token (panewire `docs/hub-scopes.md`). It sends
 machine (operator decision D1):
 
 ```sh
-HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.close@*
+HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.read@*,node.command:job.done@*,node.command:pane.close@*
 ```
 
 | Scope | Reap uses it for |
@@ -255,6 +255,8 @@ HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.comma
 | `node.command:agents.list@*` | not sent by reap today (discovery uses the fleet-wide list); granted with D1 for a per-machine re-read |
 | `node.command:worktree.inspect@*` | worktree matching and the aged-out worktree check |
 | `node.command:worktree.remove@*` | guarded cleanup of merged PR worktrees |
+| `node.command:pane.read@*` | identity-checked visible composer classification before a close |
+| `node.command:job.done@*` | host-local guarded `panewire done` after closing a job pane |
 | `node.command:pane.capture@*` | saving the report or screen before a close |
 | `node.command:pane.close@*` | the exact-match close |
 
@@ -302,7 +304,7 @@ A single PR's fetch failure never aborts the pass.
 | `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 
-A runtug job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
+A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
 unit, never its worktree — that is in git and is cleaned by the worktree
 rules above. Archiving runs these steps in order, and any failure keeps the
 local job dir and reports the step:
@@ -317,7 +319,7 @@ local job dir and reports the step:
    case-insensitively — are excluded from Drive and hk and named in the
    record. Symlinks and special files are not copied (following a link could
    archive a secret from outside the job dir). The hk task id comes from the
-   job's runtug events (`events/*-job.task_link.json`, falling back to
+   job's panewire events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
    destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
    job's newest entry. A destination that already holds a `manifest.json` is
@@ -391,16 +393,15 @@ needs no GitHub token.
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
-| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `runtug` spawns a visible reviewer pane through runtug and keeps headless as the fallback. |
-| `runtug.command` | `runtug` | runtug executable. |
-| `runtug.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
-| `runtug.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
-| `runtug.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
-| `runtug.jobs` | `~/work/herdr-inbox/jobs` | runtug's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
-| `runtug.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; runtug names the remote worktree after the checkout. |
-| `runtug.lane` | `runtug.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
-| `runtug.panewire` | `panewire` | panewire executable for reading that lane; it takes the hub connection from `PANEWIRE_HUB_URL` and `PANEWIRE_HUB_TOKEN_ENV` in mergewake's environment. |
-| `runtug.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a runtug whose `spawn` has `--exclude-host`). Must not contain `runtug.host`. |
+| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `panewire` spawns a visible reviewer pane through panewire and keeps headless as the fallback. |
+| `panewire.command` | `panewire` | Single executable for spawn and inbox calls. |
+| `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
+| `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
+| `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
+| `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
+| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. |
+| `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
+| `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 
 #### Large PRs
 
@@ -416,37 +417,37 @@ renamed file is listed in the review body, and the pass marker records
 `diff_source: local` with `diff_summarized`, so no file disappears silently. Any
 other HTTP error fails the review as before.
 
-#### Runtug executor
+#### Panewire executor
 
-With `executor: runtug` each missing pass is first offered to a reviewer pane:
+With `executor: panewire` each missing pass is first offered to a reviewer pane:
 
 1. The PR's `Mergewake-Task` trailer (PR body, then head commit) is read
    through the handoffkeep sink; the task's `refs.job_id` is the author's
-   runtug job and its title marker (`(grade A, T2)`) gives `--t`. The
+   panewire job and its title marker (`(grade A, T2)`) gives `--t`. The
    author's hk job record (`GET /v1/jobs/<author job>`, read through the same
    handoffkeep endpoint and credentials the sink's CLI uses) supplies
    `--builder-family`; a builder spawned before job records have no record,
    and the trailer/commit inference answers instead. A task with no bound job
-   (the author did not run through runtug) is not skipped: the pass runs as a
+   (the author did not run through panewire) is not skipped: the pass runs as a
    top-level reviewer job, `--builder-job` is omitted, and `--builder-family`
    still carries the author's family (trailer/commit inference) so the
    reviewer excludes it.
-2. A fork PR (head repository other than the repo) is not offered: runtug can
+2. A fork PR (head repository other than the repo) is not offered: panewire can
    replicate only a spec origin carries. The pass claim is taken, then
    `git -C <root> fetch --no-tags origin +pull/<n>/head:refs/remotes/origin/pull/<n>/head <base>`
-   (runtug builds the detached spec for another host from that ref, not from
+   (panewire builds the detached spec for another host from that ref, not from
    `FETCH_HEAD`) and a worktree
-   detached at the exact head SHA is added under `runtug.checkouts`
+   detached at the exact head SHA is added under `panewire.checkouts`
    (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
    branch, and the author's branch being checked out in another worktree is no
    obstacle. The worktree is removed after the wait.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings, operator decisions) the headless prompt carries, then runs
-   `runtug spawn -c <checkout> -m auto -p <brief> -l
+   `panewire spawn -c <checkout> -m auto -p <brief> -l
    mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> [--builder-job <author job>] --builder-family <family from the author's job record, else inferred> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
-   --wait-timeout <rest of review.timeout>`. runtug picks host and model and,
+   --wait-timeout <rest of review.timeout>`. panewire picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
    clones the repo under `$HOME/work` and adds a worktree detached at the same
    head, fetched as `pull/<n>/head`. Exit 77 (no admitted seat outside that family) retries
@@ -456,8 +457,8 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass falls back. Otherwise
    it writes `{"findings":[…]}` to `findings.json` in its job directory
-   (`<jobs>/<label>/` here, runtug's jobs root on another host) and runs
-   `runtug done <label> --result "$J/findings.json" --report "$J/report.md"`,
+   (`<jobs>/<label>/` here, panewire's jobs root on another host) and runs
+   `panewire done <label> --result "$J/findings.json" --report "$J/report.md"`,
    which stores the findings on the pane's hk job record in the same write
    as `state: completed`.
 5. After the wait, mergewake reads `GET /v1/jobs/<label>` (same endpoint and
@@ -466,32 +467,30 @@ With `executor: runtug` each missing pass is first offered to a reviewer pane:
    `escalated` or `lost` record (the receipt records the state), a still
    pending or missing record, and an unreadable hk all fall back — the last
    three after polling every 5s for up to 30s (at most half the remaining
-   deadline), an unreadable hk reporting reason `hk-unavailable`. A pane
-   spawned before `runtug done --result` has no result on its record, so for
-   one release the lane announcement + `handoffkeep attach get` (or, on this
+   deadline), an unreadable hk reporting reason `hk-unavailable`. A historical pane from before `runtug done --result` (runtug was replaced by panewire) has no result on its record, so the lane announcement + `handoffkeep attach get` (or, on this
    host, `<jobs>/<label>/findings.json`) is still tried and each use is
    counted: the receipt's `fallback` notes it and a
    `review-inbox-fallback` audit record carries the running count. The
    findings go through the same validation as headless output (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
-   claim and done marker. The receipt adds `"executor":"runtug"`, the
-   reviewer is `runtug:<seat>`, and the family is the one on the reviewer's
+   claim and done marker. The receipt adds `"executor":"panewire"`, the
+   reviewer is `panewire:<seat>`, and the family is the one on the reviewer's
    job record — a remote pane's spawn events live on its own host — with the
    local `job.spawned` event (or the profile whose gate profile is the seat)
    as the fallback only when the record has none; an unknown family counts as
    same-family. The checkout is removed after the wait.
 
 No task trailer, no repo `root`, a fork PR, a failed checkout,
-a runtug refusal or wait failure, a refusal by the pane, no findings or
+a panewire refusal or wait failure, a refusal by the pane, no findings or
 rejected findings all fall back to the
 headless executor for that pass under the same claim; its receipt records
-`"fallback":"runtug: <reason>"`. All executors share `review.timeout`, so a
-pane that used the whole deadline leaves nothing for the fallback. In runtug
+`"fallback":"panewire: <reason>"`. All executors share `review.timeout`, so a
+pane that used the whole deadline leaves nothing for the fallback. In panewire
 mode a failing quota tool is not fatal: it only leaves the headless fallback
-without candidates. Passes of a blocking PR are separate panes; runtug
+without candidates. Passes of a blocking PR are separate panes; panewire
 enforces only the author-family exclusion between them.
 
-runtug fails closed when the remote host cannot stand at the head: an
+panewire fails closed when the remote host cannot stand at the head: an
 existing worktree there that is not detached at that commit or is dirty is a
 placement refusal for that pass, which falls back to headless.
 
@@ -618,7 +617,7 @@ on it.
   changed lines and their impact paths (callers, config and data they feed) and
   reports a defect outside the shown hunks only when a changed line causes it,
   anchored on that changed line (`fleet-review` §Rounds); a finding on any other
-  line fails the same new-side-line check as before. The runtug brief carries the delta patch inline instead of `git diff`.
+  line fails the same new-side-line check as before. The panewire brief carries the delta patch inline instead of `git diff`.
   When the previous patch cannot be read, the round reviews the whole diff and
   the audit event says why (`round_note`). When nothing changed at all, the round
   does not count, reviews the whole diff for reference only, and reports only a
@@ -1187,7 +1186,7 @@ cause. The skip entries in the `review` and `review-skipped` decisions
 
 - `reviewer` and `reason`;
 - `host`, which is the configured host for headless reviewers, or the
-  `review.runtug.host` value for runtug panes;
+  `review.panewire.host` value for panewire panes;
 - for a failed process, `exit_code` and `stderr_tail`, the last 512 bytes of
   stderr after redaction;
 - otherwise `cause`, the bounded error text.
@@ -1198,7 +1197,7 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 
 | `kind` | `outcome` | `reason` | `detail` |
 | --- | --- | --- | --- |
-| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `runtug_spawn_exit`, ...) | `pass= reviewer= host= exit= reason="..."` then `stderr:` or `cause:` |
+| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= host= exit= reason="..."` then `stderr:` or `cause:` |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
 
 The shipping config, dashboard and alerts are in panewire `deploy/alloy` and
@@ -1223,7 +1222,7 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
-| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `runtug done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `panewire done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
@@ -1712,3 +1711,42 @@ read-only, and install scripts must be safe to repeat at the same commit.
 from PR merge checks. Omission reuses `required_checks`. For example a project
 with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
 without weakening the PR gate. First-PR CI measurement always uses required_checks.
+
+The hub reap transport reads composers with `pane.read`: only `empty` permits
+closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone panes
+and hub errors keep the pane. Codex placeholder text remains nonempty unless the
+node can prove it is an accepted placeholder. After closure, `job.done` runs on
+the job host with the saved report path; only `done` and `already-done` succeed.
+The node-side `pane.close` rechecks the visible composer before and after its
+settle interval; text, an unreadable composer or an unknown composer keeps the
+pane even if its name, status and cwd did not change after capture.
+Grant both scopes before enabling this caller; older hubs fail safely and keep
+panes. The operator credential cannot substitute for these service-only ops.
+
+
+Launcher cutover: set `review.executor: panewire`. Remove the former
+`review.runtug.command` (the runtug executable) and `review.runtug.panewire`
+(the separate inbox executable) before moving the remaining settings to
+`review.panewire`; remove the old `review.runtug` block. Set
+`review.panewire.command` to the panewire executable, or omit it for the
+`panewire` PATH default. Do not copy the old executable settings: strict decoding
+rejects the retired nested `panewire` field, and the old `command` would still
+launch runtug. The old executor key is refused.
+
+For example, after retaining the desired workspace/owner/host settings:
+
+```yaml
+review:
+  executor: panewire
+  panewire:
+    command: /usr/local/bin/panewire
+    workspace: reviews
+    owner: review-desk
+    host: auto
+```
+
+The single binary supplies both spawn and inbox calls. Spawn needs the fleet
+hosts config (`FLEET_HOSTS_CONFIG`) with its hub operator credential. The default
+CLI returns ACCEPTED after a durable reservation; mergewake keeps `--wait`,
+which observes spawn completion and then the existing job completion contract.
+A reconciling attempt is never retried on another host.

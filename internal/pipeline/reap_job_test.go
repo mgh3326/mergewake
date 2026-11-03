@@ -48,7 +48,7 @@ func leadPane(fields string) string {
 }
 
 // leadFixture is a service whose hk binds task 2497 to job lead-a on host
-// local; runtug done flips the record to completed, as its hk PUT does.
+// local; panewire done flips the record to completed, as its hk PUT does.
 func leadFixture(t *testing.T, pane string) (*Service, *jobGH, *jobSink, *scriptRunner) {
 	t.Helper()
 	sink := &jobSink{
@@ -69,7 +69,7 @@ func leadFixture(t *testing.T, pane string) (*Service, *jobGH, *jobSink, *script
 		key("sh", "-c", leadScreen, "sh", "/jobs/lead-a", "w2:p1"):                                              "",
 	}}
 	run.fn = func(k string) (string, bool) {
-		if k == key("runtug", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt") {
+		if k == key("panewire", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt") {
 			rec := sink.recs["lead-a"]
 			rec.State = "completed"
 			sink.recs["lead-a"] = rec
@@ -119,7 +119,7 @@ func TestReapFindsLeadPaneThroughJob(t *testing.T) {
 	if done := leadRow(t, s, "job-done"); done == nil || done["result"] != "would-done" {
 		t.Fatalf("job-done row: %v", done)
 	}
-	if run.called("herdr\x00pane\x00close") || run.called("runtug") {
+	if run.called("herdr\x00pane\x00close") || run.called("panewire") {
 		t.Fatalf("shadow acted: %q", run.calls)
 	}
 }
@@ -139,7 +139,7 @@ func TestReapKeepsLeadWhileJobHasOpenPR(t *testing.T) {
 	if row == nil || row["result"] != "skipped" || row["reason"] != "job_has_open_pr" || !slices.Equal(anyStrings(row["open"]), []string{"example/other#31"}) {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
-	if run.called("herdr\x00pane\x00close") || run.called("runtug") || leadRow(t, s, "job-done") != nil {
+	if run.called("herdr\x00pane\x00close") || run.called("panewire") || leadRow(t, s, "job-done") != nil {
 		t.Fatalf("pane closed with an open PR: %q", run.calls)
 	}
 
@@ -174,13 +174,13 @@ func TestReapLeadSavesScreenClosesThenMarksDone(t *testing.T) {
 	}
 	screen := slices.Index(run.calls, key("sh", "-c", leadScreen, "sh", "/jobs/lead-a", "w2:p1"))
 	closed := slices.Index(run.calls, key("herdr", "pane", "close", "w2:p1"))
-	doneKey := key("runtug", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
+	doneKey := key("panewire", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
 	done := slices.Index(run.calls, doneKey)
 	if screen < 0 || closed < screen || done < closed {
 		t.Fatalf("want screen, close, done in order: %q", run.calls)
 	}
 	if n := callCount(run, doneKey); n != 1 {
-		t.Fatalf("runtug done ran %d times", n)
+		t.Fatalf("panewire done ran %d times", n)
 	}
 	if sink.recs["lead-a"].State != "completed" {
 		t.Fatal("job not completed")
@@ -197,7 +197,7 @@ func TestReapLeadSavesScreenClosesThenMarksDone(t *testing.T) {
 // pane is gone.
 func TestReapRetriesJobDoneAfterClose(t *testing.T) {
 	s, _, _, run := leadFixture(t, leadPane(""))
-	doneKey := key("runtug", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
+	doneKey := key("panewire", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
 	run.errs = map[string]error{doneKey: errors.New("hk unreachable")}
 	agents := run.outs[key("herdr", "agent", "list")]
 	run.queue = map[string][]string{key("herdr", "agent", "list"): {agents, agents, `{"result":{"agents":[]}}`}}
@@ -270,7 +270,7 @@ func TestReapLeadProtections(t *testing.T) {
 			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 				t.Fatal(err)
 			}
-			if run.called("herdr\x00pane\x00close") || run.called("runtug") {
+			if run.called("herdr\x00pane\x00close") || run.called("panewire") {
 				t.Fatalf("closed: %q", run.calls)
 			}
 			if row := leadRow(t, s, "close-pane"); row == nil || row["result"] != "skipped" || row["reason"] != tt.reason {
@@ -320,7 +320,7 @@ func TestReapWithoutTrailerKeepsWorktreeMatch(t *testing.T) {
 	if row == nil || row["result"] != "closed" || row["pane"] != "w1:p1" || row["cwd"] != "/repo.wt" || row["worktree"] != "/repo.wt" || row["branch"] != "wk/x" || row["job"] != "wk-7" || row["saved"] != "/jobs/wk-7/report.md" || row["task"] != nil {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
-	if r.called("runtug") || leadRow(t, s, "job-done") != nil {
+	if r.called("panewire") || leadRow(t, s, "job-done") != nil {
 		t.Fatalf("worktree match marked a job done: %q", r.calls)
 	}
 	if leadRow(t, s, "remove-worktree")["result"] != "removed" {
@@ -332,7 +332,7 @@ func TestReapWithoutTrailerKeepsWorktreeMatch(t *testing.T) {
 // retries.
 func TestReapJobDoneRunsOnceWhenHKLags(t *testing.T) {
 	s, _, _, run := leadFixture(t, leadPane(""))
-	doneKey := key("runtug", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
+	doneKey := key("panewire", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
 	run.fn = func(k string) (string, bool) { return "", k == doneKey }
 	agents := run.outs[key("herdr", "agent", "list")]
 	run.queue = map[string][]string{key("herdr", "agent", "list"): {agents, agents}}
@@ -343,7 +343,7 @@ func TestReapJobDoneRunsOnceWhenHKLags(t *testing.T) {
 		}
 	}
 	if n := callCount(run, doneKey); n != 1 {
-		t.Fatalf("runtug done ran %d times", n)
+		t.Fatalf("panewire done ran %d times", n)
 	}
 }
 
@@ -352,7 +352,7 @@ func TestReapJobDoneRunsOnceWhenHKLags(t *testing.T) {
 func TestReapJobBoundLeadKeepsWorktreeCleanup(t *testing.T) {
 	outs := worktreeOuts("/repo")
 	outs[key("herdr", "pane", "read", "w1:p1", "--source", "visible")] = emptyComposer
-	outs[key("runtug", "done", "wk-7", "--report", "/jobs/wk-7/report.md")] = ""
+	outs[key("panewire", "done", "wk-7", "--report", "/jobs/wk-7/report.md")] = ""
 	r := &scriptRunner{outs: outs}
 	agents, panes := outs[key("herdr", "agent", "list")], outs[key("herdr", "pane", "list")]
 	empty := `{"result":{"agents":[],"panes":[]}}`

@@ -291,13 +291,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	cli := quota.CLI{Runner: s.Runner, Command: command, Now: s.Now}
 	var provider quota.Provider = cli
-	// The runtug executor needs no local quota tool: runtug selects the
+	// The panewire executor needs no local quota tool: panewire selects the
 	// reviewer, and headless candidates are only its fallback.
-	viaRuntug := s.Config.Review.Executor == "runtug"
+	viaPanewire := s.Config.Review.Executor == "panewire"
 	var quotaErr error
 	ranked, e := provider.Recommend(ctx, grade)
 	if e != nil {
-		if !viaRuntug {
+		if !viaPanewire {
 			return fmt.Errorf("quota recommendation: %w", e)
 		}
 		quotaErr, ranked = fmt.Errorf("quota recommendation: %w", e), nil
@@ -308,7 +308,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	var usage quota.Usage
 	if byPace && quotaErr == nil {
 		if usage, e = cli.Usage(ctx); e != nil {
-			if !viaRuntug {
+			if !viaPanewire {
 				return fmt.Errorf("quota usage: %w", e)
 			}
 			// The headless fallback keeps the recommendation, in rank order.
@@ -429,7 +429,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	for _, pass := range missing {
 		plans = append(plans, &passPlan{pass: pass, candidates: order()})
 		if len(plans[len(plans)-1].candidates) == 0 {
-			if viaRuntug {
+			if viaPanewire {
 				continue
 			}
 			err := unavailable()
@@ -457,8 +457,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			if len(plan.candidates) > 0 {
 				row["same_family"] = fam(plan.candidates[0]) == family
 			}
-			if viaRuntug {
-				row["executor"] = "runtug"
+			if viaPanewire {
+				row["executor"] = "panewire"
 			}
 			if byPace {
 				pace := []string{}
@@ -528,8 +528,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	headless := &headlessExecutor{s: s, repo: r.Name, pr: n, diff: rp.diff, context: prContext.text, dir: dir, control: control, provider: provider, cli: cli, freePool: freePool, family: fam, failed: map[string]bool{}, exhausted: map[string]bool{}, none: unavailable}
 	executors := []passExecutor{headless}
-	if viaRuntug {
-		executors = []passExecutor{&runtugExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}, headless}
+	if viaPanewire {
+		executors = []passExecutor{&panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}, headless}
 	}
 	for _, plan := range plans {
 		plan.lens = lens(plan)
@@ -577,7 +577,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			// Only an executor that produced nothing gets here; a later one
 			// that succeeds breaks above, so this keeps the reason the
-			// preferred executor (runtug) gave up.
+			// preferred executor (panewire) gave up.
 			if len(out.skips) > 0 {
 				fallback = out.skips[len(out.skips)-1].Reason
 			}
@@ -595,8 +595,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		plan.name = selected
 		plan.sameFamily = out.family == "" || out.family == family
 		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
-		if viaRuntug && out.executor != "runtug" {
-			receipt.Fallback = "runtug: " + fallback
+		if viaPanewire && out.executor != "panewire" {
+			receipt.Fallback = "panewire: " + fallback
 		}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
 			return e
@@ -691,7 +691,7 @@ type reviewSkip struct {
 	Reason   string `json:"reason"`
 	Reset    string `json:"reset,omitempty"`
 	Note     string `json:"note,omitempty"`
-	// Host is where the reviewer ran (headless) or was asked to run (runtug).
+	// Host is where the reviewer ran (headless) or was asked to run (panewire).
 	Host string `json:"host,omitempty"`
 	// ExitCode, StderrTail and Cause say why a reviewer process failed; see
 	// withCause. StderrTail is redacted and bounded.

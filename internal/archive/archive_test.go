@@ -114,7 +114,7 @@ func write(t *testing.T, p, body string) {
 	}
 }
 
-// job lays out a runtug-shaped job dir with credential-like files mixed in.
+// job lays out a panewire-shaped job dir with credential-like files mixed in.
 func job(t *testing.T, jobs, name string) string {
 	t.Helper()
 	dir := filepath.Join(jobs, name)

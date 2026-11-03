@@ -87,7 +87,7 @@ can assign READY directly.
 | review_queued | Capacity reservation and committed dispatch intent enter reviewing | Scheduler |
 | reviewing | Valid result enters awaiting_author or gate_pending; transport uncertainty stays reviewing | Result validator |
 | awaiting_author | Verified dispositions or a changed head return to observing; exhausted fix rounds enter blocked_author | Author action, engine |
-| blocked_author | Explicit authorized resume starts a new bounded cycle; aging may notify operator | Author/operator, engine |
+| blocked_author | A changed head is recorded but remains blocked; only explicit authorized resume starts a new bounded cycle; aging may notify operator | Author/operator, engine |
 | gate_pending | Fresh exact-head gate passes to ready; pending CI waits; failures route to author | Existing policy/gate |
 | ready | Opted-in acting mode requests pinned-head merge; confirmed result enters merged; moved head returns to observing | Merge adapter |
 | merged / closed | Terminal; cancel obsolete queued work and retain evidence/ownership | GitHub observation |
@@ -106,14 +106,22 @@ publish evidence for the current head. A superseded attempt retains capacity
 until remote termination is known. No PR lock or SQL transaction lasts for the
 duration of a review.
 
+Both webhook-driven refresh and reconciliation use this same transition rule:
+while `blocked_author`, record the latest head/base and advance the generation
+to fence obsolete work, but preserve the blocked state and exhausted fix-round
+count. A new commit does not enqueue another review or restart aging. Only an
+authorized resume records a new bounded cycle.
+
 ## MySQL 8 schema, claims and migrations
 
 Use managed OCI MySQL 8 with InnoDB, UTC `DATETIME(6)`, explicit primary/foreign
 keys and case-sensitive ASCII identity columns (`ascii_bin`); human text uses
 `utf8mb4`. One active coordinator is initially deployed, with bounded concurrent
 short transactions. The managed DB is an operator decision, not a claim that a
-second writer is required. A durable coordinator lease/epoch fences accidental
-duplicate server instances; only the lease holder dispatches or merges.
+second writer is required. A durable coordinator lease/epoch fences database
+mutations by duplicate server instances. External dispatch and merge authority
+also require the downstream contracts below; the database lease alone cannot
+fence a network request from a paused former owner.
 
 | Table | Keys and important fields |
 | --- | --- |
@@ -121,12 +129,12 @@ duplicate server instances; only the lease holder dispatches or merges.
 | coordinators | service PK, owner_epoch, lease_until |
 | deliveries | (source, delivery_id) PK, payload_digest, received_at, normalized payload |
 | prs | (repository, number) PK, head, base, generation, version, state, next_sequence, fix_rounds, author_route, route_provenance, first_wait_at |
-| jobs | id PK, PR FK, sequence, generation, kind, scope_digest, priority, status, available_at, attempt_epoch, lease_until, failure_count, last_error_code |
-| attempts | (job_id, epoch) PK, request_uuid UNIQUE, remote_job_id, chosen_host, canonical_pool, state, dispatch/result timestamps |
+| jobs | id PK, PR FK, sequence, generation, kind, scope_digest, priority, status, available_at, owner_epoch, attempt_epoch, lease_until, failure_count, last_error_code |
+| attempts | (job_id, epoch) PK, owner_epoch, request_uuid UNIQUE, remote_job_id, chosen_host, canonical_pool, state, dispatch/result timestamps |
 | reservations | attempt FK UNIQUE, class, host, pool, predicted_cpu/memory/work, terminal_confirmed |
 | capacity | resource PK, revision; locks for global/class/pool accounting, no fixed host ceilings |
 | receipts | id PK, PR/head/patch/policy/context/family/scope identities, prior_receipt FK, trusted result digest |
-| outbox | event_id PK, job/PR identity, effect_kind, route, redacted payload, status, available_at, failures |
+| outbox | event_id PK, owner_epoch, job/PR identity, effect_kind, route, redacted payload, status, available_at, failures |
 | reconcile_cursors | repository PK, last_complete_at, next_page, generation |
 | request_cache | resource key digest PK, validator, bounded body, observed_at, freshness/deadline |
 | audit | id PK, PR/job/attempt identity, transition, reason_code, timestamp |
@@ -171,13 +179,43 @@ their results are retrieved after recovery or their callbacks receive retryable
 503. Reconnect revalidates the coordinator epoch and reconciles pending effects
 before admission resumes. Merge dispatch requires a fresh durable permit and
 successful DB check immediately before the GitHub call; failure prevents it.
+A fresh check is necessary but is not an external lease fence: the process can
+pause after it and resume after another owner acquires the lease. Persist
+`owner_epoch` with every external effect intent and dispatch attempt, alongside
+an immutable operation ID and payload digest. An old epoch cannot gain a new
+operation ID or change the payload of an existing operation during recovery.
+
+For panewire dispatch, task 2724's downstream contract must reject stale owner
+epochs before creating a new job and durably deduplicate retries of an already
+accepted operation ID/digest to the original outcome. Recording the newer epoch
+and accepting a dispatch must be serialized at that downstream boundary. The
+adapter cannot claim safe automated failover until this contract is tested.
+
+GitHub's [merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+does not accept this coordinator epoch. A pinned-head merge
+protects the target head, but does not fence owner epochs or policy changes;
+checking posted receipts before retry also cannot prevent concurrent posts.
+Therefore direct GitHub mutation authority has no lease-only automatic takeover:
+the supervisor/operator must prove the previous mutation executor is terminated,
+its egress path is fenced, and outstanding requests are terminal/reconciled
+before enabling a replacement. If that proof is unavailable, keep mutations,
+including merges, disabled. Persist uncertain operations across takeover and
+reconcile each immutable target before an operation-specific retry. This is a
+deployment/adapter acceptance prerequisite, not a property supplied by MySQL.
+
+Fault fixtures must pause an owner between DB check and dispatch, advance the
+epoch, and verify stale dispatch rejection and stable-ID replay. For direct
+GitHub adapters, the same fixture must refuse replacement mutation authority
+until prior-executor shutdown/egress fencing and pending-operation reconciliation
+are proven. No external adapter is complete on the strength of a lease test alone.
 A GitHub request already sent cannot be recalled by a subsequent DB outage:
 record it as uncertain and reconcile before any retry. Never claim atomic commit
 across MySQL and GitHub.
 
 ## Store before do, retries and remote uncertainty
 
-Persist effect intent, deterministic request UUID, attempt epoch, scope, selected
+Persist effect intent, coordinator owner epoch, deterministic request UUID,
+attempt epoch, scope, selected
 placement and reservation before sending a spawn. Keep the same identity across
 transport retries. Results authenticate their source and match job, epoch, head,
 scope and actual reviewer family. Validate findings and exact reviewed patch
@@ -232,8 +270,15 @@ quota-aware placement API; never infer pool from a model name.
 
 For each eligible host/profile, estimate job demand from the rolling median of
 the last 20 successful comparable jobs (scope/size/model class), with a
-conservative configured cold-start estimate and p90 memory demand. Maintain the
-measured work throughput `R` from these samples. Use these dimensionless terms:
+conservative configured cold-start estimate and p90 memory demand. Configure a
+finite, strictly positive bootstrap throughput `R_boot` for each host/profile
+and comparable-job class, in the same work-units/second used for measured
+throughput. Reject missing, zero, negative or non-finite bootstrap values before
+admission. Use `R = R_boot` until at least five successful comparable jobs within
+the last seven days exist, then use their median work/elapsed-time throughput
+over at most the latest 20 samples. Ignore invalid/nonpositive samples; fall
+back to `R_boot` if fewer than five valid recent samples remain. This makes a
+new host or class rankable before its first job. Use these dimensionless terms:
 
 ```text
 L = projected Load5 / core_count

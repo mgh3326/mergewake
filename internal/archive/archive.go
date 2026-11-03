@@ -1,4 +1,4 @@
-// Package archive moves a finished runtug job directory off its session host.
+// Package archive moves a finished panewire job directory off its session host.
 // The job's regular files are copied uncompressed into a locally synced Google
 // Drive folder on the archive host, every copy is verified by sha256 against
 // the source, a manifest.json is written beside them, the job's text files are
@@ -179,7 +179,7 @@ func safeName(p string) bool {
 
 var taskID = regexp.MustCompile(`^[1-9][0-9]*$`)
 
-// task reads the hk task id from the job's runtug events: the newest
+// task reads the hk task id from the job's panewire events: the newest
 // job.task_link event wins, with job.claim as a fallback for older jobs.
 func (a *Archiver) task(ctx context.Context, h reap.Host, dir string, files []File) (string, error) {
 	for _, kind := range []string{"job.task_link", "job.claim"} {

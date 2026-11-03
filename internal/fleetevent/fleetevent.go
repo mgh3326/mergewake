@@ -1,6 +1,6 @@
 // Package fleetevent writes fleet-event v1 records: one JSON object per line,
 // appended to a local, size-bounded file that Grafana Alloy tails and ships to
-// Loki. The same shape is written by runtug, panewire and mergewake; the
+// Loki. The same shape is written by panewire and mergewake; the
 // contract lives in panewire's deploy/alloy/README.md ("Fleet events").
 //
 // Every string field is redacted and bounded before it is written, so a caller
