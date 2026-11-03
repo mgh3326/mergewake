@@ -367,3 +367,30 @@ func TestStallAlarmSkipsBlockedHead(t *testing.T) {
 		t.Fatalf("a blocked head raised a stall alarm: %+v", f.n.events)
 	}
 }
+
+// A pass that arrives after the block, on this head or on an earlier head with
+// the same patch, leaves no stale outcome.
+func TestLaterPassClearsBlockedOutcome(t *testing.T) {
+	diff, _ := (&fakeGH{}).Diff(context.Background(), "", 0)
+	for name, passes := range map[string]map[string][]github.PassReceipt{
+		"own pass":       {shaA: {{Pass: 1, Lens: "default", Family: "openai"}}},
+		"inherited pass": {shaC: {{Pass: 1, Lens: "default", Family: "openai", Patch: reviewPatchID(diff)}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := blockSetup(t)
+			if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+				t.Fatal(e)
+			}
+			f.g.passes = passes
+			if e := f.review(t); e != nil {
+				t.Fatal(e)
+			}
+			if got := f.blocked(t, 7); got != "" {
+				t.Fatalf("outcome row still blocked: %q", got)
+			}
+			if f.gh.posts != 1 || !f.g.refs[doneRef(7, shaA)] {
+				t.Fatalf("posts=%d refs=%v", f.gh.posts, f.g.refs)
+			}
+		})
+	}
+}
