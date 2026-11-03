@@ -40,6 +40,7 @@ type reapReceipt struct {
 	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
 	Task     string    `json:"task,omitempty"`  // Mergewake-Task of a job-bound row
 	Open     []string  `json:"open,omitempty"`  // open PRs (owner/name#N) keeping a job's pane
+	Kept     int       `json:"kept_panes,omitempty"`
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
