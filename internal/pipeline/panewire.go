@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,7 +35,48 @@ const inlineBriefLimit = 48 << 10
 var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
 
 var spawnedSeat = regexp.MustCompile(`(?m)^OK pane=\S+ model=(\S+)`)
-var spawnedLocation = regexp.MustCompile(`(?m)^OK pane=(\S+).*\bhost=(\S+)`)
+
+// spawnPlacement reads the executing panewire's placement receipt. The
+// placement value is base64url JSON containing the chosen host and pane id;
+// cwd is available in stdout on versions that report it directly.
+func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "OK" || !strings.HasPrefix(fields[1], "pane=") {
+			continue
+		}
+		v := integrations.JobRecord{PaneID: strings.TrimPrefix(fields[1], "pane=")}
+		for _, field := range fields[2:] {
+			switch {
+			case strings.HasPrefix(field, "host="):
+				v.Host = strings.TrimPrefix(field, "host=")
+			case strings.HasPrefix(field, "cwd="):
+				v.Cwd = strings.TrimPrefix(field, "cwd=")
+			case strings.HasPrefix(field, "placement="):
+				raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(field, "placement="))
+				if err != nil {
+					continue
+				}
+				var p struct {
+					Host string `json:"chosen_host"`
+					Pane string `json:"pane_id"`
+					Cwd  string `json:"cwd"`
+				}
+				if json.Unmarshal(raw, &p) == nil {
+					v.Host = p.Host
+					if p.Pane != "" {
+						v.PaneID = p.Pane
+					}
+					if p.Cwd != "" {
+						v.Cwd = p.Cwd
+					}
+				}
+			}
+		}
+		return v, v.Host != "" && v.PaneID != ""
+	}
+	return integrations.JobRecord{}, false
+}
 
 // findingsAttachment is the handoffkeep attachment id a pane announces.
 var findingsAttachment = regexp.MustCompile(`\battachment=([0-9a-f]{64})\b`)
@@ -207,20 +249,17 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	note := ""
 	var stdout []byte
-	spawnSucceeded := false
-	// Do not consult a potentially old job record for failures that happened
-	// before the spawn command was attempted. On a failed spawn, cleanup also
-	// requires this invocation's own OK placement line.
+	// Only this invocation's OK placement line proves which host-local pane
+	// id belongs to this pass.
 	defer func() {
-		confirmed := spawnSucceeded || spawnedLocation.Match(stdout)
-		x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, string(stdout), confirmed)
+		placement, confirmed := spawnPlacement(string(stdout))
+		x.cleanupReviewer(ctx, label, checkout, pr.Head.SHA, placement, confirmed)
 	}()
 	stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
 	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 		note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
 	}
-	spawnSucceeded = e == nil
 	if e != nil {
 		if ctx.Err() != nil {
 			res, skipErr := skip("panewire reviewer deadline")
@@ -289,7 +328,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 // cleanupReviewer closes only the pane recorded for this pass, after checking
 // the live pane row still has this pass's name and cwd. It writes failures to
 // the reap-style receipt and never changes the review outcome.
-func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head, spawnOutput string, confirmed bool) {
+func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checkout, head string, placement integrations.JobRecord, confirmed bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 	defer cancel()
 	if !confirmed {
@@ -297,43 +336,29 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 		return
 	}
 	job, err := x.job(ctx, label)
-	location := spawnedLocation.FindStringSubmatch(spawnOutput)
-	if err != nil {
-		if location == nil {
-			x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: checkout, Result: "error", Reason: fleetevent.Redact("job record: " + err.Error())}, false)
-			return
-		}
-		// A failed job lookup contributes no identity. Use only the placement
-		// returned by this invocation's spawn command.
-		job = integrations.JobRecord{Label: label, PaneID: location[1], Host: location[2]}
-	} else if location != nil {
-		if job.PaneID != "" && job.PaneID != location[1] || job.Host != "" && job.Host != location[2] {
-			x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: job.Host, Pane: job.PaneID, Worktree: checkout, Result: "skipped", Reason: "job record and spawn placement disagree"}, false)
-			return
-		}
-		if job.PaneID == "" {
-			job.PaneID = location[1]
-		}
-		if job.Host == "" {
-			job.Host = location[2]
-		}
+	if err == nil && (job.Host != "" && job.Host != placement.Host || job.PaneID != "" && job.PaneID != placement.PaneID) {
+		x.s.reapNote(reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: placement.Host, Pane: placement.PaneID, Worktree: checkout, Result: "skipped", Reason: "job record and spawn placement disagree"}, false)
+		return
 	}
-	row := reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: job.Host, Pane: job.PaneID, Worktree: checkout}
+	jobMatchesPlacement := err == nil && job.Host == placement.Host && job.PaneID == placement.PaneID
+	if jobMatchesPlacement && job.Cwd != "" {
+		placement.Cwd = job.Cwd
+	}
+	row := reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: placement.Host, Pane: placement.PaneID, Worktree: checkout}
 	record := func(result, reason string) {
 		row.Result, row.Reason = result, fleetevent.Redact(reason)
 		_ = x.s.reapNote(row, false)
 	}
-	row.Host, row.Pane = job.Host, job.PaneID
-	if job.Host == "" {
-		record("skipped", "job record has no host")
+	if placement.Host == "" {
+		record("skipped", "spawn placement has no host")
 		return
 	}
-	if job.PaneID == "" {
-		record("skipped", "job record has no pane id")
+	if placement.PaneID == "" {
+		record("skipped", "spawn placement has no pane id")
 		return
 	}
-	if job.Host == "local" || x.localReviewerHost(job.Host) {
-		x.cleanupLocalReviewer(ctx, &row, label, checkout, job.PaneID, record)
+	if placement.Host == "local" || x.localReviewerHost(placement.Host) {
+		x.cleanupLocalReviewer(ctx, &row, label, checkout, placement.PaneID, record)
 		return
 	}
 	hub, err := x.s.reapHub()
@@ -344,7 +369,7 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 		record("error", "hub: "+err.Error())
 		return
 	}
-	host := reap.HubHost{Hub: hub, Machine: job.Host}
+	host := reap.HubHost{Hub: hub, Machine: placement.Host}
 	panes, err := host.AllPanes(ctx)
 	if err != nil {
 		record("error", "pane list: "+err.Error())
@@ -352,13 +377,18 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 	}
 	var pane *reap.Pane
 	for i := range panes {
-		if panes[i].ID == job.PaneID {
+		if panes[i].ID == placement.PaneID {
 			pane = &panes[i]
 			break
 		}
 	}
 	if pane == nil {
-		record("skipped", "pane already gone")
+		cwd := placement.Cwd
+		if cwd == "" || filepath.Base(filepath.Clean(cwd)) != label {
+			record("skipped", "pane gone; remote cwd unavailable or mismatched")
+			return
+		}
+		x.removeReviewerWorktree(ctx, host, &row, cwd, head, record)
 		return
 	}
 	row.Cwd = pane.Cwd
@@ -386,8 +416,13 @@ func (x *panewireExecutor) cleanupReviewer(parent context.Context, label, checko
 		record("kept", "pane close recheck: "+outcome)
 		return
 	}
-	tree, err := host.Inspect(ctx, pane.Cwd)
-	if err != nil || tree == nil || tree.Path != pane.Cwd || tree.Head != head {
+	x.removeReviewerWorktree(ctx, host, &row, pane.Cwd, head, record)
+}
+
+func (x *panewireExecutor) removeReviewerWorktree(ctx context.Context, host reap.HubHost, row *reapReceipt, cwd, head string, record func(string, string)) {
+	row.Cwd = cwd
+	tree, err := host.Inspect(ctx, cwd)
+	if err != nil || tree == nil || tree.Path != cwd || tree.Head != head || !strings.EqualFold(tree.Repo, x.repo.Name) {
 		if err == nil {
 			err = errors.New("worktree identity changed")
 		}
