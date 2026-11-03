@@ -1,7 +1,8 @@
 # PR follow-up server on OCI
 
-Status: proposed; implementation requires a recorded operator decision on this
-design. Task: 2721. The operator's November 3 update supersedes the initial
+Status: accepted with revisions in handoffkeep document
+`decision/2026-11-03/mergewake-server-design-accept` (task 2721).
+The operator's November 3 update supersedes the initial
 SQLite and fixed host-cap proposal: use managed OCI MySQL 8, performance/load
 placement without fixed per-host caps, and herdr 0.9.5 reap guards.
 
@@ -210,10 +211,10 @@ a host-local checkout or read remote job directories.
 
 ## Worker admission and placement
 
-Configure N total review slots, N >= 2. Automatic reviews can consume at most
+Configure N total review slots, N >= 2 (initial N=6). Automatic reviews can consume at most
 N-1; an authenticated operator request may use any free slot, including the
 reserved last slot. Automatic requests never borrow that slot. Fix workers have
-a separate bounded global budget, and consume the same measured host resources
+a separate bounded global budget (initially 4), and consume the same measured host resources
 and applicable pool quota. Operator review reserve also preserves configured
 predicted memory/CPU and quota headroom for one review; this is dynamic resource
 reservation, not a fixed per-host cap. Physical capacity or quota can still make
@@ -226,8 +227,8 @@ and swap use/activity, plus panewire heartbeat/agent projection for active panes
 and freshness. Current node load projection exposes Load5/core count but not
 all memory/swap fields, so it alone cannot supply the full score. Require metrics
 with sample age <=60s and heartbeat age <=60s; unknown hosts wait rather than
-being treated as idle. Obtain canonical pool/quota from scopefuel's profile
-gate and the hub quota-aware placement API; never infer pool from a model name.
+being treated as idle. Obtain canonical pool/quota from pacelever and the hub
+quota-aware placement API; never infer pool from a model name.
 
 For each eligible host/profile, estimate job demand from the rolling median of
 the last 20 successful comparable jobs (scope/size/model class), with a
@@ -266,8 +267,10 @@ or optimal placement is claimed before measurement.
 Code-ready means non-draft with a complete diff, known author family and policy
 readiness checks satisfied. Final green CI is still required at landing.
 
-1. Docs-only: no model review when every change is an allowlisted prose file
-   and no executable/config/build/generator/symlink/submodule change exists.
+1. Docs-only: no model review only for <=50 changed lines when every change is
+   an allowlisted prose file and no executable/config/build/generator/symlink/
+   submodule change exists. Larger docs-only diffs get one cross-family
+   delta-scale pass.
    Classifier uncertainty requires full review. The gate records the exemption
    against exact head and policy; CI and disposition checks still apply.
 2. First code-ready patch: one full cross-family pass. Explicit stricter
@@ -330,7 +333,11 @@ Record a redacted, timestamped event mix and initial evidence snapshot, then
 replay both the existing sweep and new controller against the same fake GitHub
 clock/transport. Count REST requests (including 304), GraphQL requests and
 points, mutations, waits and completed reviews separately, normalized per hour
-over the recorded window. Include quiet and burst periods and dropped/duplicate
+over the recorded window. Unit 2 must keep REST usage strictly below 2500 calls/h
+(50% of the shared 5000/h budget), including retries and reconciliation, with
+headroom for other producers. Prefer a GitHub App installation token when
+available so server calls do not exhaust the user's shared budget; report token
+class and actual rate-limit headers without credentials. Include quiet and burst periods and dropped/duplicate
 deliveries. No request saving is claimed from the desk's observed sleep count;
 the supplied runtime measurements are motivation, not this comparison's result.
 
@@ -489,8 +496,9 @@ After recorded design acceptance, use one PR per unit, each commit carrying
 7. herdr saved-profile reap transport and sequence-aware close guards.
 8. Server container image and deploy/migration/cutover/rollback runbook.
 
-Resolve upstream durable spawn and retained branch/worktree ownership contracts
-before claiming units 3 and 5 complete. Delegate bounded units through the
+Panewire hub owns upstream durable spawn and retained branch/worktree ownership
+contracts under task 2724. Units 3 and 5 stay incomplete until that dependency
+lands and its contracts are verified. Delegate bounded units through the
 available fleet spawning tool; a failed spawn falls back to the lead. No merge,
 deployment or host edits are part of this lane.
 
@@ -506,8 +514,9 @@ the prior compatible binary and an explicitly reconciled legacy state export,
 then enables exactly one PR owner. Do not restore stale JSON over external
 effects or assume a MySQL backup can undo a merge.
 
-Implementation reconciliation: no implementation has started. Record the
-acceptance document key and accepted contract changes here before unit 1 begins.
-The design decision must settle the conservative review thresholds and initial
-placement policy, and confirm the upstream API owners; no acceptance is inferred
+Implementation reconciliation: design accepted by the operator in handoffkeep
+document `decision/2026-11-03/mergewake-server-design-accept`. Its revisions are
+incorporated above: <=50-line docs exemption, pacelever quota source, panewire
+hub task 2724 dependencies, REST budget target, initial 6 review slots (1
+reserved) and fix-worker budget 4. Unit 1 may now begin. No acceptance is inferred
 from elapsed time or successful event delivery.
