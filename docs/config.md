@@ -384,6 +384,7 @@ needs no GitHub token.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `login` | Required | GitHub identity posting the independent exact-head review. |
+| `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
 | `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
 | `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
@@ -480,9 +481,9 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    as the fallback only when the record has none; an unknown family counts as
    same-family. The checkout is removed after the wait.
 
-No task trailer, no repo `root`, a fork PR, a failed checkout,
-a panewire refusal or wait failure, a refusal by the pane, no findings or
-rejected findings all fall back to the
+No task trailer or T marker on a PR outside the fleet, no repo `root`, a fork
+PR, a failed checkout, a panewire refusal or wait failure, a refusal by the
+pane, no findings or rejected findings all fall back to the
 headless executor for that pass under the same claim; its receipt records
 `"fallback":"panewire: <reason>"`. All executors share `review.timeout`, so a
 pane that used the whole deadline leaves nothing for the fallback. In panewire
@@ -493,6 +494,38 @@ enforces only the author-family exclusion between them.
 panewire fails closed when the remote host cannot stand at the head: an
 existing worktree there that is not detached at that commit or is dirty is a
 placement refusal for that pass, which falls back to headless.
+
+#### Blocked fleet reviews
+
+With `executor: panewire`, a PR opened by `review.login` or a
+`review.fleet_authors` account does not take the fallback above when it lacks
+what panewire needs. Its review is blocked until the author fixes the PR or the
+task:
+
+| Outcome | Cause | Fix |
+| --- | --- | --- |
+| `blocked: missing-task-trailer` | Neither the PR body nor the head commit has one valid `Mergewake-Task` trailer. | Add `Mergewake-Task: <id>` to the PR body. |
+| `blocked: task-missing-T-marker` | The task's title has no grade and T marker. | Add `(grade X, Tn)` to the hk task title, for example `(grade B, T1)`. |
+
+For a blocked head, mergewake:
+
+- records the outcome on the PR's outcome row, under `review_blocked_by_head`;
+- posts one PR comment per head that names the fix, deduplicated by a hidden
+  head key in the comments of `review.login`;
+- emits one `decision` event per head and outcome to `notifier.fallback_lane`,
+  or to `notifier.lane` when no fallback is set.
+
+mergewake takes no pass claim and writes no receipt or `-done` marker, so the
+merge gate reports `review_missing`. A block is not a review failure: it adds no
+retry backoff and no failure escalation, and the stall alarm skips the head. The
+next poll after the fix runs the review on the same head and clears the outcome.
+
+A read error is not a block. If the commit or the task cannot be read, the pass
+takes the fallback above. Other authors, the headless executor, a repo without
+`root` and a head that already has its passes or inherits them are unaffected.
+`mergewake review` exits non-zero on a blocked head. A dry run only prints the
+decision. Shadow mode also records the outcome, and it posts and emits
+nothing.
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths

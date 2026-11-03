@@ -196,6 +196,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	familySource := "flag"
 	// A completed head needs no author identity; missing passes do.
 	if _, complete := distinctPasses(receipts, needed); !complete {
+		if b, blocked := s.reviewBlockFor(ctx, r, pr); blocked {
+			return s.blockReview(ctx, r, pr, b, o)
+		}
+		if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+			return e
+		}
 		if family == "" {
 			m := familyTrailer.FindStringSubmatch(pr.Body)
 			if len(m) == 2 {

@@ -656,6 +656,20 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
 }
 
+// IssueComment is one comment on a PR's conversation.
+type IssueComment struct {
+	Body string   `json:"body"`
+	User PullUser `json:"user"`
+}
+
+func (c *Client) IssueComments(ctx context.Context, repo string, n int) ([]IssueComment, error) {
+	return list[IssueComment](ctx, c, fmt.Sprintf("%s/issues/%d/comments", base(repo), n))
+}
+
+func (c *Client) PostIssueComment(ctx context.Context, repo string, n int, body string) error {
+	return c.json(ctx, "POST", fmt.Sprintf("%s/issues/%d/comments", base(repo), n), map[string]any{"body": body}, nil)
+}
+
 type Commit struct {
 	SHA     string `json:"sha"`
 	Parents []Ref  `json:"parents"`

@@ -549,3 +549,30 @@ func TestPostReviewNamesLocalDiffFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestIssueCommentRoutes(t *testing.T) {
+	var sent map[string]any
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/project/issues/7/comments" {
+			t.Errorf("request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+				t.Error(err)
+			}
+			fmt.Fprint(w, `{}`)
+			return
+		}
+		fmt.Fprint(w, `[{"body":"note","user":{"login":"review-bot"}}]`)
+	})
+	got, err := c.IssueComments(context.Background(), "example/project", 7)
+	if err != nil || len(got) != 1 || got[0].Body != "note" || got[0].User.Login != "review-bot" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if err = c.PostIssueComment(context.Background(), "example/project", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if sent["body"] != "hello" {
+		t.Fatalf("%+v", sent)
+	}
+}
