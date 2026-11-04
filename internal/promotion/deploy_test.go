@@ -121,6 +121,7 @@ type memLedger map[string]bool
 
 func (m memLedger) Failed(d string) (bool, error) { return m[d], nil }
 func (m memLedger) MarkFailed(d string) error     { m[d] = true; return nil }
+func (m memLedger) Clear(d string) error          { delete(m, d); return nil }
 
 type heldLock struct{}
 
@@ -159,25 +160,35 @@ func TestPass_AdmitsInsideLockAndDeploysCurrentPointer(t *testing.T) {
 	}
 }
 
-// Finding: a failed explicit deploy holds that image, as follow did; a newer
-// promotion is deployed; non-image failures do not hold.
-func TestPass_FailedImageIsHeldUntilANewerPromotion(t *testing.T) {
+// Findings: every exit 1 holds the image (shiftgate's last_op cannot be bound
+// to this run), whether last_op is image-specific, transient, stale or
+// missing; a newer promotion or an explicit clear releases it; other codes
+// do not hold.
+func TestPass_FailedImageIsHeldUntilANewerPromotionOrClear(t *testing.T) {
 	w := gWorld(t)
-	led := memLedger{}
-	// A pull failure (exit 1, not image-specific) is retried, not held.
-	f := &sgFake{status: sgStatus(digestOf("base"), "", false), after: withLastOp(sgStatus(digestOf("base"), "", false), digestOf("G"), "pull_failed"), code: 1}
-	if o, code, e := pass(t, w, f, noLock{}, led); o == DeployFailed || code != 1 || e == nil || len(led) != 0 {
-		t.Fatal(o, code, e, led)
+	base := sgStatus(digestOf("base"), "", false)
+	for _, after := range []string{
+		withLastOp(base, digestOf("G"), "pull_failed"),
+		withLastOp(base, digestOf("G"), "unhealthy"), // possibly a stale record
+		withLastOp(base, digestOf("other"), "healed"),
+		base, // no last_op at all
+	} {
+		led := memLedger{}
+		f := &sgFake{status: base, after: after, code: 1}
+		if o, code, e := pass(t, w, f, noLock{}, led); o != DeployFailed || code != 1 || e == nil || !led[digestOf("G")] {
+			t.Fatal(after, o, code, e, led)
+		}
 	}
-	// A confirmed image-specific abort is held.
-	f = &sgFake{status: sgStatus(digestOf("base"), "", false), after: withLastOp(sgStatus(digestOf("base"), "", false), digestOf("G"), "unhealthy"), code: 1}
-	if o, code, _ := pass(t, w, f, noLock{}, led); o != DeployFailed || code != 1 || !led[digestOf("G")] {
-		t.Fatal(o, code, led)
-	}
-	f = &sgFake{status: sgStatus(digestOf("base"), "", false)}
+	led := memLedger{digestOf("G"): true}
+	f := &sgFake{status: base}
 	if o, code, e := pass(t, w, f, noLock{}, led); o != FailedImage || code != 0 || e != nil || len(f.calls) != 0 {
 		t.Fatal(o, code, e, f.calls)
 	}
+	led.Clear(digestOf("G"))
+	if o, _, e := pass(t, w, f, noLock{}, led); o != Deployed || e != nil {
+		t.Fatal(o, e)
+	}
+	led[digestOf("G")] = true
 	w.merge("R")
 	w.ci("R", "green")
 	if _, e := promote(t, w, "R", false); e != nil {
@@ -187,11 +198,11 @@ func TestPass_FailedImageIsHeldUntilANewerPromotion(t *testing.T) {
 		t.Fatal(o, e)
 	}
 	led2 := memLedger{}
-	for _, f := range []*sgFake{{status: ""}, {status: sgStatus(digestOf("base"), "", false), code: 75}, {status: sgStatus(digestOf("base"), "", false), code: 3}, {status: sgStatus(digestOf("base"), "", false), code: 1}} {
+	for _, f := range []*sgFake{{status: ""}, {status: base, code: 75}, {status: base, code: 3}} {
 		pass(t, w, f, noLock{}, led2)
 	}
 	if len(led2) != 0 {
-		t.Fatalf("non-image failures held: %v", led2)
+		t.Fatalf("non-failure codes held: %v", led2)
 	}
 }
 
@@ -206,7 +217,19 @@ func TestFileLedger(t *testing.T) {
 	if ok, _ := l.Failed("sha256:a"); !ok {
 		t.Fatal("not recorded")
 	}
-	if ok, _ := l.Failed("sha256:b"); ok {
+	if e := l.MarkFailed("sha256:b"); e != nil {
+		t.Fatal(e)
+	}
+	if e := l.Clear("sha256:a"); e != nil {
+		t.Fatal(e)
+	}
+	if ok, _ := l.Failed("sha256:a"); ok {
+		t.Fatal("cleared digest still held")
+	}
+	if ok, _ := l.Failed("sha256:b"); !ok {
+		t.Fatal("clear removed another digest")
+	}
+	if ok, _ := l.Failed("sha256:c"); ok {
 		t.Fatal("wrong digest held")
 	}
 }

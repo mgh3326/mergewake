@@ -95,6 +95,7 @@ func runAdmit(ctx context.Context, args []string, out, stderr io.Writer) error {
 	sgPath := fs.String("shiftgate", "/usr/local/bin/shiftgate", "full path of shiftgate (with --deploy)")
 	sudo := fs.Bool("sudo", true, "run shiftgate under sudo -n (with --deploy)")
 	state := fs.String("state-dir", "~/.local/state/mergewake/admit", "per-service deploy lock and failed-image ledger (with --deploy)")
+	clearFailed := fs.String("clear-failed", "", "remove DIGEST from the service's failed-image ledger and exit (with --deploy)")
 	cache := fs.String("cache", "~/.cache/mergewake/promotion", "bare git cache for promotion tag objects")
 	if e := fs.Parse(args); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
@@ -103,7 +104,7 @@ func runAdmit(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	if fs.NArg() != 0 || *repo == "" || (*deploy && *service == "") {
-		return errors.New("usage: mergewake admit --repo OWNER/NAME [--json] [--deploy --service NAME [--shiftgate PATH] [--sudo=false]]")
+		return errors.New("usage: mergewake admit --repo OWNER/NAME [--json] [--deploy --service NAME [--shiftgate PATH] [--sudo=false] [--clear-failed DIGEST]]")
 	}
 	s, e := suiteFor(*repo)
 	if e != nil {
@@ -124,6 +125,9 @@ func runAdmit(ctx context.Context, args []string, out, stderr io.Writer) error {
 	stateDir := config.Expand(*state)
 	sg := promotion.Shiftgate{Path: *sgPath, Sudo: *sudo, Exec: promotion.OSExec{}}
 	ledger := promotion.FileLedger{Path: filepath.Join(stateDir, "failed-"+*service)}
+	if *clearFailed != "" {
+		return ledger.Clear(*clearFailed)
+	}
 	adm, outcome, code, e := promotion.Pass(ctx, reader, *repo, s, *service, sg, promotion.FileLock{Dir: stateDir}, ledger)
 	fmt.Fprintf(stderr, "%s seq %d %s: %s\n", *repo, adm.Seq, adm.Digest, outcome)
 	if e != nil {

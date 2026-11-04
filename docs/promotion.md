@@ -59,7 +59,7 @@ Each pass takes a per-service lock in `--state-dir` (a pass that cannot take it 
 | `hold.digest` == admitted digest | do not deploy (`deploy` would clear the hold) | 0 |
 | `active.digest` == admitted digest | nothing to do | 0 |
 | an operation is pending | wait | 75 |
-| otherwise | `sudo -n /usr/local/bin/shiftgate deploy <svc> --digest <d>`. Exit 75 stays 75. Exit 1 adds the digest to the failed-image ledger only when shiftgate's `last_op` for this deploy shows an image-specific result (`unhealthy`, `target_not_running`, `pre_deploy_failed`), the same set `shiftgate follow` holds. Any other exit 1 (for example `pull_failed`), and every other code, retries without a hold. | 0, 75, or shiftgate's code |
+| otherwise | `sudo -n /usr/local/bin/shiftgate deploy <svc> --digest <d>`. Exit 75 stays 75. Every exit 1 adds the digest to the failed-image ledger. shiftgate's `status` has no operation id, so its `last_op` cannot be bound to this run (a precheck failure appends no record, a heal can replace it, an append can fail), and a guess could rerun a pre-deploy command. A transient failure such as `pull_failed` is therefore held too; after checking the host, the operator releases it with `mergewake admit --deploy --repo R --service S --clear-failed <digest>`, and a newer promotion is never blocked. Other codes retry without a hold. | 0, 75, or shiftgate's code |
 
 Residual: shiftgate has no atomic "deploy unless held". A manual rollback that lands between this pass's status read and its `deploy` exec (one process start) is not seen. Closing that needs a shiftgate change, which is out of scope here.
 

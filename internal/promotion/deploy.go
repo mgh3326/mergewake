@@ -57,10 +57,6 @@ type sgService struct {
 	LastOp *sgOp    `json:"last_op"`
 }
 
-// imageResults are the deploy results shiftgate follow holds: the image
-// itself failed. Anything else (pull_failed, host errors) retries.
-var imageResults = map[string]bool{"unhealthy": true, "target_not_running": true, "pre_deploy_failed": true}
-
 // Outcome is what a deploy pass did.
 type Outcome string
 
@@ -77,6 +73,7 @@ const (
 type Ledger interface {
 	Failed(digest string) (bool, error)
 	MarkFailed(digest string) error
+	Clear(digest string) error
 }
 
 // DeployFailed is shiftgate's exit 1 from deploy: this image failed.
@@ -114,8 +111,11 @@ func Pass(ctx context.Context, r Reader, repo string, s Suite, service string, g
 	return adm, o, code, e
 }
 
-// ExitDeployFailed is shiftgate's "failed (old colour serving)" exit: the image
-// itself failed, so it is held. Other codes are not image-specific and retry.
+// ExitDeployFailed is shiftgate's "failed (old colour serving)" exit. It is
+// always held: shiftgate's status carries no operation id, so its last_op
+// cannot be bound to this invocation (a precheck failure appends nothing, and
+// a heal can replace the record), and a pre-deploy command must not rerun on
+// a guess. An operator resolves the hold with `admit --clear-failed`.
 const ExitDeployFailed = 1
 
 // Deploy implements the consumer steps after admission: skip if the admitted
@@ -143,12 +143,11 @@ func Deploy(ctx context.Context, adm Admission, service string, g Shiftgate) (Ou
 	case code == 75:
 		return Retry, ExitRetry, nil
 	case code == ExitDeployFailed:
-		// Hold only a confirmed image-specific abort, read from shiftgate's
-		// own record of this deploy; anything else retries next run.
-		if op, e := g.lastOp(ctx, service); e == nil && op != nil && op.Op == "deploy" && op.ToDigest == adm.Digest && imageResults[op.Result] {
-			return DeployFailed, code, fmt.Errorf("shiftgate deploy %s failed (%s); the old colour serves", adm.Digest, op.Result)
+		hint := "result unknown"
+		if op, e := g.lastOp(ctx, service); e == nil && op != nil && op.Op == "deploy" && op.ToDigest == adm.Digest {
+			hint = "last_op result " + op.Result + ", not bound to this run"
 		}
-		return "", code, fmt.Errorf("shiftgate deploy %s exited 1 without an image-specific result; retrying next run", adm.Digest)
+		return DeployFailed, code, fmt.Errorf("shiftgate deploy %s exited 1 (%s); held until a newer promotion or admit --clear-failed", adm.Digest, hint)
 	case code != 0:
 		return "", code, fmt.Errorf("shiftgate deploy %s exited %d", adm.Digest, code)
 	}
@@ -238,4 +237,26 @@ func (l FileLedger) MarkFailed(digest string) error {
 	defer f.Close()
 	_, e = f.WriteString(digest + "\n")
 	return e
+}
+
+// Clear removes digest from the ledger, so the next pass may deploy it again.
+func (l FileLedger) Clear(digest string) error {
+	b, e := os.ReadFile(l.Path)
+	if os.IsNotExist(e) {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	var keep []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line != "" && line != digest {
+			keep = append(keep, line+"\n")
+		}
+	}
+	tmp := l.Path + ".tmp"
+	if e := os.WriteFile(tmp, []byte(strings.Join(keep, "")), 0o600); e != nil {
+		return e
+	}
+	return os.Rename(tmp, l.Path)
 }
