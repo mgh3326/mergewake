@@ -161,3 +161,71 @@ func TestWaitingCIFailureAndRerun(t *testing.T) {
 		t.Fatal(s)
 	}
 }
+
+func hasEffect(effects []EffectKind, want EffectKind) bool {
+	for _, e := range effects {
+		if e == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFirstObservationOfDraftStaysDraft(t *testing.T) {
+	r, err := Reduce(Snapshot{}, Event{Kind: Observe, Head: "head-1", Base: "base", Draft: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Next.IsDraft || r.Next.Stage != Draft || !r.Next.Valid() {
+		t.Fatalf("draft first observation stored as eligible: %+v", r.Next)
+	}
+	if len(r.Effects) != 0 {
+		t.Fatalf("draft first observation scheduled work: %v", r.Effects)
+	}
+	plain, err := Reduce(Snapshot{}, Event{Kind: Observe, Head: "head-1", Base: "base"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Next.IsDraft || plain.Next.Stage != Observing || !hasEffect(plain.Effects, Refresh) {
+		t.Fatalf("non-draft first observation changed: %+v %v", plain.Next, plain.Effects)
+	}
+}
+
+func TestGreenCIKeepsFindingsAndGateHolds(t *testing.T) {
+	findings := advance(t, advance(t, advance(t, observed(t), QueueReview), StartReview), Findings)
+	gate := advance(t, advance(t, advance(t, advance(t, observed(t), QueueReview), StartReview), ReviewPassed), GateFailed)
+	cases := map[string]Snapshot{
+		"findings":                  findings,
+		"findings after CI failure": ciFact(t, findings, CIFailure).Next,
+		"gate":                      gate,
+	}
+	for name, held := range cases {
+		t.Run(name, func(t *testing.T) {
+			if held.Stage != AwaitingAuthor || !held.Valid() {
+				t.Fatalf("setup not held: %+v", held)
+			}
+			r := ciFact(t, held, CISuccess)
+			if r.Next.Stage != AwaitingAuthor || r.Next.CI != CISuccess || r.Next.Hold != held.Hold || !r.Next.Valid() {
+				t.Fatalf("green CI released the hold: %+v", r.Next)
+			}
+			if hasEffect(r.Effects, Refresh) || len(r.Effects) != 0 {
+				t.Fatalf("green CI scheduled work: %v", r.Effects)
+			}
+			fix := advance(t, r.Next, FixPatch)
+			if fix.Stage != ReviewQueued {
+				t.Fatalf("author fix refused after green CI: %+v", fix)
+			}
+		})
+	}
+}
+
+func TestGreenCIReleasesCIFailureHold(t *testing.T) {
+	failed := ciFact(t, advance(t, observed(t), WaitCI), CIFailure).Next
+	if failed.Stage != AwaitingAuthor || failed.Hold != HoldCI {
+		t.Fatalf("CI failure did not record its hold: %+v", failed)
+	}
+	green := ciFact(t, failed, CISuccess)
+	if green.Next.Stage != Observing || green.Next.Hold != HoldNone || !hasEffect(green.Effects, Refresh) {
+		t.Fatalf("CI-failure hold not released by green CI: %+v %v", green.Next, green.Effects)
+	}
+}

@@ -30,6 +30,24 @@ type Snapshot struct {
 	// Lifecycle is the receipt namespace; reopen and explicit resume invalidate it.
 	Lifecycle uint64
 	CI        CIStatus
+	// Hold records why the stage is AwaitingAuthor; it is empty in every other stage.
+	Hold HoldReason
+}
+
+// HoldReason separates the causes of AwaitingAuthor. Only a CI-failure hold is
+// released by a later green CI; findings and gate holds wait for a new head or
+// an authorized resume.
+type HoldReason string
+
+const (
+	HoldNone     HoldReason = ""
+	HoldCI       HoldReason = "ci"
+	HoldFindings HoldReason = "findings"
+	HoldGate     HoldReason = "gate"
+)
+
+func (h HoldReason) valid() bool {
+	return h == HoldCI || h == HoldFindings || h == HoldGate
 }
 
 type CIStatus string
@@ -108,6 +126,12 @@ func (s Snapshot) Valid() bool {
 	if s.Stage == Draft && !s.IsDraft {
 		return false
 	}
+	if s.Hold != HoldNone && !s.Hold.valid() {
+		return false
+	}
+	if (s.Stage == AwaitingAuthor) != (s.Hold != HoldNone) {
+		return false
+	}
 	if s.IsDraft && s.Stage != Draft && s.Stage != BlockedAuthor && s.Stage != SystemBlocked && s.Stage != Closed && s.Stage != Merged {
 		return false
 	}
@@ -136,12 +160,14 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 		n.CI = ""
 		if s.Generation == 0 {
 			n.Lifecycle = 1
+			// The first observation takes its draft flag from the event.
+			n.IsDraft = e.Draft
 		} else {
 			effects = append(effects, Cancel)
 		}
 		// Observation cannot erase exhausted fix cycles or operational failures.
 		if s.Stage != BlockedAuthor && s.Stage != SystemBlocked {
-			if s.IsDraft {
+			if n.IsDraft {
 				n.Stage = Draft
 			} else {
 				n.Stage = Observing
@@ -216,12 +242,19 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 			if s.IsDraft || s.Stage == BlockedAuthor || s.Stage == SystemBlocked || s.Stage == Reviewing || s.Stage == ReviewQueued {
 				break
 			}
+			// Green CI releases only a CI-failure hold; findings and gate holds stay.
+			if e.CI == CISuccess && s.Stage == AwaitingAuthor && s.Hold != HoldCI {
+				break
+			}
 			n.Generation++
 			effects = []EffectKind{Cancel}
 			if e.CI == CIPending {
 				n.Stage = WaitingCI
 			} else if e.CI.failed() {
 				n.Stage = AwaitingAuthor
+				if s.Stage != AwaitingAuthor {
+					n.Hold = HoldCI
+				}
 				effects = append(effects, NotifyAuthor)
 			} else {
 				n.Stage = Observing
@@ -311,6 +344,7 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 					n.Stage = WaitingCI
 				} else if s.CI.failed() {
 					n.Stage = AwaitingAuthor
+					n.Hold = HoldCI
 					effects = []EffectKind{NotifyAuthor}
 				} else {
 					effects = []EffectKind{Gate}
@@ -320,6 +354,7 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 					return Transition{}, ErrTransition
 				}
 				n.Stage, n.Failures = AwaitingAuthor, 0
+				n.Hold = HoldFindings
 				n.Reviewed = true
 				if s.FixRounds >= 2 {
 					n.Stage = BlockedAuthor
@@ -342,11 +377,15 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 					return Transition{}, ErrTransition
 				}
 				n.Stage = AwaitingAuthor
+				n.Hold = HoldGate
 				effects = []EffectKind{NotifyAuthor}
 			default:
 				return Transition{}, ErrTransition
 			}
 		}
+	}
+	if n.Stage != AwaitingAuthor {
+		n.Hold = HoldNone
 	}
 	if n == s && len(effects) == 0 {
 		return Transition{Next: s}, nil
