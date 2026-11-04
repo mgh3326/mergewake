@@ -113,6 +113,19 @@ PR head SHA, and the worktree's origin remote names the configured
 repository. Titles and names are never used for matching; a reused branch
 whose tip moved on does not match.
 
+One exception covers mergewake's own branch update. When it merges the base
+into a stale PR branch, the PR head becomes a merge commit the worker never
+checked out. Such a worktree still matches when the PR head has exactly two
+parents, the first is the worktree's checkout, and the second is the base SHA
+of an `ok` base-update receipt for that PR in the repo's state dir
+(`<state_dir>/<repo>/base-updates/`, written by the branch update, only read
+here). With no receipt, a receipt that is not `ok`, a different first parent
+(the worktree holds commits the PR head lacks) or a single parent, nothing
+matches. The exception applies to every use of the match: closing the pane,
+the worktree recorded on a job-bound row, and worktree and branch removal.
+The head commit is read once per PR per daemon process, shared with the task
+lookup below; a worktree that matches the head exactly costs no extra call.
+
 Before a matching pane is closed it must be reported as `idle` or `done` —
 an allowlist; `working`, `blocked`, `waiting`, empty and unknown states all
 keep the pane — and `<jobs>/<name>` must already exist, which is what proves
@@ -166,7 +179,12 @@ After the close, mergewake marks the job done the way the lead would:
 `panewire done <job> --report <saved>` on the job's host, a `job-done` row with
 `done` (`would-done` in shadow). A job hk already holds terminal is skipped as
 `already-<state>`. If the done fails, the next pass retries it once the pane
-is gone, until a `done` row or a terminal hk state ends it. Each job is decided once per pass,
+is gone, until a `done` row or a terminal hk state ends it. When the job's host
+was read and no pane wears the job's label, and no earlier pass closed that
+job's pane, reap writes one `close-pane` row with `skipped` and the reason
+`job-pane-missing` (with `task`, `job` and `host`), so a task bound to a lost
+job leaves a trace; the same outcome on a later pass writes no new row. A host
+whose panes could not be read writes none. Each job is decided once per pass,
 on the first of its merged PRs. Job-bound rows carry `task` and `job`; they
 carry `cwd` and `worktree` only when the lead sits in that PR's own
 worktree, which worktree cleanup then picks up as before.
