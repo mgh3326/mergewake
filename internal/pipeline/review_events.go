@@ -44,7 +44,7 @@ func (s *Service) reviewerEvents(repo string, pr, pass int, skips []reviewSkip) 
 		if sk.ExitCode != nil || sk.StderrTail != "" || sk.Cause != "" || sk.Reason == "review failed" || sk.Reason == "quota exhausted" {
 			outcome = "failed"
 		}
-		detail := fmt.Sprintf("pass=%d reviewer=%s host=%s", pass, sk.Reviewer, sk.Host)
+		detail := fmt.Sprintf("pass=%d reviewer=%s profile=%s host=%s", pass, sk.Reviewer, sk.Profile, sk.Host)
 		if sk.ExitCode != nil {
 			detail += " exit=" + strconv.Itoa(*sk.ExitCode)
 		}

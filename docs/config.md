@@ -1220,6 +1220,10 @@ cause. The skip entries in the `review` and `review-skipped` decisions
 - `reviewer` and `reason`;
 - `host`, which is the configured host for headless reviewers, or the
   `review.panewire.host` value for panewire panes;
+- `profile`, the launch profile the reviewer ran as: the profile on the pane's
+  hk job record for a spawned panewire reviewer, or the configured reviewer
+  name for a headless one. It is omitted when no profile was chosen yet (a
+  skip before any spawn, or a spawn that failed before its record was read);
 - for a failed process, `exit_code` and `stderr_tail`, the last 512 bytes of
   stderr after redaction;
 - otherwise `cause`, the bounded error text.
@@ -1230,7 +1234,7 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 
 | `kind` | `outcome` | `reason` | `detail` |
 | --- | --- | --- | --- |
-| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= host= exit= reason="..."` then `stderr:` or `cause:` |
+| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
 
 The shipping config, dashboard and alerts are in panewire `deploy/alloy` and
