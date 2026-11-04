@@ -174,6 +174,17 @@ func (s *Store) Apply(ctx context.Context, f Fence, in Input) (Applied, error) {
 		if err != nil {
 			return Applied{}, err
 		}
+		// A concurrent first delivery may have committed while this transaction waited for the PR row lock.
+		err = tx.QueryRowContext(ctx, `SELECT digest FROM mw_deliveries WHERE source=? AND delivery_id=?`, in.Source, in.ID).Scan(&prior)
+		if err == nil {
+			if prior != digest {
+				return Applied{}, ErrConflict
+			}
+			return Applied{snap, true}, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Applied{}, err
+		}
 		if snap.Version != in.ExpectedVersion {
 			return Applied{}, ErrConflict
 		}
