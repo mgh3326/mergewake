@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"slices"
 	"strings"
@@ -37,6 +38,16 @@ func TestGateCompletedWithoutVerdict(t *testing.T) {
 			}
 			if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
 				t.Fatal(err)
+			}
+			if tt.name == "mixed ready" {
+				var output bytes.Buffer
+				s.Out = &output
+				if err := s.Land(context.Background(), r, 7, Options{DryRun: true}); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(output.String(), `"checks_cancelled":["test"]`) {
+					t.Fatalf("land record=%s", output.String())
+				}
 			}
 			if tt.summary != "" && !strings.Contains(lastEvent(t, n), tt.summary) {
 				t.Fatalf("notice=%s", lastEvent(t, n))
