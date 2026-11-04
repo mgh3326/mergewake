@@ -1236,6 +1236,12 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 | --- | --- | --- | --- |
 | `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
+| `role_error` | `failed` | `role_failed` (one code for every failed daemon pass) | `role= failures= error="..."`: the role, its consecutive failure count after this pass, and the quoted error text |
+
+A daemon role pass that returns an error appends one `role_error` line, so every
+failure stays visible after the status file's `last_error` is overwritten or
+cleared. A successful pass writes no line, and a failed event write never stops
+the loop or the status save.
 
 The shipping config, dashboard and alerts are in panewire `deploy/alloy` and
 `deploy/grafana`.

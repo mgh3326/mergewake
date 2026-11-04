@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
@@ -183,6 +184,7 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 	d.mu.Lock()
 	ch := d.wake[l.Role]
 	d.mu.Unlock()
+	events := fleetevent.New(d.StateDir, "mergewake", d.now)
 	for ctx.Err() == nil {
 		st.Running = true
 		st.LastRun = d.now().UTC()
@@ -200,6 +202,11 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		if err != nil {
 			st.LastError = err.Error()
 			st.Failures++
+			// Best effort: the status file keeps only the latest error, so each
+			// failed pass also leaves one line outside it. A write failure
+			// changes nothing about the loop.
+			events.Emit("role_error", l.Role, "failed", "role_failed",
+				fmt.Sprintf("role=%s failures=%d error=%q", l.Role, st.Failures, st.LastError))
 		} else {
 			st.Failures = 0
 		}
