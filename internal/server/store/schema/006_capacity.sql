@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS mw_capacity (
+ id INT NOT NULL,
+ review_slots INT NOT NULL,
+ fix_slots INT NOT NULL,
+ PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

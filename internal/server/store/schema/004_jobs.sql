@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS mw_jobs (
+ id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+ repository VARCHAR(201) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ number BIGINT UNSIGNED NOT NULL,
+ sequence BIGINT UNSIGNED NOT NULL,
+ generation BIGINT UNSIGNED NOT NULL,
+ scope CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ class VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ status VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ available_at DATETIME(6) NOT NULL,
+ epoch BIGINT UNSIGNED NOT NULL,
+ lease_until DATETIME(6) NOT NULL,
+ failures INT NOT NULL,
+ PRIMARY KEY (id),
+ UNIQUE KEY logical_work (repository,number,generation,kind,scope),
+ UNIQUE KEY pr_sequence (repository,number,sequence),
+ KEY due_jobs (status,available_at,class,id),
+ FOREIGN KEY (repository,number) REFERENCES mw_prs (repository,number)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

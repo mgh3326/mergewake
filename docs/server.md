@@ -82,7 +82,7 @@ can assign READY directly.
 | State | Trigger and next state | Decision owner |
 | --- | --- | --- |
 | observing | Fresh head/base/policy/files/CI establishes draft, waiting_ci, review_queued or gate_pending | Engine planner |
-| draft | Ready-for-review event returns to observing | GitHub observation, engine |
+| draft | Verified ready-for-review fact returns to observing in a fresh generation; draft conversion also invalidates reviewing/ready work at the same SHA | GitHub observation, engine |
 | waiting_ci | Required code-ready checks start/succeed as policy requires; review_queued; failures go to awaiting_author | Engine, configured readiness policy |
 | review_queued | Capacity reservation and committed dispatch intent enter reviewing | Scheduler |
 | reviewing | Valid result enters awaiting_author or gate_pending; transport uncertainty stays reviewing | Result validator |
@@ -90,7 +90,8 @@ can assign READY directly.
 | blocked_author | A changed head is recorded but remains blocked; only explicit authorized resume starts a new bounded cycle; aging may notify operator | Author/operator, engine |
 | gate_pending | Fresh exact-head gate passes to ready; pending CI waits; failures route to author | Existing policy/gate |
 | ready | Opted-in acting mode requests pinned-head merge; confirmed result enters merged; moved head returns to observing | Merge adapter |
-| merged / closed | Terminal; cancel obsolete queued work and retain evidence/ownership | GitHub observation |
+| merged | Final; cancel obsolete queued work and retain evidence/ownership | GitHub observation |
+| closed | A verified current GitHub open fact reopens into a fresh generation and receipt lifecycle; old attempts/receipts cannot authorize it | GitHub observation, engine |
 | system_blocked | K consecutive unexpected failures suspend that operation; authorized retry or verified recovery resumes | Engine, operator on escalation |
 
 Operational wait reasons (quota, capacity, rate deadline, missing telemetry,
@@ -112,6 +113,36 @@ to fence obsolete work, but preserve the blocked state and exhausted fix-round
 count. A new commit does not enqueue another review or restart aging. Only an
 authorized resume records a new bounded cycle.
 
+Generation fences eligibility as well as head/base changes. Converting an open
+PR to draft advances it even at the same SHA, supersedes queued review/gate work
+and persists cancellation intents for older remote work. Draft eligibility is
+stored separately from author/system holds so draft/ready toggles cannot erase
+an exhausted fix budget. Ready-for-review advances generation again and refreshes
+eligibility; late draft facts/results from the prior generation are refused.
+Cancellation carries a persisted inclusive cutoff generation, never the current
+head alone; a delayed cancellation cannot target new eligible work. Requesting
+cancellation does not release reservations before remote terminal confirmation.
+
+Closed is distinct from merged. Reopening requires a verified current open fact,
+increments generation and the receipt lifecycle namespace, and invalidates prior
+review qualification without resetting the fix budget or operational holds.
+Equal patch-id alone cannot reuse evidence from a closed lifecycle. Merged PRs
+remain final. A delayed old close cannot close a reopened generation.
+
+Required-check observations distinguish pending, success, failure, cancelled
+and timed_out. Waiting-CI failure/cancellation/timeout enters awaiting_author;
+a pending rerun returns to waiting_ci and success refreshes eligibility before
+a fresh gate. These are domain facts, not consecutive system failures. CI-only
+changes may preserve an independent review already queued/running, but its
+completion observes the current CI state and cannot make pending/failed CI READY.
+
+Every refresh captures the expected PR version before its GitHub read and commits
+through that CAS. Normalize webhook signals through current GitHub facts; do not
+stamp an old delivery/read with the latest version after it finishes. Duplicate
+delivery keys alone cannot prevent a late read from regressing eligibility.
+Fixtures cover reopen, same-SHA draft/ready, CI rerun, stale reads/results,
+cancel cutoff persistence and unconfirmed reservation retention.
+
 ## MySQL 8 schema, claims and migrations
 
 Use managed OCI MySQL 8 with InnoDB, UTC `DATETIME(6)`, explicit primary/foreign
@@ -128,12 +159,13 @@ fence a network request from a paused former owner.
 | schema_migrations | version PK, checksum, applied_at, status |
 | coordinators | service PK, owner_epoch, lease_until |
 | deliveries | (source, delivery_id) PK, payload_digest, received_at, normalized payload |
-| prs | (repository, number) PK, head, base, generation, version, state, next_sequence, fix_rounds, author_route, route_provenance, first_wait_at |
+| prs | (repository, number) PK, head, base, generation, version, state, draft eligibility, receipt lifecycle, CI status, next_sequence, fix_rounds, author_route, route_provenance, first_wait_at |
 | jobs | id PK, PR FK, sequence, generation, kind, scope_digest, priority, status, available_at, owner_epoch, attempt_epoch, lease_until, failure_count, last_error_code |
 | attempts | (job_id, epoch) PK, owner_epoch, request_uuid UNIQUE, remote_job_id, chosen_host, canonical_pool, state, dispatch/result timestamps |
 | reservations | attempt FK UNIQUE, class, host, pool, predicted_cpu/memory/work, terminal_confirmed |
+| cancellations | job FK/PK, through_generation; old-generation control work does not block current PR progress |
 | capacity | resource PK, revision; locks for global/class/pool accounting, no fixed host ceilings |
-| receipts | id PK, PR/head/patch/policy/context/family/scope identities, prior_receipt FK, trusted result digest |
+| receipts | id PK, PR/lifecycle/head/patch/policy/context/family/scope identities, prior_receipt FK, trusted result digest |
 | outbox | event_id PK, owner_epoch, job/PR identity, effect_kind, route, redacted payload, status, available_at, failures |
 | reconcile_cursors | repository PK, last_complete_at, next_page, generation |
 | request_cache | resource key digest PK, validator, bounded body, observed_at, freshness/deadline |
@@ -565,3 +597,9 @@ incorporated above: <=50-line docs exemption, pacelever quota source, panewire
 hub task 2724 dependencies, REST budget target, initial 6 review slots (1
 reserved) and fix-worker budget 4. Unit 1 may now begin. No acceptance is inferred
 from elapsed time or successful event delivery.
+
+Unit 1's independent-review follow-up separates closed/reopen from merged
+finality, models same-SHA draft eligibility and CI reruns, and requires a fresh
+receipt namespace on reopen. These lifecycle corrections supersede the original
+combined merged/closed terminal row; external adapters remain unimplemented and
+the unit 2 REST budget remains a measurement target.
