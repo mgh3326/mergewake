@@ -2,7 +2,10 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -11,58 +14,86 @@ import (
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// parentsGH answers Commit with a fixed parent list and counts the reads.
-type parentsGH struct {
-	reapGH
-	parents     []string
-	commitCalls int
-	commitErr   error
-}
-
-func (g *parentsGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
-	g.commitCalls++
-	if g.commitErr != nil {
-		return github.Commit{}, g.commitErr
-	}
-	c := github.Commit{SHA: sha}
-	for _, p := range g.parents {
-		c.Parents = append(c.Parents, github.Ref{SHA: p})
-	}
-	return c, nil
-}
-
+// The worktree heads these tests put on the merged PR's branch. headSHA, the
+// PR head, is shared with every reap test.
 const (
-	workerHead = "bbbb2222" // the worker's checkout, first parent of the update merge
-	baseTip    = "cccc3333" // main when mergewake updated the branch, second parent
+	behindHead   = "bbbb2222" // an ancestor of headSHA: every commit in it is in the merged PR
+	divergedHead = "eeee5555" // a sibling of headSHA: each side has commits the other lacks
+	unknownHead  = "dddd4444" // a commit GitHub does not have
 )
 
-// updateReceipt writes the base-update receipt through updateStaleBranch, the
-// receipt's only writer, so a drift in its key fails these tests. "ok" is a
-// successful update; anything else is the GitHub status the update returned.
-func updateReceipt(t *testing.T, s *Service, gh *parentsGH, base, status string) {
-	t.Helper()
-	switch status {
-	case "ok":
-		gh.updateErr = nil
-	case "unknown":
-		gh.updateErr = errors.New("connection reset")
-	default:
-		gh.updateErr = &github.APIError{Code: 409}
-	}
-	if got, _, err := s.updateStaleBranch(context.Background(), testRepo, mergedPull, base); err != nil || (status == "ok" && got != "ok") {
-		t.Fatalf("receipt %q err=%v", got, err)
-	}
+// compareReply is what the compare endpoint answers for one pair: a compare
+// status with its merge base, or an HTTP error code.
+type compareReply struct {
+	status, base string
+	code         int
 }
 
-// ownUpdateService is a reap service whose worktree is checked out at checkout
-// while the merged PR's head is a merge commit with the given parents.
-func ownUpdateService(t *testing.T, checkout string, parents ...string) (*Service, *parentsGH, *scriptRunner) {
+// compareClient is the production client pointed at a server that answers
+// GitHub's compare endpoint from table. A pair missing from the table is a 404,
+// which is what GitHub answers for a commit it does not have.
+func compareClient(t *testing.T, table map[[2]string]compareReply) *github.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pair := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/repos/example/project/compare/"), "...", 2)
+		var reply compareReply
+		ok := false
+		if len(pair) == 2 {
+			reply, ok = table[[2]string{pair[0], pair[1]}]
+		}
+		switch {
+		case !ok:
+			w.WriteHeader(http.StatusNotFound)
+		case reply.code != 0:
+			w.WriteHeader(reply.code)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": reply.status, "merge_base_commit": map[string]string{"sha": reply.base}})
+		}
+	}))
+	t.Cleanup(server.Close)
+	c := github.New("placeholder")
+	c.BaseURL, c.UploadURL, c.HTTP = server.URL, server.URL, server.Client()
+	return c
+}
+
+// compareGH is the reap fake GitHub with Ancestor answered by the production
+// client, so the status mapping and the 404 are the real ones. calls records
+// each ancestor question a pass asked.
+type compareGH struct {
+	GitHub
+	client *github.Client
+	calls  [][2]string
+}
+
+func (g *compareGH) Ancestor(ctx context.Context, repo, older, newer string) (bool, error) {
+	g.calls = append(g.calls, [2]string{older, newer})
+	return g.client.Ancestor(ctx, repo, older, newer)
+}
+
+// WatchRevert and OpenPulls are forwarded to the inner fake: reap finds them by
+// type assertion on the client, which the embedded interface hides.
+func (g *compareGH) WatchRevert(ctx context.Context, repo string, pr int, sha string) (*github.Pull, error) {
+	return g.GitHub.(interface {
+		WatchRevert(context.Context, string, int, string) (*github.Pull, error)
+	}).WatchRevert(ctx, repo, pr, sha)
+}
+
+func (g *compareGH) OpenPulls(ctx context.Context, repo, branch string) ([]github.Pull, error) {
+	return g.GitHub.(interface {
+		OpenPulls(context.Context, string, string) ([]github.Pull, error)
+	}).OpenPulls(ctx, repo, branch)
+}
+
+// ancestryService is a reap service whose worktree sits at head on the merged
+// PR's branch, with the compare answers in table.
+func ancestryService(t *testing.T, head string, table map[[2]string]compareReply) (*Service, *compareGH, *scriptRunner) {
 	t.Helper()
 	outs := worktreeOuts("/repo")
-	outs[key("git", "-C", "/repo.wt", "rev-parse", "HEAD")] = checkout + "\n"
-	r := &scriptRunner{outs: outs}
-	gh := &parentsGH{parents: parents}
-	return svc(t, gh, r), gh, r
+	outs[key("git", "-C", "/repo.wt", "rev-parse", "HEAD")] = head + "\n"
+	run := &scriptRunner{outs: outs}
+	gh := &compareGH{GitHub: &reapGH{}, client: compareClient(t, table)}
+	return svc(t, gh, run), gh, run
 }
 
 func noRows(t *testing.T, s *Service) {
@@ -72,146 +103,162 @@ func noRows(t *testing.T, s *Service) {
 	}
 }
 
-// (a) mergewake's own update merge: the worker's pane closes and its worktree
-// is removed after worktree_after, shadow and acting.
-func TestReapMatchesOwnBaseUpdateMerge(t *testing.T) {
+// requireRows fails unless the receipt log holds every action/result pair.
+func requireRows(t *testing.T, s *Service, want ...string) {
+	t.Helper()
+	got := map[string]bool{}
+	for _, row := range reapLogRows(t, s, testRepo.Name) {
+		got[row["action"].(string)+"/"+row["result"].(string)] = true
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("missing %s in %v", w, got)
+		}
+	}
+}
+
+// requireNothing fails if the pass wrote a row or closed a pane or removed a
+// worktree.
+func requireNothing(t *testing.T, s *Service, run *scriptRunner) {
+	t.Helper()
+	noRows(t, s)
+	if run.called("pane\x00close") || run.called("worktree\x00remove") {
+		t.Fatalf("acted: %q", run.calls)
+	}
+}
+
+// (a) On the PR head the worktree is the PR's own, and no compare is asked.
+func TestReapAncestorExactHeadNeedsNoCompare(t *testing.T) {
+	s, gh, _ := ancestryService(t, headSHA, nil)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 0 {
+		t.Fatalf("compares %v", gh.calls)
+	}
+	requireRows(t, s, "close-pane/would-close", "remove-worktree/would-remove", "delete-branch/would-delete")
+}
+
+// (b) Two commits behind the merged head: an ancestor, so every commit in the
+// worktree is in the merged PR. It is the PR's own and is closed and removed
+// like an exact match, after one compare.
+func TestReapAncestorBehindHeadQualifies(t *testing.T) {
+	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
 	for name, o := range map[string]Options{"shadow": {Shadow: true}, "apply": {}} {
 		t.Run(name, func(t *testing.T) {
-			s, gh, r := ownUpdateService(t, workerHead, workerHead, baseTip)
-			updateReceipt(t, s, gh, baseTip, "ok")
+			s, gh, run := ancestryService(t, behindHead, table)
 			if err := s.Reap(context.Background(), testRepo, 0, o); err != nil {
 				t.Fatal(err)
 			}
-			got := map[string]bool{}
-			for _, row := range reapLogRows(t, s, testRepo.Name) {
-				got[row["action"].(string)+"/"+row["result"].(string)] = true
-				if row["reason"] == "worktree-changed" {
-					t.Fatalf("candidate rejected on removal: %v", row)
-				}
+			if len(gh.calls) != 1 || gh.calls[0] != [2]string{behindHead, headSHA} {
+				t.Fatalf("compares %v", gh.calls)
 			}
-			want := []string{"close-pane/would-close", "remove-worktree/would-remove", "delete-branch/would-delete"}
-			if name == "apply" {
-				want = []string{"close-pane/closed", "remove-worktree/removed", "delete-branch/deleted"}
-				if !r.called("worktree\x00remove\x00/repo.wt") || !r.called("pane\x00close\x00w1:p1") {
-					t.Fatalf("calls %q", r.calls)
-				}
+			if name == "shadow" {
+				requireRows(t, s, "close-pane/would-close", "remove-worktree/would-remove", "delete-branch/would-delete")
+				return
 			}
-			for _, w := range want {
-				if !got[w] {
-					t.Fatalf("missing %s in %v", w, got)
-				}
-			}
-			if gh.commitCalls != 1 {
-				t.Fatalf("head commit read %d times in one pass", gh.commitCalls)
+			requireRows(t, s, "close-pane/closed", "remove-worktree/removed", "delete-branch/deleted")
+			if !run.called("worktree\x00remove\x00/repo.wt") {
+				t.Fatalf("calls %q", run.calls)
 			}
 		})
 	}
 }
 
-// (b)-(e) and the neighbours: nothing matches unless every part of the claim
-// holds, so a worktree with its own commits or an unproven merge stays.
-func TestReapOwnBaseUpdateNeedsEveryPart(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		parents []string
-		receipt string // "" writes none
-		base    string // receipt's base; baseTip when empty
-	}{
-		{"no receipt", []string{workerHead, baseTip}, "", ""},
-		{"receipt not ok", []string{workerHead, baseTip}, "409", ""},
-		{"receipt outcome unknown", []string{workerHead, baseTip}, "unknown", ""},
-		{"receipt for another base", []string{workerHead, baseTip}, "ok", "dddd4444"},
-		{"first parent is not the checkout", []string{"eeee5555", baseTip}, "ok", ""},
-		{"checkout is the second parent", []string{baseTip, workerHead}, "ok", workerHead},
-		{"single parent", []string{"eeee5555"}, "ok", "eeee5555"},
-		{"three parents", []string{workerHead, baseTip, "ffff6666"}, "ok", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, gh, r := ownUpdateService(t, workerHead, tc.parents...)
-			if tc.receipt != "" {
-				base := tc.base
-				if base == "" {
-					base = baseTip
-				}
-				updateReceipt(t, s, gh, base, tc.receipt)
-			}
-			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			noRows(t, s)
-			if r.called("pane\x00close") || r.called("worktree\x00remove") {
-				t.Fatalf("acted: %q", r.calls)
-			}
-		})
+// (c) A head GitHub does not know (compare 404) is not the PR's own and is not
+// an error: nothing is recorded, closed or removed.
+func TestReapAncestorUnknownHeadDoesNotQualify(t *testing.T) {
+	table := map[[2]string]compareReply{{unknownHead, headSHA}: {code: http.StatusNotFound}}
+	s, gh, run := ancestryService(t, unknownHead, table)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatalf("unknown head reported: %v", err)
 	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("compares %v", gh.calls)
+	}
+	requireNothing(t, s, run)
 }
 
-// A head commit that cannot be read matches nothing, reports one error and is
-// not asked for again in the same pass.
-func TestReapOwnBaseUpdateCommitErrorMatchesNothing(t *testing.T) {
-	s, gh, r := ownUpdateService(t, workerHead)
-	gh.commitErr = errors.New("github down")
-	err := s.Reap(context.Background(), testRepo, 0, Options{})
-	if err == nil || strings.Count(err.Error(), "head parents") != 1 {
-		t.Fatalf("err=%v", err)
+// (d) A diverged head: the compare says diverged, so the worktree holds commits
+// the merged PR lacks. It does not qualify.
+func TestReapAncestorDivergedHeadDoesNotQualify(t *testing.T) {
+	table := map[[2]string]compareReply{{divergedHead, headSHA}: {status: "diverged", base: "ffff0000"}}
+	s, gh, run := ancestryService(t, divergedHead, table)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatalf("diverged head reported: %v", err)
 	}
-	noRows(t, s)
-	if r.called("pane\x00close") {
-		t.Fatal("closed on an unreadable head")
+	if len(gh.calls) != 1 {
+		t.Fatalf("compares %v", gh.calls)
 	}
+	requireNothing(t, s, run)
 }
 
-// (h) The head commit is read once per PR, by the task lookup that already
-// read it before this change, whether the worktree matches exactly or only
-// through the update merge, and however many passes follow.
-func TestReapHeadCommitReadOnce(t *testing.T) {
-	for name, tc := range map[string]struct {
-		checkout string
-		parents  []string
-	}{
-		"exact head":   {headSHA, nil},
-		"update merge": {workerHead, []string{workerHead, baseTip}},
-		"unrelated":    {workerHead, []string{"eeee5555", baseTip}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s, gh, _ := ownUpdateService(t, tc.checkout, tc.parents...)
-			for i := 0; i < 3; i++ {
-				if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if gh.commitCalls != 1 || gh.pullCalls != 0 {
-				t.Fatalf("over 3 passes: commit reads %d, pull reads %d", gh.commitCalls, gh.pullCalls)
-			}
-		})
-	}
-}
-
-// jobParentsGH lists PRs like jobGH and answers Commit with parents.
-type jobParentsGH struct {
-	jobGH
-	parents []string
-}
-
-func (g *jobParentsGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
-	c := github.Commit{SHA: sha}
-	for _, p := range g.parents {
-		c.Parents = append(c.Parents, github.Ref{SHA: p})
-	}
-	return c, nil
-}
-
-// The job path records the worktree of a lead sitting on the first parent of
-// mergewake's update merge, which later cleanup reads.
-func TestReapJobBoundCloseRowNamesOwnUpdateWorktree(t *testing.T) {
-	s, gh, _, run := leadFixture(t, leadPane(""))
-	s.GH = &jobParentsGH{jobGH: *gh, parents: []string{workerHead, baseTip}}
-	run.outs[key("git", "-C", "/other.wt", "branch", "--show-current")] = "wk/lead\n"
-	run.outs[key("git", "-C", "/other.wt", "rev-parse", "HEAD")] = workerHead + "\n"
-	run.outs[key("git", "-C", "/other.wt", "remote", "get-url", "origin")] = "git@github.com:example/project.git\n"
-	if _, _, err := s.updateStaleBranch(context.Background(), testRepo, leadPR, baseTip); err != nil {
+// (e) Qualifying by ancestry does not lift the dirty guard: the pane closes, the
+// worktree is refused as dirty and is never removed.
+func TestReapAncestorDirtyWorktreeKeptByGuard(t *testing.T) {
+	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
+	s, gh, run := ancestryService(t, behindHead, table)
+	run.outs[key("git", "-C", "/repo.wt", "status", "--porcelain")] = " M tool.go\n"
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("compares %v", gh.calls)
+	}
+	requireRows(t, s, "close-pane/closed", "remove-worktree/skipped")
+	reason := ""
+	for _, row := range reapLogRows(t, s, testRepo.Name) {
+		if row["action"] == "remove-worktree" {
+			reason, _ = row["reason"].(string)
+		}
+	}
+	if reason != "dirty" {
+		t.Fatalf("remove-worktree reason %q: %v", reason, reapLogRows(t, s, testRepo.Name))
+	}
+	if run.called("worktree\x00remove") || run.called("branch\x00-d") {
+		t.Fatalf("dirty worktree removed: %q", run.calls)
+	}
+}
+
+// A compare that fails with anything but a 404 matches nothing: the failure is
+// reported once, and the compare is not asked again in that pass.
+func TestReapAncestorReadErrorMatchesNothing(t *testing.T) {
+	table := map[[2]string]compareReply{{behindHead, headSHA}: {code: http.StatusInternalServerError}}
+	s, gh, run := ancestryService(t, behindHead, table)
+	err := s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || strings.Count(err.Error(), "head ancestry") != 1 {
+		t.Fatalf("err=%v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("compares %v", gh.calls)
+	}
+	requireNothing(t, s, run)
+}
+
+// The compare is asked once per PR head per pass, however many panes and
+// removal re-checks ask within that pass: three passes ask it three times.
+func TestReapAncestryReadOncePerPass(t *testing.T) {
+	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
+	s, gh, _ := ancestryService(t, behindHead, table)
+	for pass := 1; pass <= 3; pass++ {
+		if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+			t.Fatal(err)
+		}
+		if len(gh.calls) != pass {
+			t.Fatalf("after pass %d: %d compares", pass, len(gh.calls))
+		}
+	}
+}
+
+// The job path records the worktree of a lead sitting on an ancestor of the
+// merged head, which later cleanup reads.
+func TestReapJobBoundCloseRowNamesAncestorWorktree(t *testing.T) {
+	s, _, _, run := leadFixture(t, leadPane(""))
+	table := map[[2]string]compareReply{{behindHead, leadPR.Head.SHA}: {status: "ahead", base: behindHead}}
+	s.GH = &compareGH{GitHub: s.GH, client: compareClient(t, table)}
+	run.outs[key("git", "-C", "/other.wt", "branch", "--show-current")] = "wk/lead\n"
+	run.outs[key("git", "-C", "/other.wt", "rev-parse", "HEAD")] = behindHead + "\n"
+	run.outs[key("git", "-C", "/other.wt", "remote", "get-url", "origin")] = "git@github.com:example/project.git\n"
 	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -221,20 +268,19 @@ func TestReapJobBoundCloseRowNamesOwnUpdateWorktree(t *testing.T) {
 	}
 }
 
-// The hub's worktree.remove is told the checkout it will remove, not the PR
-// head it no longer equals.
-func TestReapPanewireRemovesOwnUpdateWorktree(t *testing.T) {
+// The hub's worktree.remove is told the checkout it will remove, which is the
+// ancestor head, not the PR head it no longer equals.
+func TestReapPanewireRemovesAncestorWorktree(t *testing.T) {
 	hub := newFakeReapHub()
-	hub.wtHead = workerHead
+	hub.wtHead = behindHead
 	s, _ := hubSvc(t, hub, &scriptRunner{})
-	gh := &parentsGH{parents: []string{workerHead, baseTip}}
-	s.GH = gh
-	updateReceipt(t, s, gh, baseTip, "ok")
+	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
+	s.GH = &compareGH{GitHub: s.GH, client: compareClient(t, table)}
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	removes := hub.ops("worktree.remove")
-	if len(removes) != 1 || removes[0]["expect_head"] != workerHead {
+	if len(removes) != 1 || removes[0]["expect_head"] != behindHead {
 		t.Fatalf("remove args: %#v rows: %v", removes, reapLogRows(t, s, testRepo.Name))
 	}
 }
