@@ -242,8 +242,8 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 			if s.IsDraft || s.Stage == BlockedAuthor || s.Stage == SystemBlocked || s.Stage == Reviewing || s.Stage == ReviewQueued {
 				break
 			}
-			// Green CI releases only a CI-failure hold; findings and gate holds stay.
-			if e.CI == CISuccess && s.Stage == AwaitingAuthor && s.Hold != HoldCI {
+			// Pending or green CI releases nothing but a CI-failure hold; findings and gate holds stay.
+			if !e.CI.failed() && s.Stage == AwaitingAuthor && s.Hold != HoldCI {
 				break
 			}
 			n.Generation++
@@ -288,7 +288,8 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 			n.Failures++
 			if n.Failures >= 3 {
 				n.Stage = SystemBlocked
-				effects = []EffectKind{Escalate}
+				n.Generation++
+				effects = []EffectKind{Cancel, Escalate}
 			}
 		case Recovered:
 			if s.Stage == SystemBlocked {
@@ -378,7 +379,8 @@ func Reduce(s Snapshot, e Event) (Transition, error) {
 				}
 				n.Stage = AwaitingAuthor
 				n.Hold = HoldGate
-				effects = []EffectKind{NotifyAuthor}
+				n.Generation++
+				effects = []EffectKind{Cancel, NotifyAuthor}
 			default:
 				return Transition{}, ErrTransition
 			}

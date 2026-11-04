@@ -229,3 +229,40 @@ func TestGreenCIReleasesCIFailureHold(t *testing.T) {
 		t.Fatalf("CI-failure hold not released by green CI: %+v %v", green.Next, green.Effects)
 	}
 }
+
+func TestPendingCIKeepsFindingsAndGateHolds(t *testing.T) {
+	findings := advance(t, advance(t, advance(t, observed(t), QueueReview), StartReview), Findings)
+	gate := advance(t, advance(t, advance(t, advance(t, observed(t), QueueReview), StartReview), ReviewPassed), GateFailed)
+	for name, held := range map[string]Snapshot{"findings": findings, "gate": gate} {
+		t.Run(name, func(t *testing.T) {
+			pending := ciFact(t, held, CIPending)
+			if pending.Next.Stage != AwaitingAuthor || pending.Next.Hold != held.Hold || pending.Next.CI != CIPending || len(pending.Effects) != 0 {
+				t.Fatalf("pending CI released the hold: %+v %v", pending.Next, pending.Effects)
+			}
+			green := ciFact(t, pending.Next, CISuccess)
+			if green.Next.Stage != AwaitingAuthor || len(green.Effects) != 0 {
+				t.Fatalf("green CI after pending released the hold: %+v %v", green.Next, green.Effects)
+			}
+		})
+	}
+}
+
+func TestExhaustedFailuresAndRefusedGateAreGenerationExits(t *testing.T) {
+	gated := advance(t, advance(t, advance(t, advance(t, observed(t), QueueReview), StartReview), ReviewPassed), GateFailed)
+	if gated.Generation != observed(t).Generation+1 || gated.Hold != HoldGate {
+		t.Fatalf("refused gate kept its generation: %+v", gated)
+	}
+	s := advance(t, advance(t, observed(t), QueueReview), StartReview)
+	var last Transition
+	for i := 0; i < 3; i++ {
+		var err error
+		last, err = Reduce(s, Event{Kind: Failure, Head: s.Head, Generation: s.Generation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s = last.Next
+	}
+	if s.Stage != SystemBlocked || s.Generation != observed(t).Generation+1 || !hasEffect(last.Effects, Cancel) || !hasEffect(last.Effects, Escalate) {
+		t.Fatalf("exhausted failures left queued or running work alive: %+v %v", s, last.Effects)
+	}
+}

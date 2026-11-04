@@ -115,7 +115,7 @@ func TestConsecutiveFailureBudget(t *testing.T) {
 			t.Fatal(err)
 		}
 		s = r.Next
-		if (len(r.Effects) == 1) != (i == 3) {
+		if hasEffect(r.Effects, Escalate) != (i == 3) {
 			t.Fatal(r)
 		}
 	}
