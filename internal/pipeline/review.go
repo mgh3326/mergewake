@@ -705,6 +705,10 @@ type reviewSkip struct {
 	Note     string `json:"note,omitempty"`
 	// Host is where the reviewer ran (headless) or was asked to run (panewire).
 	Host string `json:"host,omitempty"`
+	// Profile is the launch profile the reviewer ran as: the reviewer's hk job
+	// record names it for a spawned panewire pane, the configured name for a
+	// headless reviewer. Empty before any profile was chosen.
+	Profile string `json:"profile,omitempty"`
 	// ExitCode, StderrTail and Cause say why a reviewer process failed; see
 	// withCause. StderrTail is redacted and bounded.
 	ExitCode   *int   `json:"exit_code,omitempty"`
