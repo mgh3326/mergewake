@@ -98,6 +98,9 @@ type reviewerSweep struct {
 	// receipts stood when the pass started.
 	streams map[string]map[string]reapReceipt
 	local   *reapHost
+	// remote is the newest remote worktree path a receipt recorded per label
+	// and host, the fallback when the pane is gone and the job names no cwd.
+	remote map[string]map[string]string
 }
 
 // reviewerCandidate is one label to visit, and the host and pane it was seen
@@ -119,7 +122,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.timeout: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}}
 	w.jobs, _ = s.Sink.(reapJobs)
 	for _, hs := range hosts {
 		if hs.host.Local() && w.local == nil {
@@ -135,8 +138,14 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 				w.streams[rec.Label] = map[string]reapReceipt{}
 			}
 			w.streams[rec.Label][reviewerStream(rec)] = rec
+			if rec.Worktree != "" && rec.Worktree != rec.Label {
+				w.remember(rec.Label, rec.Host, rec.Cwd)
+			}
 		case "reviewer-cleanup":
 			lastCleanup[reviewerLabelOf(rec)] = rec
+			// Cwd holds the remote pane's cwd or the remote worktree; the
+			// local checkout is only ever in Worktree.
+			w.remember(reviewerLabelOf(rec), rec.Host, rec.Cwd)
 		}
 	}
 	finished := func(label string) bool {
@@ -197,6 +206,18 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		w.visit(ctx, c)
 	}
 	return w.errs
+}
+
+// remember records a remote path a receipt named for a label on a host; only
+// an absolute path whose base is the label counts.
+func (w *reviewerSweep) remember(label, host, path string) {
+	if label == "" || host == "" || !filepath.IsAbs(path) || filepath.Base(filepath.Clean(path)) != label {
+		return
+	}
+	if w.remote[label] == nil {
+		w.remote[label] = map[string]string{}
+	}
+	w.remote[label][host] = path
 }
 
 // row starts a reviewer-reap receipt for a label.
@@ -275,6 +296,12 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		gate.Host = hs.host.Name
 	}
 	cwd := job.Cwd
+	if cwd == "" && hs != nil {
+		cwd = w.remote[l.name][hs.host.Name]
+		if cwd == "" {
+			cwd = w.remote[l.name][hs.host.MachineID()]
+		}
+	}
 	if hs != nil {
 		pane, ok := w.closePane(ctx, gate, hs, job, l)
 		if !ok {

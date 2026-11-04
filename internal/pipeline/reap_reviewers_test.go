@@ -358,6 +358,28 @@ func TestReapReviewer_F_I6_RemovesOnlyThroughHubGuard(t *testing.T) {
 	})
 }
 
+// A pane already gone whose job record names no cwd still has its remote
+// worktree removed, at the path an earlier reviewer-cleanup receipt recorded.
+func TestReapReviewer_F_I6_RemovesGoneReviewerAtReceiptedPath(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(12, time.Hour)
+	cwd := "/repo/" + label
+	f.hub.detached[cwd] = true
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", PaneID: "w1:p5"}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Host: "node-a", Pane: "w1:p5", Cwd: cwd, Worktree: "/checkouts/" + label, Result: "kept", Reason: "reviewer job escalated; the pane stays for the operator"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != cwd || len(f.hub.ops("pane.close")) != 0 {
+		t.Fatalf("hub ops: %v", f.hub.commands)
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[0].Reason != "pane already gone" || rows[1].Result != "removed" || rows[1].Worktree != cwd {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
 // localCheckout is a reviewer checkout <checkouts>/<label> on this machine,
 // detached at the reviewed head; the local host runs pane in it when inUse.
 func localCheckout(t *testing.T, f *reviewerFix, label string, inUse bool) string {
