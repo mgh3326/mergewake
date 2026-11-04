@@ -2,7 +2,6 @@ name: CI post-merge
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -16,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test-race:
-    runs-on: ${{ github.event_name != 'pull_request' && vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,7 +26,7 @@ jobs:
           cache: true
       - run: go test -race ./...
   test-macos:
-    runs-on: ${{ github.event_name != 'pull_request' && vars.PANEWIRE_POST_MAC_RUNNER || 'macos-latest' }}
+    runs-on: ${{ vars.PANEWIRE_POST_MAC_RUNNER || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,7 +37,7 @@ jobs:
           cache: true
       - run: go test ./...
   mysql8-store:
-    runs-on: ${{ github.event_name != 'pull_request' && vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
     services:
       mysql:
         image: mysql:8.0
@@ -61,7 +60,7 @@ jobs:
         env:
           MERGEWAKE_TEST_MYSQL_DSN: root:disposable-ci-password@tcp(127.0.0.1:3306)/mergewake_test?parseTime=true
   auto-tag-test:
-    runs-on: ${{ github.event_name != 'pull_request' && vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.PANEWIRE_POST_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:

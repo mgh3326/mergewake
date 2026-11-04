@@ -1,6 +1,5 @@
 name: CI (any ref)
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       ref:
@@ -15,28 +14,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - env:
-          TARGET_SHA: ${{ inputs.ref || github.event.pull_request.head.sha }}
+          TARGET_SHA: ${{ inputs.ref }}
         run: '[[ "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]'
   ci:
     needs: validate
     concurrency:
-      group: ci-any-ref-ci-${{ inputs.ref || github.event.pull_request.head.sha }}
+      group: ci-any-ref-ci-${{ inputs.ref }}
       cancel-in-progress: true
     permissions:
       contents: read
     uses: ./.github/workflows/ci-post.yml
     with:
-      ref: ${{ inputs.ref || github.event.pull_request.head.sha }}
+      ref: ${{ inputs.ref }}
   status:
     if: ${{ always() && needs.validate.result == 'success' && needs.ci.result != 'cancelled' }}
     needs: [validate, ci]
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-any-ref-status-${{ inputs.ref || github.event.pull_request.head.sha }}
+      group: ci-any-ref-status-${{ inputs.ref }}
       cancel-in-progress: true
     env:
       GH_TOKEN: ${{ github.token }}
-      TARGET_SHA: ${{ inputs.ref || github.event.pull_request.head.sha }}
+      TARGET_SHA: ${{ inputs.ref }}
       RESULT: ${{ needs.ci.result }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
