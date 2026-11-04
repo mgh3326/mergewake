@@ -144,7 +144,14 @@ type Repo struct {
 	// Lane receives this repo's PR events when neither the task trailer nor a
 	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
 	Lane string `yaml:"lane"`
+	// HKTaskEvents sends PR, review, merge and revert events to hk's
+	// POST /v1/task-events. Absent means on; false keeps a repo whose hk
+	// predates the endpoint (handoffkeep#136) from posting anything.
+	HKTaskEvents *bool `yaml:"hk_task_events"`
 }
+
+// TaskEventsOn reports whether hk_task_events is unset or true.
+func (r Repo) TaskEventsOn() bool { return r.HKTaskEvents == nil || *r.HKTaskEvents }
 
 // RolloutWindowGroup keeps the fleet control-plane peers in one mandatory
 // availability window, independent of which caller constructs the inventory.

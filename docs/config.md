@@ -46,6 +46,7 @@ Different hosts may use the same inventory and different deny lists.
 | `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
 | `lane` | Empty | Lane for this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one; checked before `notifier.fallback_lane`. |
+| `hk_task_events` | `true` | With the `handoffkeep` sink, post a task event to hk's `POST /v1/task-events` for each PR with a `Mergewake-Task` trailer: `mergewake.pr` when an open, ready PR is first observed, `mergewake.review` when a review run claims a pass, `mergewake.merge` after mergewake's own merge, and `mergewake.revert` when a watch revert PR is merged (a revert merged more than seven days before mergewake first sees it is not posted). Dry runs and shadow mode post nothing. A failed post never fails the action; each post is an `hk-task-event` row in `decisions.jsonl`. Set `false` for a repo whose hk predates the endpoint (handoffkeep#136). |
 
 Each `install[]` entry has:
 
