@@ -240,9 +240,10 @@ func (c *Client) CreateRef(ctx context.Context, repo, branch, sha string) error 
 type CI string
 
 const (
-	Green   CI = "green"
-	Red     CI = "red"
-	Pending CI = "pending"
+	Green     CI = "green"
+	Red       CI = "red"
+	Pending   CI = "pending"
+	Cancelled CI = "cancelled"
 )
 
 type checkRun struct {
@@ -290,13 +291,13 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 				switch r.Conclusion {
 				case "success":
 					state = Green
+				case "cancelled", "skipped", "neutral":
+					state = Cancelled
 				case "failure", "timed_out", "action_required", "startup_failure", "stale":
 					state = Red
 				}
 			}
-			// Cancelled and skipped conclusions stay unknown rather than red:
-			// they cannot mark a red boundary for culprit search or count as
-			// confirmed-green evidence.
+			// Check treats cancelled evidence as pending for aggregate consumers.
 			states[r.Name] = state
 		}
 		if len(runs.CheckRuns) < 100 {
@@ -325,8 +326,13 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 		case "failure", "error":
 			v = Red
 		}
-		if old, ok := states[name]; ok && old != v {
-			return nil, fmt.Errorf("ambiguous check and status named %q", name)
+		if old, ok := states[name]; ok {
+			if old == Cancelled {
+				old = Pending
+			}
+			if old != v {
+				return nil, fmt.Errorf("ambiguous check and status named %q", name)
+			}
 		}
 		states[name] = v
 	}
@@ -354,8 +360,8 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 	return result, nil
 }
 
-// CheckStates resolves each required check name to green, red or pending.
-// Missing or unknown evidence is pending, matching Check's aggregate result.
+// CheckStates resolves each required name, distinguishing completed runs without
+// a verdict from pending evidence. Missing evidence is pending.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
 	states, e := cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (map[string]CI, error) { return c.checkStates(freshRequest(ctx), repo, sha) })
 	if e != nil {

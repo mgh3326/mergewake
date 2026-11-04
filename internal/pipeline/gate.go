@@ -33,12 +33,13 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
-	Block     string       `json:"review_block,omitempty"`
-	PatchID   string       `json:"patch_id,omitempty"`
-	Rounds    int          `json:"rounds"`
-	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
-	Inherited string       `json:"inherited_from,omitempty"`
-	Findings  dispositions `json:"dispositions"`
+	ChecksCancelled []string     `json:"checks_cancelled,omitempty"`
+	Block           string       `json:"review_block,omitempty"`
+	PatchID         string       `json:"patch_id,omitempty"`
+	Rounds          int          `json:"rounds"`
+	Reviewed        []string     `json:"reviewed_patch_ids,omitempty"`
+	Inherited       string       `json:"inherited_from,omitempty"`
+	Findings        dispositions `json:"dispositions"`
 }
 
 // dispositions counts the PR's review threads by how they stand: blocking and
@@ -93,7 +94,7 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
-// every required check green on H, no unresolved review threads (or, under a
+// every required check green or completed without a verdict on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
 // base branch an ancestor of H, and the PR mergeable. A review covers a patch,
@@ -113,6 +114,8 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		case github.Red:
 			v.Reasons = append(v.Reasons, "check_failed:"+name)
 		case github.Green:
+		case github.Cancelled:
+			v.Review.ChecksCancelled = append(v.Review.ChecksCancelled, name)
 		default:
 			pending = true
 		}
