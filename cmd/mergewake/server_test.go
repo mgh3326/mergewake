@@ -21,3 +21,19 @@ func TestServerStoreBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestServerStoreHelpPrintsUsageWithoutStore(t *testing.T) {
+	t.Setenv("MERGEWAKE_MYSQL_DSN", "")
+	t.Setenv("MERGEWAKE_MYSQL_DSN_FILE", "")
+	for _, args := range [][]string{{"--help"}, {"help"}, {"migrate", "--help"}, {"check", "-h"}} {
+		var out, errout bytes.Buffer
+		if err := runServerStore(context.Background(), args, &out, &errout); err != nil {
+			t.Fatal(args, err)
+		}
+		if args[0] == "--help" || args[0] == "help" {
+			if !strings.Contains(out.String(), "usage: server") {
+				t.Fatal(args, out.String())
+			}
+		}
+	}
+}

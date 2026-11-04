@@ -15,12 +15,19 @@ func runServerStore(ctx context.Context, args []string, out, stderr io.Writer) e
 		return errors.New("usage: server migrate|check (credentials from MERGEWAKE_MYSQL_DSN or MERGEWAKE_MYSQL_DSN_FILE)")
 	}
 	command := args[0]
+	if command == "--help" || command == "help" {
+		_, err := fmt.Fprintln(out, "usage: server migrate|check (credentials from MERGEWAKE_MYSQL_DSN or MERGEWAKE_MYSQL_DSN_FILE)")
+		return err
+	}
 	if command != "migrate" && command != "check" {
 		return errors.New("server currently supports migrate and check only")
 	}
 	fs := flag.NewFlagSet("server "+command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() != 0 {

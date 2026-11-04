@@ -127,6 +127,16 @@ func (s *Store) Snapshot(ctx context.Context, k Key) (state.Snapshot, error) {
 	return snapshot, nil
 }
 
+// deliveryDigest identifies a redelivery by its content. ExpectedVersion is a
+// fence for the first apply only, so it is excluded: a redelivery that carries a
+// newer expected version must return the stored outcome, not a conflict.
+func deliveryDigest(in Input) string {
+	in.ExpectedVersion = 0
+	b, _ := json.Marshal(in)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 // Apply atomically deduplicates an input, updates the aggregate and persists
 // all resulting work. Operator class must be granted by the trusted API adapter.
 func (s *Store) Apply(ctx context.Context, f Fence, in Input) (Applied, error) {
@@ -139,9 +149,7 @@ func (s *Store) Apply(ctx context.Context, f Fence, in Input) (Applied, error) {
 	if in.Event.Base != "" && !commitID.MatchString(in.Event.Base) {
 		return Applied{}, ErrConfig
 	}
-	b, _ := json.Marshal(in)
-	sum := sha256.Sum256(b)
-	digest := hex.EncodeToString(sum[:])
+	digest := deliveryDigest(in)
 	return transaction(ctx, s, func(tx *sql.Tx) (Applied, error) {
 		if err := checkFence(ctx, tx, f); err != nil {
 			return Applied{}, err
