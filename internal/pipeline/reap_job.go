@@ -48,7 +48,7 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 	if ok {
 		return b, nil
 	}
-	task, e := s.prTask(ctx, r, p)
+	task, e := s.reapTask(ctx, r, p)
 	if e != nil {
 		return b, e
 	}
@@ -76,12 +76,30 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 	return b, nil
 }
 
+// reapTask is prTask for a merged PR: the same trailer lookup, reading the head
+// commit through the memo the update-merge match shares, so the commit is read
+// at most once per PR.
+func (s *Service) reapTask(ctx context.Context, r config.Repo, p github.Pull) (string, error) {
+	if t := trailer(p.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
+		return t, nil
+	}
+	c, e := s.headCommit(ctx, r, p)
+	if e != nil {
+		return "", e
+	}
+	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
+		return t, nil
+	}
+	return "", nil
+}
+
 // reapJobPane closes the pane of PR p's bound job when the whole job is
 // finished, then marks the job done. closed names jobs an earlier pass closed
 // and reap has not marked done, so a job whose pane is already gone still
-// gets its done. match reports whether a worktree is PR p's own: a lead
+// gets its done; everClosed names jobs any pass closed, so a pane gone for that
+// reason is not reported missing. match reports whether a worktree is PR p's own: a lead
 // sitting in it records the worktree, which later cleanup reads.
-func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull, b reapBinding, hosts []*reapHost, byName map[string]*reapHost, match func(*reap.Worktree) bool, mergedAt *time.Time, acting bool, closed map[string]reapReceipt, note func(reapReceipt)) {
+func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull, b reapBinding, hosts []*reapHost, byName map[string]*reapHost, match func(*reap.Worktree) bool, mergedAt *time.Time, acting bool, closed map[string]reapReceipt, everClosed map[string]bool, note func(reapReceipt)) {
 	rec := reapReceipt{Action: "close-pane", Repo: r.Name, PR: p.Number, Task: b.Task, Job: b.Job}
 	job, e := s.Sink.(reapJobs).Job(ctx, b.Job)
 	switch {
@@ -94,15 +112,22 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		note(rec)
 		return
 	}
-	hs, pane, n, ok := jobPane(hosts, job, b.Job)
+	hs, pane, n, ok, scanned := jobPane(hosts, job, b.Job)
 	switch {
 	case !ok:
 		rec.Result, rec.Reason = "skipped", "job-host-unconfigured"
 		note(rec)
 		return
 	case n == 0:
-		if prior, ok := closed[b.Job]; ok && !terminalJob(job.State) {
+		switch prior, ok := closed[b.Job]; {
+		case ok && !terminalJob(job.State):
 			s.reapJobDone(ctx, prior, byName[prior.Host], job, acting, note)
+		case scanned != nil && !ok && !everClosed[b.Job]:
+			// The host's panes were read and none wears the label, and no pass
+			// closed it: say why nothing follows, once (the row dedupes).
+			rec.Host = scanned.host.Name
+			rec.Result, rec.Reason = "skipped", "job-pane-missing"
+			note(rec)
 		}
 		return
 	case n > 1:
@@ -216,8 +241,10 @@ func (s *Service) reapJobDone(ctx context.Context, closed reapReceipt, hs *reapH
 // configured host whose name or machine is the record's host. herdr pane ids
 // are host-local, so no other host is searched; a record whose host is not
 // configured resolves no host (ok false). n counts label matches: only
-// exactly one is used.
-func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reapHost, found reap.Pane, n int, ok bool) {
+// exactly one is used. scanned is a host whose panes were read, set only when every
+// host matching the record was readable, so it supports "no pane wears the label".
+func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reapHost, found reap.Pane, n int, ok bool, scanned *reapHost) {
+	unread := false
 	label := job.Label
 	if label == "" {
 		label = id
@@ -228,8 +255,10 @@ func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reap
 		}
 		ok = true
 		if hs.failed {
+			unread = true
 			continue
 		}
+		scanned = hs
 		for _, pane := range hs.panes {
 			if pane.Name == label {
 				at, found = hs, pane
@@ -237,7 +266,11 @@ func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reap
 			}
 		}
 	}
-	return at, found, n, ok
+	if unread {
+		// A host that could not be read may hold the label: say nothing.
+		scanned = nil
+	}
+	return at, found, n, ok, scanned
 }
 
 // jobOpenPRs lists the open PRs, against any base in every configured repo,
