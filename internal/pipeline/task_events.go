@@ -138,9 +138,11 @@ func revertEventKey(repo string, revertPR int) string {
 
 // revertEventPending reports whether the merged PR v has a revert PR whose
 // event an acting pass has not settled yet, so reconciliation keeps visiting
-// the row after its outcome is final.
+// the row after its outcome is final. Unreadable keys (sent is nil) leave the
+// row pending, so observeRevertTaskEvent audits the read failure and a later
+// poll retries it.
 func (s *Service) revertEventPending(r config.Repo, v outcomes.Outcome, o Options, sent *sentKeys) bool {
-	return sent != nil && v.MergedAt != nil && v.RevertPR > 0 && s.taskEventsActive(r, o) && !sent.has(revertEventKey(r.Name, v.RevertPR))
+	return v.MergedAt != nil && v.RevertPR > 0 && s.taskEventsActive(r, o) && (sent == nil || !sent.has(revertEventKey(r.Name, v.RevertPR)))
 }
 
 // observeRevertTaskEvent posts mergewake.revert once the revert PR of the
