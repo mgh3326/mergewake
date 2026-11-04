@@ -1,0 +1,529 @@
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
+	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
+)
+
+// The reviewer sweep closes the leftover pane of a finished reviewer job and
+// removes its reviewer worktrees. A review pass already cleans up after itself
+// (panewire_cleanup.go); this sweep picks up what a pass had to keep: a pane
+// whose job was still running, a spawn whose wait timed out, an unconfirmed
+// placement, or a refused removal. It runs whatever the PR's state, because a
+// reviewer's job ends on its own clock, not on the merge.
+//
+// Every action needs all of: a reviewer label, a completed reviewer job, a
+// pass that is over, a pane that is the one the job names, and an empty
+// composer. A remote worktree goes only through the hub's guarded removal; a
+// local checkout is removed only when it is clean, detached at the reviewed
+// head and no local pane runs in it.
+
+// reviewerLabelPattern is the label a review pass gives its pane, job and
+// checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go).
+var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)$`)
+
+type reviewerLabel struct {
+	name    string
+	pr      int
+	sha7    string
+	started time.Time
+}
+
+func parseReviewerLabel(name string) (reviewerLabel, bool) {
+	m := reviewerLabelPattern.FindStringSubmatch(name)
+	if m == nil {
+		return reviewerLabel{}, false
+	}
+	pr, e1 := strconv.Atoi(m[1])
+	unix, e2 := strconv.ParseInt(m[4], 10, 64)
+	if e1 != nil || e2 != nil || pr <= 0 {
+		return reviewerLabel{}, false
+	}
+	return reviewerLabel{name: name, pr: pr, sha7: m[2], started: time.Unix(unix, 0)}, true
+}
+
+// reviewerStream names one receipt stream of a label: the pane stream (gate
+// and close rows, no worktree) or one worktree on one host. rowKey dedupes
+// reviewer-reap rows by it.
+func reviewerStream(v reapReceipt) string {
+	if v.Worktree == "" {
+		return "pane"
+	}
+	return v.Host + "\x00" + v.Worktree
+}
+
+// reviewerTerminal reports whether a row ends its stream: nothing is left to
+// do for that pane or worktree.
+func reviewerTerminal(v reapReceipt) bool {
+	return v.Result == "closed" || v.Result == "removed" || v.Result == "skipped" && strings.Contains(v.Reason, "already gone")
+}
+
+// reviewerLabelOf names the label a reviewer receipt is about: reviewer-reap
+// rows carry it, reviewer-cleanup rows name the checkout or remote worktree
+// whose directory base is the label.
+func reviewerLabelOf(v reapReceipt) string {
+	switch v.Action {
+	case "reviewer-reap":
+		return v.Label
+	case "reviewer-cleanup":
+		return filepath.Base(filepath.Clean(v.Worktree))
+	}
+	return ""
+}
+
+type reviewerSweep struct {
+	s      *Service
+	r      config.Repo
+	hosts  []*reapHost
+	acting bool
+	now    time.Time
+	settle time.Duration // review.timeout + 1m: a younger label's pass may still run
+	jobs   reapJobs
+	note   func(reapReceipt)
+	errs   []error
+	// streams is the newest reviewer-reap row per label and stream, as the
+	// receipts stood when the pass started.
+	streams map[string]map[string]reapReceipt
+	local   *reapHost
+}
+
+// reviewerCandidate is one label to visit, and the host and pane it was seen
+// on when a pane drove it.
+type reviewerCandidate struct {
+	label reviewerLabel
+	seen  *reapHost
+	pane  *reap.Pane
+}
+
+// reapReviewers runs the sweep on every scanned host. prNum > 0 limits it to
+// that PR's labels. note writes one reviewer-reap row and its audit record.
+func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
+	timeout := s.Config.Review.Timeout
+	if timeout == "" {
+		timeout = "10m" // config's default when the key is unset
+	}
+	d, e := config.Duration(timeout)
+	if e != nil {
+		return []error{fmt.Errorf("reviewer reap: review.timeout: %w", e)}
+	}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}}
+	w.jobs, _ = s.Sink.(reapJobs)
+	for _, hs := range hosts {
+		if hs.host.Local() && w.local == nil {
+			w.local = hs
+		}
+	}
+
+	lastCleanup := map[string]reapReceipt{}
+	for _, rec := range receipts {
+		switch rec.Action {
+		case "reviewer-reap":
+			if w.streams[rec.Label] == nil {
+				w.streams[rec.Label] = map[string]reapReceipt{}
+			}
+			w.streams[rec.Label][reviewerStream(rec)] = rec
+		case "reviewer-cleanup":
+			lastCleanup[reviewerLabelOf(rec)] = rec
+		}
+	}
+	finished := func(label string) bool {
+		if streams := w.streams[label]; len(streams) > 0 {
+			for _, v := range streams {
+				if !reviewerTerminal(v) {
+					return false
+				}
+			}
+			return true
+		}
+		v, ok := lastCleanup[label]
+		return !ok || reviewerTerminal(v)
+	}
+	keep := func(name string) (reviewerLabel, bool) {
+		l, ok := parseReviewerLabel(name)
+		return l, ok && (prNum == 0 || l.pr == prNum)
+	}
+
+	var cands []reviewerCandidate
+	paned := map[string]bool{}
+	for _, hs := range hosts {
+		if hs.failed {
+			continue
+		}
+		// The agent list names panes and is what CloseExact re-reads; the
+		// full pane list only serves the in-use check.
+		for i := range hs.panes {
+			pane := hs.panes[i]
+			l, ok := keep(pane.Name)
+			if !ok || pane.ID == "" {
+				continue
+			}
+			paned[l.name] = true
+			cands = append(cands, reviewerCandidate{label: l, seen: hs, pane: &pane})
+		}
+	}
+	labels := map[string]bool{}
+	for label := range w.streams {
+		labels[label] = true
+	}
+	for label := range lastCleanup {
+		labels[label] = true
+	}
+	for label := range labels {
+		if paned[label] || finished(label) {
+			continue
+		}
+		if l, ok := keep(label); ok {
+			cands = append(cands, reviewerCandidate{label: l})
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].label.name < cands[j].label.name })
+	for _, c := range cands {
+		if e := ctx.Err(); e != nil {
+			return append(w.errs, e)
+		}
+		w.visit(ctx, c)
+	}
+	return w.errs
+}
+
+// row starts a reviewer-reap receipt for a label.
+func (w *reviewerSweep) row(l reviewerLabel) reapReceipt {
+	return reapReceipt{Action: "reviewer-reap", Repo: w.r.Name, PR: l.pr, Label: l.name}
+}
+
+func (w *reviewerSweep) record(v reapReceipt, result, reason string) {
+	v.Result, v.Reason = result, fleetevent.Redact(reason)
+	w.note(v)
+}
+
+// visit applies the sweep to one label: the gates (I2–I4), the pane close
+// (I5), the remote worktree (I6) and the local checkout (I7), in that order.
+// Any step that does not finish stops the later ones.
+func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
+	l := c.label
+	// I3: the pass that spawned the pane may still be waiting on it.
+	if !l.started.Add(w.settle).Before(w.now) {
+		return
+	}
+	gate := w.row(l)
+	if c.seen != nil {
+		gate.Host, gate.Pane, gate.Cwd = c.seen.host.Name, c.pane.ID, c.pane.Cwd
+	}
+	// I2: only a completed reviewer job (or the worker seat a refused reviewer
+	// role retries as) is ever acted on.
+	if w.jobs == nil {
+		w.record(gate, "kept", "job records unavailable")
+		return
+	}
+	job, e := w.jobs.Job(ctx, l.name)
+	switch {
+	case errors.Is(e, integrations.ErrJobNotFound):
+		w.record(gate, "kept", "job-record-missing")
+		return
+	case e != nil:
+		w.record(gate, "error", "job record: "+integrations.Detail(e))
+		return
+	case job.State != "completed":
+		st := job.State
+		if st == "" {
+			st = "unknown"
+		}
+		w.record(gate, "kept", "job:"+st)
+		return
+	case job.Role != "reviewer" && job.Role != "worker":
+		w.record(gate, "kept", "role:"+job.Role)
+		return
+	}
+	// I4: the pane must be on the host the job names.
+	var hs *reapHost
+	if job.Host == "" && c.seen != nil {
+		w.record(gate, "kept", "job record and pane disagree")
+		return
+	}
+	if job.Host != "" {
+		for _, h := range w.hosts {
+			if h.host.Name == job.Host || h.host.MachineID() == job.Host {
+				hs = h
+				break
+			}
+		}
+		switch {
+		case c.seen != nil && c.seen != hs:
+			w.record(gate, "kept", "job record and pane disagree")
+			return
+		case hs == nil:
+			gate.Host = job.Host
+			w.record(gate, "kept", "job-host-unconfigured")
+			return
+		case hs.failed:
+			// The host's scan already reported its error.
+			return
+		}
+		gate.Host = hs.host.Name
+	}
+	cwd := job.Cwd
+	if hs != nil {
+		pane, ok := w.closePane(ctx, gate, hs, job, l)
+		if !ok {
+			return
+		}
+		if pane != nil && pane.Cwd != "" {
+			cwd = pane.Cwd
+		}
+		if !hs.host.Local() {
+			if !w.removeRemote(ctx, hs, l, cwd) {
+				return
+			}
+		}
+	}
+	w.removeLocal(ctx, l)
+}
+
+// closePane finds the label's pane on hs and closes it under I4 and I5. It
+// returns true once the pane is closed (or would be, in shadow) or gone.
+func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reapHost, job integrations.JobRecord, l reviewerLabel) (*reap.Pane, bool) {
+	var found []reap.Pane
+	for _, p := range hs.panes {
+		if p.Name == l.name && p.ID != "" {
+			found = append(found, p)
+		}
+	}
+	switch len(found) {
+	case 0:
+		// Gone. A pane this sweep closed before needs no second row.
+		if prior, ok := w.streams[l.name]["pane"]; !ok || prior.Result != "closed" {
+			rec.Pane = job.PaneID
+			w.record(rec, "skipped", "pane already gone")
+		}
+		return nil, true
+	case 1:
+	default:
+		w.record(rec, "kept", "pane-ambiguous")
+		return nil, false
+	}
+	pane := found[0]
+	rec.Pane, rec.Cwd = pane.ID, pane.Cwd
+	switch {
+	case job.PaneID == "" || pane.ID != job.PaneID || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != l.name:
+		w.record(rec, "kept", "job record and pane disagree")
+		return nil, false
+	case pane.Focused:
+		w.record(rec, "kept", "operator-owned")
+		return nil, false
+	}
+	// I5: an unsent draft, or a composer that cannot be read, keeps the pane.
+	switch composer, e := hs.ops.Composer(ctx, pane); {
+	case e != nil:
+		w.record(rec, "kept", reap.ComposerUnknown)
+		return nil, false
+	case composer != reap.ComposerEmpty:
+		w.record(rec, "kept", composer)
+		return nil, false
+	}
+	if !w.acting {
+		hs.closed[pane.ID] = true
+		w.record(rec, "would-close", "")
+		return &pane, true
+	}
+	outcome, e := hs.ops.CloseExact(ctx, pane)
+	switch {
+	case e != nil:
+		w.record(rec, "error", "pane close: "+e.Error())
+		return nil, false
+	case outcome == reap.CloseClosed:
+		hs.closed[pane.ID] = true
+		w.record(rec, "closed", "")
+		return &pane, true
+	case outcome == reap.CapturePaneGone:
+		// Not marked closed: the in-use check must still see any pane that
+		// remains in the worktree.
+		w.record(rec, "skipped", "pane already gone")
+		return &pane, true
+	}
+	w.record(rec, "kept", "pane close recheck: "+outcome)
+	return nil, false
+}
+
+// removeRemote removes the reviewer's detached worktree on a remote host,
+// only through the hub's guarded removal (I6). It returns true when the
+// worktree is removed, would be, or is gone.
+func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l reviewerLabel, cwd string) bool {
+	rec := w.row(l)
+	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
+	if cwd == "" || filepath.Base(filepath.Clean(cwd)) != l.name {
+		// Its own stream: the pane stream must keep its close.
+		rec.Worktree = l.name
+		w.record(rec, "pending-cleanup", "remote cwd unavailable or mismatched")
+		return false
+	}
+	remover, ok := hs.ops.(interface {
+		WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
+	})
+	if !hs.viaHub || !ok {
+		w.record(rec, "pending-cleanup", "no hub for guarded removal")
+		return false
+	}
+	if hs.usageUnknown {
+		w.record(rec, "kept", "pane-scan-failed")
+		return false
+	}
+	if w.acting {
+		// A pane may have moved into the worktree since discovery.
+		if e := hs.refreshPanes(ctx); e != nil {
+			w.record(rec, "kept", "pane-scan-failed")
+			return false
+		}
+	}
+	if hs.paneInUse(cwd) {
+		w.record(rec, "kept", "pane-in-use")
+		return false
+	}
+	tree, e := hs.ops.Inspect(ctx, cwd)
+	switch {
+	case e != nil:
+		w.record(rec, "error", "worktree inspect: "+e.Error())
+		return false
+	case tree == nil:
+		w.record(rec, "skipped", "worktree already gone")
+		return true
+	case !w.reviewedTree(tree, cwd, l):
+		w.record(rec, "kept", "worktree identity changed")
+		return false
+	case !w.acting:
+		w.record(rec, "would-remove", "")
+		return true
+	}
+	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil)
+	if e != nil {
+		w.record(rec, "error", "worktree remove: "+e.Error())
+		return false
+	}
+	result, reason := worktreeRemoveVerdict(removed)
+	switch {
+	case result == "removed":
+		w.record(rec, "removed", "")
+		return true
+	case reason == "worktree-gone":
+		w.record(rec, "skipped", "worktree already gone")
+		return true
+	}
+	rec.Files = removed.Files
+	w.record(rec, "pending-cleanup", "hub guarded removal refused: "+reason)
+	return false
+}
+
+// reviewedTree reports whether a worktree is the reviewer's own: at path, in
+// this repo, detached at a head with the label's sha7.
+func (w *reviewerSweep) reviewedTree(tree *reap.Worktree, path string, l reviewerLabel) bool {
+	return filepath.Clean(tree.Path) == filepath.Clean(path) && strings.EqualFold(tree.Repo, w.r.Name) && tree.Branch == "" && strings.HasPrefix(tree.Head, l.sha7)
+}
+
+// localHost is the configured local host, or a scan of this machine's panes
+// when none is configured, so the in-use check always reads real panes.
+func (w *reviewerSweep) localHost(ctx context.Context) *reapHost {
+	if w.local != nil {
+		return w.local
+	}
+	ex := reap.Exec{Runner: w.s.Runner, Host: reap.Host{Name: "local"}}
+	w.local = &reapHost{host: ex.Host, exec: ex, ops: ex, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
+	if e := w.local.refreshPanes(ctx); e != nil {
+		w.local.usageUnknown = true
+	}
+	return w.local
+}
+
+// removeLocal removes the reviewer's checkout <review.panewire.checkouts>/<label>
+// on this machine (I7): clean, detached at the label's head, and no local
+// pane in it. A checkout that is not there writes nothing.
+func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
+	dir := config.Expand(w.s.Config.Review.Panewire.Checkouts)
+	if dir == "" {
+		return
+	}
+	path := filepath.Join(dir, l.name)
+	if _, e := os.Lstat(path); e != nil {
+		return
+	}
+	hs := w.localHost(ctx)
+	rec := w.row(l)
+	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, path, path
+	if hs.failed || hs.usageUnknown {
+		w.record(rec, "kept", "pane-scan-failed")
+		return
+	}
+	if hs.paneInUse(path) {
+		w.record(rec, "kept", "pane-in-use")
+		return
+	}
+	tree, e := hs.exec.Inspect(ctx, path)
+	switch {
+	case e != nil:
+		w.record(rec, "error", "checkout inspect: "+e.Error())
+		return
+	case tree == nil:
+		w.record(rec, "kept", "checkout is not a linked worktree")
+		return
+	case !w.reviewedTree(tree, path, l):
+		w.record(rec, "kept", "checkout identity changed")
+		return
+	}
+	clean, e := hs.exec.Clean(ctx, path)
+	var ignored []string
+	if e == nil {
+		ignored, e = hs.exec.Ignored(ctx, path)
+	}
+	var unsafe []string
+	for _, f := range ignored {
+		if !reap.Regenerable(w.s.Config.Reap.Regenerable, f) {
+			unsafe = append(unsafe, f)
+		}
+	}
+	switch {
+	case e != nil:
+		w.record(rec, "kept", "status-check-failed")
+		return
+	case !clean:
+		w.record(rec, "kept", "dirty")
+		return
+	case len(unsafe) > 0:
+		rec.Files = unsafe
+		w.record(rec, "kept", "ignored-files:"+filesSig(unsafe))
+		return
+	case !w.acting:
+		w.record(rec, "would-remove", "")
+		return
+	}
+	// The discovery scan is stale: re-read the panes before removing.
+	if e := hs.refreshPanes(ctx); e != nil {
+		w.record(rec, "kept", "pane-scan-failed")
+		return
+	}
+	if hs.paneInUse(path) {
+		w.record(rec, "kept", "pane-in-use")
+		return
+	}
+	if e := hs.exec.RemoveWorktree(ctx, filepath.Dir(tree.Common), path); e != nil {
+		w.record(rec, "error", "checkout remove: "+e.Error())
+		return
+	}
+	w.record(rec, "removed", "")
+}
+
+// reviewerRow reports whether a receipt is about a reviewer, not the PR's
+// author: the PR scan and its worktree candidates ignore these rows.
+func reviewerRow(v reapReceipt) bool {
+	return v.Action == "reviewer-cleanup" || v.Action == "reviewer-reap"
+}
