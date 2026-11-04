@@ -50,13 +50,18 @@ Admission reads over the public git protocol (`git ls-remote` and a tag-object-o
 
 `--deploy` implements steps 1–4 of the inventory's §"Exact consumer change for slice 2":
 
+Each pass takes a per-service lock in `--state-dir` (a pass that cannot take it exits 75 and touches nothing), then admits, then acts. Overlapping passes therefore cannot deploy a stale admission over a newer one.
+
 | shiftgate state for the service | Action | Exit |
 |---|---|---|
+| admitted digest is in the failed-image ledger (`--state-dir/failed-<service>`) | do not deploy; the hold `shiftgate follow` set on a failed deploy is kept here because explicit `deploy` sets none | 0 |
 | status unreadable, not JSON, or the service is missing | refuse | 1 |
 | `hold.digest` == admitted digest | do not deploy (`deploy` would clear the hold) | 0 |
 | `active.digest` == admitted digest | nothing to do | 0 |
 | an operation is pending | wait | 75 |
-| otherwise | `sudo -n /usr/local/bin/shiftgate deploy <svc> --digest <d>`; its exit 75 stays 75 | 0, 75, or shiftgate's code |
+| otherwise | `sudo -n /usr/local/bin/shiftgate deploy <svc> --digest <d>`. Exit 75 stays 75. Exit 1 (image failed, old colour serves) adds the digest to the failed-image ledger. Other codes do not hold. | 0, 75, or shiftgate's code |
+
+Residual: shiftgate has no atomic "deploy unless held". A manual rollback that lands between this pass's status read and its `deploy` exec (one process start) is not seen. Closing that needs a shiftgate change, which is out of scope here.
 
 Manual `shiftgate rollback` stays outside the gate and remains the recovery path. A rollback holds the digest it left, so the next `admit --deploy` reports `held` and does not redeploy it. Promoting a newer commit is the way forward.
 

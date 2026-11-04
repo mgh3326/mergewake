@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -93,6 +94,7 @@ func runAdmit(ctx context.Context, args []string, out, stderr io.Writer) error {
 	service := fs.String("service", "", "shiftgate service name (with --deploy)")
 	sgPath := fs.String("shiftgate", "/usr/local/bin/shiftgate", "full path of shiftgate (with --deploy)")
 	sudo := fs.Bool("sudo", true, "run shiftgate under sudo -n (with --deploy)")
+	state := fs.String("state-dir", "~/.local/state/mergewake/admit", "per-service deploy lock and failed-image ledger (with --deploy)")
 	cache := fs.String("cache", "~/.cache/mergewake/promotion", "bare git cache for promotion tag objects")
 	if e := fs.Parse(args); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
@@ -108,18 +110,21 @@ func runAdmit(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	reader := promotion.Git{Cache: config.Expand(*cache), Exec: promotion.OSExec{}}
-	adm, e := promotion.Admit(ctx, reader, *repo, s)
-	if e != nil {
-		return e
-	}
 	if !*deploy {
+		adm, e := promotion.Admit(ctx, reader, *repo, s)
+		if e != nil {
+			return e
+		}
 		if *asJSON {
 			return json.NewEncoder(out).Encode(adm.Record)
 		}
 		_, e = fmt.Fprintln(out, adm.Digest)
 		return e
 	}
-	outcome, code, e := promotion.Deploy(ctx, adm, *service, promotion.Shiftgate{Path: *sgPath, Sudo: *sudo, Exec: promotion.OSExec{}})
+	stateDir := config.Expand(*state)
+	sg := promotion.Shiftgate{Path: *sgPath, Sudo: *sudo, Exec: promotion.OSExec{}}
+	ledger := promotion.FileLedger{Path: filepath.Join(stateDir, "failed-"+*service)}
+	adm, outcome, code, e := promotion.Pass(ctx, reader, *repo, s, *service, sg, promotion.FileLock{Dir: stateDir}, ledger)
 	fmt.Fprintf(stderr, "%s seq %d %s: %s\n", *repo, adm.Seq, adm.Digest, outcome)
 	if e != nil {
 		return &exitError{code, e}

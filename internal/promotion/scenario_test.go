@@ -246,3 +246,23 @@ func TestDryRunWritesNothing(t *testing.T) {
 	}
 	mustAdmit(t, w, "G")
 }
+
+// Finding: an interrupted first seed (record created, branch not) must recover.
+func TestSeedRecoversFromInterruptedSeed(t *testing.T) {
+	w := newWorld()
+	w.merge("G")
+	w.ci("G", "green")
+	w.failNext = "pointer"
+	_, e := promote(t, w, "G", true)
+	mustRefuse(t, e, "authorizes nothing")
+	_, e = admitted(t, w)
+	mustRefuse(t, e, "no deployable pointer")
+	rec, e := promote(t, w, "G", true)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rec.Seq != 2 || rec.Previous != nil {
+		t.Fatalf("seq %d prev %+v", rec.Seq, rec.Previous)
+	}
+	mustAdmit(t, w, "G")
+}

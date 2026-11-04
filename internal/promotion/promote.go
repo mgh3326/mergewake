@@ -130,9 +130,9 @@ func (p *Promoter) Promote(ctx context.Context, repo string, s Suite, opts Optio
 			return Record{}, deny("current pointer is not admissible, refusing to chain onto it: %v", e)
 		}
 		prev = &Previous{Seq: cur.Seq, SHA: cur.SHA}
-	} else if maxSeq != 0 {
-		return Record{}, deny("records exist but no pointer; refusing to seed over them")
 	}
+	// With no pointer, existing records (an interrupted seed) authorize
+	// nothing; the seed takes a fresh seq and its own certification.
 	evidence, e := p.certify(ctx, repo, s, opts.SHA)
 	if e != nil {
 		return Record{}, e

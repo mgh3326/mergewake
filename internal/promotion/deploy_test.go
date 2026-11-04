@@ -112,3 +112,91 @@ func TestDeploy_DeniesUnreadableStatusOrUnknownService(t *testing.T) {
 		})
 	}
 }
+
+type memLedger map[string]bool
+
+func (m memLedger) Failed(d string) (bool, error) { return m[d], nil }
+func (m memLedger) MarkFailed(d string) error     { m[d] = true; return nil }
+
+type heldLock struct{}
+
+func (heldLock) Lock(string) (func(), error) { return nil, errors.New("held") }
+
+func pass(t *testing.T, w *world, f *sgFake, l Locker, led memLedger) (Outcome, int, error) {
+	t.Helper()
+	_, o, code, e := Pass(context.Background(), w, repo, testSuite(t), "brewdial-api", Shiftgate{Path: "/usr/local/bin/shiftgate", Sudo: true, Exec: f}, l, led)
+	return o, code, e
+}
+
+// Finding: overlapping passes are serialized; a pass that cannot take the
+// service lock touches nothing and retries, so no stale admission deploys.
+func TestPass_OverlappingPassRetriesWithoutTouchingShiftgate(t *testing.T) {
+	w := gWorld(t)
+	f := &sgFake{status: sgStatus(digestOf("base"), "", false)}
+	o, code, e := pass(t, w, f, heldLock{}, memLedger{})
+	if e != nil || o != Retry || code != ExitRetry || len(f.calls) != 0 {
+		t.Fatal(o, code, e, f.calls)
+	}
+}
+
+// Finding: admission is read inside the lock, so the pass deploys the
+// pointer as it is when the pass runs, never an earlier read.
+func TestPass_AdmitsInsideLockAndDeploysCurrentPointer(t *testing.T) {
+	w := gWorld(t)
+	w.merge("R")
+	w.ci("R", "green")
+	if _, e := promote(t, w, "R", false); e != nil {
+		t.Fatal(e)
+	}
+	f := &sgFake{status: sgStatus(digestOf("G"), "", false)}
+	o, _, e := pass(t, w, f, noLock{}, memLedger{})
+	if e != nil || o != Deployed || !strings.HasSuffix(strings.Join(f.calls[len(f.calls)-1], " "), digestOf("R")) {
+		t.Fatal(o, e, f.calls)
+	}
+}
+
+// Finding: a failed explicit deploy holds that image, as follow did; a newer
+// promotion is deployed; non-image failures do not hold.
+func TestPass_FailedImageIsHeldUntilANewerPromotion(t *testing.T) {
+	w := gWorld(t)
+	led := memLedger{}
+	f := &sgFake{status: sgStatus(digestOf("base"), "", false), code: 1}
+	if o, code, _ := pass(t, w, f, noLock{}, led); o != DeployFailed || code != 1 || !led[digestOf("G")] {
+		t.Fatal(o, code, led)
+	}
+	f = &sgFake{status: sgStatus(digestOf("base"), "", false)}
+	if o, code, e := pass(t, w, f, noLock{}, led); o != FailedImage || code != 0 || e != nil || len(f.calls) != 0 {
+		t.Fatal(o, code, e, f.calls)
+	}
+	w.merge("R")
+	w.ci("R", "green")
+	if _, e := promote(t, w, "R", false); e != nil {
+		t.Fatal(e)
+	}
+	if o, _, e := pass(t, w, f, noLock{}, led); o != Deployed || e != nil {
+		t.Fatal(o, e)
+	}
+	led2 := memLedger{}
+	for _, f := range []*sgFake{{status: ""}, {status: sgStatus(digestOf("base"), "", false), code: 75}, {status: sgStatus(digestOf("base"), "", false), code: 3}} {
+		pass(t, w, f, noLock{}, led2)
+	}
+	if len(led2) != 0 {
+		t.Fatalf("non-image failures held: %v", led2)
+	}
+}
+
+func TestFileLedger(t *testing.T) {
+	l := FileLedger{Path: t.TempDir() + "/x/failed"}
+	if ok, e := l.Failed("sha256:a"); ok || e != nil {
+		t.Fatal(ok, e)
+	}
+	if e := l.MarkFailed("sha256:a"); e != nil {
+		t.Fatal(e)
+	}
+	if ok, _ := l.Failed("sha256:a"); !ok {
+		t.Fatal("not recorded")
+	}
+	if ok, _ := l.Failed("sha256:b"); ok {
+		t.Fatal("wrong digest held")
+	}
+}
