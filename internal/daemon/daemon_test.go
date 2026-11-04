@@ -7,9 +7,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 )
 
 func TestRolesLockShutdownAndStatus(t *testing.T) {
@@ -307,4 +310,126 @@ func TestWakeNeverPostponesScheduledPoll(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// runUntil runs one loop whose passes return errs in order (nil is success)
+// and cancels once every pass has run. It returns the loop's Run error.
+func runUntil(t *testing.T, d *Daemon, role string, errs []error) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := 0
+	d.LockDir = t.TempDir()
+	d.Host = "host-a"
+	d.Jitter = func() float64 { return 0 }
+	loop := Loop{Role: role, Interval: time.Millisecond, Run: func(context.Context) error {
+		e := errs[n]
+		n++
+		if n == len(errs) {
+			cancel()
+		}
+		return e
+	}}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx, []Loop{loop}) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon did not finish")
+		return nil
+	}
+}
+
+func readRoleEvents(t *testing.T, state string) []fleetevent.Event {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(state, "events", fleetevent.FileName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	var out []fleetevent.Event
+	for _, line := range bytes.Split(bytes.TrimSpace(b), []byte("\n")) {
+		var ev fleetevent.Event
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("bad event line %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestRoleErrorEventPerFailedPass(t *testing.T) {
+	state := t.TempDir()
+	d := &Daemon{StateDir: state}
+	// Two failures, then a success whose cancel ends the loop.
+	if err := runUntil(t, d, "pr", []error{errors.New("boom one"), errors.New("boom two"), nil}); err != nil {
+		t.Fatal(err)
+	}
+	evs := readRoleEvents(t, state)
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2: %+v", len(evs), evs)
+	}
+	for i, ev := range evs {
+		if ev.Kind != "role_error" || ev.Outcome != "failed" || ev.Reason != "role_failed" || ev.Job != "pr" || ev.Tool != "mergewake" {
+			t.Fatalf("event %d = %+v", i, ev)
+		}
+		want := []string{`role=pr failures=1 error="boom one"`, `role=pr failures=2 error="boom two"`}[i]
+		if ev.Detail != want {
+			t.Fatalf("event %d detail = %q, want %q", i, ev.Detail, want)
+		}
+	}
+	// The status file keeps its shape: the success cleared the error.
+	var s Status
+	b, err := os.ReadFile(filepath.Join(state, "daemon", "pr.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &s); err != nil || s.Failures != 0 || s.LastError != "" {
+		t.Fatalf("status = %+v, err = %v", s, err)
+	}
+}
+
+func TestRoleErrorEventRedactsSecrets(t *testing.T) {
+	state := t.TempDir()
+	d := &Daemon{StateDir: state}
+	secret := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	err := errors.New("fetch failed: Authorization: Bearer " + secret + " and GITHUB_TOKEN=hunter2hunter2")
+	if e := runUntil(t, d, "watch", []error{err}); e != nil {
+		t.Fatal(e)
+	}
+	evs := readRoleEvents(t, state)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	for _, leak := range []string{secret, "hunter2hunter2"} {
+		if strings.Contains(evs[0].Detail, leak) {
+			t.Fatalf("detail leaks %q: %q", leak, evs[0].Detail)
+		}
+	}
+	if !strings.Contains(evs[0].Detail, "role=watch failures=1") {
+		t.Fatalf("detail = %q", evs[0].Detail)
+	}
+}
+
+func TestRoleErrorEventWriteFailureKeepsLoopAndStatus(t *testing.T) {
+	state := t.TempDir()
+	// A regular file where the events directory belongs makes every write fail.
+	if err := os.WriteFile(filepath.Join(state, "events"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{StateDir: state}
+	if err := runUntil(t, d, "pr", []error{errors.New("boom"), nil}); err != nil {
+		t.Fatalf("loop must survive an unwritable events dir: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(state, "daemon", "pr.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s Status
+	if err := json.Unmarshal(b, &s); err != nil || s.Role != "pr" || s.Running || s.LastFinish.IsZero() {
+		t.Fatalf("status = %+v, err = %v", s, err)
+	}
 }
