@@ -176,7 +176,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		cleanup()
 		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
-	defer cleanup()
+	// A local pane runs in this checkout: closeReviewerPane keeps it until the
+	// pane is closed or gone.
+	keepCheckout := false
+	defer func() {
+		if !keepCheckout {
+			cleanup()
+		}
+	}()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -213,6 +220,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
 	}
 	if e != nil {
+		// Every exit but the pre-start refusal may leave a pane running in
+		// this checkout: a timed-out --wait is one such exit. Keep the checkout
+		// and name it in a receipt for a later cleanup. A refused spawn started
+		// no pane, so its checkout is still removed below.
+		if exitStatus(e) != panewireRefused {
+			keepCheckout = true
+			x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+		}
 		if ctx.Err() != nil {
 			res, skipErr := skip("panewire reviewer deadline")
 			res.skips[len(res.skips)-1].withCause(e)
@@ -222,6 +237,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		res.skips[len(res.skips)-1].withCause(e)
 		return res, skipErr
 	}
+	// The spawn returned, so its wait finished. Every outcome from here is
+	// terminal for this pass, and the pane is closed after it is recorded. A
+	// timed-out wait returned above and never reaches this defer, because the
+	// pane may still be working.
+	placement, confirmed := spawnPlacement(string(stdout))
+	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
+	defer func() { x.closeReviewerPane(ctx, pane) }()
 	res, e := x.recordResult(ctx, label)
 	if e != nil {
 		if !errors.Is(e, ctx.Err()) {
@@ -235,6 +257,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	case res.result != nil:
 		b = res.result
 	case res.reason == "escalated" || res.reason == "lost":
+		pane.hold = "reviewer job " + res.reason + "; the pane stays for the operator"
 		return skip("reviewer job record %s", res.reason)
 	default:
 		// The record answered without findings — a pane spawned before
@@ -299,7 +322,7 @@ func (x *panewireExecutor) spawnBrief(ctx context.Context, path, jobDir string) 
 	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
 		return "", errors.New("uploaded review brief sha256 mismatch")
 	}
-	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal. The local source copy is %s.\n", id, len(body), shellQuote(files.AttachmentCommand()), id, path)
+	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal.\n", id, len(body), shellQuote(filepath.Base(files.AttachmentCommand())), id)
 	pointer := filepath.Join(jobDir, "review-prompt.md")
 	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
 }

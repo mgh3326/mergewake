@@ -320,7 +320,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// spares the GitHub refetch on every poll.
 	prPaths := map[int]map[string]bool{}
 	for _, rec := range receipts {
-		if rec.PR == 0 {
+		// reviewer-cleanup rows name reviewer checkouts and never get a
+		// remove-worktree row, so they must not hold a PR open.
+		if rec.PR == 0 || rec.Action == "reviewer-cleanup" {
 			continue
 		}
 		path := rec.Worktree
@@ -359,8 +361,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// files stops costing a GitHub call every poll.
 	lastPRCheck := map[int]time.Time{}
 	for _, rec := range receipts {
-		// Archive rows need no GitHub call and must not delay a refetch.
-		if rec.Action != "archive-job" && rec.Time.After(lastPRCheck[rec.PR]) {
+		// Archive rows need no GitHub call and must not delay a refetch; neither
+		// do reviewer-cleanup rows, which a review pass writes on every outcome.
+		if rec.Action != "archive-job" && rec.Action != "reviewer-cleanup" && rec.Time.After(lastPRCheck[rec.PR]) {
 			lastPRCheck[rec.PR] = rec.Time
 		}
 	}
@@ -639,7 +642,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 		}
 		for _, rec := range receipts {
-			if rec.PR != p.Number {
+			if rec.PR != p.Number || rec.Action == "reviewer-cleanup" {
 				continue
 			}
 			path := rec.Worktree

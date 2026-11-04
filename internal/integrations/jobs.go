@@ -35,6 +35,7 @@ type JobRecord struct {
 	// pane there, as panewire recorded them at spawn.
 	Host   string `json:"host"`
 	PaneID string `json:"pane_id"`
+	Cwd    string `json:"cwd"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist
