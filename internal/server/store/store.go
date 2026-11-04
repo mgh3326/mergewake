@@ -448,6 +448,19 @@ func (s *Store) ConfirmAbsent(ctx context.Context, f Fence, c Claim) error {
 		if jobStatus == "superseded" {
 			return true, nil
 		}
+		var k Key
+		if err = tx.QueryRowContext(ctx, `SELECT repository,number FROM mw_jobs WHERE id=?`, c.ID).Scan(&k.Repository, &k.Number); err != nil {
+			return false, err
+		}
+		snap, seq, err := readPR(ctx, tx, k, true)
+		if err != nil {
+			return false, err
+		}
+		if snap.Stage == state.Closed || snap.Stage == state.Merged {
+			// A closed or merged PR refuses Failure, so retire the absent attempt instead of retrying it forever.
+			_, err = tx.ExecContext(ctx, `UPDATE mw_jobs SET status='superseded' WHERE id=?`, c.ID)
+			return true, err
+		}
 		failures++
 		jobStatus = "queued"
 		if failures >= 3 {
@@ -456,14 +469,6 @@ func (s *Store) ConfirmAbsent(ctx context.Context, f Fence, c Claim) error {
 		delay := RetryDelay(failures)
 		delay += time.Duration(mathrand.Int64N(int64(delay/5) + 1))
 		if _, err = tx.ExecContext(ctx, `UPDATE mw_jobs SET status=?,failures=?,available_at=TIMESTAMPADD(MICROSECOND,?,UTC_TIMESTAMP(6)) WHERE id=?`, jobStatus, failures, delay.Microseconds(), c.ID); err != nil {
-			return false, err
-		}
-		var k Key
-		if err = tx.QueryRowContext(ctx, `SELECT repository,number FROM mw_jobs WHERE id=?`, c.ID).Scan(&k.Repository, &k.Number); err != nil {
-			return false, err
-		}
-		snap, seq, err := readPR(ctx, tx, k, true)
-		if err != nil {
 			return false, err
 		}
 		e := state.Event{Kind: state.Failure, Head: snap.Head, Generation: snap.Generation}
