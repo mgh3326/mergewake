@@ -363,10 +363,15 @@ func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 				t.Fatal(e)
 			}
 			parts := strings.Split(string(prompt), "`")
-			if len(parts) < 3 || parts[1] != shellQuote(command)+" attach get "+id {
-				t.Fatalf("prompt does not use the configured command: %s", prompt)
+			if len(parts) < 3 || parts[1] != shellQuote(filepath.Base(command))+" attach get "+id {
+				t.Fatalf("prompt does not use the configured command basename: %s", prompt)
 			}
-			got, e := exec.Command("sh", "-c", parts[1]).Output()
+			if strings.Contains(string(prompt), job) {
+				t.Fatalf("prompt contains host directory: %s", prompt)
+			}
+			cmd := exec.Command("sh", "-c", parts[1])
+			cmd.Env = append(os.Environ(), "PATH="+job+string(os.PathListSeparator)+os.Getenv("PATH"))
+			got, e := cmd.Output()
 			if e != nil || !bytes.Equal(got, body) {
 				t.Fatalf("retrieved brief differs: error=%v bytes=%d", e, len(got))
 			}
