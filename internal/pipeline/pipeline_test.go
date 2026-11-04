@@ -34,6 +34,7 @@ var shaD = strings.Repeat("d", 40)
 type fakeGH struct {
 	GitHub
 	pullCalls                                                    int
+	commitCalls                                                  int
 	updateHeads                                                  []string
 	updateErr                                                    error
 	updateHook                                                   func()
@@ -222,6 +223,7 @@ func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 	return nil
 }
 func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error) {
+	g.commitCalls++
 	if e := g.commitErr[sha]; e != nil {
 		return github.Commit{}, e
 	}
@@ -1242,13 +1244,16 @@ func TestInferAuthorFamilyFromCommit(t *testing.T) {
 		{"human unknown", "subject\n", "mgh3326", "m@example.com", "GitHub", "noreply@github.com", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
+			_, g, _, _, r := setup(t)
 			g.messages = map[string]string{shaA: tt.message}
 			g.authorName, g.authorEmail = tt.author, tt.authorEmail
 			g.committerName, g.committerEmail = tt.committer, tt.committerEmail
-			fam, e := s.inferAuthorFamily(context.Background(), r, shaA)
-			if e != nil || fam != tt.want {
-				t.Fatalf("%q %v", fam, e)
+			c, e := g.Commit(context.Background(), r.Name, shaA)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if fam := inferAuthorFamily(c); fam != tt.want {
+				t.Fatalf("%q", fam)
 			}
 		})
 	}
