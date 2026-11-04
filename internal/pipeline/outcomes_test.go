@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 )
@@ -77,5 +78,85 @@ func TestShadowOutcomesAndSevenDayFollowup(t *testing.T) {
 	}
 	if g.mergeCount != 0 || g.revertCount != 0 || g.claimCount != 0 {
 		t.Fatal("shadow observation mutated GitHub")
+	}
+}
+
+func TestAuthorProfile(t *testing.T) {
+	for _, tt := range []struct {
+		value, profile, effort string
+	}{
+		{"opus", "opus", ""},
+		{"opus@high", "opus", "high"},
+		{"codex-sol@xhigh", "codex-sol", "xhigh"},
+		{"codex@bogus", "codex", ""},
+		{"a@b@c", "", ""},
+		{"bad name", "", ""},
+		{"", "", ""},
+	} {
+		profile, effort := authorProfile(tt.value)
+		if profile != tt.profile || effort != tt.effort {
+			t.Errorf("authorProfile(%q) = %q, %q; want %q, %q", tt.value, profile, effort, tt.profile, tt.effort)
+		}
+	}
+}
+
+// fleetPRBody keeps the trailer block of mgh3326/panewire#143 (merged
+// 2026-11-01), written to the rstack wake brief without an @effort suffix.
+const fleetPRBody = "Synthetic summary of the change.\n" +
+	"\n" +
+	"Mergewake-Author-Family: anthropic\n" +
+	"Mergewake-Author-Profile: opus\n" +
+	"\n" +
+	"🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+
+func TestObservePRRecordsProfileWithoutEffort(t *testing.T) {
+	for _, tt := range []struct {
+		name, body, model string
+	}{
+		{"derived from profile", fleetPRBody, "opus-model"},
+		{"explicit model wins", fleetPRBody + "\nMergewake-Author-Model: concrete-model\n", "concrete-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, repo := setup(t)
+			s.Config.Review.Profiles["opus"] = config.Reviewer{Family: "anthropic", Command: "claude", Args: []string{"--model", "opus-model", "--effort", "high"}}
+			g.pull.Body = tt.body
+			s.GH = &outcomeGH{fakeGH: g, first: true}
+			if err := s.ObservePR(context.Background(), repo, g.pull, Options{Shadow: true}); err != nil {
+				t.Fatal(err)
+			}
+			state, err := s.ledger().Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]
+			if v.Profile != "opus" || v.Effort != "" || v.Model != tt.model || v.Family != "anthropic" {
+				t.Fatalf("profile=%q effort=%q model=%q family=%q", v.Profile, v.Effort, v.Model, v.Family)
+			}
+		})
+	}
+}
+
+// Rows written before profile-only trailers were accepted stay unattributed,
+// so ReconcileOutcomes revisits them and records the profile on its next pass.
+func TestReconcileBackfillsProfileWithoutEffort(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	s.Config.Review.Profiles["opus"] = config.Reviewer{Family: "anthropic", Command: "claude", Args: []string{"--model", "opus-model"}}
+	merged := time.Now().UTC().Format(time.RFC3339)
+	g.pull.MergedAt = &merged
+	g.pull.State = "closed"
+	g.pull.Body = fleetPRBody
+	s.GH = &outcomeGH{fakeGH: g, first: true}
+	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) { v.Final = true; v.Decision = "landed" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReconcileOutcomes(context.Background(), repo, map[int]bool{}, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]; v.Profile != "opus" || v.Model != "opus-model" {
+		t.Fatalf("profile=%q model=%q", v.Profile, v.Model)
 	}
 }
