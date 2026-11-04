@@ -26,6 +26,7 @@ type fakeReapHub struct {
 	capture  map[string]any
 	close    map[string]any
 	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
+	wtHead   string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
 	commands []map[string]any
 }
 
@@ -73,7 +74,11 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		case "worktree.inspect":
 			result = map[string]any{"worktree": nil}
 			if body["args"].(map[string]any)["cwd"] == "/repo.wt" {
-				result = map[string]any{"worktree": map[string]any{"path": "/repo.wt", "branch": "wk/x", "head": headSHA, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
+				head := h.wtHead
+				if head == "" {
+					head = headSHA
+				}
+				result = map[string]any{"worktree": map[string]any{"path": "/repo.wt", "branch": "wk/x", "head": head, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
 			}
 		case "pane.read":
 			result = h.composer
