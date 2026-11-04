@@ -469,7 +469,7 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			var e error
 			if inbox, e = reader.AckedEvents(ctx, d.Lane); e != nil {
 				inboxErr[d.Lane] = e
-				errs = append(errs, fmt.Errorf("findings ack on %s: %w", d.Lane, e))
+				errs = append(errs, s.audit(r.Name, "findings-ack-unavailable", map[string]any{"pr": d.PR, "lane": d.Lane, "error": integrations.Detail(e)}, o.DryRun))
 			} else {
 				inboxes[d.Lane] = inbox
 			}

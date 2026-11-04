@@ -25,6 +25,8 @@ import (
 
 var ErrReviewUnavailable = errors.New("review unavailable")
 
+const familyRequired = "author family required via --author-family, a Mergewake-Author-Family trailer in the PR body or head commit, or a known commit author"
+
 var gradeTrailer = regexp.MustCompile(`(?m)^Mergewake-Grade: ([^\r\n]+)[\t ]*$`)
 
 var familyTrailer = regexp.MustCompile(`(?m)^Mergewake-Author-Family: ([a-zA-Z0-9_-]+)\s*$`)
@@ -89,23 +91,20 @@ func familyFromIdentity(name, email string) string {
 	return ""
 }
 
-// inferAuthorFamily classifies the head commit when a PR carries no family
-// trailer: Co-Authored-By trailers first (agent-authored commits name the
-// tool there), then the author and committer identities.
-func (s *Service) inferAuthorFamily(ctx context.Context, r config.Repo, sha string) (string, error) {
-	c, e := s.GH.Commit(ctx, r.Name, sha)
-	if e != nil {
-		return "", e
-	}
+// inferAuthorFamily classifies the head commit when neither the PR body nor
+// its commit message declares a family: Co-Authored-By trailers first
+// (agent-authored commits name the tool there), then the author and committer
+// identities.
+func inferAuthorFamily(c github.Commit) string {
 	for _, m := range coAuthorTrailer.FindAllStringSubmatch(c.Commit.Message, -1) {
 		if f := familyFromIdentity(m[1], m[2]); f != "" {
-			return f, nil
+			return f
 		}
 	}
 	if f := familyFromIdentity(c.Commit.Author.Name, c.Commit.Author.Email); f != "" {
-		return f, nil
+		return f
 	}
-	return familyFromIdentity(c.Commit.Committer.Name, c.Commit.Committer.Email), nil
+	return familyFromIdentity(c.Commit.Committer.Name, c.Commit.Committer.Email)
 }
 
 func (s *Service) authorModel(r config.Repo, body string) string {
@@ -227,11 +226,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 		}
 		if family == "" {
-			inferred, e := s.inferAuthorFamily(ctx, r, pr.Head.SHA)
+			c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
 			if e != nil {
 				return e
 			}
-			if inferred != "" {
+			if m := familyTrailer.FindStringSubmatch(c.Commit.Message); len(m) == 2 {
+				family, familySource = m[1], "commit_trailer"
+			} else if inferred := inferAuthorFamily(c); inferred != "" {
 				family, familySource = inferred, "commit"
 			}
 		}
@@ -239,11 +240,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			family, familySource = s.Config.Review.DefaultFamily, "default"
 		}
 		if family == "" {
-			return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
 		family = config.CanonicalFamily(family)
 		if family == "" {
-			return fmt.Errorf("%w: author family required via --author-family or Mergewake-Author-Family trailer", ErrReviewUnavailable)
+			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
 	}
 	posted := map[int]github.PassReceipt{}

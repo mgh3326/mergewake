@@ -1,8 +1,11 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -302,21 +305,85 @@ func TestFindingsDeliveryCanBeDisabled(t *testing.T) {
 	}
 }
 
-// An unreadable ACK neither re-sends nor escalates on a guess, and never
-// holds a new round's findings; the error is reported.
-func TestFindingsUnreadableAckDoesNotHoldNewFindings(t *testing.T) {
+// auditRecords decodes the audit lines written to out for one command.
+func auditRecords(t *testing.T, out []byte, command string) []map[string]any {
+	t.Helper()
+	var got []map[string]any
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var rec struct {
+			Command string         `json:"command"`
+			Value   map[string]any `json:"value"`
+		}
+		if e := dec.Decode(&rec); e != nil {
+			t.Fatal(e)
+		}
+		if rec.Command == command {
+			got = append(got, rec.Value)
+		}
+	}
+	return got
+}
+
+// An unreadable ACK neither re-sends nor escalates on a guess, never holds a
+// new round's findings, and does not fail the pass: it is audited once per
+// lane per pass.
+func TestFindingsUnreadableAckIsAuditedNotFailed(t *testing.T) {
 	s, g, n, _, r, now := deliverSetup(t)
+	var out bytes.Buffer
+	s.Out = &out
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
 	deliver(t, s, r)
 	n.ackErr = errors.New("hub unreachable")
 	*now = now.Add(time.Hour)
 	g.feedback.Threads = append(g.feedback.Threads, finding("T2", "coderabbitai[bot]", crBody("major", "Major"), 8))
-	e := s.DeliverFindings(context.Background(), r, 7, Options{})
-	if e == nil || !strings.Contains(e.Error(), "hub unreachable") {
-		t.Fatalf("error not reported: %v", e)
+	if e := s.DeliverFindings(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatalf("unreadable ack failed the pass: %v", e)
 	}
 	if n.count != 2 || !strings.Contains(n.events[1].Text, "T2") || strings.HasSuffix(n.events[1].ID, "-resend") {
 		t.Fatalf("new finding held or a guess re-sent: %+v", n.events)
+	}
+	unavailable := auditRecords(t, out.Bytes(), "findings-ack-unavailable")
+	if len(unavailable) != 1 {
+		t.Fatalf("want one findings-ack-unavailable record for the lane, got %+v", unavailable)
+	}
+	rec := unavailable[0]
+	if rec["pr"] != float64(7) || rec["lane"] != n.events[0].Lane || !strings.Contains(fmt.Sprint(rec["error"]), "hub unreachable") {
+		t.Fatalf("record %+v", rec)
+	}
+	if len(auditRecords(t, out.Bytes(), "findings-error")) != 0 {
+		t.Fatal("findings-error recorded for an unreadable ack")
+	}
+}
+
+// An aged finding is still escalated when its ACK cannot be read, because
+// escalation does not depend on the read.
+func TestFindingsUnreadableAckStillEscalatesAgedFindings(t *testing.T) {
+	s, g, n, _, r, now := deliverSetup(t)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	deliver(t, s, r)
+	n.ackErr = errors.New("hub unreachable")
+	*now = now.Add(2 * time.Hour)
+	if e := s.DeliverFindings(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatalf("unreadable ack failed the pass: %v", e)
+	}
+	if n.count != 2 {
+		t.Fatalf("aged finding not escalated: %+v", n.events)
+	}
+	esc := n.events[1]
+	if esc.Lane != s.Config.Notifier.Lane || esc.Type != "decision" || !strings.Contains(esc.Text, "findings still open") {
+		t.Fatalf("escalation %+v", esc)
+	}
+}
+
+// A notifier delivery error is not an ACK read: it still fails the pass.
+func TestFindingsNotifierErrorStillFailsDelivery(t *testing.T) {
+	s, g, n, _, r, _ := deliverSetup(t)
+	n.err = errors.New("notify down")
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	e := s.DeliverFindings(context.Background(), r, 7, Options{})
+	if e == nil || !strings.Contains(e.Error(), "notify down") {
+		t.Fatalf("delivery error not returned: %v", e)
 	}
 }
 
