@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,10 +59,9 @@ func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) 
 }
 
 // reapHeadCommits memoises the head commit of a merged PR for the process: a
-// merged PR's head never changes, and both the task lookup (reapBind) and the
-// update-merge match (ownBaseUpdate) need it, so one read serves both. It is
-// keyed by state dir so two services never share an answer; a read error is
-// not cached.
+// merged PR's head never changes, so the task lookup (reapTask) reads it once.
+// It is keyed by state dir so two services never share an answer; a read error
+// is not cached.
 var (
 	reapHeadMu      sync.Mutex
 	reapHeadCommits = map[string]github.Commit{}
@@ -85,21 +83,6 @@ func (s *Service) headCommit(ctx context.Context, r config.Repo, p github.Pull) 
 	reapHeadCommits[k] = c
 	reapHeadMu.Unlock()
 	return c, nil
-}
-
-// ownBaseUpdate reports whether PR p's head is the merge commit mergewake's own
-// update-branch made on top of the checkout head: exactly two parents, the
-// first one the checkout, the second the base SHA of an "ok" receipt that
-// updateStaleBranch wrote for this PR. Anything else, including a checkout
-// with local commits the PR head lacks, is not the worker's own work.
-func (s *Service) ownBaseUpdate(ctx context.Context, r config.Repo, p github.Pull, checkout string) (bool, error) {
-	c, e := s.headCommit(ctx, r, p)
-	if e != nil || len(c.Parents) != 2 || c.Parents[0].SHA != checkout {
-		return false, e
-	}
-	key := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", p.Number, c.Parents[1].SHA)))
-	status, e := os.ReadFile(filepath.Join(s.state(r.Name), "base-updates", hex.EncodeToString(key[:])))
-	return e == nil && string(status) == "ok", nil
 }
 
 func (s *Service) reapLog(repo string) string { return filepath.Join(s.state(repo), "reap.jsonl") }
@@ -518,12 +501,18 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	jobSeen := map[string]bool{}
 	// matches reports whether a worktree is merged PR p's own: it is on the PR's
-	// branch in this repo and its checkout is the PR head, or the parent of the
-	// merge commit mergewake's own branch update made the head (ownBaseUpdate).
-	// The head commit is read only for the second case (shared with the task
-	// lookup, memoised per process; a failed read is not retried within the pass), so a worktree that matches
-	// exactly costs no GitHub call.
-	parentsFailed := map[int]bool{}
+	// branch in this repo and its head is the PR head, or an ancestor of it, so
+	// every commit in the worktree is in the merged PR. A head that is an
+	// ancestor is asked of GitHub once per PR head per pass; a head GitHub does
+	// not know (404) does not match and is not an error. Any other failed read
+	// matches nothing for the rest of the pass and is reported once. A worktree
+	// whose head is the PR head costs no GitHub call.
+	type ancestryKey struct {
+		pr   int
+		head string
+	}
+	ancestry := map[ancestryKey]bool{}
+	ancestryFailed := map[int]bool{}
 	matches := func(w *reap.Worktree, p github.Pull) bool {
 		if w == nil || w.Branch == "" || w.Branch != p.Head.Ref || p.Head.SHA == "" || w.Head == "" || !strings.EqualFold(w.Repo, r.Name) {
 			return false
@@ -531,15 +520,24 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if w.Head == p.Head.SHA {
 			return true
 		}
-		if parentsFailed[p.Number] {
+		k := ancestryKey{p.Number, w.Head}
+		if ok, seen := ancestry[k]; seen {
+			return ok
+		}
+		if ancestryFailed[p.Number] {
 			return false
 		}
-		own, e := s.ownBaseUpdate(ctx, r, p, w.Head)
-		if e != nil {
-			parentsFailed[p.Number] = true
-			errs = append(errs, fmt.Errorf("PR %d head parents: %w", p.Number, e))
+		ok, e := s.GH.Ancestor(ctx, r.Name, w.Head, p.Head.SHA)
+		switch {
+		case github.NotFound(e):
+			ok, e = false, nil
+		case e != nil:
+			ancestryFailed[p.Number] = true
+			errs = append(errs, fmt.Errorf("PR %d head ancestry: %w", p.Number, e))
+			return false
 		}
-		return own
+		ancestry[k] = ok
+		return ok
 	}
 
 	for _, p := range pulls {
