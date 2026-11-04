@@ -12,6 +12,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 )
 
@@ -122,6 +123,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 	if err != nil {
 		return err
 	}
+	s.observePRTaskEvent(ctx, r, p, o)
 	state, err := s.ledger().Read()
 	if err != nil {
 		return err
@@ -217,6 +219,16 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 			}
 			if recovery.MergedAt != nil {
 				at := parsedTime(*recovery.MergedAt)
+				if o.Acting() {
+					// The revert PR is merged, not merely opened: hk moves
+					// the task back (rule 10).
+					stamp := s.now()
+					if at != nil {
+						stamp = *at
+					}
+					recovery.Number = v.RevertPR
+					s.postTaskEvent(ctx, r, p, integrations.SourceRevert, &recovery, stamp)
+				}
 				if at != nil && !at.Before(*v.MergedAt) && !at.After(v.MergedAt.Add(7*24*time.Hour)) {
 					yes := true
 					reverted = &yes
