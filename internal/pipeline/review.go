@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
 )
@@ -569,6 +571,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		fallback := ""
 		for _, x := range executors {
 			if out, e = x.runPass(ctx, plan, claim); e != nil {
+				var lost *reviewResultLost
+				if errors.As(e, &lost) {
+					auditErr := s.audit(r.Name, "review-result-lost", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+					noticeErr := s.notifyReviewResultLost(ctx, r, pr, plan, lost)
+					return errors.Join(e, auditErr, noticeErr)
+				}
 				// A reviewer cut off by the review deadline is recorded like a
 				// pass nobody produced.
 				if ctx.Err() != nil {
@@ -837,4 +845,26 @@ func configJSON(b []byte, v any) error {
 		return errors.New("trailing data after JSON")
 	}
 	return nil
+}
+
+func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr github.Pull, plan *passPlan, lost *reviewResultLost) error {
+	sent, err := loadSentKeys(filepath.Join(s.state(r.Name), "review-result-lost-sent"), math.MaxInt)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%d %s %d", pr.Number, pr.Head.SHA, plan.pass)
+	if sent.has(key) {
+		return nil
+	}
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	err = s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   fmt.Sprintf("mergewake-review-result-lost-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, plan.pass),
+		Lane: s.Config.Notifier.Lane, Type: "automation-failed",
+		Text: fmt.Sprintf("[mergewake] reviewer finished but its result was lost for %s#%d head=%s pass=%d lens=%s reviewer=%s report=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, lost.label, lost.report),
+	})
+	if err != nil {
+		return err
+	}
+	return sent.add(key)
 }
