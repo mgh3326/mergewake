@@ -112,7 +112,7 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		note(rec)
 		return
 	}
-	hs, pane, n, ok := jobPane(hosts, job, b.Job)
+	hs, pane, n, ok, scanned := jobPane(hosts, job, b.Job)
 	switch {
 	case !ok:
 		rec.Result, rec.Reason = "skipped", "job-host-unconfigured"
@@ -122,10 +122,10 @@ func (s *Service) reapJobPane(ctx context.Context, r config.Repo, p github.Pull,
 		switch prior, ok := closed[b.Job]; {
 		case ok && !terminalJob(job.State):
 			s.reapJobDone(ctx, prior, byName[prior.Host], job, acting, note)
-		case hs != nil && !ok && !everClosed[b.Job]:
+		case scanned != nil && !ok && !everClosed[b.Job]:
 			// The host's panes were read and none wears the label, and no pass
 			// closed it: say why nothing follows, once (the row dedupes).
-			rec.Host = hs.host.Name
+			rec.Host = scanned.host.Name
 			rec.Result, rec.Reason = "skipped", "job-pane-missing"
 			note(rec)
 		}
@@ -241,8 +241,10 @@ func (s *Service) reapJobDone(ctx context.Context, closed reapReceipt, hs *reapH
 // configured host whose name or machine is the record's host. herdr pane ids
 // are host-local, so no other host is searched; a record whose host is not
 // configured resolves no host (ok false). n counts label matches: only
-// exactly one is used.
-func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reapHost, found reap.Pane, n int, ok bool) {
+// exactly one is used. scanned is a host whose panes were read, set only when every
+// host matching the record was readable, so it supports "no pane wears the label".
+func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reapHost, found reap.Pane, n int, ok bool, scanned *reapHost) {
+	unread := false
 	label := job.Label
 	if label == "" {
 		label = id
@@ -253,12 +255,10 @@ func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reap
 		}
 		ok = true
 		if hs.failed {
+			unread = true
 			continue
 		}
-		// at names the host whose panes were read, even when none wears the
-		// label: n == 0 with a host means the label is absent, without one that
-		// the host could not be read.
-		at = hs
+		scanned = hs
 		for _, pane := range hs.panes {
 			if pane.Name == label {
 				at, found = hs, pane
@@ -266,7 +266,11 @@ func jobPane(hosts []*reapHost, job integrations.JobRecord, id string) (at *reap
 			}
 		}
 	}
-	return at, found, n, ok
+	if unread {
+		// A host that could not be read may hold the label: say nothing.
+		scanned = nil
+	}
+	return at, found, n, ok, scanned
 }
 
 // jobOpenPRs lists the open PRs, against any base in every configured repo,

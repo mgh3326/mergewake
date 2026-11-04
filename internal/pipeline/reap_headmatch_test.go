@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // parentsGH answers Commit with a fixed parent list and counts the reads.
@@ -349,4 +350,42 @@ func TestReapJobPathKeepsPaneGuards(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A second host that also answers to the job's recorded host and cannot be
+// read: the pane found on the readable host is still closed there, and when
+// no pane is found nothing is reported missing, because the unread host may
+// hold it.
+func TestReapJobPaneWithUnreadableSiblingHost(t *testing.T) {
+	sibling := func(s *Service) {
+		s.Config.Hosts = append(s.Config.Hosts, reapHostSibling())
+	}
+	t.Run("pane found keeps its host", func(t *testing.T) {
+		s, _, _, run := leadFixture(t, leadPane(""))
+		sibling(s)
+		_ = s.Reap(context.Background(), testRepo, 0, Options{Shadow: true})
+		row := leadRow(t, s, "close-pane")
+		if row == nil || row["result"] != "would-close" || row["host"] != "local" {
+			t.Fatalf("row %v", row)
+		}
+		_ = run
+	})
+	t.Run("no pane and sibling unread", func(t *testing.T) {
+		s, _, _, run := leadFixture(t, leadPane(""))
+		sibling(s)
+		run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
+		run.outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
+		_ = s.Reap(context.Background(), testRepo, 0, Options{})
+		if _, err := os.Stat(s.reapLog("example/project")); err == nil {
+			for _, row := range reapLogRows(t, s, "example/project") {
+				if row["reason"] == "job-pane-missing" {
+					t.Fatalf("row %v", row)
+				}
+			}
+		}
+	})
+}
+
+func reapHostSibling() reap.Host {
+	return reap.Host{Name: "remote", SSH: "ops@unreachable.example", Machine: "local"}
 }
