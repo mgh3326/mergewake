@@ -23,6 +23,7 @@ type cleanupOpts struct {
 	removeOutcome    string                    // worktree.remove's answer; default "removed"
 	forbid           []string                  // hub ops answered 403
 	waitTimeout      bool                      // the spawn's --wait timed out after its pane started
+	refuseAll        bool                      // both the reviewer and the worker seat are refused before any pane starts
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
 }
 
@@ -64,6 +65,9 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 	defer cancel()
 	runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
 	runner.waitTimeout = o.waitTimeout
+	if o.refuseAll {
+		runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
+	}
 	runner.afterRun = func() {
 		label := arg(runner.spawns[len(runner.spawns)-1], "-l")
 		cwd := "/repo/" + label
@@ -239,15 +243,51 @@ func TestReviewerCleanupRecordsRefusedRemovalAsPending(t *testing.T) {
 	}
 }
 
+// A timed-out wait may leave its pane running in the local checkout. The pass
+// must close nothing, remove no worktree, and name the kept checkout for later.
 func TestReviewerCleanupDoesNotCloseAfterWaitTimeout(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{waitTimeout: true})
 	if len(res.hubOps()) != 0 {
 		t.Fatalf("a pane whose wait timed out was touched: hub ops = %v", res.hubOps())
 	}
-	if receipts := res.receipts(t); len(receipts) != 0 {
+	for _, call := range gitCalls(res.runner, res.repo.Root) {
+		if strings.Contains(call, "worktree remove") {
+			t.Fatalf("the checkout of a timed-out wait was removed: git %q", call)
+		}
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || !strings.Contains(receipts[0].Worktree, "checkouts") {
 		t.Fatalf("receipts = %+v", receipts)
 	}
-	if audits := res.audits(t); len(audits) != 0 {
+	if audits := res.audits(t); len(audits) != 1 || audits[0]["result"] != "pending-cleanup" {
 		t.Fatalf("audits = %+v", audits)
+	}
+}
+
+// A refused spawn starts no pane, so its checkout is removed as before.
+func TestReviewerCleanupRemovesCheckoutWhenSpawnRefused(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{refuseAll: true})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	removed := false
+	for _, call := range gitCalls(res.runner, res.repo.Root) {
+		removed = removed || strings.Contains(call, "worktree remove")
+	}
+	if !removed {
+		t.Fatalf("a refused spawn kept its checkout: git %v", gitCalls(res.runner, res.repo.Root))
+	}
+	if len(res.hubOps()) != 0 || len(res.receipts(t)) != 0 {
+		t.Fatalf("a refused spawn has no pane: hub ops=%v", res.hubOps())
+	}
+}
+
+// The spawn's placement is read only from its OK line, so a placement without
+// chosen_host must keep the host the OK line already named.
+func TestSpawnPlacementKeepsHostWhenPlacementOmitsIt(t *testing.T) {
+	placement := base64.RawURLEncoding.EncodeToString([]byte(`{"pane_id":"w1:p1"}`))
+	got, ok := spawnPlacement("OK pane=p1 host=node-a placement=" + placement + "\n")
+	if !ok || got.Host != "node-a" || got.PaneID != "w1:p1" {
+		t.Fatalf("placement = %+v confirmed=%v", got, ok)
 	}
 }

@@ -220,6 +220,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
 	}
 	if e != nil {
+		// Every exit but the pre-start refusal may leave a pane running in
+		// this checkout: a timed-out --wait is one such exit. Keep the checkout
+		// and name it in a receipt for a later cleanup. A refused spawn started
+		// no pane, so its checkout is still removed below.
+		if exitStatus(e) != panewireRefused {
+			keepCheckout = true
+			x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+		}
 		if ctx.Err() != nil {
 			res, skipErr := skip("panewire reviewer deadline")
 			res.skips[len(res.skips)-1].withCause(e)

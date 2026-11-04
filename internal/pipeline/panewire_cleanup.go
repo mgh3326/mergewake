@@ -77,7 +77,9 @@ func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
 					Cwd  string `json:"cwd"`
 				}
 				if json.Unmarshal(raw, &p) == nil {
-					v.Host = p.Host
+					if p.Host != "" {
+						v.Host = p.Host
+					}
 					if p.Pane != "" {
 						v.PaneID = p.Pane
 					}
@@ -232,6 +234,14 @@ func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost,
 	default:
 		c.record("pending-cleanup", "hub guarded removal refused: "+reason)
 	}
+}
+
+// keepUnfinishedCheckout handles a spawn that ended without a pane result. It
+// closes nothing: the checkout stays with a pending-cleanup receipt that names
+// it, so the checkout is not removed under a pane that may still run.
+func (x *panewireExecutor) keepUnfinishedCheckout(p reviewerPane, reason string) {
+	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: p.checkout}}
+	c.record("pending-cleanup", reason)
 }
 
 // record writes this cleanup's one result: a reap receipt and the
