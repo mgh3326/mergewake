@@ -45,6 +45,7 @@ type panewireRunner struct {
 	unplaced     bool   // the OK line names no placement receipt
 	quotaErr     error
 	usageErr     error
+	quotaCalls   int // quota tool invocations (recommend, usage, gate)
 	spawns       [][]string
 	git          [][]string
 	headless     int
@@ -90,6 +91,7 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		}
 		return nil, nil
 	case "scopefuel":
+		r.quotaCalls++
 		if r.quotaErr != nil {
 			return nil, r.quotaErr
 		}
@@ -478,21 +480,20 @@ func TestPanewireRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 	}
 }
 
-// A failed `worktree add --detach` is cleaned up and falls back; nothing
-// ever touches a local branch.
-func TestPanewireFailedCheckoutFallsBack(t *testing.T) {
+// A failed `worktree add --detach` is cleaned up and fails the pass; nothing
+// ever touches a local branch, and nothing runs headless.
+func TestPanewireFailedCheckoutFailsPass(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
 	s, g, r := panewireSetup(t, runner)
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
-	}
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
 	got := gitCalls(runner, r.Root)
 	if len(got) != 3 || !strings.HasPrefix(got[1], "worktree add --detach ") || !strings.HasPrefix(got[2], "worktree remove --force ") {
 		t.Fatalf("%q", got)
 	}
-	if p := g.passes[shaA]; len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, "checkout PR head "+shaA[:7]) {
-		t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
+	if len(runner.spawns) != 0 {
+		t.Fatalf("spawns=%d", len(runner.spawns))
 	}
+	assertPanewirePassFailed(t, s, g, r, runner, e, "checkout PR head "+shaA[:7])
 }
 
 // A review cancelled while the findings are awaited ends with the context
@@ -512,9 +513,9 @@ func TestPanewireCancelWhileCollectingWrapsOnce(t *testing.T) {
 	}
 }
 
-// GitHub reports a deleted fork's head as "repo": null; the pass falls back to
-// headless before the claim, without touching git or panewire.
-func TestPanewireDeletedForkFallsBackToHeadless(t *testing.T) {
+// GitHub reports a deleted fork's head as "repo": null; the pass fails before
+// the claim, without touching git, panewire or a headless reviewer.
+func TestPanewireDeletedForkFailsPass(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	var pull github.Pull
@@ -522,13 +523,11 @@ func TestPanewireDeletedForkFallsBackToHeadless(t *testing.T) {
 		t.Fatal(e)
 	}
 	g.pull.Head = pull.Head
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	if len(runner.git) != 0 || len(runner.spawns) != 0 || g.claimCount != 0 {
+		t.Fatalf("git=%v spawns=%d claims=%d", runner.git, len(runner.spawns), g.claimCount)
 	}
-	got := g.passes[shaA]
-	if len(runner.git) != 0 || len(runner.spawns) != 0 || runner.headless != 1 || len(got) != 1 || !strings.Contains(got[0].Fallback, "deleted fork") {
-		t.Fatalf("git=%v spawns=%d headless=%d %+v", runner.git, len(runner.spawns), runner.headless, got)
-	}
+	assertPanewirePassFailed(t, s, g, r, runner, e, "deleted fork")
 }
 
 // An announcement that trails panewire's completion is waited for.
@@ -569,22 +568,17 @@ func TestPanewireLocalFindingsFileStillRead(t *testing.T) {
 }
 
 // A pane whose worktree is not at the head refuses; the refusal is never
-// posted as a clean review.
-func TestPanewireHeadRefusalFallsBackToHeadless(t *testing.T) {
+// posted as a clean review, and it fails the pass without a headless run.
+func TestPanewireHeadRefusalFailsPass(t *testing.T) {
 	runner := &panewireRunner{findings: `{"refused":"HEAD is 1234567, expected ` + shaA + `"}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	got := g.passes[shaA]
-	if runner.headless != 1 || len(got) != 1 || got[0].Executor != "" || !strings.Contains(got[0].Fallback, "refused: HEAD is 1234567") {
-		t.Fatalf("headless=%d %+v", runner.headless, got)
-	}
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	assertPanewirePassFailed(t, s, g, r, runner, e, "refused: HEAD is 1234567")
 }
 
 // The detached checkout never names the author's branch, so a host where
 // that branch is checked out in another worktree is not refused. A fork PR
-// still falls back: panewire replicates only a spec on the repo's origin.
+// fails its pass: panewire replicates only a spec on the repo's origin.
 func TestPanewireCheckoutDetached(t *testing.T) {
 	for name, tc := range map[string]struct {
 		fork   string
@@ -600,7 +594,8 @@ func TestPanewireCheckoutDetached(t *testing.T) {
 			if tc.fork != "" {
 				g.pull.Head.Repo.FullName = tc.fork
 			}
-			if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+			e := s.Review(context.Background(), r, 7, "openai", Options{})
+			if (e != nil) != (tc.reason != "") {
 				t.Fatal(e)
 			}
 			got := gitCalls(runner, r.Root)
@@ -622,9 +617,10 @@ func TestPanewireCheckoutDetached(t *testing.T) {
 				}
 				return
 			}
-			if len(runner.spawns) != 0 || runner.headless != 1 || !strings.Contains(p[0].Fallback, tc.reason) {
-				t.Fatalf("spawns=%d %+v", len(runner.spawns), p)
+			if len(runner.spawns) != 0 {
+				t.Fatalf("spawns=%d", len(runner.spawns))
 			}
+			assertPanewirePassFailed(t, s, g, r, runner, e, tc.reason)
 		})
 	}
 }
@@ -714,7 +710,7 @@ func TestPanewireFamilyRefusalRetriesAsWorker(t *testing.T) {
 	}
 }
 
-func TestPanewireFallsBackToHeadless(t *testing.T) {
+func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body   string
 		runner *panewireRunner
@@ -731,15 +727,10 @@ func TestPanewireFallsBackToHeadless(t *testing.T) {
 			if tc.body != "" {
 				g.pull.Body = tc.body
 			}
-			if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-				t.Fatal(e)
-			}
-			got := g.passes[shaA]
-			if tc.runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || got[0].Executor != "" || !strings.HasPrefix(got[0].Fallback, "panewire: ") || !strings.Contains(got[0].Fallback, tc.reason) {
-				t.Fatalf("headless=%d %+v", tc.runner.headless, got)
-			}
-			// One lease covers both executors of the pass.
-			if g.claimCount != 2 { // claim ref + done marker
+			e := s.Review(context.Background(), r, 7, "openai", Options{})
+			assertPanewirePassFailed(t, s, g, r, tc.runner, e, tc.reason)
+			// At most the pass claim is taken; no done marker follows.
+			if g.claimCount > 1 {
 				t.Fatalf("claims=%d", g.claimCount)
 			}
 		})
@@ -755,12 +746,13 @@ func TestPanewireNeedsNoQuotaTool(t *testing.T) {
 	if g.postCount != 1 || g.passes[shaA][0].Executor != "panewire" {
 		t.Fatal(g.passes)
 	}
-	// Without quota or a working pane the pass fails with both reasons.
+	// Without a working pane the pass fails with the pane's reason alone: the
+	// quota tool is never asked and no headless reviewer is tried.
 	runner = &panewireRunner{quotaErr: errors.New("scopefuel: not found")}
 	s, g, r = panewireSetup(t, runner)
 	e := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "panewire: no findings") || !strings.Contains(e.Error(), "headless: review unavailable: quota recommendation") || g.postCount != 0 {
-		t.Fatal(e, g.postCount)
+	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "panewire: no findings") || strings.Contains(e.Error(), "headless") || strings.Contains(e.Error(), "quota") || g.postCount != 0 || runner.quotaCalls != 0 || runner.headless != 0 {
+		t.Fatal(e, g.postCount, runner.quotaCalls, runner.headless)
 	}
 }
 
@@ -776,22 +768,20 @@ func TestHeadlessExecutorUnchangedWithoutPanewire(t *testing.T) {
 	}
 }
 
-// A headless skip before the fallback succeeds must not replace the panewire
-// reason recorded in the receipt.
-func TestPanewireFallbackReasonSurvivesHeadlessSkips(t *testing.T) {
+// Configured headless profiles are never tried under the panewire executor:
+// a failed spawn records only the panewire skip.
+func TestPanewireFailureTriesNoConfiguredProfile(t *testing.T) {
 	runner := &panewireRunner{fakeRunner: fakeRunner{recommend: []string{"bad", "claude"}}, refuse: map[string]int{"reviewer": 70}}
 	s, g, r := panewireSetup(t, runner)
 	s.Config.Review.Pairings = map[string][]string{"openai": {"bad", "claude"}}
 	s.Config.Review.Profiles["bad"] = config.Reviewer{Family: "xai", Command: "grok", Args: []string{"--unknown", "x"}}
 	out := &bytes.Buffer{}
 	s.Out = out
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	if strings.Contains(out.String(), `"reviewer":"bad"`) || strings.Contains(out.String(), `"reviewer":"claude"`) || runner.quotaCalls != 0 {
+		t.Fatalf("headless profile tried: quota=%d %s", runner.quotaCalls, out)
 	}
-	got := g.passes[shaA][0]
-	if !strings.Contains(out.String(), `"reviewer":"bad","reason":"reviewer profile rejected"`) || got.Reviewer != "claude" || got.Fallback != "panewire: panewire spawn exit 70: exit status" {
-		t.Fatalf("%+v", got)
-	}
+	assertPanewirePassFailed(t, s, g, r, runner, e, "panewire spawn exit 70: exit status")
 }
 
 // A pass run without a context deadline waits up to review.timeout instead of
@@ -813,18 +803,16 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	}
 }
 
-// In panewire mode a failed usage read keeps the recommendation: the headless
-// fallback still has its ranked candidates, ordered without pace.
-func TestPanewireUsageFailureKeepsRankedFallback(t *testing.T) {
+// In panewire mode quota usage is never read, so a failing usage snapshot
+// changes nothing: a failed spawn fails the pass without ranked candidates.
+func TestPanewireIgnoresUsageFailure(t *testing.T) {
 	runner := &panewireRunner{usageErr: errors.New("usage snapshot unavailable"), refuse: map[string]int{"reviewer": 70}}
 	s, g, r := panewireSetup(t, runner)
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	if runner.quotaCalls != 0 {
+		t.Fatalf("quota calls=%d", runner.quotaCalls)
 	}
-	got := g.passes[shaA]
-	if runner.headless != 1 || len(got) != 1 || got[0].Reviewer != "claude" || !strings.Contains(got[0].Fallback, "panewire spawn exit 70") {
-		t.Fatalf("headless=%d %+v", runner.headless, got)
-	}
+	assertPanewirePassFailed(t, s, g, r, runner, e, "panewire spawn exit 70")
 }
 
 // A failed add -b that left no branch at the PR head never deletes a branch:
@@ -832,7 +820,7 @@ func TestPanewireUsageFailureKeepsRankedFallback(t *testing.T) {
 func TestPanewireFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", addFails: true}
 	s, _, r := panewireSetup(t, runner)
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); !errors.Is(e, ErrReviewUnavailable) {
 		t.Fatal(e)
 	}
 	for _, c := range gitCalls(runner, r.Root) {
@@ -844,15 +832,15 @@ func TestPanewireFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 
 // The W4 rule decides what a finished reviewer pane's hk record means:
 // completed with a result uses it; a pending or missing record and an
-// unreadable hk fall back after the bounded poll;
-// escalated and lost fall back immediately and the receipt keeps the state.
+// unreadable hk fail the pass after the bounded poll;
+// escalated and lost fail it immediately and the skip keeps the state.
 func TestPanewireJobRecordResultW4(t *testing.T) {
 	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
 	for name, tc := range map[string]struct {
 		record   *integrations.JobRecord
 		jobErr   error
 		result   string
-		executor string // pass executor: "panewire" or "" (headless)
+		executor string // "panewire" when the pane produced the pass, "" when it failed
 		reason   string
 		polled   bool // the record was asked for more than once
 	}{
@@ -872,22 +860,15 @@ func TestPanewireJobRecordResultW4(t *testing.T) {
 				runner.sink.missing = tc.record
 			}
 			runner.sink.jobErr = tc.jobErr
-			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-				t.Fatal(e)
-			}
+			e := s.Review(context.Background(), r, 7, "", Options{})
 			got := g.passes[shaA]
-			if len(got) != 1 || got[0].Executor != tc.executor {
-				t.Fatalf("%+v", got)
-			}
 			if tc.executor == "panewire" {
-				if got[0].Family != "google" || runner.headless != 0 {
-					t.Fatalf("%+v headless=%d", got[0], runner.headless)
+				if e != nil || len(got) != 1 || got[0].Executor != "panewire" || got[0].Family != "google" || runner.headless != 0 {
+					t.Fatalf("err=%v %+v headless=%d", e, got, runner.headless)
 				}
 				return
 			}
-			if runner.headless != 1 || !strings.Contains(got[0].Fallback, tc.reason) {
-				t.Fatalf("headless=%d %+v", runner.headless, got[0])
-			}
+			assertPanewirePassFailed(t, s, g, r, runner, e, tc.reason)
 			reads := 0
 			for _, id := range runner.sink.gets {
 				if id != "author-job" {

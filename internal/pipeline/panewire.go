@@ -53,7 +53,8 @@ var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 // panewire's reviewer role excludes the author's family; when panewire refuses
 // every other family the pass runs once more as a worker seat, which may be
 // the author's family. Anything that stops the pane from producing findings
-// is a skip unless a completed job has lost its result.
+// is a skip unless a completed job has lost its result; a skip fails the pass,
+// and the next review run spawns a new pane.
 type panewireExecutor struct {
 	s            *Service
 	repo         config.Repo
@@ -93,7 +94,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profile := ""
 	skip := func(format string, args ...any) (passOutcome, error) {
 		// Reasons can carry a command's stderr and reach the decision log
-		// and the posted receipt's fallback: redact them here.
+		// and the review-skipped audit: redact them here.
 		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
 		return out, nil
 	}
