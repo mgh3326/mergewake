@@ -315,3 +315,38 @@ func TestReapClosedJobIsNotMissing(t *testing.T) {
 		}
 	}
 }
+
+// The job path's pane guards keep their reasons: the status, jobs-dir, job
+// name and pane id checks that the other job tests do not name.
+func TestReapJobPathKeepsPaneGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pane   string
+		setup  func(*Service, *jobSink)
+		reason string
+	}{
+		{"working", strings.Replace(leadPane(""), `"idle"`, `"working"`, 1), nil, "status:working"},
+		{"no pane id", strings.Replace(leadPane(""), `"pane_id":"w2:p1"`, `"pane_id":""`, 1), nil, "pane-id-missing"},
+		{"jobs dir unset", leadPane(""), func(s *Service, _ *jobSink) { s.Config.Hosts[0].Jobs = "" }, "jobs-dir-unset"},
+		{"job name invalid", leadPane(""), func(_ *Service, sink *jobSink) {
+			sink.jobs["2497"] = "lead a"
+			sink.recs["lead a"] = sink.recs["lead-a"]
+		}, "job-name-invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, sink, run := leadFixture(t, tc.pane)
+			if tc.setup != nil {
+				tc.setup(s, sink)
+			}
+			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if run.called("pane\x00close") || run.called("panewire") {
+				t.Fatalf("closed: %q", run.calls)
+			}
+			if row := leadRow(t, s, "close-pane"); row == nil || row["result"] != "skipped" || row["reason"] != tc.reason {
+				t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
+			}
+		})
+	}
+}
