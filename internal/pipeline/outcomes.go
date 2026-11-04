@@ -26,6 +26,24 @@ func trailer(body, key string) string {
 	}
 	return matches[0][1]
 }
+
+var profileName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+// authorProfile parses a Mergewake-Author-Profile value. Workers write either
+// `profile` (the rstack wake brief) or `profile@effort`. An effort outside the
+// known levels keeps the profile and leaves effort empty; a name that fails
+// profileName or a value with more than one `@` records nothing.
+func authorProfile(value string) (profile, effort string) {
+	name, level, _ := strings.Cut(value, "@")
+	if strings.Contains(level, "@") || !profileName.MatchString(name) {
+		return "", ""
+	}
+	switch level {
+	case "low", "medium", "high", "xhigh", "max":
+		return name, level
+	}
+	return name, ""
+}
 func parsedTime(value string) *time.Time {
 	v, err := time.Parse(time.RFC3339, value)
 	if err != nil {
@@ -48,14 +66,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 		v.Effort = ""
 		v.Experiment = ""
 		v.Arm = ""
-		author := strings.Split(trailer(p.Body, "Mergewake-Author-Profile"), "@")
-		if len(author) == 2 && regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`).MatchString(author[0]) {
-			v.Profile = author[0]
-			switch author[1] {
-			case "low", "medium", "high", "xhigh", "max":
-				v.Effort = author[1]
-			}
-		}
+		v.Profile, v.Effort = authorProfile(trailer(p.Body, "Mergewake-Author-Profile"))
 		experiment := strings.SplitN(trailer(p.Body, "Mergewake-Experiment"), "/", 2)
 		if len(experiment) == 2 {
 			v.Experiment = experiment[0]
