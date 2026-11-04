@@ -358,3 +358,143 @@ func TestTaskEventFailureLeavesLand(t *testing.T) {
 		})
 	}
 }
+
+// revertSetup is a merged PR whose outcome row is final and attributed, with
+// watch revert PR #9 recorded, so reconciliation would skip the row once its
+// seven-day verdict is set.
+func revertSetup(t *testing.T, mergedAgo time.Duration) (*Service, *outcomeGH, *fakeHK, config.Repo) {
+	t.Helper()
+	s, g, hk, r := hkSetup(t)
+	merged := time.Now().UTC().Add(-mergedAgo).Format(time.RFC3339)
+	g.pull.State, g.pull.Merged, g.pull.MergedAt = "closed", true, &merged
+	g.pull.Body = "Mergewake-Author-Profile: example\nMergewake-Author-Model: example-model\nMergewake-Grade: B\nMergewake-Task: 2909\n"
+	source := &outcomeGH{fakeGH: g, first: true, recovery: github.Pull{Number: 9, State: "open"}}
+	s.GH = source
+	if e := s.ledger().Update(r.Name, 7, func(v *outcomes.Outcome) { v.RevertPR = 9 }); e != nil {
+		t.Fatal(e)
+	}
+	return s, source, hk, r
+}
+
+// reconcile runs ReconcileOutcomes, tolerating only the outcome publish
+// error of the fake store, which these tests do not exercise.
+func reconcile(t *testing.T, s *Service, r config.Repo, o Options) {
+	t.Helper()
+	if e := s.ReconcileOutcomes(context.Background(), r, map[int]bool{}, o); e != nil && !strings.Contains(e.Error(), "retained in outbox") {
+		t.Fatal(e)
+	}
+}
+
+func mergeRevert(g *outcomeGH, ago time.Duration) {
+	at := time.Now().UTC().Add(-ago).Format(time.RFC3339)
+	g.recovery.State, g.recovery.MergedAt = "closed", &at
+}
+
+// A shadow pass that sets the reverted verdict does not use up the revert
+// event: the next acting reconciliation posts it, once.
+func TestTaskEventRevertAfterShadowPass(t *testing.T) {
+	s, g, hk, r := revertSetup(t, 2*time.Hour)
+	mergeRevert(g, time.Hour)
+	reconcile(t, s, r, Options{Shadow: true})
+	state, _ := s.ledger().Read()
+	if v := state.Latest[outcomes.Key(r.Name, 7)]; v.Reverted == nil || !*v.Reverted || !v.Final || !v.Attributed() || v.FirstCIGreen == nil {
+		t.Fatalf("shadow pass did not finalize the row: %+v", v)
+	}
+	if len(hk.received()) != 0 {
+		t.Fatal("shadow pass posted")
+	}
+	for range 2 {
+		reconcile(t, s, r, Options{})
+	}
+	got := hk.received()
+	if len(got) != 1 {
+		t.Fatalf("events %+v", got)
+	}
+	revertURL := "https://github.com/example/project/pull/9"
+	wantEvent(t, got[0], integrations.SourceRevert, revertURL, testPRURL, testPRURL, revertURL)
+}
+
+// A revert PR merged after the seven-day verdict closed as not reverted still
+// posts its event.
+func TestTaskEventRevertAfterWindow(t *testing.T) {
+	s, g, hk, r := revertSetup(t, 8*24*time.Hour)
+	reconcile(t, s, r, Options{})
+	state, _ := s.ledger().Read()
+	if v := state.Latest[outcomes.Key(r.Name, 7)]; v.Reverted == nil || *v.Reverted {
+		t.Fatalf("verdict %+v", v.Reverted)
+	}
+	if len(hk.received()) != 0 {
+		t.Fatal("an open revert PR posted")
+	}
+	mergeRevert(g, time.Minute)
+	reconcile(t, s, r, Options{})
+	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceRevert {
+		t.Fatalf("events %+v", got)
+	}
+}
+
+// A revert merged before revertEventWindow is settled without a post, so the
+// first acting pass over an old ledger does not replay it.
+func TestTaskEventOldRevertNotReplayed(t *testing.T) {
+	s, g, hk, r := revertSetup(t, 20*24*time.Hour)
+	mergeRevert(g, 19*24*time.Hour)
+	for range 2 {
+		reconcile(t, s, r, Options{})
+	}
+	if got := hk.received(); len(got) != 0 {
+		t.Fatalf("replayed %+v", got)
+	}
+	sent, _ := s.taskEventKeys(r.Name)
+	if !sent.has(revertEventKey(r.Name, 9)) {
+		t.Fatal("old revert left pending")
+	}
+}
+
+// A hung hk never spends the review deadline: the reviewer runs and posts its
+// pass, and the review event goes out after the run.
+func TestTaskEventReviewKeepsDeadline(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	s.Config.Review.Timeout = "300ms"
+	s.Runner = deadlineRunner{s.Runner.(*fakeRunner)}
+	hk.delay = 2 * time.Second // each of 3 tries times out at 200ms
+	if e := s.Review(context.Background(), r, 7, "openai", Options{Observed: true}); e != nil {
+		t.Fatal(e)
+	}
+	if g.postCount != 1 {
+		t.Fatalf("review posts %d", g.postCount)
+	}
+	got := hk.received()
+	if len(got) != 3 || got[0].Source != integrations.SourceReview {
+		t.Fatalf("events %+v", got)
+	}
+}
+
+// deadlineRunner is a reviewer that fails once its deadline has passed, as a
+// real reviewer process is killed.
+type deadlineRunner struct{ *fakeRunner }
+
+func (r deadlineRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if e := ctx.Err(); e != nil {
+		return nil, e
+	}
+	return r.fakeRunner.Run(ctx, command, args, input, dir)
+}
+
+// A task ID beyond int64 is audited and never posted, and the PR is not
+// retried on every poll.
+func TestTaskEventTaskIDOverflow(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	g.pull.Body = "Mergewake-Task: 9223372036854775808\n"
+	for range 2 {
+		if e := s.ObservePR(context.Background(), r, g.pull, Options{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if got := hk.received(); len(got) != 0 {
+		t.Fatalf("posted %+v", got)
+	}
+	rows := taskEventAudit(t, s, r.Name)
+	if len(rows) != 1 || !strings.Contains(rows[0].Error, "out of range") {
+		t.Fatalf("audit %+v", rows)
+	}
+}
