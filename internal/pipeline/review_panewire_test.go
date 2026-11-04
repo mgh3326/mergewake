@@ -294,6 +294,7 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
+	g.refs = map[string]bool{doneRef(7, shaB): true}
 	large := "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+" + strings.Repeat("large delta 한글 ", 6000) + "\n"
 	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {

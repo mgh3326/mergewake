@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,19 +23,28 @@ const patchTwo = patchOne + "@@ -10,2 +10,3 @@\n ctx\n+added line\n ctx2\n"
 // records what PostReview was given.
 type roundGH struct {
 	*fakeGH
-	heads  []github.ReviewedHead
-	full   string
-	old    string
-	posted [][]github.Finding
-	ciUp   *bool
+	heads    []github.ReviewedHead
+	full     string
+	old      string
+	posted   [][]github.Finding
+	ciUp     *bool
+	doneErr  map[string]error
+	compared string
 }
 
 func (g *roundGH) Diff(context.Context, string, int) (string, error) { return g.full, nil }
 func (g *roundGH) ReviewedHeads(context.Context, string, int, string) ([]github.ReviewedHead, error) {
 	return g.heads, nil
 }
-func (g *roundGH) CompareDiff(context.Context, string, string, string) (string, error) {
+func (g *roundGH) CompareDiff(_ context.Context, _, _, head string) (string, error) {
+	g.compared = head
 	return g.old, nil
+}
+func (g *roundGH) ReviewClaimed(ctx context.Context, repo string, n int, sha string) (bool, error) {
+	if err := g.doneErr[sha]; err != nil {
+		return false, err
+	}
+	return g.fakeGH.ReviewClaimed(ctx, repo, n, sha)
 }
 func (g *roundGH) PostReview(ctx context.Context, repo string, n int, sha string, f []github.Finding, meta github.PassReceipt) error {
 	g.posted = append(g.posted, f)
@@ -63,6 +73,12 @@ func roundSetup(t *testing.T, heads []github.ReviewedHead, old, full, out string
 	t.Helper()
 	s, g, _, _, r := setup(t)
 	rg := &roundGH{fakeGH: g, heads: heads, old: old, full: full}
+	g.refs = map[string]bool{}
+	for _, h := range heads {
+		if h.SHA != g.pull.Head.SHA {
+			g.refs["mergewake/reviews/7/"+h.SHA+"-done"] = true
+		}
+	}
 	run := &roundRunner{fakeRunner: &fakeRunner{}, out: out}
 	s.GH, s.Runner = rg, run
 	return s, rg, run, r
@@ -75,6 +91,50 @@ func fjson(line int, severity, body string) string {
 func fsjson(items ...string) string { return `{"findings":[` + strings.Join(items, ",") + `]}` }
 
 var priorHeads = []github.ReviewedHead{{SHA: shaB, Round: 1}}
+
+func TestPlanRoundCompletedBase(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		heads     []github.ReviewedHead
+		done      []string
+		err       error
+		old       string
+		wantBase  string
+		wantRound int
+		wantNote  string
+		wantEmpty bool
+	}{
+		{name: "incomplete prior", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, wantRound: 2, wantNote: "no completed prior head"},
+		{name: "skip incomplete newest", heads: []github.ReviewedHead{{SHA: shaC, Round: 1}, {SHA: shaB, Round: 2}}, done: []string{shaC}, old: patchOne, wantBase: shaC, wantRound: 3},
+		{name: "completed prior", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, done: []string{shaB}, old: patchOne, wantBase: shaB, wantRound: 2},
+		{name: "probe error", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, err: errors.New("probe failed"), old: patchOne, wantRound: 2, wantNote: "probe failed"},
+		{name: "probe skipped", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, err: github.ErrPollSkipped, old: patchOne, wantRound: 2, wantNote: github.ErrPollSkipped.Error()},
+		{name: "identical completed", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, done: []string{shaB}, old: patchTwo, wantBase: shaB, wantRound: 1, wantEmpty: true},
+		{name: "identical incomplete", heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchTwo, wantRound: 2, wantNote: "no completed prior head"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, r := roundSetup(t, tt.heads, tt.old, patchTwo, fsjson())
+			g.refs = map[string]bool{}
+			for _, sha := range tt.done {
+				g.refs["mergewake/reviews/7/"+sha+"-done"] = true
+			}
+			if tt.err != nil {
+				g.doneErr = map[string]error{shaB + "-done": tt.err}
+			}
+			rp := s.planRound(context.Background(), r, g.pull, patchTwo)
+			if rp.base != tt.wantBase || rp.round != tt.wantRound || rp.empty != tt.wantEmpty || rp.quiet != tt.wantEmpty || !strings.Contains(rp.note, tt.wantNote) {
+				t.Fatalf("plan = %+v", rp)
+			}
+			wantDiff := patchTwo
+			if tt.wantBase != "" && !tt.wantEmpty {
+				wantDiff = interdiff(tt.old, patchTwo)
+			}
+			if rp.diff != wantDiff || g.compared != tt.wantBase {
+				t.Fatalf("diff %q compared %q; want %q and %q", rp.diff, g.compared, wantDiff, tt.wantBase)
+			}
+		})
+	}
+}
 
 func TestRoundOneReviewsTheWholeDiff(t *testing.T) {
 	s, g, run, r := roundSetup(t, nil, "", patchTwo, fsjson())
