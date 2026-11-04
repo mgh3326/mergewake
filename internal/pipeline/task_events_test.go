@@ -498,3 +498,26 @@ func TestTaskEventTaskIDOverflow(t *testing.T) {
 		t.Fatalf("audit %+v", rows)
 	}
 }
+
+// Unreadable sent keys keep a final row with a revert PR in reconciliation:
+// the read failure is audited each poll instead of the row being skipped.
+func TestTaskEventRevertKeysUnreadable(t *testing.T) {
+	s, g, hk, r := revertSetup(t, 2*time.Hour)
+	mergeRevert(g, time.Hour)
+	reconcile(t, s, r, Options{Shadow: true}) // finalizes the row
+	if e := os.MkdirAll(filepath.Join(s.state(r.Name), "hk-task-events"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	reconcile(t, s, r, Options{})
+	rows := taskEventAudit(t, s, r.Name)
+	if len(rows) != 1 || !strings.Contains(rows[0].Error, "sent keys unreadable") || len(hk.received()) != 0 {
+		t.Fatalf("audit %+v events %d", rows, len(hk.received()))
+	}
+	if e := os.Remove(filepath.Join(s.state(r.Name), "hk-task-events")); e != nil {
+		t.Fatal(e)
+	}
+	reconcile(t, s, r, Options{})
+	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceRevert {
+		t.Fatalf("events %+v", got)
+	}
+}
