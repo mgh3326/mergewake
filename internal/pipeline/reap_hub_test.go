@@ -27,7 +27,10 @@ type fakeReapHub struct {
 	close    map[string]any
 	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
 	wtHead   string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
-	commands []map[string]any
+	wtPaths  map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
+	// removeOutcome is worktree.remove's answer; "removed" when empty.
+	removeOutcome string
+	commands      []map[string]any
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -73,12 +76,12 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		switch body["op"] {
 		case "worktree.inspect":
 			result = map[string]any{"worktree": nil}
-			if body["args"].(map[string]any)["cwd"] == "/repo.wt" {
+			if cwd := body["args"].(map[string]any)["cwd"].(string); cwd == "/repo.wt" || h.wtPaths[cwd] {
 				head := h.wtHead
 				if head == "" {
 					head = headSHA
 				}
-				result = map[string]any{"worktree": map[string]any{"path": "/repo.wt", "branch": "wk/x", "head": head, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
+				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": "wk/x", "head": head, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
 			}
 		case "pane.read":
 			result = h.composer
@@ -89,7 +92,11 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		case "pane.close":
 			result = h.close
 		case "worktree.remove":
-			result = map[string]any{"outcome": "removed"}
+			outcome := h.removeOutcome
+			if outcome == "" {
+				outcome = "removed"
+			}
+			result = map[string]any{"outcome": outcome}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "cmd-1", "machine": "node-a", "op": body["op"], "result": result})
 	}))

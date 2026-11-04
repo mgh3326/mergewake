@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,7 +39,10 @@ type panewireRunner struct {
 	refuseStderr string
 	findings     string // "" writes no findings file
 	family       string
-	noEvents     bool // the pane ran on another host: no spawn events in the local job dir
+	noEvents     bool   // the pane ran on another host: no spawn events in the local job dir
+	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
+	waitTimeout  bool   // the spawn ran its pane, then its --wait timed out (non-zero exit)
+	unplaced     bool   // the OK line names no placement receipt
 	quotaErr     error
 	usageErr     error
 	spawns       [][]string
@@ -135,7 +139,16 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		if r.afterRun != nil {
 			r.afterRun()
 		}
-		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool\nwait job=l outcome=completed report= pane=p1\n"), nil
+		if r.waitTimeout {
+			return nil, panewireExit(1)
+		}
+		// By default the pane reports a remote placement, so the pass keeps
+		// the local checkout cleanup it had before the reviewer-pane close.
+		placement := r.placement
+		if placement == "" && !r.unplaced {
+			placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"p1"}`))
+		}
+		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool" + placement + "\nwait job=l outcome=completed report= pane=p1\n"), nil
 	}
 	r.headless++
 	return r.fakeRunner.Run(ctx, command, args, input, dir)
