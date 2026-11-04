@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -84,5 +86,38 @@ func TestUnknownFamilyBlockLandAndNotice(t *testing.T) {
 	notices := auditRecords(t, out.Bytes(), "pr-notify")
 	if len(notices) != 1 || notices[0]["review_block"] != "blocked: author-family-unknown" || !strings.Contains(f.n.events[len(f.n.events)-1].Text, "review_missing (blocked: author-family-unknown)") {
 		t.Fatalf("audit=%s events=%+v", out.String(), f.n.events)
+	}
+}
+
+func TestFixedTaskBlockClearsBeforeFamilyError(t *testing.T) {
+	f := blockSetup(t)
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	f.g.pull.Body = "Mergewake-Task: 42\n"
+	f.g.commitErr = map[string]error{shaA: errors.New("commit unavailable")}
+	if e := f.review(t); e == nil || errors.Is(e, ErrReviewBlocked) {
+		t.Fatalf("want commit error: %v", e)
+	}
+	if got := f.blocked(t, 7); got != "" {
+		t.Fatalf("stale block: %q", got)
+	}
+}
+
+func TestGateKeepsVerdictWhenBlockLedgerUnreadable(t *testing.T) {
+	f := familyBlockSetup(t)
+	if e := os.MkdirAll(f.s.Config.StateDir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(f.s.Config.StateDir, "outcomes.jsonl"), []byte("invalid json\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	p, e := f.s.Policy(context.Background(), f.r, shaB)
+	if e != nil {
+		t.Fatal(e)
+	}
+	v, e := f.s.mergeGate(context.Background(), f.r, f.g.pull, p, shaB)
+	if e != nil || v.State != "blocked" || strings.Join(v.Reasons, ",") != "review_missing" || v.Review.Block != "" {
+		t.Fatalf("verdict=%+v error=%v", v, e)
 	}
 }

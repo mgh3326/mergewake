@@ -229,11 +229,9 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")
-		ledger, err := s.ledger().Read()
-		if err != nil {
-			return v, err
+		if ledger, err := s.ledger().Read(); err == nil {
+			v.Review.Block = ledger.Latest[outcomes.Key(r.Name, pr.Number)].ReviewBlocked[pr.Head.SHA]
 		}
-		v.Review.Block = ledger.Latest[outcomes.Key(r.Name, pr.Number)].ReviewBlocked[pr.Head.SHA]
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)
 	if e != nil {

@@ -206,6 +206,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return s.blockReview(ctx, r, pr, b, o)
 		}
 	}
+	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+		return e
+	}
 	if !complete {
 		if family == "" {
 			m := familyTrailer.FindStringSubmatch(pr.Body)
@@ -243,9 +246,6 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
-	}
-	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
-		return e
 	}
 	posted := map[int]github.PassReceipt{}
 	for _, receipt := range receipts {
