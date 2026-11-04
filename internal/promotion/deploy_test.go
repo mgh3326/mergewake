@@ -9,6 +9,7 @@ import (
 
 type sgFake struct {
 	status string
+	after  string // status after a deploy call, if set
 	code   int
 	calls  [][]string
 }
@@ -25,6 +26,9 @@ func (f *sgFake) Command(_ context.Context, name string, args ...string) ([]byte
 		}
 		return []byte(f.status), 0, nil
 	case "deploy":
+		if f.after != "" {
+			f.status = f.after
+		}
 		return nil, f.code, nil
 	}
 	return nil, 2, nil
@@ -160,7 +164,13 @@ func TestPass_AdmitsInsideLockAndDeploysCurrentPointer(t *testing.T) {
 func TestPass_FailedImageIsHeldUntilANewerPromotion(t *testing.T) {
 	w := gWorld(t)
 	led := memLedger{}
-	f := &sgFake{status: sgStatus(digestOf("base"), "", false), code: 1}
+	// A pull failure (exit 1, not image-specific) is retried, not held.
+	f := &sgFake{status: sgStatus(digestOf("base"), "", false), after: withLastOp(sgStatus(digestOf("base"), "", false), digestOf("G"), "pull_failed"), code: 1}
+	if o, code, e := pass(t, w, f, noLock{}, led); o == DeployFailed || code != 1 || e == nil || len(led) != 0 {
+		t.Fatal(o, code, e, led)
+	}
+	// A confirmed image-specific abort is held.
+	f = &sgFake{status: sgStatus(digestOf("base"), "", false), after: withLastOp(sgStatus(digestOf("base"), "", false), digestOf("G"), "unhealthy"), code: 1}
 	if o, code, _ := pass(t, w, f, noLock{}, led); o != DeployFailed || code != 1 || !led[digestOf("G")] {
 		t.Fatal(o, code, led)
 	}
@@ -177,7 +187,7 @@ func TestPass_FailedImageIsHeldUntilANewerPromotion(t *testing.T) {
 		t.Fatal(o, e)
 	}
 	led2 := memLedger{}
-	for _, f := range []*sgFake{{status: ""}, {status: sgStatus(digestOf("base"), "", false), code: 75}, {status: sgStatus(digestOf("base"), "", false), code: 3}} {
+	for _, f := range []*sgFake{{status: ""}, {status: sgStatus(digestOf("base"), "", false), code: 75}, {status: sgStatus(digestOf("base"), "", false), code: 3}, {status: sgStatus(digestOf("base"), "", false), code: 1}} {
 		pass(t, w, f, noLock{}, led2)
 	}
 	if len(led2) != 0 {
@@ -199,4 +209,8 @@ func TestFileLedger(t *testing.T) {
 	if ok, _ := l.Failed("sha256:b"); ok {
 		t.Fatal("wrong digest held")
 	}
+}
+
+func withLastOp(status, digest, result string) string {
+	return strings.Replace(status, `{"name":"brewdial-api",`, `{"name":"brewdial-api","last_op":{"op":"deploy","to_digest":"`+digest+`","result":"`+result+`"},`, 1)
 }

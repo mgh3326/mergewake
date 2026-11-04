@@ -46,10 +46,20 @@ type sgState struct {
 	Hold    *sgSlot         `json:"hold"`
 	Pending json.RawMessage `json:"pending"`
 }
-type sgService struct {
-	Name  string   `json:"name"`
-	State *sgState `json:"state"`
+type sgOp struct {
+	Op       string `json:"op"`
+	ToDigest string `json:"to_digest"`
+	Result   string `json:"result"`
 }
+type sgService struct {
+	Name   string   `json:"name"`
+	State  *sgState `json:"state"`
+	LastOp *sgOp    `json:"last_op"`
+}
+
+// imageResults are the deploy results shiftgate follow holds: the image
+// itself failed. Anything else (pull_failed, host errors) retries.
+var imageResults = map[string]bool{"unhealthy": true, "target_not_running": true, "pre_deploy_failed": true}
 
 // Outcome is what a deploy pass did.
 type Outcome string
@@ -133,7 +143,12 @@ func Deploy(ctx context.Context, adm Admission, service string, g Shiftgate) (Ou
 	case code == 75:
 		return Retry, ExitRetry, nil
 	case code == ExitDeployFailed:
-		return DeployFailed, code, fmt.Errorf("shiftgate deploy %s failed; the old colour serves", adm.Digest)
+		// Hold only a confirmed image-specific abort, read from shiftgate's
+		// own record of this deploy; anything else retries next run.
+		if op, e := g.lastOp(ctx, service); e == nil && op != nil && op.Op == "deploy" && op.ToDigest == adm.Digest && imageResults[op.Result] {
+			return DeployFailed, code, fmt.Errorf("shiftgate deploy %s failed (%s); the old colour serves", adm.Digest, op.Result)
+		}
+		return "", code, fmt.Errorf("shiftgate deploy %s exited 1 without an image-specific result; retrying next run", adm.Digest)
 	case code != 0:
 		return "", code, fmt.Errorf("shiftgate deploy %s exited %d", adm.Digest, code)
 	}
@@ -152,7 +167,20 @@ func decide(st *sgState, digest string) Outcome {
 	return ""
 }
 
-func (g Shiftgate) status(ctx context.Context, service string) (*sgState, error) {
+func (g Shiftgate) lastOp(ctx context.Context, service string) (*sgOp, error) {
+	all, e := g.services(ctx)
+	if e != nil {
+		return nil, e
+	}
+	for _, s := range all {
+		if s.Name == service {
+			return s.LastOp, nil
+		}
+	}
+	return nil, deny("shiftgate status has no service %s", service)
+}
+
+func (g Shiftgate) services(ctx context.Context) ([]sgService, error) {
 	out, code, e := g.run(ctx, "status", "--json")
 	if e != nil || code != 0 {
 		return nil, deny("shiftgate status failed (exit %d): %v", code, e)
@@ -160,6 +188,14 @@ func (g Shiftgate) status(ctx context.Context, service string) (*sgState, error)
 	var all []sgService
 	if e := json.Unmarshal(out, &all); e != nil {
 		return nil, deny("shiftgate status is not JSON: %v", e)
+	}
+	return all, nil
+}
+
+func (g Shiftgate) status(ctx context.Context, service string) (*sgState, error) {
+	all, e := g.services(ctx)
+	if e != nil {
+		return nil, e
 	}
 	for _, s := range all {
 		if s.Name == service {
