@@ -46,6 +46,7 @@ type fakeGH struct {
 	findings                                                     int
 	passes                                                       map[string][]github.PassReceipt
 	feedback                                                     github.ReviewFeedback
+	feedbackHead                                                 string
 	refs                                                         map[string]bool
 	leaseTimes                                                   map[string]time.Time
 	files                                                        []policy.File
@@ -207,6 +208,9 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
 	fb.HeadSHA = g.pull.Head.SHA
+	if g.feedbackHead != "" {
+		fb.HeadSHA = g.feedbackHead
+	}
 	return fb, nil
 }
 func (g *fakeGH) Unresolved(context.Context, string, int) (int, error) { return g.findings, nil }

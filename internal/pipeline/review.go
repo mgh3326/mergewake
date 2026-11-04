@@ -160,7 +160,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return e
 	}
 	if len(files) != pr.ChangedFiles {
-		return errors.New("incomplete PR file list")
+		// changed_files and the files list disagree just after a push: no
+		// usable data this round. The retry loop treats this sentinel as a
+		// skip, not a failure.
+		return fmt.Errorf("PR file list is settling: %w", github.ErrPollSkipped)
 	}
 	needed := 1
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {

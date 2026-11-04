@@ -65,7 +65,8 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
 	key := method + " " + endpoint + " " + accept
-	if method == "GET" && ctx.Value(freshRequestKey{}) == nil {
+	fresh := ctx.Value(freshRequestKey{}) != nil || ctx.Value(freshEvidenceKey{}) != nil
+	if method == "GET" && !fresh {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
 		} else if hit.Replay && hit.Code == http.StatusNotFound {
@@ -74,7 +75,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
-	release, cached, e := c.beginRequest(ctx, key, ctx.Value(freshRequestKey{}) != nil)
+	release, cached, e := c.beginRequest(ctx, key, fresh)
 	if e != nil {
 		return nil, e
 	}

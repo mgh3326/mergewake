@@ -140,7 +140,9 @@ func (s *Service) retryReviewStatus(ctx context.Context, r config.Repo, pr githu
 		return false, false, err
 	}
 	if len(files) != pr.ChangedFiles {
-		return false, false, errors.New("incomplete PR file list")
+		// The file list is still settling: skip this pass without a failure,
+		// as for a live lease.
+		return false, true, nil
 	}
 	needed := 1
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
