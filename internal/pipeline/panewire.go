@@ -337,7 +337,7 @@ func (x *panewireExecutor) spawnBrief(ctx context.Context, path, jobDir string) 
 	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
 		return "", errors.New("uploaded review brief sha256 mismatch")
 	}
-	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal. The local source copy is %s.\n", id, len(body), shellQuote(files.AttachmentCommand()), id, path)
+	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal.\n", id, len(body), shellQuote(filepath.Base(files.AttachmentCommand())), id)
 	pointer := filepath.Join(jobDir, "review-prompt.md")
 	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
 }
