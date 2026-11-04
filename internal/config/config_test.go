@@ -764,3 +764,16 @@ func TestReviewRecoveryDurationsRejectNonPositive(t *testing.T) {
 		}
 	}
 }
+
+// hk_task_events is on unless a repo sets it false.
+func TestHKTaskEventsDefault(t *testing.T) {
+	for text, want := range map[string]bool{"": true, "hk_task_events: true\n": true, "hk_task_events: false\n": false} {
+		var r Repo
+		if e := Decode(strings.NewReader("name: example/project\n"+text), &r); e != nil {
+			t.Fatal(e)
+		}
+		if r.TaskEventsOn() != want {
+			t.Fatalf("%q: on=%v", text, r.TaskEventsOn())
+		}
+	}
+}
