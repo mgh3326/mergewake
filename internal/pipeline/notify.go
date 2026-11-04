@@ -64,16 +64,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return e
 	}
 	record := struct {
-		PR      int      `json:"pr"`
-		Head    string   `json:"head"`
-		State   string   `json:"state"`
-		Reasons []string `json:"reasons,omitempty"`
-		Lane    string   `json:"lane,omitempty"`
-		Via     string   `json:"via,omitempty"`
-		Sent    bool     `json:"sent"`
-		Deduped bool     `json:"deduped,omitempty"`
-		Error   string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons}
+		PR          int      `json:"pr"`
+		Head        string   `json:"head"`
+		State       string   `json:"state"`
+		Reasons     []string `json:"reasons,omitempty"`
+		ReviewBlock string   `json:"review_block,omitempty"`
+		Lane        string   `json:"lane,omitempty"`
+		Via         string   `json:"via,omitempty"`
+		Sent        bool     `json:"sent"`
+		Deduped     bool     `json:"deduped,omitempty"`
+		Error       string   `json:"error,omitempty"`
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ReviewBlock: v.Review.Block}
 	if o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
@@ -103,6 +104,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	summary := pr.Title
 	if v.State == "blocked" {
 		summary = strings.Join(v.Reasons, "; ")
+		if v.Review.Block != "" {
+			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
+		}
 	}
 	if n := v.Review.Findings.DismissedBlocking; v.State == "ready" && n > 0 {
 		// A dismissed critical/high no longer holds the gate; the desk still
