@@ -36,6 +36,7 @@ Usage: mergewake <command> [flags]
   release    Publish a verified manifest as a GitHub Release asset
   rollout    Pull and install the latest verified manifest once
   daemon     Run enabled pipeline roles (shadow by default)
+  server     Migrate or check the durable PR server store
   agent      Poll configured repositories and perform verified rollouts
   reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
@@ -79,6 +80,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	if args[0] == "notify" {
 		return runNotify(ctx, args[1:], out, stderr)
+	}
+	if args[0] == "server" {
+		return runServerStore(ctx, args[1:], out, stderr)
 	}
 	command := args[0]
 	switch command {

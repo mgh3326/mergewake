@@ -77,8 +77,7 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 }
 
 // reapTask is prTask for a merged PR: the same trailer lookup, reading the head
-// commit through the memo the update-merge match shares, so the commit is read
-// at most once per PR.
+// commit through the memo, so the commit is read at most once per PR.
 func (s *Service) reapTask(ctx context.Context, r config.Repo, p github.Pull) (string, error) {
 	if t := trailer(p.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
 		return t, nil
