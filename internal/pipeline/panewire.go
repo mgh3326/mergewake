@@ -79,10 +79,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	// profile is the launch profile in the reviewer's hk job record; it stays
+	// empty until a spawned pane's record has been read.
+	profile := ""
 	skip := func(format string, args ...any) (passOutcome, error) {
 		// Reasons can carry a command's stderr and reach the decision log
 		// and the posted receipt's fallback: redact them here.
-		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host})
+		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
 		return out, nil
 	}
 	root := config.Expand(x.repo.Root)
@@ -226,6 +229,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 	}
+	profile = res.rec.Profile
 	var b []byte
 	switch {
 	case res.result != nil:
