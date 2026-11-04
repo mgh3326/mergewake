@@ -103,7 +103,9 @@ func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerP
 	defer cancel()
 	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: p.checkout}}
 	if !p.confirmed {
-		c.record("skipped", "spawn did not name a host and pane")
+		// The pane's host is unknown, so it may still run in the local checkout.
+		*p.keepLocalCheckout = true
+		c.record("pending-cleanup", "spawn named no host and pane; checkout kept")
 		return
 	}
 	c.local = p.placement.Host == "local" || x.localReviewerHost(p.placement.Host)

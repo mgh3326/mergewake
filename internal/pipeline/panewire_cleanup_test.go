@@ -24,6 +24,7 @@ type cleanupOpts struct {
 	forbid           []string                  // hub ops answered 403
 	waitTimeout      bool                      // the spawn's --wait timed out after its pane started
 	refuseAll        bool                      // both the reviewer and the worker seat are refused before any pane starts
+	noPlacement      bool                      // the spawn's OK line names no placement receipt
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
 }
 
@@ -63,7 +64,10 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
+	runner.unplaced = o.noPlacement
+	if !o.noPlacement {
+		runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
+	}
 	runner.waitTimeout = o.waitTimeout
 	if o.refuseAll {
 		runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
@@ -289,5 +293,26 @@ func TestSpawnPlacementKeepsHostWhenPlacementOmitsIt(t *testing.T) {
 	got, ok := spawnPlacement("OK pane=p1 host=node-a placement=" + placement + "\n")
 	if !ok || got.Host != "node-a" || got.PaneID != "w1:p1" {
 		t.Fatalf("placement = %+v confirmed=%v", got, ok)
+	}
+}
+
+// Without a placement the pane's host is unknown, so the pass cannot rule out
+// a pane running in the local checkout. The checkout stays, named for later.
+func TestReviewerCleanupKeepsCheckoutWhenPlacementUnconfirmed(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("an unplaced pane was touched: hub ops = %v", res.hubOps())
+	}
+	for _, call := range gitCalls(res.runner, res.repo.Root) {
+		if strings.Contains(call, "worktree remove") {
+			t.Fatalf("the checkout of an unplaced pane was removed: git %q", call)
+		}
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || !strings.Contains(receipts[0].Worktree, "checkouts") {
+		t.Fatalf("receipts = %+v", receipts)
 	}
 }
