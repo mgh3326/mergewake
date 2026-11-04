@@ -1,0 +1,183 @@
+# Deploy entry-point inventory
+
+This inventory lists every way code from this account's repositories reaches a host, so that deploy can become the strict gate after independent review. It also names the first path to gate. It changes nothing: no consumer, ruleset or updater moves until slice 2.
+
+Terms used here:
+
+- **Publication** makes an artifact available (a release, an image, a moved tag). **Execution** puts it on a host. They are separate rows, because gating one does not gate the other.
+- **Full post-merge suite** is the set of jobs that runs on a push to the default branch, at that exact SHA, and tests the code.
+- **Admission check** is what the entry point verifies before it changes a running service.
+- Private repositories appear by role: *private application repo A* and *B*, *the private control repo*, *the private updater repo*. Hosts appear by role.
+- **The four-repo application group** is auto_trader, fillwire, and private application repos A and B (private control repo `memory/project_at_integrator_role_1016.md:13`).
+- **D\<n\>** is a read-only command that the desk ran on a host. Its result settles a fact that no repository shows.
+
+## Enumeration
+
+| Step | Command | Result |
+|---|---|---|
+| Repositories, as briefed | `gh repo list mgh3326 --no-archived --limit 300` | 300 rows: the limit truncates the list |
+| Repositories, complete | `gh repo list mgh3326 --no-archived --limit 1000 --json name --jq length` | 554 |
+| Cross-check | `gh api --paginate 'user/repos?affiliation=owner&per_page=100'` | 557 owned, 3 archived, 554 not archived |
+| Registered workflows, per repository | `gh api --paginate 'repos/mgh3326/<repo>/actions/workflows?per_page=100'` | 74, all `active` |
+| Workflow files, per repository | `gh api 'repos/mgh3326/<repo>/contents/.github/workflows?ref=<default branch>'`, then each file with `Accept: application/vnd.github.raw` | 151 files (149 workflows, 2 helper scripts) in 38 repositories |
+| Non-workflow deploy files, per repository | `gh api 'repos/mgh3326/<repo>/git/trees/<default branch>?recursive=1'`, filtered for install, bootstrap, deploy, rollout, release and update scripts, `*.service`, `*.timer`, `*.plist`, cron and compose files | 695 paths in the 554 repositories |
+
+Coverage has no gaps: every failed read was a 404 (no workflow directory) or an empty repository. The 3 archived repositories (runtug, agent-skills, paneglance) are outside the sweep. runtug was read separately, because the updater manifest example still names it.
+
+The 80 workflow files that are not registered are all in forks whose Actions never ran them. They cannot deploy until someone enables them. Conversely, 5 of the 74 registered workflows are not on a default branch, and only ever ran for a pull request. See [Candidates ruled out](#candidates-ruled-out).
+
+Repository evidence is pinned to these default-branch commits:
+
+| Repository | Commit | Repository | Commit |
+|---|---|---|---|
+| auto_trader | `aa61042` | mergewake | `969c151` |
+| brewdial | `f766282` | pacelever | `b62e68f` |
+| broker-edge | `b6b4d9d` | panewire | `6b347f3` |
+| cordglean | `12e458a` | rstack | `2a127d9` |
+| fillwire | `d04491b` | shiftgate | `4f8347a` |
+| handoffkeep | `89ff16b` | private application repo A | `4996a69` |
+| monostrike | `d6ecd90` | private application repo B | `cdde0dc` |
+| rent_rader | `8600785` | private control repo | `2d71344` |
+| life-log | `478cdbd` | private updater repo | `9cf1d0e` |
+
+## Publication entry points
+
+These rows make an artifact available and touch no host.
+
+| Entry point | Repo(s) | Trigger | Artifact source | Full post-merge suite | Who executes it | Current admission check | Bypasses | Enabled state | Evidence | Unknown |
+|---|---|---|---|---|---|---|---|---|---|---|
+| P1. `deploy-oci.yml` moves the `production` image tag | brewdial | Push to `production`; `workflow_dispatch` with `dry_run=false`. Pull requests build and push but do not move the tag. | arm64 image built by this workflow at the pushed commit; the tag receives the exact manifest bytes of the pushed digest | `CI Gate`: `Typecheck, Lint & Test`. `Kotlin API CI`: `API paths changed`, `API tests (PostgreSQL 17)`, `API tests (MySQL 8.4)`, `Data copy (PostgreSQL <-> MySQL)`, `API tests (PostgreSQL + MySQL)`. Also `deploy-scripts.yml`: `scripts` and `shiftgate-render.yml`: `render` (both path filtered); `k8s-validate.yml`: `k3d`. None runs on `production`, and this workflow reads none of them. | GitHub Actions; a person pushes `main` to `production` | Commit must be on `main`; a run that is not the `production` tip skips the tag move. No CI check. The `oci-production` environment has no protection rules, despite the workflow comment. | `production` is unprotected. Any holder of `packages: write` can move the tag outside this workflow. | Active. Last `production` run: `f766282`, success, 2026-11-01. | brewdial `.github/workflows/deploy-oci.yml:28`, `:97`, `:169`, `:183`, `:196`; `docs/runbooks/oci-heatwave-cutover.md:119` | |
+| P2. Main-branch images (`sha-<short>`, `latest`) | brewdial | Push to `main` (`image-kt.yml` is limited to its paths) | Images built by `image.yml` and `image-kt.yml` | As P1 | GitHub Actions | None; these runs do not wait for CI | Moving `latest` | Active. Not read by follow (X1). Read by the k3s route (X3). | brewdial `.github/workflows/image.yml:11`; `.github/workflows/image-kt.yml:8`; `.github/workflows/deploy-oci-k3s.yml:21` | |
+| P3. `deploy.yml` application image (`sha-<short7>`, `main`, `latest`) | auto_trader | `workflow_run` after `Test` on a `main` push; `workflow_dispatch`; published release | Multi-arch image built at the exact `Test` head SHA; the OCI revision label records it | `Test`: `lint`, `taskiq-smoke`, `test (3.13, 1)` to `test (3.13, 4)` | GitHub Actions | `deploy_ci_gate.py` requires all six jobs green at that SHA, before the build and again before the moving tags | `allow_unverified` dispatch input, with a logged reason | Active. Last run: success, 2026-11-03. | auto_trader `.github/workflows/deploy.yml:5`, `:11`, `:76`, `:228`; `scripts/deploy_ci_gate.py:23`; `docs/runbooks/ncp-pull-deploy.md:66` | |
+| P4. `build-caddy.yml` legacy Caddy image | auto_trader | Push to `production` (path filtered); `workflow_dispatch` | Caddy image | none | GitHub Actions | None | Not applicable | Active, and the runbook says the NCP path does not use this image | auto_trader `.github/workflows/build-caddy.yml:5`; `docs/runbooks/ncp-pull-deploy.md:93` | |
+| P5. Auto-tag plus release binaries | mergewake, pacelever, panewire, handoffkeep, fillwire | Each code-bearing `main` push tags the next patch and dispatches the release | Release assets and `SHA256SUMS` at the tag | mergewake `CI`: `vet`, `test`, `build-{linux,darwin}-{amd64,arm64}`, `auto-tag-test`. pacelever `CI`: `vet`, `test`, `probe-macos`, build matrix, `auto-tag-test`. panewire `CI`: `test (ubuntu-latest)`, `test (macos-latest)`, `postgres`, `ci-ok`, `auto-tag-test`. handoffkeep `ci`: `test`, `vitest`, build matrix, `auto-tag-test`. fillwire `CI`: `verify`, `secrets`, `publish`, `auto-tag-test`. | GitHub Actions | The release's own `build` and `test` jobs. It does not wait for the post-merge suite: publication is not deployment authorization. | `workflow_dispatch` with `publish`; a multi-commit push releases only its tip | Active. Latest: mergewake v0.5.36, pacelever v0.3.20, panewire v0.0.12, handoffkeep v0.0.4, fillwire v0.0.1. | mergewake `.github/workflows/auto-tag.yml:4`, `.github/workflows/release.yml:11`, `.github/workflows/release.yml:93`, `docs/auto-releases.md:3`; pacelever `.github/workflows/auto-tag.yml:4`; panewire `.github/workflows/auto-tag.yml:4`; handoffkeep `.github/workflows/auto-tag.yml:4`; fillwire `.github/workflows/auto-tag.yml:4` | |
+| P6. Tag-only release binaries | shiftgate, cordglean | A person pushes a `v*` tag | Release assets and `SHA256SUMS` at the tag | shiftgate `CI`: `vet`, `test`, `build-{linux,darwin}-{amd64,arm64}`. cordglean `Go checks`: `checks`. | GitHub Actions | The release's own `build` and `test` jobs | `workflow_dispatch` | Active. Latest: both v0.1.0. | shiftgate `.github/workflows/release.yml:11`; cordglean `.github/workflows/release.yml:11` | |
+| P7. Service images (full-SHA tag and `main`) | handoffkeep, panewire | Push to `main`; pull requests and dispatch build only | GHCR image tagged with the full commit | As P5 | GitHub Actions | Smoke test of the image. No post-merge suite wait. | Moving `main` tag | Active | handoffkeep `.github/workflows/image.yml:6`; panewire `.github/workflows/image.yml:5`, `docs/hub-image.md:12` | |
+| P8. Digest-pin images | fillwire, broker-edge | Push to `main` | fillwire: `sha-<full sha>`. broker-edge: `main` and `sha-<short>`. | fillwire: as P5. broker-edge `ci`: `go`, `secrets`, `image`. | GitHub Actions | fillwire's `publish` needs `verify` and `secrets`. broker-edge's `image` job follows `go` and `secrets`. | Moving `main` tag (broker-edge) | Active | fillwire `.github/workflows/ci.yml:54`; broker-edge `.github/workflows/ci.yml:27` | |
+| P9. `mergewake release` manifest release | any repository in a mergewake inventory | Daemon `release` role, or the CLI | Manifest release (`mergewake-*`) for a `main` commit | The repository's `required_checks` or `watch_checks` | mergewake daemon or a person | Release CI, read through the policy | `--commit` | Pending D2 | mergewake `internal/pipeline/pipeline.go:256`; `internal/github/release.go:106`; `cmd/mergewake/main.go:117` | Whether any host enables the role: D2 |
+| P10. `docker-publish.yml` | life-log | Push to `main` | GHCR image | none | GitHub Actions | None | Not applicable | Active; last run 2026-03-19. Consumer: pending D1. | life-log `.github/workflows/docker-publish.yml:3` | Whether any host runs it: D1 |
+
+## Execution entry points
+
+These rows change what runs on a host.
+
+| Entry point | Repo(s) | Trigger | Artifact source | Full post-merge suite | Who executes it | Current admission check | Bypasses | Enabled state | Evidence | Unknown |
+|---|---|---|---|---|---|---|---|---|---|---|
+| X1. `shiftgate follow brewdial-api --tag production` | brewdial (config), shiftgate (tool) | Dagu schedule on the OCI host, every few minutes | Whatever digest the mutable `production` tag resolves to (P1) | As P1, but follow reads none of it | Dagu on the OCI host | Digest format, active-digest and hold comparison, then a health-first blue-green deploy. No CI, branch or provenance check. | Latest-following by design: moving the tag deploys. A hand-picked digest is replaced on the next run. | Pending D4, D5 | brewdial `.github/workflows/deploy-oci.yml:11`; `docs/runbooks/oci-heatwave-cutover.md:96`; `deploy/oci/shiftgate/services.yaml:30`; shiftgate `internal/deploy/follow.go:41`, `docs/design.md:175` | Whether the job exists and its schedule: D4. What serves now: D5. |
+| X2. Manual `shiftgate deploy --digest` and `rollback` | brewdial, shiftgate | A person on the OCI host | Any digest typed on the command line | As P1, not read | Desk on the OCI host | Health-first deploy only | Manual pin. `deploy` of a held digest clears the hold. `rollback` has no gate. | Available wherever shiftgate is installed: D1, D5 | shiftgate `cmd/shiftgate/main.go:94`, `cmd/shiftgate/main.go:107`, `internal/deploy/deploy.go:517` | Installed version: D5 |
+| X3. `deploy-oci-k3s.yml` (deprecated) | brewdial | `workflow_dispatch` only | `sha-<short>` from P2, resolved to a digest | As P1, not read | GitHub Actions, then SSH to the OCI host | Commit must be on `main`; the image must exist | Any `main` SHA, including old ones. No CI check. | Workflow active, secrets present, no recorded runs. Target: pending D6. | brewdial `.github/workflows/deploy-oci-k3s.yml:3`, `:27`, `:101` | Whether k3s still serves: D6 |
+| X4. Native `brewdial-api.service` built on the host | brewdial | A person on the OCI host | Checkout built on the host | As P1, not read | Desk | None | Not applicable | Pending D6 | brewdial `deploy/oci/README.md:10`, `deploy/oci/brewdial-api.service:1` | Whether the unit still runs: D6 |
+| X5. `deploy-ncp-pull.sh` | auto_trader | Desk, on an hk decision | GHCR tag (default `main`), pinned to the digest the gate returns | `Test`: `lint`, `taskiq-smoke`, `test (3.13, 1)` to `test (3.13, 4)`; the gate reads them | Desk on the NCP host | `deploy_ci_gate.py` requires the six jobs at the image's exact revision before any pull; retired-unit check; health checks | `--allow-unverified REASON`. `--rollback` and automatic recovery are unchecked. The default tag is the moving `main`. The installed script is a copy. | Pending D7 | auto_trader `scripts/deploy-ncp-pull.sh:32`, `:144`, `docs/runbooks/ncp-pull-deploy.md:20`, `docs/runbooks/ncp-pull-deploy.md:50`, `docs/runbooks/ncp-pull-deploy.md:145` | Whether the installed copy matches the repo, and no timer runs it: D1, D7 |
+| X6. Forced-command pull of private application repo A | private application repo A | Push to `main` (merge is deploy); `workflow_dispatch` | The host checkout fast-forwards to the branch | `Test`: `test` (runs in parallel; deploy does not wait for it) | GitHub Actions, then SSH to the NCP host under a forced command | None in the workflow | The merge itself; the workflow has no `needs` and no check | Active. Last run: success, 2026-10-29. Host side: pending D8. | private application repo A `.github/workflows/deploy-operator.yml:3`, `:17`, `.github/workflows/test.yml:3`; private control repo `memory/project_strategist_role.md:15` | Host script and polling fallback: D8 |
+| X7. Checkout advance of private application repo B | private application repo B | A person runs `git merge --ff-only origin/main`; the next flow run picks up the code | The host checkout at whatever `main` was | none | Desk on the NCP host and the desk Mac | None. The repository policy is in shadow mode. | No artifact and no receipt; registered Prefect deployments keep their old pull step | Pending D9, D12 | private application repo B `docs/runbooks/ncp-prefect-worker.md:18`, `docs/runbooks/news-ingestor-restore-1078.md:65`, `deploy/systemd/at-prefect-worker.service:12`, `.mergewake/policy.yaml:3` | Checkouts, SHAs and any automatic advance: D1, D9, D12 |
+| X8. Digest-pinned fillwire unit | fillwire | Desk on the NCP host | `sha-<full sha>` resolved to a digest and written to a pin file | fillwire `CI`: `verify`, `secrets`, `publish`, `auto-tag-test` | Desk | Tags are never deployed. No CI check. | Hand-picked digest; restoring any pin | Pending D10 | fillwire `docs/digest-pin-deploy.md:3`, `docs/digest-pin-deploy.md:25`, `docs/digest-pin-deploy.md:45` | Unit state and pin: D10 |
+| X9. `broker-edge` `deploy-pull.sh` | broker-edge | Desk on the host | Tag (default `main`) resolved to a digest | `ci`: `go`, `secrets`, `image`; not read | Desk | Metrics health check; no CI check | Default moving tag; `--rollback` | Pending D10 | broker-edge `scripts/deploy-pull.sh:2`, `:24`, `docs/digest-pin-deploy.md:35` | Unit state and pin: D10 |
+| X10. mergewake rollout: release binaries | mergewake, pacelever | Daemon `rollout` role (polls, webhooks wake it); `mergewake rollout`; `mergewake agent` | First compatible published `v*` release, bytes verified against `SHA256SUMS` | `CI` as P5; the gate reads `required_checks` or `watch_checks` | mergewake daemon or a person | Commit on `main`, exact-commit CI green, path-based `deploy_approval`, receipt and inventory identity | Latest-following candidate selection. `--dry-run` shows the plan only. | Pending D2 | mergewake `internal/pipeline/pipeline.go:346`, `internal/github/binary.go:17`, `internal/github/binary.go:41`, `docs/fleet-binaries.md:47`, `docs/deploy-approval.md:3`, `examples/fleet-binaries.yaml:8` | Which hosts enable it, with `--apply` or not: D2 |
+| X11. mergewake rollout: follow-release containers | handoffkeep, panewire | As X10 | Newest stable release, resolved to the commit's GHCR digest | handoffkeep `ci` and panewire `CI` as P5 | mergewake daemon or a person | As X10, plus digest validation, pre-deploy backup, health check and the shared control-plane window | `--digest` for a single container target. `--adopt` records a running container. | Pending D2, D11 | mergewake `internal/pipeline/container_release.go:12`, `internal/github/release.go:147`, `internal/pipeline/pipeline.go:401`, `cmd/mergewake/main.go:120`, `docs/fleet-ncp.md:21`, `docs/fleet-ncp.md:94`, `examples/fleet-services.yaml:10` | Which hosts enable it: D2. Whether the services run this way: D11 |
+| X12. mergewake rollout: manifest releases | any repository in a mergewake inventory | As X10 | Newest `mergewake-*` manifest release (P9) | The repository's checks | mergewake daemon or a person | As X10, plus manifest validation | As X10 | Pending D2 | mergewake `internal/pipeline/pipeline.go:404`, `internal/github/release.go:106`, `internal/rollout/rollout.go:145` | Whether any inventory uses it: D2 |
+| X13. `fleet-update` | private updater repo (tool); runtug, mergewake, pacelever, panewire, cordglean, shiftgate, handoffkeep (payloads) | Dagu proposal daily, or by hand | `releases/latest` or the tag pinned in the manifest | Each payload's suite as P5 and P6, not read. The tool itself has `fleet-update`: `lint`, `test (ubuntu-latest)`, `test (macos-latest)`. | Dagu worker or a person, on each host | `SHA256SUMS`, version output, service post-check. No CI or approval. | Latest-following; `version=` pin, including a downgrade | The repo says the DAG is not registered. Pending D3, D4. | private updater repo `fleet-update/README.md:68`, `fleet-update/README.md:143`, `fleet-update/dagu/fleet-update.yaml:1`, `fleet-update/fleet-update:267`; mergewake `docs/releasing.md:36` | Installed, registered and manifest lines: D3, D4 |
+| X14. `fleet-install` | rstack (tool); any tagged fleet tool (payloads) | A person, with a tool and a tag | Named release tag, after its release run succeeds | Each payload's suite, not read | Desk over SSH | Release workflow success, `SHA256SUMS`, `--version` | Manual pin by design | Marked deprecated in the tool. Pending D3. | rstack `bin/fleet-install:2`, `docs/fleet-install.md:10`, `docs/fleet-install.md:21` | Whether the config is still present: D3 |
+| X15. `install.sh` bootstrap | mergewake | A person on a host | `latest` by default, or a tag | `CI` as P5, not read | A person | `SHA256SUMS` only | Latest by default; any tag; no main-ancestry or CI check | Always available (public script) | mergewake `install.sh:5`, `install.sh:22`, `install.sh:37`, `README.md:52` | |
+| X16. `go install module@ref` | panewire, handoffkeep, cordglean | A person on a host | Source at the ref (`@latest` is documented) | Each repo's suite, not read | A person | None | Latest or any ref; no checksum beyond the Go module sum | Always available. Installed binaries: D1. | panewire `README.md:58`, `README.md:67`; handoffkeep `README.md:34`; cordglean `README.md:21` | Which hosts use it: D1 |
+| X17. Desk binary swap | handoffkeep, panewire, mergewake, runtug | The desk, on a merged change or an operator request | A host or desk build at a commit, or release assets, copied in and renamed | Each repo's suite, not read | Desk, or a seat started for one deploy | The installer procedure's inputs: head SHA, PR list, window or approval; post-checks. No required CI check. | The route is itself the bypass: it skips rollout, approval and receipts | In active use per hk deploy records of 2026-11-02 and 2026-11-03. Per host: pending D1, D11. | rstack `skills/ops/references/deploy.md:14`, `skills/ops/references/deploy.md:24`; private control repo `deploy/ncp/handoffkeep-deploy.sh:1`, `bin/fleet-deploy-b7bfc3e.sh:1`, `FLEET.md:37` | Current binaries per host: D1, D11 |
+| X18. Application host jobs and units | auto_trader, private application repo A | Copied to the host by hand; timers then fire | `ops/ncp/systemd/*` and `deploy/*` unit files; the jobs run the recorded deployed digest | As X5 and X6, not read | Desk installs; systemd runs | None at install | Copied units drift from the repository | Pending D1 | auto_trader `docs/runbooks/ncp-pull-deploy.md:95`, `ops/ncp/bin/at-job.sh:8`; private application repo A `deploy/systemd/operator-artifacts-sync.timer:1` | Which timers are enabled: D1 |
+| X19. Pi bootstrap and control-repo checkout | private control repo; scopefuel (installed by it) | A person runs the bootstrap; `fleet-failover.timer` then runs the checkout's script every minute | `git pull --ff-only` of checkouts; `uv tool install` from a checkout or from git | `ci`: `test` (Python unit tests and the Pi guard fixtures), not read | A person; systemd user timer | None | Whatever the checkout's branch holds runs on the next timer | Pending D13 | private control repo `deploy/pi/bootstrap.sh:136`, `:161`, `:172`, `deploy/pi/fleet-failover.service:6`, `deploy/pi/fleet-failover.timer:6` | Timer state and checkout SHA: D13 |
+| X20. rstack skill and tool install | rstack | A person runs `install.sh` in a checkout | The checkout; links into harness skill directories and `~/.local/bin` | `CI`: `contracts (ubuntu-latest)`, `contracts (macos-latest)`, `ci-ok`; not read | A person on each host | None | Any checkout state | Pending D14 | rstack `install.sh:5`, `README.md:38`, `docs/fleet-rev.md:9` | Checkouts and any automatic update: D14 |
+| X21. GitHub Pages deploy | monostrike, rent_rader | Push to `main`; `workflow_dispatch` | Flutter web build in the same workflow | none | GitHub Actions | None | Merge is deploy | Active. The host is GitHub Pages, not a fleet host. | monostrike `.github/workflows/deploy-web.yml:3`; rent_rader `.github/workflows/deploy-web.yml:3` | |
+| X22. Retired auto_trader paths | auto_trader | None | Not applicable | Not applicable | Nobody | The scripts refuse to run | Not applicable | Disabled by code | auto_trader `scripts/deploy.sh:14`, `scripts/deploy.sh:27`, `scripts/deploy-native.sh:4`, `DEPLOYMENT.md:3` | |
+
+## Findings that change the design input
+
+- **"The NCP pull script for four repositories" is not one script.** Each member of the four-repo application group has its own route: X5, X6, X7 and X8. Only auto_trader has an exact-SHA gate. A single manifest must span all four routes, not replace one branch-pull script.
+- **The routes in daily use are not the gated ones.** The hk deploy records of 2026-11-02 and 2026-11-03 describe desk binary swaps (X17) for handoffkeep, panewire and mergewake. mergewake's approval gate covers X10 to X12 only.
+- **brewdial's follow has no admission of its own.** `deploy-oci.yml` (P1) is the publisher and X1 is the executor; together they replace a direct deploy. Their only link is a mutable GHCR tag, and neither reads the post-merge suite.
+- **Branch protection is mostly absent.** `gh api repos/mgh3326/<repo>/branches/main/protection` returned "Branch not protected" for mergewake, handoffkeep, panewire and brewdial, and `branches/production` for brewdial; `rulesets` is empty for every public repository read. auto_trader's `main` is protected with `lint` and `PR gate` required. Private repositories: pending D15.
+
+## Repositories without a full post-merge suite
+
+These block certification, because no exact-SHA evidence exists to certify:
+
+- **Private application repo B.** It has no workflows at all, although it has a `tests/` directory (private application repo B `.mergewake/policy.yaml:4`).
+- **monostrike** and **rent_rader.** Their only workflow builds and publishes.
+- **life-log.** Its only workflow publishes an image.
+- **runtug** (archived). It has `ci.yml` and `release.yml`, but an archived repository cannot run them again. Any further delivery needs a decision on the binary first.
+
+These have a suite that certification cannot use yet:
+
+- **Private application repo A.** `Test` runs on every push, but deploy does not wait for it.
+- **The private control repo.** `ci` runs Python unit tests and the Pi guard fixtures only, while its checkout runs as live scripts.
+
+## Pilot: brewdial-api on the OCI host
+
+**Winner: brewdial-api, through its shiftgate follower.** The comparison assumes the facts that D4 and D5 settle.
+
+| Criterion | brewdial-api (shiftgate follow, X1) | handoffkeep (mergewake container rollout, X11) | panewire hub (mergewake container rollout, X11) |
+|---|---|---|---|
+| Reversibility | Blue-green: the old colour keeps running until the new one is healthy, and `shiftgate rollback` flips back. Migrations run forward at container start and do not roll back. (brewdial `deploy/oci/shiftgate/services.yaml:43`) | Stops the old container first, a bounded outage. Migrations run at startup and are never rolled back automatically. (mergewake `docs/fleet-ncp.md:5`, `docs/fleet-ncp.md:47`) | Stops the old container first. Shares the control-plane window, so losing it impairs recovery coordination. (mergewake `docs/fleet-ncp.md:96`) |
+| Real post-merge suite | Yes: `CI Gate` and `Kotlin API CI` run at each `main` push and exercise the API against real databases. | Yes: `ci` runs `test`, `vitest` and the build matrix. | Yes: `ci` runs `test`, `postgres` and `ci-ok`. |
+| Exact artifact (digest) | Yes: `deploy-oci.yml` reads the pushed digest and verifies the bytes. It is recorded only in the run's output and summary. | Yes: GHCR full-SHA tag resolved by `imagetools inspect`. | Yes: same. |
+| Consumer change size | One scheduled job on one host. No shiftgate change. | The services must first move onto this route: hk deploy records show desk binary swaps. Result: D11. | Same as handoffkeep. |
+| Blast radius if the pilot goes wrong | One application API | Task service for the whole fleet | Coordination for the whole fleet |
+
+auto_trader (X5) is not a candidate. Its gate is the strongest here, but it has the highest consequence, and the design input requires a reversible first consumer.
+
+### Exact consumer change for slice 2
+
+The consumer is the Dagu job on the OCI host that runs `shiftgate follow brewdial-api --tag production` (D4).
+
+Slice 2 replaces that one job's command with a small adapter, and leaves shiftgate unchanged:
+
+1. Read the commit at the protected `deployable` branch of brewdial, and refuse if it cannot be read.
+2. Read the digest recorded for exactly that commit, and refuse if none exists. A tag lookup is not acceptable, because a tag is mutable.
+3. Read `shiftgate status --json`. Stop if that digest is already active, or if it is the held digest. The adapter must check the hold itself, because `shiftgate deploy` clears a hold on the digest it deploys (shiftgate `internal/deploy/deploy.go:517`).
+4. Run `shiftgate deploy brewdial-api --digest <digest>`, and keep treating exit 75 as "retry on the next run".
+
+Slice 2 must also close the other routes for this service, or the gate has no effect:
+
+- Stop the `shiftgate follow` job for this service, not only add a new one. A running follower replaces any digest that the tag does not point at (shiftgate `docs/design.md:227`).
+- Disable or gate `deploy-oci-k3s.yml` (X3), and retire the native unit (X4) if D6 shows either is still live.
+- Keep manual `shiftgate rollback` as the recovery path, and record that it stays outside the gate.
+
+Risk to carry into slice 2: brewdial is partway through its Node-to-Kotlin and PostgreSQL-to-MySQL migration (brewdial `docs/runbooks/oci-heatwave-cutover.md:1`). `brewdial-api-kt` is prepared but not deployed (brewdial `deploy/oci/shiftgate/services.yaml:50`). Pilot on `brewdial-api` only.
+
+No production effect happens in this PR.
+
+## Candidates ruled out
+
+| Candidate | Why it is not an entry point | Evidence |
+|---|---|---|
+| Workflows in forks with no registered run: agent-orchestrator, hermes-agent, oh-my-opencode, openclaw, productive-box, superset, tradingcodex, tvscreener, xbloom-ble | Not registered; Actions never ran them | `actions/workflows` returned no entry for these files |
+| auto_freqtrade (fork), `docker-build.yml`, `deploy-docs.yml` | Registered and active, but 0 runs ever | `actions/runs` total 0 |
+| herdr-mirror (fork), `release.yml` | Registered and active, but no tag run; 1 CI run ever. The binary reaches hosts through D16. | `actions/runs` total 1 |
+| stealth-browser-mcp (fork), financial-analyst | CI or review automation only | stealth-browser-mcp `.github/workflows/ci.yml:1`; financial-analyst `.github/workflows/claude.yml:1` |
+| Registered workflows that are not on a default branch: mergewake `image.yml` and `server-store.yml`; two in tistory_tail; one in a private orchestration repo | Only pull-request runs; nothing on `main` can trigger them | `actions/workflows/<file>/runs`: mergewake `image.yml` 1 run on `feat/daemon-image`, `server-store.yml` 5 runs on `wk/mw-server-store` |
+| CI-only repositories: go-kis, go-toss, miro-mcp, postuntil, recallbeam, review-kit, scopefuel | No publish or host step (postuntil ships only example units). How these reach a host is D16, and X19 for scopefuel. | Each `.github/workflows/ci.yml` |
+| Private game repo | Main and release CI only; no host step | Private game repo `.github/workflows/unity-ci.yml:1` |
+| auto_trader `live-integration.yml`, `test-durations-refresh.yml` | Runs tests or opens a PR; no host step | auto_trader `.github/workflows/live-integration.yml:7`, `.github/workflows/test-durations-refresh.yml:424` |
+| shiftgate `examples/github-actions/`, `examples/dagu/` | Examples, not wired to a repository | shiftgate `examples/github-actions/shiftgate-deploy.yml:1` |
+| Backup and observability units (brewdial backup and verify timers, panewire `deploy/alloy`, broker-edge `deploy/observability`) | Deliver data jobs or third-party binaries, not this account's code | brewdial `deploy/oci/brewdial-backup.timer:1`; panewire `deploy/alloy/install-linux.sh:1`; broker-edge `deploy/observability/oci/prometheus.service:1` |
+| The private operations-notes repo | Notes only; no code | Private operations-notes repo `README.md:1` |
+
+## Desk evidence
+
+Results of the read-only desk commands are recorded here by id once they are run.
+
+| Id | Host role | Settles | Result |
+|---|---|---|---|
+| D1 | Every host | Timers, cron, launchd, binaries, versions, containers | Pending |
+| D2 | Hosts with mergewake | Rollout and release enablement | Pending |
+| D3 | Hosts with fleet-update or fleet-install | Whether those routes are live | Pending |
+| D4 | OCI | The Dagu follow job | Pending |
+| D5 | OCI | What shiftgate serves | Pending |
+| D6 | OCI | Whether k3s and the native unit are live | Pending |
+| D7 | NCP | The auto_trader script, gate and digest | Pending |
+| D8 | NCP | The forced command and the checkout of repo A | Pending |
+| D9 | NCP | The checkout of repo B | Pending |
+| D10 | NCP | fillwire and broker-edge units | Pending |
+| D11 | NCP | How handoffkeep and the hub run | Pending |
+| D12 | Desk Mac | The Mac checkout of repo B | Pending |
+| D13 | Pi | Bootstrap and failover timer | Pending |
+| D14 | Hosts with rstack | Skill checkouts | Pending |
+| D15 | Admin `gh` | Private repository rulesets | Pending |
+| D16 | Every host | Remaining installed tools | Pending |
+| D17 | OCI | `production` tag against the active digest | Pending |
