@@ -359,8 +359,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// files stops costing a GitHub call every poll.
 	lastPRCheck := map[int]time.Time{}
 	for _, rec := range receipts {
-		// Archive rows need no GitHub call and must not delay a refetch.
-		if rec.Action != "archive-job" && rec.Time.After(lastPRCheck[rec.PR]) {
+		// Archive rows need no GitHub call and must not delay a refetch; neither
+		// do reviewer-cleanup rows, which a review pass writes on every outcome.
+		if rec.Action != "archive-job" && rec.Action != "reviewer-cleanup" && rec.Time.After(lastPRCheck[rec.PR]) {
 			lastPRCheck[rec.PR] = rec.Time
 		}
 	}
