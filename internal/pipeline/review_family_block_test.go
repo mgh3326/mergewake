@@ -31,6 +31,9 @@ func TestUnknownFamilyBlocksAndRecovers(t *testing.T) {
 	if f.gh.posts != 1 || f.n.count != 1 || !strings.Contains(f.gh.comments[0].Body, "Mergewake-Author-Family: <family>") || !strings.Contains(f.gh.comments[0].Body, "head commit") {
 		t.Fatalf("comments=%+v events=%+v", f.gh.comments, f.n.events)
 	}
+	if !strings.Contains(f.gh.comments[0].Body, "If these are already present, no changes to them are needed.") {
+		t.Fatalf("comment implies satisfied requirements need changes: %s", f.gh.comments[0].Body)
+	}
 	if f.g.postCount != 0 || f.g.claimCount != 0 || f.g.refs[doneRef(7, shaA)] {
 		t.Fatal("blocked head wrote review state")
 	}
