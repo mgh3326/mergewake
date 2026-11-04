@@ -2,9 +2,11 @@ package outcomes
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -220,5 +222,132 @@ func TestLedgerFixedClockIsReproducible(t *testing.T) {
 	}
 	if ids[0] == "" || ids[0] != ids[1] {
 		t.Fatalf("same input and clock gave different outcome IDs: %v", ids)
+	}
+}
+
+type recordRunner struct{ adds [][]string }
+
+func (r *recordRunner) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
+	if args[1] == "list" {
+		return nil, nil
+	}
+	r.adds = append(r.adds, args)
+	return []byte("recorded rep id=srv:7\n"), nil
+}
+
+func inExperiment(v *Outcome) {
+	complete(v)
+	v.Experiment, v.Arm = "x1", "downshift"
+}
+
+func notesOf(t *testing.T, args []string) (top, nested map[string]any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(args[len(args)-1]), &top); err != nil {
+		t.Fatal(err)
+	}
+	nested, _ = top["outcome"].(map[string]any)
+	if nested == nil {
+		t.Fatal("notes carry no outcome object")
+	}
+	return top, nested
+}
+
+func TestPublishWithoutEffortSendsNoExperiment(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, func(v *Outcome) { inExperiment(v); v.Effort = "" }); err != nil {
+		t.Fatal(err)
+	}
+	r := &recordRunner{}
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.adds) != 1 {
+		t.Fatalf("reps add calls=%d", len(r.adds))
+	}
+	if slices.Contains(r.adds[0], "--effort") {
+		t.Fatalf("effort-less row passed --effort: %q", r.adds[0])
+	}
+	top, nested := notesOf(t, r.adds[0])
+	if top["experiment_id"] != "" || top["arm"] != "" || nested["experiment_id"] != "" || nested["arm"] != "" {
+		t.Fatalf("experiment leaked: top=%v/%v nested=%v/%v", top["experiment_id"], top["arm"], nested["experiment_id"], nested["arm"])
+	}
+	s, err := ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := s.Latest[Key("example/project", 1)]
+	if s.Published[row.ID] == "" {
+		t.Fatal("no published event")
+	}
+	if row.Experiment != "x1" || row.Arm != "downshift" {
+		t.Fatalf("ledger row changed: %q/%q", row.Experiment, row.Arm)
+	}
+}
+
+func TestPublishWithEffortKeepsExperiment(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, inExperiment); err != nil {
+		t.Fatal(err)
+	}
+	r := &recordRunner{}
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.adds) != 1 {
+		t.Fatalf("reps add calls=%d", len(r.adds))
+	}
+	if !strings.Contains(strings.Join(r.adds[0], " "), "--model model --effort high --task ") {
+		t.Fatalf("args: %q", r.adds[0])
+	}
+	top, nested := notesOf(t, r.adds[0])
+	if top["experiment_id"] != "x1" || top["arm"] != "downshift" || nested["experiment_id"] != "x1" || nested["arm"] != "downshift" {
+		t.Fatalf("notes lost experiment: %v", top)
+	}
+}
+
+func TestPublishRefusesMissingModel(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, func(v *Outcome) { inExperiment(v); v.Model = "" }); err != nil {
+		t.Fatal(err)
+	}
+	r := &recordRunner{}
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+		t.Fatal(err) // Flush skips an unattributed row without error
+	}
+	if len(r.adds) != 0 {
+		t.Fatalf("published unattributed row: %q", r.adds)
+	}
+	var v Outcome
+	inExperiment(&v)
+	v.Model = ""
+	v.ID = "m"
+	if _, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v); err == nil || !strings.Contains(err.Error(), "outcome attribution incomplete") {
+		t.Fatalf("publish err=%v", err)
+	}
+	s, _ := ledger.Read()
+	if len(s.Published) != 0 {
+		t.Fatalf("published=%v", s.Published)
+	}
+}
+
+func TestReportGroupsEffortlessRowAsInferredOutsideArms(t *testing.T) {
+	at := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	var noEffort, withEffort Outcome
+	inExperiment(&noEffort)
+	noEffort.Effort, noEffort.Task, noEffort.UpdatedAt = "", "t1", at
+	inExperiment(&withEffort)
+	withEffort.Task, withEffort.UpdatedAt = "t2", at
+	got := map[string]Aggregate{}
+	for _, g := range Report([]Outcome{noEffort, withEffort}, time.Time{}) {
+		got[g.ProfileEffort] = g
+	}
+	if len(got) != 2 {
+		t.Fatalf("groups=%v", got)
+	}
+	if g := got["example@inferred"]; g.Seen != 1 || g.Experiment != "" || g.Arm != "" || g.AttributionMissing != 0 {
+		t.Fatalf("inferred group=%+v", g)
+	}
+	if g := got["example@high"]; g.Seen != 1 || g.Experiment != "x1" || g.Arm != "downshift" || g.AttributionMissing != 0 {
+		t.Fatalf("high group=%+v", g)
 	}
 }
