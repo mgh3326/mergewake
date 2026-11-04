@@ -206,9 +206,6 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return s.blockReview(ctx, r, pr, b, o)
 		}
 	}
-	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
-		return e
-	}
 	if !complete {
 		if family == "" {
 			m := familyTrailer.FindStringSubmatch(pr.Body)
@@ -239,13 +236,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if family == "" && s.Config.Review.DefaultFamily != "" {
 			family, familySource = s.Config.Review.DefaultFamily, "default"
 		}
-		if family == "" {
-			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
-		}
 		family = config.CanonicalFamily(family)
 		if family == "" {
+			if s.fleetAuthor(pr.User.Login) {
+				return s.blockReview(ctx, r, pr, reviewBlock{blockUnknownFamily, "Add `Mergewake-Author-Family: <family>` to the PR body. The head commit trailer also works."}, o)
+			}
 			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
+	}
+	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+		return e
 	}
 	posted := map[int]github.PassReceipt{}
 	for _, receipt := range receipts {

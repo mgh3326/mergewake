@@ -10,6 +10,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
@@ -32,6 +33,7 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
+	Block     string       `json:"review_block,omitempty"`
 	PatchID   string       `json:"patch_id,omitempty"`
 	Rounds    int          `json:"rounds"`
 	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
@@ -227,6 +229,11 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")
+		ledger, err := s.ledger().Read()
+		if err != nil {
+			return v, err
+		}
+		v.Review.Block = ledger.Latest[outcomes.Key(r.Name, pr.Number)].ReviewBlocked[pr.Head.SHA]
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)
 	if e != nil {
