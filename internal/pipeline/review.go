@@ -239,11 +239,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if family == "" && s.Config.Review.DefaultFamily != "" {
 			family, familySource = s.Config.Review.DefaultFamily, "default"
 		}
-		if family == "" {
-			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
-		}
 		family = config.CanonicalFamily(family)
 		if family == "" {
+			if s.fleetAuthor(pr.User.Login) {
+				return s.blockReview(ctx, r, pr, reviewBlock{blockUnknownFamily, "Add `Mergewake-Author-Family: <family>` to the PR body. The head commit trailer also works."}, o)
+			}
 			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
 	}
