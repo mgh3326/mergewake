@@ -61,7 +61,7 @@ type Outcome struct {
 }
 
 func (v Outcome) Attributed() bool {
-	return v.Profile != "" && v.Model != "" && v.Effort != "" && v.Grade != "" && v.Tier != ""
+	return v.Profile != "" && v.Model != "" && v.Grade != "" && v.Tier != ""
 }
 
 func (v Outcome) ReviewedHead() bool { _, ok := v.Reviews[v.Head]; return ok }
@@ -252,17 +252,21 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 			return "confirmed:" + v.ID, nil
 		}
 	}
-	if v.Profile == "" || v.Model == "" || v.Effort == "" || v.Grade == "" || v.Tier == "" {
+	if v.Profile == "" || v.Model == "" || v.Grade == "" || v.Tier == "" {
 		return "", errors.New("outcome attribution incomplete; retained in outbox")
 	}
 	wire := v
+	if v.Effort == "" {
+		// An effort-less rep gets an inferred default rung downstream, so it must not count in an experiment arm.
+		wire.Experiment, wire.Arm = "", ""
+	}
 	if !v.ReviewedHead() && v.Blockers() == 0 {
 		wire.Findings = nil
 	}
 	notes, err := json.Marshal(map[string]any{
 		"source": "mergewake", "schema": 1, "sample_key": v.Task, "outcome_id": v.ID, "revision": v.Revision, "supersedes": v.Supersedes,
 		"first_ci_green": v.FirstCIGreen, "findings_by_severity": wire.Findings, "reverted_within_7d": v.Reverted, "time_to_merge_s": v.TimeToMerge, "same_family": v.SameFamily,
-		"experiment_id": v.Experiment, "arm": v.Arm, "evidence": v.Evidence(), "outcome_rule": "first-ci-green+no-critical-high+no-revert-7d/v1", "outcome": wire, "observed_findings_by_severity": v.Findings, "followup": v.Revision > 1,
+		"experiment_id": wire.Experiment, "arm": wire.Arm, "evidence": v.Evidence(), "outcome_rule": "first-ci-green+no-critical-high+no-revert-7d/v1", "outcome": wire, "observed_findings_by_severity": v.Findings, "followup": v.Revision > 1,
 	})
 	if err != nil {
 		return "", err
@@ -271,7 +275,11 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	if v.Decision == "landed" {
 		completed = "1"
 	}
-	args := []string{"reps", "add", "--profile", v.Profile, "--model", v.Model, "--effort", v.Effort, "--task", v.Task, "--tier", v.Tier, "--role", "impl", "--grade", v.Grade, "--rounds", "1", "--blockers-found", strconv.Itoa(v.Blockers()), "--completed", completed, "--notes", string(notes)}
+	args := []string{"reps", "add", "--profile", v.Profile, "--model", v.Model}
+	if v.Effort != "" {
+		args = append(args, "--effort", v.Effort)
+	}
+	args = append(args, "--task", v.Task, "--tier", v.Tier, "--role", "impl", "--grade", v.Grade, "--rounds", "1", "--blockers-found", strconv.Itoa(v.Blockers()), "--completed", completed, "--notes", string(notes))
 	b, err = c.Runner.Run(ctx, c.Command, args, "", "")
 	if err != nil {
 		return "", err
@@ -355,14 +363,17 @@ func Report(values []Outcome, since time.Time) []Aggregate {
 		if !since.IsZero() && v.OpenedAt.Before(since) {
 			continue
 		}
-		profile := v.Profile + "@" + v.Effort
-		if v.Profile == "" {
+		profile, experiment, arm := v.Profile+"@"+v.Effort, v.Experiment, v.Arm
+		switch {
+		case v.Profile == "":
 			profile = "unknown"
+		case v.Effort == "":
+			profile, experiment, arm = v.Profile+"@inferred", "", ""
 		}
-		key := profile + "\x00" + v.Experiment + "\x00" + v.Arm
+		key := profile + "\x00" + experiment + "\x00" + arm
 		g := groups[key]
 		if g == nil {
-			g = &Aggregate{ProfileEffort: profile, Experiment: v.Experiment, Arm: v.Arm, Findings: map[string]int{}}
+			g = &Aggregate{ProfileEffort: profile, Experiment: experiment, Arm: arm, Findings: map[string]int{}}
 			groups[key] = g
 		}
 		switch v.Evidence() {
