@@ -110,7 +110,23 @@ func (s *Service) planRound(ctx context.Context, r config.Repo, pr github.Pull, 
 	if curRound > 0 {
 		rp.round = curRound
 	}
-	last := prior[len(prior)-1].SHA
+	last := ""
+	for i := len(prior) - 1; i >= 0; i-- {
+		sha := prior[i].SHA
+		done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, sha+"-done")
+		if err != nil {
+			rp.note = "prior review completion unreadable: " + err.Error()
+			return rp
+		}
+		if done {
+			last = sha
+			break
+		}
+	}
+	if last == "" {
+		rp.note = "no completed prior head"
+		return rp
+	}
 	differ, ok := s.GH.(rangeDiffer)
 	if !ok {
 		rp.note = "GitHub client cannot read the previous patch"
