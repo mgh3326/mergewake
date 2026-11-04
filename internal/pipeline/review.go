@@ -19,6 +19,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
 )
@@ -547,6 +548,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if viaPanewire {
 		executors = []passExecutor{&panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}, headless}
 	}
+	// The review event is posted when the run ends, so a slow hk never
+	// spends the reviewers' deadline.
+	var reviewStarted *time.Time
+	defer func() {
+		if reviewStarted != nil {
+			s.postTaskEvent(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted)
+		}
+	}()
 	for _, plan := range plans {
 		plan.lens = lens(plan)
 		// A GitHub ref claims this PR head across hosts before any reviewer is
@@ -562,6 +571,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			acquired, e := s.GH.ClaimReview(ctx, r.Name, claimRef(n, pr.Head.SHA, plan.pass), pr.Head.SHA, ttl)
 			claimed = acquired
+			if acquired && e == nil && reviewStarted == nil {
+				// This run holds the pass and a reviewer runs next: the
+				// review has started. One event per run, whatever the passes.
+				now := s.now()
+				reviewStarted = &now
+			}
 			return acquired, e
 		}
 		var skips []reviewSkip
