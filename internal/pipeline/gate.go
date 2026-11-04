@@ -73,6 +73,23 @@ func reviewRounds(history []github.ReviewedPass) (rounds int, patches []string) 
 	return rounds, patches
 }
 
+// settlingVerdict holds the verdict quiet for one reason while the evidence
+// settles; it never merges. Like the CI-pending branch it reads the review
+// record best-effort: a failed read costs only the record.
+func (s *Service) settlingVerdict(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict, reason string) gateVerdict {
+	v.State = "pending"
+	v.Reasons = []string{reason}
+	s.readReviewRecord(ctx, r, pr, &v)
+	return v
+}
+
+func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github.Pull, v *gateVerdict) {
+	if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
+		v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
+		v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
+	}
+}
+
 // mergeGate evaluates the repo session's merge gate once for head H:
 // every required check green on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
@@ -105,12 +122,8 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
 		}
-		// The review record stays readable while CI runs; a failed read costs
-		// only the record.
-		if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
-			v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
-			v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
-		}
+		// The review record stays readable while CI runs.
+		s.readReviewRecord(ctx, r, pr, &v)
 		return v, nil
 	}
 	// The decision-head review feedback and the file list come first: the
@@ -120,7 +133,10 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	if fb.HeadSHA != pr.Head.SHA {
-		return v, errors.New("review feedback is not bound to the decision head")
+		// GitHub's REST pull head and the GraphQL head disagree for a few
+		// seconds after a push or update-branch: the evidence is still
+		// settling, so the verdict waits instead of failing the pass.
+		return s.settlingVerdict(ctx, r, pr, v, "head_moving"), nil
 	}
 	login := policy.NormalizeAuthor(s.Config.Review.Login)
 	files, e := s.GH.Files(ctx, r.Name, pr.Number)
@@ -128,7 +144,8 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	if len(files) != pr.ChangedFiles {
-		return v, errors.New("incomplete PR file list")
+		// changed_files and the files list disagree just after a push.
+		return s.settlingVerdict(ctx, r, pr, v, "files_settling"), nil
 	}
 	class := p.ClassifyGuarded(files, r.Policy).Class
 	// The PR totals decide the fast lane only while the file list backs them:
