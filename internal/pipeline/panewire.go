@@ -176,7 +176,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		cleanup()
 		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
 	}
-	defer cleanup()
+	// A local pane runs in this checkout: closeReviewerPane keeps it until the
+	// pane is closed or gone.
+	keepCheckout := false
+	defer func() {
+		if !keepCheckout {
+			cleanup()
+		}
+	}()
 	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
 		return skip("write brief: %v", e)
 	}
@@ -222,6 +229,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		res.skips[len(res.skips)-1].withCause(e)
 		return res, skipErr
 	}
+	// The spawn returned, so its wait finished. Every outcome from here is
+	// terminal for this pass, and the pane is closed after it is recorded. A
+	// timed-out wait returned above and never reaches this defer, because the
+	// pane may still be working.
+	placement, confirmed := spawnPlacement(string(stdout))
+	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
+	defer func() { x.closeReviewerPane(ctx, pane) }()
 	res, e := x.recordResult(ctx, label)
 	if e != nil {
 		if !errors.Is(e, ctx.Err()) {
@@ -235,6 +249,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	case res.result != nil:
 		b = res.result
 	case res.reason == "escalated" || res.reason == "lost":
+		pane.hold = "reviewer job " + res.reason + "; the pane stays for the operator"
 		return skip("reviewer job record %s", res.reason)
 	default:
 		// The record answered without findings — a pane spawned before

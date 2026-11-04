@@ -38,7 +38,9 @@ type panewireRunner struct {
 	refuseStderr string
 	findings     string // "" writes no findings file
 	family       string
-	noEvents     bool // the pane ran on another host: no spawn events in the local job dir
+	noEvents     bool   // the pane ran on another host: no spawn events in the local job dir
+	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
+	waitTimeout  bool   // the spawn ran its pane, then its --wait timed out (non-zero exit)
 	quotaErr     error
 	usageErr     error
 	spawns       [][]string
@@ -135,7 +137,10 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		if r.afterRun != nil {
 			r.afterRun()
 		}
-		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool\nwait job=l outcome=completed report= pane=p1\n"), nil
+		if r.waitTimeout {
+			return nil, panewireExit(1)
+		}
+		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool" + r.placement + "\nwait job=l outcome=completed report= pane=p1\n"), nil
 	}
 	r.headless++
 	return r.fakeRunner.Run(ctx, command, args, input, dir)
