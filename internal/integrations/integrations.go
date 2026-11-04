@@ -210,6 +210,12 @@ type Handoffkeep struct {
 	// Jobs, when set, reads job records (tests inject it); nil resolves the
 	// handoffkeep HTTP endpoint from the CLI's own credential convention.
 	Jobs JobReader
+	// EventAttempts, EventBackoff and EventTimeout tune PostTaskEvent: the
+	// tries in total, the first retry's wait (doubling after), and each
+	// try's HTTP timeout. Zero uses the Default* values.
+	EventAttempts int
+	EventBackoff  time.Duration
+	EventTimeout  time.Duration
 }
 
 var TaskID = regexp.MustCompile(`^[1-9][0-9]*$`)
