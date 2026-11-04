@@ -185,3 +185,72 @@ func TestPanewireSpawnFailureRecordsCause(t *testing.T) {
 		}
 	}
 }
+
+// reviewerEventDetails returns the detail of every reviewer fleet event.
+func reviewerEventDetails(t *testing.T, stateDir string) []string {
+	t.Helper()
+	_, events := readLines(t, filepath.Join(stateDir, "events", "fleet-events.jsonl"))
+	var details []string
+	for _, ev := range events {
+		if ev["kind"] == "reviewer" {
+			details = append(details, ev["detail"].(string))
+		}
+	}
+	return details
+}
+
+// A spawned panewire pane that fails names, in the event, the launch profile
+// its hk job record carries; the other fields keep their names and order.
+func TestPanewireFailureEventNamesJobRecordProfile(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, _, r := panewireSetup(t, runner)
+	runner.sink.missing = &integrations.JobRecord{State: "escalated", Family: "openai", Profile: "codex-high"}
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	details := reviewerEventDetails(t, s.Config.StateDir)
+	want := `pass=1 reviewer=panewire profile=codex-high host=auto reason="reviewer job record escalated"`
+	if len(details) != 1 || details[0] != want {
+		t.Fatalf("details %q, want [%q]", details, want)
+	}
+	_, rows := readLines(t, filepath.Join(s.Config.StateDir, r.Name, "decisions.jsonl"))
+	for _, row := range rows {
+		value, _ := row["value"].(map[string]any)
+		skipped, _ := value["skipped"].([]any)
+		for _, raw := range skipped {
+			if sk, _ := raw.(map[string]any); sk["reviewer"] == "panewire" && sk["profile"] != "codex-high" {
+				t.Fatalf("decision-log skip lacks the profile: %v", sk)
+			}
+		}
+	}
+}
+
+// A skip before any pane was spawned has no profile yet: the field is
+// present and empty.
+func TestPanewireSkipBeforeSpawnLeavesProfileEmpty(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`}
+	s, g, r := panewireSetup(t, runner)
+	g.pull.Body = "Mergewake-Author-Family: openai\n"
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	details := reviewerEventDetails(t, s.Config.StateDir)
+	want := `pass=1 reviewer=panewire profile= host=auto reason="no Mergewake-Task trailer"`
+	if len(details) != 1 || details[0] != want {
+		t.Fatalf("details %q, want [%q]", details, want)
+	}
+}
+
+// A headless reviewer that fails is named by the profile it ran as.
+func TestHeadlessFailureEventNamesProfile(t *testing.T) {
+	inner := &fallbackRunner{}
+	s, _, _ := fallbackSetup(t, inner)
+	s.Runner = crashRunner{inner}
+	if err := s.Review(context.Background(), fallbackRepo, 7, "anthropic", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	details := reviewerEventDetails(t, s.Config.StateDir)
+	if len(details) != 1 || !strings.HasPrefix(details[0], `pass=1 reviewer=devin-swe2 profile=devin-swe2 host=host-a exit=3 reason="review failed" stderr: `) {
+		t.Fatalf("details %q", details)
+	}
+}

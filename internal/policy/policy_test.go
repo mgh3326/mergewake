@@ -1,6 +1,46 @@
 package policy
 
-import "testing"
+import (
+	"os"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+func TestRepositoryReapPolicy(t *testing.T) {
+	raw, err := os.ReadFile("../../.mergewake/policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p Policy
+	if err := yaml.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	const reapReason = "Reap closes live panes; a wrong close loses a worker's context that git revert cannot restore"
+	for _, tc := range []struct {
+		name, path, class, reason string
+	}{
+		{"reap package", "internal/reap/exec.go", "blocking", reapReason},
+		{"pipeline reap", "internal/pipeline/reap_job.go", "blocking", reapReason},
+		{"unrelated pipeline", "internal/pipeline/notify.go", "routine", ""},
+		{"existing rollout", "internal/rollout/x.go", "blocking", "Installation writes may damage files before a revert lands"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := p.Classify([]File{{Path: tc.path, Kind: "modified"}})
+			if d.Class != tc.class {
+				t.Fatalf("class = %q, want %q; reasons: %v", d.Class, tc.class, d.Reasons)
+			}
+			if tc.reason != "" {
+				for _, reason := range d.Reasons {
+					if reason == tc.reason+": "+tc.path {
+						return
+					}
+				}
+				t.Fatalf("reasons = %v, want %q", d.Reasons, tc.reason)
+			}
+		})
+	}
+}
 
 func TestClassify(t *testing.T) {
 	p := Policy{Version: 1, RequiredChecks: []string{"CI"}, Blocking: []Rule{{Paths: []string{"orders/**"}, Reason: "live effects"}, {Paths: []string{"**"}, Kinds: []string{"removed"}, Reason: "deletion"}}}

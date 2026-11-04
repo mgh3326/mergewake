@@ -40,6 +40,8 @@ type GitHub interface {
 	ReviewFeedback(context.Context, string, int) (github.ReviewFeedback, error)
 	Unresolved(context.Context, string, int) (int, error)
 	PostReview(context.Context, string, int, string, []github.Finding, github.PassReceipt) error
+	IssueComments(context.Context, string, int) ([]github.IssueComment, error)
+	PostIssueComment(context.Context, string, int, string) error
 	Commit(context.Context, string, string) (github.Commit, error)
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
 	MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error)

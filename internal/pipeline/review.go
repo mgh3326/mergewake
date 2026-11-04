@@ -160,7 +160,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return e
 	}
 	if len(files) != pr.ChangedFiles {
-		return errors.New("incomplete PR file list")
+		// changed_files and the files list disagree just after a push: no
+		// usable data this round. The retry loop treats this sentinel as a
+		// skip, not a failure.
+		return fmt.Errorf("PR file list is settling: %w", github.ErrPollSkipped)
 	}
 	needed := 1
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
@@ -185,6 +188,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
 		if from, _, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
+			if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+				return e
+			}
 			if o.Acting() {
 				if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
 					return e
@@ -195,7 +201,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	familySource := "flag"
 	// A completed head needs no author identity; missing passes do.
-	if _, complete := distinctPasses(receipts, needed); !complete {
+	_, complete := distinctPasses(receipts, needed)
+	if !complete {
+		if b, blocked := s.reviewBlockFor(ctx, r, pr); blocked {
+			return s.blockReview(ctx, r, pr, b, o)
+		}
+	}
+	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+		return e
+	}
+	if !complete {
 		if family == "" {
 			m := familyTrailer.FindStringSubmatch(pr.Body)
 			if len(m) == 2 {
@@ -693,6 +708,10 @@ type reviewSkip struct {
 	Note     string `json:"note,omitempty"`
 	// Host is where the reviewer ran (headless) or was asked to run (panewire).
 	Host string `json:"host,omitempty"`
+	// Profile is the launch profile the reviewer ran as: the reviewer's hk job
+	// record names it for a spawned panewire pane, the configured name for a
+	// headless reviewer. Empty before any profile was chosen.
+	Profile string `json:"profile,omitempty"`
 	// ExitCode, StderrTail and Cause say why a reviewer process failed; see
 	// withCause. StderrTail is redacted and bounded.
 	ExitCode   *int   `json:"exit_code,omitempty"`

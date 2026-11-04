@@ -65,7 +65,8 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
 	key := method + " " + endpoint + " " + accept
-	if method == "GET" && ctx.Value(freshRequestKey{}) == nil {
+	fresh := ctx.Value(freshRequestKey{}) != nil || ctx.Value(freshEvidenceKey{}) != nil
+	if method == "GET" && !fresh {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
 		} else if hit.Replay && hit.Code == http.StatusNotFound {
@@ -74,7 +75,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
-	release, cached, e := c.beginRequest(ctx, key, ctx.Value(freshRequestKey{}) != nil)
+	release, cached, e := c.beginRequest(ctx, key, fresh)
 	if e != nil {
 		return nil, e
 	}
@@ -654,6 +655,20 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 		body += "\n\nListed without content (pure renames or over the local diff budget):\n" + meta.DiffSummarized
 	}
 	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
+}
+
+// IssueComment is one comment on a PR's conversation.
+type IssueComment struct {
+	Body string   `json:"body"`
+	User PullUser `json:"user"`
+}
+
+func (c *Client) IssueComments(ctx context.Context, repo string, n int) ([]IssueComment, error) {
+	return list[IssueComment](ctx, c, fmt.Sprintf("%s/issues/%d/comments", base(repo), n))
+}
+
+func (c *Client) PostIssueComment(ctx context.Context, repo string, n int, body string) error {
+	return c.json(ctx, "POST", fmt.Sprintf("%s/issues/%d/comments", base(repo), n), map[string]any{"body": body}, nil)
 }
 
 type Commit struct {

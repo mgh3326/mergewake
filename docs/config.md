@@ -113,6 +113,19 @@ PR head SHA, and the worktree's origin remote names the configured
 repository. Titles and names are never used for matching; a reused branch
 whose tip moved on does not match.
 
+One exception covers mergewake's own branch update. When it merges the base
+into a stale PR branch, the PR head becomes a merge commit the worker never
+checked out. Such a worktree still matches when the PR head has exactly two
+parents, the first is the worktree's checkout, and the second is the base SHA
+of an `ok` base-update receipt for that PR in the repo's state dir
+(`<state_dir>/<repo>/base-updates/`, written by the branch update, only read
+here). With no receipt, a receipt that is not `ok`, a different first parent
+(the worktree holds commits the PR head lacks) or a single parent, nothing
+matches. The exception applies to every use of the match: closing the pane,
+the worktree recorded on a job-bound row, and worktree and branch removal.
+The head commit is read once per PR per daemon process, shared with the task
+lookup below; a worktree that matches the head exactly costs no extra call.
+
 Before a matching pane is closed it must be reported as `idle` or `done` —
 an allowlist; `working`, `blocked`, `waiting`, empty and unknown states all
 keep the pane — and `<jobs>/<name>` must already exist, which is what proves
@@ -166,7 +179,12 @@ After the close, mergewake marks the job done the way the lead would:
 `panewire done <job> --report <saved>` on the job's host, a `job-done` row with
 `done` (`would-done` in shadow). A job hk already holds terminal is skipped as
 `already-<state>`. If the done fails, the next pass retries it once the pane
-is gone, until a `done` row or a terminal hk state ends it. Each job is decided once per pass,
+is gone, until a `done` row or a terminal hk state ends it. When the job's host
+was read and no pane wears the job's label, and no earlier pass closed that
+job's pane, reap writes one `close-pane` row with `skipped` and the reason
+`job-pane-missing` (with `task`, `job` and `host`), so a task bound to a lost
+job leaves a trace; the same outcome on a later pass writes no new row. A host
+whose panes could not be read writes none. Each job is decided once per pass,
 on the first of its merged PRs. Job-bound rows carry `task` and `job`; they
 carry `cwd` and `worktree` only when the lead sits in that PR's own
 worktree, which worktree cleanup then picks up as before.
@@ -384,6 +402,7 @@ needs no GitHub token.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `login` | Required | GitHub identity posting the independent exact-head review. |
+| `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
 | `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
 | `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
@@ -480,9 +499,9 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    as the fallback only when the record has none; an unknown family counts as
    same-family. The checkout is removed after the wait.
 
-No task trailer, no repo `root`, a fork PR, a failed checkout,
-a panewire refusal or wait failure, a refusal by the pane, no findings or
-rejected findings all fall back to the
+No task trailer or T marker on a PR outside the fleet, no repo `root`, a fork
+PR, a failed checkout, a panewire refusal or wait failure, a refusal by the
+pane, no findings or rejected findings all fall back to the
 headless executor for that pass under the same claim; its receipt records
 `"fallback":"panewire: <reason>"`. All executors share `review.timeout`, so a
 pane that used the whole deadline leaves nothing for the fallback. In panewire
@@ -493,6 +512,38 @@ enforces only the author-family exclusion between them.
 panewire fails closed when the remote host cannot stand at the head: an
 existing worktree there that is not detached at that commit or is dirty is a
 placement refusal for that pass, which falls back to headless.
+
+#### Blocked fleet reviews
+
+With `executor: panewire`, a PR opened by `review.login` or a
+`review.fleet_authors` account does not take the fallback above when it lacks
+what panewire needs. Its review is blocked until the author fixes the PR or the
+task:
+
+| Outcome | Cause | Fix |
+| --- | --- | --- |
+| `blocked: missing-task-trailer` | Neither the PR body nor the head commit has one valid `Mergewake-Task` trailer. | Add `Mergewake-Task: <id>` to the PR body. |
+| `blocked: task-missing-T-marker` | The task's title has no grade and T marker. | Add `(grade X, Tn)` to the hk task title, for example `(grade B, T1)`. |
+
+For a blocked head, mergewake:
+
+- records the outcome on the PR's outcome row, under `review_blocked_by_head`;
+- posts one PR comment per head that names the fix, deduplicated by a hidden
+  head key in the comments of `review.login`;
+- emits one `decision` event per head and outcome to `notifier.fallback_lane`,
+  or to `notifier.lane` when no fallback is set.
+
+mergewake takes no pass claim and writes no receipt or `-done` marker, so the
+merge gate reports `review_missing`. A block is not a review failure: it adds no
+retry backoff and no failure escalation, and the stall alarm skips the head. The
+next poll after the fix runs the review on the same head and clears the outcome.
+
+A read error is not a block. If the commit or the task cannot be read, the pass
+takes the fallback above. Other authors, the headless executor, a repo without
+`root` and a head that already has its passes or inherits them are unaffected.
+`mergewake review` exits non-zero on a blocked head. A dry run only prints the
+decision. Shadow mode also records the outcome, and it posts and emits
+nothing.
 
 Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
 to the profile name), and optional `gate_effort`. Commands may be installed paths
@@ -1187,6 +1238,10 @@ cause. The skip entries in the `review` and `review-skipped` decisions
 - `reviewer` and `reason`;
 - `host`, which is the configured host for headless reviewers, or the
   `review.panewire.host` value for panewire panes;
+- `profile`, the launch profile the reviewer ran as: the profile on the pane's
+  hk job record for a spawned panewire reviewer, or the configured reviewer
+  name for a headless one. It is omitted when no profile was chosen yet (a
+  skip before any spawn, or a spawn that failed before its record was read);
 - for a failed process, `exit_code` and `stderr_tail`, the last 512 bytes of
   stderr after redaction;
 - otherwise `cause`, the bounded error text.
@@ -1197,8 +1252,14 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 
 | `kind` | `outcome` | `reason` | `detail` |
 | --- | --- | --- | --- |
-| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= host= exit= reason="..."` then `stderr:` or `cause:` |
+| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
+| `role_error` | `failed` | `role_failed` (one code for every failed daemon pass) | `role= failures= error="..."`: the role, its consecutive failure count after this pass, and the quoted error text |
+
+A daemon role pass that returns an error appends one `role_error` line, so every
+failure stays visible after the status file's `last_error` is overwritten or
+cleared. A successful pass writes no line, and a failed event write never stops
+the loop or the status save.
 
 The shipping config, dashboard and alerts are in panewire `deploy/alloy` and
 `deploy/grafana`.

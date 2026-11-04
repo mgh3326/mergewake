@@ -66,7 +66,7 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profiles := s.Config.Review.Profiles
 	for i, name := range plan.candidates {
 		skip := func(reason string, reset time.Time) {
-			sk := reviewSkip{Reviewer: name, Reason: fleetevent.Redact(reason), Host: s.Config.Host}
+			sk := reviewSkip{Reviewer: name, Reason: fleetevent.Redact(reason), Host: s.Config.Host, Profile: name}
 			if !reset.IsZero() {
 				sk.Reset = reset.UTC().Format(time.RFC3339)
 			}

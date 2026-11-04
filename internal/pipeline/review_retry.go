@@ -62,6 +62,10 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	if ctx.Err() != nil {
 		return errors.Join(err, ctx.Err())
 	}
+	if errors.Is(err, ErrReviewBlocked) {
+		// The author acts next, not a reviewer: no failure, backoff or escalation.
+		return fsutil.WriteJSON(file, reviewRetryState{Head: pr.Head.SHA})
+	}
 	if err == nil {
 		var complete, pending bool
 		complete, pending, err = s.retryReviewStatus(ctx, r, pr)
@@ -136,7 +140,9 @@ func (s *Service) retryReviewStatus(ctx context.Context, r config.Repo, pr githu
 		return false, false, err
 	}
 	if len(files) != pr.ChangedFiles {
-		return false, false, errors.New("incomplete PR file list")
+		// The file list is still settling: skip this pass without a failure,
+		// as for a live lease.
+		return false, true, nil
 	}
 	needed := 1
 	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
