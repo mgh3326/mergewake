@@ -223,7 +223,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		if claimed {
 			x := &panewireExecutor{s: s, repo: r, pr: pr}
-			job, own, err := x.reviewerJob(ctx, i)
+			job, own, err := x.ownReviewerJob(i)
 			if err != nil {
 				return err
 			}

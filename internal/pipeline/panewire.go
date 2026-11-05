@@ -414,6 +414,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			if closeErr != nil {
 				_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
+				// An older head's job may still hold the reservation: its
+				// record goes back so the next pass closes it.
+				for _, old := range x.movedHead {
+					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
+				}
 				return out, errors.Join(e, closeErr)
 			}
 			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
