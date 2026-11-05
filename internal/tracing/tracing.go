@@ -67,7 +67,12 @@ func Pass(ctx context.Context, role string) (context.Context, *sentry.Span) {
 	if sentry.GetHubFromContext(ctx) == nil {
 		return ctx, nil
 	}
-	span := sentry.StartTransaction(ctx, role+" pass", sentry.WithOpName("mergewake.pass"))
+	options := []sentry.SpanOption{sentry.WithOpName("mergewake.pass")}
+	switch role {
+	case "pr", "reap", "release", "rollout":
+		options = append(options, sentry.WithSpanSampled(sentry.SampledTrue))
+	}
+	span := sentry.StartTransaction(ctx, role+" pass", options...)
 	span.SetTag("role", role)
 	return context.WithValue(span.Context(), enabledKey{}, true), span
 }
