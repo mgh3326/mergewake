@@ -420,3 +420,16 @@ func TestBotUpdateRetargetedDuringDecisionNotMerged(t *testing.T) {
 		t.Fatal("merged into a base the gate did not see")
 	}
 }
+
+// A bot patch that lands on a base that moved on records it, as the review gate
+// does, and is not held by it.
+func TestBotUpdateRecordsBaseBehind(t *testing.T) {
+	_, g, _, out, land := botSetup(t, "")
+	g.stale = true
+	if e := land(context.Background(), Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if g.mergeCount != 1 || !strings.Contains(out.String(), `"base_behind":true`) {
+		t.Fatalf("merges=%d record: %s", g.mergeCount, out)
+	}
+}

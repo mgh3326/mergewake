@@ -73,8 +73,14 @@ func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p 
 	if e != nil {
 		return v, e
 	}
-	if !fresh && pr.MergeableState == "behind" {
-		v.Reasons = append(v.Reasons, "base_stale")
+	if !fresh {
+		// As in the review gate: only a base GitHub requires up to date blocks;
+		// otherwise the stale base is recorded for information.
+		if pr.MergeableState == "behind" {
+			v.Reasons = append(v.Reasons, "base_stale")
+		} else {
+			v.Review.BaseBehind = true
+		}
 	}
 	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
