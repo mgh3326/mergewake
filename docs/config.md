@@ -407,12 +407,12 @@ needs no GitHub token.
 | `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
 | `quota` | `scopefuel` | Default executable for `outcomes.command`; review does not call it. |
 | `scopefuel` | Empty | Legacy alias used for the `outcomes.command` fallback when `quota` is omitted. |
-| `default_grade` | `B` | Task grade for review selection when the PR has no `Mergewake-Grade: A` body trailer. Outcomes never use it. |
+| `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
 | `select` | `pace` | Accepted for compatibility; unused. |
 | `pairings` | Empty map | Accepted for compatibility; unused for reviewer selection. |
-| `profiles` | Empty map | Profile families and `args` model values support author and reviewer family and model lookup. `command`, `gate_profile` and `gate_effort` are accepted but unused; other `args` are unused. |
+| `profiles` | Empty map | Profile families and `args` model values support author and reviewer family and model lookup; `gate_profile` can match a panewire seat to its family. `command` and `gate_effort` are accepted but unused; other `args` are unused. |
 | `executor` | `panewire` | Panewire spawns a reviewer pane for each pass. `headless` is retired and rejected. See [Panewire executor](#panewire-executor). |
 | `panewire.command` | `panewire` | Single executable for spawn and inbox calls. |
 | `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
@@ -560,7 +560,7 @@ fails and is retried as above. Other authors and heads that already have their p
 decision. Shadow mode also records the outcome, and it posts and emits
 nothing.
 
-Profile `family` and `args` model values remain available for family and model lookup. The `command`, `gate_profile`, and `gate_effort` fields are accepted but unused.
+Profile `family`, `args` model values, and `gate_profile` remain available for family and model lookup. The `command` and `gate_effort` fields are accepted but unused.
 
 Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
 invoking the model. When every required pass is posted, the
@@ -1138,7 +1138,7 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 
 | `kind` | `outcome` | `reason` | `detail` |
 | --- | --- | --- | --- |
-| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
+| `reviewer` | `failed` (exit and stderr) or `skipped` | the skip reason as a code (`panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
 | `role_error` | `failed` | `role_failed` (one code for every failed daemon pass) | `role= failures= error="..."`: the role, its consecutive failure count after this pass, and the quoted error text |
 
