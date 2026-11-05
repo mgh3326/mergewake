@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -152,7 +153,7 @@ func TestBotUpdateOtherFilesAndBlockingClassNotLanded(t *testing.T) {
 }
 
 // (e) A red required check is told; a pending one waits quietly; a cancelled
-// one follows the gate rule and holds nothing.
+// one waits for a rerun, then blocks; a skipped one holds nothing.
 func TestBotUpdateChecks(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -162,11 +163,18 @@ func TestBotUpdateChecks(t *testing.T) {
 	}{
 		{"red", github.Red, 0, true},
 		{"pending", github.Pending, 0, false},
-		{"cancelled", github.Cancelled, 1, false},
+		{"cancelled 5 min ago", github.Cancelled, 0, false},
+		{"cancelled 40 min ago", github.Cancelled, 0, true},
+		{"skipped", github.Skipped, 1, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, _, land := botSetup(t, "")
+			s.Now = func() time.Time { return cancelNow }
 			g.ci = tt.ci
+			g.cancelledAt = map[string]time.Time{"CI": cancelNow.Add(-5 * time.Minute)}
+			if strings.HasSuffix(tt.name, "40 min ago") {
+				g.cancelledAt["CI"] = cancelNow.Add(-40 * time.Minute)
+			}
 			if e := land(context.Background(), Options{}); e != nil {
 				t.Fatal(e)
 			}
@@ -175,6 +183,9 @@ func TestBotUpdateChecks(t *testing.T) {
 				t.Fatalf("merges=%d notices=%q", g.mergeCount, notices(n))
 			}
 			if tt.name == "red" && !strings.Contains(notices(n)[0], "check_failed:CI") {
+				t.Fatalf("notice=%q", notices(n))
+			}
+			if strings.HasSuffix(tt.name, "40 min ago") && !strings.Contains(notices(n)[0], "check_cancelled:CI") {
 				t.Fatalf("notice=%q", notices(n))
 			}
 		})

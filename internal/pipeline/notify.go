@@ -66,6 +66,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		State           string   `json:"state"`
 		Reasons         []string `json:"reasons,omitempty"`
 		ChecksCancelled []string `json:"checks_cancelled,omitempty"`
+		ChecksSkipped   []string `json:"checks_skipped,omitempty"`
 		ReviewBlock     string   `json:"review_block,omitempty"`
 		BaseBehind      bool     `json:"base_behind,omitempty"`
 		Lane            string   `json:"lane,omitempty"`
@@ -73,7 +74,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Sent            bool     `json:"sent"`
 		Deduped         bool     `json:"deduped,omitempty"`
 		Error           string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ChecksSkipped: v.Review.ChecksSkipped, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
 	if !o.Reporting() {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
@@ -107,8 +108,13 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
 		}
 	}
-	if n := len(v.Review.ChecksCancelled); v.State == "ready" && n > 0 {
-		summary += fmt.Sprintf(" | %d required check(s) cancelled: %s", n, strings.Join(v.Review.ChecksCancelled, ", "))
+	if v.State == "blocked" {
+		for _, name := range v.Review.ChecksCancelled {
+			summary = strings.Replace(summary, "check_cancelled:"+name, "check_cancelled:"+name+" (rerun it)", 1)
+		}
+	}
+	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
+		summary += fmt.Sprintf(" | %d required check(s) skipped: %s", n, strings.Join(v.Review.ChecksSkipped, ", "))
 	}
 	if n := v.Review.Findings.DismissedBlocking; v.State == "ready" && n > 0 {
 		// A dismissed critical/high no longer holds the gate; the desk still

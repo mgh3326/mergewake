@@ -61,6 +61,7 @@ type fakeGH struct {
 	head                                                         string
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
+	cancelledAt                                                  map[string]time.Time
 	messages                                                     map[string]string
 	authorName, authorEmail                                      string
 	committerName, committerEmail                                string
@@ -161,6 +162,16 @@ func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string
 			} else {
 				out[n] = g.ci
 			}
+		}
+	}
+	return out, nil
+}
+func (g *fakeGH) CancelledAt(ctx context.Context, repo, sha string, required []string) (map[string]time.Time, error) {
+	states, _ := g.CheckStates(ctx, repo, sha, required)
+	out := map[string]time.Time{}
+	for _, n := range required {
+		if states[n] == github.Cancelled {
+			out[n] = g.cancelledAt[n]
 		}
 	}
 	return out, nil

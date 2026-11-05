@@ -254,10 +254,14 @@ func DispatchRefused(e error) bool {
 type CI string
 
 const (
-	Green     CI = "green"
-	Red       CI = "red"
-	Pending   CI = "pending"
+	Green   CI = "green"
+	Red     CI = "red"
+	Pending CI = "pending"
+	// Cancelled is a completed run GitHub cancelled: it holds no verdict on the
+	// head, and the gate waits for a rerun. Skipped covers skipped and neutral
+	// runs, which are not evidence and hold nothing.
 	Cancelled CI = "cancelled"
+	Skipped   CI = "skipped"
 )
 
 type checkRun struct {
@@ -265,6 +269,8 @@ type checkRun struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
+	// CompletedAt is when the run finished; the zero time means GitHub did not say.
+	CompletedAt time.Time `json:"completed_at"`
 }
 type status struct {
 	ID      int64  `json:"id"`
@@ -272,8 +278,21 @@ type status struct {
 	State   string `json:"state"`
 }
 
+// checkEvidence is the per-name state of a head's checks plus, for each name
+// whose latest run is cancelled, when that run completed.
+type checkEvidence struct {
+	states    map[string]CI
+	cancelled map[string]time.Time
+}
+
 func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerdicts bool) (map[string]CI, error) {
+	ev, e := c.checkEvidence(ctx, repo, sha, preserveVerdicts)
+	return ev.states, e
+}
+
+func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVerdicts bool) (checkEvidence, error) {
 	states := map[string]CI{}
+	cancelledAt := map[string]time.Time{}
 	ids := map[string]int64{}
 	ran := map[string]bool{}
 	for page := 1; page <= 100; page++ {
@@ -281,7 +300,7 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 			CheckRuns []checkRun `json:"check_runs"`
 		}
 		if e := c.json(ctx, "GET", fmt.Sprintf("%s/commits/%s/check-runs?filter=latest&per_page=100&page=%d", base(repo), sha, page), nil, &runs); e != nil {
-			return nil, e
+			return checkEvidence{}, e
 		}
 		for _, r := range runs.CheckRuns {
 			// Two workflows can define a job with the same name (a CI "test" and a
@@ -303,12 +322,16 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 			}
 			ids[r.Name] = r.ID
 			state := Pending
+			delete(cancelledAt, r.Name)
 			if r.Status == "completed" {
 				switch r.Conclusion {
 				case "success":
 					state = Green
-				case "cancelled", "skipped", "neutral":
+				case "cancelled":
 					state = Cancelled
+					cancelledAt[r.Name] = r.CompletedAt
+				case "skipped", "neutral":
+					state = Skipped
 				case "failure", "timed_out", "action_required", "startup_failure", "stale":
 					state = Red
 				}
@@ -320,12 +343,12 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 			break
 		}
 		if page == 100 {
-			return nil, errors.New("check pagination limit")
+			return checkEvidence{}, errors.New("check pagination limit")
 		}
 	}
 	statuses, e := list[status](ctx, c, base(repo)+"/commits/"+sha+"/statuses")
 	if e != nil {
-		return nil, e
+		return checkEvidence{}, e
 	}
 	latest := map[string]status{}
 	for _, s := range statuses {
@@ -349,15 +372,16 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 		if old, ok := states[name]; ok && old != v {
 			decisive := func(x CI) bool { return x == Green || x == Red }
 			if decisive(old) && decisive(v) {
-				return nil, fmt.Errorf("ambiguous check and status named %q", name)
+				return checkEvidence{}, fmt.Errorf("ambiguous check and status named %q", name)
 			}
 			if decisive(old) {
 				continue
 			}
 		}
 		states[name] = v
+		delete(cancelledAt, name)
 	}
-	return states, nil
+	return checkEvidence{states, cancelledAt}, nil
 }
 
 func (c *Client) Check(ctx context.Context, repo, sha string, required []string) (CI, error) {
@@ -384,19 +408,39 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 // CheckStates resolves each required name, distinguishing completed runs without
 // a verdict from pending evidence. Missing evidence is pending.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
-	states, e := cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (map[string]CI, error) { return c.checkStates(freshRequest(ctx), repo, sha, true) })
+	ev, e := c.headChecks(ctx, repo, sha)
 	if e != nil {
 		return nil, e
 	}
 	out := make(map[string]CI, len(required))
 	for _, n := range required {
-		v, ok := states[n]
+		v, ok := ev.states[n]
 		if !ok {
 			v = Pending
 		}
 		out[n] = v
 	}
 	return out, nil
+}
+
+// CancelledAt returns, for each required name whose latest run on sha is
+// cancelled, when that run completed. A zero time means GitHub gave none.
+func (c *Client) CancelledAt(ctx context.Context, repo, sha string, required []string) (map[string]time.Time, error) {
+	ev, e := c.headChecks(ctx, repo, sha)
+	if e != nil {
+		return nil, e
+	}
+	out := map[string]time.Time{}
+	for _, n := range required {
+		if t, ok := ev.cancelled[n]; ok {
+			out[n] = t
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) headChecks(ctx context.Context, repo, sha string) (checkEvidence, error) {
+	return cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (checkEvidence, error) { return c.checkEvidence(freshRequest(ctx), repo, sha, true) })
 }
 
 type Review struct {
