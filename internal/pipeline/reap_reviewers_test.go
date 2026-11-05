@@ -239,6 +239,12 @@ func TestReapReviewer_D_I4_KeepsPaneTheJobDoesNotName(t *testing.T) {
 				f.hub.agents[list].([]any)[0].(map[string]any)["cwd"] = "/repo/elsewhere"
 			}
 		}},
+		{"job cwd", func(f *reviewerFix, label string) {
+			// Same base name, but not the cwd the job record names.
+			rec := f.sink.recs[label]
+			rec.Cwd = "/repo/other/" + label
+			f.sink.recs[label] = rec
+		}},
 		{"host", func(f *reviewerFix, label string) {
 			rec := f.sink.recs[label]
 			rec.Host = "node-b"
@@ -454,6 +460,44 @@ func TestReapReviewer_G_I7_RemovesLocalCheckoutOnlyWhenUnused(t *testing.T) {
 				t.Fatalf("rows: %v", rowSummary(rows))
 			}
 		})
+	}
+}
+
+// (g) A local pass's reviewer-cleanup row says "closed" once the pane closed;
+// the pass then removes the checkout and may fail. The label stays open while
+// the checkout is on disk, and the sweep removes it.
+func TestReapReviewer_G_I7_RetriesCheckoutLeftAfterClosedPane(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+	label := reviewerLabelFor(12, time.Hour)
+	path := localCheckout(t, f, label, false)
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "local", PaneID: "w9:p1"}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Host: "local", Pane: "w9:p1", Worktree: path, Result: "closed", Reason: "pane closed; local checkout removed by the pass"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) {
+		t.Fatalf("checkout not removed; calls %q", f.run.calls)
+	}
+	rows := f.rows(t)
+	if got := rowSummary(rows); len(rows) != 2 || rows[0].Reason != "pane already gone" || rows[1].Result != "removed" || rows[1].Worktree != path {
+		t.Fatalf("rows: %v", got)
+	}
+
+	// Once the checkout is gone the closed row is terminal again: no visit.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	before := len(f.run.calls)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(t); len(rows) != 2 {
+		t.Fatalf("second run rows: %v", rowSummary(rows))
+	}
+	for _, c := range f.run.calls[before:] {
+		if strings.Contains(c, path) {
+			t.Fatalf("second run touched the checkout: %q", c)
+		}
 	}
 }
 

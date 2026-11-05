@@ -149,6 +149,12 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 	}
 	finished := func(label string) bool {
+		// A reviewer-cleanup "closed" row only says the pane closed: the pass
+		// removes its local checkout afterwards and may fail. A checkout still
+		// on disk keeps the label open until its own removal is confirmed.
+		if w.localCheckout(label) != "" {
+			return false
+		}
 		if streams := w.streams[label]; len(streams) > 0 {
 			for _, v := range streams {
 				if !reviewerTerminal(v) {
@@ -218,6 +224,20 @@ func (w *reviewerSweep) remember(label, host, path string) {
 		w.remote[label] = map[string]string{}
 	}
 	w.remote[label][host] = path
+}
+
+// localCheckout is the label's local reviewer checkout
+// <review.panewire.checkouts>/<label>, or "" when it is not on disk.
+func (w *reviewerSweep) localCheckout(label string) string {
+	dir := config.Expand(w.s.Config.Review.Panewire.Checkouts)
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, label)
+	if _, e := os.Lstat(path); e != nil {
+		return ""
+	}
+	return path
 }
 
 // row starts a reviewer-reap receipt for a label.
@@ -344,7 +364,9 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 	pane := found[0]
 	rec.Pane, rec.Cwd = pane.ID, pane.Cwd
 	switch {
-	case job.PaneID == "" || pane.ID != job.PaneID || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != l.name:
+	case job.PaneID == "" || pane.ID != job.PaneID || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != l.name,
+		job.Cwd != "" && filepath.Clean(job.Cwd) != filepath.Clean(pane.Cwd):
+		// The job record, when it names a cwd, must name this pane's.
 		w.record(rec, "kept", "job record and pane disagree")
 		return nil, false
 	case pane.Focused:
@@ -476,12 +498,8 @@ func (w *reviewerSweep) localHost(ctx context.Context) *reapHost {
 // on this machine (I7): clean, detached at the label's head, and no local
 // pane in it. A checkout that is not there writes nothing.
 func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
-	dir := config.Expand(w.s.Config.Review.Panewire.Checkouts)
-	if dir == "" {
-		return
-	}
-	path := filepath.Join(dir, l.name)
-	if _, e := os.Lstat(path); e != nil {
+	path := w.localCheckout(l.name)
+	if path == "" {
 		return
 	}
 	hs := w.localHost(ctx)
