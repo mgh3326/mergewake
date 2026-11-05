@@ -30,6 +30,7 @@ type reviewerPane struct {
 // reviewerPanes is the pane surface a close needs; reap.Exec serves a local
 // host and reap.HubHost a remote one.
 type reviewerPanes interface {
+	Panes(context.Context) ([]reap.Pane, error)
 	AllPanes(context.Context) ([]reap.Pane, error)
 	Composer(context.Context, reap.Pane) (string, error)
 	CloseExact(context.Context, reap.Pane) (string, error)
@@ -48,8 +49,13 @@ type reviewerCleanup struct {
 
 // spawnPlacement reads the executing panewire's placement receipt. The
 // placement value is base64url JSON containing the chosen host and pane id;
-// cwd is available in stdout on versions that report it directly.
+// cwd is available in stdout on versions that report it directly. A spawn the
+// hub coordinator placed reports `SPAWNED job=<id> host=<h> profile=<p>
+// pane=<id>` instead, with "none" for a value it does not know.
 func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
+	if v, ok := spawnedPlacement(stdout); ok {
+		return v, true
+	}
 	for _, line := range strings.Split(stdout, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "OK" || !strings.HasPrefix(fields[1], "pane=") {
@@ -92,6 +98,35 @@ func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
 		return v, v.Host != "" && v.PaneID != ""
 	}
 	return integrations.JobRecord{}, false
+}
+
+// spawnedPlacement reads the hub coordinator's SPAWNED line. The last such line
+// wins, and a host or pane of "none" is not a placement.
+func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
+	var v integrations.JobRecord
+	found := false
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "SPAWNED" || !strings.HasPrefix(fields[1], "job=") {
+			continue
+		}
+		v, found = integrations.JobRecord{}, true
+		for _, field := range fields[2:] {
+			key, value, _ := strings.Cut(field, "=")
+			if value == "none" {
+				value = ""
+			}
+			switch key {
+			case "host":
+				v.Host = value
+			case "pane":
+				v.PaneID = value
+			case "profile":
+				v.Profile = value
+			}
+		}
+	}
+	return v, found && v.Host != "" && v.PaneID != ""
 }
 
 // closeReviewerPane runs once a pass has reached a terminal outcome. It closes
@@ -182,8 +217,23 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 		return c.p.placement.Cwd, true
 	}
 	c.row.Cwd = pane.Cwd
+	if pane.Name == "" || !closableStatus[pane.Status] {
+		// The full pane list carries no names on a hub node (herdr's pane
+		// list has none), and its status need not be the agent's; the agent
+		// list names the same pane id and reports its agent status.
+		if err := c.nameFromAgents(ctx, ops, pane); err != nil {
+			c.record("error", "agent list: "+err.Error())
+			return "", false
+		}
+	}
 	if pane.Name != c.p.label || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != c.p.label {
 		c.record("kept", "pane name/cwd mismatch")
+		return "", false
+	}
+	if !closableStatus[pane.Status] {
+		// The hub closes only an idle or done agent; a pane still working is
+		// left for the reviewer sweep.
+		c.record("kept", "pane is not idle or done: "+pane.Status)
 		return "", false
 	}
 	composer, err := ops.Composer(ctx, *pane)
@@ -206,6 +256,29 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 	}
 	c.paneClosed = true
 	return pane.Cwd, true
+}
+
+// closableStatus is the agent status the hub's pane.close accepts.
+var closableStatus = map[string]bool{"idle": true, "done": true}
+
+// nameFromAgents fills pane's name from the agent list entry with the same
+// pane id and cwd. A missing or different entry leaves the name empty, which
+// the identity check then refuses.
+func (c *reviewerCleanup) nameFromAgents(ctx context.Context, ops reviewerPanes, pane *reap.Pane) error {
+	agents, err := ops.Panes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		if a.ID == pane.ID && filepath.Clean(a.Cwd) == filepath.Clean(pane.Cwd) {
+			if pane.Name == "" {
+				pane.Name = a.Name
+			}
+			pane.Status = a.Status
+			return nil
+		}
+	}
+	return nil
 }
 
 // removeWorktree asks the hub to remove the detached worktree with the reviewed

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -33,12 +34,13 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
-	Block     string       `json:"review_block,omitempty"`
-	PatchID   string       `json:"patch_id,omitempty"`
-	Rounds    int          `json:"rounds"`
-	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
-	Inherited string       `json:"inherited_from,omitempty"`
-	Findings  dispositions `json:"dispositions"`
+	ChecksCancelled []string     `json:"checks_cancelled,omitempty"`
+	Block           string       `json:"review_block,omitempty"`
+	PatchID         string       `json:"patch_id,omitempty"`
+	Rounds          int          `json:"rounds"`
+	Reviewed        []string     `json:"reviewed_patch_ids,omitempty"`
+	Inherited       string       `json:"inherited_from,omitempty"`
+	Findings        dispositions `json:"dispositions"`
 }
 
 // dispositions counts the PR's review threads by how they stand: blocking and
@@ -85,6 +87,30 @@ func (s *Service) settlingVerdict(ctx context.Context, r config.Repo, pr github.
 	return v
 }
 
+// headSettleTries and headSettleWait bound how long one gate pass waits for
+// GitHub's GraphQL head to catch up with the REST head (about 4 s).
+var headSettleTries, headSettleWait = 3, 2 * time.Second
+
+// settledFeedback re-reads the review feedback past the evidence cache until
+// its head matches pr's head or the bound runs out; the last read is returned.
+func (s *Service) settledFeedback(ctx context.Context, repo string, pr github.Pull) (github.ReviewFeedback, error) {
+	var fb github.ReviewFeedback
+	var e error
+	for i := 0; i < headSettleTries; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return fb, ctx.Err()
+			case <-time.After(headSettleWait):
+			}
+		}
+		if fb, e = s.GH.ReviewFeedback(github.FreshEvidence(ctx), repo, pr.Number); e != nil || fb.HeadSHA == pr.Head.SHA {
+			return fb, e
+		}
+	}
+	return fb, nil
+}
+
 func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github.Pull, v *gateVerdict) {
 	if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
 		v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
@@ -93,13 +119,14 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
-// every required check green on H, no unresolved review threads (or, under a
+// every required check green or completed without a verdict on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
 // base branch an ancestor of H, and the PR mergeable. A review covers a patch,
 // not a SHA: a head whose patch id equals a reviewed head's inherits that
 // head's passes, so merging the base into a head costs a CI run, not a review. A pending required
-// check waits silently unless a sibling already failed; mergeable unknown
+// check waits silently unless a sibling already failed or the PR conflicts
+// (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
@@ -113,13 +140,20 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		case github.Red:
 			v.Reasons = append(v.Reasons, "check_failed:"+name)
 		case github.Green:
+		case github.Cancelled:
+			v.Review.ChecksCancelled = append(v.Review.ChecksCancelled, name)
 		default:
 			pending = true
 		}
 	}
 	if pending {
-		// A sibling failure is already final for this head; otherwise the
-		// incomplete evidence stays quiet.
+		// A sibling failure is already final for this head, and so is a
+		// conflict: GitHub runs no pull_request workflow for a conflicting PR,
+		// so its checks never appear. Otherwise the incomplete evidence stays
+		// quiet.
+		if conflicting(pr) {
+			v.Reasons = append(v.Reasons, "conflict")
+		}
 		v.State = "blocked"
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
@@ -136,9 +170,15 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if fb.HeadSHA != pr.Head.SHA {
 		// GitHub's REST pull head and the GraphQL head disagree for a few
-		// seconds after a push or update-branch: the evidence is still
-		// settling, so the verdict waits instead of failing the pass.
-		return s.settlingVerdict(ctx, r, pr, v, "head_moving"), nil
+		// seconds after a push or update-branch, and a cached feedback read
+		// can still carry the old head. Re-read past the cache a few times in
+		// this pass before deferring the verdict to the next one.
+		if fb, e = s.settledFeedback(ctx, r.Name, pr); e != nil {
+			return v, e
+		}
+		if fb.HeadSHA != pr.Head.SHA {
+			return s.settlingVerdict(ctx, r, pr, v, "head_moving"), nil
+		}
 	}
 	login := policy.NormalizeAuthor(s.Config.Review.Login)
 	files, e := s.GH.Files(ctx, r.Name, pr.Number)
@@ -240,7 +280,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if !fresh {
 		v.Reasons = append(v.Reasons, "base_stale")
 	}
-	if (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty" {
+	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
 	}
 	switch {
@@ -250,6 +290,11 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// conflicting reports whether GitHub says the PR cannot merge into its base.
+func conflicting(pr github.Pull) bool {
+	return (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty"
 }
 
 // linesVerified reports whether the PR's additions and deletions equal the
