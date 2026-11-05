@@ -7,6 +7,7 @@ required_checks:
   - build-linux-arm64
   - build-darwin-amd64
   - build-darwin-arm64
+watch_checks: [ci-ok]
 blocking:
   - paths: [internal/rollout/**]
     reason: Installation writes may damage files before a revert lands

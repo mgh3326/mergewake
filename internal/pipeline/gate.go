@@ -18,8 +18,8 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
-// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale and
-// conflict. The two graded reasons replace threads_open when the policy has a
+// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on and GitHub requires an
+// up-to-date branch) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
@@ -34,12 +34,16 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
-	Block     string       `json:"review_block,omitempty"`
-	PatchID   string       `json:"patch_id,omitempty"`
-	Rounds    int          `json:"rounds"`
-	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
-	Inherited string       `json:"inherited_from,omitempty"`
-	Findings  dispositions `json:"dispositions"`
+	// BaseBehind marks a base that is not an ancestor of the head while GitHub
+	// still merges the PR as is. It blocks nothing.
+	BaseBehind      bool         `json:"base_behind,omitempty"`
+	ChecksCancelled []string     `json:"checks_cancelled,omitempty"`
+	Block           string       `json:"review_block,omitempty"`
+	PatchID         string       `json:"patch_id,omitempty"`
+	Rounds          int          `json:"rounds"`
+	Reviewed        []string     `json:"reviewed_patch_ids,omitempty"`
+	Inherited       string       `json:"inherited_from,omitempty"`
+	Findings        dispositions `json:"dispositions"`
 }
 
 // dispositions counts the PR's review threads by how they stand: blocking and
@@ -118,13 +122,14 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
-// every required check green on H, no unresolved review threads (or, under a
+// every required check green or completed without a verdict on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
 // base branch an ancestor of H, and the PR mergeable. A review covers a patch,
 // not a SHA: a head whose patch id equals a reviewed head's inherits that
 // head's passes, so merging the base into a head costs a CI run, not a review. A pending required
-// check waits silently unless a sibling already failed; mergeable unknown
+// check waits silently unless a sibling already failed or the PR conflicts
+// (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
@@ -138,13 +143,20 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		case github.Red:
 			v.Reasons = append(v.Reasons, "check_failed:"+name)
 		case github.Green:
+		case github.Cancelled:
+			v.Review.ChecksCancelled = append(v.Review.ChecksCancelled, name)
 		default:
 			pending = true
 		}
 	}
 	if pending {
-		// A sibling failure is already final for this head; otherwise the
-		// incomplete evidence stays quiet.
+		// A sibling failure is already final for this head, and so is a
+		// conflict: GitHub runs no pull_request workflow for a conflicting PR,
+		// so its checks never appear. Otherwise the incomplete evidence stays
+		// quiet.
+		if conflicting(pr) {
+			v.Reasons = append(v.Reasons, "conflict")
+		}
 		v.State = "blocked"
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
@@ -269,9 +281,16 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	if !fresh {
-		v.Reasons = append(v.Reasons, "base_stale")
+		// A base that moved on blocks only when GitHub requires an up-to-date
+		// branch ("behind"). A conflict-free PR it can merge as is lands; the
+		// stale base is recorded for information.
+		if pr.MergeableState == "behind" {
+			v.Reasons = append(v.Reasons, "base_stale")
+		} else {
+			v.Review.BaseBehind = true
+		}
 	}
-	if (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty" {
+	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
 	}
 	switch {
@@ -281,6 +300,11 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// conflicting reports whether GitHub says the PR cannot merge into its base.
+func conflicting(pr github.Pull) bool {
+	return (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty"
 }
 
 // linesVerified reports whether the PR's additions and deletions equal the
