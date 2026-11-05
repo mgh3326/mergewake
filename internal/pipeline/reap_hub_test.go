@@ -20,14 +20,16 @@ import (
 // fakeReapHub answers the panewire hub's node-command endpoints for one
 // machine, node-a, whose only agent sits in the merged PR's worktree.
 type fakeReapHub struct {
-	mu       sync.Mutex
-	agents   map[string]any // the node-a row of GET /v1/nodes/agents
-	composer map[string]any
-	capture  map[string]any
-	close    map[string]any
-	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
-	wtHead   string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
-	wtPaths  map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
+	mu             sync.Mutex
+	agents         map[string]any // the node-a row of GET /v1/nodes/agents
+	jobResult      json.RawMessage
+	jobResultError string
+	composer       map[string]any
+	capture        map[string]any
+	close          map[string]any
+	forbid         map[string]bool // paths or ops answered 403 scope_forbidden
+	wtHead         string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
+	wtPaths        map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
 	// removeOutcome is worktree.remove's answer; "removed" when empty.
 	removeOutcome string
 	commands      []map[string]any
@@ -105,6 +107,15 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			}
 		case "pane.read":
 			result = h.composer
+		case "job.result":
+			if h.jobResultError != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": h.jobResultError})
+				return
+			}
+			result = h.jobResult
+			if len(h.jobResult) == 0 {
+				result = json.RawMessage(`{"found":false}`)
+			}
 		case "job.done":
 			result = map[string]any{"outcome": "done"}
 		case "pane.capture":

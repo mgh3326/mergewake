@@ -9,39 +9,24 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-type remoteResultRunner struct {
-	*panewireRunner
-	result string
-	err    error
-	calls  [][]string
-}
-
-func (r *remoteResultRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
-	if command == "panewire" && len(args) >= 2 && args[0] == "node" && args[1] == "job-result" {
-		r.calls = append(r.calls, append([]string(nil), args...))
-		return []byte(r.result), r.err
-	}
-	return r.panewireRunner.Run(ctx, command, args, input, dir)
-}
-
 func TestReviewerRemoteResult(t *testing.T) {
 	for _, tc := range []struct {
 		name, status, result, outcome string
-		err                           error
+		nodeError                     string
 		budget, recovered             bool
 	}{
 		{name: "finished", status: "done", result: `{"found":true,"findings":{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]},"report":{"present":true,"last_line":"done"}}`, outcome: "found", recovered: true},
 		{name: "missing", status: "done", result: `{"found":true,"findings":null,"findings_error":"missing"}`, outcome: "missing"},
-		{name: "old_cli", status: "done", err: panewireExit(2), outcome: "error"},
+		{name: "old_node", status: "done", nodeError: "unknown_op", outcome: "error"},
 		{name: "past_budget", status: "working", result: `{"found":true,"findings":{"findings":[]}}`, outcome: "found", budget: true, recovered: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, repo, runner, c := interruptedReviewer(t)
 			old := readReviewerJob(t, s, repo, 1)
-			budgetPane(t, s, runner, old, tc.status)
+			hub := budgetPane(t, s, runner, old, tc.status)
+			hub.jobResult = json.RawMessage(tc.result)
+			hub.jobResultError = tc.nodeError
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-			rr := &remoteResultRunner{panewireRunner: runner, result: tc.result, err: tc.err}
-			s.Runner = rr
 			if tc.budget {
 				pastBudget(g, c)
 			} else {
@@ -50,8 +35,9 @@ func TestReviewerRemoteResult(t *testing.T) {
 			if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
 				t.Fatal(err)
 			}
-			if len(rr.calls) != 1 || arg(rr.calls[0], "--host") != "node-a" || arg(rr.calls[0], "--job") != old.Label {
-				t.Fatalf("calls=%v", rr.calls)
+			calls := hub.ops("job.result")
+			if len(calls) != 1 || calls[0]["job"] != old.Label {
+				t.Fatalf("calls=%v", calls)
 			}
 			rows := auditRows(t, s, repo, "reviewer-remote-result")
 			if len(rows) != 1 || rows[0]["outcome"] != tc.outcome {
@@ -71,5 +57,28 @@ func TestReviewerRemoteResult(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type oldLocalPanewire struct{ *panewireRunner }
+
+func (r oldLocalPanewire) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && len(args) > 1 && args[0] == "node" && args[1] == "job-result" {
+		return nil, panewireExit(2)
+	}
+	return r.panewireRunner.Run(ctx, command, args, input, dir)
+}
+
+func TestReviewerRemoteResultLocalOldCLI(t *testing.T) {
+	runner := &panewireRunner{}
+	s, _, repo := panewireSetup(t, runner)
+	s.Runner = oldLocalPanewire{runner}
+	x := panewireExecutor{s: s, repo: repo}
+	if got := x.remoteFindings(context.Background(), &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil {
+		t.Fatalf("findings = %s", got)
+	}
+	rows := auditRows(t, s, repo, "reviewer-remote-result")
+	if len(rows) != 1 || rows[0]["outcome"] != "error" {
+		t.Fatalf("audit=%v", rows)
 	}
 }

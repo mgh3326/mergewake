@@ -736,33 +736,56 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) []byte {
 	outcome := "error"
 	var findings json.RawMessage
-	if rec.Host != "" {
-		b, err := x.s.Runner.Run(ctx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
+	var result struct {
+		Found         bool            `json:"found"`
+		Findings      json.RawMessage `json:"findings"`
+		FindingsError string          `json:"findings_error"`
+		Report        struct {
+			Present  bool   `json:"present"`
+			Bytes    int64  `json:"bytes"`
+			SHA256   string `json:"sha256"`
+			LastLine string `json:"last_line"`
+		} `json:"report"`
+		Completed bool `json:"completed"`
+	}
+	var err error
+	switch {
+	case rec.Host == "":
+		outcome = "missing_host"
+	case rec.Host == "local" || x.localReviewerHost(rec.Host):
+		var b []byte
+		b, err = x.s.Runner.Run(ctx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
 		if err == nil {
-			var result struct {
-				Found         bool            `json:"found"`
-				Findings      json.RawMessage `json:"findings"`
-				FindingsError string          `json:"findings_error"`
-			}
-			if json.Unmarshal(b, &result) != nil {
+			err = json.Unmarshal(b, &result)
+		}
+	default:
+		var hub *reap.Hub
+		hub, err = x.s.reapHub()
+		if err == nil && hub != nil {
+			host := reap.HubHost{Hub: hub, Machine: rec.Host}
+			err = host.Hub.Command(ctx, host.Machine, "job.result", map[string]string{"job": label}, &result)
+		} else if err == nil {
+			err = errors.New("hub unavailable")
+		}
+	}
+	if rec.Host != "" && err == nil {
+		switch {
+		case !result.Found:
+			outcome = "not_found"
+		case len(result.Findings) == 0 || string(result.Findings) == "null":
+			switch result.FindingsError {
+			case "missing", "too_large", "not_json", "schema":
+				outcome = result.FindingsError
+			default:
 				outcome = "invalid_response"
-			} else if !result.Found {
-				outcome = "not_found"
-			} else if len(result.Findings) == 0 || string(result.Findings) == "null" {
-				switch result.FindingsError {
-				case "missing", "too_large", "not_json", "schema":
-					outcome = result.FindingsError
-				default:
-					outcome = "invalid_response"
-				}
-			} else if _, err := parseFindings(result.Findings, x.diff); err != nil {
+			}
+		default:
+			if _, err := parseFindings(result.Findings, x.diff); err != nil {
 				outcome = "invalid_findings"
 			} else {
 				outcome, findings = "found", result.Findings
 			}
 		}
-	} else {
-		outcome = "missing_host"
 	}
 	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
 	return findings
