@@ -17,6 +17,7 @@ func conflictGate(t *testing.T, mergeable *bool, state string, checks map[string
 	g.enabled = true
 	markReviewed(g)
 	g.required = []string{"vet", "test"}
+	g.ci = github.Pending // a required check that never ran is not green
 	g.pull.Mergeable, g.pull.MergeableState = mergeable, state
 	if checks != nil {
 		g.checkNames = map[string]map[string]github.CI{shaA: checks}
@@ -72,6 +73,7 @@ func TestGateMergeableQueuedCheckStaysPending(t *testing.T) {
 func TestNotifyConflictNoChecksRoutesToAuthorOnce(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.required = []string{"vet", "test"}
+	g.ci = github.Pending
 	no := false
 	g.pull.Mergeable, g.pull.MergeableState = &no, "dirty"
 	g.pull.Body = "Mergewake-Task: 2481"

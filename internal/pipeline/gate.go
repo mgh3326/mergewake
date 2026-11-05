@@ -144,8 +144,13 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		}
 	}
 	if pending {
-		// A sibling failure is already final for this head; otherwise the
-		// incomplete evidence stays quiet.
+		// A sibling failure is already final for this head, and so is a
+		// conflict: GitHub runs no pull_request workflow for a conflicting PR,
+		// so its checks never appear. Otherwise the incomplete evidence stays
+		// quiet.
+		if conflicting(pr) {
+			v.Reasons = append(v.Reasons, "conflict")
+		}
 		v.State = "blocked"
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
