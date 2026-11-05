@@ -413,7 +413,7 @@ needs no GitHub token.
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
 | `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
 | `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
-| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `panewire` spawns a visible reviewer pane through panewire and keeps headless as the fallback. |
+| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `panewire` spawns a visible reviewer pane through panewire for each pass, with no headless fallback (see [Panewire executor](#panewire-executor)). |
 | `panewire.command` | `panewire` | Single executable for spawn and inbox calls. |
 | `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
@@ -476,7 +476,7 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    records that as `fallback`.
 4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
    mismatch (a stale remote worktree) it writes
-   `{"refused":"…"}` instead of reviewing, and the pass falls back. Otherwise
+   `{"refused":"…"}` instead of reviewing, and the pass fails. Otherwise
    it writes `{"findings":[…]}` to `findings.json` in its job directory
    (`<jobs>/<label>/` here, panewire's jobs root on another host) and runs
    `panewire done <label> --result "$J/findings.json" --report "$J/report.md"`,
@@ -486,7 +486,7 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    credential convention as above) and applies the W4 rule: a completed
    record's `result` is used; a completed record without a result, an
    `escalated` or `lost` record (the receipt records the state), a still
-   pending or missing record, and an unreadable hk all fall back — the last
+   pending or missing record, and an unreadable hk all fail the pass — the last
    three after polling every 5s for up to 30s (at most half the remaining
    deadline), an unreadable hk reporting reason `hk-unavailable`. A historical pane from before `runtug done --result` (runtug was replaced by panewire) has no result on its record, so the lane announcement + `handoffkeep attach get` (or, on this
    host, `<jobs>/<label>/findings.json`) is still tried and each use is
@@ -501,26 +501,40 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    as the fallback only when the record has none; an unknown family counts as
    same-family. The checkout is removed after the wait.
 
+The panewire executor is the only executor of the pass: nothing runs headless.
 No task trailer or T marker on a PR outside the fleet, no repo `root`, a fork
 PR, a failed checkout, a panewire refusal or wait failure, a refusal by the
-pane, no findings or rejected findings all fall back to the
-headless executor for that pass under the same claim; its receipt records
-`"fallback":"panewire: <reason>"`. All executors share `review.timeout`, so a
-pane that used the whole deadline leaves nothing for the fallback. In panewire
-mode a failing quota tool is not fatal: it only leaves the headless fallback
-without candidates. Passes of a blocking PR are separate panes; panewire
+pane, no findings or rejected findings all fail the pass. The run records a
+`review_missing` event and a `review-skipped` audit record with the panewire
+skip, posts nothing, writes no `-done` marker and fails with "review
+unavailable". The daemon's review retry backs off, runs the review again and
+so spawns a new reviewer pane, and escalates once after
+`daemon.pr.review_retry.failures` failures. A pane cut off by `review.timeout`
+records `review_deadline` instead, and a completed reviewer whose result was
+lost records `review-result-lost` and notifies the desk; both are retried the
+same way. The receipt's `executor` is always `panewire`, and its `fallback`
+carries only the panewire seat or return-path note from steps 3 and 5.
+
+Under the panewire executor, review does not call the quota tool and does not
+read `review.profiles`, `review.pairings`, `review.select` or `review.quota`
+to choose reviewers: panewire selects the reviewer. The keys are still
+accepted, so existing configs keep loading. `review.profiles` is still read for
+the author's model and family from a `Mergewake-Author-Profile` trailer, for
+the author model on the outcomes record, and to name the family of a seat whose
+job record and spawn events carry none; `review.quota` is still the default
+`outcomes.command`. Passes of a blocking PR are separate panes; panewire
 enforces only the author-family exclusion between them.
 
 panewire fails closed when the remote host cannot stand at the head: an
 existing worktree there that is not detached at that commit or is dirty is a
-placement refusal for that pass, which falls back to headless.
+placement refusal for that pass, which fails it.
 
 #### Blocked fleet reviews
 
 With `executor: panewire`, a PR opened by `review.login` or a
-`review.fleet_authors` account does not take the fallback above when it lacks
-what panewire needs. Its review is blocked until the author fixes the PR or the
-task:
+`review.fleet_authors` account is not failed and retried as above when it
+lacks what panewire needs. Its review is blocked until the author fixes the PR
+or the task:
 
 | Outcome | Cause | Fix |
 | --- | --- | --- |
@@ -541,7 +555,7 @@ retry backoff and no failure escalation, and the stall alarm skips the head. The
 next poll after the fix runs the review on the same head and clears the outcome.
 
 A read error is not a block. If the commit or the task cannot be read, the pass
-takes the fallback above. Other authors, the headless executor, a repo without
+fails and is retried as above. Other authors, the headless executor, a repo without
 `root` and a head that already has its passes or inherits them are unaffected.
 `mergewake review` exits non-zero on a blocked head. A dry run only prints the
 decision. Shadow mode also records the outcome, and it posts and emits

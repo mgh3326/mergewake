@@ -57,6 +57,7 @@ var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 // is a skip unless a completed job has lost its result, another reviewer job
 // of the task holds the reservation, or the pass's own job may still run: a
 // pass resumes its recorded job (reviewer_job.go) and never spawns a second.
+// A skip fails the pass, and the next review run spawns a new pane.
 type panewireExecutor struct {
 	s            *Service
 	repo         config.Repo
@@ -96,7 +97,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	profile := ""
 	skip := func(format string, args ...any) (passOutcome, error) {
 		// Reasons can carry a command's stderr and reach the decision log
-		// and the posted receipt's fallback: redact them here.
+		// and the review-skipped audit: redact them here.
 		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
 		return out, nil
 	}

@@ -152,13 +152,13 @@ func TestSkipReasonCodes(t *testing.T) {
 }
 
 // A refused panewire reviewer spawn records its exit code, a redacted stderr
-// tail and the requested host in the decision log and as one event, and the
-// review still completes headless.
+// tail and the requested host in the decision log and as one reviewer event,
+// and the pass fails without a headless review.
 func TestPanewireSpawnFailureRecordsCause(t *testing.T) {
 	runner := &panewireRunner{refuse: map[string]int{"reviewer": 70}, refuseStderr: "panewire: quota gate refused " + fakeSecretText + "\n"}
 	s, _, r := panewireSetup(t, runner)
-	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
-		t.Fatal(err)
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); !errors.Is(err, ErrReviewUnavailable) || runner.headless != 0 {
+		t.Fatalf("err=%v headless=%d", err, runner.headless)
 	}
 	logRaw, rows := readLines(t, filepath.Join(s.Config.StateDir, r.Name, "decisions.jsonl"))
 	var skip map[string]any
@@ -176,7 +176,7 @@ func TestPanewireSpawnFailureRecordsCause(t *testing.T) {
 		t.Fatalf("panewire skip lacks its cause: %v\n%s", skip, logRaw)
 	}
 	evRaw, events := readLines(t, filepath.Join(s.Config.StateDir, "events", "fleet-events.jsonl"))
-	if len(events) != 1 || events[0]["kind"] != "reviewer" || events[0]["outcome"] != "failed" || events[0]["reason"] != "panewire_spawn_exit" {
+	if len(events) != 2 || events[0]["kind"] != "reviewer" || events[0]["outcome"] != "failed" || events[0]["reason"] != "panewire_spawn_exit" || events[1]["kind"] != "review" || events[1]["reason"] != "review_missing" {
 		t.Fatalf("events: %s", evRaw)
 	}
 	for _, secret := range fakeSecrets {
@@ -205,7 +205,7 @@ func TestPanewireFailureEventNamesJobRecordProfile(t *testing.T) {
 	runner := &panewireRunner{family: "openai"}
 	s, _, r := panewireSetup(t, runner)
 	runner.sink.missing = &integrations.JobRecord{State: "escalated", Family: "openai", Profile: "codex-high"}
-	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); !errors.Is(err, ErrReviewUnavailable) {
 		t.Fatal(err)
 	}
 	details := reviewerEventDetails(t, s.Config.StateDir)
@@ -231,7 +231,7 @@ func TestPanewireSkipBeforeSpawnLeavesProfileEmpty(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`}
 	s, g, r := panewireSetup(t, runner)
 	g.pull.Body = "Mergewake-Author-Family: openai\n"
-	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
+	if err := s.Review(context.Background(), r, 7, "openai", Options{}); !errors.Is(err, ErrReviewUnavailable) {
 		t.Fatal(err)
 	}
 	details := reviewerEventDetails(t, s.Config.StateDir)
