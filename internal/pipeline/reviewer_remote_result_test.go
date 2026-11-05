@@ -151,3 +151,19 @@ func TestReviewerRemoteResultTransientRetry(t *testing.T) {
 		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
 	}
 }
+
+func TestReviewerRemoteResultNoHubConfigured(t *testing.T) {
+	s, g, repo, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, repo, 1)
+	budgetPane(t, s, runner, old, "done")
+	s.Config.Reap.Transport = "ssh"
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	pastBudget(g, c)
+	if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	closedOnce(t, runner, old.Label)
+	if len(runner.spawns) != 2 || g.postCount != 1 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+}

@@ -323,6 +323,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 						state, spawn = fresh.State, false
 					} else if b, retry := x.remoteFindings(ctx, plan, fresh, label); b != nil {
 						collected, remoteRecord, spawn = b, &fresh, false
+						// Give transient read errors one additional review budget to recover.
 					} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
 						return out, errPassPending
 					} else {
@@ -772,6 +773,7 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 			host := reap.HubHost{Hub: hub, Machine: rec.Host}
 			err = host.Hub.Command(lookupCtx, host.Machine, "job.result", map[string]string{"job": label}, &result)
 		} else if err == nil {
+			outcome = "no_hub"
 			err = errors.New("hub unavailable")
 		}
 	}
@@ -796,7 +798,7 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 	}
 	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
 	switch outcome {
-	case "found", "not_found", "missing", "too_large", "not_json", "schema":
+	case "found", "not_found", "missing", "too_large", "not_json", "schema", "no_hub":
 		return findings, false
 	default:
 		return nil, true
