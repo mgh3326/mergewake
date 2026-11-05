@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -297,29 +299,55 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	// each waits for its reviewer pane. One PR's review and settle stay in
 	// order. Settles run one at a time: they share the repo's delivery,
 	// notify and ready ledgers, and each land must see the base the previous
-	// land left, as in the sequential order.
+	// land left, as in the sequential order. They start in hk priority order
+	// (ties in list order); a priority-1 review also starts past the bound,
+	// up to urgentExtra more at once.
 	results := make([][]error, len(prs))
 	slots := make(chan struct{}, s.Config.Daemon.PR.Parallel())
+	extra := make(chan struct{}, urgentExtra)
 	var settling sync.Mutex
 	var running sync.WaitGroup
+	reviewable := make([]int, 0, len(prs))
 	for i, pr := range prs {
-		if pr.Draft || isListedBot(pr, listed) {
-			continue
+		if !pr.Draft && !isListedBot(pr, listed) {
+			reviewable = append(reviewable, i)
 		}
+	}
+	priorities := reviewPriorities(ctx, s, r, prs, reviewable, handled)
+	slices.SortStableFunc(reviewable, func(a, b int) int { return cmp.Compare(priorities[a].Rank(), priorities[b].Rank()) })
+	for _, i := range reviewable {
+		pr := prs[i]
 		// A cancelled pass starts no further PR and returns once the running
-		// ones have.
+		// ones have. A free review slot is taken first; a priority-1 review
+		// with none free takes an extra one rather than wait.
+		release := slots
+		var urgent chan struct{}
+		if priorities[i].Urgent() {
+			urgent = extra
+		}
 		select {
 		case slots <- struct{}{}:
-		case <-ctx.Done():
+		default:
+			select {
+			case slots <- struct{}{}:
+			case urgent <- struct{}{}:
+				release = extra
+			case <-ctx.Done():
+			}
 		}
 		if ctx.Err() != nil {
 			running.Wait()
 			return ctx.Err()
 		}
+		if !handled[i] {
+			if e := s.AuditReviewStart(r, pr, priorities[i], o, release == extra); e != nil {
+				errs = append(errs, e)
+			}
+		}
 		running.Add(1)
 		go func() {
 			defer running.Done()
-			defer func() { <-slots }()
+			defer func() { <-release }()
 			results[i] = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
 		}()
 	}
@@ -329,6 +357,30 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	}
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
+}
+
+// urgentExtra is how many priority-1 reviews of one repo may run past
+// review_parallel at once.
+const urgentExtra = 2
+
+// reviewPriorities resolves, at once and at most once per PR, the priority of
+// every PR in reviewable whose head still needs a review. Lookups never fail
+// the pass: a PR without a priority keeps its place in list order.
+func reviewPriorities(ctx context.Context, s *pipeline.Service, r config.Repo, prs []github.Pull, reviewable []int, handled []bool) []pipeline.ReviewPriority {
+	out := make([]pipeline.ReviewPriority, len(prs))
+	var wg sync.WaitGroup
+	for _, i := range reviewable {
+		if handled[i] {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out[i] = s.ReviewPriority(ctx, r, prs[i])
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // reviewPR runs one PR's review, then settles it under settling unless phase
