@@ -75,7 +75,7 @@ func (st anyRefIncident) decide(sha string, now time.Time, wait time.Duration) a
 		if d.SHA != sha {
 			continue
 		}
-		if now.Sub(d.At) > wait {
+		if now.Sub(d.At) >= wait {
 			return anyRefStep{reason: "any-ref CI timed out on " + sha7(sha), notify: true}
 		}
 		return anyRefStep{reason: "waiting for any-ref CI on " + sha7(sha)}

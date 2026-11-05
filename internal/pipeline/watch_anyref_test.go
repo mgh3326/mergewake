@@ -275,7 +275,8 @@ func TestWatchAnyRefTimeout(t *testing.T) {
 	if got := lastWatch(t, s, r, Options{}); got.Reason != reasonFor(anyU2) {
 		t.Fatalf("%+v", got)
 	}
-	now = now.Add(2 * time.Minute)
+	// Exactly the wait bound after dispatch counts as timed out.
+	now = now.Add(time.Minute)
 	for i := 0; i < 2; i++ {
 		got := lastWatch(t, s, r, Options{})
 		if got.Action != "hold" || got.Reason != "any-ref CI timed out on "+anyU2[:7] {
