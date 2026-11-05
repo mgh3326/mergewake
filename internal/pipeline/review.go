@@ -492,6 +492,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			return e
 		}
+		// The pass is posted: its reviewer job record, if any, is spent. A
+		// record left behind is never resumed, since a posted pass is not run
+		// again for this head.
+		_ = s.dropReviewerJob(r.Name, n, plan.pass)
 		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": out.family, "same_family": plan.sameFamily, "findings": len(findings), "author_family": family, "answered_context": prContext.answered}
 		if prContext.truncated {
 			event["context_truncated"] = true

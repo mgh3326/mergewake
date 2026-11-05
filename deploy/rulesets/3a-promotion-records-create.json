@@ -1,0 +1,14 @@
+{
+  "name": "promotion/*: promotion App creates",
+  "target": "tag",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["refs/tags/promotion/*"], "exclude": [] }
+  },
+  "rules": [
+    { "type": "creation" }
+  ],
+  "bypass_actors": [
+    { "actor_id": 0, "actor_type": "Integration", "bypass_mode": "always" }
+  ]
+}

@@ -35,6 +35,8 @@ func (e panewireExit) ExitCode() int { return int(e) }
 type panewireRunner struct {
 	fakeRunner
 	refuse map[string]int // panewire --role → exit status
+	// exits, when set, is the exit status of each spawn in turn (0 runs it).
+	exits []int
 	// refuseStderr, when set, is the stderr a refused spawn wrote.
 	refuseStderr string
 	findings     string // "" writes no findings file
@@ -43,6 +45,7 @@ type panewireRunner struct {
 	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
 	waitTimeout  bool   // the spawn ran its pane, then its --wait timed out (non-zero exit)
 	unplaced     bool   // the OK line names no placement receipt
+	spawnOut     string // when set, the spawn's whole stdout (the hub coordinator's SPAWNED receipt)
 	quotaErr     error
 	usageErr     error
 	quotaCalls   int // quota tool invocations (recommend, usage, gate)
@@ -115,6 +118,13 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 			}
 			return nil, panewireExit(code)
 		}
+		if len(r.exits) > 0 {
+			code := r.exits[0]
+			r.exits = r.exits[1:]
+			if code != 0 {
+				return nil, panewireExit(code)
+			}
+		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])
 		label := arg(args, "-l")
 		switch {
@@ -143,6 +153,9 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		}
 		if r.waitTimeout {
 			return nil, panewireExit(1)
+		}
+		if r.spawnOut != "" {
+			return []byte(r.spawnOut), nil
 		}
 		// By default the pane reports a remote placement, so the pass keeps
 		// the local checkout cleanup it had before the reviewer-pane close.

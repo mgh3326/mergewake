@@ -61,6 +61,7 @@ func TestLandStaleBaseBlocks(t *testing.T) {
 	g.enabled = true
 	markReviewed(g)
 	g.stale = true
+	g.pull.MergeableState = "behind"
 	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +69,7 @@ func TestLandStaleBaseBlocks(t *testing.T) {
 		t.Fatal("stale-base head merged")
 	}
 	g.stale = false
+	g.pull.MergeableState = "clean"
 	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}

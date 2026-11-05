@@ -435,6 +435,9 @@ func TestReviewExecutor(t *testing.T) {
 	if rt := c.Review.Panewire; e != nil || rt.Lane != "findings-desk" || !slices.Equal(rt.ExcludeHosts, []string{"host-a", "host-b"}) {
 		t.Fatalf("%+v %v", rt, e)
 	}
+	if c, e = load("review:\n  panewire: {stale_after: 40m}\n"); e != nil || c.Review.Panewire.StaleAfter != "40m" {
+		t.Fatalf("stale_after: %+v %v", c.Review.Panewire, e)
+	}
 	c, e = load("review:\n  executor: panewire\n  panewire:\n    command: /usr/local/bin/panewire\n    workspace: reviews\n    owner: review-desk\n    host: auto\n")
 	if e != nil || c.Review.Panewire.Command != "/usr/local/bin/panewire" {
 		t.Fatalf("documented launcher migration: %+v %v", c.Review, e)
@@ -444,7 +447,7 @@ func TestReviewExecutor(t *testing.T) {
 			t.Fatalf("retired launcher settings accepted: %s", retired)
 		}
 	}
-	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  panewire: {bogus: x}\n", "review:\n  panewire: {lane: 'a b'}\n", "review:\n  panewire: {exclude_hosts: ['a,b']}\n", "review:\n  panewire: {host: host-a, exclude_hosts: [host-a]}\n"} {
+	for _, bad := range []string{"review:\n  executor: pane\n", "review:\n  panewire: {bogus: x}\n", "review:\n  panewire: {lane: 'a b'}\n", "review:\n  panewire: {exclude_hosts: ['a,b']}\n", "review:\n  panewire: {host: host-a, exclude_hosts: [host-a]}\n", "review:\n  panewire: {stale_after: 20mins}\n", "review:\n  panewire: {stale_after: 0s}\n"} {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
 		}

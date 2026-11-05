@@ -351,3 +351,56 @@ func TestReportGroupsEffortlessRowAsInferredOutsideArms(t *testing.T) {
 		t.Fatalf("high group=%+v", g)
 	}
 }
+
+// A row written before reviewers_by_head and grade_unknown existed decodes and
+// reports as it did.
+func TestReportOldRowWithoutReviewers(t *testing.T) {
+	old := `{"outcome_id":"x","revision":1,"task_ref":"t1","profile":"example","model":"m","effort":"high","grade":"A","tier":"T1","finalized":true,"decision":"landed","reviews_by_head":{"h":{}},"head":"h","updated_at":"2026-01-02T00:00:00Z"}`
+	var v Outcome
+	if err := json.Unmarshal([]byte(old), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.ReviewersByHead != nil || !v.Attributed() {
+		t.Fatalf("%+v", v)
+	}
+	b, _ := json.Marshal(v)
+	if strings.Contains(string(b), "reviewers_by_head") {
+		t.Fatal(string(b))
+	}
+	got := Report([]Outcome{v}, time.Time{})
+	if len(got) != 1 || got[0].GradeUnknown != 0 || got[0].AttributionMissing != 0 || got[0].Seen != 1 {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestPublishCarriesReviewersInOutcome(t *testing.T) {
+	r := &cliRunner{}
+	var v Outcome
+	complete(&v)
+	v.Task, v.ID = Key("example/project", 1), "stable"
+	v.SetReviewer("head", "1", "panewire:seat-a")
+	v.SetReviewer("head", "2", "claude")
+	if _, err := (CLI{Runner: r, Command: "scopefuel"}).Publish(context.Background(), v); err != nil {
+		t.Fatal(err)
+	}
+	var notes struct {
+		Outcome Outcome `json:"outcome"`
+	}
+	if err := json.Unmarshal([]byte(r.args[len(r.args)-1]), &notes); err != nil {
+		t.Fatal(err)
+	}
+	if got := notes.Outcome.ReviewersByHead["head"]; got["1"] != "panewire:seat-a" || got["2"] != "claude" {
+		t.Fatalf("%v", notes.Outcome.ReviewersByHead)
+	}
+}
+
+func TestReportCountsUnknownGrade(t *testing.T) {
+	var known, unknown Outcome
+	complete(&known)
+	complete(&unknown)
+	known.Task, unknown.Task, unknown.Grade = "t1", "t2", ""
+	got := Report([]Outcome{known, unknown}, time.Time{})
+	if len(got) != 1 || got[0].GradeUnknown != 1 || got[0].AttributionMissing != 1 || got[0].Seen != 2 {
+		t.Fatalf("%+v", got)
+	}
+}

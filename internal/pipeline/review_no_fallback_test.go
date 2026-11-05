@@ -148,38 +148,57 @@ func TestPanewireSkipsRunNoHeadless(t *testing.T) {
 }
 
 // (c) Through RetryReview a failed pane backs the review off; the next run
-// past the backoff spawns a new reviewer pane and posts. Nothing runs
-// headless in either run.
+// past the backoff retries the pass through panewire and posts. A refused
+// spawn started no job, so the retry spawns a new reviewer pane under a new
+// label; a spawn that failed after it may have started keeps its job record,
+// so the retry resumes that job instead (reviewer_job.go). Nothing runs
+// headless in any run.
 func TestRetryReviewRespawnsPanewireAfterFailedPane(t *testing.T) {
-	runner := &panewireRunner{family: "openai", refuse: map[string]int{"reviewer": 70}}
-	s, g, r := panewireSetup(t, runner)
-	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-	c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
-	s.Now = c.now
-	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "2m", Failures: 3}
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
-		t.Fatalf("first run: %v", err)
-	}
-	if len(runner.spawns) != 1 || g.postCount != 0 {
-		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
-	}
-	// Inside the backoff nothing runs.
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil || len(runner.spawns) != 1 {
-		t.Fatalf("backoff run: err=%v spawns=%d", err, len(runner.spawns))
-	}
-	c.t = c.t.Add(time.Minute)
-	// The failed run's pass lease also expires before the next attempt.
-	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	runner.refuse = nil
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-	if len(runner.spawns) != 2 || arg(runner.spawns[0], "-l") == arg(runner.spawns[1], "-l") {
-		t.Fatalf("no new reviewer spawned: %q", runner.spawns)
-	}
-	got := g.passes[shaA]
-	if runner.headless != 0 || g.postCount != 1 || !g.refs[doneRef(7, shaA)] || len(got) != 1 || got[0].Executor != "panewire" || got[0].Fallback != "" {
-		t.Fatalf("headless=%d posts=%d refs=%v passes=%+v", runner.headless, g.postCount, g.refs, got)
+	for _, tc := range []struct {
+		name          string
+		refuse        map[string]int
+		failedSpawns  int // spawn calls in the failed run
+		retrySpawns   int // spawn calls in the retry
+		newLabelRetry bool
+	}{
+		{"refused", map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}, 2, 1, true},
+		{"spawn exit 70", map[string]int{"reviewer": 70}, 1, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &panewireRunner{family: "openai", refuse: tc.refuse}
+			s, g, r := panewireSetup(t, runner)
+			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+			s.Now = c.now
+			s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "2m", Failures: 3}
+			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
+				t.Fatalf("first run: %v", err)
+			}
+			if len(runner.spawns) != tc.failedSpawns || g.postCount != 0 {
+				t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+			}
+			// Inside the backoff nothing runs.
+			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil || len(runner.spawns) != tc.failedSpawns {
+				t.Fatalf("backoff run: err=%v spawns=%d", err, len(runner.spawns))
+			}
+			c.t = c.t.Add(time.Minute)
+			// The failed run's pass lease also expires before the next attempt.
+			g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
+			runner.refuse = nil
+			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+				t.Fatalf("second run: %v", err)
+			}
+			if len(runner.spawns) != tc.failedSpawns+tc.retrySpawns {
+				t.Fatalf("retry spawns: %q", runner.spawns)
+			}
+			if tc.newLabelRetry && arg(runner.spawns[0], "-l") == arg(runner.spawns[len(runner.spawns)-1], "-l") {
+				t.Fatalf("no new reviewer spawned: %q", runner.spawns)
+			}
+			got := g.passes[shaA]
+			if runner.headless != 0 || g.postCount != 1 || !g.refs[doneRef(7, shaA)] || len(got) != 1 || got[0].Executor != "panewire" || got[0].Fallback != "" {
+				t.Fatalf("headless=%d posts=%d refs=%v passes=%+v", runner.headless, g.postCount, g.refs, got)
+			}
+		})
 	}
 }
 

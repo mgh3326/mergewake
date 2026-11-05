@@ -26,6 +26,10 @@ type cleanupOpts struct {
 	refuseAll        bool                      // both the reviewer and the worker seat are refused before any pane starts
 	noPlacement      bool                      // the spawn's OK line names no placement receipt
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
+	spawnOut         string                    // the spawn's whole stdout, replacing the OK line
+	unnamedPanes     bool                      // the full pane list carries no names, as on a hub node
+	paneListStatus   string                    // the full pane list's agent_status when unnamedPanes; "idle" when empty
+	agentStatus      string                    // the agent list's agent_status; "idle" when empty
 }
 
 type cleanupResult struct {
@@ -69,6 +73,7 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
 	}
 	runner.waitTimeout = o.waitTimeout
+	runner.spawnOut = o.spawnOut
 	if o.refuseAll {
 		runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
 	}
@@ -83,6 +88,18 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		pane := map[string]any{"pane_id": "w1:p1", "name": name, "agent_status": "idle", "agent": "claude", "cwd": cwd}
 		hub.agents["agents"] = []any{pane}
 		hub.agents["panes"] = []any{pane}
+		if o.unnamedPanes {
+			// A hub node's full pane list comes from herdr's pane list,
+			// which carries no names; only the agent list names panes.
+			status := "idle"
+			if o.paneListStatus != "" {
+				status = o.paneListStatus
+			}
+			hub.agents["panes"] = []any{map[string]any{"pane_id": "w1:p1", "name": nil, "agent_status": status, "cwd": cwd}}
+		}
+		if o.agentStatus != "" {
+			pane["agent_status"] = o.agentStatus
+		}
 		hub.wtPaths = map[string]bool{cwd: true}
 		if o.expireAfterSpawn {
 			cancel()
@@ -172,6 +189,104 @@ func TestReviewerCleanupClosesThenRemovesWithReceipt(t *testing.T) {
 	audits := res.audits(t)
 	if len(audits) != 1 || audits[0]["result"] != "removed" || audits[0]["pane"] != "w1:p1" || audits[0]["head"] != headSHA || audits[0]["pass"] != float64(1) || audits[0]["pr"] != float64(7) {
 		t.Fatalf("audits = %+v", audits)
+	}
+}
+
+// A spawn the hub coordinator placed reports a SPAWNED line, not an OK line.
+// Its host and pane are the placement, so the pass closes the pane and removes
+// its worktree instead of keeping both as pending-cleanup.
+func TestReviewerCleanupReadsHubSpawnedReceipt(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{spawnOut: "ACCEPTED job=l request=r1\nSPAWNED job=l host=node-a profile=seat-y pane=w1:p1\nwait job=l outcome=completed report= pane=\n"})
+	if res.err != nil || res.out.executor != "panewire" || res.out.reviewer != "panewire:seat-y" {
+		t.Fatalf("outcome=%+v error=%v", res.out, res.err)
+	}
+	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || receipts[0].Host != "node-a" {
+		t.Fatalf("receipts = %+v", receipts)
+	}
+}
+
+// On a hub node the full pane list has no names. The pass takes the name from
+// the agent list for the same pane id and cwd, and closes the pane.
+func TestReviewerCleanupNamesPaneFromAgentList(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	}
+	if r := res.receipts(t); len(r) != 1 || r[0].Result != "removed" {
+		t.Fatalf("receipts = %+v", r)
+	}
+}
+
+// The full pane list's status need not be the agent's: the close sends the
+// agent list's status, which the hub accepts.
+func TestReviewerCleanupTakesStatusFromAgentList(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, paneListStatus: "unknown", agentStatus: "done"})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	closes := res.hub.ops("pane.close")
+	if len(closes) != 1 || closes[0]["agent_status"] != "done" {
+		t.Fatalf("pane.close = %v", closes)
+	}
+	if r := res.receipts(t); len(r) != 1 || r[0].Result != "removed" {
+		t.Fatalf("receipts = %+v", r)
+	}
+}
+
+// An agent still working is not sent to the hub's close, which would refuse it.
+func TestReviewerCleanupKeepsWorkingPane(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, agentStatus: "working"})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	if len(res.hub.ops("pane.close")) != 0 || len(res.hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("a working pane was closed: %v", res.hubOps())
+	}
+	if r := res.receipts(t); len(r) != 1 || r[0].Result != "kept" || !strings.Contains(r[0].Reason, "working") {
+		t.Fatalf("receipts = %+v", r)
+	}
+}
+
+// An agent entry with another name for the pane id still refuses the close.
+func TestReviewerCleanupUnnamedPaneWithOtherAgentNameIsKept(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, paneName: func(string) string { return "mw-author" }})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	if r := res.receipts(t); len(r) != 1 || r[0].Result != "kept" || r[0].Reason != "pane name/cwd mismatch" {
+		t.Fatalf("receipts = %+v", r)
+	}
+	for _, op := range res.hubOps() {
+		if op == "pane.close" || op == "worktree.remove" {
+			t.Fatalf("a mismatched pane was touched: %v", res.hubOps())
+		}
+	}
+}
+
+func TestSpawnedPlacement(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		host string
+		pane string
+		ok   bool
+	}{
+		{"SPAWNED job=l host=node-a profile=p pane=w1:p1\n", "node-a", "w1:p1", true},
+		{"SPAWNED job=l host=node-a profile=p pane=none\n", "", "", false},
+		{"SPAWNED job=l host=none profile=none pane=none\n", "", "", false},
+		{"SPAWNED job=l host=old profile=p pane=w1:p0\nSPAWNED job=l host=node-b profile=p pane=w2:p2 lane=unregistered\n", "node-b", "w2:p2", true},
+		{"ACCEPTED job=l request=r\n", "", "", false},
+	} {
+		got, ok := spawnPlacement(tc.out)
+		if ok != tc.ok || got.Host != tc.host || got.PaneID != tc.pane {
+			t.Errorf("%q: got %+v ok=%v", tc.out, got, ok)
+		}
 	}
 }
 

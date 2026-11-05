@@ -44,6 +44,42 @@ func authorProfile(value string) (profile, effort string) {
 	}
 	return name, ""
 }
+
+// taskMarker reads both halves of the `(grade X, Tn)` routing marker in an hk
+// task title; taskScale, which panewire routes by, captures only the T.
+var taskMarker = regexp.MustCompile(`(?i)(?:\(|\b)grade (S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
+
+// taskTitleScale reads the grade and tier from the title of the hk task the PR
+// names. found is false when the PR names no task or the sink cannot read one;
+// err is an hk read failure. A title without a marker is found, with empty
+// grade and tier.
+func (s *Service) taskTitleScale(ctx context.Context, r config.Repo, p github.Pull) (grade, tier string, found bool, err error) {
+	jobs, ok := s.Sink.(interface {
+		TaskJob(context.Context, string) (string, string, error)
+	})
+	if !ok {
+		return "", "", false, nil
+	}
+	task, err := s.prTask(ctx, r, p)
+	if err != nil || task == "" {
+		return "", "", false, err
+	}
+	_, title, err := jobs.TaskJob(ctx, task)
+	if err != nil {
+		return "", "", false, err
+	}
+	if m := taskMarker.FindStringSubmatch(title); m != nil {
+		return strings.ToUpper(m[1]), strings.ToUpper(m[2]), true, nil
+	}
+	return "", "", true, nil
+}
+func validTier(t string) bool {
+	switch t {
+	case "T0", "T1", "T2", "T3":
+		return true
+	}
+	return false
+}
 func parsedTime(value string) *time.Time {
 	v, err := time.Parse(time.RFC3339, value)
 	if err != nil {
@@ -54,6 +90,28 @@ func parsedTime(value string) *time.Time {
 func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o Options) error {
 	if o.DryRun {
 		return nil
+	}
+	// The grade and tier come from the PR's own evidence: the trailer, else the
+	// hk task title. Never from config. hk is read before the ledger lock is
+	// taken, and only when a trailer leaves a gap.
+	grade, tier := trailer(p.Body, "Mergewake-Grade"), trailer(p.Body, "Mergewake-Tier")
+	if !config.ValidGrade(grade) {
+		grade = ""
+	}
+	if !validTier(tier) {
+		tier = ""
+	}
+	// A failed hk read keeps what an earlier observation of the row recorded.
+	titleUnread := false
+	if grade == "" || tier == "" {
+		g, t, _, e := s.taskTitleScale(ctx, r, p)
+		titleUnread = e != nil
+		if grade == "" {
+			grade = g
+		}
+		if tier == "" {
+			tier = t
+		}
 	}
 	err := s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) {
 		v.Head = p.Head.SHA
@@ -80,24 +138,11 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 				}
 			}
 		}
-		v.Grade = trailer(p.Body, "Mergewake-Grade")
-		if v.Grade == "" {
-			v.Grade = s.Config.Review.DefaultGrade
+		if grade != "" || !titleUnread {
+			v.Grade = grade
 		}
-		if !config.ValidGrade(v.Grade) {
-			v.Grade = ""
-		}
-		v.Tier = trailer(p.Body, "Mergewake-Tier")
-		if v.Tier == "" {
-			v.Tier = s.Config.Outcomes.Tier
-		}
-		if v.Tier == "" {
-			v.Tier = "T1"
-		}
-		switch v.Tier {
-		case "T0", "T1", "T2", "T3":
-		default:
-			v.Tier = ""
+		if tier != "" || !titleUnread {
+			v.Tier = tier
 		}
 		if p.ClosedAt != nil {
 			v.ClosedAt = parsedTime(*p.ClosedAt)
@@ -138,6 +183,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 			}
 			if len(reviews) > 0 {
 				sameFamily := false
+				reviewers := map[string]map[string]string{}
 				for _, head := range slices.Sorted(maps.Keys(reviews)) {
 					passes, e := s.GH.ReviewPasses(ctx, r.Name, p.Number, head, s.Config.Review.Login)
 					if e != nil {
@@ -145,6 +191,12 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 					}
 					for _, receipt := range passes {
 						sameFamily = sameFamily || receipt.SameFamily
+						if receipt.Reviewer != "" {
+							if reviewers[head] == nil {
+								reviewers[head] = map[string]string{}
+							}
+							reviewers[head][strconv.Itoa(receipt.Pass)] = receipt.Reviewer
+						}
 					}
 				}
 				if e = s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) {
@@ -161,6 +213,11 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 						}
 					}
 					v.SameFamily = v.SameFamily || sameFamily
+					for head, passes := range reviewers {
+						for pass, reviewer := range passes {
+							v.SetReviewer(head, pass, reviewer)
+						}
+					}
 				}); e != nil {
 					return e
 				}
@@ -262,6 +319,9 @@ func (s *Service) recordReview(repo string, pr int, head string, findings []gith
 			}
 		}
 		v.SameFamily = v.SameFamily || receipt.SameFamily
+		if receipt.Reviewer != "" {
+			v.SetReviewer(head, strconv.Itoa(receipt.Pass), receipt.Reviewer)
+		}
 	})
 }
 func (s *Service) recordDecision(repo string, pr int, action string, shadow, sameFamily, dry bool) error {
