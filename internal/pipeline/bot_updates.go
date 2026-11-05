@@ -38,12 +38,11 @@ func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p 
 
 func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
-	states, e := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {
 		return v, e
 	}
-	failed, cancelled, pending := judgeChecks(states, p.RequiredChecks)
-	v.Review.ChecksCancelled = cancelled
+	v.Review.ChecksCancelled, v.Review.ChecksSkipped = j.Cancelled, j.Skipped
 	files, e := s.GH.Files(ctx, r.Name, pr.Number)
 	if e != nil {
 		return v, e
@@ -66,8 +65,9 @@ func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pu
 	if reason := nonPatchReason(pr.Body); reason != "" {
 		v.Reasons = append(v.Reasons, reason)
 	}
-	v.Reasons = append(v.Reasons, failed...)
-	if pending {
+	v.Reasons = append(v.Reasons, j.Failed...)
+	v.Reasons = append(v.Reasons, j.Expired...)
+	if j.Pending {
 		// Incomplete checks wait unless the verdict is already final.
 		if conflicting(pr) {
 			v.Reasons = append(v.Reasons, "conflict")
@@ -76,6 +76,7 @@ func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pu
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
 		}
+		v.Reasons = append(v.Reasons, j.Waiting...)
 		return v, nil
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)
