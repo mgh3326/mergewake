@@ -602,8 +602,12 @@ func (s *Service) markDone(ctx context.Context, repo string, n int, sha string) 
 var hunk = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
 
 func parseFindings(b []byte, diff string) ([]github.Finding, error) {
+	// Summary is the job result's short summary that workers write on
+	// completion (hk job result summary); it carries no findings and is not
+	// used here, but its presence must not make a finished review look lost.
 	var v struct {
 		Findings []github.Finding `json:"findings"`
+		Summary  string           `json:"summary"`
 	}
 	if e := configJSON(b, &v); e != nil {
 		return nil, e
