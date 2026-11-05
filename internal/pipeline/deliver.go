@@ -266,14 +266,31 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 			}
 		}
 	}
-	// Explicit PR routing is evidence of ownership; a repo/desk default is not.
-	lane, via, e := s.notifyLane(ctx, r, pr)
-	if e != nil {
-		return rt, e
+	// Explicit PR routing is evidence of ownership: a Notify-Lane trailer, then
+	// the task's lane unless it is the desk. A repo/desk default is not.
+	notify := trailer(pr.Body, "Mergewake-Notify-Lane")
+	if notify == "" {
+		c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+		if e != nil {
+			return rt, e
+		}
+		notify = trailer(c.Commit.Message, "Mergewake-Notify-Lane")
 	}
-	if via == "notify-lane trailer" {
-		rt.lane, rt.via = lane, via
+	if laneName.MatchString(notify) {
+		rt.lane, rt.via = notify, "notify-lane trailer"
 		return rt, nil
+	}
+	if l, ok := s.Sink.(interface {
+		Lane(context.Context, string) (string, error)
+	}); task != "" && ok {
+		lane, e := l.Lane(ctx, task)
+		if e != nil {
+			return rt, e
+		}
+		if laneName.MatchString(lane) && lane != desk {
+			rt.lane, rt.via = lane, "task "+task
+			return rt, nil
+		}
 	}
 	rt.lane, rt.via = desk, "unknown author; desk"
 	return rt, nil
