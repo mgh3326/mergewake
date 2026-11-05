@@ -935,6 +935,8 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
 
+| `bot_updates` | Absent | Opt-in landing of a dependency bot's patch updates without review; see [Dependency-bot patch updates](#dependency-bot-patch-updates). |
+
 Each blocking rule has:
 
 | Key | Required / default | Meaning |
@@ -1000,6 +1002,40 @@ true) clears an outdated finding by anyone but `review.login`: a block finding
 (a CodeRabbit `major` included) once its reviewer has reviewed the current
 head. The other `review_gate` keys stay parseable but do not affect the land
 gate.
+
+### Dependency-bot patch updates
+
+A bot's PR has no `Mergewake-Task` trailer, so no reviewer can be spawned for
+it. `daemon.pr.skip_bots` drops such PRs; `bot_updates` lets a repository say
+which bots' patch updates land on their own and which files they may change:
+
+```yaml
+bot_updates:
+  authors: ["renovate[bot]"]
+  paths: ["**/package-lock.json", "**/pnpm-lock.yaml", "uv.lock", "**/package.json"]
+  land: patch   # the only value
+```
+
+A PR by a listed bot (the exact login, and a GitHub `Bot` account) skips
+`skip_bots` and review. It is landed by `land`, bound to its head SHA, with
+`reason: bot-patch` in the land record, only when all of these hold:
+
+- every changed file matches `paths`, and the PR classifies `routine`;
+- every update row in the body is a patch bump. The body must hold a table with
+  a `Change` column (the Renovate layout, `` `8.3.4` -> `8.3.6` ``). An `Update`
+  column names the type; without one the versions decide: same major and
+  minor, higher patch. A body with no such table, or a version that is not
+  plain `x.y.z`, is "update type unknown";
+- the required checks are green as the review gate judges them;
+- GitHub reports the PR mergeable, up to date where the base requires it, with
+  no unresolved thread.
+
+Any other PR of a listed bot is told to the desk once per head as a
+`BOT_UPDATE` lane event naming the reasons, and nothing else is done with it.
+A pending check or an unknown mergeable state waits without a notice. Shadow
+mode and `--dry-run` never merge; the land record says what would happen, and
+only dry-run stays silent. Other bots stay dropped by `skip_bots`, and the
+review gate of every other PR is unchanged.
 
 ### Patch-id review verdicts
 
@@ -1411,7 +1447,8 @@ The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` remains readable for compatibility and no longer controls daemon
 escalation. Shadow and dry-run modes do not retry reviews or write retry state.
 `daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
-and landing. They still count as open for outcome reconciliation.
+and landing, except a bot the repository's policy lists under `bot_updates`.
+They still count as open for outcome reconciliation.
 
 `daemon.pr.review_parallel` bounds how many PRs of one repository a PR pass
 reviews at once; the default is `4`, the maximum is `32`, and `1` reviews one

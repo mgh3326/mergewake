@@ -488,6 +488,9 @@ func authorAction(summary string) bool {
 	return false
 }
 func verdictType(state, via string) string {
+	if state == botNoticeState {
+		return "decision"
+	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
 	}
