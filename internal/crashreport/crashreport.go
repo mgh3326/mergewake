@@ -114,26 +114,23 @@ func StartContext(ctx context.Context, stateDir, tool, version string, log io.Wr
 	if os.MkdirAll(dir, 0o700) != nil {
 		return ctx, stopClient
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); reportPendingCrashesWithClient(client, delivery, tool, dir, time.Now()) }()
+	go reportPendingCrashesWithClient(client, delivery, tool, dir, time.Now())
 	name := filepath.Join(dir, fmt.Sprintf("crash-%d-%d.log", time.Now().UnixNano(), os.Getpid()))
 	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return ctx, func() { wg.Wait(); stopClient() }
+		return ctx, stopClient
 	}
 	armed := debug.SetCrashOutput(file, debug.CrashOptions{}) == nil
 	_ = file.Close()
 	if !armed {
 		_ = os.Remove(name)
-		return ctx, func() { wg.Wait(); stopClient() }
+		return ctx, stopClient
 	}
 	return ctx, func() {
 		_ = debug.SetCrashOutput(nil, debug.CrashOptions{})
 		if info, err := os.Stat(name); err == nil && info.Size() == 0 {
 			_ = os.Remove(name)
 		}
-		wg.Wait()
 		stopClient()
 	}
 }
