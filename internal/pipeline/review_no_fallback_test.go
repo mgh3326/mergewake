@@ -171,6 +171,7 @@ func TestRetryReviewRespawnsPanewireAfterFailedPane(t *testing.T) {
 			c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 			s.Now = c.now
 			s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "2m", Failures: 3}
+			s.Config.Review.Timeout = "2m"
 			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
 				t.Fatalf("first run: %v", err)
 			}

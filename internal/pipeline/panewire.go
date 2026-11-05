@@ -19,6 +19,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -29,6 +30,8 @@ const panewireRefused = 77
 // postReserve is the most of the review deadline kept back from the pane wait
 // for validating and posting its findings.
 const postReserve = time.Minute
+
+const reviewerPassWait = 90 * time.Second
 
 // Leave room for panewire's policy preamble below the hub's 64 KiB limit.
 const inlineBriefLimit = 48 << 10
@@ -157,13 +160,38 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if !acquired && (!resumed || leaseSHA == "" || rj.LeaseSHA != leaseSHA) {
 		return out, errPassPending
 	}
-	if acquired && resumed {
+	if resumed {
+		timeout, err := config.Duration(s.Config.Review.Timeout)
+		if err != nil {
+			return out, err
+		}
+		if s.now().Sub(rj.Recorded) >= timeout {
+			return out, fmt.Errorf("%w: reviewer %s exceeded review deadline: %w", ErrReviewUnavailable, rj.Label, context.DeadlineExceeded)
+		}
+	}
+	if resumed && !acquired {
+		renewer, ok := s.GH.(interface {
+			RenewReviewLease(context.Context, string, string, string) (string, bool, error)
+		})
+		if !ok {
+			return out, errors.New("GitHub client cannot renew review leases")
+		}
+		var renewed bool
+		leaseSHA, renewed, e = renewer.RenewReviewLease(ctx, x.repo.Name, claimRef(pr.Number, pr.Head.SHA, plan.pass), leaseSHA)
+		if e != nil {
+			return out, e
+		}
+		if !renewed {
+			return out, errPassPending
+		}
+	}
+	if resumed {
 		rj.LeaseSHA = leaseSHA
 		if e = x.saveReviewerJob(rj); e != nil {
 			return out, e
 		}
 	}
-	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix())
+	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix()+int64(plan.replacements))
 	checkout := filepath.Join(cfg.Checkouts, label)
 	if resumed {
 		label, checkout = rj.Label, rj.Checkout
@@ -227,9 +255,55 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// with no spawn. One still live is re-attached by replaying its spawn,
 	// until it has been live longer than the stale bound.
 	spawn := true
+	var collected []byte
 	if resumed {
 		rec, e := x.job(ctx, label)
 		state := rec.State
+		if e == nil && state != "completed" {
+			finished, err := x.reviewerFinished(ctx, rec, rj)
+			if err != nil {
+				return out, err
+			}
+			if finished {
+				var found bool
+				collected, found, e = x.availableFindings(ctx, label, findingsPath)
+				if e != nil {
+					return out, e
+				}
+				if !found {
+					collectErr := errors.New("finished pane has no findings")
+					fresh, err := x.job(ctx, label)
+					if err != nil {
+						return out, err
+					}
+					if fresh.State != "completed" {
+						lost := &reviewResultLost{label, "pane finished without a result", fresh.Profile, reportPath, collectErr}
+						auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+						noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
+						if auditErr != nil || noticeErr != nil {
+							return out, errors.Join(lost, auditErr, noticeErr)
+						}
+						if fresh.OwnerLane == "" {
+							return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
+						}
+						_, err = s.Runner.Run(ctx, cfg.Command, []string{"job", "close", label, "--lane", fresh.OwnerLane, "--outcome", "abandoned", "--reason", "reviewer finished without a result"}, "", "")
+						if err != nil {
+							return out, errors.Join(lost, err)
+						}
+						if err = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
+							return out, err
+						}
+						if rj.Replacements >= 1 {
+							return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
+						}
+						plan.replacements = rj.Replacements + 1
+						return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+					}
+				} else {
+					spawn = false
+				}
+			}
+		}
 		switch {
 		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
 			spawn = false
@@ -255,7 +329,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// or a quarter of what is left when that is shorter.
 		deadline, _ := ctx.Deadline()
 		left := time.Until(deadline)
-		wait := left - min(postReserve, left/4)
+		wait := min(reviewerPassWait, left-min(postReserve, left/4))
+		if resumed {
+			timeout, err := config.Duration(s.Config.Review.Timeout)
+			if err != nil {
+				return out, err
+			}
+			wait = min(wait, timeout-s.now().Sub(rj.Recorded))
+		}
 		if wait < time.Second {
 			if resumed {
 				return out, fmt.Errorf("%w: no time left to re-attach reviewer job %s", ErrReviewUnavailable, label)
@@ -282,7 +363,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			// The record names the job before it is spawned, so a wait that
 			// ends early leaves a job the next run can resume.
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now()}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now(), Replacements: plan.replacements}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
@@ -332,7 +413,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// The job was spawned and may still run: the record stays and the
 			// next run resumes it rather than spawning another reviewer.
 			if resumed || code == panewireWaitTimeout {
-				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", ErrReviewUnavailable, label, code, fleetevent.Redact(integrations.Detail(e)))
+				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
 			res.skips[len(res.skips)-1].withCause(e)
@@ -381,7 +462,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// `panewire done --result` still returns them through the lane
 		// announcement or, on this host, the job-dir file. Kept for one
 		// release; each use is counted on the receipt and audited.
-		b, e = x.collect(collectCtx, label, findingsPath)
+		if collected != nil {
+			b = collected
+		} else {
+			b, e = x.collect(collectCtx, label, findingsPath)
+		}
 		if e != nil {
 			if ctx.Err() != nil {
 				keepJob = true
@@ -550,6 +635,28 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 		case <-time.After(wait):
 		}
 	}
+}
+
+// availableFindings checks the legacy sources once for a finished pane.
+func (x *panewireExecutor) availableFindings(ctx context.Context, label, path string) ([]byte, bool, error) {
+	lane := x.s.Config.Review.Panewire.Lane
+	if lane != "" {
+		b, err := x.announced(ctx, lane, label)
+		if err != nil {
+			return nil, false, err
+		}
+		if b != nil {
+			return b, true, nil
+		}
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
 }
 
 // collect is the legacy findings path, kept for one release for panes whose
@@ -781,4 +888,44 @@ func exitStatus(e error) int {
 		return x.ExitCode()
 	}
 	return -1
+}
+
+// reviewerFinished checks only the recorded pane on its recorded host.
+func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integrations.JobRecord, rj reviewerJob) (bool, error) {
+	if rec.Host == "" || rec.PaneID == "" {
+		return false, nil
+	}
+	var ops reviewerPanes
+	if rec.Host == "local" || x.localReviewerHost(rec.Host) {
+		ops = reap.Exec{Runner: x.s.Runner}
+	} else {
+		hub, err := x.s.reapHub()
+		if err != nil {
+			return false, err
+		}
+		if hub == nil {
+			return false, nil
+		}
+		ops = reap.HubHost{Hub: hub, Machine: rec.Host}
+	}
+	panes, err := ops.AllPanes(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range panes {
+		if p.ID != rec.PaneID {
+			continue
+		}
+		agents, err := ops.Panes(ctx)
+		if err != nil {
+			return false, err
+		}
+		for _, a := range agents {
+			if a.ID == p.ID && a.Name == rj.Label && a.Cwd == p.Cwd {
+				return closableStatus[a.Status], nil
+			}
+		}
+		return false, nil
+	}
+	return true, nil
 }

@@ -106,9 +106,10 @@ func (s *Service) authorModel(r config.Repo, body string) string {
 }
 
 type passPlan struct {
-	pass       int
-	lens       string
-	sameFamily bool
+	pass         int
+	lens         string
+	sameFamily   bool
+	replacements int
 }
 
 // Review runs the required diff-only passes for the PR head: one for routine
@@ -408,7 +409,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			// A reviewer cut off by the review deadline is recorded like a
 			// pass nobody produced.
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(e, context.DeadlineExceeded) {
 				s.reviewerEvents(r.Name, n, plan.pass, out.skips)
 				s.reviewMissingEvent(r.Name, n, plan.pass, "review_deadline", out.skips, "")
 			}
