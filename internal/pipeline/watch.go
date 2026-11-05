@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -333,7 +334,17 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if ci != github.Red {
 		return errors.New("main CI changed during diagnosis")
 	}
-	result.URL, e = s.GH.Revert(ctx, r.Name, r.Branch, head, culprit, origin.Number)
+	trailers, e := s.recoveryTrailers(ctx, r, *origin)
+	if e != nil {
+		return e
+	}
+	reverter, ok := s.GH.(interface {
+		RevertWithTrailers(context.Context, string, string, string, string, int, string) (string, error)
+	})
+	if !ok {
+		return errors.New("GitHub client does not support recovery trailers")
+	}
+	result.URL, e = reverter.RevertWithTrailers(ctx, r.Name, r.Branch, head, culprit, origin.Number, trailers)
 	if e != nil {
 		return e
 	}
@@ -419,4 +430,35 @@ func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []
 	}
 	sort.Ints(out)
 	return out, nil
+}
+
+// recoveryTrailers copies the culprit's PR-body values, falling back to its head commit.
+func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
+	commit, err := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+	if err != nil {
+		return "", err
+	}
+	var lines []string
+	for _, key := range []string{"Mergewake-Task", "Mergewake-Grade", "Mergewake-Tier", "Mergewake-Notify-Lane"} {
+		value := trailer(pr.Body, key)
+		valid := func(v string) bool {
+			switch key {
+			case "Mergewake-Task":
+				return integrations.TaskID.MatchString(v)
+			case "Mergewake-Grade":
+				return config.ValidGrade(v)
+			case "Mergewake-Tier":
+				return validTier(v)
+			default:
+				return v != ""
+			}
+		}
+		if !valid(value) {
+			value = trailer(commit.Commit.Message, key)
+		}
+		if valid(value) {
+			lines = append(lines, key+": "+value)
+		}
+	}
+	return strings.Join(lines, "\n"), nil
 }

@@ -58,6 +58,7 @@ type fakeGH struct {
 	files                                                        []policy.File
 	ci                                                           github.CI
 	mergeCount, revertCount, postCount, claimCount, publishCount int
+	revertTrailers                                               string
 	head                                                         string
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
@@ -307,6 +308,10 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	g.latch = true
 	return "https://github.com/example/project/pull/9", nil
 }
+func (g *fakeGH) RevertWithTrailers(ctx context.Context, repo, branch, head, culprit string, pr int, trailers string) (string, error) {
+	g.revertTrailers = trailers
+	return g.Revert(ctx, repo, branch, head, culprit, pr)
+}
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
 	if g.diffErr != nil {
 		return "", g.diffErr
@@ -388,6 +393,13 @@ func (s *fakeLaneSink) Lane(_ context.Context, task string) (string, error) {
 	return s.lanes[task], nil
 }
 
+// Fake hub environment: tests never reach a real hub, and no value here is a
+// credential.
+const (
+	testHubURL      = "https://hub.invalid"
+	testHubTokenEnv = "MW_TEST_HUB_TOKEN"
+)
+
 type fakeRunner struct {
 	pane      *panewireRunner
 	calls     int
@@ -429,6 +441,10 @@ func (r *fakeRunner) Run(ctx context.Context, command string, args []string, inp
 }
 func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
 	t.Helper()
+	// The hub environment the daemon inherits from its host wrapper. A test
+	// that wants it missing overrides the variable after setup.
+	t.Setenv(hubURLEnv, testHubURL)
+	t.Setenv(hubTokenEnv, testHubTokenEnv)
 	g := &fakeGH{ci: github.Green, feedback: github.ReviewFeedback{PRAuthor: "pr-author", ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}}
 	mergeable := true
 	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Mergeable: &mergeable, MergeableState: "clean", Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
