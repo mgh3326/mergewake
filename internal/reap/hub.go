@@ -346,6 +346,11 @@ func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base strin
 		Files       []string `json:"files"`
 		RetryAfterS int      `json:"retry_after_s"`
 	}
+	// The node refuses a null list as invalid_request, so "no regenerable
+	// globs" is sent as an empty list.
+	if regenerable == nil {
+		regenerable = []string{}
+	}
 	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.remove", args, &v); err != nil {
 		return WorktreeRemoveResult{}, err

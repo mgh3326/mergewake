@@ -119,6 +119,13 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				}
 			}
 		case "worktree.remove":
+			// The hub validates strictly: a null regenerable list is
+			// invalid_request (panewire node_command.go worktree.remove).
+			if _, ok := body["args"].(map[string]any)["regenerable"].([]any); !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
+				return
+			}
 			outcome := h.removeOutcome
 			if outcome == "" {
 				outcome = "removed"
