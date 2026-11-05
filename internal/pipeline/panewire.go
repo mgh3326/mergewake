@@ -26,6 +26,25 @@ import (
 // means no admitted seat outside the builder's family remained.
 const panewireRefused = 77
 
+// panewireHubEnv names the environment panewire reads to place a reviewer on
+// the hub. A daemon inherits it from its host wrapper.
+const (
+	hubURLEnv   = "PANEWIRE_HUB_URL"
+	hubTokenEnv = "PANEWIRE_HUB_TOKEN_ENV"
+)
+
+// missingHubEnv names the hub variables that are unset or empty. It reports
+// names only, never values.
+func missingHubEnv() []string {
+	var missing []string
+	for _, name := range []string{hubURLEnv, hubTokenEnv} {
+		if os.Getenv(name) == "" {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 // postReserve is the most of the review deadline kept back from the pane wait
 // for validating and posting its findings.
 const postReserve = time.Minute
@@ -102,6 +121,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// and the review-skipped audit: redact them here.
 		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
 		return out, nil
+	}
+	// panewire places the reviewer through the hub it reads from these
+	// variables. A daemon inherits them from its host wrapper; a manual run
+	// from a plain shell has neither, and panewire then plans on the local node
+	// and refuses with a containment error that hides the cause. Fail here,
+	// before the claim, the reviewer record and the spawn.
+	if missing := missingHubEnv(); len(missing) > 0 {
+		return skip("panewire reviewer spawn needs %s in the environment (unset or empty); run mergewake with the same hub environment as the daemon", strings.Join(missing, " and "))
 	}
 	root := config.Expand(x.repo.Root)
 	if root == "" {
