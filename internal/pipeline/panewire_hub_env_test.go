@@ -2,10 +2,13 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // (a),(b) Without the hub environment panewire cannot place a reviewer: the
@@ -83,5 +86,40 @@ func TestPanewireHubEnvErrorNamesNoValues(t *testing.T) {
 				t.Fatalf("audit carries the value of a set variable: %s", body)
 			}
 		})
+	}
+}
+
+// A resumed job that already completed is answered from its hk record with no
+// panewire call, so a run without the hub environment still posts it.
+func TestPanewireHubEnvMissingResumedCompletedPosts(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	c.t = c.t.Add(2 * time.Second)
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	t.Setenv(hubURLEnv, "")
+	t.Setenv(hubTokenEnv, "")
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 1 || g.postCount != 1 || !g.refs[doneRef(7, shaA)] {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// A resumed job that still needs a re-attach calls panewire, so it fails with
+// the missing names and keeps its record for the next run.
+func TestPanewireHubEnvMissingResumedReattachSkips(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	c.t = c.t.Add(2 * time.Second)
+	t.Setenv(hubTokenEnv, "")
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), hubTokenEnv) {
+		t.Fatalf("err=%v, want ErrReviewUnavailable naming %s", err, hubTokenEnv)
+	}
+	if len(runner.spawns) != 1 || g.postCount != 0 || len(g.passes[shaA]) != 0 {
+		t.Fatalf("spawns=%d posts=%d passes=%+v", len(runner.spawns), g.postCount, g.passes[shaA])
+	}
+	if _, err := os.Stat(s.reviewerJobPath(r.Name, 7, 1)); err != nil {
+		t.Fatalf("reviewer record lost: %v", err)
 	}
 }

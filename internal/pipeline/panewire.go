@@ -128,10 +128,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// panewire places the reviewer through the hub it reads from these
 	// variables. A daemon inherits them from its host wrapper; a manual run
 	// from a plain shell has neither, and panewire then plans on the local node
-	// and refuses with a containment error that hides the cause. Fail here,
-	// before the claim, the reviewer record and the spawn.
-	if missing := missingHubEnv(); len(missing) > 0 {
-		return skip("panewire reviewer spawn needs %s in the environment (unset or empty); run mergewake with the same hub environment as the daemon", strings.Join(missing, " and "))
+	// and refuses with a containment error that hides the cause. Only a call
+	// to panewire needs them: a resumed job that already finished is answered
+	// from its hk record without one.
+	hubMissing := func() string {
+		missing := missingHubEnv()
+		if len(missing) == 0 {
+			return ""
+		}
+		return fmt.Sprintf("panewire reviewer spawn needs %s in the environment (unset or empty); run mergewake with the same hub environment as the daemon", strings.Join(missing, " and "))
 	}
 	root := config.Expand(x.repo.Root)
 	if root == "" {
@@ -179,6 +184,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	rj, resumed, e := x.reviewerJob(plan.pass)
 	if e != nil {
 		return out, e
+	}
+	// A fresh pass fails before the claim and the reviewer record; a resumed
+	// one checks where it would re-attach, below.
+	if reason := hubMissing(); !resumed && reason != "" {
+		return skip("%s", reason)
 	}
 	leaseSHA, acquired, e := claim()
 	if e != nil {
@@ -352,6 +362,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	note := ""
 	var stdout []byte
 	if spawn {
+		if reason := hubMissing(); reason != "" {
+			return skip("%s", reason)
+		}
 		// The pane wait leaves time to validate and post the findings: a minute,
 		// or a quarter of what is left when that is shorter.
 		deadline, _ := ctx.Deadline()
