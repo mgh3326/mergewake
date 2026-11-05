@@ -1045,7 +1045,7 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
-| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
+| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only when the base moved ahead of the head and GitHub reports the PR `behind` (branch protection requires an up-to-date branch). Otherwise a conflict-free PR with a moved base is not blocked, its branch is not updated, and the land and notify records carry `base_behind: true`. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
@@ -1422,7 +1422,8 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `review_missing`, `base_stale`, `conflict`. Pending or
+`triage_unanswered:<n>`), `review_missing`, `base_stale` (only when GitHub requires an
+up-to-date branch), `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
