@@ -43,6 +43,7 @@ type panewireRunner struct {
 	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
 	waitTimeout  bool   // the spawn ran its pane, then its --wait timed out (non-zero exit)
 	unplaced     bool   // the OK line names no placement receipt
+	spawnOut     string // when set, the spawn's whole stdout (the hub coordinator's SPAWNED receipt)
 	quotaErr     error
 	usageErr     error
 	spawns       [][]string
@@ -141,6 +142,9 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		}
 		if r.waitTimeout {
 			return nil, panewireExit(1)
+		}
+		if r.spawnOut != "" {
+			return []byte(r.spawnOut), nil
 		}
 		// By default the pane reports a remote placement, so the pass keeps
 		// the local checkout cleanup it had before the reviewer-pane close.
