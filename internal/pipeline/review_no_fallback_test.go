@@ -211,6 +211,7 @@ func TestPanewireNeedsNoProfilesOrQuota(t *testing.T) {
 			runner := &panewireRunner{family: "openai", quotaErr: errors.New("scopefuel: not found")}
 			s, g, r := panewireSetup(t, runner)
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			s.Config.Review.Quota = "scopefuel"
 			s.Config.Review.Profiles = profiles
 			s.Config.Review.Pairings = nil
 			out := &bytes.Buffer{}
@@ -237,7 +238,7 @@ func TestPanewireNeedsNoProfilesOrQuota(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := g.passes[shaA]
-			if runner.quotaCalls != 0 || runner.headless != 0 || len(runner.spawns) != 1 || g.postCount != 1 || len(got) != 1 || got[0].Executor != "panewire" {
+			if runner.quotaCalls != 0 || len(runner.quotaActions) != 0 || runner.headless != 0 || len(runner.spawns) != 1 || g.postCount != 1 || len(got) != 1 || got[0].Executor != "panewire" {
 				t.Fatalf("quota=%d headless=%d spawns=%d posts=%d passes=%+v", runner.quotaCalls, runner.headless, len(runner.spawns), g.postCount, got)
 			}
 			reviews, _ := reviewRecords(t, s, r, "review")

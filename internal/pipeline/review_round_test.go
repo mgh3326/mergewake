@@ -62,16 +62,16 @@ type roundRunner struct {
 }
 
 func (r *roundRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
-	if command == "scopefuel" {
-		return r.fakeRunner.Run(ctx, command, args, input, dir)
+	b, err := r.fakeRunner.Run(ctx, command, args, input, dir)
+	if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
+		r.prompt = r.fakeRunner.input
 	}
-	r.prompt = input
-	return []byte(r.out), nil
+	return b, err
 }
 
 func roundSetup(t *testing.T, heads []github.ReviewedHead, old, full, out string) (*Service, *roundGH, *roundRunner, config.Repo) {
 	t.Helper()
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	rg := &roundGH{fakeGH: g, heads: heads, old: old, full: full}
 	g.refs = map[string]bool{}
 	for _, h := range heads {
@@ -79,7 +79,8 @@ func roundSetup(t *testing.T, heads []github.ReviewedHead, old, full, out string
 			g.refs["mergewake/reviews/7/"+h.SHA+"-done"] = true
 		}
 	}
-	run := &roundRunner{fakeRunner: &fakeRunner{}, out: out}
+	run := &roundRunner{fakeRunner: s.Runner.(*fakeRunner), out: out}
+	run.pane.findings = out
 	s.GH, s.Runner = rg, run
 	return s, rg, run, r
 }
@@ -141,7 +142,7 @@ func TestRoundOneReviewsTheWholeDiff(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(run.prompt, "+new") || !strings.Contains(run.prompt, "+added line") || strings.Contains(run.prompt, "REVIEW ROUND") {
+	if !strings.Contains(run.prompt, "git diff "+shaB+"..."+shaA) || strings.Contains(run.prompt, "Delta to review") {
 		t.Fatal(run.prompt)
 	}
 	if got := g.passes[g.pull.Head.SHA]; len(got) != 1 || got[0].Round != 1 || got[0].Delta != "" || got[0].Quiet {
@@ -159,7 +160,7 @@ func TestRoundTwoPromptHasOnlyTheInterdiffAndPriorFindings(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	diffAt := strings.Index(run.prompt, "UNTRUSTED DIFF:")
+	diffAt := strings.Index(run.prompt, "## Delta to review")
 	delta := run.prompt[diffAt:]
 	if !strings.Contains(delta, "+added line") || strings.Contains(delta, "+new") || strings.Contains(delta, "-old") {
 		t.Fatalf("round two must see only the interdiff:\n%s", delta)
@@ -201,7 +202,7 @@ func TestRoundTwoCarriesSameLoginDispositions(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	ctx := run.prompt[:strings.Index(run.prompt, "UNTRUSTED DIFF:")]
+	ctx := run.prompt[:strings.Index(run.prompt, "## Delta to review")]
 	for _, want := range []string{
 		"PRIOR FINDINGS (rounds 1-1", "tool:1 (high)", "disposition: answered: Fixed in abc1234",
 		"tool:2 (medium)", "disposition: answered: Dismiss: keep is a fixed fixture string",
@@ -324,6 +325,10 @@ type bodySink struct {
 	body string
 }
 
+func (b *bodySink) TaskJob(context.Context, string) (string, string, error) {
+	return "", "fixture (grade B, T2)", nil
+}
+
 func (b *bodySink) TaskBody(_ context.Context, task string) (string, error) {
 	if task != "12" {
 		return "", nil
@@ -421,7 +426,7 @@ func TestUnchangedPatchDoesNotSpendARound(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(run.prompt, "No hunk changed since the last reviewed head") || !strings.Contains(run.prompt, "+new") {
+	if !strings.Contains(run.prompt, "No hunk changed since the last reviewed head") || !strings.Contains(run.prompt, "git diff "+shaB+"..."+shaA) {
 		t.Fatal(run.prompt)
 	}
 	if len(g.posted[0]) != 1 || g.posted[0][0].Severity != "high" {
@@ -470,7 +475,7 @@ func TestUnreadablePreviousPatchFallsBackToTheWholeDiff(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(run.prompt, "+new") || !strings.Contains(run.prompt, "REVIEW ROUND 2. The diff below is the whole PR") {
+	if !strings.Contains(run.prompt, "git diff "+shaB+"..."+shaA) || !strings.Contains(run.prompt, "REVIEW ROUND 2. The diff below is the whole PR") {
 		t.Fatal(run.prompt)
 	}
 	if got := g.passes[g.pull.Head.SHA]; got[0].Round != 2 || got[0].Delta != "" {

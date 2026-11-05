@@ -32,6 +32,7 @@ var shaC = strings.Repeat("c", 40)
 var shaD = strings.Repeat("d", 40)
 
 type fakeGH struct {
+	fixtureTask bool
 	GitHub
 	pullCalls                                                    int
 	commitCalls                                                  int
@@ -240,6 +241,9 @@ func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error)
 		}
 	}
 	v.Commit.Message = g.messages[sha]
+	if g.fixtureTask && !strings.Contains(v.Commit.Message, "Mergewake-Task:") {
+		v.Commit.Message += "\nMergewake-Task: 42\n"
+	}
 	v.Commit.Author.Name, v.Commit.Author.Email = g.authorName, g.authorEmail
 	v.Commit.Committer.Name, v.Commit.Committer.Email = g.committerName, g.committerEmail
 	if ps := g.parents2[sha]; len(ps) > 0 {
@@ -308,6 +312,12 @@ func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { re
 
 type fakeSink struct{ records, reopens int }
 
+type reviewSink struct{ *fakeSink }
+
+func (s *reviewSink) TaskJob(context.Context, string) (string, string, error) {
+	return "", "fixture (grade B, T2)", nil
+}
+
 // Existing installer tests explicitly approve the bootstrap deployment.
 func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
 
@@ -343,6 +353,7 @@ func (s *fakeLaneSink) Lane(_ context.Context, task string) (string, error) {
 }
 
 type fakeRunner struct {
+	pane      *panewireRunner
 	calls     int
 	input     string
 	inputs    []string
@@ -350,7 +361,20 @@ type fakeRunner struct {
 	recommend []string
 }
 
-func (r *fakeRunner) Run(_ context.Context, command string, args []string, input, dir string) ([]byte, error) {
+func (r *fakeRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if r.pane != nil && (command == "git" || command == "panewire") {
+		if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
+			r.calls++
+			r.args = args
+			b, err := os.ReadFile(arg(args, "-p"))
+			if err != nil {
+				return nil, err
+			}
+			r.input = string(b)
+			r.inputs = append(r.inputs, r.input)
+		}
+		return r.pane.Run(ctx, command, args, input, dir)
+	}
 	r.calls++
 	r.input = input
 	r.args = args
@@ -372,10 +396,22 @@ func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Re
 	g := &fakeGH{ci: github.Green, feedback: github.ReviewFeedback{PRAuthor: "pr-author", ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}}
 	mergeable := true
 	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Mergeable: &mergeable, MergeableState: "clean", Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
+	g.pull.Head.Ref = "feature"
+	g.pull.Head.Repo.FullName = "example/project"
 	sink := &fakeSink{}
 	n := &fakeNotifier{}
-	r := config.Repo{Name: "example/project", Branch: "main", Policy: ".mergewake/policy.yaml", SmokeTimeout: "5s"}
-	s := &Service{Config: config.Config{Version: 1, Host: "host-a", StateDir: filepath.Join(t.TempDir(), "state"), WatchLimit: 20, Review: config.Review{Login: "review-bot", Timeout: "5s", Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}}, GH: g, Runner: &fakeRunner{}, Sink: sink, Notifier: n, Out: io.Discard}
+	r := config.Repo{Name: "example/project", Branch: "main", Policy: ".mergewake/policy.yaml", SmokeTimeout: "5s", Root: t.TempDir()}
+	s := &Service{Config: config.Config{Version: 1, Host: "host-a", StateDir: filepath.Join(t.TempDir(), "state"), WatchLimit: 20, Review: config.Review{Login: "review-bot", Timeout: "5s", Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}}, GH: g, Runner: &fakeRunner{pane: &panewireRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug"}]}`, family: "anthropic"}}, Sink: sink, Notifier: n, Out: io.Discard}
+	dir := t.TempDir()
+	s.Config.Review.Executor = "panewire"
+	s.Config.Review.Panewire = config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(dir, "jobs"), Checkouts: filepath.Join(dir, "checkouts")}
+	return s, g, sink, n, r
+}
+
+func reviewSetup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
+	s, g, sink, n, r := setup(t)
+	g.fixtureTask = true
+	s.Sink = &reviewSink{sink}
 	return s, g, sink, n, r
 }
 
@@ -524,10 +560,10 @@ func TestLandHeadChangeInvalidatesReviews(t *testing.T) {
 	}
 }
 
-// With no other-family quota the review still runs and records same_family;
+// A same-family pane review records same_family;
 // the -done marker it leaves is what lets the blocking PR land.
 func TestLandSameFamilyReviewLands(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.enabled = true
 	g.blocking = true
 	g.pull.Body = "Mergewake-Author-Family: anthropic\nMergewake-Author-Profile: claude@high\n"
@@ -747,7 +783,7 @@ func TestWatchCulpritMergeCommitAndUnknownEvidence(t *testing.T) {
 }
 
 func TestReviewOnePassAndIsolation(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	runner := s.Runner.(*fakeRunner)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{DryRun: true}); e != nil {
 		t.Fatal(e)
@@ -758,11 +794,8 @@ func TestReviewOnePassAndIsolation(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if g.postCount != 1 || g.claimCount != 2 || !strings.Contains(runner.input, "UNTRUSTED DIFF") {
+	if g.postCount != 1 || g.claimCount != 2 || len(runner.pane.spawns) != 1 {
 		t.Fatal("review did not run")
-	}
-	if !strings.Contains(strings.Join(runner.args, " "), "--no-tools") {
-		t.Fatal("tools enabled")
 	}
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
@@ -772,8 +805,7 @@ func TestReviewOnePassAndIsolation(t *testing.T) {
 	}
 }
 
-// A blocking PR reviewed by two same-family profiles gets the split lenses and
-// records same_family, while two different families both keep the default lens.
+// Blocking PRs receive split lenses and record whether the pane family matches the author.
 func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
@@ -793,7 +825,7 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 			sameFamily: []bool{true, true},
 		},
 		{
-			name: "different families keep default lens",
+			name: "different family gets split lenses",
 			profiles: map[string]config.Reviewer{
 				"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}},
 				"gpt":    {Family: "openai", Command: "pi", Args: []string{"--model", "gpt-model"}},
@@ -804,23 +836,20 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
+			s, g, _, _, r := reviewSetup(t)
 			runner := s.Runner.(*fakeRunner)
 			g.blocking = true
 			g.pull.Body = "Mergewake-Author-Family: anthropic\nMergewake-Author-Profile: claude@high\n"
 			s.Config.Review.Profiles = tt.profiles
-			runner.recommend = tt.recommend
+			if !tt.sameFamily[0] {
+				runner.pane.family = "openai"
+			}
 			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 				t.Fatal(e)
 			}
 			passes := g.passes[g.pull.Head.SHA]
 			if len(passes) != 2 || runner.calls != 2 || g.claimCount != 3 {
 				t.Fatalf("passes=%d runs=%d claims=%d", len(passes), runner.calls, g.claimCount)
-			}
-			// Pass 2 stays off the author's family while quota admits another
-			// family, even when that means a fresh call on the pass 1 profile.
-			if tt.sameFamily[1] && passes[0].Reviewer == passes[1].Reviewer {
-				t.Fatal("one profile ran both passes although a second same-family profile was admitted")
 			}
 			wantOutcome := false
 			for i, pass := range passes {
@@ -840,33 +869,6 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 	}
 }
 
-// When quota admits nobody outside the author's family, review still runs: a
-// same-family reviewer with a different model, or the same model in a fresh
-// call when nothing else exists.
-func TestReviewFamilyFallbackOrder(t *testing.T) {
-	s, g, _, _, r := setup(t)
-	g.pull.Body = "Mergewake-Author-Family: anthropic\nMergewake-Author-Profile: claude@high\n"
-	s.Config.Review.Profiles["claude-sonnet"] = config.Reviewer{Family: "anthropic", Command: "pi", Args: []string{"--model", "other-model"}}
-	runner := s.Runner.(*fakeRunner)
-	runner.recommend = []string{"claude", "claude-sonnet"}
-	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	pass := g.passes[g.pull.Head.SHA]
-	if len(pass) != 1 || pass[0].Reviewer != "claude-sonnet" || !pass[0].SameFamily {
-		t.Fatalf("%+v", pass)
-	}
-
-	s, g, _, _, r = setup(t)
-	g.pull.Body = "Mergewake-Author-Family: anthropic\nMergewake-Author-Profile: claude@high\n"
-	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	pass = g.passes[g.pull.Head.SHA]
-	if len(pass) != 1 || pass[0].Reviewer != "claude" || !pass[0].SameFamily {
-		t.Fatalf("%+v", pass)
-	}
-}
 func TestFindingValidation(t *testing.T) {
 	diff := "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -10,2 +10,2 @@\n old\n-gone\n+new\n"
 	for _, tt := range []struct {
@@ -1109,7 +1111,7 @@ func TestContainerRolloutDryRunWritesNoState(t *testing.T) {
 func TestChangedHeadStopsReviewAndLand(t *testing.T) {
 	for _, command := range []string{"review", "land"} {
 		t.Run(command, func(t *testing.T) {
-			s, g, _, _, r := setup(t)
+			s, g, _, _, r := reviewSetup(t)
 			g.enabled = true
 			g.nextHead = shaC
 			if command == "land" {
@@ -1193,29 +1195,32 @@ func TestServiceClockStampsAudit(t *testing.T) {
 	}
 }
 
-// An author family given as an alias ("claude") normalises to the canonical
-// family ("anthropic"), so a same-family reviewer is never treated as
-// independent and pass 2 falls back to the remaining family.
+// An author family alias is normalised before it is passed to panewire.
 func TestReviewAuthorFamilyAlias(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.blocking = true
 	s.Config.Review.Profiles = map[string]config.Reviewer{
 		"sonnet": {Family: "anthropic", Command: "pi", Args: []string{"--model", "sonnet-model"}},
 		"gpt":    {Family: "openai", Command: "pi", Args: []string{"--model", "gpt-model"}},
 	}
 	runner := s.Runner.(*fakeRunner)
-	runner.recommend = []string{"sonnet", "gpt"}
+	runner.pane.family = "openai"
 	if e := s.Review(context.Background(), r, 7, "claude", Options{}); e != nil {
 		t.Fatal(e)
+	}
+	for _, spawn := range runner.pane.spawns {
+		if arg(spawn, "--builder-family") != "anthropic" {
+			t.Fatalf("alias not normalised: %v", spawn)
+		}
 	}
 	passes := g.passes[g.pull.Head.SHA]
 	if len(passes) != 2 || runner.calls != 2 {
 		t.Fatalf("%+v", passes)
 	}
-	if passes[0].Reviewer != "gpt" || passes[0].SameFamily {
+	if passes[0].Reviewer != "panewire:seat-x" || passes[0].SameFamily {
 		t.Fatalf("pass 1 picked %+v", passes[0])
 	}
-	if passes[1].Reviewer != "gpt" || passes[1].SameFamily {
+	if passes[1].Reviewer != "panewire:seat-x" || passes[1].SameFamily {
 		t.Fatalf("pass 2 picked %+v", passes[1])
 	}
 }
@@ -1251,16 +1256,15 @@ func TestInferAuthorFamilyFromCommit(t *testing.T) {
 	}
 }
 
-// A trailer-less PR authored by an agent commit still gets reviewed: the
-// inferred family chooses the reviewer pool exactly like a declared one.
+// A trailer-less PR authored by an agent commit still gets reviewed with its inferred family.
 func TestReviewRunsWithInferredFamily(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.messages = map[string]string{shaA: "subject\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n"}
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
 	pass := g.passes[shaA]
-	if len(pass) != 1 || pass[0].Reviewer != "claude" || !pass[0].SameFamily {
+	if len(pass) != 1 || pass[0].Reviewer != "panewire:seat-x" || !pass[0].SameFamily {
 		t.Fatalf("%+v", pass)
 	}
 }
@@ -1268,7 +1272,7 @@ func TestReviewRunsWithInferredFamily(t *testing.T) {
 // With no trailer and no recognisable identity, review.default_family still
 // lets the pass run; without one the PR stays review-unavailable.
 func TestReviewDefaultFamily(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	s.Config.Review.DefaultFamily = "anthropic"
 	g.authorName, g.authorEmail = "mgh3326", "m@example.com"
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
@@ -1278,7 +1282,7 @@ func TestReviewDefaultFamily(t *testing.T) {
 		t.Fatal(g.passes)
 	}
 
-	s, g, _, _, r = setup(t)
+	s, g, _, _, r = reviewSetup(t)
 	g.authorName, g.authorEmail = "mgh3326", "m@example.com"
 	if e := s.Review(context.Background(), r, 7, "", Options{}); !errors.Is(e, ErrReviewUnavailable) {
 		t.Fatal(e)

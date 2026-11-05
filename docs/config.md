@@ -655,54 +655,6 @@ are on the `review` audit event.
 
 
 
-A pool also classified `exclude` stays excluded until that policy is cleared or
-changed (inspect `scopefuel policy list`; `scopefuel policy clear kimi` clears its
-pool override). Once the quota tool returns an eligible Kimi recommendation, no
-mergewake code or config change is needed. Do not switch providers merely to
-circumvent an underlying pool's subscription state.
-
-Every adapter receives the diff on stdin in an empty temporary working directory.
-Reviewer processes run in their own process group. On timeout, cancellation or
-mergewake's own SIGINT/SIGTERM/SIGHUP the whole group receives SIGTERM, then
-SIGKILL from a timer after a 5s grace, independent of any read still in progress; after every exit, including success, the group is
-killed and reaped, so a child the CLI forked cannot outlive the call or hold the
-review open through an inherited stdout. On Linux the leader also gets
-`PDEATHSIG=SIGKILL` for a parent killed by SIGKILL; descendants that leave the
-process group (`setsid`) are outside this guarantee. A timeout is reported as
-`<cli> reviewer: env timed out; process group terminated`. The temporary
-directory (including private homes such as Kimi's) is removed on return, and
-each review removes this user's `mergewake-review-*` directories older than
-twice `review.timeout`, which only a SIGKILLed review leaves behind.
-Only adapter-owned control files may be present (Command Code's deny hook).
-GitHub credentials are removed from the review process environment. Claude uses
-safe/restricted print mode, no built-in tools, no MCP and no settings discovery;
-pi disables tools, MCP and context discovery; Command Code uses safe mode, deny
-permissions and a PreToolUse deny hook. Devin print mode receives a private deny
-configuration disabling file, shell, MCP, imports and subagents as far as its CLI
-supports. Grok uses an empty tool list, MCP deny, no web and no subagents. agy print mode
-takes its prompt only as an argv value, so the diff is sent as one stream-json
-user message on stdin (`--print= --input-format stream-json --output-format
-stream-json`); it runs with `--sandbox`, slash commands disabled, and
-session-only settings denying shell, file, URL and MCP tools and non-workspace
-access, on top of headless agy denying any tool permission it would prompt for.
-Any tool step in its event stream, a result other than one successful turn, or
-an empty response fails the pass. agy keeps its own conversation history; no
-flag disables it. Codex
-exec ignores user config/rules, disables shell, code mode, search, plugins, MCP,
-apps and delegation, and uses a read-only sandbox. These are CLI restrictions,
-not a uniform OS sandbox for the CLIs themselves; credentials remain owned by
-the provider CLI.
-
-Kimi uses ACP instead of `-p`, which only accepts an argv prompt. ACP receives
-one stdin prompt, no filesystem/terminal client capabilities or MCP servers, and
-any attempted tool call ends the pass. Its temporary private home keeps only
-provider/model configuration and transient credential copies; global tool access
-is disabled. Temporary files are removed on normal completion/cancellation.
-The Kimi configuration semantics are documented in its
-[configuration reference](https://moonshotai.github.io/kimi-code/en/configuration/config-files)
-and [ACP reference](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html).
-Codex controls follow the official [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json).
-
 Output must be exactly one JSON object:
 
 ```json
