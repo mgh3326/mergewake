@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
 )
@@ -239,11 +241,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if family == "" && s.Config.Review.DefaultFamily != "" {
 			family, familySource = s.Config.Review.DefaultFamily, "default"
 		}
-		if family == "" {
-			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
-		}
 		family = config.CanonicalFamily(family)
 		if family == "" {
+			if s.fleetAuthor(pr.User.Login) {
+				return s.blockReview(ctx, r, pr, reviewBlock{blockUnknownFamily, "Add `Mergewake-Author-Family: <family>` to the PR body. The head commit trailer also works."}, o)
+			}
 			return fmt.Errorf("%w: %s", ErrReviewUnavailable, familyRequired)
 		}
 	}
@@ -547,6 +549,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if viaPanewire {
 		executors = []passExecutor{&panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}, headless}
 	}
+	// The review event is posted when the run ends, so a slow hk never
+	// spends the reviewers' deadline.
+	var reviewStarted *time.Time
+	defer func() {
+		if reviewStarted != nil {
+			s.postTaskEvent(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted)
+		}
+	}()
 	for _, plan := range plans {
 		plan.lens = lens(plan)
 		// A GitHub ref claims this PR head across hosts before any reviewer is
@@ -562,6 +572,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			acquired, e := s.GH.ClaimReview(ctx, r.Name, claimRef(n, pr.Head.SHA, plan.pass), pr.Head.SHA, ttl)
 			claimed = acquired
+			if acquired && e == nil && reviewStarted == nil {
+				// This run holds the pass and a reviewer runs next: the
+				// review has started. One event per run, whatever the passes.
+				now := s.now()
+				reviewStarted = &now
+			}
 			return acquired, e
 		}
 		var skips []reviewSkip
@@ -569,6 +585,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		fallback := ""
 		for _, x := range executors {
 			if out, e = x.runPass(ctx, plan, claim); e != nil {
+				var lost *reviewResultLost
+				if errors.As(e, &lost) {
+					auditErr := s.audit(r.Name, "review-result-lost", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+					noticeErr := s.notifyReviewResultLost(ctx, r, pr, plan, lost)
+					return errors.Join(e, auditErr, noticeErr)
+				}
 				// A reviewer cut off by the review deadline is recorded like a
 				// pass nobody produced.
 				if ctx.Err() != nil {
@@ -837,4 +859,26 @@ func configJSON(b []byte, v any) error {
 		return errors.New("trailing data after JSON")
 	}
 	return nil
+}
+
+func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr github.Pull, plan *passPlan, lost *reviewResultLost) error {
+	sent, err := loadSentKeys(filepath.Join(s.state(r.Name), "review-result-lost-sent"), math.MaxInt)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%d %s %d", pr.Number, pr.Head.SHA, plan.pass)
+	if sent.has(key) {
+		return nil
+	}
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	err = s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   fmt.Sprintf("mergewake-review-result-lost-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, plan.pass),
+		Lane: s.Config.Notifier.Lane, Type: "automation-failed",
+		Text: fmt.Sprintf("[mergewake] reviewer finished but its result was lost for %s#%d head=%s pass=%d lens=%s reviewer=%s report=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, lost.label, lost.report),
+	})
+	if err != nil {
+		return err
+	}
+	return sent.add(key)
 }

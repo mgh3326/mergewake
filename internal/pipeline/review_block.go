@@ -24,6 +24,7 @@ var ErrReviewBlocked = errors.New("review blocked")
 const (
 	blockMissingTrailer = "blocked: missing-task-trailer"
 	blockMissingMarker  = "blocked: task-missing-T-marker"
+	blockUnknownFamily  = "blocked: author-family-unknown"
 )
 
 // reviewBlock is what stops one head's review, and the fix for the comment.
@@ -130,7 +131,7 @@ func (s *Service) commentReviewBlock(ctx context.Context, r config.Repo, pr gith
 			return nil
 		}
 	}
-	body := fmt.Sprintf("%s\n**Review blocked** (`%s`): mergewake will not review head `%s`, and the merge gate holds it as not reviewed.\n\n%s\n\nThe review starts on the next poll after the fix.", key, b.reason, short7(pr.Head.SHA), b.fix)
+	body := fmt.Sprintf("%s\n**Review blocked** (`%s`): mergewake will not review head `%s`, and the merge gate holds it as not reviewed.\n\n%s\n\nFor review, the PR must have `Mergewake-Task: <id>` and `Mergewake-Author-Family: <family>` in the PR body (head commit trailers also work), and the task title must have `(grade X, Tn)`. If these are already present, no changes to them are needed.\n\nThe review starts on the next poll after the fix.", key, b.reason, short7(pr.Head.SHA), b.fix)
 	return s.GH.PostIssueComment(ctx, r.Name, pr.Number, body)
 }
 

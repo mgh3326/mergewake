@@ -122,6 +122,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 	if err != nil {
 		return err
 	}
+	s.observePRTaskEvent(ctx, r, p, o)
 	state, err := s.ledger().Read()
 	if err != nil {
 		return err
@@ -228,9 +229,13 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 			reverted = &no
 		}
 		if reverted != nil {
-			return s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) { v.Reverted = reverted })
+			if e := s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) { v.Reverted = reverted }); e != nil {
+				return e
+			}
 		}
 	}
+	// The revert event follows the revert PR, not the seven-day verdict.
+	s.observeRevertTaskEvent(ctx, r, p, v.MergedAt, v.RevertPR, o)
 	return nil
 }
 func (s *Service) recordReview(repo string, pr int, head string, findings []github.Finding, receipt github.PassReceipt, dry bool) error {
@@ -295,12 +300,14 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		return err
 	}
 	var errs []error
+	// A final row is visited again while its revert event is unsettled.
+	sent, _ := s.taskEventKeys(r.Name)
 	for _, key := range slices.Sorted(maps.Keys(state.Latest)) {
 		v := state.Latest[key]
 		if v.Repo != r.Name || open[v.PR] {
 			continue
 		}
-		if v.Final && v.Attributed() && v.FirstCIGreen != nil && (v.MergedAt == nil || v.Reverted != nil) {
+		if v.Final && v.Attributed() && v.FirstCIGreen != nil && (v.MergedAt == nil || v.Reverted != nil) && !s.revertEventPending(r, v, o, sent) {
 			continue
 		}
 		p, e := s.GH.Pull(ctx, r.Name, v.PR)

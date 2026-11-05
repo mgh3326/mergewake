@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,7 +39,11 @@ type panewireRunner struct {
 	refuseStderr string
 	findings     string // "" writes no findings file
 	family       string
-	noEvents     bool // the pane ran on another host: no spawn events in the local job dir
+	noEvents     bool   // the pane ran on another host: no spawn events in the local job dir
+	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
+	waitTimeout  bool   // the spawn ran its pane, then its --wait timed out (non-zero exit)
+	unplaced     bool   // the OK line names no placement receipt
+	spawnOut     string // when set, the spawn's whole stdout (the hub coordinator's SPAWNED receipt)
 	quotaErr     error
 	usageErr     error
 	spawns       [][]string
@@ -135,7 +140,19 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 		if r.afterRun != nil {
 			r.afterRun()
 		}
-		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool\nwait job=l outcome=completed report= pane=p1\n"), nil
+		if r.waitTimeout {
+			return nil, panewireExit(1)
+		}
+		if r.spawnOut != "" {
+			return []byte(r.spawnOut), nil
+		}
+		// By default the pane reports a remote placement, so the pass keeps
+		// the local checkout cleanup it had before the reviewer-pane close.
+		placement := r.placement
+		if placement == "" && !r.unplaced {
+			placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"p1"}`))
+		}
+		return []byte("OK pane=p1 model=seat-x label=l status=working landed=yes job=l quota_record=x/quota_pool" + placement + "\nwait job=l outcome=completed report= pane=p1\n"), nil
 	}
 	r.headless++
 	return r.fakeRunner.Run(ctx, command, args, input, dir)
@@ -281,6 +298,7 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
+	g.refs = map[string]bool{doneRef(7, shaB): true}
 	large := "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+" + strings.Repeat("large delta 한글 ", 6000) + "\n"
 	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
@@ -349,10 +367,15 @@ func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 				t.Fatal(e)
 			}
 			parts := strings.Split(string(prompt), "`")
-			if len(parts) < 3 || parts[1] != shellQuote(command)+" attach get "+id {
-				t.Fatalf("prompt does not use the configured command: %s", prompt)
+			if len(parts) < 3 || parts[1] != shellQuote(filepath.Base(command))+" attach get "+id {
+				t.Fatalf("prompt does not use the configured command basename: %s", prompt)
 			}
-			got, e := exec.Command("sh", "-c", parts[1]).Output()
+			if strings.Contains(string(prompt), job) {
+				t.Fatalf("prompt contains host directory: %s", prompt)
+			}
+			cmd := exec.Command("sh", "-c", parts[1])
+			cmd.Env = append(os.Environ(), "PATH="+job+string(os.PathListSeparator)+os.Getenv("PATH"))
+			got, e := cmd.Output()
 			if e != nil || !bytes.Equal(got, body) {
 				t.Fatalf("retrieved brief differs: error=%v bytes=%d", e, len(got))
 			}
@@ -824,8 +847,8 @@ func TestPanewireFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 }
 
 // The W4 rule decides what a finished reviewer pane's hk record means:
-// completed with a result uses it; completed without one, a pending or
-// missing record, and an unreadable hk fall back after the bounded poll;
+// completed with a result uses it; a pending or missing record and an
+// unreadable hk fall back after the bounded poll;
 // escalated and lost fall back immediately and the receipt keeps the state.
 func TestPanewireJobRecordResultW4(t *testing.T) {
 	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
@@ -837,14 +860,13 @@ func TestPanewireJobRecordResultW4(t *testing.T) {
 		reason   string
 		polled   bool // the record was asked for more than once
 	}{
-		"completed with result":    {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "panewire"},
-		"refusal in the result":    {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
-		"completed without result": {record: &integrations.JobRecord{State: "completed"}, reason: "completed without a result"},
-		"escalated":                {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
-		"lost":                     {record: &integrations.JobRecord{State: "lost"}, reason: "reviewer job record lost"},
-		"still spawned":            {record: &integrations.JobRecord{State: "spawned"}, reason: "job record state spawned", polled: true},
-		"no record":                {reason: "no job record", polled: true},
-		"hk unreadable":            {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
+		"completed with result": {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "panewire"},
+		"refusal in the result": {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
+		"escalated":             {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
+		"lost":                  {record: &integrations.JobRecord{State: "lost"}, reason: "reviewer job record lost"},
+		"still spawned":         {record: &integrations.JobRecord{State: "spawned"}, reason: "job record state spawned", polled: true},
+		"no record":             {reason: "no job record", polled: true},
+		"hk unreadable":         {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runner := &panewireRunner{family: "openai"}

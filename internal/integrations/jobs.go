@@ -35,6 +35,7 @@ type JobRecord struct {
 	// pane there, as panewire recorded them at spawn.
 	Host   string `json:"host"`
 	PaneID string `json:"pane_id"`
+	Cwd    string `json:"cwd"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist
@@ -135,29 +136,40 @@ type hkJobs struct {
 	HTTP                        *http.Client
 }
 
-func (c *hkJobs) get(ctx context.Context, id string) (JobRecord, error) {
-	client := c.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		if strings.HasPrefix(c.base, "http://") {
-			// Plain HTTP is allowed only to loopback or the tailnet; an
-			// HTTP_PROXY must not receive the bearer token outside it.
-			t := http.DefaultTransport.(*http.Transport).Clone()
-			t.Proxy = nil
-			client.Transport = t
-		}
+// client is the injected HTTP client, else one that refuses redirects and,
+// over plain HTTP, ignores any proxy.
+func (c *hkJobs) client(timeout time.Duration) *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
 	}
-	req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id), nil)
-	if e != nil {
-		return JobRecord{}, errors.New("invalid job record request")
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if strings.HasPrefix(c.base, "http://") {
+		// Plain HTTP is allowed only to loopback or the tailnet; an
+		// HTTP_PROXY must not receive the bearer token outside it.
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.Proxy = nil
+		client.Transport = t
 	}
+	return client
+}
+
+// authorize sets the bearer credential and the CF Access pair, if any.
+func (c *hkJobs) authorize(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
 	if c.cfID != "" {
 		req.Header.Set("CF-Access-Client-Id", c.cfID)
 		req.Header.Set("CF-Access-Client-Secret", c.cfSecret)
 	}
-	resp, e := client.Do(req)
+}
+
+func (c *hkJobs) get(ctx context.Context, id string) (JobRecord, error) {
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id), nil)
+	if e != nil {
+		return JobRecord{}, errors.New("invalid job record request")
+	}
+	c.authorize(req)
+	resp, e := c.client(8 * time.Second).Do(req)
 	if e != nil {
 		return JobRecord{}, fmt.Errorf("handoffkeep request failed")
 	}

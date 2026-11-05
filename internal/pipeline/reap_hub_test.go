@@ -27,7 +27,17 @@ type fakeReapHub struct {
 	close    map[string]any
 	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
 	wtHead   string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
-	commands []map[string]any
+	wtPaths  map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
+	// removeOutcome is worktree.remove's answer; "removed" when empty.
+	removeOutcome string
+	commands      []map[string]any
+	// detached cwds are linked worktrees at wtHead with no branch (reviewer
+	// checkouts); dropClosed and dropRemoved make a closed pane leave the
+	// lists and a removed worktree stop inspecting, as on a real node.
+	detached    map[string]bool
+	foreign     map[string]bool // cwds whose worktree belongs to another repository
+	dropClosed  bool
+	dropRemoved bool
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -73,12 +83,20 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		switch body["op"] {
 		case "worktree.inspect":
 			result = map[string]any{"worktree": nil}
-			if body["args"].(map[string]any)["cwd"] == "/repo.wt" {
+			if cwd := body["args"].(map[string]any)["cwd"].(string); cwd == "/repo.wt" || h.wtPaths[cwd] || h.detached[cwd] {
 				head := h.wtHead
 				if head == "" {
 					head = headSHA
 				}
-				result = map[string]any{"worktree": map[string]any{"path": "/repo.wt", "branch": "wk/x", "head": head, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
+				branch := "wk/x"
+				if h.detached[cwd] {
+					branch = ""
+				}
+				origin := "git@github.com:example/project.git"
+				if h.foreign[cwd] {
+					origin = "git@github.com:example/other.git"
+				}
+				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": branch, "head": head, "origin_url": origin, "common": "/repo/.git"}}
 			}
 		case "pane.read":
 			result = h.composer
@@ -88,8 +106,27 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			result = h.capture
 		case "pane.close":
 			result = h.close
+			if h.dropClosed && h.close["outcome"] == "closed" {
+				id := body["args"].(map[string]any)["pane_id"]
+				for _, list := range []string{"agents", "panes"} {
+					var keep []any
+					for _, p := range h.agents[list].([]any) {
+						if p.(map[string]any)["pane_id"] != id {
+							keep = append(keep, p)
+						}
+					}
+					h.agents[list] = append([]any{}, keep...)
+				}
+			}
 		case "worktree.remove":
-			result = map[string]any{"outcome": "removed"}
+			outcome := h.removeOutcome
+			if outcome == "" {
+				outcome = "removed"
+			}
+			if h.dropRemoved && outcome == "removed" {
+				delete(h.detached, body["args"].(map[string]any)["cwd"].(string))
+			}
+			result = map[string]any{"outcome": outcome}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "cmd-1", "machine": "node-a", "op": body["op"], "result": result})
 	}))

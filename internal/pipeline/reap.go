@@ -26,7 +26,7 @@ import (
 // so a later pass can find it. Dry-run prints rows without writing the file.
 type reapReceipt struct {
 	Time     time.Time `json:"time"`
-	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch, archive-job
+	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch, archive-job, reviewer-cleanup, reviewer-reap
 	Repo     string    `json:"repo"`
 	PR       int       `json:"pr"`
 	Host     string    `json:"host"`
@@ -41,6 +41,7 @@ type reapReceipt struct {
 	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
 	Task     string    `json:"task,omitempty"`  // Mergewake-Task of a job-bound row
 	Open     []string  `json:"open,omitempty"`  // open PRs (owner/name#N) keeping a job's pane
+	Label    string    `json:"label,omitempty"` // reviewer label of a reviewer-reap row
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
@@ -274,6 +275,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// logging the same would-* every poll, or a removed worktree logging
 	// worktree-gone forever, would otherwise grow reap.jsonl without bound.
 	rowKey := func(v reapReceipt) string {
+		if v.Action == "reviewer-reap" {
+			return fmt.Sprintf("%s|%s|%s", v.Action, v.Label, reviewerStream(v))
+		}
 		path := v.Pane
 		if v.Action == "archive-job" || v.Action == "job-done" {
 			path = v.Job
@@ -320,7 +324,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// spares the GitHub refetch on every poll.
 	prPaths := map[int]map[string]bool{}
 	for _, rec := range receipts {
-		if rec.PR == 0 {
+		// reviewer-cleanup and reviewer-reap rows name reviewer checkouts and
+		// never get a remove-worktree row, so they must not hold a PR open.
+		if rec.PR == 0 || reviewerRow(rec) {
 			continue
 		}
 		path := rec.Worktree
@@ -359,8 +365,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// files stops costing a GitHub call every poll.
 	lastPRCheck := map[int]time.Time{}
 	for _, rec := range receipts {
-		// Archive rows need no GitHub call and must not delay a refetch.
-		if rec.Action != "archive-job" && rec.Time.After(lastPRCheck[rec.PR]) {
+		// Archive rows need no GitHub call and must not delay a refetch; neither
+		// do reviewer rows, which a review pass or the reviewer sweep writes.
+		if rec.Action != "archive-job" && !reviewerRow(rec) && rec.Time.After(lastPRCheck[rec.PR]) {
 			lastPRCheck[rec.PR] = rec.Time
 		}
 	}
@@ -386,7 +393,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Receipt-named PRs can be older than the listing horizon. A fetch
 		// failure only loses that PR this pass; it never aborts the rest.
 		for _, rec := range receipts {
-			if rec.PR == 0 || known[rec.PR] || prDone(rec.PR) || now.Sub(lastPRCheck[rec.PR]) < refetchAfter {
+			// The reviewer sweep covers its own rows whatever the PR's state.
+			if rec.PR == 0 || rec.Action == "reviewer-reap" || known[rec.PR] || prDone(rec.PR) || now.Sub(lastPRCheck[rec.PR]) < refetchAfter {
 				continue
 			}
 			known[rec.PR] = true
@@ -478,7 +486,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			removed++
 		case "deleted":
 			deleted++
-		case "skipped":
+		case "skipped", "kept", "pending-cleanup":
 			skipped++
 		case "error":
 			subject := v.Worktree
@@ -487,6 +495,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				subject = "pane " + v.Pane
 			case "archive-job", "job-done":
 				subject = "job " + v.Job
+			case "reviewer-reap":
+				subject = "reviewer " + v.Label
 			}
 			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
@@ -496,6 +506,20 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		repeat := lastRow[rowKey(v)] == rowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived"))
 		lastRow[rowKey(v)] = rowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
+			errs = append(errs, e)
+		}
+	}
+	// reviewerNote is note plus one reviewer-reap audit record per new row: a
+	// deduped repeat writes neither.
+	reviewerNote := func(v reapReceipt) {
+		repeat := lastRow[rowKey(v)] == rowSig(v)
+		note(v)
+		if repeat {
+			return
+		}
+		if e := s.audit(r.Name, "reviewer-reap", map[string]any{
+			"pr": v.PR, "label": v.Label, "host": v.Host, "pane": v.Pane, "worktree": v.Worktree, "result": v.Result, "reason": v.Reason,
+		}, o.DryRun); e != nil {
 			errs = append(errs, e)
 		}
 	}
@@ -546,6 +570,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 		if !(p.Merged || p.MergedAt != nil) || p.Base.Ref != r.Branch {
 			if prNum > 0 {
+				// A reviewer's job ends whatever its PR's state: sweep the
+				// PR's reviewers before refusing the author's path.
+				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue
@@ -639,7 +666,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 		}
 		for _, rec := range receipts {
-			if rec.PR != p.Number {
+			if rec.PR != p.Number || reviewerRow(rec) {
 				continue
 			}
 			path := rec.Worktree
@@ -839,6 +866,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			note(brec)
 		}
 	}
+	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
 	if s.Config.Reap.Archive.Enabled {
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, acting, note)...)
 	}

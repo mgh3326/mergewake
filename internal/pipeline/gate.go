@@ -7,9 +7,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
@@ -32,6 +34,7 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
+	Block     string       `json:"review_block,omitempty"`
 	PatchID   string       `json:"patch_id,omitempty"`
 	Rounds    int          `json:"rounds"`
 	Reviewed  []string     `json:"reviewed_patch_ids,omitempty"`
@@ -81,6 +84,30 @@ func (s *Service) settlingVerdict(ctx context.Context, r config.Repo, pr github.
 	v.Reasons = []string{reason}
 	s.readReviewRecord(ctx, r, pr, &v)
 	return v
+}
+
+// headSettleTries and headSettleWait bound how long one gate pass waits for
+// GitHub's GraphQL head to catch up with the REST head (about 4 s).
+var headSettleTries, headSettleWait = 3, 2 * time.Second
+
+// settledFeedback re-reads the review feedback past the evidence cache until
+// its head matches pr's head or the bound runs out; the last read is returned.
+func (s *Service) settledFeedback(ctx context.Context, repo string, pr github.Pull) (github.ReviewFeedback, error) {
+	var fb github.ReviewFeedback
+	var e error
+	for i := 0; i < headSettleTries; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return fb, ctx.Err()
+			case <-time.After(headSettleWait):
+			}
+		}
+		if fb, e = s.GH.ReviewFeedback(github.FreshEvidence(ctx), repo, pr.Number); e != nil || fb.HeadSHA == pr.Head.SHA {
+			return fb, e
+		}
+	}
+	return fb, nil
 }
 
 func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github.Pull, v *gateVerdict) {
@@ -134,9 +161,15 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if fb.HeadSHA != pr.Head.SHA {
 		// GitHub's REST pull head and the GraphQL head disagree for a few
-		// seconds after a push or update-branch: the evidence is still
-		// settling, so the verdict waits instead of failing the pass.
-		return s.settlingVerdict(ctx, r, pr, v, "head_moving"), nil
+		// seconds after a push or update-branch, and a cached feedback read
+		// can still carry the old head. Re-read past the cache a few times in
+		// this pass before deferring the verdict to the next one.
+		if fb, e = s.settledFeedback(ctx, r.Name, pr); e != nil {
+			return v, e
+		}
+		if fb.HeadSHA != pr.Head.SHA {
+			return s.settlingVerdict(ctx, r, pr, v, "head_moving"), nil
+		}
 	}
 	login := policy.NormalizeAuthor(s.Config.Review.Login)
 	files, e := s.GH.Files(ctx, r.Name, pr.Number)
@@ -227,6 +260,9 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")
+		if ledger, err := s.ledger().Read(); err == nil {
+			v.Review.Block = ledger.Latest[outcomes.Key(r.Name, pr.Number)].ReviewBlocked[pr.Head.SHA]
+		}
 	}
 	fresh, e := s.GH.Ancestor(ctx, r.Name, baseHead, pr.Head.SHA)
 	if e != nil {

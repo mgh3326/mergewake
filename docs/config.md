@@ -46,6 +46,7 @@ Different hosts may use the same inventory and different deny lists.
 | `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
 | `lane` | Empty | Lane for this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one; checked before `notifier.fallback_lane`. |
+| `hk_task_events` | `true` | With the `handoffkeep` sink, post a task event to hk's `POST /v1/task-events` for each PR with a `Mergewake-Task` trailer: `mergewake.pr` when an open, ready PR is first observed, `mergewake.review` when a review run claims a pass, `mergewake.merge` after mergewake's own merge, and `mergewake.revert` when a watch revert PR is merged (a revert merged more than seven days before mergewake first sees it is not posted). Dry runs and shadow mode post nothing. A failed post never fails the action; each post is an `hk-task-event` row in `decisions.jsonl`. Set `false` for a repo whose hk predates the endpoint (handoffkeep#136). |
 
 Each `install[]` entry has:
 
@@ -418,7 +419,7 @@ needs no GitHub token.
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
-| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. |
+| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the reviewer pane is closed (only when its name, cwd and composer still match) and its remote detached worktree is removed through the hub's guarded removal; a refusal is recorded as `pending-cleanup`. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. A pane whose wait timed out is never closed here. |
 | `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 
