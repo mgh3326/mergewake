@@ -1,0 +1,29 @@
+{
+  "mgh3326/brewdial": {
+    "version": "brewdial-suite-1",
+    "main": "main",
+    "pointer": "deployable",
+    "workflows": [
+      {
+        "path": ".github/workflows/ci.yml",
+        "jobs": ["Typecheck, Lint & Test"]
+      },
+      {
+        "path": ".github/workflows/ci-kt.yml",
+        "jobs": [
+          "API paths changed",
+          "API tests (PostgreSQL 17)",
+          "API tests (MySQL 8.4)",
+          "Data copy (PostgreSQL <-> MySQL)",
+          "API tests (PostgreSQL + MySQL)"
+        ]
+      }
+    ],
+    "artifact": {
+      "image": "ghcr.io/mgh3326/brewdial",
+      "tag": "sha-{short7}",
+      "platform": "linux/arm64",
+      "revision_label": "org.opencontainers.image.revision"
+    }
+  }
+}

@@ -18,8 +18,8 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
-// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale and
-// conflict. The two graded reasons replace threads_open when the policy has a
+// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on and GitHub requires an
+// up-to-date branch) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
@@ -34,6 +34,9 @@ type gateVerdict struct {
 // head's review came from when it did not run on this head, and how the
 // findings stand.
 type reviewRecord struct {
+	// BaseBehind marks a base that is not an ancestor of the head while GitHub
+	// still merges the PR as is. It blocks nothing.
+	BaseBehind      bool         `json:"base_behind,omitempty"`
 	ChecksCancelled []string     `json:"checks_cancelled,omitempty"`
 	Block           string       `json:"review_block,omitempty"`
 	PatchID         string       `json:"patch_id,omitempty"`
@@ -278,7 +281,14 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	if !fresh {
-		v.Reasons = append(v.Reasons, "base_stale")
+		// A base that moved on blocks only when GitHub requires an up-to-date
+		// branch ("behind"). A conflict-free PR it can merge as is lands; the
+		// stale base is recorded for information.
+		if pr.MergeableState == "behind" {
+			v.Reasons = append(v.Reasons, "base_stale")
+		} else {
+			v.Review.BaseBehind = true
+		}
 	}
 	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
