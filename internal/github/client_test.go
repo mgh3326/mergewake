@@ -463,6 +463,33 @@ func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
 	}
 }
 
+func TestAllClosedPullsReadsEveryPageMergedOrNot(t *testing.T) {
+	pages := 0
+	merged := time.Now().UTC().Format(time.RFC3339)
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if q := r.URL.Query(); q.Get("state") != "closed" || q.Get("base") != "" {
+			t.Errorf("query %v", q)
+		}
+		if r.URL.Query().Get("page") == "1" {
+			batch := make([]Pull, 100)
+			for i := range batch {
+				batch[i] = Pull{Number: i + 1, State: "closed"}
+			}
+			reply(w, batch)
+			return
+		}
+		reply(w, []Pull{{Number: 101, State: "closed", MergedAt: &merged, Base: Ref{Ref: "release"}}})
+	})
+	pulls, e := c.AllClosedPulls(context.Background(), "example/project")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if pages != 2 || len(pulls) != 101 || pulls[100].Number != 101 {
+		t.Fatalf("pages=%d pulls=%d", pages, len(pulls))
+	}
+}
+
 func TestAdvisoryFindingGradesAdvisoryAndCriticalNever(t *testing.T) {
 	advisory := FindingBody(Finding{Severity: "medium", Body: "style nit", Advisory: true})
 	if !strings.Contains(advisory, AdvisoryMarker) || !strings.Contains(advisory, "<!-- mergewake-severity:medium -->") || !strings.Contains(advisory, "**Advisory**") {

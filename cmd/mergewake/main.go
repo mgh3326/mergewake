@@ -116,7 +116,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	repo := fs.String("repo", "", "configured owner/name (required except agent, status, superfan)")
 	var pr *int
 	var family, commit *string
-	var shadow, once *bool
+	var shadow, once, legacy *bool
+	var legacyHost *string
 	var name, runner *string
 	var launch *bool
 	var digest, adopt *string
@@ -127,6 +128,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			family = fs.String("author-family", "", "PR author model family (or PR body trailer)")
 		} else if command == "reap" {
 			shadow = fs.Bool("shadow", false, "force observation mode")
+			legacy = fs.Bool("legacy", false, "one-time sweep of worktrees whose PR merged at least 14 days ago, past the daemon's scan window (every configured repo unless --repo; plans unless --apply)")
+			legacyHost = fs.String("host", "", "with --legacy: sweep one configured host only")
 		} else {
 			shadow = fs.Bool("shadow", false, "force decision-only mode")
 		}
@@ -156,6 +159,16 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
+	if command == "reap" {
+		switch {
+		case !*legacy && *legacyHost != "":
+			return errors.New("--host needs --legacy")
+		case *legacy && *pr != 0:
+			return errors.New("--legacy looks at every PR; it does not take --pr")
+		case *legacy && *apply && *dry:
+			return errors.New("--apply and --dry-run are exclusive")
+		}
+	}
 	if command == "superfan" {
 		return runSuperfan(ctx, *name, *launch, *runner, *dry, out)
 	}
@@ -164,7 +177,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	r := config.Repo{}
-	if command != "agent" && command != "status" && command != "daemon" || *repo != "" {
+	sweepAll := legacy != nil && *legacy && *repo == ""
+	if (command != "agent" && command != "status" && command != "daemon" && !sweepAll) || *repo != "" {
 		if *repo == "" {
 			return errors.New("--repo is required")
 		}
@@ -244,6 +258,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		// reap.act (checked inside Reap) is the acting gate; daemon.act only
 		// applies when the daemon drives the role.
 		o.Shadow = o.Shadow || *shadow
+		if *legacy {
+			return runReapLegacy(ctx, &s, c, *repo, *legacyHost, o)
+		}
 		return s.Reap(ctx, r, *pr, o)
 	case "agent":
 		if len(c.Repos) == 0 {
@@ -263,6 +280,21 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		}, stderr)
 	}
 	return nil
+}
+
+// runReapLegacy runs the one-time legacy sweep over --repo or, without it,
+// every configured repo. It is not part of the daemon loop.
+func runReapLegacy(ctx context.Context, s *pipeline.Service, c config.Config, repo, host string, o pipeline.Options) error {
+	var errs []error
+	for _, r := range c.Repos {
+		if repo != "" && r.Name != repo {
+			continue
+		}
+		if e := s.ReapLegacy(ctx, r, host, o); e != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))
+		}
+	}
+	return errors.Join(errs...)
 }
 func poll(ctx context.Context, interval string, once bool, fn func() error, stderr io.Writer) error {
 	d, e := config.Duration(interval)

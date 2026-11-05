@@ -316,6 +316,14 @@ func (c *Client) ClosedPulls(ctx context.Context, repo, branch string) ([]Pull, 
 	return out, c.json(ctx, "GET", route, nil, &out)
 }
 
+// AllClosedPulls lists every closed PR of the repo, merged or not, against any
+// base, oldest first. The legacy worktree sweep reads it once: unlike
+// MergedPulls it has no recency window. Pagination past GitHub's limit is an
+// error, never a partial list.
+func (c *Client) AllClosedPulls(ctx context.Context, repo string) ([]Pull, error) {
+	return list[Pull](ctx, c, base(repo)+"/pulls?state=closed&sort=created&direction=asc")
+}
+
 // ReviewClaimed checks durable completion markers. In-flight passes use the
 // expiring ReviewLease instead.
 func (c *Client) ReviewClaimed(ctx context.Context, repo string, number int, sha string) (bool, error) {
