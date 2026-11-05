@@ -407,7 +407,7 @@ needs no GitHub token.
 | `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
 | `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
-| `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
+| `default_grade` | `B` | Task grade for review selection when the PR has no `Mergewake-Grade: A` body trailer. Outcomes never use it. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
@@ -804,8 +804,11 @@ Mergewake-Tier: T1
 
 `Mergewake-Author-Model` is optional when the configured author profile has a
 concrete `--model` argument. Use `baseline` and `downshift` arm names for pacelever exploration compatibility.
-Grade defaults to `review.default_grade`; tier defaults
-to `outcomes.default_tier` (`T1`). Missing attribution stays visible locally and
+Grade and tier come from the trailer, else from the `(grade X, Tn)` marker in the
+title of the PR's `Mergewake-Task`, else they are unknown; no config default fills
+them. A row with an unknown grade is never published; `outcomes report` counts it
+in `grade_unknown`. Each posted pass records its reviewer in `reviewers_by_head`.
+Missing attribution stays visible locally and
 is retained for repair rather than fabricated for a shared rep.
 
 The first CI observation uses attempt 1 of the earliest PR run of each required
@@ -1042,7 +1045,7 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
-| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
+| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only when the base moved ahead of the head and GitHub reports the PR `behind` (branch protection requires an up-to-date branch). Otherwise a conflict-free PR with a moved base is not blocked, its branch is not updated, and the land and notify records carry `base_behind: true`. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
@@ -1419,7 +1422,8 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `review_missing`, `base_stale`, `conflict`. Pending or
+`triage_unanswered:<n>`), `review_missing`, `base_stale` (only when GitHub requires an
+up-to-date branch), `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
@@ -1778,6 +1782,32 @@ read-only, and install scripts must be safe to repeat at the same commit.
 from PR merge checks. Omission reuses `required_checks`. For example a project
 with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
 without weakening the PR gate. First-PR CI measurement always uses required_checks.
+
+`policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
+that runs the watch checks for any commit: it has a `workflow_dispatch` trigger
+with input `ref` and posts the watch checks as commit statuses on that sha (for
+example `any_ref_workflow: ci-any-ref.yml`). When a red main head's bisect needs
+a commit that has no green or red result, an acting watch dispatches the workflow
+once for that commit on the watched branch, records the dispatch in
+`any-ref-dispatch.json` in the repo state dir, and holds with
+`waiting for any-ref CI on <sha7>`. A later pass reads the result. The wait never
+happens inside a pass, and waiting holds do not notify. A restart never
+dispatches the same commit twice for the same red head.
+
+Each red head is one incident; a new red head starts a new one, and a green head
+ends it. Per incident, watch dispatches at most `ceil(log2(n)) + 2` times, where
+`n` is the number of commits after the green boundary. It waits at most
+`policy.any_ref_timeout` (a Go duration; default `45m`) for each commit after its
+dispatch. Past either bound, or when GitHub refuses the dispatch (HTTP 403, 404
+or 422), watch holds with a reason that names the cause and notifies once per
+incident. A refusal is not retried until the next incident. Shadow and
+`--dry-run` passes dispatch nothing and name the commit they would dispatch in
+`any_ref_dispatch`. Without the key, unknown evidence holds as before. The token
+needs permission to dispatch workflows.
+
+A check run and a commit status with the same name combine as follows: a pending,
+cancelled or skipped value yields to a green or red one. Two decisive values
+that disagree are an error.
 
 The hub reap transport reads composers with `pane.read`: only `empty` permits
 closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone panes

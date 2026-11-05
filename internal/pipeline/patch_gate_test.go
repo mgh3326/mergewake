@@ -223,12 +223,14 @@ func TestBaseStateNeverReReviews(t *testing.T) {
 	// Head A after the base moved on.
 	g.pull.Head.SHA = shaA
 	g.stale = true
+	g.pull.MergeableState = "behind"
 	if v := gateAt(t, s, g, shaB); reasons(v) != "base_stale" {
 		t.Fatalf("stale head: %+v", v)
 	}
 	// Head B has the base merged in; its CI has not finished.
 	g.pull.Head.SHA = shaB
 	g.stale = false
+	g.pull.MergeableState = "clean"
 	g.ci = github.Pending
 	if v := gateAt(t, s, g, shaB); v.State != "pending" || reasons(v) != "" {
 		t.Fatalf("waiting on CI: %+v", v)

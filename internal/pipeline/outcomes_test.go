@@ -36,7 +36,7 @@ func TestShadowOutcomesAndSevenDayFollowup(t *testing.T) {
 	g.pull.CreatedAt = opened.Format(time.RFC3339)
 	g.pull.MergedAt = &merged
 	g.pull.State = "closed"
-	g.pull.Body = "Mergewake-Author-Profile: example@high\nMergewake-Author-Model: concrete-model\nMergewake-Experiment: effort-test/control\nMergewake-Grade: A\n"
+	g.pull.Body = "Mergewake-Author-Profile: example@high\nMergewake-Author-Model: concrete-model\nMergewake-Experiment: effort-test/control\nMergewake-Grade: A\nMergewake-Tier: T1\n"
 	source := &outcomeGH{fakeGH: g, first: true}
 	s.GH = source
 	if err := s.ObservePR(context.Background(), repo, g.pull, Options{Shadow: true}); err != nil {

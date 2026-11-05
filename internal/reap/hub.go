@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 )
 
 // Hub reaches session hosts through the panewire hub's node commands
@@ -138,12 +141,35 @@ func (h *Hub) client() *http.Client {
 // the host's panes, so a caller must fail that host rather than read it empty.
 var ErrHubAuth = errors.New("hub refused the credential")
 
-// hubError is a non-200 hub answer, carrying the hub's or node's error code.
+// hubDetailMax bounds the detail a hub error shows, in bytes.
+const hubDetailMax = 240
+
+// hubError is a hub answer that carries an error code: a non-200 status, or a
+// 200 whose body holds `error` (a node that answered with an error). Detail is
+// the node's optional explanation.
 type hubError struct {
 	Status int
 	Code   string
+	Detail string
 	Client string
 	Path   string
+}
+
+// detailSuffix is ": <detail>" with the detail redacted and cut to hubDetailMax
+// bytes on a rune boundary, or "" when there is none. Redaction runs first so a
+// cut never leaves the front of a secret.
+func (e *hubError) detailSuffix() string {
+	d := fleetevent.Redact(strings.TrimSpace(e.Detail))
+	if d == "" {
+		return ""
+	}
+	if len(d) > hubDetailMax {
+		d = d[:hubDetailMax]
+		for !utf8.ValidString(d) {
+			d = d[:len(d)-1]
+		}
+	}
+	return ": " + d
 }
 
 func (e *hubError) auth() bool {
@@ -152,9 +178,9 @@ func (e *hubError) auth() bool {
 
 func (e *hubError) Error() string {
 	if e.auth() {
-		return fmt.Sprintf("hub scope/auth error: %s for client %s on %s (%d %s)", ErrHubAuth, e.Client, e.Path, e.Status, e.Code)
+		return fmt.Sprintf("hub scope/auth error: %s for client %s on %s (%d %s)%s", ErrHubAuth, e.Client, e.Path, e.Status, e.Code, e.detailSuffix())
 	}
-	return fmt.Sprintf("hub %d %s", e.Status, e.Code)
+	return fmt.Sprintf("hub %d %s%s", e.Status, e.Code, e.detailSuffix())
 }
 
 func (e *hubError) Is(target error) bool { return target == ErrHubAuth && e.auth() }
@@ -194,13 +220,14 @@ func (h *Hub) do(ctx context.Context, method, path string, body any, out any) er
 	}
 	if res.StatusCode != http.StatusOK {
 		var v struct {
-			Error string `json:"error"`
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
 		}
 		_ = json.Unmarshal(b, &v)
 		if v.Error == "" {
 			v.Error = "unexpected-response"
 		}
-		return &hubError{Status: res.StatusCode, Code: v.Error, Client: h.Client, Path: path}
+		return &hubError{Status: res.StatusCode, Code: v.Error, Detail: v.Detail, Client: h.Client, Path: path}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("hub %s: %w", path, err)
@@ -242,13 +269,21 @@ func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error)
 	return row, nil
 }
 
-// Command runs one node command and decodes its result.
+// Command runs one node command and decodes its result. A node that answers
+// with an error comes back as HTTP 200 carrying `error` (and optionally
+// `detail`) and no result; that is a hubError, never a missing result.
 func (h *Hub) Command(ctx context.Context, machine, op string, args any, out any) error {
 	var v struct {
 		Result json.RawMessage `json:"result"`
+		Error  string          `json:"error"`
+		Detail string          `json:"detail"`
 	}
-	if err := h.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(machine)+"/command", map[string]any{"op": op, "args": args}, &v); err != nil {
+	path := "/v1/nodes/" + url.PathEscape(machine) + "/command"
+	if err := h.do(ctx, http.MethodPost, path, map[string]any{"op": op, "args": args}, &v); err != nil {
 		return err
+	}
+	if v.Error != "" {
+		return &hubError{Status: http.StatusOK, Code: v.Error, Detail: v.Detail, Client: h.Client, Path: path}
 	}
 	if len(v.Result) == 0 {
 		return fmt.Errorf("hub %s: missing result", op)

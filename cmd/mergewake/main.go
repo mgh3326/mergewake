@@ -43,6 +43,8 @@ Usage: mergewake <command> [flags]
   outcomes   Report or sync the shadow-safe model outcomes ledger
   notify     Post a deploy from another deployer to the Discord feed (needs discord.enabled)
   status     Read installed receipts and check local drift
+  promote    Certify one main commit and its image digest, record it, and advance the deployable pointer
+  admit      Print the digest the deployable pointer and its record agree on, or refuse; --deploy hands it to shiftgate
   superfan   Print or launch an experimental resident monitor spec
 
 All commands accept --help. Acting commands accept --dry-run.
@@ -56,6 +58,10 @@ func main() {
 	defer cancel()
 	if e := run(ctx, os.Args[1:], os.Stdout, os.Stderr); e != nil {
 		fmt.Fprintln(os.Stderr, "mergewake:", e)
+		var x *exitError
+		if errors.As(e, &x) && x.code > 1 {
+			os.Exit(x.code)
+		}
 		os.Exit(1)
 	}
 }
@@ -80,6 +86,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	if args[0] == "notify" {
 		return runNotify(ctx, args[1:], out, stderr)
+	}
+	if args[0] == "promote" {
+		return runPromote(ctx, args[1:], out, stderr)
+	}
+	if args[0] == "admit" {
+		return runAdmit(ctx, args[1:], out, stderr)
 	}
 	if args[0] == "server" {
 		return runServerStore(ctx, args[1:], out, stderr)

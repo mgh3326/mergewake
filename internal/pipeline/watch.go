@@ -27,10 +27,25 @@ type watchResult struct {
 	URL        string `json:"url,omitempty"`
 	Candidates []int  `json:"candidates,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	// AnyRefDispatch is the commit whose any-ref CI this pass dispatched, or
+	// would dispatch in shadow and dry runs.
+	AnyRefDispatch string `json:"any_ref_dispatch,omitempty"`
+}
+
+// UnknownEvidenceError names the bracket commit whose CI evidence Bisect
+// needed but could not read as green or red.
+type UnknownEvidenceError struct {
+	Index int
+	SHA   string
+}
+
+func (e *UnknownEvidenceError) Error() string {
+	return "bisect has missing or pending CI; operator or any-ref CI required"
 }
 
 // Bisect returns the first red candidate following a known green baseline.
-// Missing/pending evidence stops the search rather than assigning blame.
+// Missing/pending evidence stops the search rather than assigning blame; the
+// error is then an *UnknownEvidenceError naming the commit.
 func Bisect(shas []string, check func(string) (github.CI, error)) (int, error) {
 	if len(shas) < 2 {
 		return 0, errors.New("bisect needs a green baseline and red head")
@@ -62,7 +77,7 @@ func Bisect(shas []string, check func(string) (github.CI, error)) (int, error) {
 		case github.Red:
 			hi = mid
 		default:
-			return 0, errors.New("bisect has missing or pending CI; operator or any-ref CI required")
+			return 0, &UnknownEvidenceError{Index: mid, SHA: shas[mid]}
 		}
 	}
 	return hi, nil
@@ -97,6 +112,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {
 				return e
 			}
+			if e = s.endAnyRef(r.Name); e != nil {
+				return e
+			}
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
@@ -119,7 +137,10 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	baseline := string(baselineBytes)
 	chain := []string{head}
 	green := ""
-	hold := func(reason string) error {
+	// holdAs ends the pass with a hold. A hold that needs the desk is reported
+	// once per head and reason; a quiet hold (waiting for any-ref CI) is only
+	// audited and fed.
+	holdAs := func(reason string, notify bool) error {
 		candidates, e := s.bracketCandidates(ctx, r, chain, green)
 		if e != nil {
 			return e
@@ -127,8 +148,22 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		result.Candidates = candidates
 		result.Action = "hold"
 		result.Reason = reason
-		return s.reportWatch(ctx, r, result, head+":"+reason, o)
+		if notify {
+			return s.reportWatch(ctx, r, result, head+":"+reason, o)
+		}
+		if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
+			return e
+		}
+		if !result.Shadow && !o.DryRun {
+			s.feedWatch(r, result, o)
+		}
+		return nil
 	}
+	hold := func(reason string) error { return holdAs(reason, true) }
+	// With any_ref_workflow set, unknown evidence is resolved by dispatching
+	// the any-ref CI for the commit bisect needs, not by holding for the
+	// operator.
+	anyRef := p.AnyRefWorkflow != ""
 	cache := map[string]github.CI{head: ci}
 	current := head
 	found := false
@@ -192,10 +227,22 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 			break
 		}
 		if v != github.Red {
+			if anyRef {
+				// Bisect asks for the evidence it needs; the rest stays unknown.
+				continue
+			}
 			return hold("incomplete CI evidence in recovery interval")
 		}
 	}
 	index, e := Bisect(chain, check)
+	var unknown *UnknownEvidenceError
+	if anyRef && errors.As(e, &unknown) {
+		reason, notify, e := s.anyRef(ctx, r, p, head, unknown.SHA, len(chain)-1, !result.Shadow && !o.DryRun, &result)
+		if e != nil {
+			return e
+		}
+		return holdAs(reason, notify)
+	}
 	if e != nil {
 		return hold("CI evidence inside the bracket is ambiguous: " + e.Error())
 	}
