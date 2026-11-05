@@ -58,8 +58,8 @@ func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) 
 	}
 }
 
-// reapHeadCommits memoises the head commit of a merged PR for the process: a
-// merged PR's head never changes, so the task lookup (reapTask) reads it once.
+// reapHeadCommits memoises a head commit for the process: a commit's message
+// never changes, so the trailer lookup (prTrailer) reads it once per head.
 // It is keyed by state dir so two services never share an answer; a read error
 // is not cached.
 var (

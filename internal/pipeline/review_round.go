@@ -9,7 +9,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // A review verdict covers a patch, not a SHA, and a review that never ends is
@@ -262,15 +261,9 @@ func (s *Service) acceptance(ctx context.Context, r config.Repo, pr github.Pull)
 	if !ok {
 		return "", "", nil
 	}
-	task := trailer(pr.Body, "Mergewake-Task")
-	if !integrations.TaskID.MatchString(task) {
-		c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-		if e != nil {
-			return "", "", e
-		}
-		if task = trailer(c.Commit.Message, "Mergewake-Task"); !integrations.TaskID.MatchString(task) {
-			return "", "", nil
-		}
+	task, e := s.prTask(ctx, r, pr)
+	if e != nil || task == "" {
+		return "", "", e
 	}
 	body, e := reader.TaskBody(ctx, task)
 	if e != nil {

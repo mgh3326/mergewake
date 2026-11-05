@@ -212,17 +212,7 @@ func mustFix(s string) bool {
 
 // prTask reads the Mergewake-Task trailer: PR body first, then the head commit.
 func (s *Service) prTask(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	if t := trailer(pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-	if e != nil {
-		return "", e
-	}
-	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	return "", nil
+	return s.prTrailer(ctx, r, pr, "Mergewake-Task", integrations.TaskID.MatchString)
 }
 
 // terminalJob reports the hk job states after which the author attempt no
@@ -268,13 +258,9 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 	}
 	// Explicit PR routing is evidence of ownership: a Notify-Lane trailer, then
 	// the task's lane unless it is the desk. A repo/desk default is not.
-	notify := trailer(pr.Body, "Mergewake-Notify-Lane")
-	if notify == "" {
-		c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-		if e != nil {
-			return rt, e
-		}
-		notify = trailer(c.Commit.Message, "Mergewake-Notify-Lane")
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	if e != nil {
+		return rt, e
 	}
 	if laneName.MatchString(notify) {
 		rt.lane, rt.via = notify, "notify-lane trailer"

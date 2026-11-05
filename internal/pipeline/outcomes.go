@@ -91,17 +91,25 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 	if o.DryRun {
 		return nil
 	}
+	// Every trailer comes from the PR body, else the head commit. A failed
+	// commit read leaves the trailer-derived fields as an earlier observation
+	// of the row recorded them, like a failed hk read below.
+	trailersUnread := false
+	read := func(key string, valid func(string) bool) string {
+		v, e := s.prTrailer(ctx, r, p, key, valid)
+		if e != nil {
+			trailersUnread = true
+		}
+		return v
+	}
+	grade, tier := read("Mergewake-Grade", config.ValidGrade), read("Mergewake-Tier", validTier)
+	family := read("Mergewake-Author-Family", nil)
+	profile := read("Mergewake-Author-Profile", nil)
+	experiment := strings.SplitN(read("Mergewake-Experiment", nil), "/", 2)
+	model := read("Mergewake-Author-Model", nil)
 	// The grade and tier come from the PR's own evidence: the trailer, else the
 	// hk task title. Never from config. hk is read before the ledger lock is
 	// taken, and only when a trailer leaves a gap.
-	grade, tier := trailer(p.Body, "Mergewake-Grade"), trailer(p.Body, "Mergewake-Tier")
-	if !config.ValidGrade(grade) {
-		grade = ""
-	}
-	if !validTier(tier) {
-		tier = ""
-	}
-	// A failed hk read keeps what an earlier observation of the row recorded.
 	titleUnread := false
 	if grade == "" || tier == "" {
 		g, t, _, e := s.taskTitleScale(ctx, r, p)
@@ -119,29 +127,30 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 		if opened := parsedTime(p.CreatedAt); opened != nil {
 			v.OpenedAt = *opened
 		}
-		v.Family = config.CanonicalFamily(trailer(p.Body, "Mergewake-Author-Family"))
-		v.Profile = ""
-		v.Effort = ""
-		v.Experiment = ""
-		v.Arm = ""
-		v.Profile, v.Effort = authorProfile(trailer(p.Body, "Mergewake-Author-Profile"))
-		experiment := strings.SplitN(trailer(p.Body, "Mergewake-Experiment"), "/", 2)
-		if len(experiment) == 2 {
-			v.Experiment = experiment[0]
-			v.Arm = experiment[1]
-		}
-		v.Model = trailer(p.Body, "Mergewake-Author-Model")
-		if profile, ok := s.Config.Review.Profiles[v.Profile]; ok && v.Model == "" {
-			for i := 0; i+1 < len(profile.Args); i += 2 {
-				if profile.Args[i] == "--model" {
-					v.Model = profile.Args[i+1]
+		if !trailersUnread {
+			v.Family = config.CanonicalFamily(family)
+			v.Profile = ""
+			v.Effort = ""
+			v.Experiment = ""
+			v.Arm = ""
+			v.Profile, v.Effort = authorProfile(profile)
+			if len(experiment) == 2 {
+				v.Experiment = experiment[0]
+				v.Arm = experiment[1]
+			}
+			v.Model = model
+			if reviewer, ok := s.Config.Review.Profiles[v.Profile]; ok && v.Model == "" {
+				for i := 0; i+1 < len(reviewer.Args); i += 2 {
+					if reviewer.Args[i] == "--model" {
+						v.Model = reviewer.Args[i+1]
+					}
 				}
 			}
 		}
-		if grade != "" || !titleUnread {
+		if grade != "" || !(titleUnread || trailersUnread) {
 			v.Grade = grade
 		}
-		if tier != "" || !titleUnread {
+		if tier != "" || !(titleUnread || trailersUnread) {
 			v.Tier = tier
 		}
 		if p.ClosedAt != nil {
