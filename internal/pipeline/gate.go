@@ -19,8 +19,8 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, threads_open:<n>,
-// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on and GitHub requires an
-// up-to-date branch) and conflict. The two graded reasons replace threads_open when the policy has a
+// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
+// require_up_to_date) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
@@ -361,10 +361,11 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		return v, e
 	}
 	if !fresh {
-		// A base that moved on blocks only when GitHub requires an up-to-date
-		// branch ("behind"). A conflict-free PR it can merge as is lands; the
-		// stale base is recorded for information.
-		if pr.MergeableState == "behind" {
+		// A base that moved on blocks only when the policy requires an
+		// up-to-date branch and GitHub reports the PR "behind". Otherwise a
+		// conflict-free PR lands as is, post-merge CI checks the composed
+		// result, and the stale base is recorded for information.
+		if p.RequireUpToDate && pr.MergeableState == "behind" {
 			v.Reasons = append(v.Reasons, "base_stale")
 		} else {
 			v.Review.BaseBehind = true

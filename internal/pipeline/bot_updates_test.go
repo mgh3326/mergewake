@@ -258,7 +258,7 @@ func TestBotUpdateMergeability(t *testing.T) {
 		{"unknown", func(g *fakeGH) { g.pull.Mergeable = nil; g.pull.MergeableState = "unknown" }, "", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, g, n, _, land := botSetup(t, "")
+			s, g, n, _, land := botSetup(t, "require_up_to_date: true\n")
 			yes := true
 			g.pull.Mergeable, g.pull.MergeableState = &yes, "clean"
 			tt.edit(g)
@@ -442,5 +442,20 @@ func TestBotUpdateRecordsBaseBehind(t *testing.T) {
 	}
 	if g.mergeCount != 1 || !strings.Contains(out.String(), `"base_behind":true`) {
 		t.Fatalf("merges=%d record: %s", g.mergeCount, out)
+	}
+}
+
+// (d) A bot patch GitHub reports behind its base lands under the default
+// policy, and is held as base_stale only when the repo requires up-to-date
+// branches.
+func TestBotUpdateBehindLandsUnlessRequired(t *testing.T) {
+	_, g, n, out, land := botSetup(t, "")
+	g.stale = true
+	g.pull.MergeableState = "behind"
+	if e := land(context.Background(), Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if g.mergeCount != 1 || len(notices(n)) != 0 || !strings.Contains(out.String(), `"base_behind":true`) {
+		t.Fatalf("merges=%d notices=%q record: %s", g.mergeCount, notices(n), out)
 	}
 }

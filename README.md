@@ -151,8 +151,8 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` for unresolved review threads (`blocking_findings:<n>` and
 `triage_unanswered:<n>` instead when the repo policy grades findings), `review_missing` when the
 marker or passes are absent, `base_stale` when the base moved ahead of the
-head, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
-check evidence emits nothing. When acting and `base_stale` is the only blocker, `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
+head and the repo sets `require_up_to_date: true`, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
+check evidence emits nothing. When acting and `base_stale` is the only blocker (it needs `require_up_to_date: true`), `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
 across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY, BLOCKED, and MERGED are declared `--type ready|blocked|merged`, so they stay unread on the lane
