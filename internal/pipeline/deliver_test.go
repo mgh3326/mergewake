@@ -432,3 +432,35 @@ func TestFindingsAcknowledgementIsNotADisposition(t *testing.T) {
 		t.Fatalf("acknowledged-only high was never followed up: %+v", n.events)
 	}
 }
+
+// Without a bound job, findings go to an explicit author lane: the
+// Notify-Lane trailer, then the task's lane unless it is the desk lane.
+func TestFindingsRouteExplicitAuthorLane(t *testing.T) {
+	for _, tt := range []struct {
+		name, taskLane, notify, job, wantLane, wantVia string
+	}{
+		{"trailer matches task lane", "author-design", "author-design", "", "author-design", "notify-lane trailer"},
+		{"task lane without trailer", "other-design", "", "", "other-design", "task 2481"},
+		{"desk task lane with trailer", "operator-desk", "design-lane", "", "design-lane", "notify-lane trailer"},
+		{"desk task lane without trailer", "operator-desk", "", "", "operator-desk", "unknown author; desk"},
+		{"bound job wins", "author-design", "design-lane", "w-7", "w-7", "task 2481 job w-7"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, sink, r, _ := deliverSetup(t)
+			sink.lanes["2481"] = tt.taskLane
+			if tt.job == "" {
+				delete(sink.jobs, "2481")
+			}
+			if tt.notify != "" {
+				g.pull.Body += "Mergewake-Notify-Lane: " + tt.notify + "\n"
+			}
+			rt, e := s.findingsRoute(context.Background(), r, g.pull)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if rt.lane != tt.wantLane || rt.via != tt.wantVia {
+				t.Fatalf("route %q via %q, want %q via %q", rt.lane, rt.via, tt.wantLane, tt.wantVia)
+			}
+		})
+	}
+}
