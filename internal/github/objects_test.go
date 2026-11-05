@@ -231,3 +231,52 @@ func TestOnlyShaAddressedObjectsAreCached(t *testing.T) {
 		t.Fatal("cacheable key rules")
 	}
 }
+
+// GitHub's commit response lists every changed file with its patch text, which
+// runs to megabytes for a lockfile. The cache keeps only the fields Commit
+// decodes.
+func TestCommitCachedAsSmallDecodedForm(t *testing.T) {
+	patch := strings.Repeat("+ generated line\n", 200_000)
+	serve := func(n *int) *Client {
+		return api(t, func(w http.ResponseWriter, r *http.Request) {
+			*n++
+			reply(w, map[string]any{
+				"sha":     testSHA,
+				"parents": []Ref{{SHA: strings.Repeat("1", 40)}, {SHA: strings.Repeat("2", 40)}},
+				"commit": map[string]any{
+					"message":   "fix: thing\n\nbody",
+					"tree":      Ref{SHA: testTree},
+					"author":    map[string]any{"name": "A", "email": "a@example.com", "date": "2026-01-02T03:04:05Z"},
+					"committer": map[string]any{"name": "C", "email": "c@example.com", "date": "2026-01-02T04:05:06+09:00"},
+				},
+				"stats": map[string]any{"total": 400000},
+				"files": []map[string]any{{"filename": "package-lock.json", "patch": patch}},
+			})
+		})
+	}
+	var requests int
+	c := serve(&requests)
+	cache := &fakeCache{}
+	c.Objects = cache
+	live, e := c.Commit(context.Background(), "example/project", testSHA)
+	if e != nil || requests != 1 {
+		t.Fatalf("%v, %d requests", e, requests)
+	}
+	stored := cache.objects["example/project|commit|"+testSHA+"|"]
+	if len(stored) == 0 || len(stored) > 1024 || bytes.Contains(stored, []byte("generated line")) || bytes.Contains(stored, []byte("package-lock")) {
+		t.Fatalf("stored %d bytes, want the small decoded form: %.200s", len(stored), stored)
+	}
+	var again int
+	c2 := serve(&again)
+	c2.Objects = cache
+	hit, e := c2.Commit(context.Background(), "example/project", testSHA)
+	if e != nil || again != 0 {
+		t.Fatalf("%v, %d requests on a cache hit", e, again)
+	}
+	if hit.SHA != live.SHA || hit.Commit.Message != live.Commit.Message || hit.Commit.Tree != live.Commit.Tree ||
+		len(hit.Parents) != 2 || hit.Parents[0] != live.Parents[0] || hit.Parents[1] != live.Parents[1] ||
+		hit.Commit.Author != live.Commit.Author || hit.Commit.Committer.Name != live.Commit.Committer.Name ||
+		hit.Commit.Committer.Email != live.Commit.Committer.Email || !hit.Commit.Committer.Date.Equal(live.Commit.Committer.Date) {
+		t.Fatalf("cached commit differs:\n%+v\n%+v", hit, live)
+	}
+}
