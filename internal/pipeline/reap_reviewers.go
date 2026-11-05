@@ -337,10 +337,10 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		if pane != nil && pane.Cwd != "" {
 			cwd = pane.Cwd
 		}
-		if !hs.host.Local() {
-			if !w.removeRemote(ctx, hs, l, cwd) {
-				return
-			}
+		// L1: an unknown remote path is recorded as pending-cleanup and does not
+		// block the local checkout. L2: a refused or failed removal does.
+		if !hs.host.Local() && w.removeRemote(ctx, hs, l, cwd) == remoteStop {
+			return
 		}
 	}
 	w.removeLocal(ctx, l)
@@ -413,72 +413,87 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 	return nil, false
 }
 
+// remoteStep is how the remote worktree step ended, as the local step needs it.
+type remoteStep int
+
+const (
+	// remoteStop: removal was refused or failed for a known path; the visit ends.
+	remoteStop remoteStep = iota
+	// remoteDone: the worktree is removed, would be, or is gone.
+	remoteDone
+	// remotePathUnknown: no remote path is known, so nothing remote was tried.
+	// The remote side stays pending-cleanup; the local checkout is independent.
+	remotePathUnknown
+)
+
 // removeRemote removes the reviewer's detached worktree on a remote host,
-// only through the hub's guarded removal (I6). It returns true when the
-// worktree is removed, would be, or is gone.
-func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l reviewerLabel, cwd string) bool {
+// only through the hub's guarded removal (I6).
+func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l reviewerLabel, cwd string) remoteStep {
 	rec := w.row(l)
 	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
 	if cwd == "" || filepath.Base(filepath.Clean(cwd)) != l.name {
 		// Its own stream: the pane stream must keep its close.
 		rec.Worktree = l.name
 		w.record(rec, "pending-cleanup", "remote cwd unavailable or mismatched")
-		return false
+		if cwd == "" {
+			return remotePathUnknown
+		}
+		return remoteStop
 	}
 	remover, ok := hs.ops.(interface {
 		WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
 	})
 	if !hs.viaHub || !ok {
 		w.record(rec, "pending-cleanup", "no hub for guarded removal")
-		return false
+		return remoteStop
 	}
 	if hs.usageUnknown {
 		w.record(rec, "kept", "pane-scan-failed")
-		return false
+		return remoteStop
 	}
 	if w.acting {
 		// A pane may have moved into the worktree since discovery.
 		if e := hs.refreshPanes(ctx); e != nil {
 			w.record(rec, "kept", "pane-scan-failed")
-			return false
+			return remoteStop
 		}
 	}
 	if hs.paneInUse(cwd) {
 		w.record(rec, "kept", "pane-in-use")
-		return false
+		return remoteStop
 	}
 	tree, e := hs.ops.Inspect(ctx, cwd)
 	switch {
 	case e != nil:
 		w.record(rec, "error", "worktree inspect: "+e.Error())
-		return false
+		return remoteStop
 	case tree == nil:
 		w.record(rec, "skipped", "worktree already gone")
-		return true
+		return remoteDone
 	case !w.reviewedTree(tree, cwd, l):
 		w.record(rec, "kept", "worktree identity changed")
-		return false
+		return remoteStop
 	case !w.acting:
 		w.record(rec, "would-remove", "")
-		return true
+		return remoteDone
 	}
 	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil)
 	if e != nil {
 		w.record(rec, "error", "worktree remove: "+e.Error())
-		return false
+		return remoteStop
 	}
 	result, reason := worktreeRemoveVerdict(removed)
 	switch {
 	case result == "removed":
 		w.record(rec, "removed", "")
-		return true
+		return remoteDone
 	case reason == "worktree-gone":
 		w.record(rec, "skipped", "worktree already gone")
-		return true
+		return remoteDone
 	}
 	rec.Files = removed.Files
 	w.record(rec, "pending-cleanup", "hub guarded removal refused: "+reason)
-	return false
+	return remoteStop
 }
 
 // reviewedTree reports whether a worktree is the reviewer's own: at path, in
