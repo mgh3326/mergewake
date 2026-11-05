@@ -46,6 +46,9 @@ func (s *Service) reviewBlockFor(ctx context.Context, r config.Repo, pr github.P
 		return reviewBlock{}, false
 	}
 	if task == "" {
+		if pr.Head.Ref == github.RecoveryBranch && trailer(pr.Body, "Mergewake-Recovery") != "" {
+			return reviewBlock{}, false
+		}
 		return reviewBlock{blockMissingTrailer, "Add one line to the PR body, with the hk task ID:\n\n    Mergewake-Task: <id>\n\nThe task's title must also carry `(grade X, Tn)`, for example `(grade B, T1)`."}, true
 	}
 	jobs, ok := s.Sink.(interface {
