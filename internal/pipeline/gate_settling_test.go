@@ -86,3 +86,33 @@ func TestRetryReviewStatusSettlingFilesIsPending(t *testing.T) {
 		t.Fatalf("complete=%v pending=%v err=%v", complete, pending, e)
 	}
 }
+
+func init() { headSettleWait = 0 }
+
+// A feedback read that still carries the old head right after update-branch
+// settles in the same pass: the gate re-reads past the cache and decides.
+func TestGateMovingHeadSettlesInSamePass(t *testing.T) {
+	s, g, _, _, _ := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.feedbackHeads = []string{shaB, shaB}
+	v := gateAt(t, s, g, shaB)
+	if v.State == "pending" && reasons(v) == "head_moving" {
+		t.Fatalf("verdict %+v: the head settled on the third read", v)
+	}
+	if g.feedbackReads != 3 {
+		t.Fatalf("feedback reads = %d, want 3", g.feedbackReads)
+	}
+}
+
+// A head that never settles is still deferred, after the bounded re-reads.
+func TestGateMovingHeadIsBounded(t *testing.T) {
+	s, g, _, _, _ := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.feedbackHead = shaB
+	v := gateAt(t, s, g, shaB)
+	if v.State != "pending" || reasons(v) != "head_moving" || g.feedbackReads != 1+headSettleTries {
+		t.Fatalf("verdict %+v reads=%d", v, g.feedbackReads)
+	}
+}
