@@ -207,22 +207,22 @@ func TestAddingTrailerLetsReviewProceed(t *testing.T) {
 	}
 }
 
-func TestNonFleetAuthorKeepsFallback(t *testing.T) {
+// A non-fleet author is not blocked; without a task trailer its pass fails
+// and is retried, with no headless review.
+func TestNonFleetAuthorWithoutTaskFailsPass(t *testing.T) {
 	f := blockSetup(t)
 	f.g.pull.User.Login = "outside-contributor"
-	if e := f.review(t); e != nil {
+	e := f.review(t)
+	if errors.Is(e, ErrReviewBlocked) {
 		t.Fatal(e)
 	}
 	if f.gh.posts != 0 || f.n.count != 0 || f.blocked(t, 7) != "" {
 		t.Fatalf("posts=%d events=%+v row=%q", f.gh.posts, f.n.events, f.blocked(t, 7))
 	}
-	got := f.g.passes[shaA]
-	if len(got) != 1 || f.runner.headless != 1 || got[0].Fallback != "panewire: no Mergewake-Task trailer" || !f.g.refs[doneRef(7, shaA)] {
-		t.Fatalf("passes=%+v headless=%d refs=%v", got, f.runner.headless, f.g.refs)
-	}
+	assertPanewirePassFailed(t, f.s, f.g, f.r, f.runner, e, "no Mergewake-Task trailer")
 }
 
-// Only a positive answer blocks: a read error stays with the fallback.
+// Only a positive answer blocks: a read error stays with the executor's skip.
 func TestUnreadableEvidenceDoesNotBlock(t *testing.T) {
 	for name, arrange := range map[string]func(blockFixture){
 		"head commit": func(f blockFixture) { f.g.commitErr = map[string]error{shaA: errors.New("GitHub down")} },
@@ -258,12 +258,11 @@ func TestHeadlessExecutorDoesNotBlock(t *testing.T) {
 func TestRepoWithoutRootDoesNotBlock(t *testing.T) {
 	f := blockSetup(t)
 	f.r.Root = ""
-	if e := f.review(t); e != nil {
-		t.Fatal(e)
+	e := f.review(t)
+	if errors.Is(e, ErrReviewBlocked) || f.gh.posts != 0 {
+		t.Fatalf("err=%v comments=%d", e, f.gh.posts)
 	}
-	if f.gh.posts != 0 || f.g.postCount != 1 {
-		t.Fatalf("comments=%d passes=%d", f.gh.posts, f.g.postCount)
-	}
+	assertPanewirePassFailed(t, f.s, f.g, f.r, f.runner, e, "repo root unset")
 }
 
 func TestCompleteHeadNeedsNoTrailer(t *testing.T) {

@@ -142,16 +142,15 @@ func TestReviewerJobEscalatedHoldsAndDrops(t *testing.T) {
 	s, g, r, runner, _ := interruptedReviewer(t)
 	runner.sink.missing = &integrations.JobRecord{State: "escalated"}
 	label := arg(runner.spawns[0], "-l")
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.spawns) != 1 {
-		t.Fatalf("spawns=%d", len(runner.spawns))
-	}
 	// Today's hold for an escalated record: the pass skips with the record's
-	// state, the same skip reason a fresh spawn's escalated record gives.
-	if got := g.passes[shaA]; len(got) != 1 || !strings.Contains(got[0].Fallback, "reviewer job record escalated") {
-		t.Fatalf("%+v", got)
+	// state, the same skip reason a fresh spawn's escalated record gives, and
+	// under the panewire executor a skip fails the pass with nothing headless.
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), "reviewer job record escalated") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(runner.spawns) != 1 || runner.headless != 0 || g.postCount != 0 || len(g.passes[shaA]) != 0 {
+		t.Fatalf("spawns=%d headless=%d posts=%d passes=%+v", len(runner.spawns), runner.headless, g.postCount, g.passes[shaA])
 	}
 	cleanups := auditRows(t, s, r, "reviewer-cleanup")
 	if len(cleanups) == 0 || cleanups[len(cleanups)-1]["label"] != label || cleanups[len(cleanups)-1]["result"] == "closed" {

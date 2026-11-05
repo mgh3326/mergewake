@@ -85,7 +85,7 @@ func TestRetryReviewResultLostDedupes(t *testing.T) {
 	}
 }
 
-func TestReviewResultCompletedAndFallback(t *testing.T) {
+func TestReviewResultCompletedAndSkips(t *testing.T) {
 	for _, tc := range []struct {
 		name, result string
 		exit         int
@@ -102,11 +102,14 @@ func TestReviewResultCompletedAndFallback(t *testing.T) {
 			}
 			s, g, r := panewireSetup(t, runner)
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Result: json.RawMessage(tc.result)}
-			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+			err := s.Review(context.Background(), r, 7, "", Options{})
+			// A pane that produced no pass fails it; nothing runs headless.
+			if (err == nil) != tc.pane || (!tc.pane && !errors.Is(err, ErrReviewUnavailable)) {
 				t.Fatal(err)
 			}
-			if g.postCount != 1 || !g.refs[doneRef(7, shaA)] || (runner.headless == 0) != tc.pane {
-				t.Fatal(fmt.Sprintf("posts=%d headless=%d", g.postCount, runner.headless))
+			want := map[bool]int{true: 1, false: 0}[tc.pane]
+			if g.postCount != want || g.refs[doneRef(7, shaA)] != tc.pane || runner.headless != 0 {
+				t.Fatal(fmt.Sprintf("posts=%d headless=%d refs=%v", g.postCount, runner.headless, g.refs))
 			}
 		})
 	}
