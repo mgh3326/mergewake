@@ -745,6 +745,34 @@ func TestReviewRetryConfig(t *testing.T) {
 	}
 }
 
+func TestReviewParallelConfig(t *testing.T) {
+	for _, tc := range []struct {
+		yaml, err string
+		want      int
+	}{
+		{"", "", DefaultReviewParallel},
+		{"review_parallel: 1", "", 1},
+		{"review_parallel: 32", "", 32},
+		{"review_parallel: 33", "daemon.pr.review_parallel must be at most 32", 0},
+		{"review_parallel: 9223372036854775807", "daemon.pr.review_parallel must be at most 32", 0},
+	} {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\ndaemon:\n  pr: {"+tc.yaml+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(p)
+		if tc.err != "" {
+			if err == nil || err.Error() != tc.err {
+				t.Fatalf("%q: %v", tc.yaml, err)
+			}
+			continue
+		}
+		if err != nil || c.Daemon.PR.Parallel() != tc.want {
+			t.Fatalf("%q: %v %d", tc.yaml, err, c.Daemon.PR.Parallel())
+		}
+	}
+}
+
 func TestReviewRecoveryDurationsRejectNonPositive(t *testing.T) {
 	for _, setting := range []struct{ field, section, key string }{
 		{"daemon.pr.review_retry.initial", "review_retry", "initial"},

@@ -169,7 +169,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	reportPath := filepath.Join(jobDir, "report.md")
 	briefPath := filepath.Join(jobDir, "review-brief.md")
 	git := func(c context.Context, args ...string) (string, error) {
-		b, e := s.Runner.Run(c, "git", append([]string{"-C", root}, args...), "", "")
+		b, e := s.gitIn(c, root, args...)
 		return strings.TrimSpace(string(b)), e
 	}
 	cleanup := func() {
@@ -385,9 +385,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			return skip("no findings: job record %s; %v", res.reason, e)
 		}
+		fallbackMu.Lock()
 		s.inboxFallbacks++
-		note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", note, s.inboxFallbacks), "; ")
-		_ = s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": label, "record": res.reason, "count": s.inboxFallbacks}, false)
+		fallbacks := s.inboxFallbacks
+		fallbackMu.Unlock()
+		note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", note, fallbacks), "; ")
+		_ = s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": label, "record": res.reason, "count": fallbacks}, false)
 	}
 	var refusal struct {
 		Refused string `json:"refused"`
