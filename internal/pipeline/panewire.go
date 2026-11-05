@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -53,7 +54,9 @@ var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 // panewire's reviewer role excludes the author's family; when panewire refuses
 // every other family the pass runs once more as a worker seat, which may be
 // the author's family. Anything that stops the pane from producing findings
-// is a skip unless a completed job has lost its result.
+// is a skip unless a completed job has lost its result, another reviewer job
+// of the task holds the reservation, or the pass's own job may still run: a
+// pass resumes its recorded job (reviewer_job.go) and never spawns a second.
 type panewireExecutor struct {
 	s            *Service
 	repo         config.Repo
@@ -147,114 +150,208 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return out, errPassPending
 	}
 
-	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, pr.Head.SHA[:7], plan.pass, s.now().Unix())
-	jobDir := filepath.Join(cfg.Jobs, label)
-	if e = os.MkdirAll(jobDir, 0700); e != nil {
-		return skip("job dir: %v", e)
+	// A pass that already spawned a reviewer job for this head resumes that
+	// job instead of spawning another under a new label: the hub keeps one
+	// reviewer reservation per task, so a new label is refused while the old
+	// job lives.
+	rj, resumed, e := x.reviewerJob(plan.pass)
+	if e != nil {
+		return out, e
 	}
+	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, pr.Head.SHA[:7], plan.pass, s.now().Unix())
+	checkout := filepath.Join(cfg.Checkouts, label)
+	if resumed {
+		label, checkout = rj.Label, rj.Checkout
+	}
+	jobDir := filepath.Join(cfg.Jobs, label)
 	findingsPath := filepath.Join(jobDir, "findings.json")
 	reportPath := filepath.Join(jobDir, "report.md")
 	briefPath := filepath.Join(jobDir, "review-brief.md")
-	checkout := filepath.Join(cfg.Checkouts, label)
-	if e = os.MkdirAll(cfg.Checkouts, 0700); e != nil {
-		return skip("checkout dir: %v", e)
-	}
 	git := func(c context.Context, args ...string) (string, error) {
 		b, e := s.gitIn(c, root, args...)
 		return strings.TrimSpace(string(b)), e
 	}
-	// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
-	// exact reviewed head. C creates no local branch, and the author's branch
-	// checked out in another worktree is no obstacle. The head lands in a
-	// real ref: panewire builds the detached spec for another host only from a
-	// local refs/remotes/origin/pull/<n>/head that points at the checkout's
-	// HEAD, and FETCH_HEAD is not one. The leading "+" lets a force-pushed
-	// PR move the ref.
-	if _, e = git(ctx, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref); e != nil {
-		return skip("fetch PR head: %v", e)
-	}
-	// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head")
-	// from this worktree and prepares the same detached worktree remotely.
 	cleanup := func() {
 		// The pane is finished or abandoned; the deadline may already be spent.
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		_, _ = git(c, "worktree", "remove", "--force", checkout)
 	}
-	if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
-		cleanup()
-		return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
+	if !resumed {
+		if e = os.MkdirAll(jobDir, 0700); e != nil {
+			return skip("job dir: %v", e)
+		}
+		if e = os.MkdirAll(cfg.Checkouts, 0700); e != nil {
+			return skip("checkout dir: %v", e)
+		}
+		// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
+		// exact reviewed head. C creates no local branch, and the author's branch
+		// checked out in another worktree is no obstacle. The head lands in a
+		// real ref: panewire builds the detached spec for another host only from a
+		// local refs/remotes/origin/pull/<n>/head that points at the checkout's
+		// HEAD, and FETCH_HEAD is not one. The leading "+" lets a force-pushed
+		// PR move the ref.
+		if _, e = git(ctx, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref); e != nil {
+			return skip("fetch PR head: %v", e)
+		}
+		// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head")
+		// from this worktree and prepares the same detached worktree remotely.
+		if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
+			cleanup()
+			return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
+		}
 	}
 	// A local pane runs in this checkout: closeReviewerPane keeps it until the
-	// pane is closed or gone.
-	keepCheckout := false
+	// pane is closed or gone. A resumed job's pane may still run in it.
+	keepCheckout := resumed
 	defer func() {
 		if !keepCheckout {
 			cleanup()
 		}
 	}()
-	if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
-		return skip("write brief: %v", e)
-	}
-	if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
-		return skip("publish brief: %v", e)
+	if !resumed {
+		if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
+			return skip("write brief: %v", e)
+		}
+		if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
+			return skip("publish brief: %v", e)
+		}
 	}
 
-	// The pane wait leaves time to validate and post the findings: a minute,
-	// or a quarter of what is left when that is shorter.
-	deadline, _ := ctx.Deadline()
-	left := time.Until(deadline)
-	wait := left - min(postReserve, left/4)
-	if wait < time.Second {
-		return skip("no time left to wait for a reviewer pane")
-	}
-	args := []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task}
-	if parent != "" {
-		args = append(args, "--builder-job", parent)
-	}
-	args = append(args, "--builder-family", builderFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
-	if cfg.Owner != "" {
-		args = append(args, "--owner", cfg.Owner)
-	}
-	if cfg.Host != "auto" {
-		args = append(args, "--override-reason", "mergewake review: configured review.panewire.host")
-	}
-	if len(cfg.ExcludeHosts) > 0 {
-		args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
+	// A resumed job that already finished answers through its record below,
+	// with no spawn. One still live is re-attached by replaying its spawn,
+	// until it has been live longer than the stale bound.
+	spawn := true
+	if resumed {
+		rec, e := x.job(ctx, label)
+		state := rec.State
+		switch {
+		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
+			spawn = false
+		case errors.Is(e, integrations.ErrJobNotFound):
+			state = "without a job record"
+		case e != nil:
+			state = "unreadable in hk"
+		}
+		if spawn {
+			bound, e := s.reviewerStaleAfter()
+			if e != nil {
+				return out, e
+			}
+			if s.now().Sub(rj.Recorded) > bound {
+				return out, x.reviewerStale(ctx, rj, state, bound)
+			}
+		}
 	}
 	note := ""
-	stdout, e := s.Runner.Run(ctx, cfg.Command, append(args, "--role", "reviewer"), "", "")
-	if e != nil && exitStatus(e) == panewireRefused && ctx.Err() == nil {
-		note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
-		stdout, e = s.Runner.Run(ctx, cfg.Command, append(args, "--role", "worker"), "", "")
-	}
-	if e != nil {
-		// Every exit but the pre-start refusal may leave a pane running in
-		// this checkout: a timed-out --wait is one such exit. Keep the checkout
-		// and name it in a receipt for a later cleanup. A refused spawn started
-		// no pane, so its checkout is still removed below.
-		if exitStatus(e) != panewireRefused {
-			keepCheckout = true
-			x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+	var stdout []byte
+	if spawn {
+		// The pane wait leaves time to validate and post the findings: a minute,
+		// or a quarter of what is left when that is shorter.
+		deadline, _ := ctx.Deadline()
+		left := time.Until(deadline)
+		wait := left - min(postReserve, left/4)
+		if wait < time.Second {
+			if resumed {
+				return out, fmt.Errorf("%w: no time left to re-attach reviewer job %s", ErrReviewUnavailable, label)
+			}
+			return skip("no time left to wait for a reviewer pane")
 		}
-		if ctx.Err() != nil {
-			res, skipErr := skip("panewire reviewer deadline")
+		var args []string
+		if resumed {
+			args = withWaitTimeout(rj.Args, wait)
+		} else {
+			args = []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task}
+			if parent != "" {
+				args = append(args, "--builder-job", parent)
+			}
+			args = append(args, "--builder-family", builderFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
+			if cfg.Owner != "" {
+				args = append(args, "--owner", cfg.Owner)
+			}
+			if cfg.Host != "auto" {
+				args = append(args, "--override-reason", "mergewake review: configured review.panewire.host")
+			}
+			if len(cfg.ExcludeHosts) > 0 {
+				args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
+			}
+			// The record names the job before it is spawned, so a wait that
+			// ends early leaves a job the next run can resume.
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now()}
+			if e = x.saveReviewerJob(rj); e != nil {
+				return out, e
+			}
+			args = rj.Args
+		}
+		stdout, e = s.Runner.Run(ctx, cfg.Command, args, "", "")
+		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
+			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
+			rj.Args = append(slices.Clone(rj.Args[:len(rj.Args)-2]), "--role", "worker")
+			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+				return out, saveErr
+			}
+			stdout, e = s.Runner.Run(ctx, cfg.Command, rj.Args, "", "")
+		}
+		if e != nil {
+			code := exitStatus(e)
+			// A refused fresh spawn created no job: its record goes.
+			if !resumed && (code == panewireRefused || code == panewireHeld) {
+				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
+					return out, errors.Join(e, dropErr)
+				}
+			}
+			// Another reviewer job of the task holds the reservation. A new
+			// reviewer, headless included, would only duplicate it: the pass
+			// fails and RetryReview tries again.
+			if code == panewireHeld && ctx.Err() == nil {
+				auditErr := s.audit(x.repo.Name, "reviewer-held", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "task": task, "resumed": resumed}, false)
+				return out, errors.Join(fmt.Errorf("%w: pass %d: another reviewer job of task %s holds the reviewer reservation (panewire exit %d): %s", ErrReviewUnavailable, plan.pass, task, code, fleetevent.Redact(integrations.Detail(e))), auditErr)
+			}
+			// Every exit but the pre-start refusal may leave a pane running in
+			// this checkout: a timed-out --wait is one such exit. Keep the checkout
+			// and name it in a receipt for a later cleanup. A refused spawn started
+			// no pane, so its checkout is still removed below.
+			if code != panewireRefused || resumed {
+				keepCheckout = true
+				x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+			}
+			if ctx.Err() != nil {
+				res, skipErr := skip("panewire reviewer deadline")
+				res.skips[len(res.skips)-1].withCause(e)
+				return res, errors.Join(fmt.Errorf("panewire reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
+			}
+			// The job was spawned and may still run: the record stays and the
+			// next run resumes it rather than spawning another reviewer.
+			if resumed || code == panewireWaitTimeout {
+				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", ErrReviewUnavailable, label, code, fleetevent.Redact(integrations.Detail(e)))
+			}
+			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
 			res.skips[len(res.skips)-1].withCause(e)
-			return res, errors.Join(fmt.Errorf("panewire reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
+			return res, skipErr
 		}
-		res, skipErr := skip("panewire spawn exit %d: %v", exitStatus(e), integrations.Detail(e))
-		res.skips[len(res.skips)-1].withCause(e)
-		return res, skipErr
 	}
-	// The spawn returned, so its wait finished. Every outcome from here is
-	// terminal for this pass, and the pane is closed after it is recorded. A
-	// timed-out wait returned above and never reaches this defer, because the
-	// pane may still be working.
+	// The spawn returned, so its wait finished, or a resumed job had already
+	// finished. Every outcome from here is terminal for this pass, and the
+	// pane is closed after it is recorded. A timed-out wait returned above and
+	// never reaches this defer, because the pane may still be working. A
+	// resumed job read without a spawn has no confirmed placement, so its pane
+	// and checkout stay with a pending-cleanup receipt.
+	keepCheckout = false
 	placement, confirmed := spawnPlacement(string(stdout))
 	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
 	defer func() { x.closeReviewerPane(ctx, pane) }()
+	// The record goes with every terminal outcome. It stays for findings
+	// returned to Review, which removes it once they are posted, and for a
+	// read the deadline cut short, which the next run repeats.
+	keepJob := false
+	defer func() {
+		if !keepJob {
+			_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
+		}
+	}()
 	res, e := x.recordResult(ctx, label)
 	if e != nil {
+		keepJob = true
 		if !errors.Is(e, ctx.Err()) {
 			e = errors.Join(e, ctx.Err())
 		}
@@ -276,6 +373,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		b, e = x.collect(ctx, label, findingsPath)
 		if e != nil {
 			if ctx.Err() != nil {
+				keepJob = true
 				if !errors.Is(e, ctx.Err()) {
 					e = errors.Join(e, ctx.Err())
 				}
@@ -318,6 +416,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
+	keepJob = true
 	return out, nil
 }
 

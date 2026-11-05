@@ -78,6 +78,9 @@ type PanewireReview struct {
 	// neither only a pane on this host can return findings.
 	Lane         string   `yaml:"lane"`
 	ExcludeHosts []string `yaml:"exclude_hosts"`
+	// StaleAfter is how long a pass's recorded reviewer job may stay live
+	// before the desk is told; empty means twice review.timeout.
+	StaleAfter string `yaml:"stale_after"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -768,6 +771,11 @@ func Load(name string) (Config, error) {
 	c.Review.Quota = Expand(c.Review.Quota)
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return c, e
+	}
+	if v := c.Review.Panewire.StaleAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("review.panewire.stale_after: %w", e)
+		}
 	}
 	switch c.Review.Executor {
 	case "":
