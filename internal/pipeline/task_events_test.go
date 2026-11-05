@@ -29,6 +29,9 @@ type fakeHK struct {
 	status int
 	code   string
 	delay  time.Duration
+	// refuseExtended answers 400 invalid_event to an event that carries any
+	// head/base/merge/reviews field, as an hk that predates them does.
+	refuseExtended bool
 }
 
 func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +45,9 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.events = append(h.events, ev)
 	h.auth = append(h.auth, r.Header.Get("Authorization"))
 	status, code, delay := h.status, h.code, h.delay
+	if h.refuseExtended && (ev.HeadSHA != "" || ev.BaseSHA != "" || ev.MergeSHA != "" || len(ev.Reviews) > 0) {
+		status, code = http.StatusBadRequest, "invalid_event"
+	}
 	h.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -330,7 +336,9 @@ func TestTaskEventSkipped(t *testing.T) {
 
 // An hk that fails, hangs or does not know the task leaves the merge and
 // Land's result unchanged; the failure is in the audit log. A 5xx is retried
-// up to EventAttempts tries, a 404 or other 4xx is not retried.
+// up to EventAttempts tries, a 404 or other 4xx is not retried. The merge event
+// carries head_sha, so a 400 is sent once more without the new fields (two
+// tries, the second also refused).
 func TestTaskEventFailureLeavesLand(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -343,7 +351,7 @@ func TestTaskEventFailureLeavesLand(t *testing.T) {
 		{name: "500", status: 500, tries: 3, errorMention: "HTTP 500"},
 		{name: "timeout", delay: 2 * time.Second, tries: 3, errorMention: "request failed"},
 		{name: "404", status: 404, code: "not_found", tries: 1, errorMention: "HTTP 404 not_found"},
-		{name: "400", status: 400, code: "invalid_request", tries: 1, errorMention: "HTTP 400 invalid_request"},
+		{name: "400", status: 400, code: "invalid_request", tries: 2, errorMention: "HTTP 400 invalid_request"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, hk, r := hkSetup(t)

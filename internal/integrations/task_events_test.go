@@ -91,3 +91,69 @@ func TestPostTaskEventRetries(t *testing.T) {
 		t.Fatalf("%v hits=%d", e, hits.Load())
 	}
 }
+
+func TestSHAAndToken(t *testing.T) {
+	good := strings.Repeat("a", 40)
+	for in, want := range map[string]string{good: good, "": "", strings.Repeat("A", 40): "", good + "0": "", "abc": ""} {
+		if SHA(in) != want {
+			t.Fatalf("SHA(%q)", in)
+		}
+	}
+	for in, want := range map[string]string{"state-risk": "state-risk", " State Risk ": "state-risk", "a/b\n": "a-b", "é": "", "": "", "v1.2_x": "v1.2_x", strings.Repeat("a", 80): strings.Repeat("a", 64)} {
+		if Token(in) != want {
+			t.Fatalf("Token(%q) = %q", in, Token(in))
+		}
+	}
+}
+
+// A 400 to an extended payload is resent once without the optional fields and
+// the result says hk refused them; a 400 to a plain event, any other status,
+// and a 400 to the resend are not retried further.
+func TestPostTaskEventFieldsRefused(t *testing.T) {
+	var bodies []map[string]any
+	status := func(map[string]any) (int, string) { return 200, `{"applied":true}` }
+	hkEventServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		bodies = append(bodies, m)
+		code, reply := status(m)
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(reply))
+	})
+	h := Handoffkeep{EventAttempts: 3, EventBackoff: time.Millisecond}
+	url := "https://github.com/example/project/pull/7"
+	ext := TaskEvent{Source: SourceReview, SourceRef: url, TaskID: 5, PR: url, HeadSHA: strings.Repeat("a", 40), Reviews: []ReviewRecord{{ReviewedHead: strings.Repeat("a", 40), Pass: 1}}}
+	plain := TaskEvent{Source: SourceReview, SourceRef: url, TaskID: 5, PR: url}
+
+	rejectNew := func(m map[string]any) (int, string) {
+		if m["head_sha"] != nil || m["reviews"] != nil {
+			return 400, `{"error":"invalid_event"}`
+		}
+		return 200, `{"applied":true}`
+	}
+	status = rejectNew
+	res, e := h.PostTaskEvent(context.Background(), ext)
+	if e != nil || !res.Applied || res.FieldsRefused != "invalid_event" || len(bodies) != 2 {
+		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
+	}
+	if bodies[0]["reviews"] == nil || bodies[1]["head_sha"] != nil || bodies[1]["reviews"] != nil || bodies[1]["source_ref"] != url || bodies[1]["task_id"] != float64(5) {
+		t.Fatalf("bodies %v", bodies)
+	}
+
+	bodies = nil
+	status = func(map[string]any) (int, string) { return 400, `{"error":"invalid_event"}` }
+	var hk *HKError
+	if _, e = h.PostTaskEvent(context.Background(), ext); !errors.As(e, &hk) || hk.Code != "invalid_event" || len(bodies) != 2 {
+		t.Fatalf("%v bodies=%d", e, len(bodies))
+	}
+	bodies = nil
+	if _, e = h.PostTaskEvent(context.Background(), plain); !errors.As(e, &hk) || len(bodies) != 1 {
+		t.Fatalf("plain 400: %v bodies=%d", e, len(bodies))
+	}
+	bodies = nil
+	status = func(map[string]any) (int, string) { return 404, `{"error":"not_found"}` }
+	if _, e = h.PostTaskEvent(context.Background(), ext); !errors.As(e, &hk) || hk.Status != 404 || len(bodies) != 1 {
+		t.Fatalf("404: %v bodies=%d", e, len(bodies))
+	}
+}
