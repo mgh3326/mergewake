@@ -17,6 +17,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/pipeline"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 type lockedWriter struct {
@@ -33,9 +34,10 @@ func (w *lockedWriter) Write(b []byte) (int, error) {
 // runDaemon runs the daemon with crash output armed: a fatal panic in any of
 // its goroutines reaches Sentry on the next start (see crashreport.Run).
 func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
-	return crashreport.Run(s.Config.StateDir, "mergewake", version, func() error {
-		return runDaemonLoops(ctx, s, gh, repo, o, stderr)
-	})
+	ctx, stop := crashreport.StartContext(ctx, s.Config.StateDir, "mergewake", version, stderr)
+	err := runDaemonLoops(ctx, s, gh, repo, o, stderr)
+	stop()
+	return err
 }
 
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
@@ -57,6 +59,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		role := entry.role
 		var requests []github.RequestCount
 		loops = append(loops, daemon.Loop{Role: role, Interval: interval, Requests: func() any { return requests }, Run: func(ctx context.Context) error {
+			ctx, transaction := tracing.Pass(ctx, role)
+			defer tracing.Finish(transaction)
 			ctx, counts := github.CountRequests(ctx, role)
 			defer func() {
 				requests = counts.Snapshot()
@@ -64,6 +68,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				for _, request := range requests {
 					total += request.Count
 				}
+				tracing.Data(transaction, "github_requests", total)
 				log.Info("github requests", "role", role, "total", total, "routes", requests[:min(len(requests), 10)])
 			}()
 			var errs []error
@@ -74,36 +79,46 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				if ctx.Err() != nil {
 					break
 				}
+				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
+				tracing.Tag(repoSpan, "repo", r.Name)
 				var err error
-				switch role {
-				case "pr":
-					err = pollPRs(ctx, s, gh, r, o)
-				case "watch":
-					err = s.Watch(ctx, r, o)
-				case "release":
-					head, e := gh.Head(ctx, r.Name, r.Branch)
-					if e != nil {
-						err = e
-						break
+				func() {
+					defer tracing.Finish(repoSpan)
+					ctx := repoCtx
+					switch role {
+					case "pr":
+						err = pollPRs(ctx, s, gh, r, o)
+					case "watch":
+						checkCtx, span := tracing.Span(ctx, "mergewake.watch")
+						err = s.Watch(checkCtx, r, o)
+						tracing.Finish(span)
+					case "release":
+						head, e := gh.Head(ctx, r.Name, r.Branch)
+						if e != nil {
+							err = e
+							break
+						}
+						p, e := s.Policy(ctx, r, head)
+						if e != nil {
+							err = e
+							break
+						}
+						ci, e := gh.Check(ctx, r.Name, head, p.RequiredChecks)
+						if e != nil {
+							err = e
+							break
+						}
+						if ci == github.Green {
+							err = s.Release(ctx, r, head, o)
+						}
+					case "rollout":
+						err = s.Rollout(ctx, r, o)
+					case "reap":
+						sweepCtx, span := tracing.Span(ctx, "mergewake.reap")
+						err = s.Reap(sweepCtx, r, 0, o)
+						tracing.Finish(span)
 					}
-					p, e := s.Policy(ctx, r, head)
-					if e != nil {
-						err = e
-						break
-					}
-					ci, e := gh.Check(ctx, r.Name, head, p.RequiredChecks)
-					if e != nil {
-						err = e
-						break
-					}
-					if ci == github.Green {
-						err = s.Release(ctx, r, head, o)
-					}
-				case "rollout":
-					err = s.Rollout(ctx, r, o)
-				case "reap":
-					err = s.Reap(ctx, r, 0, o)
-				}
+				}()
 				if err != nil {
 					errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
 				}
@@ -196,8 +211,17 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	// landed first; reviews run after that.
 	options := make([]pipeline.Options, len(prs))
 	handled := make([]bool, len(prs))
+	prContexts := make([]context.Context, len(prs))
 	for i, pr := range prs {
-		observationErr := s.ObservePR(ctx, r, pr, o)
+		prCtx, span := tracing.Span(ctx, "mergewake.pr")
+		tracing.Data(span, "pr", pr.Number)
+		prContexts[i] = prCtx
+		defer tracing.Finish(span)
+	}
+	for i, pr := range prs {
+		observeCtx, observeSpan := tracing.Span(prContexts[i], "mergewake.observe")
+		observationErr := s.ObservePR(observeCtx, r, pr, o)
+		tracing.Finish(observeSpan)
 		options[i] = o
 		options[i].Observed = observationErr == nil
 		if e := observationErr; e != nil {
@@ -215,7 +239,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 			continue
 		}
 		handled[i] = true
-		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
+		errs = append(errs, settlePR(prContexts[i], s, r, pr.Number, options[i])...)
 	}
 	// Reviews of different PRs run at once, at most review_parallel of them:
 	// each waits for its reviewer pane. One PR's review and settle stay in
@@ -244,7 +268,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		go func() {
 			defer running.Done()
 			defer func() { <-slots }()
-			results[i] = reviewPR(ctx, s, r, pr, options[i], !handled[i], &settling)
+			results[i] = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
 		}()
 	}
 	running.Wait()
@@ -260,7 +284,10 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 // settled next pass.
 func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) []error {
 	var errs []error
-	if e := s.RetryReview(ctx, r, pr, o); e != nil {
+	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
+	e := s.RetryReview(reviewCtx, r, pr, o)
+	tracing.Finish(reviewSpan)
+	if e != nil {
 		if errors.Is(e, pipeline.ErrReviewUnavailable) {
 			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
 				errs = append(errs, printErr)
@@ -281,14 +308,25 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 // author fixes them without the desk relaying anything, then notifies the
 // verdict and lands the PR.
 func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	ctx, span := tracing.Span(ctx, "mergewake.settle")
+	defer tracing.Finish(span)
 	var errs []error
-	if e := s.DeliverFindings(ctx, r, n, o); e != nil {
+	deliverCtx, deliver := tracing.Span(ctx, "mergewake.deliver")
+	e := s.DeliverFindings(deliverCtx, r, n, o)
+	tracing.Finish(deliver)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d findings: %w", n, e))
 	}
-	if e := s.NotifyPR(ctx, r, n, o); e != nil {
+	notifyCtx, notify := tracing.Span(ctx, "mergewake.notify")
+	e = s.NotifyPR(notifyCtx, r, n, o)
+	tracing.Finish(notify)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d notify: %w", n, e))
 	}
-	if e := s.Land(ctx, r, n, o); e != nil {
+	landCtx, land := tracing.Span(ctx, "mergewake.land")
+	e = s.Land(landCtx, r, n, o)
+	tracing.Finish(land)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d land: %w", n, e))
 	}
 	return errs

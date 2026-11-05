@@ -3,13 +3,17 @@
 // A fatal panic in any goroutine is written by the Go runtime to this
 // process's crash file (runtime/debug.SetCrashOutput). The next start uploads
 // crash files left by processes that are gone, then deletes them. Only
-// crashes are sent: no errors, traces, breadcrumbs, request data or user
-// data. Without SENTRY_DSN_MERGEWAKE nothing is written or sent.
+// Crash events contain no breadcrumbs, request data or user data. The daemon
+// also sends sampled performance traces when configured. Without a DSN nothing
+// is written or sent.
 package crashreport
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,6 +29,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 const (
@@ -82,6 +87,51 @@ func Start(stateDir, tool, version string) (stop func()) {
 		if info, err := os.Stat(name); err == nil && info.Size() == 0 {
 			_ = os.Remove(name)
 		}
+	}
+}
+
+// StartContext shares one isolated Sentry client between tracing and crash uploads.
+func StartContext(ctx context.Context, stateDir, tool, version string, log io.Writer) (context.Context, func()) {
+	delivery := &crashDelivery{base: http.DefaultTransport}
+	ctx, client := tracing.StartWithOptions(ctx, log, sentry.ClientOptions{
+		Release: tool + "@" + version, Environment: "fleet", SampleRate: 1,
+		SendDefaultPII: false, ServerName: fleetevent.ShortHost(), HTTPTransport: delivery,
+		BeforeSend: func(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
+			event.User = sentry.User{}
+			event.Request = nil
+			event.Breadcrumbs = nil
+			return event
+		},
+	})
+	if client == nil {
+		return ctx, Start(stateDir, tool, version)
+	}
+	stopClient := func() { client.Flush(crashReportFlush) }
+	if stateDir == "" {
+		return ctx, stopClient
+	}
+	dir := filepath.Join(stateDir, "crash")
+	if os.MkdirAll(dir, 0o700) != nil {
+		return ctx, stopClient
+	}
+	go reportPendingCrashesWithClient(client, delivery, tool, dir, time.Now())
+	name := filepath.Join(dir, fmt.Sprintf("crash-%d-%d.log", time.Now().UnixNano(), os.Getpid()))
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return ctx, stopClient
+	}
+	armed := debug.SetCrashOutput(file, debug.CrashOptions{}) == nil
+	_ = file.Close()
+	if !armed {
+		_ = os.Remove(name)
+		return ctx, stopClient
+	}
+	return ctx, func() {
+		_ = debug.SetCrashOutput(nil, debug.CrashOptions{})
+		if info, err := os.Stat(name); err == nil && info.Size() == 0 {
+			_ = os.Remove(name)
+		}
+		stopClient()
 	}
 }
 
@@ -170,6 +220,26 @@ func reportPendingCrashes(dsn, tool, version, dir string, now time.Time) {
 	_ = recordCrashSends(dir, now, sent)
 }
 
+func reportPendingCrashesWithClient(client *sentry.Client, delivery *crashDelivery, tool, dir string, now time.Time) {
+	unlock, ok := lockCrashDir(dir)
+	if !ok {
+		return
+	}
+	defer unlock()
+	pending := collectCrashFiles(dir)
+	allowed := min(len(pending), crashBudgetLeft(dir, now))
+	for _, path := range pending[allowed:] {
+		_ = os.Remove(path)
+	}
+	// Fail closed: a send log that cannot be written could not enforce the
+	// daily cap, so nothing is sent until it can.
+	if allowed == 0 || writeCrashSendLog(dir, crashSendLog(dir, now)) != nil {
+		return
+	}
+	sent, _ := uploadWithClient(client, delivery, tool, pending[:allowed])
+	_ = recordCrashSends(dir, now, sent)
+}
+
 // lockCrashDir takes an exclusive lock on crash/lock, waiting for the other
 // process (another mergewake) when it holds it.
 func lockCrashDir(dir string) (unlock func(), ok bool) {
@@ -215,7 +285,15 @@ func writeCrashSendLog(dir string, kept []string) error {
 // delivery keeps the file for the next start.
 func uploadCrashReports(dsn, tool, version string, paths []string) (sent int, err error) {
 	delivery := &crashDelivery{base: http.DefaultTransport}
-	client, err := sentry.NewClient(sentry.ClientOptions{
+	client, err := crashClient(dsn, tool, version, delivery)
+	if err != nil {
+		return 0, err
+	}
+	return uploadWithClient(client, delivery, tool, paths)
+}
+
+func crashClient(dsn, tool, version string, delivery *crashDelivery) (*sentry.Client, error) {
+	return sentry.NewClient(sentry.ClientOptions{
 		Dsn:              dsn,
 		Release:          tool + "@" + version,
 		Environment:      "fleet",
@@ -232,9 +310,9 @@ func uploadCrashReports(dsn, tool, version string, paths []string) (sent int, er
 			return event
 		},
 	})
-	if err != nil {
-		return 0, err
-	}
+}
+
+func uploadWithClient(client *sentry.Client, delivery *crashDelivery, tool string, paths []string) (sent int, err error) {
 	var failed error
 	for _, path := range paths {
 		event := crashReportEvent(tool, path)
@@ -267,7 +345,20 @@ type crashDelivery struct {
 }
 
 func (d *crashDelivery) RoundTrip(request *http.Request) (*http.Response, error) {
+	// Transactions share the transport but do not consume the crash budget.
+	crash := true
+	if request.GetBody != nil {
+		if body, e := request.GetBody(); e == nil {
+			raw, _ := io.ReadAll(body)
+			_ = body.Close()
+			lines := bytes.SplitN(raw, []byte("\n"), 3)
+			crash = len(lines) > 1 && bytes.Contains(lines[1], []byte(`"type":"event"`))
+		}
+	}
 	response, err := d.base.RoundTrip(request)
+	if !crash {
+		return response, err
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err != nil || response.StatusCode < 200 || response.StatusCode > 299 {
