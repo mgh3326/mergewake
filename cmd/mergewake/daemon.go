@@ -189,10 +189,16 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots)
 	// Before the per-PR work: a review can hold this pass for minutes.
 	s.FeedPRs(ctx, r, prs, o)
-	for _, pr := range prs {
+	// A review waits for its reviewer pane, so one slow review used to hold
+	// the land decision of every PR behind it for the whole pass. PRs whose
+	// head already carries the review done marker are delivered, notified and
+	// landed first; reviews run after that.
+	options := make([]pipeline.Options, len(prs))
+	handled := make([]bool, len(prs))
+	for i, pr := range prs {
 		observationErr := s.ObservePR(ctx, r, pr, o)
-		childOptions := o
-		childOptions.Observed = observationErr == nil
+		options[i] = o
+		options[i].Observed = observationErr == nil
 		if e := observationErr; e != nil {
 			errs = append(errs, fmt.Errorf("PR %d outcomes: %w", pr.Number, e))
 		}
@@ -202,7 +208,22 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		if pr.Draft {
 			continue
 		}
-		e := s.RetryReview(ctx, r, pr, childOptions)
+		// An unreadable or poll-skipped marker is not done: the PR keeps
+		// today's order below.
+		if done, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); e != nil || !done {
+			continue
+		}
+		handled[i] = true
+		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
+	}
+	for i, pr := range prs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if pr.Draft {
+			continue
+		}
+		e := s.RetryReview(ctx, r, pr, options[i])
 		if e != nil {
 			if errors.Is(e, pipeline.ErrReviewUnavailable) {
 				if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
@@ -212,20 +233,32 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 			}
 		}
-		// Findings go to the author lane before the verdict: the author fixes
-		// them without the desk relaying anything.
-		if e := s.DeliverFindings(ctx, r, pr.Number, childOptions); e != nil {
-			errs = append(errs, fmt.Errorf("PR %d findings: %w", pr.Number, e))
+		if handled[i] {
+			// Settled above on the reviewed head; a review the retry
+			// reran is settled next pass.
+			continue
 		}
-		if e := s.NotifyPR(ctx, r, pr.Number, childOptions); e != nil {
-			errs = append(errs, fmt.Errorf("PR %d notify: %w", pr.Number, e))
-		}
-		if e = s.Land(ctx, r, pr.Number, childOptions); e != nil {
-			errs = append(errs, fmt.Errorf("PR %d land: %w", pr.Number, e))
-		}
+		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
 	}
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
+}
+
+// settlePR delivers findings to the author lane before the verdict, so the
+// author fixes them without the desk relaying anything, then notifies the
+// verdict and lands the PR.
+func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	var errs []error
+	if e := s.DeliverFindings(ctx, r, n, o); e != nil {
+		errs = append(errs, fmt.Errorf("PR %d findings: %w", n, e))
+	}
+	if e := s.NotifyPR(ctx, r, n, o); e != nil {
+		errs = append(errs, fmt.Errorf("PR %d notify: %w", n, e))
+	}
+	if e := s.Land(ctx, r, n, o); e != nil {
+		errs = append(errs, fmt.Errorf("PR %d land: %w", n, e))
+	}
+	return errs
 }
 
 // skipBotPulls drops PRs opened by bot accounts when skip is set; they stay in
