@@ -1526,6 +1526,11 @@ escalation. Shadow and dry-run modes do not retry reviews or write retry state.
 `daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
 and landing. They still count as open for outcome reconciliation.
 
+`daemon.pr.review_parallel` bounds how many PRs of one repository a PR pass
+reviews at once; the default is `4`, and `1` reviews one PR at a time. Each PR's
+review is followed by its findings delivery, notification and land; those
+settle steps run one PR at a time. Repositories still run one after another.
+
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,
 last_error, next_run, running and failures. Values are the last saved observation;

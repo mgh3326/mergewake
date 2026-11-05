@@ -12,7 +12,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
-	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -310,5 +309,5 @@ func (s *Service) archiveNote(v archiveRow, dry bool) error {
 	if e != nil {
 		return e
 	}
-	return fsutil.AppendLine(filepath.Join(s.Config.StateDir, "archive-jobs.jsonl"), b)
+	return appendLine(filepath.Join(s.Config.StateDir, "archive-jobs.jsonl"), b)
 }

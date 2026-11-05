@@ -65,6 +65,7 @@ type Service struct {
 	// inboxFallbacks counts findings returned through the legacy lane/file
 	// path while the reviewer job record carried no result (MW-3); the count
 	// rides on each review-inbox-fallback audit record for one release.
+	// Guarded by fallbackMu.
 	inboxFallbacks int
 	// patches caches each PR head's patch id (see patchIDOf), guarded by
 	// patchMu.
@@ -82,7 +83,11 @@ type Options struct {
 // dry runs decide only, and shadow mode observes without acting.
 func (o Options) Acting() bool { return !o.DryRun && !o.Shadow }
 
-func (s *Service) Print(v any) error { return json.NewEncoder(s.Out).Encode(v) }
+func (s *Service) Print(v any) error {
+	printMu.Lock()
+	defer printMu.Unlock()
+	return json.NewEncoder(s.Out).Encode(v)
+}
 func (s *Service) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -106,7 +111,7 @@ func (s *Service) audit(repo, command string, value any, dry bool) error {
 	if dry {
 		return nil
 	}
-	return fsutil.AppendLine(filepath.Join(s.state(repo), "decisions.jsonl"), b)
+	return appendLine(filepath.Join(s.state(repo), "decisions.jsonl"), b)
 }
 func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy.Policy, error) {
 	var p policy.Policy

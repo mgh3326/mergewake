@@ -261,6 +261,20 @@ type PRLoop struct {
 	// Renovate) out of review, notify, landing and the stall alarm: they carry
 	// no author family, so a review can never start and the alarm only nags.
 	SkipBots bool `yaml:"skip_bots"`
+	// ReviewParallel bounds how many PRs of one repository a pass reviews at
+	// once. Zero or less means DefaultReviewParallel; 1 reviews one PR at a time.
+	ReviewParallel int `yaml:"review_parallel"`
+}
+
+// DefaultReviewParallel is the review bound when review_parallel is unset.
+const DefaultReviewParallel = 4
+
+// Parallel is the number of PR reviews a pass may run at once.
+func (l PRLoop) Parallel() int {
+	if l.ReviewParallel <= 0 {
+		return DefaultReviewParallel
+	}
+	return l.ReviewParallel
 }
 
 // ReviewRetry bounds retries and the number of failures before escalation.

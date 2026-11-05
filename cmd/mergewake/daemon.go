@@ -216,32 +216,64 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		handled[i] = true
 		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
 	}
+	// Reviews of different PRs run at once, at most review_parallel of them:
+	// each waits for its reviewer pane. One PR's review and settle stay in
+	// order. Settles run one at a time: they share the repo's delivery,
+	// notify and ready ledgers, and each land must see the base the previous
+	// land left, as in the sequential order.
+	results := make([][]error, len(prs))
+	slots := make(chan struct{}, s.Config.Daemon.PR.Parallel())
+	var settling sync.Mutex
+	var running sync.WaitGroup
 	for i, pr := range prs {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		if pr.Draft {
 			continue
 		}
-		e := s.RetryReview(ctx, r, pr, options[i])
-		if e != nil {
-			if errors.Is(e, pipeline.ErrReviewUnavailable) {
-				if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
-					errs = append(errs, printErr)
-				}
-			} else {
-				errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
-			}
+		// A cancelled pass starts no further PR and returns once the running
+		// ones have.
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
 		}
-		if handled[i] {
-			// Settled above on the reviewed head; a review the retry
-			// reran is settled next pass.
-			continue
+		if ctx.Err() != nil {
+			running.Wait()
+			return ctx.Err()
 		}
-		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			defer func() { <-slots }()
+			results[i] = reviewPR(ctx, s, r, pr, options[i], !handled[i], &settling)
+		}()
+	}
+	running.Wait()
+	for _, e := range results {
+		errs = append(errs, e...)
 	}
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
+}
+
+// reviewPR runs one PR's review, then settles it under settling unless phase
+// one already settled its reviewed head. A review the retry reran there is
+// settled next pass.
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) []error {
+	var errs []error
+	if e := s.RetryReview(ctx, r, pr, o); e != nil {
+		if errors.Is(e, pipeline.ErrReviewUnavailable) {
+			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
+				errs = append(errs, printErr)
+			}
+		} else {
+			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
+		}
+	}
+	if !settle {
+		return errs
+	}
+	settling.Lock()
+	defer settling.Unlock()
+	return append(errs, settlePR(ctx, s, r, pr.Number, o)...)
 }
 
 // settlePR delivers findings to the author lane before the verdict, so the

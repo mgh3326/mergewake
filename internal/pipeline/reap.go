@@ -15,7 +15,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
-	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -121,7 +120,7 @@ func (s *Service) reapNote(v reapReceipt, dry bool) error {
 	if e != nil {
 		return e
 	}
-	return fsutil.AppendLine(s.reapLog(v.Repo), b)
+	return appendLine(s.reapLog(v.Repo), b)
 }
 
 // reapHost caches one host's agent list, full pane list and per-cwd worktree

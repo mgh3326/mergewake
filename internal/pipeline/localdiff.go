@@ -66,7 +66,7 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 		return diffResult{}, errors.New("no command runner for the local checkout")
 	}
 	git := func(args ...string) (string, error) {
-		b, e := s.Runner.Run(ctx, "git", append([]string{"-C", root}, args...), "", "")
+		b, e := s.gitIn(ctx, root, args...)
 		return string(b), e
 	}
 	field := func(args ...string) (string, error) {
