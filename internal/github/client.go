@@ -34,7 +34,11 @@ type Client struct {
 	// Polling loops (daemon, watch, agent) set it; one-shot commands leave it
 	// false so a recorded interval never stalls a single run. Retry-After,
 	// 403/429 backoff and rate-limit pacing apply either way.
-	Polling  bool
+	Polling bool
+	// Objects, when set, caches sha-addressed objects (commits, trees, blobs,
+	// files read through a commit) across passes and processes. Nil means every
+	// read goes to GitHub.
+	Objects  ObjectCache
 	poll     pollingState
 	evidence evidenceCache
 }
@@ -65,7 +69,11 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
 	key := method + " " + endpoint + " " + accept
-	fresh := ctx.Value(freshRequestKey{}) != nil || ctx.Value(freshEvidenceKey{}) != nil
+	fresh := isFresh(ctx)
+	if method != "GET" && route != "/graphql" {
+		// Whatever the outcome, the write may have changed what the pass memoized.
+		defer passOf(ctx).invalidate(memoRepo(route))
+	}
 	if method == "GET" && !fresh {
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
@@ -202,9 +210,11 @@ type Pull struct {
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
-	var p Pull
-	e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
-	return p, e
+	return memoized(ctx, memoKey{repo, "pull", strconv.Itoa(n)}, func() (Pull, error) {
+		var p Pull
+		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
+		return p, e
+	})
 }
 func (c *Client) Files(ctx context.Context, repo string, n int) ([]policy.File, error) {
 	return list[policy.File](ctx, c, fmt.Sprintf("%s/pulls/%d/files", base(repo), n))
@@ -227,11 +237,13 @@ func (c *Client) UpdateBranch(ctx context.Context, repo string, n int, head stri
 	return c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/update-branch", base(repo), n), map[string]string{"expected_head_sha": head}, nil)
 }
 func (c *Client) Head(ctx context.Context, repo, branch string) (string, error) {
-	var r struct {
-		Object Ref `json:"object"`
-	}
-	e := c.json(ctx, "GET", base(repo)+"/git/ref/heads/"+url.PathEscape(branch), nil, &r)
-	return r.Object.SHA, e
+	return memoized(ctx, memoKey{repo, "head", branch}, func() (string, error) {
+		var r struct {
+			Object Ref `json:"object"`
+		}
+		e := c.json(ctx, "GET", base(repo)+"/git/ref/heads/"+url.PathEscape(branch), nil, &r)
+		return r.Object.SHA, e
+	})
 }
 func (c *Client) CreateRef(ctx context.Context, repo, branch, sha string) error {
 	return c.json(ctx, "POST", base(repo)+"/git/refs", map[string]string{"ref": "refs/heads/" + branch, "sha": sha}, nil)
@@ -547,10 +559,18 @@ func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, logi
 // on the PR, across all heads, oldest first. A review counts only when its body
 // carries the marker of the commit it was posted on.
 func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
-	var out []ReviewedPass
 	if login == "" {
-		return out, errors.New("review.login is required")
+		return nil, errors.New("review.login is required")
 	}
+	out, e := memoized(ctx, memoKey{repo, "reviews", strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
+		return c.reviewHistory(ctx, repo, n, login)
+	})
+	// The memo's slice is shared: hand each caller its own.
+	return slices.Clone(out), e
+}
+
+func (c *Client) reviewHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
+	var out []ReviewedPass
 	reviews, e := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
 	if e != nil {
 		return out, e
@@ -811,9 +831,7 @@ func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since tim
 }
 
 func (c *Client) Commit(ctx context.Context, repo, sha string) (Commit, error) {
-	var v Commit
-	e := c.json(ctx, "GET", base(repo)+"/commits/"+url.PathEscape(sha), nil, &v)
-	return v, e
+	return immutable[Commit](ctx, c, repo, kindCommit, sha, base(repo)+"/commits/"+url.PathEscape(sha))
 }
 func (c *Client) PRsForCommit(ctx context.Context, repo, sha string) ([]Pull, error) {
 	return list[Pull](ctx, c, base(repo)+"/commits/"+sha+"/pulls")
@@ -834,17 +852,24 @@ type TreeEntry struct {
 	SHA  string `json:"sha"`
 }
 
+type treeResponse struct {
+	Tree      []TreeEntry `json:"tree"`
+	Truncated bool        `json:"truncated"`
+}
+type blobResponse struct {
+	Content  string `json:"content"`
+	Encoding string `json:"encoding"`
+	Size     int64  `json:"size"`
+}
+
 func (c *Client) Entry(ctx context.Context, repo, tree, name string) (TreeEntry, error) {
 	if !manifest.SafePath(name) {
 		return TreeEntry{}, errors.New("unsafe source path")
 	}
 	parts := strings.Split(name, "/")
 	for i, p := range parts {
-		var t struct {
-			Tree      []TreeEntry `json:"tree"`
-			Truncated bool        `json:"truncated"`
-		}
-		if e := c.json(ctx, "GET", base(repo)+"/git/trees/"+tree, nil, &t); e != nil {
+		t, e := immutable[treeResponse](ctx, c, repo, kindTree, tree, base(repo)+"/git/trees/"+tree)
+		if e != nil {
 			return TreeEntry{}, e
 		}
 		if t.Truncated {
@@ -872,6 +897,20 @@ func (c *Client) Entry(ctx context.Context, repo, tree, name string) (TreeEntry,
 	return TreeEntry{}, errors.New("missing source")
 }
 func (c *Client) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, error) {
+	if c.Objects != nil && cacheable(sha, name) {
+		if body, ok := c.cacheGet(ctx, repo, kindFile, sha, name); ok {
+			passOf(ctx).noteCache(true)
+			return body, nil
+		}
+		passOf(ctx).noteCache(false)
+	}
+	data, e := c.readFile(ctx, repo, sha, name)
+	if e == nil {
+		c.cachePut(ctx, repo, kindFile, sha, name, data)
+	}
+	return data, e
+}
+func (c *Client) readFile(ctx context.Context, repo, sha, name string) ([]byte, error) {
 	commit, e := c.Commit(ctx, repo, sha)
 	if e != nil {
 		return nil, e
@@ -886,12 +925,8 @@ func (c *Client) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, 
 	if entry.Type != "blob" || (entry.Mode != "100644" && entry.Mode != "100755") {
 		return nil, fmt.Errorf("source %s in %s@%s is a %s (mode %s); must be a regular Git blob", name, repo, sha, entry.Type, entry.Mode)
 	}
-	var b struct {
-		Content  string `json:"content"`
-		Encoding string `json:"encoding"`
-		Size     int64  `json:"size"`
-	}
-	if e = c.json(ctx, "GET", base(repo)+"/git/blobs/"+entry.SHA, nil, &b); e != nil {
+	b, e := immutable[blobResponse](ctx, c, repo, kindBlob, entry.SHA, base(repo)+"/git/blobs/"+entry.SHA)
+	if e != nil {
 		return nil, e
 	}
 	if b.Encoding != "base64" || b.Size > manifest.MaxFileSize {

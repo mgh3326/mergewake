@@ -20,14 +20,20 @@ type requestKey struct {
 	method, route string
 	status        int
 }
+
+// RequestCounts is the state of one pass: its request counts, its cache
+// counters and its read memo (see memo.go). The ctx that CountRequests returns
+// carries it, so a new pass starts empty.
 type RequestCounts struct {
 	mu     sync.Mutex
 	role   string
 	counts map[requestKey]int
+	pass   passMemo
 }
 type requestCountsKey struct{}
 
-// CountRequests attributes all HTTP responses under ctx to this pass.
+// CountRequests starts a pass: it attributes all HTTP responses under ctx to
+// it and scopes the per-pass read memo to it.
 func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
 	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
 	return context.WithValue(ctx, requestCountsKey{}, c), c

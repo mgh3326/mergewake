@@ -22,6 +22,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/rollout"
+	"github.com/mgh3326/mergewake/internal/server/store"
 	"github.com/mgh3326/mergewake/internal/superfan"
 )
 
@@ -223,11 +224,18 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			for _, request := range requests {
 				total += request.Count
 			}
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "routes": requests})
+			cache := counts.CacheStats()
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "routes": requests})
 		}()
 	}
 	gh := github.New(token)
 	gh.Stderr = stderr
+	// The object cache exists only when a database DSN is configured; the
+	// database is dialled on first use, never here.
+	if objects := store.NewObjects(os.Getenv); objects != nil {
+		gh.Objects = objects
+		defer objects.Close()
+	}
 	// Only looping commands honour X-Poll-Interval; one-shot commands must not
 	// stall on an interval recorded by an earlier request.
 	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
