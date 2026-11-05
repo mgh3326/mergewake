@@ -543,6 +543,154 @@ func TestReapReviewer_H_I8_ShadowAndDryRunNeverAct(t *testing.T) {
 	}
 }
 
+// unknownPathFix is a completed reviewer job on remote node-a whose pane is
+// gone and whose remote worktree path is known nowhere (the job record has no
+// cwd and no receipt names one), with a clean local checkout. An earlier
+// reviewer-cleanup row names only the local checkout, as the pre-hk-2955 labels
+// had.
+func unknownPathFix(t *testing.T) (*reviewerFix, string, string) {
+	t.Helper()
+	f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+	label := reviewerLabelFor(12, time.Hour)
+	path := localCheckout(t, f, label, false)
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", PaneID: "w1:p5"}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Host: "node-a", Pane: "w1:p5", Worktree: path, Result: "pending-cleanup", Reason: "spawn ended before a pane result; the checkout may still run a pane"})
+	return f, label, path
+}
+
+// L1: a completed job on a remote host, pane gone, no cwd anywhere, clean
+// local checkout: the remote side stays pending-cleanup and the local checkout
+// is removed.
+func TestReapReviewer_L1_UnknownRemotePathDoesNotBlockLocalRemoval(t *testing.T) {
+	f, label, path := unknownPathFix(t)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) {
+		t.Fatalf("checkout not removed; calls %q", f.run.calls)
+	}
+	if len(f.hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("a remote removal ran without a path: %v", f.hub.commands)
+	}
+	var remote, local *reapReceipt
+	rows := f.rows(t)
+	for i := range rows {
+		switch {
+		case rows[i].Host == "local":
+			local = &rows[i]
+		case rows[i].Host != "" && rows[i].Worktree == label:
+			remote = &rows[i]
+		}
+	}
+	if remote == nil || remote.Result != "pending-cleanup" || remote.Reason != "remote cwd unavailable or mismatched" {
+		t.Fatalf("remote row missing: %v", rowSummary(rows))
+	}
+	if local == nil || local.Result != "removed" || local.Worktree != path {
+		t.Fatalf("local row missing: %v", rowSummary(rows))
+	}
+}
+
+// L2: the remote path is known and the hub refuses the removal: the visit
+// stops, the local checkout stays.
+func TestReapReviewer_L2_RefusedRemoteStopsBeforeLocalRemoval(t *testing.T) {
+	f, label, path := unknownPathFix(t)
+	cwd := "/repo/" + label
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", PaneID: "w1:p5", Cwd: cwd}
+	f.hub.detached[cwd] = true
+	f.hub.removeOutcome = "dirty"
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.hub.ops("worktree.remove")) != 1 {
+		t.Fatalf("hub ops: %v", f.hub.commands)
+	}
+	if f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) {
+		t.Fatalf("local checkout removed after a refused remote removal; calls %q", f.run.calls)
+	}
+	rows := f.rows(t)
+	for _, v := range rows {
+		if v.Host == "local" {
+			t.Fatalf("local row after a refused remote removal: %v", rowSummary(rows))
+		}
+	}
+	if last := rows[len(rows)-1]; last.Result != "pending-cleanup" || last.Reason != "hub guarded removal refused: dirty" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+// L3: the same as L1 with a dirty local checkout: kept dirty.
+func TestReapReviewer_L3_UnknownRemotePathKeepsDirtyLocalCheckout(t *testing.T) {
+	f, label, path := unknownPathFix(t)
+	f.run.outs[key("git", "-C", path, "status", "--porcelain")] = " M tool.go\n"
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) {
+		t.Fatalf("dirty checkout removed; calls %q", f.run.calls)
+	}
+	var local []reapReceipt
+	for _, v := range f.rows(t) {
+		if v.Host == "local" {
+			local = append(local, v)
+		}
+	}
+	if len(local) != 1 || local[0].Result != "kept" || local[0].Reason != "dirty" || local[0].Label != label {
+		t.Fatalf("local rows: %v", rowSummary(local))
+	}
+}
+
+// L4: the same as L1 with the job still spawned: kept job:spawned, and
+// nothing is removed.
+func TestReapReviewer_L4_UnknownRemotePathKeepsSpawnedJobsCheckout(t *testing.T) {
+	f, label, path := unknownPathFix(t)
+	rec := f.sink.recs[label]
+	rec.State = "spawned"
+	f.sink.recs[label] = rec
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) || f.acts() != 0 {
+		t.Fatalf("acted on a spawned job: hub %v local %q", f.hub.commands, f.run.calls)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "job:spawned" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+// L5: the same as L1 under reap.act off, shadow and --dry-run: nothing is
+// removed; the local checkout is only reported as would-remove.
+func TestReapReviewer_L5_UnknownRemotePathNeverActsInShadowOrDryRun(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		o     Options
+		noAct bool
+	}{
+		{"reap.act off", Options{}, true},
+		{"shadow", Options{Shadow: true}, false},
+		{"dry-run", Options{DryRun: true}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, _, path := unknownPathFix(t)
+			f.s.Config.Reap.Act = !test.noAct
+			var out strings.Builder
+			f.s.Out = &out
+			if err := f.reap(t, 0, test.o); err != nil {
+				t.Fatal(err)
+			}
+			if f.acts() != 0 || f.run.called("worktree\x00remove") {
+				t.Fatalf("acted: hub %v local %q", f.hub.commands, f.run.calls)
+			}
+			if want := `"worktree":"` + path + `","result":"would-remove"`; !strings.Contains(out.String(), want) {
+				t.Fatalf("missing %s in %s", want, out.String())
+			}
+			if strings.Contains(out.String(), `"result":"removed"`) {
+				t.Fatalf("removed row in %s", out.String())
+			}
+		})
+	}
+}
+
 // (i) A second run over finished labels writes no row and makes no hub call;
 // a label still pending writes no repeat row either.
 func TestReapReviewer_I_I9_SecondRunIsQuiet(t *testing.T) {
