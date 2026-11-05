@@ -231,6 +231,126 @@ func (hs *reapHost) paneInUse(path string) bool {
 	return false
 }
 
+// reapHistory replays reap.jsonl for one pass. lastRow remembers the newest
+// logged result per receipt stream so a repeat pass only writes rows whose
+// outcome changed: a shadow run logging the same would-* every poll, or a
+// removed worktree logging worktree-gone forever, would otherwise grow
+// reap.jsonl without bound.
+type reapHistory struct {
+	lastRow map[string]string
+	// jobClosed is the newest job-bound close per job, so its done can still
+	// follow a close whose done failed; prFinished a PR whose job reap
+	// already marked done.
+	jobClosed map[string]reapReceipt
+	// jobEverClosed names every job a pass closed the pane of, done or not: a
+	// job whose pane is gone for that reason is not a missing pane.
+	jobEverClosed map[string]bool
+	prFinished    map[int]bool
+	// prPaths holds every host and worktree a PR's receipts ever named.
+	prPaths map[int]map[string]bool
+	// lastPRCheck is each PR's newest row that cost a GitHub call.
+	lastPRCheck map[int]time.Time
+}
+
+// reapRowKey identifies one receipt stream: pane closes key by pane, worktree
+// work keys by path.
+func reapRowKey(v reapReceipt) string {
+	if v.Action == "reviewer-reap" {
+		return fmt.Sprintf("%s|%s|%s", v.Action, v.Label, reviewerStream(v))
+	}
+	path := v.Pane
+	if v.Action == "archive-job" || v.Action == "job-done" {
+		path = v.Job
+	} else if v.Action != "close-pane" {
+		// Rows predating the Worktree field still name their path in Cwd.
+		switch {
+		case v.Worktree != "":
+			path = v.Worktree
+		case v.Cwd != "":
+			path = v.Cwd
+		}
+	}
+	return fmt.Sprintf("%s|%d|%s|%s", v.Action, v.PR, v.Host, path)
+}
+
+func reapRowSig(v reapReceipt) string { return v.Result + "|" + v.Reason }
+
+func newReapHistory(receipts []reapReceipt) *reapHistory {
+	h := &reapHistory{
+		lastRow:       map[string]string{},
+		jobClosed:     map[string]reapReceipt{},
+		jobEverClosed: map[string]bool{},
+		prFinished:    map[int]bool{},
+		prPaths:       map[int]map[string]bool{},
+		lastPRCheck:   map[int]time.Time{},
+	}
+	jobDone := map[string]bool{}
+	for _, rec := range receipts {
+		h.lastRow[reapRowKey(rec)] = reapRowSig(rec)
+		if rec.Action == "job-done" && rec.Result == "done" {
+			jobDone[rec.Job] = true
+		}
+		if rec.Action == "close-pane" && rec.Job != "" && rec.Result == "closed" {
+			h.jobEverClosed[rec.Job] = true
+		}
+		switch {
+		case rec.Action == "close-pane" && rec.Task != "" && rec.Result == "closed":
+			h.jobClosed[rec.Job] = rec
+		case rec.Action == "job-done" && (rec.Result == "done" || strings.HasPrefix(rec.Reason, "already-")):
+			h.prFinished[rec.PR] = true
+		}
+	}
+	for _, rec := range receipts {
+		// reviewer-cleanup and reviewer-reap rows name reviewer checkouts and
+		// never get a remove-worktree row, so they must not hold a PR open.
+		if rec.PR == 0 || reviewerRow(rec) {
+			continue
+		}
+		path := rec.Worktree
+		if path == "" {
+			path = rec.Cwd
+		}
+		if path == "" {
+			continue
+		}
+		if h.prPaths[rec.PR] == nil {
+			h.prPaths[rec.PR] = map[string]bool{}
+		}
+		h.prPaths[rec.PR][rec.Host+"\x00"+path] = true
+	}
+	// A job reap already marked done needs no retry, whatever hk shows.
+	for job := range jobDone {
+		delete(h.jobClosed, job)
+	}
+	for _, rec := range receipts {
+		// Archive rows need no GitHub call and must not delay a refetch; neither
+		// do reviewer rows, which a review pass or the reviewer sweep writes.
+		if rec.Action != "archive-job" && !reviewerRow(rec) && rec.Time.After(h.lastPRCheck[rec.PR]) {
+			h.lastPRCheck[rec.PR] = rec.Time
+		}
+	}
+	return h
+}
+
+// prDone reports whether every worktree a PR's receipts ever named already
+// reached a terminal remove outcome. A closed pane alone is not done — its
+// worktree cleanup may still be pending — so only an all-terminal set spares
+// the GitHub refetch on every poll.
+func (h *reapHistory) prDone(pr int) bool {
+	paths := h.prPaths[pr]
+	if len(paths) == 0 {
+		return h.prFinished[pr]
+	}
+	for hp := range paths {
+		host, path, _ := strings.Cut(hp, "\x00")
+		sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: pr, Host: host, Worktree: path})]
+		if sig != "removed|" && sig != "worktree-gone|" {
+			return false
+		}
+	}
+	return true
+}
+
 // Reap closes agent panes sitting in worktrees of merged-PR head branches, then
 // removes the worktree and local branch once the merge is older than
 // reap.worktree_after and no watch recovery PR landed. Anything dirty, unknown
@@ -268,108 +388,11 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if e != nil {
 		return e
 	}
-	// rowKey identifies one receipt stream (pane closes key by pane, worktree
-	// work keys by path); lastRow remembers the newest logged result per key
-	// so a repeat pass only writes rows whose outcome changed: a shadow run
-	// logging the same would-* every poll, or a removed worktree logging
-	// worktree-gone forever, would otherwise grow reap.jsonl without bound.
-	rowKey := func(v reapReceipt) string {
-		if v.Action == "reviewer-reap" {
-			return fmt.Sprintf("%s|%s|%s", v.Action, v.Label, reviewerStream(v))
-		}
-		path := v.Pane
-		if v.Action == "archive-job" || v.Action == "job-done" {
-			path = v.Job
-		} else if v.Action != "close-pane" {
-			// Rows predating the Worktree field still name their path in Cwd.
-			switch {
-			case v.Worktree != "":
-				path = v.Worktree
-			case v.Cwd != "":
-				path = v.Cwd
-			}
-		}
-		return fmt.Sprintf("%s|%d|%s|%s", v.Action, v.PR, v.Host, path)
-	}
-	rowSig := func(v reapReceipt) string { return v.Result + "|" + v.Reason }
-	lastRow := map[string]string{}
-	// jobClosed is the newest job-bound close per job, so its done can still
-	// follow a close whose done failed; prFinished a PR whose job reap
-	// already marked done.
-	jobClosed := map[string]reapReceipt{}
-	// jobEverClosed names every job a pass closed the pane of, done or not: a
-	// job whose pane is gone for that reason is not a missing pane.
-	jobEverClosed := map[string]bool{}
-	prFinished := map[int]bool{}
-	jobDone := map[string]bool{}
-	for _, rec := range receipts {
-		lastRow[rowKey(rec)] = rowSig(rec)
-		if rec.Action == "job-done" && rec.Result == "done" {
-			jobDone[rec.Job] = true
-		}
-		if rec.Action == "close-pane" && rec.Job != "" && rec.Result == "closed" {
-			jobEverClosed[rec.Job] = true
-		}
-		switch {
-		case rec.Action == "close-pane" && rec.Task != "" && rec.Result == "closed":
-			jobClosed[rec.Job] = rec
-		case rec.Action == "job-done" && (rec.Result == "done" || strings.HasPrefix(rec.Reason, "already-")):
-			prFinished[rec.PR] = true
-		}
-	}
-	// prDone reports whether every worktree a PR's receipts ever named already
-	// reached a terminal remove outcome. A closed pane alone is not done —
-	// its worktree cleanup may still be pending — so only an all-terminal set
-	// spares the GitHub refetch on every poll.
-	prPaths := map[int]map[string]bool{}
-	for _, rec := range receipts {
-		// reviewer-cleanup and reviewer-reap rows name reviewer checkouts and
-		// never get a remove-worktree row, so they must not hold a PR open.
-		if rec.PR == 0 || reviewerRow(rec) {
-			continue
-		}
-		path := rec.Worktree
-		if path == "" {
-			path = rec.Cwd
-		}
-		if path == "" {
-			continue
-		}
-		if prPaths[rec.PR] == nil {
-			prPaths[rec.PR] = map[string]bool{}
-		}
-		prPaths[rec.PR][rec.Host+"\x00"+path] = true
-	}
-	// A job reap already marked done needs no retry, whatever hk shows.
-	for job := range jobDone {
-		delete(jobClosed, job)
-	}
-	prDone := func(pr int) bool {
-		paths := prPaths[pr]
-		if len(paths) == 0 {
-			return prFinished[pr]
-		}
-		for hp := range paths {
-			host, path, _ := strings.Cut(hp, "\x00")
-			sig := lastRow[rowKey(reapReceipt{Action: "remove-worktree", PR: pr, Host: host, Worktree: path})]
-			if sig != "removed|" && sig != "worktree-gone|" {
-				return false
-			}
-		}
-		return true
-	}
+	h := newReapHistory(receipts)
 	// A receipt-named PR beyond the listing horizon is refetched at most once
 	// per day, measured from its newest row: each attempt appends a check-pr
 	// row, so a persistent skip like reverted, unpushed or refused ignored
 	// files stops costing a GitHub call every poll.
-	lastPRCheck := map[int]time.Time{}
-	for _, rec := range receipts {
-		// Archive rows need no GitHub call and must not delay a refetch; neither
-		// do reviewer rows, which a review pass or the reviewer sweep writes.
-		if rec.Action != "archive-job" && !reviewerRow(rec) && rec.Time.After(lastPRCheck[rec.PR]) {
-			lastPRCheck[rec.PR] = rec.Time
-		}
-	}
 	const refetchAfter = 24 * time.Hour
 
 	pulls := []github.Pull{}
@@ -393,7 +416,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// failure only loses that PR this pass; it never aborts the rest.
 		for _, rec := range receipts {
 			// The reviewer sweep covers its own rows whatever the PR's state.
-			if rec.PR == 0 || rec.Action == "reviewer-reap" || known[rec.PR] || prDone(rec.PR) || now.Sub(lastPRCheck[rec.PR]) < refetchAfter {
+			if rec.PR == 0 || rec.Action == "reviewer-reap" || known[rec.PR] || h.prDone(rec.PR) || now.Sub(h.lastPRCheck[rec.PR]) < refetchAfter {
 				continue
 			}
 			known[rec.PR] = true
@@ -502,8 +525,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed archive always appends: its time spaces the next retry.
 		// So does a completed one, which carries its own Drive and hk record.
-		repeat := lastRow[rowKey(v)] == rowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived"))
-		lastRow[rowKey(v)] = rowSig(v)
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived"))
+		h.lastRow[reapRowKey(v)] = reapRowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)
 		}
@@ -511,7 +534,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// reviewerNote is note plus one reviewer-reap audit record per new row: a
 	// deduped repeat writes neither.
 	reviewerNote := func(v reapReceipt) {
-		repeat := lastRow[rowKey(v)] == rowSig(v)
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v)
 		note(v)
 		if repeat {
 			return
@@ -592,7 +615,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if !jobSeen[bound.Job] {
 				jobSeen[bound.Job] = true
 				match := func(w *reap.Worktree) bool { return matches(w, p) }
-				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, jobClosed, jobEverClosed, note)
+				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, h.jobClosed, h.jobEverClosed, note)
 			}
 		}
 		for _, hs := range hosts {
@@ -675,7 +698,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			// A worktree already removed or proven gone is terminal: re-adding
 			// it as a candidate would only log the same skip every pass. Live
 			// pane matches are never suppressed.
-			sig := lastRow[rowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: rec.Host, Worktree: path})]
+			sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: rec.Host, Worktree: path})]
 			if sig == "removed|" || sig == "worktree-gone|" {
 				continue
 			}

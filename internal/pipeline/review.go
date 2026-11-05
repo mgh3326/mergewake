@@ -178,36 +178,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return e
 	}
 	if !complete {
-		if family == "" {
-			m := familyTrailer.FindStringSubmatch(pr.Body)
-			if len(m) == 2 {
-				family, familySource = m[1], "trailer"
-			}
+		if family, familySource, e = s.authorFamily(ctx, r, pr, family); e != nil {
+			return e
 		}
-		author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
-		if len(author) == 2 {
-			if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
-				if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
-					return errors.New("author family conflicts with configured profile")
-				}
-				family, familySource = profile.Family, "profile"
-			}
-		}
-		if family == "" {
-			c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-			if e != nil {
-				return e
-			}
-			if m := familyTrailer.FindStringSubmatch(c.Commit.Message); len(m) == 2 {
-				family, familySource = m[1], "commit_trailer"
-			} else if inferred := inferAuthorFamily(c); inferred != "" {
-				family, familySource = inferred, "commit"
-			}
-		}
-		if family == "" && s.Config.Review.DefaultFamily != "" {
-			family, familySource = s.Config.Review.DefaultFamily, "default"
-		}
-		family = config.CanonicalFamily(family)
 		if family == "" {
 			if s.fleetAuthor(pr.User.Login) {
 				return s.blockReview(ctx, r, pr, reviewBlock{blockUnknownFamily, "Add `Mergewake-Author-Family: <family>` to the PR body. The head commit trailer also works."}, o)
@@ -256,34 +229,19 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	grade := s.Config.Review.DefaultGrade
-	if grade == "" {
-		grade = "B"
-	}
-	if m := gradeTrailer.FindStringSubmatch(pr.Body); len(m) == 2 {
-		grade = strings.TrimSpace(m[1])
-	}
-	if !config.ValidGrade(grade) {
-		return errors.New("invalid PR review grade")
+	grade, e := s.reviewGrade(pr)
+	if e != nil {
+		return e
 	}
 	var plans []*passPlan
 	for _, pass := range missing {
 		plans = append(plans, &passPlan{pass: pass})
 	}
-	lens := func(plan *passPlan) string {
-		if needed == 2 {
-			if plan.pass == 1 {
-				return "correctness"
-			}
-			return "state-risk"
-		}
-		return "default"
-	}
 
 	if !o.Acting() {
 		out := []map[string]any{}
 		for _, plan := range plans {
-			plan.lens = lens(plan)
+			plan.lens = passLens(needed, plan.pass)
 			row := map[string]any{"pass": plan.pass, "lens": plan.lens, "executor": "panewire"}
 			out = append(out, row)
 		}
@@ -335,8 +293,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			s.postTaskEvent(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted)
 		}
 	}()
+	run := reviewRunInfo{family: family, familySource: familySource, prContext: prContext, rp: rp, src: src, contractErr: contractErr, contextErr: contextErr}
 	for _, plan := range plans {
-		plan.lens = lens(plan)
+		plan.lens = passLens(needed, plan.pass)
 		// A GitHub ref claims this PR head across hosts before any reviewer is
 		// invoked. One claim covers every candidate of the pass.
 		claimed := false
@@ -414,59 +373,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		// record left behind is never resumed, since a posted pass is not run
 		// again for this head.
 		_ = s.dropReviewerJob(r.Name, n, plan.pass)
-		event := map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": out.family, "same_family": plan.sameFamily, "findings": len(findings), "author_family": family, "answered_context": prContext.answered}
-		if prContext.truncated {
-			event["context_truncated"] = true
-		}
-		event["round"] = rp.round
-		if rp.base != "" {
-			event["delta_base"] = rp.base
-		}
-		if rp.quiet {
-			event["quiet"] = true
-		}
-		if rp.note != "" {
-			event["round_note"] = rp.note
-		}
-		if prContext.prior > 0 {
-			event["prior_context"] = prContext.prior
-		}
-		if rp.contract != "" {
-			event["contract"] = rp.contractSource
-		}
-		if contractErr != nil {
-			event["contract_error"] = contractErr.Error()
-		}
-		if shape.duplicates > 0 {
-			event["duplicates_dropped"] = shape.duplicates
-		}
-		if shape.advisory > 0 {
-			event["advisory"] = shape.advisory
-		}
-		if shape.budget > 0 {
-			event["budget_dropped"] = shape.budget
-		}
-		if contextErr != nil {
-			event["context_error"] = contextErr.Error()
-		}
-		if out.executor != "" {
-			event["executor"] = out.executor
-		}
-		if receipt.Fallback != "" {
-			event["fallback"] = receipt.Fallback
-		}
-		if src.source != "" {
-			event["diff_source"] = src.source
-		}
-		if len(src.summarized) > 0 {
-			event["diff_summarized"] = len(src.summarized)
-		}
-		if familySource == "commit" || familySource == "default" {
-			event["author_family_inferred"] = familySource
-		}
-		if len(skips) > 0 {
-			event["skipped"] = skips
-		}
+		event := run.passEvent(n, pr.Head.SHA, plan, out, selected, len(findings), shape, receipt, skips)
 		if e = s.audit(r.Name, "review", event, false); e != nil {
 			return e
 		}
@@ -475,6 +382,139 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
 	}
 	return nil
+}
+
+// authorFamily resolves the PR author's model family: the --author-family
+// flag, else the PR body trailer, then a configured author profile (which a
+// conflicting flag or trailer refuses), then the head commit's trailer or
+// inferred author, then review.default_family. It returns the canonical
+// family, or "" when none is known, and the source that decided it.
+func (s *Service) authorFamily(ctx context.Context, r config.Repo, pr github.Pull, family string) (string, string, error) {
+	source := "flag"
+	if family == "" {
+		if m := familyTrailer.FindStringSubmatch(pr.Body); len(m) == 2 {
+			family, source = m[1], "trailer"
+		}
+	}
+	author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
+	if len(author) == 2 {
+		if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
+			if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
+				return "", source, errors.New("author family conflicts with configured profile")
+			}
+			family, source = profile.Family, "profile"
+		}
+	}
+	if family == "" {
+		c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+		if e != nil {
+			return "", source, e
+		}
+		if m := familyTrailer.FindStringSubmatch(c.Commit.Message); len(m) == 2 {
+			family, source = m[1], "commit_trailer"
+		} else if inferred := inferAuthorFamily(c); inferred != "" {
+			family, source = inferred, "commit"
+		}
+	}
+	if family == "" && s.Config.Review.DefaultFamily != "" {
+		family, source = s.Config.Review.DefaultFamily, "default"
+	}
+	return config.CanonicalFamily(family), source, nil
+}
+
+// reviewGrade is the PR's `Mergewake-Grade` trailer, else review.default_grade.
+func (s *Service) reviewGrade(pr github.Pull) (string, error) {
+	grade := s.Config.Review.DefaultGrade
+	if grade == "" {
+		grade = "B"
+	}
+	if m := gradeTrailer.FindStringSubmatch(pr.Body); len(m) == 2 {
+		grade = strings.TrimSpace(m[1])
+	}
+	if !config.ValidGrade(grade) {
+		return "", errors.New("invalid PR review grade")
+	}
+	return grade, nil
+}
+
+// passLens is the focus of one pass: a two-pass review splits correctness
+// from state risk; a one-pass review covers everything.
+func passLens(needed, pass int) string {
+	if needed == 2 {
+		if pass == 1 {
+			return "correctness"
+		}
+		return "state-risk"
+	}
+	return "default"
+}
+
+// reviewRunInfo is what one Review run knows before its passes start, which
+// every pass's audit event reports.
+type reviewRunInfo struct {
+	family, familySource    string
+	prContext               reviewContext
+	rp                      roundPlan
+	src                     diffResult
+	contractErr, contextErr error
+}
+
+// passEvent is the audit row for one posted pass.
+func (ri reviewRunInfo) passEvent(n int, head string, plan *passPlan, out passOutcome, selected string, findings int, shape shaped, receipt github.PassReceipt, skips []reviewSkip) map[string]any {
+	event := map[string]any{"pr": n, "head": head, "pass": plan.pass, "lens": plan.lens, "reviewer": selected, "family": out.family, "same_family": plan.sameFamily, "findings": findings, "author_family": ri.family, "answered_context": ri.prContext.answered}
+	if ri.prContext.truncated {
+		event["context_truncated"] = true
+	}
+	event["round"] = ri.rp.round
+	if ri.rp.base != "" {
+		event["delta_base"] = ri.rp.base
+	}
+	if ri.rp.quiet {
+		event["quiet"] = true
+	}
+	if ri.rp.note != "" {
+		event["round_note"] = ri.rp.note
+	}
+	if ri.prContext.prior > 0 {
+		event["prior_context"] = ri.prContext.prior
+	}
+	if ri.rp.contract != "" {
+		event["contract"] = ri.rp.contractSource
+	}
+	if ri.contractErr != nil {
+		event["contract_error"] = ri.contractErr.Error()
+	}
+	if shape.duplicates > 0 {
+		event["duplicates_dropped"] = shape.duplicates
+	}
+	if shape.advisory > 0 {
+		event["advisory"] = shape.advisory
+	}
+	if shape.budget > 0 {
+		event["budget_dropped"] = shape.budget
+	}
+	if ri.contextErr != nil {
+		event["context_error"] = ri.contextErr.Error()
+	}
+	if out.executor != "" {
+		event["executor"] = out.executor
+	}
+	if receipt.Fallback != "" {
+		event["fallback"] = receipt.Fallback
+	}
+	if ri.src.source != "" {
+		event["diff_source"] = ri.src.source
+	}
+	if len(ri.src.summarized) > 0 {
+		event["diff_summarized"] = len(ri.src.summarized)
+	}
+	if ri.familySource == "commit" || ri.familySource == "default" {
+		event["author_family_inferred"] = ri.familySource
+	}
+	if len(skips) > 0 {
+		event["skipped"] = skips
+	}
+	return event
 }
 
 // feedbackReadLimit caps the optional thread read; a quarter of the review
