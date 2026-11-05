@@ -578,8 +578,25 @@ func Load(name string) (Config, error) {
 	if e = Decode(f, &c); e != nil {
 		return c, e
 	}
-	if c.Version != 1 || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(c.Host) {
-		return c, errors.New("config requires version: 1 and host")
+	// Order matters: later sections default from earlier ones (hosts read the
+	// reap transport, outcomes the review quota tool, repos and review the
+	// state directory).
+	for _, section := range []func(*Config) error{
+		validateBasics, validateDaemon, validateReap, validateHosts, validateReview,
+		validateOutcomes, validateRepos, validateAdapters, validateProfiles,
+	} {
+		if e = section(&c); e != nil {
+			return c, e
+		}
+	}
+	return c, nil
+}
+
+// validateBasics applies top-level defaults and checks the host label and poll timing.
+func validateBasics(c *Config) error {
+	var e error
+	if c.Version != 1 || !hostLabel.MatchString(c.Host) {
+		return errors.New("config requires version: 1 and host")
 	}
 	if c.StateDir == "" {
 		c.StateDir = "~/.local/state/mergewake"
@@ -595,22 +612,28 @@ func Load(name string) (Config, error) {
 		c.WatchLimit = 100
 	}
 	if c.WatchLimit < 2 || c.WatchLimit > 1000 {
-		return c, errors.New("watch_limit must be 2..1000")
+		return errors.New("watch_limit must be 2..1000")
 	}
 	if _, e = Duration(c.PollInterval); e != nil {
-		return c, e
+		return e
 	}
+	return nil
+}
+
+// validateDaemon checks the daemon loops, PR-role retry, notify and findings timing, the webhook and the Discord feed.
+func validateDaemon(c *Config) error {
+	var e error
 	for _, loop := range []*Loop{&c.Daemon.PR.Loop, &c.Daemon.Watch, &c.Daemon.Release, &c.Daemon.Rollout} {
 		if loop.Interval == "" {
 			loop.Interval = c.PollInterval
 		}
 		if _, err := Duration(loop.Interval); err != nil {
-			return c, err
+			return err
 		}
 	}
 	if v := c.Daemon.PR.StallAfter; v != "" && v != "off" {
 		if _, e = Duration(v); e != nil {
-			return c, fmt.Errorf("daemon.pr.stall_after: %w", e)
+			return fmt.Errorf("daemon.pr.stall_after: %w", e)
 		}
 	}
 	retry := c.Daemon.PR.ReviewRetry
@@ -618,68 +641,74 @@ func Load(name string) (Config, error) {
 		name, value := f.name, f.value
 		if value != "" {
 			if _, err := Duration(value); err != nil {
-				return c, fmt.Errorf("daemon.pr.review_retry.%s: %w", name, err)
+				return fmt.Errorf("daemon.pr.review_retry.%s: %w", name, err)
 			}
 		}
 	}
 	initial, maximum, _ := retry.Settings()
 	if initial > maximum {
-		return c, errors.New("daemon.pr.review_retry.initial exceeds maximum")
+		return errors.New("daemon.pr.review_retry.initial exceeds maximum")
 	}
 	if retry.Failures < 0 {
-		return c, errors.New("daemon.pr.review_retry.failures must not be negative")
+		return errors.New("daemon.pr.review_retry.failures must not be negative")
 	}
 	if v := c.Daemon.PR.Notify.RenotifyAfter; v != "" && v != "off" {
 		if _, e = Duration(v); e != nil {
-			return c, fmt.Errorf("daemon.pr.notify.renotify_after: %w", e)
+			return fmt.Errorf("daemon.pr.notify.renotify_after: %w", e)
 		}
 	}
 	if c.Daemon.PR.Notify.RenotifyMax < 0 {
-		return c, errors.New("daemon.pr.notify.renotify_max must not be negative")
+		return errors.New("daemon.pr.notify.renotify_max must not be negative")
 	}
 	if v := c.Daemon.PR.Findings.AckAfter; v != "" {
 		if _, e = Duration(v); e != nil {
-			return c, fmt.Errorf("daemon.pr.findings.ack_after: %w", e)
+			return fmt.Errorf("daemon.pr.findings.ack_after: %w", e)
 		}
 	}
 	if v := c.Daemon.PR.Findings.EscalateAfter; v != "" {
 		if _, e = Duration(v); e != nil {
-			return c, fmt.Errorf("daemon.pr.findings.escalate_after: %w", e)
+			return fmt.Errorf("daemon.pr.findings.escalate_after: %w", e)
 		}
 	}
 	if c.Daemon.PR.Findings.EscalateRounds < 0 {
-		return c, errors.New("daemon.pr.findings.escalate_rounds must not be negative")
+		return errors.New("daemon.pr.findings.escalate_rounds must not be negative")
 	}
 	if c.Daemon.PR.ReviewParallel > MaxReviewParallel {
-		return c, fmt.Errorf("daemon.pr.review_parallel must be at most %d", MaxReviewParallel)
+		return fmt.Errorf("daemon.pr.review_parallel must be at most %d", MaxReviewParallel)
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
-		return c, e
+		return e
 	}
 	if e = validateDiscord(&c.Discord); e != nil {
-		return c, e
+		return e
 	}
+	return nil
+}
+
+// validateReap applies reap defaults and checks its globs, transport and archive.
+func validateReap(c *Config) error {
+	var e error
 	if c.Reap.Act && !c.Reap.Enabled {
-		return c, errors.New("reap.act requires reap.enabled")
+		return errors.New("reap.act requires reap.enabled")
 	}
 	if c.Reap.WorktreeAfter == "" {
 		c.Reap.WorktreeAfter = "168h"
 	}
 	if _, e = Duration(c.Reap.WorktreeAfter); e != nil {
-		return c, e
+		return e
 	}
 	if c.Reap.ScanAfter == "" {
 		c.Reap.ScanAfter = "720h"
 	}
 	if _, e = Duration(c.Reap.ScanAfter); e != nil {
-		return c, e
+		return e
 	}
 	if len(c.Reap.Protect) == 0 {
 		c.Reap.Protect = DefaultReapProtect
 	}
 	for _, g := range c.Reap.Protect {
 		if _, e = policy.Match(g, "probe"); e != nil {
-			return c, e
+			return e
 		}
 	}
 	if len(c.Reap.Regenerable) == 0 {
@@ -687,7 +716,7 @@ func Load(name string) (Config, error) {
 	}
 	for _, g := range c.Reap.Regenerable {
 		if _, e = policy.Match(g, "probe"); e != nil {
-			return c, e
+			return e
 		}
 	}
 	if c.Reap.Transport == "" {
@@ -700,43 +729,48 @@ func Load(name string) (Config, error) {
 	case ReapTransportSSH:
 	case ReapTransportPanewire:
 		if _, e = reap.HubOrigin(c.Reap.Hub.URL); e != nil {
-			return c, e
+			return e
 		}
 		if c.Reap.Hub.TokenFile == "" {
-			return c, errors.New("reap.transport panewire requires reap.hub.token_file")
+			return errors.New("reap.transport panewire requires reap.hub.token_file")
 		}
 		c.Reap.Hub.TokenFile = Expand(c.Reap.Hub.TokenFile)
 		if c.Reap.Hub.CFFile != "" {
 			c.Reap.Hub.CFFile = Expand(c.Reap.Hub.CFFile)
 		}
 		if !filepath.IsAbs(c.Reap.Hub.TokenFile) || (c.Reap.Hub.CFFile != "" && !filepath.IsAbs(c.Reap.Hub.CFFile)) {
-			return c, errors.New("reap.hub credential files must be absolute paths")
+			return errors.New("reap.hub credential files must be absolute paths")
 		}
 		// Refuse the operator credential at load, not only when a pass first
 		// reads the file. A file not there yet is left to that per-pass read.
 		if _, _, e = reap.HubCredential(c.Reap.Hub.TokenFile); e != nil && !errors.Is(e, fs.ErrNotExist) {
-			return c, fmt.Errorf("reap.hub.token_file: %w", e)
+			return fmt.Errorf("reap.hub.token_file: %w", e)
 		}
 	default:
-		return c, errors.New("reap.transport must be panewire or ssh")
+		return errors.New("reap.transport must be panewire or ssh")
 	}
 	if e = validateArchive(&c.Reap.Archive); e != nil {
-		return c, e
+		return e
 	}
+	return nil
+}
+
+// validateHosts checks host labels and job directories; it runs after validateReap, whose transport decides whether a machine-only host is reachable.
+func validateHosts(c *Config) error {
 	seenHosts := map[string]bool{}
 	for i, h := range c.Hosts {
-		if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(h.Name) || seenHosts[h.Name] {
-			return c, errors.New("hosts require unique name labels")
+		if !hostLabel.MatchString(h.Name) || seenHosts[h.Name] {
+			return errors.New("hosts require unique name labels")
 		}
 		seenHosts[h.Name] = true
 		if strings.HasPrefix(h.SSH, "-") || strings.ContainsAny(h.SSH, " \t\r\n") {
-			return c, errors.New("hosts[].ssh must be empty, local, or an ssh destination")
+			return errors.New("hosts[].ssh must be empty, local, or an ssh destination")
 		}
-		if h.Machine != "" && !regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`).MatchString(h.Machine) {
-			return c, errors.New("hosts[].machine must be a panewire machine id")
+		if h.Machine != "" && !machineID.MatchString(h.Machine) {
+			return errors.New("hosts[].machine must be a panewire machine id")
 		}
 		if c.Reap.Transport == ReapTransportSSH && !h.Local() && (h.SSH == "" || h.SSH == "local") {
-			return c, errors.New("hosts[].machine without ssh requires reap.transport panewire")
+			return errors.New("hosts[].machine without ssh requires reap.transport panewire")
 		}
 		if h.Jobs == "" {
 			continue
@@ -744,12 +778,18 @@ func Load(name string) (Config, error) {
 		if h.Local() {
 			c.Hosts[i].Jobs = Expand(h.Jobs)
 			if !filepath.IsAbs(c.Hosts[i].Jobs) {
-				return c, errors.New("hosts[].jobs must be an absolute path")
+				return errors.New("hosts[].jobs must be an absolute path")
 			}
 		} else if !filepath.IsAbs(h.Jobs) {
-			return c, errors.New("ssh host jobs must be an absolute path; ~ does not expand remotely")
+			return errors.New("ssh host jobs must be an absolute path; ~ does not expand remotely")
 		}
 	}
+	return nil
+}
+
+// validateReview applies review defaults and checks the panewire executor settings.
+func validateReview(c *Config) error {
+	var e error
 	if c.Review.Timeout == "" {
 		c.Review.Timeout = "10m"
 	}
@@ -757,7 +797,7 @@ func Load(name string) (Config, error) {
 		c.Review.DefaultGrade = "B"
 	}
 	if !ValidGrade(c.Review.DefaultGrade) {
-		return c, errors.New("invalid review.default_grade")
+		return errors.New("invalid review.default_grade")
 	}
 	if c.Review.Quota == "" {
 		c.Review.Quota = c.Review.Scopefuel
@@ -767,11 +807,11 @@ func Load(name string) (Config, error) {
 	}
 	c.Review.Quota = Expand(c.Review.Quota)
 	if _, e = Duration(c.Review.Timeout); e != nil {
-		return c, e
+		return e
 	}
 	if v := c.Review.Panewire.StaleAfter; v != "" {
 		if _, e = Duration(v); e != nil {
-			return c, fmt.Errorf("review.panewire.stale_after: %w", e)
+			return fmt.Errorf("review.panewire.stale_after: %w", e)
 		}
 	}
 	switch c.Review.Executor {
@@ -779,9 +819,9 @@ func Load(name string) (Config, error) {
 		c.Review.Executor = "panewire"
 	case "panewire":
 	case "headless":
-		return c, errors.New("review.executor: headless was retired; use panewire (the default)")
+		return errors.New("review.executor: headless was retired; use panewire (the default)")
 	default:
-		return c, errors.New("review.executor must be panewire")
+		return errors.New("review.executor must be panewire")
 	}
 	rt := &c.Review.Panewire
 	if rt.Command == "" {
@@ -803,17 +843,22 @@ func Load(name string) (Config, error) {
 		rt.Lane = rt.Owner
 	}
 	if rt.Lane != "" && !laneName.MatchString(rt.Lane) {
-		return c, errors.New("invalid review.panewire.lane")
+		return errors.New("invalid review.panewire.lane")
 	}
 	for _, h := range rt.ExcludeHosts {
 		if !hostName.MatchString(h) {
-			return c, fmt.Errorf("invalid review.panewire.exclude_hosts entry %q", h)
+			return fmt.Errorf("invalid review.panewire.exclude_hosts entry %q", h)
 		}
 		if h == rt.Host {
-			return c, fmt.Errorf("review.panewire.host %s is also in exclude_hosts", h)
+			return fmt.Errorf("review.panewire.host %s is also in exclude_hosts", h)
 		}
 	}
 	rt.Command, rt.Jobs, rt.Checkouts = Expand(rt.Command), Expand(rt.Jobs), Expand(rt.Checkouts)
+	return nil
+}
+
+// validateOutcomes defaults the outcomes command to the review quota tool, so it runs after validateReview.
+func validateOutcomes(c *Config) error {
 	if c.Outcomes.Command == "" {
 		c.Outcomes.Command = c.Review.Quota
 	}
@@ -824,21 +869,27 @@ func Load(name string) (Config, error) {
 	switch c.Outcomes.Tier {
 	case "T0", "T1", "T2", "T3":
 	default:
-		return c, errors.New("invalid outcomes.default_tier")
+		return errors.New("invalid outcomes.default_tier")
 	}
+	return nil
+}
+
+// validateRepos applies per-repository defaults and checks each install inventory.
+func validateRepos(c *Config) error {
+	var e error
 	seen := map[string]bool{}
 	for i := range c.Repos {
 		r := &c.Repos[i]
 		if !ValidRepo(r.Name) || seen[r.Name] {
-			return c, errors.New("repos require unique owner/name values")
+			return errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
 		if r.RolloutGroup != "" && !laneName.MatchString(r.RolloutGroup) {
-			return c, errors.New("rollout_group must be a safe lane-style identifier")
+			return errors.New("rollout_group must be a safe lane-style identifier")
 		}
 
 		if r.Lane != "" && !laneName.MatchString(r.Lane) {
-			return c, fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
+			return fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
 		}
 		if r.Branch == "" {
 			r.Branch = "main"
@@ -850,64 +901,11 @@ func Load(name string) (Config, error) {
 			r.SmokeTimeout = "30s"
 		}
 		if _, e = Duration(r.SmokeTimeout); e != nil {
-			return c, e
+			return e
 		}
 		for j := range r.Install {
-			spec := &r.Install[j]
-			if spec.Kind == "" {
-				spec.Kind = "file"
-			}
-			if spec.PreDeploy != nil && (spec.Kind != "container" || spec.PreDeploy.Command == "") {
-				return c, errors.New("pre_deploy requires a container install and a command")
-			}
-			switch spec.Kind {
-			case "file":
-			case "container":
-				if e = validateContainer(spec); e != nil {
-					return c, e
-				}
-			case "command", "release":
-				if spec.Verify.Command == "" {
-					return c, errors.New("command/release installs require verify")
-				}
-				if spec.Kind == "command" && (spec.Command.Command == "" || !strings.Contains(strings.Join(spec.Command.Args, " "), "{sha}")) {
-					return c, errors.New("command install requires a pinned {sha} argument")
-				}
-				if spec.VerifyOutput == "" {
-					spec.VerifyOutput = "{sha}"
-				}
-				if !strings.Contains(spec.VerifyOutput, "{sha}") {
-					return c, errors.New("verify_output must include {sha}")
-				}
-				if spec.InitialSHA != "" && !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(spec.InitialSHA) {
-					return c, errors.New("initial_sha requires a full SHA")
-				}
-				if spec.Timeout == "" {
-					spec.Timeout = "5m"
-				}
-				if _, err := Duration(spec.Timeout); err != nil {
-					return c, err
-				}
-			default:
-				return c, errors.New("install kind must be file, command, release or container")
-			}
-			if len(spec.Serial) > 0 || spec.Canary != "" {
-				if spec.ReceiptsDir == "" {
-					return c, errors.New("serial/canary requires receipts_dir")
-				}
-				names := append(append([]string{}, spec.Serial...), spec.Canary)
-				for _, host := range names {
-					if host != "" && (!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`).MatchString(host)) {
-						return c, errors.New("invalid serial/canary host label")
-					}
-				}
-				seenHosts := map[string]bool{}
-				for _, host := range spec.Serial {
-					if seenHosts[host] {
-						return c, errors.New("duplicate serial host")
-					}
-					seenHosts[host] = true
-				}
+			if e = validateInstall(&r.Install[j]); e != nil {
+				return e
 			}
 		}
 		family := ""
@@ -916,27 +914,93 @@ func Load(name string) (Config, error) {
 			if family == "" {
 				family = f
 			} else if family != f {
-				return c, errors.New("one repo inventory cannot mix file, command/release and container installs")
+				return errors.New("one repo inventory cannot mix file, command/release and container installs")
 			}
 		}
 		for _, g := range r.Deny {
 			if _, e = policy.Match(g, "probe"); e != nil {
-				return c, e
+				return e
 			}
 		}
 	}
+	return nil
+}
+
+// validateInstall defaults one install spec's kind and checks it for that kind.
+func validateInstall(spec *Install) error {
+	var e error
+	if spec.Kind == "" {
+		spec.Kind = "file"
+	}
+	if spec.PreDeploy != nil && (spec.Kind != "container" || spec.PreDeploy.Command == "") {
+		return errors.New("pre_deploy requires a container install and a command")
+	}
+	switch spec.Kind {
+	case "file":
+	case "container":
+		if e = validateContainer(spec); e != nil {
+			return e
+		}
+	case "command", "release":
+		if spec.Verify.Command == "" {
+			return errors.New("command/release installs require verify")
+		}
+		if spec.Kind == "command" && (spec.Command.Command == "" || !strings.Contains(strings.Join(spec.Command.Args, " "), "{sha}")) {
+			return errors.New("command install requires a pinned {sha} argument")
+		}
+		if spec.VerifyOutput == "" {
+			spec.VerifyOutput = "{sha}"
+		}
+		if !strings.Contains(spec.VerifyOutput, "{sha}") {
+			return errors.New("verify_output must include {sha}")
+		}
+		if spec.InitialSHA != "" && !fullSHA.MatchString(spec.InitialSHA) {
+			return errors.New("initial_sha requires a full SHA")
+		}
+		if spec.Timeout == "" {
+			spec.Timeout = "5m"
+		}
+		if _, err := Duration(spec.Timeout); err != nil {
+			return err
+		}
+	default:
+		return errors.New("install kind must be file, command, release or container")
+	}
+	if len(spec.Serial) > 0 || spec.Canary != "" {
+		if spec.ReceiptsDir == "" {
+			return errors.New("serial/canary requires receipts_dir")
+		}
+		names := append(append([]string{}, spec.Serial...), spec.Canary)
+		for _, host := range names {
+			if host != "" && (!hostLabel.MatchString(host)) {
+				return errors.New("invalid serial/canary host label")
+			}
+		}
+		seenHosts := map[string]bool{}
+		for _, host := range spec.Serial {
+			if seenHosts[host] {
+				return errors.New("duplicate serial host")
+			}
+			seenHosts[host] = true
+		}
+	}
+	return nil
+}
+
+// validateAdapters checks the notifier and sink.
+func validateAdapters(c *Config) error {
 	switch c.Notifier.Type {
 	case "", "noop", "stdout", "panewire":
 	default:
-		return c, errors.New("unknown notifier type")
+		return errors.New("unknown notifier type")
 	}
 	switch c.Sink.Type {
 	case "", "noop", "handoffkeep":
 	default:
-		return c, errors.New("unknown sink type")
+		return errors.New("unknown sink type")
 	}
 	if c.Notifier.Type == "panewire" && c.Notifier.Lane == "" {
-		return c, errors.New("panewire notifier requires lane")
+		return errors.New("panewire notifier requires lane")
 	}
 	if c.Notifier.FallbackLane == "" {
 		c.Notifier.FallbackLane = c.Notifier.Lane
@@ -945,43 +1009,48 @@ func Load(name string) (Config, error) {
 		c.Sink.ReopenState = "reopened"
 	}
 	if c.Sink.ReopenState != "reopened" {
-		return c, errors.New("sink.reopen_state must be reopened")
+		return errors.New("sink.reopen_state must be reopened")
 	}
+	return nil
+}
+
+// validateProfiles checks reviewer profiles, pairings and the default family, canonicalizing family names.
+func validateProfiles(c *Config) error {
 	for _, name := range slices.Sorted(maps.Keys(c.Review.Profiles)) {
 		p := c.Review.Profiles[name]
 		if name == "" || p.Family == "" || !ReviewerCommand(p.Command) {
-			return c, errors.New("review profiles require a name, family, and supported reviewer command")
+			return errors.New("review profiles require a name, family, and supported reviewer command")
 		}
 		if e := ValidateReviewer(p); e != nil {
-			return c, e
+			return e
 		}
 		p.Family = CanonicalFamily(p.Family)
 		if p.Family == "" {
-			return c, errors.New("review profiles require a name, family, and supported reviewer command")
+			return errors.New("review profiles require a name, family, and supported reviewer command")
 		}
 		c.Review.Profiles[name] = p
 	}
 	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
-		return c, errors.New("review.select must be pace or rank")
+		return errors.New("review.select must be pace or rank")
 	}
 	pairings := map[string][]string{}
 	for _, family := range slices.Sorted(maps.Keys(c.Review.Pairings)) {
 		names := c.Review.Pairings[family]
 		if family == "" || len(names) == 0 {
-			return c, errors.New("empty review pairing")
+			return errors.New("empty review pairing")
 		}
 		canonical := CanonicalFamily(family)
 		if canonical == "" {
-			return c, errors.New("empty review pairing")
+			return errors.New("empty review pairing")
 		}
 		if _, dup := pairings[canonical]; dup {
-			return c, errors.New("review pairings collide after family normalisation")
+			return errors.New("review pairings collide after family normalisation")
 		}
 		pairings[canonical] = names
 		for _, name := range names {
 			p, ok := c.Review.Profiles[name]
 			if !ok || p.Family == canonical {
-				return c, errors.New("pairings must name configured profiles from a different family")
+				return errors.New("pairings must name configured profiles from a different family")
 			}
 		}
 	}
@@ -998,10 +1067,10 @@ func Load(name string) (Config, error) {
 			}
 		}
 		if !ok {
-			return c, errors.New("review.default_family must name a configured profile family")
+			return errors.New("review.default_family must name a configured profile family")
 		}
 	}
-	return c, nil
+	return nil
 }
 
 func ValidGrade(s string) bool {
@@ -1122,6 +1191,11 @@ var (
 	// passed as single arguments (panewire splits --exclude-host on commas).
 	laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	hostName = laneName
+	// hostLabel names this host, configured hosts and serial/canary targets;
+	// machineID is a panewire machine id; fullSHA is a 40-hex commit.
+	hostLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+	machineID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+	fullSHA   = regexp.MustCompile(`^[a-f0-9]{40}$`)
 )
 
 func validContainerTarget(p string) bool {

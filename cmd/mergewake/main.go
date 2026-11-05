@@ -67,6 +67,35 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// ownFlagCommands parse their own flags and do not take the shared
+// --config/--apply/--repo set.
+var ownFlagCommands = map[string]func(context.Context, []string, io.Writer, io.Writer) error{
+	"report":       runReport,
+	"outcomes":     runOutcomes,
+	"archive-jobs": runArchiveJobs,
+	"notify":       runNotify,
+	"promote":      runPromote,
+	"admit":        runAdmit,
+	"server":       runServerStore,
+}
+
+// shadowMode decides, in one place, whether a shared-flag command only
+// observes. Without --apply every command observes, and --shadow always
+// forces it. land and watch are the exceptions: their opt-in is repository
+// policy, so --apply does not matter and only --shadow forces observation.
+// The daemon also observes until daemon.act is set. reap.act, checked inside
+// Reap, is reap's own acting gate on top of this.
+func shadowMode(command string, apply, forced, daemonAct bool) bool {
+	switch command {
+	case "land", "watch":
+		return forced
+	case "daemon":
+		return !apply || forced || !daemonAct
+	}
+	return !apply || forced
+}
+
 func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
 		_, e := fmt.Fprint(out, usage)
@@ -80,26 +109,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		_, err := fmt.Fprintln(out, commit)
 		return err
 	}
-	if args[0] == "report" {
-		return runReport(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "outcomes" {
-		return runOutcomes(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "archive-jobs" {
-		return runArchiveJobs(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "notify" {
-		return runNotify(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "promote" {
-		return runPromote(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "admit" {
-		return runAdmit(ctx, args[1:], out, stderr)
-	}
-	if args[0] == "server" {
-		return runServerStore(ctx, args[1:], out, stderr)
+	if sub, ok := ownFlagCommands[args[0]]; ok {
+		return sub(ctx, args[1:], out, stderr)
 	}
 	command := args[0]
 	switch command {
@@ -221,26 +232,20 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	// stall on an interval recorded by an earlier request.
 	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
-	o := pipeline.Options{DryRun: *dry, Shadow: !*apply}
+	o := pipeline.Options{DryRun: *dry, Shadow: shadowMode(command, *apply, shadow != nil && *shadow, c.Daemon.Act)}
 	if digest != nil {
 		o.Digest = *digest
 	}
 	if adopt != nil {
 		o.Adopt = *adopt
 	}
-	if shadow != nil {
-		o.Shadow = o.Shadow || *shadow
-	}
 	if pr != nil && (command == "reap" && *pr < 0 || command != "reap" && *pr <= 0) {
 		return errors.New("--pr must be positive")
 	}
 	switch command {
 	case "daemon":
-		o.Shadow = o.Shadow || !c.Daemon.Act
 		return runDaemon(ctx, &s, gh, *repo, o, stderr)
 	case "land":
-		// Landing's opt-in is repository policy; --shadow still forces observation.
-		o.Shadow = *shadow
 		return s.Land(ctx, r, *pr, o)
 	case "review":
 		return s.Review(ctx, r, *pr, *family, o)
@@ -249,7 +254,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "rollout":
 		return s.Rollout(ctx, r, o)
 	case "watch":
-		o.Shadow = *shadow
 		return poll(ctx, c.PollInterval, *once || *dry, func() error { return s.Watch(ctx, r, o) }, stderr)
 	case "reap":
 		if !c.Reap.Enabled {
