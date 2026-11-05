@@ -319,7 +319,9 @@ func (s *reviewSink) TaskJob(context.Context, string) (string, string, error) {
 }
 
 // Existing installer tests explicitly approve the bootstrap deployment.
-func (s *fakeSink) DeployDecision(context.Context, string, string) (bool, error) { return true, nil }
+func (s *fakeSink) DeployDecision(context.Context, string, string, time.Time) (bool, error) {
+	return true, nil
+}
 
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
 func (s *fakeSink) Record(context.Context, string, []byte) error { s.records++; return nil }

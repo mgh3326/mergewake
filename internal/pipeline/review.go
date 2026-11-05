@@ -126,27 +126,15 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if pr.State != "open" || pr.Draft {
 		return errors.New("review requires an open, ready PR")
 	}
-	head, e := s.GH.Head(ctx, r.Name, r.Branch)
+	needed, settled, e := s.reviewPassesNeeded(ctx, r, pr)
 	if e != nil {
 		return e
 	}
-	p, e := s.Policy(ctx, r, head)
-	if e != nil {
-		return e
-	}
-	files, e := s.GH.Files(ctx, r.Name, n)
-	if e != nil {
-		return e
-	}
-	if len(files) != pr.ChangedFiles {
+	if !settled {
 		// changed_files and the files list disagree just after a push: no
 		// usable data this round. The retry loop treats this sentinel as a
 		// skip, not a failure.
 		return fmt.Errorf("PR file list is settling: %w", github.ErrPollSkipped)
-	}
-	needed := 1
-	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
-		needed = 2
 	}
 	history, e := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
 	if e != nil {

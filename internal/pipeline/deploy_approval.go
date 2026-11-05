@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -83,15 +84,15 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 		review.Reasons = append(review.Reasons, "environment file identity unavailable")
 	}
 	var priorIdentity deployIdentity
-	identityFound, identityErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &priorIdentity)
+	identityFound, identityErr := fsutil.ReadJSON(filepath.Join(state, approvedInventoryName), &priorIdentity)
 	if identityErr != nil || !identityFound || priorIdentity.Config != identity.Config {
 		review.Reasons = append(review.Reasons, "host inventory approval missing or changed")
 	}
-	receiptName := "installed.json"
+	receiptName := rollout.FileReceiptName
 	if container {
 		receiptName = rollout.ContainerReceiptName
 	} else if len(m.Commands) > 0 {
-		receiptName = "command-installed.json"
+		receiptName = rollout.CommandReceiptName
 	}
 	var receipt struct {
 		Host     string            `json:"host"`
@@ -193,12 +194,12 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 		}{"hold", review})
 	}
 	decisions, ok := s.Sink.(interface {
-		DeployDecision(context.Context, string, string) (bool, error)
+		DeployDecision(context.Context, string, string, time.Time) (bool, error)
 	})
 	if !ok {
 		return false, fmt.Errorf("deployment held: handoffkeep decision adapter required (%s)", question)
 	}
-	approved, e := decisions.DeployDecision(ctx, r.DeployTask, question)
+	approved, e := decisions.DeployDecision(ctx, r.DeployTask, question, s.now())
 	if e != nil {
 		return false, fmt.Errorf("deployment held: %w", e)
 	}

@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -82,7 +84,8 @@ func parseSuites(b []byte) (map[string]Suite, error) {
 	if e := d.Decode(&m); e != nil {
 		return nil, fmt.Errorf("suite definitions: %w", e)
 	}
-	for repo, s := range m {
+	for _, repo := range slices.Sorted(maps.Keys(m)) {
+		s := m[repo]
 		if s.Version == "" || s.Main == "" || s.Pointer == "" || len(s.Workflows) == 0 {
 			return nil, fmt.Errorf("suite %s: version, main, pointer and workflows are required", repo)
 		}

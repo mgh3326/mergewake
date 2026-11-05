@@ -42,3 +42,20 @@ func TestAppendLineCreatesAndAppends(t *testing.T) {
 		t.Fatalf("%q %v", b, e)
 	}
 }
+
+func TestLockExcludesUntilUnlocked(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "state", "lock")
+	unlock, e := Lock(name, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e := Lock(name, false); e == nil {
+		t.Fatal("second non-blocking lock acquired a held lock")
+	}
+	unlock()
+	again, e := Lock(name, true)
+	if e != nil {
+		t.Fatalf("lock not released: %v", e)
+	}
+	again()
+}

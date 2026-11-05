@@ -3,15 +3,16 @@ package pipeline
 import (
 	"context"
 	"errors"
-	"github.com/mgh3326/mergewake/internal/config"
-	"github.com/mgh3326/mergewake/internal/fsutil"
-	"github.com/mgh3326/mergewake/internal/manifest"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
 func TestRolloutWindowSerializesServices(t *testing.T) {

@@ -127,26 +127,14 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 
 // retryReviewStatus distinguishes a live lease from an unsuccessful attempt.
 func (s *Service) retryReviewStatus(ctx context.Context, r config.Repo, pr github.Pull) (bool, bool, error) {
-	head, err := s.GH.Head(ctx, r.Name, r.Branch)
+	needed, settled, err := s.reviewPassesNeeded(ctx, r, pr)
 	if err != nil {
 		return false, false, err
 	}
-	p, err := s.Policy(ctx, r, head)
-	if err != nil {
-		return false, false, err
-	}
-	files, err := s.GH.Files(ctx, r.Name, pr.Number)
-	if err != nil {
-		return false, false, err
-	}
-	if len(files) != pr.ChangedFiles {
+	if !settled {
 		// The file list is still settling: skip this pass without a failure,
 		// as for a live lease.
 		return false, true, nil
-	}
-	needed := 1
-	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
-		needed = 2
 	}
 	history, err := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login)
 	if err != nil {
@@ -181,4 +169,30 @@ func (s *Service) retryReviewStatus(ctx context.Context, r config.Repo, pr githu
 		}
 	}
 	return false, false, nil
+}
+
+// reviewPassesNeeded is how many independent passes a PR head needs under the
+// base branch's trusted policy: two for a guarded blocking change, else one.
+// settled is false while GitHub's changed_files and file list still disagree
+// just after a push; callers treat that round as having no usable data.
+func (s *Service) reviewPassesNeeded(ctx context.Context, r config.Repo, pr github.Pull) (needed int, settled bool, err error) {
+	head, e := s.GH.Head(ctx, r.Name, r.Branch)
+	if e != nil {
+		return 0, false, e
+	}
+	p, e := s.Policy(ctx, r, head)
+	if e != nil {
+		return 0, false, e
+	}
+	files, e := s.GH.Files(ctx, r.Name, pr.Number)
+	if e != nil {
+		return 0, false, e
+	}
+	if len(files) != pr.ChangedFiles {
+		return 0, false, nil
+	}
+	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+		return 2, true, nil
+	}
+	return 1, true, nil
 }

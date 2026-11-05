@@ -4,11 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -128,7 +125,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			if e != nil {
 				// Keep what was already delivered; a retry of the failed batch
 				// reuses its event ID, which panewire dedupes.
-				if changed && !o.DryRun {
+				if changed && o.Reporting() {
 					e = errors.Join(e, s.saveDeliveries(r.Name, ledger))
 				}
 				return errors.Join(followErr, e)
@@ -137,7 +134,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			changed = true
 		}
 	}
-	if changed && !o.DryRun {
+	if changed && o.Reporting() {
 		followErr = errors.Join(followErr, s.saveDeliveries(r.Name, ledger))
 	}
 	return followErr
@@ -381,7 +378,7 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	if rt.via == "unknown author; desk" {
 		typ = "decision"
 	}
-	if !o.DryRun {
+	if o.Reporting() {
 		reportCtx, cancel := reportContext(ctx)
 		defer cancel()
 		if e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID, Text: d.Text, Lane: lane, Type: typ}); e != nil {
@@ -448,7 +445,7 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 		aged := now.Sub(d.SentAt) >= s.Config.Daemon.PR.Findings.EscalationWindow() || (s.Config.Daemon.PR.Findings.EscalationRounds() > 0 && len(d.Heads) >= s.Config.Daemon.PR.Findings.EscalationRounds())
 		if aged {
 			text := fmt.Sprintf("[mergewake] ESC %s#%d | findings still open after %d head rounds and %s | %s", r.Name, pr.Number, len(d.Heads), now.Sub(d.SentAt).Round(time.Minute), d.Text)
-			if !o.DryRun && d.Owner != "" && d.Owner != d.Lane {
+			if o.Reporting() && d.Owner != "" && d.Owner != d.Lane {
 				nctx, cancel := reportContext(ctx)
 				e := s.Notifier.Notify(nctx, integrations.Event{ID: d.ID + "-escalated", Text: clip(text, findingsLaneText), Lane: d.Owner, Type: "decision"})
 				cancel()
@@ -484,7 +481,7 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			d.AckedAt, d.AckBy, changed = now, "inbox", true
 			errs = append(errs, s.audit(r.Name, "findings-acked", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
 		case d.ResentAt.IsZero() && now.Sub(d.SentAt) >= window:
-			if !o.DryRun {
+			if o.Reporting() {
 				reportCtx, cancel := reportContext(ctx)
 				e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID + "-resend", Text: resendText(d.Text, window), Lane: d.Lane, Type: "findings"})
 				cancel()
@@ -514,16 +511,11 @@ func (s *Service) deliveriesFile(repo string) string {
 }
 
 func (s *Service) loadDeliveries(repo string) ([]findingsDelivery, error) {
-	b, e := os.ReadFile(s.deliveriesFile(repo))
-	if errors.Is(e, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if e != nil {
-		return nil, e
-	}
 	var ds []findingsDelivery
-	if e = json.Unmarshal(b, &ds); e != nil {
+	if found, e := fsutil.ReadJSON(s.deliveriesFile(repo), &ds); found && e != nil {
 		return nil, fmt.Errorf("%s: %w", s.deliveriesFile(repo), e)
+	} else if e != nil {
+		return nil, e
 	}
 	return ds, nil
 }
@@ -535,9 +527,5 @@ func (s *Service) saveDeliveries(repo string, ds []findingsDelivery) error {
 	if len(ds) > 1000 {
 		ds = ds[len(ds)-1000:]
 	}
-	b, e := json.Marshal(ds)
-	if e != nil {
-		return e
-	}
-	return fsutil.Atomic(s.deliveriesFile(repo), b, 0600)
+	return fsutil.WriteJSON(s.deliveriesFile(repo), ds)
 }

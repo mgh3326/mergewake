@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -84,6 +83,9 @@ type Feed struct {
 	// FirstRetry is the backoff after a first failed post; zero means
 	// feedFirstRetry.
 	FirstRetry time.Duration
+	// Now stamps queued entries, which also orders delivery; nil means
+	// time.Now. Discord rate-limit waits stay on the wall clock.
+	Now func() time.Time
 
 	wake      chan struct{}
 	notBefore map[string]time.Time
@@ -102,6 +104,13 @@ func NewFeed(c config.Config, log *slog.Logger) *Feed {
 		wake:      make(chan struct{}, 1),
 		notBefore: map[string]time.Time{},
 	}
+}
+
+func (f *Feed) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
 }
 
 // wants reports whether repo's events of this channel have anywhere to go.
@@ -124,18 +133,11 @@ func (f *Feed) outboxFile(repo, key string) string {
 // sender, and `mergewake notify`, which is a separate process. It is held only
 // for local file work, never across a post.
 func (f *Feed) locked(fn func() error) error {
-	dir := filepath.Join(f.StateDir, "discord")
-	if e := os.MkdirAll(dir, 0700); e != nil {
-		return e
-	}
-	l, e := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0600)
+	unlock, e := fsutil.Lock(filepath.Join(f.StateDir, "discord", "lock"), true)
 	if e != nil {
 		return e
 	}
-	defer l.Close()
-	if e = syscall.Flock(int(l.Fd()), syscall.LOCK_EX); e != nil {
-		return e
-	}
+	defer unlock()
 	return fn()
 }
 
@@ -181,7 +183,7 @@ func (f *Feed) Emit(ev feedEvent) error {
 			f.Log.Warn("discord message dropped", "repo", ev.Repo, "key", key, "reason", "outbox full")
 			return sent.add(key)
 		}
-		return fsutil.WriteJSON(name, feedEntry{Repo: ev.Repo, Key: key, Kind: ev.Kind, Queued: time.Now().UTC(), Message: ev.Message})
+		return fsutil.WriteJSON(name, feedEntry{Repo: ev.Repo, Key: key, Kind: ev.Kind, Queued: f.now().UTC(), Message: ev.Message})
 	})
 	if e != nil {
 		return e

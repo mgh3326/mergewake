@@ -41,7 +41,7 @@ type closedLister interface {
 // post spends no API calls. A dry run posts nothing; shadow mode still posts,
 // like the pr role's lane events: reporting is not acting.
 func (s *Service) feedOn(repo, channel string, o Options) bool {
-	return s.Feed != nil && !o.DryRun && s.Feed.wants(repo, channel)
+	return s.Feed != nil && o.Reporting() && s.Feed.wants(repo, channel)
 }
 
 // feedError records a feed problem without returning it: a daemon role backs

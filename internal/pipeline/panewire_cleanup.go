@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -134,7 +133,7 @@ func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
 // the hub's guarded removal. It never changes the review outcome, and it runs
 // on a context detached from the pass so an expired deadline cannot skip it.
 func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerPane) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+	ctx, cancel := reportContext(parent)
 	defer cancel()
 	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: p.checkout}}
 	if !p.confirmed {

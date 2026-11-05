@@ -77,19 +77,12 @@ func (d *Daemon) Trigger(role string) bool {
 	}
 	return true
 }
-func lock(name string) (*os.File, error) {
-	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
+func lock(name string) (func(), error) {
+	unlock, err := fsutil.Lock(name, false)
+	if errors.Is(err, syscall.EWOULDBLOCK) {
 		return nil, fmt.Errorf("daemon role already running: %w", err)
 	}
-	return f, nil
+	return unlock, err
 }
 func (d *Daemon) now() time.Time {
 	if d.Now != nil {
@@ -128,10 +121,10 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 		}
 		lockDir = filepath.Join(cache, "mergewake", "daemon-locks")
 	}
-	var locks []*os.File
+	var locks []func()
 	defer func() {
-		for _, f := range locks {
-			f.Close()
+		for _, unlock := range locks {
+			unlock()
 		}
 	}()
 	for _, l := range loops {
@@ -144,11 +137,11 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 		if exists || (l.Role != "pr" && l.Role != "watch" && l.Role != "release" && l.Role != "rollout" && l.Role != "reap") {
 			return errors.New("invalid or duplicate daemon role")
 		}
-		f, err := lock(filepath.Join(lockDir, l.Role+".lock"))
+		unlock, err := lock(filepath.Join(lockDir, l.Role+".lock"))
 		if err != nil {
 			return fmt.Errorf("%s: %w", l.Role, err)
 		}
-		locks = append(locks, f)
+		locks = append(locks, unlock)
 		d.mu.Lock()
 		d.wake[l.Role] = make(chan struct{}, 1)
 		d.mu.Unlock()

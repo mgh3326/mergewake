@@ -21,6 +21,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/rollout"
 	"github.com/mgh3326/mergewake/internal/superfan"
 )
 
@@ -345,7 +346,7 @@ func status(c config.Config, repo string, out io.Writer) error {
 			}
 			continue
 		}
-		b, e := os.ReadFile(filepath.Join(c.StateDir, r.Name, "rollout", "installed.json"))
+		b, e := os.ReadFile(filepath.Join(rollout.StateDir(c.StateDir, r.Name), rollout.FileReceiptName))
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))
 			continue
