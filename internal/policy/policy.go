@@ -74,6 +74,30 @@ type FastLane struct {
 	MaxChangedLines int `yaml:"max_changed_lines"`
 }
 
+// BotUpdates names the dependency bots whose patch updates land without a
+// review and the files such an update may change. Land is "patch", the only
+// mode.
+type BotUpdates struct {
+	Authors []string `yaml:"authors"`
+	Paths   []string `yaml:"paths"`
+	Land    string   `yaml:"land"`
+}
+
+// Lists reports whether a PR opened by login, a GitHub user of userType, is by
+// a listed bot. The login must match exactly (case aside): NormalizeAuthor
+// would let a human account named like the bot pass.
+func (b *BotUpdates) Lists(login, userType string) bool {
+	if b == nil || userType != "Bot" {
+		return false
+	}
+	for _, a := range b.Authors {
+		if strings.EqualFold(a, login) {
+			return true
+		}
+	}
+	return false
+}
+
 // GateVerdict is the graded outcome for one PR classification. Blocking
 // findings stop the merge until fixed; triage findings gate it until answered.
 type GateVerdict struct {
@@ -346,6 +370,9 @@ type Policy struct {
 	Blocking         []Rule      `yaml:"blocking"`
 	ReviewGate       *ReviewGate `yaml:"review_gate"`
 	FastLane         *FastLane   `yaml:"fast_lane"`
+	// BotUpdates opts the repository into landing a dependency bot's patch
+	// updates without review. Absent keeps every bot PR out of the land path.
+	BotUpdates *BotUpdates `yaml:"bot_updates"`
 	// AnyRefWorkflow names a workflow file in .github/workflows that runs the
 	// watch checks for any commit (workflow_dispatch with input ref). When it
 	// is set, watch dispatches it for a commit bisect needs but has no result
@@ -458,6 +485,24 @@ func (p Policy) Validate() error {
 		for _, a := range p.ReviewGate.IgnoreAuthors {
 			if strings.TrimSpace(a) == "" {
 				return errors.New("review_gate ignore_authors must be nonempty")
+			}
+		}
+	}
+	if b := p.BotUpdates; b != nil {
+		if b.Land != "patch" {
+			return fmt.Errorf("bot_updates land must be %q", "patch")
+		}
+		if len(b.Authors) == 0 || len(b.Paths) == 0 {
+			return errors.New("bot_updates requires authors and paths")
+		}
+		for _, a := range b.Authors {
+			if strings.TrimSpace(a) == "" || strings.TrimSpace(a) != a {
+				return errors.New("bot_updates authors must be nonempty logins")
+			}
+		}
+		for _, g := range b.Paths {
+			if _, err := Match(g, "probe"); err != nil {
+				return err
 			}
 		}
 	}

@@ -121,6 +121,25 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 	}
 }
 
+// judgeChecks folds the required checks' states into what the gate acts on:
+// check_failed reasons for red ones, the cancelled ones (completed without a
+// verdict on the head, so they hold nothing) and whether any is still
+// incomplete. Every gate judges checks through it.
+func judgeChecks(states map[string]github.CI, required []string) (failed, cancelled []string, pending bool) {
+	for _, name := range required {
+		switch states[name] {
+		case github.Red:
+			failed = append(failed, "check_failed:"+name)
+		case github.Green:
+		case github.Cancelled:
+			cancelled = append(cancelled, name)
+		default:
+			pending = true
+		}
+	}
+	return failed, cancelled, pending
+}
+
 // mergeGate evaluates the repo session's merge gate once for head H:
 // every required check green or completed without a verdict on H, no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
@@ -137,18 +156,9 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if e != nil {
 		return v, e
 	}
-	pending := false
-	for _, name := range p.RequiredChecks {
-		switch states[name] {
-		case github.Red:
-			v.Reasons = append(v.Reasons, "check_failed:"+name)
-		case github.Green:
-		case github.Cancelled:
-			v.Review.ChecksCancelled = append(v.Review.ChecksCancelled, name)
-		default:
-			pending = true
-		}
-	}
+	failed, cancelled, pending := judgeChecks(states, p.RequiredChecks)
+	v.Reasons = append(v.Reasons, failed...)
+	v.Review.ChecksCancelled = cancelled
 	if pending {
 		// A sibling failure is already final for this head, and so is a
 		// conflict: GitHub runs no pull_request workflow for a conflicting PR,

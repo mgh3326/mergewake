@@ -17,6 +17,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/pipeline"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 type lockedWriter struct {
@@ -187,7 +188,17 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	for _, pr := range prs {
 		seen[pr.Number] = true
 	}
-	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots)
+	// A policy that lists dependency bots keeps their PRs out of the drop and
+	// out of review: they are settled by Land's bot-patch gate alone. An
+	// unreadable policy lists none, so the bots stay dropped as before.
+	var listed []string
+	if hasBotPull(prs) {
+		var err error
+		if listed, err = s.BotUpdateAuthors(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
+		}
+	}
+	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots, listed...)
 	// Before the per-PR work: a review can hold this pass for minutes.
 	s.FeedPRs(ctx, r, prs, o)
 	// A review waits for its reviewer pane, so one slow review used to hold
@@ -209,6 +220,10 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		if pr.Draft {
 			continue
 		}
+		if isListedBot(pr, listed) {
+			errs = append(errs, botLand(ctx, s, r, pr.Number, options[i])...)
+			continue
+		}
 		// An unreadable or poll-skipped marker is not done: the PR keeps
 		// today's order below.
 		if done, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); e != nil || !done {
@@ -227,7 +242,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	var settling sync.Mutex
 	var running sync.WaitGroup
 	for i, pr := range prs {
-		if pr.Draft {
+		if pr.Draft || isListedBot(pr, listed) {
 			continue
 		}
 		// A cancelled pass starts no further PR and returns once the running
@@ -294,17 +309,42 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	return errs
 }
 
-// skipBotPulls drops PRs opened by bot accounts when skip is set; they stay in
-// the open set for outcome reconciliation.
-func skipBotPulls(prs []github.Pull, skip bool) []github.Pull {
+// skipBotPulls drops PRs opened by bot accounts when skip is set, except those
+// by a bot in listed; they stay in the open set for outcome reconciliation.
+func skipBotPulls(prs []github.Pull, skip bool, listed ...string) []github.Pull {
 	if !skip {
 		return prs
 	}
 	out := make([]github.Pull, 0, len(prs))
 	for _, pr := range prs {
-		if pr.User.Type != "Bot" {
+		if pr.User.Type != "Bot" || isListedBot(pr, listed) {
 			out = append(out, pr)
 		}
 	}
 	return out
+}
+
+func hasBotPull(prs []github.Pull) bool {
+	for _, pr := range prs {
+		if pr.User.Type == "Bot" {
+			return true
+		}
+	}
+	return false
+}
+
+// isListedBot reports whether pr is by a bot the policy lists. It is the same
+// test Land's gate selection applies.
+func isListedBot(pr github.Pull, listed []string) bool {
+	return (&policy.BotUpdates{Authors: listed}).Lists(pr.User.Login, pr.User.Type)
+}
+
+// botLand settles a listed bot's PR: Land decides it with the bot-patch gate,
+// merging it or telling the desk why not. It delivers no findings, sends no
+// verdict notice and starts no review.
+func botLand(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	if e := s.Land(ctx, r, n, o); e != nil {
+		return []error{fmt.Errorf("PR %d land: %w", n, e)}
+	}
+	return nil
 }
