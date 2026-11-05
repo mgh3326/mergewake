@@ -432,16 +432,6 @@ func TestReviewerFinishedWithoutResultIsReplaced(t *testing.T) {
 	}
 }
 
-func TestReviewerTotalBudgetUsesRecordedTime(t *testing.T) {
-	s, _, r, runner, c := interruptedReviewer(t)
-	c.t = c.t.Add(5 * time.Second)
-	err := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrReviewUnavailable) || len(runner.spawns) != 1 {
-		t.Fatalf("err=%v spawns=%d", err, len(runner.spawns))
-	}
-	readReviewerJob(t, s, r, 1)
-}
-
 func TestReviewerLiveLeaseRenewsAndExcludesOtherHost(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	ref := claimRef(7, shaA, 1)

@@ -197,15 +197,6 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if !acquired && (!resumed || leaseSHA == "" || rj.LeaseSHA != leaseSHA) {
 		return out, errPassPending
 	}
-	if resumed {
-		timeout, err := config.Duration(s.Config.Review.Timeout)
-		if err != nil {
-			return out, err
-		}
-		if s.now().Sub(rj.Recorded) >= timeout {
-			return out, fmt.Errorf("%w: reviewer %s exceeded review deadline: %w", ErrReviewUnavailable, rj.Label, context.DeadlineExceeded)
-		}
-	}
 	if resumed && !acquired {
 		renewer, ok := s.GH.(interface {
 			RenewReviewLease(context.Context, string, string, string) (string, bool, error)
@@ -294,6 +285,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	spawn := true
 	var collected []byte
 	if resumed {
+		// The record is answered in this order, and the total budget comes after
+		// the first two: a completed job or an available result is collected, a
+		// finished pane without one is replaced, and only then does a record older
+		// than review.timeout count as lost. A record never stays while every run
+		// would return the same budget error.
+		timeout, err := config.Duration(s.Config.Review.Timeout)
+		if err != nil {
+			return out, err
+		}
+		overBudget := s.now().Sub(rj.Recorded) >= timeout
 		rec, e := x.job(ctx, label)
 		state := rec.State
 		if e == nil && state != "completed" {
@@ -301,45 +302,36 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if err != nil {
 				return out, err
 			}
-			if finished {
+			// An escalated or lost job is held for the operator by the switch below,
+			// whatever its age.
+			if finished || (overBudget && state != "escalated" && state != "lost") {
 				var found bool
 				collected, found, e = x.availableFindings(ctx, label, findingsPath)
 				if e != nil {
 					return out, e
 				}
-				if !found {
-					collectErr := errors.New("finished pane has no findings")
+				if found {
+					spawn = false
+				} else {
 					fresh, err := x.job(ctx, label)
 					if err != nil {
 						return out, err
 					}
-					if fresh.State != "completed" {
-						lost := &reviewResultLost{label, "pane finished without a result", fresh.Profile, reportPath, collectErr}
-						auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
-						noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
-						if auditErr != nil || noticeErr != nil {
-							return out, errors.Join(lost, auditErr, noticeErr)
+					if fresh.State == "completed" {
+						spawn = false
+					} else {
+						cause := "pane finished without a result"
+						if !finished {
+							cause = "reviewer still running past the review deadline"
 						}
-						if fresh.OwnerLane == "" {
-							return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
-						}
-						_, err = s.Runner.Run(ctx, cfg.Command, []string{"job", "close", label, "--lane", fresh.OwnerLane, "--outcome", "abandoned", "--reason", "reviewer finished without a result"}, "", "")
-						if err != nil {
-							return out, errors.Join(lost, err)
-						}
-						if err = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
-							return out, err
-						}
-						if rj.Replacements >= 1 {
-							return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
-						}
-						plan.replacements = rj.Replacements + 1
-						return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+						return x.replaceLostReviewer(ctx, plan, rj, fresh, cause, leaseSHA)
 					}
-				} else {
-					spawn = false
 				}
 			}
+		} else if errors.Is(e, integrations.ErrJobNotFound) && overBudget {
+			// No job record means no hub claim to release: the record goes and the
+			// pass is replaced once.
+			return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job record missing past the review deadline", leaseSHA)
 		}
 		switch {
 		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
@@ -554,6 +546,39 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.fallback = note
 	keepJob = true
 	return out, nil
+}
+
+// replaceLostReviewer is the lost path for a resumed reviewer that will not
+// return a result: it audits and notifies, closes the job so its hub claim is
+// released (a job with no record has none), drops the record and runs the pass
+// again once under a new label with the held lease. After a replacement it
+// returns review-unavailable and leaves no record behind.
+func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPlan, rj reviewerJob, job integrations.JobRecord, cause, leaseSHA string) (passOutcome, error) {
+	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
+	out := passOutcome{}
+	reportPath := filepath.Join(cfg.Jobs, rj.Label, "report.md")
+	lost := &reviewResultLost{rj.Label, cause, job.Profile, reportPath, errors.New(cause)}
+	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
+	if auditErr != nil || noticeErr != nil {
+		return out, errors.Join(lost, auditErr, noticeErr)
+	}
+	if job.State != "" {
+		if job.OwnerLane == "" {
+			return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
+		}
+		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil {
+			return out, errors.Join(lost, err)
+		}
+	}
+	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
+		return out, err
+	}
+	if rj.Replacements >= 1 {
+		return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
+	}
+	plan.replacements = rj.Replacements + 1
+	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
