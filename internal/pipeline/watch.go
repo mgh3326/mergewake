@@ -433,10 +433,8 @@ func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []
 
 // recoveryTrailers copies the culprit's PR-body values, falling back to its head commit.
 func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	commit, err := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-	if err != nil {
-		return "", err
-	}
+	var message string
+	loaded := false
 	var lines []string
 	for _, key := range []string{"Mergewake-Task", "Mergewake-Grade", "Mergewake-Tier", "Mergewake-Notify-Lane"} {
 		value := trailer(pr.Body, key)
@@ -453,7 +451,14 @@ func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github
 			}
 		}
 		if !valid(value) {
-			value = trailer(commit.Commit.Message, key)
+			if !loaded {
+				commit, err := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+				if err != nil {
+					return "", err
+				}
+				message, loaded = commit.Commit.Message, true
+			}
+			value = trailer(message, key)
 		}
 		if valid(value) {
 			lines = append(lines, key+": "+value)
