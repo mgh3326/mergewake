@@ -46,18 +46,32 @@ type Outcome struct {
 	FirstCIGreen *bool                     `json:"first_ci_green"`
 	Findings     map[string]int            `json:"findings_by_severity"`
 	Reviews      map[string]map[string]int `json:"reviews_by_head"`
-	Decision     string                    `json:"decision"`
-	Action       string                    `json:"action"`
-	Shadow       bool                      `json:"shadow"`
-	Final        bool                      `json:"finalized"`
-	TimeToMerge  *float64                  `json:"time_to_merge_s"`
-	Reverted     *bool                     `json:"reverted_within_7d"`
-	RevertPR     int                       `json:"revert_pr,omitempty"`
-	RevertURL    string                    `json:"revert_url,omitempty"`
-	UpdatedAt    time.Time                 `json:"updated_at"`
+	// ReviewersByHead names, by head and pass number, the reviewer each posted
+	// pass ran as, as its receipt records it.
+	ReviewersByHead map[string]map[string]string `json:"reviewers_by_head,omitempty"`
+	Decision        string                       `json:"decision"`
+	Action          string                       `json:"action"`
+	Shadow          bool                         `json:"shadow"`
+	Final           bool                         `json:"finalized"`
+	TimeToMerge     *float64                     `json:"time_to_merge_s"`
+	Reverted        *bool                        `json:"reverted_within_7d"`
+	RevertPR        int                          `json:"revert_pr,omitempty"`
+	RevertURL       string                       `json:"revert_url,omitempty"`
+	UpdatedAt       time.Time                    `json:"updated_at"`
 	// ReviewBlocked holds, by head, why that head's review cannot start, such
 	// as "blocked: missing-task-trailer". A blocked head has no review.
 	ReviewBlocked map[string]string `json:"review_blocked_by_head,omitempty"`
+}
+
+// SetReviewer records the reviewer of one pass on a head.
+func (v *Outcome) SetReviewer(head, pass, reviewer string) {
+	if v.ReviewersByHead == nil {
+		v.ReviewersByHead = map[string]map[string]string{}
+	}
+	if v.ReviewersByHead[head] == nil {
+		v.ReviewersByHead[head] = map[string]string{}
+	}
+	v.ReviewersByHead[head][pass] = reviewer
 }
 
 func (v Outcome) Attributed() bool {
@@ -328,6 +342,7 @@ func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
 
 type Aggregate struct {
 	AttributionMissing int            `json:"attribution_missing"`
+	GradeUnknown       int            `json:"grade_unknown"`
 	WithFixes          int            `json:"with_fixes"`
 	CleanPass          int            `json:"clean_pass"`
 	Failure            int            `json:"failure"`
@@ -388,6 +403,9 @@ func Report(values []Outcome, since time.Time) []Aggregate {
 		}
 		if !v.Attributed() {
 			g.AttributionMissing++
+		}
+		if v.Grade == "" {
+			g.GradeUnknown++
 		}
 		g.Seen++
 		if v.Final {
