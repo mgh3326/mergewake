@@ -367,7 +367,7 @@ func revertSetup(t *testing.T, mergedAgo time.Duration) (*Service, *outcomeGH, *
 	s, g, hk, r := hkSetup(t)
 	merged := time.Now().UTC().Add(-mergedAgo).Format(time.RFC3339)
 	g.pull.State, g.pull.Merged, g.pull.MergedAt = "closed", true, &merged
-	g.pull.Body = "Mergewake-Author-Profile: example\nMergewake-Author-Model: example-model\nMergewake-Grade: B\nMergewake-Task: 2909\n"
+	g.pull.Body = "Mergewake-Author-Profile: example\nMergewake-Author-Model: example-model\nMergewake-Grade: B\nMergewake-Tier: T1\nMergewake-Task: 2909\n"
 	source := &outcomeGH{fakeGH: g, first: true, recovery: github.Pull{Number: 9, State: "open"}}
 	s.GH = source
 	if e := s.ledger().Update(r.Name, 7, func(v *outcomes.Outcome) { v.RevertPR = 9 }); e != nil {
