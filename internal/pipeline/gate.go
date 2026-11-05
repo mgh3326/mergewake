@@ -124,7 +124,8 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 // base branch an ancestor of H, and the PR mergeable. A review covers a patch,
 // not a SHA: a head whose patch id equals a reviewed head's inherits that
 // head's passes, so merging the base into a head costs a CI run, not a review. A pending required
-// check waits silently unless a sibling already failed; mergeable unknown
+// check waits silently unless a sibling already failed or the PR conflicts
+// (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
@@ -271,7 +272,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	if !fresh {
 		v.Reasons = append(v.Reasons, "base_stale")
 	}
-	if (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty" {
+	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
 	}
 	switch {
@@ -281,6 +282,11 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// conflicting reports whether GitHub says the PR cannot merge into its base.
+func conflicting(pr github.Pull) bool {
+	return (pr.Mergeable != nil && !*pr.Mergeable) || pr.MergeableState == "dirty"
 }
 
 // linesVerified reports whether the PR's additions and deletions equal the
