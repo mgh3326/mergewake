@@ -495,6 +495,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
+		if reason == "conflict" {
+			return true
+		}
 		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
