@@ -140,7 +140,7 @@ func TestReapReviewer_A_I1_I2_I4_I5_I6_ClosesPaneAndRemovesWorktree(t *testing.T
 		t.Fatalf("closes: %v", closes)
 	}
 	removes := f.hub.ops("worktree.remove")
-	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label || removes[0]["expect_head"] != headSHA || removes[0]["base"] != "main" {
+	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label || removes[0]["detached"] != true || removes[0]["expect_head"] != headSHA || removes[0]["base"] != "main" {
 		t.Fatalf("removes: %v", removes)
 	}
 	if len(f.run.calls) != 0 {

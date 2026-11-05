@@ -126,8 +126,18 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
 				return
 			}
+			// The node refuses a detached worktree unless the request says
+			// detached, and a branch worktree when it does (panewire
+			// node_worktree.go worktree.remove).
+			args := body["args"].(map[string]any)
+			wantDetached, _ := args["detached"].(bool)
 			outcome := h.removeOutcome
-			if outcome == "" {
+			switch isDetached := h.detached[args["cwd"].(string)]; {
+			case isDetached && !wantDetached:
+				outcome = "detached"
+			case !isDetached && wantDetached:
+				outcome = "not_detached"
+			case outcome == "":
 				outcome = "removed"
 			}
 			if h.dropRemoved && outcome == "removed" {
@@ -193,7 +203,7 @@ func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
 	removes := hub.ops("worktree.remove")
-	if len(removes) != 1 || len(removes[0]) != 4 || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
+	if len(removes) != 1 || len(removes[0]) != 5 || removes[0]["detached"] != false || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
 		t.Fatalf("remove args: %#v", removes)
 	}
 }

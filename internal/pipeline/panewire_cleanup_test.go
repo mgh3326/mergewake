@@ -100,7 +100,8 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		if o.agentStatus != "" {
 			pane["agent_status"] = o.agentStatus
 		}
-		hub.wtPaths = map[string]bool{cwd: true}
+		// Reviewer checkouts are detached, as on a real node.
+		hub.detached = map[string]bool{cwd: true}
 		if o.expireAfterSpawn {
 			cancel()
 		}
