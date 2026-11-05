@@ -35,6 +35,8 @@ func (e panewireExit) ExitCode() int { return int(e) }
 type panewireRunner struct {
 	fakeRunner
 	refuse map[string]int // panewire --role → exit status
+	// exits, when set, is the exit status of each spawn in turn (0 runs it).
+	exits []int
 	// refuseStderr, when set, is the stderr a refused spawn wrote.
 	refuseStderr string
 	findings     string // "" writes no findings file
@@ -113,6 +115,13 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 				return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(code), Stderr: r.refuseStderr}
 			}
 			return nil, panewireExit(code)
+		}
+		if len(r.exits) > 0 {
+			code := r.exits[0]
+			r.exits = r.exits[1:]
+			if code != 0 {
+				return nil, panewireExit(code)
+			}
 		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])
 		label := arg(args, "-l")

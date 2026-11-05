@@ -78,6 +78,9 @@ type PanewireReview struct {
 	// neither only a pane on this host can return findings.
 	Lane         string   `yaml:"lane"`
 	ExcludeHosts []string `yaml:"exclude_hosts"`
+	// StaleAfter is how long a pass's recorded reviewer job may stay live
+	// before the desk is told; empty means twice review.timeout.
+	StaleAfter string `yaml:"stale_after"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
