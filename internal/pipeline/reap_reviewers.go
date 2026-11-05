@@ -441,7 +441,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteStop
 	}
 	remover, ok := hs.ops.(interface {
-		WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
+		WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
 	})
 	if !hs.viaHub || !ok {
 		w.record(rec, "pending-cleanup", "no hub for guarded removal")
@@ -477,7 +477,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "would-remove", "")
 		return remoteDone
 	}
-	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil)
+	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil, true)
 	if e != nil {
 		w.record(rec, "error", "worktree remove: "+e.Error())
 		return remoteStop

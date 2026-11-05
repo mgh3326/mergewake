@@ -750,12 +750,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					continue
 				}
 				remover, ok := c.hs.ops.(interface {
-					WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
+					WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
 				})
 				if !ok {
 					rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
 				} else {
-					result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable)
+					result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false)
 					if err != nil {
 						rec.Result, rec.Reason = "error", err.Error()
 					} else {

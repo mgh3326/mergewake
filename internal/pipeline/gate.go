@@ -13,6 +13,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
@@ -151,6 +152,14 @@ func judgeChecks(states map[string]github.CI, required []string) (failed, cancel
 // (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
+	v, err := s.mergeGateResult(ctx, r, pr, p, baseHead)
+	if err == nil {
+		tracing.Verdict(ctx, v.State, v.Reasons)
+	}
+	return v, err
+}
+
+func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
 	states, e := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {

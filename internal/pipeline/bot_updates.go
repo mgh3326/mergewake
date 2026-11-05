@@ -11,6 +11,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // botPatchReason marks the land records of the bot-patch path, the only path
@@ -28,6 +29,14 @@ const botNoticeState = "bot_update"
 // merge it with no unresolved thread. A pending check or an unknown mergeable
 // state waits quietly; any other reason is blocked and goes to the desk.
 func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
+	v, err := s.botGateResult(ctx, r, pr, p, baseHead)
+	if err == nil {
+		tracing.Verdict(ctx, v.State, v.Reasons)
+	}
+	return v, err
+}
+
+func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
 	states, e := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {

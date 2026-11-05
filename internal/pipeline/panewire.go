@@ -19,6 +19,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // panewireRefused is panewire's role/seat/family refusal: with --role reviewer it
@@ -285,14 +286,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			args = rj.Args
 		}
-		stdout, e = s.Runner.Run(ctx, cfg.Command, args, "", "")
+		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+		stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+		tracing.Finish(runSpan)
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = append(slices.Clone(rj.Args[:len(rj.Args)-2]), "--role", "worker")
 			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
 				return out, saveErr
 			}
-			stdout, e = s.Runner.Run(ctx, cfg.Command, rj.Args, "", "")
+			runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = s.Runner.Run(runCtx, cfg.Command, rj.Args, "", "")
+			tracing.Finish(runSpan)
 		}
 		if e != nil {
 			code := exitStatus(e)
@@ -351,7 +356,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
 		}
 	}()
-	res, e := x.recordResult(ctx, label)
+	collectCtx, collectSpan := tracing.Span(ctx, "mergewake.collect")
+	defer tracing.Finish(collectSpan)
+	res, e := x.recordResult(collectCtx, label)
 	if e != nil {
 		keepJob = true
 		if !errors.Is(e, ctx.Err()) {
@@ -372,7 +379,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// `panewire done --result` still returns them through the lane
 		// announcement or, on this host, the job-dir file. Kept for one
 		// release; each use is counted on the receipt and audited.
-		b, e = x.collect(ctx, label, findingsPath)
+		b, e = x.collect(collectCtx, label, findingsPath)
 		if e != nil {
 			if ctx.Err() != nil {
 				keepJob = true
