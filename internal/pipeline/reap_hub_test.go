@@ -35,6 +35,7 @@ type fakeReapHub struct {
 	// checkouts); dropClosed and dropRemoved make a closed pane leave the
 	// lists and a removed worktree stop inspecting, as on a real node.
 	detached    map[string]bool
+	foreign     map[string]bool // cwds whose worktree belongs to another repository
 	dropClosed  bool
 	dropRemoved bool
 }
@@ -91,7 +92,11 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				if h.detached[cwd] {
 					branch = ""
 				}
-				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": branch, "head": head, "origin_url": "git@github.com:example/project.git", "common": "/repo/.git"}}
+				origin := "git@github.com:example/project.git"
+				if h.foreign[cwd] {
+					origin = "git@github.com:example/other.git"
+				}
+				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": branch, "head": head, "origin_url": origin, "common": "/repo/.git"}}
 			}
 		case "pane.read":
 			result = h.composer
