@@ -1778,6 +1778,32 @@ from PR merge checks. Omission reuses `required_checks`. For example a project
 with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
 without weakening the PR gate. First-PR CI measurement always uses required_checks.
 
+`policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
+that runs the watch checks for any commit: it has a `workflow_dispatch` trigger
+with input `ref` and posts the watch checks as commit statuses on that sha (for
+example `any_ref_workflow: ci-any-ref.yml`). When a red main head's bisect needs
+a commit that has no green or red result, an acting watch dispatches the workflow
+once for that commit on the watched branch, records the dispatch in
+`any-ref-dispatch.json` in the repo state dir, and holds with
+`waiting for any-ref CI on <sha7>`. A later pass reads the result. The wait never
+happens inside a pass, and waiting holds do not notify. A restart never
+dispatches the same commit twice for the same red head.
+
+Each red head is one incident; a new red head starts a new one, and a green head
+ends it. Per incident, watch dispatches at most `ceil(log2(n)) + 2` times, where
+`n` is the number of commits after the green boundary. It waits at most
+`policy.any_ref_timeout` (a Go duration; default `45m`) for each commit after its
+dispatch. Past either bound, or when GitHub refuses the dispatch (HTTP 403, 404
+or 422), watch holds with a reason that names the cause and notifies once per
+incident. A refusal is not retried until the next incident. Shadow and
+`--dry-run` passes dispatch nothing and name the commit they would dispatch in
+`any_ref_dispatch`. Without the key, unknown evidence holds as before. The token
+needs permission to dispatch workflows.
+
+A check run and a commit status with the same name combine as follows: a pending,
+cancelled or skipped value yields to a green or red one. Two decisive values
+that disagree are an error.
+
 The hub reap transport reads composers with `pane.read`: only `empty` permits
 closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone panes
 and hub errors keep the pane. Codex placeholder text remains nonempty unless the

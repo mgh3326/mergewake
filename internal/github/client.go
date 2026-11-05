@@ -237,6 +237,20 @@ func (c *Client) CreateRef(ctx context.Context, repo, branch, sha string) error 
 	return c.json(ctx, "POST", base(repo)+"/git/refs", map[string]string{"ref": "refs/heads/" + branch, "sha": sha}, nil)
 }
 
+// DispatchWorkflow starts a workflow_dispatch run of the named workflow file
+// on branch ref, passing inputs.
+func (c *Client) DispatchWorkflow(ctx context.Context, repo, workflow, ref string, inputs map[string]string) error {
+	return c.json(ctx, "POST", base(repo)+"/actions/workflows/"+url.PathEscape(workflow)+"/dispatches", map[string]any{"ref": ref, "inputs": inputs}, nil)
+}
+
+// DispatchRefused reports whether GitHub declined a workflow dispatch for a
+// reason a retry cannot fix: missing scope (403), unknown workflow (404), or
+// a workflow without a matching workflow_dispatch trigger (422).
+func DispatchRefused(e error) bool {
+	var a *APIError
+	return errors.As(e, &a) && (a.Code == 403 || a.Code == 404 || a.Code == 422)
+}
+
 type CI string
 
 const (
@@ -328,12 +342,17 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 		case "failure", "error":
 			v = Red
 		}
-		if old, ok := states[name]; ok {
-			if old == Cancelled {
-				old = Pending
-			}
-			if old != v {
+		// An unknown value (pending, cancelled or skipped) never conflicts with
+		// a decisive one of the same name: an any-ref status can settle a commit
+		// whose own run was skipped or cancelled. Two decisive values that
+		// disagree stay an error; two unknown values read as the status.
+		if old, ok := states[name]; ok && old != v {
+			decisive := func(x CI) bool { return x == Green || x == Red }
+			if decisive(old) && decisive(v) {
 				return nil, fmt.Errorf("ambiguous check and status named %q", name)
+			}
+			if decisive(old) {
+				continue
 			}
 		}
 		states[name] = v
