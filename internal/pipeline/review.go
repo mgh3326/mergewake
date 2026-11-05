@@ -24,9 +24,7 @@ var ErrReviewUnavailable = errors.New("review unavailable")
 
 const familyRequired = "author family required via --author-family, a Mergewake-Author-Family trailer in the PR body or head commit, or a known commit author"
 
-var gradeTrailer = regexp.MustCompile(`(?m)^Mergewake-Grade: ([^\r\n]+)[\t ]*$`)
-
-var familyTrailer = regexp.MustCompile(`(?m)^Mergewake-Author-Family: ([a-zA-Z0-9_-]+)\s*$`)
+var familyValue = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 var coAuthorTrailer = regexp.MustCompile(`(?im)^Co-Authored-By:\s*([^<>\r\n]+?)\s*<([^<>\r\n]*)>`)
 
@@ -51,15 +49,6 @@ func doneRef(n int, sha string) string { return fmt.Sprintf("mergewake/reviews/%
 func (s *Service) reviewLeaseTTL() (time.Duration, error) {
 	timeout, err := config.Duration(s.Config.Review.Timeout)
 	return timeout + time.Minute, err
-}
-
-func profileModel(p config.Reviewer) string {
-	for i := 0; i+1 < len(p.Args); i += 2 {
-		if p.Args[i] == "--model" {
-			return p.Args[i+1]
-		}
-	}
-	return ""
 }
 
 // familyFromIdentity maps a commit identity's name and email to a canonical
@@ -90,19 +79,6 @@ func inferAuthorFamily(c github.Commit) string {
 		return f
 	}
 	return familyFromIdentity(c.Commit.Committer.Name, c.Commit.Committer.Email)
-}
-
-func (s *Service) authorModel(r config.Repo, body string) string {
-	if m := trailer(body, "Mergewake-Author-Model"); m != "" {
-		return m
-	}
-	author := strings.SplitN(trailer(body, "Mergewake-Author-Profile"), "@", 2)
-	if len(author) == 2 {
-		if p, ok := s.Config.Review.Profiles[author[0]]; ok {
-			return profileModel(p)
-		}
-	}
-	return ""
 }
 
 type passPlan struct {
@@ -186,12 +162,19 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}
 	if !complete {
 		if family == "" {
-			m := familyTrailer.FindStringSubmatch(pr.Body)
-			if len(m) == 2 {
-				family, familySource = m[1], "trailer"
+			f, e := s.prTrailer(ctx, r, pr, "Mergewake-Author-Family", familyValue.MatchString)
+			if e != nil {
+				return e
+			}
+			if f != "" {
+				family, familySource = f, "trailer"
 			}
 		}
-		author := strings.SplitN(trailer(pr.Body, "Mergewake-Author-Profile"), "@", 2)
+		profileTrailer, e := s.prTrailer(ctx, r, pr, "Mergewake-Author-Profile", nil)
+		if e != nil {
+			return e
+		}
+		author := strings.SplitN(profileTrailer, "@", 2)
 		if len(author) == 2 {
 			if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
 				if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
@@ -201,13 +184,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 		}
 		if family == "" {
-			c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+			c, e := s.headCommit(ctx, r, pr)
 			if e != nil {
 				return e
 			}
-			if m := familyTrailer.FindStringSubmatch(c.Commit.Message); len(m) == 2 {
-				family, familySource = m[1], "commit_trailer"
-			} else if inferred := inferAuthorFamily(c); inferred != "" {
+			if inferred := inferAuthorFamily(c); inferred != "" {
 				family, familySource = inferred, "commit"
 			}
 		}
@@ -276,8 +257,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if grade == "" {
 		grade = "B"
 	}
-	if m := gradeTrailer.FindStringSubmatch(pr.Body); len(m) == 2 {
-		grade = strings.TrimSpace(m[1])
+	g, e := s.prTrailer(ctx, r, pr, "Mergewake-Grade", nil)
+	if e != nil {
+		return e
+	}
+	if g != "" {
+		grade = g
 	}
 	if !config.ValidGrade(grade) {
 		return errors.New("invalid PR review grade")

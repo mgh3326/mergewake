@@ -98,6 +98,10 @@ func TestFixedTaskBlockClearsBeforeFamilyError(t *testing.T) {
 		t.Fatal(e)
 	}
 	f.g.pull.Body = "Mergewake-Task: 42\n"
+	// The head commit is memoised per head; forget it so the next read fails.
+	reapHeadMu.Lock()
+	clear(reapHeadCommits)
+	reapHeadMu.Unlock()
 	f.g.commitErr = map[string]error{shaA: errors.New("commit unavailable")}
 	if e := f.review(t); e == nil || errors.Is(e, ErrReviewBlocked) {
 		t.Fatalf("want commit error: %v", e)

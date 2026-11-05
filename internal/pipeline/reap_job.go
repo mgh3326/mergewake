@@ -48,7 +48,7 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 	if ok {
 		return b, nil
 	}
-	task, e := s.reapTask(ctx, r, p)
+	task, e := s.prTask(ctx, r, p)
 	if e != nil {
 		return b, e
 	}
@@ -74,22 +74,6 @@ func (s *Service) reapBind(ctx context.Context, r config.Repo, p github.Pull) (r
 	s.reapBinds[k] = b
 	reapBindMu.Unlock()
 	return b, nil
-}
-
-// reapTask is prTask for a merged PR: the same trailer lookup, reading the head
-// commit through the memo, so the commit is read at most once per PR.
-func (s *Service) reapTask(ctx context.Context, r config.Repo, p github.Pull) (string, error) {
-	if t := trailer(p.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	c, e := s.headCommit(ctx, r, p)
-	if e != nil {
-		return "", e
-	}
-	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	return "", nil
 }
 
 // reapJobPane closes the pane of PR p's bound job when the whole job is

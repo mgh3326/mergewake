@@ -423,31 +423,9 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 // configured notifier lane. The returned rule names the choosing source and is
 // recorded in the event text; a sink read error retries rather than reroutes.
 func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
-	message := ""
-	fetched := false
-	headMessage := func() (string, error) {
-		if !fetched {
-			fetched = true
-			c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-			if e != nil {
-				return "", e
-			}
-			message = c.Commit.Message
-		}
-		return message, nil
-	}
-	task := ""
-	if t := trailer(pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		task = t
-	}
-	if task == "" {
-		msg, e := headMessage()
-		if e != nil {
-			return "", "", e
-		}
-		if t := trailer(msg, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-			task = t
-		}
+	task, e := s.prTask(ctx, r, pr)
+	if e != nil {
+		return "", "", e
 	}
 	if task != "" {
 		if l, ok := s.Sink.(interface {
@@ -462,13 +440,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 			}
 		}
 	}
-	notify := trailer(pr.Body, "Mergewake-Notify-Lane")
-	if notify == "" {
-		msg, e := headMessage()
-		if e != nil {
-			return "", "", e
-		}
-		notify = trailer(msg, "Mergewake-Notify-Lane")
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	if e != nil {
+		return "", "", e
 	}
 	if laneName.MatchString(notify) {
 		return notify, "notify-lane trailer", nil

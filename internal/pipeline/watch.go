@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -16,8 +15,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
-
-var taskTrailer = regexp.MustCompile(`(?m)^Mergewake-Task: ([1-9][0-9]*)\s*$`)
 
 type watchResult struct {
 	Head       string `json:"head"`
@@ -306,8 +303,12 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return hold("automatic revert requires a single-parent commit; merge-commit culprit needs a first-parent recovery change")
 	}
 	task := r.Task
-	if m := taskTrailer.FindStringSubmatch(origin.Body); len(m) == 2 {
-		task = m[1]
+	originTask, e := s.prTask(ctx, r, *origin)
+	if e != nil {
+		return e
+	}
+	if originTask != "" {
+		task = originTask
 	}
 	if s.Config.Sink.Type == "handoffkeep" && !integrations.TaskID.MatchString(task) {
 		return errors.New("origin task missing; add Mergewake-Task trailer or repo task")
@@ -433,35 +434,22 @@ func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []
 
 // recoveryTrailers copies the culprit's PR-body values, falling back to its head commit.
 func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	var message string
-	loaded := false
 	var lines []string
-	for _, key := range []string{"Mergewake-Task", "Mergewake-Grade", "Mergewake-Tier", "Mergewake-Notify-Lane"} {
-		value := trailer(pr.Body, key)
-		valid := func(v string) bool {
-			switch key {
-			case "Mergewake-Task":
-				return integrations.TaskID.MatchString(v)
-			case "Mergewake-Grade":
-				return config.ValidGrade(v)
-			case "Mergewake-Tier":
-				return validTier(v)
-			default:
-				return v != ""
-			}
+	for _, t := range []struct {
+		key   string
+		valid func(string) bool
+	}{
+		{"Mergewake-Task", integrations.TaskID.MatchString},
+		{"Mergewake-Grade", config.ValidGrade},
+		{"Mergewake-Tier", validTier},
+		{"Mergewake-Notify-Lane", nil},
+	} {
+		value, err := s.prTrailer(ctx, r, pr, t.key, t.valid)
+		if err != nil {
+			return "", err
 		}
-		if !valid(value) {
-			if !loaded {
-				commit, err := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-				if err != nil {
-					return "", err
-				}
-				message, loaded = commit.Commit.Message, true
-			}
-			value = trailer(message, key)
-		}
-		if valid(value) {
-			lines = append(lines, key+": "+value)
+		if value != "" {
+			lines = append(lines, t.key+": "+value)
 		}
 	}
 	return strings.Join(lines, "\n"), nil

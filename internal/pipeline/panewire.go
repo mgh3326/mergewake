@@ -821,17 +821,7 @@ func (x *panewireExecutor) announced(ctx context.Context, lane, label string) ([
 
 // task reads the Mergewake-Task trailer: PR body first, then the head commit.
 func (x *panewireExecutor) task(ctx context.Context) (string, error) {
-	if t := trailer(x.pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	c, e := x.s.GH.Commit(ctx, x.repo.Name, x.pr.Head.SHA)
-	if e != nil {
-		return "", e
-	}
-	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	return "", nil
+	return x.s.prTask(ctx, x.repo, x.pr)
 }
 
 // reviewerFamily names the family the reviewer ran as. The reviewer's hk job
