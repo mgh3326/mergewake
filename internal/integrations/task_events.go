@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,80 @@ type TaskEvent struct {
 	RevertedPR string     `json:"reverted_pr,omitempty"`
 	RevertPR   string     `json:"revert_pr,omitempty"`
 	At         *time.Time `json:"at,omitempty"`
+	// The fields below are optional extensions (hk 3037): head and base of the
+	// PR on any source, the merge commit on mergewake.merge, and one record per
+	// posted review pass on mergewake.review. An hk that does not know them
+	// answers 400; PostTaskEvent then resends the event without them.
+	HeadSHA  string         `json:"head_sha,omitempty"`
+	BaseSHA  string         `json:"base_sha,omitempty"`
+	MergeSHA string         `json:"merge_sha,omitempty"`
+	Reviews  []ReviewRecord `json:"reviews,omitempty"`
+}
+
+// MaxReviewRecords is how many reviews[] items hk takes in one event.
+const MaxReviewRecords = 16
+
+// ReviewRecord is one review pass posted for a head, in hk's `reviews[]`
+// shape. Every field but ReviewedHead is left out when mergewake does not know
+// it. Tokens (Lens, Family, ...) match [a-z0-9_.-]; use Token to build them.
+type ReviewRecord struct {
+	ReviewedHead   string     `json:"reviewed_head"`
+	ReviewedBase   string     `json:"reviewed_base,omitempty"`
+	PatchID        string     `json:"patch_id,omitempty"`
+	Round          int        `json:"round,omitempty"`
+	Pass           int        `json:"pass,omitempty"`
+	Lens           string     `json:"lens,omitempty"`
+	ReviewerJobID  string     `json:"reviewer_job_id,omitempty"`
+	Family         string     `json:"family,omitempty"`
+	Profile        string     `json:"profile,omitempty"`
+	Model          string     `json:"model,omitempty"`
+	Harness        string     `json:"harness,omitempty"`
+	Effort         string     `json:"effort,omitempty"`
+	Executor       string     `json:"executor,omitempty"`
+	Fallback       bool       `json:"fallback,omitempty"`
+	PolicyRevision string     `json:"policy_revision,omitempty"`
+	ContractSource string     `json:"contract_source,omitempty"`
+	Verdict        string     `json:"verdict,omitempty"`
+	Critical       int        `json:"critical"`
+	High           int        `json:"high"`
+	Medium         int        `json:"medium"`
+	Low            int        `json:"low"`
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+}
+
+var (
+	shaRE        = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	tokenInvalid = regexp.MustCompile(`[^a-z0-9_.-]+`)
+)
+
+// SHA returns s when it is a 40-hex commit ID, else "" (omitted).
+func SHA(s string) string {
+	if shaRE.MatchString(s) {
+		return s
+	}
+	return ""
+}
+
+// Token normalises s to a short [a-z0-9_.-] token: lower-cased, every other
+// run of characters one "-", edges trimmed. "" when nothing is left.
+func Token(s string) string {
+	t := strings.Trim(tokenInvalid.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), "-"), "-")
+	if len(t) > 64 {
+		t = strings.Trim(t[:64], "-")
+	}
+	return t
+}
+
+// extended reports whether ev carries any optional field, and plain returns
+// ev without them: the form every hk accepts.
+func (ev TaskEvent) extended() bool {
+	return ev.HeadSHA != "" || ev.BaseSHA != "" || ev.MergeSHA != "" || len(ev.Reviews) > 0
+}
+
+func (ev TaskEvent) plain() TaskEvent {
+	ev.HeadSHA, ev.BaseSHA, ev.MergeSHA, ev.Reviews = "", "", "", nil
+	return ev
 }
 
 // TaskEventResult is what hk did with an event: applied moved the task,
@@ -41,6 +116,10 @@ type TaskEventResult struct {
 	Redelivered bool   `json:"redelivered"`
 	State       string `json:"state,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+	// FieldsRefused is set by PostTaskEvent, never by hk: hk answered 400 to the
+	// extended payload (this is its error code, or "invalid" when it sent none)
+	// and the event was accepted only when resent without the optional fields.
+	FieldsRefused string `json:"-"`
 }
 
 // HKError is a non-2xx answer from hk. Code is hk's error code
@@ -80,15 +159,45 @@ var hkErrorCode = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 // credentials Job reads. A network error or 5xx is retried, with doubling
 // backoff, up to EventAttempts tries in total while ctx lasts; a 4xx is
 // returned at once as *HKError.
+//
+// An extended payload (see TaskEvent) that hk answers with 400 is resent once
+// without the optional fields, so the event is never lost to them; the result
+// then carries FieldsRefused.
 func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEventResult, error) {
+	res, used, e := h.postTaskEvent(ctx, ev, 0)
+	var hk *HKError
+	if e != nil && ev.extended() && errors.As(e, &hk) && hk.Status == http.StatusBadRequest {
+		code := hk.Code
+		if code == "" {
+			code = "invalid"
+		}
+		// The resend spends what is left of the EventAttempts budget, and at
+		// least one try: the event is never lost to the new fields.
+		if res, _, e = h.postTaskEvent(ctx, ev.plain(), max(1, h.attempts()-used)); e == nil {
+			res.FieldsRefused = code
+		}
+	}
+	return res, e
+}
+
+func (h Handoffkeep) attempts() int {
+	if h.EventAttempts < 1 {
+		return DefaultEventAttempts
+	}
+	return h.EventAttempts
+}
+
+// postTaskEvent is one send of ev with up to attempts tries (0: the full
+// EventAttempts budget); it returns the tries used.
+func (h Handoffkeep) postTaskEvent(ctx context.Context, ev TaskEvent, attempts int) (TaskEventResult, int, error) {
 	c, e := hkJobEndpoint()
 	if e != nil {
-		return TaskEventResult{}, e
+		return TaskEventResult{}, 0, e
 	}
-	attempts, backoff, timeout := h.EventAttempts, h.EventBackoff, h.EventTimeout
 	if attempts < 1 {
-		attempts = DefaultEventAttempts
+		attempts = h.attempts()
 	}
+	backoff, timeout := h.EventBackoff, h.EventTimeout
 	if backoff <= 0 {
 		backoff = DefaultEventBackoff
 	}
@@ -97,7 +206,7 @@ func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEvent
 	}
 	body, e := json.Marshal(ev)
 	if e != nil {
-		return TaskEventResult{}, e
+		return TaskEventResult{}, 0, e
 	}
 	client := c.client(timeout)
 	for try := 1; ; try++ {
@@ -107,11 +216,11 @@ func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEvent
 			if e != nil && try > 1 {
 				e = fmt.Errorf("%w (after %d attempts)", e, try)
 			}
-			return res, e
+			return res, try, e
 		}
 		select {
 		case <-ctx.Done():
-			return res, fmt.Errorf("%w (after %d attempts)", e, try)
+			return res, try, fmt.Errorf("%w (after %d attempts)", e, try)
 		case <-time.After(backoff << (try - 1)):
 		}
 	}

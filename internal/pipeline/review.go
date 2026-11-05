@@ -9,6 +9,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -331,13 +332,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// The review event is posted when the run ends, so a slow hk never
 	// spends the reviewers' deadline.
 	var reviewStarted *time.Time
+	// reviews records each pass this run posted, for the event.
+	var reviews []integrations.ReviewRecord
 	defer func() {
 		if reviewStarted != nil {
-			s.postTaskEvent(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted)
+			s.postTaskEventWith(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted, reviews)
 		}
 	}()
 	for _, plan := range plans {
 		plan.lens = lens(plan)
+		passStarted := s.now()
 		// A GitHub ref claims this PR head across hosts before any reviewer is
 		// invoked. One claim covers every candidate of the pass.
 		claim := func() (string, bool, error) {
@@ -449,8 +453,15 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			continue
 		}
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
+			// A review GitHub stored before the call failed is a posted pass: a
+			// later run finds its receipt and skips it, so the event of this run
+			// is the only one that can carry its record.
+			if stored, readErr := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login); readErr == nil && slices.ContainsFunc(stored, func(p github.PassReceipt) bool { return p.Pass == plan.pass }) {
+				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+			}
 			return e
 		}
+		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
 		// The pass is posted: its reviewer job record, if any, is spent. A
 		// record left behind is never resumed, since a posted pass is not run
 		// again for this head.
