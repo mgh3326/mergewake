@@ -26,6 +26,7 @@ type cleanupOpts struct {
 	refuseAll        bool                      // both the reviewer and the worker seat are refused before any pane starts
 	noPlacement      bool                      // the spawn's OK line names no placement receipt
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
+	spawnOut         string                    // the spawn's whole stdout, replacing the OK line
 }
 
 type cleanupResult struct {
@@ -69,6 +70,7 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		runner.placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"w1:p1"}`))
 	}
 	runner.waitTimeout = o.waitTimeout
+	runner.spawnOut = o.spawnOut
 	if o.refuseAll {
 		runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
 	}
@@ -172,6 +174,43 @@ func TestReviewerCleanupClosesThenRemovesWithReceipt(t *testing.T) {
 	audits := res.audits(t)
 	if len(audits) != 1 || audits[0]["result"] != "removed" || audits[0]["pane"] != "w1:p1" || audits[0]["head"] != headSHA || audits[0]["pass"] != float64(1) || audits[0]["pr"] != float64(7) {
 		t.Fatalf("audits = %+v", audits)
+	}
+}
+
+// A spawn the hub coordinator placed reports a SPAWNED line, not an OK line.
+// Its host and pane are the placement, so the pass closes the pane and removes
+// its worktree instead of keeping both as pending-cleanup.
+func TestReviewerCleanupReadsHubSpawnedReceipt(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{spawnOut: "ACCEPTED job=l request=r1\nSPAWNED job=l host=node-a profile=seat-y pane=w1:p1\nwait job=l outcome=completed report= pane=\n"})
+	if res.err != nil || res.out.executor != "panewire" || res.out.reviewer != "panewire:seat-y" {
+		t.Fatalf("outcome=%+v error=%v", res.out, res.err)
+	}
+	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || receipts[0].Host != "node-a" {
+		t.Fatalf("receipts = %+v", receipts)
+	}
+}
+
+func TestSpawnedPlacement(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		host string
+		pane string
+		ok   bool
+	}{
+		{"SPAWNED job=l host=node-a profile=p pane=w1:p1\n", "node-a", "w1:p1", true},
+		{"SPAWNED job=l host=node-a profile=p pane=none\n", "", "", false},
+		{"SPAWNED job=l host=none profile=none pane=none\n", "", "", false},
+		{"SPAWNED job=l host=old profile=p pane=w1:p0\nSPAWNED job=l host=node-b profile=p pane=w2:p2 lane=unregistered\n", "node-b", "w2:p2", true},
+		{"ACCEPTED job=l request=r\n", "", "", false},
+	} {
+		got, ok := spawnPlacement(tc.out)
+		if ok != tc.ok || got.Host != tc.host || got.PaneID != tc.pane {
+			t.Errorf("%q: got %+v ok=%v", tc.out, got, ok)
+		}
 	}
 }
 

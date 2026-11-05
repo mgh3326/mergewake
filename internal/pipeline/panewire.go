@@ -307,6 +307,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	seat := ""
 	if m := spawnedSeat.FindSubmatch(stdout); m != nil {
 		seat = string(m[1])
+	} else if placement.Profile != "" {
+		seat = placement.Profile
 	}
 	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
 	if seat != "" {

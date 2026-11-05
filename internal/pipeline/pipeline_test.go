@@ -48,6 +48,8 @@ type fakeGH struct {
 	passes                                                       map[string][]github.PassReceipt
 	feedback                                                     github.ReviewFeedback
 	feedbackHead                                                 string
+	feedbackHeads                                                []string // per-read GraphQL heads, consumed in order before feedbackHead
+	feedbackReads                                                int
 	refs                                                         map[string]bool
 	leaseTimes                                                   map[string]time.Time
 	files                                                        []policy.File
@@ -209,7 +211,10 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
 	fb.HeadSHA = g.pull.Head.SHA
-	if g.feedbackHead != "" {
+	g.feedbackReads++
+	if len(g.feedbackHeads) > 0 {
+		fb.HeadSHA, g.feedbackHeads = g.feedbackHeads[0], g.feedbackHeads[1:]
+	} else if g.feedbackHead != "" {
 		fb.HeadSHA = g.feedbackHead
 	}
 	return fb, nil
