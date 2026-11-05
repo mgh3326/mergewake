@@ -41,6 +41,7 @@ type Client struct {
 	Objects  ObjectCache
 	poll     pollingState
 	evidence evidenceCache
+	writes   writeEpochs
 }
 
 func (c *Client) now() time.Time {
@@ -71,8 +72,8 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	key := method + " " + endpoint + " " + accept
 	fresh := isFresh(ctx)
 	if method != "GET" && route != "/graphql" {
-		// Whatever the outcome, the write may have changed what the pass memoized.
-		defer passOf(ctx).invalidate(memoRepo(route))
+		// Whatever the outcome, the write may have changed what any pass memoized.
+		defer c.writes.bump(memoRepo(route))
 	}
 	if method == "GET" && !fresh {
 		if hit, e := c.pollShortcut(key); e != nil {
@@ -210,7 +211,7 @@ type Pull struct {
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
-	return memoized(ctx, memoKey{repo, "pull", strconv.Itoa(n)}, func() (Pull, error) {
+	return memoized(ctx, c, memoKey{repo, "pull", strconv.Itoa(n)}, func() (Pull, error) {
 		var p Pull
 		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
 		return p, e
@@ -237,7 +238,7 @@ func (c *Client) UpdateBranch(ctx context.Context, repo string, n int, head stri
 	return c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/update-branch", base(repo), n), map[string]string{"expected_head_sha": head}, nil)
 }
 func (c *Client) Head(ctx context.Context, repo, branch string) (string, error) {
-	return memoized(ctx, memoKey{repo, "head", branch}, func() (string, error) {
+	return memoized(ctx, c, memoKey{repo, "head", branch}, func() (string, error) {
 		var r struct {
 			Object Ref `json:"object"`
 		}
@@ -562,7 +563,7 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 	if login == "" {
 		return nil, errors.New("review.login is required")
 	}
-	out, e := memoized(ctx, memoKey{repo, "reviews", strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
+	out, e := memoized(ctx, c, memoKey{repo, "reviews", strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
 		return c.reviewHistory(ctx, repo, n, login)
 	})
 	// The memo's slice is shared: hand each caller its own.

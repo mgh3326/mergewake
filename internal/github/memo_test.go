@@ -1,7 +1,9 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -144,5 +146,61 @@ func TestPassMemoErrorsAreNotKept(t *testing.T) {
 	}
 	if _, e := c.Pull(ctx, "example/project", 8); e == nil || srv.n("GET /repos/example/project/pulls/8") != 2 {
 		t.Fatalf("an error was memoized: %d requests", srv.n("GET /repos/example/project/pulls/8"))
+	}
+}
+
+// The daemon's roles run concurrently, each in its own pass. A write in one
+// pass must stop every other pass of the client reusing what it memoized.
+func TestWriteInOnePassDropsOtherPassMemos(t *testing.T) {
+	var srv memoServer
+	c := srv.client(t)
+	watch, _ := CountRequests(context.Background(), "watch")
+	pr, _ := CountRequests(context.Background(), "pr")
+	if _, e := c.Head(watch, "example/project", "main"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := c.Pull(watch, "example/project", 7); e != nil {
+		t.Fatal(e)
+	}
+	if e := c.UpdateBranch(pr, "example/project", 7, testSHA); e != nil {
+		t.Fatal(e)
+	}
+	c.Head(watch, "example/project", "main")
+	c.Pull(watch, "example/project", 7)
+	if srv.n(headRoute) != 2 || srv.n(pullRoute) != 2 {
+		t.Fatalf("a pass reused its memo across another pass's write: head %d, pull %d", srv.n(headRoute), srv.n(pullRoute))
+	}
+	// A write to another repository leaves this one's memo alone.
+	c.Head(watch, "example/project", "main")
+	c.UpdateBranch(pr, "example/other", 7, testSHA)
+	c.Head(watch, "example/project", "main")
+	if srv.n(headRoute) != 2 {
+		t.Fatalf("a write to another repository dropped the memo: %d", srv.n(headRoute))
+	}
+}
+
+// watch and agent reuse one context across iterations; each iteration is a new
+// pass with an empty memo and a working cache, while the counters run on.
+func TestNewPassResetsMemoAndBreakerButKeepsCounters(t *testing.T) {
+	var srv memoServer
+	c := srv.client(t)
+	var log bytes.Buffer
+	c.Stderr = &log
+	c.Objects = &fakeCache{getErr: errors.New("down")}
+	run, counts := CountRequests(context.Background(), "watch")
+	c.Pull(run, "example/project", 7)
+	c.Pull(run, "example/project", 7)
+	c.Commit(run, "example/project", testSHA)
+	next := NewPass(run)
+	c.Pull(next, "example/project", 7)
+	c.Commit(next, "example/project", testSHA)
+	if srv.n(pullRoute) != 2 {
+		t.Fatalf("the memo carried into the next pass: %d requests", srv.n(pullRoute))
+	}
+	if n := strings.Count(log.String(), "object cache unavailable"); n != 2 {
+		t.Fatalf("the cache breaker carried into the next pass: %d log lines", n)
+	}
+	if s := counts.CacheStats(); s.MemoHits != 1 || s.Misses != 2 {
+		t.Fatalf("counters did not run on across passes: %+v", s)
 	}
 }

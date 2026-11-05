@@ -52,7 +52,7 @@ func cacheable(sha, path string) bool {
 // cacheGet returns the stored body, or false on a miss or any cache error. A
 // failed pass keeps the cache off until the pass ends.
 func (c *Client) cacheGet(ctx context.Context, repo, kind, sha, path string) ([]byte, bool) {
-	p := passOf(ctx)
+	p := memoOf(ctx)
 	if c.Objects == nil || !cacheable(sha, path) || p.cacheOff() {
 		return nil, false
 	}
@@ -67,7 +67,7 @@ func (c *Client) cacheGet(ctx context.Context, repo, kind, sha, path string) ([]
 }
 
 func (c *Client) cachePut(ctx context.Context, repo, kind, sha, path string, body []byte) {
-	p := passOf(ctx)
+	p := memoOf(ctx)
 	if c.Objects == nil || !cacheable(sha, path) || len(body) > MaxCachedObject || p.cacheOff() {
 		return
 	}
@@ -80,7 +80,7 @@ func (c *Client) cachePut(ctx context.Context, repo, kind, sha, path string, bod
 
 // cacheFailed logs the first cache error of a pass and switches the cache off
 // for the rest of it. Without a pass there is no breaker, so every error logs.
-func (c *Client) cacheFailed(p *RequestCounts, err error) {
+func (c *Client) cacheFailed(p *passMemo, err error) {
 	if !p.tripCache() {
 		return
 	}

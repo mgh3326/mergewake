@@ -262,7 +262,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "rollout":
 		return s.Rollout(ctx, r, o)
 	case "watch":
-		return poll(ctx, c.PollInterval, *once || *dry, func() error { return s.Watch(ctx, r, o) }, stderr)
+		return poll(ctx, c.PollInterval, *once || *dry, func(ctx context.Context) error { return s.Watch(ctx, r, o) }, stderr)
 	case "reap":
 		if !c.Reap.Enabled {
 			return errors.New("reap requires reap.enabled")
@@ -278,7 +278,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		if len(c.Repos) == 0 {
 			return errors.New("agent requires at least one configured repository")
 		}
-		return poll(ctx, c.PollInterval, *once || *dry, func() error {
+		return poll(ctx, c.PollInterval, *once || *dry, func(ctx context.Context) error {
 			var errs []error
 			for _, r := range c.Repos {
 				if *repo != "" && r.Name != *repo {
@@ -308,13 +308,16 @@ func runReapLegacy(ctx context.Context, s *pipeline.Service, c config.Config, re
 	}
 	return errors.Join(errs...)
 }
-func poll(ctx context.Context, interval string, once bool, fn func() error, stderr io.Writer) error {
+
+// poll runs fn once per interval, each iteration as its own pass: the read memo
+// and the object-cache breaker never carry over, while request counts run on.
+func poll(ctx context.Context, interval string, once bool, fn func(context.Context) error, stderr io.Writer) error {
 	d, e := config.Duration(interval)
 	if e != nil {
 		return e
 	}
 	for {
-		e = fn()
+		e = fn(github.NewPass(ctx))
 		if once {
 			return e
 		}
