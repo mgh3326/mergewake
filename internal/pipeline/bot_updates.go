@@ -172,8 +172,20 @@ type updateRow struct {
 func bodyUpdates(body string) []updateRow {
 	var rows []updateRow
 	changeCol, updateCol := -1, -1
+	inFence, fenceChar, fenceLen := false, byte(0), 0
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
+		// A table inside a fenced code block is an example, not an update.
+		// A fence closes only on the same character, at least as long, with
+		// nothing after it.
+		if ch, n, ok := fenceRun(line); ok && (!inFence || ch == fenceChar && n >= fenceLen && len(line) == n) {
+			inFence, fenceChar, fenceLen = !inFence, ch, n
+			changeCol, updateCol = -1, -1
+			continue
+		}
+		if inFence {
+			continue
+		}
 		if !strings.HasPrefix(line, "|") {
 			changeCol, updateCol = -1, -1
 			continue
@@ -199,6 +211,19 @@ func bodyUpdates(body string) []updateRow {
 		rows = append(rows, readUpdateRow(cells, changeCol, updateCol))
 	}
 	return rows
+}
+
+// fenceRun reports the character and length of a run of at least three
+// backticks or tildes opening line.
+func fenceRun(line string) (byte, int, bool) {
+	if line == "" || (line[0] != '`' && line[0] != '~') {
+		return 0, 0, false
+	}
+	n := 0
+	for n < len(line) && line[n] == line[0] {
+		n++
+	}
+	return line[0], n, n >= 3
 }
 
 func allRule(cells []string) bool {

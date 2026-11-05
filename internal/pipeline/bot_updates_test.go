@@ -377,3 +377,46 @@ func TestVersionKind(t *testing.T) {
 		}
 	}
 }
+
+// Tables inside fenced code blocks are examples: they never count as updates,
+// and a fence closes only on a matching one.
+func TestBotUpdateIgnoresFencedTables(t *testing.T) {
+	example := "| Package | Update | Change |\n|---|---|---|\n| vite | patch | `1.0.0` -> `1.0.1` |\n"
+	for _, tt := range []struct {
+		name, body string
+		want       int
+	}{
+		{"only a fenced example", "```\n" + example + "```\n", 0},
+		{"tilde fence", "~~~md\n" + example + "~~~\n", 0},
+		{"longer outer fence ignores inner ones", "````\n```\n~~~\n" + example + "````\n", 0},
+		{"mismatched fence char does not close", "```\n~~~\n" + example + "```\n", 0},
+		{"shorter fence does not close", "````\n```\n" + example + "````\n", 0},
+		{"real table after a fence", "```\nx\n```\n" + example, 1},
+		{"unclosed fence swallows the rest", "```\n" + example, 0},
+	} {
+		if got := len(bodyUpdates(tt.body)); got != tt.want {
+			t.Errorf("%s: %d rows, want %d", tt.name, got, tt.want)
+		}
+	}
+	// A real minor update plus a fenced patch example is not patch.
+	body := renovateBody("minor", "8.3.4", "8.4.0") + "```\n" + example + "```\n"
+	if got := nonPatchReason(body); !strings.Contains(got, "minor") {
+		t.Errorf("reason=%q", got)
+	}
+	// A patch example in a fence is no update table.
+	if got := nonPatchReason("```\n" + example + "```\n"); got != "update type unknown" {
+		t.Errorf("reason=%q", got)
+	}
+}
+
+// A PR retargeted between the decision and the merge is not merged.
+func TestBotUpdateRetargetedDuringDecisionNotMerged(t *testing.T) {
+	_, g, _, _, land := botSetup(t, "")
+	g.nextBase = "release"
+	if e := land(context.Background(), Options{}); e == nil || !strings.Contains(e.Error(), "changed during decision") {
+		t.Fatalf("err=%v", e)
+	}
+	if g.mergeCount != 0 {
+		t.Fatal("merged into a base the gate did not see")
+	}
+}

@@ -236,7 +236,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
-	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft {
+	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft || freshPR.Base.Ref != r.Branch {
 		return errors.New("PR changed during decision")
 	}
 	fresh, e := s.GH.Head(ctx, r.Name, r.Branch)
