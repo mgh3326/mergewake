@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -15,8 +14,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
-
-var taskTrailer = regexp.MustCompile(`(?m)^Mergewake-Task: ([1-9][0-9]*)\s*$`)
 
 type watchResult struct {
 	Head       string `json:"head"`
@@ -305,8 +302,12 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return hold("automatic revert requires a single-parent commit; merge-commit culprit needs a first-parent recovery change")
 	}
 	task := r.Task
-	if m := taskTrailer.FindStringSubmatch(origin.Body); len(m) == 2 {
-		task = m[1]
+	originTask, e := s.prTask(ctx, r, *origin)
+	if e != nil {
+		return e
+	}
+	if originTask != "" {
+		task = originTask
 	}
 	if s.Config.Sink.Type == "handoffkeep" && !integrations.TaskID.MatchString(task) {
 		return errors.New("origin task missing; add Mergewake-Task trailer or repo task")
