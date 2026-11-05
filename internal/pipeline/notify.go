@@ -103,14 +103,20 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	summary := pr.Title
 	if v.State == "blocked" {
-		summary = strings.Join(v.Reasons, "; ")
+		cancelled := make(map[string]bool, len(v.Review.ChecksCancelled))
+		for _, name := range v.Review.ChecksCancelled {
+			cancelled["check_cancelled:"+name] = true
+		}
+		annotated := make([]string, 0, len(v.Reasons))
+		for _, reason := range v.Reasons {
+			if cancelled[reason] {
+				reason += " (rerun it)"
+			}
+			annotated = append(annotated, reason)
+		}
+		summary = strings.Join(annotated, "; ")
 		if v.Review.Block != "" {
 			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
-		}
-	}
-	if v.State == "blocked" {
-		for _, name := range v.Review.ChecksCancelled {
-			summary = strings.Replace(summary, "check_cancelled:"+name, "check_cancelled:"+name+" (rerun it)", 1)
 		}
 	}
 	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
@@ -485,7 +491,7 @@ func authorAction(summary string) bool {
 		if reason == "conflict" {
 			return true
 		}
-		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:"} {
+		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
 			}

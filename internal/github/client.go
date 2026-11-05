@@ -310,7 +310,10 @@ func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVe
 			// sibling verdict against a cancellation; aggregate Check retains its
 			// original latest-run behavior.
 			idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral" || (preserveVerdicts && r.Conclusion == "cancelled"))
-			if idle && ran[r.Name] {
+			// A skipped or neutral run holds no verdict either, so it never
+			// replaces a cancellation: the cancelled run still has to be rerun.
+			holdsNothing := r.Conclusion == "skipped" || r.Conclusion == "neutral"
+			if idle && (ran[r.Name] || (holdsNothing && states[r.Name] == Cancelled)) {
 				continue
 			}
 			if !idle && !ran[r.Name] {
@@ -423,20 +426,28 @@ func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []s
 	return out, nil
 }
 
-// CancelledAt returns, for each required name whose latest run on sha is
-// cancelled, when that run completed. A zero time means GitHub gave none.
-func (c *Client) CancelledAt(ctx context.Context, repo, sha string, required []string) (map[string]time.Time, error) {
+// CheckSnapshot is CheckStates plus, for each required name whose latest run
+// on sha is cancelled, when that run completed (a zero time means GitHub gave
+// none). Both come from one read, so a run that replaces a cancelled one
+// cannot land between them.
+func (c *Client) CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]CI, map[string]time.Time, error) {
 	ev, e := c.headChecks(ctx, repo, sha)
 	if e != nil {
-		return nil, e
+		return nil, nil, e
 	}
-	out := map[string]time.Time{}
+	states := make(map[string]CI, len(required))
+	at := map[string]time.Time{}
 	for _, n := range required {
+		v, ok := ev.states[n]
+		if !ok {
+			v = Pending
+		}
+		states[n] = v
 		if t, ok := ev.cancelled[n]; ok {
-			out[n] = t
+			at[n] = t
 		}
 	}
-	return out, nil
+	return states, at, nil
 }
 
 func (c *Client) headChecks(ctx context.Context, repo, sha string) (checkEvidence, error) {

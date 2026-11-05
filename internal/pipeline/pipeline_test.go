@@ -62,15 +62,19 @@ type fakeGH struct {
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
 	cancelledAt                                                  map[string]time.Time
-	messages                                                     map[string]string
-	authorName, authorEmail                                      string
-	committerName, committerEmail                                string
-	parents                                                      map[string]string
-	parents2                                                     map[string][]string
-	commitPRs                                                    map[string][]github.Pull
-	latch, headChanged, stale                                    bool
-	policyReads                                                  []string
-	m                                                            manifest.Manifest
+	// staleOnce is the check states the first CheckSnapshot returns, as a
+	// cached read that predates a rerun; snapshots counts the reads.
+	staleOnce                     map[string]github.CI
+	snapshots                     int
+	messages                      map[string]string
+	authorName, authorEmail       string
+	committerName, committerEmail string
+	parents                       map[string]string
+	parents2                      map[string][]string
+	commitPRs                     map[string][]github.Pull
+	latch, headChanged, stale     bool
+	policyReads                   []string
+	m                             manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
 	// diffErr, when set, answers every Diff call instead of a patch (for
@@ -166,15 +170,19 @@ func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string
 	}
 	return out, nil
 }
-func (g *fakeGH) CancelledAt(ctx context.Context, repo, sha string, required []string) (map[string]time.Time, error) {
+func (g *fakeGH) CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, map[string]time.Time, error) {
+	g.snapshots++
 	states, _ := g.CheckStates(ctx, repo, sha, required)
+	if g.staleOnce != nil && g.snapshots == 1 {
+		states = g.staleOnce
+	}
 	out := map[string]time.Time{}
 	for _, n := range required {
 		if states[n] == github.Cancelled {
 			out[n] = g.cancelledAt[n]
 		}
 	}
-	return out, nil
+	return states, out, nil
 }
 func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string) ([]github.PassReceipt, error) {
 	if g.reviewed && sha == g.pull.Head.SHA {

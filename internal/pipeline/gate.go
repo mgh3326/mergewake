@@ -127,11 +127,12 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 // newer run before the gate stops waiting for it and blocks.
 const cancelledCheckWait = 30 * time.Minute
 
-// cancelledTimes is the part of the GitHub client that says when a cancelled
-// run completed. Evidence without it cannot age a cancellation, so the gate
-// keeps waiting.
-type cancelledTimes interface {
-	CancelledAt(ctx context.Context, repo, sha string, required []string) (map[string]time.Time, error)
+// checkSnapshotter is the part of the GitHub client that returns the required
+// checks' states together with when each cancelled run completed, from one
+// read. Evidence without it cannot age a cancellation, so the gate keeps
+// waiting.
+type checkSnapshotter interface {
+	CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, map[string]time.Time, error)
 }
 
 // checkJudgment is what the required checks say about a head. Failed and
@@ -174,19 +175,30 @@ func judgeChecks(states map[string]github.CI, required []string, cancelledAt map
 	return j
 }
 
-// judgeHead reads the required checks of sha and judges them.
+// judgeHead reads the required checks of sha and judges them. A verdict that
+// would block on an expired cancellation is confirmed against a fresh read
+// first, since a polled read can predate the run that replaced it.
 func (s *Service) judgeHead(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
+	j, e := s.readChecks(ctx, repo, sha, required)
+	if e != nil || len(j.Expired) == 0 {
+		return j, e
+	}
+	return s.readChecks(github.FreshEvidence(ctx), repo, sha, required)
+}
+
+func (s *Service) readChecks(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
+	if snap, ok := s.GH.(checkSnapshotter); ok {
+		states, at, e := snap.CheckSnapshot(ctx, repo, sha, required)
+		if e != nil {
+			return checkJudgment{}, e
+		}
+		return judgeChecks(states, required, at, s.now()), nil
+	}
 	states, e := s.GH.CheckStates(ctx, repo, sha, required)
 	if e != nil {
 		return checkJudgment{}, e
 	}
-	var at map[string]time.Time
-	if ct, ok := s.GH.(cancelledTimes); ok {
-		if at, e = ct.CancelledAt(ctx, repo, sha, required); e != nil {
-			return checkJudgment{}, e
-		}
-	}
-	return judgeChecks(states, required, at, s.now()), nil
+	return judgeChecks(states, required, nil, s.now()), nil
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:

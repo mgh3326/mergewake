@@ -22,6 +22,9 @@ func TestCheckStatesCompletedWithoutVerdict(t *testing.T) {
 		{"failure", `[{"id":1,"name":"CI","status":"completed","conclusion":"failure"}]`, `[]`, Red, Red},
 		{"failure then cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"failure"},{"id":2,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Red, Pending},
 		{"cancelled listed before failure", `[{"id":2,"name":"CI","status":"completed","conclusion":"cancelled"},{"id":1,"name":"CI","status":"completed","conclusion":"failure"}]`, `[]`, Red, Pending},
+		{"cancelled then skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"},{"id":2,"name":"CI","status":"completed","conclusion":"skipped"}]`, `[]`, Cancelled, Pending},
+		{"cancelled then neutral", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"},{"id":2,"name":"CI","status":"completed","conclusion":"neutral"}]`, `[]`, Cancelled, Pending},
+		{"skipped then cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"skipped"},{"id":2,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Cancelled, Pending},
 		{"success then cancelled", `[{"id":1,"name":"CI","status":"completed","conclusion":"success"},{"id":2,"name":"CI","status":"completed","conclusion":"cancelled"}]`, `[]`, Green, Pending},
 		{"newer failure", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled"},{"id":2,"name":"CI","status":"completed","conclusion":"failure"}]`, `[]`, Red, Red},
 		{"status error", `[]`, `[{"id":1,"context":"CI","state":"error"}]`, Red, Red},
@@ -48,7 +51,7 @@ func TestCheckStatesCompletedWithoutVerdict(t *testing.T) {
 }
 
 // A cancelled run reports when it completed; a newer run on the head replaces it.
-func TestCancelledAtLatestRun(t *testing.T) {
+func TestCheckSnapshotLatestRun(t *testing.T) {
 	for _, tt := range []struct {
 		name, runs string
 		state      CI
@@ -59,6 +62,7 @@ func TestCancelledAtLatestRun(t *testing.T) {
 		{"newer green", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled","completed_at":"2026-11-05T10:00:00Z"},{"id":2,"name":"CI","status":"completed","conclusion":"success"}]`, Green, time.Time{}},
 		{"newer queued", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled","completed_at":"2026-11-05T10:00:00Z"},{"id":2,"name":"CI","status":"queued"}]`, Pending, time.Time{}},
 		{"skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"skipped","completed_at":"2026-11-05T10:00:00Z"}]`, Skipped, time.Time{}},
+		{"cancelled then skipped", `[{"id":1,"name":"CI","status":"completed","conclusion":"cancelled","completed_at":"2026-11-05T10:00:00Z"},{"id":2,"name":"CI","status":"completed","conclusion":"skipped","completed_at":"2026-11-05T11:00:00Z"}]`, Cancelled, time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := api(t, func(w http.ResponseWriter, r *http.Request) {
@@ -68,14 +72,13 @@ func TestCancelledAtLatestRun(t *testing.T) {
 					fmt.Fprint(w, `[]`)
 				}
 			})
-			states, err := c.CheckStates(context.Background(), "o/r", "sha", []string{"CI"})
+			states, at, err := c.CheckSnapshot(context.Background(), "o/r", "sha", []string{"CI"})
 			if err != nil || states["CI"] != tt.state {
 				t.Fatalf("states=%v err=%v, want %s", states, err, tt.state)
 			}
-			at, err := c.CancelledAt(context.Background(), "o/r", "sha", []string{"CI"})
 			got, ok := at["CI"]
-			if err != nil || ok != (tt.state == Cancelled) || !got.Equal(tt.at) {
-				t.Fatalf("cancelledAt=%v err=%v, want %v", at, err, tt.at)
+			if ok != (tt.state == Cancelled) || !got.Equal(tt.at) {
+				t.Fatalf("cancelledAt=%v, want %v", at, tt.at)
 			}
 		})
 	}

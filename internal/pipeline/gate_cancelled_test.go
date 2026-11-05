@@ -104,3 +104,36 @@ func TestGateCancelledWithoutTimeWaits(t *testing.T) {
 		t.Fatalf("verdict=%+v", v)
 	}
 }
+
+// A polled read can predate the run that replaced the cancellation: an expired
+// cancellation is confirmed against a fresh read before the gate blocks.
+func TestGateExpiredCancelledConfirmedByFreshRead(t *testing.T) {
+	s, g, _, _ := notifySetup(t)
+	s.Now = func() time.Time { return cancelNow }
+	g.required = []string{"vet", "test"}
+	g.cancelledAt = map[string]time.Time{"test": cancelNow.Add(-40 * time.Minute)}
+	g.checkNames = map[string]map[string]github.CI{shaA: {"vet": github.Green, "test": github.Green}}
+	g.staleOnce = map[string]github.CI{"vet": github.Green, "test": github.Cancelled}
+	if v := gateAt(t, s, g, shaB); v.State != "ready" || len(v.Reasons) != 0 || g.snapshots != 2 {
+		t.Fatalf("snapshots=%d verdict=%+v", g.snapshots, v)
+	}
+}
+
+// The rerun hint marks each cancelled reason exactly, even when one check name
+// is a prefix of another, and an expired cancellation goes to the author lane.
+func TestGateCancelledNoticeAnnotatesExactReasons(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	s.Now = func() time.Time { return cancelNow }
+	g.required = []string{"test-integration", "test"}
+	g.cancelledAt = map[string]time.Time{"test-integration": cancelNow.Add(-40 * time.Minute), "test": cancelNow.Add(-40 * time.Minute)}
+	g.checkNames = map[string]map[string]github.CI{shaA: {"test-integration": github.Cancelled, "test": github.Cancelled}}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastEvent(t, n); !strings.Contains(got, "check_cancelled:test-integration (rerun it); check_cancelled:test (rerun it)") {
+		t.Fatalf("notice=%s", got)
+	}
+	if !authorAction("check_cancelled:test (rerun it)") {
+		t.Fatal("an expired cancellation is not routed to the author")
+	}
+}
