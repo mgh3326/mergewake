@@ -32,14 +32,15 @@ const panewireWaitTimeout = 85
 // included; Recorded is when the job was first spawned and bounds how long a
 // live job is waited for.
 type reviewerJob struct {
-	PR       int       `json:"pr"`
-	Head     string    `json:"head"`
-	LeaseSHA string    `json:"lease_sha,omitempty"`
-	Pass     int       `json:"pass"`
-	Label    string    `json:"label"`
-	Checkout string    `json:"checkout"`
-	Args     []string  `json:"args"`
-	Recorded time.Time `json:"recorded"`
+	PR           int       `json:"pr"`
+	Head         string    `json:"head"`
+	LeaseSHA     string    `json:"lease_sha,omitempty"`
+	Pass         int       `json:"pass"`
+	Label        string    `json:"label"`
+	Checkout     string    `json:"checkout"`
+	Args         []string  `json:"args"`
+	Recorded     time.Time `json:"recorded"`
+	Replacements int       `json:"replacements,omitempty"`
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {

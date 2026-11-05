@@ -32,11 +32,19 @@ import (
 type reviewHub struct {
 	mu      sync.Mutex
 	n       int
+	repo    string
 	refs    map[string]string // branch → sha
 	commits map[string]string // sha → message
 	reviews map[int][]map[string]any
 	seq     int
 	trace   *eventLog
+}
+
+func (h *reviewHub) repoName() string {
+	if h.repo == "" {
+		return "o/one"
+	}
+	return h.repo
 }
 
 const hubBase = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -46,7 +54,7 @@ func hubHead(n int) string { return fmt.Sprintf("%040x", n) }
 var hubPolicy = []byte("version: 1\nenabled: true\nrequired_checks: [CI]\n")
 
 func (h *reviewHub) pull(n int) string {
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: 42\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":"o/one"}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, hubHead(n), n, hubBase)
+	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: 42\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, hubHead(n), n, h.repoName(), hubBase)
 }
 
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)
@@ -103,8 +111,8 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Fprint(w, h.pull(number))
-	case strings.HasPrefix(path, "/repos/o/one/git/ref/heads/"):
-		branch := strings.TrimPrefix(path, "/repos/o/one/git/ref/heads/")
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/git/ref/heads/"):
+		branch := strings.TrimPrefix(path, "/repos/"+h.repoName()+"/git/ref/heads/")
 		if branch == "main" {
 			fmt.Fprintf(w, `{"object":{"sha":%q}}`, hubBase)
 			return
@@ -115,7 +123,7 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Fprintf(w, `{"object":{"sha":%q}}`, sha)
-	case path == "/repos/o/one/git/refs" && r.Method == "POST":
+	case path == "/repos/"+h.repoName()+"/git/refs" && r.Method == "POST":
 		var in struct{ Ref, SHA string }
 		_ = json.Unmarshal(body, &in)
 		branch := strings.TrimPrefix(in.Ref, "refs/heads/")
@@ -125,26 +133,26 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.refs[branch] = in.SHA
 		fmt.Fprint(w, `{}`)
-	case strings.HasPrefix(path, "/repos/o/one/git/refs/heads/") && r.Method == "PATCH":
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/git/refs/heads/") && r.Method == "PATCH":
 		var in struct{ SHA string }
 		_ = json.Unmarshal(body, &in)
-		h.refs[strings.TrimPrefix(path, "/repos/o/one/git/refs/heads/")] = in.SHA
+		h.refs[strings.TrimPrefix(path, "/repos/"+h.repoName()+"/git/refs/heads/")] = in.SHA
 		fmt.Fprint(w, `{}`)
-	case path == "/repos/o/one/git/commits" && r.Method == "POST":
+	case path == "/repos/"+h.repoName()+"/git/commits" && r.Method == "POST":
 		var in struct{ Message string }
 		_ = json.Unmarshal(body, &in)
 		h.seq++
 		sha := fmt.Sprintf("%040x", 1<<40+h.seq)
 		h.commits[sha] = in.Message
 		fmt.Fprintf(w, `{"sha":%q}`, sha)
-	case strings.HasPrefix(path, "/repos/o/one/commits/") && strings.HasSuffix(path, "/pulls"):
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/commits/") && strings.HasSuffix(path, "/pulls"):
 		fmt.Fprint(w, `[]`)
-	case strings.HasPrefix(path, "/repos/o/one/commits/") && strings.HasSuffix(path, "/check-runs"):
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/commits/") && strings.HasSuffix(path, "/check-runs"):
 		fmt.Fprint(w, `{"check_runs":[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]}`)
-	case strings.HasPrefix(path, "/repos/o/one/commits/") && strings.HasSuffix(path, "/statuses"):
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/commits/") && strings.HasSuffix(path, "/statuses"):
 		fmt.Fprint(w, `[]`)
-	case strings.HasPrefix(path, "/repos/o/one/commits/"):
-		sha := strings.TrimPrefix(path, "/repos/o/one/commits/")
+	case strings.HasPrefix(path, "/repos/"+h.repoName()+"/commits/"):
+		sha := strings.TrimPrefix(path, "/repos/"+h.repoName()+"/commits/")
 		msg := h.commits[sha]
 		if msg == "" {
 			msg = "change"
@@ -299,12 +307,16 @@ func (parallelSink) TaskJob(context.Context, string) (string, string, error) {
 }
 
 func newParallelFixture(t *testing.T, prs, parallel int) *parallelFixture {
+	return newParallelFixtureForRepo(t, prs, parallel, "o/one")
+}
+
+func newParallelFixtureForRepo(t *testing.T, prs, parallel int, name string) *parallelFixture {
 	t.Helper()
 	trace := &eventLog{}
-	hub := &reviewHub{n: prs, refs: map[string]string{}, commits: map[string]string{}, reviews: map[int][]map[string]any{}, trace: trace}
+	hub := &reviewHub{n: prs, repo: name, refs: map[string]string{}, commits: map[string]string{}, reviews: map[int][]map[string]any{}, trace: trace}
 	srv := httptest.NewServer(hub)
 	t.Cleanup(srv.Close)
-	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml", Root: t.TempDir()}
+	repo := config.Repo{Name: name, Branch: "main", Policy: "policy.yaml", Root: t.TempDir()}
 	cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10,
 		Review: config.Review{Login: "reviewer", Timeout: "60s", Executor: "panewire", Panewire: config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(t.TempDir(), "jobs"), Checkouts: filepath.Join(t.TempDir(), "checkouts")},
 			Pairings: map[string][]string{"openai": {"claude"}},
@@ -480,5 +492,50 @@ func TestPollPRsParallelReviewsShareServiceState(t *testing.T) {
 		if !strings.Contains(string(sent), fmt.Sprintf("ready %d %s", n, hubHead(n))) {
 			t.Fatalf("pr-notify-sent lacks PR %d:\n%s", n, sent)
 		}
+	}
+}
+
+type reviewerWaitExit struct{}
+
+func (reviewerWaitExit) Error() string { return "wait timed out" }
+func (reviewerWaitExit) ExitCode() int { return 85 }
+
+type slowPassRunner struct {
+	wait    string
+	running bool
+}
+
+func (r *slowPassRunner) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
+	if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
+		i := slices.Index(args, "--wait-timeout")
+		if i >= 0 && i+1 < len(args) {
+			r.wait = args[i+1]
+		}
+		r.running = true
+		return nil, reviewerWaitExit{}
+	}
+	return nil, nil
+}
+
+func TestSlowReviewerDoesNotDelayNextRepo(t *testing.T) {
+	a := newParallelFixtureForRepo(t, 1, 1, "o/one")
+	b := newParallelFixtureForRepo(t, 1, 1, "o/two")
+	a.s.Config.Review.Timeout = "25m"
+	slow := &slowPassRunner{}
+	a.s.Runner = slow
+	close(b.runner.release)
+	for _, f := range []*parallelFixture{a, b} {
+		if err := pollPRs(context.Background(), f.s, f.gh, f.repo, pipeline.Options{}); err != nil && !strings.Contains(err.Error(), "land") {
+			t.Fatal(err)
+		}
+	}
+	if slow.wait != "90" || !slow.running {
+		t.Fatalf("wait=%q running=%v", slow.wait, slow.running)
+	}
+	if _, err := os.Stat(filepath.Join(a.s.Config.StateDir, a.repo.Name, "reviewer-jobs", "1-p1.json")); err != nil {
+		t.Fatalf("reviewer record: %v", err)
+	}
+	if !slices.Contains(b.trace.snapshot(), "notify 1") {
+		t.Fatalf("second repo did not settle: %v", b.trace.snapshot())
 	}
 }

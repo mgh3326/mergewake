@@ -50,6 +50,7 @@ type panewireRunner struct {
 	usageErr     error
 	quotaCalls   int // quota tool invocations (recommend, usage, gate)
 	quotaActions [][]string
+	closes       [][]string
 	spawns       [][]string
 	git          [][]string
 	headless     int
@@ -68,6 +69,10 @@ type panewireRunner struct {
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
+	}
+	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
+		r.closes = append(r.closes, slices.Clone(args))
+		return nil, nil
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "inbox" {
 		if args[1] == "ack" {
@@ -803,8 +808,8 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	if e != nil || out.executor != "panewire" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}
-	// A minute of the ten is kept back for posting.
-	if w := arg(runner.spawns[0], "--wait-timeout"); w != "539" && w != "540" {
+	// Each pass waits at most 90 seconds.
+	if w := arg(runner.spawns[0], "--wait-timeout"); w != "90" {
 		t.Fatalf("--wait-timeout %s", w)
 	}
 }

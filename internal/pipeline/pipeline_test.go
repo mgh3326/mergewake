@@ -54,6 +54,7 @@ type fakeGH struct {
 	feedbackReads                                                int
 	refs                                                         map[string]bool
 	leaseTimes                                                   map[string]time.Time
+	leaseIDs                                                     map[string]string
 	files                                                        []policy.File
 	ci                                                           github.CI
 	mergeCount, revertCount, postCount, claimCount, publishCount int
@@ -195,7 +196,11 @@ func (g *fakeGH) ReviewLease(_ context.Context, _ string, branch string, ttl tim
 	if !g.refs[branch] {
 		return "", false, nil
 	}
-	return shaA, time.Since(g.leaseTimes[branch]) < ttl, nil
+	sha := g.leaseIDs[branch]
+	if sha == "" {
+		sha = shaA
+	}
+	return sha, time.Since(g.leaseTimes[branch]) < ttl, nil
 }
 func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl time.Duration) (bool, error) {
 	_, active, err := g.ReviewLease(ctx, repo, branch, ttl)
@@ -209,6 +214,9 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 		g.leaseTimes = map[string]time.Time{}
 	}
 	g.refs[branch] = true
+	if g.leaseIDs != nil {
+		delete(g.leaseIDs, branch)
+	}
 	g.leaseTimes[branch] = time.Now()
 	g.claimCount++
 	return true, nil
@@ -219,6 +227,21 @@ func (g *fakeGH) ClaimReviewWithSHA(ctx context.Context, repo, branch, head stri
 		return "", acquired, err
 	}
 	return shaA, true, nil
+}
+func (g *fakeGH) RenewReviewLease(_ context.Context, _ string, branch, expected string) (string, bool, error) {
+	current := g.leaseIDs[branch]
+	if current == "" {
+		current = shaA
+	}
+	if !g.refs[branch] || expected != current {
+		return "", false, nil
+	}
+	if g.leaseIDs == nil {
+		g.leaseIDs = make(map[string]string)
+	}
+	g.leaseIDs[branch] = current + "a"
+	g.leaseTimes[branch] = time.Now()
+	return g.leaseIDs[branch], true, nil
 }
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
