@@ -146,7 +146,7 @@ func (s *Store) CheckSchema(ctx context.Context) error {
 	return nil
 }
 
-var columnDef = regexp.MustCompile(`^ ([a-z_]+) ((?:BIGINT|INT)(?: UNSIGNED)?|VARCHAR\([0-9]+\)|CHAR\([0-9]+\)|DATETIME\(6\)|JSON) (.+?)(?:,)?$`)
+var columnDef = regexp.MustCompile(`^ ([a-z_]+) ((?:BIGINT|INT)(?: UNSIGNED)?|MEDIUMBLOB|VARCHAR\([0-9]+\)|CHAR\([0-9]+\)|DATETIME\(6\)|JSON) (.+?)(?:,)?$`)
 var indexDef = regexp.MustCompile(`^ (PRIMARY KEY|(?:UNIQUE )?KEY [a-z_]+) \(([^)]+)\),?$`)
 var foreignDef = regexp.MustCompile(`^ FOREIGN KEY \(([^)]+)\) REFERENCES ([a-z_]+) \(([^)]+)\),?$`)
 

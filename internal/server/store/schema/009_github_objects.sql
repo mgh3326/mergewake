@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS mw_github_objects (
+ repository VARCHAR(201) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ kind VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ sha VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ path VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ body MEDIUMBLOB NOT NULL,
+ size INT UNSIGNED NOT NULL,
+ fetched_at DATETIME(6) NOT NULL,
+ PRIMARY KEY (repository,kind,sha,path)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
