@@ -434,30 +434,22 @@ func (s *Service) bracketCandidates(ctx context.Context, r config.Repo, chain []
 
 // recoveryTrailers copies the culprit's PR-body values, falling back to its head commit.
 func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	commit, err := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-	if err != nil {
-		return "", err
-	}
 	var lines []string
-	for _, key := range []string{"Mergewake-Task", "Mergewake-Grade", "Mergewake-Tier", "Mergewake-Notify-Lane"} {
-		value := trailer(pr.Body, key)
-		valid := func(v string) bool {
-			switch key {
-			case "Mergewake-Task":
-				return integrations.TaskID.MatchString(v)
-			case "Mergewake-Grade":
-				return config.ValidGrade(v)
-			case "Mergewake-Tier":
-				return validTier(v)
-			default:
-				return v != ""
-			}
+	for _, t := range []struct {
+		key   string
+		valid func(string) bool
+	}{
+		{"Mergewake-Task", integrations.TaskID.MatchString},
+		{"Mergewake-Grade", config.ValidGrade},
+		{"Mergewake-Tier", validTier},
+		{"Mergewake-Notify-Lane", nil},
+	} {
+		value, err := s.prTrailer(ctx, r, pr, t.key, t.valid)
+		if err != nil {
+			return "", err
 		}
-		if !valid(value) {
-			value = trailer(commit.Commit.Message, key)
-		}
-		if valid(value) {
-			lines = append(lines, key+": "+value)
+		if value != "" {
+			lines = append(lines, t.key+": "+value)
 		}
 	}
 	return strings.Join(lines, "\n"), nil
