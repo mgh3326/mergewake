@@ -54,13 +54,12 @@ type legacyRevertWatcher interface {
 }
 
 // legacyCand is one worktree path on one host that some PR's bound job worked
-// in, with every closed PR that led to it.
+// in.
 type legacyCand struct {
 	host string // configured host name
 	cwd  string
 	job  string
 	task string
-	prs  []github.Pull
 }
 
 // legacyReach counts what the binding could not reach, per repo.
@@ -173,11 +172,16 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	if e != nil {
 		return fmt.Errorf("list open PRs: %w", e)
 	}
-	openBranch := map[string]bool{}
-	for _, p := range open {
-		openBranch[p.Head.Ref] = true
-	}
 	sort.Slice(closed, func(i, j int) bool { return closed[i].Number < closed[j].Number })
+	// newest closed PR of this repo per head branch, whether or not it is bound
+	// to a job: a newer closed-unmerged PR on a reused branch must keep the
+	// worktree of an older merged one.
+	newest := map[string]*github.Pull{}
+	for i := range closed {
+		if q := &closed[i]; sameRepoHead(*q, r.Name) {
+			newest[q.Head.Ref] = q
+		}
+	}
 
 	var errs []error
 	reach := legacyReach{ClosedPRs: len(closed), Unreachable: map[string]int{}, BoundJobsBy: map[string]int{}, boundJobSeen: map[string]bool{}}
@@ -245,7 +249,6 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 			byHost[hostName][rec.Cwd] = c
 			reach.Worktrees++
 		}
-		c.prs = append(c.prs, p)
 	}
 	if e := s.Print(map[string]any{"action": legacyAction + "-reach", "repo": r.Name, "reach": reach}); e != nil {
 		errs = append(errs, e)
@@ -255,7 +258,7 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	if e != nil {
 		return errors.Join(append(errs, e)...)
 	}
-	sweep := &legacySweep{s: s, r: r, o: o, acting: acting, lastRow: lastRow, open: openBranch, watcher: watcher, ancestry: map[string]bool{}}
+	sweep := &legacySweep{s: s, r: r, o: o, acting: acting, lastRow: lastRow, newest: newest, open: openBranches(open, r.Name), openLister: openLister, watcher: watcher, ancestry: map[string]bool{}}
 	for _, h := range wanted {
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
@@ -288,36 +291,63 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	return errors.Join(append(errs, s.audit(r.Name, "reap-legacy", map[string]any{"host": host, "apply": acting, "reach": reach}, o.DryRun))...)
 }
 
+// sameRepoHead reports whether PR p's head branch lives in repo itself. A fork's
+// branch of the same name, or a fork that was deleted (no head repository),
+// is not the repository's branch.
+func sameRepoHead(p github.Pull, repo string) bool {
+	return strings.EqualFold(p.Head.Repo.FullName, repo)
+}
+
+// openBranches is the set of the repo's own head branches that have an open PR.
+func openBranches(open []github.Pull, repo string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range open {
+		if sameRepoHead(p, repo) {
+			out[p.Head.Ref] = true
+		}
+	}
+	return out
+}
+
 func legacyKey(host, path string) string { return host + "\x00" + path }
 
 // legacySweep carries one repo's pass state across its hosts.
 type legacySweep struct {
-	s        *Service
-	r        config.Repo
-	o        Options
-	acting   bool
-	lastRow  map[string]string
-	open     map[string]bool // head branches that still have an open PR
-	watcher  legacyRevertWatcher
+	s       *Service
+	r       config.Repo
+	o       Options
+	acting  bool
+	lastRow map[string]string
+	newest  map[string]*github.Pull // head branch → its newest closed PR
+	open    map[string]bool         // head branches that had an open PR when the sweep began
+	watcher legacyRevertWatcher
+	// openLister re-reads open PRs right before a removal.
+	openLister interface {
+		OpenPulls(context.Context, string, string) ([]github.Pull, error)
+	}
 	ancestry map[string]bool
 }
 
 // candidate evaluates and records one worktree. It returns the errors that
 // should fail the run; every evaluation, even a kept one, leaves a row.
 func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand, tally legacyTally) []error {
-	key := legacyKey(c.host, c.cwd)
 	// A removed worktree is finished and a refused one is never retried on its
-	// own: neither is inspected again.
-	switch prior, _, _ := strings.Cut(w.lastRow[key], "|"); prior {
-	case "removed", "refused":
+	// own: neither is inspected again. This is the cheap check by the job's cwd;
+	// evaluate repeats it by the inspected worktree root, which is what rows
+	// are keyed by when the cwd sits inside the worktree.
+	if prior := w.prior(c.host, c.cwd); prior != "" {
 		tally.add("already-"+prior, "")
 		return nil
 	}
 	rec := reapReceipt{Action: legacyAction, Repo: w.r.Name, Host: c.host, Cwd: c.cwd, Worktree: c.cwd, Job: c.job, Task: c.task}
 	var errs []error
-	skip := w.evaluate(ctx, hs, c, &rec, &errs)
-	if skip {
-		tally.add("out-of-scope", "reviewer-checkout")
+	switch skip := w.evaluate(ctx, hs, c, &rec, &errs); skip {
+	case "":
+	case "reviewer-checkout":
+		tally.add("out-of-scope", skip)
+		return errs
+	default: // already-removed, already-refused
+		tally.add(skip, "")
 		return errs
 	}
 	tally.add(rec.Result, strings.SplitN(rec.Reason, ":", 2)[0])
@@ -325,6 +355,15 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 		errs = append(errs, e)
 	}
 	return errs
+}
+
+// prior is "removed" or "refused" when the worktree's newest row is final.
+func (w *legacySweep) prior(host, path string) string {
+	switch r, _, _ := strings.Cut(w.lastRow[legacyKey(host, path)], "|"); r {
+	case "removed", "refused":
+		return r
+	}
+	return ""
 }
 
 // note prints a row and appends it to reap.jsonl unless it repeats the
@@ -335,72 +374,70 @@ func (w *legacySweep) note(v reapReceipt) error {
 	key, sig := legacyKey(v.Host, v.Worktree), v.Result+"|"+v.Reason
 	repeat := w.lastRow[key] == sig
 	w.lastRow[key] = sig
-	if e := w.s.Print(v); e != nil {
-		return e
+	// The receipt is the durable record, so it is written before the row is
+	// printed: a failing stdout must not lose a removal.
+	var werr error
+	if !repeat {
+		b, e := json.Marshal(v)
+		if e != nil {
+			return e
+		}
+		werr = appendLine(w.s.reapLog(v.Repo), b)
 	}
-	if repeat {
-		return nil
-	}
-	b, e := json.Marshal(v)
-	if e != nil {
-		return e
-	}
-	return appendLine(w.s.reapLog(v.Repo), b)
+	return errors.Join(werr, w.s.Print(v))
 }
 
 // evaluate fills rec with the verdict for one worktree, in the order the
-// cheap rules come before GitHub calls and the node is asked last. It reports
-// true for a worktree that is out of scope and gets no row.
-func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand, rec *reapReceipt, errs *[]error) (outOfScope bool) {
+// cheap rules come before GitHub calls and the node is asked last. It returns
+// a non-empty skip for a worktree that gets no row: "reviewer-checkout" is out
+// of scope, "already-removed" and "already-refused" are final rows of an
+// earlier run found under the inspected worktree root.
+func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand, rec *reapReceipt, errs *[]error) (skip string) {
 	keep := func(reason string) { rec.Result, rec.Reason = "kept", reason }
 	if hs == nil || hs.failed {
 		keep("host-unreadable")
-		return false
+		return ""
 	}
 	wt, e := hs.ops.Inspect(ctx, c.cwd)
 	switch {
 	case e != nil:
 		rec.Result, rec.Reason = "error", "worktree-inspect-error"
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", c.host, c.cwd, e))
-		return false
+		return ""
 	case wt == nil:
 		keep("gone")
-		return false
+		return ""
+	}
+	// Reviewer checkouts (mwr-*) belong to the reviewer sweep, attached or not.
+	if strings.HasPrefix(filepath.Base(wt.Path), "mwr-") {
+		return "reviewer-checkout"
 	}
 	rec.Worktree, rec.Branch, rec.Head = wt.Path, wt.Branch, wt.Head
+	// Rows are keyed by the worktree root the node reported, which differs from
+	// the job's cwd when the job worked in a subdirectory.
+	if prior := w.prior(c.host, wt.Path); prior != "" {
+		return "already-" + prior
+	}
 	switch {
 	case wt.Repo == "":
 		keep("repo-unknown")
-		return false
+		return ""
 	case !strings.EqualFold(wt.Repo, w.r.Name):
 		keep("other-repo")
-		return false
+		return ""
 	case wt.Branch == "":
-		// Reviewer checkouts (mwr-*) belong to the reviewer sweep.
-		if strings.HasPrefix(filepath.Base(wt.Path), "mwr-") {
-			return true
-		}
 		keep("detached")
-		return false
+		return ""
 	case wt.Head == "":
 		keep("head-unknown")
-		return false
+		return ""
 	}
-	// The PR of this branch: the newest one on it. A fork's PR of the same
-	// branch name is not this worktree's.
-	var p *github.Pull
-	for i := range c.prs {
-		q := &c.prs[i]
-		if q.Head.Ref != wt.Branch || q.Head.Repo.FullName != "" && !strings.EqualFold(q.Head.Repo.FullName, w.r.Name) {
-			continue
-		}
-		if p == nil || q.Number > p.Number {
-			p = q
-		}
-	}
+	// The PR of this branch is the newest closed one on it, bound to a job or
+	// not; a fork's branch of the same name is not this repository's.
+	p := w.newest[wt.Branch]
 	if p == nil {
 		keep("no-pr")
-		return false
+		return ""
 	}
 	rec.PR = p.Number
 	var mergedAt *time.Time
@@ -421,7 +458,7 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	default:
 		w.merged(ctx, hs, wt, *p, *mergedAt, rec, errs)
 	}
-	return false
+	return ""
 }
 
 // merged runs the rules that apply to a merged PR old enough to sweep.
@@ -513,6 +550,33 @@ func (w *legacySweep) merged(ctx context.Context, hs *reapHost, wt *reap.Worktre
 	}
 	if hs.paneInUse(wt.Path) {
 		keep("pane-in-use")
+		return
+	}
+	// A PR may have opened on the branch since the sweep began.
+	open, e := w.openLister.OpenPulls(ctx, w.r.Name, "")
+	if e != nil {
+		*errs = append(*errs, fmt.Errorf("%s open PRs: %w", w.r.Name, e))
+		keep("open-pr-check-failed")
+		return
+	}
+	if openBranches(open, w.r.Name)[wt.Branch] {
+		keep("open-pr")
+		return
+	}
+	// The PR was chosen from the branch seen at the first inspection; the
+	// removal request carries only the head, so confirm the checkout is still
+	// that branch at that head.
+	cur, e := hs.ops.Inspect(ctx, wt.Path)
+	switch {
+	case e != nil:
+		rec.Result, rec.Reason = "error", "worktree-inspect-error"
+		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, wt.Path, e))
+		return
+	case cur == nil:
+		keep("gone")
+		return
+	case cur.Path != wt.Path || cur.Branch != wt.Branch || cur.Head != wt.Head:
+		keep("worktree-changed")
 		return
 	}
 	result, e := remover.WorktreeRemove(ctx, wt.Path, wt.Head, w.r.Branch, w.s.Config.Reap.Regenerable, false)

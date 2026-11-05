@@ -104,8 +104,9 @@ Session hosts where agent panes may run, used only by `reap`.
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 **Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
-is a one-shot pass, not part of the daemon loop, over worktrees whose merge is
-older than `scan_after`. It reads every closed PR of the repo and follows
+is a one-shot pass, not part of the daemon loop, over worktrees whose PR merged
+at least 14 days ago, however long ago (the daemon only sees merges inside
+`scan_after`; this ignores that window). It reads every closed PR of the repo and follows
 `Mergewake-Task` → hk task → bound job → the job record's host and cwd. It asks
 the node about that cwd (`worktree.inspect`) and removes the worktree only
 through the node's guarded `worktree.remove` (`detached:false`), and only when
@@ -113,10 +114,17 @@ the PR is merged into the base at least 14 days ago, the head is the merged
 head or inside the merged work, no pane or process is in it, and the node
 finds it clean. The node decides cleanliness at removal; a plan never probes
 it, so a plan row says `would-remove` with reason `node guard decides
-cleanliness`. Closed-unmerged PRs, worktrees of other repos, PRs with an open
-PR on the branch, detached worktrees and anything unclassifiable are kept with
-the reason. A node refusal is recorded as `refused` and never retried by a
-rerun. Every worktree gets one `legacy-sweep` row in `reap.jsonl` (plans too),
+cleanliness`. Closed-unmerged PRs, worktrees of other repos, branches with an open
+PR, detached worktrees and anything unclassifiable are kept with
+the reason; `mwr-*` reviewer checkouts, attached or detached, are left to the
+reviewer sweep and get no row. A final node refusal (`ignored-files`, `dirty`, `worktree-changed` and similar)
+is recorded as `refused` and never retried by a rerun; a refusal that says try
+again (`busy`, `pane-in-use`, `pane-scan-failed`, `git_too_old`) is recorded as
+`kept` and asked again on the next run. Just before each removal the sweep
+re-reads open PRs and re-inspects the worktree, and keeps it if the branch has
+an open PR or the checkout changed. Only PRs whose head is in the repo itself
+count: a fork's branch of the same name neither blocks nor selects a worktree.
+The newest closed PR of the branch decides, bound to a job or not. Every worktree gets one `legacy-sweep` row in `reap.jsonl` (plans too),
 and each host ends with a summary of counts by result and reason. PRs with no
 trailer, no bound job or no job record cannot be reached this way and are only
 counted. Only panewire-hub hosts can be swept. The daemon's reap ignores

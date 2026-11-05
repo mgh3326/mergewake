@@ -17,6 +17,11 @@ type legacyGH struct {
 	reapGH
 	closed []github.Pull
 	open   []github.Pull
+	// openByCall, when set, answers the nth OpenPulls call (the last entry for
+	// later calls); onOpen runs at the start of each call.
+	openByCall [][]github.Pull
+	openCalls  int
+	onOpen     func(call int)
 }
 
 func (g *legacyGH) AllClosedPulls(context.Context, string) ([]github.Pull, error) {
@@ -26,6 +31,13 @@ func (g *legacyGH) AllClosedPulls(context.Context, string) ([]github.Pull, error
 func (g *legacyGH) OpenPulls(_ context.Context, _, branch string) ([]github.Pull, error) {
 	if branch != "" {
 		return nil, context.Canceled
+	}
+	g.openCalls++
+	if g.onOpen != nil {
+		g.onOpen(g.openCalls)
+	}
+	if n := len(g.openByCall); n > 0 {
+		return g.openByCall[min(g.openCalls, n)-1], nil
 	}
 	return g.open, nil
 }
@@ -49,6 +61,7 @@ func legacyPR(number int, daysAgo int, merged bool) github.Pull {
 		Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
 		MergeCommitSHA: "abc123",
 	}
+	p.Head.Repo.FullName = "example/project"
 	if merged {
 		p.Merged, p.MergedAt = true, rfc(time.Now().Add(-time.Duration(daysAgo)*24*time.Hour))
 	}
@@ -297,6 +310,9 @@ func TestLegacySweepKeepsForeignDetachedAndSkipsReviewerCheckouts(t *testing.T) 
 		"other repo": {func(h *fakeReapHub) { h.foreign = map[string]bool{legacyCwd: true} }, legacyCwd, "other-repo"},
 		"detached":   {func(h *fakeReapHub) { h.detached = map[string]bool{legacyCwd: true} }, legacyCwd, "detached"},
 		"reviewer":   {func(h *fakeReapHub) { h.detached = map[string]bool{"/mwr-40-aaaa111-p1-1": true} }, "/mwr-40-aaaa111-p1-1", ""},
+		// An attached mwr-* checkout (on the PR's own branch) is the reviewer
+		// sweep's too, even once its PR is old enough.
+		"attached reviewer": {func(h *fakeReapHub) { h.wtPaths["/mwr-40-aaaa111-p1-1"] = true }, "/mwr-40-aaaa111-p1-1", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, hub, _ := legacyFixture(t)
@@ -360,5 +376,158 @@ func TestReapIgnoresLegacySweepRows(t *testing.T) {
 	}
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("daemon reap acted on a legacy-sweep row: %v", hub.ops("worktree.remove"))
+	}
+}
+
+func forkPR(number int, ref string) github.Pull {
+	p := github.Pull{Number: number, State: "open", Head: github.Ref{Ref: ref, SHA: "f0f0f0f0"}, Base: github.Ref{Ref: "main"}}
+	p.Head.Repo.FullName = "someone/project"
+	return p
+}
+
+// An open PR that appears on the branch while the sweep runs keeps the
+// worktree: open PRs are re-read right before each removal.
+func TestLegacySweepRereadsOpenPRsBeforeRemoval(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	opened := legacyPR(50, 0, false)
+	opened.State = "open"
+	gh.openByCall = [][]github.Pull{nil, {opened}}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "open-pr")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed a branch with an open PR %d times", n)
+	}
+	if gh.openCalls != 2 {
+		t.Fatalf("open PR reads: %d", gh.openCalls)
+	}
+}
+
+// Open PRs are matched by source repository: a fork's branch of the same name
+// does not hold the worktree, the repo's own open PR does.
+func TestLegacySweepOpenPRsMatchBySourceRepository(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	gh.open = []github.Pull{forkPR(51, "wk/x")}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("a fork's open PR blocked the removal: %d calls", n)
+	}
+	wantRow(t, legacyOnly(t, s), "removed", "")
+
+	s2, hub2, gh2 := legacyFixture(t)
+	own := legacyPR(52, 0, false)
+	own.State = "open"
+	gh2.open = []github.Pull{own}
+	if err := s2.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s2), "kept", "open-pr")
+	if n := len(hub2.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed a branch with an open PR %d times", n)
+	}
+}
+
+// A job whose cwd is inside the worktree finds its own refusal: rows are keyed
+// by the worktree root the node reported.
+func TestLegacySweepRefusalFoundByWorktreeRoot(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	sub := legacyCwd + "/sub"
+	hub.wtPaths[sub] = true
+	hub.tops = map[string]string{sub: legacyCwd}
+	hub.removeOutcome = "ignored-files"
+	s.Sink.(*jobSink).recs["job-a"] = integrations.JobRecord{Host: "node-a", Cwd: sub}
+	for i := 0; i < 2; i++ {
+		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("rerun retried a refusal found under the root: %d calls", n)
+	}
+	row := legacyOnly(t, s)
+	if row["result"] != "refused" || row["worktree"] != legacyCwd {
+		t.Fatalf("row: %v", row)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, os.ErrClosed }
+
+// The receipt is appended before the row is printed: a failing stdout after a
+// removal still leaves the removed row.
+func TestLegacySweepReceiptIsWrittenBeforePrinting(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	s.Out = failingWriter{}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err == nil {
+		t.Fatal("a failing stdout went unreported")
+	}
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("worktree.remove calls: %d", n)
+	}
+	wantRow(t, legacyOnly(t, s), "removed", "")
+}
+
+// The newest closed PR of the branch decides, even when it is bound to no job:
+// a later closed-unmerged PR keeps the worktree of an older merged one.
+func TestLegacySweepNewestClosedPRDecidesEvenWithoutJob(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	later := legacyPR(41, 20, false)
+	later.Body = "No trailer."
+	gh.closed = append(gh.closed, later)
+	s.GH = &noTrailerGH{legacyGH: gh}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	row := legacyOnly(t, s)
+	wantRow(t, row, "kept", "closed-unmerged")
+	if row["pr"] != float64(41) {
+		t.Fatalf("row: %v", row)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed %d", n)
+	}
+}
+
+// A PR with no head repository (a deleted fork) is not this repository's: it
+// neither selects the worktree nor decides its age.
+func TestLegacySweepIgnoresPRWithoutHeadRepository(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	orphan := legacyPR(41, 1, true)
+	orphan.Head.Repo.FullName = ""
+	gh.closed = append(gh.closed, orphan)
+	if err := s.ReapLegacy(context.Background(), testRepo, "", plan()); err != nil {
+		t.Fatal(err)
+	}
+	row := legacyOnly(t, s)
+	wantRow(t, row, "would-remove", legacyGuardNote)
+	if row["pr"] != float64(40) {
+		t.Fatalf("selected the deleted fork's PR: %v", row)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("plan removed %d", n)
+	}
+}
+
+// A checkout that left the matched branch between the first inspection and the
+// removal keeps its worktree: the request carries only the head.
+func TestLegacySweepReinspectsBeforeRemoval(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	gh.onOpen = func(call int) {
+		if call == 2 { // the re-read right before the removal
+			hub.mu.Lock()
+			hub.detached = map[string]bool{legacyCwd: true}
+			hub.mu.Unlock()
+		}
+	}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "worktree-changed")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed a switched checkout %d times", n)
 	}
 }

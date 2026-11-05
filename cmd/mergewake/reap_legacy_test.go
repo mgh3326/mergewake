@@ -25,7 +25,7 @@ func TestReapLegacyFlagValidation(t *testing.T) {
 	if e := run(context.Background(), []string{"reap", "--help"}, &out, &out); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(out.String(), "-legacy") || !strings.Contains(out.String(), "-host") {
+	if !strings.Contains(out.String(), "-legacy") || !strings.Contains(out.String(), "-host") || !strings.Contains(out.String(), "at least 14 days ago") {
 		t.Fatalf("help:\n%s", out.String())
 	}
 }

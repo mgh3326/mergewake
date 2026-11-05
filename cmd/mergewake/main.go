@@ -124,7 +124,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			family = fs.String("author-family", "", "PR author model family (or PR body trailer)")
 		} else if command == "reap" {
 			shadow = fs.Bool("shadow", false, "force observation mode")
-			legacy = fs.Bool("legacy", false, "one-time sweep of worktrees older than the daemon's scan window (every configured repo unless --repo; plans unless --apply)")
+			legacy = fs.Bool("legacy", false, "one-time sweep of worktrees whose PR merged at least 14 days ago, past the daemon's scan window (every configured repo unless --repo; plans unless --apply)")
 			legacyHost = fs.String("host", "", "with --legacy: sweep one configured host only")
 		} else {
 			shadow = fs.Bool("shadow", false, "force decision-only mode")
