@@ -421,8 +421,14 @@ func TestReviewExecutor(t *testing.T) {
 	}
 	c, e := load("")
 	rt := c.Review.Panewire
-	if e != nil || c.Review.Executor != "headless" || rt.Command != "panewire" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
+	if e != nil || c.Review.Executor != "panewire" || rt.Command != "panewire" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
 		t.Fatalf("%+v %v", c.Review, e)
+	}
+	if _, e := load("review:\n  executor: headless\n"); e == nil || e.Error() != "review.executor: headless was retired; use panewire (the default)" {
+		t.Fatalf("headless error: %v", e)
+	}
+	if c, e := load("review:\n  quota: /x/pacelever\n"); e != nil || c.Outcomes.Command != "/x/pacelever" {
+		t.Fatalf("outcomes fallback: %q %v", c.Outcomes.Command, e)
 	}
 	c, e = load("review:\n  executor: panewire\n  panewire: {owner: review-desk, host: host-b, checkouts: /work/reviews}\n")
 	if e != nil || c.Review.Executor != "panewire" || c.Review.Panewire.Owner != "review-desk" || c.Review.Panewire.Host != "host-b" || c.Review.Panewire.Checkouts != "/work/reviews" {

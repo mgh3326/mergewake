@@ -769,18 +769,6 @@ func TestPanewireNeedsNoQuotaTool(t *testing.T) {
 	}
 }
 
-func TestHeadlessExecutorUnchangedWithoutPanewire(t *testing.T) {
-	runner := &panewireRunner{}
-	s, g, r := panewireSetup(t, runner)
-	s.Config.Review.Executor = "headless"
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if len(runner.spawns) != 0 || runner.headless != 1 || g.passes[shaA][0].Fallback != "" || g.passes[shaA][0].Executor != "" {
-		t.Fatal(runner.spawns, g.passes)
-	}
-}
-
 // Configured headless profiles are never tried under the panewire executor:
 // a failed spawn records only the panewire skip.
 func TestPanewireFailureTriesNoConfiguredProfile(t *testing.T) {
