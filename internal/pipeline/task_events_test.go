@@ -367,7 +367,7 @@ func revertSetup(t *testing.T, mergedAgo time.Duration) (*Service, *outcomeGH, *
 	s, g, hk, r := hkSetup(t)
 	merged := time.Now().UTC().Add(-mergedAgo).Format(time.RFC3339)
 	g.pull.State, g.pull.Merged, g.pull.MergedAt = "closed", true, &merged
-	g.pull.Body = "Mergewake-Author-Profile: example\nMergewake-Author-Model: example-model\nMergewake-Grade: B\nMergewake-Task: 2909\n"
+	g.pull.Body = "Mergewake-Author-Profile: example\nMergewake-Author-Model: example-model\nMergewake-Grade: B\nMergewake-Tier: T1\nMergewake-Task: 2909\n"
 	source := &outcomeGH{fakeGH: g, first: true, recovery: github.Pull{Number: 9, State: "open"}}
 	s.GH = source
 	if e := s.ledger().Update(r.Name, 7, func(v *outcomes.Outcome) { v.RevertPR = 9 }); e != nil {
@@ -496,5 +496,28 @@ func TestTaskEventTaskIDOverflow(t *testing.T) {
 	rows := taskEventAudit(t, s, r.Name)
 	if len(rows) != 1 || !strings.Contains(rows[0].Error, "out of range") {
 		t.Fatalf("audit %+v", rows)
+	}
+}
+
+// Unreadable sent keys keep a final row with a revert PR in reconciliation:
+// the read failure is audited each poll instead of the row being skipped.
+func TestTaskEventRevertKeysUnreadable(t *testing.T) {
+	s, g, hk, r := revertSetup(t, 2*time.Hour)
+	mergeRevert(g, time.Hour)
+	reconcile(t, s, r, Options{Shadow: true}) // finalizes the row
+	if e := os.MkdirAll(filepath.Join(s.state(r.Name), "hk-task-events"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	reconcile(t, s, r, Options{})
+	rows := taskEventAudit(t, s, r.Name)
+	if len(rows) != 1 || !strings.Contains(rows[0].Error, "sent keys unreadable") || len(hk.received()) != 0 {
+		t.Fatalf("audit %+v events %d", rows, len(hk.received()))
+	}
+	if e := os.Remove(filepath.Join(s.state(r.Name), "hk-task-events")); e != nil {
+		t.Fatal(e)
+	}
+	reconcile(t, s, r, Options{})
+	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceRevert {
+		t.Fatalf("events %+v", got)
 	}
 }
