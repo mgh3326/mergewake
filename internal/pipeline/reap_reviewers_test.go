@@ -238,6 +238,9 @@ func TestReapReviewer_D_I4_KeepsPaneTheJobDoesNotName(t *testing.T) {
 			for _, list := range []string{"agents", "panes"} {
 				f.hub.agents[list].([]any)[0].(map[string]any)["cwd"] = "/repo/elsewhere"
 			}
+			// Still a worktree of this repo, so the pane is this sweep's
+			// candidate and the job/pane disagreement is what keeps it.
+			f.hub.detached["/repo/elsewhere"] = true
 		}},
 		{"job cwd", func(f *reviewerFix, label string) {
 			// Same base name, but not the cwd the job record names.
@@ -683,6 +686,40 @@ func TestReapReviewer_K_I2_I6_CleansReviewerOfClosedPR(t *testing.T) {
 }
 
 // parseReviewerLabel accepts exactly the label a review pass writes.
+// (l) A label names a PR number, not a repo. A completed reviewer pane whose
+// worktree belongs to another repository is not this repo's sweep's: it is not
+// closed, read or receipted here, and this repo's own reviewer still is.
+func TestReapReviewer_L_I1_LeavesAnotherReposReviewer(t *testing.T) {
+	f := newReviewerFix(t)
+	other := reviewerLabelFor(141, time.Hour)
+	own := reviewerLabelFor(12, time.Hour)
+	f.addReviewer(other, "w1:p6")
+	f.addReviewer(own, "w1:p5")
+	f.hub.foreign = map[string]bool{"/repo/" + other: true}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"pane.read", "pane.close", "worktree.remove"} {
+		for _, c := range f.hub.ops(op) {
+			if c["pane_id"] == "w1:p6" || c["cwd"] == "/repo/"+other {
+				t.Fatalf("%s touched another repo's reviewer: %v", op, c)
+			}
+		}
+	}
+	closed := false
+	for _, r := range f.rows(t) {
+		if r.Label == other {
+			t.Fatalf("another repo's reviewer was receipted here: %v", rowSummary(f.rows(t)))
+		}
+		if r.Label == own && r.Result == "closed" {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Fatalf("own reviewer not closed: %v", rowSummary(f.rows(t)))
+	}
+}
+
 func TestReapReviewerLabelParse(t *testing.T) {
 	for name, ok := range map[string]bool{
 		"mwr-12-aaaa111-p1-1700000000":  true,
