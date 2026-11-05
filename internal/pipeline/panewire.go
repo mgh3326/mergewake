@@ -53,7 +53,7 @@ var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 // panewire's reviewer role excludes the author's family; when panewire refuses
 // every other family the pass runs once more as a worker seat, which may be
 // the author's family. Anything that stops the pane from producing findings
-// is a skip, and the next executor (headless) runs the pass.
+// is a skip unless a completed job has lost its result.
 type panewireExecutor struct {
 	s            *Service
 	repo         config.Repo
@@ -63,6 +63,15 @@ type panewireExecutor struct {
 	round        int
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
+}
+
+type reviewResultLost struct {
+	label, record, profile, report string
+	cause                          error
+}
+
+func (e *reviewResultLost) Error() string {
+	return fmt.Sprintf("reviewer %s finished but its result was lost: %v", e.label, e.cause)
 }
 
 func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
@@ -272,6 +281,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				}
 				return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 			}
+			if res.rec.State == "completed" {
+				return out, &reviewResultLost{label, res.reason, profile, reportPath, e}
+			}
 			return skip("no findings: job record %s; %v", res.reason, e)
 		}
 		s.inboxFallbacks++
@@ -286,11 +298,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	findings, e := parseFindings(b, x.diff)
 	if e != nil {
+		if res.rec.State == "completed" && ctx.Err() == nil {
+			return out, &reviewResultLost{label, res.reason, profile, reportPath, e}
+		}
 		return skip("reviewer pane %s findings rejected: %v", label, e)
 	}
 	seat := ""
 	if m := spawnedSeat.FindSubmatch(stdout); m != nil {
 		seat = string(m[1])
+	} else if placement.Profile != "" {
+		seat = placement.Profile
 	}
 	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
 	if seat != "" {
@@ -395,6 +412,7 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 			case "completed":
 				if len(rec.Result) > 0 {
 					out.result = []byte(rec.Result)
+					out.reason = "completed with a result"
 				} else {
 					out.reason = "completed without a result"
 				}

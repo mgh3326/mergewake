@@ -48,8 +48,13 @@ type reviewerCleanup struct {
 
 // spawnPlacement reads the executing panewire's placement receipt. The
 // placement value is base64url JSON containing the chosen host and pane id;
-// cwd is available in stdout on versions that report it directly.
+// cwd is available in stdout on versions that report it directly. A spawn the
+// hub coordinator placed reports `SPAWNED job=<id> host=<h> profile=<p>
+// pane=<id>` instead, with "none" for a value it does not know.
 func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
+	if v, ok := spawnedPlacement(stdout); ok {
+		return v, true
+	}
 	for _, line := range strings.Split(stdout, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "OK" || !strings.HasPrefix(fields[1], "pane=") {
@@ -92,6 +97,35 @@ func spawnPlacement(stdout string) (integrations.JobRecord, bool) {
 		return v, v.Host != "" && v.PaneID != ""
 	}
 	return integrations.JobRecord{}, false
+}
+
+// spawnedPlacement reads the hub coordinator's SPAWNED line. The last such line
+// wins, and a host or pane of "none" is not a placement.
+func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
+	var v integrations.JobRecord
+	found := false
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "SPAWNED" || !strings.HasPrefix(fields[1], "job=") {
+			continue
+		}
+		v, found = integrations.JobRecord{}, true
+		for _, field := range fields[2:] {
+			key, value, _ := strings.Cut(field, "=")
+			if value == "none" {
+				value = ""
+			}
+			switch key {
+			case "host":
+				v.Host = value
+			case "pane":
+				v.PaneID = value
+			case "profile":
+				v.Profile = value
+			}
+		}
+	}
+	return v, found && v.Host != "" && v.PaneID != ""
 }
 
 // closeReviewerPane runs once a pass has reached a terminal outcome. It closes
