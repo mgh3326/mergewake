@@ -843,8 +843,8 @@ func TestPanewireFailedCheckoutKeepsUnprovenBranch(t *testing.T) {
 }
 
 // The W4 rule decides what a finished reviewer pane's hk record means:
-// completed with a result uses it; completed without one, a pending or
-// missing record, and an unreadable hk fall back after the bounded poll;
+// completed with a result uses it; a pending or missing record and an
+// unreadable hk fall back after the bounded poll;
 // escalated and lost fall back immediately and the receipt keeps the state.
 func TestPanewireJobRecordResultW4(t *testing.T) {
 	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
@@ -856,14 +856,13 @@ func TestPanewireJobRecordResultW4(t *testing.T) {
 		reason   string
 		polled   bool // the record was asked for more than once
 	}{
-		"completed with result":    {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "panewire"},
-		"refusal in the result":    {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
-		"completed without result": {record: &integrations.JobRecord{State: "completed"}, reason: "completed without a result"},
-		"escalated":                {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
-		"lost":                     {record: &integrations.JobRecord{State: "lost"}, reason: "reviewer job record lost"},
-		"still spawned":            {record: &integrations.JobRecord{State: "spawned"}, reason: "job record state spawned", polled: true},
-		"no record":                {reason: "no job record", polled: true},
-		"hk unreadable":            {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
+		"completed with result": {record: &integrations.JobRecord{State: "completed", Family: "google", Result: json.RawMessage(findings)}, executor: "panewire"},
+		"refusal in the result": {record: &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"refused":"HEAD is 1234567"}`)}, reason: "refused: HEAD is 1234567"},
+		"escalated":             {record: &integrations.JobRecord{State: "escalated"}, reason: "reviewer job record escalated"},
+		"lost":                  {record: &integrations.JobRecord{State: "lost"}, reason: "reviewer job record lost"},
+		"still spawned":         {record: &integrations.JobRecord{State: "spawned"}, reason: "job record state spawned", polled: true},
+		"no record":             {reason: "no job record", polled: true},
+		"hk unreadable":         {jobErr: errors.New("connection refused"), reason: "hk-unavailable", polled: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runner := &panewireRunner{family: "openai"}

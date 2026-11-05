@@ -237,6 +237,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
 		return e
 	}
+	s.postTaskEvent(ctx, r, pr, integrations.SourceMerge, nil, s.now())
 	merged, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
