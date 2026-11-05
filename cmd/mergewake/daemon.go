@@ -83,6 +83,13 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
 			return forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
+				// Release and rollout work from the install inventory. A
+				// repository without one has nothing to publish or install, so
+				// the pass decides that from config and reads nothing.
+				if (role == "release" || role == "rollout") && len(r.Install) == 0 {
+					log.Debug("skip repository without install inventory", "role", role, "repo", r.Name)
+					return nil
+				}
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 				tracing.Tag(repoSpan, "repo", r.Name)
 				var err error
