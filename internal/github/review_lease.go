@@ -40,9 +40,15 @@ func (c *Client) ReviewLease(ctx context.Context, repo, branch string, ttl time.
 // expired lease advances only by fast-forward; competing renewals are siblings,
 // so only one can win. No delete/create gap can admit two reviewers.
 func (c *Client) ClaimReview(ctx context.Context, repo, branch, head string, ttl time.Duration) (bool, error) {
+	_, acquired, err := c.ClaimReviewWithSHA(ctx, repo, branch, head, ttl)
+	return acquired, err
+}
+
+// ClaimReviewWithSHA returns the exact commit created by a successful claim.
+func (c *Client) ClaimReviewWithSHA(ctx context.Context, repo, branch, head string, ttl time.Duration) (string, bool, error) {
 	old, active, err := c.ReviewLease(ctx, repo, branch, ttl)
 	if err != nil || active {
-		return false, err
+		return "", false, err
 	}
 	parent := old
 	if parent == "" {
@@ -50,7 +56,7 @@ func (c *Client) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 	}
 	commit, err := c.Commit(ctx, repo, parent)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	var lease Ref
 	err = c.json(ctx, "POST", base(repo)+"/git/commits", map[string]any{
@@ -58,7 +64,7 @@ func (c *Client) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 		"tree":    commit.Commit.Tree.SHA, "parents": []string{parent},
 	}, &lease)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	if old == "" {
 		err = c.CreateRef(ctx, repo, branch, lease.SHA)
@@ -68,9 +74,9 @@ func (c *Client) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 	if err != nil {
 		var api *APIError
 		if errors.As(err, &api) && (api.Code == 409 || api.Code == 422) {
-			return false, nil
+			return "", false, nil
 		}
-		return false, err
+		return "", false, err
 	}
-	return true, nil
+	return lease.SHA, true, nil
 }

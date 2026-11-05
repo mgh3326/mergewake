@@ -352,7 +352,7 @@ func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, context: strings.Repeat("context ", 10000)}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (bool, error) { return true, nil })
+	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (string, bool, error) { return "lease", true, nil })
 	if e != nil || len(runner.spawns) != 0 || len(out.skips) != 1 || !strings.Contains(out.skips[0].Reason, "publish brief: attachment service unavailable") {
 		t.Fatalf("spawns=%d outcome=%+v error=%v", len(runner.spawns), out, e)
 	}
@@ -525,7 +525,7 @@ func TestPanewireCancelWhileCollectingWrapsOnce(t *testing.T) {
 	runner.afterRun = cancel
 	diff, _ := g.Diff(ctx, r.Name, 7)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
-	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })
 	if !errors.Is(e, context.Canceled) || strings.Count(e.Error(), context.Canceled.Error()) != 1 {
 		t.Fatalf("%v", e)
 	}
@@ -799,7 +799,7 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	diff, _ := g.Diff(context.Background(), r.Name, 7)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
-	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })
 	if e != nil || out.executor != "panewire" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}

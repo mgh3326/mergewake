@@ -107,7 +107,7 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		}
 	}
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: "diff --git a/tool b/tool\n+new\n"}
-	out, err := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	out, err := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })
 	return cleanupResult{out: out, err: err, ctx: ctx, s: s, repo: r, hub: hub, runner: runner}
 }
 

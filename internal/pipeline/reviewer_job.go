@@ -34,6 +34,7 @@ const panewireWaitTimeout = 85
 type reviewerJob struct {
 	PR       int       `json:"pr"`
 	Head     string    `json:"head"`
+	LeaseSHA string    `json:"lease_sha,omitempty"`
 	Pass     int       `json:"pass"`
 	Label    string    `json:"label"`
 	Checkout string    `json:"checkout"`
