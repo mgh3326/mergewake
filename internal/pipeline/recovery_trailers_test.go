@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
@@ -10,6 +11,10 @@ import (
 func TestRecoveryMarkerBranchGate(t *testing.T) {
 	f := blockSetup(t)
 	f.g.pull.Body = "Mergewake-Recovery: abc123\n"
+	f.g.pull.Head.Repo.FullName = f.r.Name
+	if err := f.s.recordRevert(f.r.Name, 123, "https://github.com/example/project/pull/7"); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		branch  string
 		blocked bool
@@ -58,5 +63,37 @@ func TestWatchPassesRecoveryTrailers(t *testing.T) {
 	}
 	if g.revertCount != 1 || g.revertTrailers != g.pull.Body {
 		t.Fatalf("reverts %d, trailers %q", g.revertCount, g.revertTrailers)
+	}
+}
+
+func TestRecoveryMarkerForkBlocked(t *testing.T) {
+	f := blockSetup(t)
+	f.g.pull.Head.Ref = github.RecoveryBranch
+	f.g.pull.Head.Repo.FullName = "fork/project"
+	f.g.pull.Body = "Mergewake-Recovery: abc123\n"
+	b, blocked := f.s.reviewBlockFor(context.Background(), f.r, f.g.pull)
+	if !blocked || b.reason != blockMissingTrailer {
+		t.Fatalf("block = %+v, %v", b, blocked)
+	}
+}
+
+func TestRecoveryTrailersCompleteBodyAvoidsCommitLookup(t *testing.T) {
+	f := blockSetup(t)
+	f.g.pull.Body = "Mergewake-Task: 42\nMergewake-Grade: B\nMergewake-Tier: T1\nMergewake-Notify-Lane: team"
+	f.g.commitErr = map[string]error{f.g.pull.Head.SHA: errors.New("unavailable")}
+	got, err := f.s.recoveryTrailers(context.Background(), f.r, f.g.pull)
+	if err != nil || got != f.g.pull.Body {
+		t.Fatalf("got %q, error %v", got, err)
+	}
+}
+
+func TestRecoveryMarkerUnrecordedBlocked(t *testing.T) {
+	f := blockSetup(t)
+	f.g.pull.Head.Ref = github.RecoveryBranch
+	f.g.pull.Head.Repo.FullName = f.r.Name
+	f.g.pull.Body = "Mergewake-Recovery: abc123\n"
+	b, blocked := f.s.reviewBlockFor(context.Background(), f.r, f.g.pull)
+	if !blocked || b.reason != blockMissingTrailer {
+		t.Fatalf("block = %+v, %v", b, blocked)
 	}
 }

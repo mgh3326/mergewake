@@ -44,7 +44,8 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	loops := []daemon.Loop{}
-	// Each role owns one goroutine; repositories within it run in config order.
+	// Each role owns one goroutine. The pr role runs its repositories at once;
+	// the other roles visit them in config order.
 	for _, entry := range []struct {
 		role string
 		cfg  config.Loop
@@ -72,14 +73,16 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				tracing.Data(transaction, "github_requests", total)
 				log.Info("github requests", "role", role, "total", total, "routes", requests[:min(len(requests), 10)])
 			}()
-			var errs []error
+			var repos []config.Repo
 			for _, r := range s.Config.Repos {
-				if repo != "" && r.Name != repo {
-					continue
+				if repo == "" || r.Name == repo {
+					repos = append(repos, r)
 				}
-				if ctx.Err() != nil {
-					break
-				}
+			}
+			// The pr role runs every repository at once: a pass is as long as
+			// its slowest repository, not their sum, so no repository starves
+			// behind the others when the daemon restarts often.
+			return forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 				tracing.Tag(repoSpan, "repo", r.Name)
 				var err error
@@ -120,11 +123,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						tracing.Finish(span)
 					}
 				}()
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
-				}
-			}
-			return errors.Join(errs...)
+				return err
+			})
 		}})
 	}
 	if len(s.Config.Repos) == 0 {
@@ -165,6 +165,36 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		d.Healthy = healthcheck(url)
 	}
 	return d.Run(ctx, loops)
+}
+
+// forRepos runs fn for each repository and joins the errors in config order,
+// each prefixed with its repository. A cancelled ctx starts no further
+// repository. With parallel, every repository runs in its own goroutine and
+// the call returns when all of them have.
+func forRepos(ctx context.Context, repos []config.Repo, parallel bool, fn func(context.Context, config.Repo) error) error {
+	errs := make([]error, len(repos))
+	var running sync.WaitGroup
+	for i, r := range repos {
+		if ctx.Err() != nil {
+			break
+		}
+		run := func() {
+			if err := fn(ctx, r); err != nil {
+				errs[i] = fmt.Errorf("%s: %w", r.Name, err)
+			}
+		}
+		if !parallel {
+			run()
+			continue
+		}
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			run()
+		}()
+	}
+	running.Wait()
+	return errors.Join(errs...)
 }
 
 // healthcheck returns the fail-open ping run after a clean loop. The request

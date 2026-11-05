@@ -400,11 +400,12 @@ func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []s
 }
 
 type Review struct {
-	ID       int64  `json:"id"`
-	Body     string `json:"body"`
-	CommitID string `json:"commit_id"`
-	State    string `json:"state"`
-	User     struct {
+	ID          int64      `json:"id"`
+	Body        string     `json:"body"`
+	CommitID    string     `json:"commit_id"`
+	SubmittedAt *time.Time `json:"submitted_at"`
+	State       string     `json:"state"`
+	User        struct {
 		Login string `json:"login"`
 	} `json:"user"`
 }
@@ -461,7 +462,9 @@ type PassReceipt struct {
 
 // ReviewedPass is one posted pass together with the head it reviewed.
 type ReviewedPass struct {
-	Head string
+	Head        string
+	SubmittedAt *time.Time
+	Marked      bool
 	PassReceipt
 }
 
@@ -516,7 +519,7 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 			receipt.Pass = next[r.CommitID] + 1
 		}
 		next[r.CommitID] = receipt.Pass
-		out = append(out, ReviewedPass{Head: r.CommitID, PassReceipt: receipt})
+		out = append(out, ReviewedPass{Head: r.CommitID, SubmittedAt: r.SubmittedAt, Marked: passMarker.MatchString(r.Body), PassReceipt: receipt})
 	}
 	return out, nil
 }

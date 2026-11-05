@@ -30,8 +30,11 @@ import (
 // review leases, done markers and posted reviews persist across requests, so
 // a review runs end to end through the real Service and github.Client.
 type reviewHub struct {
-	mu      sync.Mutex
-	n       int
+	mu sync.Mutex
+	n  int
+	// first is the number of the first PR; zero means 1. Repositories in one
+	// test take different numbers, so their heads differ as real ones do.
+	first   int
 	repo    string
 	refs    map[string]string // branch → sha
 	commits map[string]string // sha → message
@@ -82,7 +85,7 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var all []string
-		for i := 1; i <= h.n; i++ {
+		for i := max(h.first, 1); i < max(h.first, 1)+h.n; i++ {
 			all = append(all, h.pull(i))
 		}
 		fmt.Fprintf(w, "[%s]", strings.Join(all, ","))
