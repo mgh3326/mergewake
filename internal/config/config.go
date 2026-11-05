@@ -269,6 +269,10 @@ type PRLoop struct {
 // DefaultReviewParallel is the review bound when review_parallel is unset.
 const DefaultReviewParallel = 4
 
+// MaxReviewParallel is the largest review_parallel Load accepts: each slot can
+// hold a reviewer pane, and a huge value would size the slot channel past memory.
+const MaxReviewParallel = 32
+
 // Parallel is the number of PR reviews a pass may run at once.
 func (l PRLoop) Parallel() int {
 	if l.ReviewParallel <= 0 {
@@ -645,6 +649,9 @@ func Load(name string) (Config, error) {
 	}
 	if c.Daemon.PR.Findings.EscalateRounds < 0 {
 		return c, errors.New("daemon.pr.findings.escalate_rounds must not be negative")
+	}
+	if c.Daemon.PR.ReviewParallel > MaxReviewParallel {
+		return c, fmt.Errorf("daemon.pr.review_parallel must be at most %d", MaxReviewParallel)
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
 		return c, e
