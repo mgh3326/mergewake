@@ -197,7 +197,7 @@ func ApplyCommands(ctx context.Context, m manifest.Manifest, o Options, host str
 		}
 		return VerifyCommand(rc, runner, s, m.Repo, sha, root)
 	}
-	receiptPath := filepath.Join(o.StateDir, "command-installed.json")
+	receiptPath := filepath.Join(o.StateDir, CommandReceiptName)
 	journalPath := filepath.Join(o.StateDir, "command-journal.json")
 	rejectPath := filepath.Join(o.StateDir, "command-rejected.json")
 	restore := func(j commandJournal, cause error) error {

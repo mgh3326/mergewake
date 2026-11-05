@@ -157,24 +157,9 @@ func (s *Service) inheritedStallReview(ctx context.Context, r config.Repo, pr gi
 	if _, _, ok := inheritedPasses(history, patch, pr.Head.SHA, 1); !ok {
 		return false, nil
 	}
-	head, e := s.GH.Head(ctx, r.Name, r.Branch)
-	if e != nil {
+	needed, settled, e := s.reviewPassesNeeded(ctx, r, pr)
+	if e != nil || !settled {
 		return false, e
-	}
-	p, e := s.Policy(ctx, r, head)
-	if e != nil {
-		return false, e
-	}
-	files, e := s.GH.Files(ctx, r.Name, pr.Number)
-	if e != nil {
-		return false, e
-	}
-	if len(files) != pr.ChangedFiles {
-		return false, nil
-	}
-	needed := 1
-	if p.ClassifyGuarded(files, r.Policy).Class == "blocking" {
-		needed = 2
 	}
 	_, _, covered := inheritedPasses(history, patch, pr.Head.SHA, needed)
 	return covered, nil

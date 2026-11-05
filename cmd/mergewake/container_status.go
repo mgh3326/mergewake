@@ -28,7 +28,7 @@ func hasContainerTarget(r config.Repo) bool {
 // containerStatus reports the running digest, health and retained images per
 // container target, and returns drift or unhealthy targets as errors.
 func containerStatus(c config.Config, r config.Repo, out io.Writer) error {
-	state := filepath.Join(c.StateDir, r.Name, "rollout")
+	state := rollout.StateDir(c.StateDir, r.Name)
 	receipt, _, err := rollout.LoadContainerReceipt(state, c.Host, r.Name)
 	if err != nil {
 		return err

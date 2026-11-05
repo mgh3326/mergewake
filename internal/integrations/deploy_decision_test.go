@@ -36,13 +36,15 @@ func TestDeployDecision(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := map[string]any{"id": "dr-1-1", "question": tc.question, "status": tc.status, "human_only": tc.human, "resolution": map[string]string{"kind": "answered", "option": tc.option}}
+			now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			req["due_at"] = now.Add(time.Minute)
 			if tc.expired {
-				req["due_at"] = time.Now().Add(-time.Minute)
+				req["due_at"] = now.Add(-time.Minute)
 			}
 			b, _ := json.Marshal(map[string]any{"refs": map[string]any{"decision_request": req}})
 			r := &decisionRunner{body: b}
 			h := Handoffkeep{Runner: r, Command: "hk"}
-			got, e := h.DeployDecision(context.Background(), "1", "release")
+			got, e := h.DeployDecision(context.Background(), "1", "release", now)
 			if e != nil || got != tc.want {
 				t.Fatalf("got %v %v", got, e)
 			}

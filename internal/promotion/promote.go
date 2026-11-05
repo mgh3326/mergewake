@@ -65,14 +65,22 @@ type Locker interface {
 	Lock(repo string) (unlock func(), err error)
 }
 
+func (p *Promoter) now() time.Time {
+	if p.Now != nil {
+		return p.Now()
+	}
+	return time.Now()
+}
+
 // Promoter is the single promotion owner. Serialization is two-layered: one
 // identity (the GitHub App) is the only writer the rulesets allow, and that
 // identity runs promotions through one executor that holds a per-repo lock
 // for the whole read-certify-write-verify sequence.
 type Promoter struct {
-	GH         GitHub
-	Registry   Registry
-	Lock       Locker
+	GH       GitHub
+	Registry Registry
+	Lock     Locker
+	// Now stamps records; nil means time.Now.
 	Now        func() time.Time
 	Identity   string
 	Generation int64
@@ -145,7 +153,7 @@ func (p *Promoter) Promote(ctx context.Context, repo string, s Suite, opts Optio
 		Schema: RecordSchema, Repo: repo, Seq: maxSeq + 1, SHA: opts.SHA, Previous: prev,
 		Artifact: art, Suite: SuiteRef{Version: s.Version, Digest: s.Digest()}, Evidence: evidence,
 		Policy: PolicyVersion, Controller: Controller{Identity: p.Identity, Generation: p.Generation},
-		Created: p.Now().UTC().Format(time.RFC3339),
+		Created: p.now().UTC().Format(time.RFC3339),
 	}
 	if opts.DryRun {
 		return rec, nil

@@ -25,7 +25,12 @@ var (
 	ErrConfig      = errors.New("invalid server database configuration")
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+	// Jitter returns a fraction in [0, 1) of the up-to-20% retry spread added
+	// to a failed attempt's delay; nil means math/rand.
+	Jitter func() float64
+}
 
 // Connect reads credentials only from host environment or a private file. It
 // connects but does not migrate; Open also checks the complete schema.

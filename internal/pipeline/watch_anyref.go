@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/bits"
@@ -58,13 +57,6 @@ func anyRefLimit(interval int) int {
 	return bits.Len(uint(interval-1)) + 2
 }
 
-func sha7(sha string) string {
-	if len(sha) > 7 {
-		return sha[:7]
-	}
-	return sha
-}
-
 // decide never waits inside a pass: it dispatches once, then later passes
 // read the result, until the per-sha wait or the per-incident count runs out.
 func (st anyRefIncident) decide(sha string, now time.Time, wait time.Duration) anyRefStep {
@@ -76,14 +68,14 @@ func (st anyRefIncident) decide(sha string, now time.Time, wait time.Duration) a
 			continue
 		}
 		if now.Sub(d.At) >= wait {
-			return anyRefStep{reason: "any-ref CI timed out on " + sha7(sha), notify: true}
+			return anyRefStep{reason: "any-ref CI timed out on " + short7(sha), notify: true}
 		}
-		return anyRefStep{reason: "waiting for any-ref CI on " + sha7(sha)}
+		return anyRefStep{reason: "waiting for any-ref CI on " + short7(sha)}
 	}
 	if len(st.Dispatches) >= st.Limit {
-		return anyRefStep{reason: fmt.Sprintf("any-ref CI dispatch bound reached (%d of %d) before %s", len(st.Dispatches), st.Limit, sha7(sha)), notify: true}
+		return anyRefStep{reason: fmt.Sprintf("any-ref CI dispatch bound reached (%d of %d) before %s", len(st.Dispatches), st.Limit, short7(sha)), notify: true}
 	}
-	return anyRefStep{dispatch: true, reason: "waiting for any-ref CI on " + sha7(sha)}
+	return anyRefStep{dispatch: true, reason: "waiting for any-ref CI on " + short7(sha)}
 }
 
 func (s *Service) anyRefFile(repo string) string {
@@ -92,22 +84,12 @@ func (s *Service) anyRefFile(repo string) string {
 
 func (s *Service) loadAnyRef(repo string) (anyRefIncident, error) {
 	var st anyRefIncident
-	b, e := os.ReadFile(s.anyRefFile(repo))
-	if errors.Is(e, os.ErrNotExist) {
-		return st, nil
-	}
-	if e != nil {
-		return st, e
-	}
-	return st, json.Unmarshal(b, &st)
+	_, e := fsutil.ReadJSON(s.anyRefFile(repo), &st)
+	return st, e
 }
 
 func (s *Service) saveAnyRef(repo string, st anyRefIncident) error {
-	b, e := json.Marshal(st)
-	if e != nil {
-		return e
-	}
-	return fsutil.Atomic(s.anyRefFile(repo), b, 0600)
+	return fsutil.WriteJSON(s.anyRefFile(repo), st)
 }
 
 // endAnyRef closes the incident when the head is green.
@@ -136,7 +118,7 @@ func (s *Service) anyRef(ctx context.Context, r config.Repo, p policy.Policy, he
 	}
 	result.AnyRefDispatch = sha
 	if !acting {
-		return "would dispatch any-ref CI on " + sha7(sha), false, nil
+		return "would dispatch any-ref CI on " + short7(sha), false, nil
 	}
 	d, ok := s.GH.(workflowDispatcher)
 	if !ok {
@@ -151,7 +133,7 @@ func (s *Service) anyRef(ctx context.Context, r config.Repo, p policy.Policy, he
 	e = d.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, map[string]string{"ref": sha})
 	if github.DispatchRefused(e) {
 		st.Dispatches = st.Dispatches[:len(st.Dispatches)-1]
-		st.Refused = "any-ref CI dispatch refused for " + sha7(sha) + ": " + e.Error()
+		st.Refused = "any-ref CI dispatch refused for " + short7(sha) + ": " + e.Error()
 		result.AnyRefDispatch = ""
 		return st.Refused, true, s.saveAnyRef(r.Name, st)
 	}

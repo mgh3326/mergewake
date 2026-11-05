@@ -618,7 +618,8 @@ func Load(name string) (Config, error) {
 		}
 	}
 	retry := c.Daemon.PR.ReviewRetry
-	for name, value := range map[string]string{"initial": retry.Initial, "maximum": retry.Maximum} {
+	for _, f := range []struct{ name, value string }{{"initial", retry.Initial}, {"maximum", retry.Maximum}} {
+		name, value := f.name, f.value
 		if value != "" {
 			if _, err := Duration(value); err != nil {
 				return c, fmt.Errorf("daemon.pr.review_retry.%s: %w", name, err)

@@ -467,7 +467,11 @@ func (s *Store) ConfirmAbsent(ctx context.Context, f Fence, c Claim) error {
 			jobStatus = "system_blocked"
 		}
 		delay := RetryDelay(failures)
-		delay += time.Duration(mathrand.Int64N(int64(delay/5) + 1))
+		if s.Jitter != nil {
+			delay += time.Duration(s.Jitter() * float64(delay/5))
+		} else {
+			delay += time.Duration(mathrand.Int64N(int64(delay/5) + 1))
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE mw_jobs SET status=?,failures=?,available_at=TIMESTAMPADD(MICROSECOND,?,UTC_TIMESTAMP(6)) WHERE id=?`, jobStatus, failures, delay.Microseconds(), c.ID); err != nil {
 			return false, err
 		}

@@ -83,6 +83,11 @@ type Options struct {
 // dry runs decide only, and shadow mode observes without acting.
 func (o Options) Acting() bool { return !o.DryRun && !o.Shadow }
 
+// Reporting reports whether a command may tell people what it decided: lane
+// events, findings deliveries and feed posts. Shadow mode still reports,
+// since telling a lane is not acting; only a dry run stays silent.
+func (o Options) Reporting() bool { return !o.DryRun }
+
 func (s *Service) Print(v any) error {
 	printMu.Lock()
 	defer printMu.Unlock()
@@ -94,6 +99,11 @@ func (s *Service) now() time.Time {
 	}
 	return time.Now()
 }
+
+// approvedInventoryName holds the deployment identity last approved for a
+// repository, beside its rollout receipts.
+const approvedInventoryName = "approved-inventory.json"
+
 func (s *Service) state(repo string) string { return filepath.Join(s.Config.StateDir, repo) }
 func (s *Service) audit(repo, command string, value any, dry bool) error {
 	record := struct {
@@ -327,7 +337,7 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 	if spec.Kind != "container" {
 		return errors.New("--adopt requires a container install target")
 	}
-	state := filepath.Join(s.state(r.Name), "rollout")
+	state := rollout.StateDir(s.Config.StateDir, r.Name)
 	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: !o.Acting(), Now: s.Now}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
 	if !o.Acting() {
 		return errors.Join(e, s.Print(result))
@@ -335,7 +345,7 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 	// --adopt --apply is the operator's attestation of the configured host
 	// recipe. Source ancestry remains unknown until the first approved rollout.
 	if e == nil && result.Status == "adopted" {
-		e = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), s.deploymentIdentity(r, manifest.Manifest{Repo: r.Name}, Options{}))
+		e = fsutil.WriteJSON(filepath.Join(state, approvedInventoryName), s.deploymentIdentity(r, manifest.Manifest{Repo: r.Name}, Options{}))
 	}
 
 	record := struct {
@@ -350,7 +360,7 @@ func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
 }
 
 func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
-	state := filepath.Join(s.state(r.Name), "rollout")
+	state := rollout.StateDir(s.Config.StateDir, r.Name)
 	// Keep range approval and receipt installation in one per-repository operation.
 	if o.Acting() {
 		unlock, err := rollout.Lock(filepath.Join(state, "decision-lock"))
@@ -527,13 +537,9 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	default:
 		selected := []config.Install{}
 		for _, file := range m.Files {
-			denied := false
-			for _, g := range r.Deny {
-				match, e := policy.Match(g, file.Target)
-				if e != nil {
-					return e
-				}
-				denied = denied || match
+			denied, e := policy.MatchAny(r.Deny, file.Target)
+			if e != nil {
+				return e
 			}
 			if denied {
 				continue
@@ -583,11 +589,11 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 		if installErr == nil {
 			identity := approvedIdentity
 			var prior deployIdentity
-			found, readErr := fsutil.ReadJSON(filepath.Join(state, "approved-inventory.json"), &prior)
+			found, readErr := fsutil.ReadJSON(filepath.Join(state, approvedInventoryName), &prior)
 			if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
 				installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
 			} else {
-				installErr = fsutil.WriteJSON(filepath.Join(state, "approved-inventory.json"), identity)
+				installErr = fsutil.WriteJSON(filepath.Join(state, approvedInventoryName), identity)
 			}
 		}
 		if installErr == nil {

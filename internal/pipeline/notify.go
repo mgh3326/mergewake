@@ -4,15 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -77,7 +74,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Deduped         bool     `json:"deduped,omitempty"`
 		Error           string   `json:"error,omitempty"`
 	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
-	if o.DryRun {
+	if !o.Reporting() {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
 	if e := s.ageCheckFailures(ctx, r, pr, v.Reasons); e != nil {
@@ -145,15 +142,11 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 	}
 	key := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", pr.Number, baseSHA)))
 	path := filepath.Join(dir, hex.EncodeToString(key[:]))
-	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	unlock, err := fsutil.Lock(path+".lock", true)
 	if err != nil {
 		return "", false, err
 	}
-	defer lock.Close()
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return "", false, err
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer unlock()
 	data, err := os.ReadFile(path)
 	if err == nil && string(data) != "unknown" {
 		return string(data), false, nil
@@ -233,17 +226,13 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	if e != nil {
 		return "", "", false, e
 	}
-	sha7 := pr.Head.SHA
-	if len(sha7) > 7 {
-		sha7 = sha7[:7]
-	}
 	textFor := func(l, v string) string {
 		shown := l
 		if shown == "" {
 			shown = "-"
 		}
 		return fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s | lane=%s via %s",
-			strings.ToUpper(state), r.Name, pr.Number, sha7, summary, shown, v)
+			strings.ToUpper(state), r.Name, pr.Number, short7(pr.Head.SHA), summary, shown, v)
 	}
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
 	if e != nil {
@@ -342,15 +331,10 @@ func (s *Service) readyClocksFile(repo string) string {
 
 func (s *Service) loadReadyClocks(repo string) (map[string]readyClock, error) {
 	clocks := map[string]readyClock{}
-	b, e := os.ReadFile(s.readyClocksFile(repo))
-	if errors.Is(e, fs.ErrNotExist) {
-		return clocks, nil
-	}
-	if e != nil {
-		return nil, e
-	}
-	if e = json.Unmarshal(b, &clocks); e != nil {
+	if found, e := fsutil.ReadJSON(s.readyClocksFile(repo), &clocks); found && e != nil {
 		return nil, fmt.Errorf("%s: %w", s.readyClocksFile(repo), e)
+	} else if e != nil {
+		return nil, e
 	}
 	return clocks, nil
 }
@@ -363,11 +347,7 @@ func (s *Service) saveReadyClocks(repo string, clocks map[string]readyClock) err
 			delete(clocks, k)
 		}
 	}
-	b, e := json.Marshal(clocks)
-	if e != nil {
-		return e
-	}
-	return fsutil.Atomic(s.readyClocksFile(repo), b, 0600)
+	return fsutil.WriteJSON(s.readyClocksFile(repo), clocks)
 }
 
 // startReadyClock records a first READY send for key.

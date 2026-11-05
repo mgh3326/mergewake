@@ -117,6 +117,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
 	if s.Config.Discord.Enabled {
 		s.Feed = pipeline.NewFeed(s.Config, log)
+		s.Feed.Now = s.Now
 		feedCtx, stop := context.WithCancel(ctx)
 		done := make(chan struct{})
 		go func() {

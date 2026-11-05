@@ -9,7 +9,8 @@ import (
 
 // DeployDecision only consumes an operator answer to this exact immutable
 // host/range/release question. The hk CLI records and mirrors the request.
-func (h Handoffkeep) DeployDecision(ctx context.Context, task, question string) (bool, error) {
+// now decides whether a request's due time has passed.
+func (h Handoffkeep) DeployDecision(ctx context.Context, task, question string, now time.Time) (bool, error) {
 	if !TaskID.MatchString(task) {
 		return false, errors.New("deploy_task must name a dedicated handoffkeep task")
 	}
@@ -37,14 +38,14 @@ func (h Handoffkeep) DeployDecision(ctx context.Context, task, question string) 
 	}
 	r := current.Refs.Request
 	if r.Question == question && r.ID != "" && r.HumanOnly {
-		if r.Due != nil && !time.Now().Before(*r.Due) {
+		if r.Due != nil && !now.Before(*r.Due) {
 			return false, nil
 		}
 		return r.Status == "answered" && r.Resolution != nil && r.Resolution.Kind == "answered" && r.Resolution.Option == "A", nil
 	}
 	// Refuse to supersede another open request. A dedicated task per target/host
 	// prevents one rollout from replacing another rollout's pending question.
-	expired := r.Due != nil && !time.Now().Before(*r.Due)
+	expired := r.Due != nil && !now.Before(*r.Due)
 	if r.ID != "" && r.Status == "open" && !expired {
 		return false, errors.New("another deployment decision is open")
 	}
