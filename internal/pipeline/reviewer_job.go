@@ -66,7 +66,7 @@ func (x *panewireExecutor) reviewerJob(pass int) (reviewerJob, bool, error) {
 			}
 			continue
 		}
-		if path == s.reviewerJobPath(repo, pr.Number, pass) && rj.Pass == pass && rj.Label != "" && len(rj.Args) > 0 {
+		if path == s.reviewerJobPath(repo, pr.Number, pass) && rj.PR == pr.Number && rj.Pass == pass && rj.Label != "" && len(rj.Args) > 0 {
 			found, ok = rj, true
 		}
 	}

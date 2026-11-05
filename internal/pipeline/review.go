@@ -115,6 +115,11 @@ type passPlan struct {
 // changes, two for blocking paths. Panewire runs each pass in a reviewer pane. A pass the executor did not produce fails the run with
 // ErrReviewUnavailable; RetryReview backs off and runs the review again.
 func (s *Service) Review(ctx context.Context, r config.Repo, n int, family string, o Options) error {
+	unlock, e := s.lockReview(ctx, r.Name, n)
+	if e != nil {
+		return e
+	}
+	defer unlock()
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
@@ -234,6 +239,15 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			return e
 		}
 		if claimed {
+			x := &panewireExecutor{s: s, repo: r, pr: pr}
+			_, own, err := x.reviewerJob(i)
+			if err != nil {
+				return err
+			}
+			if own {
+				missing = append(missing, i)
+				continue
+			}
 			pending = append(pending, i)
 		} else {
 			missing = append(missing, i)
@@ -362,6 +376,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		passCtx, passSpan := tracing.Span(ctx, "mergewake.review.pass")
 		tracing.Data(passSpan, "pass", plan.pass)
 		out, e := x.runPass(passCtx, plan, claim)
+		if e == nil && out.reviewer != "" && reviewStarted == nil {
+			now := s.now()
+			reviewStarted = &now
+		}
 		privateNames := []string{s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane, s.Config.Review.Panewire.Lane, s.Config.Review.Panewire.Owner}
 		for _, repo := range s.Config.Repos {
 			privateNames = append(privateNames, repo.Lane)
@@ -415,6 +433,21 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		if fresh.Head.SHA != pr.Head.SHA {
 			return errors.New("PR head changed during review; run once for the new head")
+		}
+		current, e := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login)
+		if e != nil {
+			return e
+		}
+		alreadyPosted := false
+		for _, p := range current {
+			if p.Pass == plan.pass {
+				alreadyPosted = true
+				break
+			}
+		}
+		if alreadyPosted {
+			_ = s.dropReviewerJob(r.Name, n, plan.pass)
+			continue
 		}
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			return e

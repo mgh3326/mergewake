@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -253,4 +255,112 @@ func TestReviewerJobOldHeadDropped(t *testing.T) {
 	// removes its record.
 	reviewerJobGone(t, s, r, 1)
 	reviewerJobGone(t, s, r, 2)
+}
+
+func TestReviewerJobActiveLeaseCompleted(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	claims := g.claimCount
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.postCount != 1 || len(runner.spawns) != 1 || g.claimCount != claims+1 {
+		t.Fatalf("posts=%d spawns=%d", g.postCount, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+func TestReviewerJobActiveLeaseLive(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	claims := g.claimCount
+	runner.afterRun = func() {
+		runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 2 || !slices.Equal(withoutWait(runner.spawns[0]), withoutWait(runner.spawns[1])) || g.claimCount != claims+1 || g.postCount != 1 {
+		t.Fatalf("spawns=%v claims=%d posts=%d", runner.spawns, g.claimCount, g.postCount)
+	}
+}
+
+func TestReviewerJobActiveLeaseNoRecord(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	if err := s.dropReviewerJob(r.Name, 7, 1); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	s.Out = &output
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"action":"review-pending"`) {
+		t.Fatalf("output: %s", output.String())
+	}
+	if len(runner.spawns) != 1 || g.postCount != 0 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+}
+
+func TestReviewerJobActiveLeaseOldHead(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	job := readReviewerJob(t, s, r, 1)
+	job.Head = shaB
+	if err := fsutil.WriteJSON(s.reviewerJobPath(r.Name, 7, 1), job); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	s.Out = &output
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"action":"review-pending"`) {
+		t.Fatalf("output: %s", output.String())
+	}
+	if len(runner.spawns) != 1 || g.postCount != 0 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+func TestReviewerJobExpiredLeaseClaimsAndResumes(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	claims := g.claimCount
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.claimCount != claims+2 || g.postCount != 1 || len(runner.spawns) != 1 {
+		t.Fatalf("claims=%d posts=%d spawns=%d", g.claimCount, g.postCount, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+func TestReviewerJobConcurrentResumePostsOnce(t *testing.T) {
+	s, g, r, runner, _ := interruptedReviewer(t)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; errs <- s.Review(context.Background(), r, 7, "", Options{}) }()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if g.postCount != 1 || len(runner.spawns) != 1 {
+		t.Fatalf("posts=%d spawns=%d", g.postCount, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 1)
 }

@@ -145,21 +145,17 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if branch == "" || !strings.EqualFold(headRepo, x.repo.Name) {
 		return skip("head branch is not in %s (fork PR); panewire cannot replicate it", x.repo.Name)
 	}
+	// Read the local record first: an active ownerless lease can be ours.
+	rj, resumed, e := x.reviewerJob(plan.pass)
+	if e != nil {
+		return out, e
+	}
 	acquired, e := claim()
 	if e != nil {
 		return out, e
 	}
-	if !acquired {
+	if !acquired && !resumed {
 		return out, errPassPending
-	}
-
-	// A pass that already spawned a reviewer job for this head resumes that
-	// job instead of spawning another under a new label: the hub keeps one
-	// reviewer reservation per task, so a new label is refused while the old
-	// job lives.
-	rj, resumed, e := x.reviewerJob(plan.pass)
-	if e != nil {
-		return out, e
 	}
 	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix())
 	checkout := filepath.Join(cfg.Checkouts, label)
