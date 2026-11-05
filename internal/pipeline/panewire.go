@@ -299,7 +299,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		overBudget := s.now().Sub(rj.Recorded) >= timeout
 		rec, e := x.job(ctx, label)
 		state := rec.State
-		if e == nil && state != "completed" {
+		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
 			finished, err := x.reviewerFinished(ctx, rec, rj)
 			if err != nil {
 				return out, err
@@ -319,10 +319,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					if err != nil {
 						return out, err
 					}
-					if fresh.State == "completed" {
-						spawn = false
-					} else if b := x.remoteFindings(ctx, plan, fresh, label); b != nil {
+					if fresh.State == "completed" || fresh.State == "escalated" || fresh.State == "lost" {
+						state, spawn = fresh.State, false
+					} else if b, retry := x.remoteFindings(ctx, plan, fresh, label); b != nil {
 						collected, remoteRecord, spawn = b, &fresh, false
+					} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+						return out, errPassPending
 					} else {
 						cause := "pane finished without a result"
 						if !finished {
@@ -335,7 +337,6 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		} else if errors.Is(e, integrations.ErrJobNotFound) && overBudget {
 			// No job record means no hub claim to release: the record goes and the
 			// pass is replaced once.
-			_ = x.remoteFindings(ctx, plan, integrations.JobRecord{}, label)
 			return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job record missing past the review deadline", leaseSHA)
 		}
 		switch {
@@ -733,9 +734,15 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 }
 
 // remoteFindings reads the host's bounded result without recording its body.
-func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) []byte {
+func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool) {
 	outcome := "error"
 	var findings json.RawMessage
+	lookupTimeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		lookupTimeout = min(lookupTimeout, time.Until(deadline)/2)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	defer cancel()
 	var result struct {
 		Found         bool            `json:"found"`
 		Findings      json.RawMessage `json:"findings"`
@@ -754,7 +761,7 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 		outcome = "missing_host"
 	case rec.Host == "local" || x.localReviewerHost(rec.Host):
 		var b []byte
-		b, err = x.s.Runner.Run(ctx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
+		b, err = x.s.Runner.Run(lookupCtx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
 		if err == nil {
 			err = json.Unmarshal(b, &result)
 		}
@@ -763,7 +770,7 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 		hub, err = x.s.reapHub()
 		if err == nil && hub != nil {
 			host := reap.HubHost{Hub: hub, Machine: rec.Host}
-			err = host.Hub.Command(ctx, host.Machine, "job.result", map[string]string{"job": label}, &result)
+			err = host.Hub.Command(lookupCtx, host.Machine, "job.result", map[string]string{"job": label}, &result)
 		} else if err == nil {
 			err = errors.New("hub unavailable")
 		}
@@ -788,7 +795,12 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 		}
 	}
 	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
-	return findings
+	switch outcome {
+	case "found", "not_found", "missing", "too_large", "not_json", "schema":
+		return findings, false
+	default:
+		return nil, true
+	}
 }
 
 // availableFindings checks the legacy sources once for a finished pane.
