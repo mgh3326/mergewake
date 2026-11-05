@@ -224,13 +224,13 @@ func readUpdateRow(cells []string, changeCol, updateCol int) updateRow {
 		named = strings.ToLower(cells[updateCol])
 	}
 	switch {
-	case named == "":
+	case named == "" || named == "patch":
+		// A patch is established by the versions: the column only names the
+		// type, and a "patch" no version supports (missing, unparseable,
+		// unchanged or lower) is unknown.
 		if byVersion != "" {
 			row.Kind = byVersion
 		}
-	case named == "patch" && byVersion != "" && byVersion != "patch":
-		// The column and the versions disagree: the stricter reading stands.
-		row.Kind = byVersion
 	default:
 		row.Kind = named
 	}

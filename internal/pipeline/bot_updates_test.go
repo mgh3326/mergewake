@@ -184,11 +184,15 @@ func TestBotUpdateChecks(t *testing.T) {
 // (f) A body with no parseable update table is not patch.
 func TestBotUpdateUnknownUpdateType(t *testing.T) {
 	for name, body := range map[string]string{
-		"no table":       "Bumps vite from 8.3.4 to 8.3.6.",
-		"empty":          "",
-		"no change cell": "| Package | Change |\n|---|---|\n| vite | updated |\n",
-		"prerelease":     "| Package | Change |\n|---|---|\n| vite | `8.3.4` -> `8.3.6-rc.1` |\n",
-		"downgrade":      "| Package | Change |\n|---|---|\n| vite | `8.3.6` -> `8.3.4` |\n",
+		"no table":                  "Bumps vite from 8.3.4 to 8.3.6.",
+		"empty":                     "",
+		"no change cell":            "| Package | Change |\n|---|---|\n| vite | updated |\n",
+		"prerelease":                "| Package | Change |\n|---|---|\n| vite | `8.3.4` -> `8.3.6-rc.1` |\n",
+		"downgrade":                 "| Package | Change |\n|---|---|\n| vite | `8.3.6` -> `8.3.4` |\n",
+		"column patch, no versions": "| Package | Update | Change |\n|---|---|---|\n| vite | patch | updated |\n",
+		"column patch, unparseable": "| Package | Update | Change |\n|---|---|---|\n| vite | patch | `3.11-alpine` -> `3.11.1-alpine` |\n",
+		"column patch, downgrade":   "| Package | Update | Change |\n|---|---|---|\n| vite | patch | `8.3.6` -> `8.3.4` |\n",
+		"column patch, unchanged":   "| Package | Update | Change |\n|---|---|---|\n| vite | patch | `8.3.4` -> `8.3.4` |\n",
 		"one row not patch": "| Package | Update | Change |\n|---|---|---|\n" +
 			"| a | patch | `1.0.0` -> `1.0.1` |\n| b | digest | `abc` -> `def` |\n",
 	} {
