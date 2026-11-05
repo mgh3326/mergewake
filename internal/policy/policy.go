@@ -61,6 +61,7 @@ type ReviewGate struct {
 	RequiredBots      []string         `yaml:"required_bots"`
 	Block             []ReviewGateRule `yaml:"block"`
 	Triage            []ReviewGateRule `yaml:"triage"`
+	OwnMediumTriage   *bool            `yaml:"own_medium_triage"`
 	IgnoreAuthors     []string         `yaml:"ignore_authors"`
 	IgnoreOutdated    *bool            `yaml:"ignore_outdated"`
 	IgnoreBotResolved *bool            `yaml:"ignore_bot_resolved"`
@@ -127,14 +128,9 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 	return g
 }
 
-// WithOwnLogin adds the default block rule for the trusted review identity:
-// its critical and high findings block until fixed or dismissed with a reason.
-// Its medium and low findings are advisory — they get a disposition from the
-// author (fleet-review §Triage rubric) but never hold the gate and are not
-// counted as unanswered. A block list that already names the login keeps only
-// the policy's rules for it, and a policy may still add the login to its triage
-// list. The reviewer prompt also admits blocking, major and minor, graded like
-// high, medium and low.
+// WithOwnLogin adds default rules for the trusted review identity unless the
+// policy names it in the corresponding list. Critical and high findings block;
+// medium findings require triage on blocking-class PRs unless disabled.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
 	own := NormalizeAuthor(login)
@@ -151,6 +147,9 @@ func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	}
 	if !names(g.Block) {
 		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
+	}
+	if (g.OwnMediumTriage == nil || *g.OwnMediumTriage) && !names(g.Triage) {
+		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium"}, Classes: []string{"blocking"}})
 	}
 	return g
 }

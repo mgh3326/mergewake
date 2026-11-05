@@ -982,17 +982,18 @@ a graded author.
 
 The defaults grade CodeRabbit `critical` and `major` and codex `P1` as block
 (operator 2026-11-01: a CodeRabbit Major ranks with a high, fixed or dismissed
-with a reason, never deferred), codex `P2` as triage, CodeRabbit
-`minor`/`nitpick` and codex `P3` as advisory, and add one rule for the configured `review.login`:
-`critical`/`high` block (the reviewer prompt's `blocking` grades like `high`).
-Its `medium`/`low` findings (and `major`/`minor`, graded like them) are
-advisory: the author still gives each a disposition (fix, dismiss with a
-reason, or defer to a task), but they never hold the gate and are not counted
-in `triage_unanswered`. Only critical and high findings need a fix. Rules are
-`{author, severity: [...], classes: [...]}` lists under `block` and `triage`;
-an explicit list replaces the default for those two keys. Naming the
-`review.login` in `block` replaces its default block rule; naming it in
-`triage` makes those of its severities triage again.
+with a reason, never deferred), codex `P2` as triage, and CodeRabbit
+`minor`/`nitpick` and codex `P3` as advisory. For the configured `review.login`,
+`critical`/`high` block (the reviewer prompt's `blocking` grades like `high`),
+while `medium` findings require triage on blocking-class PRs and remain advisory
+on routine PRs. Its `low` findings remain advisory. Set
+`review_gate.own_medium_triage: false` to disable the default medium rule;
+when omitted or true, it is enabled.
+
+Rules are `{author, severity: [...], classes: [...]}` lists under `block` and
+`triage`; `classes` selects the PR change class. An explicit list replaces the
+default for those two keys. Naming `review.login` in `block` replaces its default
+block rule; naming it in `triage` replaces its default triage rule.
 Thread comments are read in full (paged past 50), since a late reply answers a
 finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
 true) clears an outdated finding by anyone but `review.login`: a block finding
