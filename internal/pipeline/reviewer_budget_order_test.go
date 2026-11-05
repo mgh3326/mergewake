@@ -15,7 +15,7 @@ import (
 
 // budgetPane stands a fake hub in front of the reviewer's pane with the given
 // agent status and records the job as claimed by an owner lane, as hk does.
-func budgetPane(t *testing.T, s *Service, runner *panewireRunner, job reviewerJob, status string) {
+func budgetPane(t *testing.T, s *Service, runner *panewireRunner, job reviewerJob, status string) *fakeReapHub {
 	t.Helper()
 	hub := newFakeReapHub()
 	pane := map[string]any{"pane_id": "p1", "name": job.Label, "agent_status": status, "cwd": "/repo/" + job.Label}
@@ -29,6 +29,7 @@ func budgetPane(t *testing.T, s *Service, runner *panewireRunner, job reviewerJo
 	s.Config.Reap.Transport = config.ReapTransportPanewire
 	s.Config.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
 	runner.sink.jobs[job.Label] = integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}
+	return hub
 }
 
 // pastBudget moves the clock beyond review.timeout from the recorded time and

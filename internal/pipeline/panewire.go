@@ -285,6 +285,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// until it has been live longer than the stale bound.
 	spawn := true
 	var collected []byte
+	var remoteRecord *integrations.JobRecord
 	if resumed {
 		// The record is answered in this order, and the total budget comes after
 		// the first two: a completed job or an available result is collected, a
@@ -298,7 +299,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		overBudget := s.now().Sub(rj.Recorded) >= timeout
 		rec, e := x.job(ctx, label)
 		state := rec.State
-		if e == nil && state != "completed" {
+		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
 			finished, err := x.reviewerFinished(ctx, rec, rj)
 			if err != nil {
 				return out, err
@@ -318,8 +319,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					if err != nil {
 						return out, err
 					}
-					if fresh.State == "completed" {
-						spawn = false
+					if fresh.State == "completed" || fresh.State == "escalated" || fresh.State == "lost" {
+						state, spawn = fresh.State, false
+					} else if b, retry := x.remoteFindings(ctx, plan, fresh, label); b != nil {
+						collected, remoteRecord, spawn = b, &fresh, false
+						// Give transient read errors one additional review budget to recover.
+					} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+						return out, errPassPending
 					} else {
 						cause := "pane finished without a result"
 						if !finished {
@@ -494,7 +500,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}()
 	collectCtx, collectSpan := tracing.Span(ctx, "mergewake.collect")
 	defer tracing.Finish(collectSpan)
-	res, e := x.recordResult(collectCtx, label)
+	var res jobOutcome
+	if remoteRecord != nil {
+		res = jobOutcome{rec: *remoteRecord, result: collected, reason: "remote result"}
+	} else {
+		res, e = x.recordResult(collectCtx, label)
+	}
 	if e != nil {
 		keepJob = true
 		if !errors.Is(e, ctx.Err()) {
@@ -720,6 +731,77 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 			return out, ctx.Err()
 		case <-time.After(wait):
 		}
+	}
+}
+
+// remoteFindings reads the host's bounded result without recording its body.
+func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool) {
+	outcome := "error"
+	var findings json.RawMessage
+	lookupTimeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		lookupTimeout = min(lookupTimeout, time.Until(deadline)/2)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	defer cancel()
+	var result struct {
+		Found         bool            `json:"found"`
+		Findings      json.RawMessage `json:"findings"`
+		FindingsError string          `json:"findings_error"`
+		Report        struct {
+			Present  bool   `json:"present"`
+			Bytes    int64  `json:"bytes"`
+			SHA256   string `json:"sha256"`
+			LastLine string `json:"last_line"`
+		} `json:"report"`
+		Completed bool `json:"completed"`
+	}
+	var err error
+	switch {
+	case rec.Host == "":
+		outcome = "missing_host"
+	case rec.Host == "local" || x.localReviewerHost(rec.Host):
+		var b []byte
+		b, err = x.s.Runner.Run(lookupCtx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
+		if err == nil {
+			err = json.Unmarshal(b, &result)
+		}
+	default:
+		var hub *reap.Hub
+		hub, err = x.s.reapHub()
+		if err == nil && hub != nil {
+			host := reap.HubHost{Hub: hub, Machine: rec.Host}
+			err = host.Hub.Command(lookupCtx, host.Machine, "job.result", map[string]string{"job": label}, &result)
+		} else if err == nil {
+			outcome = "no_hub"
+			err = errors.New("hub unavailable")
+		}
+	}
+	if rec.Host != "" && err == nil {
+		switch {
+		case !result.Found:
+			outcome = "not_found"
+		case len(result.Findings) == 0 || string(result.Findings) == "null":
+			switch result.FindingsError {
+			case "missing", "too_large", "not_json", "schema":
+				outcome = result.FindingsError
+			default:
+				outcome = "invalid_response"
+			}
+		default:
+			if _, err := parseFindings(result.Findings, x.diff); err != nil {
+				outcome = "invalid_findings"
+			} else {
+				outcome, findings = "found", result.Findings
+			}
+		}
+	}
+	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
+	switch outcome {
+	case "found", "not_found", "missing", "too_large", "not_json", "schema", "no_hub":
+		return findings, false
+	default:
+		return nil, true
 	}
 }
 

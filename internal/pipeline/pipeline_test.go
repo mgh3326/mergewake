@@ -57,6 +57,7 @@ type fakeGH struct {
 	leaseIDs                                                     map[string]string
 	files                                                        []policy.File
 	ci                                                           github.CI
+	postedFindings                                               []github.Finding
 	mergeCount, revertCount, postCount, claimCount, publishCount int
 	revertTrailers                                               string
 	head                                                         string
@@ -353,6 +354,7 @@ func (g *fakeGH) CreateRef(_ context.Context, _, branch, _ string) error {
 }
 func (g *fakeGH) PostReview(_ context.Context, _ string, _ int, sha string, f []github.Finding, meta github.PassReceipt) error {
 	g.postCount++
+	g.postedFindings = append(g.postedFindings, f...)
 	if g.passes == nil {
 		g.passes = map[string][]github.PassReceipt{}
 	}

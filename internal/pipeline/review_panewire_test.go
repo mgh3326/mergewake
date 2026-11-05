@@ -71,6 +71,9 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
 	}
+	if command == "panewire" && len(args) > 1 && args[0] == "node" && args[1] == "job-result" {
+		return []byte(`{"found":false}`), nil
+	}
 	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
 		r.closes = append(r.closes, slices.Clone(args))
 		var e error
