@@ -285,6 +285,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// until it has been live longer than the stale bound.
 	spawn := true
 	var collected []byte
+	var remoteRecord *integrations.JobRecord
 	if resumed {
 		// The record is answered in this order, and the total budget comes after
 		// the first two: a completed job or an available result is collected, a
@@ -320,6 +321,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					}
 					if fresh.State == "completed" {
 						spawn = false
+					} else if b := x.remoteFindings(ctx, plan, fresh, label); b != nil {
+						collected, remoteRecord, spawn = b, &fresh, false
 					} else {
 						cause := "pane finished without a result"
 						if !finished {
@@ -332,6 +335,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		} else if errors.Is(e, integrations.ErrJobNotFound) && overBudget {
 			// No job record means no hub claim to release: the record goes and the
 			// pass is replaced once.
+			_ = x.remoteFindings(ctx, plan, integrations.JobRecord{}, label)
 			return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job record missing past the review deadline", leaseSHA)
 		}
 		switch {
@@ -494,7 +498,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}()
 	collectCtx, collectSpan := tracing.Span(ctx, "mergewake.collect")
 	defer tracing.Finish(collectSpan)
-	res, e := x.recordResult(collectCtx, label)
+	var res jobOutcome
+	if remoteRecord != nil {
+		res = jobOutcome{rec: *remoteRecord, result: collected, reason: "remote result"}
+	} else {
+		res, e = x.recordResult(collectCtx, label)
+	}
 	if e != nil {
 		keepJob = true
 		if !errors.Is(e, ctx.Err()) {
@@ -721,6 +730,42 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 		case <-time.After(wait):
 		}
 	}
+}
+
+// remoteFindings reads the host's bounded result without recording its body.
+func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) []byte {
+	outcome := "error"
+	var findings json.RawMessage
+	if rec.Host != "" {
+		b, err := x.s.Runner.Run(ctx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
+		if err == nil {
+			var result struct {
+				Found         bool            `json:"found"`
+				Findings      json.RawMessage `json:"findings"`
+				FindingsError string          `json:"findings_error"`
+			}
+			if json.Unmarshal(b, &result) != nil {
+				outcome = "invalid_response"
+			} else if !result.Found {
+				outcome = "not_found"
+			} else if len(result.Findings) == 0 || string(result.Findings) == "null" {
+				switch result.FindingsError {
+				case "missing", "too_large", "not_json", "schema":
+					outcome = result.FindingsError
+				default:
+					outcome = "invalid_response"
+				}
+			} else if _, err := parseFindings(result.Findings, x.diff); err != nil {
+				outcome = "invalid_findings"
+			} else {
+				outcome, findings = "found", result.Findings
+			}
+		}
+	} else {
+		outcome = "missing_host"
+	}
+	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
+	return findings
 }
 
 // availableFindings checks the legacy sources once for a finished pane.
