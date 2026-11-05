@@ -183,6 +183,13 @@ func (e *hubError) Error() string {
 	return fmt.Sprintf("hub %d %s%s", e.Status, e.Code, e.detailSuffix())
 }
 
+// InvalidArgs matches a node answer of invalid_args: for worktree.list, a common
+// that is not a git dir on that node.
+func InvalidArgs(err error) bool {
+	var h *hubError
+	return errors.As(err, &h) && h.Code == "invalid_args"
+}
+
 func (e *hubError) Is(target error) bool { return target == ErrHubAuth && e.auth() }
 
 func (h *Hub) do(ctx context.Context, method, path string, body any, out any) error {
@@ -336,6 +343,41 @@ func (h HubHost) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 	}
 	w := v.Worktree
 	return &Worktree{Path: w.Path, Branch: w.Branch, Head: w.Head, Repo: RepoFromRemote(w.OriginURL), Common: w.Common}, nil
+}
+
+// WorktreeList reads one page of the worktrees of a common git dir (panewire's
+// read-only worktree.list). The node picks the page size; an empty cursor is
+// the first page.
+func (h HubHost) WorktreeList(ctx context.Context, common, cursor string) (WorktreePage, error) {
+	var v struct {
+		Worktrees []struct {
+			Path     string `json:"path"`
+			Branch   string `json:"branch"`
+			Head     string `json:"head"`
+			Detached bool   `json:"detached"`
+			Status   struct {
+				Dirty     bool   `json:"dirty"`
+				Untracked int    `json:"untracked"`
+				Ignored   int    `json:"ignored"`
+				Error     string `json:"error"`
+			} `json:"status"`
+		} `json:"worktrees"`
+		NextCursor string `json:"next_cursor"`
+		Total      int    `json:"total"`
+	}
+	args := map[string]any{"common": common}
+	if cursor != "" {
+		args["cursor"] = cursor
+	}
+	if err := h.Hub.Command(ctx, h.Machine, "worktree.list", args, &v); err != nil {
+		return WorktreePage{}, err
+	}
+	page := WorktreePage{NextCursor: v.NextCursor, Total: v.Total}
+	for _, w := range v.Worktrees {
+		page.Worktrees = append(page.Worktrees, ListedWorktree{Path: w.Path, Branch: w.Branch, Head: w.Head, Detached: w.Detached,
+			Status: WorktreeStatus{Dirty: w.Status.Dirty, Untracked: w.Status.Untracked, Ignored: w.Status.Ignored, Error: w.Status.Error}})
+	}
+	return page, nil
 }
 
 // WorktreeRemove asks the node to apply the same guarded cleanup checks used

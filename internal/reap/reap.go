@@ -126,6 +126,67 @@ type WorktreeRemoveResult struct {
 	RetryAfterS int
 }
 
+// ListedWorktree is one row of the node's worktree.list: a worktree of one
+// common git dir, with the node's own read of its status.
+type ListedWorktree struct {
+	Path     string
+	Branch   string
+	Head     string
+	Detached bool
+	Status   WorktreeStatus
+}
+
+// WorktreeStatus is the node's status read of a listed worktree. Dirty includes
+// tracked changes and untracked entries; Error is set when the status could not
+// be read (a missing worktree stays in the list with an error).
+type WorktreeStatus struct {
+	Dirty     bool
+	Untracked int
+	Ignored   int
+	Error     string
+}
+
+// Clean reports whether the node read the status and found nothing to lose.
+func (s WorktreeStatus) Clean() bool { return s.Error == "" && !s.Dirty && s.Untracked == 0 }
+
+// WorktreePage is one page of worktree.list; NextCursor is empty on the last.
+type WorktreePage struct {
+	Worktrees  []ListedWorktree
+	NextCursor string
+	Total      int
+}
+
+// WorktreeLister reads one page of a common git dir's worktrees.
+type WorktreeLister interface {
+	WorktreeList(ctx context.Context, common, cursor string) (WorktreePage, error)
+}
+
+// maxListPages bounds a listing so a node that keeps answering a cursor cannot
+// hold the sweep: 100 rows a page is far beyond any host's worktree count.
+const maxListPages = 200
+
+// ListWorktrees reads every page of common. A cursor that does not advance, or
+// a listing that never ends, is an error, never a short list.
+func ListWorktrees(ctx context.Context, l WorktreeLister, common string) ([]ListedWorktree, error) {
+	var all []ListedWorktree
+	cursor := ""
+	for page := 0; page < maxListPages; page++ {
+		p, err := l.WorktreeList(ctx, common, cursor)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, p.Worktrees...)
+		if p.NextCursor == "" {
+			return all, nil
+		}
+		if p.NextCursor == cursor {
+			return nil, errors.New("worktree.list cursor did not advance")
+		}
+		cursor = p.NextCursor
+	}
+	return nil, fmt.Errorf("worktree.list of %s did not end after %d pages", common, maxListPages)
+}
+
 // Exec runs herdr/git commands for one host, locally or over ssh.
 type Exec struct {
 	Runner Runner
