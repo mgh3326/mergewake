@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -101,5 +103,33 @@ func TestGitInSerializesCheckoutWrites(t *testing.T) {
 	}
 	if runner.readsPeak < 2 {
 		t.Fatalf("reads were serialized too: peak %d", runner.readsPeak)
+	}
+}
+
+// Concurrent reviews print to one Out, which need not be safe for concurrent
+// writes: every Print stays one whole JSON line.
+func TestPrintKeepsLinesWhole(t *testing.T) {
+	out := &bytes.Buffer{}
+	s := &Service{Out: out}
+	const goroutines, prints = 8, 50
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Go(func() {
+			for i := range prints {
+				if e := s.Print(map[string]any{"action": "review", "pr": g, "i": i, "reason": strings.Repeat("x", 512)}); e != nil {
+					t.Error(e)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != goroutines*prints {
+		t.Fatalf("%d lines, want %d", len(lines), goroutines*prints)
+	}
+	for _, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("broken line %q", line)
+		}
 	}
 }
