@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 )
 
 type File struct {
@@ -346,6 +347,25 @@ type Policy struct {
 	Blocking         []Rule      `yaml:"blocking"`
 	ReviewGate       *ReviewGate `yaml:"review_gate"`
 	FastLane         *FastLane   `yaml:"fast_lane"`
+	// AnyRefWorkflow names a workflow file in .github/workflows that runs the
+	// watch checks for any commit (workflow_dispatch with input ref). When it
+	// is set, watch dispatches it for a commit bisect needs but has no result
+	// for. Empty keeps the hold.
+	AnyRefWorkflow string `yaml:"any_ref_workflow"`
+	// AnyRefTimeout bounds the wait for one dispatched commit's result, as a
+	// Go duration. Empty means DefaultAnyRefTimeout.
+	AnyRefTimeout string `yaml:"any_ref_timeout"`
+}
+
+// DefaultAnyRefTimeout is how long watch waits for one any-ref CI result.
+const DefaultAnyRefTimeout = 45 * time.Minute
+
+// AnyRefWait returns the validated any_ref_timeout, or the default.
+func (p Policy) AnyRefWait() time.Duration {
+	if d, e := time.ParseDuration(p.AnyRefTimeout); e == nil && d > 0 {
+		return d
+	}
+	return DefaultAnyRefTimeout
 }
 
 // AutoUpdateBranchEnabled defaults branch updates on when the key is absent.
@@ -380,6 +400,17 @@ func (p Policy) Validate() error {
 			return errors.New("watch_checks must be nonempty and unique")
 		}
 		watchSeen[n] = true
+	}
+	if w := p.AnyRefWorkflow; w != "" && (strings.TrimSpace(w) != w || strings.Contains(w, "/") || !(strings.HasSuffix(w, ".yml") || strings.HasSuffix(w, ".yaml"))) {
+		return fmt.Errorf("any_ref_workflow %q must be a workflow file name ending in .yml or .yaml", w)
+	}
+	if p.AnyRefTimeout != "" {
+		if d, e := time.ParseDuration(p.AnyRefTimeout); e != nil || d <= 0 {
+			return fmt.Errorf("any_ref_timeout %q must be a positive duration", p.AnyRefTimeout)
+		}
+		if p.AnyRefWorkflow == "" {
+			return errors.New("any_ref_timeout requires any_ref_workflow")
+		}
 	}
 	for _, r := range append(append([]Rule{}, p.Blocking...), p.DeployApproval...) {
 		if len(r.Paths) == 0 || strings.TrimSpace(r.Reason) == "" {

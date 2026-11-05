@@ -237,12 +237,27 @@ func (c *Client) CreateRef(ctx context.Context, repo, branch, sha string) error 
 	return c.json(ctx, "POST", base(repo)+"/git/refs", map[string]string{"ref": "refs/heads/" + branch, "sha": sha}, nil)
 }
 
+// DispatchWorkflow starts a workflow_dispatch run of the named workflow file
+// on branch ref, passing inputs.
+func (c *Client) DispatchWorkflow(ctx context.Context, repo, workflow, ref string, inputs map[string]string) error {
+	return c.json(ctx, "POST", base(repo)+"/actions/workflows/"+url.PathEscape(workflow)+"/dispatches", map[string]any{"ref": ref, "inputs": inputs}, nil)
+}
+
+// DispatchRefused reports whether GitHub declined a workflow dispatch for a
+// reason a retry cannot fix: missing scope (403), unknown workflow (404), or
+// a workflow without a matching workflow_dispatch trigger (422).
+func DispatchRefused(e error) bool {
+	var a *APIError
+	return errors.As(e, &a) && (a.Code == 403 || a.Code == 404 || a.Code == 422)
+}
+
 type CI string
 
 const (
-	Green   CI = "green"
-	Red     CI = "red"
-	Pending CI = "pending"
+	Green     CI = "green"
+	Red       CI = "red"
+	Pending   CI = "pending"
+	Cancelled CI = "cancelled"
 )
 
 type checkRun struct {
@@ -257,7 +272,7 @@ type status struct {
 	State   string `json:"state"`
 }
 
-func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]CI, error) {
+func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerdicts bool) (map[string]CI, error) {
 	states := map[string]CI{}
 	ids := map[string]int64{}
 	ran := map[string]bool{}
@@ -272,8 +287,10 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 			// Two workflows can define a job with the same name (a CI "test" and a
 			// release "test" that skips on PRs). A skipped or neutral run never
 			// overrides a sibling that actually ran; it only counts when it is the
-			// sole run of that name.
-			idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral")
+			// sole run of that name. Per-check gate evidence also preserves a
+			// sibling verdict against a cancellation; aggregate Check retains its
+			// original latest-run behavior.
+			idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral" || (preserveVerdicts && r.Conclusion == "cancelled"))
 			if idle && ran[r.Name] {
 				continue
 			}
@@ -290,13 +307,13 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 				switch r.Conclusion {
 				case "success":
 					state = Green
+				case "cancelled", "skipped", "neutral":
+					state = Cancelled
 				case "failure", "timed_out", "action_required", "startup_failure", "stale":
 					state = Red
 				}
 			}
-			// Cancelled and skipped conclusions stay unknown rather than red:
-			// they cannot mark a red boundary for culprit search or count as
-			// confirmed-green evidence.
+			// Check treats cancelled evidence as pending for aggregate consumers.
 			states[r.Name] = state
 		}
 		if len(runs.CheckRuns) < 100 {
@@ -325,8 +342,18 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string) (map[string]
 		case "failure", "error":
 			v = Red
 		}
+		// An unknown value (pending, cancelled or skipped) never conflicts with
+		// a decisive one of the same name: an any-ref status can settle a commit
+		// whose own run was skipped or cancelled. Two decisive values that
+		// disagree stay an error; two unknown values read as the status.
 		if old, ok := states[name]; ok && old != v {
-			return nil, fmt.Errorf("ambiguous check and status named %q", name)
+			decisive := func(x CI) bool { return x == Green || x == Red }
+			if decisive(old) && decisive(v) {
+				return nil, fmt.Errorf("ambiguous check and status named %q", name)
+			}
+			if decisive(old) {
+				continue
+			}
 		}
 		states[name] = v
 	}
@@ -337,7 +364,7 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 	if len(required) == 0 {
 		return Pending, errors.New("no required checks configured")
 	}
-	states, e := c.checkStates(ctx, repo, sha)
+	states, e := c.checkStates(ctx, repo, sha, false)
 	if e != nil {
 		return Pending, e
 	}
@@ -354,10 +381,10 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 	return result, nil
 }
 
-// CheckStates resolves each required check name to green, red or pending.
-// Missing or unknown evidence is pending, matching Check's aggregate result.
+// CheckStates resolves each required name, distinguishing completed runs without
+// a verdict from pending evidence. Missing evidence is pending.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
-	states, e := cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (map[string]CI, error) { return c.checkStates(freshRequest(ctx), repo, sha) })
+	states, e := cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (map[string]CI, error) { return c.checkStates(freshRequest(ctx), repo, sha, true) })
 	if e != nil {
 		return nil, e
 	}
@@ -547,7 +574,7 @@ func (c *Client) CompareDiff(ctx context.Context, repo, baseRef, head string) (s
 
 // CIStarted reports whether any check run or status exists for sha.
 func (c *Client) CIStarted(ctx context.Context, repo, sha string) (bool, error) {
-	states, e := c.checkStates(ctx, repo, sha)
+	states, e := c.checkStates(ctx, repo, sha, false)
 	return len(states) > 0, e
 }
 

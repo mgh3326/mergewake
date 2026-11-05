@@ -433,6 +433,9 @@ func TestLand(t *testing.T) {
 			g.enabled = tt.enabled
 			g.blocking = tt.blocking
 			g.stale = tt.stale
+			if tt.stale {
+				g.pull.MergeableState = "behind"
+			}
 			if tt.reviewed {
 				markReviewed(g)
 			}
