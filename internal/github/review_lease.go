@@ -80,3 +80,29 @@ func (c *Client) ClaimReviewWithSHA(ctx context.Context, repo, branch, head stri
 	}
 	return lease.SHA, true, nil
 }
+
+// RenewReviewLease advances only the lease commit the caller owns.
+func (c *Client) RenewReviewLease(ctx context.Context, repo, branch, expected string) (string, bool, error) {
+	old, err := c.Head(ctx, repo, branch)
+	if err != nil || old != expected {
+		return "", false, err
+	}
+	commit, err := c.Commit(ctx, repo, old)
+	if err != nil {
+		return "", false, err
+	}
+	var lease Ref
+	err = c.json(ctx, "POST", base(repo)+"/git/commits", map[string]any{"message": leasePrefix + c.now().UTC().Format(time.RFC3339Nano), "tree": commit.Commit.Tree.SHA, "parents": []string{old}}, &lease)
+	if err != nil {
+		return "", false, err
+	}
+	err = c.json(ctx, "PATCH", base(repo)+"/git/refs/heads/"+branch, map[string]any{"sha": lease.SHA, "force": false}, nil)
+	if err != nil {
+		var api *APIError
+		if errors.As(err, &api) && (api.Code == 409 || api.Code == 422) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return lease.SHA, true, nil
+}

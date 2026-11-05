@@ -31,7 +31,7 @@ func interruptedReviewer(t *testing.T) (*Service, *fakeGH, config.Repo, *panewir
 	s.Now = c.now
 	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
 	err := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), "the next run resumes it") {
+	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	if len(runner.spawns) != 1 || runner.headless != 0 || g.postCount != 0 {
@@ -165,7 +165,8 @@ func TestReviewerJobEscalatedHoldsAndDrops(t *testing.T) {
 // row and one desk notice across runs, and no new label or replay.
 func TestReviewerJobStaleNotifiesOnce(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
-	c.t = c.t.Add(time.Hour) // review.timeout is 5s: well past twice it
+	s.Config.Review.Panewire.StaleAfter = "1s"
+	c.t = c.t.Add(2 * time.Second)
 	for i := 0; i < 2; i++ {
 		err := s.Review(context.Background(), r, 7, "", Options{})
 		if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), "still claimed") {
@@ -385,5 +386,169 @@ func TestReviewerJobActiveLeaseDifferentCommit(t *testing.T) {
 				t.Fatalf("output=%s posts=%d spawns=%d", output.String(), g.postCount, len(runner.spawns))
 			}
 		})
+	}
+}
+
+func TestReviewerPassWaitIsBounded(t *testing.T) {
+	runner := &panewireRunner{exits: []int{panewireWaitTimeout}}
+	s, _, r := panewireSetup(t, runner)
+	s.Config.Review.Timeout = "25m"
+	_ = s.Review(context.Background(), r, 7, "", Options{})
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d", len(runner.spawns))
+	}
+	wait, err := strconv.Atoi(arg(runner.spawns[0], "--wait-timeout"))
+	if err != nil || wait > 90 {
+		t.Fatalf("wait=%d, want at most 90 seconds (err=%v)", wait, err)
+	}
+	readReviewerJob(t, s, r, 1)
+}
+
+func TestReviewerFinishedWithoutResultIsReplaced(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, r, 1)
+	hub := newFakeReapHub()
+	hub.agents["panes"] = []any{map[string]any{"pane_id": "p1", "cwd": "/repo/" + old.Label}}
+	hub.agents["agents"] = []any{map[string]any{"pane_id": "p1", "name": old.Label, "agent_status": "done", "cwd": "/repo/" + old.Label}}
+	server := hub.serve(t)
+	token := filepath.Join(t.TempDir(), "hub.env")
+	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=svc-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Config.Reap.Transport = config.ReapTransportPanewire
+	s.Config.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
+	runner.sink.jobs[old.Label] = integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	c.t = c.t.Add(time.Second)
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.closes) != 1 || runner.closes[0][2] != old.Label || len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label || g.postCount != 1 {
+		t.Fatalf("closes=%v spawns=%v posts=%d", runner.closes, runner.spawns, g.postCount)
+	}
+	if len(auditRows(t, s, r, "review-result-lost")) != 1 {
+		t.Fatal("missing lost audit")
+	}
+}
+
+func TestReviewerTotalBudgetUsesRecordedTime(t *testing.T) {
+	s, _, r, runner, c := interruptedReviewer(t)
+	c.t = c.t.Add(5 * time.Second)
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrReviewUnavailable) || len(runner.spawns) != 1 {
+		t.Fatalf("err=%v spawns=%d", err, len(runner.spawns))
+	}
+	readReviewerJob(t, s, r, 1)
+}
+
+func TestReviewerLiveLeaseRenewsAndExcludesOtherHost(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	ref := claimRef(7, shaA, 1)
+	s.Config.Review.Timeout = "1h"
+	runner.exits = []int{panewireWaitTimeout, panewireWaitTimeout}
+	for i := 0; i < 2; i++ {
+		c.t = c.t.Add(time.Minute)
+		g.leaseTimes[ref] = time.Now().Add(-30 * time.Minute)
+		before := g.leaseTimes[ref]
+		if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if !g.leaseTimes[ref].After(before) {
+			t.Fatal("lease not renewed")
+		}
+	}
+	if err := s.dropReviewerJob(r.Name, 7, 1); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	s.Out = &output
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"action":"review-pending"`) || len(runner.spawns) != 3 {
+		t.Fatalf("output=%s spawns=%d", output.String(), len(runner.spawns))
+	}
+}
+
+func TestReviewerSecondLostResultDoesNotSpawnThird(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, r, 1)
+	hub := newFakeReapHub()
+	server := hub.serve(t)
+	token := filepath.Join(t.TempDir(), "hub.env")
+	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=svc-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Config.Reap.Transport = config.ReapTransportPanewire
+	s.Config.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
+	done := func(job reviewerJob) {
+		pane := map[string]any{"pane_id": "p1", "name": job.Label, "agent_status": "done", "cwd": "/repo/" + job.Label}
+		hub.agents["panes"] = []any{pane}
+		hub.agents["agents"] = []any{pane}
+		runner.sink.jobs[job.Label] = integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}
+	}
+	done(old)
+	runner.exits = []int{panewireWaitTimeout}
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	c.t = c.t.Add(time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	replacement := readReviewerJob(t, s, r, 1)
+	done(replacement)
+	c.t = c.t.Add(time.Second)
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if !errors.Is(err, ErrReviewUnavailable) || len(runner.spawns) != 2 || len(runner.closes) != 2 {
+		t.Fatalf("err=%v spawns=%d closes=%d", err, len(runner.spawns), len(runner.closes))
+	}
+}
+
+func TestReviewerLeaseAcrossReplacementOutlivesOriginalTTL(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	start := c.t
+	old := readReviewerJob(t, s, r, 1)
+	hub := newFakeReapHub()
+	pane := map[string]any{"pane_id": "p1", "name": old.Label, "agent_status": "done", "cwd": "/repo/" + old.Label}
+	hub.agents["panes"] = []any{pane}
+	hub.agents["agents"] = []any{pane}
+	server := hub.serve(t)
+	token := filepath.Join(t.TempDir(), "hub.env")
+	if err := os.WriteFile(token, []byte("HUB_MACHINE_ID=svc-mergewake\nHUB_TOKEN=svc-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Config.Reap.Transport = config.ReapTransportPanewire
+	s.Config.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
+	runner.sink.jobs[old.Label] = integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}
+	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
+	runner.exits = []int{panewireWaitTimeout, panewireWaitTimeout}
+	ref := claimRef(7, shaA, 1)
+	c.t = c.t.Add(4 * time.Second)
+	g.leaseTimes[ref] = time.Now().Add(-4 * time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	replacement := readReviewerJob(t, s, r, 1)
+	if replacement.Label == old.Label || replacement.LeaseSHA != g.leaseIDs[ref] {
+		t.Fatalf("replacement=%+v lease=%s", replacement, g.leaseIDs[ref])
+	}
+	c.t = c.t.Add(3 * time.Second)
+	g.leaseTimes[ref] = time.Now().Add(-3 * time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	current := readReviewerJob(t, s, r, 1)
+	if c.t.Sub(start) <= 6*time.Second || current.LeaseSHA != g.leaseIDs[ref] || current.LeaseSHA == replacement.LeaseSHA {
+		t.Fatalf("elapsed=%s record=%+v lease=%s", c.t.Sub(start), current, g.leaseIDs[ref])
+	}
+	other := *s
+	other.Config.StateDir = t.TempDir()
+	var output bytes.Buffer
+	other.Out = &output
+	if err := other.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"action":"review-pending"`) || len(runner.spawns) != 3 {
+		t.Fatalf("output=%s spawns=%d", output.String(), len(runner.spawns))
 	}
 }
