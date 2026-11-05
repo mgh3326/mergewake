@@ -121,7 +121,7 @@ func TestFreshEvidenceBypassesPollWindow(t *testing.T) {
 	c.Stderr = io.Discard
 	ctx := context.Background()
 	for _, use := range []context.Context{ctx, ctx, FreshEvidence(ctx)} {
-		if _, err := c.request(use, "GET", "/repos/o/r/pulls/1", "application/json", nil); err != nil {
+		if _, err := c.request(use, "GET", "/repos/o/r/events", "application/json", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
