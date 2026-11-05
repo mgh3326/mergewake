@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -308,6 +309,7 @@ func TestReviewerJobActiveLeaseNoRecord(t *testing.T) {
 
 func TestReviewerJobActiveLeaseOldHead(t *testing.T) {
 	s, g, r, runner, _ := interruptedReviewer(t)
+	runner.sink.missing = &integrations.JobRecord{State: "claimed", OwnerLane: "owner"}
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
 	job := readReviewerJob(t, s, r, 1)
 	job.Head = shaB
@@ -325,7 +327,14 @@ func TestReviewerJobActiveLeaseOldHead(t *testing.T) {
 	if len(runner.spawns) != 1 || g.postCount != 0 {
 		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
 	}
-	reviewerJobGone(t, s, r, 1)
+	// The preflight only reads: the older head's record and job are left for
+	// the pass that runs.
+	if len(runner.closes) != 0 || len(auditRows(t, s, r, "reviewer-head-moved")) != 0 {
+		t.Fatalf("closes=%v", runner.closes)
+	}
+	if rj := readReviewerJob(t, s, r, 1); rj.Head != shaB {
+		t.Fatalf("record %+v", rj)
+	}
 }
 
 func TestReviewerJobExpiredLeaseClaimsAndResumes(t *testing.T) {
@@ -541,4 +550,221 @@ func TestReviewerLeaseAcrossReplacementOutlivesOriginalTTL(t *testing.T) {
 	if !strings.Contains(output.String(), `"action":"review-pending"`) || len(runner.spawns) != 3 {
 		t.Fatalf("output=%s spawns=%d", output.String(), len(runner.spawns))
 	}
+}
+
+// movedHeadSetup records a reviewer job of an older head for both passes and
+// answers the new head's own job with a finished review.
+func movedHeadSetup(t *testing.T, runner *panewireRunner, old integrations.JobRecord) (*Service, *fakeGH, config.Repo, []string) {
+	t.Helper()
+	s, g, r := panewireSetup(t, runner)
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"findings":[]}`)}
+	var labels []string
+	for _, pass := range []int{1, 2} {
+		label := fmt.Sprintf("mwr-7-%s-p%d-1", shaB[:7], pass)
+		labels = append(labels, label)
+		runner.sink.jobs[label] = old
+		rj := reviewerJob{PR: 7, Head: shaB, Pass: pass, Label: label, Checkout: "/nowhere", Args: []string{"spawn", "-l", label}, Recorded: time.Now()}
+		if err := fsutil.WriteJSON(s.reviewerJobPath(r.Name, 7, pass), rj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, g, r, labels
+}
+
+// movedHeadClosed checks the closes, in order: each is the abandoned close of
+// the named label by the job's owner lane.
+func movedHeadClosed(t *testing.T, runner *panewireRunner, labels ...string) {
+	t.Helper()
+	if len(runner.closes) != len(labels) {
+		t.Fatalf("closes=%v, want %v", runner.closes, labels)
+	}
+	for i, label := range labels {
+		want := []string{"job", "close", label, "--lane", "owner", "--outcome", "abandoned", "--reason", "PR head moved"}
+		if !slices.Equal(runner.closes[i], want) {
+			t.Fatalf("close %v, want %v", runner.closes[i], want)
+		}
+	}
+}
+
+// (a) A live job of an older head is closed before its record is dropped, so
+// the new head's reviewer is not refused for the held reservation.
+func TestReviewerHeadMovedClosesLiveJob(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	movedHeadClosed(t, runner, labels...)
+	if len(runner.spawns) != 1 || g.postCount != 1 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	if l := arg(runner.spawns[0], "-l"); !strings.HasPrefix(l, "mwr-7-"+shaA[:7]+"-p1-") {
+		t.Fatalf("label %s", l)
+	}
+	rows := auditRows(t, s, r, "reviewer-head-moved")
+	if len(rows) != 2 || rows[0]["old_head"] != shaB || rows[0]["new_head"] != shaA || rows[0]["label"] != labels[0] || rows[1]["label"] != labels[1] {
+		t.Fatalf("audit=%v", rows)
+	}
+	reviewerJobGone(t, s, r, 1)
+	reviewerJobGone(t, s, r, 2)
+}
+
+// (b) A completed job of an older head holds no reservation: no close.
+func TestReviewerHeadMovedCompletedJobNotClosed(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, g, r, _ := movedHeadSetup(t, runner, integrations.JobRecord{State: "completed", OwnerLane: "owner"})
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.closes) != 0 || len(runner.spawns) != 1 || g.postCount != 1 || len(auditRows(t, s, r, "reviewer-head-moved")) != 0 {
+		t.Fatalf("closes=%v spawns=%d posts=%d", runner.closes, len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+	reviewerJobGone(t, s, r, 2)
+}
+
+// A job record hk does not have holds nothing either.
+func TestReviewerHeadMovedMissingJobDropped(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, _, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{})
+	for _, label := range labels {
+		delete(runner.sink.jobs, label)
+	}
+	runner.sink.missing = nil
+	// Any id but the new head's label is unknown to hk; the new head's job
+	// is answered once it is spawned.
+	runner.afterRun = func() {
+		runner.sink.missing = &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"findings":[]}`)}
+	}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.closes) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("closes=%v spawns=%d", runner.closes, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 2)
+}
+
+// (c) A close that fails keeps the record and spawns nothing; the next pass
+// closes again.
+func TestReviewerHeadMovedCloseFailureKeepsRecord(t *testing.T) {
+	runner := &panewireRunner{family: "openai", closeErrs: []error{panewireExit(1)}}
+	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if err == nil || !strings.Contains(err.Error(), labels[0]) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(runner.spawns) != 0 || g.postCount != 0 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	if rj := readReviewerJob(t, s, r, 1); rj.Head != shaB || rj.Label != labels[0] {
+		t.Fatalf("record %+v", rj)
+	}
+	if rows := auditRows(t, s, r, "reviewer-head-moved"); len(rows) != 0 {
+		t.Fatalf("audit=%v", rows)
+	}
+	if err = s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 1 || g.postCount != 1 {
+		t.Fatalf("retry spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// (d) A fresh spawn refused as held, after this run closed the older head's
+// job, closes it once more and spawns again once.
+func TestReviewerHeadMovedHeldSpawnRetriesOnce(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}}
+	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// Both records are closed up front; the refusal closes each again.
+	movedHeadClosed(t, runner, labels[0], labels[1], labels[0], labels[1])
+	if len(runner.spawns) != 2 || g.postCount != 1 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	if !slices.Equal(runner.spawns[0], runner.spawns[1]) {
+		t.Fatalf("retry changed the spawn:\n%v\n%v", runner.spawns[0], runner.spawns[1])
+	}
+	if len(auditRows(t, s, r, "reviewer-held")) != 0 {
+		t.Fatal("a held spawn that succeeded on retry is not a held pass")
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// A second refusal is a held pass: the spawn is retried once, not forever.
+func TestReviewerHeadMovedHeldTwiceFailsPass(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld, panewireHeld}}
+	s, g, r, _ := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if !errors.Is(err, ErrReviewUnavailable) || len(runner.spawns) != 2 || g.postCount != 0 {
+		t.Fatalf("err=%v spawns=%d posts=%d", err, len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// (e) A record for the current head is untouched: its job is replayed, not
+// closed.
+func TestReviewerCurrentHeadRecordNotClosed(t *testing.T) {
+	s, _, r, runner, c := interruptedReviewer(t)
+	runner.sink.missing = &integrations.JobRecord{State: "claimed", OwnerLane: "owner"}
+	c.t = c.t.Add(2 * time.Second)
+	runner.afterRun = func() {
+		runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.closes) != 0 || len(runner.spawns) != 2 || len(auditRows(t, s, r, "reviewer-head-moved")) != 0 {
+		t.Fatalf("closes=%v spawns=%d", runner.closes, len(runner.spawns))
+	}
+}
+
+// A dry run never acts on the older head's job: the record stays, so a later
+// acting run closes the job.
+func TestReviewerHeadMovedDryRunLeavesJobAndRecord(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	g.refs = map[string]bool{claimRef(7, shaA, 1): true}
+	g.leaseTimes = map[string]time.Time{claimRef(7, shaA, 1): time.Now()}
+	if err := s.Review(context.Background(), r, 7, "", Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.closes) != 0 || len(runner.spawns) != 0 || len(auditRows(t, s, r, "reviewer-head-moved")) != 0 {
+		t.Fatalf("closes=%v spawns=%d", runner.closes, len(runner.spawns))
+	}
+	for i, pass := range []int{1, 2} {
+		if rj := readReviewerJob(t, s, r, pass); rj.Label != labels[i] {
+			t.Fatalf("record %+v", rj)
+		}
+	}
+}
+
+// A repeat close that fails puts the older heads' records back, so the next
+// pass still knows which job to close.
+func TestReviewerHeadMovedRepeatCloseFailureRestoresRecords(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}, closeErrs: []error{nil, nil, panewireExit(1)}}
+	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	err := s.Review(context.Background(), r, 7, "", Options{})
+	if err == nil || len(runner.spawns) != 1 || g.postCount != 0 {
+		t.Fatalf("err=%v spawns=%d posts=%d", err, len(runner.spawns), g.postCount)
+	}
+	for i, pass := range []int{1, 2} {
+		if rj := readReviewerJob(t, s, r, pass); rj.Head != shaB || rj.Label != labels[i] {
+			t.Fatalf("pass %d record %+v", pass, rj)
+		}
+	}
+	// The next run, once the pass lease has lapsed, closes them again and
+	// reviews the new head.
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
+	if err = s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 2 || g.postCount != 1 {
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+	reviewerJobGone(t, s, r, 2)
 }
