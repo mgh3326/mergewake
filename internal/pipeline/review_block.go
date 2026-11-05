@@ -36,10 +36,9 @@ type reviewBlock struct {
 // reviewBlockFor finds a fleet PR the panewire executor could not place. Only
 // a positive answer blocks: an unreadable PR commit or task is not a missing
 // trailer or marker, so it stays with the executor's skip and retry. So do
-// non-fleet authors, and the reviews that need no task: the headless executor,
-// and a repo without a root, where panewire cannot run.
+// non-fleet authors and repos without a root, where panewire fails the pass.
 func (s *Service) reviewBlockFor(ctx context.Context, r config.Repo, pr github.Pull) (reviewBlock, bool) {
-	if s.Config.Review.Executor != "panewire" || config.Expand(r.Root) == "" || !s.fleetAuthor(pr.User.Login) {
+	if config.Expand(r.Root) == "" || !s.fleetAuthor(pr.User.Login) {
 		return reviewBlock{}, false
 	}
 	task, e := s.prTask(ctx, r, pr)

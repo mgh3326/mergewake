@@ -49,6 +49,7 @@ type panewireRunner struct {
 	quotaErr     error
 	usageErr     error
 	quotaCalls   int // quota tool invocations (recommend, usage, gate)
+	quotaActions [][]string
 	spawns       [][]string
 	git          [][]string
 	headless     int
@@ -65,6 +66,9 @@ type panewireRunner struct {
 }
 
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
+		r.quotaActions = append(r.quotaActions, slices.Clone(args))
+	}
 	if command == "panewire" && len(args) > 1 && args[0] == "inbox" {
 		if args[1] == "ack" {
 			r.acks = append(r.acks, args)
@@ -224,6 +228,7 @@ func (s *taskJobSink) Attachment(_ context.Context, sha string) ([]byte, error) 
 func panewireSetup(t *testing.T, runner *panewireRunner) (*Service, *fakeGH, config.Repo) {
 	t.Helper()
 	s, g, _, _, r := setup(t)
+	g.fixtureTask = false
 	s.Runner = runner
 	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}, jobs: map[string]integrations.JobRecord{}}
 	s.Sink = sink
@@ -766,18 +771,6 @@ func TestPanewireNeedsNoQuotaTool(t *testing.T) {
 	e := s.Review(context.Background(), r, 7, "", Options{})
 	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "panewire: no findings") || strings.Contains(e.Error(), "headless") || strings.Contains(e.Error(), "quota") || g.postCount != 0 || runner.quotaCalls != 0 || runner.headless != 0 {
 		t.Fatal(e, g.postCount, runner.quotaCalls, runner.headless)
-	}
-}
-
-func TestHeadlessExecutorUnchangedWithoutPanewire(t *testing.T) {
-	runner := &panewireRunner{}
-	s, g, r := panewireSetup(t, runner)
-	s.Config.Review.Executor = "headless"
-	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if len(runner.spawns) != 0 || runner.headless != 1 || g.passes[shaA][0].Fallback != "" || g.passes[shaA][0].Executor != "" {
-		t.Fatal(runner.spawns, g.passes)
 	}
 }
 

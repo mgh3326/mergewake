@@ -211,6 +211,7 @@ func TestPanewireNeedsNoProfilesOrQuota(t *testing.T) {
 			runner := &panewireRunner{family: "openai", quotaErr: errors.New("scopefuel: not found")}
 			s, g, r := panewireSetup(t, runner)
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			s.Config.Review.Quota = "scopefuel"
 			s.Config.Review.Profiles = profiles
 			s.Config.Review.Pairings = nil
 			out := &bytes.Buffer{}
@@ -237,57 +238,11 @@ func TestPanewireNeedsNoProfilesOrQuota(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := g.passes[shaA]
-			if runner.quotaCalls != 0 || runner.headless != 0 || len(runner.spawns) != 1 || g.postCount != 1 || len(got) != 1 || got[0].Executor != "panewire" {
+			if runner.quotaCalls != 0 || len(runner.quotaActions) != 0 || runner.headless != 0 || len(runner.spawns) != 1 || g.postCount != 1 || len(got) != 1 || got[0].Executor != "panewire" {
 				t.Fatalf("quota=%d headless=%d spawns=%d posts=%d passes=%+v", runner.quotaCalls, runner.headless, len(runner.spawns), g.postCount, got)
 			}
 			reviews, _ := reviewRecords(t, s, r, "review")
 			if len(reviews) != 1 || reviews[0]["executor"] != "panewire" || reviews[0]["pace"] != nil || reviews[0]["fallback"] != nil {
-				t.Fatalf("review audit=%v", reviews)
-			}
-		})
-	}
-}
-
-// (e) review.executor headless, or unset, keeps today's behaviour: quota
-// recommendation and usage, ordered candidates with pace, a headless post.
-func TestHeadlessExecutorKeepsCandidatesQuotaAndPace(t *testing.T) {
-	for _, executor := range []string{"headless", ""} {
-		t.Run("executor="+executor, func(t *testing.T) {
-			runner := &panewireRunner{}
-			s, g, r := panewireSetup(t, runner)
-			s.Config.Review.Executor = executor
-			out := &bytes.Buffer{}
-			s.Out = out
-			if err := s.Review(context.Background(), r, 7, "openai", Options{DryRun: true}); err != nil {
-				t.Fatal(err)
-			}
-			var plan struct {
-				Passes []struct {
-					Candidates []string `json:"candidates"`
-					Pace       []string `json:"pace"`
-					SameFamily *bool    `json:"same_family"`
-					Executor   string   `json:"executor"`
-				} `json:"passes"`
-			}
-			if e := json.Unmarshal(out.Bytes(), &plan); e != nil {
-				t.Fatalf("%v: %s", e, out)
-			}
-			if len(plan.Passes) != 1 || len(plan.Passes[0].Candidates) != 1 || plan.Passes[0].Candidates[0] != "claude" || len(plan.Passes[0].Pace) != 1 || plan.Passes[0].SameFamily == nil || *plan.Passes[0].SameFamily || plan.Passes[0].Executor != "" {
-				t.Fatalf("plan: %s", out)
-			}
-			dryQuota := runner.quotaCalls
-			if dryQuota < 2 { // recommend + usage
-				t.Fatalf("quota calls=%d", dryQuota)
-			}
-			if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
-				t.Fatal(err)
-			}
-			got := g.passes[shaA]
-			if len(runner.spawns) != 0 || runner.headless != 1 || runner.quotaCalls <= dryQuota || g.postCount != 1 || len(got) != 1 || got[0].Reviewer != "claude" || got[0].Executor != "" || got[0].Fallback != "" {
-				t.Fatalf("spawns=%d headless=%d quota=%d posts=%d passes=%+v", len(runner.spawns), runner.headless, runner.quotaCalls, g.postCount, got)
-			}
-			reviews, _ := reviewRecords(t, s, r, "review")
-			if len(reviews) != 1 || reviews[0]["pace"] == nil || reviews[0]["executor"] != nil {
 				t.Fatalf("review audit=%v", reviews)
 			}
 		})

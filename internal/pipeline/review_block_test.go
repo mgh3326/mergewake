@@ -244,17 +244,6 @@ func TestUnreadableEvidenceDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestHeadlessExecutorDoesNotBlock(t *testing.T) {
-	f := blockSetup(t)
-	f.s.Config.Review.Executor = "headless"
-	if e := f.review(t); e != nil {
-		t.Fatal(e)
-	}
-	if f.gh.posts != 0 || f.g.postCount != 1 {
-		t.Fatalf("comments=%d passes=%d", f.gh.posts, f.g.postCount)
-	}
-}
-
 func TestRepoWithoutRootDoesNotBlock(t *testing.T) {
 	f := blockSetup(t)
 	f.r.Root = ""

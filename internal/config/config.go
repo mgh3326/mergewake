@@ -48,13 +48,9 @@ type Review struct {
 	// model alias. Reviewed heads record that the family was inferred.
 	DefaultFamily string `yaml:"default_family"`
 	Timeout       string `yaml:"timeout"`
-	// Select orders admitted reviewers: "pace" (default) by projected use at
-	// each pool's reset from `<quota> --json`; "rank" keeps the quota tool's
-	// recommendation order without reading usage.
+	// Select is accepted for compatibility and is unused.
 	Select string `yaml:"select"`
-	// Executor runs each pass: "headless" (default) invokes a profile's CLI on
-	// the diff here; "panewire" spawns a reviewer pane through panewire in a
-	// checkout of the PR head and keeps headless as the fallback.
+	// Executor runs each pass through panewire.
 	Executor string         `yaml:"executor"`
 	Panewire PanewireReview `yaml:"panewire"`
 	// BudgetRounds is the number of review rounds a PR gets before later rounds
@@ -779,10 +775,12 @@ func Load(name string) (Config, error) {
 	}
 	switch c.Review.Executor {
 	case "":
-		c.Review.Executor = "headless"
-	case "headless", "panewire":
+		c.Review.Executor = "panewire"
+	case "panewire":
+	case "headless":
+		return c, errors.New("review.executor: headless was retired; use panewire (the default)")
 	default:
-		return c, errors.New("review.executor must be headless or panewire")
+		return c, errors.New("review.executor must be panewire")
 	}
 	rt := &c.Review.Panewire
 	if rt.Command == "" {
