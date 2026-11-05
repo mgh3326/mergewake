@@ -727,6 +727,7 @@ func TestReviewerCurrentHeadRecordNotClosed(t *testing.T) {
 func TestReviewerHeadMovedDryRunLeavesJobAndRecord(t *testing.T) {
 	runner := &panewireRunner{family: "openai"}
 	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	g.refs = map[string]bool{claimRef(7, shaA, 1): true}
 	g.leaseTimes = map[string]time.Time{claimRef(7, shaA, 1): time.Now()}
 	if err := s.Review(context.Background(), r, 7, "", Options{DryRun: true}); err != nil {
 		t.Fatal(err)
