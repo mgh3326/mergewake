@@ -27,6 +27,8 @@ import (
 // means no admitted seat outside the builder's family remained.
 const panewireRefused = 77
 
+var errSecretLikeBrief = errors.New("review brief refused as secret-like content")
+
 // panewireHubEnv names the environment panewire reads to place a reviewer on
 // the hub. A daemon inherits it from its host wrapper.
 const (
@@ -443,6 +445,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		if e != nil {
 			code := exitStatus(e)
+			var commandErr *integrations.CommandError
+			stderr := ""
+			if errors.As(e, &commandErr) {
+				stderr = commandErr.Stderr
+			}
+			if code == 81 && (strings.Contains(string(stdout), "secret_like_content") || strings.Contains(stderr, "secret_like_content")) {
+				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
+					return out, dropErr
+				}
+				keepCheckout = false
+				return out, errSecretLikeBrief
+			}
 			// A refused fresh spawn created no job: its record goes.
 			if !resumed && (code == panewireRefused || code == panewireHeld) {
 				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
