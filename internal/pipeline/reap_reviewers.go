@@ -185,6 +185,13 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 			if !ok || pane.ID == "" {
 				continue
 			}
+			// A label names a PR number, not a repo: every repo's sweep sees
+			// every reviewer pane on the host. Only a pane standing in a
+			// worktree of this repo is this sweep's; an unknown worktree is
+			// not, so another repo's reviewer is never closed or receipted here.
+			if tree := hs.trees[pane.Cwd]; tree == nil || !strings.EqualFold(tree.Repo, w.r.Name) {
+				continue
+			}
 			paned[l.name] = true
 			cands = append(cands, reviewerCandidate{label: l, seen: hs, pane: &pane})
 		}

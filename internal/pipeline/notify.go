@@ -25,8 +25,8 @@ var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 // NotifyPR emits one lane event when the merge-gate verdict for a PR head
 // becomes ready or blocked: READY once every required check is green, no
-// review thread is unresolved, the review -done marker exists, the base is an
-// ancestor of the head, and the PR is mergeable; BLOCKED with the
+// review thread is unresolved, the review -done marker exists, the PR is mergeable and,
+// when GitHub requires an up-to-date branch, the base is an ancestor of the head; BLOCKED with the
 // closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
 // (PR, head, verdict) notifies once across restarts, except that a READY PR
 // still open and READY on the same head is notified again every
@@ -64,17 +64,19 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return e
 	}
 	record := struct {
-		PR          int      `json:"pr"`
-		Head        string   `json:"head"`
-		State       string   `json:"state"`
-		Reasons     []string `json:"reasons,omitempty"`
-		ReviewBlock string   `json:"review_block,omitempty"`
-		Lane        string   `json:"lane,omitempty"`
-		Via         string   `json:"via,omitempty"`
-		Sent        bool     `json:"sent"`
-		Deduped     bool     `json:"deduped,omitempty"`
-		Error       string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ReviewBlock: v.Review.Block}
+		PR              int      `json:"pr"`
+		Head            string   `json:"head"`
+		State           string   `json:"state"`
+		Reasons         []string `json:"reasons,omitempty"`
+		ChecksCancelled []string `json:"checks_cancelled,omitempty"`
+		ReviewBlock     string   `json:"review_block,omitempty"`
+		BaseBehind      bool     `json:"base_behind,omitempty"`
+		Lane            string   `json:"lane,omitempty"`
+		Via             string   `json:"via,omitempty"`
+		Sent            bool     `json:"sent"`
+		Deduped         bool     `json:"deduped,omitempty"`
+		Error           string   `json:"error,omitempty"`
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
 	if o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
@@ -107,6 +109,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		if v.Review.Block != "" {
 			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
 		}
+	}
+	if n := len(v.Review.ChecksCancelled); v.State == "ready" && n > 0 {
+		summary += fmt.Sprintf(" | %d required check(s) cancelled: %s", n, strings.Join(v.Review.ChecksCancelled, ", "))
 	}
 	if n := v.Review.Findings.DismissedBlocking; v.State == "ready" && n > 0 {
 		// A dismissed critical/high no longer holds the gate; the desk still
@@ -491,6 +496,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
+		if reason == "conflict" {
+			return true
+		}
 		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true

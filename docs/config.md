@@ -407,7 +407,7 @@ needs no GitHub token.
 | `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
 | `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
 | `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
-| `default_grade` | `B` | Task grade when the PR has no `Mergewake-Grade: A` body trailer. |
+| `default_grade` | `B` | Task grade for review selection when the PR has no `Mergewake-Grade: A` body trailer. Outcomes never use it. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
 | `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
@@ -818,8 +818,11 @@ Mergewake-Tier: T1
 
 `Mergewake-Author-Model` is optional when the configured author profile has a
 concrete `--model` argument. Use `baseline` and `downshift` arm names for pacelever exploration compatibility.
-Grade defaults to `review.default_grade`; tier defaults
-to `outcomes.default_tier` (`T1`). Missing attribution stays visible locally and
+Grade and tier come from the trailer, else from the `(grade X, Tn)` marker in the
+title of the PR's `Mergewake-Task`, else they are unknown; no config default fills
+them. A row with an unknown grade is never published; `outcomes report` counts it
+in `grade_unknown`. Each posted pass records its reviewer in `reviewers_by_head`.
+Missing attribution stays visible locally and
 is retained for repair rather than fabricated for a shared rep.
 
 The first CI observation uses attempt 1 of the earliest PR run of each required
@@ -1056,7 +1059,7 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
-| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
+| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only when the base moved ahead of the head and GitHub reports the PR `behind` (branch protection requires an up-to-date branch). Otherwise a conflict-free PR with a moved base is not blocked, its branch is not updated, and the land and notify records carry `base_behind: true`. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
@@ -1433,7 +1436,8 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `review_missing`, `base_stale`, `conflict`. Pending or
+`triage_unanswered:<n>`), `review_missing`, `base_stale` (only when GitHub requires an
+up-to-date branch), `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
