@@ -40,7 +40,7 @@ func TestReviewLatencyFixture(t *testing.T) {
 		t.Fatal(e)
 	}
 	p := func(n int) github.Pull { return github.Pull{Number: n, Head: github.Ref{SHA: "abc"}, MergedAt: &ms} }
-	f := latencyFake{pulls: []github.Pull{p(1), p(2)}, passes: map[int][]github.ReviewedPass{1: {{Head: "abc", Marked: true, SubmittedAt: &first}, {Head: "abc", Marked: true, SubmittedAt: &last}}}}
+	f := latencyFake{pulls: []github.Pull{p(1), p(2)}, passes: map[int][]github.ReviewedPass{1: {{Head: "abc", SubmittedAt: &first}, {Head: "abc", SubmittedAt: &last}}}}
 	r, e := ReviewLatency(context.Background(), dir, []config.Repo{{Name: "o/r", Branch: "main"}}, "bot", start.Add(-time.Hour), f)
 	if e != nil {
 		t.Fatal(e)
@@ -102,5 +102,29 @@ func TestReviewLatencyJSON(t *testing.T) {
 	}
 	if rows[0]["first_seen"] != nil || rows[0]["review_seconds"] != nil || rows[0]["repo"] != "o/r" {
 		t.Fatalf("row: %s", v["rows"])
+	}
+}
+
+func TestReviewLatencyLegacyPass(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	posted := start.Add(time.Hour)
+	merged := start.Add(2 * time.Hour)
+	mergedText := merged.Format(time.RFC3339)
+	dir := t.TempDir()
+	event, err := json.Marshal(outcomes.Event{Version: 1, Kind: "outcome", At: start, Outcome: &outcomes.Outcome{Repo: "o/r", PR: 1, Head: "abc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "outcomes.jsonl"), append(event, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := latencyFake{pulls: []github.Pull{{Number: 1, Head: github.Ref{SHA: "abc"}, MergedAt: &mergedText}}, passes: map[int][]github.ReviewedPass{1: {{Head: "abc", SubmittedAt: &posted}}}}
+	report, err := ReviewLatency(context.Background(), dir, []config.Repo{{Name: "o/r", Branch: "main"}}, "bot", start.Add(-time.Hour), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := report.Rows[0]
+	if row.FirstReview == nil || !row.FirstReview.Equal(posted) || row.ReviewSeconds == nil || *row.ReviewSeconds != 0 || row.DoneToMergeSeconds == nil || *row.DoneToMergeSeconds != 3600 || row.WaitCensored {
+		t.Fatalf("legacy pass: %+v", row)
 	}
 }
