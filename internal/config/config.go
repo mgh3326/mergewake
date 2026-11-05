@@ -751,6 +751,11 @@ func Load(name string) (Config, error) {
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return c, e
 	}
+	if v := c.Review.Panewire.StaleAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return c, fmt.Errorf("review.panewire.stale_after: %w", e)
+		}
+	}
 	switch c.Review.Executor {
 	case "":
 		c.Review.Executor = "headless"
