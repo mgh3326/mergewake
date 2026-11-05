@@ -267,7 +267,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
-		Type: verdictType(state, via),
+		Type: verdictType(state, summary, via, s.isDeskLane(lane)),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
 		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
@@ -277,7 +277,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
-				Type: verdictType(state, via),
+				Type: verdictType(state, summary, via, s.isDeskLane(fallback)),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
@@ -397,7 +397,7 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 		ID:   fmt.Sprintf("mergewake-ready-%s-%d-%s-reminder-%d", r.Name, pr.Number, pr.Head.SHA, c.Repeats),
 		Text: textFor(lane, rvia),
 		Lane: lane,
-		Type: "ready",
+		Type: verdictType("ready", "", via, s.isDeskLane(lane)),
 	})
 	if e != nil {
 		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
@@ -487,12 +487,36 @@ func authorAction(summary string) bool {
 	}
 	return false
 }
-func verdictType(state, via string) string {
+
+// isDeskLane reports whether lane is the desk lane (notifier.fallback_lane, else
+// notifier.lane). An empty lane goes to the notifier's own default, the desk.
+func (s *Service) isDeskLane(lane string) bool {
+	desk := s.Config.Notifier.FallbackLane
+	if desk == "" {
+		desk = s.Config.Notifier.Lane
+	}
+	return lane == "" || lane == desk
+}
+
+// verdictType is the panewire type a lane event is declared with. READY and
+// BLOCKED interrupt and must be acked, so only the verdicts that need action
+// from their receiver keep them: an author lane gets READY as info (mergewake
+// merges it itself), and a BLOCKED whose only reason is review_missing as
+// progress (mergewake's own reviewer is running). The desk keeps both
+// unchanged. A review_missing carrying a block detail waits on the author and
+// stays blocked.
+func verdictType(state, summary, via string, desk bool) string {
 	if state == botNoticeState {
 		return "decision"
 	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
+	}
+	switch {
+	case state == "ready" && !desk:
+		return "info"
+	case state == "blocked" && summary == "review_missing":
+		return "progress"
 	}
 	return eventType(state)
 }
