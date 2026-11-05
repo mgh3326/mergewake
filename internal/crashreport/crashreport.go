@@ -28,6 +28,7 @@ import (
 	"github.com/getsentry/sentry-go"
 
 	"github.com/mgh3326/mergewake/internal/fleetevent"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -245,18 +246,8 @@ func reportPendingCrashesWithClient(client *sentry.Client, delivery *crashDelive
 // lockCrashDir takes an exclusive lock on crash/lock, waiting for the other
 // process (another mergewake) when it holds it.
 func lockCrashDir(dir string) (unlock func(), ok bool) {
-	file, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, false
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		_ = file.Close()
-		return nil, false
-	}
-	return func() {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-		_ = file.Close()
-	}, true
+	unlock, err := fsutil.Lock(filepath.Join(dir, "lock"), true)
+	return unlock, err == nil
 }
 
 // crashSendLog reads <dir>/sent: one unix second per accepted report, kept
@@ -289,7 +280,7 @@ func recordCrashSends(dir string, now time.Time, n int) error {
 }
 
 func writeCrashSendLog(dir string, kept []string) error {
-	return os.WriteFile(filepath.Join(dir, "sent"), []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+	return fsutil.Atomic(filepath.Join(dir, "sent"), []byte(strings.Join(kept, "\n")+"\n"), 0600)
 }
 
 // uploadCrashReports sends one Sentry event per crash file and deletes a file

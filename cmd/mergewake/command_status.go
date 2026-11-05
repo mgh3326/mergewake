@@ -18,7 +18,7 @@ import (
 )
 
 func commandStatus(c config.Config, r config.Repo, out io.Writer) error {
-	b, err := os.ReadFile(filepath.Join(c.StateDir, r.Name, "rollout", "command-installed.json"))
+	b, err := os.ReadFile(filepath.Join(rollout.StateDir(c.StateDir, r.Name), rollout.CommandReceiptName))
 	if err != nil {
 		return err
 	}

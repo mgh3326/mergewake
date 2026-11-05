@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -160,7 +161,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if e != nil {
 		return out, e
 	}
-	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, pr.Head.SHA[:7], plan.pass, s.now().Unix())
+	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix())
 	checkout := filepath.Join(cfg.Checkouts, label)
 	if resumed {
 		label, checkout = rj.Label, rj.Checkout
@@ -175,7 +176,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	cleanup := func() {
 		// The pane is finished or abandoned; the deadline may already be spent.
-		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		c, cancel := reportContext(ctx)
 		defer cancel()
 		_, _ = git(c, "worktree", "remove", "--force", checkout)
 	}
@@ -200,7 +201,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// from this worktree and prepares the same detached worktree remotely.
 		if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
 			cleanup()
-			return skip("checkout PR head %s: %v", pr.Head.SHA[:7], e)
+			return skip("checkout PR head %s: %v", short7(pr.Head.SHA), e)
 		}
 	}
 	// A local pane runs in this checkout: closeReviewerPane keeps it until the
@@ -685,7 +686,9 @@ func (x *panewireExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, se
 			return ev.Payload.Family
 		}
 	}
-	for name, p := range x.s.Config.Review.Profiles {
+	// Sorted, so two profiles sharing a seat resolve to the same family every run.
+	for _, name := range slices.Sorted(maps.Keys(x.s.Config.Review.Profiles)) {
+		p := x.s.Config.Review.Profiles[name]
 		if gate := p.GateProfile; seat != "" && (gate == seat || gate == "" && name == seat) {
 			return p.Family
 		}

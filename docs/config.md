@@ -404,16 +404,16 @@ needs no GitHub token.
 | --- | --- | --- |
 | `login` | Required | GitHub identity posting the independent exact-head review. |
 | `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
-| `timeout` | `10m` | Bounds recommendation, quota gates, model invocation and submission. |
-| `quota` | `scopefuel` | Executable implementing `--recommend GRADE --json`, `--json` (usage snapshot) and `gate -m PROFILE`. Set a compatible pacelever path when installed. |
-| `scopefuel` | Empty | Legacy alias used when `quota` is omitted. |
-| `default_grade` | `B` | Task grade for review selection when the PR has no `Mergewake-Grade: A` body trailer. Outcomes never use it. |
+| `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
+| `quota` | `scopefuel` | Default executable for `outcomes.command`; review does not call it. |
+| `scopefuel` | Empty | Legacy alias used for the `outcomes.command` fallback when `quota` is omitted. |
+| `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
-| `select` | `pace` | `pace` orders admitted reviewers by projected use at each pool's reset; `rank` keeps the quota tool's recommendation order and never reads usage. |
-| `pairings` | Empty map | Optional author-family → ordered profile override, intersected with eligible recommendations. Never bypasses subscription, exclusion, or quota gates. |
-| `profiles` | Empty map | Operator-owned profile → family, CLI and model selection data. Families describe the underlying model, independently of CLI or quota pool. |
-| `executor` | `headless` | `headless` runs each pass with a profile's CLI on the diff on this host; `panewire` spawns a visible reviewer pane through panewire for each pass, with no headless fallback (see [Panewire executor](#panewire-executor)). |
+| `select` | `pace` | Accepted for compatibility; unused. |
+| `pairings` | Empty map | Accepted for compatibility; unused for reviewer selection. |
+| `profiles` | Empty map | Profile families and `args` model values support author and reviewer family and model lookup; `gate_profile` can match a panewire seat to its family. `command` and `gate_effort` are accepted but unused; other `args` are unused. |
+| `executor` | `panewire` | Panewire spawns a reviewer pane for each pass. `headless` is retired and rejected. See [Panewire executor](#panewire-executor). |
 | `panewire.command` | `panewire` | Single executable for spawn and inbox calls. |
 | `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
@@ -464,7 +464,7 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    obstacle. The worktree is removed after the wait.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
-   findings, operator decisions) the headless prompt carries, then runs
+   findings and operator decisions), then runs
    `panewire spawn -c <checkout> -m auto -p <brief> -l
    mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> [--builder-job <author job>] --builder-family <family from the author's job record, else inferred> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
@@ -492,7 +492,7 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    host, `<jobs>/<label>/findings.json`) is still tried and each use is
    counted: the receipt's `fallback` notes it and a
    `review-inbox-fallback` audit record carries the running count. The
-   findings go through the same validation as headless output (new-side
+   findings go through validation (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
    claim and done marker. The receipt adds `"executor":"panewire"`, the
    reviewer is `panewire:<seat>`, and the family is the one on the reviewer's
@@ -555,80 +555,12 @@ retry backoff and no failure escalation, and the stall alarm skips the head. The
 next poll after the fix runs the review on the same head and clears the outcome.
 
 A read error is not a block. If the commit or the task cannot be read, the pass
-fails and is retried as above. Other authors, the headless executor, a repo without
-`root` and a head that already has its passes or inherits them are unaffected.
+fails and is retried as above. Other authors and heads that already have their passes or inherit them are not blocked. A repo without `root` fails the pass with a skip reason.
 `mergewake review` exits non-zero on a blocked head. A dry run only prints the
 decision. Shadow mode also records the outcome, and it posts and emits
 nothing.
 
-Profiles contain `family`, `command`, `args`, optional `gate_profile` (defaults
-to the profile name), and optional `gate_effort`. Commands may be installed paths
-ending in `agy`, `claude`, `codex`, `devin`, `grok`, `kimi`, `pi`, or `cmd`. Args are
-option/value pairs: `--model` for all adapters, `--effort` for agy, Claude,
-Codex, Grok and Command Code, or `--provider`/`--thinking` for pi. Other options are
-refused. Codex effort becomes a TOML override; Kimi effort is set in its isolated
-model config from `gate_effort`. Use concrete model IDs from the installed CLI.
-
-Only `kind: candidate` rows are admitted. With `select: pace` (the default) the
-quota tool's usage snapshot (`<quota> --json`) is read once per review and each
-admitted profile is placed by the pool its recommendation row names (`pool`):
-
-- **Projection.** For every window that applies, projected use at reset is
-  `used_pct ÷ elapsed fraction of the window`, where the elapsed fraction is
-  `1 − (resets_at − now) ÷ window` (floored at 5% so a window that just reset
-  does not turn a few percent into a large multiple). The worst window wins.
-  Account- and group-scoped buckets apply to every profile of the pool;
-  model-scoped buckets only to a profile whose `--model` contains the scope
-  name (ignoring case and punctuation). An unused window projects 0%. A
-  `credit` window has no reset: its `used_pct` is the projection, and it never
-  counts as waste.
-- **Order.** Free models first (recommendation `billing: free`, or a matching
-  model bucket noted *Free*), then pools projected under 70% (they would end
-  the window with quota unused) by lowest projection, then the remaining pools
-  under 100% by lowest projection. Ties keep the recommendation order.
-- **Skip.** A pool projected at or above 100%, an excluded or stale/degraded
-  pool, a missing pool, a bucket with unknown usage, an unknown window, a
-  missing reset (with usage above 0) or a reset already passed are never
-  picked. When every admitted profile is skipped the review fails with each
-  profile and the reason (`… projected 104% at 7d reset`, `… pool not
-  measured`), and nothing is gated, claimed or invoked.
-
-The chosen reviewer's pool, tier and projection are recorded as `pace` in the
-review audit event (stdout and `decisions.jsonl`); dry-run prints the pace of
-every candidate and lists skipped profiles with their reason (`pace_skipped`). `pairings`, when set, fixes the order of other-family
-reviewers ahead of pace but never admits a skipped pool. `select: rank` preserves the quota tool's ranked `rows` order
-instead, for quota tools without pools or a usage snapshot. Routine changes need one diff-only pass on the exact PR
-head; blocking paths need two. For each pass the reviewer is chosen in this
-order: a different model family than the author, preferring `pairings` order and
-families not already used on this head; any different family; a different
-family again on a profile an earlier pass used; the author's
-family with a different model (from `Mergewake-Author-Model` or the configured
-author profile's `--model`); the author's family at all; and finally any
-admitted profile in a fresh diff-only call. Review never stops merely because
-no different-family reviewer has quota; only an empty eligible set fails.
-Unknown profiles are skipped. `gate_effort` must match an explicit recommended
-effort; it is also passed to the gate. Missing executables and failed gates
-fall through. A failed recommendation fails closed. After a head claim, a
-reviewer that exits non-zero or returns invalid output falls through to the
-next candidate of the same pass, once each and never beyond the candidate
-list; nothing is posted from a failed run and there is no output repair. A
-failure whose stderr shows a rate limit or exhausted quota (`rate limit`,
-`429`, `Too Many Requests`, `quota`, `usage limit`, `reached … limit`) also rules
-out sibling profiles on the same free-billed pool for the rest of the review.
-For a free-billed Devin SWE-2 profile that reports when its limit lifts
-(`reset in 1 hour 2 minutes`, `(at 11:01 UTC)` or an RFC 3339 time), the reset
-is recorded through the quota tool, `<quota> observe devin-free-limit --reset
-<RFC3339> --observed <RFC3339> --rung swe-2 --source mergewake:<repo>#<pr>`, so
-later reviews stop ranking the rung; other pools have no observe path and are
-only skipped. Each skipped reviewer and its reason (`quota exhausted` with the
-`reset`, `review failed`, `quota gate refused`, `reviewer CLI not installed`)
-appears as `skipped` in the review audit event. When every candidate of a pass
-fails the review ends with `review unavailable: no reviewer produced pass N
-(<reviewer>: <reason>; …)` and an audit `review-skipped` record; a failed pass
-retains its lease until the configured review timeout plus one minute, after
-which it can be reclaimed for a fresh call. All candidates share the review
-timeout; once it expires no further reviewer is tried. Dry-run and shadow may
-read recommendations but never invoke a reviewer, gate, claim or post a review.
+Profile `family`, `args` model values, and `gate_profile` remain available for family and model lookup. The `command` and `gate_effort` fields are accepted but unused.
 
 Each pass claims a GitHub ref `mergewake/reviews/<pr>/<head>[-pN]` before
 invoking the model. When every required pass is posted, the
@@ -641,15 +573,9 @@ their commit date for expiry. Unknown claim timestamps fail closed. Posted revie
 the pass number, lens, reviewer profile, family, and `same_family` flag;
 receipts and outcomes bind to the exact PR head, so a head change invalidates
 them. Blocking PRs use a correctness/regressions lens for pass 1 and a
-state/migration/security/deploy lens for pass 2, including after quota fallbacks.
+state/migration/security/deploy lens for pass 2.
 Landing counts distinct pass numbers and requires distinct lenses when the
 reviewer family is the same. Routine PRs use the default lens.
-Every pass prefers a reviewer family other than the PR author's. When quota
-admits only one other-family profile, pass 2 runs it again (a fresh call with
-the pass 2 lens) before falling back to the author's family; the author's
-family is used only when no usable other-family candidate remains (quota
-refusal, an unavailable CLI or a failed invocation all count).
-
 Before invoking a reviewer, the review adds PR context ahead of the diff so a
 settled point is not re-flagged on every new head. It lists this PR's review
 threads whose finding has a reply from someone other than its author (resolved
@@ -727,64 +653,7 @@ on it.
 Round, `delta_base`, `quiet`, `prior_context`, `advisory` and the drop counts
 are on the `review` audit event.
 
-Subscription and exclusion apply to **every** CLI. Rows marked unsubscribed,
-`subscribed=false`, excluded pool classes, and matching recommendation exclusions
-are ineligible, including through `pairings`. The quota tool remains the policy
-authority; mergewake never enables a pool. Inspect it with `scopefuel policy list`.
-For example, keep the Kimi profile configured and use:
 
-```sh
-scopefuel policy set kimi --subscribed on
-scopefuel policy set kimi --subscribed off
-```
-
-A pool also classified `exclude` stays excluded until that policy is cleared or
-changed (inspect `scopefuel policy list`; `scopefuel policy clear kimi` clears its
-pool override). Once the quota tool returns an eligible Kimi recommendation, no
-mergewake code or config change is needed. Do not switch providers merely to
-circumvent an underlying pool's subscription state.
-
-Every adapter receives the diff on stdin in an empty temporary working directory.
-Reviewer processes run in their own process group. On timeout, cancellation or
-mergewake's own SIGINT/SIGTERM/SIGHUP the whole group receives SIGTERM, then
-SIGKILL from a timer after a 5s grace, independent of any read still in progress; after every exit, including success, the group is
-killed and reaped, so a child the CLI forked cannot outlive the call or hold the
-review open through an inherited stdout. On Linux the leader also gets
-`PDEATHSIG=SIGKILL` for a parent killed by SIGKILL; descendants that leave the
-process group (`setsid`) are outside this guarantee. A timeout is reported as
-`<cli> reviewer: env timed out; process group terminated`. The temporary
-directory (including private homes such as Kimi's) is removed on return, and
-each review removes this user's `mergewake-review-*` directories older than
-twice `review.timeout`, which only a SIGKILLed review leaves behind.
-Only adapter-owned control files may be present (Command Code's deny hook).
-GitHub credentials are removed from the review process environment. Claude uses
-safe/restricted print mode, no built-in tools, no MCP and no settings discovery;
-pi disables tools, MCP and context discovery; Command Code uses safe mode, deny
-permissions and a PreToolUse deny hook. Devin print mode receives a private deny
-configuration disabling file, shell, MCP, imports and subagents as far as its CLI
-supports. Grok uses an empty tool list, MCP deny, no web and no subagents. agy print mode
-takes its prompt only as an argv value, so the diff is sent as one stream-json
-user message on stdin (`--print= --input-format stream-json --output-format
-stream-json`); it runs with `--sandbox`, slash commands disabled, and
-session-only settings denying shell, file, URL and MCP tools and non-workspace
-access, on top of headless agy denying any tool permission it would prompt for.
-Any tool step in its event stream, a result other than one successful turn, or
-an empty response fails the pass. agy keeps its own conversation history; no
-flag disables it. Codex
-exec ignores user config/rules, disables shell, code mode, search, plugins, MCP,
-apps and delegation, and uses a read-only sandbox. These are CLI restrictions,
-not a uniform OS sandbox for the CLIs themselves; credentials remain owned by
-the provider CLI.
-
-Kimi uses ACP instead of `-p`, which only accepts an argv prompt. ACP receives
-one stdin prompt, no filesystem/terminal client capabilities or MCP servers, and
-any attempted tool call ends the pass. Its temporary private home keeps only
-provider/model configuration and transient credential copies; global tool access
-is disabled. Temporary files are removed on normal completion/cancellation.
-The Kimi configuration semantics are documented in its
-[configuration reference](https://moonshotai.github.io/kimi-code/en/configuration/config-files)
-and [ACP reference](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html).
-Codex controls follow the official [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json).
 
 Output must be exactly one JSON object:
 
@@ -1113,17 +982,18 @@ a graded author.
 
 The defaults grade CodeRabbit `critical` and `major` and codex `P1` as block
 (operator 2026-11-01: a CodeRabbit Major ranks with a high, fixed or dismissed
-with a reason, never deferred), codex `P2` as triage, CodeRabbit
-`minor`/`nitpick` and codex `P3` as advisory, and add one rule for the configured `review.login`:
-`critical`/`high` block (the reviewer prompt's `blocking` grades like `high`).
-Its `medium`/`low` findings (and `major`/`minor`, graded like them) are
-advisory: the author still gives each a disposition (fix, dismiss with a
-reason, or defer to a task), but they never hold the gate and are not counted
-in `triage_unanswered`. Only critical and high findings need a fix. Rules are
-`{author, severity: [...], classes: [...]}` lists under `block` and `triage`;
-an explicit list replaces the default for those two keys. Naming the
-`review.login` in `block` replaces its default block rule; naming it in
-`triage` makes those of its severities triage again.
+with a reason, never deferred), codex `P2` as triage, and CodeRabbit
+`minor`/`nitpick` and codex `P3` as advisory. For the configured `review.login`,
+`critical`/`high` block (the reviewer prompt's `blocking` grades like `high`),
+while `medium` and `major` findings require triage on blocking-class PRs and remain advisory
+on routine PRs. Its `low` findings remain advisory. Set
+`review_gate.own_medium_triage: false` to disable the default medium and major rule;
+when omitted or true, it is enabled.
+
+Rules are `{author, severity: [...], classes: [...]}` lists under `block` and
+`triage`; `classes` selects the PR change class. An explicit list replaces the
+default for those two keys. Naming `review.login` in `block` replaces its default
+block rule; naming it in `triage` replaces its default triage rule.
 Thread comments are read in full (paged past 50), since a late reply answers a
 finding. `ignore_authors` skips threads from the named bots. `ignore_outdated` (default
 true) clears an outdated finding by anyone but `review.login`: a block finding
@@ -1255,11 +1125,9 @@ cause. The skip entries in the `review` and `review-skipped` decisions
 (`<state_dir>/<repo>/decisions.jsonl`) carry:
 
 - `reviewer` and `reason`;
-- `host`, which is the configured host for headless reviewers, or the
-  `review.panewire.host` value for panewire panes;
+- `host`, the `review.panewire.host` value for panewire panes;
 - `profile`, the launch profile the reviewer ran as: the profile on the pane's
-  hk job record for a spawned panewire reviewer, or the configured reviewer
-  name for a headless one. It is omitted when no profile was chosen yet (a
+  hk job record for a spawned panewire reviewer. It is omitted when no profile was chosen yet (a
   skip before any spawn, or a spawn that failed before its record was read);
 - for a failed process, `exit_code` and `stderr_tail`, the last 512 bytes of
   stderr after redaction;
@@ -1271,7 +1139,7 @@ every field is redacted and bounded. Grafana Alloy ships these lines to Loki.
 
 | `kind` | `outcome` | `reason` | `detail` |
 | --- | --- | --- | --- |
-| `reviewer` | `failed` (exit, stderr, `review failed`, `quota exhausted`) or `skipped` | the skip reason as a code (`review_failed`, `quota_gate_refused`, `panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
+| `reviewer` | `failed` (exit and stderr) or `skipped` | the skip reason as a code (`panewire_spawn_exit`, ...) | `pass= reviewer= profile= host= exit= reason="..."` then `stderr:` or `cause:` (`profile=` is empty when no profile was chosen yet) |
 | `review` | `missing` | `review_missing` (no reviewer produced the pass) or `review_deadline` | `pass= skipped=` and the skip summary |
 | `role_error` | `failed` | `role_failed` (one code for every failed daemon pass) | `role= failures= error="..."`: the role, its consecutive failure count after this pass, and the quoted error text |
 

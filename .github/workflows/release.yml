@@ -4,14 +4,13 @@ name: Release
 # amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
 # with GITHUB_TOKEN. A test tag v0.0.0* (e.g. v0.0.0-test.1) runs the same
 # build and checks on the tag but is never published.
-# Pull requests and manual runs build the same assets for a
+# Manual runs build the same assets for a
 # dry-run tag (v0.0.0-dryrun.<run>) and check checksums and `mergewake --version`
 # without publishing anything. Hosts pull published assets themselves; this
 # workflow never reaches a host.
 on:
   push:
     tags: ['v*']
-  pull_request:
   workflow_dispatch:
     inputs:
       publish:

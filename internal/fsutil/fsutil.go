@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // Atomic writes beside the target, so rename never crosses filesystems.
@@ -83,4 +84,30 @@ func AppendLine(name string, line []byte) error {
 		e = f.Sync()
 	}
 	return e
+}
+
+// Lock takes an exclusive advisory lock on name, creating it and its directory
+// owner-only. With wait it blocks until the holder releases; without, a held
+// lock fails at once. The lock lives as long as the returned unlock is not
+// called, and the kernel drops it if the process exits.
+func Lock(name string, wait bool) (unlock func(), err error) {
+	if e := os.MkdirAll(filepath.Dir(name), 0700); e != nil {
+		return nil, e
+	}
+	f, e := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0600)
+	if e != nil {
+		return nil, e
+	}
+	how := syscall.LOCK_EX
+	if !wait {
+		how |= syscall.LOCK_NB
+	}
+	if e = syscall.Flock(int(f.Fd()), how); e != nil {
+		f.Close()
+		return nil, e
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }

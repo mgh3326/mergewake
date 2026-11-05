@@ -38,6 +38,17 @@ type Result struct {
 	Removed   map[string][]string `json:"removed_images,omitempty"`
 	Warnings  []string            `json:"warnings,omitempty"`
 }
+
+// Receipt names under a repository's rollout state directory, one per
+// install kind; ContainerReceiptName is the third.
+const (
+	FileReceiptName    = "installed.json"
+	CommandReceiptName = "command-installed.json"
+)
+
+// StateDir is where a repository's rollout receipts, journals and locks live.
+func StateDir(stateRoot, repo string) string { return filepath.Join(stateRoot, repo, "rollout") }
+
 type Options struct {
 	BeforeDeploy   func(context.Context, config.Install, string) error
 	Root, StateDir string
@@ -93,7 +104,7 @@ func rollback(dir string, j Journal) error {
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-	receipt := filepath.Join(filepath.Dir(dir), "installed.json")
+	receipt := filepath.Join(filepath.Dir(dir), FileReceiptName)
 	if j.ReceiptExisted {
 		if e := fsutil.Atomic(receipt, j.PreviousReceipt, 0600); e != nil {
 			return e
@@ -232,7 +243,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 	var receipt struct {
 		Manifest manifest.Manifest `json:"manifest"`
 	}
-	if found, re := fsutil.ReadJSON(filepath.Join(o.StateDir, "installed.json"), &receipt); re != nil {
+	if found, re := fsutil.ReadJSON(filepath.Join(o.StateDir, FileReceiptName), &receipt); re != nil {
 		err = re
 		return
 	} else if found {
@@ -270,7 +281,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 		return
 	}
 	j := Journal{Root: root}
-	j.PreviousReceipt, e = os.ReadFile(filepath.Join(o.StateDir, "installed.json"))
+	j.PreviousReceipt, e = os.ReadFile(filepath.Join(o.StateDir, FileReceiptName))
 	if e == nil {
 		j.ReceiptExisted = true
 	} else if !os.IsNotExist(e) {
@@ -355,7 +366,7 @@ func Apply(ctx context.Context, m manifest.Manifest, o Options, fetch func(conte
 	}
 	// Persist the receipt while rollback remains possible.
 	res.Status = "success"
-	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, "installed.json"), struct {
+	if e = fsutil.WriteJSON(filepath.Join(o.StateDir, FileReceiptName), struct {
 		Manifest manifest.Manifest `json:"manifest"`
 		Result   Result            `json:"result"`
 	}{m, res}); e != nil {

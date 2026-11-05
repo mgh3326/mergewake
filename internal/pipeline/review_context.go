@@ -297,16 +297,3 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 	rc.text = contextHeader + b.String()
 	return rc
 }
-
-// withContext places the PR context ahead of the diff marker, or ahead of the
-// whole prompt when the marker is absent, so the context is never dropped.
-func withContext(prompt, context string) string {
-	if context == "" {
-		return prompt
-	}
-	const marker = "UNTRUSTED DIFF:\n"
-	if !strings.Contains(prompt, marker) {
-		return context + prompt
-	}
-	return strings.Replace(prompt, marker, context+marker, 1)
-}

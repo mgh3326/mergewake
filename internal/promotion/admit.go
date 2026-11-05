@@ -61,9 +61,15 @@ func Admit(ctx context.Context, r Reader, repo string, s Suite) (Admission, erro
 	if e != nil {
 		return Admission{}, deny("list promotion records: %v", e)
 	}
-	// Newest first. Records whose tag targets another commit authorize nothing
-	// (an older promotion, or a record whose pointer move never happened).
-	sort.Slice(tags, func(i, j int) bool { return SeqOf(tags[i].Name) > SeqOf(tags[j].Name) })
+	// Newest first, ties by name so the first match is the same on every
+	// run. Records whose tag targets another commit authorize nothing (an
+	// older promotion, or a record whose pointer move never happened).
+	sort.Slice(tags, func(i, j int) bool {
+		if a, b := SeqOf(tags[i].Name), SeqOf(tags[j].Name); a != b {
+			return a > b
+		}
+		return tags[i].Name < tags[j].Name
+	})
 	for _, t := range tags {
 		seq := SeqOf(t.Name)
 		if seq == 0 || t.Target != pointer {

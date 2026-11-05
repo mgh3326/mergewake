@@ -1,6 +1,9 @@
 package policy
 
-import "testing"
+import (
+	"gopkg.in/yaml.v3"
+	"testing"
+)
 
 func TestReviewGateDisposition(t *testing.T) {
 	no := false
@@ -194,5 +197,51 @@ func TestReviewGateLandModeValidation(t *testing.T) {
 		if err := p.Validate(); (err != nil) != fail {
 			t.Fatalf("land %q: %v", mode, err)
 		}
+	}
+}
+
+func TestOwnMediumTriageDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, class, severity string
+		answered              bool
+		want                  int
+	}{
+		{"blocking unanswered", "blocking", "medium", false, 1},
+		{"blocking major unanswered", "blocking", "major", false, 1},
+		{"blocking answered", "blocking", "medium", true, 0},
+		{"routine unanswered", "routine", "medium", false, 0},
+		{"blocking low", "blocking", "low", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := (ReviewGate{}).WithOwnLogin("review-bot")
+			v := g.Evaluate([]ReviewFinding{{Author: "review-bot", Severity: tc.severity, OwnReview: true, Answered: tc.answered}}, tc.class)
+			if len(v.Triage) != tc.want {
+				t.Fatalf("triage = %d, want %d", len(v.Triage), tc.want)
+			}
+		})
+	}
+}
+
+func TestOwnMediumTriageConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		want        int
+	}{
+		{"absent", "{}", 1}, {"enabled", "own_medium_triage: true", 1}, {"disabled", "own_medium_triage: false", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var g ReviewGate
+			if err := yaml.Unmarshal([]byte(tc.input), &g); err != nil {
+				t.Fatal(err)
+			}
+			v := g.WithOwnLogin("review-bot").Evaluate([]ReviewFinding{{Author: "review-bot", Severity: "medium", OwnReview: true}}, "blocking")
+			if len(v.Triage) != tc.want {
+				t.Fatalf("triage = %d, want %d", len(v.Triage), tc.want)
+			}
+		})
+	}
+	g := (ReviewGate{Triage: []ReviewGateRule{{Author: "Review-Bot[bot]", Severity: []string{"low"}}}}).WithOwnLogin("review-bot")
+	if len(g.Triage) != 1 || g.Triage[0].Severity[0] != "low" {
+		t.Fatalf("triage rules: %+v", g.Triage)
 	}
 }

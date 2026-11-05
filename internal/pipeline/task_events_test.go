@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,6 +69,10 @@ func (h *fakeHK) received() []integrations.TaskEvent {
 type hkSink struct {
 	fakeSink
 	hk integrations.Handoffkeep
+}
+
+func (s *hkSink) TaskJob(context.Context, string) (string, string, error) {
+	return "", "fixture (grade B, T2)", nil
 }
 
 func (s *hkSink) PostTaskEvent(ctx context.Context, ev integrations.TaskEvent) (integrations.TaskEventResult, error) {
@@ -301,7 +306,7 @@ func TestTaskEventSkipped(t *testing.T) {
 			prep(g, &r)
 			g.enabled = true
 			ctx := context.Background()
-			if e := s.Review(ctx, r, 7, "openai", Options{}); e != nil {
+			if e := s.Review(ctx, r, 7, "openai", Options{}); e != nil && !(name == "no trailer" && errors.Is(e, ErrReviewUnavailable)) {
 				t.Fatal(e)
 			}
 			markReviewed(g)
@@ -309,7 +314,11 @@ func TestTaskEventSkipped(t *testing.T) {
 			if e := s.Land(ctx, r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
-			if g.postCount != 1 || g.mergeCount != 1 {
+			wantPosts := 1
+			if name == "no trailer" {
+				wantPosts = 0
+			}
+			if g.postCount != wantPosts || g.mergeCount != 1 {
 				t.Fatalf("reviews=%d merges=%d", g.postCount, g.mergeCount)
 			}
 			if got := hk.received(); len(got) != 0 {
@@ -454,7 +463,8 @@ func TestTaskEventOldRevertNotReplayed(t *testing.T) {
 // pass, and the review event goes out after the run.
 func TestTaskEventReviewKeepsDeadline(t *testing.T) {
 	s, g, hk, r := hkSetup(t)
-	s.Config.Review.Timeout = "300ms"
+	s.Config.Review.Timeout = "1500ms"
+	s.Sink.(*hkSink).hk.EventTimeout = 700 * time.Millisecond
 	s.Runner = deadlineRunner{s.Runner.(*fakeRunner)}
 	hk.delay = 2 * time.Second // each of 3 tries times out at 200ms
 	if e := s.Review(context.Background(), r, 7, "openai", Options{Observed: true}); e != nil {

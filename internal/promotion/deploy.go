@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 // Exit codes of `mergewake admit --deploy`.
@@ -212,7 +214,7 @@ type FileLedger struct{ Path string }
 
 func (l FileLedger) Failed(digest string) (bool, error) {
 	b, e := os.ReadFile(l.Path)
-	if os.IsNotExist(e) {
+	if errors.Is(e, fs.ErrNotExist) {
 		return false, nil
 	}
 	if e != nil {
@@ -227,22 +229,13 @@ func (l FileLedger) Failed(digest string) (bool, error) {
 }
 
 func (l FileLedger) MarkFailed(digest string) error {
-	if e := os.MkdirAll(filepath.Dir(l.Path), 0o700); e != nil {
-		return e
-	}
-	f, e := os.OpenFile(l.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if e != nil {
-		return e
-	}
-	defer f.Close()
-	_, e = f.WriteString(digest + "\n")
-	return e
+	return fsutil.AppendLine(l.Path, []byte(digest))
 }
 
 // Clear removes digest from the ledger, so the next pass may deploy it again.
 func (l FileLedger) Clear(digest string) error {
 	b, e := os.ReadFile(l.Path)
-	if os.IsNotExist(e) {
+	if errors.Is(e, fs.ErrNotExist) {
 		return nil
 	}
 	if e != nil {
@@ -254,9 +247,5 @@ func (l FileLedger) Clear(digest string) error {
 			keep = append(keep, line+"\n")
 		}
 	}
-	tmp := l.Path + ".tmp"
-	if e := os.WriteFile(tmp, []byte(strings.Join(keep, "")), 0o600); e != nil {
-		return e
-	}
-	return os.Rename(tmp, l.Path)
+	return fsutil.Atomic(l.Path, []byte(strings.Join(keep, "")), 0600)
 }

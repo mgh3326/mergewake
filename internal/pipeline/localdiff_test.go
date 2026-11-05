@@ -15,7 +15,7 @@ import (
 )
 
 // realGitRunner runs git against a test repository and delegates every other
-// command (quota, the headless reviewer) to fakeRunner.
+// command to fakeRunner.
 type realGitRunner struct{ fakeRunner }
 
 func (r *realGitRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -78,17 +78,27 @@ func seedLargeDiffRepo(t *testing.T) (root, base, head string) {
 // must continue from the checkout and name the fallback in the pass marker.
 func TestReviewFallsBackToLocalDiffOn406(t *testing.T) {
 	root, base, head := seedLargeDiffRepo(t)
-	s, g, _, _, r := setup(t)
-	runner := &realGitRunner{}
+	s, g, _, _, r := reviewSetup(t)
+	runner := &realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}
 	s.Runner = runner
 	r.Root = root
 	g.diffErr = &github.APIError{Code: http.StatusNotAcceptable, Method: "GET", Path: "/repos/example/project/pulls/7"}
 	g.pull.Base = github.Ref{Ref: "main", SHA: base}
-	g.pull.Head = github.Ref{SHA: head}
+	g.pull.Head = github.Ref{SHA: head, Ref: "feature"}
+	g.pull.Head.Repo.FullName = r.Name
 	g.pull.ChangedFiles = 2
 	g.files = []policy.File{
 		{Path: "tool", Kind: "modified"},
 		{Path: "renamed", Previous: "old", Kind: "renamed"},
+	}
+	src, err := s.reviewDiff(context.Background(), r, g.pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"diff --git a/tool b/tool", "+new", "rename to renamed"} {
+		if !strings.Contains(src.text, want) {
+			t.Fatalf("local diff missing %q: %s", want, src.text)
+		}
 	}
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
@@ -100,17 +110,15 @@ func TestReviewFallsBackToLocalDiffOn406(t *testing.T) {
 	if !strings.Contains(p[0].DiffSummarized, "renamed") {
 		t.Fatalf("pure rename not listed: %q", p[0].DiffSummarized)
 	}
-	for _, want := range []string{"diff --git a/tool b/tool", "+new", "rename to renamed"} {
-		if !strings.Contains(runner.input, want) {
-			t.Fatalf("reviewer input missing %q:\n%s", want, runner.input)
-		}
+	if !strings.Contains(runner.input, "git diff "+base+"..."+head) {
+		t.Fatal(runner.input)
 	}
 }
 
 // Any other failure still stops the review as before: only 406 uses the local
 // checkout.
 func TestReviewLocalFallbackOnlyOn406(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.diffErr = &github.APIError{Code: http.StatusInternalServerError, Method: "GET", Path: "/repos/example/project/pulls/7"}
 	r.Root = filepath.Join(t.TempDir(), "missing")
 	err := s.Review(context.Background(), r, 7, "openai", Options{})

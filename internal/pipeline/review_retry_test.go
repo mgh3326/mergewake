@@ -13,7 +13,7 @@ import (
 )
 
 func TestRetryReviewBackoffRestartAndHeadReset(t *testing.T) {
-	s, g, _, n, r := setup(t)
+	s, g, _, n, r := reviewSetup(t)
 	c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	s.Now = c.now
 	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "2m", Failures: 3}
@@ -68,7 +68,7 @@ func TestRetryReviewBackoffRestartAndHeadReset(t *testing.T) {
 func TestRetryReviewStaleDoneAndLease(t *testing.T) {
 	for _, staleLease := range []bool{false, true} {
 		t.Run(map[bool]string{false: "done", true: "expired lease"}[staleLease], func(t *testing.T) {
-			s, g, _, _, r := setup(t)
+			s, g, _, _, r := reviewSetup(t)
 			s.Config.Review.DefaultFamily = "openai"
 			g.refs = map[string]bool{doneRef(7, shaA): true}
 			if staleLease {
@@ -91,7 +91,7 @@ func TestRetryReviewStaleDoneAndLease(t *testing.T) {
 
 func TestRetryReviewShadowDoesNotWrite(t *testing.T) {
 	for _, o := range []Options{{DryRun: true}, {Shadow: true}} {
-		s, g, _, n, r := setup(t)
+		s, g, _, n, r := reviewSetup(t)
 		s.Config.Review.DefaultFamily = "openai"
 		g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic"}}}
 		if err := s.RetryReview(context.Background(), r, g.pull, o); err != nil {
@@ -107,14 +107,15 @@ func TestRetryReviewShadowDoesNotWrite(t *testing.T) {
 
 func TestRetryReviewLocalFallbackWithStaleMarker(t *testing.T) {
 	root, base, head := seedLargeDiffRepo(t)
-	s, g, _, _, r := setup(t)
-	runner := &realGitRunner{}
+	s, g, _, _, r := reviewSetup(t)
+	runner := &realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}
 	s.Runner = runner
 	s.Config.Review.DefaultFamily = "openai"
 	r.Root = root
 	g.diffErr = &github.APIError{Code: 406, Method: "GET", Path: "/pull"}
 	g.pull.Base = github.Ref{Ref: "main", SHA: base}
-	g.pull.Head = github.Ref{SHA: head}
+	g.pull.Head = github.Ref{SHA: head, Ref: "feature"}
+	g.pull.Head.Repo.FullName = r.Name
 	g.pull.ChangedFiles = 2
 	g.files = []policy.File{{Path: "tool", Kind: "modified"}, {Path: "renamed", Previous: "old", Kind: "renamed"}}
 	g.refs = map[string]bool{doneRef(7, head): true, claimRef(7, head, 1): true}
@@ -175,7 +176,7 @@ func TestFleetAuthorGateIntegration(t *testing.T) {
 }
 
 func TestRetryReviewCompletedWithoutAuthorFamilyDoesNotEscalate(t *testing.T) {
-	s, g, _, n, r := setup(t)
+	s, g, _, n, r := reviewSetup(t)
 	g.passes = map[string][]github.PassReceipt{shaA: {{Pass: 1, Family: "anthropic"}}}
 	g.refs = map[string]bool{doneRef(7, shaA): true}
 	s.Config.Daemon.PR.ReviewRetry.Failures = 1
@@ -188,7 +189,7 @@ func TestRetryReviewCompletedWithoutAuthorFamilyDoesNotEscalate(t *testing.T) {
 }
 
 func TestRetryReviewWaitsForLiveLeaseThenRecovers(t *testing.T) {
-	s, g, _, n, r := setup(t)
+	s, g, _, n, r := reviewSetup(t)
 	s.Config.Review.DefaultFamily = "openai"
 	ref := claimRef(7, shaA, 1)
 	g.refs = map[string]bool{ref: true}

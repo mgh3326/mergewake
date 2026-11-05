@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -34,7 +35,7 @@ type deploySink struct {
 	questions []string
 }
 
-func (d *deploySink) DeployDecision(_ context.Context, _ string, q string) (bool, error) {
+func (d *deploySink) DeployDecision(_ context.Context, _ string, q string, _ time.Time) (bool, error) {
 	d.questions = append(d.questions, q)
 	return d.approved, nil
 }

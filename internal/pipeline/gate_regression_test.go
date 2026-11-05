@@ -147,7 +147,7 @@ func TestLandConflictAndUnknownMergeable(t *testing.T) {
 // The -done marker a review leaves is the gate's review evidence: a completed
 // review makes the head landable without further review bookkeeping.
 func TestReviewDoneMarkerLands(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.enabled = true
 	if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func TestReviewDoneMarkerLands(t *testing.T) {
 func TestReviewReclaimsExpiredClaim(t *testing.T) {
 	for _, age := range []time.Duration{time.Second, 2 * time.Minute} {
 		t.Run(age.String(), func(t *testing.T) {
-			s, g, _, _, r := setup(t)
+			s, g, _, _, r := reviewSetup(t)
 			ref := claimRef(7, g.pull.Head.SHA, 1)
 			g.refs = map[string]bool{ref: true}
 			g.leaseTimes = map[string]time.Time{ref: time.Now().Add(-age)}

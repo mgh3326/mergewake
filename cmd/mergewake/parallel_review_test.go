@@ -46,7 +46,7 @@ func hubHead(n int) string { return fmt.Sprintf("%040x", n) }
 var hubPolicy = []byte("version: 1\nenabled: true\nrequired_checks: [CI]\n")
 
 func (h *reviewHub) pull(n int) string {
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\n","changed_files":1,"head":{"sha":%q,"ref":"b%d"},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, hubHead(n), n, hubBase)
+	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: 42\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":"o/one"}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, hubHead(n), n, hubBase)
 }
 
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)
@@ -184,9 +184,7 @@ func (l *eventLog) snapshot() []string {
 	return append([]string(nil), l.events...)
 }
 
-// blockingRunner answers the quota tool and git, and holds each headless
-// reviewer run until release lets one go. It ignores ctx on purpose: a review
-// returns only when released, as a reviewer pane does when it finishes.
+// blockingRunner holds each fake panewire spawn until released.
 type blockingRunner struct {
 	trace    *eventLog
 	release  chan struct{}
@@ -200,24 +198,23 @@ type blockingRunner struct {
 	changed      chan struct{}
 }
 
-var reviewedHead = regexp.MustCompile(`@@ -1 \+1 @@\n-old (\d+)`)
+var reviewedBrief = regexp.MustCompile(`#(\d+) pass`)
 
 func (b *blockingRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
-	switch command {
-	case "scopefuel":
-		if len(args) > 0 && args[0] == "--json" {
-			return []byte(`{"providers":[{"id":"idle","pool_class":"spend","status":"ok","buckets":[{"label":"7d","window":"7d","used_pct":0,"scope":{"kind":"account"}}]}]}`), nil
-		}
-		if len(args) > 0 && args[0] == "--recommend" {
-			return []byte(`{"rows":[{"profile":"claude","kind":"candidate","pool":"idle"}]}`), nil
-		}
-		return nil, nil
-	case "git":
+	if command != "panewire" || len(args) == 0 || args[0] != "spawn" {
 		return nil, nil
 	}
+	i := slices.Index(args, "-p")
+	if i < 0 || i+1 >= len(args) {
+		return nil, errors.New("missing brief")
+	}
+	brief, err := os.ReadFile(args[i+1])
+	if err != nil {
+		return nil, err
+	}
 	pr := "?"
-	if m := reviewedHead.FindStringSubmatch(input); m != nil {
-		pr = m[1]
+	if m := reviewedBrief.FindSubmatch(brief); m != nil {
+		pr = string(m[1])
 	}
 	b.mu.Lock()
 	b.inFlight++
@@ -228,13 +225,16 @@ func (b *blockingRunner) Run(ctx context.Context, command string, args []string,
 	b.trace.add("review " + pr)
 	b.notify()
 	<-b.release
+	if err := os.WriteFile(filepath.Join(filepath.Dir(args[i+1]), "findings.json"), []byte(`{"findings":[]}`), 0600); err != nil {
+		return nil, err
+	}
 	b.trace.add("reviewed " + pr)
 	b.mu.Lock()
 	b.inFlight--
 	b.returned++
 	b.mu.Unlock()
 	b.notify()
-	return []byte(`{"findings":[]}`), nil
+	return []byte("OK pane=p1 model=seat-x status=working landed=yes\nwait outcome=completed\n"), nil
 }
 
 func (b *blockingRunner) notify() {
@@ -292,15 +292,21 @@ type parallelFixture struct {
 	out    *bytes.Buffer
 }
 
+type parallelSink struct{ integrations.Noop }
+
+func (parallelSink) TaskJob(context.Context, string) (string, string, error) {
+	return "", "fixture (grade B, T2)", nil
+}
+
 func newParallelFixture(t *testing.T, prs, parallel int) *parallelFixture {
 	t.Helper()
 	trace := &eventLog{}
 	hub := &reviewHub{n: prs, refs: map[string]string{}, commits: map[string]string{}, reviews: map[int][]map[string]any{}, trace: trace}
 	srv := httptest.NewServer(hub)
 	t.Cleanup(srv.Close)
-	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml"}
+	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml", Root: t.TempDir()}
 	cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10,
-		Review: config.Review{Login: "reviewer", Timeout: "60s", Select: "rank",
+		Review: config.Review{Login: "reviewer", Timeout: "60s", Executor: "panewire", Panewire: config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(t.TempDir(), "jobs"), Checkouts: filepath.Join(t.TempDir(), "checkouts")},
 			Pairings: map[string][]string{"openai": {"claude"}},
 			Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}},
 		Notifier: config.Notifier{Lane: "desk"}}
@@ -312,7 +318,7 @@ func newParallelFixture(t *testing.T, prs, parallel int) *parallelFixture {
 	gh.Stderr = io.Discard
 	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: integrations.Noop{}, Notifier: recordingNotifier{trace}, Out: out}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
 	return &parallelFixture{s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 

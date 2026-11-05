@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
@@ -467,6 +468,43 @@ func TestGateFixClaimMustBeARealCommitInThePR(t *testing.T) {
 			}
 			if got := reasons(v); got != tt.want {
 				t.Fatalf("reasons=%q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOwnMediumTriageGateAndNotify(t *testing.T) {
+	s, g, n, sink, r, _ := deliverSetup(t)
+	sink.recs["w-7"] = integrations.JobRecord{Role: "worker", Label: "author-lane", OwnerLane: "operator-desk", State: "completed"}
+	g.enabled = true
+	g.policyExtra = gradedPolicy + "blocking:\n  - paths: ['**']\n    reason: effects\n"
+	g.files = []policy.File{{Path: "tool", Kind: "modified"}}
+	g.feedback.Threads = []github.ReviewThread{gradedThread("review-bot", "medium", false, shaA)}
+	g.findings = 1
+	p, err := s.Policy(context.Background(), r, shaB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+	if err != nil || v.State != "blocked" || reasons(v) != "triage_unanswered:1" {
+		t.Fatalf("verdict: %+v, error: %v", v, err)
+	}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(n.events) != 1 || n.events[0].Lane != "author-lane" || !strings.Contains(n.events[0].Text, "triage_unanswered:1") {
+		t.Fatalf("events: %+v", n.events)
+	}
+}
+
+func TestOwnMediumTriageAnswered(t *testing.T) {
+	for _, body := range []string{"Fixed in abc1234", "Dismissed: already covered", "Defer to task 42"} {
+		t.Run(body, func(t *testing.T) {
+			th := gradedThread("review-bot", "medium", false, shaB)
+			th.Comments = append(th.Comments, github.ReviewComment{Author: "dev", AuthorType: "User", Body: body})
+			v := verdict(t, gradedPolicy+"blocking:\n  - paths: ['**']\n    reason: effects\n", 10, th)
+			if v.State != "ready" || reasons(v) != "" {
+				t.Fatalf("%+v", v)
 			}
 		})
 	}

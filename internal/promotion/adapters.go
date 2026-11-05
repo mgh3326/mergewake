@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 )
 
@@ -157,7 +160,8 @@ func (g Git) PromotionTags(ctx context.Context, repo string) ([]TagRef, error) {
 		return nil, e
 	}
 	var out []TagRef
-	for ref, sha := range refs {
+	for _, ref := range slices.Sorted(maps.Keys(refs)) {
+		sha := refs[ref]
 		if strings.HasSuffix(ref, "^{}") {
 			continue
 		}
@@ -224,18 +228,11 @@ func parseTag(raw string) (Tag, error) {
 type FileLock struct{ Dir string }
 
 func (l FileLock) Lock(repo string) (func(), error) {
-	if e := os.MkdirAll(l.Dir, 0o700); e != nil {
-		return nil, e
-	}
-	f, e := os.OpenFile(filepath.Join(l.Dir, "promote-"+strings.ReplaceAll(repo, "/", "_")+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if e != nil {
-		return nil, e
-	}
-	if e := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
-		f.Close()
+	unlock, e := fsutil.Lock(filepath.Join(l.Dir, "promote-"+strings.ReplaceAll(repo, "/", "_")+".lock"), false)
+	if errors.Is(e, syscall.EWOULDBLOCK) {
 		return nil, fmt.Errorf("another promotion of %s holds the lock", repo)
 	}
-	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+	return unlock, e
 }
 
 // OSExec runs commands directly, without a shell.

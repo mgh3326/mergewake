@@ -138,7 +138,7 @@ func TestInheritedPassesNeedMatchingReceipts(t *testing.T) {
 // diff is diffB, as if the base had been merged into it.
 func reviewedAtA(t *testing.T, diffB string) (*Service, *fakeGH, *fakeRunner, func(Options) error, string) {
 	t.Helper()
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	runner := s.Runner.(*fakeRunner)
 	diffA := toolDiff("1111111..2222222", 1, "new")
 	g.diffs = map[string]string{shaA: diffA, shaB: diffB}

@@ -104,7 +104,7 @@ func TestReviewContextBounds(t *testing.T) {
 }
 
 func TestReviewPromptCarriesContextAndReceiptRecordsIt(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.pull.Body = "## Operator decisions\nkeep quota_exclude"
 	g.feedback.Threads = []github.ReviewThread{
 		thread("a.go", 3, true, say("other-bot", "quota_exclude flagged"), say("pr-author", "intended")),
@@ -114,11 +114,11 @@ func TestReviewPromptCarriesContextAndReceiptRecordsIt(t *testing.T) {
 		t.Fatal(e)
 	}
 	runner := s.Runner.(*fakeRunner)
-	diffAt := strings.Index(runner.input, "UNTRUSTED DIFF:")
+	contextAt := strings.Index(runner.input, "## PR context")
 	for _, want := range []string{"a.go:3", "keep quota_exclude"} {
 		at := strings.Index(runner.input, want)
-		if at < 0 || at > diffAt {
-			t.Fatalf("%q missing or after the diff marker:\n%s", want, runner.input)
+		if contextAt < 0 || at < contextAt {
+			t.Fatalf("%q missing from the PR context:\n%s", want, runner.input)
 		}
 	}
 	if strings.Contains(runner.input, "b.go") {
@@ -130,7 +130,7 @@ func TestReviewPromptCarriesContextAndReceiptRecordsIt(t *testing.T) {
 }
 
 func TestReviewPromptUnchangedWithoutContext(t *testing.T) {
-	s, _, _, _, r := setup(t)
+	s, _, _, _, r := reviewSetup(t)
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -139,20 +139,8 @@ func TestReviewPromptUnchangedWithoutContext(t *testing.T) {
 	}
 }
 
-func TestWithContextNeverDropsContext(t *testing.T) {
-	if got := withContext("head\nUNTRUSTED DIFF:\n", "CTX\n"); got != "head\nCTX\nUNTRUSTED DIFF:\n" {
-		t.Fatal(got)
-	}
-	if got := withContext("no marker", "CTX\n"); got != "CTX\nno marker" {
-		t.Fatal(got)
-	}
-	if got := withContext("p", ""); got != "p" {
-		t.Fatal(got)
-	}
-}
-
 func TestReviewContextKeepsDecisionsWhenThreadReadFails(t *testing.T) {
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.pull.Body = "## Operator decisions\nkeep quota_exclude"
 	s.GH = &feedbackFailGH{g}
 	var out strings.Builder
@@ -209,7 +197,7 @@ func TestSlowFeedbackReadDoesNotSpendTheReviewDeadline(t *testing.T) {
 	old := feedbackReadLimit
 	feedbackReadLimit = 30 * time.Millisecond
 	defer func() { feedbackReadLimit = old }()
-	s, g, _, _, r := setup(t)
+	s, g, _, _, r := reviewSetup(t)
 	g.pull.Body = "## Operator decisions\nkeep quota_exclude"
 	s.GH = slowFeedbackGH{g}
 	var out strings.Builder

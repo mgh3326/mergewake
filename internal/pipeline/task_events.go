@@ -12,10 +12,9 @@ import (
 	"github.com/mgh3326/mergewake/internal/outcomes"
 )
 
-// prURL is the PR's canonical URL, the form hk takes as source_ref.
-func prURL(repo string, n int) string {
-	return "https://github.com/" + repo + "/pull/" + strconv.Itoa(n)
-}
+// prURL is the PR's canonical URL, the form hk takes as source_ref. It is the
+// outcomes ledger key too, so a task event and its outcome name the same PR.
+func prURL(repo string, n int) string { return outcomes.Key(repo, n) }
 
 // taskEventRecord is the audit row of one task-event post.
 type taskEventRecord struct {

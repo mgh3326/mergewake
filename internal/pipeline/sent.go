@@ -66,8 +66,8 @@ func (l *sentKeys) remove(key string) error {
 	return fsutil.Atomic(l.file, []byte(strings.Join(l.keys, "\n")+"\n"), 0600)
 }
 
-// reportContext bounds a sink or notifier report and lets it finish even when
-// the poll that triggered it is being cancelled.
+// reportContext bounds a sink or notifier report, or a cleanup, and lets it
+// finish even when the poll or pass that triggered it is being cancelled.
 func reportContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }

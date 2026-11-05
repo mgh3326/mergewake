@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -18,7 +19,6 @@ import (
 	"github.com/getsentry/sentry-go"
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
@@ -60,9 +60,9 @@ func traceFixture(t *testing.T) *parallelFixture {
 	hub := &reviewHub{n: 2, refs: map[string]string{}, commits: map[string]string{}, reviews: map[int][]map[string]any{}, trace: trace}
 	hub.refs["mergewake/reviews/1/"+hubHead(1)+"-done"] = hubHead(1)
 	hub.reviews[1] = []map[string]any{{"id": 1, "user": map[string]string{"login": "reviewer"}, "commit_id": hubHead(1), "body": github.PassMarker(github.PassReceipt{Pass: 1, Reviewer: "claude", Family: "anthropic"}), "state": "COMMENTED"}}
-	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml"}
+	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml", Root: t.TempDir()}
 	cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10,
-		Review: config.Review{Login: "reviewer", Timeout: "60s", Select: "rank", Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}, Notifier: config.Notifier{Lane: "private-lane"}}
+		Review: config.Review{Login: "reviewer", Timeout: "60s", Executor: "panewire", Panewire: config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(t.TempDir(), "jobs"), Checkouts: filepath.Join(t.TempDir(), "checkouts")}, Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}, Notifier: config.Notifier{Lane: "private-lane"}}
 	cfg.Daemon.PR.ReviewParallel = 2
 	cfg.Daemon.PR.Loop = config.Loop{Enabled: true, Interval: "1h"}
 	gh := github.New("")
@@ -72,7 +72,7 @@ func traceFixture(t *testing.T) *parallelFixture {
 	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	close(runner.release)
 	out := &bytes.Buffer{}
-	service := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: integrations.Noop{}, Notifier: recordingNotifier{trace}, Out: out}
+	service := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
 	return &parallelFixture{s: service, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
