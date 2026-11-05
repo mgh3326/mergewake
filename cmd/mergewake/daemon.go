@@ -17,6 +17,8 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/pipeline"
+	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 type lockedWriter struct {
@@ -33,15 +35,17 @@ func (w *lockedWriter) Write(b []byte) (int, error) {
 // runDaemon runs the daemon with crash output armed: a fatal panic in any of
 // its goroutines reaches Sentry on the next start (see crashreport.Run).
 func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
-	return crashreport.Run(s.Config.StateDir, "mergewake", version, func() error {
-		return runDaemonLoops(ctx, s, gh, repo, o, stderr)
-	})
+	ctx, stop := crashreport.StartContext(ctx, s.Config.StateDir, "mergewake", version, stderr)
+	err := runDaemonLoops(ctx, s, gh, repo, o, stderr)
+	stop()
+	return err
 }
 
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	loops := []daemon.Loop{}
-	// Each role owns one goroutine; repositories within it run in config order.
+	// Each role owns one goroutine. The pr role runs its repositories at once;
+	// the other roles visit them in config order.
 	for _, entry := range []struct {
 		role string
 		cfg  config.Loop
@@ -57,6 +61,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		role := entry.role
 		var requests []github.RequestCount
 		loops = append(loops, daemon.Loop{Role: role, Interval: interval, Requests: func() any { return requests }, Run: func(ctx context.Context) error {
+			ctx, transaction := tracing.Pass(ctx, role)
+			defer tracing.Finish(transaction)
 			ctx, counts := github.CountRequests(ctx, role)
 			defer func() {
 				requests = counts.Snapshot()
@@ -64,51 +70,68 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				for _, request := range requests {
 					total += request.Count
 				}
+				tracing.Data(transaction, "github_requests", total)
 				log.Info("github requests", "role", role, "total", total, "routes", requests[:min(len(requests), 10)])
 			}()
-			var errs []error
+			var repos []config.Repo
 			for _, r := range s.Config.Repos {
-				if repo != "" && r.Name != repo {
-					continue
-				}
-				if ctx.Err() != nil {
-					break
-				}
-				var err error
-				switch role {
-				case "pr":
-					err = pollPRs(ctx, s, gh, r, o)
-				case "watch":
-					err = s.Watch(ctx, r, o)
-				case "release":
-					head, e := gh.Head(ctx, r.Name, r.Branch)
-					if e != nil {
-						err = e
-						break
-					}
-					p, e := s.Policy(ctx, r, head)
-					if e != nil {
-						err = e
-						break
-					}
-					ci, e := gh.Check(ctx, r.Name, head, p.RequiredChecks)
-					if e != nil {
-						err = e
-						break
-					}
-					if ci == github.Green {
-						err = s.Release(ctx, r, head, o)
-					}
-				case "rollout":
-					err = s.Rollout(ctx, r, o)
-				case "reap":
-					err = s.Reap(ctx, r, 0, o)
-				}
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", r.Name, err))
+				if repo == "" || r.Name == repo {
+					repos = append(repos, r)
 				}
 			}
-			return errors.Join(errs...)
+			// The pr role runs every repository at once: a pass is as long as
+			// its slowest repository, not their sum, so no repository starves
+			// behind the others when the daemon restarts often.
+			return forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
+				// Release and rollout work from the install inventory. A
+				// repository without one has nothing to publish or install, so
+				// the pass decides that from config and reads nothing.
+				if (role == "release" || role == "rollout") && len(r.Install) == 0 {
+					log.Debug("skip repository without install inventory", "role", role, "repo", r.Name)
+					return nil
+				}
+				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
+				tracing.Tag(repoSpan, "repo", r.Name)
+				var err error
+				func() {
+					defer tracing.Finish(repoSpan)
+					ctx := repoCtx
+					switch role {
+					case "pr":
+						err = pollPRs(ctx, s, gh, r, o)
+					case "watch":
+						checkCtx, span := tracing.Span(ctx, "mergewake.watch")
+						err = s.Watch(checkCtx, r, o)
+						tracing.Finish(span)
+					case "release":
+						head, e := gh.Head(ctx, r.Name, r.Branch)
+						if e != nil {
+							err = e
+							break
+						}
+						p, e := s.Policy(ctx, r, head)
+						if e != nil {
+							err = e
+							break
+						}
+						ci, e := gh.Check(ctx, r.Name, head, p.RequiredChecks)
+						if e != nil {
+							err = e
+							break
+						}
+						if ci == github.Green {
+							err = s.Release(ctx, r, head, o)
+						}
+					case "rollout":
+						err = s.Rollout(ctx, r, o)
+					case "reap":
+						sweepCtx, span := tracing.Span(ctx, "mergewake.reap")
+						err = s.Reap(sweepCtx, r, 0, o)
+						tracing.Finish(span)
+					}
+				}()
+				return err
+			})
 		}})
 	}
 	if len(s.Config.Repos) == 0 {
@@ -151,6 +174,36 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	return d.Run(ctx, loops)
 }
 
+// forRepos runs fn for each repository and joins the errors in config order,
+// each prefixed with its repository. A cancelled ctx starts no further
+// repository. With parallel, every repository runs in its own goroutine and
+// the call returns when all of them have.
+func forRepos(ctx context.Context, repos []config.Repo, parallel bool, fn func(context.Context, config.Repo) error) error {
+	errs := make([]error, len(repos))
+	var running sync.WaitGroup
+	for i, r := range repos {
+		if ctx.Err() != nil {
+			break
+		}
+		run := func() {
+			if err := fn(ctx, r); err != nil {
+				errs[i] = fmt.Errorf("%s: %w", r.Name, err)
+			}
+		}
+		if !parallel {
+			run()
+			continue
+		}
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			run()
+		}()
+	}
+	running.Wait()
+	return errors.Join(errs...)
+}
+
 // healthcheck returns the fail-open ping run after a clean loop. The request
 // is a bare GET with a bounded timeout; errors never embed the URL, which is a
 // secret (forge-able ping endpoint) that must not reach the daemon logs.
@@ -187,7 +240,17 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	for _, pr := range prs {
 		seen[pr.Number] = true
 	}
-	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots)
+	// A policy that lists dependency bots keeps their PRs out of the drop and
+	// out of review: they are settled by Land's bot-patch gate alone. An
+	// unreadable policy lists none, so the bots stay dropped as before.
+	var listed []string
+	if hasBotPull(prs) {
+		var err error
+		if listed, err = s.BotUpdateAuthors(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
+		}
+	}
+	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots, listed...)
 	// Before the per-PR work: a review can hold this pass for minutes.
 	s.FeedPRs(ctx, r, prs, o)
 	// A review waits for its reviewer pane, so one slow review used to hold
@@ -196,8 +259,17 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	// landed first; reviews run after that.
 	options := make([]pipeline.Options, len(prs))
 	handled := make([]bool, len(prs))
+	prContexts := make([]context.Context, len(prs))
 	for i, pr := range prs {
-		observationErr := s.ObservePR(ctx, r, pr, o)
+		prCtx, span := tracing.Span(ctx, "mergewake.pr")
+		tracing.Data(span, "pr", pr.Number)
+		prContexts[i] = prCtx
+		defer tracing.Finish(span)
+	}
+	for i, pr := range prs {
+		observeCtx, observeSpan := tracing.Span(prContexts[i], "mergewake.observe")
+		observationErr := s.ObservePR(observeCtx, r, pr, o)
+		tracing.Finish(observeSpan)
 		options[i] = o
 		options[i].Observed = observationErr == nil
 		if e := observationErr; e != nil {
@@ -209,13 +281,17 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		if pr.Draft {
 			continue
 		}
+		if isListedBot(pr, listed) {
+			errs = append(errs, botLand(prContexts[i], s, r, pr.Number, options[i])...)
+			continue
+		}
 		// An unreadable or poll-skipped marker is not done: the PR keeps
 		// today's order below.
 		if done, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); e != nil || !done {
 			continue
 		}
 		handled[i] = true
-		errs = append(errs, settlePR(ctx, s, r, pr.Number, options[i])...)
+		errs = append(errs, settlePR(prContexts[i], s, r, pr.Number, options[i])...)
 	}
 	// Reviews of different PRs run at once, at most review_parallel of them:
 	// each waits for its reviewer pane. One PR's review and settle stay in
@@ -227,7 +303,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	var settling sync.Mutex
 	var running sync.WaitGroup
 	for i, pr := range prs {
-		if pr.Draft {
+		if pr.Draft || isListedBot(pr, listed) {
 			continue
 		}
 		// A cancelled pass starts no further PR and returns once the running
@@ -244,7 +320,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		go func() {
 			defer running.Done()
 			defer func() { <-slots }()
-			results[i] = reviewPR(ctx, s, r, pr, options[i], !handled[i], &settling)
+			results[i] = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
 		}()
 	}
 	running.Wait()
@@ -260,7 +336,10 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 // settled next pass.
 func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) []error {
 	var errs []error
-	if e := s.RetryReview(ctx, r, pr, o); e != nil {
+	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
+	e := s.RetryReview(reviewCtx, r, pr, o)
+	tracing.Finish(reviewSpan)
+	if e != nil {
 		if errors.Is(e, pipeline.ErrReviewUnavailable) {
 			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
 				errs = append(errs, printErr)
@@ -281,30 +360,71 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 // author fixes them without the desk relaying anything, then notifies the
 // verdict and lands the PR.
 func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	ctx, span := tracing.Span(ctx, "mergewake.settle")
+	defer tracing.Finish(span)
 	var errs []error
-	if e := s.DeliverFindings(ctx, r, n, o); e != nil {
+	deliverCtx, deliver := tracing.Span(ctx, "mergewake.deliver")
+	e := s.DeliverFindings(deliverCtx, r, n, o)
+	tracing.Finish(deliver)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d findings: %w", n, e))
 	}
-	if e := s.NotifyPR(ctx, r, n, o); e != nil {
+	notifyCtx, notify := tracing.Span(ctx, "mergewake.notify")
+	e = s.NotifyPR(notifyCtx, r, n, o)
+	tracing.Finish(notify)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d notify: %w", n, e))
 	}
-	if e := s.Land(ctx, r, n, o); e != nil {
+	landCtx, land := tracing.Span(ctx, "mergewake.land")
+	e = s.Land(landCtx, r, n, o)
+	tracing.Finish(land)
+	if e != nil {
 		errs = append(errs, fmt.Errorf("PR %d land: %w", n, e))
 	}
 	return errs
 }
 
-// skipBotPulls drops PRs opened by bot accounts when skip is set; they stay in
-// the open set for outcome reconciliation.
-func skipBotPulls(prs []github.Pull, skip bool) []github.Pull {
+// skipBotPulls drops PRs opened by bot accounts when skip is set, except those
+// by a bot in listed; they stay in the open set for outcome reconciliation.
+func skipBotPulls(prs []github.Pull, skip bool, listed ...string) []github.Pull {
 	if !skip {
 		return prs
 	}
 	out := make([]github.Pull, 0, len(prs))
 	for _, pr := range prs {
-		if pr.User.Type != "Bot" {
+		if pr.User.Type != "Bot" || isListedBot(pr, listed) {
 			out = append(out, pr)
 		}
 	}
 	return out
+}
+
+func hasBotPull(prs []github.Pull) bool {
+	for _, pr := range prs {
+		if pr.User.Type == "Bot" {
+			return true
+		}
+	}
+	return false
+}
+
+// isListedBot reports whether pr is by a bot the policy lists. It is the same
+// test Land's gate selection applies.
+func isListedBot(pr github.Pull, listed []string) bool {
+	return (&policy.BotUpdates{Authors: listed}).Lists(pr.User.Login, pr.User.Type)
+}
+
+// botLand settles a listed bot's PR: Land decides it with the bot-patch gate,
+// merging it or telling the desk why not. It delivers no findings, sends no
+// verdict notice and starts no review.
+func botLand(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	ctx, span := tracing.Span(ctx, "mergewake.settle")
+	defer tracing.Finish(span)
+	landCtx, land := tracing.Span(ctx, "mergewake.land")
+	e := s.Land(landCtx, r, n, o)
+	tracing.Finish(land)
+	if e != nil {
+		return []error{fmt.Errorf("PR %d land: %w", n, e)}
+	}
+	return nil
 }

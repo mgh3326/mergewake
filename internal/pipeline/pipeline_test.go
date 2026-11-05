@@ -40,6 +40,7 @@ type fakeGH struct {
 	updateErr                                                    error
 	updateHook                                                   func()
 	nextHead                                                     string
+	nextBase                                                     string // base ref from the second Pull on
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
 	requiredBots                                                 []string
@@ -53,21 +54,29 @@ type fakeGH struct {
 	feedbackReads                                                int
 	refs                                                         map[string]bool
 	leaseTimes                                                   map[string]time.Time
+	leaseIDs                                                     map[string]string
 	files                                                        []policy.File
 	ci                                                           github.CI
+	postedFindings                                               []github.Finding
 	mergeCount, revertCount, postCount, claimCount, publishCount int
+	revertTrailers                                               string
 	head                                                         string
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
-	messages                                                     map[string]string
-	authorName, authorEmail                                      string
-	committerName, committerEmail                                string
-	parents                                                      map[string]string
-	parents2                                                     map[string][]string
-	commitPRs                                                    map[string][]github.Pull
-	latch, headChanged, stale                                    bool
-	policyReads                                                  []string
-	m                                                            manifest.Manifest
+	cancelledAt                                                  map[string]time.Time
+	// staleOnce is the check states the first CheckSnapshot returns, as a
+	// cached read that predates a rerun; snapshots counts the reads.
+	staleOnce                     map[string]github.CI
+	snapshots                     int
+	messages                      map[string]string
+	authorName, authorEmail       string
+	committerName, committerEmail string
+	parents                       map[string]string
+	parents2                      map[string][]string
+	commitPRs                     map[string][]github.Pull
+	latch, headChanged, stale     bool
+	policyReads                   []string
+	m                             manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
 	// diffErr, when set, answers every Diff call instead of a patch (for
@@ -84,6 +93,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 	p := g.pull
 	if g.pullCalls > 1 && g.nextHead != "" {
 		p.Head.SHA = g.nextHead
+	}
+	if g.pullCalls > 1 && g.nextBase != "" {
+		p.Base.Ref = g.nextBase
 	}
 	return p, nil
 }
@@ -160,6 +172,20 @@ func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string
 	}
 	return out, nil
 }
+func (g *fakeGH) CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, map[string]time.Time, error) {
+	g.snapshots++
+	states, _ := g.CheckStates(ctx, repo, sha, required)
+	if g.staleOnce != nil && g.snapshots == 1 {
+		states = g.staleOnce
+	}
+	out := map[string]time.Time{}
+	for _, n := range required {
+		if states[n] == github.Cancelled {
+			out[n] = g.cancelledAt[n]
+		}
+	}
+	return states, out, nil
+}
 func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string) ([]github.PassReceipt, error) {
 	if g.reviewed && sha == g.pull.Head.SHA {
 		return []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}, nil
@@ -191,7 +217,11 @@ func (g *fakeGH) ReviewLease(_ context.Context, _ string, branch string, ttl tim
 	if !g.refs[branch] {
 		return "", false, nil
 	}
-	return shaA, time.Since(g.leaseTimes[branch]) < ttl, nil
+	sha := g.leaseIDs[branch]
+	if sha == "" {
+		sha = shaA
+	}
+	return sha, time.Since(g.leaseTimes[branch]) < ttl, nil
 }
 func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl time.Duration) (bool, error) {
 	_, active, err := g.ReviewLease(ctx, repo, branch, ttl)
@@ -205,9 +235,34 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 		g.leaseTimes = map[string]time.Time{}
 	}
 	g.refs[branch] = true
+	if g.leaseIDs != nil {
+		delete(g.leaseIDs, branch)
+	}
 	g.leaseTimes[branch] = time.Now()
 	g.claimCount++
 	return true, nil
+}
+func (g *fakeGH) ClaimReviewWithSHA(ctx context.Context, repo, branch, head string, ttl time.Duration) (string, bool, error) {
+	acquired, err := g.ClaimReview(ctx, repo, branch, head, ttl)
+	if !acquired || err != nil {
+		return "", acquired, err
+	}
+	return shaA, true, nil
+}
+func (g *fakeGH) RenewReviewLease(_ context.Context, _ string, branch, expected string) (string, bool, error) {
+	current := g.leaseIDs[branch]
+	if current == "" {
+		current = shaA
+	}
+	if !g.refs[branch] || expected != current {
+		return "", false, nil
+	}
+	if g.leaseIDs == nil {
+		g.leaseIDs = make(map[string]string)
+	}
+	g.leaseIDs[branch] = current + "a"
+	g.leaseTimes[branch] = time.Now()
+	return g.leaseIDs[branch], true, nil
 }
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
@@ -273,6 +328,10 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	g.latch = true
 	return "https://github.com/example/project/pull/9", nil
 }
+func (g *fakeGH) RevertWithTrailers(ctx context.Context, repo, branch, head, culprit string, pr int, trailers string) (string, error) {
+	g.revertTrailers = trailers
+	return g.Revert(ctx, repo, branch, head, culprit, pr)
+}
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
 	if g.diffErr != nil {
 		return "", g.diffErr
@@ -295,6 +354,7 @@ func (g *fakeGH) CreateRef(_ context.Context, _, branch, _ string) error {
 }
 func (g *fakeGH) PostReview(_ context.Context, _ string, _ int, sha string, f []github.Finding, meta github.PassReceipt) error {
 	g.postCount++
+	g.postedFindings = append(g.postedFindings, f...)
 	if g.passes == nil {
 		g.passes = map[string][]github.PassReceipt{}
 	}
@@ -354,6 +414,13 @@ func (s *fakeLaneSink) Lane(_ context.Context, task string) (string, error) {
 	return s.lanes[task], nil
 }
 
+// Fake hub environment: tests never reach a real hub, and no value here is a
+// credential.
+const (
+	testHubURL      = "https://hub.invalid"
+	testHubTokenEnv = "MW_TEST_HUB_TOKEN"
+)
+
 type fakeRunner struct {
 	pane      *panewireRunner
 	calls     int
@@ -395,6 +462,10 @@ func (r *fakeRunner) Run(ctx context.Context, command string, args []string, inp
 }
 func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
 	t.Helper()
+	// The hub environment the daemon inherits from its host wrapper. A test
+	// that wants it missing overrides the variable after setup.
+	t.Setenv(hubURLEnv, testHubURL)
+	t.Setenv(hubTokenEnv, testHubTokenEnv)
 	g := &fakeGH{ci: github.Green, feedback: github.ReviewFeedback{PRAuthor: "pr-author", ReviewAuthors: map[string]int{"coderabbitai": 1, "chatgpt-codex-connector": 1, "review-bot": 1}}}
 	mergeable := true
 	g.pull = github.Pull{Number: 7, State: "open", ChangedFiles: 1, Mergeable: &mergeable, MergeableState: "clean", Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}
@@ -457,6 +528,7 @@ func TestLand(t *testing.T) {
 			g.stale = tt.stale
 			if tt.stale {
 				g.pull.MergeableState = "behind"
+				g.policyExtra = "require_up_to_date: true\n"
 			}
 			if tt.reviewed {
 				markReviewed(g)

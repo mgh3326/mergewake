@@ -224,6 +224,7 @@ func TestBaseStateNeverReReviews(t *testing.T) {
 	g.pull.Head.SHA = shaA
 	g.stale = true
 	g.pull.MergeableState = "behind"
+	g.policyExtra = "require_up_to_date: true\n"
 	if v := gateAt(t, s, g, shaB); reasons(v) != "base_stale" {
 		t.Fatalf("stale head: %+v", v)
 	}

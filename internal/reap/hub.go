@@ -339,8 +339,10 @@ func (h HubHost) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 }
 
 // WorktreeRemove asks the node to apply the same guarded cleanup checks used
-// by Exec before removing a merged worktree.
-func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base string, regenerable []string) (WorktreeRemoveResult, error) {
+// by Exec before removing a merged worktree. detached marks a reviewer
+// checkout (no branch): the node refuses a detached worktree unless the
+// request says so, and refuses a branch worktree when it does.
+func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base string, regenerable []string, detached bool) (WorktreeRemoveResult, error) {
 	var v struct {
 		Outcome     string   `json:"outcome"`
 		Files       []string `json:"files"`
@@ -351,7 +353,7 @@ func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base strin
 	if regenerable == nil {
 		regenerable = []string{}
 	}
-	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable}
+	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable, "detached": detached}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.remove", args, &v); err != nil {
 		return WorktreeRemoveResult{}, err
 	}

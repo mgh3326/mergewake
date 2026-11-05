@@ -90,9 +90,12 @@ func TestReviewLeaseAcquisition(t *testing.T) {
 					http.NotFound(w, r)
 				}
 			})
-			got, err := c.ClaimReview(context.Background(), "example/project", branch, testSHA, time.Minute)
+			leaseSHA, got, err := c.ClaimReviewWithSHA(context.Background(), "example/project", branch, testSHA, time.Minute)
 			if got != tt.want || (err != nil) != tt.fail {
 				t.Fatalf("got=%v err=%v", got, err)
+			}
+			if (tt.want && leaseSHA != next) || (!tt.want && leaseSHA != "") {
+				t.Fatalf("lease SHA = %q", leaseSHA)
 			}
 			if tt.present && tt.age < time.Minute && writes != 0 {
 				t.Fatal("live claim changed")
@@ -111,5 +114,46 @@ func TestReviewLeaseUnknownTimestampFailsClosed(t *testing.T) {
 	})
 	if _, _, err := c.ReviewLease(context.Background(), "example/project", "claim", time.Minute); err == nil {
 		t.Fatal("unknown lease accepted")
+	}
+}
+
+func TestRenewReviewLeasePreservesOwnership(t *testing.T) {
+	old, next := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	writes := 0
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.Contains(r.URL.Path, "/git/ref/"):
+			reply(w, map[string]any{"object": Ref{SHA: old}})
+		case r.Method == "GET" && strings.Contains(r.URL.Path, "/commits/"):
+			reply(w, map[string]any{"commit": map[string]any{"tree": Ref{SHA: testSHA}}})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/git/commits"):
+			var body struct {
+				Parents []string
+				Tree    string
+				Message string
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Parents) != 1 || body.Parents[0] != old || body.Tree != testSHA || !strings.HasPrefix(body.Message, leasePrefix) {
+				t.Fatalf("commit=%+v", body)
+			}
+			reply(w, Ref{SHA: next})
+		case r.Method == "PATCH":
+			writes++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["sha"] != next || body["force"] != false {
+				t.Fatalf("patch=%v", body)
+			}
+			reply(w, map[string]any{})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	if sha, ok, err := c.RenewReviewLease(context.Background(), "example/project", "claim", "wrong"); err != nil || ok || sha != "" || writes != 0 {
+		t.Fatalf("mismatch sha=%q ok=%v err=%v writes=%d", sha, ok, err, writes)
+	}
+	if sha, ok, err := c.RenewReviewLease(context.Background(), "example/project", "claim", old); err != nil || !ok || sha != next || writes != 1 {
+		t.Fatalf("sha=%q ok=%v err=%v writes=%d", sha, ok, err, writes)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -25,7 +26,7 @@ import (
 // so a later pass can find it. Dry-run prints rows without writing the file.
 type reapReceipt struct {
 	Time     time.Time `json:"time"`
-	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch, archive-job, reviewer-cleanup, reviewer-reap
+	Action   string    `json:"action"` // close-pane, remove-worktree, delete-branch, archive-job, reviewer-cleanup, reviewer-reap, legacy-sweep
 	Repo     string    `json:"repo"`
 	PR       int       `json:"pr"`
 	Host     string    `json:"host"`
@@ -41,6 +42,7 @@ type reapReceipt struct {
 	Task     string    `json:"task,omitempty"`  // Mergewake-Task of a job-bound row
 	Open     []string  `json:"open,omitempty"`  // open PRs (owner/name#N) keeping a job's pane
 	Label    string    `json:"label,omitempty"` // reviewer label of a reviewer-reap row
+	Head     string    `json:"head,omitempty"`  // checked-out commit of a legacy-sweep row
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
@@ -58,8 +60,8 @@ func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) 
 	}
 }
 
-// reapHeadCommits memoises the head commit of a merged PR for the process: a
-// merged PR's head never changes, so the task lookup (reapTask) reads it once.
+// reapHeadCommits memoises a head commit for the process: a commit's message
+// never changes, so the trailer lookup (prTrailer) reads it once per head.
 // It is keyed by state dir so two services never share an answer; a read error
 // is not cached.
 var (
@@ -351,6 +353,52 @@ func (h *reapHistory) prDone(pr int) bool {
 	return true
 }
 
+// reapScanHost reads one host's agent list, full pane list and the worktree of
+// every pane cwd. A host whose panes cannot be read comes back failed; one whose
+// full pane list cannot be read has usageUnknown set. Under the panewire
+// transport every remote host goes through the hub; this machine's own panes
+// still run locally.
+func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) (*reapHost, []error) {
+	var errs []error
+	hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
+	hs.ops = hs.exec
+	if hub != nil && !h.Local() {
+		hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
+	}
+	panes, e := hs.ops.Panes(ctx)
+	if e != nil {
+		hs.failed = true
+		return hs, append(errs, fmt.Errorf("%s: %w", h.Name, e))
+	}
+	hs.panes = panes
+	// The full pane list also covers non-agent shells and jobs: without it
+	// the usage check is unknown and removals must skip.
+	all, e := hs.ops.AllPanes(ctx)
+	if e != nil {
+		hs.usageUnknown = true
+		errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
+	}
+	hs.all = all
+	for _, list := range [][]reap.Pane{panes, all} {
+		for _, p := range list {
+			if p.Cwd != "" {
+				if _, ok := hs.trees[p.Cwd]; !ok {
+					w, e := hs.ops.Inspect(ctx, p.Cwd)
+					// A hub that refuses the credential answers nothing
+					// about the worktree: fail the host instead of reading
+					// every pane as outside one.
+					if errors.Is(e, reap.ErrHubAuth) {
+						hs.failed = true
+						return hs, append(errs, fmt.Errorf("%s: %w", h.Name, e))
+					}
+					hs.trees[p.Cwd] = w
+				}
+			}
+		}
+	}
+	return hs, errs
+}
+
 // Reap closes agent panes sitting in worktrees of merged-PR head branches, then
 // removes the worktree and local branch once the merge is older than
 // reap.worktree_after and no watch recovery PR landed. Anything dirty, unknown
@@ -388,6 +436,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if e != nil {
 		return e
 	}
+	// Legacy sweep receipts must not enter the regular replay.
+	receipts = slices.DeleteFunc(receipts, legacyRow)
 	h := newReapHistory(receipts)
 	// A receipt-named PR beyond the listing horizon is refetched at most once
 	// per day, measured from its newest row: each attempt appends a check-pr
@@ -446,49 +496,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	hosts := []*reapHost{}
 	byName := map[string]*reapHost{}
 	for _, h := range s.Config.Hosts {
-		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
-		hs.ops = hs.exec
-		// Under the panewire transport every remote host goes through the
-		// hub; this machine's own panes still run locally.
-		if hub != nil && !h.Local() {
-			hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
-		}
+		hs, hostErrs := s.reapScanHost(ctx, hub, h)
+		errs = append(errs, hostErrs...)
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
-		panes, e := hs.ops.Panes(ctx)
-		if e != nil {
-			hs.failed = true
-			errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
-			continue
-		}
-		hs.panes = panes
-		// The full pane list also covers non-agent shells and jobs: without it
-		// the usage check is unknown and removals must skip.
-		all, e := hs.ops.AllPanes(ctx)
-		if e != nil {
-			hs.usageUnknown = true
-			errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
-		}
-		hs.all = all
-	inspect:
-		for _, list := range [][]reap.Pane{panes, all} {
-			for _, p := range list {
-				if p.Cwd != "" {
-					if _, ok := hs.trees[p.Cwd]; !ok {
-						w, e := hs.ops.Inspect(ctx, p.Cwd)
-						// A hub that refuses the credential answers nothing
-						// about the worktree: fail the host instead of reading
-						// every pane as outside one.
-						if errors.Is(e, reap.ErrHubAuth) {
-							hs.failed = true
-							errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
-							break inspect
-						}
-						hs.trees[p.Cwd] = w
-					}
-				}
-			}
-		}
 	}
 
 	// Errors are counted once, from errs: note itself appends every "error"
@@ -773,12 +784,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					continue
 				}
 				remover, ok := c.hs.ops.(interface {
-					WorktreeRemove(context.Context, string, string, string, []string) (reap.WorktreeRemoveResult, error)
+					WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
 				})
 				if !ok {
 					rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
 				} else {
-					result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable)
+					result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false)
 					if err != nil {
 						rec.Result, rec.Reason = "error", err.Error()
 					} else {

@@ -32,45 +32,115 @@ const panewireWaitTimeout = 85
 // included; Recorded is when the job was first spawned and bounds how long a
 // live job is waited for.
 type reviewerJob struct {
-	PR       int       `json:"pr"`
-	Head     string    `json:"head"`
-	Pass     int       `json:"pass"`
-	Label    string    `json:"label"`
-	Checkout string    `json:"checkout"`
-	Args     []string  `json:"args"`
-	Recorded time.Time `json:"recorded"`
+	PR           int       `json:"pr"`
+	Head         string    `json:"head"`
+	LeaseSHA     string    `json:"lease_sha,omitempty"`
+	Pass         int       `json:"pass"`
+	Label        string    `json:"label"`
+	Checkout     string    `json:"checkout"`
+	Args         []string  `json:"args"`
+	Recorded     time.Time `json:"recorded"`
+	Replacements int       `json:"replacements,omitempty"`
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {
 	return filepath.Join(s.state(repo), "reviewer-jobs", fmt.Sprintf("%d-p%d.json", pr, pass))
 }
 
-// reviewerJob reads the record of this pass for the PR head. Records of the
-// PR left by another head are dropped first.
-func (x *panewireExecutor) reviewerJob(pass int) (reviewerJob, bool, error) {
+// recordedJob is one record file of the PR and its path.
+type recordedJob struct {
+	path string
+	rj   reviewerJob
+}
+
+func (x *panewireExecutor) recordedJobs() ([]recordedJob, error) {
 	s, repo, pr := x.s, x.repo.Name, x.pr
 	paths, e := filepath.Glob(filepath.Join(s.state(repo), "reviewer-jobs", fmt.Sprintf("%d-p*.json", pr.Number)))
 	if e != nil {
-		return reviewerJob{}, false, e
+		return nil, e
 	}
-	var found reviewerJob
-	ok := false
+	var out []recordedJob
 	for _, path := range paths {
 		var rj reviewerJob
 		if _, e = fsutil.ReadJSON(path, &rj); e != nil {
-			return reviewerJob{}, false, fmt.Errorf("reviewer job record %s: %w", filepath.Base(path), e)
+			return nil, fmt.Errorf("reviewer job record %s: %w", filepath.Base(path), e)
 		}
-		if rj.Head != pr.Head.SHA {
-			if e = os.Remove(path); e != nil && !errors.Is(e, fs.ErrNotExist) {
-				return reviewerJob{}, false, e
-			}
-			continue
-		}
-		if path == s.reviewerJobPath(repo, pr.Number, pass) && rj.Pass == pass && rj.Label != "" && len(rj.Args) > 0 {
-			found, ok = rj, true
+		out = append(out, recordedJob{path, rj})
+	}
+	return out, nil
+}
+
+// ownJob picks the record of this pass for the PR head.
+func (x *panewireExecutor) ownJob(recs []recordedJob, pass int) (reviewerJob, bool) {
+	for _, rec := range recs {
+		rj := rec.rj
+		if rj.Head == x.pr.Head.SHA && rec.path == x.s.reviewerJobPath(x.repo.Name, x.pr.Number, pass) && rj.PR == x.pr.Number && rj.Pass == pass && rj.Label != "" && len(rj.Args) > 0 {
+			return rj, true
 		}
 	}
-	return found, ok, nil
+	return reviewerJob{}, false
+}
+
+// ownReviewerJob reads the record of this pass for the PR head and changes
+// nothing: records of other heads are left for the pass that runs.
+func (x *panewireExecutor) ownReviewerJob(pass int) (reviewerJob, bool, error) {
+	recs, e := x.recordedJobs()
+	if e != nil {
+		return reviewerJob{}, false, e
+	}
+	rj, ok := x.ownJob(recs, pass)
+	return rj, ok, nil
+}
+
+// reviewerJob reads the record of this pass for the PR head. Records of the
+// PR left by another head are dropped first, after their jobs are closed.
+// Only a pass that acts calls it.
+func (x *panewireExecutor) reviewerJob(ctx context.Context, pass int) (reviewerJob, bool, error) {
+	recs, e := x.recordedJobs()
+	if e != nil {
+		return reviewerJob{}, false, e
+	}
+	for _, rec := range recs {
+		if rec.rj.Head == x.pr.Head.SHA {
+			continue
+		}
+		if e = x.closeMovedHeadJob(ctx, rec.rj); e != nil {
+			return reviewerJob{}, false, e
+		}
+		if e = os.Remove(rec.path); e != nil && !errors.Is(e, fs.ErrNotExist) {
+			return reviewerJob{}, false, e
+		}
+	}
+	rj, ok := x.ownJob(recs, pass)
+	return rj, ok, nil
+}
+
+// closeMovedHeadJob closes the reviewer job of a record left by an older head
+// of the PR, so its hub reservation does not refuse every spawn for the new
+// head. A job with no hk record, or one that already ended, holds nothing and
+// is left alone. A failed close returns the error: the caller keeps the record
+// and the next pass tries again. A closed job is remembered for this run, so a
+// spawn refused as held can close it once more and retry.
+func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob) error {
+	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
+	job, e := x.job(ctx, rj.Label)
+	switch {
+	case errors.Is(e, integrations.ErrJobNotFound), errors.Is(e, errJobRecords):
+		return nil
+	case e != nil:
+		return fmt.Errorf("reviewer job %s of head %s: %w", rj.Label, short7(rj.Head), e)
+	case terminalJob(job.State):
+		return nil
+	case job.OwnerLane == "":
+		return fmt.Errorf("reviewer job %s of head %s is %s and names no owner lane to close it", rj.Label, short7(rj.Head), job.State)
+	}
+	if _, e = s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", "PR head moved"}, "", ""); e != nil {
+		return fmt.Errorf("close reviewer job %s of head %s: %w", rj.Label, short7(rj.Head), e)
+	}
+	if !slices.ContainsFunc(x.movedHead, func(m reviewerJob) bool { return m.Label == rj.Label }) {
+		x.movedHead = append(x.movedHead, rj)
+	}
+	return s.audit(x.repo.Name, "reviewer-head-moved", map[string]any{"pr": pr.Number, "old_head": rj.Head, "new_head": pr.Head.SHA, "label": rj.Label}, false)
 }
 
 func (x *panewireExecutor) saveReviewerJob(rj reviewerJob) error {

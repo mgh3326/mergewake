@@ -19,15 +19,38 @@ import (
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // panewireRefused is panewire's role/seat/family refusal: with --role reviewer it
 // means no admitted seat outside the builder's family remained.
 const panewireRefused = 77
 
+// panewireHubEnv names the environment panewire reads to place a reviewer on
+// the hub. A daemon inherits it from its host wrapper.
+const (
+	hubURLEnv   = "PANEWIRE_HUB_URL"
+	hubTokenEnv = "PANEWIRE_HUB_TOKEN_ENV"
+)
+
+// missingHubEnv names the hub variables that are unset or empty. It reports
+// names only, never values.
+func missingHubEnv() []string {
+	var missing []string
+	for _, name := range []string{hubURLEnv, hubTokenEnv} {
+		if os.Getenv(name) == "" {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 // postReserve is the most of the review deadline kept back from the pane wait
 // for validating and posting its findings.
 const postReserve = time.Minute
+
+const reviewerPassWait = 90 * time.Second
 
 // Leave room for panewire's policy preamble below the hub's 64 KiB limit.
 const inlineBriefLimit = 48 << 10
@@ -68,6 +91,7 @@ type panewireExecutor struct {
 	round        int
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
+	movedHead    []reviewerJob // records of older heads whose jobs this run closed
 }
 
 type reviewResultLost struct {
@@ -79,7 +103,7 @@ func (e *reviewResultLost) Error() string {
 	return fmt.Sprintf("reviewer %s finished but its result was lost: %v", e.label, e.cause)
 }
 
-func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
+func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (string, bool, error)) (passOutcome, error) {
 	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
 	out := passOutcome{}
 	// Review bounds its context by review.timeout; a caller without a deadline
@@ -101,6 +125,19 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// and the review-skipped audit: redact them here.
 		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
 		return out, nil
+	}
+	// panewire places the reviewer through the hub it reads from these
+	// variables. A daemon inherits them from its host wrapper; a manual run
+	// from a plain shell has neither, and panewire then plans on the local node
+	// and refuses with a containment error that hides the cause. Only a call
+	// to panewire needs them: a resumed job that already finished is answered
+	// from its hk record without one.
+	hubMissing := func() string {
+		missing := missingHubEnv()
+		if len(missing) == 0 {
+			return ""
+		}
+		return fmt.Sprintf("panewire reviewer spawn needs %s in the environment (unset or empty); run mergewake with the same hub environment as the daemon", strings.Join(missing, " and "))
 	}
 	root := config.Expand(x.repo.Root)
 	if root == "" {
@@ -144,23 +181,46 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if branch == "" || !strings.EqualFold(headRepo, x.repo.Name) {
 		return skip("head branch is not in %s (fork PR); panewire cannot replicate it", x.repo.Name)
 	}
-	acquired, e := claim()
+	// Read the local record first: an active ownerless lease can be ours.
+	rj, resumed, e := x.reviewerJob(ctx, plan.pass)
 	if e != nil {
 		return out, e
 	}
-	if !acquired {
+	// A fresh pass fails before the claim and the reviewer record; a resumed
+	// one checks where it would re-attach, below.
+	if reason := hubMissing(); !resumed && reason != "" {
+		return skip("%s", reason)
+	}
+	leaseSHA, acquired, e := claim()
+	if e != nil {
+		return out, e
+	}
+	if !acquired && (!resumed || leaseSHA == "" || rj.LeaseSHA != leaseSHA) {
 		return out, errPassPending
 	}
-
-	// A pass that already spawned a reviewer job for this head resumes that
-	// job instead of spawning another under a new label: the hub keeps one
-	// reviewer reservation per task, so a new label is refused while the old
-	// job lives.
-	rj, resumed, e := x.reviewerJob(plan.pass)
-	if e != nil {
-		return out, e
+	if resumed && !acquired {
+		renewer, ok := s.GH.(interface {
+			RenewReviewLease(context.Context, string, string, string) (string, bool, error)
+		})
+		if !ok {
+			return out, errors.New("GitHub client cannot renew review leases")
+		}
+		var renewed bool
+		leaseSHA, renewed, e = renewer.RenewReviewLease(ctx, x.repo.Name, claimRef(pr.Number, pr.Head.SHA, plan.pass), leaseSHA)
+		if e != nil {
+			return out, e
+		}
+		if !renewed {
+			return out, errPassPending
+		}
 	}
-	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix())
+	if resumed {
+		rj.LeaseSHA = leaseSHA
+		if e = x.saveReviewerJob(rj); e != nil {
+			return out, e
+		}
+	}
+	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix()+int64(plan.replacements))
 	checkout := filepath.Join(cfg.Checkouts, label)
 	if resumed {
 		label, checkout = rj.Label, rj.Checkout
@@ -224,9 +284,62 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// with no spawn. One still live is re-attached by replaying its spawn,
 	// until it has been live longer than the stale bound.
 	spawn := true
+	var collected []byte
+	var remoteRecord *integrations.JobRecord
 	if resumed {
+		// The record is answered in this order, and the total budget comes after
+		// the first two: a completed job or an available result is collected, a
+		// finished pane without one is replaced, and only then does a record older
+		// than review.timeout count as lost. A record never stays while every run
+		// would return the same budget error.
+		timeout, err := config.Duration(s.Config.Review.Timeout)
+		if err != nil {
+			return out, err
+		}
+		overBudget := s.now().Sub(rj.Recorded) >= timeout
 		rec, e := x.job(ctx, label)
 		state := rec.State
+		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
+			finished, err := x.reviewerFinished(ctx, rec, rj)
+			if err != nil {
+				return out, err
+			}
+			// An escalated or lost job is held for the operator by the switch below,
+			// whatever its age.
+			if finished || (overBudget && state != "escalated" && state != "lost") {
+				var found bool
+				collected, found, e = x.availableFindings(ctx, label, findingsPath)
+				if e != nil {
+					return out, e
+				}
+				if found {
+					spawn = false
+				} else {
+					fresh, err := x.job(ctx, label)
+					if err != nil {
+						return out, err
+					}
+					if fresh.State == "completed" || fresh.State == "escalated" || fresh.State == "lost" {
+						state, spawn = fresh.State, false
+					} else if b, retry := x.remoteFindings(ctx, plan, fresh, label); b != nil {
+						collected, remoteRecord, spawn = b, &fresh, false
+						// Give transient read errors one additional review budget to recover.
+					} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+						return out, errPassPending
+					} else {
+						cause := "pane finished without a result"
+						if !finished {
+							cause = "reviewer still running past the review deadline"
+						}
+						return x.replaceLostReviewer(ctx, plan, rj, fresh, cause, leaseSHA)
+					}
+				}
+			}
+		} else if errors.Is(e, integrations.ErrJobNotFound) && overBudget {
+			// No job record means no hub claim to release: the record goes and the
+			// pass is replaced once.
+			return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job record missing past the review deadline", leaseSHA)
+		}
 		switch {
 		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
 			spawn = false
@@ -248,11 +361,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	note := ""
 	var stdout []byte
 	if spawn {
+		if reason := hubMissing(); reason != "" {
+			return skip("%s", reason)
+		}
 		// The pane wait leaves time to validate and post the findings: a minute,
 		// or a quarter of what is left when that is shorter.
 		deadline, _ := ctx.Deadline()
 		left := time.Until(deadline)
-		wait := left - min(postReserve, left/4)
+		wait := min(reviewerPassWait, left-min(postReserve, left/4))
+		if resumed {
+			timeout, err := config.Duration(s.Config.Review.Timeout)
+			if err != nil {
+				return out, err
+			}
+			wait = min(wait, timeout-s.now().Sub(rj.Recorded))
+		}
 		if wait < time.Second {
 			if resumed {
 				return out, fmt.Errorf("%w: no time left to re-attach reviewer job %s", ErrReviewUnavailable, label)
@@ -279,20 +402,44 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			// The record names the job before it is spawned, so a wait that
 			// ends early leaves a job the next run can resume.
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now()}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now(), Replacements: plan.replacements}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
 			args = rj.Args
 		}
-		stdout, e = s.Runner.Run(ctx, cfg.Command, args, "", "")
+		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+		stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+		tracing.Finish(runSpan)
+		// A fresh spawn refused as held, while this run closed the job of an
+		// older head: close it once more and spawn again, once.
+		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHead) > 0 {
+			var closeErr error
+			for _, old := range x.movedHead {
+				closeErr = errors.Join(closeErr, x.closeMovedHeadJob(ctx, old))
+			}
+			if closeErr != nil {
+				_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
+				// An older head's job may still hold the reservation: its
+				// record goes back so the next pass closes it.
+				for _, old := range x.movedHead {
+					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
+				}
+				return out, errors.Join(e, closeErr)
+			}
+			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+			tracing.Finish(runSpan)
+		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = append(slices.Clone(rj.Args[:len(rj.Args)-2]), "--role", "worker")
 			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
 				return out, saveErr
 			}
-			stdout, e = s.Runner.Run(ctx, cfg.Command, rj.Args, "", "")
+			runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = s.Runner.Run(runCtx, cfg.Command, rj.Args, "", "")
+			tracing.Finish(runSpan)
 		}
 		if e != nil {
 			code := exitStatus(e)
@@ -325,7 +472,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// The job was spawned and may still run: the record stays and the
 			// next run resumes it rather than spawning another reviewer.
 			if resumed || code == panewireWaitTimeout {
-				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", ErrReviewUnavailable, label, code, fleetevent.Redact(integrations.Detail(e)))
+				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
 			res.skips[len(res.skips)-1].withCause(e)
@@ -351,7 +498,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
 		}
 	}()
-	res, e := x.recordResult(ctx, label)
+	collectCtx, collectSpan := tracing.Span(ctx, "mergewake.collect")
+	defer tracing.Finish(collectSpan)
+	var res jobOutcome
+	if remoteRecord != nil {
+		res = jobOutcome{rec: *remoteRecord, result: collected, reason: "remote result"}
+	} else {
+		res, e = x.recordResult(collectCtx, label)
+	}
 	if e != nil {
 		keepJob = true
 		if !errors.Is(e, ctx.Err()) {
@@ -372,7 +526,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// `panewire done --result` still returns them through the lane
 		// announcement or, on this host, the job-dir file. Kept for one
 		// release; each use is counted on the receipt and audited.
-		b, e = x.collect(ctx, label, findingsPath)
+		if collected != nil {
+			b = collected
+		} else {
+			b, e = x.collect(collectCtx, label, findingsPath)
+		}
 		if e != nil {
 			if ctx.Err() != nil {
 				keepJob = true
@@ -420,6 +578,39 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.fallback = note
 	keepJob = true
 	return out, nil
+}
+
+// replaceLostReviewer is the lost path for a resumed reviewer that will not
+// return a result: it audits and notifies, closes the job so its hub claim is
+// released (a job with no record has none), drops the record and runs the pass
+// again once under a new label with the held lease. After a replacement it
+// returns review-unavailable and leaves no record behind.
+func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPlan, rj reviewerJob, job integrations.JobRecord, cause, leaseSHA string) (passOutcome, error) {
+	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
+	out := passOutcome{}
+	reportPath := filepath.Join(cfg.Jobs, rj.Label, "report.md")
+	lost := &reviewResultLost{rj.Label, cause, job.Profile, reportPath, errors.New(cause)}
+	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
+	if auditErr != nil || noticeErr != nil {
+		return out, errors.Join(lost, auditErr, noticeErr)
+	}
+	if job.State != "" {
+		if job.OwnerLane == "" {
+			return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
+		}
+		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil {
+			return out, errors.Join(lost, err)
+		}
+	}
+	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
+		return out, err
+	}
+	if rj.Replacements >= 1 {
+		return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
+	}
+	plan.replacements = rj.Replacements + 1
+	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
@@ -543,6 +734,99 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 	}
 }
 
+// remoteFindings reads the host's bounded result without recording its body.
+func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool) {
+	outcome := "error"
+	var findings json.RawMessage
+	lookupTimeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		lookupTimeout = min(lookupTimeout, time.Until(deadline)/2)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	defer cancel()
+	var result struct {
+		Found         bool            `json:"found"`
+		Findings      json.RawMessage `json:"findings"`
+		FindingsError string          `json:"findings_error"`
+		Report        struct {
+			Present  bool   `json:"present"`
+			Bytes    int64  `json:"bytes"`
+			SHA256   string `json:"sha256"`
+			LastLine string `json:"last_line"`
+		} `json:"report"`
+		Completed bool `json:"completed"`
+	}
+	var err error
+	switch {
+	case rec.Host == "":
+		outcome = "missing_host"
+	case rec.Host == "local" || x.localReviewerHost(rec.Host):
+		var b []byte
+		b, err = x.s.Runner.Run(lookupCtx, x.s.Config.Review.Panewire.Command, []string{"node", "job-result", "--host", rec.Host, "--job", label}, "", "")
+		if err == nil {
+			err = json.Unmarshal(b, &result)
+		}
+	default:
+		var hub *reap.Hub
+		hub, err = x.s.reapHub()
+		if err == nil && hub != nil {
+			host := reap.HubHost{Hub: hub, Machine: rec.Host}
+			err = host.Hub.Command(lookupCtx, host.Machine, "job.result", map[string]string{"job": label}, &result)
+		} else if err == nil {
+			outcome = "no_hub"
+			err = errors.New("hub unavailable")
+		}
+	}
+	if rec.Host != "" && err == nil {
+		switch {
+		case !result.Found:
+			outcome = "not_found"
+		case len(result.Findings) == 0 || string(result.Findings) == "null":
+			switch result.FindingsError {
+			case "missing", "too_large", "not_json", "schema":
+				outcome = result.FindingsError
+			default:
+				outcome = "invalid_response"
+			}
+		default:
+			if _, err := parseFindings(result.Findings, x.diff); err != nil {
+				outcome = "invalid_findings"
+			} else {
+				outcome, findings = "found", result.Findings
+			}
+		}
+	}
+	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
+	switch outcome {
+	case "found", "not_found", "missing", "too_large", "not_json", "schema", "no_hub":
+		return findings, false
+	default:
+		return nil, true
+	}
+}
+
+// availableFindings checks the legacy sources once for a finished pane.
+func (x *panewireExecutor) availableFindings(ctx context.Context, label, path string) ([]byte, bool, error) {
+	lane := x.s.Config.Review.Panewire.Lane
+	if lane != "" {
+		b, err := x.announced(ctx, lane, label)
+		if err != nil {
+			return nil, false, err
+		}
+		if b != nil {
+			return b, true, nil
+		}
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
 // collect is the legacy findings path, kept for one release for panes whose
 // job record has no result: the handoffkeep attachment announced on the
 // findings lane, else the file in the local job directory, which exists only
@@ -640,17 +924,7 @@ func (x *panewireExecutor) announced(ctx context.Context, lane, label string) ([
 
 // task reads the Mergewake-Task trailer: PR body first, then the head commit.
 func (x *panewireExecutor) task(ctx context.Context) (string, error) {
-	if t := trailer(x.pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	c, e := x.s.GH.Commit(ctx, x.repo.Name, x.pr.Head.SHA)
-	if e != nil {
-		return "", e
-	}
-	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	return "", nil
+	return x.s.prTask(ctx, x.repo, x.pr)
 }
 
 // reviewerFamily names the family the reviewer ran as. The reviewer's hk job
@@ -772,4 +1046,44 @@ func exitStatus(e error) int {
 		return x.ExitCode()
 	}
 	return -1
+}
+
+// reviewerFinished checks only the recorded pane on its recorded host.
+func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integrations.JobRecord, rj reviewerJob) (bool, error) {
+	if rec.Host == "" || rec.PaneID == "" {
+		return false, nil
+	}
+	var ops reviewerPanes
+	if rec.Host == "local" || x.localReviewerHost(rec.Host) {
+		ops = reap.Exec{Runner: x.s.Runner}
+	} else {
+		hub, err := x.s.reapHub()
+		if err != nil {
+			return false, err
+		}
+		if hub == nil {
+			return false, nil
+		}
+		ops = reap.HubHost{Hub: hub, Machine: rec.Host}
+	}
+	panes, err := ops.AllPanes(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range panes {
+		if p.ID != rec.PaneID {
+			continue
+		}
+		agents, err := ops.Panes(ctx)
+		if err != nil {
+			return false, err
+		}
+		for _, a := range agents {
+			if a.ID == p.ID && a.Name == rj.Label && a.Cwd == p.Cwd {
+				return closableStatus[a.Status], nil
+			}
+		}
+		return false, nil
+	}
+	return true, nil
 }

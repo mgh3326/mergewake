@@ -13,13 +13,14 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
-// Reasons use a closed vocabulary: check_failed:<name>, threads_open:<n>,
-// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on and GitHub requires an
-// up-to-date branch) and conflict. The two graded reasons replace threads_open when the policy has a
+// Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, threads_open:<n>,
+// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
+// require_up_to_date) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
@@ -38,6 +39,7 @@ type reviewRecord struct {
 	// still merges the PR as is. It blocks nothing.
 	BaseBehind      bool         `json:"base_behind,omitempty"`
 	ChecksCancelled []string     `json:"checks_cancelled,omitempty"`
+	ChecksSkipped   []string     `json:"checks_skipped,omitempty"`
 	Block           string       `json:"review_block,omitempty"`
 	PatchID         string       `json:"patch_id,omitempty"`
 	Rounds          int          `json:"rounds"`
@@ -121,8 +123,86 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 	}
 }
 
+// cancelledCheckWait is how long a cancelled required check may sit without a
+// newer run before the gate stops waiting for it and blocks.
+const cancelledCheckWait = 30 * time.Minute
+
+// checkSnapshotter is the part of the GitHub client that returns the required
+// checks' states together with when each cancelled run completed, from one
+// read. Evidence without it cannot age a cancellation, so the gate keeps
+// waiting.
+type checkSnapshotter interface {
+	CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, map[string]time.Time, error)
+}
+
+// checkJudgment is what the required checks say about a head. Failed and
+// Expired hold check_failed:<name> and check_cancelled:<name> reasons that
+// block; Waiting holds the check_cancelled:<name> reasons still inside the
+// wait; Cancelled lists every required check whose latest run is cancelled;
+// Skipped lists the skipped or neutral ones, which hold nothing; Pending is
+// set while any check is incomplete or waiting on a rerun.
+type checkJudgment struct {
+	Failed, Expired, Waiting, Cancelled, Skipped []string
+	Pending                                      bool
+}
+
+// judgeChecks folds the required checks' states into what the gate acts on.
+// A cancelled check holds no verdict on the head: it waits for a newer run,
+// and blocks once its completion is cancelledCheckWait old. Every gate judges
+// checks through it.
+func judgeChecks(states map[string]github.CI, required []string, cancelledAt map[string]time.Time, now time.Time) checkJudgment {
+	var j checkJudgment
+	for _, name := range required {
+		switch states[name] {
+		case github.Red:
+			j.Failed = append(j.Failed, "check_failed:"+name)
+		case github.Green:
+		case github.Skipped:
+			j.Skipped = append(j.Skipped, name)
+		case github.Cancelled:
+			j.Cancelled = append(j.Cancelled, name)
+			reason := "check_cancelled:" + name
+			if at := cancelledAt[name]; !at.IsZero() && now.Sub(at) >= cancelledCheckWait {
+				j.Expired = append(j.Expired, reason)
+			} else {
+				j.Waiting = append(j.Waiting, reason)
+				j.Pending = true
+			}
+		default:
+			j.Pending = true
+		}
+	}
+	return j
+}
+
+// judgeHead reads the required checks of sha and judges them. A verdict that
+// would block on an expired cancellation is confirmed against a fresh read
+// first, since a polled read can predate the run that replaced it.
+func (s *Service) judgeHead(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
+	j, e := s.readChecks(ctx, repo, sha, required)
+	if e != nil || len(j.Expired) == 0 {
+		return j, e
+	}
+	return s.readChecks(github.FreshEvidence(ctx), repo, sha, required)
+}
+
+func (s *Service) readChecks(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
+	if snap, ok := s.GH.(checkSnapshotter); ok {
+		states, at, e := snap.CheckSnapshot(ctx, repo, sha, required)
+		if e != nil {
+			return checkJudgment{}, e
+		}
+		return judgeChecks(states, required, at, s.now()), nil
+	}
+	states, e := s.GH.CheckStates(ctx, repo, sha, required)
+	if e != nil {
+		return checkJudgment{}, e
+	}
+	return judgeChecks(states, required, nil, s.now()), nil
+}
+
 // mergeGate evaluates the repo session's merge gate once for head H:
-// every required check green or completed without a verdict on H, no unresolved review threads (or, under a
+// every required check green or skipped on H (a cancelled one waits for a rerun, then blocks), no unresolved review threads (or, under a
 // graded policy, no unfixed blocking or unanswered triage findings), the
 // review completion marker mergewake/reviews/<pr>/<H>-done present, the
 // base branch an ancestor of H, and the PR mergeable. A review covers a patch,
@@ -132,24 +212,23 @@ func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github
 // (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
+	v, err := s.mergeGateResult(ctx, r, pr, p, baseHead)
+	if err == nil {
+		tracing.Verdict(ctx, v.State, v.Reasons)
+	}
+	return v, err
+}
+
+func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
-	states, e := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
 	if e != nil {
 		return v, e
 	}
-	pending := false
-	for _, name := range p.RequiredChecks {
-		switch states[name] {
-		case github.Red:
-			v.Reasons = append(v.Reasons, "check_failed:"+name)
-		case github.Green:
-		case github.Cancelled:
-			v.Review.ChecksCancelled = append(v.Review.ChecksCancelled, name)
-		default:
-			pending = true
-		}
-	}
-	if pending {
+	v.Reasons = append(v.Reasons, j.Failed...)
+	v.Reasons = append(v.Reasons, j.Expired...)
+	v.Review.ChecksCancelled, v.Review.ChecksSkipped = j.Cancelled, j.Skipped
+	if j.Pending {
 		// A sibling failure is already final for this head, and so is a
 		// conflict: GitHub runs no pull_request workflow for a conflicting PR,
 		// so its checks never appear. Otherwise the incomplete evidence stays
@@ -161,6 +240,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		if len(v.Reasons) == 0 {
 			v.State = "pending"
 		}
+		v.Reasons = append(v.Reasons, j.Waiting...)
 		// The review record stays readable while CI runs.
 		s.readReviewRecord(ctx, r, pr, &v)
 		return v, nil
@@ -281,10 +361,11 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, e
 	}
 	if !fresh {
-		// A base that moved on blocks only when GitHub requires an up-to-date
-		// branch ("behind"). A conflict-free PR it can merge as is lands; the
-		// stale base is recorded for information.
-		if pr.MergeableState == "behind" {
+		// A base that moved on blocks only when the policy requires an
+		// up-to-date branch and GitHub reports the PR "behind". Otherwise a
+		// conflict-free PR lands as is, post-merge CI checks the composed
+		// result, and the stale base is recorded for information.
+		if p.RequireUpToDate && pr.MergeableState == "behind" {
 			v.Reasons = append(v.Reasons, "base_stale")
 		} else {
 			v.Review.BaseBehind = true

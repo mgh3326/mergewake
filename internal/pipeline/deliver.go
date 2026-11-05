@@ -212,17 +212,7 @@ func mustFix(s string) bool {
 
 // prTask reads the Mergewake-Task trailer: PR body first, then the head commit.
 func (s *Service) prTask(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	if t := trailer(pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-	if e != nil {
-		return "", e
-	}
-	if t := trailer(c.Commit.Message, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		return t, nil
-	}
-	return "", nil
+	return s.prTrailer(ctx, r, pr, "Mergewake-Task", integrations.TaskID.MatchString)
 }
 
 // terminalJob reports the hk job states after which the author attempt no
@@ -266,14 +256,27 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 			}
 		}
 	}
-	// Explicit PR routing is evidence of ownership; a repo/desk default is not.
-	lane, via, e := s.notifyLane(ctx, r, pr)
+	// Explicit PR routing is evidence of ownership: a Notify-Lane trailer, then
+	// the task's lane unless it is the desk. A repo/desk default is not.
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
 	if e != nil {
 		return rt, e
 	}
-	if via == "notify-lane trailer" {
-		rt.lane, rt.via = lane, via
+	if laneName.MatchString(notify) {
+		rt.lane, rt.via = notify, "notify-lane trailer"
 		return rt, nil
+	}
+	if l, ok := s.Sink.(interface {
+		Lane(context.Context, string) (string, error)
+	}); task != "" && ok {
+		lane, e := l.Lane(ctx, task)
+		if e != nil {
+			return rt, e
+		}
+		if laneName.MatchString(lane) && lane != desk {
+			rt.lane, rt.via = lane, "task "+task
+			return rt, nil
+		}
 	}
 	rt.lane, rt.via = desk, "unknown author; desk"
 	return rt, nil

@@ -20,14 +20,16 @@ import (
 // fakeReapHub answers the panewire hub's node-command endpoints for one
 // machine, node-a, whose only agent sits in the merged PR's worktree.
 type fakeReapHub struct {
-	mu       sync.Mutex
-	agents   map[string]any // the node-a row of GET /v1/nodes/agents
-	composer map[string]any
-	capture  map[string]any
-	close    map[string]any
-	forbid   map[string]bool // paths or ops answered 403 scope_forbidden
-	wtHead   string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
-	wtPaths  map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
+	mu             sync.Mutex
+	agents         map[string]any // the node-a row of GET /v1/nodes/agents
+	jobResult      json.RawMessage
+	jobResultError string
+	composer       map[string]any
+	capture        map[string]any
+	close          map[string]any
+	forbid         map[string]bool // paths or ops answered 403 scope_forbidden
+	wtHead         string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
+	wtPaths        map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
 	// removeOutcome is worktree.remove's answer; "removed" when empty.
 	removeOutcome string
 	commands      []map[string]any
@@ -35,7 +37,8 @@ type fakeReapHub struct {
 	// checkouts); dropClosed and dropRemoved make a closed pane leave the
 	// lists and a removed worktree stop inspecting, as on a real node.
 	detached    map[string]bool
-	foreign     map[string]bool // cwds whose worktree belongs to another repository
+	foreign     map[string]bool   // cwds whose worktree belongs to another repository
+	tops        map[string]string // cwd → worktree toplevel, when the cwd is a subdirectory
 	dropClosed  bool
 	dropRemoved bool
 }
@@ -96,10 +99,23 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				if h.foreign[cwd] {
 					origin = "git@github.com:example/other.git"
 				}
-				result = map[string]any{"worktree": map[string]any{"path": cwd, "branch": branch, "head": head, "origin_url": origin, "common": "/repo/.git"}}
+				top := cwd
+				if t := h.tops[cwd]; t != "" {
+					top = t
+				}
+				result = map[string]any{"worktree": map[string]any{"path": top, "branch": branch, "head": head, "origin_url": origin, "common": "/repo/.git"}}
 			}
 		case "pane.read":
 			result = h.composer
+		case "job.result":
+			if h.jobResultError != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": h.jobResultError})
+				return
+			}
+			result = h.jobResult
+			if len(h.jobResult) == 0 {
+				result = json.RawMessage(`{"found":false}`)
+			}
 		case "job.done":
 			result = map[string]any{"outcome": "done"}
 		case "pane.capture":
@@ -126,8 +142,18 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request"})
 				return
 			}
+			// The node refuses a detached worktree unless the request says
+			// detached, and a branch worktree when it does (panewire
+			// node_worktree.go worktree.remove).
+			args := body["args"].(map[string]any)
+			wantDetached, _ := args["detached"].(bool)
 			outcome := h.removeOutcome
-			if outcome == "" {
+			switch isDetached := h.detached[args["cwd"].(string)]; {
+			case isDetached && !wantDetached:
+				outcome = "detached"
+			case !isDetached && wantDetached:
+				outcome = "not_detached"
+			case outcome == "":
 				outcome = "removed"
 			}
 			if h.dropRemoved && outcome == "removed" {
@@ -193,7 +219,7 @@ func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
 	removes := hub.ops("worktree.remove")
-	if len(removes) != 1 || len(removes[0]) != 4 || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
+	if len(removes) != 1 || len(removes[0]) != 5 || removes[0]["detached"] != false || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
 		t.Fatalf("remove args: %#v", removes)
 	}
 }

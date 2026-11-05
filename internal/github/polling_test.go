@@ -86,7 +86,7 @@ func TestThrottleWaitIsLogged(t *testing.T) {
 			w.Header().Set("X-RateLimit-Remaining", "3")
 			w.Header().Set("X-RateLimit-Reset", "4102444800")
 			w.Write([]byte(`{}`))
-		case "/interval":
+		case "/repos/o/r/events":
 			w.Header().Set("X-Poll-Interval", "30")
 			w.Write([]byte(`{}`))
 		default:
@@ -132,11 +132,11 @@ func TestThrottleWaitIsLogged(t *testing.T) {
 	c.BaseURL = server.URL
 	c.Stderr = buf
 	c.Polling = true
-	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+	if _, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
-	_, _ = c.request(ctx, "GET", "/interval", "application/json", nil)
+	_, _ = c.request(ctx, "GET", "/repos/o/r/events", "application/json", nil)
 	cancel()
 	if line := buf.String(); !strings.Contains(line, "poll interval") || !strings.Contains(line, "HTTP 200") {
 		t.Fatalf("log %q", line)
@@ -155,7 +155,7 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits[r.URL.Path]++
 		switch r.URL.Path {
-		case "/interval":
+		case "/repos/o/r/events":
 			w.Header().Set("X-Poll-Interval", "30")
 		case "/retry":
 			w.Header().Set("Retry-After", "30")
@@ -170,7 +170,7 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 	buf := &bytes.Buffer{}
 	c.Stderr = buf
 	for i := 0; i < 2; i++ {
-		if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+		if _, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil); e != nil {
 			t.Fatal(e)
 		}
 	}
@@ -183,15 +183,15 @@ func TestPollIntervalOnlyInPollingLoops(t *testing.T) {
 	c = New("")
 	c.BaseURL = server.URL
 	c.Polling = true
-	hits["/interval"] = 0
-	if _, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil {
+	hits["/repos/o/r/events"] = 0
+	if _, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
-	if b, e := c.request(context.Background(), "GET", "/interval", "application/json", nil); e != nil || string(b) != `{}` {
+	if b, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil); e != nil || string(b) != `{}` {
 		t.Fatalf("polling replay = %s %v", b, e)
 	}
-	if hits["/interval"] != 1 {
-		t.Fatalf("polling client ignored poll interval: %d server hits", hits["/interval"])
+	if hits["/repos/o/r/events"] != 1 {
+		t.Fatalf("polling client ignored poll interval: %d server hits", hits["/repos/o/r/events"])
 	}
 
 	// Retry-After still throttles one-shot clients.
@@ -228,11 +228,11 @@ func TestPollIntervalServesCacheOrSkips(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gets[r.URL.Path]++
 		switch r.URL.Path {
-		case "/cached":
+		case "/repos/o/r/events":
 			w.Header().Set("ETag", `"e"`)
 			w.Header().Set("X-Poll-Interval", "300")
 			w.Write([]byte(`{"v":1}`))
-		case "/uncached":
+		case "/orgs/o/events":
 			w.Header().Set("X-Poll-Interval", "300")
 			w.Write([]byte(`{"v":2}`))
 		default:
@@ -245,30 +245,30 @@ func TestPollIntervalServesCacheOrSkips(t *testing.T) {
 	c.Polling = true
 	c.Stderr = io.Discard
 
-	for _, path := range []string{"/cached", "/uncached"} {
+	for _, path := range []string{"/repos/o/r/events", "/orgs/o/events"} {
 		if _, e := c.request(context.Background(), "GET", path, "application/json", nil); e != nil {
 			t.Fatal(path, e)
 		}
 	}
-	b, e := c.request(context.Background(), "GET", "/cached", "application/json", nil)
+	b, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil)
 	if e != nil || string(b) != `{"v":1}` {
 		t.Fatalf("%s %v", b, e)
 	}
 	// An uncached key inside its poll window replays its last body instead of
 	// being skipped: a skip here left PR reviews unstarted round after round.
-	if b, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); e != nil || string(b) != `{"v":2}` {
+	if b, e := c.request(context.Background(), "GET", "/orgs/o/events", "application/json", nil); e != nil || string(b) != `{"v":2}` {
 		t.Fatalf("replay = %s %v", b, e)
 	}
 	if _, e := c.request(context.Background(), "GET", "/other", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
-	if gets["/cached"] != 1 || gets["/uncached"] != 1 || gets["/other"] != 1 {
+	if gets["/repos/o/r/events"] != 1 || gets["/orgs/o/events"] != 1 || gets["/other"] != 1 {
 		t.Fatalf("gets %v", gets)
 	}
 
 	// Without Polling the interval is still ignored for one-shot commands.
 	c.Polling = false
-	if _, e := c.request(context.Background(), "GET", "/uncached", "application/json", nil); e != nil {
+	if _, e := c.request(context.Background(), "GET", "/orgs/o/events", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -291,13 +291,13 @@ func TestMutationDropsPollWindows(t *testing.T) {
 	c.Polling = true
 	c.Stderr = io.Discard
 	ctx := context.Background()
-	if _, e := c.request(ctx, "GET", "/pr", "application/json", nil); e != nil {
+	if _, e := c.request(ctx, "GET", "/repos/o/r/events", "application/json", nil); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := c.request(ctx, "POST", "/comment", "application/json", []byte(`{}`)); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := c.request(ctx, "GET", "/pr", "application/json", nil); e != nil {
+	if _, e := c.request(ctx, "GET", "/repos/o/r/events", "application/json", nil); e != nil {
 		t.Fatalf("read after mutation = %v", e)
 	}
 	if gets != 2 {
@@ -320,7 +320,7 @@ func TestPollReplayOnlyInsideLiveWindowForPollingClients(t *testing.T) {
 	c.Polling = true
 	c.Stderr = io.Discard
 	get := func() string {
-		b, e := c.request(context.Background(), "GET", "/k", "application/json", nil)
+		b, e := c.request(context.Background(), "GET", "/events", "application/json", nil)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -348,9 +348,7 @@ func TestPollReplayOnlyInsideLiveWindowForPollingClients(t *testing.T) {
 	}
 }
 
-// An unclaimed review ref answers 404 with a poll window. The daemon reads it
-// twice per round; the second read must replay the 404, not skip, or the
-// review never starts. A mutation drops the replay.
+// A polling endpoint can replay a 404 inside its window; a mutation drops it.
 func TestPollReplaysNotFoundInsideWindow(t *testing.T) {
 	n := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +366,7 @@ func TestPollReplaysNotFoundInsideWindow(t *testing.T) {
 	c.Polling = true
 	c.Stderr = io.Discard
 	for i := 0; i < 2; i++ {
-		_, e := c.request(context.Background(), "GET", "/repos/o/r/git/ref/heads/x", "application/json", nil)
+		_, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil)
 		if !NotFound(e) {
 			t.Fatalf("read %d: want a 404, got %v", i+1, e)
 		}
@@ -379,7 +377,7 @@ func TestPollReplaysNotFoundInsideWindow(t *testing.T) {
 	if _, e := c.request(context.Background(), "POST", "/repos/o/r/git/refs", "application/json", []byte(`{}`)); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := c.request(context.Background(), "GET", "/repos/o/r/git/ref/heads/x", "application/json", nil); !NotFound(e) || n != 2 {
+	if _, e := c.request(context.Background(), "GET", "/repos/o/r/events", "application/json", nil); !NotFound(e) || n != 2 {
 		t.Fatalf("after a mutation the ref must be read again: %v, %d hits", e, n)
 	}
 }
@@ -547,5 +545,74 @@ func TestRouteTemplateKeepsEmbeddedHexAndLabelsNumbers(t *testing.T) {
 		if got := routeTemplate(tt.route); got != tt.want {
 			t.Errorf("routeTemplate(%q) = %q; want %q", tt.route, got, tt.want)
 		}
+	}
+}
+
+func TestPollScopeGitRef404(t *testing.T) {
+	hits := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("X-Poll-Interval", "300")
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer s.Close()
+	c := New("")
+	c.BaseURL = s.URL
+	c.Polling = true
+	var log bytes.Buffer
+	c.Stderr = &log
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, err := c.request(ctx, "GET", "/repos/o/r/git/ref/heads/marker", "application/json", nil)
+		cancel()
+		if !NotFound(err) {
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	if hits != 2 || log.Len() != 0 {
+		t.Fatalf("hits=%d log=%q", hits, log.String())
+	}
+}
+
+func TestPollScopeRoutes(t *testing.T) {
+	for _, tt := range []struct {
+		path    string
+		polling bool
+	}{
+		{"/events", true}, {"/repos/o/r/events?per_page=100", true}, {"/orgs/o/events", true},
+		{"/users/u/events", true}, {"/users/u/events/public", true}, {"/users/u/events/orgs/o", true},
+		{"/users/u/received_events", true}, {"/users/u/received_events/public", true},
+		{"/notifications", true}, {"/repos/o/r/notifications", true},
+		{"/repos/o/r/pulls", false}, {"/repos/o/r/git/ref/heads/events", false},
+		{"/repos/o/r/events/1", false}, {"/repos/o/r/issues/1/notifications", false},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			hits := 0
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits++
+				w.Header().Set("X-Poll-Interval", "60")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer s.Close()
+			c := New("")
+			c.BaseURL = s.URL
+			c.Polling = true
+			c.Stderr = io.Discard
+			for i := 0; i < 2; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				_, err := c.request(ctx, "GET", tt.path, "application/json", nil)
+				cancel()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := 2
+			if tt.polling {
+				want = 1
+			}
+			if hits != want {
+				t.Fatalf("hits=%d, want %d", hits, want)
+			}
+		})
 	}
 }

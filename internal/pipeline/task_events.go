@@ -25,6 +25,16 @@ type taskEventRecord struct {
 	Error     string                        `json:"error,omitempty"`
 }
 
+// fieldsRefusedRecord is the audit row of an hk that answered 400 to the
+// optional head/base/merge/reviews fields: the event was resent without them.
+// It names the hk error code only, never the payload.
+type fieldsRefusedRecord struct {
+	Source    string `json:"source"`
+	Task      string `json:"task"`
+	SourceRef string `json:"source_ref"`
+	Code      string `json:"code"`
+}
+
 // postOutcome is what postTaskEvent did with one event.
 type postOutcome int
 
@@ -48,6 +58,12 @@ const (
 // mergewake.revert and nil otherwise. Every post, failed or not, is one
 // hk-task-event audit row.
 func (s *Service) postTaskEvent(ctx context.Context, r config.Repo, pr github.Pull, source string, revert *github.Pull, at time.Time) postOutcome {
+	return s.postTaskEventWith(ctx, r, pr, source, revert, at, nil)
+}
+
+// postTaskEventWith is postTaskEvent for a mergewake.review event that also
+// carries reviews, one record per posted pass.
+func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr github.Pull, source string, revert *github.Pull, at time.Time, reviews []integrations.ReviewRecord) postOutcome {
 	hk, ok := s.Sink.(integrations.TaskEventPoster)
 	if !ok || !r.TaskEventsOn() {
 		return postGated
@@ -78,6 +94,13 @@ func (s *Service) postTaskEvent(ctx context.Context, r config.Repo, pr github.Pu
 	if revert != nil {
 		ev.RevertPR, ev.RevertedPR = row.SourceRef, ev.PR
 	}
+	ev.HeadSHA, ev.BaseSHA = integrations.SHA(pr.Head.SHA), integrations.SHA(pr.Base.SHA)
+	if source == integrations.SourceMerge {
+		ev.MergeSHA = s.mergeCommit(ctx, r, pr)
+	}
+	if source == integrations.SourceReview && len(reviews) > 0 {
+		ev.Reviews = reviews[:min(len(reviews), integrations.MaxReviewRecords)]
+	}
 	res, e := hk.PostTaskEvent(ctx, ev)
 	if e != nil {
 		row.Error = e.Error()
@@ -85,7 +108,61 @@ func (s *Service) postTaskEvent(ctx context.Context, r config.Repo, pr github.Pu
 		row.Result = &res
 	}
 	_ = s.audit(r.Name, "hk-task-event", row, false)
+	if e == nil && res.FieldsRefused != "" {
+		_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused}, false)
+	}
 	return postSent
+}
+
+// mergeCommitBudget bounds the merge commit read, so a stalled GitHub cannot
+// spend the deadline the event post itself needs.
+const mergeCommitBudget = 5 * time.Second
+
+// mergeCommit reads the merge commit of the just-merged pr, or "" when GitHub
+// does not show the PR merged yet, the read fails or it exceeds
+// mergeCommitBudget: the event then goes without merge_sha rather than not at
+// all.
+func (s *Service) mergeCommit(ctx context.Context, r config.Repo, pr github.Pull) string {
+	ctx, cancel := context.WithTimeout(ctx, mergeCommitBudget)
+	defer cancel()
+	merged, e := s.GH.Pull(ctx, r.Name, pr.Number)
+	if e != nil || !merged.Merged {
+		return ""
+	}
+	return integrations.SHA(merged.MergeCommitSHA)
+}
+
+// passRecord is the hk reviews[] record of one posted pass: what the pass
+// reviewed (head, base, patch), who produced it and how many findings of each
+// severity it posted. Fields mergewake does not know here stay empty.
+func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Finding, contractSource string, started, finished time.Time) integrations.ReviewRecord {
+	rec := integrations.ReviewRecord{
+		ReviewedHead:   pr.Head.SHA,
+		ReviewedBase:   integrations.SHA(pr.Base.SHA),
+		PatchID:        integrations.Token(receipt.Patch),
+		Round:          receipt.Round,
+		Pass:           receipt.Pass,
+		Lens:           integrations.Token(receipt.Lens),
+		Family:         integrations.Token(receipt.Family),
+		Executor:       integrations.Token(receipt.Executor),
+		Fallback:       receipt.Fallback != "",
+		ContractSource: integrations.Token(contractSource),
+		StartedAt:      &started,
+		FinishedAt:     &finished,
+	}
+	for _, f := range findings {
+		switch f.Severity {
+		case "critical":
+			rec.Critical++
+		case "high", "blocking":
+			rec.High++
+		case "medium", "major":
+			rec.Medium++
+		case "low", "minor":
+			rec.Low++
+		}
+	}
+	return rec
 }
 
 // taskEventKeys is the per-repo record of events already posted, so a poll

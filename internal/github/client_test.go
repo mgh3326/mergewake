@@ -286,8 +286,17 @@ func TestLatestRejectsWrongTagCommit(t *testing.T) {
 	}
 }
 func TestRevertOverlapAndCASLatch(t *testing.T) {
-	for _, overlap := range []bool{false, true} {
-		t.Run(fmt.Sprint(overlap), func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		overlap  bool
+		trailers string
+	}{
+		{"marker", false, ""},
+		{"trailers", false, "Mergewake-Task: 42\nMergewake-Grade: B\nMergewake-Tier: T1\nMergewake-Notify-Lane: team"},
+		{"overlap", true, ""},
+	} {
+		overlap := tc.overlap
+		t.Run(tc.name, func(t *testing.T) {
 			latched := false
 			prs, trees := 0, 0
 			c := api(t, func(w http.ResponseWriter, r *http.Request) {
@@ -348,13 +357,26 @@ func TestRevertOverlapAndCASLatch(t *testing.T) {
 					reply(w, Ref{SHA: strings.Repeat("d", 40)})
 				case strings.HasSuffix(p, "/pulls") && r.Method == "POST":
 					prs++
+					var payload struct {
+						Body string `json:"body"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					want := tc.trailers
+					if want == "" {
+						want = "Mergewake-Recovery: " + strings.Repeat("b", 40)
+					}
+					if !strings.HasSuffix(payload.Body, want) {
+						t.Fatalf("body: %q", payload.Body)
+					}
 					reply(w, map[string]string{"html_url": "https://github.com/example/project/pull/8"})
 				default:
 					t.Error("unexpected", r.Method, p)
 					http.NotFound(w, r)
 				}
 			})
-			_, e := c.Revert(context.Background(), "example/project", "main", strings.Repeat("c", 40), strings.Repeat("b", 40), 7)
+			_, e := c.RevertWithTrailers(context.Background(), "example/project", "main", strings.Repeat("c", 40), strings.Repeat("b", 40), 7, tc.trailers)
 			if overlap {
 				if e == nil || trees != 0 || prs != 0 {
 					t.Fatalf("overlap wrote: %d %d %v", trees, prs, e)
@@ -363,7 +385,7 @@ func TestRevertOverlapAndCASLatch(t *testing.T) {
 				if e != nil || prs != 1 {
 					t.Fatal(e)
 				}
-				if _, e = c.Revert(context.Background(), "example/project", "main", strings.Repeat("c", 40), strings.Repeat("b", 40), 7); e == nil || prs != 1 {
+				if _, e = c.RevertWithTrailers(context.Background(), "example/project", "main", strings.Repeat("c", 40), strings.Repeat("b", 40), 7, tc.trailers); e == nil || prs != 1 {
 					t.Fatal("second recovery escaped latch")
 				}
 			}
@@ -438,6 +460,33 @@ func TestMergedPullsFiltersBaseAndBoundsScan(t *testing.T) {
 	}
 	if len(pulls) != 2 || pulls[0].Number != 1 || pulls[1].Number != 4 {
 		t.Fatalf("%+v", pulls)
+	}
+}
+
+func TestAllClosedPullsReadsEveryPageMergedOrNot(t *testing.T) {
+	pages := 0
+	merged := time.Now().UTC().Format(time.RFC3339)
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if q := r.URL.Query(); q.Get("state") != "closed" || q.Get("base") != "" {
+			t.Errorf("query %v", q)
+		}
+		if r.URL.Query().Get("page") == "1" {
+			batch := make([]Pull, 100)
+			for i := range batch {
+				batch[i] = Pull{Number: i + 1, State: "closed"}
+			}
+			reply(w, batch)
+			return
+		}
+		reply(w, []Pull{{Number: 101, State: "closed", MergedAt: &merged, Base: Ref{Ref: "release"}}})
+	})
+	pulls, e := c.AllClosedPulls(context.Background(), "example/project")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if pages != 2 || len(pulls) != 101 || pulls[100].Number != 101 {
+		t.Fatalf("pages=%d pulls=%d", pages, len(pulls))
 	}
 }
 

@@ -103,6 +103,33 @@ Session hosts where agent panes may run, used only by `reap`.
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
+**Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
+is a one-shot pass, not part of the daemon loop, over worktrees whose PR merged
+at least 14 days ago, however long ago (the daemon only sees merges inside
+`scan_after`; this ignores that window). It reads every closed PR of the repo and follows
+`Mergewake-Task` → hk task → bound job → the job record's host and cwd. It asks
+the node about that cwd (`worktree.inspect`) and removes the worktree only
+through the node's guarded `worktree.remove` (`detached:false`), and only when
+the PR is merged into the base at least 14 days ago, the head is the merged
+head or inside the merged work, no pane or process is in it, and the node
+finds it clean. The node decides cleanliness at removal; a plan never probes
+it, so a plan row says `would-remove` with reason `node guard decides
+cleanliness`. Closed-unmerged PRs, worktrees of other repos, branches with an open
+PR, detached worktrees and anything unclassifiable are kept with
+the reason; `mwr-*` reviewer checkouts, attached or detached, are left to the
+reviewer sweep and get no row. A final node refusal (`ignored-files`, `dirty`, `worktree-changed` and similar)
+is recorded as `refused` and never retried by a rerun; a refusal that says try
+again (`busy`, `pane-in-use`, `pane-scan-failed`, `git_too_old`) is recorded as
+`kept` and asked again on the next run. Just before each removal the sweep
+re-reads open PRs and re-inspects the worktree, and keeps it if the branch has
+an open PR or the checkout changed. Only PRs whose head is in the repo itself
+count: a fork's branch of the same name neither blocks nor selects a worktree.
+The newest closed PR of the branch decides, bound to a job or not. Every worktree gets one `legacy-sweep` row in `reap.jsonl` (plans too),
+and each host ends with a summary of counts by result and reason. PRs with no
+trailer, no bound job or no job record cannot be reached this way and are only
+counted. Only panewire-hub hosts can be swept. The daemon's reap ignores
+`legacy-sweep` rows.
+
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role close merged-PR sessions, then clean their worktrees once they
 age out. For each merged PR on a configured repo's base branch, every host is
@@ -929,11 +956,14 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
-| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only when the base moved ahead of the head and GitHub reports the PR `behind` (branch protection requires an up-to-date branch). Otherwise a conflict-free PR with a moved base is not blocked, its branch is not updated, and the land and notify records carry `base_behind: true`. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
+| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only with `require_up_to_date: true`; without it no PR is updated for a moved base. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
+| `require_up_to_date` | `false` | Hold a head whose base moved ahead as `base_stale` when GitHub reports the PR `behind` (branch protection requires an up-to-date branch), in both the review gate and the bot-patch gate; with `auto_update_branch` on, the branch is then updated. Absent or `false`: a conflict-free PR with a moved base is not held and its branch is not updated; the land and notify records carry `base_behind: true`, and the main-branch CI checks the composed result after the merge. A conflict blocks as `conflict` either way. Must be a boolean. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
+
+| `bot_updates` | Absent | Opt-in landing of a dependency bot's patch updates without review; see [Dependency-bot patch updates](#dependency-bot-patch-updates). |
 
 Each blocking rule has:
 
@@ -1000,6 +1030,40 @@ true) clears an outdated finding by anyone but `review.login`: a block finding
 (a CodeRabbit `major` included) once its reviewer has reviewed the current
 head. The other `review_gate` keys stay parseable but do not affect the land
 gate.
+
+### Dependency-bot patch updates
+
+A bot's PR has no `Mergewake-Task` trailer, so no reviewer can be spawned for
+it. `daemon.pr.skip_bots` drops such PRs; `bot_updates` lets a repository say
+which bots' patch updates land on their own and which files they may change:
+
+```yaml
+bot_updates:
+  authors: ["renovate[bot]"]
+  paths: ["**/package-lock.json", "**/pnpm-lock.yaml", "uv.lock", "**/package.json"]
+  land: patch   # the only value
+```
+
+A PR by a listed bot (the exact login, and a GitHub `Bot` account) skips
+`skip_bots` and review. It is landed by `land`, bound to its head SHA, with
+`reason: bot-patch` in the land record, only when all of these hold:
+
+- every changed file matches `paths`, and the PR classifies `routine`;
+- every update row in the body is a patch bump. The body must hold a table with
+  a `Change` column (the Renovate layout, `` `8.3.4` -> `8.3.6` ``). An `Update`
+  column names the type; without one the versions decide: same major and
+  minor, higher patch. A body with no such table, or a version that is not
+  plain `x.y.z`, is "update type unknown";
+- the required checks are green as the review gate judges them;
+- GitHub reports the PR mergeable, up to date where the base requires it, with
+  no unresolved thread.
+
+Any other PR of a listed bot is told to the desk once per head as a
+`BOT_UPDATE` lane event naming the reasons, and nothing else is done with it.
+A pending check or an unknown mergeable state waits without a notice. Shadow
+mode and `--dry-run` never merge; the land record says what would happen, and
+only dry-run stays silent. Other bots stay dropped by `skip_bots`, and the
+review gate of every other PR is unchanged.
 
 ### Patch-id review verdicts
 
@@ -1305,8 +1369,7 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `review_missing`, `base_stale` (only when GitHub requires an
-up-to-date branch), `conflict`. Pending or
+`triage_unanswered:<n>`), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
@@ -1411,12 +1474,16 @@ The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` remains readable for compatibility and no longer controls daemon
 escalation. Shadow and dry-run modes do not retry reviews or write retry state.
 `daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
-and landing. They still count as open for outcome reconciliation.
+and landing, except a bot the repository's policy lists under `bot_updates`.
+They still count as open for outcome reconciliation.
 
 `daemon.pr.review_parallel` bounds how many PRs of one repository a PR pass
 reviews at once; the default is `4`, the maximum is `32`, and `1` reviews one
 PR at a time. Each PR's review is followed by its findings delivery,
-notification and land; those settle steps run one PR at a time. Repositories still run one after another.
+notification and land; those settle steps run one PR at a time within a
+repository. The PR role runs all configured repositories at once, so the bound
+applies to each repository, not to the daemon; no global reviewer cap exists.
+The other roles visit repositories one after another.
 
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,

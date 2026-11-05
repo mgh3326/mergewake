@@ -66,6 +66,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		State           string   `json:"state"`
 		Reasons         []string `json:"reasons,omitempty"`
 		ChecksCancelled []string `json:"checks_cancelled,omitempty"`
+		ChecksSkipped   []string `json:"checks_skipped,omitempty"`
 		ReviewBlock     string   `json:"review_block,omitempty"`
 		BaseBehind      bool     `json:"base_behind,omitempty"`
 		Lane            string   `json:"lane,omitempty"`
@@ -73,7 +74,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Sent            bool     `json:"sent"`
 		Deduped         bool     `json:"deduped,omitempty"`
 		Error           string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ChecksSkipped: v.Review.ChecksSkipped, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
 	if !o.Reporting() {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
@@ -102,13 +103,24 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	summary := pr.Title
 	if v.State == "blocked" {
-		summary = strings.Join(v.Reasons, "; ")
+		cancelled := make(map[string]bool, len(v.Review.ChecksCancelled))
+		for _, name := range v.Review.ChecksCancelled {
+			cancelled["check_cancelled:"+name] = true
+		}
+		annotated := make([]string, 0, len(v.Reasons))
+		for _, reason := range v.Reasons {
+			if cancelled[reason] {
+				reason += " (rerun it)"
+			}
+			annotated = append(annotated, reason)
+		}
+		summary = strings.Join(annotated, "; ")
 		if v.Review.Block != "" {
 			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
 		}
 	}
-	if n := len(v.Review.ChecksCancelled); v.State == "ready" && n > 0 {
-		summary += fmt.Sprintf(" | %d required check(s) cancelled: %s", n, strings.Join(v.Review.ChecksCancelled, ", "))
+	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
+		summary += fmt.Sprintf(" | %d required check(s) skipped: %s", n, strings.Join(v.Review.ChecksSkipped, ", "))
 	}
 	if n := v.Review.Findings.DismissedBlocking; v.State == "ready" && n > 0 {
 		// A dismissed critical/high no longer holds the gate; the desk still
@@ -267,7 +279,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
-		Type: verdictType(state, via),
+		Type: verdictType(state, summary, via, s.isDeskLane(lane)),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
 		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
@@ -277,7 +289,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
-				Type: verdictType(state, via),
+				Type: verdictType(state, summary, via, s.isDeskLane(fallback)),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
@@ -397,7 +409,7 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 		ID:   fmt.Sprintf("mergewake-ready-%s-%d-%s-reminder-%d", r.Name, pr.Number, pr.Head.SHA, c.Repeats),
 		Text: textFor(lane, rvia),
 		Lane: lane,
-		Type: "ready",
+		Type: verdictType("ready", "", via, s.isDeskLane(lane)),
 	})
 	if e != nil {
 		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
@@ -411,31 +423,9 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 // configured notifier lane. The returned rule names the choosing source and is
 // recorded in the event text; a sink read error retries rather than reroutes.
 func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
-	message := ""
-	fetched := false
-	headMessage := func() (string, error) {
-		if !fetched {
-			fetched = true
-			c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
-			if e != nil {
-				return "", e
-			}
-			message = c.Commit.Message
-		}
-		return message, nil
-	}
-	task := ""
-	if t := trailer(pr.Body, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-		task = t
-	}
-	if task == "" {
-		msg, e := headMessage()
-		if e != nil {
-			return "", "", e
-		}
-		if t := trailer(msg, "Mergewake-Task"); integrations.TaskID.MatchString(t) {
-			task = t
-		}
+	task, e := s.prTask(ctx, r, pr)
+	if e != nil {
+		return "", "", e
 	}
 	if task != "" {
 		if l, ok := s.Sink.(interface {
@@ -450,13 +440,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 			}
 		}
 	}
-	notify := trailer(pr.Body, "Mergewake-Notify-Lane")
-	if notify == "" {
-		msg, e := headMessage()
-		if e != nil {
-			return "", "", e
-		}
-		notify = trailer(msg, "Mergewake-Notify-Lane")
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	if e != nil {
+		return "", "", e
 	}
 	if laneName.MatchString(notify) {
 		return notify, "notify-lane trailer", nil
@@ -479,7 +465,7 @@ func authorAction(summary string) bool {
 		if reason == "conflict" {
 			return true
 		}
-		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:"} {
+		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
 			}
@@ -487,9 +473,36 @@ func authorAction(summary string) bool {
 	}
 	return false
 }
-func verdictType(state, via string) string {
+
+// isDeskLane reports whether lane is the desk lane (notifier.fallback_lane, else
+// notifier.lane). An empty lane goes to the notifier's own default, the desk.
+func (s *Service) isDeskLane(lane string) bool {
+	desk := s.Config.Notifier.FallbackLane
+	if desk == "" {
+		desk = s.Config.Notifier.Lane
+	}
+	return lane == "" || lane == desk
+}
+
+// verdictType is the panewire type a lane event is declared with. READY and
+// BLOCKED interrupt and must be acked, so only the verdicts that need action
+// from their receiver keep them: an author lane gets READY as info (mergewake
+// merges it itself), and a BLOCKED whose only reason is review_missing as
+// progress (mergewake's own reviewer is running). The desk keeps both
+// unchanged. A review_missing carrying a block detail waits on the author and
+// stays blocked.
+func verdictType(state, summary, via string, desk bool) string {
+	if state == botNoticeState {
+		return "decision"
+	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
+	}
+	switch {
+	case state == "ready" && !desk:
+		return "info"
+	case state == "blocked" && summary == "review_missing":
+		return "progress"
 	}
 	return eventType(state)
 }

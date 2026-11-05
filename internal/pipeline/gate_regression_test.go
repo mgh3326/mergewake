@@ -62,6 +62,7 @@ func TestLandStaleBaseBlocks(t *testing.T) {
 	markReviewed(g)
 	g.stale = true
 	g.pull.MergeableState = "behind"
+	g.policyExtra = "require_up_to_date: true\n"
 	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
 		t.Fatal(err)
 	}

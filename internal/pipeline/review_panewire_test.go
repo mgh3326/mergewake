@@ -50,6 +50,8 @@ type panewireRunner struct {
 	usageErr     error
 	quotaCalls   int // quota tool invocations (recommend, usage, gate)
 	quotaActions [][]string
+	closes       [][]string
+	closeErrs    []error // the result of each `panewire job close` in turn (nil succeeds)
 	spawns       [][]string
 	git          [][]string
 	headless     int
@@ -68,6 +70,17 @@ type panewireRunner struct {
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
+	}
+	if command == "panewire" && len(args) > 1 && args[0] == "node" && args[1] == "job-result" {
+		return []byte(`{"found":false}`), nil
+	}
+	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
+		r.closes = append(r.closes, slices.Clone(args))
+		var e error
+		if len(r.closeErrs) > 0 {
+			e, r.closeErrs = r.closeErrs[0], r.closeErrs[1:]
+		}
+		return nil, e
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "inbox" {
 		if args[1] == "ack" {
@@ -352,7 +365,7 @@ func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, context: strings.Repeat("context ", 10000)}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (bool, error) { return true, nil })
+	out, e := x.runPass(ctx, &passPlan{pass: 2, lens: "state-risk"}, func() (string, bool, error) { return "lease", true, nil })
 	if e != nil || len(runner.spawns) != 0 || len(out.skips) != 1 || !strings.Contains(out.skips[0].Reason, "publish brief: attachment service unavailable") {
 		t.Fatalf("spawns=%d outcome=%+v error=%v", len(runner.spawns), out, e)
 	}
@@ -525,7 +538,7 @@ func TestPanewireCancelWhileCollectingWrapsOnce(t *testing.T) {
 	runner.afterRun = cancel
 	diff, _ := g.Diff(ctx, r.Name, 7)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
-	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	_, e := x.runPass(ctx, &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })
 	if !errors.Is(e, context.Canceled) || strings.Count(e.Error(), context.Canceled.Error()) != 1 {
 		t.Fatalf("%v", e)
 	}
@@ -799,12 +812,12 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	diff, _ := g.Diff(context.Background(), r.Name, 7)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
-	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (bool, error) { return true, nil })
+	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })
 	if e != nil || out.executor != "panewire" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}
-	// A minute of the ten is kept back for posting.
-	if w := arg(runner.spawns[0], "--wait-timeout"); w != "539" && w != "540" {
+	// Each pass waits at most 90 seconds.
+	if w := arg(runner.spawns[0], "--wait-timeout"); w != "90" {
 		t.Fatalf("--wait-timeout %s", w)
 	}
 }

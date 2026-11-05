@@ -294,7 +294,7 @@ func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost,
 		c.record("skipped", "worktree identity changed; not removed")
 		return
 	}
-	removed, err := host.WorktreeRemove(ctx, tree.Path, c.p.head, c.x.pr.Base.Ref, nil)
+	removed, err := host.WorktreeRemove(ctx, tree.Path, c.p.head, c.x.pr.Base.Ref, nil, true)
 	if err != nil {
 		c.record("error", "worktree remove: "+err.Error())
 		return
