@@ -40,6 +40,7 @@ type fakeGH struct {
 	updateErr                                                    error
 	updateHook                                                   func()
 	nextHead                                                     string
+	nextBase                                                     string // base ref from the second Pull on
 	pull                                                         github.Pull
 	enabled, blocking, reviewed, gate                            bool
 	requiredBots                                                 []string
@@ -84,6 +85,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 	p := g.pull
 	if g.pullCalls > 1 && g.nextHead != "" {
 		p.Head.SHA = g.nextHead
+	}
+	if g.pullCalls > 1 && g.nextBase != "" {
+		p.Base.Ref = g.nextBase
 	}
 	return p, nil
 }
