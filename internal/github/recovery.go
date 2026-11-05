@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const RecoveryBranch = "mergewake/recovery"
@@ -34,6 +35,10 @@ func (c *Client) RecoveryActive(ctx context.Context, repo string) (bool, error) 
 // Revert restores only paths whose current blobs still equal the culprit's
 // postimage. Later edits on the same path need an operator rather than a guess.
 func (c *Client) Revert(ctx context.Context, repo, branch, head, culprit string, pr int) (string, error) {
+	return c.RevertWithTrailers(ctx, repo, branch, head, culprit, pr, "")
+}
+
+func (c *Client) RevertWithTrailers(ctx context.Context, repo, branch, head, culprit string, pr int, trailers string) (string, error) {
 	current, e := c.Commit(ctx, repo, head)
 	if e != nil {
 		return "", e
@@ -124,9 +129,15 @@ func (c *Client) Revert(ctx context.Context, repo, branch, head, culprit string,
 	if e = c.CreateRef(ctx, repo, RecoveryBranch, commit.SHA); e != nil {
 		return "", e
 	}
+	if !strings.HasPrefix(trailers, "Mergewake-Task: ") {
+		if trailers != "" {
+			trailers += "\n"
+		}
+		trailers += "Mergewake-Recovery: " + culprit
+	}
 	var pull struct {
 		HTMLURL string `json:"html_url"`
 	}
-	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery tag latch remains until an operator deletes it and any remaining recovery branch.", culprit, pr)}, &pull)
+	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery tag latch remains until an operator deletes it and any remaining recovery branch.", culprit, pr) + "\n\n" + trailers}, &pull)
 	return pull.HTMLURL, e
 }
