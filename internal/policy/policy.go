@@ -361,15 +361,20 @@ func (g ReviewGate) MissingRequiredBots(fs []ReviewFinding, reviews map[string]i
 }
 
 type Policy struct {
-	DeployApproval   []Rule      `yaml:"deploy_approval"`
-	AutoUpdateBranch *bool       `yaml:"auto_update_branch"`
-	Version          int         `yaml:"version"`
-	Enabled          bool        `yaml:"enabled"`
-	RequiredChecks   []string    `yaml:"required_checks"`
-	WatchChecks      []string    `yaml:"watch_checks"`
-	Blocking         []Rule      `yaml:"blocking"`
-	ReviewGate       *ReviewGate `yaml:"review_gate"`
-	FastLane         *FastLane   `yaml:"fast_lane"`
+	DeployApproval   []Rule `yaml:"deploy_approval"`
+	AutoUpdateBranch *bool  `yaml:"auto_update_branch"`
+	// RequireUpToDate opts the repository into holding a head whose base moved
+	// ahead (GitHub reports the PR "behind") as base_stale. Absent or false
+	// lands such a head and records Review.BaseBehind; post-merge CI checks the
+	// composed result.
+	RequireUpToDate bool        `yaml:"require_up_to_date"`
+	Version         int         `yaml:"version"`
+	Enabled         bool        `yaml:"enabled"`
+	RequiredChecks  []string    `yaml:"required_checks"`
+	WatchChecks     []string    `yaml:"watch_checks"`
+	Blocking        []Rule      `yaml:"blocking"`
+	ReviewGate      *ReviewGate `yaml:"review_gate"`
+	FastLane        *FastLane   `yaml:"fast_lane"`
 	// BotUpdates opts the repository into landing a dependency bot's patch
 	// updates without review. Absent keeps every bot PR out of the land path.
 	BotUpdates *BotUpdates `yaml:"bot_updates"`

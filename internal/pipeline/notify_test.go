@@ -161,7 +161,7 @@ func TestNotifyBlockedReasons(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
 			tt.prepare(g)
-			g.policyExtra = "auto_update_branch: false\n"
+			g.policyExtra = "require_up_to_date: true\nauto_update_branch: false\n"
 			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
@@ -485,7 +485,7 @@ func TestNotifyAutoUpdateBranch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
-			g.stale, g.policyExtra, g.findings, g.updateErr = true, tc.extra, tc.findings, tc.updateErr
+			g.stale, g.policyExtra, g.findings, g.updateErr = true, "require_up_to_date: true\n"+tc.extra, tc.findings, tc.updateErr
 			g.pull.MergeableState = "behind"
 			for i := 0; i < 2; i++ {
 				if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
@@ -513,6 +513,7 @@ func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
 	g.pull.MergeableState = "behind"
+	g.policyExtra = "require_up_to_date: true\n"
 	if err := s.NotifyPR(context.Background(), r, 7, Options{DryRun: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -551,6 +552,7 @@ func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
 	g.pull.MergeableState = "behind"
+	g.policyExtra = "require_up_to_date: true\n"
 	if err := s.NotifyPR(context.Background(), r, 7, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -566,6 +568,7 @@ func TestAutoUpdateMarkerWriteFailureRecovers(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
 	g.pull.MergeableState = "behind"
+	g.policyExtra = "require_up_to_date: true\n"
 	var marker string
 	g.updateHook = func() {
 		entries, err := os.ReadDir(filepath.Join(s.state(r.Name), "base-updates"))

@@ -526,6 +526,7 @@ func TestLand(t *testing.T) {
 			g.stale = tt.stale
 			if tt.stale {
 				g.pull.MergeableState = "behind"
+				g.policyExtra = "require_up_to_date: true\n"
 			}
 			if tt.reviewed {
 				markReviewed(g)

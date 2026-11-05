@@ -84,9 +84,9 @@ func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pu
 		return v, e
 	}
 	if !fresh {
-		// As in the review gate: only a base GitHub requires up to date blocks;
+		// As in the review gate: only a base the policy requires up to date blocks;
 		// otherwise the stale base is recorded for information.
-		if pr.MergeableState == "behind" {
+		if p.RequireUpToDate && pr.MergeableState == "behind" {
 			v.Reasons = append(v.Reasons, "base_stale")
 		} else {
 			v.Review.BaseBehind = true
