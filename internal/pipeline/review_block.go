@@ -25,7 +25,10 @@ const (
 	blockMissingTrailer = "blocked: missing-task-trailer"
 	blockMissingMarker  = "blocked: task-missing-T-marker"
 	blockUnknownFamily  = "blocked: author-family-unknown"
+	blockSecretLike     = "blocked: secret-like-content"
 )
+
+var secretLikeBlock = reviewBlock{blockSecretLike, "The diff contains a string that looks like a credential. Remove it, or if it is a test fixture make it obviously fake (for example, use a placeholder), and push a new head."}
 
 // reviewBlock is what stops one head's review, and the fix for the comment.
 type reviewBlock struct {

@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -156,6 +157,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if !complete {
 		if b, blocked := s.reviewBlockFor(ctx, r, pr); blocked {
 			return s.blockReview(ctx, r, pr, b, o)
+		}
+		state, err := s.ledger().Read()
+		if err != nil {
+			return err
+		}
+		if state.Latest[outcomes.Key(r.Name, n)].ReviewBlocked[pr.Head.SHA] == blockSecretLike {
+			return s.blockReview(ctx, r, pr, secretLikeBlock, o)
 		}
 	}
 	if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
@@ -390,6 +398,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		tracing.Reviewer(passSpan, out.reviewer, privateNames...)
 		tracing.Finish(passSpan)
 		if e != nil {
+			if errors.Is(e, errSecretLikeBrief) {
+				return errors.Join(s.blockReview(ctx, r, pr, secretLikeBlock, o), e)
+			}
 			var lost *reviewResultLost
 			if errors.As(e, &lost) {
 				auditErr := s.audit(r.Name, "review-result-lost", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
