@@ -985,9 +985,9 @@ The defaults grade CodeRabbit `critical` and `major` and codex `P1` as block
 with a reason, never deferred), codex `P2` as triage, and CodeRabbit
 `minor`/`nitpick` and codex `P3` as advisory. For the configured `review.login`,
 `critical`/`high` block (the reviewer prompt's `blocking` grades like `high`),
-while `medium` findings require triage on blocking-class PRs and remain advisory
+while `medium` and `major` findings require triage on blocking-class PRs and remain advisory
 on routine PRs. Its `low` findings remain advisory. Set
-`review_gate.own_medium_triage: false` to disable the default medium rule;
+`review_gate.own_medium_triage: false` to disable the default medium and major rule;
 when omitted or true, it is enabled.
 
 Rules are `{author, severity: [...], classes: [...]}` lists under `block` and

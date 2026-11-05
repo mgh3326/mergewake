@@ -207,6 +207,7 @@ func TestOwnMediumTriageDefault(t *testing.T) {
 		want                  int
 	}{
 		{"blocking unanswered", "blocking", "medium", false, 1},
+		{"blocking major unanswered", "blocking", "major", false, 1},
 		{"blocking answered", "blocking", "medium", true, 0},
 		{"routine unanswered", "routine", "medium", false, 0},
 		{"blocking low", "blocking", "low", false, 0},

@@ -130,7 +130,7 @@ func (g ReviewGate) WithDefaults() ReviewGate {
 
 // WithOwnLogin adds default rules for the trusted review identity unless the
 // policy names it in the corresponding list. Critical and high findings block;
-// medium findings require triage on blocking-class PRs unless disabled.
+// medium and major findings require triage on blocking-class PRs unless disabled.
 func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 	g = g.WithDefaults()
 	own := NormalizeAuthor(login)
@@ -149,7 +149,7 @@ func (g ReviewGate) WithOwnLogin(login string) ReviewGate {
 		g.Block = append(append([]ReviewGateRule(nil), g.Block...), ReviewGateRule{Author: own, Severity: []string{"critical", "high", "blocking"}})
 	}
 	if (g.OwnMediumTriage == nil || *g.OwnMediumTriage) && !names(g.Triage) {
-		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium"}, Classes: []string{"blocking"}})
+		g.Triage = append(append([]ReviewGateRule(nil), g.Triage...), ReviewGateRule{Author: own, Severity: []string{"medium", "major"}, Classes: []string{"blocking"}})
 	}
 	return g
 }
