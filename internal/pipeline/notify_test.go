@@ -150,6 +150,7 @@ func TestNotifyBlockedReasons(t *testing.T) {
 		}, "threads_open:2"},
 		{"stale base", func(g *fakeGH) {
 			g.stale = true
+			g.pull.MergeableState = "behind"
 		}, "base_stale"},
 		{"conflict", func(g *fakeGH) {
 			no := false
@@ -485,6 +486,7 @@ func TestNotifyAutoUpdateBranch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
 			g.stale, g.policyExtra, g.findings, g.updateErr = true, tc.extra, tc.findings, tc.updateErr
+			g.pull.MergeableState = "behind"
 			for i := 0; i < 2; i++ {
 				if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
 					t.Fatal(err)
@@ -510,6 +512,7 @@ func TestNotifyAutoUpdateBranch(t *testing.T) {
 func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
+	g.pull.MergeableState = "behind"
 	if err := s.NotifyPR(context.Background(), r, 7, Options{DryRun: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -547,6 +550,7 @@ func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
 func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
+	g.pull.MergeableState = "behind"
 	if err := s.NotifyPR(context.Background(), r, 7, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -561,6 +565,7 @@ func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
 func TestAutoUpdateMarkerWriteFailureRecovers(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.stale = true
+	g.pull.MergeableState = "behind"
 	var marker string
 	g.updateHook = func() {
 		entries, err := os.ReadDir(filepath.Join(s.state(r.Name), "base-updates"))

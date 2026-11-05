@@ -25,8 +25,8 @@ var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 // NotifyPR emits one lane event when the merge-gate verdict for a PR head
 // becomes ready or blocked: READY once every required check is green, no
-// review thread is unresolved, the review -done marker exists, the base is an
-// ancestor of the head, and the PR is mergeable; BLOCKED with the
+// review thread is unresolved, the review -done marker exists, the PR is mergeable and,
+// when GitHub requires an up-to-date branch, the base is an ancestor of the head; BLOCKED with the
 // closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
 // (PR, head, verdict) notifies once across restarts, except that a READY PR
 // still open and READY on the same head is notified again every
@@ -70,12 +70,13 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Reasons         []string `json:"reasons,omitempty"`
 		ChecksCancelled []string `json:"checks_cancelled,omitempty"`
 		ReviewBlock     string   `json:"review_block,omitempty"`
+		BaseBehind      bool     `json:"base_behind,omitempty"`
 		Lane            string   `json:"lane,omitempty"`
 		Via             string   `json:"via,omitempty"`
 		Sent            bool     `json:"sent"`
 		Deduped         bool     `json:"deduped,omitempty"`
 		Error           string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block}
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
 	if o.DryRun {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
