@@ -9,6 +9,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -467,6 +468,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			continue
 		}
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
+			// A review GitHub stored before the call failed is a posted pass: a
+			// later run finds its receipt and skips it, so the event of this run
+			// is the only one that can carry its record.
+			if stored, readErr := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login); readErr == nil && slices.ContainsFunc(stored, func(p github.PassReceipt) bool { return p.Pass == plan.pass }) {
+				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+			}
 			return e
 		}
 		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))

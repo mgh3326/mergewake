@@ -164,29 +164,40 @@ var hkErrorCode = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 // without the optional fields, so the event is never lost to them; the result
 // then carries FieldsRefused.
 func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEventResult, error) {
-	res, e := h.postTaskEvent(ctx, ev)
+	res, used, e := h.postTaskEvent(ctx, ev, 0)
 	var hk *HKError
 	if e != nil && ev.extended() && errors.As(e, &hk) && hk.Status == http.StatusBadRequest {
 		code := hk.Code
 		if code == "" {
 			code = "invalid"
 		}
-		if res, e = h.postTaskEvent(ctx, ev.plain()); e == nil {
+		// The resend spends what is left of the EventAttempts budget, and at
+		// least one try: the event is never lost to the new fields.
+		if res, _, e = h.postTaskEvent(ctx, ev.plain(), max(1, h.attempts()-used)); e == nil {
 			res.FieldsRefused = code
 		}
 	}
 	return res, e
 }
 
-func (h Handoffkeep) postTaskEvent(ctx context.Context, ev TaskEvent) (TaskEventResult, error) {
+func (h Handoffkeep) attempts() int {
+	if h.EventAttempts < 1 {
+		return DefaultEventAttempts
+	}
+	return h.EventAttempts
+}
+
+// postTaskEvent is one send of ev with up to attempts tries (0: the full
+// EventAttempts budget); it returns the tries used.
+func (h Handoffkeep) postTaskEvent(ctx context.Context, ev TaskEvent, attempts int) (TaskEventResult, int, error) {
 	c, e := hkJobEndpoint()
 	if e != nil {
-		return TaskEventResult{}, e
+		return TaskEventResult{}, 0, e
 	}
-	attempts, backoff, timeout := h.EventAttempts, h.EventBackoff, h.EventTimeout
 	if attempts < 1 {
-		attempts = DefaultEventAttempts
+		attempts = h.attempts()
 	}
+	backoff, timeout := h.EventBackoff, h.EventTimeout
 	if backoff <= 0 {
 		backoff = DefaultEventBackoff
 	}
@@ -195,7 +206,7 @@ func (h Handoffkeep) postTaskEvent(ctx context.Context, ev TaskEvent) (TaskEvent
 	}
 	body, e := json.Marshal(ev)
 	if e != nil {
-		return TaskEventResult{}, e
+		return TaskEventResult{}, 0, e
 	}
 	client := c.client(timeout)
 	for try := 1; ; try++ {
@@ -205,11 +216,11 @@ func (h Handoffkeep) postTaskEvent(ctx context.Context, ev TaskEvent) (TaskEvent
 			if e != nil && try > 1 {
 				e = fmt.Errorf("%w (after %d attempts)", e, try)
 			}
-			return res, e
+			return res, try, e
 		}
 		select {
 		case <-ctx.Done():
-			return res, fmt.Errorf("%w (after %d attempts)", e, try)
+			return res, try, fmt.Errorf("%w (after %d attempts)", e, try)
 		case <-time.After(backoff << (try - 1)):
 		}
 	}

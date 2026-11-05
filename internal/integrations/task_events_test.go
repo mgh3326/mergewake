@@ -157,3 +157,37 @@ func TestPostTaskEventFieldsRefused(t *testing.T) {
 		t.Fatalf("404: %v bodies=%d", e, len(bodies))
 	}
 }
+
+// The compatibility resend spends what is left of EventAttempts: two 5xx
+// tries, then the 400, leave one try for the plain event; the budget is never
+// exceeded, and the resend always gets at least one try.
+func TestPostTaskEventFieldsRefusedSharesBudget(t *testing.T) {
+	var hits, flaky atomic.Int32
+	flaky.Store(2)
+	hkEventServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		b, _ := io.ReadAll(r.Body)
+		switch {
+		case n <= flaky.Load():
+			w.WriteHeader(503)
+		case strings.Contains(string(b), "head_sha"):
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":"invalid_event"}`))
+		default:
+			w.WriteHeader(503)
+		}
+	})
+	url := "https://github.com/example/project/pull/7"
+	ev := TaskEvent{Source: SourcePR, SourceRef: url, TaskID: 5, PR: url, HeadSHA: strings.Repeat("a", 40)}
+	_, e := Handoffkeep{EventAttempts: 4, EventBackoff: time.Millisecond}.PostTaskEvent(context.Background(), ev)
+	// 503, 503, 400 (3 of 4 tries), then the resend gets the last one.
+	if e == nil || hits.Load() != 4 {
+		t.Fatalf("%v hits=%d", e, hits.Load())
+	}
+	hits.Store(0)
+	flaky.Store(0)
+	_, e = Handoffkeep{EventAttempts: 1, EventBackoff: time.Millisecond}.PostTaskEvent(context.Background(), ev)
+	if e == nil || hits.Load() != 2 {
+		t.Fatalf("one-try budget: %v hits=%d", e, hits.Load())
+	}
+}

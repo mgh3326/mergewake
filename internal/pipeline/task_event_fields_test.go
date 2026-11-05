@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -183,5 +184,54 @@ func TestPassRecordTokens(t *testing.T) {
 	}
 	if _, ok := m["family"]; ok {
 		t.Fatal("empty family sent")
+	}
+}
+
+// failingPostGH stores the review and then fails the call, as a lost
+// response after GitHub accepted the write does.
+type failingPostGH struct{ *fakeGH }
+
+func (g failingPostGH) PostReview(ctx context.Context, repo string, n int, sha string, f []github.Finding, meta github.PassReceipt) error {
+	_ = g.fakeGH.PostReview(ctx, repo, n, sha, f, meta)
+	return errors.New("response lost")
+}
+
+// A pass GitHub stored although PostReview returned an error is still a
+// posted pass: its record goes in the event, because no later run will post it.
+func TestTaskEventReviewsStoredDespiteError(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	s.GH = failingPostGH{g}
+	if e := s.Review(context.Background(), r, 7, "openai", Options{Observed: true}); e == nil {
+		t.Fatal("review did not return the PostReview error")
+	}
+	got := hk.received()
+	if len(got) != 1 || len(got[0].Reviews) != 1 || got[0].Reviews[0].Pass != 1 || got[0].Reviews[0].ReviewedHead != shaA {
+		t.Fatalf("events %+v", got)
+	}
+}
+
+// slowPullGH blocks the PR read until its context ends.
+type slowPullGH struct{ *fakeGH }
+
+func (g slowPullGH) Pull(ctx context.Context, repo string, n int) (github.Pull, error) {
+	<-ctx.Done()
+	return github.Pull{}, ctx.Err()
+}
+
+// A stalled merge commit read costs merge_sha, not the event: the read has its
+// own budget, and the post still has its deadline.
+func TestTaskEventMergeSHALookupBounded(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	s.GH = slowPullGH{g}
+	start := time.Now()
+	if got := s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceMerge, nil, time.Now()); got != postSent {
+		t.Fatalf("outcome %v", got)
+	}
+	if time.Since(start) > mergeCommitBudget+5*time.Second {
+		t.Fatalf("took %v", time.Since(start))
+	}
+	ev := hk.received()
+	if len(ev) != 1 || ev[0].MergeSHA != "" || ev[0].HeadSHA != shaA {
+		t.Fatalf("events %+v", ev)
 	}
 }

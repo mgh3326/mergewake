@@ -114,10 +114,17 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	return postSent
 }
 
+// mergeCommitBudget bounds the merge commit read, so a stalled GitHub cannot
+// spend the deadline the event post itself needs.
+const mergeCommitBudget = 5 * time.Second
+
 // mergeCommit reads the merge commit of the just-merged pr, or "" when GitHub
-// does not show the PR merged yet or the read fails: the event then goes
-// without merge_sha rather than not at all.
+// does not show the PR merged yet, the read fails or it exceeds
+// mergeCommitBudget: the event then goes without merge_sha rather than not at
+// all.
 func (s *Service) mergeCommit(ctx context.Context, r config.Repo, pr github.Pull) string {
+	ctx, cancel := context.WithTimeout(ctx, mergeCommitBudget)
+	defer cancel()
 	merged, e := s.GH.Pull(ctx, r.Name, pr.Number)
 	if e != nil || !merged.Merged {
 		return ""
