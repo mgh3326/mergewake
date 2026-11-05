@@ -13,6 +13,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/quota"
 	"github.com/mgh3326/mergewake/internal/reviewer"
+	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
 // errPassPending means another host holds the pass claim for this head.
@@ -123,10 +124,15 @@ func (h *headlessExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, e
 			}
 		}
-		output, runErr := reviewer.Run(ctx, s.Runner, plan.invocation, withContext(promptFor(plan.lens), h.context)+h.diff, h.dir, s.Config.TokenEnv)
+		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+		output, runErr := reviewer.Run(runCtx, s.Runner, plan.invocation, withContext(promptFor(plan.lens), h.context)+h.diff, h.dir, s.Config.TokenEnv)
+		tracing.Finish(runSpan)
 		if runErr == nil {
 			var findings []github.Finding
-			if findings, e = parseFindings(output, h.diff); e == nil {
+			_, collectSpan := tracing.Span(ctx, "mergewake.collect")
+			findings, e = parseFindings(output, h.diff)
+			tracing.Finish(collectSpan)
+			if e == nil {
 				out.reviewer, out.family, out.findings = name, h.family(name), findings
 				return out, nil
 			}
