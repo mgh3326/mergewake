@@ -58,6 +58,7 @@ type fakeGH struct {
 	files                                                        []policy.File
 	ci                                                           github.CI
 	mergeCount, revertCount, postCount, claimCount, publishCount int
+	revertTrailers                                               string
 	head                                                         string
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
@@ -306,6 +307,10 @@ func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string,
 	g.revertCount++
 	g.latch = true
 	return "https://github.com/example/project/pull/9", nil
+}
+func (g *fakeGH) RevertWithTrailers(ctx context.Context, repo, branch, head, culprit string, pr int, trailers string) (string, error) {
+	g.revertTrailers = trailers
+	return g.Revert(ctx, repo, branch, head, culprit, pr)
 }
 func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
 	if g.diffErr != nil {
