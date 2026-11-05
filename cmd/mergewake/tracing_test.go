@@ -170,35 +170,55 @@ func TestTracingPassTreeAndPrivacy(t *testing.T) {
 	t.Log("tree: pr pass → repo o/one → PR 1, PR 2 → observe, settle (deliver, notify, land), review → pass 1 → spawn_wait, collect")
 }
 
-func TestTracingOffAndSampling(t *testing.T) {
-	t.Setenv(tracing.DSNEnv, "")
-	t.Setenv(tracing.RateEnv, "1")
-	rec := &traceTransport{}
-	ctx, stop := tracing.Start(context.Background(), io.Discard, rec)
-	defer stop()
-	if sentry.GetHubFromContext(ctx) != nil {
-		t.Fatal("client without DSN")
+func TestTracingPassSampling(t *testing.T) {
+	for _, tc := range []struct {
+		name, dsn, rate, role string
+		wantEvent             bool
+	}{
+		{"pr at zero", "https://key@example.invalid/1", "0", "pr", true},
+		{"reap at zero", "https://key@example.invalid/1", "0", "reap", true},
+		{"release at zero", "https://key@example.invalid/1", "0", "release", true},
+		{"rollout at zero", "https://key@example.invalid/1", "0", "rollout", true},
+		{"watch at zero", "https://key@example.invalid/1", "0", "watch", false},
+		{"watch at one", "https://key@example.invalid/1", "1", "watch", true},
+		{"no DSN", "", "1", "pr", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tracing.DSNEnv, tc.dsn)
+			t.Setenv(tracing.RateEnv, tc.rate)
+			rec := &traceTransport{}
+			ctx, stop := tracing.Start(context.Background(), io.Discard, rec)
+			if tc.dsn == "" && sentry.GetHubFromContext(ctx) != nil {
+				t.Fatal("client without DSN")
+			}
+			ctx, pass := tracing.Pass(ctx, tc.role)
+			_, child := tracing.Span(ctx, "test.child")
+			tracing.Finish(child)
+			tracing.Finish(pass)
+			stop()
+			events := rec.snapshot()
+			if tc.wantEvent {
+				if len(events) != 1 || events[0].Transaction != tc.role+" pass" || events[0].Tags["role"] != tc.role {
+					t.Fatalf("expected %s transaction, got %+v", tc.role, events)
+				}
+				if len(events[0].Spans) != 1 || events[0].Spans[0].Op != "test.child" {
+					t.Fatalf("missing child span: %+v", events[0].Spans)
+				}
+			} else if len(events) != 0 {
+				t.Fatalf("unexpected events: %+v", events)
+			}
+		})
 	}
-	_, span := tracing.Pass(ctx, "pr")
-	tracing.Finish(span)
-	if len(rec.snapshot()) != 0 {
-		t.Fatal("event without DSN")
-	}
+}
+
+func TestTracingInvalidWatchRate(t *testing.T) {
 	t.Setenv(tracing.DSNEnv, "https://key@example.invalid/1")
-	t.Setenv(tracing.RateEnv, "0")
-	ctx, done := tracing.Start(context.Background(), io.Discard, rec)
-	_, span = tracing.Pass(ctx, "pr")
-	tracing.Finish(span)
-	done()
-	if len(rec.snapshot()) != 0 {
-		t.Fatal("event at zero sample rate")
-	}
 	t.Setenv(tracing.RateEnv, "invalid")
 	var logs bytes.Buffer
-	ctx, done = tracing.Start(context.Background(), &logs, rec)
-	defer done()
+	ctx, stop := tracing.Start(context.Background(), &logs, &traceTransport{})
+	defer stop()
 	if got := sentry.GetHubFromContext(ctx).Client().Options().TracesSampleRate; got != 0.2 {
-		t.Fatal(got)
+		t.Fatalf("watch sample rate = %v, want 0.2", got)
 	}
 	if got := strings.Count(logs.String(), "invalid SENTRY_TRACES_SAMPLE_RATE_MERGEWAKE"); got != 1 {
 		t.Fatalf("logs: %q", logs.String())
