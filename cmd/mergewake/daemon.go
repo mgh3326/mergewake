@@ -34,11 +34,10 @@ func (w *lockedWriter) Write(b []byte) (int, error) {
 // runDaemon runs the daemon with crash output armed: a fatal panic in any of
 // its goroutines reaches Sentry on the next start (see crashreport.Run).
 func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
-	return crashreport.Run(s.Config.StateDir, "mergewake", version, func() error {
-		ctx, stop := tracing.Start(ctx, stderr, nil)
-		defer stop()
-		return runDaemonLoops(ctx, s, gh, repo, o, stderr)
-	})
+	ctx, stop := crashreport.StartContext(ctx, s.Config.StateDir, "mergewake", version, stderr)
+	err := runDaemonLoops(ctx, s, gh, repo, o, stderr)
+	stop()
+	return err
 }
 
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {

@@ -19,9 +19,19 @@ const RateEnv = "SENTRY_TRACES_SAMPLE_RATE_MERGEWAKE"
 
 // Start installs an isolated client on ctx only when a DSN is configured.
 func Start(ctx context.Context, log io.Writer, transport sentry.Transport) (context.Context, func()) {
+	ctx, client := StartWithOptions(ctx, log, sentry.ClientOptions{Transport: transport})
+	return ctx, func() {
+		if client != nil {
+			client.Flush(10 * time.Second)
+		}
+	}
+}
+
+// StartWithOptions creates the shared crash and tracing client when configured.
+func StartWithOptions(ctx context.Context, log io.Writer, options sentry.ClientOptions) (context.Context, *sentry.Client) {
 	dsn := strings.TrimSpace(os.Getenv(DSNEnv))
 	if dsn == "" {
-		return ctx, func() {}
+		return ctx, nil
 	}
 	rate := 0.2
 	if raw := strings.TrimSpace(os.Getenv(RateEnv)); raw != "" {
@@ -32,19 +42,22 @@ func Start(ctx context.Context, log io.Writer, transport sentry.Transport) (cont
 			rate = v
 		}
 	}
-	client, err := sentry.NewClient(sentry.ClientOptions{Dsn: dsn, EnableTracing: true, TracesSampleRate: rate, Transport: transport, ServerName: "", BeforeSendTransaction: func(e *sentry.Event, _ *sentry.EventHint) *sentry.Event {
+	options.Dsn = dsn
+	options.EnableTracing = true
+	options.TracesSampleRate = rate
+	options.BeforeSendTransaction = func(e *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 		e.ServerName = ""
 		e.User = sentry.User{}
 		e.Request = nil
 		e.Breadcrumbs = nil
 		return e
-	}})
+	}
+	client, err := sentry.NewClient(options)
 	if err != nil {
 		fmt.Fprintln(log, "unable to initialize Sentry tracing")
-		return ctx, func() {}
+		return ctx, nil
 	}
-	ctx = sentry.SetHubOnContext(ctx, sentry.NewHub(client, sentry.NewScope()))
-	return ctx, func() { client.Flush(10 * time.Second) }
+	return sentry.SetHubOnContext(ctx, sentry.NewHub(client, sentry.NewScope())), client
 }
 
 type enabledKey struct{}
