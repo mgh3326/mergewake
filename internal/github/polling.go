@@ -157,7 +157,27 @@ func (c *Client) logThrottle(w throttle, d time.Duration) {
 	fmt.Fprintf(out, "mergewake: GitHub request throttled: %s (HTTP %d); sleeping %s until %s\n",
 		reason, w.code, d.Round(time.Second), w.until.UTC().Format(time.RFC3339))
 }
-func (c *Client) observeHeaders(h http.Header, code int, key string) {
+
+// pollingEndpoint identifies GitHub's events and notifications polling routes.
+func pollingEndpoint(route string) bool {
+	path := strings.SplitN(route, "?", 2)[0]
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 1 {
+		return parts[0] == "events" || parts[0] == "notifications"
+	}
+	if len(parts) == 4 && parts[0] == "repos" {
+		return parts[3] == "events" || parts[3] == "notifications"
+	}
+	if len(parts) == 3 && (parts[0] == "orgs" || parts[0] == "users") {
+		return parts[2] == "events" || parts[0] == "users" && parts[2] == "received_events"
+	}
+	if len(parts) == 4 && parts[0] == "users" && (parts[2] == "events" || parts[2] == "received_events") {
+		return parts[3] == "public"
+	}
+	return len(parts) == 5 && parts[0] == "users" && parts[2] == "events" && parts[3] == "orgs"
+}
+
+func (c *Client) observeHeaders(h http.Header, code int, key string, polling bool) {
 	p := &c.poll
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -190,7 +210,7 @@ func (c *Client) observeHeaders(h http.Header, code int, key string) {
 	if w.until.After(p.rate.until) {
 		p.rate = w
 	}
-	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); e == nil && seconds > 0 {
+	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); polling && e == nil && seconds > 0 {
 		p.polls[key] = throttle{until: now.Add(time.Duration(min(seconds, 86400)) * time.Second), reason: "poll interval", code: code}
 	}
 }

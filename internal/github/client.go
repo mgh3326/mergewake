@@ -103,7 +103,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	}
 	defer resp.Body.Close()
 	recordRequest(ctx, method, route, resp.StatusCode)
-	c.observeHeaders(resp.Header, resp.StatusCode, key)
+	c.observeHeaders(resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
 	if resp.StatusCode == http.StatusNotModified && method == "GET" {
 		if cached.ETag == "" {
 			return nil, errUncached304
