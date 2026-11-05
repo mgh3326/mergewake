@@ -46,6 +46,13 @@ func (t *traceTransport) snapshot() []*sentry.Event {
 	return append([]*sentry.Event(nil), t.events...)
 }
 
+type traceRunner struct{ *blockingRunner }
+
+func (r traceRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	b, err := r.blockingRunner.Run(ctx, command, args, input, dir)
+	return bytes.ReplaceAll(b, []byte("model=seat-x"), []byte("model=claude")), err
+}
+
 type handlerTransport struct{ handler http.Handler }
 
 func (h handlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -72,7 +79,7 @@ func traceFixture(t *testing.T) *parallelFixture {
 	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	close(runner.release)
 	out := &bytes.Buffer{}
-	service := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
+	service := &pipeline.Service{Config: cfg, GH: gh, Runner: traceRunner{runner}, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
 	return &parallelFixture{s: service, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
@@ -138,6 +145,9 @@ func TestTracingPassTreeAndPrivacy(t *testing.T) {
 		review := has(pr, "mergewake.review")
 		if n == 2 {
 			pass := has(review, "mergewake.review.pass")
+			if pass.Data["reviewer"] != "claude" {
+				t.Fatalf("missing reviewer: %v", pass.Data)
+			}
 			if pass.Data["pass"] != 1 {
 				t.Fatal(pass.Data)
 			}

@@ -96,7 +96,13 @@ func Tag(span *sentry.Span, key, value string) {
 }
 
 // Reviewer records only recognized public reviewer identifiers, never arbitrary configuration text.
-func Reviewer(span *sentry.Span, name string) {
+func Reviewer(span *sentry.Span, name string, excluded ...string) {
+	name = strings.TrimPrefix(name, "panewire:")
+	for _, value := range excluded {
+		if name == value {
+			return
+		}
+	}
 	switch name {
 	case "claude", "codex", "gemini", "devin":
 		Data(span, "reviewer", name)

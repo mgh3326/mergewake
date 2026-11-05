@@ -362,7 +362,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		passCtx, passSpan := tracing.Span(ctx, "mergewake.review.pass")
 		tracing.Data(passSpan, "pass", plan.pass)
 		out, e := x.runPass(passCtx, plan, claim)
-		tracing.Reviewer(passSpan, out.reviewer)
+		privateNames := []string{s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane, s.Config.Review.Panewire.Lane, s.Config.Review.Panewire.Owner}
+		for _, repo := range s.Config.Repos {
+			privateNames = append(privateNames, repo.Lane)
+		}
+		tracing.Reviewer(passSpan, out.reviewer, privateNames...)
 		tracing.Finish(passSpan)
 		if e != nil {
 			var lost *reviewResultLost
