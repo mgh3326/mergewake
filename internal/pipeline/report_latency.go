@@ -222,7 +222,7 @@ func ReviewLatency(ctx context.Context, dir string, repos []config.Repo, login s
 			}
 			for _, pass := range passes {
 				t := pass.SubmittedAt
-				if !pass.Marked || pass.Head != p.Head.SHA || t == nil || t.After(merged) {
+				if pass.Head != p.Head.SHA || t == nil || t.After(merged) {
 					continue
 				}
 				if row.FirstReview == nil || t.Before(*row.FirstReview) {

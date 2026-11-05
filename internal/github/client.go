@@ -464,7 +464,6 @@ type PassReceipt struct {
 type ReviewedPass struct {
 	Head        string
 	SubmittedAt *time.Time
-	Marked      bool
 	PassReceipt
 }
 
@@ -519,7 +518,7 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 			receipt.Pass = next[r.CommitID] + 1
 		}
 		next[r.CommitID] = receipt.Pass
-		out = append(out, ReviewedPass{Head: r.CommitID, SubmittedAt: r.SubmittedAt, Marked: passMarker.MatchString(r.Body), PassReceipt: receipt})
+		out = append(out, ReviewedPass{Head: r.CommitID, SubmittedAt: r.SubmittedAt, PassReceipt: receipt})
 	}
 	return out, nil
 }
