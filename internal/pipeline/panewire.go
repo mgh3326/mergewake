@@ -91,6 +91,7 @@ type panewireExecutor struct {
 	round        int
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
+	movedHead    []reviewerJob // records of older heads whose jobs this run closed
 }
 
 type reviewResultLost struct {
@@ -181,7 +182,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return skip("head branch is not in %s (fork PR); panewire cannot replicate it", x.repo.Name)
 	}
 	// Read the local record first: an active ownerless lease can be ours.
-	rj, resumed, e := x.reviewerJob(plan.pass)
+	rj, resumed, e := x.reviewerJob(ctx, plan.pass)
 	if e != nil {
 		return out, e
 	}
@@ -404,6 +405,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
 		stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
 		tracing.Finish(runSpan)
+		// A fresh spawn refused as held, while this run closed the job of an
+		// older head: close it once more and spawn again, once.
+		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHead) > 0 {
+			var closeErr error
+			for _, old := range x.movedHead {
+				closeErr = errors.Join(closeErr, x.closeMovedHeadJob(ctx, old))
+			}
+			if closeErr != nil {
+				_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
+				return out, errors.Join(e, closeErr)
+			}
+			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+			tracing.Finish(runSpan)
+		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = append(slices.Clone(rj.Args[:len(rj.Args)-2]), "--role", "worker")

@@ -51,6 +51,7 @@ type panewireRunner struct {
 	quotaCalls   int // quota tool invocations (recommend, usage, gate)
 	quotaActions [][]string
 	closes       [][]string
+	closeErr     error // when set, `panewire job close` fails with it
 	spawns       [][]string
 	git          [][]string
 	headless     int
@@ -72,7 +73,7 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
 		r.closes = append(r.closes, slices.Clone(args))
-		return nil, nil
+		return nil, r.closeErr
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "inbox" {
 		if args[1] == "ack" {
