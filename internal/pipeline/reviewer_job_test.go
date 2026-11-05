@@ -364,3 +364,26 @@ func TestReviewerJobConcurrentResumePostsOnce(t *testing.T) {
 	}
 	reviewerJobGone(t, s, r, 1)
 }
+
+func TestReviewerJobActiveLeaseDifferentCommit(t *testing.T) {
+	for _, lease := range []string{"other-lease", ""} {
+		t.Run(lease, func(t *testing.T) {
+			s, g, r, runner, _ := interruptedReviewer(t)
+			g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+			job := readReviewerJob(t, s, r, 1)
+			job.LeaseSHA = lease
+			if err := fsutil.WriteJSON(s.reviewerJobPath(r.Name, 7, 1), job); err != nil {
+				t.Fatal(err)
+			}
+			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			var output bytes.Buffer
+			s.Out = &output
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), `"action":"review-pending"`) || g.postCount != 0 || len(runner.spawns) != 1 {
+				t.Fatalf("output=%s posts=%d spawns=%d", output.String(), g.postCount, len(runner.spawns))
+			}
+		})
+	}
+}

@@ -234,17 +234,17 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if e != nil {
 			return e
 		}
-		_, claimed, e := s.GH.ReviewLease(ctx, r.Name, claimRef(n, pr.Head.SHA, i), ttl)
+		leaseSHA, claimed, e := s.GH.ReviewLease(ctx, r.Name, claimRef(n, pr.Head.SHA, i), ttl)
 		if e != nil {
 			return e
 		}
 		if claimed {
 			x := &panewireExecutor{s: s, repo: r, pr: pr}
-			_, own, err := x.reviewerJob(i)
+			job, own, err := x.reviewerJob(i)
 			if err != nil {
 				return err
 			}
-			if own {
+			if own && job.LeaseSHA != "" && job.LeaseSHA == leaseSHA {
 				missing = append(missing, i)
 				continue
 			}
@@ -354,24 +354,37 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		plan.lens = lens(plan)
 		// A GitHub ref claims this PR head across hosts before any reviewer is
 		// invoked. One claim covers every candidate of the pass.
-		claimed := false
-		claim := func() (bool, error) {
-			if claimed {
-				return true, nil
-			}
+		claim := func() (string, bool, error) {
 			ttl, e := s.reviewLeaseTTL()
 			if e != nil {
-				return false, e
+				return "", false, e
 			}
-			acquired, e := s.GH.ClaimReview(ctx, r.Name, claimRef(n, pr.Head.SHA, plan.pass), pr.Head.SHA, ttl)
-			claimed = acquired
-			if acquired && e == nil && reviewStarted == nil {
-				// This run holds the pass and a reviewer runs next: the
-				// review has started. One event per run, whatever the passes.
-				now := s.now()
-				reviewStarted = &now
+			ref := claimRef(n, pr.Head.SHA, plan.pass)
+			claimer, ok := s.GH.(interface {
+				ClaimReviewWithSHA(context.Context, string, string, string, time.Duration) (string, bool, error)
+			})
+			if !ok {
+				return "", false, errors.New("GitHub client cannot return review lease identity")
 			}
-			return acquired, e
+			sha, acquired, e := claimer.ClaimReviewWithSHA(ctx, r.Name, ref, pr.Head.SHA, ttl)
+			if e != nil {
+				return "", false, e
+			}
+			if acquired {
+				if reviewStarted == nil {
+					now := s.now()
+					reviewStarted = &now
+				}
+				return sha, true, nil
+			}
+			sha, active, e := s.GH.ReviewLease(ctx, r.Name, ref, ttl)
+			if e != nil {
+				return "", false, e
+			}
+			if !active {
+				return "", false, nil
+			}
+			return sha, false, nil
 		}
 		passCtx, passSpan := tracing.Span(ctx, "mergewake.review.pass")
 		tracing.Data(passSpan, "pass", plan.pass)

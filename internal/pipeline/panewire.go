@@ -80,7 +80,7 @@ func (e *reviewResultLost) Error() string {
 	return fmt.Sprintf("reviewer %s finished but its result was lost: %v", e.label, e.cause)
 }
 
-func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (bool, error)) (passOutcome, error) {
+func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (string, bool, error)) (passOutcome, error) {
 	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
 	out := passOutcome{}
 	// Review bounds its context by review.timeout; a caller without a deadline
@@ -150,12 +150,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if e != nil {
 		return out, e
 	}
-	acquired, e := claim()
+	leaseSHA, acquired, e := claim()
 	if e != nil {
 		return out, e
 	}
-	if !acquired && !resumed {
+	if !acquired && (!resumed || leaseSHA == "" || rj.LeaseSHA != leaseSHA) {
 		return out, errPassPending
+	}
+	if acquired && resumed {
+		rj.LeaseSHA = leaseSHA
+		if e = x.saveReviewerJob(rj); e != nil {
+			return out, e
+		}
 	}
 	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix())
 	checkout := filepath.Join(cfg.Checkouts, label)
@@ -276,7 +282,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			// The record names the job before it is spawned, so a wait that
 			// ends early leaves a job the next run can resume.
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now()}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now()}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}

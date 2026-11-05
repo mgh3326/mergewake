@@ -213,6 +213,13 @@ func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl
 	g.claimCount++
 	return true, nil
 }
+func (g *fakeGH) ClaimReviewWithSHA(ctx context.Context, repo, branch, head string, ttl time.Duration) (string, bool, error) {
+	acquired, err := g.ClaimReview(ctx, repo, branch, head, ttl)
+	if !acquired || err != nil {
+		return "", acquired, err
+	}
+	return shaA, true, nil
+}
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
 	fb.HeadSHA = g.pull.Head.SHA

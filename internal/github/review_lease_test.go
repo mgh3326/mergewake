@@ -90,9 +90,12 @@ func TestReviewLeaseAcquisition(t *testing.T) {
 					http.NotFound(w, r)
 				}
 			})
-			got, err := c.ClaimReview(context.Background(), "example/project", branch, testSHA, time.Minute)
+			leaseSHA, got, err := c.ClaimReviewWithSHA(context.Background(), "example/project", branch, testSHA, time.Minute)
 			if got != tt.want || (err != nil) != tt.fail {
 				t.Fatalf("got=%v err=%v", got, err)
+			}
+			if (tt.want && leaseSHA != next) || (!tt.want && leaseSHA != "") {
+				t.Fatalf("lease SHA = %q", leaseSHA)
 			}
 			if tt.present && tt.age < time.Minute && writes != 0 {
 				t.Fatal("live claim changed")
