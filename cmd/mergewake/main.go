@@ -218,6 +218,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	gh := github.New(token)
+	integrations.AttachReviewHistory(gh, sink)
 	if c.GitHubApp != nil {
 		key, e := c.GitHubApp.Key()
 		if e != nil {
@@ -235,7 +236,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 				total += request.Count
 			}
 			cache := counts.CacheStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests})
+			hk := gh.HKReviewStats()
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests, "hk_review_hits": hk.Hits, "hk_review_misses": hk.Misses, "hk_review_mismatches": hk.Mismatches})
 		}()
 	}
 	gh.Stderr = stderr
