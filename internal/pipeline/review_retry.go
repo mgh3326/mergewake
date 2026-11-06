@@ -151,11 +151,17 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		state.Failures++
 	}
 	for _, q := range class.quotas {
-		// A reset not yet reached is waited for; an unknown or past one waits
-		// the initial backoff, so a stale reset cannot respawn at every poll.
+		// A reset not yet reached is waited for, but never longer than the
+		// maximum backoff: panewire's auto seat skips a pool its quota gate
+		// measures exhausted, so the retry need not wait out a far reset. An
+		// unknown or past one waits the initial backoff, so a stale reset
+		// cannot respawn at every poll.
 		at := s.now().Add(initial)
 		if q.resetAt.After(s.now()) {
 			at = q.resetAt
+			if limit := s.now().Add(maximum); at.After(limit) {
+				at = limit
+			}
 		}
 		if at.After(state.Next) {
 			state.Next = at

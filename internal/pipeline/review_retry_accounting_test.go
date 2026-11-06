@@ -59,6 +59,7 @@ func quotaStopped(t *testing.T, endReason string) (*Service, *fakeGH, config.Rep
 func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	reset := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+reset.Format(time.RFC3339))
+	s.Config.Daemon.PR.ReviewRetry.Maximum = "24h" // above the wait, so the reset is not capped
 	old := readReviewerJob(t, s, r, 1)
 	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
 		t.Fatal(err)
@@ -124,11 +125,25 @@ func TestRetryQuotaStopWithoutResetWaitsInitial(t *testing.T) {
 	}
 }
 
+// (h) A reset far ahead (a weekly quota) is not waited out: the retry waits at
+// most the maximum backoff, since panewire skips a pool it measures exhausted.
+func TestRetryQuotaStopFarResetWaitsAtMostMaximum(t *testing.T) {
+	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC).Format(time.RFC3339))
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	st := retryStateOf(t, s, r)
+	if st.Failures != 0 || !st.Next.Equal(c.t.Add(30*time.Minute)) || len(runner.spawns) != 1 {
+		t.Fatalf("state=%+v spawns=%d, want next=%v", st, len(runner.spawns), c.t.Add(30*time.Minute))
+	}
+}
+
 // (c) The next attempt time is in the state file, so a restarted daemon
 // keeps waiting for it.
 func TestRetryQuotaStopSurvivesRestart(t *testing.T) {
 	reset := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+reset.Format(time.RFC3339))
+	s.Config.Daemon.PR.ReviewRetry.Maximum = "24h" // above the wait, so the reset is not capped
 	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
 		t.Fatal(err)
 	}
