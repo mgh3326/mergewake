@@ -645,31 +645,25 @@ func TestReviewerHeadMovedMissingJobDropped(t *testing.T) {
 	reviewerJobGone(t, s, r, 2)
 }
 
-// (c) A close that fails keeps the record and spawns nothing; the next pass
-// closes again.
-func TestReviewerHeadMovedCloseFailureKeepsRecord(t *testing.T) {
+// (c) A close that fails is audited, not fatal: the record is dropped and the
+// new head's reviewer spawns in the same pass.
+func TestReviewerHeadMovedCloseFailureIsSkipped(t *testing.T) {
 	runner := &panewireRunner{family: "openai", closeErrs: []error{panewireExit(1)}}
 	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
-	err := s.Review(context.Background(), r, 7, "", Options{})
-	if err == nil || !strings.Contains(err.Error(), labels[0]) {
-		t.Fatalf("err=%v", err)
-	}
-	if len(runner.spawns) != 0 || g.postCount != 0 {
-		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
-	}
-	if rj := readReviewerJob(t, s, r, 1); rj.Head != shaB || rj.Label != labels[0] {
-		t.Fatalf("record %+v", rj)
-	}
-	if rows := auditRows(t, s, r, "reviewer-head-moved"); len(rows) != 0 {
-		t.Fatalf("audit=%v", rows)
-	}
-	if err = s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.spawns) != 1 || g.postCount != 1 {
-		t.Fatalf("retry spawns=%d posts=%d", len(runner.spawns), g.postCount)
+		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
 	}
 	reviewerJobGone(t, s, r, 1)
+	reviewerJobGone(t, s, r, 2)
+	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 1 || rows[0]["label"] != labels[0] || rows[0]["head"] != shaB || rows[0]["reason"] == "" {
+		t.Fatalf("skipped audit=%v", rows)
+	}
+	if rows := auditRows(t, s, r, "reviewer-head-moved"); len(rows) != 1 || rows[0]["label"] != labels[1] {
+		t.Fatalf("head-moved audit=%v", rows)
+	}
 }
 
 // (d) A fresh spawn refused as held, after this run closed the older head's
@@ -742,28 +736,19 @@ func TestReviewerHeadMovedDryRunLeavesJobAndRecord(t *testing.T) {
 	}
 }
 
-// A repeat close that fails puts the older heads' records back, so the next
-// pass still knows which job to close.
-func TestReviewerHeadMovedRepeatCloseFailureRestoresRecords(t *testing.T) {
+// A repeat close that fails is audited like the first: the spawn is retried
+// once and the records are dropped.
+func TestReviewerHeadMovedRepeatCloseFailureIsSkipped(t *testing.T) {
 	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}, closeErrs: []error{nil, nil, panewireExit(1)}}
 	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
-	err := s.Review(context.Background(), r, 7, "", Options{})
-	if err == nil || len(runner.spawns) != 1 || g.postCount != 0 {
-		t.Fatalf("err=%v spawns=%d posts=%d", err, len(runner.spawns), g.postCount)
-	}
-	for i, pass := range []int{1, 2} {
-		if rj := readReviewerJob(t, s, r, pass); rj.Head != shaB || rj.Label != labels[i] {
-			t.Fatalf("pass %d record %+v", pass, rj)
-		}
-	}
-	// The next run, once the pass lease has lapsed, closes them again and
-	// reviews the new head.
-	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	if err = s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.spawns) != 2 || g.postCount != 1 {
 		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 1 || rows[0]["label"] != labels[0] {
+		t.Fatalf("skipped audit=%v", rows)
 	}
 	reviewerJobGone(t, s, r, 1)
 	reviewerJobGone(t, s, r, 2)

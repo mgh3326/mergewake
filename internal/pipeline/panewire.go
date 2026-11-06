@@ -602,8 +602,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 }
 
 // replaceLostReviewer is the lost path for a resumed reviewer that will not
-// return a result: it audits and notifies, closes the job so its hub claim is
-// released (a job with no record has none), drops the record and runs the pass
+// return a result: it audits and notifies, tries to close the job so its hub claim
+// is released (a job with no record has none), drops the record and runs the pass
 // again once under a new label with the held lease. After a replacement it
 // returns review-unavailable and leaves no record behind.
 func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPlan, rj reviewerJob, job integrations.JobRecord, cause, leaseSHA string) (passOutcome, error) {
@@ -617,11 +617,8 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 		return out, errors.Join(lost, auditErr, noticeErr)
 	}
 	if job.State != "" {
-		if job.OwnerLane == "" {
-			return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
-		}
-		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil {
-			return out, errors.Join(lost, err)
+		if _, err := x.closeReviewerJob(ctx, rj, job, cause); err != nil {
+			return out, err
 		}
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
