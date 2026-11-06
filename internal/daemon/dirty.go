@@ -17,8 +17,11 @@ type Dirty struct {
 	mu    sync.Mutex
 	seq   uint64
 	floor uint64
-	prs   map[prMark]mark
-	shas  map[prMark]mark
+	// pruneAt is the mark count that triggers the next prune: twice what the
+	// last prune left, so pruning costs O(1) per mark.
+	pruneAt int
+	prs     map[prMark]mark
+	shas    map[prMark]mark
 }
 
 type prMark struct {
@@ -64,7 +67,7 @@ func (d *Dirty) Mark(repo string, number int, sha string) {
 	if sha != "" {
 		d.shas[prMark{repo: repo, sha: sha}] = m
 	}
-	if len(d.prs)+len(d.shas) > dirtyPrune {
+	if len(d.prs)+len(d.shas) > min(max(d.pruneAt, dirtyPrune), dirtyMaxLen) {
 		d.prune(m.at)
 	}
 }
@@ -84,6 +87,7 @@ func (d *Dirty) prune(now time.Time) {
 		clear(d.shas)
 		d.floor = d.seq
 	}
+	d.pruneAt = 2 * (len(d.prs) + len(d.shas))
 }
 
 // Seq is the position an evaluation records before it reads anything.

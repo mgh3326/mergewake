@@ -12,7 +12,7 @@ const (
 	headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-func deliver(t *testing.T, d Daemon, event, body string) {
+func deliver(t *testing.T, d *Daemon, event, body string) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
 	defer srv.Close()
@@ -23,11 +23,11 @@ func deliver(t *testing.T, d Daemon, event, body string) {
 	}
 }
 
-func dirtyDaemon(dirty *Dirty) Daemon {
+func dirtyDaemon(dirty *Dirty) *Daemon {
 	var triggered []string
 	d := webhookDaemon(&triggered)
 	d.Webhook.Dirty = dirty
-	return d
+	return &d
 }
 
 // A check_run that carries only its head commit (no pull_requests, as for a
