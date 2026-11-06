@@ -39,7 +39,7 @@ func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p 
 
 func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
-	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks, conflicting(pr))
 	if e != nil {
 		return v, e
 	}
@@ -68,6 +68,7 @@ func (s *Service) botGateResult(ctx context.Context, r config.Repo, pr github.Pu
 	}
 	v.Reasons = append(v.Reasons, j.Failed...)
 	v.Reasons = append(v.Reasons, j.Expired...)
+	v.Reasons = append(v.Reasons, j.Absent...)
 	if j.Pending {
 		// Incomplete checks wait unless the verdict is already final.
 		if conflicting(pr) {

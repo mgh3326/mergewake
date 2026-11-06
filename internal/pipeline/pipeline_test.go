@@ -64,6 +64,8 @@ type fakeGH struct {
 	checks                                                       map[string]github.CI
 	checkNames                                                   map[string]map[string]github.CI
 	cancelledAt                                                  map[string]time.Time
+	// committedAt is the committer date Commit returns by SHA.
+	committedAt map[string]time.Time
 	// staleOnce is the check states the first CheckSnapshot returns, as a
 	// cached read that predates a rerun; snapshots counts the reads.
 	staleOnce                     map[string]github.CI
@@ -299,6 +301,7 @@ func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error)
 	if g.fixtureTask && !strings.Contains(v.Commit.Message, "Mergewake-Task:") {
 		v.Commit.Message += "\nMergewake-Task: 42\n"
 	}
+	v.Commit.Committer.Date = g.committedAt[sha]
 	v.Commit.Author.Name, v.Commit.Author.Email = g.authorName, g.authorEmail
 	v.Commit.Committer.Name, v.Commit.Committer.Email = g.committerName, g.committerEmail
 	if ps := g.parents2[sha]; len(ps) > 0 {

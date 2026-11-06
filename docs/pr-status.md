@@ -19,7 +19,7 @@ fields under `state` `merged` or `closed`.
 | `head` | Newest head known. Equals `gate_head` until a fresh read sees a newer one. |
 | `gate_head` | The head the gate decided on. |
 | `state` | `ready`, `blocked`, `pending`, then `merged` or `closed`. |
-| `reasons` | The gate's closed vocabulary (`review_missing`, `check_failed:<name>`, `threads_open:<n>`, ...). |
+| `reasons` | The gate's closed vocabulary (`review_missing`, `check_failed:<name>`, `check_absent:<name>`, `threads_open:<n>`, ...). |
 | `checks` | Each required check and its state: `green`, `red`, `pending`, `cancelled`, `skipped`. |
 | `review` | `passes` (pass, lens, family) bound to the head, `done` marker, and `inherited_from` when the passes came from an earlier head with the same patch. |
 | `threads` | `blocking` (holds the gate), `other` (triage and advisory), `unresolved` (all unresolved threads; absent when the gate stopped before reading them). |
