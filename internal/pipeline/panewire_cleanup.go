@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -22,6 +23,10 @@ type reviewerPane struct {
 	placement integrations.JobRecord // host and pane id from this spawn's OK line
 	confirmed bool                   // the OK line named a host and a pane
 	hold      string                 // why the pane stays open; empty when the pass is terminal
+	// force closes the pane even while it is working: only a reviewer replaced
+	// past its deadline sets it. The pane's output is saved first, and its name
+	// and cwd must still match.
+	force bool
 	// keepLocalCheckout is set while a local pane still runs in the checkout.
 	keepLocalCheckout *bool
 }
@@ -32,6 +37,7 @@ type reviewerPanes interface {
 	Panes(context.Context) ([]reap.Pane, error)
 	AllPanes(context.Context) ([]reap.Pane, error)
 	Composer(context.Context, reap.Pane) (string, error)
+	Capture(context.Context, reap.Pane, string, *time.Time, bool) (reap.Capture, error)
 	CloseExact(context.Context, reap.Pane) (string, error)
 }
 
@@ -132,13 +138,24 @@ func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
 // the pane this pass spawned and removes its remote detached worktree through
 // the hub's guarded removal. It never changes the review outcome, and it runs
 // on a context detached from the pass so an expired deadline cannot skip it.
-func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerPane) {
+// It reports whether the pane is closed or gone.
+func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerPane) (closed bool) {
 	ctx, cancel := reportContext(parent)
 	defer cancel()
 	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: p.checkout}}
+	defer func() {
+		closed = c.paneClosed || c.paneGone
+		// A forced close that does not close the pane is a skip, never a pass
+		// failure: the replacement has already been decided.
+		if p.force && !closed {
+			_ = x.s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "head": p.head, "pass": p.pass, "label": p.label, "pane": p.placement.PaneID, "reason": c.row.Reason}, false)
+		}
+	}()
 	if !p.confirmed {
 		// The pane's host is unknown, so it may still run in the local checkout.
-		*p.keepLocalCheckout = true
+		if p.keepLocalCheckout != nil {
+			*p.keepLocalCheckout = true
+		}
 		c.record("pending-cleanup", "spawn named no host and pane; checkout kept")
 		return
 	}
@@ -180,12 +197,16 @@ func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerP
 		return
 	}
 	c.removeWorktree(ctx, host, cwd)
+	return
 }
 
 // closeLocal closes a pane on this host. The checkout it runs in is removed by
 // the caller's deferred cleanup once the pane is closed or gone.
 func (c *reviewerCleanup) closeLocal(ctx context.Context) {
-	if _, ok := c.closePane(ctx, reap.Exec{Runner: c.x.s.Runner}); !ok {
+	// Jobs names the reviewer's job directory, so a forced close can save the
+	// pane's screen there before closing it.
+	ops := reap.Exec{Runner: c.x.s.Runner, Host: reap.Host{Name: "local", Jobs: c.x.s.Config.Review.Panewire.Jobs}}
+	if _, ok := c.closePane(ctx, ops); !ok {
 		return
 	}
 	if c.paneGone {
@@ -229,20 +250,29 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 		c.record("kept", "pane name/cwd mismatch")
 		return "", false
 	}
-	if !closableStatus[pane.Status] {
-		// The hub closes only an idle or done agent; a pane still working is
-		// left for the reviewer sweep.
-		c.record("kept", "pane is not idle or done: "+pane.Status)
-		return "", false
-	}
-	composer, err := ops.Composer(ctx, *pane)
-	if err != nil {
-		c.record("error", "composer read: "+err.Error())
-		return "", false
-	}
-	if composer != reap.ComposerEmpty {
-		c.record("kept", "composer is not empty or could not be confirmed empty")
-		return "", false
+	if c.p.force {
+		// A reviewer past its deadline is replaced whatever it is doing, so its
+		// screen is saved for the record and the pane closes while it works.
+		if _, err := ops.Capture(ctx, *pane, c.p.label, nil, true); err != nil {
+			c.record("error", "pane screen: "+err.Error())
+			return "", false
+		}
+	} else {
+		if !closableStatus[pane.Status] {
+			// The hub closes only an idle or done agent; a pane still working is
+			// left for the reviewer sweep.
+			c.record("kept", "pane is not idle or done: "+pane.Status)
+			return "", false
+		}
+		composer, err := ops.Composer(ctx, *pane)
+		if err != nil {
+			c.record("error", "composer read: "+err.Error())
+			return "", false
+		}
+		if composer != reap.ComposerEmpty {
+			c.record("kept", "composer is not empty or could not be confirmed empty")
+			return "", false
+		}
 	}
 	outcome, err := ops.CloseExact(ctx, *pane)
 	if err != nil {

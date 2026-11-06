@@ -454,7 +454,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 						case fresh.Host == "":
 							cause = "reviewer never placed before the review deadline"
 						default:
-							cause = "reviewer still running past the review deadline"
+							cause = lostOverdue
 						}
 						return x.replaceLostReviewer(ctx, plan, rj, fresh, cause, leaseSHA)
 					}
@@ -1014,11 +1014,18 @@ func (x *panewireExecutor) pending(revisit Revisit, rj reviewerJob, why string) 
 	return fmt.Errorf("%w: reviewer %s %s; its finish or its timer brings the PR back", errPassPending, rj.Label, why)
 }
 
+// lostOverdue is the lost cause of a reviewer that kept working past the review
+// deadline: mergewake replaces it, so its pane is merged into the close below
+// even while it is working. Every other lost cause leaves the pane alone.
+const lostOverdue = "reviewer still running past the review deadline"
+
 // replaceLostReviewer is the lost path for a resumed reviewer that will not
 // return a result: it audits and notifies, tries to close the job so its hub claim
 // is released (a job with no record has none), drops the record and runs the pass
 // again once under a new label with the held lease. After a replacement it
-// returns review-unavailable and leaves no record behind.
+// returns review-unavailable and leaves no record behind. A reviewer still
+// working past its deadline has its screen saved and its pane closed too,
+// because its result can no longer be used.
 func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPlan, rj reviewerJob, job integrations.JobRecord, cause, leaseSHA string) (passOutcome, error) {
 	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
 	out := passOutcome{}
@@ -1032,6 +1039,18 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if job.State != "" {
 		if _, err := x.closeReviewerJob(ctx, rj, job, "abandoned", cause); err != nil {
 			return out, err
+		}
+	}
+	if cause == lostOverdue && job.Host != "" && job.PaneID != "" {
+		pane := reviewerPane{label: rj.Label, checkout: rj.Checkout, head: pr.Head.SHA, pass: plan.pass, placement: job, confirmed: true, force: true}
+		if x.closeReviewerPane(ctx, pane) && rj.Checkout != "" {
+			// The local checkout is this pass's mirror of the pane's replica;
+			// the pass that would have removed it now runs under another label.
+			if root := config.Expand(x.repo.Root); root != "" {
+				c, cancel := reportContext(ctx)
+				_, _ = s.gitIn(c, root, "worktree", "remove", "--force", rj.Checkout)
+				cancel()
+			}
 		}
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
