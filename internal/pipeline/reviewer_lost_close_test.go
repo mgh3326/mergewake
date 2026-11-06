@@ -114,3 +114,35 @@ func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
 		t.Fatalf("spawns = %v", runner.spawns)
 	}
 }
+
+// (e) A forced close whose capture names a skip (the pane is no fleet job: its
+// job dir is missing) is a refusal: the pane stays open, the skip and its
+// reason are audited, and the replacement still runs.
+func TestLostOverdueReviewerCaptureSkipKeepsPane(t *testing.T) {
+	for _, skip := range []string{"not-a-job", "pane-gone", "pane-changed"} {
+		t.Run(skip, func(t *testing.T) {
+			s, g, r, runner, c := interruptedReviewer(t)
+			old := readReviewerJob(t, s, r, 1)
+			hub := lostPaneHub(t, s, runner, old, "working")
+			hub.capture = map[string]any{"outcome": skip}
+			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			pastBudget(g, c)
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if captures := hub.ops("pane.capture"); len(captures) != 1 {
+				t.Fatalf("pane.capture = %v", captures)
+			}
+			if closes := hub.ops("pane.close"); len(closes) != 0 {
+				t.Fatalf("a pane the capture skipped was closed: %v", closes)
+			}
+			rows := auditRows(t, s, r, "reviewer-close-skipped")
+			if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), skip) || rows[0]["pane"] != "p1" {
+				t.Fatalf("reviewer-close-skipped = %v", rows)
+			}
+			if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
+				t.Fatalf("spawns = %v", runner.spawns)
+			}
+		})
+	}
+}
