@@ -17,15 +17,22 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/mgh3326/mergewake/internal/changestate"
 	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 type Client struct {
+	Changes                   changestate.Writer
+	ChangeLogin               string
+	changeHeads               sync.Map
+	changeJobsMu              sync.Mutex
+	changeJobs                map[string]chan struct{}
 	BaseURL, UploadURL, Token string
 	HTTP                      *http.Client
 	// Stderr receives throttle-wait log lines; nil means os.Stderr.
@@ -281,6 +288,8 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
 		if e == nil {
 			c.shadowPull(repo, n, p)
+			c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
+			c.writePull(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "")
 		}
 		return p, e
 	})
@@ -404,6 +413,9 @@ func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVe
 	}
 	ev, e := foldChecks(all, statuses, preserveVerdicts)
 	c.shadowChecks(repo, sha, all, statuses, preserveVerdicts, ev, e)
+	if e == nil {
+		c.writeChecks(ctx, repo, sha, all, statuses)
+	}
 	return ev, e
 }
 
@@ -513,7 +525,7 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 // CheckStates resolves each required name, distinguishing completed runs without
 // a verdict from pending evidence. Missing evidence is pending.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
-	ev, e := c.headChecks(ctx, repo, sha)
+	ev, e := c.headChecks(context.WithValue(ctx, requiredChecksKey{}, required), repo, sha)
 	if e != nil {
 		return nil, e
 	}
@@ -533,7 +545,7 @@ func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []s
 // none). Both come from one read, so a run that replaces a cancelled one
 // cannot land between them.
 func (c *Client) CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]CI, map[string]time.Time, error) {
-	ev, e := c.headChecks(ctx, repo, sha)
+	ev, e := c.headChecks(context.WithValue(ctx, requiredChecksKey{}, required), repo, sha)
 	if e != nil {
 		return nil, nil, e
 	}
@@ -980,7 +992,11 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 		body += "\n\nListed without content (pure renames or over the local diff budget):\n" + meta.DiffSummarized
 	}
 	body += OutsideDiffSection(findings)
-	return c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
+	err := c.json(ctx, "POST", fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n), map[string]any{"commit_id": sha, "body": body, "event": "COMMENT", "comments": comments}, nil)
+	if err == nil {
+		c.writePostedFindings(repo, n, sha, findings, meta)
+	}
+	return err
 }
 
 // IssueComment is one comment on a PR's conversation.

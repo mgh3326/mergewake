@@ -239,6 +239,7 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 	v, err := s.mergeGateResult(ctx, r, pr, p, baseHead)
 	if err == nil {
 		tracing.Verdict(ctx, v.State, v.Reasons)
+		s.writeGate(ctx, r, pr, baseHead, v)
 	}
 	return v, err
 }

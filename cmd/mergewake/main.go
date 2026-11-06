@@ -218,7 +218,17 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	gh := github.New(token)
+	if !*dry {
+		gh.Changes = integrations.NewChangeWriter(nil, c.StateDir)
+		gh.ChangeLogin = c.Review.Login
+		defer func() {
+			wait, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			gh.WaitChanges(wait)
+		}()
+	}
 	integrations.AttachReviewHistory(gh, sink)
+
 	if c.GitHubApp != nil {
 		key, e := c.GitHubApp.Key()
 		if e != nil {
@@ -236,8 +246,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 				total += request.Count
 			}
 			cache := counts.CacheStats()
-			hk := gh.HKReviewStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests, "hk_review_hits": hk.Hits, "hk_review_misses": hk.Misses, "hk_review_mismatches": hk.Mismatches})
+			wait, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			gh.WaitChanges(wait)
+			cancel()
+			state := gh.ChangeCounts()
+			reviews := gh.HKReviewStats()
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "hk_state_writes": state.Writes, "hk_state_stale": state.Stale, "hk_state_rejected": state.Rejected, "hk_state_unavailable": state.Unavailable, "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests, "hk_review_hits": reviews.Hits, "hk_review_misses": reviews.Misses, "hk_review_mismatches": reviews.Mismatches})
 		}()
 	}
 	gh.Stderr = stderr

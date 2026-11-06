@@ -319,6 +319,24 @@ func (s *Store) PRForHead(repo, sha string) int {
 	return 0
 }
 
+// PRsForHead returns every open PR currently associated with sha.
+func (s *Store) PRsForHead(repo, sha string) []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, e := s.repo(repo)
+	if e != nil {
+		return nil
+	}
+	var out []int
+	for n, p := range r.PRs {
+		if p.HeadSHA == sha {
+			out = append(out, n)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // Head returns a copy of the checks stored for sha; usable is whether they are
 // complete and recent enough to answer a read.
 func (s *Store) Head(repo, sha string) (h Head, ok, usable bool) {
