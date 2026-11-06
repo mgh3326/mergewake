@@ -329,7 +329,7 @@ func checksClass(checks []Check) string {
 		switch c.State {
 		case "red":
 			return "failure"
-		case "pending", "cancelled", "":
+		case "pending", "cancelled", "absent", "":
 			class = "pending"
 		}
 	}

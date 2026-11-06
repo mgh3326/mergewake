@@ -1521,9 +1521,11 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 `review.login` it attests (on the head, or on a head with the same patch id), the base branch an ancestor of the
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
+`check_absent:<name>` per required check with no run or status on the head at all (see below),
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path is not in the diff; a person's `Disposition: dismiss: <reason>` PR comment naming the head's SHA clears it), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Pending or
-missing check evidence emits nothing. A READY verdict under acting mode with
+`triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path is not in the diff; a person's `Disposition: dismiss: <reason>` PR comment naming the head's SHA clears it), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Queued or running
+check evidence emits nothing, and neither does a required check that has not reported yet
+inside the grace described under `check_absent` below. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
@@ -1553,12 +1555,23 @@ gate can emit falls in one of three classes:
 
 | Reason | Class | What the notifier does |
 |---|---|---|
-| `check_failed:<name>`, `check_cancelled:<name>` | author | Live job lane first (the findings route); with no live job, the `Mergewake-Notify-Lane` trailer, then the task lane unless it is the desk, then the desk as a `decision` (unknown author). |
+| `check_failed:<name>`, `check_cancelled:<name>`, `check_absent:<name>` | author | Live job lane first (the findings route); with no live job, the `Mergewake-Notify-Lane` trailer, then the task lane unless it is the desk, then the desk as a `decision` (unknown author). |
 | `blocking_findings:<n>`, `triage_unanswered:<n>` | author | Same route. |
 | `conflict` | author | Same route. |
 | `review_missing (<block detail>)`, for example `missing-task-trailer` | author | Same route: the review waits on something only the author can add. |
 | `review_missing` with no block detail | mergewake-internal wait | Nothing is sent. Only the stall alert below. |
 | `threads_open:<n>`, `base_stale`, `update_failed:<status>` | needs a human decision | Unchanged: the task lane, trailer or notifier lane, in the `notifyLane` order, type `blocked`. |
+
+`check_absent:<name>` means the required check has no check run and no commit
+status on the head, which is different from a queued or running check. It
+usually means the PR branch's workflow predates the job, and updating the branch
+fixes it. The gate waits quietly (pending) until the head commit's committer date
+is 20 minutes old, or until every other required check has completed (green, red
+or skipped) with at least one of them present; then it blocks with the reason. A
+PR with a `conflict` never reports its checks absent, because GitHub runs no
+workflow for it. The committer date is the clock because it needs no stored
+state, so a commit made long before it was pushed reaches the grace sooner than
+the push time alone would.
 
 A mixed reason set is sent when any reason is author or human, and its text
 lists only those reasons. A set made only of internal waits sends nothing.

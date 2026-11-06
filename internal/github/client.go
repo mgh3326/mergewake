@@ -352,6 +352,10 @@ const (
 	// runs, which are not evidence and hold nothing.
 	Cancelled CI = "cancelled"
 	Skipped   CI = "skipped"
+	// Absent is a required name with no check run and no status on the head at
+	// all: nothing has been queued, started or reported under it, unlike
+	// Pending, where a run exists but has not finished.
+	Absent CI = "absent"
 )
 
 type checkRun struct {
@@ -523,7 +527,8 @@ func (c *Client) Check(ctx context.Context, repo, sha string, required []string)
 }
 
 // CheckStates resolves each required name, distinguishing completed runs without
-// a verdict from pending evidence. Missing evidence is pending.
+// a verdict from pending evidence. A name with no run or status on the head is
+// Absent.
 func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]CI, error) {
 	ev, e := c.headChecks(context.WithValue(ctx, requiredChecksKey{}, required), repo, sha)
 	if e != nil {
@@ -533,7 +538,7 @@ func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []s
 	for _, n := range required {
 		v, ok := ev.states[n]
 		if !ok {
-			v = Pending
+			v = Absent
 		}
 		out[n] = v
 	}
@@ -554,7 +559,7 @@ func (c *Client) CheckSnapshot(ctx context.Context, repo, sha string, required [
 	for _, n := range required {
 		v, ok := ev.states[n]
 		if !ok {
-			v = Pending
+			v = Absent
 		}
 		states[n] = v
 		if t, ok := ev.cancelled[n]; ok {
