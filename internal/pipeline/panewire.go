@@ -571,7 +571,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if json.Unmarshal(b, &refusal) == nil && refusal.Refused != "" {
 		return skip("reviewer pane %s refused: %s", label, refusal.Refused)
 	}
-	findings, e := parseFindings(b, x.diff)
+	findings, dropped, e := parseFindings(b, x.diff)
 	if e != nil {
 		if res.rec.State == "completed" && ctx.Err() == nil {
 			return out, &reviewResultLost{label, res.reason, profile, reportPath, e}
@@ -583,6 +583,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		seat = string(m[1])
 	} else if placement.Profile != "" {
 		seat = placement.Profile
+	}
+	for _, d := range dropped {
+		_ = s.audit(x.repo.Name, "review-finding-dropped", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": label, "path": d.Path, "line": d.Line, "reason": d.Reason}, false)
 	}
 	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
 	if seat != "" {
@@ -803,7 +806,7 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 				outcome = "invalid_response"
 			}
 		default:
-			if _, err := parseFindings(result.Findings, x.diff); err != nil {
+			if _, _, err := parseFindings(result.Findings, x.diff); err != nil {
 				outcome = "invalid_findings"
 			} else {
 				outcome, findings = "found", result.Findings

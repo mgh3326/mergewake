@@ -124,7 +124,7 @@ func Verdict(ctx context.Context, state string, reasons []string) {
 	for _, reason := range reasons {
 		kind, _, _ := strings.Cut(reason, ":")
 		switch kind {
-		case "check_failed", "conflict", "blocking_findings", "triage_unanswered", "threads_open", "review_missing", "base_stale", "head_moving", "files_settling":
+		case "check_failed", "conflict", "blocking_findings", "finding_outside_diff", "triage_unanswered", "threads_open", "review_missing", "base_stale", "head_moving", "files_settling":
 			safe = append(safe, kind)
 		}
 	}

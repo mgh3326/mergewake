@@ -465,7 +465,7 @@ func authorAction(summary string) bool {
 		if reason == "conflict" {
 			return true
 		}
-		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
+		for _, prefix := range []string{"blocking_findings:", "finding_outside_diff:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
 			}
