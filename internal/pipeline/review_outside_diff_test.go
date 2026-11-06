@@ -81,6 +81,13 @@ func (g *outsideGH) IssueComments(context.Context, string, int) ([]github.IssueC
 // blocking outside-diff findings (on the gated head, or on the earlier head heads names, beside a clean pass pair on the gated one).
 func outsideVerdict(t *testing.T, blocking int, comments []github.IssueComment, heads ...string) gateVerdict {
 	t.Helper()
+	return outsideVerdictFor(t, blocking, "", comments, heads...)
+}
+
+// outsideVerdictFor is outsideVerdict where the receipts carry receiptPatch
+// instead of the current patch id when it is not empty.
+func outsideVerdictFor(t *testing.T, blocking int, receiptPatch string, comments []github.IssueComment, heads ...string) gateVerdict {
+	t.Helper()
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	g.files = []policy.File{{Path: "tool", Kind: "modified", Additions: 1}}
@@ -90,14 +97,18 @@ func outsideVerdict(t *testing.T, blocking int, comments []github.IssueComment, 
 	if len(heads) > 0 {
 		passHead = heads[0]
 	}
+	patch := s.patchIDOf(context.Background(), r.Name, 7, shaA)
+	if receiptPatch != "" {
+		patch = receiptPatch
+	}
 	history := []github.ReviewedPass{
-		{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Lens: "correctness"}},
-		{Head: shaA, PassReceipt: github.PassReceipt{Pass: 2, Lens: "state-risk"}},
+		{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Lens: "correctness", Patch: patch}},
+		{Head: shaA, PassReceipt: github.PassReceipt{Pass: 2, Lens: "state-risk", Patch: patch}},
 	}
 	if passHead == shaA {
 		history[0].OutsideBlocking = blocking
 	} else {
-		history = append(history, github.ReviewedPass{Head: passHead, PassReceipt: github.PassReceipt{Pass: 1, Lens: "correctness"}, OutsideBlocking: blocking})
+		history = append(history, github.ReviewedPass{Head: passHead, PassReceipt: github.PassReceipt{Pass: 1, Lens: "correctness", Patch: patch}, OutsideBlocking: blocking})
 	}
 	s.GH = &outsideGH{fakeGH: g, comments: comments, history: history}
 	p, e := s.Policy(context.Background(), r, shaB)
@@ -221,8 +232,9 @@ func TestMalformedResultIsStillRejected(t *testing.T) {
 	}
 }
 
-// A head that inherited its review (same patch id) carries the inherited
-// pass's outside-diff findings; an unrelated head's pass does not count.
+// Only receipts for the current patch count; a head that inherited its review
+// (same patch id) carries the inherited pass's outside-diff findings, and an
+// unrelated head's pass does not.
 func TestOutsideBlockingFollowsInheritedPatch(t *testing.T) {
 	history := []github.ReviewedPass{
 		{Head: shaB, PassReceipt: github.PassReceipt{Pass: 1, Patch: "p1"}, OutsideBlocking: 2},
@@ -234,5 +246,21 @@ func TestOutsideBlockingFollowsInheritedPatch(t *testing.T) {
 	}
 	if got := outsideBlocking(history, shaA, "p1", ""); got != 1 {
 		t.Fatalf("not inherited: %d", got)
+	}
+	// The base moved under the same head: the receipt is for another patch.
+	if got := outsideBlocking(history, shaA, "p3", ""); got != 0 {
+		t.Fatalf("stale patch counted: %d", got)
+	}
+	// An unreadable diff leaves the patch unknown; the hold stays.
+	if got := outsideBlocking(history, shaA, "", ""); got != 1 {
+		t.Fatalf("unknown patch: %d", got)
+	}
+}
+
+// The base moving under a fixed head changes the patch: a pass recorded for the
+// old patch no longer holds the head.
+func TestOutsideDiffHoldIgnoresAnotherPatch(t *testing.T) {
+	if got := reasons(outsideVerdictFor(t, 1, "an-older-patch", nil)); got == "finding_outside_diff:1" {
+		t.Fatalf("a stale-patch receipt held the head: %q", got)
 	}
 }

@@ -398,13 +398,19 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 }
 
 // outsideBlocking counts the critical and high findings the review passes of
-// this head listed in their bodies because the path is not in the diff. A head
-// that inherited its review (same patch id) carries the inherited head's too:
-// the finding was about that patch, which has not changed.
+// this head listed in their bodies because the path is not in the diff. Only a
+// receipt for the current patch counts: the base can move under a fixed head
+// and put the path into the diff, and the finding was about the old patch. A
+// head that inherited its review (same patch id) carries the inherited head's
+// too. When the current patch id is unknown (the diff could not be read), the
+// head's own receipts count, so a failed read never lifts the hold.
 func outsideBlocking(history []github.ReviewedPass, head, patch, inherited string) int {
 	n := 0
 	for _, p := range history {
-		if p.Head == head || (inherited != "" && p.Head == inherited && p.Patch == patch) {
+		switch {
+		case p.Head == head && (patch == "" || p.Patch == patch):
+			n += p.OutsideBlocking
+		case inherited != "" && p.Head == inherited && p.Patch == patch:
 			n += p.OutsideBlocking
 		}
 	}
