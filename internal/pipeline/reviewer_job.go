@@ -23,6 +23,10 @@ import (
 // reservation per (task, role), and another reviewer job of the task holds it.
 const panewireHeld = 74
 
+// panewireQuotaTimeout is panewire's quota gate deadline exit: the spawn waited
+// for quota and gave up before it placed a pane.
+const panewireQuotaTimeout = 124
+
 // panewireWaitTimeout is panewire's `spawn --wait` deadline exit: the job was
 // spawned and still runs.
 const panewireWaitTimeout = 85

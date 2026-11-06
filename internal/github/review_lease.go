@@ -106,3 +106,40 @@ func (c *Client) RenewReviewLease(ctx context.Context, repo, branch, expected st
 	}
 	return lease.SHA, true, nil
 }
+
+// ReleaseReviewLease ends the lease commit the caller owns by fast-forwarding the
+// branch to a child commit stamped at the Unix epoch, which ReviewLease reads as
+// expired. It is a compare-and-swap like ClaimReviewWithSHA and RenewReviewLease:
+// the update is not forced, so if another host renewed the lease the branch no
+// longer sits at expected, the child is not a fast-forward, GitHub refuses it
+// and the renewed lease stays. GitHub's ref delete has no such precondition, so
+// the branch is expired, not deleted; the next claim fast-forwards it.
+func (c *Client) ReleaseReviewLease(ctx context.Context, repo, branch, expected string) (bool, error) {
+	if expected == "" {
+		return false, nil
+	}
+	commit, err := c.Commit(ctx, repo, expected)
+	if NotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var released Ref
+	err = c.json(ctx, "POST", base(repo)+"/git/commits", map[string]any{
+		"message": leasePrefix + time.Unix(0, 0).UTC().Format(time.RFC3339Nano),
+		"tree":    commit.Commit.Tree.SHA, "parents": []string{expected},
+	}, &released)
+	if err != nil {
+		return false, err
+	}
+	err = c.json(ctx, "PATCH", base(repo)+"/git/refs/heads/"+branch, map[string]any{"sha": released.SHA, "force": false}, nil)
+	if err != nil {
+		var api *APIError
+		if NotFound(err) || (errors.As(err, &api) && (api.Code == 409 || api.Code == 422)) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}

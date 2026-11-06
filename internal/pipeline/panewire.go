@@ -521,11 +521,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				stderr = commandErr.Stderr
 			}
 			if code == 81 && (strings.Contains(string(stdout), "secret_like_content") || strings.Contains(stderr, "secret_like_content")) {
+				if !resumed && ctx.Err() == nil {
+					x.releaseLease(ctx, plan, leaseSHA, "secret-like-brief")
+				}
 				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
 					return out, dropErr
 				}
 				keepCheckout = false
 				return out, errSecretLikeBrief
+			}
+			// A fresh spawn that ended before any pane exists left nothing to
+			// wait for: the pass lease is expired, so the next run starts the
+			// pass at once instead of waiting out the lease. An exit that may
+			// follow a placed pane, such as a timed-out wait, keeps the lease.
+			if reason, never := spawnNeverPlaced(code); never && !resumed && ctx.Err() == nil {
+				x.releaseLease(ctx, plan, leaseSHA, reason)
 			}
 			// A refused fresh spawn created no job: its record goes.
 			if !resumed && (code == panewireRefused || code == panewireHeld) {
@@ -680,6 +690,41 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	keepJob = true
 	x.note("collected", rj)
 	return out, nil
+}
+
+// spawnNeverPlaced names the panewire exits that come before any pane exists:
+// the role/seat refusal, the held reservation and the quota gate timeout. Any
+// other exit, a timed-out --wait among them, may follow a placed pane.
+func spawnNeverPlaced(code int) (string, bool) {
+	switch code {
+	case panewireRefused:
+		return "spawn-refused", true
+	case panewireHeld:
+		return "reviewer-held", true
+	case panewireQuotaTimeout:
+		return "quota-gate-timeout", true
+	}
+	return "", false
+}
+
+// releaseLease expires the lease this run took, only while the branch still
+// sits at leaseSHA (a compare-and-swap), so a lease another host renewed stays.
+// It is best effort:
+// when the release fails the lease expires by its TTL, as it did before.
+func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, leaseSHA, reason string) {
+	releaser, ok := x.s.GH.(interface {
+		ReleaseReviewLease(context.Context, string, string, string) (bool, error)
+	})
+	if !ok || leaseSHA == "" {
+		return
+	}
+	c, cancel := reportContext(ctx)
+	defer cancel()
+	released, err := releaser.ReleaseReviewLease(c, x.repo.Name, claimRef(x.pr.Number, x.pr.Head.SHA, plan.pass), leaseSHA)
+	if err != nil || !released {
+		return
+	}
+	_ = x.s.audit(x.repo.Name, "review-lease-released", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "reason": reason}, false)
 }
 
 // spawnedKeep bounds the spawn receipt kept on a reviewer record.
