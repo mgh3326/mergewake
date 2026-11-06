@@ -260,6 +260,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			return out, e
 		}
 	}
+	// A fresh run that took the lease and skips before it has recorded a
+	// reviewer job leaves no pane and no record to wait for: the lease is
+	// expired at once instead of holding the PR for its whole TTL. A resumed
+	// pass, or a run past the record, is left to the spawn's own handling.
+	reviewerRecorded := resumed
+	if acquired && !resumed {
+		defer func() {
+			if !reviewerRecorded && len(out.skips) > 0 {
+				x.releaseLease(ctx, plan, leaseSHA, out.skips[len(out.skips)-1].Reason)
+			}
+		}()
+	}
 	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix()+int64(plan.replacements))
 	checkout := filepath.Join(cfg.Checkouts, label)
 	if resumed {
@@ -470,6 +482,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
+			reviewerRecorded = true
 			args = rj.Args
 		}
 		// The recorded arguments keep --wait, so a run that waits replays the
@@ -692,9 +705,29 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	return out, nil
 }
 
+// panewire exits that come before any pane exists (panewire docs/config.md,
+// "Exit codes"). A spawn that ends with one placed nothing and left no job to
+// wait for.
+const (
+	panewireConfigRefused    = 70 // configuration, unreadable catalog or policy
+	panewireDuplicateState   = 75 // unreadable duplicate state or a changed artifact
+	panewirePreflight        = 78 // a checked remote host failed a check
+	panewireMockIsolation    = 79 // mock isolation refusal
+	panewireLocalDisabled    = 80 // local spawning disabled, no remote fallback
+	panewireNoHost           = 81 // no host admitted the seat
+	panewireQuotaWait        = 86 // every eligible account is exhausted, the role waits
+	panewireQuotaEscalate    = 87 // every eligible account is exhausted, the role escalates
+	panewireAuthUnavailable  = 88 // no usable account binding
+	panewireQuotaUnknown     = 89 // quota unknown after a bounded refresh
+	panewireBriefUnconfirmed = 76 // a pane may exist: the brief submission is unconfirmed
+	panewireLaneUnregistered = 82 // a pane is committed: its lane did not register
+)
+
 // spawnNeverPlaced names the panewire exits that come before any pane exists:
-// the role/seat refusal, the held reservation and the quota gate timeout. Any
-// other exit, a timed-out --wait among them, may follow a placed pane.
+// the role/seat refusal, the held reservation, the quota gate timeout and the
+// refusals of configuration, placement, quota and auth. Any other exit, a
+// timed-out --wait among them, may follow a placed pane; so do
+// panewireBriefUnconfirmed and panewireLaneUnregistered, which keep the lease.
 func spawnNeverPlaced(code int) (string, bool) {
 	switch code {
 	case panewireRefused:
@@ -703,6 +736,24 @@ func spawnNeverPlaced(code int) (string, bool) {
 		return "reviewer-held", true
 	case panewireQuotaTimeout:
 		return "quota-gate-timeout", true
+	case panewireConfigRefused:
+		return "spawn-config-refused", true
+	case panewireDuplicateState:
+		return "spawn-duplicate-state", true
+	case panewirePreflight:
+		return "spawn-preflight-failed", true
+	case panewireMockIsolation:
+		return "spawn-mock-isolation", true
+	case panewireLocalDisabled:
+		return "spawn-local-disabled", true
+	case panewireNoHost:
+		return "spawn-no-host", true
+	case panewireQuotaWait, panewireQuotaEscalate:
+		return "spawn-quota-exhausted", true
+	case panewireAuthUnavailable:
+		return "spawn-auth-unavailable", true
+	case panewireQuotaUnknown:
+		return "spawn-quota-unknown", true
 	}
 	return "", false
 }
