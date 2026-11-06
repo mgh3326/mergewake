@@ -27,8 +27,8 @@ const (
 	// overdueLandAfter: the head's review is done and the PR is still open
 	// this long after.
 	overdueLandAfter = 10 * time.Minute
-	// overdueReadyAfter: the PR is still open this long after mergewake first
-	// saw the head.
+	// overdueReadyAfter: the PR is still open this long after mergewake sent
+	// its READY verdict for the head.
 	overdueReadyAfter = 45 * time.Minute
 	// overdueLeadLane is the one shared lane merge_overdue goes to first.
 	overdueLeadLane = "lead"
@@ -41,18 +41,69 @@ const (
 	overdueReadyTooLong     = "ready_too_long"
 )
 
-// overdueClock holds the three clocks of one (PR, head). A zero time means
-// the event has not been seen yet. Touched only bounds how long an idle entry
-// is kept.
+// overdueClock holds the clocks of one (PR, head). A zero time means the event
+// has not been seen yet. Touched only bounds how long an idle entry is kept.
 type overdueClock struct {
 	HeadSeen   time.Time `json:"head_seen,omitzero"`
 	ChecksDone time.Time `json:"checks_done,omitzero"`
 	ReviewDone time.Time `json:"review_done,omitzero"`
-	Touched    time.Time `json:"touched,omitzero"`
+	// Ready is when mergewake sent the READY verdict for the head; no READY,
+	// no ready_too_long.
+	Ready time.Time `json:"ready,omitzero"`
+	// CarriedFrom is the head this entry inherited HeadSeen and Ready from,
+	// when mergewake made this head by updating the branch. Empty otherwise.
+	CarriedFrom string    `json:"carried_from,omitempty"`
+	Touched     time.Time `json:"touched,omitzero"`
+}
+
+// branchUpdate records that mergewake updated a PR's branch from OldHead: the
+// head that update produces inherits the old head's clocks.
+type branchUpdate struct {
+	PR      int       `json:"pr"`
+	OldHead string    `json:"old_head"`
+	At      time.Time `json:"at"`
+}
+
+// overdueState is pr-overdue-clocks.json: the clocks by (PR, head) and the
+// branch updates mergewake made, so the head an update produced finds its
+// predecessor's clocks after a restart.
+type overdueState struct {
+	Clocks  map[string]overdueClock `json:"clocks"`
+	Updates []branchUpdate          `json:"updates,omitempty"`
 }
 
 func (s *Service) overdueClocksFile(repo string) string {
 	return filepath.Join(s.state(repo), "pr-overdue-clocks.json")
+}
+
+// readOverdueState reads the clocks file. A file written before the updates
+// were kept is a bare map of clocks: it has no "clocks" key, and still loads.
+func readOverdueState(file string) (overdueState, error) {
+	st := overdueState{}
+	found, e := fsutil.ReadJSON(file, &st)
+	if e != nil {
+		return overdueState{}, fmt.Errorf("%s: %w", file, e)
+	}
+	if found && st.Clocks == nil {
+		clocks := map[string]overdueClock{}
+		if _, e := fsutil.ReadJSON(file, &clocks); e != nil {
+			return overdueState{}, fmt.Errorf("%s: %w", file, e)
+		}
+		st.Clocks = clocks
+	}
+	if st.Clocks == nil {
+		st.Clocks = map[string]overdueClock{}
+	}
+	return st, nil
+}
+
+func writeOverdueState(file string, st overdueState) error {
+	return fsutil.WriteJSON(file, st)
+}
+
+// overdueKey is the clocks key of one (PR, head).
+func overdueKey(pr github.Pull) string {
+	return fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
 }
 
 // overdueCounts is how many merge_overdue notices were delivered per repo
@@ -96,20 +147,31 @@ func reviewCompleted(v gateVerdict) bool {
 // tickOverdueClocks starts each clock the first time its event is seen for
 // this (PR, head) and returns the clocks as they stand. They live in
 // pr-overdue-clocks.json, so a restart keeps them; a new head has its own
-// entry. Entries untouched for a week are dropped.
-func (s *Service) tickOverdueClocks(r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
+// entry, except a head mergewake made itself by updating a stale branch: that
+// one inherits the old head's HeadSeen and Ready. The READY time comes from the
+// READY verdict mergewake sent for the head (notify.go laneEvent). Entries
+// untouched for a week are dropped.
+func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
 	file := s.overdueClocksFile(r.Name)
 	defer lockPath(file)()
-	clocks := map[string]overdueClock{}
-	if found, e := fsutil.ReadJSON(file, &clocks); found && e != nil {
-		return overdueClock{}, fmt.Errorf("%s: %w", file, e)
-	} else if e != nil {
+	st, e := readOverdueState(file)
+	if e != nil {
 		return overdueClock{}, e
 	}
 	now := s.now().UTC()
-	key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
-	c, existed := clocks[key]
+	key := overdueKey(pr)
+	c, existed := st.Clocks[key]
 	changed := !existed
+	if !existed {
+		from, old, ok, e := s.updateCarry(ctx, r, st, pr)
+		if e != nil {
+			return overdueClock{}, e
+		}
+		if ok {
+			c.HeadSeen, c.Ready, c.CarriedFrom = old.HeadSeen, old.Ready, from
+			changed = true
+		}
+	}
 	start := func(at *time.Time, due bool) {
 		if due && at.IsZero() {
 			*at, changed = now, true
@@ -118,19 +180,98 @@ func (s *Service) tickOverdueClocks(r config.Repo, pr github.Pull, v gateVerdict
 	start(&c.HeadSeen, true)
 	start(&c.ChecksDone, checksCompleted(v))
 	start(&c.ReviewDone, reviewCompleted(v))
+	if c.Ready.IsZero() {
+		ready, ok, e := s.readySent(r.Name, pr)
+		if e != nil {
+			return overdueClock{}, e
+		}
+		if ok {
+			c.Ready, changed = ready, true
+		}
+	}
 	if now.Sub(c.Touched) >= time.Hour {
 		c.Touched, changed = now, true
 	}
 	if !changed {
 		return c, nil
 	}
-	clocks[key] = c
-	for k, o := range clocks {
+	st.Clocks[key] = c
+	for k, o := range st.Clocks {
 		if o.Touched.Before(now.Add(-7 * 24 * time.Hour)) {
-			delete(clocks, k)
+			delete(st.Clocks, k)
 		}
 	}
-	return c, fsutil.WriteJSON(file, clocks)
+	st.Updates = pruneBranchUpdates(st.Updates, now.Add(-7*24*time.Hour))
+	return c, writeOverdueState(file, st)
+}
+
+// updateCarry reports the clocks a new head inherits because mergewake made it
+// by updating the branch: its first parent is the recorded old head and the
+// commit is a merge, which is what an update produces. A commit the author
+// pushed on top of that has the update's result as its parent, so it is not
+// carried, nor is the head of any push the author made instead.
+func (s *Service) updateCarry(ctx context.Context, r config.Repo, st overdueState, pr github.Pull) (string, overdueClock, bool, error) {
+	for _, u := range st.Updates {
+		if u.PR != pr.Number || u.OldHead == pr.Head.SHA {
+			continue
+		}
+		old, ok := st.Clocks[fmt.Sprintf("%d %s", u.PR, u.OldHead)]
+		if !ok {
+			continue
+		}
+		commit, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
+		if e != nil {
+			return "", overdueClock{}, false, e
+		}
+		if len(commit.Parents) < 2 || commit.Parents[0].SHA != u.OldHead {
+			continue
+		}
+		return u.OldHead, old, true, nil
+	}
+	return "", overdueClock{}, false, nil
+}
+
+// pruneBranchUpdates drops the update records older than cutoff.
+func pruneBranchUpdates(updates []branchUpdate, cutoff time.Time) []branchUpdate {
+	kept := updates[:0]
+	for _, u := range updates {
+		if u.At.After(cutoff) {
+			kept = append(kept, u)
+		}
+	}
+	return kept
+}
+
+// recordBranchUpdate keeps that mergewake updated PR's branch from oldHead, so
+// the head the update produces inherits the old head's clocks. It is written
+// with the clocks: a restart between the update and the new head keeps it.
+func (s *Service) recordBranchUpdate(repo string, pr int, oldHead string) error {
+	file := s.overdueClocksFile(repo)
+	defer lockPath(file)()
+	st, e := readOverdueState(file)
+	if e != nil {
+		return e
+	}
+	for _, u := range st.Updates {
+		if u.PR == pr && u.OldHead == oldHead {
+			return nil
+		}
+	}
+	st.Updates = append(st.Updates, branchUpdate{PR: pr, OldHead: oldHead, At: s.now().UTC()})
+	return writeOverdueState(file, st)
+}
+
+// readySent is when the READY verdict for this head was sent, if it was.
+func (s *Service) readySent(repo string, pr github.Pull) (time.Time, bool, error) {
+	clocks, e := s.loadReadyClocks(repo)
+	if e != nil {
+		return time.Time{}, false, e
+	}
+	c, ok := clocks[verdictKey("ready", pr.Number, pr.Head.SHA)]
+	if !ok || c.First.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return c.First, true, nil
 }
 
 // overdueHeld reports whether the verdict holds the head for a reason that is
@@ -138,8 +279,11 @@ func (s *Service) tickOverdueClocks(r config.Repo, pr github.Pull, v gateVerdict
 // check, a conflict or a stale base, and the other reasons that wait on the
 // author (open threads, unanswered triage, a review blocked on a detail) or
 // on the evidence to settle. Only a head with no reason, or with mergewake's
-// own review_missing queue state, can be overdue. It is evaluated again on
-// every pass.
+// own review_missing queue state, can be overdue. A pending verdict whose
+// required checks are all done waits on GitHub's mergeability computation
+// alone, which holds this evaluation; a pending verdict that waits on CI is
+// not held, so ready_too_long still fires for a head whose checks were rerun
+// after its READY. It is evaluated again on every pass.
 func overdueHeld(v gateVerdict) bool {
 	for _, reason := range v.Reasons {
 		if reason == "review_missing" && v.Review.Block == "" {
@@ -147,7 +291,7 @@ func overdueHeld(v gateVerdict) bool {
 		}
 		return true
 	}
-	return false
+	return v.State == "pending" && checksCompleted(v)
 }
 
 // overdueDue lists the conditions whose time has passed, with the age each is
@@ -164,7 +308,7 @@ func overdueDue(c overdueClock, started bool, now time.Time) (conditions []strin
 		add(overdueReviewNotStarted, c.ChecksDone, overdueReviewStartAfter)
 	}
 	add(overdueNotLanded, c.ReviewDone, overdueLandAfter)
-	add(overdueReadyTooLong, c.HeadSeen, overdueReadyAfter)
+	add(overdueReadyTooLong, c.Ready, overdueReadyAfter)
 	return conditions, ages
 }
 
@@ -230,7 +374,7 @@ func (s *Service) mergeOverdue(ctx context.Context, r config.Repo, pr github.Pul
 }
 
 func (s *Service) announceOverdue(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, v gateVerdict) error {
-	c, e := s.tickOverdueClocks(r, pr, v)
+	c, e := s.tickOverdueClocks(ctx, r, pr, v)
 	if e != nil {
 		return e
 	}
@@ -263,23 +407,29 @@ func (s *Service) announceOverdue(ctx context.Context, r config.Repo, pr github.
 	}
 	var errs []error
 	for _, condition := range fresh {
-		errs = append(errs, s.sendOverdue(ctx, r, pr, v, sent, keyOf(condition), condition, ages[condition]))
+		errs = append(errs, s.sendOverdue(ctx, r, pr, v, c, sent, keyOf(condition), condition, ages[condition]))
 	}
 	return errors.Join(errs...)
 }
 
 // overdueText is the notice: the condition and age, then what the gate, the
-// required checks and the review say about the head.
-func (s *Service) overdueText(r config.Repo, pr github.Pull, v gateVerdict, condition string, age time.Duration) string {
+// required checks and the review say about the head. A head mergewake made by
+// updating the branch says where its clocks came from, so an age older than
+// the head is not read as a stale entry.
+func (s *Service) overdueText(r config.Repo, pr github.Pull, v gateVerdict, c overdueClock, condition string, age time.Duration) string {
 	gate := v.State
 	if len(v.Reasons) > 0 {
 		gate += " " + strings.Join(v.Reasons, "; ")
 	}
+	carried := ""
+	if c.CarriedFrom != "" {
+		carried = " | clocks carried from " + short7(c.CarriedFrom) + " after mergewake updated the branch"
+	}
 	checks := "-"
 	if len(v.Status.Checks) > 0 {
 		parts := make([]string, 0, len(v.Status.Checks))
-		for _, c := range v.Status.Checks {
-			parts = append(parts, c.Name+"="+c.State)
+		for _, chk := range v.Status.Checks {
+			parts = append(parts, chk.Name+"="+chk.State)
 		}
 		checks = strings.Join(parts, ", ")
 	}
@@ -291,8 +441,8 @@ func (s *Service) overdueText(r config.Repo, pr github.Pull, v gateVerdict, cond
 	if labels := s.reviewerJobLabels(r, pr); len(labels) > 0 {
 		reviewer = strings.Join(labels, ", ")
 	}
-	return fmt.Sprintf("[mergewake] MERGE_OVERDUE %s#%d head=%s | %s after %s | gate: %s | checks: %s | review: passes %d/%s, reviewer %s",
-		r.Name, pr.Number, short7(pr.Head.SHA), condition, age.Round(time.Minute), gate, checks, v.HeadPasses, needed, reviewer)
+	return fmt.Sprintf("[mergewake] MERGE_OVERDUE %s#%d head=%s | %s after %s%s | gate: %s | checks: %s | review: passes %d/%s, reviewer %s",
+		r.Name, pr.Number, short7(pr.Head.SHA), condition, age.Round(time.Minute), carried, gate, checks, v.HeadPasses, needed, reviewer)
 }
 
 // sendOverdue delivers one notice. The lead lane gets it first. A lane the
@@ -300,8 +450,8 @@ func (s *Service) overdueText(r config.Repo, pr github.Pull, v gateVerdict, cond
 // task lane instead, and the desk hears a short FYI. A notice neither lane
 // takes is parked under a decided key, so a failing delivery is not retried
 // every pass. The notice is counted and audited once it is delivered.
-func (s *Service) sendOverdue(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict, sent *sentKeys, key, condition string, age time.Duration) error {
-	text := s.overdueText(r, pr, v, condition, age)
+func (s *Service) sendOverdue(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict, c overdueClock, sent *sentKeys, key, condition string, age time.Duration) error {
+	text := s.overdueText(r, pr, v, c, condition, age)
 	id := fmt.Sprintf("mergewake-merge-overdue-%s-%d-%s-%s", r.Name, pr.Number, pr.Head.SHA, condition)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
