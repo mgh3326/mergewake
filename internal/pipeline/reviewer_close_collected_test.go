@@ -2,10 +2,14 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -107,4 +111,72 @@ func TestLostAndMovedHeadClosesStayAbandoned(t *testing.T) {
 		}
 		movedHeadClosed(t, runner, labels...)
 	})
+}
+
+// auditOut records the JSON lines printed to it and fails the one write whose
+// text carries fail, so a single audit write can be made to fail while the rest
+// of the pass keeps writing.
+type auditOut struct {
+	mu   sync.Mutex
+	fail string
+	text strings.Builder
+}
+
+func (w *auditOut) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fail != "" && strings.Contains(string(p), w.fail) {
+		return 0, errors.New("audit sink unavailable")
+	}
+	return w.text.Write(p)
+}
+
+func (w *auditOut) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.text.String()
+}
+
+// (e) A close whose command fails and whose audit write fails too never
+// aborts the pass: the collected findings are still posted, and the failure is
+// logged once with the reviewer's label and a reason.
+func TestCollectedCloseFailureAndDeadAuditKeepFindings(t *testing.T) {
+	f := collectFromFile(t, "spawned")
+	out := &auditOut{fail: "reviewer-close-skipped"}
+	f.s.Out = out
+	f.runner.closeErrs = []error{panewireExit(1)}
+	f.review(t)
+	collectedClosedOnce(t, f.runner, f.old.Label)
+	lines := out.String()
+	if !strings.Contains(lines, `"state":"close-failed"`) || !strings.Contains(lines, f.old.Label) || !strings.Contains(lines, "audit sink unavailable") {
+		t.Fatalf("close failure not logged with its label and reason: %s", lines)
+	}
+}
+
+// (f) A review context that is already past its deadline does not skip the
+// collected close: it runs on reportContext instead.
+func TestCollectedCloseRunsPastReviewDeadline(t *testing.T) {
+	f := collectFromFile(t, "spawned")
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
+	defer cancel()
+	x := &panewireExecutor{s: f.s, repo: f.r, pr: f.g.pull}
+	if err := x.closeCollectedJob(ctx, f.old, f.runner.sink.jobs[f.old.Label]); err != nil {
+		t.Fatalf("close on a spent review context: %v", err)
+	}
+	collectedClosedOnce(t, f.runner, f.old.Label)
+}
+
+// (g) The success path is unchanged: one completed close and no failure line.
+func TestCollectedCloseSuccessUnchanged(t *testing.T) {
+	f := collectFromFile(t, "spawned")
+	out := &auditOut{}
+	f.s.Out = out
+	f.review(t)
+	collectedClosedOnce(t, f.runner, f.old.Label)
+	if lines := out.String(); strings.Contains(lines, "close-failed") {
+		t.Fatalf("unexpected close failure: %s", lines)
+	}
+	if rows := auditRows(t, f.s, f.r, "reviewer-close-skipped"); len(rows) != 0 {
+		t.Fatalf("skipped audit=%v", rows)
+	}
 }

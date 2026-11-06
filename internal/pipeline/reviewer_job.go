@@ -198,12 +198,16 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 // collected and accepted but which never ran `panewire done`, so the hub frees
 // its reservation at once instead of holding it for the grace period. A job
 // with no hk record, or one already terminal, holds nothing and is left alone.
-// It is best effort: closeReviewerJob audits a close that cannot run.
+// It is best effort: closeReviewerJob audits a close that cannot run, and the
+// close runs on reportContext so a review deadline that already passed cannot
+// skip it. The caller never fails the pass on its error; it logs it.
 func (x *panewireExecutor) closeCollectedJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord) error {
 	if job.State == "" || terminalJob(job.State) {
 		return nil
 	}
-	_, e := x.closeReviewerJob(ctx, rj, job, "completed", "result collected by mergewake")
+	c, cancel := reportContext(ctx)
+	defer cancel()
+	_, e := x.closeReviewerJob(c, rj, job, "completed", "result collected by mergewake")
 	return e
 }
 
