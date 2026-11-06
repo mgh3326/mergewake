@@ -79,6 +79,32 @@ var findingsAttachment = regexp.MustCompile(`\battachment=([0-9a-f]{64})\b`)
 // findingsPoll is the pause between looks.
 var findingsGrace, findingsPoll = 30 * time.Second, 5 * time.Second
 
+// reviewerRoleArgs are the role arguments of a reviewer spawn. panewire keys
+// the reviewer reservation by (task, pass) when given --review-pass, so the
+// lenses of one head hold separate reservations. It accepts 1..9; a pass
+// outside that range gets no flag, and ok is false.
+func reviewerRoleArgs(pass int) (args []string, ok bool) {
+	if pass < 1 || pass > 9 {
+		return []string{"--role", "reviewer"}, false
+	}
+	return []string{"--role", "reviewer", "--review-pass", strconv.Itoa(pass)}, true
+}
+
+// workerSeatArgs turns a recorded reviewer spawn into the worker-seat
+// fallback: panewire refuses --review-pass outside the reviewer role, so the
+// role and the flag are both removed before --role worker is appended.
+func workerSeatArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--role" || args[i] == "--review-pass" {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return append(out, "--role", "worker")
+}
+
 // panewireExecutor spawns the pass as a visible reviewer pane through panewire.
 // panewire picks host and model; the pane reviews a worktree detached at the
 // PR head, which panewire replicates on a remote host, and returns its findings
@@ -432,7 +458,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			// The record names the job before it is spawned, so a wait that
 			// ends early leaves a job the next run can resume.
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), "--role", "reviewer"), Recorded: s.now(), Replacements: plan.replacements}
+			roleArgs, inRange := reviewerRoleArgs(plan.pass)
+			if !inRange {
+				// The flag is dropped, not the spawn: the pass still runs,
+				// held under the task's single reviewer reservation.
+				if auditErr := s.audit(x.repo.Name, "review-pass-out-of-range", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label}, false); auditErr != nil {
+					return out, auditErr
+				}
+			}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
@@ -471,7 +505,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
-			rj.Args = append(slices.Clone(rj.Args[:len(rj.Args)-2]), "--role", "worker")
+			rj.Args = workerSeatArgs(rj.Args)
 			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
 				return out, saveErr
 			}
