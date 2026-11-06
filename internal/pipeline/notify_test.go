@@ -34,10 +34,11 @@ func lastEvent(t *testing.T, n *fakeNotifier) string {
 	return n.events[len(n.events)-1].Text
 }
 
-// A checked-green, reviewed and mergeable head emits READY once; a repeat poll
-// at the same head stays quiet, including across a service restart.
+// A checked-green, reviewed and mergeable head emits READY once to the author
+// worker lane; a repeat poll at the same head stays quiet, including across a
+// service restart.
 func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
-	s, g, n, r := notifySetup(t)
+	s, g, n, r := workerNotifySetup(t)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -48,10 +49,10 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	if !strings.HasPrefix(text, "[mergewake] READY example/project#7 head=aaaaaaa | Add feature") {
 		t.Fatal(text)
 	}
-	if !strings.Contains(text, "lane=config-lane via fallback") {
+	if !strings.Contains(text, "lane=worker-lane via task 42 job w-7") {
 		t.Fatal(text)
 	}
-	if n.events[0].ID != "mergewake-ready-example/project-7-"+shaA || n.events[0].Lane != "config-lane" {
+	if n.events[0].ID != "mergewake-ready-example/project-7-"+shaA || n.events[0].Lane != "worker-lane" {
 		t.Fatalf("%+v", n.events[0])
 	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
@@ -84,7 +85,7 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 // Event IDs carry the full head SHA: two heads sharing a seven-character
 // prefix are distinct events, matching the dedupe key's granularity.
 func TestNotifyEventIDUsesFullHead(t *testing.T) {
-	s, g, n, r := notifySetup(t)
+	s, g, n, r := workerNotifySetup(t)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -170,10 +171,12 @@ func TestNotifyBlockedReasons(t *testing.T) {
 	}
 }
 
-// Lane routing precedence: handoffkeep task lane from the Mergewake-Task
+// Lane routing for the notices that keep the general rules (here a BLOCKED
+// with no author action): handoffkeep task lane from the Mergewake-Task
 // trailer (body, then head commit message), the Mergewake-Notify-Lane trailer
 // when the task lane is unresolved, then the configured notifier lane. A sink
-// read error retries rather than rerouting.
+// read error retries rather than rerouting. READY and MERGED never come here:
+// they go only to the author worker lane.
 func TestNotifyLaneRouting(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -205,6 +208,9 @@ func TestNotifyLaneRouting(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
+			// threads_open is a BLOCKED no author action owns: it keeps the
+			// general lane rules.
+			g.findings = 1
 			tt.prepare(s, g)
 			e := s.NotifyPR(context.Background(), r, 7, Options{})
 			if tt.fail {
@@ -226,7 +232,7 @@ func TestNotifyLaneRouting(t *testing.T) {
 // A state change at the same head is a new event; revisiting a sent state stays
 // quiet, drafts and disabled notify emit nothing, and dry-run writes no keys.
 func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
-	s, g, n, r := notifySetup(t)
+	s, g, n, r := workerNotifySetup(t)
 	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
@@ -324,7 +330,10 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 	s.Notifier = n
 	s.Config.Notifier.FallbackLane = "config-lane"
 	g.pull.Body = "Mergewake-Task: 42"
-	s.Sink = &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}}
+	s.Sink = &jobSink{
+		jobs: map[string]string{"42": "w-7"},
+		recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
+	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -346,6 +355,11 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 	s, g, _, r = notifySetup(t)
 	n = &laneFailNotifier{err: errors.New("panewire failed: exit status 2")}
 	s.Notifier = n
+	g.pull.Body = "Mergewake-Task: 42"
+	s.Sink = &jobSink{
+		jobs: map[string]string{"42": "w-7"},
+		recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
+	}
 	for i := 0; i < 3; i++ {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
@@ -364,8 +378,9 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 	}
 }
 
-// A repo lane takes PRs no trailer routes, ahead of the global fallback; a
-// task lane or a Mergewake-Notify-Lane trailer still wins over it.
+// A repo lane takes notices no trailer routes (here a BLOCKED with no author
+// action), ahead of the global fallback; a task lane or a Mergewake-Notify-Lane
+// trailer still wins over it.
 func TestNotifyLaneRepoLane(t *testing.T) {
 	for _, tt := range []struct {
 		name, body, lane, via string
@@ -379,6 +394,7 @@ func TestNotifyLaneRepoLane(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
 			r.Lane = "repo-lane"
+			g.findings = 1
 			g.pull.Body = tt.body
 			if tt.sink != nil {
 				s.Sink = &fakeLaneSink{lanes: tt.sink}
@@ -393,12 +409,12 @@ func TestNotifyLaneRepoLane(t *testing.T) {
 	}
 }
 
-// A READY PR that stays open and READY on the same head is notified again
-// after daemon.pr.notify.renotify_after and stops after renotify_max repeats;
-// every READY is declared --type ready so it stays unread until acked. A
-// merged PR gets no reminder.
+// A READY PR that stays open and READY on the same head is notified again to
+// its author worker lane after daemon.pr.notify.renotify_after and stops after
+// renotify_max repeats; every READY to a worker lane is declared --type info
+// (mergewake owns the merge). A merged PR gets no reminder.
 func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
-	s, g, n, r := notifySetup(t)
+	s, g, n, r := workerNotifySetup(t)
 	now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 	s.Now = func() time.Time { return now }
 	poll := func(d time.Duration) {
@@ -409,7 +425,7 @@ func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
 		}
 	}
 	poll(0)
-	if n.count != 1 || n.events[0].Type != "ready" {
+	if n.count != 1 || n.events[0].Type != "info" {
 		t.Fatalf("first READY: %+v", n.events)
 	}
 	poll(29 * time.Minute)
@@ -421,7 +437,7 @@ func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
 		t.Fatalf("no reminder after 30m: %d events", n.count)
 	}
 	e := n.events[1]
-	if e.Type != "ready" || e.ID != "mergewake-ready-example/project-7-"+shaA+"-reminder-1" || !strings.Contains(e.Text, "[mergewake] READY example/project#7") || !strings.Contains(e.Text, "reminder 1/3, unmerged for 30m0s") {
+	if e.Type != "info" || e.ID != "mergewake-ready-example/project-7-"+shaA+"-reminder-1" || !strings.Contains(e.Text, "[mergewake] READY example/project#7") || !strings.Contains(e.Text, "reminder 1/3, unmerged for 30m0s") {
 		t.Fatalf("reminder %+v", e)
 	}
 	for i := 0; i < 5; i++ {
@@ -432,7 +448,7 @@ func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
 	}
 
 	// A merged PR gets none, however long it has been.
-	s2, g2, n2, r2 := notifySetup(t)
+	s2, g2, n2, r2 := workerNotifySetup(t)
 	s2.Now = func() time.Time { return now }
 	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil || n2.count != 1 {
 		t.Fatal(e, n2.count)
@@ -452,7 +468,7 @@ func TestNotifyReadyRenotifyConfig(t *testing.T) {
 		max   int
 		want  int
 	}{{"off", 0, 1}, {"10m", 1, 2}, {"", 0, 4}} {
-		s, _, n, r := notifySetup(t)
+		s, _, n, r := workerNotifySetup(t)
 		s.Config.Daemon.PR.Notify.RenotifyAfter, s.Config.Daemon.PR.Notify.RenotifyMax = tt.after, tt.max
 		now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 		s.Now = func() time.Time { return now }

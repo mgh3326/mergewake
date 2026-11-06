@@ -719,13 +719,15 @@ func TestLandSameFamilyReviewLands(t *testing.T) {
 	}
 }
 
-// A merged PR emits one MERGED event to the owning lane, deduped like the
-// other verdict events.
+// A merged PR emits one MERGED event to its author worker lane, deduped like
+// the other verdict events.
 func TestLandMergedEventOnce(t *testing.T) {
 	s, g, _, n, r := setup(t)
 	g.enabled = true
 	markReviewed(g)
 	g.pull.Title = "Add feature"
+	g.pull.Body = "Mergewake-Task: 42\n"
+	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
 	s.Config.Notifier.Lane = "config-lane"
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
@@ -735,7 +737,7 @@ func TestLandMergedEventOnce(t *testing.T) {
 	}
 	text := n.events[0].Text
 	if !strings.HasPrefix(text, "[mergewake] MERGED example/project#7 head=aaaaaaa | Add feature") ||
-		!strings.Contains(text, "lane=config-lane via fallback") || n.events[0].Lane != "config-lane" {
+		!strings.Contains(text, "lane=worker-lane via task 42 job w-7") || n.events[0].Lane != "worker-lane" {
 		t.Fatalf("%+v", n.events[0])
 	}
 	// A merged PR is closed on the next poll: nothing further happens.
@@ -754,6 +756,8 @@ func TestLandMergedNotifyFailureObserved(t *testing.T) {
 	s, g, _, n, r := setup(t)
 	g.enabled = true
 	markReviewed(g)
+	g.pull.Body = "Mergewake-Task: 42\n"
+	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
 	n.err = errors.New("notifier offline")
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)

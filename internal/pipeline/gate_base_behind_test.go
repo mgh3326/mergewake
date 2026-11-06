@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 const requireUpToDate = "require_up_to_date: true\n"
@@ -23,7 +24,8 @@ func (m *mergeRecorder) Merge(ctx context.Context, repo string, n int, sha strin
 }
 
 // baseBehindSetup is a reviewed, green PR whose base moved on after its head,
-// with GitHub reporting state for it.
+// with GitHub reporting state for it. Its task binds a worker job, so a READY
+// verdict has the author lane it goes to.
 func baseBehindSetup(t *testing.T, stale bool, state, extraPolicy string) (*Service, *mergeRecorder, *fakeNotifier, *bytes.Buffer, config.Repo) {
 	t.Helper()
 	s, g, n, r := notifySetup(t)
@@ -31,6 +33,8 @@ func baseBehindSetup(t *testing.T, stale bool, state, extraPolicy string) (*Serv
 	g.policyExtra = extraPolicy
 	g.stale = stale
 	g.pull.MergeableState = state
+	g.pull.Body = "Mergewake-Task: 42\n"
+	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
 	if state == "dirty" {
 		no := false
 		g.pull.Mergeable = &no

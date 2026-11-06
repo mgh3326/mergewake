@@ -257,16 +257,25 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // parked with one logged decision per (PR, head, verdict) instead of failing
 // every loop. An empty via means a decision was already logged and the
 // caller stays silent.
+//
+// READY and MERGED go only to the PR author's worker lane: the job bound to
+// its task, else its author pane. Design and desk lanes have nothing to do
+// with either verdict — mergewake merges on its own gate — so with neither
+// lane the event is recorded but not sent (see suppressWorkerEvent).
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
 	var lane, via string
 	var e error
-	if state == "blocked" && authorAction(summary) {
+	workerOnly := state == "ready" || state == "merged"
+	switch {
+	case state == "blocked" && authorAction(summary):
 		route, err := s.findingsRoute(ctx, r, pr)
 		if err != nil {
 			return "", "", false, err
 		}
 		lane, via = route.lane, route.via
-	} else {
+	case workerOnly:
+		lane, via, e = s.workerLane(ctx, r, pr)
+	default:
 		lane, via, e = s.notifyLane(ctx, r, pr)
 	}
 	if e != nil {
@@ -293,13 +302,17 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		key += " " + summary
 	}
 	if sent.has(key) {
-		if state == "ready" {
+		// A suppressed READY has a clock but no lane: it never re-notifies.
+		if state == "ready" && lane != "" {
 			return s.renotifyReady(ctx, r, pr, key, lane, via, textFor)
 		}
 		return lane, via, false, nil
 	}
 	if sent.has("decided " + key) {
 		return "", "", false, nil
+	}
+	if workerOnly && lane == "" {
+		return s.suppressWorkerEvent(ctx, r, pr, state, key, sent)
 	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
@@ -357,6 +370,63 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 // verdictKey is the sent and READY-clock key of one (PR, head, verdict).
 func verdictKey(state string, n int, head string) string {
 	return fmt.Sprintf("%s %d %s", state, n, head)
+}
+
+// workerLane resolves the PR author's worker lane: the job hk bound to its
+// task, else the author pane's job (the first two steps of findingsRoute).
+// Empty when neither gives a lane. A read error retries rather than reroutes.
+func (s *Service) workerLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
+	task, e := s.prTask(ctx, r, pr)
+	if e != nil {
+		return "", "", e
+	}
+	if lane, via, e := s.boundJobLane(ctx, task); e != nil {
+		return "", "", e
+	} else if lane != "" {
+		return lane, via, nil
+	}
+	lane, via, ok, e := s.authorPane(ctx, r, pr)
+	if e != nil {
+		return "", "", e
+	}
+	if ok {
+		return lane, via, nil
+	}
+	return "", "", nil
+}
+
+// suppressWorkerEvent records a READY or MERGED with no author worker lane to
+// send it to. The decision is recorded as if it had been sent — the sent key
+// so it is not retried every pass, and the READY clock so ready_too_long
+// still counts from the verdict — with one logged pr-notify row naming the
+// lane and via the older rules would have used and why nothing went out. The
+// empty lane tells the caller the decision was already logged.
+func (s *Service) suppressWorkerEvent(ctx context.Context, r config.Repo, pr github.Pull, state, key string, sent *sentKeys) (string, string, bool, error) {
+	wouldLane, wouldVia, e := s.notifyLane(ctx, r, pr)
+	if e != nil {
+		return "", "", false, e
+	}
+	if e = sent.add(key); e != nil {
+		return "", "", false, e
+	}
+	if state == "ready" {
+		if e = s.startReadyClock(r, key, wouldLane); e != nil {
+			return "", "", false, e
+		}
+	}
+	record := struct {
+		PR         int    `json:"pr"`
+		Head       string `json:"head"`
+		State      string `json:"state"`
+		Lane       string `json:"lane,omitempty"`
+		Via        string `json:"via,omitempty"`
+		Sent       bool   `json:"sent"`
+		Suppressed string `json:"suppressed,omitempty"`
+	}{PR: pr.Number, Head: pr.Head.SHA, State: state, Lane: wouldLane, Via: wouldVia, Suppressed: "no worker lane"}
+	if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
+		return "", "", false, e
+	}
+	return "", "", false, nil
 }
 
 // eventType is the panewire notification type a verdict is declared with, so

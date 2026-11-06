@@ -320,6 +320,26 @@ func (parallelSink) TaskJob(context.Context, string) (string, string, error) {
 	return "", "fixture (grade B, T2)", nil
 }
 
+// fixtureJob is the hk job the fixture task binds to: the PR author's worker
+// lane, where READY and MERGED go.
+const fixtureJob = "w-fixture"
+
+// workerSink is parallelSink with an author job binding. It reads job records
+// (JobReader), so the engine may schedule revisits; a fixture that must model
+// a sink without job records uses parallelSink instead.
+type workerSink struct{ parallelSink }
+
+func (workerSink) TaskJob(context.Context, string) (string, string, error) {
+	return fixtureJob, "fixture (grade B, T2)", nil
+}
+
+func (workerSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+	if id == fixtureJob {
+		return integrations.JobRecord{State: "spawned", Role: "worker", Label: "fixture-lane"}, nil
+	}
+	return integrations.JobRecord{}, integrations.ErrJobNotFound
+}
+
 func newParallelFixture(t *testing.T, prs, parallel int) *parallelFixture {
 	return newParallelFixtureForRepo(t, prs, parallel, "o/one")
 }
@@ -390,14 +410,17 @@ func TestPollPRsBoundsParallelReviews(t *testing.T) {
 	if after[4] < 1 {
 		t.Fatalf("the fifth review started before any review returned: %v", after)
 	}
-	notified := 0
+	// Every PR reached its land decision, which is what the notifier would
+	// announce: READY itself goes only to a worker lane, and this fixture has
+	// no hk job binding.
+	settled := 0
 	for _, e := range f.trace.snapshot() {
-		if strings.HasPrefix(e, "notify ") {
-			notified++
+		if strings.HasPrefix(e, "merge ") {
+			settled++
 		}
 	}
-	if notified != 5 {
-		t.Fatalf("%d PRs settled, want 5: %q", notified, f.trace.snapshot())
+	if settled != 5 {
+		t.Fatalf("%d PRs settled, want 5: %q", settled, f.trace.snapshot())
 	}
 }
 
@@ -411,7 +434,7 @@ func TestPollPRsParallelOneKeepsOrder(t *testing.T) {
 	}
 	var want []string
 	for n := 1; n <= 3; n++ {
-		want = append(want, fmt.Sprintf("review %d", n), fmt.Sprintf("reviewed %d", n), fmt.Sprintf("notify %d", n), fmt.Sprintf("merge %d", n))
+		want = append(want, fmt.Sprintf("review %d", n), fmt.Sprintf("reviewed %d", n), fmt.Sprintf("merge %d", n))
 	}
 	if got := steps(f.trace.snapshot()); !slices.Equal(got, want) {
 		t.Fatalf("order %q, want %q", got, want)
@@ -455,9 +478,10 @@ func TestPollPRsCancelStartsNoNewPR(t *testing.T) {
 }
 
 // Concurrent reviews through the real Service and GitHub client: run under
-// -race, this exercises their shared state. Every PR is reviewed and
-// notified once, the decisions log and Out stay whole JSON lines, and a
-// second pass finds every notify key, so no ledger write was lost.
+// -race, this exercises their shared state. Every PR is reviewed once, the
+// decisions log and Out stay whole JSON lines, and a second pass finds every
+// READY's sent key (this fixture has no worker lane, so READY is suppressed
+// and only its key is written), so no ledger write was lost.
 func TestPollPRsParallelReviewsShareServiceState(t *testing.T) {
 	const prs = 6
 	f := newParallelFixture(t, prs, 4)
@@ -472,14 +496,14 @@ func TestPollPRsParallelReviewsShareServiceState(t *testing.T) {
 		t.Fatalf("second pass: %v", err)
 	}
 	if _, peak, started, _, _ := f.runner.state(); started != prs || peak != 4 {
-		t.Fatalf("started %d reviews with peak %d, want %d with peak 4", started, peak, prs)
+		t.Fatalf("started %d reviews with peak %d, want %d with peak 4: %q", started, peak, prs, f.trace.snapshot())
 	}
 	count := map[string]int{}
 	for _, e := range steps(f.trace.snapshot()) {
 		count[strings.Fields(e)[0]]++
 	}
-	if count["review"] != prs || count["reviewed"] != prs || count["notify"] != prs {
-		t.Fatalf("counts %v, want %d reviews and notifies: %q", count, prs, f.trace.snapshot())
+	if count["review"] != prs || count["reviewed"] != prs {
+		t.Fatalf("counts %v, want %d reviews: %q", count, prs, f.trace.snapshot())
 	}
 	whole := func(name string, b []byte) int {
 		lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
@@ -549,7 +573,7 @@ func TestSlowReviewerDoesNotDelayNextRepo(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(a.s.Config.StateDir, a.repo.Name, "reviewer-jobs", "1-p1.json")); err != nil {
 		t.Fatalf("reviewer record: %v", err)
 	}
-	if !slices.Contains(b.trace.snapshot(), "notify 1") {
+	if !slices.Contains(b.trace.snapshot(), "merge 1") {
 		t.Fatalf("second repo did not settle: %v", b.trace.snapshot())
 	}
 }
