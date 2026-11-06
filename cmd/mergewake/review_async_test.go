@@ -22,18 +22,19 @@ import (
 // reviewerSink is a sink that reads hk job records, so the engine starts
 // reviewers without waiting for them.
 type reviewerSink struct {
-	parallelSink
+	workerSink
 	mu   sync.Mutex
 	jobs map[string]integrations.JobRecord
 }
 
-func (s *reviewerSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+func (s *reviewerSink) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rec, ok := s.jobs[id]; ok {
+	rec, ok := s.jobs[id]
+	s.mu.Unlock()
+	if ok {
 		return rec, nil
 	}
-	return integrations.JobRecord{}, integrations.ErrJobNotFound
+	return s.workerSink.Job(ctx, id)
 }
 
 func (s *reviewerSink) set(id string, rec integrations.JobRecord) {
@@ -250,7 +251,7 @@ func TestEngineWithoutJobRecordsKeepsTheBoundedWait(t *testing.T) {
 	close(f.runner.release)
 	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 1, "")
 	e.q.Wait()
-	if !slices.Contains(f.trace.snapshot(), "notify 1") {
+	if !slices.Contains(f.trace.snapshot(), "merge 1") {
 		t.Fatalf("trace %v", f.trace.snapshot())
 	}
 }

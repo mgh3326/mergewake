@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
@@ -70,6 +71,9 @@ func notices(n *fakeNotifier) (out []string) {
 // to the head, with no review, and says so in the land record.
 func TestBotUpdateLandsPatchBoundToHead(t *testing.T) {
 	s, g, n, out, land := botSetup(t, "")
+	// MERGED goes to the PR author's worker lane: bind the PR's task to a job.
+	g.pull.Body += "\nMergewake-Task: 42\n"
+	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
 	if e := land(context.Background(), Options{}); e != nil {
 		t.Fatal(e)
 	}

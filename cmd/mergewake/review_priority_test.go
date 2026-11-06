@@ -114,14 +114,14 @@ func TestPollPRsStartsReviewsInTaskPriorityOrder(t *testing.T) {
 		}
 	}
 	// Only the start order moved: every PR is still reviewed and settled.
-	notified := 0
+	settled := 0
 	for _, e := range f.trace.snapshot() {
-		if strings.HasPrefix(e, "notify ") {
-			notified++
+		if strings.HasPrefix(e, "merge ") {
+			settled++
 		}
 	}
-	if notified != 3 {
-		t.Fatalf("%d PRs settled, want 3: %q", notified, f.trace.snapshot())
+	if settled != 3 {
+		t.Fatalf("%d PRs settled, want 3: %q", settled, f.trace.snapshot())
 	}
 }
 

@@ -35,7 +35,8 @@ func TestGateCancelledRequiredCheck(t *testing.T) {
 		{"expired cancelled without review", github.Cancelled, github.Cancelled, 40 * time.Minute, false, "blocked", "check_cancelled:vet;check_cancelled:test;review_missing", []string{"vet", "test"}, nil, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, g, n, r := notifySetup(t)
+			// A worker binding, so the ready case has an author lane to reach.
+			s, g, n, r := workerNotifySetup(t)
 			s.Now = func() time.Time { return cancelNow }
 			g.required = []string{"vet", "test"}
 			g.checkNames = map[string]map[string]github.CI{shaA: {"vet": tt.vet, "test": tt.test}}

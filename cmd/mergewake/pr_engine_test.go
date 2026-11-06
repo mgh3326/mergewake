@@ -48,6 +48,8 @@ func TestEventQueueEngineEvaluatesAnEventPRWhileAnotherReviewIsBlocked(t *testin
 // sees two at a time.
 func TestEventQueueLandsOfOneRepoRunOneAfterTheOther(t *testing.T) {
 	e, f := engineFixture(t, 2)
+	// A worker binding, so each READY settles through the notifier.
+	f.s.Sink = workerSink{}
 	close(f.runner.release)
 	g := &settleGauge{trace: f.trace}
 	f.s.Notifier = g
