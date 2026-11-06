@@ -310,7 +310,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// whatever its age.
 			if finished || (overBudget && state != "escalated" && state != "lost") {
 				var found bool
-				collected, found, e = x.availableFindings(ctx, label, findingsPath)
+				collected, found, e = x.availableFindings(ctx, plan, label, findingsPath)
 				if e != nil {
 					return out, e
 				}
@@ -330,7 +330,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 						return out, errPassPending
 					} else {
 						cause := "pane finished without a result"
-						if !finished {
+						switch {
+						case finished:
+						case fresh.Host == "":
+							cause = "reviewer never placed before the review deadline"
+						default:
 							cause = "reviewer still running past the review deadline"
 						}
 						return x.replaceLostReviewer(ctx, plan, rj, fresh, cause, leaseSHA)
@@ -819,15 +823,18 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 	}
 }
 
-// availableFindings checks the legacy sources once for a finished pane.
-func (x *panewireExecutor) availableFindings(ctx context.Context, label, path string) ([]byte, bool, error) {
+// availableFindings checks the legacy sources once for a finished pane. A
+// findings-lane read error means "not available from that source": it is
+// audited with its class and the local file is still tried, so the job result
+// and the replacement path after it stay reachable. Only a local file read
+// error other than not-exist is returned.
+func (x *panewireExecutor) availableFindings(ctx context.Context, plan *passPlan, label, path string) ([]byte, bool, error) {
 	lane := x.s.Config.Review.Panewire.Lane
 	if lane != "" {
 		b, err := x.announced(ctx, lane, label)
 		if err != nil {
-			return nil, false, err
-		}
-		if b != nil {
+			_ = x.s.audit(x.repo.Name, "reviewer-lane-unreadable", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "class": laneErrorClass(err), "error": fleetevent.Redact(err.Error())}, false)
+		} else if b != nil {
 			return b, true, nil
 		}
 	}
@@ -839,6 +846,14 @@ func (x *panewireExecutor) availableFindings(ctx context.Context, label, path st
 		return nil, false, err
 	}
 	return b, true, nil
+}
+
+// laneErrorClass names why the findings lane could not be read, for the audit line.
+func laneErrorClass(err error) string {
+	if msg := err.Error(); strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403") {
+		return "inbox_unauthorized"
+	}
+	return "inbox_unavailable"
 }
 
 // collect is the legacy findings path, kept for one release for panes whose
