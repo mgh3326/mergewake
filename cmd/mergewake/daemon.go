@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -330,29 +332,55 @@ func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client
 	// each waits for its reviewer pane. One PR's review and settle stay in
 	// order. Settles run one at a time: they share the repo's delivery,
 	// notify and ready ledgers, and each land must see the base the previous
-	// land left, as in the sequential order.
+	// land left, as in the sequential order. They start in hk priority order
+	// (ties in list order); a priority-1 review also starts past the bound,
+	// up to urgentExtra more at once.
 	results := make([][]error, len(prs))
 	slots := make(chan struct{}, s.Config.Daemon.PR.Parallel())
+	extra := make(chan struct{}, urgentExtra)
 	var settling sync.Mutex
 	var running sync.WaitGroup
+	reviewable := make([]int, 0, len(prs))
 	for i, pr := range prs {
-		if pr.Draft || isListedBot(pr, listed) || plans[i].skip {
-			continue
+		if !pr.Draft && !isListedBot(pr, listed) && !plans[i].skip {
+			reviewable = append(reviewable, i)
 		}
+	}
+	priorities := reviewPriorities(ctx, s, r, prs, reviewable, handled)
+	slices.SortStableFunc(reviewable, func(a, b int) int { return cmp.Compare(priorities[a].Rank(), priorities[b].Rank()) })
+	for _, i := range reviewable {
+		pr := prs[i]
 		// A cancelled pass starts no further PR and returns once the running
-		// ones have.
+		// ones have. A free review slot is taken first; a priority-1 review
+		// with none free takes an extra one rather than wait.
+		release := slots
+		var urgent chan struct{}
+		if priorities[i].Urgent() {
+			urgent = extra
+		}
 		select {
 		case slots <- struct{}{}:
-		case <-ctx.Done():
+		default:
+			select {
+			case slots <- struct{}{}:
+			case urgent <- struct{}{}:
+				release = extra
+			case <-ctx.Done():
+			}
 		}
 		if ctx.Err() != nil {
 			running.Wait()
 			return ctx.Err()
 		}
+		if !handled[i] {
+			if e := s.AuditReviewStart(r, pr, priorities[i], o, release == extra); e != nil {
+				errs = append(errs, e)
+			}
+		}
 		running.Add(1)
 		go func() {
 			defer running.Done()
-			defer func() { <-slots }()
+			defer func() { <-release }()
 			var clean bool
 			results[i], clean = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
 			failed[i] = failed[i] || !clean
@@ -373,6 +401,64 @@ func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client
 	skips.report(r.Name, numbers, plans)
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
+}
+
+// urgentExtra is how many priority-1 reviews of one repo may run past
+// review_parallel at once.
+const urgentExtra = 2
+
+// reviewPriorityGrace is how long a pass waits for the priority lookups before
+// it starts reviews. A lookup still out then is dropped and its PR is ordered
+// as one without a priority, so a slow hk delays no other PR beyond this. A
+// var so tests can shorten it.
+var reviewPriorityGrace = 2 * time.Second
+
+// reviewPriorities resolves, at once and at most once per PR, the priority of
+// every PR in reviewable whose head still needs a review, and waits for them
+// for at most reviewPriorityGrace. Lookups never fail the pass: a PR without a
+// priority keeps its place in list order.
+func reviewPriorities(ctx context.Context, s *pipeline.Service, r config.Repo, prs []github.Pull, reviewable []int, handled []bool) []pipeline.ReviewPriority {
+	out := make([]pipeline.ReviewPriority, len(prs))
+	// Each lookup reports on its own buffered channel, so one that finishes
+	// after the grace never writes into out.
+	answers := map[int]chan pipeline.ReviewPriority{}
+	for _, i := range reviewable {
+		if handled[i] {
+			continue
+		}
+		ch := make(chan pipeline.ReviewPriority, 1)
+		answers[i] = ch
+		go func() { ch <- s.ReviewPriority(ctx, r, prs[i]) }()
+	}
+	grace := time.NewTimer(reviewPriorityGrace)
+	defer grace.Stop()
+	expired := false
+	for _, i := range reviewable {
+		ch, ok := answers[i]
+		if !ok {
+			continue
+		}
+		out[i] = pipeline.ReviewPriority{Source: "timeout"}
+		if expired {
+			select {
+			case out[i] = <-ch:
+			default:
+			}
+			continue
+		}
+		select {
+		case out[i] = <-ch:
+		case <-grace.C:
+			expired = true
+			select {
+			case out[i] = <-ch:
+			default:
+			}
+		case <-ctx.Done():
+			expired = true
+		}
+	}
+	return out
 }
 
 // reviewPR runs one PR's review, then settles it under settling unless phase
