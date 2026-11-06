@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -138,6 +139,91 @@ func (c *Client) RevertWithTrailers(ctx context.Context, repo, branch, head, cul
 	var pull struct {
 		HTMLURL string `json:"html_url"`
 	}
-	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery tag latch remains until an operator deletes it and any remaining recovery branch.", culprit, pr) + "\n\n" + trailers}, &pull)
+	e = c.json(ctx, "POST", base(repo)+"/pulls", map[string]any{"title": fmt.Sprintf("Revert #%d: main CI recovery", pr), "head": RecoveryBranch, "base": branch, "body": fmt.Sprintf("Reverts %s from PR #%d. Review and merge this PR. The recovery latch clears itself once this PR is merged and the newest main is green; until then it stays.", culprit, pr) + "\n\n" + trailers}, &pull)
 	return pull.HTMLURL, e
+}
+
+// recoveryLatchSHA is the commit the latch was created at: the tag, or the
+// legacy branch alone. Empty means no latch.
+func (c *Client) recoveryLatchSHA(ctx context.Context, repo string) (string, error) {
+	var ref struct {
+		Object Ref `json:"object"`
+	}
+	e := c.json(ctx, "GET", base(repo)+"/git/ref/tags/"+RecoveryTag, nil, &ref)
+	if e == nil {
+		return ref.Object.SHA, nil
+	}
+	if !NotFound(e) {
+		return "", e
+	}
+	sha, e := c.Head(ctx, repo, RecoveryBranch)
+	if NotFound(e) {
+		return "", nil
+	}
+	return sha, e
+}
+
+// RecoveryRevert returns the revert PR the active latch belongs to, or nil when
+// there is none to prove: no latch, or one a person created. A PR belongs to
+// the latch when watch opened it (its body names the culprit) from the recovery
+// branch and its history holds the commit the latch was created at. Pushes to
+// the PR branch after review leave that commit in place; an older recovery's PR
+// never holds it.
+func (c *Client) RecoveryRevert(ctx context.Context, repo string) (*Pull, error) {
+	latch, e := c.recoveryLatchSHA(ctx, repo)
+	if e != nil || latch == "" {
+		return nil, e
+	}
+	pulls, e := list[Pull](ctx, c, base(repo)+"/pulls?state=all&head="+url.QueryEscape(strings.Split(repo, "/")[0]+":"+RecoveryBranch))
+	if e != nil {
+		return nil, e
+	}
+	sort.Slice(pulls, func(i, j int) bool { return pulls[i].Number > pulls[j].Number })
+	for _, p := range pulls {
+		if p.Head.Ref != RecoveryBranch || !strings.EqualFold(p.Head.Repo.FullName, repo) || !strings.HasPrefix(p.Body, "Reverts ") {
+			continue
+		}
+		if p.Head.SHA != latch {
+			held, e := c.Ancestor(ctx, repo, latch, p.Head.SHA)
+			if NotFound(e) {
+				continue
+			}
+			if e != nil {
+				return nil, e
+			}
+			if !held {
+				continue
+			}
+		}
+		full, e := c.Pull(ctx, repo, p.Number)
+		return &full, e
+	}
+	return nil, nil
+}
+
+// ClearRecovery deletes the recovery tag and branch. A ref that is already gone
+// counts as deleted, so a pass that died halfway finishes on the next one.
+func (c *Client) ClearRecovery(ctx context.Context, repo string) error {
+	var errs []error
+	for _, ref := range []string{"tags/" + RecoveryTag, "heads/" + RecoveryBranch} {
+		if e := c.json(ctx, "DELETE", base(repo)+"/git/refs/"+ref, nil, nil); e != nil && !NotFound(e) && !isUnprocessable(e) {
+			errs = append(errs, e)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	// A 422 can also mean a ref the rules refuse to delete, so trust only a
+	// read that finds the latch gone.
+	active, e := c.RecoveryActive(ctx, repo)
+	if e == nil && active {
+		e = errors.New("recovery latch still present after delete")
+	}
+	return e
+}
+
+// isUnprocessable is GitHub's answer for deleting a ref that does not exist.
+func isUnprocessable(e error) bool {
+	var a *APIError
+	return errors.As(e, &a) && a.Code == 422
 }

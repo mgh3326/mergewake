@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -623,5 +624,119 @@ func TestIssueCommentRoutes(t *testing.T) {
 	}
 	if sent["body"] != "hello" {
 		t.Fatalf("%+v", sent)
+	}
+}
+
+func TestRecoveryRevertFindsThePRHoldingTheLatchCommit(t *testing.T) {
+	latch, older, pushed := strings.Repeat("d", 40), strings.Repeat("1", 40), strings.Repeat("2", 40)
+	pull := func(n int, head, body string) map[string]any {
+		return map[string]any{"number": n, "body": body, "merged_at": "2026-01-02T00:00:00Z", "merge_commit_sha": strings.Repeat("9", 40),
+			"head": map[string]any{"ref": RecoveryBranch, "sha": head, "repo": map[string]any{"full_name": "example/project"}}}
+	}
+	for _, tt := range []struct {
+		name  string
+		tag   bool
+		pulls []map[string]any
+		held  bool
+		want  int
+	}{
+		{"head still at the latch commit", true, []map[string]any{pull(9, latch, "Reverts abc from PR #7.")}, false, 9},
+		{"head moved on after review fixes", true, []map[string]any{pull(9, pushed, "Reverts abc from PR #7.")}, true, 9},
+		{"an older recovery's PR never holds it", true, []map[string]any{pull(4, older, "Reverts abc from PR #3.")}, false, 0},
+		{"a PR a person opened", true, []map[string]any{pull(9, latch, "my own fix")}, false, 0},
+		{"branch alone", false, []map[string]any{pull(9, latch, "Reverts abc from PR #7.")}, false, 9},
+		{"newest matching PR wins", true, []map[string]any{pull(4, older, "Reverts abc from PR #3."), pull(9, latch, "Reverts abc from PR #7.")}, false, 9},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				p := r.URL.Path
+				switch {
+				case strings.Contains(p, "/git/ref/tags/"):
+					if tt.tag {
+						reply(w, map[string]any{"object": Ref{SHA: latch}})
+					} else {
+						http.NotFound(w, r)
+					}
+				case strings.Contains(p, "/git/ref/heads/"):
+					reply(w, map[string]any{"object": Ref{SHA: latch}})
+				case strings.Contains(p, "/compare/"):
+					status := "diverged"
+					if tt.held && strings.HasPrefix(p[strings.LastIndex(p, "/")+1:], latch) {
+						status = "ahead"
+					}
+					reply(w, map[string]any{"status": status, "merge_base_commit": Ref{SHA: latch}})
+				case strings.HasSuffix(p, "/pulls"):
+					reply(w, tt.pulls)
+				case strings.Contains(p, "/pulls/"):
+					n, _ := strconv.Atoi(p[strings.LastIndex(p, "/")+1:])
+					for _, v := range tt.pulls {
+						if v["number"] == n {
+							reply(w, v)
+							return
+						}
+					}
+					http.NotFound(w, r)
+				default:
+					t.Error("unexpected", r.Method, p)
+					http.NotFound(w, r)
+				}
+			})
+			got, e := c.RecoveryRevert(context.Background(), "example/project")
+			if e != nil {
+				t.Fatal(e)
+			}
+			if (got == nil) != (tt.want == 0) || got != nil && (got.Number != tt.want || got.MergedAt == nil) {
+				t.Fatalf("%+v", got)
+			}
+		})
+	}
+}
+
+func TestClearRecoveryTreatsMissingRefsAsDeleted(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		tag, branch bool
+		missing     int
+		fail        bool
+	}{
+		{"both refs", true, true, 404, false},
+		{"tag gone, branch left over", false, true, 404, false},
+		{"both gone, 422 for a missing ref", false, false, 422, false},
+		{"a ref the rules refuse to delete", true, false, 422, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			deletes := 0
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				p := r.URL.Path
+				isTag := strings.Contains(p, "/tags/")
+				exists := (isTag && tt.tag) || (!isTag && tt.branch)
+				switch {
+				case r.Method == "DELETE":
+					deletes++
+					if !exists {
+						w.WriteHeader(tt.missing)
+						return
+					}
+					if tt.fail {
+						w.WriteHeader(422)
+						return
+					}
+					if isTag {
+						tt.tag = false
+					} else {
+						tt.branch = false
+					}
+					w.WriteHeader(204)
+				case exists:
+					reply(w, map[string]any{"object": Ref{SHA: testSHA}})
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			e := c.ClearRecovery(context.Background(), "example/project")
+			if (e != nil) != tt.fail || deletes != 2 {
+				t.Fatalf("deletes=%d err=%v", deletes, e)
+			}
+		})
 	}
 }
