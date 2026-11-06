@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
@@ -28,6 +29,7 @@ type RequestCounts struct {
 	role                   string
 	counts                 map[requestKey]int
 	hits, misses, memoHits int
+	notModified            int
 }
 type requestCountsKey struct{}
 
@@ -81,6 +83,9 @@ func recordRequest(ctx context.Context, method, route string, status int) {
 	k := requestKey{method, routeTemplate(route), status}
 	c.mu.Lock()
 	c.counts[k]++
+	if status == http.StatusNotModified {
+		c.notModified++
+	}
 	c.mu.Unlock()
 }
 func (c *RequestCounts) Snapshot() []RequestCount {

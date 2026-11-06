@@ -44,6 +44,14 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	loops := []daemon.Loop{}
+	// Skipping unchanged PRs needs the webhook receiver: its per-PR marks are
+	// what tells a quiet PR from one whose review thread was just resolved.
+	var dirty *daemon.Dirty
+	var skips *prSkips
+	if s.Config.Daemon.Webhook.Enabled {
+		dirty = &daemon.Dirty{}
+		skips = &prSkips{Dirty: dirty, Log: log}
+	}
 	// Each role owns one goroutine. The pr role runs its repositories at once;
 	// the other roles visit them in config order.
 	for _, entry := range []struct {
@@ -72,7 +80,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				}
 				tracing.Data(transaction, "github_requests", total)
 				cache := counts.CacheStats()
-				log.Info("github requests", "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "routes", requests[:min(len(requests), 10)])
+				log.Info("github requests", "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "routes", requests[:min(len(requests), 10)])
 			}()
 			var repos []config.Repo
 			for _, r := range s.Config.Repos {
@@ -99,7 +107,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 					ctx := repoCtx
 					switch role {
 					case "pr":
-						err = pollPRs(ctx, s, gh, r, o)
+						err = pollPRsSkipping(ctx, s, gh, r, o, skips)
 					case "watch":
 						checkCtx, span := tracing.Span(ctx, "mergewake.watch")
 						err = s.Watch(checkCtx, r, o)
@@ -162,7 +170,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		if secret == "" {
 			return errors.New("daemon.webhook.secret_env is unset or empty")
 		}
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty}
 		gap, err := config.Duration(wc.MinGap)
 		if err != nil {
 			return err
@@ -232,6 +240,12 @@ func healthcheck(endpoint string) func(context.Context) error {
 	}
 }
 func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options) error {
+	return pollPRsSkipping(ctx, s, gh, r, o, nil)
+}
+
+// pollPRsSkipping is pollPRs that leaves PRs alone when skips finds them
+// unchanged since their last clean evaluation; nil evaluates every PR.
+func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options, skips *prSkips) error {
 	prs, err := gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
 		return err
@@ -267,7 +281,22 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		prContexts[i] = prCtx
 		defer tracing.Finish(span)
 	}
+	// A PR whose ETags, head, base and webhooks are as its last clean
+	// evaluation left them keeps that verdict: nothing below touches it.
+	plans := make([]skipPlan, len(prs))
+	if skips != nil {
+		base, baseErr := gh.Head(ctx, r.Name, r.Branch)
+		for i, pr := range prs {
+			if !isListedBot(pr, listed) {
+				plans[i] = skips.plan(ctx, gh, r.Name, pr.Number, base, baseErr)
+			}
+		}
+	}
+	failed := make([]bool, len(prs))
 	for i, pr := range prs {
+		if plans[i].skip {
+			continue
+		}
 		observeCtx, observeSpan := tracing.Span(prContexts[i], "mergewake.observe")
 		observationErr := s.ObservePR(observeCtx, r, pr, o)
 		tracing.Finish(observeSpan)
@@ -275,6 +304,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		options[i].Observed = observationErr == nil
 		if e := observationErr; e != nil {
 			errs = append(errs, fmt.Errorf("PR %d outcomes: %w", pr.Number, e))
+			failed[i] = true
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -292,7 +322,9 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 			continue
 		}
 		handled[i] = true
-		errs = append(errs, settlePR(prContexts[i], s, r, pr.Number, options[i])...)
+		settleErrs := settlePR(prContexts[i], s, r, pr.Number, options[i])
+		failed[i] = failed[i] || len(settleErrs) > 0
+		errs = append(errs, settleErrs...)
 	}
 	// Reviews of different PRs run at once, at most review_parallel of them:
 	// each waits for its reviewer pane. One PR's review and settle stay in
@@ -304,7 +336,7 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 	var settling sync.Mutex
 	var running sync.WaitGroup
 	for i, pr := range prs {
-		if pr.Draft || isListedBot(pr, listed) {
+		if pr.Draft || isListedBot(pr, listed) || plans[i].skip {
 			continue
 		}
 		// A cancelled pass starts no further PR and returns once the running
@@ -321,13 +353,24 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 		go func() {
 			defer running.Done()
 			defer func() { <-slots }()
-			results[i] = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
+			var clean bool
+			results[i], clean = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
+			failed[i] = failed[i] || !clean
 		}()
 	}
 	running.Wait()
 	for _, e := range results {
 		errs = append(errs, e...)
 	}
+	numbers := make([]int, len(prs))
+	for i, pr := range prs {
+		numbers[i] = pr.Number
+		// Only a settled PR is remembered: a draft, or a head whose review is
+		// done. One still being reviewed is evaluated every pass, as before.
+		skips.record(r.Name, pr.Number, plans[i], !failed[i] && (pr.Draft || handled[i]))
+	}
+	skips.forget(r.Name, seen)
+	skips.report(r.Name, numbers, plans)
 	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
 	return errors.Join(errs...)
 }
@@ -335,12 +378,13 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 // reviewPR runs one PR's review, then settles it under settling unless phase
 // one already settled its reviewed head. A review the retry reran there is
 // settled next pass.
-func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) []error {
-	var errs []error
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean bool) {
+	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
 	e := s.RetryReview(reviewCtx, r, pr, o)
 	tracing.Finish(reviewSpan)
 	if e != nil {
+		clean = false
 		if errors.Is(e, pipeline.ErrReviewUnavailable) {
 			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
 				errs = append(errs, printErr)
@@ -350,11 +394,12 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 		}
 	}
 	if !settle {
-		return errs
+		return errs, clean
 	}
 	settling.Lock()
 	defer settling.Unlock()
-	return append(errs, settlePR(ctx, s, r, pr.Number, o)...)
+	settleErrs := settlePR(ctx, s, r, pr.Number, o)
+	return append(errs, settleErrs...), clean && len(settleErrs) == 0
 }
 
 // settlePR delivers findings to the author lane before the verdict, so the
