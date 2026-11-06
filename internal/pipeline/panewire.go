@@ -626,7 +626,14 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	if job.State != "" && ownerLane != "" {
 		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", ownerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil && !jobAlreadyClosed(err) {
-			return out, errors.Join(lost, err)
+			skip := jobCloseUnavailable(err)
+			if skip == "" {
+				return out, errors.Join(lost, err)
+			}
+			skipRow := map[string]any{"pr": pr.Number, "pass": plan.pass, "label": lost.label, "close_owner_lane": ownerLane, "close_owner_source": ownerSource, "close_skipped": skip}
+			if auditErr := s.audit(x.repo.Name, "review-result-lost-close-skipped", skipRow, false); auditErr != nil {
+				return out, errors.Join(lost, auditErr)
+			}
 		}
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
@@ -653,12 +660,31 @@ func (s *Service) reviewerCloseOwner(job integrations.JobRecord) (lane, source s
 	return "", ""
 }
 
-var jobAlreadyClosedText = regexp.MustCompile(`(?i)already[ _-](revoked|ended|closed|completed|terminal|finished)`)
+var (
+	jobAlreadyClosedText = regexp.MustCompile(`(?i)already has a terminal record|already[ _-](revoked|ended|closed|completed|terminal|finished)`)
+	jobNoEventsDirText   = regexp.MustCompile(`(?i)close: no events directory for job`)
+	jobNoClaimOwnerText  = regexp.MustCompile(`(?i)has no claim naming an owner lane`)
+)
 
 // jobAlreadyClosed reports a `panewire job close` failure that means the job
 // is already revoked or ended, so there is no hub claim left to release.
 func jobAlreadyClosed(err error) bool {
 	return jobAlreadyClosedText.MatchString(integrations.Detail(err))
+}
+
+// jobCloseUnavailable names why `panewire job close` cannot close the job from
+// here, or "" for any other failure. close reads the job's events directory on
+// the host it runs on, so a reviewer placed on another host has none here; a
+// job whose claim names no owner lane only closes with --operator-override,
+// which mergewake never passes. Either way the replacement goes on.
+func jobCloseUnavailable(err error) string {
+	switch d := integrations.Detail(err); {
+	case jobNoEventsDirText.MatchString(d):
+		return "close: not on this host"
+	case jobNoClaimOwnerText.MatchString(d):
+		return "close: job claim names no owner lane (operator override only)"
+	}
+	return ""
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.

@@ -87,9 +87,10 @@ func TestLostReviewerNoOwnerAnywhereSkipsCloseAndReplaces(t *testing.T) {
 	}
 }
 
-// (c) A close that answers "already revoked" counts as closed.
+// (c) A close refused because the job already has a terminal record counts as
+// closed. The text is panewire's own.
 func TestLostReviewerCloseAlreadyRevokedContinues(t *testing.T) {
-	already := &integrations.CommandError{Command: "panewire", Err: panewireExit(1), Stderr: "job close: job is already revoked\n"}
+	already := &integrations.CommandError{Command: "panewire", Err: panewireExit(1), Stderr: "close refused: job mwr-12-aaaa111-p1-1793790000 already has a terminal record (00003-job.revoked.json) after its latest claim\n"}
 	s, r, runner, old := lostReviewerSetup(t, integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}, "cfg-owner", already)
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
@@ -113,6 +114,32 @@ func TestLostReviewerOtherCloseErrorKeepsRecord(t *testing.T) {
 	}
 	if rj := readReviewerJob(t, s, r, 1); rj.Label != old.Label {
 		t.Fatalf("record %+v", rj)
+	}
+}
+
+// A close that cannot run from this host (the job's events live on another
+// host) or cannot name an owner skips the close, says so in the audit, and
+// replaces the reviewer without --operator-override.
+func TestLostReviewerCloseUnavailableSkipsAndReplaces(t *testing.T) {
+	for _, tt := range []struct{ name, stderr, note string }{
+		{"other host", "close: no events directory for job mwr-12-aaaa111-p1-1793790000\n", "close: not on this host"},
+		{"no claim owner", "close refused: job mwr-12-aaaa111-p1-1793790000 has no claim naming an owner lane; only --operator-override can close it\n", "operator override only"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fail := &integrations.CommandError{Command: "panewire", Err: panewireExit(1), Stderr: tt.stderr}
+			s, r, runner, old := lostReviewerSetup(t, integrations.JobRecord{State: "claimed", Host: "node-a", PaneID: "p1"}, "cfg-owner", fail)
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.closes) != 1 || slices.Contains(runner.closes[0], "--operator-override") {
+				t.Fatalf("closes=%v", runner.closes)
+			}
+			replaced(t, s, r, runner, old)
+			rows := auditRows(t, s, r, "review-result-lost-close-skipped")
+			if len(rows) != 1 || rows[0]["close_owner_source"] != "config" || !strings.Contains(rows[0]["close_skipped"].(string), tt.note) {
+				t.Fatalf("skip rows: %v", rows)
+			}
+		})
 	}
 }
 
