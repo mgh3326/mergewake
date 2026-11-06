@@ -54,6 +54,7 @@ type reviewerLabel struct {
 	name    string
 	pr      int
 	sha7    string
+	pass    int
 	started time.Time
 }
 
@@ -64,10 +65,11 @@ func parseReviewerLabel(name string) (reviewerLabel, bool) {
 	}
 	pr, e1 := strconv.Atoi(m[1])
 	unix, e2 := strconv.ParseInt(m[4], 10, 64)
-	if e1 != nil || e2 != nil || pr <= 0 {
+	pass, e3 := strconv.Atoi(m[3])
+	if e1 != nil || e2 != nil || e3 != nil || pr <= 0 {
 		return reviewerLabel{}, false
 	}
-	return reviewerLabel{name: name, pr: pr, sha7: m[2], started: time.Unix(unix, 0)}, true
+	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(unix, 0)}, true
 }
 
 // reviewerStream names one receipt stream of a label: the pane stream (gate

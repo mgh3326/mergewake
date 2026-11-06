@@ -133,6 +133,9 @@ type panewireExecutor struct {
 	movedHead    []reviewerJob // records of older heads whose jobs this run closed
 	mu           sync.Mutex    // guards movedHead: the passes of a head run concurrently
 	jobMu        sync.Mutex    // one pass at a time closes the records of older heads
+	opts         Options
+	sweepMu      sync.Mutex // guards swept: one reviewer sweep per run
+	swept        bool
 }
 
 type reviewResultLost struct {
@@ -169,6 +172,71 @@ func (e *reviewQuotaStopped) resetText() string {
 		return "unknown"
 	}
 	return e.resetAt.UTC().Format(time.RFC3339)
+}
+
+// reviewerHeld is a fresh reviewer spawn panewire refused because another
+// reviewer job of the task holds the reservation. It is no review failure: the
+// hold frees on its own. retryAfter is the wait panewire's refusal named, zero
+// when it named none: the retry then comes at the next evaluation.
+type reviewerHeld struct {
+	err        error
+	retryAfter time.Duration
+}
+
+func (e *reviewerHeld) Error() string { return e.err.Error() }
+func (e *reviewerHeld) Unwrap() error { return e.err }
+
+// heldRetryAfterRe finds retry_after_s, the seconds until the hold frees, in a
+// held refusal ("retry_after_s=<n>", or the JSON body's "retry_after_s":<n>).
+var heldRetryAfterRe = regexp.MustCompile(`retry_after_s"?\s*[:=]\s*"?(\d+)`)
+
+// heldHolderRe finds the holder job in "hub refused spawn: job_already_claimed
+// (held by request=<id> job=<label>)".
+var heldHolderRe = regexp.MustCompile(`held by request=\S+ job=([^\s)]+)`)
+
+// heldRetryAfterOf reads retry_after_s from a refusal's detail; zero when it is
+// absent or not a positive number of seconds (at most a day).
+func heldRetryAfterOf(detail string) time.Duration {
+	m := heldRetryAfterRe.FindStringSubmatch(detail)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1 {
+		return 0
+	}
+	return time.Duration(min(n, 86400)) * time.Second
+}
+
+// olderHeadHolder reports whether a held refusal names, as its holder, a
+// reviewer of this PR and this pass that reviewed another head: a label this
+// service's own earlier head left behind.
+func olderHeadHolder(detail string, pr github.Pull, pass int) bool {
+	m := heldHolderRe.FindStringSubmatch(detail)
+	if m == nil {
+		return false
+	}
+	l, ok := parseReviewerLabel(m[1])
+	return ok && l.pr == pr.Number && l.pass == pass && !strings.HasPrefix(pr.Head.SHA, l.sha7)
+}
+
+// reapOlderHeadReviewers runs the reviewer sweep of the PR once per review run:
+// it closes the finished panes of earlier heads' reviewers, which frees the
+// hub's reservation. Anything it cannot do is left to the next evaluation.
+func (x *panewireExecutor) reapOlderHeadReviewers(ctx context.Context) error {
+	x.sweepMu.Lock()
+	defer x.sweepMu.Unlock()
+	if x.swept {
+		return nil
+	}
+	x.swept = true
+	sweep := x.s.sweepReviewers
+	if sweep == nil {
+		sweep = func(ctx context.Context, r config.Repo, n int, o Options) error {
+			return x.s.Reap(context.WithValue(ctx, reviewersOnlyKey{}, true), r, n, o)
+		}
+	}
+	return sweep(ctx, x.repo, x.pr.Number, x.opts)
 }
 
 // parseQuotaStop reads an hk end_reason of the form
@@ -599,7 +667,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		tracing.Finish(runSpan)
 		// A fresh spawn refused as held, while this run closed the job of an
 		// older head: close it once more and spawn again, once.
+		heldRetried := false
 		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHeadJobs()) > 0 {
+			heldRetried = true
 			var closeErr error
 			for _, old := range x.movedHeadJobs() {
 				closeErr = errors.Join(closeErr, x.closeMovedHeadJob(ctx, old))
@@ -612,6 +682,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
 				}
 				return out, errors.Join(e, closeErr)
+			}
+			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = launch(runCtx, args)
+			tracing.Finish(runSpan)
+		}
+		// A fresh spawn refused as held by a reviewer of an older head of this
+		// pass: sweep that head's finished panes and spawn again, once.
+		if e != nil && !resumed && !heldRetried && exitStatus(e) == panewireHeld && ctx.Err() == nil && x.opts.Acting() && olderHeadHolder(integrations.Detail(e), pr, plan.pass) {
+			if sweepErr := x.reapOlderHeadReviewers(ctx); sweepErr != nil {
+				_ = s.audit(x.repo.Name, "reviewer-held-sweep-failed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "error": fleetevent.Redact(sweepErr.Error())}, false)
 			}
 			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
 			stdout, e = launch(runCtx, args)
@@ -662,7 +742,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// fails and RetryReview tries again.
 			if code == panewireHeld && ctx.Err() == nil {
 				auditErr := s.audit(x.repo.Name, "reviewer-held", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "task": task, "resumed": resumed}, false)
-				return out, errors.Join(fmt.Errorf("%w: pass %d: another reviewer job of task %s holds the reviewer reservation (panewire exit %d): %s", ErrReviewUnavailable, plan.pass, task, code, fleetevent.Redact(integrations.Detail(e))), auditErr)
+				detail := integrations.Detail(e)
+				held := &reviewerHeld{retryAfter: heldRetryAfterOf(detail), err: fmt.Errorf("%w: pass %d: another reviewer job of task %s holds the reviewer reservation (panewire exit %d): %s", ErrReviewUnavailable, plan.pass, task, code, fleetevent.Redact(detail))}
+				return out, errors.Join(held, auditErr)
 			}
 			// Every exit but the pre-start refusal may leave a pane running in
 			// this checkout: a timed-out --wait is one such exit. Keep the checkout

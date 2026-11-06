@@ -218,15 +218,15 @@ func TestReviewerHeldIsNotASkip(t *testing.T) {
 		t.Fatalf("held audit=%v", held)
 	}
 	reviewerJobGone(t, s, r, 1)
-	// RetryReview counts it as a failed attempt and backs off.
+	// RetryReview counts no failure and no backoff: the next evaluation retries.
 	c := &clock{t: time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)}
 	s.Now = c.now
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
 		t.Fatalf("retry err=%v", err)
 	}
 	var state reviewRetryState
-	if _, err := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), &state); err != nil || state.Failures != 1 || runner.headless != 0 {
+	if _, err := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), &state); err != nil || state.Failures != 0 || state.Backoffs != 0 || runner.headless != 0 {
 		t.Fatalf("retry state %+v err=%v headless=%d", state, err, runner.headless)
 	}
 }

@@ -73,6 +73,9 @@ type Service struct {
 	// reapBinds caches each merged PR's task/job binding for reap (see
 	// reapBinding), guarded by reapBindMu.
 	reapBinds map[string]reapBinding
+	// sweepReviewers closes the finished reviewer panes of a PR; nil runs the
+	// reviewer sweep of Reap. Tests set it.
+	sweepReviewers func(context.Context, config.Repo, int, Options) error
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
