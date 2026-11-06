@@ -179,6 +179,22 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		}
 		d.WakeGap = gap
 	}
+	// A finished reviewer job wakes the pr role without waiting for the
+	// webhook gap; the watch reads hk job records only.
+	d.Reviewers = &daemon.ReviewerWatch{
+		Dirty: dirty,
+		Jobs: func() []daemon.WatchedJob {
+			var jobs []daemon.WatchedJob
+			for _, r := range s.Config.Repos {
+				if repo == "" || r.Name == repo {
+					jobs = append(jobs, s.RecordedReviewerJobs(r.Name)...)
+				}
+			}
+			return jobs
+		},
+		Read:     s.ReviewerJobView,
+		NotFound: pipeline.IsJobNotFound,
+	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
 	}

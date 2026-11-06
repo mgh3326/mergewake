@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -57,25 +58,75 @@ type Daemon struct {
 	// WakeGap is the shortest time from the end of a pass to a pass a Trigger
 	// wakes. A wake also never cuts short a rate-limit wait.
 	WakeGap time.Duration
-	mu      sync.Mutex
-	wake    map[string]chan struct{}
-	failed  map[string]int
+	// ReviewerWakeGap is the same for a wake from the reviewer watch; zero means
+	// ReviewerGap. A finished reviewer job costs no GitHub request to notice, so
+	// it does not wait for WakeGap.
+	ReviewerWakeGap time.Duration
+	// Reviewers, when set, runs next to the loops while the pr role runs and
+	// wakes it when a reviewer job finishes. nil means off.
+	Reviewers *ReviewerWatch
+	mu        sync.Mutex
+	wake      map[string]chan struct{}
+	pending   map[string][]WakeSource
+	failed    map[string]int
 }
+
+// ReviewerGap is the shortest time from the end of a pass to a pass a finished
+// reviewer job wakes. It is only long enough to keep a burst of finishing jobs
+// from running passes back to back.
+const ReviewerGap = 30 * time.Second
+
+// WakeSource names what started a pass.
+type WakeSource string
+
+const (
+	WakeInterval WakeSource = "interval"
+	WakeWebhook  WakeSource = "webhook"
+	WakeReviewer WakeSource = "reviewer"
+)
 
 // Trigger wakes a role after a trusted adapter receives an event. It coalesces
 // bursts; the role's local lock and timer still govern all work.
-func (d *Daemon) Trigger(role string) bool {
+func (d *Daemon) Trigger(role string) bool { return d.trigger(role, WakeWebhook) }
+
+// TriggerReviewer wakes a role because a reviewer job finished.
+func (d *Daemon) TriggerReviewer(role string) bool { return d.trigger(role, WakeReviewer) }
+
+func (d *Daemon) trigger(role string, src WakeSource) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ch, ok := d.wake[role]
 	if !ok {
 		return false
 	}
+	// The source is kept beside the coalesced signal: a reviewer wake behind a
+	// pending webhook wake must still be seen, it has the shorter gap.
+	if !slices.Contains(d.pending[role], src) {
+		d.pending[role] = append(d.pending[role], src)
+	}
 	select {
 	case ch <- struct{}{}:
 	default:
 	}
 	return true
+}
+
+func (d *Daemon) takeWakes(role string) []WakeSource {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := d.pending[role]
+	delete(d.pending, role)
+	return out
+}
+
+func (d *Daemon) gap(src WakeSource) time.Duration {
+	if src != WakeReviewer {
+		return d.WakeGap
+	}
+	if d.ReviewerWakeGap > 0 {
+		return d.ReviewerWakeGap
+	}
+	return ReviewerGap
 }
 func lock(name string) (func(), error) {
 	unlock, err := fsutil.Lock(name, false)
@@ -112,6 +163,7 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 	d.mu.Lock()
 	d.wake = map[string]chan struct{}{}
 	d.failed = map[string]int{}
+	d.pending = map[string][]WakeSource{}
 	d.mu.Unlock()
 	lockDir := d.LockDir
 	if lockDir == "" {
@@ -154,6 +206,23 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 			return err
 		}
 	}
+	if d.Reviewers != nil && d.Reviewers.Jobs != nil {
+		d.mu.Lock()
+		_, hasPR := d.wake["pr"]
+		d.mu.Unlock()
+		if hasPR {
+			rw := *d.Reviewers
+			rw.Log = d.Log
+			if rw.Wake == nil {
+				rw.Wake = func() { d.TriggerReviewer("pr") }
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rw.Run(ctx)
+			}()
+		}
+	}
 	// One slot per loop keeps the joined error in configuration order.
 	errs := make([]error, len(loops))
 	for i, loop := range loops {
@@ -178,6 +247,8 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 	ch := d.wake[l.Role]
 	d.mu.Unlock()
 	events := fleetevent.New(d.StateDir, "mergewake", d.now)
+	// The first pass is the start; every later one is named by what ended the wait.
+	src := WakeInterval
 	for ctx.Err() == nil {
 		st.Running = true
 		st.LastRun = d.now().UTC()
@@ -230,54 +301,59 @@ func (d *Daemon) runLoop(ctx context.Context, l Loop) error {
 		if e := save(); e != nil {
 			return e
 		}
-		d.Log.Info("loop completed", "role", l.Role, "error", st.LastError, "failures", st.Failures, "next_run", st.NextRun)
+		d.Log.Info("loop completed", "role", l.Role, "wake", string(src), "error", st.LastError, "failures", st.Failures, "next_run", st.NextRun)
 		if ctx.Err() != nil {
 			break
 		}
-		d.wait(ctx, ch, delay, st.LastFinish)
+		src = d.wait(ctx, l.Role, ch, delay, st.LastFinish)
 	}
 	st.Running = false
 	st.NextRun = time.Time{}
 	return save()
 }
 
-// wait sleeps until the scheduled poll, or earlier when a wake arrives. A woken
-// pass starts no sooner than WakeGap after lastFinish and never inside a
+// wait sleeps until the scheduled poll, or earlier when a wake arrives, and
+// returns what ended it: the source of the wake that set the start time, or the
+// interval. A woken pass starts no sooner than the wake source's gap (WakeGap,
+// or ReviewerGap for the reviewer watch) after lastFinish and never inside a
 // rate-limit wait, read again at each wake because another role may have moved
 // it. A wake never pushes the scheduled poll later. Cancellation returns at
 // once; the caller's loop condition then stops.
-func (d *Daemon) wait(ctx context.Context, ch <-chan struct{}, delay time.Duration, lastFinish time.Time) {
+func (d *Daemon) wait(ctx context.Context, role string, ch <-chan struct{}, delay time.Duration, lastFinish time.Time) WakeSource {
 	due := d.now().Add(delay)
+	src := WakeInterval
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return src
 		case <-timer.C:
-			return
+			return src
 		case <-ch:
-			now := d.now()
-			at := lastFinish.Add(d.WakeGap)
-			if d.RateWait != nil {
-				if r := now.Add(d.RateWait()); r.After(at) {
-					at = r
+			for _, w := range d.takeWakes(role) {
+				now := d.now()
+				at := lastFinish.Add(d.gap(w))
+				if d.RateWait != nil {
+					if r := now.Add(d.RateWait()); r.After(at) {
+						at = r
+					}
 				}
-			}
-			if at.Before(now) {
-				at = now
-			}
-			if !at.Before(due) {
-				continue
-			}
-			due = at
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+				if at.Before(now) {
+					at = now
 				}
+				if !at.Before(due) {
+					continue
+				}
+				due, src = at, w
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(at.Sub(now))
 			}
-			timer.Reset(at.Sub(now))
 		}
 	}
 }
