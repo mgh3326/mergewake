@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -40,11 +41,16 @@ type Client struct {
 	// Objects, when set, caches sha-addressed objects (commits, trees, blobs,
 	// files read through a commit) across passes and processes. Nil means every
 	// read goes to GitHub.
-	Objects  ObjectCache
-	app      *appAuth
-	poll     pollingState
-	evidence evidenceCache
-	writes   writeEpochs
+	Objects ObjectCache
+	// Webhook, when set, holds what verified deliveries carried. Every Pull,
+	// head-check and review-history read compares it with the API (shadow) and
+	// seeds it from the API; with ServeWebhookState on it answers instead.
+	Webhook           *webhookstate.Store
+	serveWebhookState bool
+	app               *appAuth
+	poll              pollingState
+	evidence          evidenceCache
+	writes            writeEpochs
 }
 
 func (c *Client) now() time.Time {
@@ -54,8 +60,15 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
+// ServeWebhookState is the phase switch of docs/webhook-state.md. Off (phase 1),
+// stored webhook state is only compared with what the API says. On (phase 2),
+// a Pull, head-check or review-history read that is not fresh is answered from
+// the stored state when it holds a recent value, and goes to the API when it
+// does not. Reads under FreshEvidence always go to the API.
+const ServeWebhookState = false
+
 func New(token string) *Client {
-	return &Client{BaseURL: "https://api.github.com", UploadURL: "https://uploads.github.com", Token: token, HTTP: &http.Client{Timeout: 45 * time.Second}}
+	return &Client{BaseURL: "https://api.github.com", UploadURL: "https://uploads.github.com", Token: token, HTTP: &http.Client{Timeout: 45 * time.Second}, serveWebhookState: ServeWebhookState}
 }
 
 type APIError struct {
@@ -99,6 +112,8 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	if method != "GET" && route != "/graphql" {
 		// Whatever the outcome, the write may have changed what any pass memoized.
 		defer c.writes.bump(memoRepo(route))
+		// Its delivery may not have arrived yet, so nothing stored answers a read.
+		defer c.distrustWebhookState(memoRepo(route))
 	}
 	if method == "GET" && !fresh {
 		if hit, e := c.pollShortcut(key); e != nil {
@@ -225,33 +240,43 @@ type Ref struct {
 		FullName string `json:"full_name"`
 	} `json:"repo"`
 }
+type PullLabel struct {
+	Name string `json:"name"`
+}
 type Pull struct {
-	CreatedAt      string   `json:"created_at"`
-	UpdatedAt      string   `json:"updated_at"`
-	ClosedAt       *string  `json:"closed_at"`
-	HTMLURL        string   `json:"html_url"`
-	MergedAt       *string  `json:"merged_at"`
-	Number         int      `json:"number"`
-	State          string   `json:"state"`
-	Draft          bool     `json:"draft"`
-	Merged         bool     `json:"merged"`
-	Title          string   `json:"title"`
-	Body           string   `json:"body"`
-	Head           Ref      `json:"head"`
-	Base           Ref      `json:"base"`
-	User           PullUser `json:"user"`
-	MergeCommitSHA string   `json:"merge_commit_sha"`
-	ChangedFiles   int      `json:"changed_files"`
-	Additions      int      `json:"additions"`
-	Deletions      int      `json:"deletions"`
-	Mergeable      *bool    `json:"mergeable"`
-	MergeableState string   `json:"mergeable_state"`
+	Labels         []PullLabel `json:"labels"`
+	CreatedAt      string      `json:"created_at"`
+	UpdatedAt      string      `json:"updated_at"`
+	ClosedAt       *string     `json:"closed_at"`
+	HTMLURL        string      `json:"html_url"`
+	MergedAt       *string     `json:"merged_at"`
+	Number         int         `json:"number"`
+	State          string      `json:"state"`
+	Draft          bool        `json:"draft"`
+	Merged         bool        `json:"merged"`
+	Title          string      `json:"title"`
+	Body           string      `json:"body"`
+	Head           Ref         `json:"head"`
+	Base           Ref         `json:"base"`
+	User           PullUser    `json:"user"`
+	MergeCommitSHA string      `json:"merge_commit_sha"`
+	ChangedFiles   int         `json:"changed_files"`
+	Additions      int         `json:"additions"`
+	Deletions      int         `json:"deletions"`
+	Mergeable      *bool       `json:"mergeable"`
+	MergeableState string      `json:"mergeable_state"`
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	return memoized(ctx, c, memoKey{repo, "pull", strconv.Itoa(n)}, func() (Pull, error) {
+		if p, ok := c.storedPull(ctx, repo, n); ok {
+			return p, nil
+		}
 		var p Pull
 		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
+		if e == nil {
+			c.shadowPull(repo, n, p)
+		}
 		return p, e
 	})
 }
@@ -322,11 +347,21 @@ type checkRun struct {
 	Conclusion string `json:"conclusion"`
 	// CompletedAt is when the run finished; the zero time means GitHub did not say.
 	CompletedAt time.Time `json:"completed_at"`
+	StartedAt   time.Time `json:"started_at"`
+	DetailsURL  string    `json:"details_url"`
+	CheckSuite  struct {
+		ID int64 `json:"id"`
+	} `json:"check_suite"`
+	App struct {
+		Slug string `json:"slug"`
+	} `json:"app"`
 }
 type status struct {
-	ID      int64  `json:"id"`
-	Context string `json:"context"`
-	State   string `json:"state"`
+	ID        int64     `json:"id"`
+	Context   string    `json:"context"`
+	State     string    `json:"state"`
+	TargetURL string    `json:"target_url"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // checkEvidence is the per-name state of a head's checks plus, for each name
@@ -342,10 +377,7 @@ func (c *Client) checkStates(ctx context.Context, repo, sha string, preserveVerd
 }
 
 func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVerdicts bool) (checkEvidence, error) {
-	states := map[string]CI{}
-	cancelledAt := map[string]time.Time{}
-	ids := map[string]int64{}
-	ran := map[string]bool{}
+	var all []checkRun
 	for page := 1; page <= 100; page++ {
 		var runs struct {
 			CheckRuns []checkRun `json:"check_runs"`
@@ -353,46 +385,7 @@ func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVe
 		if e := c.json(ctx, "GET", fmt.Sprintf("%s/commits/%s/check-runs?filter=latest&per_page=100&page=%d", base(repo), sha, page), nil, &runs); e != nil {
 			return checkEvidence{}, e
 		}
-		for _, r := range runs.CheckRuns {
-			// Two workflows can define a job with the same name (a CI "test" and a
-			// release "test" that skips on PRs). A skipped or neutral run never
-			// overrides a sibling that actually ran; it only counts when it is the
-			// sole run of that name. Per-check gate evidence also preserves a
-			// sibling verdict against a cancellation; aggregate Check retains its
-			// original latest-run behavior.
-			idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral" || (preserveVerdicts && r.Conclusion == "cancelled"))
-			// A skipped or neutral run holds no verdict either, so it never
-			// replaces a cancellation: the cancelled run still has to be rerun.
-			holdsNothing := r.Conclusion == "skipped" || r.Conclusion == "neutral"
-			if idle && (ran[r.Name] || (holdsNothing && states[r.Name] == Cancelled)) {
-				continue
-			}
-			if !idle && !ran[r.Name] {
-				ran[r.Name] = true
-				ids[r.Name] = 0
-			}
-			if r.ID < ids[r.Name] {
-				continue
-			}
-			ids[r.Name] = r.ID
-			state := Pending
-			delete(cancelledAt, r.Name)
-			if r.Status == "completed" {
-				switch r.Conclusion {
-				case "success":
-					state = Green
-				case "cancelled":
-					state = Cancelled
-					cancelledAt[r.Name] = r.CompletedAt
-				case "skipped", "neutral":
-					state = Skipped
-				case "failure", "timed_out", "action_required", "startup_failure", "stale":
-					state = Red
-				}
-			}
-			// Check treats cancelled evidence as pending for aggregate consumers.
-			states[r.Name] = state
-		}
+		all = append(all, runs.CheckRuns...)
 		if len(runs.CheckRuns) < 100 {
 			break
 		}
@@ -403,6 +396,59 @@ func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVe
 	statuses, e := list[status](ctx, c, base(repo)+"/commits/"+sha+"/statuses")
 	if e != nil {
 		return checkEvidence{}, e
+	}
+	ev, e := foldChecks(all, statuses, preserveVerdicts)
+	c.shadowChecks(repo, sha, all, statuses, preserveVerdicts, ev, e)
+	return ev, e
+}
+
+// foldChecks reduces a head's check runs and commit statuses to one state per
+// check name. It is the one place that judges them, so a read from the API and
+// a read from stored webhook state cannot disagree about how.
+func foldChecks(runs []checkRun, statuses []status, preserveVerdicts bool) (checkEvidence, error) {
+	states := map[string]CI{}
+	cancelledAt := map[string]time.Time{}
+	ids := map[string]int64{}
+	ran := map[string]bool{}
+	for _, r := range runs {
+		// Two workflows can define a job with the same name (a CI "test" and a
+		// release "test" that skips on PRs). A skipped or neutral run never
+		// overrides a sibling that actually ran; it only counts when it is the
+		// sole run of that name. Per-check gate evidence also preserves a
+		// sibling verdict against a cancellation; aggregate Check retains its
+		// original latest-run behavior.
+		idle := r.Status == "completed" && (r.Conclusion == "skipped" || r.Conclusion == "neutral" || (preserveVerdicts && r.Conclusion == "cancelled"))
+		// A skipped or neutral run holds no verdict either, so it never
+		// replaces a cancellation: the cancelled run still has to be rerun.
+		holdsNothing := r.Conclusion == "skipped" || r.Conclusion == "neutral"
+		if idle && (ran[r.Name] || (holdsNothing && states[r.Name] == Cancelled)) {
+			continue
+		}
+		if !idle && !ran[r.Name] {
+			ran[r.Name] = true
+			ids[r.Name] = 0
+		}
+		if r.ID < ids[r.Name] {
+			continue
+		}
+		ids[r.Name] = r.ID
+		state := Pending
+		delete(cancelledAt, r.Name)
+		if r.Status == "completed" {
+			switch r.Conclusion {
+			case "success":
+				state = Green
+			case "cancelled":
+				state = Cancelled
+				cancelledAt[r.Name] = r.CompletedAt
+			case "skipped", "neutral":
+				state = Skipped
+			case "failure", "timed_out", "action_required", "startup_failure", "stale":
+				state = Red
+			}
+		}
+		// Check treats cancelled evidence as pending for aggregate consumers.
+		states[r.Name] = state
 	}
 	latest := map[string]status{}
 	for _, s := range statuses {
@@ -502,6 +548,9 @@ func (c *Client) CheckSnapshot(ctx context.Context, repo, sha string, required [
 }
 
 func (c *Client) headChecks(ctx context.Context, repo, sha string) (checkEvidence, error) {
+	if ev, ok := c.storedHeadChecks(ctx, repo, sha); ok {
+		return ev, nil
+	}
 	return cachedEvidence(ctx, c, evidenceKey{repo, "checks", sha}, func() (checkEvidence, error) { return c.checkEvidence(freshRequest(ctx), repo, sha, true) })
 }
 
@@ -681,11 +730,20 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 }
 
 func (c *Client) reviewHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
-	var out []ReviewedPass
+	if reviews, ok := c.storedReviews(ctx, repo, n); ok {
+		return passesFrom(reviews, login)
+	}
 	reviews, e := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
 	if e != nil {
-		return out, e
+		return nil, e
 	}
+	c.shadowReviews(repo, n, reviews)
+	return passesFrom(reviews, login)
+}
+
+// passesFrom lists the passes login posted among reviews, oldest first.
+func passesFrom(reviews []Review, login string) ([]ReviewedPass, error) {
+	var out []ReviewedPass
 	next := map[string]int{}
 	for _, r := range reviews {
 		if r.User.Login != login || r.CommitID == "" || !strings.HasPrefix(r.Body, Marker(r.CommitID)+"\n") {
