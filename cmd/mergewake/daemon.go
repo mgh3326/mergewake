@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/crashreport"
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/prstatus"
@@ -179,7 +180,10 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		if secret == "" {
 			return errors.New("daemon.webhook.secret_env is unset or empty")
 		}
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty,
+		state := webhookstate.Open(s.Config.StateDir)
+		state.Log = log
+		gh.Webhook = state
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state,
 			Status: prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
 				Wake: func() { d.Trigger("pr") }}}
 		gap, err := config.Duration(wc.MinGap)

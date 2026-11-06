@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 )
 
 // MaxWebhookBody caps a delivery at 5 MiB.
@@ -36,9 +38,15 @@ type Webhook struct {
 	Invalidate func(repo string)
 	// Dirty, when set, records the PRs a delivery names (see deliveryPayload.mark).
 	Dirty *Dirty
+	// State, when set, keeps what each delivery carries (see webhookstate). A
+	// payload it cannot parse is logged once per event type and never changes
+	// the response or the wake.
+	State *webhookstate.Store
 	// Status, when set, answers StatusPath on the same listener. It is local
 	// and read-only, so it takes no signature; the delivery Path always wins.
 	Status http.Handler
+
+	parseWarned sync.Map
 }
 
 // StatusPath is where Status is served.
@@ -69,6 +77,13 @@ func (d *Daemon) serveWebhook(ctx context.Context, wg *sync.WaitGroup) error {
 	}
 	// ReadTimeout bounds the whole request, body included, so a dripped body
 	// cannot hold a connection open.
+	if wh.State != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.flushState(ctx)
+		}()
+	}
 	srv := &http.Server{Handler: http.HandlerFunc(d.handleDelivery), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	wg.Add(1)
 	go func() {
@@ -136,6 +151,13 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	if wh.Repos[delivery.Repository.FullName] {
 		event := r.Header.Get("X-GitHub-Event")
 		if event == "pull_request" || strings.HasPrefix(event, "pull_request_review") || event == "check_suite" || event == "check_run" || event == "status" {
+			if wh.State != nil {
+				if e := wh.State.Apply(delivery.Repository.FullName, event, r.Header.Get("X-GitHub-Delivery"), payload); e != nil {
+					if _, seen := wh.parseWarned.LoadOrStore(event, true); !seen {
+						d.Log.Warn("webhook state ignored a delivery", "event", event, "error", e.Error())
+					}
+				}
+			}
 			if wh.Invalidate != nil {
 				wh.Invalidate(delivery.Repository.FullName)
 			}
@@ -204,5 +226,37 @@ func (p deliveryPayload) mark(d *Dirty, event string) {
 		d.Mark(repo, 0, p.SHA)
 	default:
 		d.Mark(repo, max(p.PullRequest.Number, p.Number), p.PullRequest.Head.SHA)
+	}
+}
+
+// stateFlushEvery is how often the kept state reaches disk; the daemon also
+// flushes when it stops.
+const stateFlushEvery = 2 * time.Second
+
+// flushState writes the webhook state to disk until ctx ends, then once more,
+// and logs the shadow-comparison counters when they changed.
+func (d *Daemon) flushState(ctx context.Context) {
+	st := d.Webhook.State
+	tick := time.NewTicker(stateFlushEvery)
+	defer tick.Stop()
+	var logged webhookstate.Counters
+	var lastLog time.Time
+	flush := func() {
+		if e := st.Flush(); e != nil {
+			d.Log.Warn("webhook state not written", "error", e.Error())
+		}
+		if c := st.Counters(); c != logged && time.Since(lastLog) >= time.Minute {
+			d.Log.Info("webhook_state counters", "webhook_state_hits", c.Hits, "webhook_state_misses", c.Misses, "webhook_state_mismatches", c.Mismatches)
+			logged, lastLog = c, time.Now()
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case <-tick.C:
+			flush()
+		}
 	}
 }
