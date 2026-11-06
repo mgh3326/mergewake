@@ -103,12 +103,36 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	summary := pr.Title
 	if v.State == "blocked" {
+		reasons, waiting := splitInternalWaits(v.Reasons, v.Review.Block)
+		if waiting {
+			since, e := s.reviewWaitSince(r, pr)
+			if e != nil {
+				return e
+			}
+			if len(reasons) == 0 {
+				// Only mergewake's own queue holds the head: nothing for any
+				// session to do until the wait outlasts reviewStallAfter.
+				lane, via, sent, e := s.reviewStalled(ctx, r, pr, v, since)
+				if e != nil {
+					if !errors.Is(e, errNotifyDelivery) {
+						return e
+					}
+					record.Via, record.Error = "delivery-failed", e.Error()
+					return s.audit(r.Name, "pr-notify", record, false)
+				}
+				if !sent {
+					return nil
+				}
+				record.Reasons, record.Lane, record.Via, record.Sent = []string{"review_stalled"}, lane, via, true
+				return s.audit(r.Name, "pr-notify", record, false)
+			}
+		}
 		cancelled := make(map[string]bool, len(v.Review.ChecksCancelled))
 		for _, name := range v.Review.ChecksCancelled {
 			cancelled["check_cancelled:"+name] = true
 		}
-		annotated := make([]string, 0, len(v.Reasons))
-		for _, reason := range v.Reasons {
+		annotated := make([]string, 0, len(reasons))
+		for _, reason := range reasons {
 			if cancelled[reason] {
 				reason += " (rerun it)"
 			}
@@ -279,7 +303,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
-		Type: verdictType(state, summary, via, s.isDeskLane(lane)),
+		Type: verdictType(state, via, s.isDeskLane(lane)),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
 		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
@@ -289,7 +313,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
-				Type: verdictType(state, summary, via, s.isDeskLane(fallback)),
+				Type: verdictType(state, via, s.isDeskLane(fallback)),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
@@ -409,7 +433,7 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 		ID:   fmt.Sprintf("mergewake-ready-%s-%d-%s-reminder-%d", r.Name, pr.Number, pr.Head.SHA, c.Repeats),
 		Text: textFor(lane, rvia),
 		Lane: lane,
-		Type: verdictType("ready", "", via, s.isDeskLane(lane)),
+		Type: verdictType("ready", via, s.isDeskLane(lane)),
 	})
 	if e != nil {
 		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
@@ -460,9 +484,12 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 	return "", "no-lane", nil
 }
 
+// authorAction reports whether summary holds a reason the PR's author fixes:
+// a conflict, findings, a failed or cancelled check, or a review blocked on a
+// detail only the author can add (NotifyPR renders it "review_missing (detail)").
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
-		if reason == "conflict" {
+		if reason == "conflict" || strings.HasPrefix(reason, "review_missing (") {
 			return true
 		}
 		for _, prefix := range []string{"blocking_findings:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
@@ -487,22 +514,17 @@ func (s *Service) isDeskLane(lane string) bool {
 // verdictType is the panewire type a lane event is declared with. READY and
 // BLOCKED interrupt and must be acked, so only the verdicts that need action
 // from their receiver keep them: an author lane gets READY as info (mergewake
-// merges it itself), and a BLOCKED whose only reason is review_missing as
-// progress (mergewake's own reviewer is running). The desk keeps both
-// unchanged. A review_missing carrying a block detail waits on the author and
-// stays blocked.
-func verdictType(state, summary, via string, desk bool) string {
+// merges it itself). A BLOCKED never reaches here for mergewake's own review
+// wait: NotifyPR sends that only as the review-stalled alert.
+func verdictType(state, via string, desk bool) string {
 	if state == botNoticeState {
 		return "decision"
 	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
 	}
-	switch {
-	case state == "ready" && !desk:
+	if state == "ready" && !desk {
 		return "info"
-	case state == "blocked" && summary == "review_missing":
-		return "progress"
 	}
 	return eventType(state)
 }

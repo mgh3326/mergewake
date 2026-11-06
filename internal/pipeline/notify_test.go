@@ -135,16 +135,14 @@ func TestNotifyPendingSilentAndFailingNames(t *testing.T) {
 }
 
 // With checks green, BLOCKED names the closed-vocabulary reason that holds the
-// head: missing review marker, open threads, a stale base or a conflict.
+// head: open threads, a stale base or a conflict. A missing review is
+// mergewake's own wait and sends nothing (TestNotifyActionable*).
 func TestNotifyBlockedReasons(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		prepare func(*fakeGH)
 		reason  string
 	}{
-		{"review missing", func(g *fakeGH) {
-			g.refs = map[string]bool{}
-		}, "review_missing"},
 		{"threads open", func(g *fakeGH) {
 			g.findings = 2
 		}, "threads_open:2"},
@@ -357,6 +355,7 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 		t.Fatalf("events=%+v", n.events)
 	}
 	g.pull.Head.SHA = shaB
+	markReviewed(g)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}

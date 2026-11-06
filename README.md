@@ -160,6 +160,11 @@ until `panewire inbox ack`, and a READY PR nobody merged is notified again every
 `daemon.pr.notify.renotify_after` (default 30m), at most `renotify_max` times
 (default 3).
 
+A `review_missing` BLOCKED with no block detail is mergewake's own queue state and
+sends nothing; a head that keeps it for more than 60 minutes gets one
+`review stalled` alert on the notify lane. The reason table and routing are in
+[`docs/config.md`](docs/config.md).
+
 Review findings and author-actionable BLOCKED notices use the task's bound
 worker or lead job lane. A completed job keeps that route. Missing author
 ownership goes to the desk as a decision. Unresolved findings reach the desk
