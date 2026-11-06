@@ -123,9 +123,9 @@ func TestTaskEventMergeSHAUnknown(t *testing.T) {
 	}
 }
 
-// An hk that answers 400 to the extended payload gets the same event once more
-// without the new fields; that succeeds, and the refusal is audited with hk's
-// error code and nothing of the payload.
+// An hk that answers 400 to every extended payload gets the event again with
+// head and base but no reviews, then plain; that succeeds, and the refusal is
+// audited with hk's error code, the resend form and nothing of the payload.
 func TestTaskEventFieldsRefusedResend(t *testing.T) {
 	s, g, hk, r := hkSetup(t)
 	hk.refuseExtended = true
@@ -134,15 +134,18 @@ func TestTaskEventFieldsRefusedResend(t *testing.T) {
 		t.Fatal(e)
 	}
 	got := hk.received()
-	if len(got) != 2 {
-		t.Fatalf("want the extended post and one plain resend: %+v", got)
+	if len(got) != 3 {
+		t.Fatalf("want the extended post, one without reviews and one plain: %+v", got)
 	}
 	if len(got[0].Reviews) != 2 || got[0].HeadSHA == "" {
 		t.Fatalf("first post %+v", got[0])
 	}
-	wantEvent(t, got[1], integrations.SourceReview, testPRURL, testPRURL, "", "")
-	if got[1].HeadSHA != "" || got[1].BaseSHA != "" || got[1].MergeSHA != "" || len(got[1].Reviews) != 0 {
-		t.Fatalf("resend kept new fields: %+v", got[1])
+	if len(got[1].Reviews) != 0 || got[1].HeadSHA == "" {
+		t.Fatalf("second post must keep head and base, without reviews: %+v", got[1])
+	}
+	wantEvent(t, got[2], integrations.SourceReview, testPRURL, testPRURL, "", "")
+	if got[2].HeadSHA != "" || got[2].BaseSHA != "" || got[2].MergeSHA != "" || len(got[2].Reviews) != 0 {
+		t.Fatalf("resend kept new fields: %+v", got[2])
 	}
 	rows := eventAuditRows(t, s, r.Name, "hk-task-event")
 	if len(rows) != 1 || rows[0]["error"] != nil || rows[0]["result"] == nil {
@@ -152,8 +155,8 @@ func TestTaskEventFieldsRefusedResend(t *testing.T) {
 	if len(refused) != 1 || refused[0]["code"] != "invalid_event" || refused[0]["source"] != integrations.SourceReview || refused[0]["source_ref"] != testPRURL {
 		t.Fatalf("refused audit %+v", refused)
 	}
-	if len(refused[0]) != 4 {
-		t.Fatalf("refused audit carries more than source, task, source_ref and code: %+v", refused[0])
+	if len(refused[0]) != 5 || refused[0]["resend"] != integrations.ResendPlain {
+		t.Fatalf("refused audit carries more than source, task, source_ref, code and resend: %+v", refused[0])
 	}
 }
 

@@ -1,9 +1,11 @@
 package pipeline
 
 import (
+	"cmp"
 	"context"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -26,13 +28,29 @@ type taskEventRecord struct {
 }
 
 // fieldsRefusedRecord is the audit row of an hk that answered 400 to the
-// optional head/base/merge/reviews fields: the event was resent without them.
-// It names the hk error code only, never the payload.
+// optional head/base/merge/reviews fields: the event was resent with fewer of
+// them. It holds hk's error code, its message (bounded and redacted, empty when
+// hk sent none) and the resend form that landed, never the payload.
 type fieldsRefusedRecord struct {
 	Source    string `json:"source"`
 	Task      string `json:"task"`
 	SourceRef string `json:"source_ref"`
 	Code      string `json:"code"`
+	Message   string `json:"message,omitempty"`
+	Resend    string `json:"resend"`
+}
+
+// reviewRecordAudit is the audit row of a review record that did not go to hk
+// as built: dropped whole, or sent with the named fields cleared.
+type reviewRecordAudit struct {
+	Source    string   `json:"source"`
+	Task      string   `json:"task"`
+	SourceRef string   `json:"source_ref"`
+	Pass      int      `json:"pass"`
+	Round     int      `json:"round"`
+	Action    string   `json:"action"`
+	Reason    string   `json:"reason,omitempty"`
+	Cleared   []string `json:"cleared,omitempty"`
 }
 
 // postOutcome is what postTaskEvent did with one event.
@@ -102,8 +120,8 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	if source == integrations.SourceMerge {
 		ev.MergeSHA = s.mergeCommit(ctx, r, pr)
 	}
-	if source == integrations.SourceReview && len(reviews) > 0 {
-		ev.Reviews = reviews[:min(len(reviews), integrations.MaxReviewRecords)]
+	if source == integrations.SourceReview {
+		ev.Reviews = s.hkReviews(r.Name, row, reviews)
 	}
 	res, e := hk.PostTaskEvent(ctx, ev)
 	if e != nil {
@@ -113,9 +131,31 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	}
 	_ = s.audit(r.Name, "hk-task-event", row, false)
 	if e == nil && res.FieldsRefused != "" {
-		_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused}, false)
+		_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
 	}
 	return postSent
+}
+
+// hkReviews fits each record to hk's rules (ReviewRecord.ForHK) and audits
+// every record it clears fields of or drops, so one bad record costs only
+// itself: the event, its head and base, and the other records still go. The
+// MaxReviewRecords cap counts the records kept.
+func (s *Service) hkReviews(repo string, row taskEventRecord, reviews []integrations.ReviewRecord) []integrations.ReviewRecord {
+	var kept []integrations.ReviewRecord
+	for _, rv := range reviews {
+		fit, cleared, drop := rv.ForHK()
+		if drop != "" || len(cleared) > 0 {
+			a := reviewRecordAudit{Source: row.Source, Task: row.Task, SourceRef: row.SourceRef, Pass: rv.Pass, Round: rv.Round, Action: "normalized", Cleared: cleared}
+			if drop != "" {
+				a.Action, a.Reason = "dropped", drop
+			}
+			_ = s.audit(repo, "task-event-review-record", a, false)
+		}
+		if drop == "" && len(kept) < integrations.MaxReviewRecords {
+			kept = append(kept, fit)
+		}
+	}
+	return kept
 }
 
 // mergeCommitBudget bounds the merge commit read, so a stalled GitHub cannot
@@ -143,10 +183,10 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 	rec := integrations.ReviewRecord{
 		ReviewedHead:   pr.Head.SHA,
 		ReviewedBase:   integrations.SHA(pr.Base.SHA),
-		PatchID:        integrations.Token(receipt.Patch),
-		Round:          receipt.Round,
+		PatchID:        stablePatchID(receipt.Patch),
+		Round:          max(receipt.Round, 1),
 		Pass:           receipt.Pass,
-		Lens:           integrations.Token(receipt.Lens),
+		Lens:           cmp.Or(integrations.Token(receipt.Lens), singleLens),
 		Family:         integrations.Token(receipt.Family),
 		Executor:       integrations.Token(receipt.Executor),
 		Fallback:       receipt.Fallback != "",
@@ -167,6 +207,14 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 		}
 	}
 	return rec
+}
+
+// stablePatchID is the part of a receipt's patch ("<git patch-id --stable>:
+// <digest of the changed text>", see reviewPatchID) that is a plain hex id, or
+// "" when that part is not one.
+func stablePatchID(patch string) string {
+	stable, _, _ := strings.Cut(patch, ":")
+	return integrations.PatchID(strings.ToLower(strings.TrimSpace(stable)))
 }
 
 // taskEventKeys is the per-repo record of events already posted, so a poll

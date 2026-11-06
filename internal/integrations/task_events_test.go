@@ -7,10 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func hkEventServer(t *testing.T, h http.HandlerFunc) {
@@ -106,9 +108,10 @@ func TestSHAAndToken(t *testing.T) {
 	}
 }
 
-// A 400 to an extended payload is resent once without the optional fields and
-// the result says hk refused them; a 400 to a plain event, any other status,
-// and a 400 to the resend are not retried further.
+// A 400 to an extended payload is resent without the optional fields (here hk
+// refuses head and reviews alike, so the resend that works is the plain one)
+// and the result says hk refused them; a 400 to a plain event and any other
+// status are not retried further, and a 400 to every form ends with hk's error.
 func TestPostTaskEventFieldsRefused(t *testing.T) {
 	var bodies []map[string]any
 	status := func(map[string]any) (int, string) { return 200, `{"applied":true}` }
@@ -134,17 +137,17 @@ func TestPostTaskEventFieldsRefused(t *testing.T) {
 	}
 	status = rejectNew
 	res, e := h.PostTaskEvent(context.Background(), ext)
-	if e != nil || !res.Applied || res.FieldsRefused != "invalid_event" || len(bodies) != 2 {
+	if e != nil || !res.Applied || res.FieldsRefused != "invalid_event" || res.FieldsResend != ResendPlain || len(bodies) != 3 {
 		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
 	}
-	if bodies[0]["reviews"] == nil || bodies[1]["head_sha"] != nil || bodies[1]["reviews"] != nil || bodies[1]["source_ref"] != url || bodies[1]["task_id"] != float64(5) {
+	if bodies[0]["reviews"] == nil || bodies[1]["head_sha"] == nil || bodies[1]["reviews"] != nil || bodies[2]["head_sha"] != nil || bodies[2]["reviews"] != nil || bodies[2]["source_ref"] != url || bodies[2]["task_id"] != float64(5) {
 		t.Fatalf("bodies %v", bodies)
 	}
 
 	bodies = nil
 	status = func(map[string]any) (int, string) { return 400, `{"error":"invalid_event"}` }
 	var hk *HKError
-	if _, e = h.PostTaskEvent(context.Background(), ext); !errors.As(e, &hk) || hk.Code != "invalid_event" || len(bodies) != 2 {
+	if _, e = h.PostTaskEvent(context.Background(), ext); !errors.As(e, &hk) || hk.Code != "invalid_event" || len(bodies) != 3 {
 		t.Fatalf("%v bodies=%d", e, len(bodies))
 	}
 	bodies = nil
@@ -189,5 +192,86 @@ func TestPostTaskEventFieldsRefusedSharesBudget(t *testing.T) {
 	_, e = Handoffkeep{EventAttempts: 1, EventBackoff: time.Millisecond}.PostTaskEvent(context.Background(), ev)
 	if e == nil || hits.Load() != 2 {
 		t.Fatalf("one-try budget: %v hits=%d", e, hits.Load())
+	}
+}
+
+// A 400 that blames only reviews[] is resent with head and base and without the
+// reviews, so a bad review record never strips them. An event whose only
+// optional field is reviews goes straight to the plain form. hk's message on the
+// first 400 comes back redacted and bounded.
+func TestPostTaskEventReviewsRefusedKeepsHeadBase(t *testing.T) {
+	var bodies []map[string]any
+	message := "reviews[0]: lens must be a short token api_key=sk-live-0123456789abcdefghij é" + strings.Repeat("x", 300)
+	hkEventServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		bodies = append(bodies, m)
+		if m["reviews"] != nil {
+			w.WriteHeader(400)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_context", "message": message})
+			return
+		}
+		_, _ = w.Write([]byte(`{"applied":true}`))
+	})
+	h := Handoffkeep{EventAttempts: 3, EventBackoff: time.Millisecond}
+	url := "https://github.com/example/project/pull/7"
+	sha := strings.Repeat("a", 40)
+	ev := TaskEvent{Source: SourceReview, SourceRef: url, TaskID: 5, PR: url, HeadSHA: sha, BaseSHA: sha, Reviews: []ReviewRecord{{ReviewedHead: sha, Pass: 1}}}
+	res, e := h.PostTaskEvent(context.Background(), ev)
+	if e != nil || res.FieldsRefused != "invalid_context" || res.FieldsResend != ResendWithoutReviews || len(bodies) != 2 {
+		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
+	}
+	if bodies[1]["head_sha"] != sha || bodies[1]["base_sha"] != sha || bodies[1]["reviews"] != nil {
+		t.Fatalf("resend %v", bodies[1])
+	}
+	if !strings.HasPrefix(res.FieldsRefusedMessage, "reviews[0]: lens must be a short token") || strings.Contains(res.FieldsRefusedMessage, "sk-live") || len(res.FieldsRefusedMessage) > 200 || !utf8.ValidString(res.FieldsRefusedMessage) {
+		t.Fatalf("message %q", res.FieldsRefusedMessage)
+	}
+
+	bodies = nil
+	ev.HeadSHA, ev.BaseSHA = "", ""
+	res, e = h.PostTaskEvent(context.Background(), ev)
+	if e != nil || res.FieldsResend != ResendPlain || len(bodies) != 2 || bodies[1]["reviews"] != nil {
+		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
+	}
+}
+
+// ForHK clears each field hk would refuse and nothing else, and drops a record
+// only when its head, pass, round or lens is unusable.
+func TestReviewRecordForHK(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	at := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+	good := ReviewRecord{ReviewedHead: sha, ReviewedBase: sha, PatchID: "abc1234", Round: 2, Pass: 1, Lens: "correctness", Family: "openai", Profile: "sonnet@high", Critical: 1, StartedAt: &at, FinishedAt: &at}
+	if out, cleared, drop := good.ForHK(); drop != "" || len(cleared) != 0 || out != good {
+		t.Fatalf("a valid record changed: %+v %v %q", out, cleared, drop)
+	}
+	for name, mutate := range map[string]func(*ReviewRecord){
+		"bad head":   func(r *ReviewRecord) { r.ReviewedHead = "abc" },
+		"pass 0":     func(r *ReviewRecord) { r.Pass = 0 },
+		"pass 1001":  func(r *ReviewRecord) { r.Pass = 1001 },
+		"round 0":    func(r *ReviewRecord) { r.Round = 0 },
+		"no lens":    func(r *ReviewRecord) { r.Lens = "" },
+		"lens space": func(r *ReviewRecord) { r.Lens = "state risk" },
+	} {
+		r := good
+		mutate(&r)
+		if _, _, drop := r.ForHK(); drop == "" {
+			t.Fatalf("%s: record kept", name)
+		}
+	}
+	bad := good
+	bad.ReviewedBase, bad.PatchID, bad.Family, bad.Verdict, bad.Profile = "x", "abc-def", "Open AI", "OK!", "a b"
+	bad.Model, bad.Executor, bad.Harness = strings.Repeat("m", 201), "a\nb", "x"
+	bad.Critical, bad.Low = -1, 2_000_000
+	earlier := at.Add(-time.Hour)
+	bad.FinishedAt = &earlier
+	out, cleared, drop := bad.ForHK()
+	want := []string{"critical", "executor", "family", "finished_at", "low", "model", "patch_id", "profile", "reviewed_base", "verdict"}
+	if drop != "" || !slices.Equal(cleared, want) {
+		t.Fatalf("drop=%q cleared=%v want %v", drop, cleared, want)
+	}
+	if out.Harness != "x" || out.Lens != "correctness" || out.Round != 2 || out.Critical != 0 || out.Low != 1_000_000 || out.FinishedAt != nil || out.StartedAt == nil {
+		t.Fatalf("%+v", out)
 	}
 }
