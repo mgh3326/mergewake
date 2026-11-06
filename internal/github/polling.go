@@ -54,6 +54,7 @@ const throttleLogThreshold = 2 * time.Second
 // beginRequest.
 func (c *Client) RateWait() time.Duration {
 	userReads := c.app == nil || c.app.fallingBack(c.now())
+	c.poll.init()
 	c.poll.mu.Lock()
 	defer c.poll.mu.Unlock()
 	var wait time.Duration
@@ -70,6 +71,7 @@ func (c *Client) RateWait() time.Duration {
 // ("user", "app"); with several App installations, the lowest. A credential
 // that has not answered yet is absent.
 func (c *Client) RateRemaining() map[string]int {
+	c.poll.init()
 	c.poll.mu.Lock()
 	defer c.poll.mu.Unlock()
 	out := map[string]int{}
@@ -254,6 +256,7 @@ func (c *Client) observeHeaders(cred string, h http.Header, code int, key string
 }
 func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 	p := &c.poll
+	p.init()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if mutation {
@@ -382,6 +385,7 @@ var errUncached304 = errors.New("GitHub returned 304 without a cached representa
 // wipes it with the rest of the cache.
 func (c *Client) cacheNotFound(key string) {
 	p := &c.poll
+	p.init()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if w, ok := p.polls[key]; !ok || !w.until.After(time.Now()) {

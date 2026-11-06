@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -614,5 +615,44 @@ func TestPollScopeRoutes(t *testing.T) {
 				t.Fatalf("hits=%d, want %d", hits, want)
 			}
 		})
+	}
+}
+
+// TestPollingStateReadersRaceFirstRequest runs RateRemaining and RateWait on
+// fresh clients while their first request initialises the polling state. Under
+// -race, a reader that touches the state before init is reported.
+func TestPollingStateReadersRaceFirstRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4000")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	for i := 0; i < 50; i++ {
+		c := New("")
+		c.BaseURL = server.URL
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for j := 0; j < 4; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				c.RateRemaining()
+				c.RateWait()
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, e := c.request(context.Background(), "GET", "/value", "application/json", nil); e != nil {
+				t.Error(e)
+			}
+		}()
+		close(start)
+		wg.Wait()
+		if got := c.RateRemaining(); got["user"] != 4000 {
+			t.Fatalf("RateRemaining = %v, want user 4000", got)
+		}
 	}
 }
