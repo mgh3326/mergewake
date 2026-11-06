@@ -352,6 +352,11 @@ func rollupClass(state string) string {
 // pass. The marker holds when it was set, so a pass that started earlier does
 // not clear it.
 func MarkDirty(stateDir, repo string, n int, at time.Time) error {
+	unlock, e := fsutil.Lock(dirtyFile(stateDir, repo, n)+".lock", true)
+	if e != nil {
+		return e
+	}
+	defer unlock()
 	return fsutil.Atomic(dirtyFile(stateDir, repo, n), []byte(at.UTC().Format(time.RFC3339Nano)+"\n"), 0600)
 }
 
@@ -376,9 +381,16 @@ func DirtyPRs(stateDir, repo string) map[int]bool {
 
 // ClearDirty removes the PR's marker when it was set before since, the start
 // of the pass that has just decided the PR; a later marker stays for the next
-// pass.
+// pass. A lock failure leaves the marker: one more re-evaluation is cheap.
 func ClearDirty(stateDir, repo string, n int, since time.Time) {
 	path := dirtyFile(stateDir, repo, n)
+	// Read and remove under MarkDirty's lock: a marker written in between
+	// would otherwise be deleted unseen.
+	unlock, e := fsutil.Lock(path+".lock", true)
+	if e != nil {
+		return
+	}
+	defer unlock()
 	b, e := os.ReadFile(path)
 	if e != nil {
 		return
