@@ -68,3 +68,55 @@ func TestEnqueueAtFiresOnceAndReplaces(t *testing.T) {
 	}
 	close(ev.release)
 }
+
+// CancelTimer stops one timer by (repo, PR, id) and leaves the others.
+func TestCancelTimerDropsOnlyThatTimer(t *testing.T) {
+	ev := newEvals()
+	ck := &fakeTimers{}
+	now := time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)
+	q := &Queue{Run: ev.Run, After: ck.after, Now: func() time.Time { return now }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); q.Wait() }()
+	q.Start(ctx)
+	q.EnqueueAt(SourceTimer, "o/one", 1, "a", now.Add(time.Minute))
+	q.EnqueueAt(SourceTimer, "o/one", 1, "b", now.Add(time.Minute))
+	q.CancelTimer("o/one", 1, "a")
+	q.CancelTimer("o/one", 1, "missing")
+	if first, second := ck.get(0), ck.get(1); !*first.stopped || *second.stopped {
+		t.Fatalf("a stopped=%v b stopped=%v", *first.stopped, *second.stopped)
+	}
+	ck.get(0).f()
+	if len(ev.started()) != 0 {
+		t.Fatal("a cancelled timer queued the PR")
+	}
+	ck.get(1).f()
+	ev.waitStarted(t, 1)
+}
+
+// (c) A PR that closes or merges is not queued by the timers it left: Forget,
+// which the engine calls for a PR it finds closed, and a sweep whose open list
+// no longer holds it both drop them.
+func TestTimersOfAPRThatLeftTheOpenSetDoNotQueueIt(t *testing.T) {
+	ev := newEvals()
+	ck := &fakeTimers{}
+	now := time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)
+	q := &Queue{Run: ev.Run, After: ck.after, Now: func() time.Time { return now }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); q.Wait() }()
+	q.Start(ctx)
+	q.SetOpen("o/one", map[int]string{1: "h1", 2: "h2", 3: "h3"})
+	q.EnqueueAt(SourceTimer, "o/one", 1, "a", now.Add(time.Minute))
+	q.EnqueueAt(SourceTimer, "o/one", 1, "b", now.Add(time.Minute))
+	q.EnqueueAt(SourceTimer, "o/one", 2, "a", now.Add(time.Minute))
+	q.EnqueueAt(SourceTimer, "o/one", 3, "a", now.Add(time.Minute))
+	q.Forget("o/one", 1)
+	q.SetOpen("o/one", map[int]string{3: "h3"})
+	for i := 0; i < 3; i++ {
+		ck.get(i).f()
+	}
+	if len(ev.started()) != 0 {
+		t.Fatalf("a PR that left the open set was queued: %v", ev.started())
+	}
+	ck.get(3).f()
+	ev.waitStarted(t, 1)
+}

@@ -135,9 +135,6 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 	defer tracing.Finish(transaction)
 	ctx, requests := github.ContinueRequests(ctx, "pr")
 	ctx = pipeline.WithMergeHook(ctx, e.onMerge)
-	if e.revisit != nil {
-		ctx = pipeline.WithRevisit(ctx, e.revisit)
-	}
 	ctx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 	tracing.Tag(repoSpan, "repo", r.Name)
 	defer tracing.Finish(repoSpan)
@@ -257,8 +254,10 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 		errs = append(errs, botLand(prCtx, e.s, r, n, opts)...)
 	default:
 		var reviewErrs []error
-		var clean bool
-		reviewErrs, clean, settled = e.review(prCtx, r, pr, opts, w)
+		var clean, reviewed bool
+		reviewCtx, endPass := e.trackTimers(prCtx, r.Name, n)
+		reviewErrs, clean, settled, reviewed = e.review(reviewCtx, r, pr, opts, w)
+		endPass(reviewed)
 		errs = append(errs, reviewErrs...)
 		failed = failed || !clean
 	}
@@ -268,10 +267,43 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	return errs, res
 }
 
+// trackTimers is the context for one PR's review pass, and the call that ends
+// it. A reviewer that is still running asks for a deadline timer through the
+// context, and the pass asks again each time it finds the reviewer still
+// running. A pass that collected, dropped or replaced a reviewer asks for
+// nothing, so the timers it did not ask for belong to reviewers that are gone:
+// endPass(reviewed) cancels them. A pass whose review failed cancels none,
+// since it may not have reached its reviewers.
+func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (context.Context, func(reviewed bool)) {
+	if e.revisit == nil {
+		return ctx, func(bool) {}
+	}
+	var mu sync.Mutex
+	armed := map[string]bool{}
+	ctx = pipeline.WithRevisit(ctx, func(repo string, pr int, label string, at time.Time) {
+		mu.Lock()
+		armed[label] = true
+		mu.Unlock()
+		e.revisit(repo, pr, label, at)
+	})
+	return ctx, func(reviewed bool) {
+		if !reviewed {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, id := range e.q.TimerIDs(repo, pr) {
+			if !armed[id] {
+				e.q.CancelTimer(repo, pr, id)
+			}
+		}
+	}
+}
+
 // review is a PR's review and settle. A head whose review is done is settled
 // first, then its evidence is checked; any other is reviewed, then settled.
-// handled reports the first.
-func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled bool) {
+// handled reports the first. reviewed is false when the review itself failed.
+func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	lock := e.repoLock(r.Name)
 	// An unreadable or poll-skipped marker is not done: the PR is reviewed.
 	if done, err := e.gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); err == nil && done {
@@ -297,11 +329,11 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 	c.reviewing++
 	c.peak = max(c.peak, c.reviewing)
 	e.mu.Unlock()
-	reviewErrs, ok := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
+	reviewErrs, ok, reviewed := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
 	e.mu.Lock()
 	e.counts(r.Name).reviewing--
 	e.mu.Unlock()
-	return append(errs, reviewErrs...), ok && len(errs) == 0, handled
+	return append(errs, reviewErrs...), ok && len(errs) == 0, handled, reviewed
 }
 
 // sweep is one pass over repo r: it puts the open PRs on the queue and

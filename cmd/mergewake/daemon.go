@@ -329,11 +329,14 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 // reviewPR runs one PR's review, then settles it under settling unless the
 // caller already settled its reviewed head. A review the retry reran there is
 // settled by the next evaluation of the PR.
-func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean bool) {
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean, reviewed bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
 	e := s.RetryReview(reviewCtx, r, pr, o)
 	tracing.Finish(reviewSpan)
+	// A review that failed for any reason but an unavailable reviewer may not
+	// have reached its reviewers.
+	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable)
 	if e != nil {
 		clean = false
 		if errors.Is(e, pipeline.ErrReviewUnavailable) {
@@ -345,12 +348,12 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 		}
 	}
 	if !settle {
-		return errs, clean
+		return errs, clean, reviewed
 	}
 	settling.Lock()
 	defer settling.Unlock()
 	settleErrs := settlePR(ctx, s, r, pr.Number, o)
-	return append(errs, settleErrs...), clean && len(settleErrs) == 0
+	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed
 }
 
 // settlePR delivers findings to the author lane before the verdict, so the
