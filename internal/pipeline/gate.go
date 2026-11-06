@@ -19,7 +19,8 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, threads_open:<n>,
-// blocking_findings:<n>, triage_unanswered:<n>, review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
+// blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
+// path is not in the diff), review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
 // require_up_to_date) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
@@ -355,6 +356,19 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 			}
 		}
 	}
+	outside := outsideBlocking(history, pr.Head.SHA, v.Review.PatchID, v.Review.Inherited)
+	if outside > 0 {
+		comments, e := s.GH.IssueComments(github.FreshEvidence(ctx), r.Name, pr.Number)
+		if e != nil {
+			return v, e
+		}
+		if outsideDismissed(comments, pr.Head.SHA, s.Config.Review.Login) {
+			outside = 0
+		}
+	}
+	if outside > 0 {
+		v.Reasons = append(v.Reasons, "finding_outside_diff:"+strconv.Itoa(outside))
+	}
 	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")
 		if ledger, err := s.ledger().Read(); err == nil {
@@ -386,6 +400,46 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// outsideBlocking counts the critical and high findings the review passes of
+// this head listed in their bodies because the path is not in the diff. Only a
+// receipt for the current patch counts: the base can move under a fixed head
+// and put the path into the diff, and the finding was about the old patch. A
+// head that inherited its review (same patch id) carries the inherited head's
+// too. When the current patch id is unknown (the diff could not be read), the
+// head's own receipts count, so a failed read never lifts the hold.
+func outsideBlocking(history []github.ReviewedPass, head, patch, inherited string) int {
+	n := 0
+	for _, p := range history {
+		switch {
+		case p.Head == head && (patch == "" || p.Patch == patch):
+			n += p.OutsideBlocking
+		case inherited != "" && p.Head == inherited && p.Patch == patch:
+			n += p.OutsideBlocking
+		}
+	}
+	return n
+}
+
+// outsideDismissed reports a dismissal of this head's outside-diff findings: a
+// PR comment from a person (not a bot, not the review identity) that is a
+// dismissal with a reason, as dismissReply reads it, and names the head by at
+// least seven characters of its SHA, so it does not carry to a later head.
+func outsideDismissed(comments []github.IssueComment, head, reviewLogin string) bool {
+	if len(head) < 7 {
+		return false
+	}
+	for _, c := range comments {
+		who := policy.NormalizeAuthor(c.User.Login)
+		if who == "" || who == policy.NormalizeAuthor(reviewLogin) || c.User.Type == "Bot" || strings.HasSuffix(c.User.Login, "[bot]") {
+			continue
+		}
+		if dismissReply.MatchString(c.Body) && strings.Contains(c.Body, head[:7]) {
+			return true
+		}
+	}
+	return false
 }
 
 // conflicting reports whether GitHub says the PR cannot merge into its base.

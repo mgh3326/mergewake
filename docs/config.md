@@ -1417,7 +1417,7 @@ threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Pending or
+`triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path is not in the diff; a person's `Disposition: dismiss: <reason>` PR comment naming the head's SHA clears it), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Pending or
 missing check evidence emits nothing. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed

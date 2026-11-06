@@ -948,8 +948,8 @@ func TestFindingValidation(t *testing.T) {
 	for _, tt := range []struct {
 		body string
 		fail bool
-	}{{`{"findings":[{"path":"a","line":11,"body":"bug"}]}`, false}, {`{"findings":[]}`, false}, {`{"findings":[{"path":"a","line":12,"body":"bug"}]}`, true}, {`{"findings":null}`, true}, {`{"findings":[]} garbage`, true}, {`{"findings":[],"extra":true}`, true}, {`{"findings":[],"summary":"reviewed the diff, no issues"}`, false}, {`{"findings":[{"path":"a","line":11,"body":"bug","summary":"x"}]}`, true}} {
-		_, e := parseFindings([]byte(tt.body), diff)
+	}{{`{"findings":[{"path":"a","line":11,"body":"bug"}]}`, false}, {`{"findings":[]}`, false}, {`{"findings":[{"path":"a","line":12,"body":"bug"}]}`, false}, {`{"findings":null}`, true}, {`{"findings":[]} garbage`, true}, {`{"findings":[],"extra":true}`, true}, {`{"findings":[],"summary":"reviewed the diff, no issues"}`, false}, {`{"findings":[{"path":"a","line":11,"body":"bug","summary":"x"}]}`, true}} {
+		_, _, e := parseFindings([]byte(tt.body), diff)
 		if (e != nil) != tt.fail {
 			t.Errorf("%s: %v", tt.body, e)
 		}

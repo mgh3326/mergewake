@@ -747,11 +747,11 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 		runner *panewireRunner
 		reason string
 	}{
-		"no task trailer":   {"Mergewake-Author-Family: openai\n", &panewireRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
-		"spawn refused":     {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
-		"refused twice":     {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
-		"no findings file":  {"", &panewireRunner{}, "wrote no findings file"},
-		"findings off diff": {"", &panewireRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x"}]}`}, "findings rejected"},
+		"no task trailer":  {"Mergewake-Author-Family: openai\n", &panewireRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
+		"spawn refused":    {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
+		"refused twice":    {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
+		"no findings file": {"", &panewireRunner{}, "wrote no findings file"},
+		"findings invalid": {"", &panewireRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x","severity":"urgent"}]}`}, "findings rejected"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, r := panewireSetup(t, tc.runner)

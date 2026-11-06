@@ -601,7 +601,13 @@ func (s *Service) markDone(ctx context.Context, repo string, n int, sha string) 
 
 var hunk = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
 
-func parseFindings(b []byte, diff string) ([]github.Finding, error) {
+// parseFindings validates a reviewer's result. A malformed document (not JSON,
+// unknown fields, more than 50 findings, an invalid severity) rejects the whole
+// result. A single bad finding does not: an empty or over-long body is dropped
+// and reported, and every other finding is kept with the anchor GitHub can
+// give it: its line when that is a new-side line of the diff, else its file
+// when the path is in the diff, else the review body.
+func parseFindings(b []byte, diff string) ([]github.Finding, []droppedFinding, error) {
 	// Summary is the job result's short summary that workers write on
 	// completion (hk job result summary); it carries no findings and is not
 	// used here, but its presence must not make a finished review look lost.
@@ -610,10 +616,10 @@ func parseFindings(b []byte, diff string) ([]github.Finding, error) {
 		Summary  string           `json:"summary"`
 	}
 	if e := configJSON(b, &v); e != nil {
-		return nil, e
+		return nil, nil, e
 	}
 	if v.Findings == nil || len(v.Findings) > 50 {
-		return nil, errors.New("review must contain a findings array of at most 50 items")
+		return nil, nil, errors.New("review must contain a findings array of at most 50 items")
 	}
 	valid := map[string]map[int]bool{}
 	file := ""
@@ -630,7 +636,7 @@ func parseFindings(b []byte, diff string) ([]github.Finding, error) {
 			if strings.HasPrefix(file, `"`) {
 				v, e := strconv.Unquote(file)
 				if e != nil {
-					return nil, e
+					return nil, nil, e
 				}
 				file = v
 			}
@@ -648,19 +654,47 @@ func parseFindings(b []byte, diff string) ([]github.Finding, error) {
 			line++
 		}
 	}
+	var kept []github.Finding
+	var dropped []droppedFinding
 	for _, f := range v.Findings {
 		switch f.Severity {
 		case "", "blocking", "major", "minor", "critical", "high", "medium", "low":
 		default:
-			return nil, errors.New("invalid finding severity")
+			return nil, nil, errors.New("invalid finding severity")
 		}
-
-		if !valid[f.Path][f.Line] || strings.TrimSpace(f.Body) == "" || len(f.Body) > 4000 {
-			return nil, errors.New("review finding is outside the new-side diff or has an invalid body")
+		// A bad body costs that finding, not the pass.
+		switch {
+		case strings.TrimSpace(f.Body) == "":
+			dropped = append(dropped, droppedFinding{f.Path, f.Line, "empty body"})
+			continue
+		case len(f.Body) > maxFindingBody:
+			dropped = append(dropped, droppedFinding{f.Path, f.Line, "body over 4000 bytes"})
+			continue
 		}
+		lines, inDiff := valid[f.Path]
+		switch {
+		case inDiff && lines[f.Line]:
+			f.Anchor = github.AnchorLine
+		case inDiff:
+			f.Anchor = github.AnchorFile
+		default:
+			f.Anchor = github.AnchorOutside
+		}
+		kept = append(kept, f)
 	}
-	return v.Findings, nil
+	return kept, dropped, nil
 }
+
+// maxFindingBody is the longest finding body a pass accepts.
+const maxFindingBody = 4000
+
+// droppedFinding is a finding parseFindings left out of the pass.
+type droppedFinding struct {
+	Path   string
+	Line   int
+	Reason string
+}
+
 func configJSON(b []byte, v any) error {
 	d := json.NewDecoder(strings.NewReader(string(b)))
 	d.DisallowUnknownFields()
