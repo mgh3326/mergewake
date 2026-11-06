@@ -20,15 +20,17 @@ import (
 // reap never sees again: reap.scan_after bounds which merged PRs it looks at,
 // so a worktree whose merge is older than that stays forever.
 //
-// The node has no worktree listing, so candidates come from the binding reap's
-// job path already uses: every closed PR of the repo (all time) → its
-// Mergewake-Task → the bound job → the job record's host and cwd. Anything
-// outside that binding (a PR with no trailer, a task with no job, a job with no
-// record) is not reachable; the sweep counts those per repo and removes
-// nothing. Removal goes only through the node's guarded worktree.remove: the
-// node decides cleanliness, ignored files and identity at the moment of
-// removal, so a dry run never probes it and a dirty worktree is answered by the
-// node's own refusal.
+// Candidates come from two sources, merged by worktree path. The node's
+// worktree.list names every worktree of a common git dir: the common dirs are
+// those of the worktrees reap already inspects on the host (pane cwds and job
+// cwds) whose origin is the configured repo. The binding reap's job path
+// already uses is the second source: every closed PR of the repo (all time) →
+// its Mergewake-Task → the bound job → the job record's host and cwd. Anything
+// the binding cannot reach (a PR with no trailer, a task with no job, a job
+// with no record) is counted per repo. Removal goes only through the node's
+// guarded worktree.remove: the node decides cleanliness, ignored files and
+// identity at the moment of removal. The listed status only adds two cheap
+// pre-checks, so a dry run never probes the guard.
 
 const (
 	legacyAction = "legacy-sweep"
@@ -53,13 +55,15 @@ type legacyRevertWatcher interface {
 	WatchRevert(context.Context, string, int, string) (*github.Pull, error)
 }
 
-// legacyCand is one worktree path on one host that some PR's bound job worked
-// in.
+// legacyCand is one worktree path on one host: one that some PR's bound job
+// worked in, one the node listed, or both.
 type legacyCand struct {
-	host string // configured host name
-	cwd  string
-	job  string
-	task string
+	host   string // configured host name
+	cwd    string
+	job    string
+	task   string
+	listed *reap.ListedWorktree // the node's row, nil when only a job reached it
+	main   bool                 // the listed row is its common's main checkout
 }
 
 // legacyReach counts what the binding could not reach, per repo.
@@ -82,6 +86,15 @@ func (t legacyTally) add(result, reason string) {
 		t[result] = map[string]int{}
 	}
 	t[result][reason]++
+}
+
+// count is the number of rows with one result.
+func (t legacyTally) count(result string) int {
+	n := 0
+	for _, c := range t[result] {
+		n += c
+	}
+	return n
 }
 
 // legacyVerdict maps the node's worktree.remove answer to a receipt result. A
@@ -264,15 +277,11 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 			return errors.Join(append(errs, e)...)
 		}
 		tally := legacyTally{}
-		cands := byHost[h.Name]
-		var hs *reapHost
-		if len(cands) > 0 {
-			var hostErrs []error
-			hs, hostErrs = s.reapScanHost(ctx, hub, h)
-			errs = append(errs, hostErrs...)
-		}
-		paths := make([]string, 0, len(cands))
-		for p := range cands {
+		hs, hostErrs := s.reapScanHost(ctx, hub, h)
+		errs = append(errs, hostErrs...)
+		items, found := sweep.enumerate(ctx, hs, byHost[h.Name], &errs)
+		paths := make([]string, 0, len(items))
+		for p := range items {
 			paths = append(paths, p)
 		}
 		sort.Strings(paths)
@@ -280,10 +289,13 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 			if e = ctx.Err(); e != nil {
 				return errors.Join(append(errs, e)...)
 			}
-			errs = append(errs, sweep.candidate(ctx, hs, cands[p], tally)...)
+			errs = append(errs, sweep.candidate(ctx, hs, items[p], tally)...)
 		}
+		found.Candidates = len(items) - tally.count("out-of-scope")
 		summary := map[string]any{"action": legacyAction + "-summary", "repo": r.Name, "host": h.Name, "apply": acting,
-			"worktrees": len(cands), "bound_jobs": reach.BoundJobsBy[h.Name], "results": tally}
+			"worktrees": len(byHost[h.Name]), "bound_jobs": reach.BoundJobsBy[h.Name], "results": tally,
+			"listing": found.Listing, "commons": found.Commons, "commons_not_found": found.NotFound, "listed": found.Listed,
+			"candidates": found.Candidates, "would_remove": tally.count("would-remove"), "kept_by_reason": tally["kept"]}
 		if e := s.Print(summary); e != nil {
 			errs = append(errs, e)
 		}
@@ -328,6 +340,92 @@ type legacySweep struct {
 	ancestry map[string]bool
 }
 
+// legacyFound is what one host's enumeration reached.
+type legacyFound struct {
+	Listing    string // "hub" when worktree.list was asked, "unavailable" otherwise
+	Commons    int    // common git dirs of the configured repo found on the host
+	NotFound   int    // commons the node did not accept for worktree.list
+	Listed     int    // rows worktree.list returned, main checkouts included
+	Candidates int    // worktrees evaluated, out-of-scope ones excluded
+}
+
+// enumerate merges the host's two candidate sources by worktree path: the
+// job-bound cwds, and every worktree worktree.list names under the common git
+// dirs of the configured repo that reap sees on the host. A job cwd inside a
+// worktree is keyed by the worktree root the node reports.
+func (w *legacySweep) enumerate(ctx context.Context, hs *reapHost, bound map[string]*legacyCand, errs *[]error) (map[string]*legacyCand, legacyFound) {
+	found := legacyFound{Listing: "unavailable"}
+	items := map[string]*legacyCand{}
+	if hs == nil || hs.failed {
+		for cwd, c := range bound {
+			items[cwd] = c
+		}
+		return items, found
+	}
+	commons := map[string]bool{}
+	note := func(t *reap.Worktree) {
+		if t != nil && t.Common != "" && strings.EqualFold(t.Repo, w.r.Name) {
+			commons[t.Common] = true
+		}
+	}
+	for _, t := range hs.trees {
+		note(t)
+	}
+	cwds := make([]string, 0, len(bound))
+	for cwd := range bound {
+		cwds = append(cwds, cwd)
+	}
+	sort.Strings(cwds)
+	for _, cwd := range cwds {
+		c := bound[cwd]
+		t, e := hs.ops.Inspect(ctx, cwd)
+		if e != nil || t == nil {
+			items[cwd] = c // evaluate reports it
+			continue
+		}
+		note(t)
+		if prev := items[t.Path]; prev == nil {
+			c.cwd = t.Path
+			items[t.Path] = c
+		}
+	}
+	found.Commons = len(commons)
+	lister, ok := hs.ops.(reap.WorktreeLister)
+	if !ok {
+		return items, found
+	}
+	found.Listing = "hub"
+	sorted := make([]string, 0, len(commons))
+	for c := range commons {
+		sorted = append(sorted, c)
+	}
+	sort.Strings(sorted)
+	for _, common := range sorted {
+		rows, e := reap.ListWorktrees(ctx, lister, common)
+		switch {
+		case reap.InvalidArgs(e):
+			found.NotFound++
+			continue
+		case e != nil:
+			*errs = append(*errs, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, common, e))
+			continue
+		}
+		main := filepath.Dir(common)
+		for i := range rows {
+			row := rows[i]
+			found.Listed++
+			c := items[row.Path]
+			if c == nil {
+				c = &legacyCand{host: hs.host.Name, cwd: row.Path}
+				items[row.Path] = c
+			}
+			c.listed = &row
+			c.main = row.Path == main
+		}
+	}
+	return items, found
+}
+
 // candidate evaluates and records one worktree. It returns the errors that
 // should fail the run; every evaluation, even a kept one, leaves a row.
 func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand, tally legacyTally) []error {
@@ -337,6 +435,15 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 	// are keyed by when the cwd sits inside the worktree.
 	if prior := w.prior(c.host, c.cwd); prior != "" {
 		tally.add("already-"+prior, "")
+		return nil
+	}
+	// The main checkout and reviewer checkouts are never this sweep's.
+	switch {
+	case c.main:
+		tally.add("out-of-scope", "main-checkout")
+		return nil
+	case c.listed != nil && strings.HasPrefix(filepath.Base(c.cwd), "mwr-"):
+		tally.add("out-of-scope", "reviewer-checkout")
 		return nil
 	}
 	rec := reapReceipt{Action: legacyAction, Repo: w.r.Name, Host: c.host, Cwd: c.cwd, Worktree: c.cwd, Job: c.job, Task: c.task}
@@ -456,14 +563,26 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	case w.s.now().Sub(*mergedAt) < legacyMinAge:
 		keep("too-young")
 	default:
-		w.merged(ctx, hs, wt, *p, *mergedAt, rec, errs)
+		w.merged(ctx, hs, c.listed, wt, *p, *mergedAt, rec, errs)
 	}
 	return ""
 }
 
 // merged runs the rules that apply to a merged PR old enough to sweep.
-func (w *legacySweep) merged(ctx context.Context, hs *reapHost, wt *reap.Worktree, p github.Pull, mergedAt time.Time, rec *reapReceipt, errs *[]error) {
+func (w *legacySweep) merged(ctx context.Context, hs *reapHost, l *reap.ListedWorktree, wt *reap.Worktree, p github.Pull, mergedAt time.Time, rec *reapReceipt, errs *[]error) {
 	keep := func(reason string) { rec.Result, rec.Reason = "kept", reason }
+	// The node's listed status is a cheap pre-check before any GitHub call; the
+	// guarded removal still decides at the moment of removal.
+	if l != nil {
+		switch {
+		case l.Status.Error != "":
+			keep("status-error")
+			return
+		case l.Status.Dirty || l.Status.Untracked > 0:
+			keep("dirty")
+			return
+		}
+	}
 	// Every commit in the worktree must already be in the merged PR or in the
 	// base: the PR head itself, or an ancestor of it or of the base.
 	if wt.Head != p.Head.SHA {

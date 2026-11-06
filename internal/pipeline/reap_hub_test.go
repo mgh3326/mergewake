@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +42,15 @@ type fakeReapHub struct {
 	tops        map[string]string // cwd → worktree toplevel, when the cwd is a subdirectory
 	dropClosed  bool
 	dropRemoved bool
+	// commons maps a cwd to the common git dir worktree.inspect reports for it
+	// (/repo/.git when absent); lists holds each common's worktree.list rows,
+	// served listPage rows at a time (all at once when zero) behind an offset
+	// cursor; listErr makes worktree.list of a common answer that node error.
+	commons  map[string]string
+	branches map[string]string // cwd → branch worktree.inspect reports (wk/x when absent)
+	lists    map[string][]map[string]any
+	listPage int
+	listErr  map[string]string
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -92,6 +102,9 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 					head = headSHA
 				}
 				branch := "wk/x"
+				if b := h.branches[cwd]; b != "" {
+					branch = b
+				}
 				if h.detached[cwd] {
 					branch = ""
 				}
@@ -103,8 +116,33 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				if t := h.tops[cwd]; t != "" {
 					top = t
 				}
-				result = map[string]any{"worktree": map[string]any{"path": top, "branch": branch, "head": head, "origin_url": origin, "common": "/repo/.git"}}
+				common := "/repo/.git"
+				if c := h.commons[cwd]; c != "" {
+					common = c
+				}
+				result = map[string]any{"worktree": map[string]any{"path": top, "branch": branch, "head": head, "origin_url": origin, "common": common}}
 			}
+		case "worktree.list":
+			args := body["args"].(map[string]any)
+			common, _ := args["common"].(string)
+			if code := h.listErr[common]; code != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": code})
+				return
+			}
+			rows := h.lists[common]
+			start := 0
+			if c, ok := args["cursor"].(string); ok {
+				start, _ = strconv.Atoi(c)
+			}
+			end, next := len(rows), ""
+			if h.listPage > 0 && start+h.listPage < len(rows) {
+				end, next = start+h.listPage, strconv.Itoa(start+h.listPage)
+			}
+			page := []map[string]any{}
+			if start < end {
+				page = rows[start:end]
+			}
+			result = map[string]any{"worktrees": page, "total": len(rows), "next_cursor": next}
 		case "pane.read":
 			result = h.composer
 		case "job.result":

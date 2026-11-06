@@ -107,9 +107,16 @@ Session hosts where agent panes may run, used only by `reap`.
 **Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
 is a one-shot pass, not part of the daemon loop, over worktrees whose PR merged
 at least 14 days ago, however long ago (the daemon only sees merges inside
-`scan_after`; this ignores that window). It reads every closed PR of the repo and follows
-`Mergewake-Task` → hk task → bound job → the job record's host and cwd. It asks
-the node about that cwd (`worktree.inspect`) and removes the worktree only
+`scan_after`; this ignores that window). Candidates come from two sources merged
+by worktree path. On each host the sweep takes the common git dirs of the
+worktrees reap already inspects (pane cwds and job cwds) whose origin is the
+configured repo, and pages the node's `worktree.list` for each; every listed
+worktree except the main checkout and `mwr-*` checkouts is a candidate. It also
+reads every closed PR of the repo and follows `Mergewake-Task` → hk task →
+bound job → the job record's host and cwd. A listed dirty or untracked worktree
+is kept `dirty` and one whose status could not be read is kept `status-error`,
+before any GitHub call. The sweep asks the node about each worktree
+(`worktree.inspect`) and removes the worktree only
 through the node's guarded `worktree.remove` (`detached:false`), and only when
 the PR is merged into the base at least 14 days ago, the head is the merged
 head or inside the merged work, no pane or process is in it, and the node
@@ -126,7 +133,9 @@ re-reads open PRs and re-inspects the worktree, and keeps it if the branch has
 an open PR or the checkout changed. Only PRs whose head is in the repo itself
 count: a fork's branch of the same name neither blocks nor selects a worktree.
 The newest closed PR of the branch decides, bound to a job or not. Every worktree gets one `legacy-sweep` row in `reap.jsonl` (plans too),
-and each host ends with a summary of counts by result and reason. PRs with no
+and each host ends with a summary of counts by result and reason, plus `listed`,
+`candidates`, `would_remove`, `kept_by_reason`, `commons` and `commons_not_found`
+(commons the node refused to list). PRs with no
 trailer, no bound job or no job record cannot be reached this way and are only
 counted. Only panewire-hub hosts can be swept. The daemon's reap ignores
 `legacy-sweep` rows.
