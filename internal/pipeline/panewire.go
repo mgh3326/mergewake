@@ -174,10 +174,10 @@ func (e *reviewQuotaStopped) resetText() string {
 // parseQuotaStop reads an hk end_reason of the form
 // "quota_stop pool=<pool> reset_at=<RFC3339 UTC>". A reset_at that does not
 // parse is unknown, like an absent one.
-func parseQuotaStop(job integrations.JobRecord) (pool string, resetAt time.Time, ok bool) {
+func parseQuotaStop(job integrations.JobRecord) (pool string, resetAt time.Time, replacement string, ok bool) {
 	fields := strings.Fields(job.EndReason)
 	if job.State != "lost" || len(fields) == 0 || fields[0] != "quota_stop" {
-		return "", time.Time{}, false
+		return "", time.Time{}, "", false
 	}
 	for _, f := range fields[1:] {
 		if v, found := strings.CutPrefix(f, "pool="); found {
@@ -188,8 +188,11 @@ func parseQuotaStop(job integrations.JobRecord) (pool string, resetAt time.Time,
 				resetAt = t
 			}
 		}
+		if v, found := strings.CutPrefix(f, "replaced_by="); found && integrations.ValidJobRecordID(v) {
+			replacement = v
+		}
 	}
-	return pool, resetAt, true
+	return pool, resetAt, replacement, true
 }
 
 func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (string, bool, error)) (passOutcome, error) {
@@ -709,7 +712,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	keepCheckout = false
 	placement, confirmed := spawnPlacement(string(stdout))
 	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
-	defer func() { x.closeReviewerPane(ctx, pane) }()
+	closePane := true
+	defer func() {
+		if closePane {
+			x.closeReviewerPane(ctx, pane)
+		}
+	}()
 	// The record goes with every terminal outcome. It stays for findings
 	// returned to Review, which removes it once they are posted, and for a
 	// read the deadline cut short, which the next run repeats.
@@ -735,11 +743,45 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 	}
 	profile = res.rec.Profile
-	pool, resetAt, quota := parseQuotaStop(res.rec)
+	pool, resetAt, replacement, quota := parseQuotaStop(res.rec)
 	var b []byte
 	switch {
 	case res.result != nil:
 		b = res.result
+	case quota && replacement != "":
+		keepJob, keepCheckout, closePane = true, true, false
+		next, err := x.job(ctx, replacement)
+		if err != nil {
+			if revisit != nil {
+				revisit(x.repo.Name, pr.Number, label, s.now().Add(revisitMargin))
+			}
+			return out, fmt.Errorf("%w: replacement %s not yet readable", errPassPending, replacement)
+		}
+		if err := s.audit(x.repo.Name, "review-reviewer-replaced", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "old_label": label, "new_label": replacement, "pool": pool}, false); err != nil {
+			return out, err
+		}
+		rj.Label, rj.Recorded = replacement, s.now()
+		for i := 0; i+1 < len(rj.Args); i++ {
+			if rj.Args[i] == "-l" {
+				rj.Args[i+1] = replacement
+				break
+			}
+		}
+		rj.Spawned = ""
+		if next.Host != "" || next.PaneID != "" {
+			rj.Spawned = fmt.Sprintf("OK pane=%s host=%s cwd=%s", next.PaneID, next.Host, next.Cwd)
+		}
+		if err := x.saveReviewerJob(rj); err != nil {
+			return out, err
+		}
+		if revisit != nil {
+			if terminalJob(next.State) {
+				revisit(x.repo.Name, pr.Number, rj.Label, s.now().Add(revisitMargin))
+				return out, fmt.Errorf("%w: replacement %s already finished", errPassPending, replacement)
+			}
+			return out, x.pending(revisit, rj, "replaced")
+		}
+		return out, fmt.Errorf("%w: reviewer replaced by %s", errPassPending, replacement)
 	case quota:
 		// panewire stopped the reviewer on an exhausted pool: no result was
 		// ever lost. The record goes with the lease, so the pass retried after

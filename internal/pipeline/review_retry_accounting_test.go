@@ -325,7 +325,7 @@ func TestParseQuotaStop(t *testing.T) {
 		"decoded record": decodedQuotaRecord(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			pool, at, ok := parseQuotaStop(tc.job)
+			pool, at, _, ok := parseQuotaStop(tc.job)
 			if pool != tc.pool || !at.Equal(tc.reset) || ok != tc.ok {
 				t.Fatalf("got %q %v %v", pool, at, ok)
 			}

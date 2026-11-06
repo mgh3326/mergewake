@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/daemon"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // evalSources records what put each evaluation on the queue.
@@ -130,5 +131,22 @@ func TestEnginePendingReviewerTimerStillFires(t *testing.T) {
 	}
 	if ids := a.e.q.TimerIDs(repo, 1); !slices.Equal(ids, []string{label}) {
 		t.Fatalf("timer ids %v after the timer fired on a running reviewer", ids)
+	}
+}
+
+func TestEngineQuotaReplacementCancelsOldTimer(t *testing.T) {
+	a := asyncEngineFixture(t, 1, 1)
+	repo := a.f.repo.Name
+	a.e.q.EnqueueNamed(daemon.SourceWebhook, repo, 1, "")
+	a.idle(t, "reviewer runs")
+	old := a.runner.label(1)
+	next := old + "-q1"
+	first := a.timers.calls()[0]
+	a.sink.set(old, integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=p replaced_by=" + next})
+	a.sink.set(next, integrations.JobRecord{State: "running", Host: "replacement", PaneID: "pane"})
+	a.e.q.EnqueueNamed(daemon.SourceReviewer, repo, 1, "")
+	a.idle(t, "replacement is followed")
+	if ids := a.e.q.TimerIDs(repo, 1); !slices.Equal(ids, []string{next}) || !first.stopped.Load() {
+		t.Fatalf("ids=%v old stopped=%v", ids, first.stopped.Load())
 	}
 }
