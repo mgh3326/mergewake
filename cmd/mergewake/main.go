@@ -225,7 +225,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 				total += request.Count
 			}
 			cache := counts.CacheStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "routes": requests})
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "routes": requests})
 		}()
 	}
 	gh := github.New(token)

@@ -1331,9 +1331,57 @@ evidence for the repository immediately. A landing decision reads the checks
 and review threads for its pinned head from GitHub. Without a delivery, other
 observations can use evidence up to ten minutes old.
 
-Each daemon pass logs `github requests` with its total and busiest routes. The
+Each daemon pass logs `github requests` with its total, its `not_modified` count
+(304 responses, which a conditional request gets for an unchanged resource and
+which GitHub does not charge to the rate limit) and its busiest routes. The
 role's status file also records counts by method, route and response status.
 An HTTP status of `0` counts a request that received no response.
+
+#### Skipping unchanged PRs
+
+With the receiver enabled, the `pr` role leaves a PR alone when nothing has
+changed since it last evaluated the PR in full. The PR then keeps its last
+verdict: no gate run, no GraphQL read, no review, notice or merge action. Its
+whole cost is the conditional requests (304s) that prove it unchanged. A PR is
+unchanged only when **all** of these hold; if any fails, it is evaluated in
+full, as without this rule:
+
+- the ETags of the PR, its review list, and its head's check runs and
+  commit statuses equal those of the last evaluation (each read answers 304);
+- its head commit and the head of the branch it targets are the same;
+- no `pull_request*`, `pull_request_review*`, `check_run`, `check_suite` or
+  `status` delivery has named it since that evaluation started. Pull-request
+  events name a PR by number. Check events name it by the PRs the payload lists
+  and by head commit, so a check delivery that lists no PR (a fork, a re-run)
+  still marks the PR whose head it ran on. A delivery marks only the PRs it
+  names, never the rest of the repository;
+- that evaluation is under 60 minutes old.
+
+The PR's `updated_at` does not decide this: it does not move when a check run
+completes or a review thread is resolved. A resolved thread is not visible in
+REST at all, so its delivery (`pull_request_review_thread`) is the signal, and
+the 60-minute bound is the safety net for a delivery that never arrives. The
+bound caps skipping; it is not a cache lifetime. It also bounds how long a
+time-based hold can lag: a cancelled check's settling wait, a stall notice and a
+review retry backoff are re-read at most 60 minutes late for a skipped PR.
+
+Only a settled PR is remembered: a draft, or a PR whose head has its review done
+marker, evaluated without an error. A PR still being reviewed, or one whose last
+evaluation failed, is evaluated every pass. Dependency-bot PRs listed in the
+policy are always evaluated. Memory is in the daemon process: a restart
+evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
+
+Each repository's pass logs `pr pass` with `prs_skipped`, `prs_evaluated`,
+`evaluated_reasons` (a count per reason) and `evaluated` (`<pr>:<reasons>`).
+Reasons: `first` (no clean evaluation remembered), `webhook`, `head`, `checks`,
+`reviews`, `pr`, `base`, `age`, `unvalidated` (a read failed or came without an
+ETag).
+
+The HTTP cache behind the 304s keeps up to 8,192 responses (128 MiB; no body
+over 4 MiB) and evicts the least recently used one, so a pass that reads
+thousands of keys still finds the validators of the last. A delivery
+invalidates evidence but never drops a validator: revalidating is free and
+always correct.
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
