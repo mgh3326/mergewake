@@ -22,6 +22,9 @@ const (
 	SourceBase Source = "base"
 	// SourceStatus is a fresh status read that found the PR changed.
 	SourceStatus Source = "status"
+	// SourceTimer is a reviewer's deadline: the PR is evaluated once the
+	// reviewer is past its timeout, so a reviewer that never finishes is replaced.
+	SourceTimer Source = "timer"
 	// SourceSweep is the periodic pass, which repairs events that never arrived.
 	SourceSweep Source = "sweep"
 )
@@ -78,7 +81,10 @@ type Queue struct {
 	Grace time.Duration
 	// Now is the clock for waits; nil means time.Now.
 	Now func() time.Time
-	Log *slog.Logger
+	// After runs f once d has passed and returns a stop func; nil means
+	// time.AfterFunc. Tests replace it with a clock they move.
+	After func(d time.Duration, f func()) (stop func() bool)
+	Log   *slog.Logger
 
 	mu      sync.Mutex
 	changed *sync.Cond
@@ -90,6 +96,19 @@ type Queue struct {
 	// open is each repo's known open PRs and their heads: what a push to the
 	// base branch enqueues, and how an event that names only a commit finds its PR.
 	open map[string]map[int]string
+	// timers are the pending EnqueueAt calls. They live only in memory: a
+	// restart repeats what they would have found through the sweep.
+	timers map[timerKey]*timer
+}
+
+type timer struct {
+	gen  uint64
+	stop func() bool
+}
+
+type timerKey struct {
+	key PRKey
+	id  string
 }
 
 // DefaultPriorityGrace is how long ordering waits for priority lookups.
@@ -165,6 +184,7 @@ func (q *Queue) init() {
 		q.entries = map[PRKey]*entry{}
 		q.repos = map[string]*repoState{}
 		q.open = map[string]map[int]string{}
+		q.timers = map[timerKey]*timer{}
 		q.changed = sync.NewCond(&q.mu)
 	}
 }
@@ -265,6 +285,38 @@ func (q *Queue) EnqueueNamed(src Source, repo string, number int, sha string) {
 		}
 	}
 	q.pump()
+}
+
+// EnqueueAt queues PR number of repo for src at time at. id names the timer: a
+// later call with the same repo, PR and id replaces it. A timer is not an
+// item: it holds nothing until it fires, and Wait does not wait for it.
+func (q *Queue) EnqueueAt(src Source, repo string, number int, id string, at time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	tk := timerKey{PRKey{repo, number}, id}
+	if old := q.timers[tk]; old != nil {
+		old.stop()
+	}
+	after := q.After
+	if after == nil {
+		after = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+	}
+	q.seq++
+	t := &timer{gen: q.seq}
+	q.timers[tk] = t
+	t.stop = after(max(at.Sub(q.now()), 0), func() {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		// A replaced timer's callback may still be in flight: only the
+		// current one queues the PR.
+		if cur := q.timers[tk]; cur == nil || cur.gen != t.gen {
+			return
+		}
+		delete(q.timers, tk)
+		q.add(src, tk.key)
+		q.pump()
+	})
 }
 
 // EnqueueRepo queues every known open PR of repo.

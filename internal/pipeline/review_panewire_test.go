@@ -831,8 +831,8 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	if e != nil || out.executor != "panewire" || len(out.skips) != 0 || len(runner.spawns) != 1 {
 		t.Fatalf("%+v %v %v", out, e, runner.spawns)
 	}
-	// Each pass waits at most 90 seconds.
-	if w := arg(runner.spawns[0], "--wait-timeout"); w != "90" {
+	// Without a reviewer-finished event each pass waits at most 30 seconds.
+	if w := arg(runner.spawns[0], "--wait-timeout"); w != "30" {
 		t.Fatalf("--wait-timeout %s", w)
 	}
 }
