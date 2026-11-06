@@ -381,6 +381,7 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		}
 		p, e := s.GH.Pull(ctx, r.Name, v.PR)
 		if e == nil {
+			s.finalizeStatus(r, p)
 			e = s.ObservePR(ctx, r, p, o)
 		}
 		if e != nil {

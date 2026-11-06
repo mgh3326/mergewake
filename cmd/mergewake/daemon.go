@@ -20,6 +20,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -172,7 +173,9 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		if secret == "" {
 			return errors.New("daemon.webhook.secret_env is unset or empty")
 		}
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty,
+			Status: prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
+				Wake: func() { d.Trigger("pr") }}}
 		gap, err := config.Duration(wc.MinGap)
 		if err != nil {
 			return err
@@ -257,6 +260,28 @@ func healthcheck(endpoint string) func(context.Context) error {
 		return nil
 	}
 }
+
+// dirtyFirst moves the PRs a fresh status read marked for re-evaluation to the
+// front, keeping the order inside each group, so any priority order the list
+// already has still decides among them.
+func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
+	if len(dirty) == 0 {
+		return prs
+	}
+	out := make([]github.Pull, 0, len(prs))
+	for _, pr := range prs {
+		if dirty[pr.Number] {
+			out = append(out, pr)
+		}
+	}
+	for _, pr := range prs {
+		if !dirty[pr.Number] {
+			out = append(out, pr)
+		}
+	}
+	return out
+}
+
 func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options) error {
 	return pollPRsSkipping(ctx, s, gh, r, o, nil)
 }
@@ -284,6 +309,8 @@ func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client
 		}
 	}
 	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots, listed...)
+	marked := prstatus.DirtyPRs(s.Config.StateDir, r.Name)
+	prs = dirtyFirst(prs, marked)
 	// Before the per-PR work: a review can hold this pass for minutes.
 	s.FeedPRs(ctx, r, prs, o)
 	// A review waits for its reviewer pane, so one slow review used to hold
@@ -307,6 +334,11 @@ func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client
 		for i, pr := range prs {
 			if !isListedBot(pr, listed) {
 				plans[i] = skips.plan(ctx, gh, r.Name, pr.Number, base, baseErr)
+				// A fresh status read that found the PR changed asked for a
+				// full evaluation, whatever the validators say.
+				if marked[pr.Number] && plans[i].skip {
+					plans[i].skip, plans[i].reasons = false, []string{"status"}
+				}
 			}
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
+	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -32,6 +33,21 @@ type gateVerdict struct {
 	// posted for this head; PassesNeeded is how many its class asks for. Both
 	// feed the review-stalled notice and nothing else.
 	HeadPasses, PassesNeeded int
+	// Status is what the gate saw, kept for the PR status snapshot. It never
+	// feeds a decision.
+	Status gateEvidence
+}
+
+// gateEvidence is the part of a gate pass the PR status snapshot carries
+// beyond the verdict: required check states, the head's review passes and
+// done marker, the open threads, and the base comparison (nil until made).
+type gateEvidence struct {
+	Checks    []prstatus.Check
+	Passes    []github.PassReceipt
+	Done      bool
+	Threads   prstatus.Threads
+	Findings  []prstatus.Finding
+	BaseFresh *bool
 }
 
 // reviewRecord is what the gate knows about a PR's review, printed by
@@ -149,6 +165,8 @@ type checkSnapshotter interface {
 type checkJudgment struct {
 	Failed, Expired, Waiting, Cancelled, Skipped []string
 	Pending                                      bool
+	// States holds each required check's state as read.
+	States map[string]github.CI
 }
 
 // judgeChecks folds the required checks' states into what the gate acts on.
@@ -156,8 +174,9 @@ type checkJudgment struct {
 // and blocks once its completion is cancelledCheckWait old. Every gate judges
 // checks through it.
 func judgeChecks(states map[string]github.CI, required []string, cancelledAt map[string]time.Time, now time.Time) checkJudgment {
-	var j checkJudgment
+	j := checkJudgment{States: make(map[string]github.CI, len(required))}
 	for _, name := range required {
+		j.States[name] = states[name]
 		switch states[name] {
 		case github.Red:
 			j.Failed = append(j.Failed, "check_failed:"+name)
@@ -233,6 +252,13 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	v.Reasons = append(v.Reasons, j.Failed...)
 	v.Reasons = append(v.Reasons, j.Expired...)
 	v.Review.ChecksCancelled, v.Review.ChecksSkipped = j.Cancelled, j.Skipped
+	for _, name := range p.RequiredChecks {
+		state := j.States[name]
+		if state == "" {
+			state = github.Pending
+		}
+		v.Status.Checks = append(v.Status.Checks, prstatus.Check{Name: name, State: string(state)})
+	}
 	if j.Pending {
 		// A sibling failure is already final for this head, and so is a
 		// conflict: GitHub runs no pull_request workflow for a conflicting PR,
@@ -286,7 +312,8 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		gate = *p.ReviewGate
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
-	_, _, v.Review.Findings = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+	var holding map[string]bool
+	_, _, v.Review.Findings, holding = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -295,6 +322,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
 		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+		v.Status.Threads = prstatus.Threads{Blocking: blocking, Other: triage + v.Review.Findings.Advisory}
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
 		}
@@ -310,7 +338,16 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		if held > 0 {
 			v.Reasons = append(v.Reasons, "threads_open:"+strconv.Itoa(held))
 		}
+		v.Status.Threads = prstatus.Threads{Blocking: held, Other: v.Review.Findings.Advisory}
+		// Every unresolved thread holds the counted gate.
+		holding = map[string]bool{}
+		for _, t := range fb.Threads {
+			if !t.IsResolved {
+				holding[t.ID] = true
+			}
+		}
 	}
+	v.Status.Findings, v.Status.Threads.Unresolved = openFindings(fb, pr.User.Login, holding)
 	// The -done marker alone is forgeable by anyone with push access, so the
 	// gate also requires the head-bound passes the trusted review identity
 	// posted: one for routine changes, two distinct passes for blocking ones.
@@ -323,6 +360,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		return v, e
 	}
 	receipts := passesFor(history, pr.Head.SHA)
+	v.Status.Passes = receipts
 	posted, complete := distinctPasses(receipts, needed)
 	v.HeadPasses, v.PassesNeeded = posted, needed
 	for _, receipt := range receipts {
@@ -343,6 +381,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	if e != nil {
 		return v, e
 	}
+	v.Status.Done = done
 	reviewed := done && complete
 	if !reviewed {
 		// A verdict covers a patch: an earlier head with the same patch id, such
@@ -379,6 +418,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	if e != nil {
 		return v, e
 	}
+	v.Status.BaseFresh = &fresh
 	if !fresh {
 		// A base that moved on blocks only when the policy requires an
 		// up-to-date branch and GitHub reports the PR "behind". Otherwise a
@@ -480,13 +520,15 @@ func postedOn(c github.ReviewComment) string {
 // ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
 // unresolved threads with no comment to grade, count as blocking findings.
 func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int) {
-	blocking, triage, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify, fleet...)
+	blocking, triage, _, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify, fleet...)
 	return blocking, triage
 }
 
 // gradeThreadsDetailed is gradeThreads together with how every graded thread
-// stands, for the review record.
-func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions) {
+// stands, for the review record, and the ids of the unresolved threads that
+// count as blocking findings.
+func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
+	holding = map[string]bool{}
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
 	for _, t := range fb.Threads {
@@ -494,6 +536,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			if !t.IsResolved {
 				blocking++
 				d.OpenBlocking++
+				holding[t.ID] = true
 			}
 			continue
 		}
@@ -527,6 +570,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			default:
 				blocking++
 				d.OpenBlocking++
+				holding[t.ID] = true
 			}
 		case policy.GradeTriage:
 			// The fast lane drops rule-graded triage, but a trusted-review
@@ -545,7 +589,53 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			d.Advisory++
 		}
 	}
-	return blocking, triage, d
+	return blocking, triage, d, holding
+}
+
+var htmlComment = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+// openFindings lists the unresolved review threads of fb for the status
+// snapshot, with the count of them all: the list is capped, the count is not.
+// holding names the threads that hold the gate. Everything comes from the
+// feedback the gate pass already read.
+func openFindings(fb github.ReviewFeedback, prAuthor string, holding map[string]bool) ([]prstatus.Finding, *int) {
+	out := []prstatus.Finding{}
+	open := 0
+	author := policy.NormalizeAuthor(prAuthor)
+	for _, t := range fb.Threads {
+		if t.IsResolved {
+			continue
+		}
+		open++
+		f := prstatus.Finding{ID: t.ID, Location: t.Path + ":" + strconv.Itoa(t.Line), Blocking: holding[t.ID]}
+		if len(t.Comments) > 0 {
+			first := t.Comments[0]
+			f.Severity = github.ThreadSeverity(first.Author, first.Body)
+			f.Summary = firstLine(first.Body)
+			f.URL = first.URL
+			for _, c := range t.Comments[1:] {
+				if author != "" && policy.NormalizeAuthor(c.Author) == author {
+					f.AuthorReplied = true
+				}
+			}
+		}
+		out = append(out, f)
+	}
+	return out, &open
+}
+
+// firstLine is the first non-empty line of a finding body, without HTML
+// comment markers, cut to prstatus.MaxSummary characters.
+func firstLine(body string) string {
+	for _, line := range strings.Split(htmlComment.ReplaceAllString(body, ""), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			if r := []rune(line); len(r) > prstatus.MaxSummary {
+				return string(r[:prstatus.MaxSummary])
+			}
+			return line
+		}
+	}
+	return ""
 }
 
 var (
