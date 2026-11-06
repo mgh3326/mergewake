@@ -1616,30 +1616,45 @@ notice per overdue condition. It is detection and notice only: nothing merges
 because of it. The thresholds are constants in `internal/pipeline/overdue.go`
 (they are not config keys), taken from the merge-sla-lead-escalation policy.
 
-Three clocks run per `(PR, head)`, kept in `pr-overdue-clocks.json` so a restart
+Four clocks run per `(PR, head)`, kept in `pr-overdue-clocks.json` so a restart
 does not reset them: `head_seen` (the first pass that saw the head, after the PR
 left draft), `checks_done` (every required check completed: green, red or
-skipped) and `review_done` (the head's done marker and all needed passes, or an
-earlier head's review of the same patch). A new head starts its own clocks.
+skipped), `review_done` (the head's done marker and all needed passes, or an
+earlier head's review of the same patch) and `ready` (the READY verdict
+mergewake sent for the head). A new head starts its own clocks, with one
+exception: a head mergewake made itself by updating a stale branch inherits the
+old head's `head_seen` and `ready`, because only the author's push resets that
+clock. mergewake records the update in the same file when the call succeeds and
+carries the clocks only when the new head's first parent is the recorded old
+head and the commit is a merge, which is what an update produces: a head the
+author pushed on top of the update's result is not carried, nor is the head of
+any other push. The update record is written with the clocks, so a restart
+between the update and the head it produced keeps the carry.
 
 | Condition | Overdue when |
 | --- | --- |
 | `review_not_started` | 20 minutes after `checks_done`, no reviewer job is recorded for the head, no pass is posted and the review is not done. CI still running owes no review. |
 | `not_landed` | 10 minutes after `review_done`, the PR is not merged. |
-| `ready_too_long` | 45 minutes after `head_seen`, the PR is not merged. |
+| `ready_too_long` | 45 minutes after `ready`, the PR is not merged. No READY was sent for the head, so a head that never became READY owes nothing, however long it waits. |
 
 A head is not overdue, and is looked at again on every pass, while the gate holds
 it for any reason but mergewake's own `review_missing` queue state: an open
 critical/high finding (`blocking_findings`, `finding_outside_diff`), a failed or
 expired-cancelled check, `check_absent`, `conflict`, `base_stale`, and the other
-author or settling waits. A T3 change (the `Mergewake-Tier` trailer, else the
+author or settling waits. A pending verdict that waits only on GitHub's
+mergeability computation is held for that evaluation; one that waits on CI is
+not, so a head READY 45 minutes ago whose checks are rerunning still owes
+`ready_too_long`. A T3 change (the `Mergewake-Tier` trailer, else the
 hk task title's marker) and a PR that touches a `deploy_approval` path of the repo
 policy are never announced. The hk hold exclusion is skipped: no hk read exposes
 a hold to mergewake.
 
 The notice is a `decision`: `[mergewake] MERGE_OVERDUE <repo>#<n> head=<sha7> |
 <condition> after <age> | gate: <state> <reasons> | checks: <name>=<state>, ... |
-review: passes x/y, reviewer <label or none>`. It goes to the lane `lead` first.
+review: passes x/y, reviewer <label or none>`. A head mergewake made by updating
+the branch carries `| clocks carried from <sha7> after mergewake updated the
+branch` between the age and the gate, so an age older than the head is not read
+as a stale entry. The notice goes to the lane `lead` first.
 When the notifier refuses that lane (it is not registered on the host), the notice
 goes to the PR's `notifyLane` lane (task lane, `Mergewake-Notify-Lane` trailer,
 repo lane, then the configured fallback), and the desk gets one short `info` FYI
