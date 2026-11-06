@@ -1662,11 +1662,18 @@ escalation. Shadow and dry-run modes do not retry reviews or write retry state.
 and landing, except a bot the repository's policy lists under `bot_updates`.
 They still count as open for outcome reconciliation.
 
-`daemon.pr.review_parallel` bounds how many PRs of one repository a PR pass
-reviews at once; the default is `4`, the maximum is `32`, and `1` reviews one
-PR at a time. Each PR's review is followed by its findings delivery,
-notification and land; those settle steps run one PR at a time within a
-repository. The PR role runs all configured repositories at once, so the bound
+`daemon.pr.review_parallel` caps how many PRs of one repository a PR pass
+reviews at once. Unset or `0` means no cap: every reviewable PR of the
+repository is reviewed at once in a pass. A positive value is an explicit cap
+(`1` reviews one PR at a time) with no maximum; a negative value is a config
+error. The operator decided that reviewers are not capped by default, and that
+a limit is set only when watching the pass log shows one is needed. The limits
+that remain are panewire's spawn quota and the host's capacity. The pr pass log
+line of each repository carries `reviews_concurrent_max`, the most reviews that
+ran at once in that pass, for Grafana and Sentry; the line is written when the
+webhook receiver is enabled. Each PR's review is followed by its findings
+delivery, notification and land; those settle steps run one PR at a time within
+a repository. The PR role runs all configured repositories at once, so the cap
 applies to each repository, not to the daemon; no global reviewer cap exists.
 The other roles visit repositories one after another.
 
@@ -1674,9 +1681,10 @@ With the `handoffkeep` sink, reviews start in hk priority order (1 is highest;
 no priority sorts last; ties keep the order GitHub lists the PRs). A PR's
 priority is hk's change priority for its PR URL, else the priority of its
 `Mergewake-Task` task, else none. A priority-1 review does not wait for a free
-`review_parallel` slot: it starts at once, with at most two such reviews past
-the bound per repository, and takes the next free slot beyond that. A failed
-or slow hk read gives that PR no priority and never fails the pass. Only the
+`review_parallel` slot: under an explicit cap it starts at once, with at most
+two such reviews past the cap per repository, and takes the next free slot
+beyond that. With no cap this changes nothing, since every review starts at
+once. A failed or slow hk read gives that PR no priority and never fails the pass. Only the
 review start order changes; settling, land, the merge gate, retries and
 notifications are unchanged. Each review start writes a `review-start` row to
 `decisions.jsonl` with the priority and where it came from.
