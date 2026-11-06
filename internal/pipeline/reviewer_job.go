@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -116,14 +117,46 @@ func (x *panewireExecutor) reviewerJob(ctx context.Context, pass int) (reviewerJ
 	return rj, ok, nil
 }
 
+// closeReviewerJob closes a reviewer job as abandoned so its hub reservation
+// is released, as best effort: the daemon's host often cannot close a job whose
+// pane ran elsewhere (no local events, no claim for the lane). The owner lane
+// is the hk record's, else the --owner of the recorded spawn arguments, else
+// the configured one. A close that cannot run or fails is audited as
+// reviewer-close-skipped and reported as not closed, never as an error: the
+// hub frees the reservation itself when the job ends, and a spawn it still
+// holds is refused as reviewer-held. Only a cancelled context or a failed
+// audit write is an error.
+func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, reason string) (bool, error) {
+	s, cfg := x.s, x.s.Config.Review.Panewire
+	lane := job.OwnerLane
+	if i := slices.Index(rj.Args, "--owner"); lane == "" && i >= 0 && i+1 < len(rj.Args) {
+		lane = rj.Args[i+1]
+	}
+	if lane == "" {
+		lane = cfg.Owner
+	}
+	skipped := "no owner lane"
+	if lane != "" {
+		_, e := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", lane, "--outcome", "abandoned", "--reason", reason}, "", "")
+		if e == nil {
+			return true, nil
+		}
+		if ctx.Err() != nil {
+			return false, e
+		}
+		skipped = fleetevent.Redact(integrations.Detail(e))
+	}
+	return false, s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "label": rj.Label, "head": rj.Head, "reason": skipped}, false)
+}
+
 // closeMovedHeadJob closes the reviewer job of a record left by an older head
 // of the PR, so its hub reservation does not refuse every spawn for the new
 // head. A job with no hk record, or one that already ended, holds nothing and
-// is left alone. A failed close returns the error: the caller keeps the record
-// and the next pass tries again. A closed job is remembered for this run, so a
-// spawn refused as held can close it once more and retry.
+// is left alone. A job that cannot be closed from here is audited and treated
+// the same: the caller drops the record. A closed job is remembered for this
+// run, so a spawn refused as held can close it once more and retry.
 func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob) error {
-	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
+	s, pr := x.s, x.pr
 	job, e := x.job(ctx, rj.Label)
 	switch {
 	case errors.Is(e, integrations.ErrJobNotFound), errors.Is(e, errJobRecords):
@@ -132,11 +165,10 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 		return fmt.Errorf("reviewer job %s of head %s: %w", rj.Label, short7(rj.Head), e)
 	case terminalJob(job.State):
 		return nil
-	case job.OwnerLane == "":
-		return fmt.Errorf("reviewer job %s of head %s is %s and names no owner lane to close it", rj.Label, short7(rj.Head), job.State)
 	}
-	if _, e = s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", "PR head moved"}, "", ""); e != nil {
-		return fmt.Errorf("close reviewer job %s of head %s: %w", rj.Label, short7(rj.Head), e)
+	closed, e := x.closeReviewerJob(ctx, rj, job, "PR head moved")
+	if e != nil || !closed {
+		return e
 	}
 	if !slices.ContainsFunc(x.movedHead, func(m reviewerJob) bool { return m.Label == rj.Label }) {
 		x.movedHead = append(x.movedHead, rj)
