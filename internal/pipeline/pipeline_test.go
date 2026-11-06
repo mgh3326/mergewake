@@ -416,6 +416,12 @@ type fakeNotifier struct {
 }
 
 func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
+	// merge_overdue notices go to the lead lane and are tested through
+	// laneNotifier. Tests here move the clock to age a verdict and count its
+	// own events, so they do not see the overdue ones.
+	if e.Lane == overdueLeadLane {
+		return nil
+	}
 	if n.err != nil {
 		return n.err
 	}
