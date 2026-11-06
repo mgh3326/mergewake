@@ -64,7 +64,7 @@ PR is looked at.
 | `pr evaluated` | One per evaluation: `repo`, `pr`, `source`, `queue_wait_ms` (event to start), `eval_ms`, and the phase fields below. |
 | `review-start latency` | One per reviewer pass whose spawn panewire accepted, see below. |
 | `pr pass` | One per repository after each sweep, as before (`prs_skipped`, `prs_evaluated`, `evaluated_reasons`, `reviews_concurrent_max`), now counting every evaluation since the last line, plus `queue_depth` (items waiting), `queue_wait_max` and `merge_overdue` (the overdue notices delivered since the last line, see `docs/config.md`). |
-| `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max` and `eval_requests` (requests the evaluations made since the last line). |
+| `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max`, `eval_requests` (requests the evaluations made since the last line) and `gate_wait_ms` (the longest wait one of them spent queued for its credential's gate). |
 
 ### Where an evaluation spends its time
 

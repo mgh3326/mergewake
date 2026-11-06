@@ -31,9 +31,12 @@ type throttle struct {
 	code   int
 }
 type pollingState struct {
-	once  sync.Once
-	gate  chan struct{}
-	mu    sync.Mutex
+	once sync.Once
+	mu   sync.Mutex
+	// gates is one semaphore per credential id, created on first use: the user
+	// token and every App installation have their own, so a write on one never
+	// queues behind reads on another.
+	gates map[string]chan struct{}
 	cache *responseCache
 	// rate is the pending wait and remaining the last X-RateLimit-Remaining,
 	// each per credential id: the user token and every App installation have
@@ -45,6 +48,11 @@ type pollingState struct {
 
 // throttleLogThreshold is the shortest wait worth a stderr line.
 const throttleLogThreshold = 2 * time.Second
+
+// githubConcurrency is how many requests one credential may have in flight at
+// once. Reads of parallel evaluations used to queue behind a single slot for
+// the whole client, so their first reads took minutes.
+const githubConcurrency = 4
 
 // RateWait exposes the transport's current throttle to loop status/scheduling.
 // It is the wait of the credentials that serve reads: without the App, the user
@@ -107,7 +115,7 @@ func (p *pollingState) init() {
 	p.once.Do(func() {
 		p.rate = map[string]throttle{}
 		p.remaining = map[string]int{}
-		p.gate = make(chan struct{}, 1)
+		p.gates = map[string]chan struct{}{}
 		p.cache = newResponseCache(maxCachedEntries, maxCachedBytes)
 		p.polls = map[string]throttle{}
 	})
@@ -139,9 +147,22 @@ func (c *Client) pollShortcut(key string) (cachedResponse, error) {
 	return cachedResponse{}, ErrPollSkipped
 }
 
+// gateFor returns the semaphore of one credential, creating it on first use.
+func (p *pollingState) gateFor(cred string) chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	gate, ok := p.gates[cred]
+	if !ok {
+		gate = make(chan struct{}, githubConcurrency)
+		p.gates[cred] = gate
+	}
+	return gate
+}
+
 func (c *Client) beginRequest(ctx context.Context, key string, fresh bool, cred string) (func(), cachedResponse, error) {
 	p := &c.poll
 	p.init()
+	gate := p.gateFor(cred)
 	for {
 		p.mu.Lock()
 		wait := p.rate[cred]
@@ -158,11 +179,13 @@ func (c *Client) beginRequest(ctx context.Context, key string, fresh bool, cred 
 		if err := waitUntil(ctx, wait.until); err != nil {
 			return nil, cachedResponse{}, err
 		}
+		start := time.Now()
 		select {
-		case p.gate <- struct{}{}:
+		case gate <- struct{}{}:
 		case <-ctx.Done():
 			return nil, cachedResponse{}, ctx.Err()
 		}
+		recordGateWait(ctx, time.Since(start))
 		// A request that landed a new throttle while this one slept or queued
 		// must not be passed: release the gate and wait out the new deadline.
 		p.mu.Lock()
@@ -172,9 +195,9 @@ func (c *Client) beginRequest(ctx context.Context, key string, fresh bool, cred 
 		}
 		p.mu.Unlock()
 		if !again.until.After(time.Now()) {
-			return func() { <-p.gate }, old, nil
+			return func() { <-gate }, old, nil
 		}
-		<-p.gate
+		<-gate
 	}
 }
 

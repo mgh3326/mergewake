@@ -253,7 +253,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			cancel()
 			state := gh.ChangeCounts()
 			reviews := gh.HKReviewStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "hk_state_writes": state.Writes, "hk_state_stale": state.Stale, "hk_state_rejected": state.Rejected, "hk_state_unavailable": state.Unavailable, "hk_state_merged_skipped": state.Skipped, "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests, "hk_review_hits": reviews.Hits, "hk_review_misses": reviews.Misses, "hk_review_mismatches": reviews.Mismatches})
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "hk_state_writes": state.Writes, "hk_state_stale": state.Stale, "hk_state_rejected": state.Rejected, "hk_state_unavailable": state.Unavailable, "hk_state_merged_skipped": state.Skipped, "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "gate_wait_ms": counts.GateWaitMax().Milliseconds(), "routes": requests, "hk_review_hits": reviews.Hits, "hk_review_misses": reviews.Misses, "hk_review_mismatches": reviews.Mismatches})
 		}()
 	}
 	gh.Stderr = stderr
