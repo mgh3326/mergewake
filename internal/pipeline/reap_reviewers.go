@@ -40,7 +40,8 @@ import (
 // A worker pane keeps the composer read: a person may type in it.
 
 // reviewerLabelPattern is the label a review pass gives its pane, job and
-// checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go).
+// checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go). The hub's
+// replacement for a quota-stopped reviewer adds -q<n> (n >= 1) to the old job id.
 // reviewerUnreadableIdle is how long a reviewer pane must have sat idle with a
 // composer the hub could not read before the sweep closes it unread. The clock
 // is the pane stream's kept composer-unknown row: the receipts dedupe repeats,
@@ -48,7 +49,7 @@ import (
 // worked in between wrote a different row and started the clock again.
 const reviewerUnreadableIdle = 2 * time.Hour
 
-var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)$`)
+var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
 
 type reviewerLabel struct {
 	name    string
@@ -56,6 +57,8 @@ type reviewerLabel struct {
 	sha7    string
 	pass    int
 	started time.Time
+	// replacement is n of the -q<n> suffix, 0 for an original label.
+	replacement int
 }
 
 func parseReviewerLabel(name string) (reviewerLabel, bool) {
@@ -64,12 +67,17 @@ func parseReviewerLabel(name string) (reviewerLabel, bool) {
 		return reviewerLabel{}, false
 	}
 	pr, e1 := strconv.Atoi(m[1])
-	unix, e2 := strconv.ParseInt(m[4], 10, 64)
-	pass, e3 := strconv.Atoi(m[3])
-	if e1 != nil || e2 != nil || e3 != nil || pr <= 0 {
+	pass, e2 := strconv.Atoi(m[3])
+	unix, e3 := strconv.ParseInt(m[4], 10, 64)
+	repl := 0
+	var e4 error
+	if m[5] != "" {
+		repl, e4 = strconv.Atoi(m[5])
+	}
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || pr <= 0 {
 		return reviewerLabel{}, false
 	}
-	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(unix, 0)}, true
+	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(unix, 0), replacement: repl}, true
 }
 
 // reviewerStream names one receipt stream of a label: the pane stream (gate

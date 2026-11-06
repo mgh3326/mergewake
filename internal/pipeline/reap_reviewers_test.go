@@ -912,3 +912,49 @@ func TestParseReviewerLabelPass(t *testing.T) {
 		t.Fatalf("label=%+v ok=%v", l, ok)
 	}
 }
+
+// (a) A hub replacement label <old>-q<n> parses to the same PR, head, pass and
+// start as the original, and keeps n.
+func TestReapReviewerLabel_ReplacementSuffixParses(t *testing.T) {
+	for name, want := range map[string]reviewerLabel{
+		"mwr-283-7e8272c-p1-1794000000":     {pr: 283, sha7: "7e8272c", pass: 1, started: time.Unix(1794000000, 0)},
+		"mwr-283-7e8272c-p1-1794000000-q1":  {pr: 283, sha7: "7e8272c", pass: 1, started: time.Unix(1794000000, 0), replacement: 1},
+		"mwr-283-7e8272c-p2-1794000000-q2":  {pr: 283, sha7: "7e8272c", pass: 2, started: time.Unix(1794000000, 0), replacement: 2},
+		"mwr-283-7e8272c-p1-1794000000-q12": {pr: 283, sha7: "7e8272c", pass: 1, started: time.Unix(1794000000, 0), replacement: 12},
+	} {
+		want.name = name
+		got, ok := parseReviewerLabel(name)
+		if !ok || got != want {
+			t.Errorf("%s: got %+v ok=%v, want %+v", name, got, ok, want)
+		}
+	}
+}
+
+// (c) A malformed replacement suffix is not a reviewer label.
+func TestReapReviewerLabel_MalformedReplacementRejected(t *testing.T) {
+	for _, suffix := range []string{"-q", "-q0", "-q01", "-qx", "-q1x", "-q-1", "-q1-q2", "q1", "-Q1"} {
+		if _, ok := parseReviewerLabel("mwr-283-7e8272c-p1-1794000000" + suffix); ok {
+			t.Errorf("suffix %q accepted", suffix)
+		}
+	}
+}
+
+// (b) A pending cleanup recorded under a replacement label is visited: its
+// clean, unused local checkout is removed, as for an original label.
+func TestReapReviewer_ReplacementLabelCleanupVisited(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+	label := reviewerLabelFor(12, time.Hour) + "-q1"
+	path := localCheckout(t, f, label, false)
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Worktree: path, Result: "pending-cleanup", Reason: "spawn ended before a pane result; the checkout may still run a pane"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.run.called(key("git", "-C", "/repo", "worktree", "remove", path)) {
+		t.Fatalf("checkout not removed; calls %q", f.run.calls)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "removed" || rows[0].Worktree != path {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
