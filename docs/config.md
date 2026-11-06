@@ -578,7 +578,8 @@ For a blocked head, mergewake:
 
 mergewake takes no pass claim and writes no receipt or `-done` marker, so the
 merge gate reports `review_missing`. A block is not a review failure: it adds no
-retry backoff and no failure escalation, and the stall alarm skips the head. The
+retry backoff and no failure escalation, and it sends no review-stalled alert: the head
+waits on its author, and the BLOCKED notice already went to the author route. The
 next poll after the fix runs the review on the same head and clears the outcome.
 
 A read error is not a block. If the commit or the task cannot be read, the pass
@@ -1238,8 +1239,6 @@ For `example/project`, state resides beneath
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
-| `review-wait.json` | When this host first saw each ready head waiting for a review (the stall alarm's clock). |
-| `review-stall-sent` | Most recent 256 `PR head` keys already alarmed as stalled. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
@@ -1422,8 +1421,10 @@ head with that reason after its required checks settle, and it is kept in
 `pr-review-wait.json`. The alert is sent once per `(PR, head)`, deduped across
 restarts by a `stalled <PR> <head>` key in `pr-notify-sent`. It is sent only while
 `review_missing` is the whole reason set. A head that is later reviewed and blocks
-again follows the rules above. The older `daemon.pr.stall_after` alarm
-(`STALLED review`, to `notifier.lane`) is separate and unchanged.
+again follows the rules above. This is the only stall alert: the older
+elapsed-time `STALLED review` alarm, which the daemon stopped calling when
+reviews moved to retry accounting, is removed with its `review-wait.json` and
+`review-stall-sent` state, and `daemon.pr.stall_after` is read but sets nothing.
 
 
 #### Findings delivery

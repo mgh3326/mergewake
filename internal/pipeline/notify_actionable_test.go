@@ -213,3 +213,24 @@ func TestNotifyActionableUnknownAuthorStaysDeskDecision(t *testing.T) {
 		t.Fatalf("%+v", n.events)
 	}
 }
+
+// One head that waits 90 minutes for its review yields exactly one stall
+// event in total, polled every 10 minutes and across a restart.
+func TestNotifyActionableNinetyMinuteWaitIsOneStallEvent(t *testing.T) {
+	s, g, n, _, r, now := deliverSetup(t)
+	g.refs = map[string]bool{}
+	for i := 0; i <= 9; i++ {
+		svc := s
+		if i >= 5 {
+			restarted := *s
+			svc = &restarted
+		}
+		if e := svc.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		*now = now.Add(10 * time.Minute)
+	}
+	if n.count != 1 || !strings.Contains(n.events[0].Text, "review stalled") || strings.Contains(n.events[0].Text, "STALLED") {
+		t.Fatalf("want exactly one review-stalled event: %+v", n.events)
+	}
+}
