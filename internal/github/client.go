@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -31,6 +32,7 @@ type Client struct {
 	Changes                   changestate.Writer
 	ChangeLogin               string
 	changeHeads               sync.Map
+	mergedStateSkipped        atomic.Uint64
 	changeJobsMu              sync.Mutex
 	changeJobs                map[string]chan struct{}
 	BaseURL, UploadURL, Token string
@@ -146,7 +148,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		return nil, e
 	}
 	req.Header.Set("Accept", accept)
-	if method == "GET" && cached.ETag != "" {
+	if method == "GET" && cached.ETag != "" && ctx.Value(uncachedRequestKey{}) == nil {
 		req.Header.Set("If-None-Match", cached.ETag)
 	}
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")

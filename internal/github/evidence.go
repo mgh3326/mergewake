@@ -18,9 +18,16 @@ type evidenceCache struct {
 }
 type freshEvidenceKey struct{}
 type freshRequestKey struct{}
+type uncachedRequestKey struct{}
 
 func freshRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, freshRequestKey{}, true)
+}
+
+// pastCache is a fresh request that also sends no If-None-Match, so GitHub
+// answers with the current body and never a 304 that replays a cached one.
+func pastCache(ctx context.Context) context.Context {
+	return context.WithValue(freshRequest(ctx), uncachedRequestKey{}, true)
 }
 
 // FreshEvidence forces decision-critical reads through to GitHub.
