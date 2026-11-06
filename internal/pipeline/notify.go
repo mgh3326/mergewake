@@ -41,6 +41,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if !s.Config.Daemon.PR.Notify.On() {
 		return nil
 	}
+	ctx = WithAuthorScan(ctx)
 	started := s.now()
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
@@ -457,7 +458,8 @@ func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pu
 	return lane, rvia, true, nil
 }
 
-// notifyLane resolves the destination lane without guessing: the handoffkeep
+// notifyLane resolves the destination lane without guessing: the PR's author
+// pane when its task names no bound job (see authorPane), the handoffkeep
 // task's lane via a Mergewake-Task trailer (PR body, then head commit message),
 // an explicit Mergewake-Notify-Lane trailer in the same order, then the
 // configured notifier lane. The returned rule names the choosing source and is
@@ -466,6 +468,23 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 	task, e := s.prTask(ctx, r, pr)
 	if e != nil {
 		return "", "", e
+	}
+	// A task with a bound job keeps the rules below; the author pane stands in
+	// only where the task names no job, as for FINDINGS.
+	if len(s.Config.Hosts) > 0 {
+		bound, _, e := s.boundJobLane(ctx, task)
+		if e != nil {
+			return "", "", e
+		}
+		if bound == "" {
+			lane, via, ok, e := s.authorPane(ctx, r, pr)
+			if e != nil {
+				return "", "", e
+			}
+			if ok {
+				return lane, via, nil
+			}
+		}
 	}
 	if task != "" {
 		if l, ok := s.Sink.(interface {
