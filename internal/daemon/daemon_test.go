@@ -433,3 +433,52 @@ func TestRoleErrorEventWriteFailureKeepsLoopAndStatus(t *testing.T) {
 		t.Fatalf("status = %+v, err = %v", s, err)
 	}
 }
+
+// A reap pass cut by cancellation (a daemon stop mid-pass) leaves nothing that
+// delays the next start: the first pass of a new run starts at once, not one
+// interval after the cut one, even though the interval is an hour.
+func TestCancelledPassRunsAgainAtNextStart(t *testing.T) {
+	state, locks := t.TempDir(), t.TempDir()
+	started := make(chan struct{}, 4)
+	cut := func(ctx context.Context) error { started <- struct{}{}; <-ctx.Done(); return ctx.Err() }
+	run := func(pass func(context.Context) error) (stop func() error) {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := Daemon{StateDir: state, LockDir: locks, Host: "host-a"}
+		done := make(chan error, 1)
+		go func() { done <- d.Run(ctx, []Loop{{Role: "reap", Interval: time.Hour, Run: pass}}) }()
+		return func() error { cancel(); return <-done }
+	}
+
+	stop := run(cut)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first run did not start a pass")
+	}
+	// The pass is cancelled mid-way; its error is the cancellation.
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(state, "daemon", "reap.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st Status
+	if err := json.Unmarshal(b, &st); err != nil || !strings.Contains(st.LastError, "context canceled") || !st.NextRun.IsZero() {
+		t.Fatalf("status after the cut pass: %+v, %v", st, err)
+	}
+
+	again := time.Now()
+	stop = run(cut)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("no pass within 3s of the next start (interval 1h); the cut pass was not retried")
+	}
+	if waited := time.Since(again); waited > 3*time.Second {
+		t.Fatalf("pass started after %s", waited)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+}

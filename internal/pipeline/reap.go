@@ -35,7 +35,7 @@ type reapReceipt struct {
 	Worktree string    `json:"worktree,omitempty"`
 	Branch   string    `json:"branch,omitempty"`
 	Saved    string    `json:"saved,omitempty"` // report/log path captured before a pane close
-	Result   string    `json:"result"`          // closed, removed, deleted, would-*, skipped, error
+	Result   string    `json:"result"`          // closed, removed, deleted, abandoned, would-*, skipped, error
 	Reason   string    `json:"reason,omitempty"`
 	Files    []string  `json:"files,omitempty"` // ignored paths named by a refusing removal skip
 	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
@@ -511,7 +511,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			closed++
 		case "done":
 			jobsDone++
-		case "would-close", "would-remove", "would-delete", "would-archive", "would-done":
+		case "would-close", "would-remove", "would-delete", "would-archive", "would-done", "would-abandon":
 			planned++
 		case "archived":
 			archived++

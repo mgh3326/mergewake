@@ -58,6 +58,10 @@ const (
 // mergewake.revert and nil otherwise. Every post, failed or not, is one
 // hk-task-event audit row.
 func (s *Service) postTaskEvent(ctx context.Context, r config.Repo, pr github.Pull, source string, revert *github.Pull, at time.Time) postOutcome {
+	if source == integrations.SourceMerge {
+		// Whatever the task event does, the merge itself has landed.
+		mergeLanded(ctx, r.Name, pr.Number)
+	}
 	return s.postTaskEventWith(ctx, r, pr, source, revert, at, nil)
 }
 
