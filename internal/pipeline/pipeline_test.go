@@ -282,6 +282,21 @@ func (g *fakeGH) RenewReviewLease(_ context.Context, _ string, branch, expected 
 	g.leaseTimes[branch] = time.Now()
 	return g.leaseIDs[branch], true, nil
 }
+func (g *fakeGH) ReleaseReviewLease(_ context.Context, _ string, branch, expected string) (bool, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
+	current := g.leaseIDs[branch]
+	if current == "" {
+		current = shaA
+	}
+	if !g.refs[branch] || expected != current {
+		return false, nil
+	}
+	delete(g.refs, branch)
+	delete(g.leaseIDs, branch)
+	delete(g.leaseTimes, branch)
+	return true, nil
+}
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
 	fb := g.feedback
 	fb.HeadSHA = g.pull.Head.SHA

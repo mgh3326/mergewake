@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -105,4 +106,31 @@ func (c *Client) RenewReviewLease(ctx context.Context, repo, branch, expected st
 		return "", false, err
 	}
 	return lease.SHA, true, nil
+}
+
+// ReleaseReviewLease deletes the lease branch only while it still points at the
+// commit the caller created, so a lease another host renewed is never removed.
+// The head is read past the pass memo. GitHub's ref delete is unconditional, so
+// a renewal landing between the read and the delete is the one remaining window;
+// the lease then simply expires by its TTL as before.
+func (c *Client) ReleaseReviewLease(ctx context.Context, repo, branch, expected string) (bool, error) {
+	var r struct {
+		Object Ref `json:"object"`
+	}
+	err := c.json(ctx, "GET", base(repo)+"/git/ref/heads/"+url.PathEscape(branch), nil, &r)
+	if NotFound(err) {
+		return false, nil
+	}
+	if err != nil || expected == "" || r.Object.SHA != expected {
+		return false, err
+	}
+	err = c.json(ctx, "DELETE", base(repo)+"/git/refs/heads/"+branch, nil, nil)
+	if err != nil {
+		var api *APIError
+		if NotFound(err) || (errors.As(err, &api) && api.Code == 422) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

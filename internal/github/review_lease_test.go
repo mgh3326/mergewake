@@ -157,3 +157,41 @@ func TestRenewReviewLeasePreservesOwnership(t *testing.T) {
 		t.Fatalf("sha=%q ok=%v err=%v writes=%d", sha, ok, err, writes)
 	}
 }
+
+func TestReleaseReviewLeaseDeletesOnlyOwnLease(t *testing.T) {
+	own, other := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	for _, tt := range []struct {
+		name    string
+		head    string // "" answers 404
+		deleted int
+		want    bool
+	}{
+		{name: "own lease", head: own, deleted: 1, want: true},
+		{name: "renewed by another host", head: other},
+		{name: "already gone"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			deleted := 0
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == "GET" && strings.Contains(r.URL.Path, "/git/ref/"):
+					if tt.head == "" {
+						http.NotFound(w, r)
+						return
+					}
+					reply(w, map[string]any{"object": Ref{SHA: tt.head}})
+				case r.Method == "DELETE" && strings.HasSuffix(r.URL.Path, "/git/refs/heads/mergewake/reviews/7/x"):
+					deleted++
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			})
+			got, err := c.ReleaseReviewLease(context.Background(), "example/project", "mergewake/reviews/7/x", own)
+			if err != nil || got != tt.want || deleted != tt.deleted {
+				t.Fatalf("released=%v err=%v deleted=%d", got, err, deleted)
+			}
+		})
+	}
+}
