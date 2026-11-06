@@ -331,7 +331,10 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		Type: verdictType(state, via, s.isDeskLane(lane)),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
-		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
+		// A worker-only verdict never falls back to the desk: that would put a
+		// READY or MERGED on a lane that must not receive it. It is parked
+		// with the decided key, as an author-action BLOCKED is.
+		if fallback != "" && fallback != lane && !workerOnly && !(state == "blocked" && authorAction(summary)) {
 			// The resolved lane may not exist on this host; the fallback lane
 			// gets one try under a distinct ID before the verdict is parked.
 			if fb := s.Notifier.Notify(reportCtx, integrations.Event{

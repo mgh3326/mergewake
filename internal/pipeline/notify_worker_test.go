@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,5 +204,34 @@ func TestWorkerLaneNoReadyReminderOutsideWorker(t *testing.T) {
 	}
 	if c := clocks[verdictKey("ready", 7, shaA)]; c.Repeats != 0 {
 		t.Fatalf("reminder counted for a suppressed READY: %+v", c)
+	}
+}
+
+// (h) A worker-only verdict whose lane refuses delivery is parked with the
+// decided key, not retried on the desk fallback: READY and MERGED never reach
+// a non-worker lane, not even as a delivery fallback.
+func TestWorkerLaneDeliveryFailureDoesNotFallBack(t *testing.T) {
+	s, g, _, r := workerNotifySetup(t)
+	n := &laneFailNotifier{fail: map[string]error{"worker-lane": errors.New("lane not registered")}}
+	s.Notifier = n
+	s.Config.Notifier.FallbackLane = "config-lane"
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, _, e := s.laneEvent(context.Background(), r, g.pull, "merged", g.pull.Title); !errors.Is(e, errNotifyDelivery) {
+		t.Fatalf("merged err=%v", e)
+	}
+	if len(n.events) != 2 || n.events[0].Lane != "worker-lane" || n.events[1].Lane != "worker-lane" {
+		t.Fatalf("fallback attempted: %+v", n.events)
+	}
+	// Both verdicts are parked: the next pass and the next MERGED stay quiet.
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, _, e := s.laneEvent(context.Background(), r, g.pull, "merged", g.pull.Title); e != nil {
+		t.Fatalf("parked MERGED: %v", e)
+	}
+	if len(n.events) != 2 {
+		t.Fatalf("parked verdict retried: %+v", n.events)
 	}
 }
