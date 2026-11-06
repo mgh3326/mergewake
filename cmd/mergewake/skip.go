@@ -134,8 +134,8 @@ func (k *prSkips) forget(repo string, open map[int]bool) {
 }
 
 // report logs one repository's pass: how many PRs it skipped and evaluated, and
-// why each evaluated PR was.
-func (k *prSkips) report(repo string, prs []int, plans []skipPlan) {
+// why each evaluated PR was, and the most reviews that ran at once.
+func (k *prSkips) report(repo string, prs []int, plans []skipPlan, reviewsConcurrentMax int) {
 	if k == nil || k.Log == nil {
 		return
 	}
@@ -156,5 +156,5 @@ func (k *prSkips) report(repo string, prs []int, plans []skipPlan) {
 		}
 	}
 	slices.Sort(evaluatedPRs)
-	k.Log.Info("pr pass", "repo", repo, "prs_skipped", skipped, "prs_evaluated", evaluated, "evaluated_reasons", reasons, "evaluated", evaluatedPRs[:min(len(evaluatedPRs), 30)])
+	k.Log.Info("pr pass", "repo", repo, "prs_skipped", skipped, "prs_evaluated", evaluated, "evaluated_reasons", reasons, "evaluated", evaluatedPRs[:min(len(evaluatedPRs), 30)], "reviews_concurrent_max", reviewsConcurrentMax)
 }

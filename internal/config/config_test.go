@@ -753,29 +753,32 @@ func TestReviewRetryConfig(t *testing.T) {
 
 func TestReviewParallelConfig(t *testing.T) {
 	for _, tc := range []struct {
-		yaml, err string
-		want      int
+		name, yaml, err string
+		want            int
 	}{
-		{"", "", DefaultReviewParallel},
-		{"review_parallel: 1", "", 1},
-		{"review_parallel: 32", "", 32},
-		{"review_parallel: 33", "daemon.pr.review_parallel must be at most 32", 0},
-		{"review_parallel: 9223372036854775807", "daemon.pr.review_parallel must be at most 32", 0},
+		{"unset is unlimited", "", "", 0},
+		{"zero is unlimited", "review_parallel: 0", "", 0},
+		{"one", "review_parallel: 1", "", 1},
+		{"above the old maximum of 32", "review_parallel: 1000", "", 1000},
+		{"largest int", "review_parallel: 9223372036854775807", "", 9223372036854775807},
+		{"negative", "review_parallel: -1", "daemon.pr.review_parallel must not be negative", 0},
 	} {
-		p := filepath.Join(t.TempDir(), "config.yaml")
-		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\ndaemon:\n  pr: {"+tc.yaml+"}\n"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		c, err := Load(p)
-		if tc.err != "" {
-			if err == nil || err.Error() != tc.err {
-				t.Fatalf("%q: %v", tc.yaml, err)
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\ndaemon:\n  pr: {"+tc.yaml+"}\n"), 0600); err != nil {
+				t.Fatal(err)
 			}
-			continue
-		}
-		if err != nil || c.Daemon.PR.Parallel() != tc.want {
-			t.Fatalf("%q: %v %d", tc.yaml, err, c.Daemon.PR.Parallel())
-		}
+			c, err := Load(p)
+			if tc.err != "" {
+				if err == nil || err.Error() != tc.err {
+					t.Fatalf("%q: %v", tc.yaml, err)
+				}
+				return
+			}
+			if err != nil || c.Daemon.PR.Parallel() != tc.want {
+				t.Fatalf("%q: %v %d", tc.yaml, err, c.Daemon.PR.Parallel())
+			}
+		})
 	}
 }
 

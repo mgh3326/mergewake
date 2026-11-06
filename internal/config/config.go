@@ -261,24 +261,14 @@ type PRLoop struct {
 	// no author family, so a review can never start and the alarm only nags.
 	SkipBots bool `yaml:"skip_bots"`
 	// ReviewParallel bounds how many PRs of one repository a pass reviews at
-	// once. Zero or less means DefaultReviewParallel; 1 reviews one PR at a time.
+	// once. Zero or unset means no bound; 1 reviews one PR at a time. Negative
+	// is refused.
 	ReviewParallel int `yaml:"review_parallel"`
 }
 
-// DefaultReviewParallel is the review bound when review_parallel is unset.
-const DefaultReviewParallel = 4
-
-// MaxReviewParallel is the largest review_parallel Load accepts: each slot can
-// hold a reviewer pane, and a huge value would size the slot channel past memory.
-const MaxReviewParallel = 32
-
-// Parallel is the number of PR reviews a pass may run at once.
-func (l PRLoop) Parallel() int {
-	if l.ReviewParallel <= 0 {
-		return DefaultReviewParallel
-	}
-	return l.ReviewParallel
-}
+// Parallel is the number of PR reviews a pass may run at once; zero means
+// no bound.
+func (l PRLoop) Parallel() int { return max(l.ReviewParallel, 0) }
 
 // ReviewRetry bounds retries and the number of failures before escalation.
 type ReviewRetry struct {
@@ -674,8 +664,8 @@ func validateDaemon(c *Config) error {
 	if c.Daemon.PR.Findings.EscalateRounds < 0 {
 		return errors.New("daemon.pr.findings.escalate_rounds must not be negative")
 	}
-	if c.Daemon.PR.ReviewParallel > MaxReviewParallel {
-		return fmt.Errorf("daemon.pr.review_parallel must be at most %d", MaxReviewParallel)
+	if c.Daemon.PR.ReviewParallel < 0 {
+		return errors.New("daemon.pr.review_parallel must not be negative")
 	}
 	if e = validateWebhook(&c.Daemon.Webhook); e != nil {
 		return e
