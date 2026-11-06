@@ -319,6 +319,46 @@ func (q *Queue) EnqueueAt(src Source, repo string, number int, id string, at tim
 	})
 }
 
+// CancelTimer drops the timer id of PR number of repo, so it never queues the
+// PR. It does nothing when there is none, or when it already fired.
+func (q *Queue) CancelTimer(repo string, number int, id string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	q.cancel(timerKey{PRKey{repo, number}, id})
+}
+
+// TimerIDs lists the ids of the timers PR number of repo has pending.
+func (q *Queue) TimerIDs(repo string, number int) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	var ids []string
+	for tk := range q.timers {
+		if tk.key == (PRKey{repo, number}) {
+			ids = append(ids, tk.id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func (q *Queue) cancel(tk timerKey) {
+	if t := q.timers[tk]; t != nil {
+		t.stop()
+		delete(q.timers, tk)
+	}
+}
+
+// cancelPR drops every timer of PR number of repo.
+func (q *Queue) cancelPR(repo string, number int) {
+	for tk := range q.timers {
+		if tk.key == (PRKey{repo, number}) {
+			q.cancel(tk)
+		}
+	}
+}
+
 // EnqueueRepo queues every known open PR of repo.
 func (q *Queue) EnqueueRepo(src Source, repo string) {
 	q.mu.Lock()
@@ -335,6 +375,11 @@ func (q *Queue) SetOpen(repo string, heads map[int]string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	for tk := range q.timers {
+		if _, ok := heads[tk.key.PR]; tk.key.Repo == repo && !ok {
+			q.cancel(tk)
+		}
+	}
 	q.open[repo] = heads
 }
 
@@ -353,11 +398,13 @@ func (q *Queue) learn(repo string, n int, sha string) {
 	q.open[repo][n] = sha
 }
 
-// Forget drops PR n of repo from the known open PRs.
+// Forget drops PR n of repo from the known open PRs, and its timers with it:
+// a PR that closed or merged is not queued by a timer that was set before.
 func (q *Queue) Forget(repo string, n int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	q.cancelPR(repo, n)
 	delete(q.open[repo], n)
 }
 

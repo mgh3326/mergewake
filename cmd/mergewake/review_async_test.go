@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,13 +109,16 @@ type timers struct {
 type timerCall struct {
 	after time.Duration
 	fire  func()
+	// stopped is set when the queue cancels the timer.
+	stopped *atomic.Bool
 }
 
 func (t *timers) after(d time.Duration, f func()) func() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.set = append(t.set, timerCall{d, f})
-	return func() bool { return true }
+	stopped := &atomic.Bool{}
+	t.set = append(t.set, timerCall{d, f, stopped})
+	return func() bool { return !stopped.Swap(true) }
 }
 
 func (t *timers) calls() []timerCall {
