@@ -1609,6 +1609,50 @@ reviews moved to retry accounting, is removed with its `review-wait.json` and
 `review-stall-sent` state, and `daemon.pr.stall_after` is read but sets nothing.
 
 
+#### Overdue notice (`merge_overdue`)
+
+The `pr` role measures how long each head waits and sends one `merge_overdue`
+notice per overdue condition. It is detection and notice only: nothing merges
+because of it. The thresholds are constants in `internal/pipeline/overdue.go`
+(they are not config keys), taken from the merge-sla-lead-escalation policy.
+
+Three clocks run per `(PR, head)`, kept in `pr-overdue-clocks.json` so a restart
+does not reset them: `head_seen` (the first pass that saw the head, after the PR
+left draft), `checks_done` (every required check completed: green, red or
+skipped) and `review_done` (the head's done marker and all needed passes, or an
+earlier head's review of the same patch). A new head starts its own clocks.
+
+| Condition | Overdue when |
+| --- | --- |
+| `review_not_started` | 20 minutes after `checks_done`, no reviewer job is recorded for the head, no pass is posted and the review is not done. CI still running owes no review. |
+| `not_landed` | 10 minutes after `review_done`, the PR is not merged. |
+| `ready_too_long` | 45 minutes after `head_seen`, the PR is not merged. |
+
+A head is not overdue, and is looked at again on every pass, while the gate holds
+it for any reason but mergewake's own `review_missing` queue state: an open
+critical/high finding (`blocking_findings`, `finding_outside_diff`), a failed or
+expired-cancelled check, `check_absent`, `conflict`, `base_stale`, and the other
+author or settling waits. A T3 change (the `Mergewake-Tier` trailer, else the
+hk task title's marker) and a PR that touches a `deploy_approval` path of the repo
+policy are never announced. The hk hold exclusion is skipped: no hk read exposes
+a hold to mergewake.
+
+The notice is a `decision`: `[mergewake] MERGE_OVERDUE <repo>#<n> head=<sha7> |
+<condition> after <age> | gate: <state> <reasons> | checks: <name>=<state>, ... |
+review: passes x/y, reviewer <label or none>`. It goes to the lane `lead` first.
+When the notifier refuses that lane (it is not registered on the host), the notice
+goes to the PR's `notifyLane` lane (task lane, `Mergewake-Notify-Lane` trailer,
+repo lane, then the configured fallback), and the desk gets one short `info` FYI
+line unless that lane is the desk. A notice no lane takes is parked under a
+`decided` key and not retried. Each delivered notice is deduped across restarts by
+a `merge_overdue <PR> <head> <condition>` key in `pr-notify-sent`.
+
+To read a day of counts: every delivered notice writes a `merge_overdue` row to
+`decisions.jsonl` (`repo`, `pr`, `head`, `condition`, `age`, `route`, `lane`), and
+the `pr pass` log line carries `merge_overdue`, the notices sent since the last
+line.
+
+
 #### Findings delivery
 
 `daemon.pr.findings` (default enabled; `{enabled: false}` turns it off) sends

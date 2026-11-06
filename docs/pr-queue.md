@@ -61,7 +61,7 @@ PR is looked at.
 | Line | Fields |
 | --- | --- |
 | `pr evaluated` | One per evaluation: `repo`, `pr`, `source`, `queue_wait_ms` (event to start), `eval_ms`. |
-| `pr pass` | One per repository after each sweep, as before (`prs_skipped`, `prs_evaluated`, `evaluated_reasons`, `reviews_concurrent_max`), now counting every evaluation since the last line, plus `queue_depth` (items waiting) and `queue_wait_max`. |
+| `pr pass` | One per repository after each sweep, as before (`prs_skipped`, `prs_evaluated`, `evaluated_reasons`, `reviews_concurrent_max`), now counting every evaluation since the last line, plus `queue_depth` (items waiting), `queue_wait_max` and `merge_overdue` (the overdue notices delivered since the last line, see `docs/config.md`). |
 | `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max` and `eval_requests` (requests the evaluations made since the last line). |
 
 Each evaluation is its own `pr pass` Sentry transaction; the sweep is another.

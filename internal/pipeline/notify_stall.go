@@ -118,6 +118,16 @@ func (s *Service) reviewStalled(ctx context.Context, r config.Repo, pr github.Pu
 // reviewer job recorded for it, when there is one.
 func (s *Service) reviewState(r config.Repo, pr github.Pull, v gateVerdict) string {
 	state := fmt.Sprintf("passes posted %d/%d", v.HeadPasses, v.PassesNeeded)
+	labels := s.reviewerJobLabels(r, pr)
+	if len(labels) == 0 {
+		return state + ", no reviewer job known"
+	}
+	return state + ", reviewer job " + strings.Join(labels, ", ")
+}
+
+// reviewerJobLabels names the reviewer jobs recorded for the PR's current
+// head, one "<label> (pass <n>)" each.
+func (s *Service) reviewerJobLabels(r config.Repo, pr github.Pull) []string {
 	paths, _ := filepath.Glob(filepath.Join(s.state(r.Name), "reviewer-jobs", fmt.Sprintf("%d-p*.json", pr.Number)))
 	var labels []string
 	for _, path := range paths {
@@ -126,8 +136,5 @@ func (s *Service) reviewState(r config.Repo, pr github.Pull, v gateVerdict) stri
 			labels = append(labels, fmt.Sprintf("%s (pass %d)", rj.Label, rj.Pass))
 		}
 	}
-	if len(labels) == 0 {
-		return state + ", no reviewer job known"
-	}
-	return state + ", reviewer job " + strings.Join(labels, ", ")
+	return labels
 }

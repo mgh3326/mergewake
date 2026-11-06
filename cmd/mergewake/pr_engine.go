@@ -359,13 +359,14 @@ func (e *prEngine) passLine(repo string) {
 	defer e.mu.Unlock()
 	e.taken[repo] = st
 	c := e.counts(repo)
+	overdue := pipeline.TakeMergeOverdue(repo)
 	// The next window starts with the reviews still running.
 	defer func() { *c = passCounts{reasons: map[string]int{}, reviewing: c.reviewing, peak: c.reviewing} }()
 	if e.skips == nil || e.skips.Log == nil {
 		return
 	}
 	slices.Sort(c.evaluatedPRs)
-	e.skips.Log.Info("pr pass", "repo", repo, "prs_skipped", c.skipped, "prs_evaluated", c.evaluated, "evaluated_reasons", c.reasons, "evaluated", c.evaluatedPRs[:min(len(c.evaluatedPRs), 30)], "reviews_concurrent_max", c.peak, "queue_depth", st.Depth, "queue_wait_max", st.WaitMax.String())
+	e.skips.Log.Info("pr pass", "repo", repo, "prs_skipped", c.skipped, "prs_evaluated", c.evaluated, "evaluated_reasons", c.reasons, "evaluated", c.evaluatedPRs[:min(len(c.evaluatedPRs), 30)], "reviews_concurrent_max", c.peak, "queue_depth", st.Depth, "queue_wait_max", st.WaitMax.String(), "merge_overdue", overdue)
 }
 
 // queueTotals is what the sweeps of all repos last saw of the queue, and the

@@ -82,6 +82,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if !o.Reporting() {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
+	s.mergeOverdue(ctx, r, pr, p, v)
 	if e := s.ageCheckFailures(ctx, r, pr, v.Reasons); e != nil {
 		return e
 	}
