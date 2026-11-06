@@ -510,12 +510,13 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		w.record(gate, "would-abandon", reason)
 		return true
 	}
-	if job.OwnerLane == "" {
+	lane, _ := w.s.reviewerCloseOwner(job)
+	if lane == "" {
 		w.record(gate, "error", "abandon job: owner lane unavailable")
 		return false
 	}
 	cmd := w.s.Config.Review.Panewire.Command
-	if _, e := w.s.Runner.Run(ctx, cmd, []string{"job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason}, "", ""); e != nil {
+	if _, e := w.s.Runner.Run(ctx, cmd, []string{"job", "close", l.name, "--lane", lane, "--outcome", "abandoned", "--reason", reason}, "", ""); e != nil {
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
 	}

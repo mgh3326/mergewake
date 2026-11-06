@@ -611,16 +611,21 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	out := passOutcome{}
 	reportPath := filepath.Join(cfg.Jobs, rj.Label, "report.md")
 	lost := &reviewResultLost{rj.Label, cause, job.Profile, reportPath, errors.New(cause)}
-	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+	row := map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}
+	ownerLane, ownerSource := s.reviewerCloseOwner(job)
+	if job.State != "" {
+		row["close_owner_lane"], row["close_owner_source"] = ownerLane, ownerSource
+		if ownerLane == "" {
+			row["close_skipped"] = "job record names no owner lane and review.panewire.owner is empty"
+		}
+	}
+	auditErr := s.audit(x.repo.Name, "review-result-lost", row, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
 	if auditErr != nil || noticeErr != nil {
 		return out, errors.Join(lost, auditErr, noticeErr)
 	}
-	if job.State != "" {
-		if job.OwnerLane == "" {
-			return out, fmt.Errorf("%w: reviewer owner lane unavailable", lost)
-		}
-		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil {
+	if job.State != "" && ownerLane != "" {
+		if _, err := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", ownerLane, "--outcome", "abandoned", "--reason", cause}, "", ""); err != nil && !jobAlreadyClosed(err) {
 			return out, errors.Join(lost, err)
 		}
 	}
@@ -632,6 +637,28 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	plan.replacements = rj.Replacements + 1
 	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+}
+
+// reviewerCloseOwner is the lane that closes a reviewer job: the owner the hk
+// job record names, else review.panewire.owner, which is the --owner mergewake
+// spawned every reviewer job with. The source is "job", "config", or "" with
+// an empty lane when neither names one.
+func (s *Service) reviewerCloseOwner(job integrations.JobRecord) (lane, source string) {
+	switch {
+	case job.OwnerLane != "":
+		return job.OwnerLane, "job"
+	case s.Config.Review.Panewire.Owner != "":
+		return s.Config.Review.Panewire.Owner, "config"
+	}
+	return "", ""
+}
+
+var jobAlreadyClosedText = regexp.MustCompile(`(?i)already[ _-](revoked|ended|closed|completed|terminal|finished)`)
+
+// jobAlreadyClosed reports a `panewire job close` failure that means the job
+// is already revoked or ended, so there is no hub claim left to release.
+func jobAlreadyClosed(err error) bool {
+	return jobAlreadyClosedText.MatchString(integrations.Detail(err))
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
