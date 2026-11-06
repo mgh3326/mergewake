@@ -158,10 +158,12 @@ head and the repo sets `require_up_to_date: true`, and `conflict` when GitHub re
 check evidence emits nothing. When acting and `base_stale` is the only blocker (it needs `require_up_to_date: true`), `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
-across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY, BLOCKED, and MERGED are declared `--type ready|blocked|merged`, so they stay unread on the lane
-until `panewire inbox ack`, and a READY PR nobody merged is notified again every
-`daemon.pr.notify.renotify_after` (default 30m), at most `renotify_max` times
-(default 3).
+across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. BLOCKED is declared `--type blocked`, so it stays unread on the lane until
+`panewire inbox ack`. READY and MERGED are recorded, not sent: mergewake merges
+on its own gate, so each writes its sent key and one `pr-notify` decision marked
+`"suppressed":"record only"` (naming the author worker lane it would have used,
+if any), and READY starts the clock `merge_overdue` counts `ready_too_long` from.
+No READY reminder is sent; `renotify_after` and `renotify_max` no longer have an effect.
 
 A `review_missing` BLOCKED with no block detail is mergewake's own queue state and
 sends nothing; a head that keeps it for more than 60 minutes gets one
