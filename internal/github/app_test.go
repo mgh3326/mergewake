@@ -172,6 +172,9 @@ func exercise(t *testing.T, c *Client) {
 	}
 }
 
+// Mutation check: widening readRepo's GET case to `GET || POST` (routing POST
+// through the App token) fails this test: the POST review carries the
+// installation token and the GraphQL query falls back to the user token.
 func TestAppReadsUseInstallationTokenAndWritesUseUserToken(t *testing.T) {
 	h := newAppHarness(t, true)
 	exercise(t, h.Client)
