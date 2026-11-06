@@ -195,3 +195,28 @@ func TestReleaseReviewLeaseDeletesOnlyOwnLease(t *testing.T) {
 		})
 	}
 }
+
+// The lease branch has slashes. Both the read and the delete must address it by
+// the plain ref path, never with %2F, which GitHub does not take as a separator.
+func TestReleaseReviewLeaseUsesPlainRefPath(t *testing.T) {
+	own := strings.Repeat("b", 40)
+	branch := "mergewake/reviews/55/" + testSHA + "-p2"
+	want := "/repos/example/project/git/ref/heads/" + branch
+	wantDelete := "/repos/example/project/git/refs/heads/" + branch
+	var seen []string
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.RequestURI)
+		switch {
+		case r.Method == "GET" && r.RequestURI == want:
+			reply(w, map[string]any{"object": Ref{SHA: own}})
+		case r.Method == "DELETE" && r.RequestURI == wantDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	got, err := c.ReleaseReviewLease(context.Background(), "example/project", branch, own)
+	if err != nil || !got {
+		t.Fatalf("released=%v err=%v requests=%q", got, err, seen)
+	}
+}
