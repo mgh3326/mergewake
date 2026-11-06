@@ -53,7 +53,16 @@ func missingHubEnv() []string {
 // for validating and posting its findings.
 const postReserve = time.Minute
 
-const reviewerPassWait = 90 * time.Second
+// reviewerPassWait bounds how long a pass waits for its reviewer when no
+// reviewer-finished event will bring the PR back (no Revisit on the context, as
+// for `mergewake review`, or a daemon that cannot read hk job records). A
+// reviewer that finishes within it is collected in the same run. With a
+// Revisit a pass never waits.
+const reviewerPassWait = 30 * time.Second
+
+// revisitMargin is added to a reviewer's deadline before its timer fires, so
+// the pass that decides lost-or-replace sees the record past review.timeout.
+const revisitMargin = 10 * time.Second
 
 // Leave room for panewire's policy preamble below the hub's 64 KiB limit.
 const inlineBriefLimit = 48 << 10
@@ -289,6 +298,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// with no spawn. One still live is re-attached by replaying its spawn,
 	// until it has been live longer than the stale bound.
 	spawn := true
+	revisit := revisitOf(ctx)
+	async := revisit != nil
+	placed := true
 	var collected []byte
 	var remoteRecord *integrations.JobRecord
 	if resumed {
@@ -353,7 +365,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
 			spawn = false
 		case errors.Is(e, integrations.ErrJobNotFound):
-			state = "without a job record"
+			state, placed = "without a job record", false
 		case e != nil:
 			state = "unreadable in hk"
 		}
@@ -369,7 +381,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	note := ""
 	var stdout []byte
+	if resumed && !spawn {
+		stdout = []byte(rj.Spawned)
+	}
 	if spawn {
+		// A reviewer the hub knows runs on its own: its finish, or its timer,
+		// brings the PR back. Only a record with no job behind it replays the
+		// spawn, in case the daemon stopped before it ran.
+		if async && resumed && placed {
+			return out, x.pending(revisit, rj, "still running")
+		}
 		if reason := hubMissing(); reason != "" {
 			return skip("%s", reason)
 		}
@@ -417,8 +438,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			args = rj.Args
 		}
+		// The recorded arguments keep --wait, so a run that waits replays the
+		// same request; an event-driven run places the reviewer and returns.
+		launch := func(c context.Context, a []string) ([]byte, error) {
+			if async {
+				a = placeOnly(a)
+			}
+			return s.Runner.Run(c, cfg.Command, a, "", "")
+		}
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
-		stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+		stdout, e = launch(runCtx, args)
 		tracing.Finish(runSpan)
 		// A fresh spawn refused as held, while this run closed the job of an
 		// older head: close it once more and spawn again, once.
@@ -437,7 +466,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, errors.Join(e, closeErr)
 			}
 			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
-			stdout, e = s.Runner.Run(runCtx, cfg.Command, args, "", "")
+			stdout, e = launch(runCtx, args)
 			tracing.Finish(runSpan)
 		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
@@ -447,7 +476,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, saveErr
 			}
 			runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
-			stdout, e = s.Runner.Run(runCtx, cfg.Command, rj.Args, "", "")
+			stdout, e = launch(runCtx, rj.Args)
 			tracing.Finish(runSpan)
 		}
 		if e != nil {
@@ -498,6 +527,20 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
 			res.skips[len(res.skips)-1].withCause(e)
 			return res, skipErr
+		}
+		if async {
+			// The reviewer is placed and runs on. Its record keeps the spawn's
+			// receipt for the pass that collects it; the pane and its checkout
+			// are that pass's to close.
+			rj.Spawned = string(stdout[:min(len(stdout), spawnedKeep)])
+			if e = x.saveReviewerJob(rj); e != nil {
+				return out, e
+			}
+			keepCheckout = true
+			if !resumed {
+				x.note("started", rj)
+			}
+			return out, x.pending(revisit, rj, "placed and running")
 		}
 	}
 	// The spawn returned, so its wait finished, or a resumed job had already
@@ -601,7 +644,41 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	keepJob = true
+	x.note("collected", rj)
 	return out, nil
+}
+
+// spawnedKeep bounds the spawn receipt kept on a reviewer record.
+const spawnedKeep = 4 << 10
+
+// note logs one reviewer state of this pass — started, pending, collected or
+// lost — with the reviewer's label and the time since it was recorded. The
+// elapsed time of collected is spawn to collection; the pass settles in the
+// same evaluation.
+func (x *panewireExecutor) note(state string, rj reviewerJob) {
+	_ = x.s.Print(map[string]any{"action": "review", "state": state, "pr": x.pr.Number, "head": short7(x.pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "elapsed_ms": x.s.now().Sub(rj.Recorded).Milliseconds()})
+}
+
+// pending ends a pass whose reviewer runs on: nothing waits for it. The
+// reviewer's finish queues the PR through the reviewer watch, and a timer
+// queues it once the reviewer is past review.timeout, when the resumed pass
+// replaces a lost one.
+func (x *panewireExecutor) pending(revisit Revisit, rj reviewerJob, why string) error {
+	s := x.s
+	timeout, e := config.Duration(s.Config.Review.Timeout)
+	if e != nil {
+		return e
+	}
+	soonest := s.now().Add(revisitMargin)
+	at := rj.Recorded.Add(timeout + revisitMargin)
+	if at.Before(soonest) {
+		at = soonest
+	}
+	revisit(x.repo.Name, x.pr.Number, rj.Label, at)
+	if why == "still running" {
+		x.note("pending", rj)
+	}
+	return fmt.Errorf("%w: reviewer %s %s; its finish or its timer brings the PR back", errPassPending, rj.Label, why)
 }
 
 // replaceLostReviewer is the lost path for a resumed reviewer that will not
@@ -627,6 +704,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
 		return out, err
 	}
+	x.note("lost", rj)
 	if rj.Replacements >= 1 {
 		return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
 	}

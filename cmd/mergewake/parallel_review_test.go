@@ -540,7 +540,7 @@ func TestSlowReviewerDoesNotDelayNextRepo(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if slow.wait != "90" || !slow.running {
+	if slow.wait != "30" || !slow.running {
 		t.Fatalf("wait=%q running=%v", slow.wait, slow.running)
 	}
 	if _, err := os.Stat(filepath.Join(a.s.Config.StateDir, a.repo.Name, "reviewer-jobs", "1-p1.json")); err != nil {
