@@ -102,3 +102,8 @@ the writer logs once and pauses for ten minutes. Network failures and hk
 responses do not change a gate verdict, review pass, or webhook response. The
 `github requests` log includes `hk_state_writes`, `hk_state_stale`,
 `hk_state_rejected`, and `hk_state_unavailable` counters.
+
+Pending observations are stored under the state directory in a private hk
+change outbox. A successful or stale response clears its entries; transient
+endpoint or request failures retain them for retry and replay after restart.
+This also preserves queued observations when a bounded shutdown wait expires.

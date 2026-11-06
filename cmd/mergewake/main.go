@@ -219,7 +219,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	gh := github.New(token)
 	if !*dry {
-		gh.Changes = integrations.NewChangeWriter(nil)
+		gh.Changes = integrations.NewChangeWriter(nil, c.StateDir)
 		gh.ChangeLogin = c.Review.Login
 		defer func() {
 			wait, cancel := context.WithTimeout(context.Background(), 3*time.Second)

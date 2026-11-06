@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +35,7 @@ type changeKey struct {
 type changePending struct {
 	sections map[string]ChangeSection
 	findings []ChangeSection
+	files    []string
 }
 type ChangeCounts = changestate.Counts
 
@@ -41,6 +45,9 @@ type ChangeWriter struct {
 	mu                                   sync.Mutex
 	sendMu                               sync.Mutex
 	pending                              map[changeKey]*changePending
+	outbox                               string
+	seen                                 map[string]bool
+	retryTimer                           *time.Timer
 	timer                                *time.Timer
 	active                               sync.WaitGroup
 	endpoint                             func() (*hkJobs, error)
@@ -49,11 +56,16 @@ type ChangeWriter struct {
 	writes, stale, rejected, unavailable atomic.Uint64
 }
 
-func NewChangeWriter(log *slog.Logger) *ChangeWriter {
+func NewChangeWriter(log *slog.Logger, stateDir ...string) *ChangeWriter {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &ChangeWriter{endpoint: hkJobEndpoint, log: log}
+	w := &ChangeWriter{endpoint: hkJobEndpoint, log: log}
+	if len(stateDir) > 0 && stateDir[0] != "" {
+		w.outbox = filepath.Join(stateDir[0], "hk-change-outbox")
+		w.reload()
+	}
+	return w
 }
 func (w *ChangeWriter) Counts() ChangeCounts {
 	if w == nil {
@@ -65,10 +77,30 @@ func (w *ChangeWriter) Queue(repo string, pr int, name string, s ChangeSection) 
 	if w == nil || repo == "" || pr < 1 || s.Value == nil || s.At.IsZero() {
 		return
 	}
+	raw, err := json.Marshal(s.Value)
+	if err != nil {
+		w.log.Warn("hk change observation invalid")
+		return
+	}
+	s.Value = json.RawMessage(raw)
+	file, err := w.persist(repo, pr, name, s)
+	if err != nil {
+		w.log.Warn("hk change outbox write failed")
+		return
+	}
+	w.add(repo, pr, name, s, file)
+}
+func (w *ChangeWriter) add(repo string, pr int, name string, s ChangeSection, file string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if time.Now().Before(w.unavailableUntil) {
-		return
+	if file != "" {
+		if w.seen == nil {
+			w.seen = map[string]bool{}
+		}
+		if w.seen[file] {
+			return
+		}
+		w.seen[file] = true
 	}
 	if w.pending == nil {
 		w.pending = map[changeKey]*changePending{}
@@ -79,16 +111,44 @@ func (w *ChangeWriter) Queue(repo string, pr int, name string, s ChangeSection) 
 		p = &changePending{sections: map[string]ChangeSection{}}
 		w.pending[k] = p
 	}
+	if file != "" {
+		p.files = append(p.files, file)
+	}
 	if name == "findings" {
 		p.findings = append(p.findings, s)
 	} else if old, ok := p.sections[name]; !ok || !s.At.Before(old.At) {
 		p.sections[name] = s
+	}
+	if time.Now().Before(w.unavailableUntil) {
+		w.retryLocked(time.Until(w.unavailableUntil))
+		return
 	}
 	if w.timer == nil {
 		w.active.Add(1)
 		w.timer = time.AfterFunc(150*time.Millisecond, w.flush)
 	}
 }
+func (w *ChangeWriter) retryLocked(after time.Duration) {
+	if w.retryTimer != nil {
+		return
+	}
+	if after < 10*time.Second {
+		after = 10 * time.Second
+	}
+	w.retryTimer = time.AfterFunc(after, func() {
+		w.mu.Lock()
+		w.retryTimer = nil
+		w.mu.Unlock()
+		w.reload()
+		w.mu.Lock()
+		if len(w.pending) > 0 && w.timer == nil {
+			w.active.Add(1)
+			w.timer = time.AfterFunc(150*time.Millisecond, w.flush)
+		}
+		w.mu.Unlock()
+	})
+}
+
 func (w *ChangeWriter) flush() {
 	defer w.active.Done()
 	w.sendMu.Lock()
@@ -112,13 +172,32 @@ func (w *ChangeWriter) flush() {
 				b.Gate = s.Value
 			}
 		}
+		slices.SortStableFunc(p.findings, func(a, b ChangeSection) int { return a.At.Compare(b.At) })
 		if len(p.findings) > 0 {
 			b.Findings = p.findings[0].Value
 		}
-		w.send(b)
-		for i := 1; i < len(p.findings); i++ {
-			w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Findings: p.findings[i].Value})
+		done := w.send(b)
+		for i := 1; done && i < len(p.findings); i++ {
+			if !w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Findings: p.findings[i].Value}) {
+				done = false
+			}
 		}
+		w.mu.Lock()
+		for _, file := range p.files {
+			delete(w.seen, file)
+			if done {
+				if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+					w.log.Warn("hk change outbox cleanup failed")
+				}
+			}
+		}
+		if !done && w.outbox != "" {
+			if !time.Now().Before(w.unavailableUntil) {
+				w.unavailableUntil = time.Now().Add(10 * time.Second)
+			}
+			w.retryLocked(time.Until(w.unavailableUntil))
+		}
+		w.mu.Unlock()
 	}
 }
 
@@ -162,7 +241,10 @@ func (w *ChangeWriter) request(c *hkJobs, method, path string, body any) (int, c
 		return 0, result
 	}
 	defer resp.Body.Close()
-	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result)
+	err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && err != nil {
+		return 0, result
+	}
 	return resp.StatusCode, result
 }
 func (w *ChangeWriter) count(r changeResult) {
@@ -174,40 +256,44 @@ func (w *ChangeWriter) count(r changeResult) {
 		}
 	}
 }
-func (w *ChangeWriter) send(b ChangeBatch) {
+func (w *ChangeWriter) send(b ChangeBatch) bool {
 	// hk accepts at most 2 MiB per request. Split a large batch without
 	// splitting a section, since complete sets and finding ordinals are atomic.
 	if raw, err := json.Marshal(b); err != nil {
-		return
+		return true
 	} else if len(raw) > 2<<20 {
 		parts := []ChangeBatch{{Repo: b.Repo, PR: b.PR, State: b.State}, {Repo: b.Repo, PR: b.PR, Checks: b.Checks}, {Repo: b.Repo, PR: b.PR, Threads: b.Threads}, {Repo: b.Repo, PR: b.PR, Findings: b.Findings}, {Repo: b.Repo, PR: b.PR, Gate: b.Gate}}
+		done := true
 		for _, part := range parts {
 			if part.State == nil && part.Checks == nil && part.Threads == nil && part.Findings == nil && part.Gate == nil {
 				continue
 			}
 			encoded, e := json.Marshal(part)
 			if e == nil && len(encoded) <= 2<<20 {
-				w.send(part)
+				if !w.send(part) {
+					done = false
+				}
 			} else {
 				w.rejected.Add(1)
 				w.log.Warn("hk change section exceeds request limit")
 			}
 		}
-		return
+		return done
 	}
 	w.mu.Lock()
 	blocked := time.Now().Before(w.unavailableUntil)
 	w.mu.Unlock()
 	if blocked {
-		return
+		return false
 	}
 	c, e := w.endpoint()
 	if e != nil {
-		return
+		w.log.Warn("hk change endpoint unavailable")
+		return false
 	}
 	status, result := w.request(c, http.MethodPost, "/v1/changes/batch", b)
 	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
-		if !w.sections(c, b, true) {
+		if supported, done := w.sections(c, b, true); !supported {
 			w.mu.Lock()
 			if !time.Now().Before(w.unavailableUntil) {
 				w.unavailableUntil = time.Now().Add(10 * time.Minute)
@@ -215,24 +301,39 @@ func (w *ChangeWriter) send(b ChangeBatch) {
 				w.log.Warn("hk change state unavailable")
 			}
 			w.mu.Unlock()
+			return false
+		} else {
+			return done
 		}
-		return
 	}
 	if status == http.StatusBadRequest {
 		w.log.Warn("hk change batch rejected", "reason", errorMessage(result.Reason))
-		w.sections(c, b, false)
-		return
+		_, done := w.sections(c, b, false)
+		return done
 	}
 	if status >= 200 && status < 300 {
+		for name, needed := range map[string]bool{"state": b.State != nil, "checks": b.Checks != nil, "threads": b.Threads != nil, "findings": b.Findings != nil, "gate": b.Gate != nil} {
+			if needed {
+				section, ok := result.Sections[name]
+				if !ok || (!section.Applied && section.Reason != "stale") {
+					w.log.Warn("hk change response incomplete")
+					return false
+				}
+			}
+		}
 		w.count(result)
+		return true
 	}
+	w.log.Warn("hk change request failed", "status", status)
+	return false
 }
-func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) bool {
+func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) (bool, bool) {
 	sections := []struct {
 		name  string
 		value any
 	}{{"state", b.State}, {"checks", b.Checks}, {"threads", b.Threads}, {"findings", b.Findings}, {"gate", b.Gate}}
 	supported := false
+	done := true
 	for _, s := range sections {
 		if s.value == nil {
 			continue
@@ -255,8 +356,9 @@ func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) bool {
 		status, result := w.request(c, method, path, payload)
 		if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
 			if probe && !supported {
-				return false
+				return false, false
 			}
+			done = false
 			continue
 		}
 		supported = true
@@ -264,10 +366,19 @@ func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) bool {
 			w.rejected.Add(1)
 			w.log.Warn("hk change section rejected", "section", s.name, "reason", errorMessage(result.Reason))
 		} else if status >= 200 && status < 300 {
+			section, ok := result.Sections[s.name]
+			if !ok || (!section.Applied && section.Reason != "stale") {
+				w.log.Warn("hk change response incomplete", "section", s.name)
+				done = false
+				continue
+			}
 			w.count(result)
+		} else {
+			w.log.Warn("hk change section request failed", "section", s.name, "status", status)
+			done = false
 		}
 	}
-	return supported
+	return supported, done
 }
 
 // Async registers observation work so one-shot commands can drain it on exit.

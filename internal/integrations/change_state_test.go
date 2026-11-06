@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +104,7 @@ func drainChange(t *testing.T, w *ChangeWriter) {
 func TestHKChangeBurstAndFreshness(t *testing.T) {
 	f := &changeFake{}
 	w, _ := changeTestWriter(t, f)
+	w.outbox = filepath.Join(t.TempDir(), "outbox")
 	now := time.Now().UTC()
 	for i := 0; i < 50; i++ {
 		at := now.Add(time.Duration(i) * time.Millisecond)
@@ -156,5 +161,179 @@ func TestHKChangeFallbackToSections(t *testing.T) {
 	drainChange(t, w)
 	if w.Counts().Writes != 1 || w.Counts().Unavailable != 0 || strings.Contains(logs.String(), "unavailable") {
 		t.Fatalf("counts=%+v logs=%s", w.Counts(), logs.String())
+	}
+}
+
+func TestHKChangeOutboxReplaysAfterFailure(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	var got []map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			http.Error(w, "temporary", 503)
+			return
+		}
+		var body map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		got = append(got, body)
+		fmt.Fprint(w, `{"sections":{"findings":{"applied":true}}}`)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	var logs bytes.Buffer
+	w := NewChangeWriter(slog.New(slog.NewTextHandler(&logs, nil)))
+	w.outbox = filepath.Join(dir, "hk-change-outbox")
+	w.endpoint = func() (*hkJobs, error) { return &hkJobs{base: srv.URL, token: "test"}, nil }
+	at := time.Now().UTC()
+	w.Queue("o/r", 7, "findings", ChangeSection{At: at, Value: map[string]any{"reviewed_head": "head", "observed_at": at, "findings": []any{map[string]any{"id": "finding"}}}})
+	drainChange(t, w)
+	files, err := os.ReadDir(w.outbox)
+	if err != nil || len(files) != 1 || !strings.Contains(logs.String(), "hk change request failed") {
+		t.Fatalf("files=%v err=%v logs=%s", files, err, logs.String())
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HANDOFFKEEP_URL", srv.URL)
+	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
+	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
+	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)), dir)
+	drainChange(t, restarted)
+	files, err = os.ReadDir(w.outbox)
+	mu.Lock()
+	defer mu.Unlock()
+	if err != nil || len(files) != 0 || len(got) != 1 || got[0]["findings"] == nil {
+		t.Fatalf("files=%v err=%v got=%v", files, err, got)
+	}
+}
+
+func TestHKChangeOutboxSurvivesBoundedShutdown(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		http.Error(w, "offline", 503)
+	}))
+	defer slow.Close()
+	var mu sync.Mutex
+	received := 0
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		received++
+		mu.Unlock()
+		fmt.Fprint(w, `{"sections":{"state":{"applied":true}}}`)
+	}))
+	defer fast.Close()
+	dir := filepath.Join(t.TempDir(), "outbox")
+	w := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w.outbox = dir
+	w.endpoint = func() (*hkJobs, error) { return &hkJobs{base: slow.URL, token: "test"}, nil }
+	at := time.Now().UTC()
+	for i := 1; i <= 5; i++ {
+		w.Queue("o/r", i, "state", ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	w.Wait(ctx)
+	cancel()
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 5 {
+		close(release)
+		t.Fatalf("files=%v err=%v", files, err)
+	}
+	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restarted.outbox = dir
+	restarted.endpoint = func() (*hkJobs, error) { return &hkJobs{base: fast.URL, token: "test"}, nil }
+	restarted.reload()
+	drainChange(t, restarted)
+	mu.Lock()
+	count := received
+	mu.Unlock()
+	if count != 5 {
+		close(release)
+		t.Fatalf("replayed=%d", count)
+	}
+	close(release)
+	drainChange(t, w)
+}
+
+func TestHKChangeOutboxRetainsEndpointFailure(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "outbox")
+	var logs bytes.Buffer
+	w := NewChangeWriter(slog.New(slog.NewTextHandler(&logs, nil)))
+	w.outbox = dir
+	w.endpoint = func() (*hkJobs, error) { return nil, errors.New("endpoint unavailable") }
+	at := time.Now().UTC()
+	w.Queue("o/r", 7, "gate", ChangeSection{At: at, Value: map[string]any{"decided_at": at}})
+	drainChange(t, w)
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 || !strings.Contains(logs.String(), "endpoint unavailable") {
+		t.Fatalf("files=%v err=%v logs=%s", files, err, logs.String())
+	}
+	f := &changeFake{}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restarted.outbox = dir
+	restarted.endpoint = func() (*hkJobs, error) { return &hkJobs{base: srv.URL, token: "test"}, nil }
+	restarted.reload()
+	drainChange(t, restarted)
+	files, err = os.ReadDir(dir)
+	if err != nil || len(files) != 0 || restarted.Counts().Writes != 1 {
+		t.Fatalf("files=%v err=%v counts=%+v", files, err, restarted.Counts())
+	}
+}
+
+func TestHKChangeOutboxReplaysFindingsInOrder(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	var times []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			http.Error(w, "temporary", 503)
+			return
+		}
+		var b struct {
+			Findings struct {
+				ObservedAt time.Time `json:"observed_at"`
+			} `json:"findings"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		times = append(times, b.Findings.ObservedAt)
+		fmt.Fprint(w, `{"sections":{"findings":{"applied":true}}}`)
+	}))
+	defer srv.Close()
+	dir := filepath.Join(t.TempDir(), "outbox")
+	w := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w.outbox = dir
+	w.endpoint = func() (*hkJobs, error) { return &hkJobs{base: srv.URL, token: "test"}, nil }
+	at := time.Now().UTC()
+	w.Queue("o/r", 7, "findings", ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
+	drainChange(t, w)
+	later := at.Add(time.Second)
+	w.Queue("o/r", 7, "findings", ChangeSection{At: later, Value: map[string]any{"observed_at": later}})
+	drainChange(t, w)
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restarted.outbox = dir
+	restarted.endpoint = w.endpoint
+	restarted.reload()
+	drainChange(t, restarted)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(times) != 2 || !times[0].Equal(at) || !times[1].Equal(later) {
+		t.Fatalf("times=%v", times)
 	}
 }
