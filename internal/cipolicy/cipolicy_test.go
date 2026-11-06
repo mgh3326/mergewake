@@ -231,3 +231,19 @@ func TestCIPolicyUnreadablePolicyWarns(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 }
+
+// A job named by an expression that quotes a watched check is taken as that
+// check; one that quotes nothing watched stays unknown.
+func TestCIPolicyExpressionJobNameQuotingWatchedCheck(t *testing.T) {
+	wf := func(name string) string {
+		return strings.Replace(goodCI, "test:", "test:\n    name: "+name, 1)
+	}
+	r := Check(input(t, polOK, map[string]string{"ci.yml": wf("${{ inputs.suite == 'all' && 'test' || 'other' }}"), "ci-any-ref.yml": anyRef}))
+	if r.Workflows[0].Produces != ProducesYes || r.Verdict != OK {
+		t.Fatalf("%+v", r)
+	}
+	r = Check(input(t, polOK, map[string]string{"ci.yml": wf("${{ matrix.os }}"), "ci-any-ref.yml": anyRef}))
+	if r.Workflows[0].Produces != ProducesUnknown {
+		t.Fatalf("%+v", r)
+	}
+}

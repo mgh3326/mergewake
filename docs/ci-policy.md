@@ -39,7 +39,9 @@ Each report lists:
 
 ### What the checker can and cannot tell
 
-A workflow is "push to the branch" when its `on:` block lists `push` and its `branches` / `branches-ignore` filter admits the branch. A workflow "produces a watched check" when a job's check name matches a watched check: the job `name` (else its id), `name (matrix values)` for a matrix job, `name / inner` for a reusable-workflow job. A job name made only of expressions cannot be resolved without running the workflow, so the workflow is reported `unknown` and, if its concurrency is not compliant, it still warns, with the reason saying so. Only the workflow-level `concurrency` block is read; a job-level block is not counted. A check that comes from a commit status, not from a workflow job, is not seen.
+A group is "per ref" when its expression contains `github.ref`, `github.ref_name` or `github.head_ref`. A constant group such as `ci-main`, or one that never names the ref, is reported as not per ref even when the workflow only runs on one branch.
+
+A workflow is "push to the branch" when its `on:` block lists `push` and its `branches` / `branches-ignore` filter admits the branch. A workflow "produces a watched check" when a job's check name matches a watched check: the job `name` (else its id), `name (matrix values)` for a matrix job, `name / inner` for a reusable-workflow job. A job name made only of expressions cannot be resolved without running the workflow; a quoted string inside it that equals a watched check (for example `ci-ok` in `${{ cond && 'ci-ok' || 'other' }}`) is taken as that check, and otherwise the workflow is reported `unknown` and, if its concurrency is not compliant, it still warns, with the reason saying so. Only the workflow-level `concurrency` block is read; a job-level block is not counted. A check that comes from a commit status, not from a workflow job, is not seen.
 
 ## The `ci-policy` warning
 

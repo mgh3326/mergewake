@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -442,8 +443,15 @@ func produces(jobs *yaml.Node, watched []string, known bool) (string, []string) 
 	for _, j := range js {
 		re, literal := jobPattern(j)
 		if !literal {
-			// A name that is only expressions would match every check.
+			// A name that is only expressions would match every check. A
+			// quoted string inside it that equals a watched check is taken as
+			// that check; anything else stays unknown.
 			unknown = true
+			for _, w := range watched {
+				if slices.Contains(exprLiterals(j.name), w) {
+					matched = append(matched, w)
+				}
+			}
 			continue
 		}
 		for _, w := range watched {
@@ -464,6 +472,19 @@ func produces(jobs *yaml.Node, watched []string, known bool) (string, []string) 
 }
 
 var expr = regexp.MustCompile(`\$\{\{.*?\}\}`)
+var quoted = regexp.MustCompile(`'([^']+)'`)
+
+// exprLiterals returns the single-quoted strings inside the expressions of a
+// job name, such as ci-ok in `${{ cond && 'ci-ok' || 'other' }}`.
+func exprLiterals(name string) []string {
+	var out []string
+	for _, e := range expr.FindAllString(name, -1) {
+		for _, m := range quoted.FindAllStringSubmatch(e, -1) {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
 
 // jobPattern builds the regexp for the check names a job can produce.
 // literal is false when the name has no text outside expressions.
