@@ -1485,6 +1485,17 @@ repository. The PR role runs all configured repositories at once, so the bound
 applies to each repository, not to the daemon; no global reviewer cap exists.
 The other roles visit repositories one after another.
 
+With the `handoffkeep` sink, reviews start in hk priority order (1 is highest;
+no priority sorts last; ties keep the order GitHub lists the PRs). A PR's
+priority is hk's change priority for its PR URL, else the priority of its
+`Mergewake-Task` task, else none. A priority-1 review does not wait for a free
+`review_parallel` slot: it starts at once, with at most two such reviews past
+the bound per repository, and takes the next free slot beyond that. A failed
+or slow hk read gives that PR no priority and never fails the pass. Only the
+review start order changes; settling, land, the merge gate, retries and
+notifications are unchanged. Each review start writes a `review-start` row to
+`decisions.jsonl` with the priority and where it came from.
+
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,
 last_error, next_run, running and failures. Values are the last saved observation;
