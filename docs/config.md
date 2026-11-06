@@ -1819,6 +1819,28 @@ and its CI, and the recovery latch tag still serializes recovery attempts.
 The latch clears itself only after the revert PR merges and main is green (see
 the recovery notes above).
 
+### Main CI and cancel-in-progress
+
+Fleet rule (hk `policy/fleet-ci-main-cancel`): push-to-main CI runs with
+`cancel-in-progress: true` per ref, so a new push cancels the run on the older
+head. Watch reads that as follows:
+
+- The newest `main` head green is success (`action: healthy`, checkpoint at that
+  head), even when older heads were cancelled and never ran to the end.
+- The newest head cancelled or pending is `waiting-for-ci`: a newer push will
+  run, and nobody is blamed.
+- A cancelled head is unknown evidence, never red. When the newest head is red,
+  watch brackets it with the nearest green ancestor and bisects.
+- Without `policy.any_ref_workflow`, a cancelled head in that bracket holds with
+  `incomplete CI evidence in recovery interval`, and a person bisects.
+- With it, watch dispatches the any-ref CI for exactly the commits bisect needs
+  (see `policy.any_ref_workflow` below) and blames the first red.
+
+The workflow named by `any_ref_workflow` is the repository's own file: it needs a
+`workflow_dispatch` input `ref` and must post each watched check as a commit
+status on that sha. mergewake's own `.mergewake/policy.yaml` sets
+`any_ref_workflow: ci-any-ref.yml`.
+
 ## Container installs
 
 `kind: container` covers the small subset of Kubernetes this fleet needs: one

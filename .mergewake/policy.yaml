@@ -8,6 +8,7 @@ required_checks:
   - build-darwin-amd64
   - build-darwin-arm64
 watch_checks: [ci-ok]
+any_ref_workflow: ci-any-ref.yml
 blocking:
   - paths: [internal/rollout/**]
     reason: Installation writes may damage files before a revert lands
