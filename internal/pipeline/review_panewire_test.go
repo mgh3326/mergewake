@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ func (e panewireExit) ExitCode() int { return int(e) }
 // spawn instead uploads the findings to sink and announces them on the inbox.
 type panewireRunner struct {
 	fakeRunner
+	paneMu sync.Mutex     // the passes of a head call the runner at once
 	refuse map[string]int // panewire --role → exit status
 	// exits, when set, is the exit status of each spawn in turn (0 runs it).
 	exits []int
@@ -68,6 +70,12 @@ type panewireRunner struct {
 }
 
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	r.paneMu.Lock()
+	defer r.paneMu.Unlock()
+	return r.run(ctx, command, args, input, dir)
+}
+
+func (r *panewireRunner) run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
 	}
@@ -166,7 +174,10 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 			}
 		}
 		if r.afterRun != nil {
+			// A hook may block until the other pass's spawn arrives.
+			r.paneMu.Unlock()
 			r.afterRun()
+			r.paneMu.Lock()
 		}
 		if r.waitTimeout {
 			return nil, panewireExit(1)
@@ -207,7 +218,9 @@ func (s *taskJobSink) PutAttachment(_ context.Context, path string) (string, err
 	}
 	sum := sha256.Sum256(body)
 	id := hex.EncodeToString(sum[:])
+	fakeGHMu.Lock()
 	s.files[id] = body
+	fakeGHMu.Unlock()
 	return id, nil
 }
 
@@ -218,7 +231,9 @@ func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
 }
 
 func (s *taskJobSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+	fakeGHMu.Lock()
 	s.gets = append(s.gets, id)
+	fakeGHMu.Unlock()
 	if s.jobErr != nil {
 		return integrations.JobRecord{}, s.jobErr
 	}

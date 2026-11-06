@@ -98,6 +98,8 @@ func (x *panewireExecutor) ownReviewerJob(pass int) (reviewerJob, bool, error) {
 // PR left by another head are dropped first, after their jobs are closed.
 // Only a pass that acts calls it.
 func (x *panewireExecutor) reviewerJob(ctx context.Context, pass int) (reviewerJob, bool, error) {
+	x.jobMu.Lock()
+	defer x.jobMu.Unlock()
 	recs, e := x.recordedJobs()
 	if e != nil {
 		return reviewerJob{}, false, e
@@ -115,6 +117,13 @@ func (x *panewireExecutor) reviewerJob(ctx context.Context, pass int) (reviewerJ
 	}
 	rj, ok := x.ownJob(recs, pass)
 	return rj, ok, nil
+}
+
+// movedHeadJobs is a snapshot of the older-head records this run closed.
+func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return slices.Clone(x.movedHead)
 }
 
 // closeReviewerJob closes a reviewer job as abandoned so its hub reservation
@@ -170,9 +179,11 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	if e != nil || !closed {
 		return e
 	}
+	x.mu.Lock()
 	if !slices.ContainsFunc(x.movedHead, func(m reviewerJob) bool { return m.Label == rj.Label }) {
 		x.movedHead = append(x.movedHead, rj)
 	}
+	x.mu.Unlock()
 	return s.audit(x.repo.Name, "reviewer-head-moved", map[string]any{"pr": pr.Number, "old_head": rj.Head, "new_head": pr.Head.SHA, "label": rj.Label}, false)
 }
 

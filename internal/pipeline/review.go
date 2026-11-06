@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -348,11 +349,17 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	var reviews []integrations.ReviewRecord
 	defer func() {
 		if reviewStarted != nil {
+			// The passes finish in any order; the event lists them by pass.
+			slices.SortStableFunc(reviews, func(a, b integrations.ReviewRecord) int { return a.Pass - b.Pass })
 			s.postTaskEventWith(ctx, r, pr, integrations.SourceReview, nil, *reviewStarted, reviews)
 		}
 	}()
-	for _, plan := range plans {
-		plan.lens = lens(plan)
+	// Every missing pass of the head runs at once: no pass reads another's
+	// result, and each owns its claim ref, reviewer job record and outcome.
+	// mu guards what the passes of this run share: reviewStarted, reviews and
+	// known.
+	var mu sync.Mutex
+	runOne := func(plan *passPlan) error {
 		passStarted := s.now()
 		// A GitHub ref claims this PR head across hosts before any reviewer is
 		// invoked. One claim covers every candidate of the pass.
@@ -373,10 +380,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				return "", false, e
 			}
 			if acquired {
+				mu.Lock()
 				if reviewStarted == nil {
 					now := s.now()
 					reviewStarted = &now
 				}
+				mu.Unlock()
 				return sha, true, nil
 			}
 			sha, active, e := s.GH.ReviewLease(ctx, r.Name, ref, ttl)
@@ -391,9 +400,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		passCtx, passSpan := tracing.Span(ctx, "mergewake.review.pass")
 		tracing.Data(passSpan, "pass", plan.pass)
 		out, e := x.runPass(passCtx, plan, claim)
-		if e == nil && out.reviewer != "" && reviewStarted == nil {
-			now := s.now()
-			reviewStarted = &now
+		if e == nil && out.reviewer != "" {
+			mu.Lock()
+			if reviewStarted == nil {
+				now := s.now()
+				reviewStarted = &now
+			}
+			mu.Unlock()
 		}
 		privateNames := []string{s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane, s.Config.Review.Panewire.Lane, s.Config.Review.Panewire.Owner}
 		for _, repo := range s.Config.Repos {
@@ -418,7 +431,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				s.reviewMissingEvent(r.Name, n, plan.pass, "review_deadline", out.skips, "")
 			}
 			if errors.Is(e, errPassPending) {
-				return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plan.pass})
+				return errPassPending
 			}
 			return e
 		}
@@ -437,9 +450,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
 			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
 		}
+		// A finding the other pass kept first is dropped here, as when the
+		// passes ran one after the other.
+		mu.Lock()
 		shape := shapeFindings(out.findings, rp, known)
 		findings := shape.kept
 		known = append(known, knownFromFindings(findings)...)
+		mu.Unlock()
 		plan.sameFamily = out.family == "" || out.family == family
 		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
@@ -465,18 +482,22 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		if alreadyPosted {
 			_ = s.dropReviewerJob(r.Name, n, plan.pass)
-			continue
+			return nil
 		}
 		if e = s.GH.PostReview(ctx, r.Name, n, pr.Head.SHA, findings, receipt); e != nil {
 			// A review GitHub stored before the call failed is a posted pass: a
 			// later run finds its receipt and skips it, so the event of this run
 			// is the only one that can carry its record.
 			if stored, readErr := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login); readErr == nil && slices.ContainsFunc(stored, func(p github.PassReceipt) bool { return p.Pass == plan.pass }) {
+				mu.Lock()
 				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+				mu.Unlock()
 			}
 			return e
 		}
+		mu.Lock()
 		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+		mu.Unlock()
 		// The pass is posted: its reviewer job record, if any, is spent. A
 		// record left behind is never resumed, since a posted pass is not run
 		// again for this head.
@@ -534,9 +555,43 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if len(skips) > 0 {
 			event["skipped"] = skips
 		}
-		if e = s.audit(r.Name, "review", event, false); e != nil {
-			return e
+		return s.audit(r.Name, "review", event, false)
+	}
+	for _, plan := range plans {
+		plan.lens = lens(plan)
+	}
+	errs := make([]error, len(plans))
+	var wg sync.WaitGroup
+	for i, plan := range plans {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = runOne(plan)
+		}()
+	}
+	wg.Wait()
+	// Each pass's outcome stands alone: a pass that failed does not undo a
+	// pass that posted, and the passes that did not post are retried. A pass
+	// still held by its reviewer or another host is not a failure.
+	var failed []error
+	held := -1
+	for i, e := range errs {
+		switch {
+		case errors.Is(e, errPassPending):
+			if held < 0 {
+				held = i
+			}
+		case e != nil:
+			failed = append(failed, e)
 		}
+	}
+	switch {
+	case len(failed) == 1:
+		return failed[0]
+	case len(failed) > 1:
+		return errors.Join(failed...)
+	case held >= 0:
+		return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plans[held].pass})
 	}
 	if len(posted)+len(plans) >= needed {
 		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
