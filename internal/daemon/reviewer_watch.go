@@ -50,6 +50,8 @@ type ReviewerWatch struct {
 	// Dirty is marked for the job's PR before the wake, so the pass does not
 	// skip it as unchanged. nil marks nothing.
 	Dirty *Dirty
+	// Enqueue evaluates the job's PR at once, when set.
+	Enqueue func(repo string, pr int)
 	// Wake starts the pr role; Run sets it when nil.
 	Wake func()
 	Log  *slog.Logger
@@ -132,6 +134,9 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 		log.Info("reviewer watch: job finished", "repo", j.Repo, "pr", j.PR, "label", j.Label, "state", v.State)
 		if w.Dirty != nil {
 			w.Dirty.Mark(j.Repo, j.PR, "")
+		}
+		if w.Enqueue != nil {
+			w.Enqueue(j.Repo, j.PR)
 		}
 		if w.Wake != nil {
 			w.Wake()

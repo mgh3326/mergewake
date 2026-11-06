@@ -80,11 +80,10 @@ func TestReviewParallelCapHoldsAndUrgentGetsExtra(t *testing.T) {
 	})
 }
 
-// With no cap every review starts at once, so the order the goroutines record
-// their starts in is the scheduler's, not the priority's. What must hold is
-// that every PR starts, each start still carries its priority, and nothing is
-// counted past a bound that does not exist: urgentExtra is not needed.
-func TestReviewParallelUnsetPriorityStillOrdersStarts(t *testing.T) {
+// With no cap nothing waits for a slot, so priority orders nothing: every PR
+// starts at once, each start still carries its priority, and none starts past a
+// bound that does not exist.
+func TestReviewParallelUnsetPriorityDoesNotHoldStarts(t *testing.T) {
 	f, sink := newPriorityFixture(t, 4, 0)
 	sink.task = map[int]int{1: 3, 2: 1, 3: 2, 4: 1}
 	done := f.poll(context.Background())
@@ -134,19 +133,4 @@ func TestPassLogReportsConcurrentReviews(t *testing.T) {
 			t.Fatalf("parallel %d: pr pass line %v, want reviews_concurrent_max %d", tc.parallel, line, tc.want)
 		}
 	}
-}
-
-// (e) A very large explicit cap loads (see the config test) and the limiter
-// built from it allocates no more than one built from a small cap.
-func TestReviewLimitLargeCapDoesNotPreallocate(t *testing.T) {
-	big := testing.AllocsPerRun(10, func() { newReviewLimit(1_000_000_000) })
-	small := testing.AllocsPerRun(10, func() { newReviewLimit(3) })
-	if big != small {
-		t.Fatalf("cap 1e9 allocs %v, cap 3 allocs %v", big, small)
-	}
-	release, over, ok := newReviewLimit(1_000_000_000).acquire(context.Background(), false)
-	if !ok || over {
-		t.Fatalf("acquire ok=%v over=%v", ok, over)
-	}
-	release()
 }

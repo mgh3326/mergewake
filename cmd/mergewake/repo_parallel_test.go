@@ -201,7 +201,8 @@ func (m *multiRepo) daemonPass(t *testing.T) (cancel context.CancelFunc, passDon
 }
 
 // A reviewer that never returns in repo A must not hold repo B: B settles its
-// PR while A is still waiting, and the pass ends only when A is done.
+// PR while A is still waiting. The pass is a sweep that queues the PRs, so it
+// ends without waiting for A either.
 func TestPRRoleRunsReposInParallel(t *testing.T) {
 	m := newMultiRepo(t, []string{"o/one", "o/two"}, 1, 1)
 	gate := make(chan struct{})
@@ -212,12 +213,12 @@ func TestPRRoleRunsReposInParallel(t *testing.T) {
 	if _, returned := m.runner.counts("o/one"); returned != 0 || len(m.merged("o/one")) != 0 {
 		t.Fatal("repo A finished before its reviewer returned")
 	}
-	if passDone() {
-		t.Fatal("the pass ended while repo A was still running")
+	waitFor(t, "the sweep to end while repo A is still reviewing", passDone)
+	if _, returned := m.runner.counts("o/one"); returned != 0 {
+		t.Fatal("repo A finished before its reviewer returned")
 	}
 	close(gate)
 	waitFor(t, "repo A to settle", func() bool { return len(m.merged("o/one")) == 1 })
-	waitFor(t, "the pass to end", passDone)
 	cancel()
 	if st := wait(); st.Failures != 0 && !strings.Contains(st.LastError, "land") {
 		t.Fatalf("pass error: %s", st.LastError)
@@ -248,6 +249,14 @@ func TestPRRoleParallelReposShareServiceState(t *testing.T) {
 	})
 	close(gate)
 	waitFor(t, "the pass to end", passDone)
+	waitFor(t, "every PR to land", func() bool {
+		for _, name := range names {
+			if len(m.merged(name)) != prs {
+				return false
+			}
+		}
+		return true
+	})
 	cancel()
 	wait()
 	whole := func(name string, b []byte) int {
@@ -335,6 +344,7 @@ func TestPRRoleJoinsErrorsFromEveryRepo(t *testing.T) {
 	cancel, passDone, wait := m.daemonPass(t)
 	defer cancel()
 	waitFor(t, "the pass to end", passDone)
+	waitFor(t, "the healthy repo to land its PR", func() bool { return len(m.merged("o/two")) == 1 })
 	cancel()
 	st := wait()
 	one, three := strings.Index(st.LastError, "o/one: GitHub GET /repos/o/one/pulls"), strings.Index(st.LastError, "o/three: GitHub GET /repos/o/three/pulls")

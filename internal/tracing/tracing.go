@@ -62,9 +62,10 @@ func StartWithOptions(ctx context.Context, log io.Writer, options sentry.ClientO
 
 type enabledKey struct{}
 
-// Pass creates a transaction only when Start installed a client.
+// Pass creates a transaction only when Start installed a client, and none is
+// running under ctx: work that already belongs to a transaction stays in it.
 func Pass(ctx context.Context, role string) (context.Context, *sentry.Span) {
-	if sentry.GetHubFromContext(ctx) == nil {
+	if sentry.GetHubFromContext(ctx) == nil || sentry.TransactionFromContext(ctx) != nil {
 		return ctx, nil
 	}
 	options := []sentry.SpanOption{sentry.WithOpName("mergewake.pass")}

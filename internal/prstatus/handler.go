@@ -22,9 +22,11 @@ const freshTimeout = 20 * time.Second
 // the PR for re-evaluation and calls Wake (the pr role's coalescing trigger)
 // and Invalidate (the repo's cached evidence); either may be nil.
 type Handler struct {
-	StateDir   string
-	Fresh      Fresher
-	Wake       func()
+	StateDir string
+	Fresh    Fresher
+	Wake     func()
+	// Enqueue, when set, evaluates the PR whose status read found a change.
+	Enqueue    func(repo string, n int)
 	Invalidate func(repo string)
 	// Now stamps markers and reads that carry no time; nil means time.Now.
 	Now func() time.Time
@@ -78,6 +80,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if changed {
 		if h.Invalidate != nil {
 			h.Invalidate(repo)
+		}
+		if h.Enqueue != nil {
+			h.Enqueue(repo, n)
 		}
 		if h.Wake != nil {
 			h.Wake()

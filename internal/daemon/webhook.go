@@ -38,6 +38,11 @@ type Webhook struct {
 	Invalidate func(repo string)
 	// Dirty, when set, records the PRs a delivery names (see deliveryPayload.mark).
 	Dirty *Dirty
+	// Queue, when set, evaluates the PRs a delivery names (see deliveryPayload.refs)
+	// at once, and every open PR of a repo when its base branch (Branches) is
+	// pushed to.
+	Queue    *Queue
+	Branches map[string]string
 	// State, when set, keeps what each delivery carries (see webhookstate). A
 	// payload it cannot parse is logged once per event type and never changes
 	// the response or the wake.
@@ -167,6 +172,18 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 			if wh.Dirty != nil {
 				delivery.mark(wh.Dirty, event)
 			}
+			// After the marks and the invalidation: the evaluation reads what
+			// the delivery changed.
+			if wh.Queue != nil {
+				for _, ref := range delivery.refs(event) {
+					wh.Queue.EnqueueNamed(SourceWebhook, delivery.Repository.FullName, ref.number, ref.sha)
+				}
+			}
+		}
+		if wh.Queue != nil && event == "push" {
+			if branch := wh.Branches[delivery.Repository.FullName]; branch != "" && delivery.Ref == "refs/heads/"+branch {
+				wh.Queue.EnqueueRepo(SourceBase, delivery.Repository.FullName)
+			}
 		}
 		for _, role := range webhookEventRoles[event] {
 			if trigger(role) {
@@ -190,8 +207,10 @@ type deliveryPayload struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
 	// Number is set by pull_request; SHA by status.
-	Number      int    `json:"number"`
-	SHA         string `json:"sha"`
+	Number int    `json:"number"`
+	SHA    string `json:"sha"`
+	// Ref is the pushed ref of a push.
+	Ref         string `json:"ref"`
 	PullRequest struct {
 		Number int `json:"number"`
 		Head   struct {
@@ -209,26 +228,40 @@ type checkPayload struct {
 	} `json:"pull_requests"`
 }
 
-// mark records, on d, every PR the delivery names: by number for the
-// pull_request* events and the PRs a check payload lists, and by head commit
-// for check_run, check_suite and status, whose payload leaves the PR out for a
-// fork or a re-run. Only those PRs go dirty; their siblings stay clean.
-func (p deliveryPayload) mark(d *Dirty, event string) {
-	repo := p.Repository.FullName
+// prRef is what a delivery says about one PR: its number, its head commit, or both.
+type prRef struct {
+	number int
+	sha    string
+}
+
+// refs lists every PR the delivery names: by number for the pull_request*
+// events and the PRs a check payload lists, and by head commit for check_run,
+// check_suite and status, whose payload leaves the PR out for a fork or a
+// re-run. Only those PRs are named; their siblings are not.
+func (p deliveryPayload) refs(event string) []prRef {
 	switch event {
 	case "check_run", "check_suite":
 		c := p.CheckRun
 		if event == "check_suite" {
 			c = p.CheckSuite
 		}
-		d.Mark(repo, 0, c.HeadSHA)
+		out := []prRef{{0, c.HeadSHA}}
 		for _, pr := range c.PullRequests {
-			d.Mark(repo, pr.Number, "")
+			out = append(out, prRef{pr.Number, ""})
 		}
+		return out
 	case "status":
-		d.Mark(repo, 0, p.SHA)
+		return []prRef{{0, p.SHA}}
 	default:
-		d.Mark(repo, max(p.PullRequest.Number, p.Number), p.PullRequest.Head.SHA)
+		return []prRef{{max(p.PullRequest.Number, p.Number), p.PullRequest.Head.SHA}}
+	}
+}
+
+// mark records, on d, every PR the delivery names (see refs). Only those PRs
+// go dirty; their siblings stay clean.
+func (p deliveryPayload) mark(d *Dirty, event string) {
+	for _, ref := range p.refs(event) {
+		d.Mark(p.Repository.FullName, ref.number, ref.sha)
 	}
 }
 
