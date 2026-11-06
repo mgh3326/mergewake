@@ -41,6 +41,7 @@ type Client struct {
 	// files read through a commit) across passes and processes. Nil means every
 	// read goes to GitHub.
 	Objects  ObjectCache
+	app      *appAuth
 	poll     pollingState
 	evidence evidenceCache
 	writes   writeEpochs
@@ -66,12 +67,34 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("GitHub %s %s: HTTP %d", e.Method, e.Path, e.Code)
 }
 func NotFound(e error) bool { var a *APIError; return errors.As(e, &a) && a.Code == 404 }
+
+// errAppDenied marks a read the App's installation token was refused (401 or
+// 403). The repository now falls back to the user token, and request retries.
+var errAppDenied = errors.New("GitHub App request refused")
+
 func (c *Client) request(ctx context.Context, method, route, accept string, data []byte) ([]byte, error) {
+	b, e := c.send(ctx, method, route, accept, data, c.credentialFor(ctx, method, route, data))
+	if errors.Is(e, errAppDenied) {
+		return c.send(ctx, method, route, accept, data, userCredential(c.Token))
+	}
+	return b, e
+}
+
+// graphql sends a GraphQL document about repo. The document decides the
+// credential: a query reads with repo's installation token, a mutation with
+// the user token.
+func (c *Client) graphql(ctx context.Context, repo, query string, variables map[string]any, out any) error {
+	return c.json(context.WithValue(ctx, graphqlRepoKey{}, repo), "POST", "/graphql", map[string]any{"query": query, "variables": variables}, out)
+}
+
+func (c *Client) send(ctx context.Context, method, route, accept string, data []byte, cred credential) ([]byte, error) {
 	endpoint := c.BaseURL + route
 	if strings.HasPrefix(route, "UPLOAD ") {
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
-	key := method + " " + endpoint + " " + accept
+	// The credential kind is part of the key: a body or poll window recorded
+	// under one credential is never replayed for, or revalidated by, the other.
+	key := method + " " + endpoint + " " + accept + " " + cred.kind
 	fresh := isFresh(ctx)
 	if method != "GET" && route != "/graphql" {
 		// Whatever the outcome, the write may have changed what any pass memoized.
@@ -86,7 +109,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
-	release, cached, e := c.beginRequest(ctx, key, fresh)
+	release, cached, e := c.beginRequest(ctx, key, fresh, cred.id)
 	if e != nil {
 		return nil, e
 	}
@@ -101,20 +124,29 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	}
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
 	req.Header.Set("User-Agent", "mergewake")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+	if cred.token != "" {
+		req.Header.Set("Authorization", "Bearer "+cred.token)
 	}
 	if data != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, e := c.HTTP.Do(req)
 	if e != nil {
-		recordRequest(ctx, method, route, 0)
+		recordRequest(ctx, method, route, 0, cred.kind)
 		return nil, fmt.Errorf("GitHub %s request failed", method)
 	}
 	defer resp.Body.Close()
-	recordRequest(ctx, method, route, resp.StatusCode)
-	c.observeHeaders(resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
+	recordRequest(ctx, method, route, resp.StatusCode, cred.kind)
+	if cred.kind == credApp && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		// A refusal for a missing permission says nothing about the budget; one
+		// from an exhausted budget or a secondary limit does, and is recorded.
+		if resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, false)
+		}
+		c.app.refuse(c, cred, resp.StatusCode)
+		return nil, errAppDenied
+	}
+	c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
 	if resp.StatusCode == http.StatusNotModified && method == "GET" {
 		if cached.ETag == "" {
 			return nil, errUncached304
@@ -784,7 +816,7 @@ func (c *Client) unresolved(ctx context.Context, repo string, n int) (int, error
 			} `json:"data"`
 		}
 		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviewThreads(first:100,after:$cursor){nodes{isResolved} pageInfo{hasNextPage endCursor}}}}}`
-		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
+		if e := c.graphql(ctx, repo, query, map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}, &result); e != nil {
 			return 0, e
 		}
 		if len(result.Errors) > 0 || result.Data == nil || result.Data.Repository == nil || result.Data.Repository.PullRequest == nil {
@@ -1039,4 +1071,80 @@ func (c *Client) readFile(ctx context.Context, repo, sha, name string) ([]byte, 
 type PullUser struct {
 	Login string `json:"login"`
 	Type  string `json:"type"`
+}
+
+// PRFresh is one GraphQL read of a PR's current state: its head, the check
+// rollup of that head, the unresolved review threads and GitHub's mergeable
+// state. It is evidence for a caller that does not trust the daemon's last
+// pass; it never feeds the merge gate.
+type PRFresh struct {
+	Head string `json:"head"`
+	// ChecksRollup is GitHub's status check rollup state for the head
+	// (SUCCESS, FAILURE, PENDING, ERROR, EXPECTED), empty when none ran.
+	ChecksRollup      string `json:"checks_rollup"`
+	UnresolvedThreads int    `json:"unresolved_threads"`
+	// ThreadsCapped is set when the PR has more threads than one query reads,
+	// so UnresolvedThreads counts only the first 100.
+	ThreadsCapped bool `json:"unresolved_threads_capped,omitempty"`
+	// Mergeable is MERGEABLE, CONFLICTING or UNKNOWN; MergeState is GitHub's
+	// merge state status (CLEAN, BEHIND, BLOCKED, DIRTY, ...).
+	Mergeable  string    `json:"mergeable"`
+	MergeState string    `json:"merge_state"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// PRFresh makes exactly one GraphQL request, bypassing every cache.
+func (c *Client) PRFresh(ctx context.Context, repo string, n int) (PRFresh, error) {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return PRFresh{}, errors.New("repo must be owner/name")
+	}
+	const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid mergeable mergeStateStatus reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}`
+	var result struct {
+		Errors []json.RawMessage `json:"errors"`
+		Data   *struct {
+			Repository *struct {
+				PullRequest *struct {
+					HeadRefOid       string `json:"headRefOid"`
+					Mergeable        string `json:"mergeable"`
+					MergeStateStatus string `json:"mergeStateStatus"`
+					ReviewThreads    struct {
+						Nodes []struct {
+							IsResolved bool `json:"isResolved"`
+						} `json:"nodes"`
+						PageInfo struct {
+							HasNextPage bool `json:"hasNextPage"`
+						} `json:"pageInfo"`
+					} `json:"reviewThreads"`
+					Commits struct {
+						Nodes []struct {
+							Commit struct {
+								StatusCheckRollup *struct {
+									State string `json:"state"`
+								} `json:"statusCheckRollup"`
+							} `json:"commit"`
+						} `json:"nodes"`
+					} `json:"commits"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	vars := map[string]any{"owner": parts[0], "name": parts[1], "number": n}
+	if e := c.json(freshRequest(ctx), "POST", "/graphql", map[string]any{"query": query, "variables": vars}, &result); e != nil {
+		return PRFresh{}, e
+	}
+	if len(result.Errors) > 0 || result.Data == nil || result.Data.Repository == nil || result.Data.Repository.PullRequest == nil {
+		return PRFresh{}, errors.New("GitHub fresh status query failed")
+	}
+	pr := result.Data.Repository.PullRequest
+	out := PRFresh{Head: pr.HeadRefOid, Mergeable: pr.Mergeable, MergeState: pr.MergeStateStatus, ThreadsCapped: pr.ReviewThreads.PageInfo.HasNextPage, ObservedAt: c.now().UTC()}
+	for _, t := range pr.ReviewThreads.Nodes {
+		if !t.IsResolved {
+			out.UnresolvedThreads++
+		}
+	}
+	if len(pr.Commits.Nodes) > 0 && pr.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
+		out.ChecksRollup = pr.Commits.Nodes[0].Commit.StatusCheckRollup.State
+	}
+	return out, nil
 }

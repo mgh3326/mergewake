@@ -36,7 +36,13 @@ type Webhook struct {
 	Invalidate func(repo string)
 	// Dirty, when set, records the PRs a delivery names (see deliveryPayload.mark).
 	Dirty *Dirty
+	// Status, when set, answers StatusPath on the same listener. It is local
+	// and read-only, so it takes no signature; the delivery Path always wins.
+	Status http.Handler
 }
+
+// StatusPath is where Status is served.
+const StatusPath = "/v1/pr-status"
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping
 // and unlisted events wake none.
@@ -85,6 +91,10 @@ func (d *Daemon) serveWebhook(ctx context.Context, wg *sync.WaitGroup) error {
 func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	wh := d.Webhook
 	if r.URL.Path != wh.Path {
+		if wh.Status != nil && r.URL.Path == StatusPath {
+			wh.Status.ServeHTTP(w, r)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}

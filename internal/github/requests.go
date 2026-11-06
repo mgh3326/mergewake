@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -28,6 +29,7 @@ type RequestCounts struct {
 	mu                     sync.Mutex
 	role                   string
 	counts                 map[requestKey]int
+	byCredential           map[string]int
 	hits, misses, memoHits int
 	notModified            int
 }
@@ -36,7 +38,7 @@ type requestCountsKey struct{}
 // CountRequests attributes all HTTP responses under ctx to this run and starts
 // its first pass (see NewPass).
 func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
-	c := &RequestCounts{role: role, counts: map[requestKey]int{}}
+	c := &RequestCounts{role: role, counts: map[requestKey]int{}, byCredential: map[string]int{}}
 	return NewPass(context.WithValue(ctx, requestCountsKey{}, c)), c
 }
 
@@ -75,7 +77,10 @@ func routeTemplate(route string) string {
 	}
 	return strings.Join(parts, "/")
 }
-func recordRequest(ctx context.Context, method, route string, status int) {
+
+// recordRequest counts one HTTP response, or a failed attempt as status 0,
+// against the credential kind ("user" or "app") that sent it.
+func recordRequest(ctx context.Context, method, route string, status int, credential string) {
 	c, ok := ctx.Value(requestCountsKey{}).(*RequestCounts)
 	if !ok {
 		return
@@ -83,10 +88,19 @@ func recordRequest(ctx context.Context, method, route string, status int) {
 	k := requestKey{method, routeTemplate(route), status}
 	c.mu.Lock()
 	c.counts[k]++
+	c.byCredential[credential]++
 	if status == http.StatusNotModified {
 		c.notModified++
 	}
 	c.mu.Unlock()
+}
+
+// ByCredential is the request count per credential kind: how much of the run
+// the App served and how much the user token did.
+func (c *RequestCounts) ByCredential() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.byCredential)
 }
 func (c *RequestCounts) Snapshot() []RequestCount {
 	c.mu.Lock()

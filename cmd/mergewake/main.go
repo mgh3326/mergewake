@@ -44,6 +44,7 @@ Usage: mergewake <command> [flags]
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   report     Report review latency from state and GitHub
   outcomes   Report or sync the shadow-safe model outcomes ledger
+  pr-status  Print a PR's last-pass merge-gate snapshot from local state, with no GitHub call unless --fresh
   notify     Post a deploy from another deployer to the Discord feed (needs discord.enabled)
   status     Read installed receipts and check local drift
   promote    Certify one main commit and its image digest, record it, and advance the deployable pointer
@@ -76,6 +77,7 @@ var ownFlagCommands = map[string]func(context.Context, []string, io.Writer, io.W
 	"outcomes":     runOutcomes,
 	"archive-jobs": runArchiveJobs,
 	"notify":       runNotify,
+	"pr-status":    runPRStatus,
 	"promote":      runPromote,
 	"admit":        runAdmit,
 	"server":       runServerStore,
@@ -215,6 +217,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if e != nil {
 		return e
 	}
+	gh := github.New(token)
+	if c.GitHubApp != nil {
+		key, e := c.GitHubApp.Key()
+		if e != nil {
+			return e
+		}
+		gh.EnableApp(c.GitHubApp.AppID, key)
+	}
 	if command != "daemon" {
 		var counts *github.RequestCounts
 		ctx, counts = github.CountRequests(ctx, command)
@@ -225,10 +235,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 				total += request.Count
 			}
 			cache := counts.CacheStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "routes": requests})
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "not_modified": cache.NotModified, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests})
 		}()
 	}
-	gh := github.New(token)
 	gh.Stderr = stderr
 	// The object cache exists only when a database DSN is configured; the
 	// database is dialled on first use, never here.
