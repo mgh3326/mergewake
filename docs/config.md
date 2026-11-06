@@ -1236,12 +1236,17 @@ How requests are routed:
   schedules passes by the credentials that serve reads: the App installations,
   plus the user token only while a repository reads on it as a fallback. A user
   token drained by workers and sessions therefore does not hold passes back;
-  the writes in them still wait for that budget one request at a time.
+  the writes in them still wait for that budget.
+- Each credential admits four requests at a time (a constant, not a config key):
+  the user token and every App installation have their own gate, so a write on
+  one never queues behind reads on another. A request waits out its credential's
+  throttle before taking a slot and checks again after taking it.
 - The ETag and poll cache are kept per credential kind, so a response recorded
   under one credential is never replayed for, or revalidated by, the other.
 - The `github requests` log line adds `by_credential` (requests the App and the
-  user token each sent, including the two App token calls) and `rate_remaining`
-  (the last reported `X-RateLimit-Remaining` of each credential seen).
+  user token each sent, including the two App token calls), `rate_remaining`
+  (the last reported `X-RateLimit-Remaining` of each credential seen) and
+  `gate_wait_ms` (the longest wait one request spent queued for its gate).
 
 #### App permissions
 

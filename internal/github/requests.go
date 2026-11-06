@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type RequestCount struct {
@@ -32,6 +33,7 @@ type RequestCounts struct {
 	byCredential           map[string]int
 	hits, misses, memoHits int
 	notModified            int
+	gateWait               time.Duration
 }
 type requestCountsKey struct{}
 
@@ -103,6 +105,28 @@ func recordRequest(ctx context.Context, method, route string, status int, creden
 		c.notModified++
 	}
 	c.mu.Unlock()
+}
+
+// recordGateWait counts the longest wait for a credential's request gate in
+// this run, so a pass can show how much of it was queueing rather than work.
+func recordGateWait(ctx context.Context, d time.Duration) {
+	c, ok := ctx.Value(requestCountsKey{}).(*RequestCounts)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	if d > c.gateWait {
+		c.gateWait = d
+	}
+	c.mu.Unlock()
+}
+
+// GateWaitMax is the longest wait one request spent queued for its credential's
+// gate.
+func (c *RequestCounts) GateWaitMax() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gateWait
 }
 
 // ByCredential is the request count per credential kind: how much of the run
