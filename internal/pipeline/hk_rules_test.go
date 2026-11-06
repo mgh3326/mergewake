@@ -21,6 +21,7 @@ var (
 	hkPatchIDRE       = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 	hkReviewTokenRE   = regexp.MustCompile(`^[a-z0-9_.-]{1,64}$`)
 	hkReviewProfileRE = regexp.MustCompile(`^[a-z0-9_.@-]{1,64}$`)
+	hkPatchDigestRE   = regexp.MustCompile(`^[0-9a-f]{16,128}$`)
 )
 
 const (
@@ -63,6 +64,13 @@ type hkReview struct {
 	Low            *int       `json:"low"`
 	StartedAt      *time.Time `json:"started_at"`
 	FinishedAt     *time.Time `json:"finished_at"`
+	// The review-history fields (hk 3208, ReviewHistory in change_payload.go).
+	Reviewer            *string `json:"reviewer"`
+	SameFamily          *bool   `json:"same_family"`
+	Delta               *bool   `json:"delta"`
+	Quiet               *bool   `json:"quiet"`
+	OutsideDiffBlocking *int    `json:"outside_diff_blocking"`
+	PatchDigest         *string `json:"patch_digest"`
 }
 
 func hkRulesCheck(raw []byte) string {
@@ -122,6 +130,15 @@ func hkCheckReview(rv hkReview) error {
 		if v != nil && (*v < 0 || *v > hkMaxReviewCount) {
 			return fmt.Errorf("%s must be 0 to %d", name, int(hkMaxReviewCount))
 		}
+	}
+	if rv.Reviewer != nil && (*rv.Reviewer == "" || !hkValidReviewText(*rv.Reviewer)) {
+		return fmt.Errorf("reviewer must be non-empty printable text of at most %d bytes", hkMaxReviewText)
+	}
+	if rv.PatchDigest != nil && !hkPatchDigestRE.MatchString(*rv.PatchDigest) {
+		return errors.New("patch_digest must be 16 to 128 lower-case hex digits")
+	}
+	if rv.OutsideDiffBlocking != nil && (*rv.OutsideDiffBlocking < 0 || *rv.OutsideDiffBlocking > hkMaxReviewCount) {
+		return fmt.Errorf("outside_diff_blocking must be 0 to %d", int(hkMaxReviewCount))
 	}
 	if rv.StartedAt != nil && rv.FinishedAt != nil && rv.FinishedAt.Before(*rv.StartedAt) {
 		return errors.New("finished_at is before started_at")

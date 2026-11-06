@@ -218,7 +218,12 @@ func (c *Client) WebhookDelivery(repo, event, delivery string, body []byte) {
 		list = append(list, v)
 	}
 	for n := range numbers {
-		c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: map[string]any{"head_sha": sha, "checks": list, "observed_at": at, "source": "webhook", "complete": false}})
+		v := map[string]any{"head_sha": sha, "checks": list, "observed_at": at, "source": "webhook", "complete": false}
+		// hk refuses a delivery_id over 128 characters, and with it the write.
+		if delivery != "" && len(delivery) <= 128 {
+			v["delivery_id"] = delivery
+		}
+		c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: v})
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	. "github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -99,4 +100,48 @@ func changeAPI(t *testing.T, handler http.HandlerFunc) *Client {
 	c.BaseURL = server.URL
 	c.HTTP = server.Client()
 	return c
+}
+
+// (e) A webhook check write carries the X-GitHub-Delivery id of the delivery
+// that produced it, at the checks section hk stamps on every check row.
+func TestWebhookChecksCarryDeliveryID(t *testing.T) {
+	var mu sync.Mutex
+	var checks []map[string]any
+	hk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		if c, ok := b["checks"].(map[string]any); ok {
+			mu.Lock()
+			checks = append(checks, c)
+			mu.Unlock()
+		}
+		fmt.Fprint(w, `{"sections":{"checks":{"applied":true}}}`)
+	}))
+	defer hk.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HANDOFFKEEP_URL", hk.URL)
+	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
+	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
+	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{}`) })
+	c.Changes = integrations.NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store := webhookstate.Open(t.TempDir())
+	c.Webhook = store
+	pr := fmt.Sprintf(`{"action":"opened","pull_request":{"number":7,"state":"open","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"},"updated_at":"2026-11-06T00:00:00Z"}}`, testSHA)
+	if e := store.Apply("o/r", "pull_request", "d-pr", []byte(pr)); e != nil {
+		t.Fatal(e)
+	}
+	run := fmt.Sprintf(`{"action":"completed","check_run":{"id":5,"name":"test","status":"completed","conclusion":"success","head_sha":%q,"started_at":"2026-11-06T00:01:00Z","completed_at":"2026-11-06T00:02:00Z","pull_requests":[{"number":7}]}}`, testSHA)
+	if e := store.Apply("o/r", "check_run", "delivery-check-1", []byte(run)); e != nil {
+		t.Fatal(e)
+	}
+	c.WebhookDelivery("o/r", "check_run", "delivery-check-1", []byte(run))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.Changes.Wait(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(checks) != 1 || checks[0]["delivery_id"] != "delivery-check-1" || checks[0]["source"] != "webhook" || checks[0]["head_sha"] != testSHA {
+		t.Fatalf("checks writes %v", checks)
+	}
 }

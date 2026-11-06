@@ -38,6 +38,9 @@ type fakeHK struct {
 	rules bool
 	// refuseReviews answers 400 to any event that carries reviews[].
 	refuseReviews bool
+	// refuseHistory answers 400 invalid_event to an event whose reviews[] carry
+	// a review-history field, as an hk that predates those fields does.
+	refuseHistory bool
 	// message is added to every 400 as hk's "message" field.
 	message string
 	// why holds the violation behind each rules refusal.
@@ -57,6 +60,9 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.auth = append(h.auth, r.Header.Get("Authorization"))
 	status, code, delay := h.status, h.code, h.delay
 	if h.refuseExtended && (ev.HeadSHA != "" || ev.BaseSHA != "" || ev.MergeSHA != "" || len(ev.Reviews) > 0) {
+		status, code = http.StatusBadRequest, "invalid_event"
+	}
+	if h.refuseHistory && hasHistoryField(raw) {
 		status, code = http.StatusBadRequest, "invalid_event"
 	}
 	if h.refuseReviews && len(ev.Reviews) > 0 {

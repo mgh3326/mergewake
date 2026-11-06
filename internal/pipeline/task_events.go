@@ -194,6 +194,20 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 		StartedAt:      &started,
 		FinishedAt:     &finished,
 	}
+	// Facts mergewake holds for every posted pass are sent as explicit values,
+	// false and 0 included. same_family is a fact only when the pass has a
+	// family: without one the review code defaults it to true.
+	delta, quiet, outside := receipt.Delta != "", receipt.Quiet, github.OutsideBlockingCount(findings)
+	rec.Delta, rec.Quiet, rec.OutsideDiffBlocking = &delta, &quiet, &outside
+	if reviewer := strings.TrimSpace(receipt.Reviewer); reviewer != "" {
+		rec.Reviewer = &reviewer
+	}
+	if rec.Family != "" {
+		rec.SameFamily = &receipt.SameFamily
+	}
+	if digest := patchDigest(receipt.Patch); digest != "" {
+		rec.PatchDigest = &digest
+	}
 	for _, f := range findings {
 		switch f.Severity {
 		case "critical":
@@ -215,6 +229,18 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 func stablePatchID(patch string) string {
 	stable, _, _ := strings.Cut(patch, ":")
 	return integrations.PatchID(strings.ToLower(strings.TrimSpace(stable)))
+}
+
+// patchDigest is the part of a receipt's patch after the colon (the digest of
+// the changed text), or "" when the receipt has none or hk would refuse it.
+// reviewPatchID cuts that digest to 12 hex digits and hk takes 16 or more, so
+// today's receipts send none: hk refuses the record that carries a short one.
+func patchDigest(patch string) string {
+	_, digest, ok := strings.Cut(patch, ":")
+	if !ok {
+		return ""
+	}
+	return integrations.PatchDigest(strings.ToLower(strings.TrimSpace(digest)))
 }
 
 // taskEventKeys is the per-repo record of events already posted, so a poll

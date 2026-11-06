@@ -149,7 +149,9 @@ func TestHKChangeWebhookChecksKeepOutOfOrderFacts(t *testing.T) {
 	if checks["observed_at"] != at.Format(time.RFC3339) || len(checks["checks"].([]any)) != 2 {
 		t.Fatalf("checks=%v", checks)
 	}
-	if _, ok := checks["delivery_id"]; ok {
-		t.Fatalf("unexpected check delivery ID: %v", checks)
+	// The two deliveries coalesce into one write, which carries the id of the
+	// delivery that produced it: the last one applied (hk 3296).
+	if checks["delivery_id"] != "1" {
+		t.Fatalf("check write delivery ID: %v", checks)
 	}
 }

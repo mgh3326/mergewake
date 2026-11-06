@@ -241,15 +241,17 @@ func TestHKReviewResendKeepsHeadBaseThenPlain(t *testing.T) {
 
 // (e) An ordinary two-lens pass record serialises exactly as it did before the
 // records were made to fit hk's rules (the bytes captured from passRecord at
-// 765eaaf). A record with a patch id is not in this golden: hk refused it.
+// 765eaaf), plus the review-history facts mergewake always knows (hk 3296):
+// same_family for a pass with a family, delta, quiet and outside_diff_blocking.
+// Neither receipt names a reviewer, so none is sent. A record with a patch id is not in this golden: hk refused it.
 func TestPassRecordTwoLensUnchanged(t *testing.T) {
 	fs := []github.Finding{{Severity: "critical"}, {Severity: "high"}, {Severity: "medium"}, {Severity: "low"}}
 	cases := []struct {
 		receipt github.PassReceipt
 		golden  string
 	}{
-		{github.PassReceipt{Pass: 1, Lens: "correctness", Family: "openai", Executor: "panewire", Round: 1}, `{"reviewed_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reviewed_base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":1,"pass":1,"lens":"correctness","family":"openai","executor":"panewire","contract_source":"linked-task-3118","critical":1,"high":1,"medium":1,"low":1,"started_at":"2026-11-06T01:00:00Z","finished_at":"2026-11-06T01:01:00Z"}`},
-		{github.PassReceipt{Pass: 2, Lens: "state-risk", Family: "anthropic", Round: 2, Fallback: "headless"}, `{"reviewed_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reviewed_base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":2,"pass":2,"lens":"state-risk","family":"anthropic","fallback":true,"contract_source":"linked-task-3118","critical":1,"high":1,"medium":1,"low":1,"started_at":"2026-11-06T01:00:00Z","finished_at":"2026-11-06T01:01:00Z"}`},
+		{github.PassReceipt{Pass: 1, Lens: "correctness", Family: "openai", Executor: "panewire", Round: 1}, `{"reviewed_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reviewed_base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":1,"pass":1,"lens":"correctness","family":"openai","executor":"panewire","contract_source":"linked-task-3118","critical":1,"high":1,"medium":1,"low":1,"started_at":"2026-11-06T01:00:00Z","finished_at":"2026-11-06T01:01:00Z","same_family":false,"delta":false,"quiet":false,"outside_diff_blocking":0}`},
+		{github.PassReceipt{Pass: 2, Lens: "state-risk", Family: "anthropic", Round: 2, Fallback: "headless"}, `{"reviewed_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reviewed_base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":2,"pass":2,"lens":"state-risk","family":"anthropic","fallback":true,"contract_source":"linked-task-3118","critical":1,"high":1,"medium":1,"low":1,"started_at":"2026-11-06T01:00:00Z","finished_at":"2026-11-06T01:01:00Z","same_family":false,"delta":false,"quiet":false,"outside_diff_blocking":0}`},
 	}
 	for i, tc := range cases {
 		b, e := json.Marshal(passRecord(recordPR(), tc.receipt, fs, "linked task 3118", recStart, recFinish))
