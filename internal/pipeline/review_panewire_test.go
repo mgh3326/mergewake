@@ -65,6 +65,7 @@ type panewireRunner struct {
 	looks        int
 	addFails     bool
 	realGit      bool   // run git for real (against a test repository)
+	gitFails     string // a git subcommand (such as "fetch") that exits 128
 	afterRun     func() // called once panewire returns
 	sink         *taskJobSink
 }
@@ -115,6 +116,9 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 			return b, nil
 		}
 		if r.addFails && slices.Contains(args, "add") {
+			return nil, panewireExit(128)
+		}
+		if r.gitFails != "" && slices.Contains(args, r.gitFails) {
 			return nil, panewireExit(128)
 		}
 		return nil, nil
