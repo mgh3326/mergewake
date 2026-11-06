@@ -215,6 +215,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if e != nil {
 		return e
 	}
+	gh := github.New(token)
+	if c.GitHubApp != nil {
+		key, e := c.GitHubApp.Key()
+		if e != nil {
+			return e
+		}
+		gh.EnableApp(c.GitHubApp.AppID, key)
+	}
 	if command != "daemon" {
 		var counts *github.RequestCounts
 		ctx, counts = github.CountRequests(ctx, command)
@@ -225,10 +233,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 				total += request.Count
 			}
 			cache := counts.CacheStats()
-			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "routes": requests})
+			_ = json.NewEncoder(stderr).Encode(map[string]any{"msg": "github requests", "role": command, "total": total, "cache_hits": cache.Hits, "cache_misses": cache.Misses, "memo_hits": cache.MemoHits, "by_credential": counts.ByCredential(), "rate_remaining": gh.RateRemaining(), "routes": requests})
 		}()
 	}
-	gh := github.New(token)
 	gh.Stderr = stderr
 	// The object cache exists only when a database DSN is configured; the
 	// database is dialled on first use, never here.

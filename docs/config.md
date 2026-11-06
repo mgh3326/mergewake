@@ -22,6 +22,7 @@ Different hosts may use the same inventory and different deny lists.
 | `host` | Required | Operator-supplied host label, used in receipts and notifications. Use a public-safe placeholder in shared configs. |
 | `state_dir` | `~/.local/state/mergewake` | Private local audit, checkpoints, receipts, locks, and journals. Keep it outside Git and install roots. |
 | `token_env` | `GITHUB_TOKEN` | Name of the environment variable containing the GitHub credential. Its value is never a config key. |
+| `github_app` | Absent | Serve GitHub reads with a GitHub App installation token; see [GitHub App reads](#github-app-reads). Absent means the `token_env` credential serves every request. |
 | `poll_interval` | `60s` | Positive Go duration between completed `watch` or `agent` iterations. |
 | `watch_limit` | `100` | Maximum commit interval inspected during recovery, from 2 through 1000. |
 | `repos` | Empty list | Repositories this host may operate on. Names must be unique; `agent` requires at least one. |
@@ -1181,6 +1182,74 @@ No token fallback shells out to `gh`. An app's review identity must match
 The source of trust is GitHub and operator-owned host config; manifests are not
 cryptographically signed. Protect local config/state permissions and do not share
 an install root between inventories or competing writers.
+
+### GitHub App reads
+
+One user token shares a single 5,000 requests per hour budget across every
+worker, session and daemon pass that uses it. With `github_app` set, mergewake
+sends **reads** with an installation token of a GitHub App, which has its own
+budget, and keeps every **write** on the `token_env` credential. Review identity,
+`review.login` and the merge gate are unchanged.
+
+```yaml
+github_app:
+  app_id: 123456                          # positive integer
+  private_key_file: /path/to/app-key.pem  # absolute path; or use private_key_env
+  # private_key_env: MERGEWAKE_APP_KEY    # name of a variable holding the PEM
+```
+
+| Key | Meaning |
+| --- | --- |
+| `app_id` | Required. The App's numeric ID. |
+| `private_key_file` | Absolute path to the App's PEM-encoded RSA private key (PKCS#1 or PKCS#8). `~` expands. |
+| `private_key_env` | Name of an environment variable holding that PEM. Set exactly one of the two key sources. |
+
+Loading the config fails, naming the key (never its content), when `app_id` is
+not positive, both or neither key source is set, or the key cannot be read or is
+not an RSA private key.
+
+How requests are routed:
+
+- `GET` requests and GraphQL **queries** use the installation token of the
+  repository they are about. Every other REST call and every GraphQL document
+  that mentions `mutation` or `subscription` uses the user token. A request that
+  names no repository (for example `/user`) uses the user token.
+- Mergewake signs an App JWT (RS256, issued 60 seconds in the past, valid 9
+  minutes), finds the installation with `GET /repos/{owner}/{repo}/installation`
+  and exchanges it at `POST /app/installations/{id}/access_tokens`. These two
+  calls never carry the user token. The installation token is cached and renewed
+  5 minutes before it expires; concurrent callers share one renewal.
+- The ETag and poll cache, the per-pass memo and the object cache work as
+  before. A write on the user token still invalidates what it invalidated.
+- Rate limits are tracked per credential. A pending wait or an exhausted budget
+  on one credential never delays requests that use the other.
+- The `github requests` log line adds `by_credential` (requests the App and the
+  user token each sent, including the two App token calls) and `rate_remaining`
+  (the last reported `X-RateLimit-Remaining` of each credential seen).
+
+#### App permissions
+
+Grant the App these **read** permissions on the repositories it serves:
+
+| Permission | Level | Reads that need it |
+| --- | --- | --- |
+| Metadata | Read | Every repository request (granted by default). |
+| Contents | Read | Refs, commits, trees, files, compare, release assets. |
+| Pull requests | Read | PRs, files, diffs, reviews, review threads (GraphQL). |
+| Checks | Read | Check runs. |
+| Commit statuses | Read | Commit statuses. |
+| Actions | Read | Workflow runs. |
+
+A repository where the App has no installation (`404` on the installation
+lookup), or where an App read answers `401` or `403` (a missing permission, a
+revoked token, an exhausted App budget), reads with the user token instead.
+Mergewake retries a refused read once with the user token, uses the user token
+for that repository for 10 minutes (1 minute after a lookup that failed for a
+transient reason), and then tries the App again. It logs
+`GitHub App not used for <owner/name>: <reason>` once per repository per process,
+not per request. A missing permission therefore costs the user budget again, not
+a failed pass: read that log line, add the permission and the repository returns
+to the App at the next retry.
 
 ## Fleet events and crash reports
 

@@ -90,7 +90,7 @@ func (n commentNode) comment() ReviewComment {
 
 // moreComments reads a thread's comments after cursor. Any gap in the paging
 // is an error: an unseen reply would otherwise read as an unanswered finding.
-func (c *Client) moreComments(ctx context.Context, thread, cursor string) ([]ReviewComment, error) {
+func (c *Client) moreComments(ctx context.Context, repo, thread, cursor string) ([]ReviewComment, error) {
 	var out []ReviewComment
 	for page := 0; page < 100; page++ {
 		if thread == "" || cursor == "" {
@@ -105,7 +105,7 @@ func (c *Client) moreComments(ctx context.Context, thread, cursor string) ([]Rev
 			} `json:"data"`
 		}
 		query := `query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{author{login __typename} body commit{oid} originalCommit{oid} url} pageInfo{hasNextPage endCursor}}}}}`
-		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"id": thread, "cursor": cursor}}, &result); e != nil {
+		if e := c.graphql(ctx, repo, query, map[string]any{"id": thread, "cursor": cursor}, &result); e != nil {
 			return nil, e
 		}
 		if len(result.Errors) > 0 || result.Data == nil || result.Data.Node == nil || result.Data.Node.Comments == nil || result.Data.Node.Comments.PageInfo == nil {
@@ -171,7 +171,7 @@ func (c *Client) reviewFeedback(ctx context.Context, repo string, n int) (Review
 			} `json:"data"`
 		}
 		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid} url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}`
-		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
+		if e := c.graphql(ctx, repo, query, map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}, &result); e != nil {
 			return fb, e
 		}
 		if len(result.Errors) > 0 || result.Data == nil || result.Data.Repository == nil || result.Data.Repository.PullRequest == nil {
@@ -223,7 +223,7 @@ func (c *Client) reviewFeedback(ctx context.Context, repo string, n int) (Review
 			// Replies past the first page decide whether the finding was
 			// answered, so they are read in full rather than assumed absent.
 			if t.Comments.PageInfo != nil && t.Comments.PageInfo.HasNextPage {
-				more, e := c.moreComments(ctx, t.ID, t.Comments.PageInfo.EndCursor)
+				more, e := c.moreComments(ctx, repo, t.ID, t.Comments.PageInfo.EndCursor)
 				if e != nil {
 					return fb, e
 				}

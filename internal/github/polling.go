@@ -36,18 +36,43 @@ type pollingState struct {
 	mu    sync.Mutex
 	cache map[string]cachedResponse
 	bytes int
-	rate  throttle
-	polls map[string]throttle
+	// rate is the pending wait and remaining the last X-RateLimit-Remaining,
+	// each per credential id: the user token and every App installation have
+	// separate budgets, so one running dry never holds up another.
+	rate      map[string]throttle
+	remaining map[string]int
+	polls     map[string]throttle
 }
 
 // throttleLogThreshold is the shortest wait worth a stderr line.
 const throttleLogThreshold = 2 * time.Second
 
-// RateWait exposes the transport's current throttle to loop status/scheduling.
+// RateWait exposes the transport's current throttle to loop status/scheduling:
+// the longest wait of any credential.
 func (c *Client) RateWait() time.Duration {
 	c.poll.mu.Lock()
 	defer c.poll.mu.Unlock()
-	return max(time.Duration(0), time.Until(c.poll.rate.until))
+	var wait time.Duration
+	for _, t := range c.poll.rate {
+		wait = max(wait, time.Until(t.until))
+	}
+	return wait
+}
+
+// RateRemaining is the last reported X-RateLimit-Remaining per credential kind
+// ("user", "app"); with several App installations, the lowest. A credential
+// that has not answered yet is absent.
+func (c *Client) RateRemaining() map[string]int {
+	c.poll.mu.Lock()
+	defer c.poll.mu.Unlock()
+	out := map[string]int{}
+	for id, n := range c.poll.remaining {
+		kind, _, _ := strings.Cut(id, ":")
+		if low, ok := out[kind]; !ok || n < low {
+			out[kind] = n
+		}
+	}
+	return out
 }
 func waitUntil(ctx context.Context, until time.Time) error {
 	d := time.Until(until)
@@ -71,6 +96,8 @@ var ErrPollSkipped = errors.New("GitHub request skipped: poll interval pending")
 
 func (p *pollingState) init() {
 	p.once.Do(func() {
+		p.rate = map[string]throttle{}
+		p.remaining = map[string]int{}
 		p.gate = make(chan struct{}, 1)
 		p.cache = map[string]cachedResponse{}
 		p.polls = map[string]throttle{}
@@ -103,12 +130,12 @@ func (c *Client) pollShortcut(key string) (cachedResponse, error) {
 	return cachedResponse{}, ErrPollSkipped
 }
 
-func (c *Client) beginRequest(ctx context.Context, key string, fresh bool) (func(), cachedResponse, error) {
+func (c *Client) beginRequest(ctx context.Context, key string, fresh bool, cred string) (func(), cachedResponse, error) {
 	p := &c.poll
 	p.init()
 	for {
 		p.mu.Lock()
-		wait := p.rate
+		wait := p.rate[cred]
 		if c.Polling && !fresh && p.polls[key].until.After(wait.until) {
 			wait = p.polls[key]
 		}
@@ -130,7 +157,7 @@ func (c *Client) beginRequest(ctx context.Context, key string, fresh bool) (func
 		// A request that landed a new throttle while this one slept or queued
 		// must not be passed: release the gate and wait out the new deadline.
 		p.mu.Lock()
-		again := p.rate
+		again := p.rate[cred]
 		if c.Polling && !fresh && p.polls[key].until.After(again.until) {
 			again = p.polls[key]
 		}
@@ -177,8 +204,9 @@ func pollingEndpoint(route string) bool {
 	return len(parts) == 5 && parts[0] == "users" && parts[2] == "events" && parts[3] == "orgs"
 }
 
-func (c *Client) observeHeaders(h http.Header, code int, key string, polling bool) {
+func (c *Client) observeHeaders(cred string, h http.Header, code int, key string, polling bool) {
 	p := &c.poll
+	p.init()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -191,6 +219,9 @@ func (c *Client) observeHeaders(h http.Header, code int, key string, polling boo
 		w.reason = "Retry-After"
 	}
 	remaining, e := strconv.Atoi(h.Get("X-RateLimit-Remaining"))
+	if e == nil {
+		p.remaining[cred] = remaining
+	}
 	if e == nil && remaining <= 100 {
 		if sec, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil {
 			reset := time.Unix(sec, 0).Add(time.Second)
@@ -207,8 +238,8 @@ func (c *Client) observeHeaders(h http.Header, code int, key string, polling boo
 		w.until = now.Add(time.Minute)
 		w.reason = "403-429 backoff"
 	}
-	if w.until.After(p.rate.until) {
-		p.rate = w
+	if w.until.After(p.rate[cred].until) {
+		p.rate[cred] = w
 	}
 	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); polling && e == nil && seconds > 0 {
 		p.polls[key] = throttle{until: now.Add(time.Duration(min(seconds, 86400)) * time.Second), reason: "poll interval", code: code}

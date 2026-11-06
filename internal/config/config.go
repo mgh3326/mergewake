@@ -544,6 +544,7 @@ type Config struct {
 	Host         string      `yaml:"host"`
 	StateDir     string      `yaml:"state_dir"`
 	TokenEnv     string      `yaml:"token_env"`
+	GitHubApp    *GitHubApp  `yaml:"github_app"`
 	PollInterval string      `yaml:"poll_interval"`
 	WatchLimit   int         `yaml:"watch_limit"`
 	Repos        []Repo      `yaml:"repos"`
@@ -582,7 +583,7 @@ func Load(name string) (Config, error) {
 	// reap transport, outcomes the review quota tool, repos and review the
 	// state directory).
 	for _, section := range []func(*Config) error{
-		validateBasics, validateDaemon, validateReap, validateHosts, validateReview,
+		validateBasics, validateGitHubApp, validateDaemon, validateReap, validateHosts, validateReview,
 		validateOutcomes, validateRepos, validateAdapters, validateProfiles,
 	} {
 		if e = section(&c); e != nil {

@@ -72,7 +72,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				}
 				tracing.Data(transaction, "github_requests", total)
 				cache := counts.CacheStats()
-				log.Info("github requests", "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "routes", requests[:min(len(requests), 10)])
+				log.Info("github requests", "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "routes", requests[:min(len(requests), 10)])
 			}()
 			var repos []config.Repo
 			for _, r := range s.Config.Repos {
