@@ -47,6 +47,9 @@ func runDaemon(ctx context.Context, s *pipeline.Service, gh *github.Client, repo
 func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client, repo string, o pipeline.Options, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	loops := []daemon.Loop{}
+	// d is assigned below, before any loop runs; a pr pass that merges a PR
+	// wakes the reap role through it.
+	var d daemon.Daemon
 	// Skipping unchanged PRs needs the webhook receiver: its per-PR marks are
 	// what tells a quiet PR from one whose review thread was just resolved.
 	var dirty *daemon.Dirty
@@ -75,6 +78,9 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			ctx, transaction := tracing.Pass(ctx, role)
 			defer tracing.Finish(transaction)
 			ctx, counts := github.CountRequests(ctx, role)
+			if role == "pr" {
+				ctx = pipeline.WithMergeHook(ctx, func(string, int) { d.Trigger("reap") })
+			}
 			defer func() {
 				requests = counts.Snapshot()
 				total := 0
@@ -149,7 +155,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	if len(s.Config.Repos) == 0 {
 		return errors.New("daemon requires configured repositories")
 	}
-	d := daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
+	d = daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
 	if s.Config.Discord.Enabled {
 		s.Feed = pipeline.NewFeed(s.Config, log)
 		s.Feed.Now = s.Now

@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fleetevent"
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -30,9 +31,23 @@ import (
 // composer. A remote worktree goes only through the hub's guarded removal; a
 // local checkout is removed only when it is clean, detached at the reviewed
 // head and no local pane runs in it.
+//
+// Two reviewer-only exceptions keep finished panes from piling up. An omp pane
+// has a composer herdr cannot read, so a reviewer pane that stayed idle with an
+// unreadable composer for reviewerUnreadableIdle closes without the read. And a
+// reviewer job that never left spawned, whose pane is idle and whose PR is
+// closed or past the reviewed head, is closed abandoned first (abandonSpawned).
+// A worker pane keeps the composer read: a person may type in it.
 
 // reviewerLabelPattern is the label a review pass gives its pane, job and
 // checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go).
+// reviewerUnreadableIdle is how long a reviewer pane must have sat idle with a
+// composer the hub could not read before the sweep closes it unread. The clock
+// is the pane stream's kept composer-unknown row: the receipts dedupe repeats,
+// so that row's time is when the sweep first saw this state, and a pane that
+// worked in between wrote a different row and started the clock again.
+const reviewerUnreadableIdle = 2 * time.Hour
+
 var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)$`)
 
 type reviewerLabel struct {
@@ -101,6 +116,11 @@ type reviewerSweep struct {
 	// remote is the newest remote worktree path a receipt recorded per label
 	// and host, the fallback when the pane is gone and the job names no cwd.
 	remote map[string]map[string]string
+	// abandoned names labels an earlier pass closed abandoned; their job
+	// record no longer reads spawned or completed, and the pane still needs reaping.
+	abandoned map[string]bool
+	// pulls memoises the PR reads of one pass; a failed read is not kept.
+	pulls map[int]github.Pull
 }
 
 // reviewerCandidate is one label to visit, and the host and pane it was seen
@@ -122,7 +142,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.timeout: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, pulls: map[int]github.Pull{}}
 	w.jobs, _ = s.Sink.(reapJobs)
 	for _, hs := range hosts {
 		if hs.host.Local() && w.local == nil {
@@ -134,6 +154,9 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	for _, rec := range receipts {
 		switch rec.Action {
 		case "reviewer-reap":
+			if rec.Result == "abandoned" {
+				w.abandoned[rec.Label] = true
+			}
 			if w.streams[rec.Label] == nil {
 				w.streams[rec.Label] = map[string]reapReceipt{}
 			}
@@ -284,7 +307,17 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	case e != nil:
 		w.record(gate, "error", "job record: "+integrations.Detail(e))
 		return
-	case job.State != "completed":
+	}
+	// A reviewer job stuck in spawned is closed abandoned when its review can
+	// no longer matter; the pane then goes through the normal reap below.
+	if job.State == "spawned" && job.Role == "reviewer" && c.pane != nil && !w.abandoned[l.name] {
+		if !w.abandonSpawned(ctx, c, gate, job) {
+			return
+		}
+		job.State = "completed"
+	}
+	switch {
+	case job.State != "completed" && !w.abandoned[l.name]:
 		st := job.State
 		if st == "" {
 			st = "unknown"
@@ -380,11 +413,18 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 		w.record(rec, "kept", "operator-owned")
 		return nil, false
 	}
-	// I5: an unsent draft, or a composer that cannot be read, keeps the pane.
+	// I5: an unsent draft, or a composer that cannot be read, keeps the pane. A
+	// reviewer pane whose composer the hub reports unreadable (not a failed
+	// read) closes once it has been idle long enough.
 	switch composer, e := hs.ops.Composer(ctx, pane); {
 	case e != nil:
 		w.record(rec, "kept", reap.ComposerUnknown)
 		return nil, false
+	case composer == reap.ComposerUnknown && job.Role == "reviewer":
+		if reason := w.unreadableKeep(rec, pane); reason != "" {
+			w.record(rec, "kept", reason)
+			return nil, false
+		}
 	case composer != reap.ComposerEmpty:
 		w.record(rec, "kept", composer)
 		return nil, false
@@ -411,6 +451,77 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 	}
 	w.record(rec, "kept", "pane close recheck: "+outcome)
 	return nil, false
+}
+
+// unreadableKeep is why a reviewer pane with an unreadable composer stays, or
+// "" once it may close: idle or done, and in the same unreadable state since a
+// kept composer-unknown row at least reviewerUnreadableIdle old. The first
+// sighting writes that row and keeps the pane.
+func (w *reviewerSweep) unreadableKeep(rec reapReceipt, pane reap.Pane) string {
+	if pane.Status != "idle" && pane.Status != "done" {
+		st := pane.Status
+		if st == "" {
+			st = "unknown"
+		}
+		return "status:" + st
+	}
+	prior, ok := w.streams[rec.Label]["pane"]
+	if !ok || prior.Result != "kept" || prior.Reason != reap.ComposerUnknown || w.now.Sub(prior.Time) < reviewerUnreadableIdle {
+		return reap.ComposerUnknown
+	}
+	return ""
+}
+
+// abandonSpawned closes a reviewer job that is still spawned when its pane is
+// idle or done and its review is over: the PR merged or closed, or the head
+// the label reviewed is no longer the PR head. It reports whether the sweep may
+// go on to the pane. The close is panewire's job close, the path a lost
+// reviewer's replacement takes; a PR still open at the reviewed head, an
+// unreadable PR or a busy pane leaves the job spawned.
+func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate, gate reapReceipt, job integrations.JobRecord) bool {
+	keep := func() bool {
+		w.record(gate, "kept", "job:spawned")
+		return false
+	}
+	if c.pane.Status != "idle" && c.pane.Status != "done" {
+		return keep()
+	}
+	l := c.label
+	pr, ok := w.pulls[l.pr]
+	if !ok {
+		var e error
+		if pr, e = w.s.GH.Pull(ctx, w.r.Name, l.pr); e != nil {
+			return keep()
+		}
+		w.pulls[l.pr] = pr
+	}
+	var reason string
+	switch {
+	case pr.Merged || pr.MergedAt != nil:
+		reason = fmt.Sprintf("PR #%d merged", l.pr)
+	case pr.State != "open":
+		reason = fmt.Sprintf("PR #%d closed", l.pr)
+	case pr.Head.SHA != "" && !strings.HasPrefix(pr.Head.SHA, l.sha7):
+		reason = fmt.Sprintf("PR #%d head moved past reviewed %s", l.pr, l.sha7)
+	default:
+		return keep()
+	}
+	if !w.acting {
+		w.record(gate, "would-abandon", reason)
+		return true
+	}
+	if job.OwnerLane == "" {
+		w.record(gate, "error", "abandon job: owner lane unavailable")
+		return false
+	}
+	cmd := w.s.Config.Review.Panewire.Command
+	if _, e := w.s.Runner.Run(ctx, cmd, []string{"job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason}, "", ""); e != nil {
+		w.record(gate, "error", "abandon job: "+e.Error())
+		return false
+	}
+	w.abandoned[l.name] = true
+	w.record(gate, "abandoned", reason)
+	return true
 }
 
 // remoteStep is how the remote worktree step ended, as the local step needs it.
