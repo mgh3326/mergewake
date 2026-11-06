@@ -35,6 +35,10 @@ var lensFocus = map[string]string{
 	"state-risk":  "state, migration, security and deploy risk: irreversible mutations, data loss, secret or auth exposure, unsafe rollout and recovery gaps",
 }
 
+// singleLens names the lens of a pass in a repo that runs one pass: it covers
+// the whole review, so it has no narrower focus than the other lenses.
+const singleLens = "default"
+
 // claimRef names the server-side ref claiming one pass for one head. Pass 1
 // keeps the original layout; the completion marker is <sha>-done.
 func claimRef(n int, sha string, pass int) string {
@@ -287,7 +291,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			}
 			return "state-risk"
 		}
-		return "default"
+		return singleLens
 	}
 
 	if !o.Acting() {

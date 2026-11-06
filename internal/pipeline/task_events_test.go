@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,6 +33,15 @@ type fakeHK struct {
 	// refuseExtended answers 400 invalid_event to an event that carries any
 	// head/base/merge/reviews field, as an hk that predates them does.
 	refuseExtended bool
+	// rules applies a copy of hk's review validation (hkRulesCheck) to every
+	// event: a violation answers 400 invalid_context, as hk does.
+	rules bool
+	// refuseReviews answers 400 to any event that carries reviews[].
+	refuseReviews bool
+	// message is added to every 400 as hk's "message" field.
+	message string
+	// why holds the violation behind each rules refusal.
+	why []string
 }
 
 func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +49,9 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	raw, _ := io.ReadAll(r.Body)
 	var ev integrations.TaskEvent
-	_ = json.NewDecoder(r.Body).Decode(&ev)
+	_ = json.Unmarshal(raw, &ev)
 	h.mu.Lock()
 	h.events = append(h.events, ev)
 	h.auth = append(h.auth, r.Header.Get("Authorization"))
@@ -48,6 +59,16 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.refuseExtended && (ev.HeadSHA != "" || ev.BaseSHA != "" || ev.MergeSHA != "" || len(ev.Reviews) > 0) {
 		status, code = http.StatusBadRequest, "invalid_event"
 	}
+	if h.refuseReviews && len(ev.Reviews) > 0 {
+		status, code = http.StatusBadRequest, "invalid_event"
+	}
+	if h.rules {
+		if why := hkRulesCheck(raw); why != "" {
+			h.why = append(h.why, why)
+			status, code = http.StatusBadRequest, "invalid_context"
+		}
+	}
+	message := h.message
 	h.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -59,7 +80,11 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if status != 0 && status != http.StatusOK {
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+		body := map[string]string{"error": code}
+		if message != "" {
+			body["message"] = message
+		}
+		_ = json.NewEncoder(w).Encode(body)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"applied": true, "redelivered": false, "state": "reviewing"})
