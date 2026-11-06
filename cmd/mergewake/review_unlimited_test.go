@@ -80,17 +80,28 @@ func TestReviewParallelCapHoldsAndUrgentGetsExtra(t *testing.T) {
 	})
 }
 
-// With no cap, priority changes only the order: urgentExtra is not needed.
+// With no cap every review starts at once, so the order the goroutines record
+// their starts in is the scheduler's, not the priority's. What must hold is
+// that every PR starts, each start still carries its priority, and nothing is
+// counted past a bound that does not exist: urgentExtra is not needed.
 func TestReviewParallelUnsetPriorityStillOrdersStarts(t *testing.T) {
 	f, sink := newPriorityFixture(t, 4, 0)
 	sink.task = map[int]int{1: 3, 2: 1, 3: 2, 4: 1}
 	done := f.poll(context.Background())
 	f.runner.waitFor(t, "four reviews in flight", func(in, started, _ int) bool { return in == 4 })
 	finish(t, f, done)
-	if got, want := strings.Join(startOrder(f.trace.snapshot()), " "), "2 4 3 1"; got != want {
-		t.Fatalf("start order %q, want %q", got, want)
+	rows := startRows(t, f)
+	if len(rows) != 4 {
+		t.Fatalf("review-start rows %v, want one per PR 1-4", rows)
 	}
-	for pr, row := range startRows(t, f) {
+	for pr, want := range sink.task {
+		row, ok := rows[pr]
+		if !ok {
+			t.Fatalf("PR %d never started", pr)
+		}
+		if got, _ := row["priority"].(float64); int(got) != want {
+			t.Fatalf("PR %d started with priority %v, want %d", pr, row["priority"], want)
+		}
 		if row["over_bound"] == true {
 			t.Fatalf("PR %d started past a bound that does not exist", pr)
 		}
