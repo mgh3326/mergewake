@@ -677,9 +677,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		tracing.Finish(runSpan)
 		// A fresh spawn refused as held, while this run closed the job of an
 		// older head: close it once more and spawn again, once.
-		heldRetried := false
 		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHeadJobs()) > 0 {
-			heldRetried = true
 			var closeErr error
 			for _, old := range x.movedHeadJobs() {
 				closeErr = errors.Join(closeErr, x.closeMovedHeadJob(ctx, old))
@@ -692,8 +690,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
 				}
 				// The refusal stays a hold: a failed re-close is no review failure.
+				// As for any held refusal, the pass lease goes back, so the next
+				// evaluation can spawn, and the hold and the close error are audited.
+				x.releaseLease(ctx, plan, leaseSHA, "reviewer-held")
 				detail := integrations.Detail(e)
-				return out, &reviewerHeld{retryAfter: heldRetryAfterOf(detail), err: errors.Join(e, closeErr)}
+				auditErr := errors.Join(
+					s.audit(x.repo.Name, "reviewer-held", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "task": task, "resumed": resumed}, false),
+					s.audit(x.repo.Name, "reviewer-held-close-failed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "error": fleetevent.Redact(closeErr.Error())}, false),
+				)
+				return out, errors.Join(&reviewerHeld{retryAfter: heldRetryAfterOf(detail), err: errors.Join(e, closeErr)}, auditErr)
 			}
 			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
 			stdout, e = launch(runCtx, args)
@@ -701,7 +706,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// A fresh spawn refused as held by a reviewer of an older head of this
 		// pass: sweep that head's finished panes and spawn again, once.
-		if e != nil && !resumed && !heldRetried && exitStatus(e) == panewireHeld && ctx.Err() == nil && x.opts.Acting() && olderHeadHolder(integrations.Detail(e), pr, plan.pass) {
+		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && x.opts.Acting() && olderHeadHolder(integrations.Detail(e), pr, plan.pass) {
 			switch sweepErr := x.reapOlderHeadReviewers(ctx); {
 			case errors.Is(sweepErr, errSweepCannotAct):
 				// reap is off or observe-only: nothing was closed, so the hold

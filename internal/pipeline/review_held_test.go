@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,6 +193,61 @@ func TestRetryHeldCloseFailureStaysAHold(t *testing.T) {
 		t.Fatalf("state=%+v", st)
 	}
 	noNotices(t, s)
+	// Like any held refusal: the pass leases go back, so the next evaluation can
+	// spawn, and the hold and the close error are audited.
+	if leaseHeld(g, 1) || leaseHeld(g, 2) {
+		t.Fatal("a pass lease is still live after the held refusal")
+	}
+	if rows := auditRows(t, s, r, "reviewer-held"); len(rows) == 0 {
+		t.Fatalf("held audit: %v", rows)
+	}
+	if rows := auditRows(t, s, r, "reviewer-held-close-failed"); len(rows) == 0 || !strings.Contains(rows[0]["error"].(string), "hk unreachable") {
+		t.Fatalf("close-failed audit: %v", rows)
+	}
+}
+
+// holdUntilSwept refuses every reviewer spawn as held by the older head's
+// reviewer of the same pass until the sweep releases it.
+type holdUntilSwept struct {
+	*panewireRunner
+	mu       sync.Mutex
+	released bool
+	attempts map[string]int
+}
+
+func (h *holdUntilSwept) release() { h.mu.Lock(); h.released = true; h.mu.Unlock() }
+
+func (h *holdUntilSwept) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && slices.Contains(args, "--review-pass") {
+		pass := arg(args, "--review-pass")
+		h.mu.Lock()
+		h.attempts[pass]++
+		released := h.released
+		h.mu.Unlock()
+		if !released {
+			holder := fmt.Sprintf("mwr-7-%s-p%s-1", shaB[:7], pass)
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(panewireHeld), Stderr: fmt.Sprintf(heldBody, holder)}
+		}
+	}
+	return h.panewireRunner.Run(ctx, command, args, input, dir)
+}
+
+// A spawn refused held again after the moved-head re-close still gets the
+// older-head sweep and its retry in the same evaluation.
+func TestRetryHeldAfterMovedHeadRecloseStillSweeps(t *testing.T) {
+	inner := &panewireRunner{family: "openai"}
+	s, g, r, _ := movedHeadSetup(t, inner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	h := &holdUntilSwept{panewireRunner: inner, attempts: map[string]int{}}
+	s.Runner = h
+	s.Config.Reap.Enabled, s.Config.Reap.Act = true, true
+	sweeps := 0
+	stubSweep(t, func(context.Context, int) error { sweeps++; h.release(); return nil })
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if sweeps != 1 || h.attempts["1"] != 3 || g.postCount == 0 {
+		t.Fatalf("sweeps=%d attempts=%v posts=%d", sweeps, h.attempts, g.postCount)
+	}
 }
 
 // (c) A holder of another PR, another pass or the same head is not closed; the
