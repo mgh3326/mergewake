@@ -360,6 +360,8 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	ctx, span := tracing.Span(ctx, "mergewake.settle")
 	defer tracing.Finish(span)
 	var errs []error
+	// FINDINGS and READY for this PR share one author-pane scan.
+	ctx = pipeline.WithAuthorScan(ctx)
 	deliverCtx, deliver := tracing.Span(ctx, "mergewake.deliver")
 	e := s.DeliverFindings(deliverCtx, r, n, o)
 	tracing.Finish(deliver)

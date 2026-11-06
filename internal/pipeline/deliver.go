@@ -80,6 +80,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	if !s.Config.Daemon.PR.Findings.On() {
 		return nil
 	}
+	ctx = WithAuthorScan(ctx)
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
@@ -221,9 +222,37 @@ func terminalJob(state string) bool {
 	return state == "completed" || state == "escalated" || state == "lost"
 }
 
+// boundJobLane is the lane of the job hk bound to task, as the job record
+// names it; empty when the task has no job or the job no usable lane. A read
+// error is returned, never read as "no job".
+func (s *Service) boundJobLane(ctx context.Context, task string) (lane, via string, err error) {
+	jobs, ok := s.Sink.(reapJobs)
+	if task == "" || !ok {
+		return "", "", nil
+	}
+	job, _, e := jobs.TaskJob(ctx, task)
+	if e != nil || job == "" {
+		return "", "", e
+	}
+	rec, e := jobs.Job(ctx, job)
+	if e != nil {
+		if errors.Is(e, integrations.ErrJobNotFound) {
+			return "", "", nil
+		}
+		return "", "", e
+	}
+	for _, l := range []string{rec.HubLane, rec.Lane, rec.Label} {
+		if laneName.MatchString(l) {
+			return l, "task " + task + " job " + job, nil
+		}
+	}
+	return "", "", nil
+}
+
 // findingsRoute uses the same task/job binding as reap, without caching an
 // open PR's binding. A worker or lead keeps its author lane after completion.
-// Missing ownership routes to the desk; a read error retries without guessing.
+// With no job binding the PR's author pane (see authorPane) is next. Missing
+// ownership routes to the desk; a read error retries without guessing.
 func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pull) (findingsRoute, error) {
 	desk := s.Config.Notifier.FallbackLane
 	if desk == "" {
@@ -236,25 +265,17 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 	if e != nil {
 		return rt, e
 	}
-	if jobs, ok := s.Sink.(reapJobs); task != "" && ok {
-		job, _, e := jobs.TaskJob(ctx, task)
-		if e != nil {
-			return rt, e
-		}
-		if job != "" {
-			rec, e := jobs.Job(ctx, job)
-			if e != nil && !errors.Is(e, integrations.ErrJobNotFound) {
-				return rt, e
-			}
-			if e == nil {
-				for _, lane := range []string{rec.HubLane, rec.Lane, rec.Label} {
-					if laneName.MatchString(lane) {
-						rt.lane, rt.via = lane, "task "+task+" job "+job
-						return rt, nil
-					}
-				}
-			}
-		}
+	if lane, via, e := s.boundJobLane(ctx, task); e != nil {
+		return rt, e
+	} else if lane != "" {
+		rt.lane, rt.via = lane, via
+		return rt, nil
+	}
+	if lane, via, ok, e := s.authorPane(ctx, r, pr); e != nil {
+		return rt, e
+	} else if ok {
+		rt.lane, rt.via = lane, via
+		return rt, nil
 	}
 	// Explicit PR routing is evidence of ownership: a Notify-Lane trailer, then
 	// the task's lane unless it is the desk. A repo/desk default is not.
