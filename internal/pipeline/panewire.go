@@ -827,12 +827,16 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 // findings-lane read error means "not available from that source": it is
 // audited with its class and the local file is still tried, so the job result
 // and the replacement path after it stay reachable. Only a local file read
-// error other than not-exist is returned.
+// error other than not-exist, or a cancelled context, is returned.
 func (x *panewireExecutor) availableFindings(ctx context.Context, plan *passPlan, label, path string) ([]byte, bool, error) {
 	lane := x.s.Config.Review.Panewire.Lane
 	if lane != "" {
 		b, err := x.announced(ctx, lane, label)
 		if err != nil {
+			// Cancellation or a spent deadline is not a lane read failure.
+			if ctx.Err() != nil {
+				return nil, false, ctx.Err()
+			}
 			_ = x.s.audit(x.repo.Name, "reviewer-lane-unreadable", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "class": laneErrorClass(err), "error": fleetevent.Redact(err.Error())}, false)
 		} else if b != nil {
 			return b, true, nil

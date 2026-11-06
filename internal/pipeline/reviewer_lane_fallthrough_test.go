@@ -126,3 +126,42 @@ func TestReviewerLaneErrorFinishedPaneTransientResultStaysPending(t *testing.T) 
 		t.Fatalf("err=%v closes=%v posts=%d", err, runner.closes, g.postCount)
 	}
 }
+
+// cancelOnInbox cancels the pass while the findings lane is being read.
+type cancelOnInbox struct {
+	*panewireRunner
+	cancel context.CancelFunc
+}
+
+func (r cancelOnInbox) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && len(args) > 1 && args[0] == "inbox" && args[1] == "list" {
+		r.cancel()
+		return nil, ctx.Err()
+	}
+	return r.panewireRunner.Run(ctx, command, args, input, dir)
+}
+
+// A cancelled context while the lane is read is returned, not treated as a
+// lane outage: a local findings file is not collected after cancellation.
+func TestReviewerLaneErrorCancellationPropagates(t *testing.T) {
+	s, g, repo, runner, _, old := laneDown(t)
+	budgetPane(t, s, runner, old, "done")
+	dir := filepath.Join(s.Config.Review.Panewire.Jobs, old.Label)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	local := `{"findings":[{"path":"tool","line":1,"body":"Found locally","severity":"high"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "findings.json"), []byte(local), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Runner = cancelOnInbox{runner, cancel}
+	err := s.Review(ctx, repo, 7, "", Options{})
+	if err == nil || !errors.Is(err, context.Canceled) || len(g.postedFindings) != 0 || g.postCount != 0 || len(runner.closes) != 0 {
+		t.Fatalf("err=%v posted=%+v posts=%d closes=%v", err, g.postedFindings, g.postCount, runner.closes)
+	}
+	if rows := auditRows(t, s, repo, "reviewer-lane-unreadable"); len(rows) != 0 {
+		t.Fatalf("cancellation audited as a lane error: %v", rows)
+	}
+}
