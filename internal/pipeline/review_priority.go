@@ -15,8 +15,9 @@ import (
 type ReviewPriority struct {
 	Value int
 	// Source is where Value came from: "change" (hk's change for the PR URL),
-	// "task" (the Mergewake-Task task), "none", or "error" for a failed
-	// lookup. A failed lookup is worth the same as none.
+	// "task" (the Mergewake-Task task), "none", "error" for a failed
+	// lookup, or "timeout" for one the pass stopped waiting for. A failed or
+	// timed-out lookup is worth the same as none.
 	Source string
 }
 

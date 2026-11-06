@@ -363,23 +363,57 @@ func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r conf
 // review_parallel at once.
 const urgentExtra = 2
 
+// reviewPriorityGrace is how long a pass waits for the priority lookups before
+// it starts reviews. A lookup still out then is dropped and its PR is ordered
+// as one without a priority, so a slow hk delays no other PR beyond this. A
+// var so tests can shorten it.
+var reviewPriorityGrace = 2 * time.Second
+
 // reviewPriorities resolves, at once and at most once per PR, the priority of
-// every PR in reviewable whose head still needs a review. Lookups never fail
-// the pass: a PR without a priority keeps its place in list order.
+// every PR in reviewable whose head still needs a review, and waits for them
+// for at most reviewPriorityGrace. Lookups never fail the pass: a PR without a
+// priority keeps its place in list order.
 func reviewPriorities(ctx context.Context, s *pipeline.Service, r config.Repo, prs []github.Pull, reviewable []int, handled []bool) []pipeline.ReviewPriority {
 	out := make([]pipeline.ReviewPriority, len(prs))
-	var wg sync.WaitGroup
+	// Each lookup reports on its own buffered channel, so one that finishes
+	// after the grace never writes into out.
+	answers := map[int]chan pipeline.ReviewPriority{}
 	for _, i := range reviewable {
 		if handled[i] {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			out[i] = s.ReviewPriority(ctx, r, prs[i])
-		}()
+		ch := make(chan pipeline.ReviewPriority, 1)
+		answers[i] = ch
+		go func() { ch <- s.ReviewPriority(ctx, r, prs[i]) }()
 	}
-	wg.Wait()
+	grace := time.NewTimer(reviewPriorityGrace)
+	defer grace.Stop()
+	expired := false
+	for _, i := range reviewable {
+		ch, ok := answers[i]
+		if !ok {
+			continue
+		}
+		out[i] = pipeline.ReviewPriority{Source: "timeout"}
+		if expired {
+			select {
+			case out[i] = <-ch:
+			default:
+			}
+			continue
+		}
+		select {
+		case out[i] = <-ch:
+		case <-grace.C:
+			expired = true
+			select {
+			case out[i] = <-ch:
+			default:
+			}
+		case <-ctx.Done():
+			expired = true
+		}
+	}
 	return out
 }
 

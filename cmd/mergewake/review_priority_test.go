@@ -21,13 +21,18 @@ type prioritySink struct {
 	change      map[int]int // PR number → change priority
 	failTask    map[int]bool
 	failChange  map[int]bool
+	hang        map[int]bool // task read blocks until its context ends
 	taskReads   map[int]int
 	changeReads map[int]int
 }
 
-func (p *prioritySink) TaskPriority(_ context.Context, task string) (int, error) {
+func (p *prioritySink) TaskPriority(ctx context.Context, task string) (int, error) {
 	n, _ := strconv.Atoi(task)
 	n -= 1000
+	if p.hang[n] {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.taskReads[n]++
@@ -52,7 +57,7 @@ func newPriorityFixture(t *testing.T, prs, parallel int) (*parallelFixture, *pri
 	t.Helper()
 	f := newParallelFixture(t, prs, parallel)
 	f.hub.taskPerPR = true
-	sink := &prioritySink{task: map[int]int{}, change: map[int]int{}, failTask: map[int]bool{}, failChange: map[int]bool{}, taskReads: map[int]int{}, changeReads: map[int]int{}}
+	sink := &prioritySink{task: map[int]int{}, change: map[int]int{}, failTask: map[int]bool{}, failChange: map[int]bool{}, hang: map[int]bool{}, taskReads: map[int]int{}, changeReads: map[int]int{}}
 	f.s.Sink = sink
 	return f, sink
 }
@@ -237,4 +242,32 @@ func TestPollPRsLookupErrorKeepsListOrder(t *testing.T) {
 			t.Fatalf("start order %v, want %v", got, want)
 		}
 	})
+}
+
+// A lookup that hangs costs only its own PR its priority: after the grace the
+// pass starts every review, the others in priority order and that PR as one
+// without a priority.
+func TestPollPRsSlowLookupDoesNotStallOtherReviews(t *testing.T) {
+	old := reviewPriorityGrace
+	reviewPriorityGrace = 200 * time.Millisecond
+	t.Cleanup(func() { reviewPriorityGrace = old })
+	f, sink := newPriorityFixture(t, 3, 1)
+	sink.task = map[int]int{2: 3, 3: 1}
+	sink.hang = map[int]bool{1: true}
+	start := time.Now()
+	done := f.poll(context.Background())
+	f.runner.waitFor(t, "the first review", func(_, started, _ int) bool { return started >= 1 })
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Fatalf("first review started after %v: the pass waited for the hung lookup", waited)
+	}
+	close(f.runner.release)
+	if err := <-done; err != nil && !strings.Contains(err.Error(), "land") {
+		t.Fatal(err)
+	}
+	if got, want := startOrder(f.trace.snapshot()), []string{"3", "2", "1"}; !slices.Equal(got, want) {
+		t.Fatalf("start order %v, want %v", got, want)
+	}
+	if row := startRows(t, f)[1]; row["priority_source"] != "timeout" || row["priority"] != float64(0) {
+		t.Fatalf("review-start row %v", row)
+	}
 }
