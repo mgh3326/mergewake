@@ -265,4 +265,8 @@ Workers can read each PR's last merge-gate verdict without spending GitHub budge
 the daemon serves `GET /v1/pr-status` on its webhook listener and `mergewake pr-status`
 reads the same snapshot from local state. See [PR status](docs/pr-status.md).
 
+`mergewake ci-policy` checks that each configured repo follows the fleet main-CI default
+(cancel in-progress main runs per ref, name an `any_ref_workflow`), and `watch` warns once per
+change. See [main-CI policy check](docs/ci-policy.md).
+
 Licensed under [Apache-2.0](LICENSE).
