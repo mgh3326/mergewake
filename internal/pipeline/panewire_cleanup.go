@@ -253,8 +253,16 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 	if c.p.force {
 		// A reviewer past its deadline is replaced whatever it is doing, so its
 		// screen is saved for the record and the pane closes while it works.
-		if _, err := ops.Capture(ctx, *pane, c.p.label, nil, true); err != nil {
+		// Capture answers a pane that is no fleet job (the job dir is missing)
+		// with a Skip and no error: such a pane is an operator's and stays open,
+		// as in the reap sweep.
+		saved, err := ops.Capture(ctx, *pane, c.p.label, nil, true)
+		if err != nil {
 			c.record("error", "pane screen: "+err.Error())
+			return "", false
+		}
+		if saved.Skip != "" {
+			c.record("kept", "pane screen skipped: "+saved.Skip)
 			return "", false
 		}
 	} else {
