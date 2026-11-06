@@ -1219,10 +1219,16 @@ How requests are routed:
   and exchanges it at `POST /app/installations/{id}/access_tokens`. These two
   calls never carry the user token. The installation token is cached and renewed
   5 minutes before it expires; concurrent callers share one renewal.
-- The ETag and poll cache, the per-pass memo and the object cache work as
-  before. A write on the user token still invalidates what it invalidated.
+- The per-pass memo and the object cache work as before. A write on the user
+  token still invalidates what it invalidated.
 - Rate limits are tracked per credential. A pending wait or an exhausted budget
-  on one credential never delays requests that use the other.
+  on one credential never delays requests that use the other. The daemon
+  schedules passes by the credentials that serve reads: the App installations,
+  plus the user token only while a repository reads on it as a fallback. A user
+  token drained by workers and sessions therefore does not hold passes back;
+  the writes in them still wait for that budget one request at a time.
+- The ETag and poll cache are kept per credential kind, so a response recorded
+  under one credential is never replayed for, or revalidated by, the other.
 - The `github requests` log line adds `by_credential` (requests the App and the
   user token each sent, including the two App token calls) and `rate_remaining`
   (the last reported `X-RateLimit-Remaining` of each credential seen).

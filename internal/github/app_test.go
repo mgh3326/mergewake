@@ -95,6 +95,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
 		}
 	}
+	if strings.HasSuffix(r.URL.Path, "/events") {
+		w.Header().Set("ETag", `"events-v1"`)
+		w.Header().Set("X-Poll-Interval", "60")
+	}
 	if r.URL.Path == "/graphql" {
 		reply(w, map[string]any{"data": map[string]any{}})
 		return
@@ -126,6 +130,8 @@ type appHarness struct {
 	stderr *bytes.Buffer
 	now    *atomic.Int64
 }
+
+func (h appHarness) now0() time.Time { return time.Unix(h.now.Load(), 0) }
 
 func newAppHarness(t *testing.T, withApp bool) appHarness {
 	t.Helper()
@@ -473,5 +479,115 @@ func TestGraphQLDocumentKind(t *testing.T) {
 		if got := readRepo(ctx, "GET", route, nil); got != "" {
 			t.Errorf("GET %s has no repository but routed to %q", route, got)
 		}
+	}
+}
+
+// userBudgetDrained makes the user token answer with no requests left until
+// reset; the App stays full unless appRemaining says otherwise.
+func userBudgetDrained(reset time.Time, appRemaining int) func(string) (int, time.Time, bool) {
+	return func(auth string) (int, time.Time, bool) {
+		if auth == "Bearer "+appTestUserToken {
+			return 0, reset, true
+		}
+		return appRemaining, reset, true
+	}
+}
+
+func TestRateWaitSchedulesPassesByTheCredentialsThatRead(t *testing.T) {
+	reset := time.Now().Add(30 * time.Minute)
+	ctx := context.Background()
+	drainUser := func(h appHarness) {
+		t.Helper()
+		if e := h.json(ctx, "POST", "/repos/o/r/pulls/1/reviews", map[string]string{"event": "COMMENT"}, nil); e != nil {
+			t.Fatal(e)
+		}
+	}
+
+	// With the App: a drained user token that only writes use must not hold passes back.
+	h := newAppHarness(t, true)
+	h.fake.remaining = userBudgetDrained(reset, 4900)
+	if e := h.json(ctx, "GET", "/repos/o/r/pulls/1", nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	drainUser(h)
+	if wait := h.RateWait(); wait != 0 {
+		t.Fatalf("RateWait = %s with the user token drained and the App fine, want 0", wait)
+	}
+	// A write still waits on the user budget.
+	short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	if e := h.json(short, "POST", "/repos/o/r/pulls/1/reviews", map[string]string{"event": "COMMENT"}, nil); e == nil {
+		t.Fatal("a write on the drained user budget was not held back")
+	}
+
+	// The App's own wait counts.
+	h = newAppHarness(t, true)
+	h.fake.remaining = func(string) (int, time.Time, bool) { return 0, reset, true }
+	if e := h.json(ctx, "GET", "/repos/o/r/pulls/1", nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	if wait := h.RateWait(); wait < 25*time.Minute {
+		t.Fatalf("RateWait = %s with the App drained, want about 30m", wait)
+	}
+
+	// A repository that fell back reads on the user token, so its budget counts.
+	h = newAppHarness(t, true)
+	h.fake.remaining = userBudgetDrained(reset, 4900)
+	h.fake.denyRead["o/r"] = http.StatusForbidden
+	if e := h.json(ctx, "GET", "/repos/o/r/pulls/1", nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	if wait := h.RateWait(); wait < 25*time.Minute {
+		t.Fatalf("RateWait = %s with a repository reading on the drained user token, want about 30m", wait)
+	}
+
+	// Without the App nothing changes: the user budget schedules passes.
+	h = newAppHarness(t, false)
+	h.fake.remaining = userBudgetDrained(reset, 4900)
+	drainUser(h)
+	if wait := h.RateWait(); wait < 25*time.Minute {
+		t.Fatalf("RateWait = %s without the App, want about 30m", wait)
+	}
+}
+
+func TestPollCacheIsNotSharedBetweenCredentials(t *testing.T) {
+	h := newAppHarness(t, true)
+	h.Polling = true
+	ctx := context.Background()
+	events := func() {
+		t.Helper()
+		if e := h.json(ctx, "GET", "/repos/o/r/events", nil, nil); e != nil {
+			t.Fatal(e)
+		}
+	}
+	events()
+	reads := func() []seen {
+		var out []seen
+		for _, s := range h.fake.repoRequests() {
+			if strings.HasSuffix(s.path, "/events") {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if got := reads(); len(got) != 1 || !strings.HasPrefix(got[0].auth, "Bearer inst-token-") {
+		t.Fatalf("first events read: %+v", got)
+	}
+	events() // inside the poll window, same credential: replayed, no request
+	if got := reads(); len(got) != 1 {
+		t.Fatalf("a replay inside the poll window reached the server: %d requests", len(got))
+	}
+	// The repository now reads on the user token. What the App cached must
+	// neither be replayed nor revalidated with its ETag.
+	h.app.mu.Lock()
+	h.app.deny(h.Client, "o/r", h.now0(), appFallbackTTL, "test")
+	h.app.mu.Unlock()
+	events()
+	got := reads()
+	if len(got) != 2 {
+		t.Fatalf("a body cached under the App credential was replayed for the user credential (%d requests)", len(got))
+	}
+	if got[1].auth != "Bearer "+appTestUserToken || got[1].header.Get("If-None-Match") != "" {
+		t.Fatalf("user read carried auth %q and If-None-Match %q", got[1].auth, got[1].header.Get("If-None-Match"))
 	}
 }

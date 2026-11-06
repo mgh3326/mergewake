@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,6 +67,8 @@ type appAuth struct {
 	tokens    map[int64]installToken
 	fallback  map[string]time.Time
 	announced map[string]bool
+	// fallbackUntil is the latest end of any repository's fallback window.
+	fallbackUntil atomic.Int64
 }
 
 // EnableApp makes the client read through installation tokens of the App with
@@ -153,6 +156,12 @@ func (a *appAuth) credential(ctx context.Context, c *Client, repo string) (crede
 	return credential{id: credApp + ":" + strconv.FormatInt(id, 10), kind: credApp, token: t.token, repo: repo, installation: id}, true
 }
 
+// fallingBack reports whether any repository currently reads with the user
+// token because the App could not serve it. It never waits on a token fetch.
+func (a *appAuth) fallingBack(now time.Time) bool {
+	return now.UnixNano() < a.fallbackUntil.Load()
+}
+
 // refuse records that an installation token was refused on a read (401: the
 // token is no longer valid, 403: a permission the App lacks): the repository
 // reads with the user token for appFallbackTTL.
@@ -169,6 +178,9 @@ func (a *appAuth) refuse(c *Client, cred credential, code int) {
 // repository per process. The caller holds a.mu.
 func (a *appAuth) deny(c *Client, repo string, now time.Time, ttl time.Duration, reason string) {
 	a.fallback[repo] = now.Add(ttl)
+	if end := now.Add(ttl).UnixNano(); end > a.fallbackUntil.Load() {
+		a.fallbackUntil.Store(end)
+	}
 	if a.announced[repo] {
 		return
 	}

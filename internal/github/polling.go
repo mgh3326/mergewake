@@ -47,13 +47,21 @@ type pollingState struct {
 // throttleLogThreshold is the shortest wait worth a stderr line.
 const throttleLogThreshold = 2 * time.Second
 
-// RateWait exposes the transport's current throttle to loop status/scheduling:
-// the longest wait of any credential.
+// RateWait exposes the transport's current throttle to loop status/scheduling.
+// It is the wait of the credentials that serve reads: without the App, the user
+// token; with it, the App installations, plus the user token while some
+// repository reads on it as a fallback. A user budget that only writes draw on
+// does not hold passes back, because a write waits on its own credential in
+// beginRequest.
 func (c *Client) RateWait() time.Duration {
+	userReads := c.app == nil || c.app.fallingBack(c.now())
 	c.poll.mu.Lock()
 	defer c.poll.mu.Unlock()
 	var wait time.Duration
-	for _, t := range c.poll.rate {
+	for id, t := range c.poll.rate {
+		if id == credUser && !userReads {
+			continue
+		}
 		wait = max(wait, time.Until(t.until))
 	}
 	return wait

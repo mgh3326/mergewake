@@ -90,7 +90,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	if strings.HasPrefix(route, "UPLOAD ") {
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
-	key := method + " " + endpoint + " " + accept
+	// The credential kind is part of the key: a body or poll window recorded
+	// under one credential is never replayed for, or revalidated by, the other.
+	key := method + " " + endpoint + " " + accept + " " + cred.kind
 	fresh := isFresh(ctx)
 	if method != "GET" && route != "/graphql" {
 		// Whatever the outcome, the write may have changed what any pass memoized.
