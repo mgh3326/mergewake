@@ -144,6 +144,54 @@ func (e *reviewResultLost) Error() string {
 	return fmt.Sprintf("reviewer %s finished but its result was lost: %v", e.label, e.cause)
 }
 
+// collectionFailure marks a review failure whose cause is mergewake's own
+// collection of a finished or lost reviewer, not the review itself: RetryReview
+// backs off for it but does not count it toward escalation.
+type collectionFailure struct{ err error }
+
+func (e *collectionFailure) Error() string { return e.err.Error() }
+func (e *collectionFailure) Unwrap() error { return e.err }
+
+// reviewQuotaStopped is a reviewer panewire stopped on an exhausted quota pool
+// before it produced a result. It is no review failure and no lost result: the
+// pass is retried once the pool resets (ResetAt zero when unknown).
+type reviewQuotaStopped struct {
+	label, pool string
+	resetAt     time.Time
+}
+
+func (e *reviewQuotaStopped) Error() string {
+	return fmt.Sprintf("reviewer %s stopped on quota pool %q (reset %s)", e.label, e.pool, e.resetText())
+}
+
+func (e *reviewQuotaStopped) resetText() string {
+	if e.resetAt.IsZero() {
+		return "unknown"
+	}
+	return e.resetAt.UTC().Format(time.RFC3339)
+}
+
+// parseQuotaStop reads an hk end_reason of the form
+// "quota_stop pool=<pool> reset_at=<RFC3339 UTC>". A reset_at that does not
+// parse is unknown, like an absent one.
+func parseQuotaStop(job integrations.JobRecord) (pool string, resetAt time.Time, ok bool) {
+	fields := strings.Fields(job.EndReason)
+	if job.State != "lost" || len(fields) == 0 || fields[0] != "quota_stop" {
+		return "", time.Time{}, false
+	}
+	for _, f := range fields[1:] {
+		if v, found := strings.CutPrefix(f, "pool="); found {
+			pool = v
+		}
+		if v, found := strings.CutPrefix(f, "reset_at="); found {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				resetAt = t
+			}
+		}
+	}
+	return pool, resetAt, true
+}
+
 func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim func() (string, bool, error)) (passOutcome, error) {
 	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
 	out := passOutcome{}
@@ -540,6 +588,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		accepted := func() {
 			if !resumed {
 				headLatencyOf(ctx).spawnAccepted(plan.pass, phases.Now())
+				attemptOf(ctx).reviewerPlaced()
 			}
 		}
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
@@ -686,10 +735,22 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 	}
 	profile = res.rec.Profile
+	pool, resetAt, quota := parseQuotaStop(res.rec)
 	var b []byte
 	switch {
 	case res.result != nil:
 		b = res.result
+	case quota:
+		// panewire stopped the reviewer on an exhausted pool: no result was
+		// ever lost. The record goes with the lease, so the pass retried after
+		// the reset starts a fresh reviewer with its one replacement unspent.
+		stopped := &reviewQuotaStopped{label: label, pool: pool, resetAt: resetAt}
+		if e := s.audit(x.repo.Name, "review-quota-stopped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "pool": pool, "reset_at": stopped.resetText()}, false); e != nil {
+			return out, errors.Join(stopped, e)
+		}
+		x.releaseLease(ctx, plan, leaseSHA, "reviewer-quota-stopped")
+		x.note("quota-stopped", rj)
+		return out, stopped
 	case res.reason == "escalated" || res.reason == "lost":
 		pane.hold = "reviewer job " + res.reason + "; the pane stays for the operator"
 		return skip("reviewer job record %s", res.reason)
@@ -935,7 +996,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if rj.Replacements >= 1 {
 		// No pass follows this record: its lease is released, not left to expire.
 		x.releaseLease(ctx, plan, leaseSHA, "reviewer-lost")
-		return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
+		return out, &collectionFailure{fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)}
 	}
 	plan.replacements = rj.Replacements + 1
 	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })

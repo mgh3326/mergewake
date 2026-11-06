@@ -18,6 +18,54 @@ type reviewRetryState struct {
 	Failures  int       `json:"failures"`
 	Next      time.Time `json:"next"`
 	Escalated bool      `json:"escalated"`
+	// Backoffs counts the failures that lengthen the backoff: every counted
+	// failure plus the collection failures, which never count toward
+	// escalation. A file without it reads as Failures.
+	Backoffs int `json:"backoffs,omitempty"`
+}
+
+// reviewFailureClass sorts what Review returned by how RetryReview accounts
+// for it: a quota stop waits for its reset and is no failure, a collection
+// failure backs off without counting toward escalation, and anything else is a
+// real review failure.
+type reviewFailureClass struct {
+	quotas     []*reviewQuotaStopped
+	collection bool
+	real       bool
+}
+
+func (c *reviewFailureClass) add(err error) {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range joined.Unwrap() {
+			c.add(e)
+		}
+		return
+	}
+	var quota *reviewQuotaStopped
+	var collect *collectionFailure
+	var lost *reviewResultLost
+	switch {
+	case errors.As(err, &quota):
+		c.quotas = append(c.quotas, quota)
+	case errors.As(err, &collect), errors.As(err, &lost):
+		c.collection = true
+	default:
+		c.real = true
+	}
+}
+
+// retryDelay is the backoff after n backed-off failures: initial, doubling up
+// to maximum.
+func retryDelay(n int, initial, maximum time.Duration) time.Duration {
+	delay := initial
+	for i := 1; i < n && delay < maximum; i++ {
+		if delay > maximum/2 {
+			delay = maximum
+		} else {
+			delay *= 2
+		}
+	}
+	return delay
 }
 
 // RetryReview checks review evidence even if a completion marker exists. A
@@ -34,6 +82,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	if state.Head != pr.Head.SHA {
 		state = reviewRetryState{Head: pr.Head.SHA}
 	}
+	state.Backoffs = max(state.Backoffs, state.Failures)
 	initial, maximum, threshold := s.Config.Daemon.PR.ReviewRetry.Settings()
 	if state.Failures >= threshold && !state.Escalated {
 		sent, err := s.escalateReviewFailure(ctx, r, pr, state.Failures)
@@ -58,7 +107,17 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	if fresh.State != "open" || fresh.Merged || fresh.Draft || fresh.Head.SHA != pr.Head.SHA {
 		return nil
 	}
+	ctx, attempt := withAttempt(ctx)
 	err = s.Review(ctx, r, pr.Number, "", o)
+	if attempt.placed.Load() {
+		// A reviewer that no earlier run had placed starts a new attempt: the
+		// count of the earlier one must not hold it. Backoffs stay, so a
+		// spawn-and-lose loop still slows down.
+		state.Failures, state.Escalated = 0, false
+		if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
+			return errors.Join(err, saveErr)
+		}
+	}
 	if ctx.Err() != nil {
 		return errors.Join(err, ctx.Err())
 	}
@@ -82,18 +141,32 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	if errors.Is(err, github.ErrPollSkipped) {
 		return nil
 	}
-	state.Failures++
-	delay := initial
-	for i := 1; i < state.Failures && delay < maximum; i++ {
-		if delay > maximum/2 {
-			delay = maximum
-		} else {
-			delay *= 2
+	var class reviewFailureClass
+	class.add(err)
+	if class.real || class.collection {
+		state.Backoffs++
+		state.Next = s.now().Add(retryDelay(state.Backoffs, initial, maximum))
+	}
+	if class.real {
+		state.Failures++
+	}
+	for _, q := range class.quotas {
+		// A reset not yet reached is waited for; an unknown or past one waits
+		// the initial backoff, so a stale reset cannot respawn at every poll.
+		at := s.now().Add(initial)
+		if q.resetAt.After(s.now()) {
+			at = q.resetAt
+		}
+		if at.After(state.Next) {
+			state.Next = at
 		}
 	}
-	state.Next = s.now().Add(delay)
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
+	}
+	if !class.real && !class.collection {
+		// Only quota stops: the audit row says it, and nothing failed.
+		return nil
 	}
 	// Escalate after persisting the failure, including the first poll at K.
 	if state.Failures >= threshold && !state.Escalated {
