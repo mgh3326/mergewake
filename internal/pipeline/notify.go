@@ -41,6 +41,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if !s.Config.Daemon.PR.Notify.On() {
 		return nil
 	}
+	started := s.now()
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
 		return e
@@ -59,6 +60,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	v, e := s.mergeGate(ctx, r, pr, p, baseSHA)
 	if e != nil {
 		return e
+	}
+	if !o.DryRun {
+		s.recordStatus(r, pr, v, started)
 	}
 	record := struct {
 		PR              int      `json:"pr"`

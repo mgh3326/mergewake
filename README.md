@@ -256,4 +256,8 @@ bench reps via the configured quota/reps CLI. `mergewake outcomes report --since
 and experiment arm. See [configuration](docs/config.md#outcomes-and-shared-measurement)
 for the conservative seven-day rule, outbox recovery and shared follow-up semantics.
 
+Workers can read each PR's last merge-gate verdict without spending GitHub budget:
+the daemon serves `GET /v1/pr-status` on its webhook listener and `mergewake pr-status`
+reads the same snapshot from local state. See [PR status](docs/pr-status.md).
+
 Licensed under [Apache-2.0](LICENSE).
