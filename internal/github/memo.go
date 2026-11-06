@@ -140,12 +140,14 @@ type CacheStats struct {
 	Hits     int `json:"cache_hits"`
 	Misses   int `json:"cache_misses"`
 	MemoHits int `json:"memo_hits"`
+	// NotModified counts 304 responses: revalidations that cost no rate limit.
+	NotModified int `json:"not_modified"`
 }
 
 func (c *RequestCounts) CacheStats() CacheStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return CacheStats{c.hits, c.misses, c.memoHits}
+	return CacheStats{c.hits, c.misses, c.memoHits, c.notModified}
 }
 
 // passOf is nil outside CountRequests; the note methods accept nil.

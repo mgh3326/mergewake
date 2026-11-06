@@ -27,6 +27,10 @@ type gateVerdict struct {
 	Reasons    []string
 	SameFamily bool
 	Review     reviewRecord
+	// HeadPasses is how many distinct review passes of the trusted identity are
+	// posted for this head; PassesNeeded is how many its class asks for. Both
+	// feed the review-stalled notice and nothing else.
+	HeadPasses, PassesNeeded int
 }
 
 // reviewRecord is what the gate knows about a PR's review, printed by
@@ -318,7 +322,8 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		return v, e
 	}
 	receipts := passesFor(history, pr.Head.SHA)
-	_, complete := distinctPasses(receipts, needed)
+	posted, complete := distinctPasses(receipts, needed)
+	v.HeadPasses, v.PassesNeeded = posted, needed
 	for _, receipt := range receipts {
 		v.SameFamily = v.SameFamily || receipt.SameFamily
 	}

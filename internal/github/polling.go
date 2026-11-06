@@ -34,8 +34,7 @@ type pollingState struct {
 	once  sync.Once
 	gate  chan struct{}
 	mu    sync.Mutex
-	cache map[string]cachedResponse
-	bytes int
+	cache *responseCache
 	// rate is the pending wait and remaining the last X-RateLimit-Remaining,
 	// each per credential id: the user token and every App installation have
 	// separate budgets, so one running dry never holds up another.
@@ -107,7 +106,7 @@ func (p *pollingState) init() {
 		p.rate = map[string]throttle{}
 		p.remaining = map[string]int{}
 		p.gate = make(chan struct{}, 1)
-		p.cache = map[string]cachedResponse{}
+		p.cache = newResponseCache(maxCachedEntries, maxCachedBytes)
 		p.polls = map[string]throttle{}
 	})
 }
@@ -124,7 +123,7 @@ func (c *Client) pollShortcut(key string) (cachedResponse, error) {
 	p.init()
 	p.mu.Lock()
 	deadline, throttled := p.polls[key]
-	cached, ok := p.cache[key]
+	cached, ok := p.cache.get(key)
 	p.mu.Unlock()
 	if !throttled || !deadline.until.After(time.Now()) {
 		return cachedResponse{}, nil
@@ -147,7 +146,7 @@ func (c *Client) beginRequest(ctx context.Context, key string, fresh bool, cred 
 		if c.Polling && !fresh && p.polls[key].until.After(wait.until) {
 			wait = p.polls[key]
 		}
-		old := p.cache[key]
+		old, _ := p.cache.get(key)
 		p.mu.Unlock()
 		// Throttle waits happen before the gate is taken: a sleeping key never
 		// serialises requests for every other key behind it.
@@ -298,10 +297,9 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 				strings.HasPrefix(target, "/pulls/"+pullNumber+"/") || strings.HasPrefix(target, "/pulls/"+pullNumber+"?") || strings.HasPrefix(target, "/pulls/"+pullNumber+" ") ||
 				strings.HasPrefix(target, "/issues/"+pullNumber+"/") || strings.HasPrefix(target, "/issues/"+pullNumber+"?") || strings.HasPrefix(target, "/issues/"+pullNumber+" ")
 		}
-		for k, v := range p.cache {
+		for _, k := range p.cache.keys() {
 			if touches(k) {
-				p.bytes -= len(v.Body)
-				delete(p.cache, k)
+				p.cache.delete(k)
 				delete(p.polls, k)
 			}
 		}
@@ -313,7 +311,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 
 		return
 	}
-	if len(body) > 4<<20 {
+	if len(body) > maxCachedBody {
 		return
 	}
 	// A response without an ETag is kept only while its poll window runs:
@@ -327,14 +325,15 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 		}
 		replay = true
 	}
-	if p.bytes+len(body) > 32<<20 || len(p.cache) >= 512 {
-		p.cache = map[string]cachedResponse{}
-		p.polls = map[string]throttle{}
-		p.bytes = 0
+	p.store(key, cachedResponse{ETag: tag, Body: body, Replay: replay})
+}
+
+// store keeps resp under key. An entry evicted to make room loses its poll
+// window with it: a window without a cached response only skips reads.
+func (p *pollingState) store(key string, resp cachedResponse) {
+	for _, evicted := range p.cache.put(key, resp) {
+		delete(p.polls, evicted)
 	}
-	p.bytes -= len(p.cache[key].Body)
-	p.cache[key] = cachedResponse{ETag: tag, Body: body, Replay: replay}
-	p.bytes += len(body)
 }
 
 // OpenPulls lists open PRs against branch, or against any base when branch
@@ -388,12 +387,5 @@ func (c *Client) cacheNotFound(key string) {
 	if w, ok := p.polls[key]; !ok || !w.until.After(time.Now()) {
 		return
 	}
-	if len(p.cache) >= 512 {
-		p.cache = map[string]cachedResponse{}
-		p.polls = map[string]throttle{}
-		p.bytes = 0
-		return
-	}
-	p.bytes -= len(p.cache[key].Body)
-	p.cache[key] = cachedResponse{Replay: true, Code: http.StatusNotFound}
+	p.store(key, cachedResponse{Replay: true, Code: http.StatusNotFound})
 }

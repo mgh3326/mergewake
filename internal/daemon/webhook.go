@@ -34,6 +34,8 @@ type Webhook struct {
 	// Trigger wakes a role; nil means Daemon.Trigger.
 	Trigger    func(role string) bool
 	Invalidate func(repo string)
+	// Dirty, when set, records the PRs a delivery names (see deliveryPayload.mark).
+	Dirty *Dirty
 }
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping
@@ -103,11 +105,7 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad signature", http.StatusUnauthorized)
 		return
 	}
-	var delivery struct {
-		Repository struct {
-			FullName string `json:"full_name"`
-		} `json:"repository"`
-	}
+	var delivery deliveryPayload
 	// GitHub sends JSON either raw or, for the form content type, in the
 	// payload field; both are read after the signature over the raw body.
 	payload := body
@@ -131,6 +129,9 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 			if wh.Invalidate != nil {
 				wh.Invalidate(delivery.Repository.FullName)
 			}
+			if wh.Dirty != nil {
+				delivery.mark(wh.Dirty, event)
+			}
 		}
 		for _, role := range webhookEventRoles[event] {
 			if trigger(role) {
@@ -145,4 +146,53 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		"repo", delivery.Repository.FullName,
 		"triggered", triggered)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// deliveryPayload is the part of a delivery that names a repository, a PR or a
+// commit.
+type deliveryPayload struct {
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	// Number is set by pull_request; SHA by status.
+	Number      int    `json:"number"`
+	SHA         string `json:"sha"`
+	PullRequest struct {
+		Number int `json:"number"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	} `json:"pull_request"`
+	CheckRun   checkPayload `json:"check_run"`
+	CheckSuite checkPayload `json:"check_suite"`
+}
+
+type checkPayload struct {
+	HeadSHA      string `json:"head_sha"`
+	PullRequests []struct {
+		Number int `json:"number"`
+	} `json:"pull_requests"`
+}
+
+// mark records, on d, every PR the delivery names: by number for the
+// pull_request* events and the PRs a check payload lists, and by head commit
+// for check_run, check_suite and status, whose payload leaves the PR out for a
+// fork or a re-run. Only those PRs go dirty; their siblings stay clean.
+func (p deliveryPayload) mark(d *Dirty, event string) {
+	repo := p.Repository.FullName
+	switch event {
+	case "check_run", "check_suite":
+		c := p.CheckRun
+		if event == "check_suite" {
+			c = p.CheckSuite
+		}
+		d.Mark(repo, 0, c.HeadSHA)
+		for _, pr := range c.PullRequests {
+			d.Mark(repo, pr.Number, "")
+		}
+	case "status":
+		d.Mark(repo, 0, p.SHA)
+	default:
+		d.Mark(repo, max(p.PullRequest.Number, p.Number), p.PullRequest.Head.SHA)
+	}
 }

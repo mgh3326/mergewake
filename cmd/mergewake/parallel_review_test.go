@@ -41,6 +41,9 @@ type reviewHub struct {
 	reviews map[int][]map[string]any
 	seq     int
 	trace   *eventLog
+	// taskPerPR gives PR n the trailer Mergewake-Task: 1000+n, else every PR
+	// links task 42.
+	taskPerPR bool
 }
 
 func (h *reviewHub) repoName() string {
@@ -57,7 +60,11 @@ func hubHead(n int) string { return fmt.Sprintf("%040x", n) }
 var hubPolicy = []byte("version: 1\nenabled: true\nrequired_checks: [CI]\n")
 
 func (h *reviewHub) pull(n int) string {
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: 42\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, hubHead(n), n, h.repoName(), hubBase)
+	task := 42
+	if h.taskPerPR {
+		task = 1000 + n
+	}
+	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, task, hubHead(n), n, h.repoName(), hubBase)
 }
 
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)
@@ -295,6 +302,7 @@ func (n recordingNotifier) Notify(_ context.Context, e integrations.Event) error
 }
 
 type parallelFixture struct {
+	hub    *reviewHub
 	s      *pipeline.Service
 	gh     *github.Client
 	repo   config.Repo
@@ -334,7 +342,7 @@ func newParallelFixtureForRepo(t *testing.T, prs, parallel int, name string) *pa
 	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
 	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
-	return &parallelFixture{s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
+	return &parallelFixture{hub: hub, s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
 func (f *parallelFixture) poll(ctx context.Context) chan error {

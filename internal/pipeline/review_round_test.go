@@ -27,7 +27,6 @@ type roundGH struct {
 	full     string
 	old      string
 	posted   [][]github.Finding
-	ciUp     *bool
 	doneErr  map[string]error
 	compared string
 }
@@ -49,9 +48,6 @@ func (g *roundGH) ReviewClaimed(ctx context.Context, repo string, n int, sha str
 func (g *roundGH) PostReview(ctx context.Context, repo string, n int, sha string, f []github.Finding, meta github.PassReceipt) error {
 	g.posted = append(g.posted, f)
 	return g.fakeGH.PostReview(ctx, repo, n, sha, f, meta)
-}
-func (g *roundGH) CIStarted(context.Context, string, string) (bool, error) {
-	return g.ciUp == nil || *g.ciUp, nil
 }
 
 // roundRunner answers every reviewer call with out and keeps the prompts.
@@ -549,153 +545,6 @@ func TestPanewireBriefCarriesTheDelta(t *testing.T) {
 type clock struct{ t time.Time }
 
 func (c *clock) now() time.Time { return c.t }
-
-func stallSetup(t *testing.T) (*Service, *roundGH, *fakeNotifier, *clock, config.Repo) {
-	t.Helper()
-	s, g, _, n, r := setup(t)
-	s.Config.Notifier.Lane = "operator-desk"
-	c := &clock{t: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)}
-	s.Now = c.now
-	return s, &roundGH{fakeGH: g}, n, c, r
-}
-
-func TestStalledPRAlarmsOnce(t *testing.T) {
-	s, g, n, c, r := stallSetup(t)
-	s.GH = g
-	prs := []github.Pull{g.pull}
-	poll := func() {
-		t.Helper()
-		if e := s.CheckStalls(context.Background(), r, prs, Options{}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	poll()
-	c.t = c.t.Add(29 * time.Minute)
-	poll()
-	if n.count != 0 {
-		t.Fatalf("alarm inside the threshold: %v", n.events)
-	}
-	c.t = c.t.Add(2 * time.Minute)
-	poll()
-	if n.count != 1 {
-		t.Fatalf("want one alarm, got %v", n.events)
-	}
-	ev := n.events[0]
-	if ev.Lane != "operator-desk" || !strings.Contains(ev.Text, "STALLED review example/project#7 head=aaaaaaa") || !strings.Contains(ev.Text, "31m0s") || !strings.Contains(ev.Text, "threshold 30m0s") {
-		t.Fatal(ev)
-	}
-	c.t = c.t.Add(3 * time.Hour)
-	poll()
-	if n.count != 1 {
-		t.Fatalf("a stalled head alarms once, got %v", n.events)
-	}
-	// A restarted daemon keeps the clock and the sent record.
-	s2 := *s
-	if e := s2.CheckStalls(context.Background(), r, prs, Options{}); e != nil || n.count != 1 {
-		t.Fatal(e, n.events)
-	}
-	// A new head starts a new clock.
-	prs[0].Head.SHA = shaC
-	g.pull.Head.SHA = shaC
-	poll()
-	c.t = c.t.Add(31 * time.Minute)
-	poll()
-	if n.count != 2 || !strings.Contains(n.events[1].Text, "head=ccccccc") {
-		t.Fatal(n.events)
-	}
-}
-
-func TestReviewedOrNotReadyPRsDoNotAlarm(t *testing.T) {
-	s, g, n, c, r := stallSetup(t)
-	s.GH = g
-	started := false
-	reviewed := g.pull
-	reviewed.Number, reviewed.Head.SHA = 8, shaB
-	g.refs = map[string]bool{claimRef(8, shaB, 1): true}
-	draft := g.pull
-	draft.Number, draft.Draft = 9, true
-	noCI := g.pull
-	noCI.Number, noCI.Head.SHA = 10, shaD
-	prs := []github.Pull{reviewed, draft}
-	poll := func() {
-		t.Helper()
-		if e := s.CheckStalls(context.Background(), r, prs, Options{}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	poll()
-	c.t = c.t.Add(5 * time.Hour)
-	poll()
-	if n.count != 0 {
-		t.Fatalf("a claimed review or a draft must not alarm: %v", n.events)
-	}
-	// CI that has not started keeps the clock stopped.
-	g.ciUp = &started
-	prs = []github.Pull{noCI}
-	g.pull = noCI
-	poll()
-	c.t = c.t.Add(5 * time.Hour)
-	poll()
-	if n.count != 0 {
-		t.Fatalf("no CI yet must not alarm: %v", n.events)
-	}
-	// Once CI starts the clock starts then, not retroactively.
-	g.ciUp = nil
-	poll()
-	c.t = c.t.Add(29 * time.Minute)
-	poll()
-	if n.count != 0 {
-		t.Fatal(n.events)
-	}
-	c.t = c.t.Add(2 * time.Minute)
-	poll()
-	if n.count != 1 {
-		t.Fatal(n.events)
-	}
-}
-
-func TestStallAlarmSwitchesAndDryRun(t *testing.T) {
-	s, g, n, c, r := stallSetup(t)
-	s.GH = g
-	prs := []github.Pull{g.pull}
-	run := func(o Options) {
-		t.Helper()
-		if e := s.CheckStalls(context.Background(), r, prs, o); e != nil {
-			t.Fatal(e)
-		}
-		c.t = c.t.Add(time.Hour)
-		if e := s.CheckStalls(context.Background(), r, prs, o); e != nil {
-			t.Fatal(e)
-		}
-	}
-	run(Options{DryRun: true})
-	s.Config.Daemon.PR.StallAfter = "off"
-	run(Options{})
-	if n.count != 0 {
-		t.Fatalf("%v", n.events)
-	}
-	s.Config.Daemon.PR.StallAfter = "10m"
-	run(Options{Shadow: true})
-	if n.count != 1 || !strings.Contains(n.events[0].Text, "threshold 10m0s") {
-		t.Fatalf("shadow mode still alarms: %v", n.events)
-	}
-}
-
-func TestFailedStallAlarmRetries(t *testing.T) {
-	s, g, n, c, r := stallSetup(t)
-	s.GH = g
-	prs := []github.Pull{g.pull}
-	_ = s.CheckStalls(context.Background(), r, prs, Options{})
-	c.t = c.t.Add(time.Hour)
-	n.err = context.DeadlineExceeded
-	if e := s.CheckStalls(context.Background(), r, prs, Options{}); e == nil {
-		t.Fatal("a failed delivery is an error")
-	}
-	n.err = nil
-	if e := s.CheckStalls(context.Background(), r, prs, Options{}); e != nil || n.count != 1 {
-		t.Fatal(e, n.events)
-	}
-}
 
 func TestStallWindowConfig(t *testing.T) {
 	for _, tt := range []struct {

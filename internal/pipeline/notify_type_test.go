@@ -39,24 +39,24 @@ func notifyTypeReady(t *testing.T, authorLane bool) (first, reminder string) {
 	return n.events[0].Type, n.events[1].Type
 }
 
-func TestNotifyTypeBlockedReviewMissingOnlyIsProgress(t *testing.T) {
+func TestNotifyTypeBlockedKeepsBlockedOnAuthorLane(t *testing.T) {
 	s, g, n, sink, r, _ := deliverSetup(t)
 	sink.recs["w-7"] = integrations.JobRecord{Role: "worker", Label: "author-lane", OwnerLane: "operator-desk", State: "completed"}
 	sink.lanes["2481"] = "author-lane"
-	// (a) review_missing alone, (b) with a blocking finding, and the same
-	// reason carrying a block detail, which waits on the author.
-	for i, summary := range []string{"review_missing", "review_missing; blocking_findings:1", "review_missing (blocked: missing-task-trailer)"} {
-		g.pull.Head.SHA = []string{shaA, shaB, shaC}[i]
+	// A blocking finding and a review_missing carrying a block detail both wait
+	// on the author and stay blocked.
+	for i, summary := range []string{"blocking_findings:1", "review_missing (blocked: missing-task-trailer)"} {
+		g.pull.Head.SHA = []string{shaA, shaB}[i]
 		if _, _, _, e := s.laneEvent(context.Background(), r, g.pull, "blocked", summary); e != nil {
 			t.Fatal(e)
 		}
 	}
-	if n.count != 3 {
+	if n.count != 2 {
 		t.Fatal(n.events)
 	}
-	for i, want := range []string{"progress", "blocked", "blocked"} {
-		if n.events[i].Type != want || n.events[i].Lane != "author-lane" {
-			t.Fatalf("event %d: type %q lane %q, want %q: %+v", i, n.events[i].Type, n.events[i].Lane, want, n.events[i])
+	for i, e := range n.events {
+		if e.Type != "blocked" || e.Lane != "author-lane" {
+			t.Fatalf("event %d: type %q lane %q: %+v", i, e.Type, e.Lane, e)
 		}
 	}
 }

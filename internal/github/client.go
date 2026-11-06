@@ -3,6 +3,7 @@ package github
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -149,6 +150,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if cached.ETag == "" {
 			return nil, errUncached304
 		}
+		probeOf(ctx).note(cmp.Or(resp.Header.Get("ETag"), cached.ETag))
 		return append([]byte(nil), cached.Body...), nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -171,6 +173,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	}
 	if e == nil && !mutation {
 		c.cacheResponse(key, resp.Header.Get("ETag"), b, false)
+		if method == "GET" {
+			probeOf(ctx).note(resp.Header.Get("ETag"))
+		}
 	}
 	return b, e
 }
