@@ -53,6 +53,8 @@ type JobReader interface {
 
 var jobRecordID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
+func ValidJobRecordID(id string) bool { return jobRecordID.MatchString(id) }
+
 // Job returns the job's hk record through the same handoffkeep endpoint and
 // credentials the CLI sink uses (HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN, the CF
 // Access pair, or ~/.config/handoffkeep/config.env). The jobs API has no CLI
@@ -62,7 +64,7 @@ func (h Handoffkeep) Job(ctx context.Context, id string) (JobRecord, error) {
 	if h.Jobs != nil {
 		return h.Jobs.Job(ctx, id)
 	}
-	if !jobRecordID.MatchString(id) {
+	if !ValidJobRecordID(id) {
 		return JobRecord{}, errors.New("job ID invalid")
 	}
 	c, e := hkJobEndpoint()
