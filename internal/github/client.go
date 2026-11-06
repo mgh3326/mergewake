@@ -691,12 +691,25 @@ func oneLine(s string, limit int) string {
 	return s[:cut] + "…"
 }
 
+// OutsideBlockingCount is how many of findings are critical, high or blocking,
+// not advisory, and outside the diff: the count the review body's marker
+// carries for the gate.
+func OutsideBlockingCount(findings []Finding) int {
+	n := 0
+	for _, f := range findings {
+		if f.Anchor == AnchorOutside && blockingFinding(f.Severity) && !f.Advisory {
+			n++
+		}
+	}
+	return n
+}
+
 // OutsideDiffSection is the review-body list of findings whose path is not in
 // the diff, with the marker that carries the gate's count. It is empty when
 // there are none.
 func OutsideDiffSection(findings []Finding) string {
 	var lines []string
-	blocking := 0
+	blocking := OutsideBlockingCount(findings)
 	for _, f := range findings {
 		if f.Anchor != AnchorOutside {
 			continue
@@ -704,9 +717,6 @@ func OutsideDiffSection(findings []Finding) string {
 		severity := f.Severity
 		if severity == "" {
 			severity = "unspecified"
-		}
-		if blockingFinding(f.Severity) && !f.Advisory {
-			blocking++
 		}
 		lines = append(lines, fmt.Sprintf("- `%s:%d` (%s): %s", oneLine(f.Path, 200), f.Line, severity, oneLine(f.Body, outsideBodyLimit)))
 	}

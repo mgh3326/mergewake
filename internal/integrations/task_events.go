@@ -78,6 +78,15 @@ type ReviewRecord struct {
 	Low            int        `json:"low"`
 	StartedAt      *time.Time `json:"started_at,omitempty"`
 	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+	// Review-history fields (hk 3296). A nil pointer is "unknown" and is left
+	// out of the JSON: hk reads a missing field as unknown and an explicit
+	// false or 0 as a fact, so mergewake sends one only for a value it knows.
+	Reviewer            *string `json:"reviewer,omitempty"`
+	SameFamily          *bool   `json:"same_family,omitempty"`
+	Delta               *bool   `json:"delta,omitempty"`
+	Quiet               *bool   `json:"quiet,omitempty"`
+	OutsideDiffBlocking *int    `json:"outside_diff_blocking,omitempty"`
+	PatchDigest         *string `json:"patch_digest,omitempty"`
 }
 
 var (
@@ -102,6 +111,15 @@ func PatchID(s string) string {
 	return ""
 }
 
+// PatchDigest returns s when it is a digest hk takes for patch_digest (16 to
+// 128 lower-case hex digits), else "" (omitted).
+func PatchDigest(s string) string {
+	if hkPatchDigest.MatchString(s) {
+		return s
+	}
+	return ""
+}
+
 // Token normalises s to a short [a-z0-9_.-] token: lower-cased, every other
 // run of characters one "-", edges trimmed. "" when nothing is left.
 func Token(s string) string {
@@ -116,6 +134,8 @@ var (
 	hkPatchID = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 	hkToken   = regexp.MustCompile(`^[a-z0-9_.-]{1,64}$`)
 	hkProfile = regexp.MustCompile(`^[a-z0-9_.@-]{1,64}$`)
+	// hkPatchDigest is hk's rule for patch_digest, the digest half of a patch receipt.
+	hkPatchDigest = regexp.MustCompile(`^[0-9a-f]{16,128}$`)
 )
 
 // hk's bounds on a review record (handoffkeep internal/store/change_payload.go).
@@ -163,6 +183,19 @@ func (rv ReviewRecord) ForHK() (out ReviewRecord, cleared []string, drop string)
 	clear("executor", !validReviewText(rv.Executor), &rv.Executor)
 	clear("policy_revision", !validReviewText(rv.PolicyRevision), &rv.PolicyRevision)
 	clear("contract_source", !validReviewText(rv.ContractSource), &rv.ContractSource)
+	if rv.Reviewer != nil && (*rv.Reviewer == "" || !validReviewText(*rv.Reviewer)) {
+		rv.Reviewer = nil
+		cleared = append(cleared, "reviewer")
+	}
+	if rv.PatchDigest != nil && !hkPatchDigest.MatchString(*rv.PatchDigest) {
+		rv.PatchDigest = nil
+		cleared = append(cleared, "patch_digest")
+	}
+	if n := rv.OutsideDiffBlocking; n != nil && (*n < 0 || *n > maxReviewCount) {
+		v := min(max(*n, 0), maxReviewCount)
+		rv.OutsideDiffBlocking = &v
+		cleared = append(cleared, "outside_diff_blocking")
+	}
 	for name, n := range map[string]*int{"critical": &rv.Critical, "high": &rv.High, "medium": &rv.Medium, "low": &rv.Low} {
 		if *n < 0 || *n > maxReviewCount {
 			*n = min(max(*n, 0), maxReviewCount)
