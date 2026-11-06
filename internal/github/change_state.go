@@ -14,10 +14,12 @@ import (
 
 func (c *Client) ChangeWriter() changestate.Writer { return c.Changes }
 func (c *Client) ChangeCounts() changestate.Counts {
-	if c.Changes == nil {
-		return changestate.Counts{}
+	var counts changestate.Counts
+	if c.Changes != nil {
+		counts = c.Changes.Counts()
 	}
-	return c.Changes.Counts()
+	counts.Skipped = c.mergedStateSkipped.Load()
+	return counts
 }
 func (c *Client) WaitChanges(ctx context.Context) {
 	if c.Changes != nil {
@@ -35,14 +37,28 @@ func (c *Client) writePull(ctx context.Context, repo string, p Pull, at time.Tim
 		return
 	}
 	state := p.State
-	if p.Merged || p.MergedAt != nil {
+	merged := p.Merged || p.MergedAt != nil
+	if merged {
 		state = "merged"
+		// hk keeps the newest observation per section, so a merged write without
+		// merge_sha or merged_at would erase what an earlier write held. A source
+		// that lacks either (a cached or replayed body, a webhook payload) is read
+		// once past the cache; if GitHub still lacks it, no write is made and a
+		// later one fills it.
+		if p.MergeCommitSHA == "" || p.MergedAt == nil {
+			var fresh Pull
+			if e := c.json(pastCache(ctx), "GET", fmt.Sprintf("%s/pulls/%d", base(repo), p.Number), nil, &fresh); e == nil && fresh.MergeCommitSHA != "" && fresh.MergedAt != nil {
+				p.MergeCommitSHA, p.MergedAt = fresh.MergeCommitSHA, fresh.MergedAt
+			}
+		}
+		if p.MergeCommitSHA == "" || p.MergedAt == nil {
+			c.mergedStateSkipped.Add(1)
+			return
+		}
 	}
 	v := map[string]any{"head_sha": p.Head.SHA, "base_sha": p.Base.SHA, "base_ref": p.Base.Ref, "state": state, "draft": p.Draft, "title": p.Title, "author": p.User.Login, "observed_at": at, "source": source}
-	if p.MergeCommitSHA != "" {
+	if merged {
 		v["merge_sha"] = p.MergeCommitSHA
-	}
-	if p.MergedAt != nil {
 		v["merged_at"] = *p.MergedAt
 	}
 	if delivery != "" {
