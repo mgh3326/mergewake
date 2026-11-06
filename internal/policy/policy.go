@@ -383,6 +383,11 @@ type Policy struct {
 	// is set, watch dispatches it for a commit bisect needs but has no result
 	// for. Empty keeps the hold.
 	AnyRefWorkflow string `yaml:"any_ref_workflow"`
+	// AnyRefChecks names the checks bisect judges a candidate commit by: the
+	// ones the any-ref workflow reports. Unset means the whole watch set. Each
+	// name must be in the watch set. The newest main head is still judged by
+	// the whole watch set.
+	AnyRefChecks []string `yaml:"any_ref_checks"`
 	// AnyRefTimeout bounds the wait for one dispatched commit's result, as a
 	// Go duration. Empty means DefaultAnyRefTimeout.
 	AnyRefTimeout string `yaml:"any_ref_timeout"`
@@ -390,6 +395,24 @@ type Policy struct {
 
 // DefaultAnyRefTimeout is how long watch waits for one any-ref CI result.
 const DefaultAnyRefTimeout = 45 * time.Minute
+
+// WatchSet is the checks that judge the newest main head: watch_checks, else
+// required_checks.
+func (p Policy) WatchSet() []string {
+	if len(p.WatchChecks) > 0 {
+		return p.WatchChecks
+	}
+	return p.RequiredChecks
+}
+
+// BisectChecks is the checks that judge a bisect candidate: any_ref_checks,
+// else the watch set.
+func (p Policy) BisectChecks() []string {
+	if len(p.AnyRefChecks) > 0 {
+		return p.AnyRefChecks
+	}
+	return p.WatchSet()
+}
 
 // AnyRefWait returns the validated any_ref_timeout, or the default.
 func (p Policy) AnyRefWait() time.Duration {
@@ -431,6 +454,27 @@ func (p Policy) Validate() error {
 			return errors.New("watch_checks must be nonempty and unique")
 		}
 		watchSeen[n] = true
+	}
+	// An empty list is an error, not "unset": it would silently mean every
+	// candidate is judged by no check.
+	if p.AnyRefChecks != nil {
+		if len(p.AnyRefChecks) == 0 {
+			return errors.New("any_ref_checks must name at least one check")
+		}
+		inWatch := map[string]bool{}
+		for _, n := range p.WatchSet() {
+			inWatch[n] = true
+		}
+		anySeen := map[string]bool{}
+		for _, n := range p.AnyRefChecks {
+			switch {
+			case strings.TrimSpace(n) == "" || anySeen[n]:
+				return errors.New("any_ref_checks must be nonempty and unique")
+			case !inWatch[n]:
+				return fmt.Errorf("any_ref_checks: %q is not in the watch set (watch_checks, else required_checks)", n)
+			}
+			anySeen[n] = true
+		}
 	}
 	if w := p.AnyRefWorkflow; w != "" && (strings.TrimSpace(w) != w || strings.Contains(w, "/") || !(strings.HasSuffix(w, ".yml") || strings.HasSuffix(w, ".yaml"))) {
 		return fmt.Errorf("any_ref_workflow %q must be a workflow file name ending in .yml or .yaml", w)
