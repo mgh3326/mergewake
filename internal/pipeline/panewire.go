@@ -220,6 +220,12 @@ func olderHeadHolder(detail string, pr github.Pull, pass int) bool {
 	return ok && l.pr == pr.Number && l.pass == pass && !strings.HasPrefix(pr.Head.SHA, l.sha7)
 }
 
+// sweepReviewers closes the finished reviewer panes of an open PR through the
+// reviewer sweep of Reap. A variable so tests can stand in for the hosts.
+var sweepReviewers = func(ctx context.Context, s *Service, r config.Repo, n int, o Options) error {
+	return s.Reap(context.WithValue(ctx, reviewersOnlyKey{}, true), r, n, o)
+}
+
 // reapOlderHeadReviewers runs the reviewer sweep of the PR once per review run:
 // it closes the finished panes of earlier heads' reviewers, which frees the
 // hub's reservation. Anything it cannot do is left to the next evaluation.
@@ -230,13 +236,7 @@ func (x *panewireExecutor) reapOlderHeadReviewers(ctx context.Context) error {
 		return nil
 	}
 	x.swept = true
-	sweep := x.s.sweepReviewers
-	if sweep == nil {
-		sweep = func(ctx context.Context, r config.Repo, n int, o Options) error {
-			return x.s.Reap(context.WithValue(ctx, reviewersOnlyKey{}, true), r, n, o)
-		}
-	}
-	return sweep(ctx, x.repo, x.pr.Number, x.opts)
+	return sweepReviewers(ctx, x.s, x.repo, x.pr.Number, x.opts)
 }
 
 // parseQuotaStop reads an hk end_reason of the form

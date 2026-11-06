@@ -34,6 +34,14 @@ func retryOnce(t *testing.T, s *Service, g *fakeGH, r config.Repo) error {
 	return s.RetryReview(context.Background(), r, g.pull, Options{})
 }
 
+// stubSweep stands in for the reviewer sweep until the test ends.
+func stubSweep(t *testing.T, fn func(context.Context, int) error) {
+	t.Helper()
+	old := sweepReviewers
+	sweepReviewers = func(ctx context.Context, _ *Service, _ config.Repo, n int, _ Options) error { return fn(ctx, n) }
+	t.Cleanup(func() { sweepReviewers = old })
+}
+
 func noNotices(t *testing.T, s *Service) {
 	t.Helper()
 	if ev := s.Notifier.(*fakeNotifier).events; len(ev) != 0 {
@@ -69,11 +77,11 @@ func TestRetryHeldByOlderHeadReviewerSweepsAndRetries(t *testing.T) {
 	s, g, r, runner, _ := heldRetrySetup(t, holder, "")
 	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: []byte(`{"findings":[]}`)}
 	var swept []int
-	s.sweepReviewers = func(_ context.Context, _ config.Repo, n int, _ Options) error {
+	stubSweep(t, func(_ context.Context, n int) error {
 		swept = append(swept, n)
 		runner.refuse = nil // the hub frees the role once the pane is gone
 		return nil
-	}
+	})
 	if err := retryOnce(t, s, g, r); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +99,7 @@ func TestRetryHeldByOlderHeadReviewerSweepsAndRetries(t *testing.T) {
 func TestRetryHeldByOlderHeadStillHeldRetriesOnce(t *testing.T) {
 	s, g, r, runner, _ := heldRetrySetup(t, "mwr-7-7e8272c-p1-1700000000", "")
 	sweeps := 0
-	s.sweepReviewers = func(context.Context, config.Repo, int, Options) error { sweeps++; return fmt.Errorf("no hosts") }
+	stubSweep(t, func(context.Context, int) error { sweeps++; return fmt.Errorf("no hosts") })
 	if err := retryOnce(t, s, g, r); err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +125,10 @@ func TestRetryHeldByOtherHolderWaitsRetryAfter(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, r, runner, c := heldRetrySetup(t, holder, " retry_after_s=240")
-			s.sweepReviewers = func(context.Context, config.Repo, int, Options) error {
+			stubSweep(t, func(context.Context, int) error {
 				t.Fatal("swept for a holder that is not an older head of this pass")
 				return nil
-			}
+			})
 			if err := retryOnce(t, s, g, r); err != nil {
 				t.Fatal(err)
 			}
