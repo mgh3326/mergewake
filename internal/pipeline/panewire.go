@@ -239,20 +239,34 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if !acquired && (!resumed || leaseSHA == "" || rj.LeaseSHA != leaseSHA) {
 		return out, errPassPending
 	}
+	// A resumed pass reads its reviewer's hk record before it renews: a pass
+	// that is unreadable or stalled must not keep its lease alive, or a fresh
+	// pass would wait a whole TTL behind a record that cannot finish.
+	var rec integrations.JobRecord
+	var recErr error
+	if resumed {
+		rec, recErr = x.job(ctx, rj.Label)
+	}
 	if resumed && !acquired {
-		renewer, ok := s.GH.(interface {
-			RenewReviewLease(context.Context, string, string, string) (string, bool, error)
-		})
-		if !ok {
-			return out, errors.New("GitHub client cannot renew review leases")
-		}
-		var renewed bool
-		leaseSHA, renewed, e = renewer.RenewReviewLease(ctx, x.repo.Name, claimRef(pr.Number, pr.Head.SHA, plan.pass), leaseSHA)
+		renew, e := x.keepsLease(rec, recErr, rj)
 		if e != nil {
 			return out, e
 		}
-		if !renewed {
-			return out, errPassPending
+		if renew {
+			renewer, ok := s.GH.(interface {
+				RenewReviewLease(context.Context, string, string, string) (string, bool, error)
+			})
+			if !ok {
+				return out, errors.New("GitHub client cannot renew review leases")
+			}
+			var renewed bool
+			leaseSHA, renewed, e = renewer.RenewReviewLease(ctx, x.repo.Name, claimRef(pr.Number, pr.Head.SHA, plan.pass), leaseSHA)
+			if e != nil {
+				return out, e
+			}
+			if !renewed {
+				return out, errPassPending
+			}
 		}
 	}
 	if resumed {
@@ -353,7 +367,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			return out, err
 		}
 		overBudget := s.now().Sub(rj.Recorded) >= timeout
-		rec, e := x.job(ctx, label)
+		e := recErr
 		state := rec.State
 		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
 			finished, err := x.reviewerFinished(ctx, rec, rj)
@@ -399,6 +413,27 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// No job record means no hub claim to release: the record goes and the
 			// pass is replaced once.
 			return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job record missing past the review deadline", leaseSHA)
+		} else if hkReadFailed(e) {
+			// hk cannot answer for this job, which says nothing about the
+			// reviewer: its result may already sit on disk or on its host.
+			host := x.logJobReadError(rj, e)
+			b, found, err := x.availableFindings(ctx, plan, label, findingsPath)
+			if err != nil {
+				return out, err
+			}
+			if !found && host != "" {
+				b, _ = x.remoteFindings(ctx, plan, integrations.JobRecord{Host: host}, label)
+				found = b != nil
+			}
+			switch {
+			case found:
+				// The result stands in for the record, as a remote result does.
+				collected, remoteRecord, spawn = b, &integrations.JobRecord{Host: host}, false
+			case overBudget:
+				return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job unreadable in hk past the review deadline", leaseSHA)
+			case async:
+				return out, x.pending(revisit, rj, "unreadable in hk")
+			}
 		}
 		switch {
 		case e == nil && (state == "completed" || state == "escalated" || state == "lost"):
@@ -794,6 +829,52 @@ func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, lea
 	_ = x.s.audit(x.repo.Name, "review-lease-released", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "reason": reason}, false)
 }
 
+// hkReadFailed reports an hk job read that failed for a reason other than a
+// missing record or a sink that cannot read job records at all.
+func hkReadFailed(e error) bool {
+	return e != nil && !errors.Is(e, integrations.ErrJobNotFound) && !errors.Is(e, errJobRecords)
+}
+
+// keepsLease reports whether a resumed pass renews its lease this evaluation.
+// A pass whose hk record cannot be read, or whose live reviewer is past the
+// stale bound, lets the lease run down: renewing it would hold a fresh pass
+// off for a reviewer that cannot finish.
+func (x *panewireExecutor) keepsLease(rec integrations.JobRecord, recErr error, rj reviewerJob) (bool, error) {
+	if hkReadFailed(recErr) {
+		return false, nil
+	}
+	if recErr != nil || terminalJob(rec.State) {
+		return true, nil
+	}
+	bound, e := x.s.reviewerStaleAfter()
+	if e != nil {
+		return false, e
+	}
+	return x.s.now().Sub(rj.Recorded) <= bound, nil
+}
+
+// logJobReadError prints an hk read failure of a reviewer's job once per
+// (label, error text) and returns the host the reviewer was placed on, when its
+// record says: the spawn receipt names it.
+func (x *panewireExecutor) logJobReadError(rj reviewerJob, e error) string {
+	host := ""
+	if placement, ok := spawnPlacement(rj.Spawned); ok {
+		host = placement.Host
+	}
+	text := fleetevent.Redact(e.Error())
+	sum := sha256.Sum256([]byte(text))
+	key := fmt.Sprintf("%s %x", rj.Label, sum[:8])
+	sent, err := loadSentKeys(filepath.Join(x.s.state(x.repo.Name), "reviewer-read-error-logged"), 256)
+	if err == nil && sent.has(key) {
+		return host
+	}
+	if err == nil {
+		_ = sent.add(key)
+	}
+	_ = x.s.Print(map[string]any{"action": "review", "state": "hk-job-unreadable", "pr": x.pr.Number, "head": short7(x.pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "host": host, "error": text})
+	return host
+}
+
 // spawnedKeep bounds the spawn receipt kept on a reviewer record.
 const spawnedKeep = 4 << 10
 
@@ -852,6 +933,8 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	x.note("lost", rj)
 	if rj.Replacements >= 1 {
+		// No pass follows this record: its lease is released, not left to expire.
+		x.releaseLease(ctx, plan, leaseSHA, "reviewer-lost")
 		return out, fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)
 	}
 	plan.replacements = rj.Replacements + 1
