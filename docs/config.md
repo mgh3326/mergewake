@@ -1337,6 +1337,34 @@ which GitHub does not charge to the rate limit) and its busiest routes. The
 role's status file also records counts by method, route and response status.
 An HTTP status of `0` counts a request that received no response.
 
+#### Wake signals
+
+The `pr` role starts a pass for one of three reasons. The pass log line
+(`loop completed`) names it in its `wake` field: `webhook`, `reviewer` or
+`interval` (the first pass after a start counts as `interval`).
+
+| Signal | What it is | Earliest start after the last pass ended |
+| --- | --- | --- |
+| `webhook` | A signed GitHub delivery that names the role (see `min_gap`). | `min_gap` |
+| `reviewer` | A reviewer job of a recorded review finished. | 30 s (a constant) |
+| `interval` | The role's `interval`; it reconciles whatever the other two missed. | its schedule |
+
+The `reviewer` signal is a watch that runs while the `pr` role runs, whether or
+not the webhook receiver is enabled. Every 30 s it reads the hk job record of
+each live reviewer job recorded under the state directory's `reviewer-jobs/`
+(at most 50 per tick, each read bounded at 5 s). It makes no GitHub request.
+When a job is `completed`, `escalated` or `lost`, or its result is available, it
+marks that PR as changed (so the skip rule below does not leave it alone) and
+wakes the role, once per job; each such job logs one `reviewer watch: job
+finished` line with the repo, PR, label and state. A wake that arrives while a
+pass runs becomes one pass right after it. A reviewer wake never waits for
+`min_gap`, and a pending webhook wake that is still inside `min_gap` is pulled
+forward by it. If hk cannot be read, the watch logs one line per outage, wakes
+nothing and leaves the interval and webhook behaviour as it was.
+
+GitHub request volume is held down by skipping and caching, not by delaying the
+reaction to a finished review.
+
 #### Skipping unchanged PRs
 
 With the receiver enabled, the `pr` role leaves a PR alone when nothing has

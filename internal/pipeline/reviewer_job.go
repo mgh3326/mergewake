@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -208,3 +209,40 @@ func (x *panewireExecutor) reviewerStale(ctx context.Context, rj reviewerJob, st
 	}
 	return errors.Join(held, auditErr, e)
 }
+
+// RecordedReviewerJobs lists the reviewer jobs recorded for repo, in record
+// file order, for the daemon's reviewer watch. It reads only the state
+// directory. A record that cannot be read is skipped: the pass that owns it
+// reports it.
+func (s *Service) RecordedReviewerJobs(repo string) []daemon.WatchedJob {
+	paths, e := filepath.Glob(filepath.Join(s.state(repo), "reviewer-jobs", "*-p*.json"))
+	if e != nil {
+		return nil
+	}
+	var out []daemon.WatchedJob
+	for _, path := range paths {
+		var rj reviewerJob
+		if _, e = fsutil.ReadJSON(path, &rj); e != nil || rj.Label == "" || rj.PR <= 0 {
+			continue
+		}
+		out = append(out, daemon.WatchedJob{Repo: repo, PR: rj.PR, Pass: rj.Pass, Label: rj.Label})
+	}
+	return out
+}
+
+// ReviewerJobView reads one reviewer job's hk record by label. It makes no
+// GitHub request.
+func (s *Service) ReviewerJobView(ctx context.Context, label string) (daemon.JobView, error) {
+	jr, ok := s.Sink.(integrations.JobReader)
+	if !ok {
+		return daemon.JobView{}, errJobRecords
+	}
+	rec, e := jr.Job(ctx, label)
+	if e != nil {
+		return daemon.JobView{}, e
+	}
+	return daemon.JobView{State: rec.State, HasResult: len(rec.Result) > 0}, nil
+}
+
+// IsJobNotFound reports a reviewer job with no hk record yet.
+func IsJobNotFound(e error) bool { return errors.Is(e, integrations.ErrJobNotFound) }
