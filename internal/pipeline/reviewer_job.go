@@ -133,8 +133,8 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 	return slices.Clone(x.movedHead)
 }
 
-// closeReviewerJob closes a reviewer job as abandoned so its hub reservation
-// is released, as best effort: the daemon's host often cannot close a job whose
+// closeReviewerJob closes a reviewer job with the given outcome so its hub
+// reservation is released, as best effort: the daemon's host often cannot close a job whose
 // pane ran elsewhere (no local events, no claim for the lane). The owner lane
 // is the hk record's, else the --owner of the recorded spawn arguments, else
 // the configured one. A close that cannot run or fails is audited as
@@ -142,7 +142,7 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 // hub frees the reservation itself when the job ends, and a spawn it still
 // holds is refused as reviewer-held. Only a cancelled context or a failed
 // audit write is an error.
-func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, reason string) (bool, error) {
+func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, outcome, reason string) (bool, error) {
 	s, cfg := x.s, x.s.Config.Review.Panewire
 	lane := job.OwnerLane
 	if i := slices.Index(rj.Args, "--owner"); lane == "" && i >= 0 && i+1 < len(rj.Args) {
@@ -153,7 +153,7 @@ func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob,
 	}
 	skipped := "no owner lane"
 	if lane != "" {
-		_, e := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", lane, "--outcome", "abandoned", "--reason", reason}, "", "")
+		_, e := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", lane, "--outcome", outcome, "--reason", reason}, "", "")
 		if e == nil {
 			return true, nil
 		}
@@ -182,7 +182,7 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	case terminalJob(job.State):
 		return nil
 	}
-	closed, e := x.closeReviewerJob(ctx, rj, job, "PR head moved")
+	closed, e := x.closeReviewerJob(ctx, rj, job, "abandoned", "PR head moved")
 	if e != nil || !closed {
 		return e
 	}
@@ -192,6 +192,19 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	}
 	x.mu.Unlock()
 	return s.audit(x.repo.Name, "reviewer-head-moved", map[string]any{"pr": pr.Number, "old_head": rj.Head, "new_head": pr.Head.SHA, "label": rj.Label}, false)
+}
+
+// closeCollectedJob closes the hk job of a reviewer whose findings mergewake
+// collected and accepted but which never ran `panewire done`, so the hub frees
+// its reservation at once instead of holding it for the grace period. A job
+// with no hk record, or one already terminal, holds nothing and is left alone.
+// It is best effort: closeReviewerJob audits a close that cannot run.
+func (x *panewireExecutor) closeCollectedJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord) error {
+	if job.State == "" || terminalJob(job.State) {
+		return nil
+	}
+	_, e := x.closeReviewerJob(ctx, rj, job, "completed", "result collected by mergewake")
+	return e
 }
 
 func (x *panewireExecutor) saveReviewerJob(rj reviewerJob) error {

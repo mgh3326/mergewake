@@ -67,8 +67,9 @@ func TestReviewerLaneErrorJobResultCollected(t *testing.T) {
 	if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.closes) != 0 || len(runner.spawns) != 1 || len(g.postedFindings) != 1 || g.postedFindings[0].Body != "A concrete bug" {
-		t.Fatalf("closes=%v spawns=%d posted=%+v", runner.closes, len(runner.spawns), g.postedFindings)
+	collectedClosedOnce(t, runner, old.Label)
+	if len(runner.spawns) != 1 || len(g.postedFindings) != 1 || g.postedFindings[0].Body != "A concrete bug" {
+		t.Fatalf("spawns=%d posted=%+v", len(runner.spawns), g.postedFindings)
 	}
 	laneAudit(t, s, auditRows(t, s, repo, "reviewer-lane-unreadable"))
 }
@@ -88,8 +89,9 @@ func TestReviewerLaneErrorLocalFileCollected(t *testing.T) {
 	if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.closes) != 0 || len(runner.spawns) != 1 || len(g.postedFindings) != 1 || g.postedFindings[0].Body != "Found locally" {
-		t.Fatalf("closes=%v spawns=%d posted=%+v", runner.closes, len(runner.spawns), g.postedFindings)
+	collectedClosedOnce(t, runner, old.Label)
+	if len(runner.spawns) != 1 || len(g.postedFindings) != 1 || g.postedFindings[0].Body != "Found locally" {
+		t.Fatalf("spawns=%d posted=%+v", len(runner.spawns), g.postedFindings)
 	}
 	laneAudit(t, s, auditRows(t, s, repo, "reviewer-lane-unreadable"))
 }
