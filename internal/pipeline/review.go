@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
@@ -124,6 +125,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		// changed_files and the files list disagree just after a push: no
 		// usable data this round. The retry loop treats this sentinel as a
 		// skip, not a failure.
+		daemon.PhasesOf(ctx).Settling("review_files_settling")
 		return fmt.Errorf("PR file list is settling: %w", github.ErrPollSkipped)
 	}
 	history, e := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)

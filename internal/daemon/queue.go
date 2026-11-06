@@ -59,6 +59,9 @@ type Work struct {
 	Expired bool
 	// Over says the item started past Cap as an urgent one.
 	Over bool
+	// Phases is where Run records the time it spends per phase; the queue logs
+	// it with the evaluation. It is never nil in a Work the queue starts.
+	Phases *Phases
 }
 
 // Queue evaluates one PR per event. Items are (repo, PR); an item that is
@@ -84,7 +87,9 @@ type Queue struct {
 	// After runs f once d has passed and returns a stop func; nil means
 	// time.AfterFunc. Tests replace it with a clock they move.
 	After func(d time.Duration, f func()) (stop func() bool)
-	Log   *slog.Logger
+	// Seen, when set, notes the head a delivery names when the delivery arrives.
+	Seen *HeadSeen
+	Log  *slog.Logger
 
 	mu      sync.Mutex
 	changed *sync.Cond
@@ -268,6 +273,10 @@ func (q *Queue) add(src Source, k PRKey) {
 // else every known open PR whose head is sha. A PR named with its head is
 // remembered under it.
 func (q *Queue) EnqueueNamed(src Source, repo string, number int, sha string) {
+	// Before the queue's lock: the note is a file write.
+	if src == SourceWebhook && number > 0 {
+		q.Seen.Delivered(repo, number, sha, q.now())
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
@@ -512,13 +521,14 @@ func (q *Queue) start(e *entry, over bool) {
 	e.state, e.over = running, over
 	waited := q.now().Sub(e.at)
 	st.waitMax = max(st.waitMax, waited)
-	w := Work{Key: e.key, Sources: slices.Clone(e.sources), Waited: waited, Known: e.prio == prioKnown, Priority: e.pri, Detail: e.detail, Expired: e.prio == prioExpired, Over: over}
+	w := Work{Key: e.key, Sources: slices.Clone(e.sources), Waited: waited, Known: e.prio == prioKnown, Priority: e.pri, Detail: e.detail, Expired: e.prio == prioExpired, Over: over, Phases: newPhases(q.now)}
 	ctx := q.ctx
 	q.wg.Add(1)
 	go func() {
 		defer q.wg.Done()
 		began := q.now()
 		q.Run(ctx, w)
+		w.Phases.End()
 		q.finish(e, w, q.now().Sub(began))
 	}()
 }
@@ -528,7 +538,7 @@ func (q *Queue) finish(e *entry, w Work, took time.Duration) {
 	for i, s := range w.Sources {
 		srcs[i] = string(s)
 	}
-	q.logger().Info("pr evaluated", "repo", e.key.Repo, "pr", e.key.PR, "source", strings.Join(srcs, "+"), "queue_wait_ms", w.Waited.Milliseconds(), "eval_ms", took.Milliseconds())
+	q.logger().Info("pr evaluated", append([]any{"repo", e.key.Repo, "pr", e.key.PR, "source", strings.Join(srcs, "+"), "queue_wait_ms", w.Waited.Milliseconds(), "eval_ms", took.Milliseconds()}, w.Phases.attrs()...)...)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	st := q.repo(e.key.Repo)

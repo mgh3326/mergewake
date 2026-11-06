@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -474,11 +475,24 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// The recorded arguments keep --wait, so a run that waits replays the
 		// same request; an event-driven run places the reviewer and returns.
+		phases := daemon.PhasesOf(ctx)
+		var spawnTook time.Duration
+		defer func() { phases.Spawned(spawnTook) }()
 		launch := func(c context.Context, a []string) ([]byte, error) {
 			if async {
 				a = placeOnly(a)
 			}
+			began := phases.Now()
+			defer func() { spawnTook += phases.Now().Sub(began) }()
 			return s.Runner.Run(c, cfg.Command, a, "", "")
+		}
+		// The spawn is accepted once panewire placed the reviewer: its call
+		// returned, or its wait ended on a pane that runs on. A resumed job was
+		// placed by an earlier evaluation.
+		accepted := func() {
+			if !resumed {
+				headLatencyOf(ctx).spawnAccepted(plan.pass, phases.Now())
+			}
 		}
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
 		stdout, e = launch(runCtx, args)
@@ -556,12 +570,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// The job was spawned and may still run: the record stays and the
 			// next run resumes it rather than spawning another reviewer.
 			if resumed || code == panewireWaitTimeout {
+				accepted()
 				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
 			res.skips[len(res.skips)-1].withCause(e)
 			return res, skipErr
 		}
+		accepted()
 		if async {
 			// The reviewer is placed and runs on. Its record keeps the spawn's
 			// receipt for the pass that collects it; the pane and its checkout
