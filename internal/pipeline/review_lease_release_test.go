@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // hookRunner runs before each panewire spawn, to stand in for another host.
@@ -21,16 +23,19 @@ func (h *hookRunner) Run(ctx context.Context, command string, args []string, inp
 	return h.panewireRunner.Run(ctx, command, args, input, dir)
 }
 
+// leaseHeld reports whether the pass lease is still live: a released lease keeps
+// its branch but is stamped expired.
 func leaseHeld(g *fakeGH, pass int) bool {
 	fakeGHMu.Lock()
 	defer fakeGHMu.Unlock()
-	return g.refs[claimRef(7, shaA, pass)]
+	_, active, _ := g.lease(claimRef(7, shaA, pass), time.Hour)
+	return active
 }
 
 func assertLeaseReleased(t *testing.T, s *Service, g *fakeGH, r config.Repo, runner *panewireRunner, reason string) {
 	t.Helper()
 	if leaseHeld(g, 1) {
-		t.Fatal("the pass lease is still held after a spawn that placed no pane")
+		t.Fatal("the pass lease is still live after a spawn that placed no pane")
 	}
 	rows := auditRows(t, s, r, "review-lease-released")
 	if len(rows) != 1 || rows[0]["pr"] != float64(7) || rows[0]["head"] != shaA || rows[0]["pass"] != float64(1) || rows[0]["reason"] != reason {
@@ -90,7 +95,16 @@ func TestLeaseReleaseSkipsRenewedLease(t *testing.T) {
 // (d) A wait that timed out after the spawn was accepted may still land a
 // pane: the lease stays.
 func TestLeaseReleaseKeepsLeaseOnWaitTimeout(t *testing.T) {
-	s, g, r, _, _ := interruptedReviewer(t)
+	runner := &panewireRunner{family: "openai", exits: []int{panewireWaitTimeout}}
+	s, g, r := panewireSetup(t, runner)
+	s.Config.Notifier.Lane = "desk"
+	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d", len(runner.spawns))
+	}
 	if !leaseHeld(g, 1) {
 		t.Fatal("the lease of a spawn whose pane may land was released")
 	}

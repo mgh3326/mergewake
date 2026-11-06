@@ -531,7 +531,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, errSecretLikeBrief
 			}
 			// A fresh spawn that ended before any pane exists left nothing to
-			// wait for: the pass lease goes with it, so the next run starts the
+			// wait for: the pass lease is expired, so the next run starts the
 			// pass at once instead of waiting out the lease. An exit that may
 			// follow a placed pane, such as a timed-out wait, keeps the lease.
 			if reason, never := spawnNeverPlaced(code); never && !resumed && ctx.Err() == nil {
@@ -707,8 +707,9 @@ func spawnNeverPlaced(code int) (string, bool) {
 	return "", false
 }
 
-// releaseLease deletes the lease branch this run took, only while it still
-// points at leaseSHA, so a lease another host renewed stays. It is best effort:
+// releaseLease expires the lease this run took, only while the branch still
+// sits at leaseSHA (a compare-and-swap), so a lease another host renewed stays.
+// It is best effort:
 // when the release fails the lease expires by its TTL, as it did before.
 func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, leaseSHA, reason string) {
 	releaser, ok := x.s.GH.(interface {

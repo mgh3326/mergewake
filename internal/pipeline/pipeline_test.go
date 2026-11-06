@@ -292,9 +292,11 @@ func (g *fakeGH) ReleaseReviewLease(_ context.Context, _ string, branch, expecte
 	if !g.refs[branch] || expected != current {
 		return false, nil
 	}
-	delete(g.refs, branch)
-	delete(g.leaseIDs, branch)
-	delete(g.leaseTimes, branch)
+	if g.leaseIDs == nil {
+		g.leaseIDs = make(map[string]string)
+	}
+	g.leaseTimes[branch] = time.Unix(0, 0)
+	g.leaseIDs[branch] = current + "r"
 	return true, nil
 }
 func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.ReviewFeedback, error) {
