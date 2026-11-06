@@ -321,18 +321,22 @@ func (n *laneFailNotifier) Notify(_ context.Context, e integrations.Event) error
 	return n.err
 }
 
-// A PR whose resolved lane refuses the event is retried once on the fallback
-// lane; a verdict that still cannot be delivered is parked with one logged
-// decision instead of failing every loop.
+// A notice that keeps the general lane rules (here a BLOCKED no author action
+// owns) whose lane refuses the event is retried once on the fallback lane; a
+// verdict that still cannot be delivered is parked with one logged decision
+// instead of failing every loop. A worker-only READY or MERGED is parked
+// without a fallback (TestWorkerLaneDeliveryFailureDoesNotFallBack).
 func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 	s, g, _, r := notifySetup(t)
 	n := &laneFailNotifier{fail: map[string]error{"task-lane": errors.New("exit status 2: unknown lane")}}
 	s.Notifier = n
 	s.Config.Notifier.FallbackLane = "config-lane"
+	g.findings = 1
 	g.pull.Body = "Mergewake-Task: 42"
 	s.Sink = &jobSink{
-		jobs: map[string]string{"42": "w-7"},
-		recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
+		lanes: map[string]string{"42": "task-lane"},
+		jobs:  map[string]string{"42": "w-7"},
+		recs:  map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
 	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
@@ -355,10 +359,12 @@ func TestNotifyDeliveryFailureFallbackAndPark(t *testing.T) {
 	s, g, _, r = notifySetup(t)
 	n = &laneFailNotifier{err: errors.New("panewire failed: exit status 2")}
 	s.Notifier = n
+	g.findings = 1
 	g.pull.Body = "Mergewake-Task: 42"
 	s.Sink = &jobSink{
-		jobs: map[string]string{"42": "w-7"},
-		recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
+		lanes: map[string]string{"42": "task-lane"},
+		jobs:  map[string]string{"42": "w-7"},
+		recs:  map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "task-lane"}},
 	}
 	for i := 0; i < 3; i++ {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
