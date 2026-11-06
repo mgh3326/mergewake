@@ -43,6 +43,9 @@ type reviewerJob struct {
 	Args         []string  `json:"args"`
 	Recorded     time.Time `json:"recorded"`
 	Replacements int       `json:"replacements,omitempty"`
+	// Spawned is the spawn's stdout, kept when the spawn did not wait: the
+	// pass that later collects the result closes the pane from its placement.
+	Spawned string `json:"spawned,omitempty"`
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {
@@ -210,6 +213,22 @@ func withWaitTimeout(args []string, wait time.Duration) []string {
 			secs = recorded
 		}
 		out[i+1] = strconv.Itoa(secs)
+	}
+	return out
+}
+
+// placeOnly returns args without --wait and --wait-timeout: the spawn
+// places the reviewer and returns.
+func placeOnly(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--wait":
+		case "--wait-timeout":
+			i++
+		default:
+			out = append(out, args[i])
+		}
 	}
 	return out
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
@@ -39,6 +40,9 @@ type prEngine struct {
 	log     *slog.Logger
 	onMerge pipeline.MergeHook
 	q       *daemon.Queue
+	// revisit is set when the reviewer watch can see reviewers finish: the
+	// pr role then starts reviewers without waiting for them.
+	revisit pipeline.Revisit
 
 	mu       sync.Mutex
 	settling map[string]*sync.Mutex
@@ -68,6 +72,13 @@ func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, rep
 	// set, else all of them; a priority-1 PR also starts past the bound, up to
 	// urgentExtra more at once.
 	e.q = &daemon.Queue{Cap: s.Config.Daemon.PR.Parallel(), Extra: urgentExtra, Run: e.run, Lookup: e.lookup, Grace: reviewPriorityGrace, Log: log}
+	// The reviewer watch reads hk job records. A sink that cannot read them
+	// never reports a finished reviewer, so the passes keep a bounded wait.
+	if _, ok := s.Sink.(integrations.JobReader); ok {
+		e.revisit = func(repo string, pr int, label string, at time.Time) {
+			e.q.EnqueueAt(daemon.SourceTimer, repo, pr, label, at)
+		}
+	}
 	return e
 }
 
@@ -124,6 +135,9 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 	defer tracing.Finish(transaction)
 	ctx, requests := github.ContinueRequests(ctx, "pr")
 	ctx = pipeline.WithMergeHook(ctx, e.onMerge)
+	if e.revisit != nil {
+		ctx = pipeline.WithRevisit(ctx, e.revisit)
+	}
 	ctx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 	tracing.Tag(repoSpan, "repo", r.Name)
 	defer tracing.Finish(repoSpan)

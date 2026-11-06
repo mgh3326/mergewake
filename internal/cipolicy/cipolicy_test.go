@@ -297,3 +297,37 @@ jobs:
 		})
 	}
 }
+
+// github.head_ref is empty on push, so the common PR-template group falls back
+// to a per-run value and cancels nothing on main: it must warn even with
+// cancel-in-progress: true. Groups that are per run or per commit warn too.
+func TestCIPolicyHeadRefGroupIsNotPerRef(t *testing.T) {
+	for name, group := range map[string]string{
+		"head_ref or run_id": "${{ github.workflow }}-${{ github.head_ref || github.run_id }}",
+		"head_ref only":      "ci-${{ github.head_ref }}",
+		"ref and sha":        "ci-${{ github.ref }}-${{ github.sha }}",
+		"ref and run_id":     "ci-${{ github.ref }}-${{ github.run_id }}",
+		"literal":            "ci",
+	} {
+		t.Run(name, func(t *testing.T) {
+			wf := strings.Replace(goodCI, "ci-${{ github.ref }}", group, 1)
+			r := Check(input(t, polOK, map[string]string{"ci.yml": wf, "ci-any-ref.yml": anyRef}))
+			if r.Verdict != Warn || r.Workflows[0].Concurrency.PerRef || !hasReason(r, "is not per ref") {
+				t.Fatalf("%+v", r)
+			}
+		})
+	}
+	for name, group := range map[string]string{
+		"ref":                   "ci-${{ github.ref }}",
+		"ref_name":              "${{ github.workflow }}-${{ github.ref_name }}",
+		"push ref, else run_id": "ci-${{ github.event_name == 'push' && github.ref || github.run_id }}",
+	} {
+		t.Run("ok "+name, func(t *testing.T) {
+			wf := strings.Replace(goodCI, "ci-${{ github.ref }}", group, 1)
+			r := Check(input(t, polOK, map[string]string{"ci.yml": wf, "ci-any-ref.yml": anyRef}))
+			if r.Verdict != OK {
+				t.Fatalf("%+v", r)
+			}
+		})
+	}
+}

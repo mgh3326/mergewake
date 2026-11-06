@@ -272,7 +272,28 @@ func judge(w Workflow) (bool, string) {
 	return false, reason
 }
 
-var perRef = regexp.MustCompile(`\bgithub\.(ref|ref_name|head_ref)\b`)
+// refKey is a ref value that is set on push events. github.head_ref is not: it
+// is empty on push, so a group built from it falls back to the rest of the
+// expression for every push.
+var refKey = regexp.MustCompile(`\bgithub\.(ref|ref_name)\b`)
+
+// uniqueKey is an expression that is one value per run or commit.
+var uniqueKey = regexp.MustCompile(`^\s*\$\{\{\s*github\.(run_id|run_number|run_attempt|sha)\s*\}\}\s*$`)
+
+// perRefGroup reports whether a concurrency group puts pushes to one ref in
+// one group: it names a push-valid ref and no segment of it is a bare per-run
+// or per-commit value.
+func perRefGroup(group string) bool {
+	if !refKey.MatchString(group) {
+		return false
+	}
+	for _, e := range expr.FindAllString(group, -1) {
+		if uniqueKey.MatchString(e) {
+			return false
+		}
+	}
+	return true
+}
 
 func concurrencyOf(n *yaml.Node) Concurrency {
 	c := Concurrency{CancelInProgress: CancelMissing}
@@ -291,7 +312,7 @@ func concurrencyOf(n *yaml.Node) Concurrency {
 			c.CancelInProgress = cancelValue(v)
 		}
 	}
-	c.PerRef = perRef.MatchString(c.Group)
+	c.PerRef = perRefGroup(c.Group)
 	return c
 }
 

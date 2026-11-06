@@ -39,7 +39,7 @@ Each report lists:
 
 ### What the checker can and cannot tell
 
-A group is "per ref" when its expression contains `github.ref`, `github.ref_name` or `github.head_ref`. A constant group such as `ci-main`, or one that never names the ref, is reported as not per ref even when the workflow only runs on one branch.
+A group is "per ref" when it contains `github.ref` or `github.ref_name`, the ref values that are set on push, and none of its `${{ }}` segments is a bare `github.run_id`, `github.run_number`, `github.run_attempt` or `github.sha` (one group per run or commit). `github.head_ref` does not count: it is empty on push, so `${{ github.workflow }}-${{ github.head_ref || github.run_id }}` gives every push its own group and cancels nothing. A constant group such as `ci-main`, or one that never names the ref, is reported as not per ref even when the workflow only runs on one branch.
 
 A workflow is "push to the branch" when its `on:` block lists `push` and its `branches` / `branches-ignore` filter admits the branch. A workflow "produces a watched check" when a job's check name matches a watched check: the job `name` (else its id), `name (matrix values)` for a matrix job, `name / inner` for a reusable-workflow job. A job name made only of expressions cannot be resolved without running the workflow; a quoted string inside it that equals a watched check (for example `ci-ok` in `${{ cond && 'ci-ok' || 'other' }}`) is taken as that check, and otherwise the workflow is reported `unknown` and, if its concurrency is not compliant, it still warns, with the reason saying so. Only the workflow-level `concurrency` block is read; a job-level block is not counted. A check that comes from a commit status, not from a workflow job, is not seen.
 

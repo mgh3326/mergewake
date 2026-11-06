@@ -114,6 +114,11 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 			if e = s.endAnyRef(r.Name); e != nil {
 				return e
 			}
+			if !result.Shadow {
+				if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
+					return e
+				}
+			}
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
