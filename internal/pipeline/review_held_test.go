@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ func heldRetrySetup(t *testing.T, holder, extra string) (*Service, *fakeGH, conf
 	c := &clock{t: time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)}
 	s.Now = c.now
 	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "30m", Failures: 3}
+	s.Config.Reap.Enabled, s.Config.Reap.Act = true, true
 	return s, g, r, runner, c
 }
 
@@ -94,24 +96,100 @@ func TestRetryHeldByOlderHeadReviewerSweepsAndRetries(t *testing.T) {
 	noNotices(t, s)
 }
 
-// An older-head holder whose pane the sweep could not free refuses the retry
-// too: one retry per evaluation, no failure, and the sweep runs once per run.
-func TestRetryHeldByOlderHeadStillHeldRetriesOnce(t *testing.T) {
+// A failed sweep is audited and leaves the evaluation held: no second spawn,
+// no failure, and the sweep runs once per run.
+func TestRetryHeldByOlderHeadSweepFailsLeavesHold(t *testing.T) {
 	s, g, r, runner, _ := heldRetrySetup(t, "mwr-7-7e8272c-p1-1700000000", "")
 	sweeps := 0
 	stubSweep(t, func(context.Context, int) error { sweeps++; return fmt.Errorf("no hosts") })
 	if err := retryOnce(t, s, g, r); err != nil {
 		t.Fatal(err)
 	}
-	if sweeps != 1 || len(runner.spawns) != 2 {
+	if sweeps != 1 || len(runner.spawns) != 1 {
 		t.Fatalf("sweeps=%d spawns=%d", sweeps, len(runner.spawns))
 	}
 	if st := retryStateOf(t, s, r); st.Failures != 0 || st.Backoffs != 0 {
 		t.Fatalf("state=%+v", st)
 	}
-	if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) != 1 {
-		t.Fatalf("sweep failure audit: %v", rows)
+	if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) == 0 {
+		t.Fatalf("sweep failure not audited")
 	}
+}
+
+// Passes of one run share the sweep and its outcome.
+func TestReapOlderHeadReviewersSharesOutcome(t *testing.T) {
+	s, g, r, _, _ := heldRetrySetup(t, otherPRHolder, "")
+	sweeps := 0
+	boom := fmt.Errorf("hosts down")
+	stubSweep(t, func(context.Context, int) error { sweeps++; return boom })
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, opts: Options{}}
+	for i := 0; i < 3; i++ {
+		if err := x.reapOlderHeadReviewers(context.Background()); err != boom {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if sweeps != 1 {
+		t.Fatalf("sweeps=%d", sweeps)
+	}
+}
+
+// Where Reap does not act (disabled, or observe-only) the sweep is not tried,
+// no second spawn follows, and no failure row is written: the hold waits.
+func TestRetryHeldSweepNeedsReapEnabledAndAct(t *testing.T) {
+	for name, set := range map[string]func(*config.Reap){
+		"disabled":     func(c *config.Reap) { c.Enabled = false },
+		"observe-only": func(c *config.Reap) { c.Act = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, g, r, runner, _ := heldRetrySetup(t, "mwr-7-7e8272c-p1-1700000000", "")
+			set(&s.Config.Reap)
+			stubSweep(t, func(context.Context, int) error {
+				t.Fatal("swept where reap cannot act")
+				return nil
+			})
+			if err := retryOnce(t, s, g, r); err != nil {
+				t.Fatal(err)
+			}
+			if st := retryStateOf(t, s, r); st.Failures != 0 || st.Backoffs != 0 || len(runner.spawns) != 1 {
+				t.Fatalf("state=%+v spawns=%d", st, len(runner.spawns))
+			}
+			if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) != 0 {
+				t.Fatalf("misleading audit: %v", rows)
+			}
+		})
+	}
+}
+
+// flipRunner runs panewireRunner and calls onHeld after a held refusal.
+type flipRunner struct {
+	*panewireRunner
+	onHeld func()
+}
+
+func (f *flipRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	out, err := f.panewireRunner.Run(ctx, command, args, input, dir)
+	if command == "panewire" && exitStatus(err) == panewireHeld {
+		f.onHeld()
+	}
+	return out, err
+}
+
+// A held refusal whose older-head job cannot be re-closed (hk unreadable)
+// stays a hold: no failure, no backoff, no escalation.
+func TestRetryHeldCloseFailureStaysAHold(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld, panewireHeld}}
+	s, g, r, _ := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
+	s.Runner = &flipRunner{runner, func() { runner.sink.jobErr = errors.New("hk unreachable") }}
+	c := &clock{t: time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)}
+	s.Now = c.now
+	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "30m", Failures: 1}
+	if err := retryOnce(t, s, g, r); err != nil {
+		t.Fatalf("err=%v: a held refusal must not fail the review", err)
+	}
+	if st := retryStateOf(t, s, r); st.Failures != 0 || st.Backoffs != 0 || st.Escalated {
+		t.Fatalf("state=%+v", st)
+	}
+	noNotices(t, s)
 }
 
 // (c) A holder of another PR, another pass or the same head is not closed; the

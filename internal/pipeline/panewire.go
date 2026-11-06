@@ -134,8 +134,9 @@ type panewireExecutor struct {
 	mu           sync.Mutex    // guards movedHead: the passes of a head run concurrently
 	jobMu        sync.Mutex    // one pass at a time closes the records of older heads
 	opts         Options
-	sweepMu      sync.Mutex // guards swept: one reviewer sweep per run
+	sweepMu      sync.Mutex // guards swept and sweepErr: one reviewer sweep per run
 	swept        bool
+	sweepErr     error
 }
 
 type reviewResultLost struct {
@@ -226,17 +227,26 @@ var sweepReviewers = func(ctx context.Context, s *Service, r config.Repo, n int,
 	return s.Reap(context.WithValue(ctx, reviewersOnlyKey{}, true), r, n, o)
 }
 
-// reapOlderHeadReviewers runs the reviewer sweep of the PR once per review run:
-// it closes the finished panes of earlier heads' reviewers, which frees the
-// hub's reservation. Anything it cannot do is left to the next evaluation.
+// errSweepCannotAct is why no sweep ran: reap is disabled or does not act.
+var errSweepCannotAct = errors.New("reviewer sweep needs reap.enabled and reap.act")
+
+// reapOlderHeadReviewers runs the reviewer sweep of the PR once per review run
+// and returns its outcome to every pass: it closes the finished panes of
+// earlier heads' reviewers, which frees the hub's reservation. It acts only
+// where Reap does (reap.enabled and reap.act); otherwise it returns
+// errSweepCannotAct and the caller leaves the hold to the next evaluation.
 func (x *panewireExecutor) reapOlderHeadReviewers(ctx context.Context) error {
 	x.sweepMu.Lock()
 	defer x.sweepMu.Unlock()
-	if x.swept {
-		return nil
+	if !x.swept {
+		x.swept = true
+		if reap := x.s.Config.Reap; !reap.Enabled || !reap.Act {
+			x.sweepErr = errSweepCannotAct
+		} else {
+			x.sweepErr = sweepReviewers(ctx, x.s, x.repo, x.pr.Number, x.opts)
+		}
 	}
-	x.swept = true
-	return sweepReviewers(ctx, x.s, x.repo, x.pr.Number, x.opts)
+	return x.sweepErr
 }
 
 // parseQuotaStop reads an hk end_reason of the form
@@ -681,7 +691,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				for _, old := range x.movedHeadJobs() {
 					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
 				}
-				return out, errors.Join(e, closeErr)
+				// The refusal stays a hold: a failed re-close is no review failure.
+				detail := integrations.Detail(e)
+				return out, &reviewerHeld{retryAfter: heldRetryAfterOf(detail), err: errors.Join(e, closeErr)}
 			}
 			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
 			stdout, e = launch(runCtx, args)
@@ -690,12 +702,17 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// A fresh spawn refused as held by a reviewer of an older head of this
 		// pass: sweep that head's finished panes and spawn again, once.
 		if e != nil && !resumed && !heldRetried && exitStatus(e) == panewireHeld && ctx.Err() == nil && x.opts.Acting() && olderHeadHolder(integrations.Detail(e), pr, plan.pass) {
-			if sweepErr := x.reapOlderHeadReviewers(ctx); sweepErr != nil {
+			switch sweepErr := x.reapOlderHeadReviewers(ctx); {
+			case errors.Is(sweepErr, errSweepCannotAct):
+				// reap is off or observe-only: nothing was closed, so the hold
+				// stays and the retry_after_s / next-evaluation rule applies.
+			case sweepErr != nil:
 				_ = s.audit(x.repo.Name, "reviewer-held-sweep-failed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "error": fleetevent.Redact(sweepErr.Error())}, false)
+			default:
+				runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
+				stdout, e = launch(runCtx, args)
+				tracing.Finish(runSpan)
 			}
-			runCtx, runSpan = tracing.Span(ctx, "mergewake.spawn_wait")
-			stdout, e = launch(runCtx, args)
-			tracing.Finish(runSpan)
 		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
