@@ -42,6 +42,16 @@ func CountRequests(ctx context.Context, role string) (context.Context, *RequestC
 	return NewPass(context.WithValue(ctx, requestCountsKey{}, c)), c
 }
 
+// ContinueRequests is CountRequests for work that may run inside a run that is
+// counting already: it joins that run's accounting under a new pass, or starts
+// one when ctx counts nothing.
+func ContinueRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
+	if c := passOf(ctx); c != nil {
+		return NewPass(ctx), c
+	}
+	return CountRequests(ctx, role)
+}
+
 var numericSegment = regexp.MustCompile(`^[0-9]+$`)
 var shaSegment = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}$`)
 var doneMarker = regexp.MustCompile(`(?i)^[0-9a-f]{40,64}-done$`)

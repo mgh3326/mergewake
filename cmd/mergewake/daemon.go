@@ -1,7 +1,6 @@
 package main
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"slices"
 	"sync"
 	"time"
 
@@ -59,6 +57,19 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		dirty = &daemon.Dirty{}
 		skips = &prSkips{Dirty: dirty, Log: log}
 	}
+	var repos []config.Repo
+	for _, r := range s.Config.Repos {
+		if repo == "" || r.Name == repo {
+			repos = append(repos, r)
+		}
+	}
+	// The pr role evaluates one PR per event through a queue; its loop is the
+	// sweep that puts every open PR on it. The queue exists only while the role
+	// is enabled, so no event evaluates a PR for a daemon that does not run it.
+	var engine *prEngine
+	if s.Config.Daemon.PR.Loop.Enabled {
+		engine = newPREngine(s, gh, o, repos, skips, log, func(string, int) { d.Trigger("reap") })
+	}
 	// Each role owns one goroutine. The pr role runs its repositories at once;
 	// the other roles visit them in config order.
 	for _, entry := range []struct {
@@ -79,9 +90,6 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			ctx, transaction := tracing.Pass(ctx, role)
 			defer tracing.Finish(transaction)
 			ctx, counts := github.CountRequests(ctx, role)
-			if role == "pr" {
-				ctx = pipeline.WithMergeHook(ctx, func(string, int) { d.Trigger("reap") })
-			}
 			defer func() {
 				requests = counts.Snapshot()
 				total := 0
@@ -92,14 +100,15 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				cache := counts.CacheStats()
 				state := gh.ChangeCounts()
 				reviews := gh.HKReviewStats()
-				log.Info("github requests", "hk_state_writes", state.Writes, "hk_state_stale", state.Stale, "hk_state_rejected", state.Rejected, "hk_state_unavailable", state.Unavailable, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "hk_review_hits", reviews.Hits, "hk_review_misses", reviews.Misses, "hk_review_mismatches", reviews.Mismatches, "routes", requests[:min(len(requests), 10)])
-			}()
-			var repos []config.Repo
-			for _, r := range s.Config.Repos {
-				if repo == "" || r.Name == repo {
-					repos = append(repos, r)
+				// The sweep's own requests are the ones above; the evaluations it
+				// queued run on their own and report what they cost here.
+				var queue []any
+				if role == "pr" {
+					depth, wait, evaluated := engine.queueTotals()
+					queue = []any{"queue_depth", depth, "queue_wait_max", wait.String(), "eval_requests", evaluated}
 				}
-			}
+				log.Info("github requests", append(queue, "hk_state_writes", state.Writes, "hk_state_stale", state.Stale, "hk_state_rejected", state.Rejected, "hk_state_unavailable", state.Unavailable, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "hk_review_hits", reviews.Hits, "hk_review_misses", reviews.Misses, "hk_review_mismatches", reviews.Mismatches, "routes", requests[:min(len(requests), 10)])...)
+			}()
 			// The pr role runs every repository at once: a pass is as long as
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
@@ -119,7 +128,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 					ctx := repoCtx
 					switch role {
 					case "pr":
-						err = pollPRsSkipping(ctx, s, gh, r, o, skips)
+						err = engine.sweep(ctx, r)
+						engine.passLine(r.Name)
 					case "watch":
 						checkCtx, span := tracing.Span(ctx, "mergewake.watch")
 						err = s.Watch(checkCtx, r, o)
@@ -174,9 +184,9 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		}()
 	}
 	if wc := s.Config.Daemon.Webhook; wc.Enabled {
-		repos := map[string]bool{}
+		known := map[string]bool{}
 		for _, r := range s.Config.Repos {
-			repos[r.Name] = true
+			known[r.Name] = true
 		}
 		secret := os.Getenv(wc.SecretEnv)
 		if secret == "" {
@@ -185,9 +195,18 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		state := webhookstate.Open(s.Config.StateDir)
 		state.Log = log
 		gh.Webhook = state
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery,
-			Status: prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
-				Wake: func() { d.Trigger("pr") }}}
+		status := prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
+			Wake: func() { d.Trigger("pr") }}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: known, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery}
+		if engine != nil {
+			branches := map[string]string{}
+			for _, r := range repos {
+				branches[r.Name] = r.Branch
+			}
+			d.Webhook.Queue, d.Webhook.Branches = engine.q, branches
+			status.Enqueue = func(repo string, n int) { engine.q.EnqueueNamed(daemon.SourceStatus, repo, n, "") }
+		}
+		d.Webhook.Status = status
 		gap, err := config.Duration(wc.MinGap)
 		if err != nil {
 			return err
@@ -210,8 +229,21 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		Read:     s.ReviewerJobView,
 		NotFound: pipeline.IsJobNotFound,
 	}
+	if engine != nil {
+		d.Reviewers.Enqueue = func(repo string, pr int) { engine.q.EnqueueNamed(daemon.SourceReviewer, repo, pr, "") }
+	}
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
+	}
+	// The queue runs until the daemon stops, and the daemon waits for the
+	// evaluations in flight, as a pass used to wait for its reviews.
+	if engine != nil {
+		queueCtx, stopQueue := context.WithCancel(ctx)
+		engine.q.Start(queueCtx)
+		defer func() {
+			stopQueue()
+			engine.q.Wait()
+		}()
 	}
 	return d.Run(ctx, loops)
 }
@@ -294,224 +326,9 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 	return out
 }
 
-func pollPRs(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options) error {
-	return pollPRsSkipping(ctx, s, gh, r, o, nil)
-}
-
-// pollPRsSkipping is pollPRs that leaves PRs alone when skips finds them
-// unchanged since their last clean evaluation; nil evaluates every PR.
-func pollPRsSkipping(ctx context.Context, s *pipeline.Service, gh *github.Client, r config.Repo, o pipeline.Options, skips *prSkips) error {
-	prs, err := gh.OpenPulls(ctx, r.Name, r.Branch)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	seen := map[int]bool{}
-	for _, pr := range prs {
-		seen[pr.Number] = true
-	}
-	// A policy that lists dependency bots keeps their PRs out of the drop and
-	// out of review: they are settled by Land's bot-patch gate alone. An
-	// unreadable policy lists none, so the bots stay dropped as before.
-	var listed []string
-	if hasBotPull(prs) {
-		var err error
-		if listed, err = s.BotUpdateAuthors(ctx, r); err != nil {
-			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
-		}
-	}
-	prs = skipBotPulls(prs, s.Config.Daemon.PR.SkipBots, listed...)
-	marked := prstatus.DirtyPRs(s.Config.StateDir, r.Name)
-	prs = dirtyFirst(prs, marked)
-	// Before the per-PR work: a review can hold this pass for minutes.
-	s.FeedPRs(ctx, r, prs, o)
-	// A review waits for its reviewer pane, so one slow review used to hold
-	// the land decision of every PR behind it for the whole pass. PRs whose
-	// head already carries the review done marker are delivered, notified and
-	// landed first; reviews run after that.
-	options := make([]pipeline.Options, len(prs))
-	handled := make([]bool, len(prs))
-	prContexts := make([]context.Context, len(prs))
-	for i, pr := range prs {
-		prCtx, span := tracing.Span(ctx, "mergewake.pr")
-		tracing.Data(span, "pr", pr.Number)
-		prContexts[i] = prCtx
-		defer tracing.Finish(span)
-	}
-	// A PR whose ETags, head, base and webhooks are as its last clean
-	// evaluation left them keeps that verdict: nothing below touches it.
-	plans := make([]skipPlan, len(prs))
-	if skips != nil {
-		base, baseErr := gh.Head(ctx, r.Name, r.Branch)
-		for i, pr := range prs {
-			if !isListedBot(pr, listed) {
-				plans[i] = skips.plan(ctx, gh, r.Name, pr.Number, base, baseErr)
-				// A fresh status read that found the PR changed asked for a
-				// full evaluation, whatever the validators say.
-				if marked[pr.Number] && plans[i].skip {
-					plans[i].skip, plans[i].reasons = false, []string{"status"}
-				}
-			}
-		}
-	}
-	failed := make([]bool, len(prs))
-	for i, pr := range prs {
-		if plans[i].skip {
-			continue
-		}
-		observeCtx, observeSpan := tracing.Span(prContexts[i], "mergewake.observe")
-		observationErr := s.ObservePR(observeCtx, r, pr, o)
-		tracing.Finish(observeSpan)
-		options[i] = o
-		options[i].Observed = observationErr == nil
-		if e := observationErr; e != nil {
-			errs = append(errs, fmt.Errorf("PR %d outcomes: %w", pr.Number, e))
-			failed[i] = true
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if pr.Draft {
-			continue
-		}
-		if isListedBot(pr, listed) {
-			errs = append(errs, botLand(prContexts[i], s, r, pr.Number, options[i])...)
-			continue
-		}
-		// An unreadable or poll-skipped marker is not done: the PR keeps
-		// today's order below.
-		if done, e := gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); e != nil || !done {
-			continue
-		}
-		handled[i] = true
-		settleErrs := settlePR(prContexts[i], s, r, pr.Number, options[i])
-		failed[i] = failed[i] || len(settleErrs) > 0
-		errs = append(errs, settleErrs...)
-	}
-	// Reviews of different PRs run at once, at most review_parallel of them
-	// when it is set, else all of them: each waits for its reviewer pane. One
-	// PR's review and settle stay in order. Settles run one at a time: they share the repo's delivery,
-	// notify and ready ledgers, and each land must see the base the previous
-	// land left, as in the sequential order. They start in hk priority order
-	// (ties in list order); a priority-1 review also starts past the bound,
-	// up to urgentExtra more at once (no bound, no extra).
-	results := make([][]error, len(prs))
-	limit := newReviewLimit(s.Config.Daemon.PR.Parallel())
-	var settling sync.Mutex
-	var running sync.WaitGroup
-	reviewable := make([]int, 0, len(prs))
-	for i, pr := range prs {
-		if !pr.Draft && !isListedBot(pr, listed) && !plans[i].skip {
-			reviewable = append(reviewable, i)
-		}
-	}
-	priorities := reviewPriorities(ctx, s, r, prs, reviewable, handled)
-	slices.SortStableFunc(reviewable, func(a, b int) int { return cmp.Compare(priorities[a].Rank(), priorities[b].Rank()) })
-	for _, i := range reviewable {
-		pr := prs[i]
-		// A cancelled pass starts no further PR and returns once the running
-		// ones have. A free review slot is taken first; a priority-1 review
-		// with none free takes an extra one rather than wait.
-		release, over, ok := limit.acquire(ctx, priorities[i].Urgent())
-		if !ok || ctx.Err() != nil {
-			if ok {
-				release()
-			}
-			running.Wait()
-			return ctx.Err()
-		}
-		if !handled[i] {
-			if e := s.AuditReviewStart(r, pr, priorities[i], o, over); e != nil {
-				errs = append(errs, e)
-			}
-		}
-		running.Add(1)
-		go func() {
-			defer running.Done()
-			defer release()
-			var clean bool
-			results[i], clean = reviewPR(prContexts[i], s, r, pr, options[i], !handled[i], &settling)
-			failed[i] = failed[i] || !clean
-		}()
-	}
-	running.Wait()
-	for _, e := range results {
-		errs = append(errs, e...)
-	}
-	numbers := make([]int, len(prs))
-	for i, pr := range prs {
-		numbers[i] = pr.Number
-		// Only a settled PR is remembered: a draft, or a head whose review is
-		// done. One still being reviewed is evaluated every pass, as before.
-		skips.record(r.Name, pr.Number, plans[i], !failed[i] && (pr.Draft || handled[i]))
-	}
-	skips.forget(r.Name, seen)
-	skips.report(r.Name, numbers, plans, limit.concurrentMax())
-	errs = append(errs, s.ReconcileOutcomes(ctx, r, seen, o))
-	return errors.Join(errs...)
-}
-
-// urgentExtra is how many priority-1 reviews of one repo may run past an
-// explicit review_parallel at once.
-const urgentExtra = 2
-
-// reviewPriorityGrace is how long a pass waits for the priority lookups before
-// it starts reviews. A lookup still out then is dropped and its PR is ordered
-// as one without a priority, so a slow hk delays no other PR beyond this. A
-// var so tests can shorten it.
-var reviewPriorityGrace = 2 * time.Second
-
-// reviewPriorities resolves, at once and at most once per PR, the priority of
-// every PR in reviewable whose head still needs a review, and waits for them
-// for at most reviewPriorityGrace. Lookups never fail the pass: a PR without a
-// priority keeps its place in list order.
-func reviewPriorities(ctx context.Context, s *pipeline.Service, r config.Repo, prs []github.Pull, reviewable []int, handled []bool) []pipeline.ReviewPriority {
-	out := make([]pipeline.ReviewPriority, len(prs))
-	// Each lookup reports on its own buffered channel, so one that finishes
-	// after the grace never writes into out.
-	answers := map[int]chan pipeline.ReviewPriority{}
-	for _, i := range reviewable {
-		if handled[i] {
-			continue
-		}
-		ch := make(chan pipeline.ReviewPriority, 1)
-		answers[i] = ch
-		go func() { ch <- s.ReviewPriority(ctx, r, prs[i]) }()
-	}
-	grace := time.NewTimer(reviewPriorityGrace)
-	defer grace.Stop()
-	expired := false
-	for _, i := range reviewable {
-		ch, ok := answers[i]
-		if !ok {
-			continue
-		}
-		out[i] = pipeline.ReviewPriority{Source: "timeout"}
-		if expired {
-			select {
-			case out[i] = <-ch:
-			default:
-			}
-			continue
-		}
-		select {
-		case out[i] = <-ch:
-		case <-grace.C:
-			expired = true
-			select {
-			case out[i] = <-ch:
-			default:
-			}
-		case <-ctx.Done():
-			expired = true
-		}
-	}
-	return out
-}
-
-// reviewPR runs one PR's review, then settles it under settling unless phase
-// one already settled its reviewed head. A review the retry reran there is
-// settled next pass.
+// reviewPR runs one PR's review, then settles it under settling unless the
+// caller already settled its reviewed head. A review the retry reran there is
+// settled by the next evaluation of the PR.
 func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")

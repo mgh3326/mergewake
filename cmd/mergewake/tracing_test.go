@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -26,15 +27,18 @@ import (
 type traceTransport struct {
 	mu     sync.Mutex
 	events []*sentry.Event
+	// cancel runs once want events have arrived (one when want is zero).
 	cancel context.CancelFunc
+	want   int
 }
 
 func (t *traceTransport) Configure(sentry.ClientOptions) {}
 func (t *traceTransport) SendEvent(e *sentry.Event) {
 	t.mu.Lock()
 	t.events = append(t.events, e)
+	enough := len(t.events) >= max(t.want, 1)
 	t.mu.Unlock()
-	if t.cancel != nil {
+	if t.cancel != nil && enough {
 		t.cancel()
 	}
 }
@@ -90,47 +94,60 @@ func TestTracingPassTreeAndPrivacy(t *testing.T) {
 	f := traceFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rec := &traceTransport{cancel: cancel}
+	// The sweep is one transaction; each of the two PRs is evaluated in one of its own.
+	rec := &traceTransport{cancel: cancel, want: 3}
 	ctx, stop := tracing.Start(ctx, io.Discard, rec)
 	defer stop()
 	if err := runDaemonLoops(ctx, f.s, f.gh, "", pipeline.Options{}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	events := rec.snapshot()
-	if len(events) != 1 {
+	if len(events) != 3 {
 		t.Fatalf("got %d events", len(events))
 	}
-	e := events[0]
-	if e.Type != "transaction" || e.Transaction != "pr pass" || e.Tags["role"] != "pr" {
-		t.Fatalf("transaction: %+v", e)
-	}
-	var repo *sentry.Span
-	prs := map[int]*sentry.Span{}
-	byParent := map[sentry.SpanID][]*sentry.Span{}
-	for _, s := range e.Spans {
-		byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
-		if s.Op == "mergewake.repo" {
-			repo = s
+	evaluated := map[int]*sentry.Event{}
+	for _, e := range events {
+		if e.Type != "transaction" || e.Transaction != "pr pass" || e.Tags["role"] != "pr" {
+			t.Fatalf("transaction: %+v", e)
 		}
-		if s.Op == "mergewake.pr" {
-			prs[s.Data["pr"].(int)] = s
+		if e.Extra["github_requests"] == nil {
+			t.Fatalf("missing request count: %+v", e.Extra)
 		}
-	}
-	if repo == nil || repo.Tags["repo"] != "o/one" || len(prs) != 2 {
-		t.Fatalf("repo/pr spans missing: %+v", e.Spans)
-	}
-	has := func(parent *sentry.Span, op string) *sentry.Span {
-		t.Helper()
-		for _, s := range byParent[parent.SpanID] {
-			if s.Op == op {
-				return s
+		for _, s := range e.Spans {
+			if s.Op == "mergewake.pr" {
+				evaluated[s.Data["pr"].(int)] = e
 			}
 		}
-		t.Fatalf("%s missing below %s", op, parent.Op)
-		return nil
+	}
+	if len(evaluated) != 2 {
+		t.Fatalf("evaluation transactions for PRs %v, want 1 and 2", slices.Sorted(maps.Keys(evaluated)))
 	}
 	for n := 1; n <= 2; n++ {
-		pr := prs[n]
+		e := evaluated[n]
+		var repo, pr *sentry.Span
+		byParent := map[sentry.SpanID][]*sentry.Span{}
+		for _, s := range e.Spans {
+			byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
+			if s.Op == "mergewake.repo" {
+				repo = s
+			}
+			if s.Op == "mergewake.pr" {
+				pr = s
+			}
+		}
+		if repo == nil || repo.Tags["repo"] != "o/one" || pr == nil {
+			t.Fatalf("repo/pr spans missing: %+v", e.Spans)
+		}
+		has := func(parent *sentry.Span, op string) *sentry.Span {
+			t.Helper()
+			for _, s := range byParent[parent.SpanID] {
+				if s.Op == op {
+					return s
+				}
+			}
+			t.Fatalf("%s missing below %s", op, parent.Op)
+			return nil
+		}
 		if pr.ParentSpanID != repo.SpanID {
 			t.Fatalf("PR %d parent", n)
 		}
@@ -155,19 +172,20 @@ func TestTracingPassTreeAndPrivacy(t *testing.T) {
 			has(pass, "mergewake.collect")
 		}
 	}
-	if e.Extra["github_requests"] == nil {
-		t.Fatalf("missing request count: %+v", e.Extra)
+	var spans []*sentry.Span
+	for _, e := range events {
+		spans = append(spans, e.Spans...)
 	}
 	raw, _ := json.Marshal(struct {
 		Tags  map[string]string
 		Spans []*sentry.Span
 		Extra map[string]interface{}
-	}{e.Tags, e.Spans, e.Extra})
+	}{events[0].Tags, spans, events[0].Extra})
 	forbidden := regexp.MustCompile(`(?i)([a-z0-9-]+\.(?:com|net|invalid)|w[0-9a-z]+:p|private-lane|/(?:Users|home)/)`)
 	if bad := forbidden.Find(raw); bad != nil {
 		t.Fatalf("private span data: %s", bad)
 	}
-	t.Log("tree: pr pass → repo o/one → PR 1, PR 2 → observe, settle (deliver, notify, land), review → pass 1 → spawn_wait, collect")
+	t.Log("trees: pr pass (sweep); pr pass → repo o/one → PR n → observe, settle (deliver, notify, land), review → pass 1 → spawn_wait, collect")
 }
 
 func TestTracingPassSampling(t *testing.T) {
