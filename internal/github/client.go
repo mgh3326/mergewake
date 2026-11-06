@@ -42,6 +42,11 @@ type Client struct {
 	// files read through a commit) across passes and processes. Nil means every
 	// read goes to GitHub.
 	Objects ObjectCache
+	// HKTimeout bounds one hk review read; zero means the default.
+	HKTimeout time.Duration
+	hk        HKReviewSource
+	hkPrimary bool
+	hkCounts  hkReviewCounters
 	// Webhook, when set, holds what verified deliveries carried. Every Pull,
 	// head-check and review-history read compares it with the API (shadow) and
 	// seeds it from the API; with ServeWebhookState on it answers instead.
@@ -705,7 +710,16 @@ var passMarker = regexp.MustCompile(`<!-- mergewake-pass:(\{.*?\}) -->`)
 // oldest first. Pass numbers come from the posted meta marker; legacy reviews
 // without one count as sequential passes.
 func (c *Client) ReviewPasses(ctx context.Context, repo string, n int, sha, login string) ([]PassReceipt, error) {
-	history, e := c.ReviewHistory(ctx, repo, n, login)
+	if login == "" {
+		return nil, errors.New("review.login is required")
+	}
+	var history []ReviewedPass
+	var e error
+	if hk := c.hkPrimaryChange(ctx, repo, n); hasHead(hk.Reviews, sha) {
+		history = hkPasses(hk.Reviews)
+	} else {
+		history, e = c.githubHistory(ctx, repo, n, login)
+	}
 	var out []PassReceipt
 	for _, p := range history {
 		if p.Head == sha {
@@ -722,8 +736,25 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 	if login == "" {
 		return nil, errors.New("review.login is required")
 	}
+	if hk := c.hkPrimaryChange(ctx, repo, n); hkServesHistory(hk) {
+		return hkPasses(hk.Reviews), nil
+	}
+	return c.githubHistory(ctx, repo, n, login)
+}
+
+// githubHistory reads the history from GitHub; in phase 1 it also compares it
+// with hk's record of the PR.
+func (c *Client) githubHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
 	out, e := memoized(ctx, c, memoKey{repo, "reviews", strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
-		return c.reviewHistory(ctx, repo, n, login)
+		history, e := c.reviewHistory(ctx, repo, n, login)
+		if e == nil && !c.hkPrimary && c.hk != nil {
+			gh := make([]HKReview, len(history))
+			for i, p := range history {
+				gh[i] = ghAsHK(p)
+			}
+			c.compareHK(repo, n, c.hkChange(ctx, repo, n).Reviews, gh)
+		}
+		return history, e
 	})
 	// The memo's slice is shared: hand each caller its own.
 	return slices.Clone(out), e
@@ -791,6 +822,9 @@ func (c *Client) ReviewedHeads(ctx context.Context, repo string, n int, login st
 	if login == "" {
 		return nil, errors.New("review.login is required")
 	}
+	if hk := c.hkPrimaryChange(ctx, repo, n); hkServesHistory(hk) {
+		return hkHeads(hk.Reviews), nil
+	}
 	reviews, e := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
 	if e != nil {
 		return nil, e
@@ -813,6 +847,9 @@ func (c *Client) ReviewedHeads(ctx context.Context, repo string, n int, login st
 			}
 		}
 		out = append(out, head)
+	}
+	if !c.hkPrimary && c.hk != nil {
+		c.compareHKHeads(repo, n, c.hkChange(ctx, repo, n).Reviews, out)
 	}
 	return out, nil
 }
