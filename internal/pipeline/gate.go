@@ -19,7 +19,8 @@ import (
 
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
-// Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, threads_open:<n>,
+// Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, check_absent:<name> (a required check
+// with no run or status on the head, once the head has had time to start it), threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
 // path is not in the diff), review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
 // require_up_to_date) and conflict. The two graded reasons replace threads_open when the policy has a
@@ -156,24 +157,54 @@ type checkSnapshotter interface {
 	CheckSnapshot(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, map[string]time.Time, error)
 }
 
-// checkJudgment is what the required checks say about a head. Failed and
-// Expired hold check_failed:<name> and check_cancelled:<name> reasons that
-// block; Waiting holds the check_cancelled:<name> reasons still inside the
-// wait; Cancelled lists every required check whose latest run is cancelled;
-// Skipped lists the skipped or neutral ones, which hold nothing; Pending is
-// set while any check is incomplete or waiting on a rerun.
+// absentGrace is how long a head may go without any run or status for a
+// required check before the gate calls that check absent. It counts from the
+// head commit's committer date, so a commit pushed long after it was made
+// reaches the grace sooner than the push time alone would.
+const absentGrace = 20 * time.Minute
+
+// checkJudgment is what the required checks say about a head. Failed,
+// Expired and Absent hold check_failed:<name>, check_cancelled:<name> and
+// check_absent:<name> reasons that block; Waiting holds the check_cancelled:<name>
+// reasons still inside the wait; Cancelled lists every required check whose
+// latest run is cancelled; Skipped lists the skipped or neutral ones, which
+// hold nothing; Pending is set while any check is incomplete, absent but not
+// yet due, or waiting on a rerun.
 type checkJudgment struct {
-	Failed, Expired, Waiting, Cancelled, Skipped []string
-	Pending                                      bool
+	Failed, Expired, Absent, Waiting, Cancelled, Skipped []string
+	Pending                                              bool
 	// States holds each required check's state as read.
 	States map[string]github.CI
 }
 
+// absentDue reports whether a required check with no run or status on the head
+// is to be named absent now rather than waited for: the head commit is
+// absentGrace old, or every other required check has completed (green, red or
+// skipped) and at least one exists, so the workflow demonstrably ran without
+// it. Cancelled and unfinished checks do not count as completed.
+func absentDue(states map[string]github.CI, required []string, headAge time.Duration) bool {
+	if headAge >= absentGrace {
+		return true
+	}
+	done := 0
+	for _, name := range required {
+		switch states[name] {
+		case github.Green, github.Red, github.Skipped:
+			done++
+		case github.Absent:
+		default:
+			return false
+		}
+	}
+	return done > 0
+}
+
 // judgeChecks folds the required checks' states into what the gate acts on.
 // A cancelled check holds no verdict on the head: it waits for a newer run,
-// and blocks once its completion is cancelledCheckWait old. Every gate judges
-// checks through it.
-func judgeChecks(states map[string]github.CI, required []string, cancelledAt map[string]time.Time, now time.Time) checkJudgment {
+// and blocks once its completion is cancelledCheckWait old. An absent check
+// waits quietly until absentIsDue, then blocks. Every gate judges checks
+// through it.
+func judgeChecks(states map[string]github.CI, required []string, cancelledAt map[string]time.Time, now time.Time, absentIsDue bool) checkJudgment {
 	j := checkJudgment{States: make(map[string]github.CI, len(required))}
 	for _, name := range required {
 		j.States[name] = states[name]
@@ -192,6 +223,12 @@ func judgeChecks(states map[string]github.CI, required []string, cancelledAt map
 				j.Waiting = append(j.Waiting, reason)
 				j.Pending = true
 			}
+		case github.Absent:
+			if absentIsDue {
+				j.Absent = append(j.Absent, "check_absent:"+name)
+			} else {
+				j.Pending = true
+			}
 		default:
 			j.Pending = true
 		}
@@ -200,29 +237,57 @@ func judgeChecks(states map[string]github.CI, required []string, cancelledAt map
 }
 
 // judgeHead reads the required checks of sha and judges them. A verdict that
-// would block on an expired cancellation is confirmed against a fresh read
-// first, since a polled read can predate the run that replaced it.
-func (s *Service) judgeHead(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
-	j, e := s.readChecks(ctx, repo, sha, required)
-	if e != nil || len(j.Expired) == 0 {
+// would block on an expired cancellation or an absent check is confirmed
+// against a fresh read first, since a polled read can predate the run that
+// replaced it or the run that started late. A conflicting PR never reports an
+// absent check: GitHub runs no workflow for it, and the gate says conflict.
+func (s *Service) judgeHead(ctx context.Context, repo, sha string, required []string, conflict bool) (checkJudgment, error) {
+	j, e := s.readChecks(ctx, repo, sha, required, conflict)
+	if e != nil || len(j.Expired) == 0 && len(j.Absent) == 0 {
 		return j, e
 	}
-	return s.readChecks(github.FreshEvidence(ctx), repo, sha, required)
+	return s.readChecks(github.FreshEvidence(ctx), repo, sha, required, conflict)
 }
 
-func (s *Service) readChecks(ctx context.Context, repo, sha string, required []string) (checkJudgment, error) {
-	if snap, ok := s.GH.(checkSnapshotter); ok {
-		states, at, e := snap.CheckSnapshot(ctx, repo, sha, required)
-		if e != nil {
-			return checkJudgment{}, e
-		}
-		return judgeChecks(states, required, at, s.now()), nil
+// absentIsDue decides whether an absent required check is named now. It reads
+// the head commit only when a check is absent and the cheap rule (every other
+// check completed) does not already settle it.
+func (s *Service) absentIsDue(ctx context.Context, repo, sha string, states map[string]github.CI, required []string, conflict bool) (bool, error) {
+	if conflict || !slices.ContainsFunc(required, func(n string) bool { return states[n] == github.Absent }) {
+		return false, nil
 	}
-	states, e := s.GH.CheckStates(ctx, repo, sha, required)
+	if absentDue(states, required, 0) {
+		return true, nil
+	}
+	c, e := s.GH.Commit(ctx, repo, sha)
+	if e != nil {
+		return false, e
+	}
+	if c.Commit.Committer.Date.IsZero() {
+		return false, nil
+	}
+	return absentDue(states, required, s.now().Sub(c.Commit.Committer.Date)), nil
+}
+
+func (s *Service) readChecks(ctx context.Context, repo, sha string, required []string, conflict bool) (checkJudgment, error) {
+	var (
+		states map[string]github.CI
+		at     map[string]time.Time
+		e      error
+	)
+	if snap, ok := s.GH.(checkSnapshotter); ok {
+		states, at, e = snap.CheckSnapshot(ctx, repo, sha, required)
+	} else {
+		states, e = s.GH.CheckStates(ctx, repo, sha, required)
+	}
 	if e != nil {
 		return checkJudgment{}, e
 	}
-	return judgeChecks(states, required, nil, s.now()), nil
+	due, e := s.absentIsDue(ctx, repo, sha, states, required, conflict)
+	if e != nil {
+		return checkJudgment{}, e
+	}
+	return judgeChecks(states, required, at, s.now(), due), nil
 }
 
 // mergeGate evaluates the repo session's merge gate once for head H:
@@ -246,12 +311,13 @@ func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, 
 
 func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
 	v := gateVerdict{State: "ready"}
-	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	j, e := s.judgeHead(ctx, r.Name, pr.Head.SHA, p.RequiredChecks, conflicting(pr))
 	if e != nil {
 		return v, e
 	}
 	v.Reasons = append(v.Reasons, j.Failed...)
 	v.Reasons = append(v.Reasons, j.Expired...)
+	v.Reasons = append(v.Reasons, j.Absent...)
 	v.Review.ChecksCancelled, v.Review.ChecksSkipped = j.Cancelled, j.Skipped
 	for _, name := range p.RequiredChecks {
 		state := j.States[name]
