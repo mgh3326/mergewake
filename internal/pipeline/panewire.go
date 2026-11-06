@@ -855,6 +855,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	keepJob = true
+	if e = x.closeCollectedJob(ctx, rj, res.rec); e != nil {
+		return out, e
+	}
 	x.note("collected", rj)
 	return out, nil
 }
@@ -1027,7 +1030,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 		return out, errors.Join(lost, auditErr, noticeErr)
 	}
 	if job.State != "" {
-		if _, err := x.closeReviewerJob(ctx, rj, job, cause); err != nil {
+		if _, err := x.closeReviewerJob(ctx, rj, job, "abandoned", cause); err != nil {
 			return out, err
 		}
 	}

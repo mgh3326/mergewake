@@ -52,8 +52,9 @@ func TestReviewerRemoteResult(t *testing.T) {
 				t.Fatalf("posted findings = %+v", g.postedFindings)
 			}
 			if tc.recovered {
-				if len(runner.closes) != 0 || len(runner.spawns) != 1 || g.postCount != 1 {
-					t.Fatalf("closes=%v spawns=%d posts=%d", runner.closes, len(runner.spawns), g.postCount)
+				collectedClosedOnce(t, runner, old.Label)
+				if len(runner.spawns) != 1 || g.postCount != 1 {
+					t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
 				}
 			} else {
 				closedOnce(t, runner, old.Label)
