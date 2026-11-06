@@ -1349,9 +1349,16 @@ claims still prevent duplicate model invocation. Completed claims can remain as
 evidence.
 
 For CI recovery, inspect the revert PR, the fixed `mergewake-recovery-latch` tag,
-and any `mergewake/recovery` branch. After recovery is complete, an operator may
-delete the tag and any remaining branch to authorize another recovery. Keep the
-tag while recovery is in flight; it survives automatic PR branch deletion. After an API timeout or a reporting failure,
+and any `mergewake/recovery` branch. The tag survives automatic PR branch
+deletion and stays while recovery is in flight. Watch clears the latch itself,
+and audits `recovery-latch-cleared` once, when the revert PR it opened is
+merged, the newest main head contains that merge commit, and the newest main is
+green on the watched checks; it then deletes the tag and any remaining branch
+and sends one info notice. The latch stays for a person when the revert PR is
+open or closed unmerged, when main is red or still pending after the merge, and
+when no revert PR that watch opened can be tied to the latch (a tag a person
+created, or a blocking-path culprit that was only reported). A person deletes
+the tag and any remaining branch in those cases. After an API timeout or a reporting failure,
 inspect GitHub/task records and local audit rather than blindly rerunning a
 mutation. The initial release has no automatic report outbox/reconciliation.
 
@@ -1741,6 +1748,8 @@ state file, which retains the most recent 128 report keys.
 
 Immediately before opening a revert PR the watch rechecks the current main head
 and its CI, and the recovery latch tag still serializes recovery attempts.
+The latch clears itself only after the revert PR merges and main is green (see
+the recovery notes above).
 
 ## Container installs
 

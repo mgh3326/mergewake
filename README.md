@@ -72,9 +72,12 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 All acting commands support `--dry-run`. There is no merge lock, mandatory
 rebase, multi-round tester loop, or committed manifest/hash-pin file. A fixed
 recovery tag (`mergewake-recovery-latch`) is a durable stop after **one** revert
-PR; the watcher never merges the revert itself. An operator must inspect recovery
-and remove that tag and any remaining `mergewake/recovery` branch before another
-recovery can begin. The tag survives automatic deletion of merged PR branches.
+PR; the watcher never merges the revert itself. Once that revert PR is merged
+and the newest main is green, the watcher deletes the tag and any remaining
+`mergewake/recovery` branch and notifies once. If the revert PR is still open,
+main is still red or pending, or the latch has no revert PR the watcher opened,
+an operator must inspect recovery and remove the tag and branch. The tag
+survives automatic deletion of merged PR branches.
 
 Release inventories describe regular files at a verified Git commit, their
 SHA256, mode, and relative install targets. Hosts separately authorize the file
