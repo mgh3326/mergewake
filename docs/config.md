@@ -578,7 +578,8 @@ For a blocked head, mergewake:
 
 mergewake takes no pass claim and writes no receipt or `-done` marker, so the
 merge gate reports `review_missing`. A block is not a review failure: it adds no
-retry backoff and no failure escalation, and the stall alarm skips the head. The
+retry backoff and no failure escalation, and it sends no review-stalled alert: the head
+waits on its author, and the BLOCKED notice already went to the author route. The
 next poll after the fix runs the review on the same head and clears the outcome.
 
 A read error is not a block. If the commit or the task cannot be read, the pass
@@ -1238,9 +1239,8 @@ For `example/project`, state resides beneath
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
-| `review-wait.json` | When this host first saw each ready head waiting for a review (the stall alarm's clock). |
-| `review-stall-sent` | Most recent 256 `PR head` keys already alarmed as stalled. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
+| `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
@@ -1331,9 +1331,57 @@ evidence for the repository immediately. A landing decision reads the checks
 and review threads for its pinned head from GitHub. Without a delivery, other
 observations can use evidence up to ten minutes old.
 
-Each daemon pass logs `github requests` with its total and busiest routes. The
+Each daemon pass logs `github requests` with its total, its `not_modified` count
+(304 responses, which a conditional request gets for an unchanged resource and
+which GitHub does not charge to the rate limit) and its busiest routes. The
 role's status file also records counts by method, route and response status.
 An HTTP status of `0` counts a request that received no response.
+
+#### Skipping unchanged PRs
+
+With the receiver enabled, the `pr` role leaves a PR alone when nothing has
+changed since it last evaluated the PR in full. The PR then keeps its last
+verdict: no gate run, no GraphQL read, no review, notice or merge action. Its
+whole cost is the conditional requests (304s) that prove it unchanged. A PR is
+unchanged only when **all** of these hold; if any fails, it is evaluated in
+full, as without this rule:
+
+- the ETags of the PR, its review list, and its head's check runs and
+  commit statuses equal those of the last evaluation (each read answers 304);
+- its head commit and the head of the branch it targets are the same;
+- no `pull_request*`, `pull_request_review*`, `check_run`, `check_suite` or
+  `status` delivery has named it since that evaluation started. Pull-request
+  events name a PR by number. Check events name it by the PRs the payload lists
+  and by head commit, so a check delivery that lists no PR (a fork, a re-run)
+  still marks the PR whose head it ran on. A delivery marks only the PRs it
+  names, never the rest of the repository;
+- that evaluation is under 60 minutes old.
+
+The PR's `updated_at` does not decide this: it does not move when a check run
+completes or a review thread is resolved. A resolved thread is not visible in
+REST at all, so its delivery (`pull_request_review_thread`) is the signal, and
+the 60-minute bound is the safety net for a delivery that never arrives. The
+bound caps skipping; it is not a cache lifetime. It also bounds how long a
+time-based hold can lag: a cancelled check's settling wait, a stall notice and a
+review retry backoff are re-read at most 60 minutes late for a skipped PR.
+
+Only a settled PR is remembered: a draft, or a PR whose head has its review done
+marker, evaluated without an error. A PR still being reviewed, or one whose last
+evaluation failed, is evaluated every pass. Dependency-bot PRs listed in the
+policy are always evaluated. Memory is in the daemon process: a restart
+evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
+
+Each repository's pass logs `pr pass` with `prs_skipped`, `prs_evaluated`,
+`evaluated_reasons` (a count per reason) and `evaluated` (`<pr>:<reasons>`).
+Reasons: `first` (no clean evaluation remembered), `webhook`, `head`, `checks`,
+`reviews`, `pr`, `base`, `age`, `unvalidated` (a read failed or came without an
+ETag).
+
+The HTTP cache behind the 304s keeps up to 8,192 responses (128 MiB; no body
+over 4 MiB) and evicts the least recently used one, so a pass that reads
+thousands of keys still finds the validators of the last. A delivery
+invalidates evidence but never drops a validator: revalidating is free and
+always correct.
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
@@ -1392,6 +1440,40 @@ configured `notifier.lane`. Both trailers are read from the PR body first and
 then the head commit message; a task-read error retries rather than rerouting.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
 other roles.
+
+##### Who hears each BLOCKED reason
+
+A BLOCKED verdict goes only to the side that can act on it. Every reason the
+gate can emit falls in one of three classes:
+
+| Reason | Class | What the notifier does |
+|---|---|---|
+| `check_failed:<name>`, `check_cancelled:<name>` | author | Live job lane first (the findings route); with no live job, the `Mergewake-Notify-Lane` trailer, then the task lane unless it is the desk, then the desk as a `decision` (unknown author). |
+| `blocking_findings:<n>`, `triage_unanswered:<n>` | author | Same route. |
+| `conflict` | author | Same route. |
+| `review_missing (<block detail>)`, for example `missing-task-trailer` | author | Same route: the review waits on something only the author can add. |
+| `review_missing` with no block detail | mergewake-internal wait | Nothing is sent. Only the stall alert below. |
+| `threads_open:<n>`, `base_stale`, `update_failed:<status>` | needs a human decision | Unchanged: the task lane, trailer or notifier lane, in the `notifyLane` order, type `blocked`. |
+
+A mixed reason set is sent when any reason is author or human, and its text
+lists only those reasons. A set made only of internal waits sends nothing.
+`READY` and `MERGED` routing, types and the READY reminders are unchanged, so the
+design session otherwise hears `READY`, `MERGED`, and the BLOCKED reasons that
+need its decision.
+
+A head that keeps `review_missing` for more than 60 minutes gets one
+`review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
+head, the wait so far, the passes posted against those needed, and the reviewer
+job recorded for the head, if any. The wait starts when this host first sees the
+head with that reason after its required checks settle, and it is kept in
+`pr-review-wait.json`. The alert is sent once per `(PR, head)`, deduped across
+restarts by a `stalled <PR> <head>` key in `pr-notify-sent`. It is sent only while
+`review_missing` is the whole reason set. A head that is later reviewed and blocks
+again follows the rules above. This is the only stall alert: the older
+elapsed-time `STALLED review` alarm, which the daemon stopped calling when
+reviews moved to retry accounting, is removed with its `review-wait.json` and
+`review-stall-sent` state, and `daemon.pr.stall_after` is read but sets nothing.
+
 
 #### Findings delivery
 
@@ -1484,6 +1566,17 @@ notification and land; those settle steps run one PR at a time within a
 repository. The PR role runs all configured repositories at once, so the bound
 applies to each repository, not to the daemon; no global reviewer cap exists.
 The other roles visit repositories one after another.
+
+With the `handoffkeep` sink, reviews start in hk priority order (1 is highest;
+no priority sorts last; ties keep the order GitHub lists the PRs). A PR's
+priority is hk's change priority for its PR URL, else the priority of its
+`Mergewake-Task` task, else none. A priority-1 review does not wait for a free
+`review_parallel` slot: it starts at once, with at most two such reviews past
+the bound per repository, and takes the next free slot beyond that. A failed
+or slow hk read gives that PR no priority and never fails the pass. Only the
+review start order changes; settling, land, the merge gate, retries and
+notifications are unchanged. Each review start writes a `review-start` row to
+`decisions.jsonl` with the priority and where it came from.
 
 Use `mergewake status --daemon --config /path/to/config.yaml` for JSON status.
 Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,

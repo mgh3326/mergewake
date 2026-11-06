@@ -108,3 +108,20 @@ func TestPRStatusDirtyPRsOrderedFirst(t *testing.T) {
 		t.Fatalf("order %v", order)
 	}
 }
+
+// A PR the unchanged-PR skip would leave alone is evaluated when a fresh
+// status read marked it, and the pass that decides it clears the marker.
+func TestPRStatusDirtyMarkerOverridesSkip(t *testing.T) {
+	f := newSkipFixture(t, 1)
+	f.pass()
+	if second := f.pass(); second.skipped != 1 {
+		t.Fatalf("setup: PR not skipped: %s", second)
+	}
+	if e := prstatus.MarkDirty(f.s.Config.StateDir, f.repo.Name, 1, f.clock.Add(time.Second)); e != nil {
+		t.Fatal(e)
+	}
+	third := f.pass()
+	if third.evaluated != 1 || !hasReason(third, 1, "status") {
+		t.Fatalf("marked PR was not evaluated: %s", third)
+	}
+}

@@ -61,8 +61,11 @@ through to that PR's snapshot:
   `checks`, `findings` and `observed_at` stay. The gate is never recomputed.
 - If the head, the checks (as success, failure or pending) or the unresolved
   thread count differ from the snapshot, the PR is marked for re-evaluation. A
-  marker file `<n>.dirty` is written; the next `pr` pass orders marked PRs first
-  and clears the marker when it decides the PR. Through the daemon listener the
+  marker file `<n>.dirty` is written; the next `pr` pass lists marked PRs first
+  (so they settle first and, among reviews of equal hk priority, start first;
+  a higher hk priority still starts earlier), evaluates them even when the
+  unchanged-PR skip would leave them alone, and clears the marker when it
+  decides the PR. Through the daemon listener the
   request also drops the repo's cached GitHub evidence and wakes the `pr` role
   (the trigger webhooks use). A later fresh read compares against the stored
   fresh read, so the same change wakes once.

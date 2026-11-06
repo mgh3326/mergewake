@@ -68,6 +68,18 @@ func (h Handoffkeep) Job(ctx context.Context, id string) (JobRecord, error) {
 	return c.get(ctx, id)
 }
 
+// ChangePriority reads the priority hk holds for the change of a PR URL
+// (`GET /v1/changes?pr=`, set by the merge-flow control): the first positive
+// one, else 0. An hk that predates the endpoint answers 404, which is "no
+// change priority", not a failed read; any other failure is an error.
+func (h Handoffkeep) ChangePriority(ctx context.Context, pr string) (int, error) {
+	c, e := hkJobEndpoint()
+	if e != nil {
+		return 0, e
+	}
+	return c.changePriority(ctx, pr)
+}
+
 // hkJobEndpoint resolves the handoffkeep base URL and bearer credential with
 // the same convention as the handoffkeep CLI: the environment wins, and
 // ~/.config/handoffkeep/config.env fills keys the environment left unset.
@@ -185,4 +197,37 @@ func (c *hkJobs) get(ctx context.Context, id string) (JobRecord, error) {
 		return JobRecord{}, fmt.Errorf("handoffkeep response is not valid JSON")
 	}
 	return rec, nil
+}
+
+func (c *hkJobs) changePriority(ctx context.Context, pr string) (int, error) {
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/changes?pr="+url.QueryEscape(pr), nil)
+	if e != nil {
+		return 0, errors.New("invalid change request")
+	}
+	c.authorize(req)
+	resp, e := c.client(8 * time.Second).Do(req)
+	if e != nil {
+		return 0, errors.New("handoffkeep request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("handoffkeep HTTP %d (response withheld)", resp.StatusCode)
+	}
+	var out struct {
+		Changes []struct {
+			Priority int `json:"priority"`
+		} `json:"changes"`
+	}
+	if e := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); e != nil {
+		return 0, errors.New("handoffkeep response is not valid JSON")
+	}
+	for _, ch := range out.Changes {
+		if ch.Priority > 0 {
+			return ch.Priority, nil
+		}
+	}
+	return 0, nil
 }

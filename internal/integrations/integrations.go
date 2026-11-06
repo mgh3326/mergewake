@@ -317,6 +317,25 @@ func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, 
 	return shown.Refs.JobID, shown.Title, nil
 }
 
+// TaskPriority reads the task's priority from `tasks show`: 1 is urgent and 4
+// low; 0 means the task has none.
+func (h Handoffkeep) TaskPriority(ctx context.Context, task string) (int, error) {
+	if !TaskID.MatchString(task) {
+		return 0, errors.New("task ID must be a positive integer")
+	}
+	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	if e != nil {
+		return 0, e
+	}
+	var shown struct {
+		Priority int `json:"priority"`
+	}
+	if e = json.Unmarshal(out, &shown); e != nil {
+		return 0, e
+	}
+	return shown.Priority, nil
+}
+
 // Attachment reads one handoffkeep attachment by its sha256 id.
 func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error) {
 	if !attachmentID.MatchString(sha) {
