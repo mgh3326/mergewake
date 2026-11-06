@@ -44,6 +44,7 @@ Usage: mergewake <command> [flags]
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   report     Report review latency from state and GitHub
   outcomes   Report or sync the shadow-safe model outcomes ledger
+  ci-policy  Check that each configured repo follows the fleet main-CI default (read-only)
   pr-status  Print a PR's last-pass merge-gate snapshot from local state, with no GitHub call unless --fresh
   notify     Post a deploy from another deployer to the Discord feed (needs discord.enabled)
   status     Read installed receipts and check local drift
@@ -78,6 +79,7 @@ var ownFlagCommands = map[string]func(context.Context, []string, io.Writer, io.W
 	"archive-jobs": runArchiveJobs,
 	"notify":       runNotify,
 	"pr-status":    runPRStatus,
+	"ci-policy":    runCIPolicy,
 	"promote":      runPromote,
 	"admit":        runAdmit,
 	"server":       runServerStore,

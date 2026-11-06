@@ -98,6 +98,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if len(p.WatchChecks) > 0 {
 		checks = p.WatchChecks
 	}
+	s.ciPolicy(ctx, r, head, o)
 	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		return e
