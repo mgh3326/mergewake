@@ -7,16 +7,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/changestate"
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 type changeWriterProvider interface {
-	ChangeWriter() *integrations.ChangeWriter
+	ChangeWriter() changestate.Writer
 }
 
-func (s *Service) changes() *integrations.ChangeWriter {
+func (s *Service) changes() changestate.Writer {
 	if p, ok := s.GH.(changeWriterProvider); ok {
 		return p.ChangeWriter()
 	}
@@ -49,7 +49,7 @@ func (s *Service) writeGate(_ context.Context, r config.Repo, pr github.Pull, ba
 			}
 			reasons = append(reasons, changeReason(reason))
 		}
-		w.Queue(r.Name, pr.Number, "gate", integrations.ChangeSection{At: at, Value: map[string]any{"head_sha": pr.Head.SHA, "state": v.State, "reasons": reasons, "policy_revision": revision, "decided_at": at, "source": "review"}})
+		w.Queue(r.Name, pr.Number, "gate", changestate.Section{At: at, Value: map[string]any{"head_sha": pr.Head.SHA, "state": v.State, "reasons": reasons, "policy_revision": revision, "decided_at": at, "source": "review"}})
 	})
 }
 

@@ -90,8 +90,9 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				}
 				tracing.Data(transaction, "github_requests", total)
 				cache := counts.CacheStats()
-				hk := gh.Changes.Counts()
-				log.Info("github requests", "hk_state_writes", hk.Writes, "hk_state_stale", hk.Stale, "hk_state_rejected", hk.Rejected, "hk_state_unavailable", hk.Unavailable, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "routes", requests[:min(len(requests), 10)])
+				state := gh.ChangeCounts()
+				reviews := gh.HKReviewStats()
+				log.Info("github requests", "hk_state_writes", state.Writes, "hk_state_stale", state.Stale, "hk_state_rejected", state.Rejected, "hk_state_unavailable", state.Unavailable, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "hk_review_hits", reviews.Hits, "hk_review_misses", reviews.Misses, "hk_review_mismatches", reviews.Mismatches, "routes", requests[:min(len(requests), 10)])
 			}()
 			var repos []config.Repo
 			for _, r := range s.Config.Repos {

@@ -1,4 +1,4 @@
-package github
+package github_test
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -33,7 +34,7 @@ func TestHKChangeThreadsAndPostedFindings(t *testing.T) {
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	fs := []Finding{{Severity: "high", Path: "a.go", Line: 3, Body: "inline bug"}, {Severity: "low", Path: "a.go", Line: 90, Body: "file bug", Anchor: AnchorFile}, {Severity: "medium", Path: "other.go", Line: 2, Body: "outside bug", Anchor: AnchorOutside}}
-	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" {
 			fmt.Fprint(w, `{}`)
 			return
@@ -86,4 +87,16 @@ func TestHKChangeThreadsAndPostedFindings(t *testing.T) {
 	if !foundThreads || !foundFindings {
 		t.Fatalf("batches=%v", batches)
 	}
+}
+
+const testSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func changeAPI(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	c := New("")
+	c.BaseURL = server.URL
+	c.HTTP = server.Client()
+	return c
 }

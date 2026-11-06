@@ -10,13 +10,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/changestate"
 )
 
 // ChangeSection carries a section and its observation time for coalescing.
-type ChangeSection struct {
-	At    time.Time
-	Value any
-}
+type ChangeSection = changestate.Section
 type ChangeBatch struct {
 	Repo     string `json:"repo"`
 	PR       int    `json:"pr"`
@@ -34,7 +33,7 @@ type changePending struct {
 	sections map[string]ChangeSection
 	findings []ChangeSection
 }
-type ChangeCounts struct{ Writes, Stale, Rejected, Unavailable uint64 }
+type ChangeCounts = changestate.Counts
 
 // ChangeWriter sends observations without holding the caller on hk. It folds
 // bursts by PR and section, retaining the newest observation in each section.
@@ -60,7 +59,7 @@ func (w *ChangeWriter) Counts() ChangeCounts {
 	if w == nil {
 		return ChangeCounts{}
 	}
-	return ChangeCounts{w.writes.Load(), w.stale.Load(), w.rejected.Load(), w.unavailable.Load()}
+	return ChangeCounts{Writes: w.writes.Load(), Stale: w.stale.Load(), Rejected: w.rejected.Load(), Unavailable: w.unavailable.Load()}
 }
 func (w *ChangeWriter) Queue(repo string, pr int, name string, s ChangeSection) {
 	if w == nil || repo == "" || pr < 1 || s.Value == nil || s.At.IsZero() {

@@ -80,6 +80,8 @@ func (h Handoffkeep) ChangePriority(ctx context.Context, pr string) (int, error)
 	return c.changePriority(ctx, pr)
 }
 
+var errEndpointUnconfigured = errors.New("handoffkeep endpoint unconfigured")
+
 // hkJobEndpoint resolves the handoffkeep base URL and bearer credential with
 // the same convention as the handoffkeep CLI: the environment wins, and
 // ~/.config/handoffkeep/config.env fills keys the environment left unset.
@@ -109,7 +111,7 @@ func hkJobEndpoint() (*hkJobs, error) {
 	base, token := read("HANDOFFKEEP_URL"), read("HANDOFFKEEP_TOKEN")
 	cfID, cfSecret := read("HANDOFFKEEP_CF_ACCESS_CLIENT_ID"), read("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET")
 	if base == "" || token == "" {
-		return nil, errors.New("handoffkeep endpoint unconfigured")
+		return nil, errEndpointUnconfigured
 	}
 	u, e := url.Parse(base)
 	if e != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

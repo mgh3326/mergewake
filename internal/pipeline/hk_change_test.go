@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/changestate"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -21,7 +22,7 @@ type hkChangeGH struct {
 	writer *integrations.ChangeWriter
 }
 
-func (g *hkChangeGH) ChangeWriter() *integrations.ChangeWriter { return g.writer }
+func (g *hkChangeGH) ChangeWriter() changestate.Writer { return g.writer }
 func TestHKChangeGateDecision(t *testing.T) {
 	var mu sync.Mutex
 	var batches []map[string]any

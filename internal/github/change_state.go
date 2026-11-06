@@ -9,10 +9,21 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/changestate"
 )
 
-func (c *Client) ChangeWriter() *integrations.ChangeWriter { return c.Changes }
+func (c *Client) ChangeWriter() changestate.Writer { return c.Changes }
+func (c *Client) ChangeCounts() changestate.Counts {
+	if c.Changes == nil {
+		return changestate.Counts{}
+	}
+	return c.Changes.Counts()
+}
+func (c *Client) WaitChanges(ctx context.Context) {
+	if c.Changes != nil {
+		c.Changes.Wait(ctx)
+	}
+}
 func changeSource(ctx context.Context) string {
 	if isFresh(ctx) {
 		return "fresh"
@@ -37,7 +48,7 @@ func (c *Client) writePull(ctx context.Context, repo string, p Pull, at time.Tim
 	if delivery != "" {
 		v["delivery_id"] = delivery
 	}
-	c.Changes.Queue(repo, p.Number, "state", integrations.ChangeSection{At: at, Value: v})
+	c.Changes.Queue(repo, p.Number, "state", changestate.Section{At: at, Value: v})
 }
 func limitRunes(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
@@ -82,7 +93,7 @@ func (c *Client) writeThreads(ctx context.Context, repo string, n int, fb Review
 		}
 		threads = append(threads, item)
 	}
-	c.Changes.Queue(repo, n, "threads", integrations.ChangeSection{At: at, Value: map[string]any{"threads": threads, "observed_at": at, "source": changeSource(ctx), "complete": true}})
+	c.Changes.Queue(repo, n, "threads", changestate.Section{At: at, Value: map[string]any{"threads": threads, "observed_at": at, "source": changeSource(ctx), "complete": true}})
 }
 
 // WebhookDelivery records an applied delivery after the webhook store orders it.
@@ -207,7 +218,7 @@ func (c *Client) WebhookDelivery(repo, event, delivery string, body []byte) {
 		list = append(list, v)
 	}
 	for n := range numbers {
-		c.Changes.Queue(repo, n, "checks", integrations.ChangeSection{At: at, Value: map[string]any{"head_sha": sha, "checks": list, "observed_at": at, "source": "webhook", "complete": false}})
+		c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: map[string]any{"head_sha": sha, "checks": list, "observed_at": at, "source": "webhook", "complete": false}})
 	}
 }
 
@@ -295,7 +306,7 @@ func (c *Client) writePostedFindings(repo string, n int, sha string, findings []
 			}
 			out = append(out, item)
 		}
-		c.Changes.Queue(repo, n, "findings", integrations.ChangeSection{At: at, Value: map[string]any{"reviewed_head": sha, "round": meta.Round, "pass": meta.Pass, "lens": meta.Lens, "findings": out, "observed_at": at, "source": "review"}})
+		c.Changes.Queue(repo, n, "findings", changestate.Section{At: at, Value: map[string]any{"reviewed_head": sha, "round": meta.Round, "pass": meta.Pass, "lens": meta.Lens, "findings": out, "observed_at": at, "source": "review"}})
 	})
 }
 
@@ -362,7 +373,7 @@ func (c *Client) writeChecks(ctx context.Context, repo, sha string, runs []check
 		}
 		n, e := strconv.Atoi(strings.TrimPrefix(key, prefix))
 		if e == nil {
-			c.Changes.Queue(repo, n, "checks", integrations.ChangeSection{At: at, Value: map[string]any{"head_sha": sha, "checks": checks, "observed_at": at, "source": changeSource(ctx), "complete": complete}})
+			c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: map[string]any{"head_sha": sha, "checks": checks, "observed_at": at, "source": changeSource(ctx), "complete": complete}})
 		}
 		return true
 	})

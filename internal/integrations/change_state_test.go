@@ -103,7 +103,7 @@ func TestHKChangeBurstAndFreshness(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < 50; i++ {
 		at := now.Add(time.Duration(i) * time.Millisecond)
-		w.Queue("o/r", 7, "state", ChangeSection{at, map[string]any{"head_sha": "x", "observed_at": at, "source": "webhook", "delivery_id": fmt.Sprint(i)}})
+		w.Queue("o/r", 7, "state", ChangeSection{At: at, Value: map[string]any{"head_sha": "x", "observed_at": at, "source": "webhook", "delivery_id": fmt.Sprint(i)}})
 	}
 	drainChange(t, w)
 	f.mu.Lock()
@@ -114,7 +114,7 @@ func TestHKChangeBurstAndFreshness(t *testing.T) {
 		t.Fatalf("requests=%d latest=%v", count, last)
 	}
 	old := now.Add(-time.Second)
-	w.Queue("o/r", 7, "state", ChangeSection{old, map[string]any{"observed_at": old, "source": "webhook"}})
+	w.Queue("o/r", 7, "state", ChangeSection{At: old, Value: map[string]any{"observed_at": old, "source": "webhook"}})
 	drainChange(t, w)
 	if got := w.Counts().Stale; got != 1 {
 		t.Fatalf("stale=%d", got)
@@ -125,7 +125,7 @@ func TestHKChangeUnavailableBackoff(t *testing.T) {
 	w, logs := changeTestWriter(t, f)
 	at := time.Now().UTC()
 	for i := 0; i < 2; i++ {
-		w.Queue("o/r", 7, "state", ChangeSection{at, map[string]any{"observed_at": at}})
+		w.Queue("o/r", 7, "state", ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
 		drainChange(t, w)
 	}
 	f.mu.Lock()
@@ -140,7 +140,7 @@ func TestHKChangeRejectIsolatesSection(t *testing.T) {
 	w, logs := changeTestWriter(t, f)
 	at := time.Now().UTC()
 	for _, name := range []string{"state", "checks", "gate"} {
-		w.Queue("o/r", 7, name, ChangeSection{at, map[string]any{"observed_at": at}})
+		w.Queue("o/r", 7, name, ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
 	}
 	drainChange(t, w)
 	if w.Counts().Rejected != 1 || w.Counts().Writes != 2 || !strings.Contains(logs.String(), "bad check") {
@@ -152,7 +152,7 @@ func TestHKChangeFallbackToSections(t *testing.T) {
 	f := &changeFake{noBatch: true}
 	w, logs := changeTestWriter(t, f)
 	at := time.Now().UTC()
-	w.Queue("o/r", 7, "state", ChangeSection{at, map[string]any{"observed_at": at}})
+	w.Queue("o/r", 7, "state", ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
 	drainChange(t, w)
 	if w.Counts().Writes != 1 || w.Counts().Unavailable != 0 || strings.Contains(logs.String(), "unavailable") {
 		t.Fatalf("counts=%+v logs=%s", w.Counts(), logs.String())
