@@ -36,6 +36,10 @@ type JobRecord struct {
 	Host   string `json:"host"`
 	PaneID string `json:"pane_id"`
 	Cwd    string `json:"cwd"`
+	// EndReason is why a job ended without a result. A job panewire stopped on
+	// an exhausted quota pool is state lost with "quota_stop pool=<pool>
+	// reset_at=<RFC3339 UTC>"; reset_at is absent when unknown.
+	EndReason string `json:"end_reason"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist

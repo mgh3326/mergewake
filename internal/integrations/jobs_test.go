@@ -36,6 +36,18 @@ func TestHKJobsGet(t *testing.T) {
 	}
 }
 
+// A job panewire stopped on an exhausted quota pool carries its end_reason.
+func TestHKJobsGetEndReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"state": "lost", "end_reason": "quota_stop pool=devin reset_at=2026-11-06T01:02:03Z"})
+	}))
+	defer srv.Close()
+	rec, e := (&hkJobs{base: srv.URL, token: "tok"}).get(context.Background(), "job-1")
+	if e != nil || rec.State != "lost" || rec.EndReason != "quota_stop pool=devin reset_at=2026-11-06T01:02:03Z" {
+		t.Fatalf("%+v %v", rec, e)
+	}
+}
+
 // Job records go through the sink's credential convention: env wins,
 // config.env fills; an http URL off loopback and the tailnet is refused. Values are never
 // printed.
