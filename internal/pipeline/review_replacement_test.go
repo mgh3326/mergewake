@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,11 +39,11 @@ func TestQuotaReplacementFollowAndCollect(t *testing.T) {
 	if len(f.v.got) != 2 || f.v.got[1].label != next {
 		t.Fatalf("timers: %+v", f.v.got)
 	}
-	f.finish(next)
+	f.runner.sink.jobs[next] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`)}
 	if err := f.review(t); err != nil {
 		t.Fatal(err)
 	}
-	if f.g.postCount != 1 || !f.g.refs[doneRef(7, shaA)] {
+	if f.g.postCount != 1 || len(f.g.postedFindings) != 1 || f.g.postedFindings[0].Body != "A concrete bug" || !f.g.refs[doneRef(7, shaA)] {
 		t.Fatalf("posts=%d", f.g.postCount)
 	}
 }
