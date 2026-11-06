@@ -196,4 +196,7 @@ func TestDaemonPostsToDiscord(t *testing.T) {
 	if !strings.Contains(stderr.String(), `"msg":"github requests"`) {
 		t.Fatalf("missing request summary: %s", stderr.String())
 	}
+	if !strings.Contains(stderr.String(), `"by_credential":{"user":`) {
+		t.Fatalf("request summary lacks the per-credential split: %s", stderr.String())
+	}
 }

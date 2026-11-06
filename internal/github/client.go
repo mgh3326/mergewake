@@ -41,6 +41,7 @@ type Client struct {
 	// files read through a commit) across passes and processes. Nil means every
 	// read goes to GitHub.
 	Objects  ObjectCache
+	app      *appAuth
 	poll     pollingState
 	evidence evidenceCache
 	writes   writeEpochs
@@ -66,12 +67,34 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("GitHub %s %s: HTTP %d", e.Method, e.Path, e.Code)
 }
 func NotFound(e error) bool { var a *APIError; return errors.As(e, &a) && a.Code == 404 }
+
+// errAppDenied marks a read the App's installation token was refused (401 or
+// 403). The repository now falls back to the user token, and request retries.
+var errAppDenied = errors.New("GitHub App request refused")
+
 func (c *Client) request(ctx context.Context, method, route, accept string, data []byte) ([]byte, error) {
+	b, e := c.send(ctx, method, route, accept, data, c.credentialFor(ctx, method, route, data))
+	if errors.Is(e, errAppDenied) {
+		return c.send(ctx, method, route, accept, data, userCredential(c.Token))
+	}
+	return b, e
+}
+
+// graphql sends a GraphQL document about repo. The document decides the
+// credential: a query reads with repo's installation token, a mutation with
+// the user token.
+func (c *Client) graphql(ctx context.Context, repo, query string, variables map[string]any, out any) error {
+	return c.json(context.WithValue(ctx, graphqlRepoKey{}, repo), "POST", "/graphql", map[string]any{"query": query, "variables": variables}, out)
+}
+
+func (c *Client) send(ctx context.Context, method, route, accept string, data []byte, cred credential) ([]byte, error) {
 	endpoint := c.BaseURL + route
 	if strings.HasPrefix(route, "UPLOAD ") {
 		endpoint = c.UploadURL + strings.TrimPrefix(route, "UPLOAD ")
 	}
-	key := method + " " + endpoint + " " + accept
+	// The credential kind is part of the key: a body or poll window recorded
+	// under one credential is never replayed for, or revalidated by, the other.
+	key := method + " " + endpoint + " " + accept + " " + cred.kind
 	fresh := isFresh(ctx)
 	if method != "GET" && route != "/graphql" {
 		// Whatever the outcome, the write may have changed what any pass memoized.
@@ -86,7 +109,7 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
-	release, cached, e := c.beginRequest(ctx, key, fresh)
+	release, cached, e := c.beginRequest(ctx, key, fresh, cred.id)
 	if e != nil {
 		return nil, e
 	}
@@ -101,20 +124,29 @@ func (c *Client) request(ctx context.Context, method, route, accept string, data
 	}
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
 	req.Header.Set("User-Agent", "mergewake")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+	if cred.token != "" {
+		req.Header.Set("Authorization", "Bearer "+cred.token)
 	}
 	if data != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, e := c.HTTP.Do(req)
 	if e != nil {
-		recordRequest(ctx, method, route, 0)
+		recordRequest(ctx, method, route, 0, cred.kind)
 		return nil, fmt.Errorf("GitHub %s request failed", method)
 	}
 	defer resp.Body.Close()
-	recordRequest(ctx, method, route, resp.StatusCode)
-	c.observeHeaders(resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
+	recordRequest(ctx, method, route, resp.StatusCode, cred.kind)
+	if cred.kind == credApp && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		// A refusal for a missing permission says nothing about the budget; one
+		// from an exhausted budget or a secondary limit does, and is recorded.
+		if resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, false)
+		}
+		c.app.refuse(c, cred, resp.StatusCode)
+		return nil, errAppDenied
+	}
+	c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
 	if resp.StatusCode == http.StatusNotModified && method == "GET" {
 		if cached.ETag == "" {
 			return nil, errUncached304
@@ -784,7 +816,7 @@ func (c *Client) unresolved(ctx context.Context, repo string, n int) (int, error
 			} `json:"data"`
 		}
 		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviewThreads(first:100,after:$cursor){nodes{isResolved} pageInfo{hasNextPage endCursor}}}}}`
-		if e := c.json(ctx, "POST", "/graphql", map[string]any{"query": query, "variables": map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}}, &result); e != nil {
+		if e := c.graphql(ctx, repo, query, map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}, &result); e != nil {
 			return 0, e
 		}
 		if len(result.Errors) > 0 || result.Data == nil || result.Data.Repository == nil || result.Data.Repository.PullRequest == nil {
