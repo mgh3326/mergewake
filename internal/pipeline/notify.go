@@ -489,14 +489,14 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 }
 
 // authorAction reports whether summary holds a reason the PR's author fixes:
-// a conflict, findings, a failed or cancelled check, or a review blocked on a
+// a conflict, findings, a failed, cancelled or absent check, or a review blocked on a
 // detail only the author can add (NotifyPR renders it "review_missing (detail)").
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
 		if reason == "conflict" || strings.HasPrefix(reason, "review_missing (") {
 			return true
 		}
-		for _, prefix := range []string{"blocking_findings:", "finding_outside_diff:", "triage_unanswered:", "check_failed:", "check_cancelled:"} {
+		for _, prefix := range []string{"blocking_findings:", "finding_outside_diff:", "triage_unanswered:", "check_failed:", "check_cancelled:", "check_absent:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
 			}

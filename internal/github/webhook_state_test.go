@@ -218,7 +218,7 @@ func TestServeFromStoredStateAvoidsTheAPI(t *testing.T) {
 		t.Fatalf("mergeability came from stored state: %v %q", p.Mergeable, p.MergeableState)
 	}
 	states, e := c.CheckStates(ctx, "o/r", "h1", []string{"test", "other"})
-	if e != nil || states["test"] != Green || states["other"] != Pending {
+	if e != nil || states["test"] != Green || states["other"] != Absent {
 		t.Fatalf("stored checks = %v, %v", states, e)
 	}
 	if _, e := c.ReviewHistory(NewPass(ctx), "o/r", 7, "bot"); e != nil {
