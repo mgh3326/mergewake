@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +92,8 @@ type fakeGH struct {
 }
 
 func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	g.pullCalls++
 	p := g.pull
 	if g.pullCalls > 1 && g.nextHead != "" {
@@ -189,6 +192,8 @@ func (g *fakeGH) CheckSnapshot(ctx context.Context, repo, sha string, required [
 	return states, out, nil
 }
 func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string) ([]github.PassReceipt, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	if g.reviewed && sha == g.pull.Head.SHA {
 		return []github.PassReceipt{{Pass: 1, Family: "anthropic", Lens: "correctness"}, {Pass: 2, Family: "openai", Lens: "state-risk"}}, nil
 	}
@@ -213,9 +218,16 @@ func (g *fakeGH) Reviewed(ctx context.Context, repo string, n int, sha, login st
 	return len(passes) > 0, e
 }
 func (g *fakeGH) ReviewClaimed(_ context.Context, _ string, n int, sha string) (bool, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	return g.refs[fmt.Sprintf("mergewake/reviews/%d/%s", n, sha)], nil
 }
 func (g *fakeGH) ReviewLease(_ context.Context, _ string, branch string, ttl time.Duration) (string, bool, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
+	return g.lease(branch, ttl)
+}
+func (g *fakeGH) lease(branch string, ttl time.Duration) (string, bool, error) {
 	if !g.refs[branch] {
 		return "", false, nil
 	}
@@ -226,7 +238,9 @@ func (g *fakeGH) ReviewLease(_ context.Context, _ string, branch string, ttl tim
 	return sha, time.Since(g.leaseTimes[branch]) < ttl, nil
 }
 func (g *fakeGH) ClaimReview(ctx context.Context, repo, branch, head string, ttl time.Duration) (bool, error) {
-	_, active, err := g.ReviewLease(ctx, repo, branch, ttl)
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
+	_, active, err := g.lease(branch, ttl)
 	if err != nil || active {
 		return false, err
 	}
@@ -252,6 +266,8 @@ func (g *fakeGH) ClaimReviewWithSHA(ctx context.Context, repo, branch, head stri
 	return shaA, true, nil
 }
 func (g *fakeGH) RenewReviewLease(_ context.Context, _ string, branch, expected string) (string, bool, error) {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	current := g.leaseIDs[branch]
 	if current == "" {
 		current = shaA
@@ -345,6 +361,8 @@ func (g *fakeGH) Diff(context.Context, string, int) (string, error) {
 	return "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+new\n", nil
 }
 func (g *fakeGH) CreateRef(_ context.Context, _, branch, _ string) error {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	g.claimCount++
 	if g.refs == nil {
 		g.refs = map[string]bool{}
@@ -356,6 +374,8 @@ func (g *fakeGH) CreateRef(_ context.Context, _, branch, _ string) error {
 	return nil
 }
 func (g *fakeGH) PostReview(_ context.Context, _ string, _ int, sha string, f []github.Finding, meta github.PassReceipt) error {
+	fakeGHMu.Lock()
+	defer fakeGHMu.Unlock()
 	g.postCount++
 	g.postedFindings = append(g.postedFindings, f...)
 	if g.passes == nil {
@@ -424,6 +444,13 @@ const (
 	testHubTokenEnv = "MW_TEST_HUB_TOKEN"
 )
 
+// fakeRunnerMu guards the call records of every fakeRunner: the passes of a
+// head call the runner at once. A package lock, so a fakeRunner stays copyable.
+var fakeRunnerMu sync.Mutex
+
+// fakeGHMu guards the fakeGH state the passes of a head share.
+var fakeGHMu sync.Mutex
+
 type fakeRunner struct {
 	pane      *panewireRunner
 	calls     int
@@ -436,17 +463,21 @@ type fakeRunner struct {
 func (r *fakeRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if r.pane != nil && (command == "git" || command == "panewire") {
 		if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
-			r.calls++
-			r.args = args
 			b, err := os.ReadFile(arg(args, "-p"))
 			if err != nil {
 				return nil, err
 			}
+			fakeRunnerMu.Lock()
+			r.calls++
+			r.args = args
 			r.input = string(b)
 			r.inputs = append(r.inputs, r.input)
+			fakeRunnerMu.Unlock()
 		}
 		return r.pane.Run(ctx, command, args, input, dir)
 	}
+	fakeRunnerMu.Lock()
+	defer fakeRunnerMu.Unlock()
 	r.calls++
 	r.input = input
 	r.args = args
@@ -924,7 +955,9 @@ func TestReviewTwoPassesLensesAndSameFamily(t *testing.T) {
 			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 				t.Fatal(e)
 			}
-			passes := g.passes[g.pull.Head.SHA]
+			// The passes post in whatever order they finish.
+			passes := slices.Clone(g.passes[g.pull.Head.SHA])
+			slices.SortFunc(passes, func(a, b github.PassReceipt) int { return a.Pass - b.Pass })
 			if len(passes) != 2 || runner.calls != 2 || g.claimCount != 3 {
 				t.Fatalf("passes=%d runs=%d claims=%d", len(passes), runner.calls, g.claimCount)
 			}

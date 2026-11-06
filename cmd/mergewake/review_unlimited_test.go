@@ -81,14 +81,26 @@ func TestReviewParallelCapHoldsAndUrgentGetsExtra(t *testing.T) {
 }
 
 // With no cap nothing waits for a slot, so priority orders nothing: every PR
-// starts at once and none starts past a bound that does not exist.
+// starts at once, each start still carries its priority, and none starts past a
+// bound that does not exist.
 func TestReviewParallelUnsetPriorityDoesNotHoldStarts(t *testing.T) {
 	f, sink := newPriorityFixture(t, 4, 0)
 	sink.task = map[int]int{1: 3, 2: 1, 3: 2, 4: 1}
 	done := f.poll(context.Background())
 	f.runner.waitFor(t, "four reviews in flight", func(in, started, _ int) bool { return in == 4 })
 	finish(t, f, done)
-	for pr, row := range startRows(t, f) {
+	rows := startRows(t, f)
+	if len(rows) != 4 {
+		t.Fatalf("review-start rows %v, want one per PR 1-4", rows)
+	}
+	for pr, want := range sink.task {
+		row, ok := rows[pr]
+		if !ok {
+			t.Fatalf("PR %d never started", pr)
+		}
+		if got, _ := row["priority"].(float64); int(got) != want {
+			t.Fatalf("PR %d started with priority %v, want %d", pr, row["priority"], want)
+		}
 		if row["over_bound"] == true {
 			t.Fatalf("PR %d started past a bound that does not exist", pr)
 		}

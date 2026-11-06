@@ -46,7 +46,9 @@ func (g *roundGH) ReviewClaimed(ctx context.Context, repo string, n int, sha str
 	return g.fakeGH.ReviewClaimed(ctx, repo, n, sha)
 }
 func (g *roundGH) PostReview(ctx context.Context, repo string, n int, sha string, f []github.Finding, meta github.PassReceipt) error {
+	fakeGHMu.Lock()
 	g.posted = append(g.posted, f)
+	fakeGHMu.Unlock()
 	return g.fakeGH.PostReview(ctx, repo, n, sha, f, meta)
 }
 
@@ -60,7 +62,9 @@ type roundRunner struct {
 func (r *roundRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	b, err := r.fakeRunner.Run(ctx, command, args, input, dir)
 	if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
+		fakeRunnerMu.Lock()
 		r.prompt = r.fakeRunner.input
+		fakeRunnerMu.Unlock()
 	}
 	return b, err
 }
@@ -243,7 +247,8 @@ func TestDuplicateAcrossPassesOfOneRunIsNotPosted(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(g.posted) != 2 || len(g.posted[0]) != 1 || len(g.posted[1]) != 0 {
+	// The passes run together: whichever finishes first keeps the finding.
+	if len(g.posted) != 2 || len(g.posted[0])+len(g.posted[1]) != 1 {
 		t.Fatalf("%+v", g.posted)
 	}
 }

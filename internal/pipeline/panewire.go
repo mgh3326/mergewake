@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -94,6 +95,8 @@ type panewireExecutor struct {
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
 	movedHead    []reviewerJob // records of older heads whose jobs this run closed
+	mu           sync.Mutex    // guards movedHead: the passes of a head run concurrently
+	jobMu        sync.Mutex    // one pass at a time closes the records of older heads
 }
 
 type reviewResultLost struct {
@@ -419,16 +422,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		tracing.Finish(runSpan)
 		// A fresh spawn refused as held, while this run closed the job of an
 		// older head: close it once more and spawn again, once.
-		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHead) > 0 {
+		if e != nil && !resumed && exitStatus(e) == panewireHeld && ctx.Err() == nil && len(x.movedHeadJobs()) > 0 {
 			var closeErr error
-			for _, old := range x.movedHead {
+			for _, old := range x.movedHeadJobs() {
 				closeErr = errors.Join(closeErr, x.closeMovedHeadJob(ctx, old))
 			}
 			if closeErr != nil {
 				_ = s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass)
 				// An older head's job may still hold the reservation: its
 				// record goes back so the next pass closes it.
-				for _, old := range x.movedHead {
+				for _, old := range x.movedHeadJobs() {
 					closeErr = errors.Join(closeErr, x.saveReviewerJob(old))
 				}
 				return out, errors.Join(e, closeErr)
