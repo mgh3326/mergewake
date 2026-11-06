@@ -94,10 +94,10 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if e != nil {
 		return e
 	}
-	checks := p.RequiredChecks
-	if len(p.WatchChecks) > 0 {
-		checks = p.WatchChecks
-	}
+	// The newest head is judged by the whole watch set; bisect judges every
+	// other commit by the checks any-ref CI reports.
+	checks := p.WatchSet()
+	bisectChecks := p.BisectChecks()
 	s.ciPolicy(ctx, r, head, o)
 	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
@@ -175,11 +175,27 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		if v, ok := cache[sha]; ok {
 			return v, nil
 		}
-		v, e := s.GH.Check(ctx, r.Name, sha, checks)
+		v, e := s.GH.Check(ctx, r.Name, sha, bisectChecks)
 		if e == nil {
 			cache[sha] = v
 		}
 		return v, e
+	}
+	// A head that is red only on checks outside any_ref_checks cannot be
+	// bisected: no commit can be shown green or red on them. Never blame a
+	// commit on partial evidence.
+	if len(bisectChecks) < len(checks) {
+		v, e := s.GH.Check(ctx, r.Name, head, bisectChecks)
+		if e != nil {
+			return e
+		}
+		if v != github.Red {
+			outside, e := s.redOutside(ctx, r.Name, head, checks, bisectChecks)
+			if e != nil {
+				return e
+			}
+			return hold("red only on checks any-ref CI does not report: " + strings.Join(outside, ", "))
+		}
 	}
 	// Only first parents walk mainline: a merge commit's second parent is the
 	// merged branch, and the merge commit itself is the integration unit.
@@ -371,6 +387,29 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		note += "; task reopen failed (recovery comment retained): " + reopen.Error()
 	}
 	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Type: "culprit-hold", Text: note}))
+}
+
+// redOutside names the red checks of sha that are in checks but not in
+// inside, in checks order.
+func (s *Service) redOutside(ctx context.Context, repo, sha string, checks, inside []string) ([]string, error) {
+	in := map[string]bool{}
+	for _, n := range inside {
+		in[n] = true
+	}
+	var red []string
+	for _, n := range checks {
+		if in[n] {
+			continue
+		}
+		v, e := s.GH.Check(ctx, repo, sha, []string{n})
+		if e != nil {
+			return nil, e
+		}
+		if v == github.Red {
+			red = append(red, n)
+		}
+	}
+	return red, nil
 }
 
 // reportWatch audits a held or reported watch outcome once per head and key,

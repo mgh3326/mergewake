@@ -1971,9 +1971,10 @@ with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main
 without weakening the PR gate. First-PR CI measurement always uses required_checks.
 
 `policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
-that runs the watch checks for any commit: it has a `workflow_dispatch` trigger
-with input `ref` and posts the watch checks as commit statuses on that sha (for
-example `any_ref_workflow: ci-any-ref.yml`). When a red main head's bisect needs
+that runs the checks bisect judges a commit by for any commit: it has a
+`workflow_dispatch` trigger with input `ref` and posts those checks (the watch
+checks, or `any_ref_checks` below) as commit statuses on that sha (for example
+`any_ref_workflow: ci-any-ref.yml`). When a red main head's bisect needs
 a commit that has no green or red result, an acting watch dispatches the workflow
 once for that commit on the watched branch, records the dispatch in
 `any-ref-dispatch.json` in the repo state dir, and holds with
@@ -1991,6 +1992,27 @@ incident. A refusal is not retried until the next incident. Shadow and
 `--dry-run` passes dispatch nothing and name the commit they would dispatch in
 `any_ref_dispatch`. Without the key, unknown evidence holds as before. The token
 needs permission to dispatch workflows.
+
+`policy.any_ref_checks` optionally lists the checks bisect judges a candidate
+commit by, for a repo whose any-ref workflow posts fewer checks than the main run
+(for example `watch_checks: [ci-ok, image]` with `any_ref_checks: [ci-ok]`, when
+the image builds only on a push to main). Unset keeps the watch set, which is
+`watch_checks`, else `required_checks`. Each name must be in the watch set and
+the list must not be empty or repeat a name; otherwise the policy is invalid and
+the error names `any_ref_checks`. The newest main head is still judged by the
+whole watch set, so it decides healthy or red as before. `any_ref_checks` applies
+to the commits bisect reads, including the green ancestor search and the commits
+an any-ref run reports on.
+
+When the newest head is red only on checks outside `any_ref_checks`, no commit
+can be shown green or red on them, so bisect would blame on partial evidence.
+Watch holds instead, queries no ancestor and notifies once per head, with the
+reason `red only on checks any-ref CI does not report: <names>`. The hold ends
+when the head turns green, or when a check inside `any_ref_checks` is red too.
+
+`mergewake ci-policy` lists the checks bisect judges by and warns when the
+any-ref workflow obviously cannot post one: no job is named for it, no job name
+is an expression, and the file never spells it.
 
 A check run and a commit status with the same name combine as follows: a pending,
 cancelled or skipped value yields to a green or red one. Two decisive values

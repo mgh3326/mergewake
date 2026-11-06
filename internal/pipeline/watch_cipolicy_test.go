@@ -87,7 +87,7 @@ func TestWatchCIPolicyWarnsOncePerBlobChange(t *testing.T) {
 
 	// Fixing the policy makes the repo compliant: no warning, no event.
 	f.policyExtra = "any_ref_workflow: any.yml\n"
-	g.workflows[".github/workflows/any.yml"] = "on: workflow_dispatch\njobs:\n  x:\n    runs-on: x\n"
+	g.workflows[".github/workflows/any.yml"] = "on: workflow_dispatch\njobs:\n  CI:\n    runs-on: x\n"
 	pass(Options{})
 	pass(Options{})
 	if warnings() != 2 || len(n.events) != 2 {

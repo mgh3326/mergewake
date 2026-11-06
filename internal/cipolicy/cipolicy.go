@@ -96,6 +96,11 @@ type AnyRef struct {
 	Workflow string `json:"workflow,omitempty"`
 	Set      bool   `json:"set"`
 	Exists   bool   `json:"exists"`
+	// Checks is any_ref_checks, else the watched checks: what bisect judges a
+	// candidate commit by.
+	Checks []string `json:"checks"`
+	// Missing lists those checks the workflow file obviously cannot post.
+	Missing []string `json:"missing,omitempty"`
 }
 
 // Report is the verdict for one repo at one head.
@@ -145,18 +150,48 @@ func Check(in Input) Report {
 		rep.Workflows = append(rep.Workflows, w)
 	}
 	if known {
-		rep.AnyRef = AnyRef{Workflow: in.Policy.AnyRefWorkflow, Set: in.Policy.AnyRefWorkflow != "", Exists: exists[in.Policy.AnyRefWorkflow]}
+		rep.AnyRef = AnyRef{Workflow: in.Policy.AnyRefWorkflow, Set: in.Policy.AnyRefWorkflow != "", Exists: exists[in.Policy.AnyRefWorkflow], Checks: in.Policy.BisectChecks()}
 		switch {
 		case !rep.AnyRef.Set:
 			rep.Reasons = append(rep.Reasons, "any_ref_workflow is not set in "+in.PolicyPath)
 		case !rep.AnyRef.Exists:
 			rep.Reasons = append(rep.Reasons, fmt.Sprintf("any_ref_workflow %s does not exist in %s", in.Policy.AnyRefWorkflow, WorkflowDir))
+		default:
+			for _, f := range in.Workflows {
+				if strings.TrimPrefix(f.Path, WorkflowDir+"/") == in.Policy.AnyRefWorkflow {
+					rep.AnyRef.Missing = anyRefMissing(f, rep.AnyRef.Checks)
+				}
+			}
+			if len(rep.AnyRef.Missing) > 0 {
+				rep.Reasons = append(rep.Reasons, fmt.Sprintf("any_ref_workflow %s does not post %s; bisect cannot judge a commit by it (set any_ref_checks to the checks it posts)", in.Policy.AnyRefWorkflow, strings.Join(rep.AnyRef.Missing, ", ")))
+			}
 		}
 	}
 	if len(rep.Reasons) > 0 {
 		rep.Verdict = Warn
 	}
 	return rep
+}
+
+// anyRefMissing returns the checks the any-ref workflow obviously cannot post:
+// no job is named for one, no job name is an unresolvable expression, and the
+// file never spells it (a script can post a commit status of that name).
+func anyRefMissing(f File, checks []string) []string {
+	var doc yaml.Node
+	if yaml.Unmarshal(f.Data, &doc) != nil || doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil
+	}
+	state, matched := produces(field(doc.Content[0], "jobs"), checks, true)
+	if state == ProducesUnknown {
+		return nil
+	}
+	var missing []string
+	for _, c := range checks {
+		if !slices.Contains(matched, c) && !strings.Contains(string(f.Data), c) {
+			missing = append(missing, c)
+		}
+	}
+	return missing
 }
 
 func key(in Input) string {
@@ -564,6 +599,9 @@ func (r Report) Text() string {
 		fmt.Fprintf(&b, "  no workflow runs on push to %s\n", r.Branch)
 	}
 	fmt.Fprintf(&b, "  any_ref_workflow: set=%t exists=%t %s\n", r.AnyRef.Set, r.AnyRef.Exists, r.AnyRef.Workflow)
+	if len(r.AnyRef.Checks) > 0 {
+		fmt.Fprintf(&b, "  any_ref_checks (bisect judges by): %s\n", strings.Join(r.AnyRef.Checks, ", "))
+	}
 	for _, reason := range r.Reasons {
 		fmt.Fprintf(&b, "  - %s\n", reason)
 	}

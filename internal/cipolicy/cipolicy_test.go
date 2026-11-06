@@ -1,6 +1,7 @@
 package cipolicy
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -245,6 +246,55 @@ func TestCIPolicyExpressionJobNameQuotingWatchedCheck(t *testing.T) {
 	r = Check(input(t, polOK, map[string]string{"ci.yml": wf("${{ matrix.os }}"), "ci-any-ref.yml": anyRef}))
 	if r.Workflows[0].Produces != ProducesUnknown {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// The any-ref workflow must be able to post the checks bisect judges by.
+func TestAnyRefChecksPostable(t *testing.T) {
+	const mainCI = `name: Main
+on: {push: {branches: [main]}}
+concurrency: {group: "ci-${{ github.ref }}", cancel-in-progress: true}
+jobs:
+  ci-ok: {runs-on: ubuntu-latest, steps: [{run: make}]}
+  image: {runs-on: ubuntu-latest, steps: [{run: make image}]}
+`
+	const anyRefCIOK = `name: Any ref
+on: {workflow_dispatch: {inputs: {ref: {required: true}}}}
+jobs:
+  ci-ok: {runs-on: ubuntu-latest, steps: [{run: make}]}
+`
+	const anyRefStatus = `name: Any ref
+on: {workflow_dispatch: {inputs: {ref: {required: true}}}}
+jobs:
+  all:
+    runs-on: ubuntu-latest
+    steps: [{run: "gh api statuses -f context=image"}]
+`
+	const anyRefExpr = `name: Any ref
+on: {workflow_dispatch: {inputs: {ref: {required: true}}}}
+jobs:
+  all: {name: "${{ matrix.name }}", runs-on: ubuntu-latest, steps: [{run: make}]}
+`
+	base := "version: 1\nrequired_checks: [ci-ok]\nwatch_checks: [ci-ok, image]\nany_ref_workflow: ci-any-ref.yml\n"
+	for _, tt := range []struct {
+		name, extra, anyRef string
+		missing             []string
+	}{
+		{"posts only ci-ok, key unset", "", anyRefCIOK, []string{"image"}},
+		{"posts only ci-ok, key names it", "any_ref_checks: [ci-ok]\n", anyRefCIOK, nil},
+		{"key names a check it cannot post", "any_ref_checks: [image]\n", anyRefCIOK, []string{"image"}},
+		{"a script spells the check", "any_ref_checks: [image]\n", anyRefStatus, nil},
+		{"unresolvable job name is not obvious", "any_ref_checks: [image]\n", anyRefExpr, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := Check(input(t, base+tt.extra, map[string]string{"main.yml": mainCI, "ci-any-ref.yml": tt.anyRef}))
+			if !slices.Equal(r.AnyRef.Missing, tt.missing) {
+				t.Fatalf("missing %v, want %v: %+v", r.AnyRef.Missing, tt.missing, r)
+			}
+			if got := hasReason(r, "does not post"); got != (len(tt.missing) > 0) || (len(tt.missing) == 0 && r.Verdict != OK) {
+				t.Fatalf("%+v", r)
+			}
+		})
 	}
 }
 
