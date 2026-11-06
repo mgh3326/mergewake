@@ -44,6 +44,41 @@ type pollingState struct {
 	rate      map[string]throttle
 	remaining map[string]int
 	polls     map[string]throttle
+	// mutations counts, per "owner/repo", the mutations that cleared that
+	// repository's cached bodies and poll windows; the "" entry counts those
+	// that cleared everything. A read marks the count before it is sent and
+	// stores nothing if the count moved while it was in flight.
+	mutations map[string]uint64
+}
+
+// readMark is a repository's mutation count taken before a request began.
+type readMark struct {
+	repo string
+	n    uint64
+}
+
+// markRead takes the mutation count a request for repo must still see when its
+// response arrives. Routes outside /repos/{owner}/{repo} have repo "".
+func (p *pollingState) markRead(repo string) readMark {
+	p.init()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return readMark{repo, p.mutationCount(repo)}
+}
+
+// overlapped reports whether a mutation cleared the cache after m was taken. The
+// caller holds p.mu and checks it in the same critical section as the store it
+// guards, so a mutation cannot land between the check and the store.
+func (p *pollingState) overlapped(m readMark) bool {
+	return p.mutationCount(m.repo) != m.n
+}
+
+func (p *pollingState) mutationCount(repo string) uint64 {
+	n := p.mutations[""]
+	if repo != "" {
+		n += p.mutations[repo]
+	}
+	return n
 }
 
 // throttleLogThreshold is the shortest wait worth a stderr line.
@@ -118,6 +153,7 @@ func (p *pollingState) init() {
 		p.gates = map[string]chan struct{}{}
 		p.cache = newResponseCache(maxCachedEntries, maxCachedBytes)
 		p.polls = map[string]throttle{}
+		p.mutations = map[string]uint64{}
 	})
 }
 
@@ -236,7 +272,10 @@ func pollingEndpoint(route string) bool {
 	return len(parts) == 5 && parts[0] == "users" && parts[2] == "events" && parts[3] == "orgs"
 }
 
-func (c *Client) observeHeaders(cred string, h http.Header, code int, key string, polling bool) {
+// observeHeaders records the credential's rate-limit state and, for a polling
+// endpoint, the key's poll window. The window is dropped when a mutation cleared
+// the repository since mark: it was set by a response that predates the write.
+func (c *Client) observeHeaders(cred string, h http.Header, code int, key string, polling bool, mark readMark) {
 	p := &c.poll
 	p.init()
 	p.mu.Lock()
@@ -273,11 +312,11 @@ func (c *Client) observeHeaders(cred string, h http.Header, code int, key string
 	if w.until.After(p.rate[cred].until) {
 		p.rate[cred] = w
 	}
-	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); polling && e == nil && seconds > 0 {
+	if seconds, e := strconv.Atoi(h.Get("X-Poll-Interval")); polling && e == nil && seconds > 0 && !p.overlapped(mark) {
 		p.polls[key] = throttle{until: now.Add(time.Duration(min(seconds, 86400)) * time.Second), reason: "poll interval", code: code}
 	}
 }
-func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
+func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool, mark readMark) {
 	p := &c.poll
 	p.init()
 	p.mu.Lock()
@@ -295,6 +334,11 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 		}
 		if err == nil && len(parts) >= 3 && parts[0] == "repos" {
 			prefix = "GET " + u.Scheme + "://" + u.Host + "/repos/" + parts[1] + "/" + parts[2]
+		}
+		if prefix == "" {
+			p.mutations[""]++
+		} else {
+			p.mutations[parts[1]+"/"+parts[2]]++
 		}
 		var pullNumber string
 		if len(parts) >= 5 && (parts[3] == "issues" && parts[4] != "comments" || parts[3] == "pulls") && len(parts) >= 6 && (parts[5] == "comments" || parts[5] == "reviews") {
@@ -337,7 +381,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool) {
 
 		return
 	}
-	if len(body) > maxCachedBody {
+	if len(body) > maxCachedBody || p.overlapped(mark) {
 		return
 	}
 	// A response without an ETag is kept only while its poll window runs:
@@ -406,12 +450,12 @@ var errUncached304 = errors.New("GitHub returned 304 without a cached representa
 // without a replay the second read was skipped every round and the review
 // never started. Only the window's own response is replayed, and any mutation
 // wipes it with the rest of the cache.
-func (c *Client) cacheNotFound(key string) {
+func (c *Client) cacheNotFound(key string, mark readMark) {
 	p := &c.poll
 	p.init()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if w, ok := p.polls[key]; !ok || !w.until.After(time.Now()) {
+	if w, ok := p.polls[key]; !ok || !w.until.After(time.Now()) || p.overlapped(mark) {
 		return
 	}
 	p.store(key, cachedResponse{Replay: true, Code: http.StatusNotFound})

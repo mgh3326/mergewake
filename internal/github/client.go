@@ -138,6 +138,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 			return append([]byte(nil), hit.Body...), nil
 		}
 	}
+	// A mutation that clears this repository while the request is in flight
+	// makes its response older than the cache: it is never stored.
+	mark := c.poll.markRead(memoRepo(strings.Split(route, "?")[0]))
 	release, cached, e := c.beginRequest(ctx, key, fresh, cred.id)
 	if e != nil {
 		return nil, e
@@ -170,12 +173,12 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		// A refusal for a missing permission says nothing about the budget; one
 		// from an exhausted budget or a secondary limit does, and is recorded.
 		if resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-RateLimit-Remaining") == "0" {
-			c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, false)
+			c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, false, mark)
 		}
 		c.app.refuse(c, cred, resp.StatusCode)
 		return nil, errAppDenied
 	}
-	c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route))
+	c.observeHeaders(cred.id, resp.Header, resp.StatusCode, key, method == "GET" && pollingEndpoint(route), mark)
 	if resp.StatusCode == http.StatusNotModified && method == "GET" {
 		if cached.ETag == "" {
 			return nil, errUncached304
@@ -185,7 +188,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if method == "GET" && resp.StatusCode == http.StatusNotFound && c.Polling {
-			c.cacheNotFound(key)
+			c.cacheNotFound(key, mark)
 		}
 		return nil, &APIError{resp.StatusCode, method, strings.Split(route, "?")[0]}
 	}
@@ -195,14 +198,14 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if len(parts) >= 3 && parts[0] == "repos" {
 			c.InvalidateEvidence(parts[1] + "/" + parts[2])
 		}
-		c.cacheResponse(key, "", nil, true)
+		c.cacheResponse(key, "", nil, true, mark)
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, manifest.MaxFileSize*2+1))
 	if len(b) > manifest.MaxFileSize*2 {
 		return nil, errors.New("GitHub response too large")
 	}
 	if e == nil && !mutation {
-		c.cacheResponse(key, resp.Header.Get("ETag"), b, false)
+		c.cacheResponse(key, resp.Header.Get("ETag"), b, false, mark)
 		if method == "GET" {
 			probeOf(ctx).note(resp.Header.Get("ETag"))
 		}
