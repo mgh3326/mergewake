@@ -1421,7 +1421,9 @@ An HTTP status of `0` counts a request that received no response.
 
 #### Wake signals
 
-The `pr` role starts a pass for one of three reasons. The pass log line
+Each event also puts the PR it names on the [PR event queue](pr-queue.md), which
+evaluates that PR at once; the pass the signals below start is the sweep that
+queues every open PR. The `pr` role starts a pass for one of three reasons. The pass log line
 (`loop completed`) names it in its `wake` field: `webhook`, `reviewer` or
 `interval` (the first pass after a start counts as `interval`).
 
@@ -1682,29 +1684,29 @@ escalation. Shadow and dry-run modes do not retry reviews or write retry state.
 and landing, except a bot the repository's policy lists under `bot_updates`.
 They still count as open for outcome reconciliation.
 
-`daemon.pr.review_parallel` caps how many PRs of one repository a PR pass
-reviews at once. Unset or `0` means no cap: every reviewable PR of the
-repository is reviewed at once in a pass. A positive value is an explicit cap
+`daemon.pr.review_parallel` caps how many PRs of one repository the `pr` role
+evaluates (reviews) at once; see the [PR event queue](pr-queue.md). Unset or `0`
+means no cap: every PR is evaluated as soon as an event queues it. A positive value is an explicit cap
 (`1` reviews one PR at a time) with no maximum; a negative value is a config
 error. The operator decided that reviewers are not capped by default, and that
 a limit is set only when watching the pass log shows one is needed. The limits
 that remain are panewire's spawn quota and the host's capacity. The pr pass log
 line of each repository carries `reviews_concurrent_max`, the most reviews that
-ran at once in that pass, for Grafana and Sentry; the line is written when the
-webhook receiver is enabled. Each PR's review is followed by its findings
+ran at once since the previous line, for Grafana and Sentry; the line is
+written when the webhook receiver is enabled. Each PR's review is followed by its findings
 delivery, notification and land; those settle steps run one PR at a time within
 a repository. The PR role runs all configured repositories at once, so the cap
 applies to each repository, not to the daemon; no global reviewer cap exists.
 The other roles visit repositories one after another.
 
-With the `handoffkeep` sink, reviews start in hk priority order (1 is highest;
-no priority sorts last; ties keep the order GitHub lists the PRs). A PR's
+With the `handoffkeep` sink, when more PRs wait than the cap lets run they start
+in hk priority order (1 is highest; no priority sorts last; ties keep arrival
+order). A PR's
 priority is hk's change priority for its PR URL, else the priority of its
 `Mergewake-Task` task, else none. A priority-1 review does not wait for a free
 `review_parallel` slot: under an explicit cap it starts at once, with at most
 two such reviews past the cap per repository, and takes the next free slot
-beyond that. With no cap this changes nothing, since every review starts at
-once. A failed or slow hk read gives that PR no priority and never fails the pass. Only the
+beyond that. With no cap this changes nothing, since no PR waits. A failed or slow hk read gives that PR no priority and never fails the pass. Only the
 review start order changes; settling, land, the merge gate, retries and
 notifications are unchanged. Each review start writes a `review-start` row to
 `decisions.jsonl` with the priority and where it came from.

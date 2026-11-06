@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -131,30 +128,4 @@ func (k *prSkips) forget(repo string, open map[int]bool) {
 			delete(k.last, key)
 		}
 	}
-}
-
-// report logs one repository's pass: how many PRs it skipped and evaluated, and
-// why each evaluated PR was, and the most reviews that ran at once.
-func (k *prSkips) report(repo string, prs []int, plans []skipPlan, reviewsConcurrentMax int) {
-	if k == nil || k.Log == nil {
-		return
-	}
-	skipped, evaluated := 0, 0
-	reasons := map[string]int{}
-	var evaluatedPRs []string
-	for i, p := range plans {
-		if p.skip {
-			skipped++
-			continue
-		}
-		evaluated++
-		for _, r := range p.reasons {
-			reasons[r]++
-		}
-		if len(p.reasons) > 0 {
-			evaluatedPRs = append(evaluatedPRs, fmt.Sprintf("%d:%s", prs[i], strings.Join(p.reasons, "+")))
-		}
-	}
-	slices.Sort(evaluatedPRs)
-	k.Log.Info("pr pass", "repo", repo, "prs_skipped", skipped, "prs_evaluated", evaluated, "evaluated_reasons", reasons, "evaluated", evaluatedPRs[:min(len(evaluatedPRs), 30)], "reviews_concurrent_max", reviewsConcurrentMax)
 }
