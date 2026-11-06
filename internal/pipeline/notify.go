@@ -233,6 +233,10 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 		if errors.As(err, &api) {
 			status = fmt.Sprint(api.Code)
 		}
+	} else if e := s.recordBranchUpdate(r.Name, pr.Number, pr.Head.SHA); e != nil {
+		// The update happened; a lost record only restarts the overdue clocks
+		// of the head it produces.
+		_ = s.audit(r.Name, "base-update-record-error", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "error": integrations.Detail(e)}, false)
 	}
 	if err = fsutil.Atomic(path, []byte(status), 0600); err != nil {
 		_ = s.audit(r.Name, "base-update-marker-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, false)
@@ -282,7 +286,9 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	// The verdict key dedupes per (PR, head, verdict): a BLOCKED reason set is
 	// part of the verdict, while a retitled READY is the same verdict.
-	key := fmt.Sprintf("%s %d %s", state, pr.Number, pr.Head.SHA)
+	// readyClocksFile holds each READY under this key; the overdue notice
+	// counts ready_too_long from it.
+	key := verdictKey(state, pr.Number, pr.Head.SHA)
 	if state == "blocked" {
 		key += " " + summary
 	}
@@ -346,6 +352,11 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		}
 	}
 	return lane, via, true, nil
+}
+
+// verdictKey is the sent and READY-clock key of one (PR, head, verdict).
+func verdictKey(state string, n int, head string) string {
+	return fmt.Sprintf("%s %d %s", state, n, head)
 }
 
 // eventType is the panewire notification type a verdict is declared with, so

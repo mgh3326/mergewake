@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -195,7 +196,7 @@ func TestMergeOverdueExclusions(t *testing.T) {
 			}}
 		}, func(rig *overdueRig) { rig.s.GH.(*outsideGH).history[0].OutsideBlocking = 0 }},
 		{"check failed", true, func(rig *overdueRig) { rig.g.ci = github.Red }, func(rig *overdueRig) { rig.g.ci = github.Green }},
-		{"check absent", false, func(rig *overdueRig) {
+		{"check absent", true, func(rig *overdueRig) {
 			rig.g.ci = github.Absent
 			rig.g.committedAt = map[string]time.Time{shaA: overdueStart.Add(-2 * time.Hour)}
 		}, func(rig *overdueRig) { rig.g.ci = github.Green }},
@@ -358,5 +359,204 @@ func TestMergeOverdueCIRunningStartsNoReviewClock(t *testing.T) {
 	}
 	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "review_not_started after 21m0s") {
 		t.Fatal(e.Text)
+	}
+}
+
+// branchUpdateTo makes the next evaluation find a stale base that mergewake
+// updates, the update producing head newHead as a merge of base into oldHead.
+func (rig *overdueRig) branchUpdateTo(newHead string) {
+	rig.t.Helper()
+	rig.g.policyExtra, rig.g.stale, rig.g.pull.MergeableState = requireUpToDate, true, "behind"
+	rig.g.updateHook = func() {
+		rig.g.stale, rig.g.pull.MergeableState = false, "clean"
+		rig.g.pull.Head.SHA = newHead
+		rig.g.parents2 = map[string][]string{newHead: {shaA, shaB}}
+		markReviewed(rig.g)
+	}
+}
+
+// (a) mergewake updates the branch at minute 30: the head it makes keeps the
+// old head's HeadSeen and READY, so ready_too_long still falls due 45 minutes
+// after the READY the author never had to repeat.
+func TestMergeOverdueCarriesClocksAcrossOwnBranchUpdate(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY for aaaaaaa
+	rig.branchUpdateTo(shaC)
+	rig.at(30 * time.Minute)
+	rig.g.updateHook = nil
+	rig.at(31 * time.Minute)
+	rig.wantConditions()
+	rig.at(44 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(45 * time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	e := rig.n.overdueEvents()[1]
+	if !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | clocks carried from aaaaaaa after mergewake updated the branch | gate: ready") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (b) An author push is a head of its own: no update made it, so its clocks
+// start at the push and its READY is the one sent for it.
+func TestMergeOverdueAuthorPushRestartsClocks(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY for aaaaaaa
+	rig.g.pull.Head.SHA = shaC
+	rig.g.parents2 = map[string][]string{shaC: {shaA}}
+	markReviewed(rig.g)
+	rig.at(31 * time.Minute)
+	rig.at(45 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(76 * time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | gate: ready") || strings.Contains(e.Text, "carried from") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (c) mergewake updates the branch, then the author pushes on top of the
+// result: the carry does not follow that push, and the clocks restart from it.
+func TestMergeOverdueAuthorPushAfterOwnUpdateRestartsClocks(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY for aaaaaaa
+	rig.branchUpdateTo(shaC)
+	rig.at(30 * time.Minute)
+	rig.g.updateHook = nil
+	rig.at(31 * time.Minute) // ccccccc inherits aaaaaaa's clocks
+	rig.g.pull.Head.SHA = shaD
+	rig.g.parents2[shaD] = []string{shaC}
+	markReviewed(rig.g)
+	rig.at(32 * time.Minute)
+	rig.wantConditions()
+	rig.at(45 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	if got := rig.n.conditions(); len(got) != 1 {
+		t.Fatalf("the push took a carried clock: %v", got)
+	}
+}
+
+// (d) The update record is written with the clocks: a restart between the
+// update and the head it produced still carries them.
+func TestMergeOverdueCarrySurvivesRestart(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0)
+	rig.branchUpdateTo(shaC)
+	rig.at(30 * time.Minute)
+	rig.g.updateHook = nil
+	restarted := *rig.s
+	rig.n = &laneNotifier{refuse: map[string]bool{}}
+	restarted.Notifier = rig.n
+	rig.s = &restarted
+	rig.at(31 * time.Minute)
+	rig.wantConditions()
+	rig.at(45 * time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | clocks carried from aaaaaaa") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (e) ready_too_long counts from the READY verdict, not from the head's first
+// pass: a head seen 59 minutes ago with its READY sent 9 minutes ago owes
+// nothing yet.
+func TestMergeOverdueReadyTooLongCountsFromReady(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.g.ci = github.Pending
+	rig.at(0) // head seen, CI still running: no READY
+	rig.at(50 * time.Minute)
+	rig.g.ci = github.Green
+	rig.at(50 * time.Minute)
+	rig.at(59 * time.Minute)
+	rig.wantConditions()
+	rig.at(60 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(95 * time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "ready_too_long after 45m0s | gate: ready") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (f) No READY was sent for the head: no ready_too_long, however long the head
+// waits.
+func TestMergeOverdueNoReadyNoReadyTooLong(t *testing.T) {
+	rig := newOverdueRig(t, false)
+	rig.at(0)
+	if e := fsutil.WriteJSON(rig.s.reviewerJobPath(rig.r.Name, 7, 1), reviewerJob{PR: 7, Head: shaA, Pass: 1, Label: "mwr-7-aaaaaaa-p1-1", Recorded: rig.now}); e != nil {
+		t.Fatal(e)
+	}
+	rig.at(120 * time.Minute)
+	rig.wantConditions()
+}
+
+// (g) A pending verdict that waits only on GitHub's mergeability computation
+// holds the notice for that evaluation.
+func TestMergeOverdueHeldWhileMergeableUnknown(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY at 0
+	rig.at(10 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.g.pull.Mergeable, rig.g.pull.MergeableState = nil, "unknown"
+	rig.at(50 * time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	yes := true
+	rig.g.pull.Mergeable, rig.g.pull.MergeableState = &yes, "clean"
+	rig.at(55 * time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "ready_too_long after 55m0s") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (h) A pending verdict that waits on CI does not hold the notice: a head
+// READY 50 minutes ago whose checks are rerunning is ready_too_long. The
+// pending path reads no review record, so review_not_started falls due too.
+func TestMergeOverdueCIWaitStillReadyTooLong(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY at 0
+	rig.g.ci = github.Pending
+	rig.at(50 * time.Minute)
+	rig.wantConditions(overdueReviewNotStarted, overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[2]; !strings.Contains(e.Text, "ready_too_long after 50m0s | gate: pending | checks: CI=pending") {
+		t.Fatal(e.Text)
+	}
+}
+
+// (i) A clocks file written before the update records and the READY clock
+// existed is a bare map of clocks: it still loads, keeps its times, and is
+// rewritten in the current shape.
+func TestMergeOverdueLegacyClocksFileLoads(t *testing.T) {
+	rig := newOverdueRig(t, false)
+	file := rig.s.overdueClocksFile(rig.r.Name)
+	legacy := map[string]overdueClock{"7 " + shaA: {
+		HeadSeen:   overdueStart.Add(-time.Hour),
+		ChecksDone: overdueStart.Add(-21 * time.Minute),
+		Touched:    overdueStart.Add(-2 * time.Hour),
+	}}
+	if e := fsutil.WriteJSON(file, legacy); e != nil {
+		t.Fatal(e)
+	}
+	rig.at(0)
+	rig.wantConditions(overdueReviewNotStarted)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "review_not_started after 21m0s") {
+		t.Fatal(e.Text)
+	}
+	st, e := readOverdueState(file)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c, ok := st.Clocks["7 "+shaA]; !ok || !c.HeadSeen.Equal(overdueStart.Add(-time.Hour)) {
+		t.Fatalf("legacy clocks lost: %+v", st)
+	}
+	b, e := os.ReadFile(file)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var raw map[string]json.RawMessage
+	if e := json.Unmarshal(b, &raw); e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := raw["clocks"]; !ok {
+		t.Fatalf("file not rewritten in the current shape: %s", b)
 	}
 }
