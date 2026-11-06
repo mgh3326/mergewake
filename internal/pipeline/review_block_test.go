@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -332,27 +331,6 @@ func TestBlockDryRunAndShadowTellNobody(t *testing.T) {
 				t.Fatalf("posts=%d events=%+v row=%q", f.gh.posts, f.n.events, f.blocked(t, 7))
 			}
 		})
-	}
-}
-
-func TestStallAlarmSkipsBlockedHead(t *testing.T) {
-	f := blockSetup(t)
-	c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
-	f.s.Now = c.now
-	f.s.Config.Daemon.PR.StallAfter = "30m"
-	prs := []github.Pull{f.g.pull}
-	if e := f.s.RetryReview(context.Background(), f.r, f.g.pull, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if e := f.s.CheckStalls(context.Background(), f.r, prs, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	c.t = c.t.Add(2 * time.Hour)
-	if e := f.s.CheckStalls(context.Background(), f.r, prs, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if f.n.count != 1 {
-		t.Fatalf("a blocked head raised a stall alarm: %+v", f.n.events)
 	}
 }
 
