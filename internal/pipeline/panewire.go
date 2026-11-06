@@ -855,8 +855,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
 	out.fallback = note
 	keepJob = true
-	if e = x.closeCollectedJob(ctx, rj, res.rec); e != nil {
-		return out, e
+	// Best effort: the findings are collected and accepted, so a close that
+	// cannot run (or its audit write) is logged and never fails the pass.
+	if cerr := x.closeCollectedJob(ctx, rj, res.rec); cerr != nil {
+		_ = s.Print(map[string]any{"action": "review", "state": "close-failed", "pr": pr.Number, "head": short7(pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "reason": fleetevent.Redact(cerr.Error())})
 	}
 	x.note("collected", rj)
 	return out, nil

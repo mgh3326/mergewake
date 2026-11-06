@@ -85,6 +85,11 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
 		r.closes = append(r.closes, slices.Clone(args))
+		// The real command runs on the caller's context and fails once it is
+		// spent; a close that runs on a detached one still succeeds.
+		if e := ctx.Err(); e != nil {
+			return nil, e
+		}
 		var e error
 		if len(r.closeErrs) > 0 {
 			e, r.closeErrs = r.closeErrs[0], r.closeErrs[1:]
