@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -17,10 +18,11 @@ type reviewActor struct {
 }
 
 type ReviewComment struct {
-	AuthorType string `json:"author_type"`
-	Author     string `json:"author"`
-	Body       string `json:"body"`
-	CommitSHA  string `json:"commit_sha"`
+	CreatedAt  time.Time `json:"created_at,omitempty"`
+	AuthorType string    `json:"author_type"`
+	Author     string    `json:"author"`
+	Body       string    `json:"body"`
+	CommitSHA  string    `json:"commit_sha"`
 	// OriginalCommitSHA is the head the comment was posted on. CommitSHA
 	// follows the PR head while the commented line is unchanged, so it cannot
 	// tell a finding posted on this head from an older one that still applies.
@@ -54,9 +56,10 @@ type ReviewFeedback struct {
 }
 
 type commentNode struct {
-	Author *reviewActor `json:"author"`
-	Body   string       `json:"body"`
-	Commit *struct {
+	CreatedAt time.Time    `json:"createdAt"`
+	Author    *reviewActor `json:"author"`
+	Body      string       `json:"body"`
+	Commit    *struct {
 		OID string `json:"oid"`
 	} `json:"commit"`
 	OriginalCommit *struct {
@@ -74,7 +77,7 @@ type commentPage struct {
 }
 
 func (n commentNode) comment() ReviewComment {
-	c := ReviewComment{Body: n.Body, URL: n.URL}
+	c := ReviewComment{Body: n.Body, URL: n.URL, CreatedAt: n.CreatedAt}
 	if n.Commit != nil {
 		c.CommitSHA = n.Commit.OID
 	}
@@ -104,7 +107,7 @@ func (c *Client) moreComments(ctx context.Context, repo, thread, cursor string) 
 				} `json:"node"`
 			} `json:"data"`
 		}
-		query := `query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{author{login __typename} body commit{oid} originalCommit{oid} url} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{author{login __typename} body commit{oid} originalCommit{oid} url createdAt} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.graphql(ctx, repo, query, map[string]any{"id": thread, "cursor": cursor}, &result); e != nil {
 			return nil, e
 		}
@@ -123,7 +126,13 @@ func (c *Client) moreComments(ctx context.Context, repo, thread, cursor string) 
 }
 
 func (c *Client) ReviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
-	return cachedEvidence(ctx, c, evidenceKey{repo, "feedback", strconv.Itoa(n)}, func() (ReviewFeedback, error) { return c.reviewFeedback(freshRequest(ctx), repo, n) })
+	return cachedEvidence(ctx, c, evidenceKey{repo, "feedback", strconv.Itoa(n)}, func() (ReviewFeedback, error) {
+		fb, err := c.reviewFeedback(freshRequest(ctx), repo, n)
+		if err == nil {
+			c.writeThreads(ctx, repo, n, fb)
+		}
+		return fb, err
+	})
 }
 func (c *Client) reviewFeedback(ctx context.Context, repo string, n int) (ReviewFeedback, error) {
 	var fb ReviewFeedback
@@ -170,7 +179,7 @@ func (c *Client) reviewFeedback(ctx context.Context, repo string, n int) (Review
 				} `json:"repository"`
 			} `json:"data"`
 		}
-		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid} url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}`
+		query := `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login __typename} headRefOid reviewDecision reviews(last:100){nodes{author{login __typename} state commit{oid}}} reviewThreads(first:100,after:$cursor){nodes{id path line isResolved isOutdated resolvedBy{login __typename} comments(first:50){nodes{author{login __typename} body commit{oid} originalCommit{oid} url createdAt} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}`
 		if e := c.graphql(ctx, repo, query, map[string]any{"owner": parts[0], "name": parts[1], "number": n, "cursor": cursor}, &result); e != nil {
 			return fb, e
 		}

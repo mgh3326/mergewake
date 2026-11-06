@@ -41,7 +41,8 @@ type Webhook struct {
 	// State, when set, keeps what each delivery carries (see webhookstate). A
 	// payload it cannot parse is logged once per event type and never changes
 	// the response or the wake.
-	State *webhookstate.Store
+	State   *webhookstate.Store
+	Applied func(repo, event, delivery string, body []byte)
 	// Status, when set, answers StatusPath on the same listener. It is local
 	// and read-only, so it takes no signature; the delivery Path always wins.
 	Status http.Handler
@@ -152,10 +153,12 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		event := r.Header.Get("X-GitHub-Event")
 		if event == "pull_request" || strings.HasPrefix(event, "pull_request_review") || event == "check_suite" || event == "check_run" || event == "status" {
 			if wh.State != nil {
-				if e := wh.State.Apply(delivery.Repository.FullName, event, r.Header.Get("X-GitHub-Delivery"), payload); e != nil {
+				if applied, e := wh.State.ApplyObserved(delivery.Repository.FullName, event, r.Header.Get("X-GitHub-Delivery"), payload); e != nil {
 					if _, seen := wh.parseWarned.LoadOrStore(event, true); !seen {
 						d.Log.Warn("webhook state ignored a delivery", "event", event, "error", e.Error())
 					}
+				} else if applied && wh.Applied != nil {
+					wh.Applied(delivery.Repository.FullName, event, r.Header.Get("X-GitHub-Delivery"), payload)
 				}
 			}
 			if wh.Invalidate != nil {

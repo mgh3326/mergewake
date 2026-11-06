@@ -84,3 +84,21 @@ Reads under `github.FreshEvidence` always go to the API. That is the land-time
 head check (`Land`: the PR, its head and the SHA-bound recheck before the merge),
 the aggregate `Check`, mergeable state, review threads, and every repository
 without the webhook receiver.
+
+## hk change records
+
+Mergewake sends observations to hk's change record for each PR using the same
+endpoint and bearer as task events. Applied webhook deliveries supply PR state
+and check observations; GitHub reads supply state, checks, and the complete
+review-thread set. Posted review passes supply findings, and gate decisions
+supply their reasons and the Git blob SHA of the policy read at the base.
+Thread excerpts are limited to 2,000 characters and finding bodies to 8 KiB.
+
+Writes are queued by PR and coalesced by section. The writer tries the batch
+route and falls back to section routes when batch is unavailable. A rejected
+batch is retried as one batch per section. A rejected section logs hk's bounded, redacted reason; a stale
+response is counted and does not affect the pipeline. If neither route exists,
+the writer logs once and pauses for ten minutes. Network failures and hk
+responses do not change a gate verdict, review pass, or webhook response. The
+`github requests` log includes `hk_state_writes`, `hk_state_stale`,
+`hk_state_rejected`, and `hk_state_unavailable` counters.

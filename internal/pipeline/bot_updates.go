@@ -32,6 +32,7 @@ func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p 
 	v, err := s.botGateResult(ctx, r, pr, p, baseHead)
 	if err == nil {
 		tracing.Verdict(ctx, v.State, v.Reasons)
+		s.writeGate(ctx, r, pr, baseHead, v)
 	}
 	return v, err
 }

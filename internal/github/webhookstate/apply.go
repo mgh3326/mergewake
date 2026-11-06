@@ -107,22 +107,28 @@ func Handles(event string) bool {
 // error and leaves the state as it was. A delivery id that was applied before
 // is a no-op.
 func (s *Store) Apply(repo, event, delivery string, body []byte) error {
+	_, err := s.ApplyObserved(repo, event, delivery, body)
+	return err
+}
+
+// ApplyObserved reports whether the delivery advanced state or checks.
+func (s *Store) ApplyObserved(repo, event, delivery string, body []byte) (bool, error) {
 	if !Handles(event) {
-		return nil
+		return false, nil
 	}
 	var p payload
 	if e := json.Unmarshal(body, &p); e != nil {
-		return fmt.Errorf("parse %s payload: %w", event, e)
+		return false, fmt.Errorf("parse %s payload: %w", event, e)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, e := s.repo(repo)
 	if e != nil {
-		return e
+		return false, e
 	}
 	if delivery != "" {
 		if slices.Contains(r.Deliveries, delivery) {
-			return nil
+			return false, nil
 		}
 		r.Deliveries = append(r.Deliveries, delivery)
 		if len(r.Deliveries) > maxDeliveries {
@@ -131,48 +137,49 @@ func (s *Store) Apply(repo, event, delivery string, body []byte) error {
 		r.dirty = true
 	}
 	now := s.now()
+	applied := false
 	switch event {
 	case "pull_request":
 		if p.PullRequest.Number == 0 {
-			return fmt.Errorf("parse pull_request payload: no pull request number")
+			return false, fmt.Errorf("parse pull_request payload: no pull request number")
 		}
 		pr, e := prFromPayload(p.PullRequest)
 		if e != nil {
-			return e
+			return false, e
 		}
-		r.putPR(pr, now, false)
+		applied = r.putPR(pr, now, false)
 	case "check_run":
 		c := p.CheckRun
 		if c.HeadSHA == "" || c.Name == "" {
-			return fmt.Errorf("parse check_run payload: no head_sha or name")
+			return false, fmt.Errorf("parse check_run payload: no head_sha or name")
 		}
-		r.head(c.HeadSHA, now).putRun(Run{ID: c.ID, SuiteID: c.CheckSuite.ID, Name: c.Name, Status: c.Status, Conclusion: c.Conclusion,
+		applied = r.head(c.HeadSHA, now).putRun(Run{ID: c.ID, SuiteID: c.CheckSuite.ID, Name: c.Name, Status: c.Status, Conclusion: c.Conclusion,
 			DetailsURL: c.DetailsURL, App: c.App.Slug, StartedAt: c.StartedAt, CompletedAt: c.CompletedAt}, false)
 		r.trimHeads()
 	case "check_suite":
 		c := p.CheckSuite
 		if c.HeadSHA == "" || c.ID == 0 {
-			return fmt.Errorf("parse check_suite payload: no head_sha or id")
+			return false, fmt.Errorf("parse check_suite payload: no head_sha or id")
 		}
-		r.head(c.HeadSHA, now).putSuite(Suite{ID: c.ID, Status: c.Status, Conclusion: c.Conclusion, App: c.App.Slug, UpdatedAt: c.UpdatedAt})
+		applied = r.head(c.HeadSHA, now).putSuite(Suite{ID: c.ID, Status: c.Status, Conclusion: c.Conclusion, App: c.App.Slug, UpdatedAt: c.UpdatedAt})
 		r.trimHeads()
 	case "status":
 		if p.SHA == "" || p.Context == "" {
-			return fmt.Errorf("parse status payload: no sha or context")
+			return false, fmt.Errorf("parse status payload: no sha or context")
 		}
-		r.head(p.SHA, now).putStatus(Status{ID: p.ID, Context: p.Context, State: p.State, TargetURL: p.TargetURL, UpdatedAt: p.UpdatedAt}, false)
+		applied = r.head(p.SHA, now).putStatus(Status{ID: p.ID, Context: p.Context, State: p.State, TargetURL: p.TargetURL, UpdatedAt: p.UpdatedAt}, false)
 		r.trimHeads()
 	case "pull_request_review":
 		n := cmp.Or(p.PullRequest.Number, p.Number)
 		if n == 0 || p.Review.ID == 0 {
-			return fmt.Errorf("parse pull_request_review payload: no pull request number or review id")
+			return false, fmt.Errorf("parse pull_request_review payload: no pull request number or review id")
 		}
 		rv := Review{ID: p.Review.ID, Login: p.Review.User.Login, State: strings.ToUpper(p.Review.State), CommitID: p.Review.CommitID,
 			Body: BoundBody(p.Review.Body, true), SubmittedAt: p.Review.SubmittedAt}
 		r.putReview(n, rv, p.Action)
 	}
 	r.dirty = true
-	return nil
+	return applied, nil
 }
 
 func prFromPayload(p payloadPR) (PR, error) {
@@ -193,17 +200,17 @@ func prFromPayload(p payloadPR) (PR, error) {
 // putPR stores pr when it is newer than what is held (api reads also replace an
 // equal one: the API is the truth for ties). A closed PR is pruned and
 // remembered, so a straggler cannot bring it back; a newer delivery reopens it.
-func (r *repoState) putPR(pr PR, now time.Time, api bool) {
+func (r *repoState) putPR(pr PR, now time.Time, api bool) bool {
 	if gone, ok := r.Gone[pr.Number]; ok && !pr.UpdatedAt.After(gone) {
-		return
+		return false
 	}
 	old := r.PRs[pr.Number]
 	if old != nil && (pr.UpdatedAt.Before(old.UpdatedAt) || (!api && pr.UpdatedAt.Equal(old.UpdatedAt))) {
-		return
+		return false
 	}
 	if pr.State == "closed" || pr.Merged {
 		r.closePR(pr, old)
-		return
+		return true
 	}
 	delete(r.Gone, pr.Number)
 	pr.FirstSeen = now
@@ -220,6 +227,8 @@ func (r *repoState) putPR(pr PR, now time.Time, api bool) {
 	if len(r.PRs) > maxPRs {
 		r.evictPR()
 	}
+
+	return true
 }
 
 func (r *repoState) closePR(pr PR, old *PR) {
@@ -328,33 +337,37 @@ func (s Status) newerThan(o Status) bool {
 	return s.UpdatedAt.After(o.UpdatedAt)
 }
 
-func (h *Head) putRun(run Run, api bool) {
+func (h *Head) putRun(run Run, api bool) bool {
 	key := fmt.Sprintf("%d/%s", run.SuiteID, run.Name)
 	old, ok := h.Runs[key]
 	if ok && (old.newerThan(run) || (!api && !run.newerThan(old))) {
-		return
+		return false
 	}
 	if !ok && len(h.Runs) >= maxRunsPerHead {
-		return
+		return false
 	}
 	h.Runs[key] = run
+	return true
 }
 
-func (h *Head) putStatus(st Status, api bool) {
+func (h *Head) putStatus(st Status, api bool) bool {
 	old, ok := h.Statuses[st.Context]
 	if ok && (old.newerThan(st) || (!api && !st.newerThan(old))) {
-		return
+		return false
 	}
 	h.Statuses[st.Context] = st
+	return true
 }
 
-func (h *Head) putSuite(su Suite) {
+func (h *Head) putSuite(su Suite) bool {
 	if old, ok := h.Suites[su.ID]; ok && !su.UpdatedAt.After(old.UpdatedAt) {
-		return
+		return false
 	}
 	if len(h.Suites) < maxRunsPerHead {
 		h.Suites[su.ID] = su
+		return true
 	}
+	return false
 }
 
 // reviewSet returns the reviews of PR n, creating the set; nil for a closed PR

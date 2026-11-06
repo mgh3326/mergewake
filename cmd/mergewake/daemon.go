@@ -90,7 +90,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				}
 				tracing.Data(transaction, "github_requests", total)
 				cache := counts.CacheStats()
-				log.Info("github requests", "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "routes", requests[:min(len(requests), 10)])
+				hk := gh.Changes.Counts()
+				log.Info("github requests", "hk_state_writes", hk.Writes, "hk_state_stale", hk.Stale, "hk_state_rejected", hk.Rejected, "hk_state_unavailable", hk.Unavailable, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "routes", requests[:min(len(requests), 10)])
 			}()
 			var repos []config.Repo
 			for _, r := range s.Config.Repos {
@@ -183,7 +184,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		state := webhookstate.Open(s.Config.StateDir)
 		state.Log = log
 		gh.Webhook = state
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state,
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: repos, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery,
 			Status: prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
 				Wake: func() { d.Trigger("pr") }}}
 		gap, err := config.Duration(wc.MinGap)
