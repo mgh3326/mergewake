@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -110,6 +111,7 @@ func reviewRounds(history []github.ReviewedPass) (rounds int, patches []string) 
 func (s *Service) settlingVerdict(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict, reason string) gateVerdict {
 	v.State = "pending"
 	v.Reasons = []string{reason}
+	daemon.PhasesOf(ctx).Settling(reason)
 	s.readReviewRecord(ctx, r, pr, &v)
 	return v
 }
@@ -301,6 +303,7 @@ func (s *Service) readChecks(ctx context.Context, repo, sha string, required []s
 // (its checks never run then); mergeable unknown
 // also waits when nothing else holds.
 func (s *Service) mergeGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
+	defer daemon.PhasesOf(ctx).Gate()()
 	v, err := s.mergeGateResult(ctx, r, pr, p, baseHead)
 	if err == nil {
 		tracing.Verdict(ctx, v.State, v.Reasons)

@@ -350,8 +350,11 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	if !settle {
 		return errs, clean, reviewed
 	}
+	ph := daemon.PhasesOf(ctx)
+	ph.Enter(daemon.PhaseLockWait)
 	settling.Lock()
 	defer settling.Unlock()
+	ph.Enter(daemon.PhaseSettle)
 	settleErrs := settlePR(ctx, s, r, pr.Number, o)
 	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed
 }
@@ -420,6 +423,7 @@ func isListedBot(pr github.Pull, listed []string) bool {
 // merging it or telling the desk why not. It delivers no findings, sends no
 // verdict notice and starts no review.
 func botLand(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+	daemon.PhasesOf(ctx).Enter(daemon.PhaseSettle)
 	ctx, span := tracing.Span(ctx, "mergewake.settle")
 	defer tracing.Finish(span)
 	landCtx, land := tracing.Span(ctx, "mergewake.land")

@@ -40,6 +40,9 @@ type prEngine struct {
 	log     *slog.Logger
 	onMerge pipeline.MergeHook
 	q       *daemon.Queue
+	// seen remembers when each PR head was first seen, for the
+	// `review-start latency` line.
+	seen *daemon.HeadSeen
 	// revisit is set when the reviewer watch can see reviewers finish: the
 	// pr role then starts reviewers without waiting for them.
 	revisit pipeline.Revisit
@@ -71,7 +74,9 @@ func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, rep
 	// Different PRs of a repo run at once, at most review_parallel when it is
 	// set, else all of them; a priority-1 PR also starts past the bound, up to
 	// urgentExtra more at once.
-	e.q = &daemon.Queue{Cap: s.Config.Daemon.PR.Parallel(), Extra: urgentExtra, Run: e.run, Lookup: e.lookup, Grace: reviewPriorityGrace, Log: log}
+	e.seen = daemon.OpenHeadSeen(s.Config.StateDir)
+	e.seen.Log = log
+	e.q = &daemon.Queue{Cap: s.Config.Daemon.PR.Parallel(), Extra: urgentExtra, Run: e.run, Lookup: e.lookup, Grace: reviewPriorityGrace, Seen: e.seen, Log: log}
 	// The reviewer watch reads hk job records. A sink that cannot read them
 	// never reports a finished reviewer, so the passes keep a bounded wait.
 	if _, ok := s.Sink.(integrations.JobReader); ok {
@@ -131,6 +136,8 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 	if !ok {
 		return
 	}
+	ctx = daemon.WithPhases(ctx, w.Phases)
+	w.Phases.Enter(daemon.PhaseRead)
 	ctx, transaction := tracing.Pass(ctx, "pr")
 	defer tracing.Finish(transaction)
 	ctx, requests := github.ContinueRequests(ctx, "pr")
@@ -181,6 +188,7 @@ type evalResult struct {
 // settle it as one PR of the old pass was.
 func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (errs []error, res evalResult) {
 	n := w.Key.PR
+	evalStart := w.Phases.Now()
 	// An event says GitHub changed: read it past the poll windows and caches.
 	readCtx := ctx
 	if slices.ContainsFunc(w.Sources, func(s daemon.Source) bool { return s != daemon.SourceSweep }) {
@@ -200,6 +208,11 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 		return nil, res
 	}
 	e.q.Learn(r.Name, n, pr.Head.SHA)
+	// The head is met here at the latest; a delivery that named it set an
+	// earlier time.
+	rec := e.seen.Evaluating(r.Name, n, pr.Head.SHA, evalStart)
+	ctx = pipeline.WithHeadLatency(ctx, &pipeline.HeadLatency{Log: e.log, Repo: r.Name, PR: n, Head: pr.Head.SHA,
+		Seen: rec.Seen, SeenBy: rec.SeenBy, FirstEval: rec.FirstEval, EvalStart: evalStart, Evals: rec.Evals})
 	// A policy that lists dependency bots keeps their PRs out of the drop and
 	// out of review: they are settled by Land's bot-patch gate alone. An
 	// unreadable policy lists none, so the bots stay dropped as before.
@@ -235,6 +248,7 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	}
 	res.reasons = plan.reasons
 	opts := e.o
+	w.Phases.Enter(daemon.PhaseObserve)
 	observeCtx, observeSpan := tracing.Span(prCtx, "mergewake.observe")
 	observationErr := e.s.ObservePR(observeCtx, r, pr, e.o)
 	tracing.Finish(observeSpan)
@@ -304,13 +318,18 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 // first, then its evidence is checked; any other is reviewed, then settled.
 // handled reports the first. reviewed is false when the review itself failed.
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
+	ph := daemon.PhasesOf(ctx)
+	ph.Enter(daemon.PhaseReview)
 	lock := e.repoLock(r.Name)
 	// An unreadable or poll-skipped marker is not done: the PR is reviewed.
 	if done, err := e.gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); err == nil && done {
 		handled = true
+		ph.Enter(daemon.PhaseLockWait)
 		lock.Lock()
+		ph.Enter(daemon.PhaseSettle)
 		errs = settlePR(ctx, e.s, r, pr.Number, o)
 		lock.Unlock()
+		ph.Enter(daemon.PhaseReview)
 	} else {
 		// A PR that never had to wait for a slot has not been looked up yet.
 		priority, ok := w.Detail.(pipeline.ReviewPriority)

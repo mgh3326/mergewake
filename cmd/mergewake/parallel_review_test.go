@@ -44,6 +44,9 @@ type reviewHub struct {
 	// taskPerPR gives PR n the trailer Mergewake-Task: 1000+n, else every PR
 	// links task 42.
 	taskPerPR bool
+	// changedFiles is the changed_files every PR reports; zero means 1, the
+	// number of files the hub lists.
+	changedFiles int
 }
 
 func (h *reviewHub) repoName() string {
@@ -64,7 +67,7 @@ func (h *reviewHub) pull(n int) string {
 	if h.taskPerPR {
 		task = 1000 + n
 	}
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, task, hubHead(n), n, h.repoName(), hubBase)
+	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":%d,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, task, max(h.changedFiles, 1), hubHead(n), n, h.repoName(), hubBase)
 }
 
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)

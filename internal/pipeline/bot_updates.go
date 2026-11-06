@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/tracing"
@@ -29,6 +30,7 @@ const botNoticeState = "bot_update"
 // merge it with no unresolved thread. A pending check or an unknown mergeable
 // state waits quietly; any other reason is blocked and goes to the desk.
 func (s *Service) botGate(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy, baseHead string) (gateVerdict, error) {
+	defer daemon.PhasesOf(ctx).Gate()()
 	v, err := s.botGateResult(ctx, r, pr, p, baseHead)
 	if err == nil {
 		tracing.Verdict(ctx, v.State, v.Reasons)

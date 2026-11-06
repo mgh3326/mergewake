@@ -7,7 +7,7 @@ other.
 ## What the queue holds
 
 The queue holds items of the form (repository, PR). An item enters it from one
-of five sources. The `source` field of the `pr evaluated` log line names them.
+of six sources. The `source` field of the `pr evaluated` log line names them.
 
 | Source | What puts the PR on the queue |
 | --- | --- |
@@ -15,6 +15,7 @@ of five sources. The `source` field of the `pr evaluated` log line names them.
 | `reviewer` | A reviewer job of the PR finished (the reviewer watch). |
 | `base` | A push to the repository's base branch (`repos[].branch`). Every open PR of the repository is queued, because its merge gate reads the base. |
 | `status` | A fresh `GET /v1/pr-status?fresh=1` read found the PR changed. |
+| `timer` | A reviewer's deadline: the PR is evaluated once its reviewer is past `review.timeout`, so a reviewer that never finishes is replaced. |
 | `sweep` | The periodic pass, below. |
 
 The `webhook` and `base` sources need `daemon.webhook`. The `reviewer` source
@@ -60,9 +61,58 @@ PR is looked at.
 
 | Line | Fields |
 | --- | --- |
-| `pr evaluated` | One per evaluation: `repo`, `pr`, `source`, `queue_wait_ms` (event to start), `eval_ms`. |
+| `pr evaluated` | One per evaluation: `repo`, `pr`, `source`, `queue_wait_ms` (event to start), `eval_ms`, and the phase fields below. |
+| `review-start latency` | One per reviewer pass whose spawn panewire accepted, see below. |
 | `pr pass` | One per repository after each sweep, as before (`prs_skipped`, `prs_evaluated`, `evaluated_reasons`, `reviews_concurrent_max`), now counting every evaluation since the last line, plus `queue_depth` (items waiting), `queue_wait_max` and `merge_overdue` (the overdue notices delivered since the last line, see `docs/config.md`). |
 | `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max` and `eval_requests` (requests the evaluations made since the last line). |
+
+### Where an evaluation spends its time
+
+The phases are disjoint and add up to `eval_ms` (the few milliseconds between
+them are not counted). All values are milliseconds.
+
+| Field | What it covers |
+| --- | --- |
+| `read_ms` | The first reads: the PR, the bot policy and the skip plan. |
+| `observe_ms` | Recording the PR's outcomes. |
+| `review_ms` | The review claim check, the priority lookup and the review call, spawn included. It ends when the evaluation starts to wait for the settle lock. |
+| `lock_wait_ms` | Waiting for the repository's settle lock. |
+| `settle_ms` | Holding that lock: findings, notice and land. |
+
+Two more fields sit inside those phases and are not added to the sum:
+
+| Field | What it covers |
+| --- | --- |
+| `spawn_ms` | The longest time one review pass spent in its panewire spawn calls, in `review_ms`. A daemon that cannot read hk job records waits for the reviewer in that call, up to 30 seconds, so it reads as that wait. |
+| `gate_ms` | The merge gate, in `settle_ms`. A land that merges runs it twice. |
+
+`settling` is present only when an evaluation held something back while
+GitHub's evidence caught up, and lists the reasons joined by `+`:
+`review_files_settling` (the review did not start: the PR's `changed_files` and
+its file list disagree just after a push), `head_moving` and `files_settling`
+(the merge gate's verdicts for the same two causes). Nothing queues the PR
+again after such an evaluation; the next delivery or the next sweep does.
+
+### Head to reviewer
+
+`review-start latency` answers how long a pushed head waited for its reviewer.
+The fields are `repo`, `pr`, `head`, `pass`, `first_seen` (RFC 3339), `first_seen_by`
+(`webhook` or `eval`), `evals` and the steps in milliseconds:
+
+| Field | What it measures |
+| --- | --- |
+| `seen_to_first_eval_ms` | First seen to the start of the first evaluation that read the head. |
+| `first_eval_to_eval_ms` | That start to the start of the evaluation that spawned the reviewer; `0` when the first evaluation spawned it. |
+| `eval_to_accepted_ms` | The start of the spawning evaluation to the moment panewire accepted the spawn. |
+| `total_ms` | The three steps added: first seen to spawn accepted. |
+
+A head is first seen when the first delivery that names its PR and its commit
+arrives (`webhook`), or when its first evaluation starts (`eval`), whichever is
+earlier. The time is kept per head in `head-seen.json` in the repository's state
+directory, so a restart does not reset it, and entries older than 48 hours are
+dropped. `evals` counts the evaluations that read the head since the daemon
+started. A pass that re-attaches a reviewer an earlier evaluation placed logs
+nothing.
 
 Each evaluation is its own `pr pass` Sentry transaction; the sweep is another.
 An evaluation's errors are kept and returned by the next sweep of its
