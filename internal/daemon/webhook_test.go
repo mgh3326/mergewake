@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 )
 
 var testSecret = []byte("test-webhook-secret")
@@ -291,5 +293,114 @@ func TestWebhookInvalidatesEvidenceBeforeWake(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted || invalidated != "o/r" {
 		t.Fatalf("status=%d invalidated=%q", resp.StatusCode, invalidated)
+	}
+}
+
+func TestWebhookKeepsDeliveryStateAndSurvivesMalformedPayloads(t *testing.T) {
+	var triggered []string
+	d := webhookDaemon(&triggered)
+	logs := &syncBuffer{}
+	d.Log = slog.New(slog.NewJSONHandler(logs, nil))
+	state := webhookstate.Open(t.TempDir())
+	d.Webhook.State = state
+	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
+	defer srv.Close()
+	send := func(event, id, body string) int {
+		resp := post(t, srv.Client(), srv.URL+"/github", event, id, []byte(body), testSecret)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	pr := func(head, updated string) string {
+		return `{"action":"synchronize","repository":{"full_name":"o/r"},"pull_request":{"number":7,"state":"open","head":{"sha":"` + head + `","ref":"t"},"base":{"sha":"b","ref":"main"},"updated_at":"` + updated + `"}}`
+	}
+
+	if code := send("pull_request", "d1", pr("h1", "2026-11-06T00:01:00Z")); code != http.StatusAccepted {
+		t.Fatalf("status=%d", code)
+	}
+	if got, ok := state.PR("o/r", 7); !ok || got.HeadSHA != "h1" {
+		t.Fatalf("delivery not kept: %+v", got)
+	}
+	// An older delivery arriving later does not overwrite, a repeated id is a no-op.
+	send("pull_request", "d0", pr("h0", "2026-11-06T00:00:00Z"))
+	send("pull_request", "d1", pr("h2", "2026-11-06T00:02:00Z"))
+	if got, _ := state.PR("o/r", 7); got.HeadSHA != "h1" {
+		t.Fatalf("head = %q, want h1", got.HeadSHA)
+	}
+
+	// (h) malformed payloads answer as before and still wake the roles.
+	triggered = nil
+	for i, tt := range []struct{ event, body string }{
+		{"pull_request", `{"repository":{"full_name":"o/r"},"pull_request":{"number":7,"updated_at":"never"}}`},
+		{"check_run", `{"repository":{"full_name":"o/r"},"check_run":{"id":"not a number"}}`},
+		{"check_run", `{"repository":{"full_name":"o/r"},"check_run":{"id":"again"}}`},
+		{"pull_request_review", `{"repository":{"full_name":"o/r"}}`},
+	} {
+		if code := send(tt.event, "bad"+string(rune('0'+i)), tt.body); code != http.StatusAccepted {
+			t.Fatalf("%s: status=%d", tt.event, code)
+		}
+	}
+	if len(triggered) != 8 {
+		t.Fatalf("malformed deliveries woke %v, want pr and watch for each of 4", triggered)
+	}
+	if got, _ := state.PR("o/r", 7); got.HeadSHA != "h1" {
+		t.Fatalf("a malformed delivery changed the state: %+v", got)
+	}
+	warned := strings.Count(logs.String(), "webhook state ignored a delivery")
+	if warned != 3 {
+		t.Fatalf("parse errors logged %d times, want once per event type (3)\n%s", warned, logs.String())
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// (g, daemon side) a delivery kept just before shutdown is on disk after Run returns.
+func TestWebhookStateIsWrittenOnShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{}, 1)
+	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", Log: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		Webhook: &Webhook{Listen: addr, Path: "/github", Secret: testSecret, Repos: map[string]bool{"o/r": true}, State: webhookstate.Open(dir)}}
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx, []Loop{{Role: "watch", Interval: time.Hour, Run: func(context.Context) error {
+			started <- struct{}{}
+			return nil
+		}}})
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("loop did not start")
+	}
+	body := `{"repository":{"full_name":"o/r"},"pull_request":{"number":7,"state":"open","head":{"sha":"h1","ref":"t"},"base":{"sha":"b","ref":"main"},"updated_at":"2026-11-06T00:01:00Z"}}`
+	resp := post(t, http.DefaultClient, "http://"+addr+"/github", "pull_request", "d-1", []byte(body), testSecret)
+	resp.Body.Close()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if pr, ok := webhookstate.Open(dir).PR("o/r", 7); !ok || pr.HeadSHA != "h1" {
+		t.Fatalf("state after shutdown = %+v (found %v)", pr, ok)
 	}
 }
