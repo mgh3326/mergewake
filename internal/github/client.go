@@ -99,6 +99,12 @@ func NotFound(e error) bool { var a *APIError; return errors.As(e, &a) && a.Code
 // 403). The repository now falls back to the user token, and request retries.
 var errAppDenied = errors.New("GitHub App request refused")
 
+// ErrAmbiguousCheck marks a check run and a commit status of the same name
+// whose decisive verdicts disagree. A re-run that posts a status beside the
+// original run is the usual source; callers holding recorded evidence resolve
+// that themselves instead of reading the commit as green.
+var ErrAmbiguousCheck = errors.New("ambiguous check and status")
+
 func (c *Client) request(ctx context.Context, method, route, accept string, data []byte) ([]byte, error) {
 	b, e := c.send(ctx, method, route, accept, data, c.credentialFor(ctx, method, route, data))
 	if errors.Is(e, errAppDenied) {
@@ -502,7 +508,7 @@ func foldChecks(runs []checkRun, statuses []status, preserveVerdicts bool) (chec
 		if old, ok := states[name]; ok && old != v {
 			decisive := func(x CI) bool { return x == Green || x == Red }
 			if decisive(old) && decisive(v) {
-				return checkEvidence{}, fmt.Errorf("ambiguous check and status named %q", name)
+				return checkEvidence{}, fmt.Errorf("%w named %q", ErrAmbiguousCheck, name)
 			}
 			if decisive(old) {
 				continue

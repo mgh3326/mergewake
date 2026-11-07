@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -99,13 +100,37 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	checks := p.WatchSet()
 	bisectChecks := p.BisectChecks()
 	s.ciPolicy(ctx, r, head, o)
-	ci, e := s.GH.Check(ctx, r.Name, head, checks)
+	result := watchResult{Head: head, Action: "waiting-for-ci", Shadow: !p.Enabled || o.Shadow}
+	inc, recorded, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return e
 	}
-	result := watchResult{Head: head, Action: "waiting-for-ci", Shadow: !p.Enabled || o.Shadow}
+	// When the head is the incident's culprit, a passed re-run posts a status
+	// beside the head's own failed run. The incident still gathering evidence
+	// owns that verdict: resolving it records the mixed result instead of
+	// failing on the ambiguous read or clearing the incident as healthy.
+	mixedHead := recorded && !inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
+	ci, e := s.GH.Check(ctx, r.Name, head, checks)
+	if e != nil {
+		if mixedHead && errors.Is(e, github.ErrAmbiguousCheck) {
+			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		}
+		return e
+	}
 	checkpoint := filepath.Join(s.state(r.Name), "last-green")
 	if ci == github.Green {
+		// A same-sha re-run can pass beside the head's own failed run. Record
+		// the mixed result once, then close the incident as healthy: a green
+		// main needs no revert, and a stale record would block a later red.
+		if mixedHead {
+			settled, e := s.settleMixedHead(ctx, r, p, result, o, inc)
+			if e != nil {
+				return e
+			}
+			if !settled {
+				return nil
+			}
+		}
 		result.Action = "healthy"
 		if !o.DryRun {
 			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {
@@ -115,7 +140,13 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 				return e
 			}
 			if !result.Shadow {
+				if e = s.fixWon(ctx, r, head); e != nil {
+					return e
+				}
 				if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
+					return e
+				}
+				if e = s.clearRecoveryState(r.Name); e != nil {
 					return e
 				}
 			}
@@ -123,6 +154,11 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	if ci != github.Red {
+		// A status-only re-run can leave the aggregate pending through a sibling
+		// check; the record settles the incident without waiting on that check.
+		if mixedHead {
+			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	s.feedBranchCI(ctx, r, head, checks, o)
@@ -131,8 +167,26 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	if active {
-		result.Action = "operator-required-recovery-latch"
-		return s.audit(r.Name, "watch", result, o.DryRun)
+		return s.recovery(ctx, r, p, head, checks, result, o)
+	}
+	// A persisted incident outranks a fresh bisect: its confirmation evidence
+	// is applied first, so a re-run's status cannot move its culprit or green
+	// boundary and a mixed result is recorded instead of blamed on a new commit.
+	// A green commit after the recorded head means main was fixed and broke
+	// again, so that red is diagnosed afresh instead of reverting the old one.
+	if recorded && inc.Culprit != "" && inc.Baseline != "" {
+		current, e := s.incidentCurrent(ctx, r, p, head, inc)
+		if e != nil {
+			return e
+		}
+		if current {
+			return s.recoverIncident(ctx, r, p, head, checks, result, o, inc)
+		}
+		if !result.Shadow && !o.DryRun {
+			if e = s.clearRecoveryState(r.Name); e != nil {
+				return e
+			}
+		}
 	}
 	baselineBytes, e := os.ReadFile(checkpoint)
 	if e != nil && !os.IsNotExist(e) {
@@ -335,8 +389,41 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if s.Config.Sink.Type == "handoffkeep" && !integrations.TaskID.MatchString(task) {
 		return errors.New("origin task missing; add Mergewake-Task trailer or repo task")
 	}
+	culpritCI, culpritKnown := github.CI(""), false
+	if v, ce := check(culprit); ce == nil && (v == github.Green || v == github.Red) {
+		culpritCI, culpritKnown = v, true
+	}
+	persist := !result.Shadow && !o.DryRun
+	st, e := s.beginRecovery(r, culprit, origin.Number, head, green, task, strings.Join(bisectChecks, ","), culpritCI, culpritKnown, persist)
+	if e != nil {
+		return e
+	}
+	if st.RevertPR != 0 {
+		result.Action = "recovery-hold"
+		result.Reason = fmt.Sprintf("revert PR #%d exists without a recovery latch", st.RevertPR)
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(st.RevertPR)+":unlatched", o)
+	}
+	st, confirmed, reason, needsDesk, e := s.confirmRecovery(ctx, r, p, st, persist, persist)
+	if e != nil {
+		return e
+	}
+	if !confirmed {
+		result.Action = "recovery-confirming"
+		result.Reason = reason
+		if needsDesk {
+			return s.reportWatch(ctx, r, result, head+":confirm:"+reason, o)
+		}
+		return s.audit(r.Name, "watch", result, o.DryRun)
+	}
+	return s.openRevert(ctx, r, head, checks, culprit, *origin, task, result, o)
+}
+
+// openRevert opens the exact-revert PR for a confirmed incident. It re-reads
+// the head and its CI first, so a pass that lost a race does not open a PR for
+// a main that already moved or went green.
+func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
 	result.Action = "open-revert-pr"
-	if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
+	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
 	if result.Shadow || o.DryRun {
@@ -349,14 +436,14 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if fresh != head {
 		return errors.New("main changed during diagnosis; rerun watch")
 	}
-	ci, e = s.GH.Check(ctx, r.Name, head, checks)
+	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		return e
 	}
 	if ci != github.Red {
 		return errors.New("main CI changed during diagnosis")
 	}
-	trailers, e := s.recoveryTrailers(ctx, r, *origin)
+	trailers, e := s.recoveryTrailers(ctx, r, origin)
 	if e != nil {
 		return e
 	}
@@ -371,6 +458,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	if e = s.recordRevert(r.Name, origin.Number, result.URL); e != nil {
+		return e
+	}
+	if e = s.recordRecoveryRevert(r.Name, result.URL, pullNumber(result.URL)); e != nil {
 		return e
 	}
 	result.Action = "opened-revert-pr"
@@ -438,7 +528,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		note += ": " + result.Reason
 	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.designLane(r)}))
 	if e != nil {
 		return e
 	}

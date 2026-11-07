@@ -317,6 +317,12 @@ func TestFeedGolden(t *testing.T) {
 			s.Config.Sink.Type = "handoffkeep"
 			s.Config.Discord.Kinds = map[string]string{"revert": "HOOK_REVERT"}
 			s.Feed.Config = s.Config.Discord
+			if e := s.saveRecovery(r.Name, recoveryIncident{
+				RedSince: feedNow, Culprit: shaB, CulpritPR: 7, Head: shaC, Baseline: shaA, Task: "42",
+				Runs: map[string][]bool{shaA: {true, true}, shaB: {false, false}}, Confirmed: true,
+			}); e != nil {
+				t.Fatal(e)
+			}
 			if e := s.Watch(context.Background(), r, Options{}); e != nil {
 				t.Fatal(e)
 			}

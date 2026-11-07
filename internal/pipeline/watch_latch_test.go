@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
 )
@@ -78,29 +79,45 @@ func TestWatchClearsRecoveryLatch(t *testing.T) {
 		}
 	})
 	for _, tt := range []struct {
-		name   string
-		ci     github.CI
-		mutate func(*latchGH)
+		name             string
+		ci               github.CI
+		mutate           func(*latchGH)
+		clears, close, c int
 	}{
-		{"b: open revert", github.Green, func(l *latchGH) {
+		{"b: open revert, a fix won", github.Green, func(l *latchGH) {
 			l.pr = mergedRevert(shaB)
 			l.pr.State, l.pr.Merged, l.pr.MergedAt, l.pr.MergeCommitSHA = "open", false, nil, ""
-		}},
-		{"b: closed unmerged revert", github.Green, func(l *latchGH) {
+		}, 1, 1, 1},
+		{"b: closed unmerged revert, a fix won", github.Green, func(l *latchGH) {
 			l.pr = mergedRevert(shaB)
 			l.pr.Merged, l.pr.MergedAt, l.pr.MergeCommitSHA = false, nil, ""
-		}},
-		{"c: merged revert but main red", github.Red, nil},
-		{"c: merged revert but main pending", github.Pending, nil},
+		}, 1, 0, 0},
+		{"c: merged revert but main red", github.Red, nil, 0, 0, 0},
+		{"c: merged revert but main pending", github.Pending, nil, 0, 0, 0},
 		{"c: green main does not yet contain the merge commit", github.Green, func(l *latchGH) {
 			l.notAncestor = map[[2]string]bool{{shaB, shaC}: true}
-		}},
-		{"d: latch with no identifiable revert PR", github.Green, func(l *latchGH) { l.pr = nil }},
+		}, 0, 0, 0},
+		{"d: latch with no identifiable revert PR", github.Green, func(l *latchGH) { l.pr = nil }, 0, 0, 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			l, n, out := latchWatch(t, tt.ci, tt.mutate)
-			if !l.tag || !l.branch || l.clears != 0 || n.count != 0 || strings.Contains(out, "recovery-latch-cleared") {
+			if tt.clears == 0 {
+				if !l.tag || !l.branch || l.clears != 0 || n.count != 0 || strings.Contains(out, "recovery-latch-cleared") {
+					t.Fatalf("tag=%t branch=%t clears=%d notices=%d\n%s", l.tag, l.branch, l.clears, n.count, out)
+				}
+				return
+			}
+			if l.tag || l.branch || l.clears != tt.clears || n.count != 0 {
 				t.Fatalf("tag=%t branch=%t clears=%d notices=%d\n%s", l.tag, l.branch, l.clears, n.count, out)
+			}
+			if len(l.closed) != tt.close || len(l.comments) != tt.c {
+				t.Fatalf("closed=%v comments=%v", l.closed, l.comments)
+			}
+			if tt.close > 0 && !strings.Contains(l.comments[0], "main is green again at "+shaC+"; revert not needed") {
+				t.Fatalf("comment %q", l.comments[0])
+			}
+			if got := strings.Count(out, `"command":"recovery-fix-won"`); got != 1 {
+				t.Fatalf("%d fix-won rows\n%s", got, out)
 			}
 		})
 	}
@@ -149,6 +166,12 @@ func TestWatchAfterLatchClearedStartsNewRecovery(t *testing.T) {
 	g.pull.MergeCommitSHA = shaD
 	g.pull.Body = "Mergewake-Task: 42"
 	s.Config.Sink.Type = "handoffkeep"
+	if e := s.saveRecovery(r.Name, recoveryIncident{
+		RedSince: time.Now(), Culprit: shaD, CulpritPR: 7, Head: shaD, Baseline: shaC, Task: "42",
+		Runs: map[string][]bool{shaC: {true, true}, shaD: {false, false}}, Confirmed: true,
+	}); e != nil {
+		t.Fatal(e)
+	}
 	if e := s.Watch(context.Background(), r, Options{}); e != nil {
 		t.Fatal(e)
 	}

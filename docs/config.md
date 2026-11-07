@@ -1330,6 +1330,8 @@ For `example/project`, state resides beneath
 | `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `panewire done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
+| `recovery.json` | The red-main incident: when main first turned red, the culprit and green baseline, the 2/2 any-ref evidence, the fix window and the revert PR. Persisted, so a restart keeps the same window; deleted once main is green. |
+| `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
@@ -1372,11 +1374,13 @@ deletion and stays while recovery is in flight. Watch clears the latch itself,
 and audits `recovery-latch-cleared` once, when the revert PR it opened is
 merged, the newest main head contains that merge commit, and the newest main is
 green on the watched checks; it then deletes the tag and any remaining branch
-and sends one info notice. The latch stays for a person when the revert PR is
-open or closed unmerged, when main is red or still pending after the merge, and
-when no revert PR that watch opened can be tied to the latch (a tag a person
-created, or a blocking-path culprit that was only reported). A person deletes
-the tag and any remaining branch in those cases. After an API timeout or a reporting failure,
+and sends one info notice. A green main also closes a revert PR the latch belongs
+to that never merged, with a `main is green again at <sha>; revert not needed`
+comment, and clears the latch (`recovery-fix-won`). The latch stays for a person
+when main is red or still pending after the merge, and when no revert PR that
+watch opened can be tied to the latch (a tag a person created, or a
+blocking-path culprit that was only reported). A person deletes the tag and any
+remaining branch in those cases. After an API timeout or a reporting failure,
 inspect GitHub/task records and local audit rather than blindly rerunning a
 mutation. The initial release has no automatic report outbox/reconciliation.
 
@@ -1826,10 +1830,32 @@ touched a blocking path is reported (`action: report-culprit`), never
 auto-reverted. Holds and reports notify once per head via the `watch-reported`
 state file, which retains the most recent 128 report keys.
 
+A red window alone never reverts. Before watch opens a revert PR it confirms the
+failure through the repo's any-ref CI: the green baseline (the bracket's
+first-parent green) must pass 2/2 and the culprit must fail 2/2. The recorded
+result counts where one exists; the rest are re-runs dispatched at the same sha
+and read as commit statuses newer than the dispatch. Mixed results are flaky:
+watch holds, blames nobody and tells the repo's design-session lane once. So do
+a timed-out re-run, a reached dispatch bound, and a repo with no
+`any_ref_workflow`; in those cases a person bisects.
+
+Once confirmed, the opened revert PR waits out a 30-minute fix window. If main
+turns green inside it, watch closes the revert PR and clears the latch. An open
+PR whose body or head commit message carries `Fixes-Red-Main: <culprit-or-head-sha>`
+is the fix for this red: the revert waits for it up to twice the window and the
+PR is reviewed with priority 1. After the window, watch merges the revert with
+the same squash merge it uses for normal PRs only when main is still red, the
+head descends from the culprit, the revert PR has no conflicts and green CI on
+the repo's watch checks, and the revert's diff is the exact reverse of the
+culprit's. That last check compares the touched paths' pre- and post-images in
+the culprit parent, the culprit, the red head and the revert head: a later edit
+or a different tree refuses the merge and holds. One design-lane line names the
+red since, the culprit PR, the revert PR, the window and the reopened task.
+
 Immediately before opening a revert PR the watch rechecks the current main head
 and its CI, and the recovery latch tag still serializes recovery attempts.
-The latch clears itself only after the revert PR merges and main is green (see
-the recovery notes above).
+The latch clears itself after the revert PR merges and main is green, or when a
+fix wins (see the recovery notes above).
 
 ### Main CI and cancel-in-progress
 

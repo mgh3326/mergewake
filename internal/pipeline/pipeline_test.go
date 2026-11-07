@@ -91,6 +91,48 @@ type fakeGH struct {
 	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
 	commitErr   map[string]error
 	notAncestor map[[2]string]bool
+	// comments and closed record PostIssueComment and ClosePull calls.
+	comments []string
+	closed   []int
+	// any-ref confirmation: dispatched counts re-runs per sha, statuses are
+	// the newest commit status per (sha, name), openPulls answers OpenPulls.
+	dispatched     map[string]int
+	dispatchInputs []map[string]string
+	statuses       map[[2]string]statusRecord
+	openPulls      []github.Pull
+}
+
+type statusRecord struct {
+	ci github.CI
+	at time.Time
+}
+
+func (g *fakeGH) DispatchWorkflow(_ context.Context, _, workflow, _ string, inputs map[string]string) error {
+	if workflow != "ci-any-ref.yml" {
+		return &github.APIError{Code: 404}
+	}
+	if g.dispatched == nil {
+		g.dispatched = map[string]int{}
+	}
+	g.dispatched[inputs["ref"]]++
+	g.dispatchInputs = append(g.dispatchInputs, maps.Clone(inputs))
+	return nil
+}
+func (g *fakeGH) LatestStatus(_ context.Context, _, sha, name string) (github.CI, time.Time, bool, error) {
+	v, ok := g.statuses[[2]string{sha, name}]
+	return v.ci, v.at, ok, nil
+}
+func (g *fakeGH) OpenPulls(context.Context, string, string) ([]github.Pull, error) {
+	return g.openPulls, nil
+}
+
+func (g *fakeGH) PostIssueComment(_ context.Context, _ string, _ int, body string) error {
+	g.comments = append(g.comments, body)
+	return nil
+}
+func (g *fakeGH) ClosePull(_ context.Context, _ string, n int) error {
+	g.closed = append(g.closed, n)
+	return nil
 }
 
 func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
@@ -157,11 +199,47 @@ func (g *fakeGH) Files(context.Context, string, int) ([]policy.File, error) {
 	}
 	return []policy.File{{Path: "tool", Kind: "modified"}}, nil
 }
-func (g *fakeGH) Check(_ context.Context, _, sha string, _ []string) (github.CI, error) {
-	if g.checks != nil {
-		return g.checks[sha], nil
+
+// Check reads the same evidence GitHub does: each required name comes from its
+// own run, the newest commit status of that name settles a run that is unknown,
+// and two decisive but disagreeing values are the ambiguity the client reports.
+// A re-run an any-ref workflow posts therefore reaches Check, not only
+// LatestStatus.
+func (g *fakeGH) Check(_ context.Context, _, sha string, required []string) (github.CI, error) {
+	if len(required) == 0 {
+		if g.checks != nil {
+			return g.checks[sha], nil
+		}
+		return g.ci, nil
 	}
-	return g.ci, nil
+	decisive := func(x github.CI) bool { return x == github.Green || x == github.Red }
+	result := github.Green
+	for _, name := range required {
+		run, ok := g.checkNames[sha][name]
+		if !ok {
+			switch {
+			case g.checks != nil:
+				run, ok = g.checks[sha], true
+			case g.ci != "":
+				run, ok = g.ci, true
+			}
+		}
+		if st, found := g.statuses[[2]string{sha, name}]; found {
+			switch {
+			case !ok || !decisive(run):
+				run, ok = st.ci, true
+			case decisive(st.ci) && run != st.ci:
+				return github.Pending, fmt.Errorf("%w named %q", github.ErrAmbiguousCheck, name)
+			}
+		}
+		if ok && run == github.Red {
+			return github.Red, nil
+		}
+		if !ok || run != github.Green {
+			result = github.Pending
+		}
+	}
+	return result, nil
 }
 func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string) (map[string]github.CI, error) {
 	out := map[string]github.CI{}
@@ -819,6 +897,12 @@ func TestWatchRecoveryLatchAndAdapters(t *testing.T) {
 			g.pull.MergeCommitSHA = shaB
 			g.pull.Body = "Mergewake-Task: 42"
 			s.Config.Sink.Type = "handoffkeep"
+			if e := s.saveRecovery(r.Name, recoveryIncident{
+				RedSince: time.Now(), Culprit: shaB, CulpritPR: 7, Head: shaC, Baseline: shaA, Task: "42",
+				Runs: map[string][]bool{shaA: {true, true}, shaB: {false, false}}, Confirmed: true,
+			}); e != nil {
+				t.Fatal(e)
+			}
 			if e := s.Watch(context.Background(), r, Options{DryRun: tt.dry}); e != nil {
 				t.Fatal(e)
 			}
