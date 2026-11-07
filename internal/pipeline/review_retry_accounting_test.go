@@ -91,7 +91,7 @@ func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	c.t = reset
 	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
 	runner.exits = []int{panewireWaitTimeout}
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
 		t.Fatal(err)
 	}
 	fresh := readReviewerJob(t, s, r, 1)
@@ -158,7 +158,8 @@ func TestRetryQuotaStopSurvivesRestart(t *testing.T) {
 	c.t = reset
 	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
 	runner.exits = []int{panewireWaitTimeout}
-	if err := restarted.RetryReview(context.Background(), r, g.pull, Options{}); err != nil || len(runner.spawns) != 2 {
+	err := restarted.RetryReview(context.Background(), r, g.pull, Options{})
+	if (err != nil && !errors.Is(err, ErrReviewPending)) || len(runner.spawns) != 2 {
 		t.Fatalf("restarted at the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 }
@@ -236,7 +237,7 @@ func TestRetryPlacedReviewerResetsState(t *testing.T) {
 		if err := fsutil.WriteJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), stale(c, shaA)); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
 			t.Fatal(err)
 		}
 		if fresh := readReviewerJob(t, s, r, 1); fresh.Label == old.Label || fresh.Replacements != 1 {
@@ -254,7 +255,7 @@ func TestRetryPlacedReviewerResetsState(t *testing.T) {
 		if err := fsutil.WriteJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), stale(c, shaA)); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
 			t.Fatal(err)
 		}
 		if len(runner.spawns) != 1 {
@@ -354,7 +355,7 @@ func TestRetrySecondLossIsCollectionFailure(t *testing.T) {
 	runner.exits = []int{panewireWaitTimeout}
 	budgetPane(t, s, runner, readReviewerJob(t, s, r, 1), "done")
 	pastBudget(g, c)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
 		t.Fatalf("replacement run: %v", err)
 	}
 	budgetPane(t, s, runner, readReviewerJob(t, s, r, 1), "done")

@@ -33,13 +33,15 @@ type reviewRetryState struct {
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
 // for it: a quota stop waits for its reset and is no failure, a held reviewer
-// waits for the time panewire named, if any, and is no failure, a collection
-// failure backs off without counting toward escalation, and anything else is a
-// real review failure.
+// waits for the time panewire named, if any, and is no failure, a pending pass
+// whose reviewer runs on or whose claim another host holds is no failure, a
+// collection failure backs off without counting toward escalation, and
+// anything else is a real review failure.
 type reviewFailureClass struct {
 	quotas     []*reviewQuotaStopped
 	held       []*reviewerHeld
 	collection bool
+	pending    bool
 	real       bool
 }
 
@@ -59,6 +61,8 @@ func (c *reviewFailureClass) add(err error) {
 		c.quotas = append(c.quotas, quota)
 	case errors.As(err, &held):
 		c.held = append(c.held, held)
+	case errors.Is(err, errPassPending), errors.Is(err, ErrReviewPending):
+		c.pending = true
 	case errors.As(err, &collect), errors.As(err, &lost):
 		c.collection = true
 	default:
@@ -150,7 +154,9 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			return fsutil.WriteJSON(file, reviewRetryState{Head: pr.Head.SHA})
 		}
 		if err == nil && pending {
-			return nil
+			// A reviewer still runs, or another host holds the pass: there is
+			// no result yet, so nothing failed and nothing may be settled.
+			err = ErrReviewPending
 		}
 		if err == nil {
 			err = errors.New("review produced no completed pass")
@@ -203,12 +209,16 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		return errors.Join(err, saveErr)
 	}
 	if !class.real && !class.collection {
-		// Only quota stops and holds: the audit row says it, and nothing failed.
+		// Only quota stops, holds and pending passes: the audit row says it,
+		// and nothing failed.
 		if state.Held {
 			return ErrReviewHeld
 		}
 		if state.QuotaStopped {
 			return ErrReviewQuotaStopped
+		}
+		if class.pending {
+			return ErrReviewPending
 		}
 		return nil
 	}

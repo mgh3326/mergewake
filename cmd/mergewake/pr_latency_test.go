@@ -112,8 +112,10 @@ func ms(t *testing.T, line map[string]any, key string) int64 {
 	return int64(v)
 }
 
-// (a) One evaluation logs every phase, and the top-level phases add up to
-// eval_ms within 5%. The nested spawn and gate times fit inside their phases.
+// (a) One evaluation logs the phases it ran, and the top-level phases add up
+// to eval_ms within 5%. A pending review never reaches settle, so its settle
+// and gate times are zero; the spawn fits inside the review phase. The
+// evaluation that collects the finished reviewer runs the gate and settles.
 func TestPREvaluatedLogsEveryPhaseAndTheyAddUp(t *testing.T) {
 	te := timedEngineFixture(t, 0)
 	te.e.q.EnqueueNamed(daemon.SourceWebhook, te.f.repo.Name, 1, "")
@@ -122,26 +124,51 @@ func TestPREvaluatedLogsEveryPhaseAndTheyAddUp(t *testing.T) {
 	if len(evaluated) != 1 {
 		t.Fatalf("%d pr evaluated lines, want 1: %s", len(evaluated), te.log.b.String())
 	}
-	line := evaluated[0]
-	eval := ms(t, line, "eval_ms")
-	read, observe, review := ms(t, line, "read_ms"), ms(t, line, "observe_ms"), ms(t, line, "review_ms")
-	lockWait, settle := ms(t, line, "lock_wait_ms"), ms(t, line, "settle_ms")
-	spawn, gate := ms(t, line, "spawn_ms"), ms(t, line, "gate_ms")
-	sum := read + observe + review + lockWait + settle
-	if eval == 0 || sum < eval*95/100 || sum > eval*105/100 {
-		t.Fatalf("phases add up to %d ms (read %d, observe %d, review %d, lock_wait %d, settle %d), eval_ms is %d", sum, read, observe, review, lockWait, settle, eval)
+	pending := evaluated[0]
+	checkPhasesAddUp(t, pending)
+	if read, review := ms(t, pending, "read_ms"), ms(t, pending, "review_ms"); read == 0 || review == 0 {
+		t.Fatalf("a phase took no time: read %d, review %d", read, review)
 	}
-	if read == 0 || review == 0 || settle < latencyNotify.Milliseconds() {
-		t.Fatalf("a phase took no time: read %d, review %d, settle %d", read, review, settle)
-	}
-	if spawn != latencySpawn.Milliseconds() || spawn > review {
+	if spawn, review := ms(t, pending, "spawn_ms"), ms(t, pending, "review_ms"); spawn != latencySpawn.Milliseconds() || spawn > review {
 		t.Fatalf("spawn_ms %d, want %d inside review_ms %d", spawn, latencySpawn.Milliseconds(), review)
 	}
-	if gate == 0 || gate > settle {
-		t.Fatalf("gate_ms %d, want a time inside settle_ms %d", gate, settle)
+	if settle, gate := ms(t, pending, "settle_ms"), ms(t, pending, "gate_ms"); settle != 0 || gate != 0 {
+		t.Fatalf("a pending review ran a settle: settle %d, gate %d", settle, gate)
 	}
-	if _, ok := line["settling"]; ok {
-		t.Fatalf("settling is set for a PR whose evidence is settled: %v", line)
+	if _, ok := pending["settling"]; ok {
+		t.Fatalf("settling is set for a PR whose evidence is settled: %v", pending)
+	}
+
+	// The reviewer finishes: its evaluation collects the pass, runs the gate
+	// and settles.
+	te.finish(te.runner.label(1))
+	te.e.q.EnqueueNamed(daemon.SourceReviewer, te.f.repo.Name, 1, "")
+	te.idle(t, "the finish settles the PR")
+	evaluated = te.lines("pr evaluated")
+	if len(evaluated) != 2 {
+		t.Fatalf("%d pr evaluated lines, want 2: %s", len(evaluated), te.log.b.String())
+	}
+	line := evaluated[1]
+	checkPhasesAddUp(t, line)
+	if read := ms(t, line, "read_ms"); read == 0 {
+		t.Fatalf("read took no time: %v", line)
+	}
+	if settle := ms(t, line, "settle_ms"); settle < latencyNotify.Milliseconds() {
+		t.Fatalf("settle_ms %d, want at least the notice's %d", settle, latencyNotify.Milliseconds())
+	}
+	if gate := ms(t, line, "gate_ms"); gate == 0 || gate > ms(t, line, "settle_ms") {
+		t.Fatalf("gate_ms %d, want a time inside settle_ms %d", gate, ms(t, line, "settle_ms"))
+	}
+}
+
+// checkPhasesAddUp asserts a pr evaluated line's top-level phases account for
+// its eval_ms within 5%.
+func checkPhasesAddUp(t *testing.T, line map[string]any) {
+	t.Helper()
+	eval := ms(t, line, "eval_ms")
+	sum := ms(t, line, "read_ms") + ms(t, line, "observe_ms") + ms(t, line, "review_ms") + ms(t, line, "lock_wait_ms") + ms(t, line, "settle_ms")
+	if eval == 0 || sum < eval*95/100 || sum > eval*105/100 {
+		t.Fatalf("phases add up to %d ms, eval_ms is %d: %v", sum, eval, line)
 	}
 }
 

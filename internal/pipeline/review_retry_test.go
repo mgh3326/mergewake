@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -194,8 +195,8 @@ func TestRetryReviewWaitsForLiveLeaseThenRecovers(t *testing.T) {
 	ref := claimRef(7, shaA, 1)
 	g.refs = map[string]bool{ref: true}
 	g.leaseTimes = map[string]time.Time{ref: time.Now()}
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatal(err)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewPending) {
+		t.Fatalf("live lease: err=%v, want ErrReviewPending", err)
 	}
 	if g.postCount != 0 || n.count != 0 {
 		t.Fatalf("live lease retried or escalated: %d %d", g.postCount, n.count)

@@ -37,6 +37,12 @@ var ErrReviewHeld = errors.New("review held")
 // the pool's reset and the PR must not be settled as unchanged.
 var ErrReviewQuotaStopped = errors.New("review quota stopped")
 
+// ErrReviewPending reports an evaluation that produced no result because a
+// reviewer is still running or another host holds the pass claim. Nothing
+// failed, but no review completed, so the PR must not be settled as unchanged
+// and its revisit timers stay armed for the reviewer's finish or deadline.
+var ErrReviewPending = errors.New("review pending")
+
 const familyRequired = "author family required via --author-family, a Mergewake-Author-Family trailer in the PR body or head commit, or a known commit author"
 
 var familyValue = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
