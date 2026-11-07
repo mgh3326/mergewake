@@ -96,9 +96,10 @@ type fakeGH struct {
 	closed   []int
 	// any-ref confirmation: dispatched counts re-runs per sha, statuses are
 	// the newest commit status per (sha, name), openPulls answers OpenPulls.
-	dispatched map[string]int
-	statuses   map[[2]string]statusRecord
-	openPulls  []github.Pull
+	dispatched     map[string]int
+	dispatchInputs []map[string]string
+	statuses       map[[2]string]statusRecord
+	openPulls      []github.Pull
 }
 
 type statusRecord struct {
@@ -114,6 +115,7 @@ func (g *fakeGH) DispatchWorkflow(_ context.Context, _, workflow, _ string, inpu
 		g.dispatched = map[string]int{}
 	}
 	g.dispatched[inputs["ref"]]++
+	g.dispatchInputs = append(g.dispatchInputs, maps.Clone(inputs))
 	return nil
 }
 func (g *fakeGH) LatestStatus(_ context.Context, _, sha, name string) (github.CI, time.Time, bool, error) {
@@ -198,29 +200,46 @@ func (g *fakeGH) Files(context.Context, string, int) ([]policy.File, error) {
 	return []policy.File{{Path: "tool", Kind: "modified"}}, nil
 }
 
-// Check reads the same evidence GitHub does: the newest commit status of a
-// required name settles a commit whose own run is unknown, and two decisive
-// but disagreeing values are the ambiguity the client reports. A re-run an
-// any-ref workflow posts therefore reaches Check, not only LatestStatus.
+// Check reads the same evidence GitHub does: each required name comes from its
+// own run, the newest commit status of that name settles a run that is unknown,
+// and two decisive but disagreeing values are the ambiguity the client reports.
+// A re-run an any-ref workflow posts therefore reaches Check, not only
+// LatestStatus.
 func (g *fakeGH) Check(_ context.Context, _, sha string, required []string) (github.CI, error) {
-	v := g.ci
-	if g.checks != nil {
-		v = g.checks[sha]
+	if len(required) == 0 {
+		if g.checks != nil {
+			return g.checks[sha], nil
+		}
+		return g.ci, nil
 	}
 	decisive := func(x github.CI) bool { return x == github.Green || x == github.Red }
+	result := github.Green
 	for _, name := range required {
-		st, ok := g.statuses[[2]string{sha, name}]
-		if !ok || st.ci == v {
-			continue
+		run, ok := g.checkNames[sha][name]
+		if !ok {
+			switch {
+			case g.checks != nil:
+				run, ok = g.checks[sha], true
+			case g.ci != "":
+				run, ok = g.ci, true
+			}
 		}
-		switch {
-		case !decisive(v):
-			v = st.ci
-		case decisive(st.ci):
-			return github.Pending, fmt.Errorf("%w named %q", github.ErrAmbiguousCheck, name)
+		if st, found := g.statuses[[2]string{sha, name}]; found {
+			switch {
+			case !ok || !decisive(run):
+				run, ok = st.ci, true
+			case decisive(st.ci) && run != st.ci:
+				return github.Pending, fmt.Errorf("%w named %q", github.ErrAmbiguousCheck, name)
+			}
+		}
+		if ok && run == github.Red {
+			return github.Red, nil
+		}
+		if !ok || run != github.Green {
+			result = github.Pending
 		}
 	}
-	return v, nil
+	return result, nil
 }
 func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string) (map[string]github.CI, error) {
 	out := map[string]github.CI{}

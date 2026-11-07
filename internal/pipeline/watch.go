@@ -117,11 +117,14 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return e
 	}
+	// A non-red aggregate can still be pending on a sibling check while the
+	// incident's re-run statuses are already complete. The record settles the
+	// incident; waiting on that check would leave a flaky result unrecorded.
+	if ci != github.Red && mixedHead {
+		return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+	}
 	checkpoint := filepath.Join(s.state(r.Name), "last-green")
 	if ci == github.Green {
-		if mixedHead {
-			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
-		}
 		result.Action = "healthy"
 		if !o.DryRun {
 			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {

@@ -536,6 +536,52 @@ func TestWatchFlakyHeadCulpritNoAmbiguity(t *testing.T) {
 	}
 }
 
+// A sibling watch check still pending must not delay the incident: the recorded
+// re-run evidence settles a head-culprit incident while Check reads pending.
+func TestWatchPendingSiblingStillResolvesIncident(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.ci = ""
+		l.required = []string{"CI", "LINT"}
+		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\nany_ref_checks: [CI]\n"
+		l.parents = map[string]string{shaC: shaA}
+		l.pull.MergeCommitSHA = shaC
+		delete(l.checks, shaC)
+		l.checkNames = map[string]map[string]github.CI{shaC: {"LINT": github.Green}}
+		l.statuses = map[[2]string]statusRecord{
+			{shaC, "CI"}: {github.Red, now.Add(-time.Minute)},
+		}
+	})
+	s.Now = func() time.Time { return now }
+
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+		t.Fatalf("%+v", got)
+	}
+	if g.dispatched[shaA] != 1 || g.dispatched[shaC] != 1 {
+		t.Fatalf("dispatches %v", g.dispatched)
+	}
+	now = now.Add(time.Minute)
+	g.statuses = map[[2]string]statusRecord{
+		{shaA, "CI"}: {github.Green, now},
+		{shaC, "CI"}: {github.Green, now},
+	}
+	g.checkNames[shaC]["LINT"] = github.Pending
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+		t.Fatalf("%+v", got)
+	}
+	st, found := recoveryState(t, s, r)
+	if !found || st.Flaky == "" || st.Culprit != shaC {
+		t.Fatalf("incident %+v found=%t", st, found)
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+	if g.revertCount != 0 {
+		t.Fatal("a flaky failure was blamed")
+	}
+}
+
 func fixPull(sha string) github.Pull {
 	return github.Pull{
 		Number: 11, State: "open", Head: github.Ref{SHA: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
@@ -628,34 +674,37 @@ func TestFixWonPerRevert(t *testing.T) {
 	}
 }
 
-// A repo whose any-ref workflow accepts packages is re-run for the culprit's
-// changed Go packages; one that does not gets the ref only.
-type packagesGH struct{ *fakeGH }
+// The confirmation re-run repeats the scope the original verdict judged: a
+// workflow that accepts a packages input is still dispatched with the ref only,
+// because a dependent package can fail while the culprit's own packages pass.
+type packagesRecoveryGH struct{ *recoveryGH }
 
-func (g *packagesGH) ReadFile(_ context.Context, _, _, name string) ([]byte, error) {
+func (g *packagesRecoveryGH) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, error) {
 	if name == ".github/workflows/ci-any-ref.yml" {
 		return []byte("on:\n  workflow_dispatch:\n    inputs:\n      packages:\n        type: string\n"), nil
 	}
-	return g.fakeGH.ReadFile(context.Background(), "", "", name)
+	return g.recoveryGH.ReadFile(ctx, repo, sha, name)
 }
 
-func TestRecoveryConfirmInputsPackages(t *testing.T) {
-	s, g, _, _, r := setup(t)
-	g.files = []policy.File{
-		{Path: "internal/mcp/a.go", Kind: "modified"},
-		{Path: "cmd/tool/b.go", Kind: "added"},
-		{Path: "docs/a.md", Kind: "modified"},
-	}
-	p := policy.Policy{AnyRefWorkflow: "ci-any-ref.yml"}
-	st := recoveryIncident{CulpritPR: 7}
+func TestRecoveryConfirmRerunsWholeScope(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, func(l *recoveryGH) {
+		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
+		l.files = []policy.File{{Path: "internal/mcp/a.go", Kind: "modified"}}
+	})
+	s.GH = &packagesRecoveryGH{g}
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
 
-	if got := s.confirmInputs(context.Background(), r, p, st, shaB); got["packages"] != "" || got["ref"] != shaB {
-		t.Fatalf("no workflow input: %v", got)
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+		t.Fatalf("%+v", got)
 	}
-	s.GH = &packagesGH{fakeGH: g}
-	got := s.confirmInputs(context.Background(), r, p, st, shaB)
-	if got["packages"] != "./cmd/tool/ ./internal/mcp/" || got["ref"] != shaB {
-		t.Fatalf("packages %v", got)
+	if len(g.dispatchInputs) != 2 {
+		t.Fatalf("dispatches %v", g.dispatchInputs)
+	}
+	for _, inputs := range g.dispatchInputs {
+		if len(inputs) != 1 || inputs["ref"] == "" {
+			t.Fatalf("re-run scope narrowed: %v", inputs)
+		}
 	}
 }
 
