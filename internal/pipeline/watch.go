@@ -117,14 +117,20 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return e
 	}
-	// A non-red aggregate can still be pending on a sibling check while the
-	// incident's re-run statuses are already complete. The record settles the
-	// incident; waiting on that check would leave a flaky result unrecorded.
-	if ci != github.Red && mixedHead {
-		return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
-	}
 	checkpoint := filepath.Join(s.state(r.Name), "last-green")
 	if ci == github.Green {
+		// A same-sha re-run can pass beside the head's own failed run. Record
+		// the mixed result once, then close the incident as healthy: a green
+		// main needs no revert, and a stale record would block a later red.
+		if mixedHead {
+			settled, e := s.settleMixedHead(ctx, r, p, result, o, inc)
+			if e != nil {
+				return e
+			}
+			if !settled {
+				return nil
+			}
+		}
 		result.Action = "healthy"
 		if !o.DryRun {
 			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {
@@ -148,6 +154,11 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	if ci != github.Red {
+		// A status-only re-run can leave the aggregate pending through a sibling
+		// check; the record settles the incident without waiting on that check.
+		if mixedHead {
+			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	s.feedBranchCI(ctx, r, head, checks, o)
@@ -161,8 +172,21 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	// A persisted incident outranks a fresh bisect: its confirmation evidence
 	// is applied first, so a re-run's status cannot move its culprit or green
 	// boundary and a mixed result is recorded instead of blamed on a new commit.
+	// A green commit after the recorded head means main was fixed and broke
+	// again, so that red is diagnosed afresh instead of reverting the old one.
 	if recorded && inc.Culprit != "" && inc.Baseline != "" {
-		return s.recoverIncident(ctx, r, p, head, checks, result, o, inc)
+		current, e := s.incidentCurrent(ctx, r, p, head, inc)
+		if e != nil {
+			return e
+		}
+		if current {
+			return s.recoverIncident(ctx, r, p, head, checks, result, o, inc)
+		}
+		if !result.Shadow && !o.DryRun {
+			if e = s.clearRecoveryState(r.Name); e != nil {
+				return e
+			}
+		}
 	}
 	baselineBytes, e := os.ReadFile(checkpoint)
 	if e != nil && !os.IsNotExist(e) {
@@ -370,7 +394,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		culpritCI, culpritKnown = v, true
 	}
 	persist := !result.Shadow && !o.DryRun
-	st, e := s.beginRecovery(r, culprit, origin.Number, head, green, task, culpritCI, culpritKnown, persist)
+	st, e := s.beginRecovery(r, culprit, origin.Number, head, green, task, strings.Join(bisectChecks, ","), culpritCI, culpritKnown, persist)
 	if e != nil {
 		return e
 	}

@@ -16,6 +16,9 @@ import (
 
 const revertHead = "dddddddddddddddddddddddddddddddddddddddd"
 
+// advancedHead is a red main head that lands after an incident's recorded head.
+const advancedHead = "ffffffffffffffffffffffffffffffffffffffff"
+
 // recoveryGH is a repository with an open revert PR watch opened, plus the
 // trees the exact-inverse proof reads.
 type recoveryGH struct {
@@ -519,18 +522,43 @@ func TestWatchFlakyHeadCulpritNoAmbiguity(t *testing.T) {
 				{shaC, "CI"}: {github.Green, now},
 			}
 			got := recoveryWatch(t, s, r)
-			if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
-				t.Fatalf("%+v", got)
+			switch failed {
+			case "check-run":
+				// The head's own red run and the green status are ambiguous, so
+				// the incident is resolved from the record and holds as flaky.
+				if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+					t.Fatalf("%+v", got)
+				}
+				st, found := recoveryState(t, s, r)
+				if !found || st.Culprit != shaC || st.Baseline != shaA || st.Flaky == "" {
+					t.Fatalf("incident %+v found=%t", st, found)
+				}
+			case "commit-status":
+				// The head reads green, so the mixed result is recorded and the
+				// green main closes the incident instead of holding it forever.
+				if got.Action != "healthy" {
+					t.Fatalf("%+v", got)
+				}
+				if _, found := recoveryState(t, s, r); found {
+					t.Fatal("flaky incident kept on a green main")
+				}
 			}
 			if g.revertCount != 0 || g.merges != 0 {
 				t.Fatal("a flaky failure was blamed")
 			}
-			st, found := recoveryState(t, s, r)
-			if !found || st.Culprit != shaC || st.Baseline != shaA || st.Flaky == "" {
-				t.Fatalf("incident %+v found=%t", st, found)
-			}
 			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 				t.Fatalf("design-lane lines: %v", lines)
+			}
+			if failed == "commit-status" {
+				// A later red head is diagnosed afresh: the closed incident does
+				// not swallow it.
+				g.head = shaD
+				g.parents = map[string]string{shaD: shaC, shaC: shaA}
+				g.checks[shaD] = github.Red
+				g.pull.MergeCommitSHA = shaD
+				if next := recoveryWatch(t, s, r); next.Action != "recovery-confirming" || next.Culprit != shaD {
+					t.Fatalf("new red not diagnosed: %+v", next)
+				}
 			}
 		})
 	}
@@ -579,6 +607,230 @@ func TestWatchPendingSiblingStillResolvesIncident(t *testing.T) {
 	}
 	if g.revertCount != 0 {
 		t.Fatal("a flaky failure was blamed")
+	}
+}
+
+// Main green then red between polls: the recorded incident is stale, so the new
+// red is diagnosed afresh instead of reverting the old culprit.
+func TestWatchGreenThenRedRediagnoses(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, func(l *recoveryGH) {
+		l.head = shaD
+		l.parents = map[string]string{shaD: shaC, shaC: shaB, shaB: shaA}
+		l.checks = map[string]github.CI{shaD: github.Red, shaC: github.Green, shaB: github.Red, shaA: github.Green}
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "hold" || g.revertCount != 0 || g.merges != 0 {
+		t.Fatalf("%+v reverts=%d merges=%d", got, g.revertCount, g.merges)
+	}
+	if _, found := recoveryState(t, s, r); found {
+		t.Fatal("stale incident kept after a newer green boundary")
+	}
+}
+
+// With the latch still active, a green commit after the recorded head means the
+// old revert belongs to a failure that was fixed: it is held, never merged.
+func TestWatchGreenThenRedWithLatchHolds(t *testing.T) {
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.head = advancedHead
+		l.parents = map[string]string{advancedHead: shaC, shaC: shaB, shaB: shaA}
+		l.checks = map[string]github.CI{advancedHead: github.Red, shaC: github.Green, shaB: github.Red, shaA: github.Green, revertHead: github.Green}
+		l.entries[advancedHead] = map[string]github.TreeEntry{"tool": blob("post")}
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	if e := s.saveRecovery(r.Name, recoveryIncident{
+		RedSince: now.Add(-31 * time.Minute), Culprit: shaB, CulpritPR: 7, Head: shaC,
+		Baseline: shaA, Task: "42", Checks: "CI", Confirmed: true, RevertPR: 9,
+	}); e != nil {
+		t.Fatal(e)
+	}
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "green after the incident") {
+		t.Fatalf("%+v", got)
+	}
+	if g.merges != 0 {
+		t.Fatal("merged a revert for a failure that was already fixed")
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "green after the incident") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// A fix PR names the current red head. When main advances from the incident's
+// recorded head to a newer red head, the fix still holds the revert.
+func TestWatchFixPRMatchesCurrentHead(t *testing.T) {
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.head = advancedHead
+		l.parents = map[string]string{advancedHead: shaC, shaC: shaB, shaB: shaA}
+		l.checks[advancedHead] = github.Red
+		l.entries[advancedHead] = map[string]github.TreeEntry{"tool": blob("post")}
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	if e := s.saveRecovery(r.Name, recoveryIncident{
+		RedSince: now.Add(-31 * time.Minute), Culprit: shaB, CulpritPR: 7, Head: shaC,
+		Baseline: shaA, Task: "42", Confirmed: true, RevertPR: 9,
+	}); e != nil {
+		t.Fatal(e)
+	}
+	g.openPulls = []github.Pull{fixPull(advancedHead)}
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-fix-pr" || !strings.Contains(got.Reason, "#11") || g.merges != 0 {
+		t.Fatalf("%+v merges=%d", got, g.merges)
+	}
+	if st, _ := recoveryState(t, s, r); st.Head != advancedHead {
+		t.Fatalf("incident head %s, want %s", st.Head, advancedHead)
+	}
+	if priority := s.ReviewPriority(context.Background(), r, fixPull(advancedHead)); priority.Value != 1 || priority.Source != "recovery-fix" {
+		t.Fatalf("fix PR priority %+v", priority)
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "#11") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// Confirmation evidence is bound to the check set it was read under: a policy
+// that changes the bisect checks makes a recorded confirmation unusable.
+func TestRecoveryCheckSetChangeHolds(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, func(l *recoveryGH) {
+		l.required = []string{"CI", "LINT"}
+		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\nany_ref_checks: [CI, LINT]\n"
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	// The recorded state names the check set the evidence was read under. It is
+	// written as JSON so the guard is exercised through the persisted form.
+	state := `{"red_since":"2026-11-07T10:00:00Z","culprit":"` + shaB + `","culprit_pr":7,` +
+		`"head":"` + shaC + `","baseline":"` + shaA + `","task":"42","checks":"CI","confirmed":true}`
+	if e := os.MkdirAll(s.state(r.Name), 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(s.recoveryFile(r.Name), []byte(state), 0600); e != nil {
+		t.Fatal(e)
+	}
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "check set changed") {
+		t.Fatalf("%+v", got)
+	}
+	if g.revertCount != 0 || g.merges != 0 {
+		t.Fatalf("reverted on evidence from another check set: reverts=%d merges=%d", g.revertCount, g.merges)
+	}
+}
+
+// The revert is merged into main; a PR retargeted elsewhere is held.
+func TestWatchRevertWrongBaseHeld(t *testing.T) {
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.revert.Base.Ref = "release"
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	now = now.Add(fixWindow)
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "targets release, not main") {
+		t.Fatalf("%+v", got)
+	}
+	if g.merges != 0 {
+		t.Fatal("merged a revert into another branch")
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "targets release") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// mainFlipsGH answers the main head's first check of a pass red and later ones
+// with ci, as a same-sha re-run that settles after the pass's first read.
+type mainFlipsGH struct {
+	*recoveryGH
+	reads int
+	ci    github.CI
+}
+
+func (g *mainFlipsGH) Check(ctx context.Context, repo, sha string, names []string) (github.CI, error) {
+	if sha == g.fakeGH.head {
+		g.reads++
+		if g.reads > 1 {
+			return g.ci, nil
+		}
+	}
+	return g.recoveryGH.Check(ctx, repo, sha, names)
+}
+
+// A re-run that settles after the pass's first read must still hold the merge:
+// main's CI is re-read fresh immediately before merging.
+func TestWatchRevertMergeRechecksMainCI(t *testing.T) {
+	s, g, _, n, r := recoverySetup(t, nil)
+	flip := &mainFlipsGH{recoveryGH: g, ci: github.Red}
+	s.GH = flip
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	flip.reads, flip.ci = 0, github.Green
+	now = now.Add(fixWindow)
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "main CI is green") {
+		t.Fatalf("%+v", got)
+	}
+	if g.merges != 0 {
+		t.Fatal("merged the revert on a green main")
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "main CI is green") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// The merge reads main fresh: a head that advances after the pass's first read
+// holds the revert instead of merging onto the recorded head.
+type advancingHeadGH struct {
+	*recoveryGH
+	moved string
+	reads int
+}
+
+func (g *advancingHeadGH) Head(ctx context.Context, repo, branch string) (string, error) {
+	if branch == github.RecoveryBranch {
+		return g.recoveryGH.Head(ctx, repo, branch)
+	}
+	g.reads++
+	if g.moved != "" && g.reads > 1 {
+		return g.moved, nil
+	}
+	return g.recoveryGH.Head(ctx, repo, branch)
+}
+
+func TestWatchRevertMergeRequiresSameMain(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, nil)
+	moved := &advancingHeadGH{recoveryGH: g}
+	s.GH = moved
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	moved.moved, moved.reads = advancedHead, 0
+	now = now.Add(fixWindow)
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "main changed during recovery") {
+		t.Fatalf("%+v", got)
+	}
+	if g.merges != 0 {
+		t.Fatal("merged onto an unverified main")
 	}
 }
 

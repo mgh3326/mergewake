@@ -38,6 +38,9 @@ type recoveryIncident struct {
 	Head      string    `json:"head"`
 	Baseline  string    `json:"baseline,omitempty"`
 	Task      string    `json:"task,omitempty"`
+	// Checks is the bisect check set the evidence was read under. A policy that
+	// changes it makes the recorded confirmation unusable.
+	Checks string `json:"checks,omitempty"`
 	// Runs is the confirmation evidence: per commit, each observed outcome
 	// (true pass, false fail). The recorded first result is included.
 	Runs map[string][]bool `json:"runs,omitempty"`
@@ -148,7 +151,7 @@ func (s *Service) urgentFix(repo string, pr int) bool {
 // evidence. The same culprit keeps its red_since and evidence; a different
 // culprit starts a new incident. culpritCI is the recorded state of the
 // culprit on the bisect checks; known is false when that read was unknown.
-func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, head, baseline, task string, culpritCI github.CI, known, persist bool) (recoveryIncident, error) {
+func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, head, baseline, task, checks string, culpritCI github.CI, known, persist bool) (recoveryIncident, error) {
 	st, found, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return st, e
@@ -161,6 +164,9 @@ func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, he
 	}
 	if found && st.Culprit == culprit {
 		st.Head = head
+		if st.Checks == "" {
+			st.Checks = checks
+		}
 		if st.Baseline == "" {
 			st.Baseline = baseline
 		}
@@ -174,7 +180,7 @@ func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, he
 	}
 	st = recoveryIncident{
 		RedSince: s.now().UTC(), Culprit: culprit, CulpritPR: culpritPR,
-		Head: head, Baseline: baseline, Task: task,
+		Head: head, Baseline: baseline, Task: task, Checks: checks,
 		Runs: map[string][]bool{}, Pending: map[string]time.Time{}, Dispatches: map[string]int{},
 	}
 	if baseline != "" {
@@ -234,6 +240,11 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 			return nil
 		}
 		return s.saveRecovery(r.Name, st)
+	}
+	// Evidence read under another check set proves nothing about this one: hold
+	// rather than merge a revert for a failure the recorded runs never judged.
+	if st.Checks != "" && st.Checks != strings.Join(p.BisectChecks(), ",") {
+		return st, false, "the confirmation check set changed; rediagnose", true, nil
 	}
 	if st.Flaky != "" {
 		return st, false, st.Flaky, true, nil
@@ -403,6 +414,69 @@ func namesFix(text string, st recoveryIncident) bool {
 	return false
 }
 
+// incidentCurrent reports whether the current red head still belongs to the
+// recorded incident. A green commit between them means main was fixed and broke
+// again, so that red needs a fresh diagnosis rather than the old culprit's
+// revert.
+func (s *Service) incidentCurrent(ctx context.Context, r config.Repo, p policy.Policy, head string, st recoveryIncident) (bool, error) {
+	if head == st.Head {
+		return true, nil
+	}
+	names := p.BisectChecks()
+	current := head
+	for i := 0; i < s.Config.WatchLimit; i++ {
+		c, e := s.GH.Commit(ctx, r.Name, current)
+		if e != nil {
+			return false, e
+		}
+		if len(c.Parents) == 0 {
+			return false, nil
+		}
+		current = c.Parents[0].SHA
+		v, e := s.GH.Check(ctx, r.Name, current, names)
+		if e != nil {
+			if !errors.Is(e, github.ErrAmbiguousCheck) {
+				return false, e
+			}
+			v = github.Pending
+		}
+		if v == github.Green {
+			return false, nil
+		}
+		if current == st.Head {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// settleMixedHead resolves a head-culprit incident whose aggregate head check
+// reads green because a same-sha re-run passed. It records the mixed result and
+// tells the design lane once; the caller then takes the healthy path, which
+// clears the incident. It reports whether the pass may continue as healthy.
+func (s *Service) settleMixedHead(ctx context.Context, r config.Repo, p policy.Policy, result watchResult, o Options, inc recoveryIncident) (bool, error) {
+	acting := !result.Shadow && !o.DryRun
+	st, confirmed, reason, needsDesk, e := s.confirmRecovery(ctx, r, p, inc, acting, acting)
+	if e != nil {
+		return false, e
+	}
+	if needsDesk {
+		result.Action = "recovery-confirming"
+		result.Reason = reason
+		if e = s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o); e != nil {
+			return false, e
+		}
+	}
+	if st.Flaky == "" && !confirmed && !needsDesk {
+		// The re-runs have not landed yet; hold one more poll rather than close
+		// the incident before a mixed result can be recorded.
+		result.Action = "recovery-confirming"
+		result.Reason = reason
+		return false, s.audit(r.Name, "watch", result, o.DryRun)
+	}
+	return true, nil
+}
+
 // recoverHeadCulprit resolves an incident whose culprit is the current head.
 // An active latch still owns the revert PR, so it keeps the recovery path.
 func (s *Service) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
@@ -427,22 +501,27 @@ func (s *Service) recoverIncident(ctx context.Context, r config.Repo, p policy.P
 	if st.CulpritPR != 0 {
 		result.Candidates = []int{st.CulpritPR}
 	}
-	if !st.Confirmed {
-		var confirmed, needsDesk bool
-		var reason string
-		var e error
-		st, confirmed, reason, needsDesk, e = s.confirmRecovery(ctx, r, p, st, acting, acting)
-		if e != nil {
-			return e
-		}
-		if !confirmed {
-			result.Action = "recovery-confirming"
-			result.Reason = reason
-			if needsDesk {
-				return s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o)
+	// The culprit and the window stay, but the head the fix is named against
+	// moves with main.
+	if st.Head != head {
+		st.Head = head
+		if acting {
+			if e := s.saveRecovery(r.Name, st); e != nil {
+				return e
 			}
-			return s.audit(r.Name, "watch", result, o.DryRun)
 		}
+	}
+	st, confirmed, reason, needsDesk, e := s.confirmRecovery(ctx, r, p, st, acting, acting)
+	if e != nil {
+		return e
+	}
+	if !confirmed {
+		result.Action = "recovery-confirming"
+		result.Reason = reason
+		if needsDesk {
+			return s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o)
+		}
+		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	if st.RevertPR != 0 {
 		result.Action = "recovery-hold"
@@ -491,10 +570,34 @@ func (s *Service) recovery(ctx context.Context, r config.Repo, p policy.Policy, 
 		culprit, culpritPR := culpritFromRevertBody(pr.Body)
 		st = recoveryIncident{
 			RedSince: s.now().UTC(), Culprit: culprit, CulpritPR: culpritPR, Head: head,
-			RevertPR: pr.Number, RevertURL: pr.HTMLURL,
+			RevertPR: pr.Number, RevertURL: pr.HTMLURL, Checks: strings.Join(p.BisectChecks(), ","),
 			Runs: map[string][]bool{}, Pending: map[string]time.Time{}, Dispatches: map[string]int{},
 		}
 		st.Confirmed = false
+		if acting {
+			if e = s.saveRecovery(r.Name, st); e != nil {
+				return e
+			}
+		}
+	}
+	// A green commit between the recorded head and this red means main was
+	// fixed and broke again while no poll saw it: the revert belongs to the old
+	// failure, so hold rather than merge it.
+	if st.Culprit != "" && st.Baseline != "" {
+		current, e := s.incidentCurrent(ctx, r, p, head, st)
+		if e != nil {
+			return e
+		}
+		if !current {
+			result.Action = "recovery-hold"
+			result.Reason = "main was green after the incident; rediagnose before reverting"
+			return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":stale-incident", o)
+		}
+	}
+	// The culprit and the window stay, but the red head moves: a fix PR names
+	// the current head, not the one the incident started at.
+	if st.Head != head {
+		st.Head = head
 		if acting {
 			if e = s.saveRecovery(r.Name, st); e != nil {
 				return e
@@ -556,22 +659,28 @@ func (s *Service) recovery(ctx context.Context, r config.Repo, p policy.Policy, 
 		result.Reason = "fix window elapsed and the failure is confirmed"
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	if reason := s.revertMergeBlocker(ctx, r, checks, head, *pr, st); reason != "" {
+	if reason := s.revertMergeBlocker(ctx, r, p, checks, head, *pr, st); reason != "" {
 		result.Action = "recovery-hold"
 		result.Reason = reason
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":"+reason, o)
 	}
-	return s.mergeRevert(ctx, r, head, *pr, st, result, o)
+	return s.mergeRevert(ctx, r, head, checks, *pr, st, result, o)
 }
 
 // revertMergeBlocker names the first condition that forbids merging the revert,
 // or "" when the merge may proceed. It re-reads the evidence a merge depends on.
-func (s *Service) revertMergeBlocker(ctx context.Context, r config.Repo, checks []string, head string, pr github.Pull, st recoveryIncident) string {
+func (s *Service) revertMergeBlocker(ctx context.Context, r config.Repo, p policy.Policy, checks []string, head string, pr github.Pull, st recoveryIncident) string {
 	if st.Culprit == "" || st.CulpritPR == 0 || st.Baseline == "" {
 		return "recovery state cannot attest the culprit"
 	}
+	if st.Checks != "" && st.Checks != strings.Join(p.BisectChecks(), ",") {
+		return "the confirmation check set changed; rediagnose"
+	}
 	if !st.Confirmed {
 		return "the failure is not confirmed 2/2"
+	}
+	if pr.Base.Ref != r.Branch {
+		return "revert PR targets " + pr.Base.Ref + ", not " + r.Branch
 	}
 	descends, e := s.GH.Ancestor(ctx, r.Name, st.Culprit, head)
 	if e != nil {
@@ -701,8 +810,12 @@ func sortedKeys(m map[string]bool) []string {
 
 // mergeRevert merges the revert PR at its current head once the evidence has
 // not changed, records the outcome and tells the design lane once.
-func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
-	fresh, e := s.GH.Pull(ctx, r.Name, pr.Number)
+func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, checks []string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
+	// Earlier reads in this pass are memoized, and a same-sha re-run can settle
+	// since. The merge turns on the PR, the head and main's CI, so read them
+	// fresh rather than from the pass snapshot.
+	freshCtx := github.FreshEvidence(ctx)
+	fresh, e := s.GH.Pull(freshCtx, r.Name, pr.Number)
 	if e != nil {
 		return e
 	}
@@ -711,7 +824,7 @@ func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, p
 		result.Reason = "revert PR changed during recovery"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":changed", o)
 	}
-	main, e := s.GH.Head(ctx, r.Name, r.Branch)
+	main, e := s.GH.Head(freshCtx, r.Name, r.Branch)
 	if e != nil {
 		return e
 	}
@@ -719,6 +832,17 @@ func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, p
 		result.Action = "recovery-hold"
 		result.Reason = "main changed during recovery"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-moved", o)
+	}
+	ci, e := s.GH.Check(freshCtx, r.Name, head, checks)
+	if e != nil {
+		result.Action = "recovery-hold"
+		result.Reason = "main CI check failed before the merge: " + integrations.Detail(e)
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-failed", o)
+	}
+	if ci != github.Red {
+		result.Action = "recovery-hold"
+		result.Reason = "main CI is " + string(ci) + " on the watch checks; revert held"
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
 	if e = s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA); e != nil {
 		return e
