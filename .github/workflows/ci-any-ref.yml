@@ -30,7 +30,7 @@ jobs:
     needs: validate
     if: ${{ inputs.suite == 'main' }}
     concurrency:
-      group: ci-any-ref-ci-${{ inputs.ref }}
+      group: ci-any-ref-ci-${{ inputs.suite }}-${{ inputs.ref }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -54,7 +54,7 @@ jobs:
     permissions:
       statuses: write
     concurrency:
-      group: ci-any-ref-status-${{ inputs.ref }}
+      group: ci-any-ref-status-${{ inputs.suite }}-${{ inputs.ref }}
       cancel-in-progress: true
     env:
       GH_TOKEN: ${{ github.token }}
