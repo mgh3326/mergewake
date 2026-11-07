@@ -528,7 +528,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					}
 					if fresh.State == "completed" || fresh.State == "escalated" || fresh.State == "lost" {
 						state, spawn = fresh.State, false
-					} else if b, retry := x.remoteFindings(ctx, plan, fresh, label); b != nil {
+					} else if b, retry, _ := x.remoteFindings(ctx, plan, fresh, label); b != nil {
 						collected, remoteRecord, spawn = b, &fresh, false
 						// Give transient read errors one additional review budget to recover.
 					} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
@@ -559,7 +559,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, err
 			}
 			if !found && host != "" {
-				b, _ = x.remoteFindings(ctx, plan, integrations.JobRecord{Host: host}, label)
+				b, _, _ = x.remoteFindings(ctx, plan, integrations.JobRecord{Host: host}, label)
 				found = b != nil
 			}
 			switch {
@@ -911,6 +911,37 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	case res.reason == "escalated" || res.reason == "lost":
 		pane.hold = "reviewer job " + res.reason + "; the pane stays for the operator"
 		return skip("reviewer job record %s", res.reason)
+	case res.reason == "completed without a result":
+		// A completion that beat `panewire done --result` leaves the pane's
+		// findings.json on the host it ran on. Read it there, then the legacy
+		// lane/file path, before treating the reviewer as lost; a result no
+		// source has is lost and logged, never a silent skip.
+		if collected != nil {
+			b = collected
+			x.countLegacy(plan, label, res.reason, &note)
+			break
+		}
+		var why string
+		if b, why = x.completedHost(collectCtx, plan, res.rec, label); b != nil {
+			break
+		}
+		b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, &note)
+		if e == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			keepJob = true
+			if !errors.Is(e, ctx.Err()) {
+				e = errors.Join(e, ctx.Err())
+			}
+			return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
+		}
+		why += "; " + e.Error()
+		x.noteResultLost(plan, label, res.rec.Host, why)
+		if resumed {
+			return x.replaceLostReviewer(ctx, plan, rj, res.rec, why, leaseSHA)
+		}
+		return out, &reviewResultLost{label, res.reason, profile, reportPath, errors.New(why)}
 	default:
 		// The record answered without findings — a pane spawned before
 		// `panewire done --result` still returns them through the lane
@@ -918,8 +949,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// release; each use is counted on the receipt and audited.
 		if collected != nil {
 			b = collected
+			x.countLegacy(plan, label, res.reason, &note)
 		} else {
-			b, e = x.collect(collectCtx, label, findingsPath)
+			b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, &note)
 		}
 		if e != nil {
 			if ctx.Err() != nil {
@@ -929,17 +961,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				}
 				return out, fmt.Errorf("panewire reviewer %s: %w", label, e)
 			}
-			if res.rec.State == "completed" {
-				return out, &reviewResultLost{label, res.reason, profile, reportPath, e}
-			}
 			return skip("no findings: job record %s; %v", res.reason, e)
 		}
-		fallbackMu.Lock()
-		s.inboxFallbacks++
-		fallbacks := s.inboxFallbacks
-		fallbackMu.Unlock()
-		note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", note, fallbacks), "; ")
-		_ = s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": label, "record": res.reason, "count": fallbacks}, false)
 	}
 	var refusal struct {
 		Refused string `json:"refused"`
@@ -1107,6 +1130,13 @@ const spawnedKeep = 4 << 10
 // same evaluation.
 func (x *panewireExecutor) note(state string, rj reviewerJob) {
 	_ = x.s.Print(map[string]any{"action": "review", "state": state, "pr": x.pr.Number, "head": short7(x.pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "elapsed_ms": x.s.now().Sub(rj.Recorded).Milliseconds()})
+}
+
+// noteResultLost prints one line for a completed reviewer whose result no
+// source produced, with the label, the host it ran on and the reason, so a
+// lost result is never silent.
+func (x *panewireExecutor) noteResultLost(plan *passPlan, label, host, reason string) {
+	_ = x.s.Print(map[string]any{"action": "review", "state": "result-lost", "pr": x.pr.Number, "head": short7(x.pr.Head.SHA), "pass": plan.pass, "reviewer": label, "host": host, "reason": fleetevent.Redact(reason)})
 }
 
 // pending ends a pass whose reviewer runs on: nothing waits for it. The
@@ -1305,7 +1335,9 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 }
 
 // remoteFindings reads the host's bounded result without recording its body.
-func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool) {
+// outcome names what the read produced (found, not_found, missing, error, …)
+// so a caller that has no retry left can say why it got nothing.
+func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool, string) {
 	outcome := "error"
 	var findings json.RawMessage
 	lookupTimeout := 10 * time.Second
@@ -1369,10 +1401,46 @@ func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, r
 	_ = x.s.audit(x.repo.Name, "reviewer-remote-result", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "outcome": outcome}, false)
 	switch outcome {
 	case "found", "not_found", "missing", "too_large", "not_json", "schema", "no_hub":
-		return findings, false
+		return findings, false, outcome
 	default:
-		return nil, true
+		return nil, true, outcome
 	}
+}
+
+// completedHost reads the findings of a completed reviewer whose hk job carries
+// no result from the host it ran on, where the pane wrote findings.json. It
+// returns the findings, or why the host produced none.
+func (x *panewireExecutor) completedHost(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, string) {
+	if rec.Host == "" {
+		return nil, "the job record names no host"
+	}
+	b, _, outcome := x.remoteFindings(ctx, plan, rec, label)
+	if b != nil {
+		return b, ""
+	}
+	return nil, fmt.Sprintf("host %s read %s", rec.Host, outcome)
+}
+
+// legacyFindings is the legacy lane/file collection of a finished pane, kept
+// for one release; each use is counted on the receipt and audited.
+func (x *panewireExecutor) legacyFindings(ctx context.Context, plan *passPlan, label, findingsPath, record string, note *string) ([]byte, error) {
+	b, e := x.collect(ctx, label, findingsPath)
+	if e != nil {
+		return nil, e
+	}
+	x.countLegacy(plan, label, record, note)
+	return b, nil
+}
+
+// countLegacy counts and audits one legacy lane/file collection on the pass
+// receipt.
+func (x *panewireExecutor) countLegacy(plan *passPlan, label, record string, note *string) {
+	fallbackMu.Lock()
+	x.s.inboxFallbacks++
+	fallbacks := x.s.inboxFallbacks
+	fallbackMu.Unlock()
+	*note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", *note, fallbacks), "; ")
+	_ = x.s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "record": record, "count": fallbacks}, false)
 }
 
 // availableFindings checks the legacy sources once for a finished pane. A

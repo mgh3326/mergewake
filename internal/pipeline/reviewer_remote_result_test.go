@@ -80,7 +80,7 @@ func TestReviewerRemoteResultLocalOldCLI(t *testing.T) {
 	s, _, repo := panewireSetup(t, runner)
 	s.Runner = oldLocalPanewire{runner}
 	x := panewireExecutor{s: s, repo: repo}
-	if got, retry := x.remoteFindings(context.Background(), &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil || !retry {
+	if got, retry, _ := x.remoteFindings(context.Background(), &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil || !retry {
 		t.Fatalf("findings = %s", got)
 	}
 	rows := auditRows(t, s, repo, "reviewer-remote-result")
@@ -124,7 +124,7 @@ func TestReviewerRemoteResultTimeoutPreservesBudget(t *testing.T) {
 	x := panewireExecutor{s: s, repo: repo}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if got, retry := x.remoteFindings(ctx, &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil || !retry || ctx.Err() != nil {
+	if got, retry, _ := x.remoteFindings(ctx, &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil || !retry || ctx.Err() != nil {
 		t.Fatalf("findings=%s parent error=%v", got, ctx.Err())
 	}
 }
