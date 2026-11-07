@@ -263,6 +263,10 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 	hold := func(st recoveryIncident, reason string) (recoveryIncident, bool, string, bool, error) {
 		return st, false, reason, true, save(st)
 	}
+	// A result that landed is evidence even when a sibling re-run timed out, so
+	// every ready result is collected before a timeout is reported; otherwise a
+	// completed mixed result is lost behind the timeout.
+	var timedOut []string
 	for sha, at := range st.Pending {
 		state, ready, e := s.rerunOutcome(ctx, reader, r, sha, names, at)
 		if e != nil {
@@ -270,8 +274,7 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 		}
 		if !ready {
 			if s.now().Sub(at) >= p.AnyRefWait() {
-				delete(st.Pending, sha)
-				return hold(st, "any-ref re-run timed out on "+short7(sha))
+				timedOut = append(timedOut, sha)
 			}
 			continue
 		}
@@ -293,6 +296,12 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 	if len(st.Runs[st.Baseline]) >= confirmRuns && len(st.Runs[st.Culprit]) >= confirmRuns {
 		st.Confirmed = true
 		return st, true, "", false, save(st)
+	}
+	if len(timedOut) > 0 {
+		for _, sha := range timedOut {
+			delete(st.Pending, sha)
+		}
+		return hold(st, "any-ref re-run timed out on "+short7(timedOut[0]))
 	}
 	for _, sha := range []string{st.Baseline, st.Culprit} {
 		if len(st.Runs[sha]) >= confirmRuns {
@@ -440,11 +449,17 @@ func (s *Service) incidentCurrent(ctx context.Context, r config.Repo, p policy.P
 			}
 			v = github.Pending
 		}
+		if current == st.Head {
+			// A green recorded head whose culprit is that same commit is the
+			// incident's own re-run: confirmation must consume it first. Green
+			// anywhere else after the head was a fix that no poll saw.
+			if v == github.Green && st.Head != st.Culprit {
+				return false, nil
+			}
+			return true, nil
+		}
 		if v == github.Green {
 			return false, nil
-		}
-		if current == st.Head {
-			return true, nil
 		}
 	}
 	return false, nil
@@ -460,21 +475,27 @@ func (s *Service) settleMixedHead(ctx context.Context, r config.Repo, p policy.P
 	if e != nil {
 		return false, e
 	}
-	if needsDesk {
+	if st.Flaky != "" {
 		result.Action = "recovery-confirming"
 		result.Reason = reason
-		if e = s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o); e != nil {
-			return false, e
+		if needsDesk {
+			if e = s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o); e != nil {
+				return false, e
+			}
 		}
+		return true, nil
 	}
-	if st.Flaky == "" && !confirmed && !needsDesk {
-		// The re-runs have not landed yet; hold one more poll rather than close
-		// the incident before a mixed result can be recorded.
-		result.Action = "recovery-confirming"
-		result.Reason = reason
-		return false, s.audit(r.Name, "watch", result, o.DryRun)
+	if confirmed {
+		return true, nil
 	}
-	return true, nil
+	// Unconfirmed evidence, including a timeout or another desk hold, keeps the
+	// incident: a green read alone must not discard what the re-runs recorded.
+	result.Action = "recovery-confirming"
+	result.Reason = reason
+	if needsDesk {
+		return false, s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o)
+	}
+	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
 // recoverHeadCulprit resolves an incident whose culprit is the current head.

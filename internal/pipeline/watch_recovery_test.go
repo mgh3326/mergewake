@@ -564,6 +564,87 @@ func TestWatchFlakyHeadCulpritNoAmbiguity(t *testing.T) {
 	}
 }
 
+// A green recorded head that is also the culprit is the incident's own re-run,
+// not a later fix: a new red head must not discard the mixed result.
+func TestWatchNewHeadAfterHeadCulpritRerunKeepsIncident(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
+		l.parents = map[string]string{shaC: shaA}
+		l.pull.MergeCommitSHA = shaC
+		delete(l.checks, shaC)
+		l.statuses = map[[2]string]statusRecord{
+			{shaC, "CI"}: {github.Red, now.Add(-time.Minute)},
+		}
+	})
+	s.Now = func() time.Time { return now }
+
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+		t.Fatalf("%+v", got)
+	}
+	now = now.Add(time.Minute)
+	g.statuses = map[[2]string]statusRecord{
+		{shaA, "CI"}: {github.Green, now},
+		{shaC, "CI"}: {github.Green, now},
+	}
+	g.head = advancedHead
+	g.parents[advancedHead] = shaC
+	g.checks[advancedHead] = github.Red
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+		t.Fatalf("%+v", got)
+	}
+	st, found := recoveryState(t, s, r)
+	if !found || st.Culprit != shaC || st.Flaky == "" {
+		t.Fatalf("incident %+v found=%t", st, found)
+	}
+	if g.revertCount != 0 {
+		t.Fatal("a flaky failure was blamed")
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// A sibling re-run timing out must not hide a completed mixed result: a landed
+// green culprit is still recorded as flaky.
+func TestWatchHeadCulpritTimeoutKeepsMixedResult(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
+		l.parents = map[string]string{shaC: shaA}
+		l.pull.MergeCommitSHA = shaC
+		delete(l.checks, shaC)
+		l.statuses = map[[2]string]statusRecord{
+			{shaC, "CI"}: {github.Red, now.Add(-time.Minute)},
+		}
+	})
+	s.Now = func() time.Time { return now }
+
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+		t.Fatalf("%+v", got)
+	}
+	now = now.Add(46 * time.Minute)
+	g.statuses = map[[2]string]statusRecord{
+		{shaC, "CI"}: {github.Green, now},
+	}
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "healthy" {
+		t.Fatalf("%+v", got)
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+	if _, found := recoveryState(t, s, r); found {
+		t.Fatal("incident kept after a green main")
+	}
+	if g.revertCount != 0 {
+		t.Fatal("a flaky failure was blamed")
+	}
+}
+
 // A sibling watch check still pending must not delay the incident: the recorded
 // re-run evidence settles a head-culprit incident while Check reads pending.
 func TestWatchPendingSiblingStillResolvesIncident(t *testing.T) {
