@@ -100,13 +100,28 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	checks := p.WatchSet()
 	bisectChecks := p.BisectChecks()
 	s.ciPolicy(ctx, r, head, o)
-	ci, e := s.GH.Check(ctx, r.Name, head, checks)
+	result := watchResult{Head: head, Action: "waiting-for-ci", Shadow: !p.Enabled || o.Shadow}
+	inc, recorded, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return e
 	}
-	result := watchResult{Head: head, Action: "waiting-for-ci", Shadow: !p.Enabled || o.Shadow}
+	// When the head is the incident's culprit, a passed re-run posts a status
+	// beside the head's own failed run. The incident still gathering evidence
+	// owns that verdict: resolving it records the mixed result instead of
+	// failing on the ambiguous read or clearing the incident as healthy.
+	mixedHead := recorded && !inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
+	ci, e := s.GH.Check(ctx, r.Name, head, checks)
+	if e != nil {
+		if mixedHead && errors.Is(e, github.ErrAmbiguousCheck) {
+			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		}
+		return e
+	}
 	checkpoint := filepath.Join(s.state(r.Name), "last-green")
 	if ci == github.Green {
+		if mixedHead {
+			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		}
 		result.Action = "healthy"
 		if !o.DryRun {
 			if e = fsutil.Atomic(checkpoint, []byte(head), 0600); e != nil {
@@ -139,6 +154,12 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	}
 	if active {
 		return s.recovery(ctx, r, p, head, checks, result, o)
+	}
+	// A persisted incident outranks a fresh bisect: its confirmation evidence
+	// is applied first, so a re-run's status cannot move its culprit or green
+	// boundary and a mixed result is recorded instead of blamed on a new commit.
+	if recorded && inc.Culprit != "" && inc.Baseline != "" {
+		return s.recoverIncident(ctx, r, p, head, checks, result, o, inc)
 	}
 	baselineBytes, e := os.ReadFile(checkpoint)
 	if e != nil && !os.IsNotExist(e) {
@@ -367,8 +388,15 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
+	return s.openRevert(ctx, r, head, checks, culprit, *origin, task, result, o)
+}
+
+// openRevert opens the exact-revert PR for a confirmed incident. It re-reads
+// the head and its CI first, so a pass that lost a race does not open a PR for
+// a main that already moved or went green.
+func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
 	result.Action = "open-revert-pr"
-	if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
+	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
 	if result.Shadow || o.DryRun {
@@ -381,14 +409,14 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if fresh != head {
 		return errors.New("main changed during diagnosis; rerun watch")
 	}
-	ci, e = s.GH.Check(ctx, r.Name, head, checks)
+	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		return e
 	}
 	if ci != github.Red {
 		return errors.New("main CI changed during diagnosis")
 	}
-	trailers, e := s.recoveryTrailers(ctx, r, *origin)
+	trailers, e := s.recoveryTrailers(ctx, r, origin)
 	if e != nil {
 		return e
 	}

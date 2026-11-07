@@ -99,9 +99,9 @@ func recoverySetup(t *testing.T, mutate func(*recoveryGH)) (*Service, *recoveryG
 		fakeGH: g,
 		revert: revert,
 		entries: map[string]map[string]github.TreeEntry{
-			shaA:      {"tool": blob("pre")},
-			shaB:      {"tool": blob("post")},
-			shaC:      {"tool": blob("post")},
+			shaA:       {"tool": blob("pre")},
+			shaB:       {"tool": blob("post")},
+			shaC:       {"tool": blob("post")},
 			revertHead: {"tool": blob("pre")},
 		},
 	}
@@ -376,35 +376,85 @@ func TestWatchBlockingCulpritReportOnly(t *testing.T) {
 	}
 }
 
-// (h) A re-run that passes at the culprit is a flaky failure: no revert.
-func TestWatchFlakyFailureNoRevert(t *testing.T) {
-	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
-		l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
-	})
+// A recorded confirmation is applied before bisect: a later pass does not
+// re-bisect, so the re-run's status cannot move the incident's culprit or
+// green boundary and no new incident starts.
+func TestWatchRecordedIncidentResolvesBeforeBisect(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, nil)
 	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
 	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	// The any-ref re-run that confirmed the culprit left a green status on it;
+	// a re-bisect would take that as the new green boundary and blame shaC.
+	g.checks[shaB] = github.Green
 
 	got := recoveryWatch(t, s, r)
-	if got.Action != "recovery-confirming" || g.revertCount != 0 {
-		t.Fatalf("%+v reverts=%d", got, g.revertCount)
+	if got.Action != "opened-revert-pr" || g.revertCount != 1 || g.merges != 0 {
+		t.Fatalf("%+v reverts=%d merges=%d", got, g.revertCount, g.merges)
 	}
-	if g.dispatched[shaA] != 1 || g.dispatched[shaB] != 1 {
-		t.Fatalf("dispatches %v", g.dispatched)
+	st, found := recoveryState(t, s, r)
+	if !found || st.Culprit != shaB || st.Baseline != shaA || !st.RedSince.Equal(now) || st.RevertPR != 9 {
+		t.Fatalf("incident %+v found=%t", st, found)
 	}
-	now = now.Add(time.Minute)
-	g.statuses = map[[2]string]statusRecord{
-		{shaA, "CI"}: {github.Green, now},
-		{shaB, "CI"}: {github.Green, now},
-	}
-	got = recoveryWatch(t, s, r)
-	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
-		t.Fatalf("%+v", got)
-	}
-	if g.revertCount != 0 || g.latch {
-		t.Fatal("a flaky failure was blamed")
-	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "flaky") && !strings.Contains(lines[0], "passed a re-run") {
-		t.Fatalf("design-lane lines: %v", lines)
+}
+
+// (h) A re-run that passes at the culprit is a flaky failure: no revert. The
+// original failure may be a check run or a commit status; both take this path.
+func TestWatchFlakyFailureNoRevert(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	for _, failed := range []string{"check-run", "commit-status"} {
+		t.Run(failed, func(t *testing.T) {
+			s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+				l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
+				if failed == "commit-status" {
+					delete(l.checks, shaB)
+					l.statuses = map[[2]string]statusRecord{
+						{shaB, "CI"}: {github.Red, now.Add(-time.Minute)},
+					}
+				}
+			})
+			s.Now = func() time.Time { return now }
+
+			got := recoveryWatch(t, s, r)
+			if got.Action != "recovery-confirming" || g.revertCount != 0 || g.merges != 0 {
+				t.Fatalf("%+v reverts=%d merges=%d", got, g.revertCount, g.merges)
+			}
+			if g.dispatched[shaA] != 1 || g.dispatched[shaB] != 1 {
+				t.Fatalf("dispatches %v", g.dispatched)
+			}
+			now = now.Add(time.Minute)
+			g.statuses = map[[2]string]statusRecord{
+				{shaA, "CI"}: {github.Green, now},
+				{shaB, "CI"}: {github.Green, now},
+			}
+			got = recoveryWatch(t, s, r)
+			if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+				t.Fatalf("%+v", got)
+			}
+			if g.revertCount != 0 || g.latch || g.merges != 0 {
+				t.Fatal("a flaky failure was blamed")
+			}
+			st, found := recoveryState(t, s, r)
+			if !found || st.Culprit != shaB || st.Baseline != shaA || st.Flaky == "" {
+				t.Fatalf("incident %+v found=%t", st, found)
+			}
+			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+				t.Fatalf("design-lane lines: %v", lines)
+			}
+			// A later pass reads the flaky record without re-blaming a later
+			// commit or telling the design lane again.
+			now = now.Add(time.Minute)
+			got = recoveryWatch(t, s, r)
+			if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+				t.Fatalf("repeat: %+v", got)
+			}
+			if g.revertCount != 0 || len(designLaneEvents(n)) != 1 {
+				t.Fatalf("repeat blamed or notified: reverts=%d lines=%v", g.revertCount, designLaneEvents(n))
+			}
+			if st, _ = recoveryState(t, s, r); st.Culprit != shaB || st.Baseline != shaA {
+				t.Fatalf("culprit or boundary moved: %+v", st)
+			}
+		})
 	}
 }
 
@@ -435,6 +485,54 @@ func TestWatchOneOfTwoAtCulpritHolds(t *testing.T) {
 	}
 	if g.revertCount != 0 {
 		t.Fatal("reverted without a second culprit run")
+	}
+}
+
+// A culprit that is also the current head must not read as healthy, nor fail
+// the pass on the ambiguous check/status read, when its re-run passes.
+func TestWatchFlakyHeadCulpritNoAmbiguity(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	for _, failed := range []string{"check-run", "commit-status"} {
+		t.Run(failed, func(t *testing.T) {
+			s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+				l.policyExtra = "any_ref_workflow: ci-any-ref.yml\n"
+				l.parents = map[string]string{shaC: shaA}
+				l.pull.MergeCommitSHA = shaC
+				if failed == "commit-status" {
+					delete(l.checks, shaC)
+					l.statuses = map[[2]string]statusRecord{
+						{shaC, "CI"}: {github.Red, now.Add(-time.Minute)},
+					}
+				}
+			})
+			s.Now = func() time.Time { return now }
+
+			if got := recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+				t.Fatalf("%+v", got)
+			}
+			if g.dispatched[shaA] != 1 || g.dispatched[shaC] != 1 {
+				t.Fatalf("dispatches %v", g.dispatched)
+			}
+			now = now.Add(time.Minute)
+			g.statuses = map[[2]string]statusRecord{
+				{shaA, "CI"}: {github.Green, now},
+				{shaC, "CI"}: {github.Green, now},
+			}
+			got := recoveryWatch(t, s, r)
+			if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
+				t.Fatalf("%+v", got)
+			}
+			if g.revertCount != 0 || g.merges != 0 {
+				t.Fatal("a flaky failure was blamed")
+			}
+			st, found := recoveryState(t, s, r)
+			if !found || st.Culprit != shaC || st.Baseline != shaA || st.Flaky == "" {
+				t.Fatalf("incident %+v found=%t", st, found)
+			}
+			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+				t.Fatalf("design-lane lines: %v", lines)
+			}
+		})
 	}
 }
 

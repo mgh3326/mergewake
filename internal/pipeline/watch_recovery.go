@@ -441,6 +441,63 @@ func namesFix(text string, st recoveryIncident) bool {
 	return false
 }
 
+// recoverHeadCulprit resolves an incident whose culprit is the current head.
+// An active latch still owns the revert PR, so it keeps the recovery path.
+func (s *Service) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
+	active, e := s.GH.RecoveryActive(ctx, r.Name)
+	if e != nil {
+		return e
+	}
+	if active {
+		return s.recovery(ctx, r, p, head, checks, result, o)
+	}
+	return s.recoverIncident(ctx, r, p, head, checks, result, o, inc)
+}
+
+// recoverIncident resolves an open incident from its persisted state before any
+// bisect runs. The recorded confirmation is applied as it stands: a re-run that
+// changes the CI picture cannot move the incident's culprit or green boundary,
+// and a re-run that passes at the culprit is recorded as flaky and told to the
+// design lane once instead of blaming a later commit.
+func (s *Service) recoverIncident(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, st recoveryIncident) error {
+	acting := !result.Shadow && !o.DryRun
+	result.Culprit, result.PR = st.Culprit, st.CulpritPR
+	if st.CulpritPR != 0 {
+		result.Candidates = []int{st.CulpritPR}
+	}
+	if !st.Confirmed {
+		var confirmed, needsDesk bool
+		var reason string
+		var e error
+		st, confirmed, reason, needsDesk, e = s.confirmRecovery(ctx, r, p, st, acting, acting)
+		if e != nil {
+			return e
+		}
+		if !confirmed {
+			result.Action = "recovery-confirming"
+			result.Reason = reason
+			if needsDesk {
+				return s.reportWatch(ctx, r, result, "recovery:"+st.Culprit+":confirm:"+reason, o)
+			}
+			return s.audit(r.Name, "watch", result, o.DryRun)
+		}
+	}
+	if st.RevertPR != 0 {
+		result.Action = "recovery-hold"
+		result.Reason = fmt.Sprintf("revert PR #%d exists without a recovery latch", st.RevertPR)
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(st.RevertPR)+":unlatched", o)
+	}
+	origin, e := s.GH.Pull(ctx, r.Name, st.CulpritPR)
+	if e != nil {
+		return e
+	}
+	task := st.Task
+	if task == "" {
+		task = r.Task
+	}
+	return s.openRevert(ctx, r, head, checks, st.Culprit, origin, task, result, o)
+}
+
 // recovery handles a red main while a recovery latch is active. It resolves the
 // revert PR the latch belongs to, waits out the fix window and an open fix PR,
 // and merges the exact revert only when every condition holds. A condition that

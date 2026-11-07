@@ -197,11 +197,30 @@ func (g *fakeGH) Files(context.Context, string, int) ([]policy.File, error) {
 	}
 	return []policy.File{{Path: "tool", Kind: "modified"}}, nil
 }
-func (g *fakeGH) Check(_ context.Context, _, sha string, _ []string) (github.CI, error) {
+
+// Check reads the same evidence GitHub does: the newest commit status of a
+// required name settles a commit whose own run is unknown, and two decisive
+// but disagreeing values are the ambiguity the client reports. A re-run an
+// any-ref workflow posts therefore reaches Check, not only LatestStatus.
+func (g *fakeGH) Check(_ context.Context, _, sha string, required []string) (github.CI, error) {
+	v := g.ci
 	if g.checks != nil {
-		return g.checks[sha], nil
+		v = g.checks[sha]
 	}
-	return g.ci, nil
+	decisive := func(x github.CI) bool { return x == github.Green || x == github.Red }
+	for _, name := range required {
+		st, ok := g.statuses[[2]string{sha, name}]
+		if !ok || st.ci == v {
+			continue
+		}
+		switch {
+		case !decisive(v):
+			v = st.ci
+		case decisive(st.ci):
+			return github.Pending, fmt.Errorf("%w named %q", github.ErrAmbiguousCheck, name)
+		}
+	}
+	return v, nil
 }
 func (g *fakeGH) CheckStates(_ context.Context, _, sha string, required []string) (map[string]github.CI, error) {
 	out := map[string]github.CI{}
