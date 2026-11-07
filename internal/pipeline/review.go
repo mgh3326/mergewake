@@ -799,7 +799,7 @@ func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr 
 	defer cancel()
 	err = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   fmt.Sprintf("mergewake-review-result-lost-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, plan.pass),
-		Lane: s.Config.Notifier.Lane, Type: "automation-failed",
+		Lane: s.ownerLane(r), Type: "automation-failed",
 		Text: fmt.Sprintf("[mergewake] reviewer finished but its result was lost for %s#%d head=%s pass=%d lens=%s reviewer=%s report=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, lost.label, lost.report),
 	})
 	if err != nil {

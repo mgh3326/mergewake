@@ -46,7 +46,7 @@ Different hosts may use the same inventory and different deny lists.
 | `smoke` | Required for file and command/release rollout | Operator-owned smoke command; see below. Never supplied by a manifest or PR. Container targets use `install[].health` instead. |
 | `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
-| `lane` | Empty | Lane for this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one; checked before `notifier.fallback_lane`. |
+| `lane` | Empty | The repo's design-session (owner) lane: receives this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one, and the human-judgment notices and holds (review failures, lost review results, review blocks, aged check failures, and out-of-scope or unacknowledged findings handed to the owner). Empty falls back to the desk (`notifier.fallback_lane`, else `notifier.lane`). |
 | `hk_task_events` | `true` | With the `handoffkeep` sink, post a task event to hk's `POST /v1/task-events` for each PR with a `Mergewake-Task` trailer: `mergewake.pr` when an open, ready PR is first observed, `mergewake.review` when a review run claims a pass, `mergewake.merge` after mergewake's own merge, and `mergewake.revert` when a watch revert PR is merged (a revert merged more than seven days before mergewake first sees it is not posted). Dry runs and shadow mode post nothing. A failed post never fails the action; each post is an `hk-task-event` row in `decisions.jsonl`. Set `false` for a repo whose hk predates the endpoint (handoffkeep#136). |
 
 Each `install[]` entry has:
@@ -583,8 +583,9 @@ For a blocked head, mergewake:
 - records the outcome on the PR's outcome row, under `review_blocked_by_head`;
 - posts one PR comment per head that names the fix, deduplicated by a hidden
   head key in the comments of `review.login`;
-- emits one `decision` event per head and outcome to `notifier.fallback_lane`,
-  or to `notifier.lane` when no fallback is set.
+- emits one `decision` event per head and outcome to the repo's owner lane
+  (`repos[].lane`), or to `notifier.fallback_lane` (else `notifier.lane`) when
+  the repo names none.
 
 mergewake takes no pass claim and writes no receipt or `-done` marker, so the
 merge gate reports `review_missing`. A block is not a review failure: it adds no
