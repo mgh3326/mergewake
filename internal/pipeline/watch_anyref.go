@@ -104,7 +104,7 @@ func (s *Service) endAnyRef(repo string) error {
 // the number of commits after the green boundary. It returns the hold reason
 // and whether that hold notifies the desk. Shadow and dry runs read the record
 // but never write it or dispatch; result says what would be dispatched.
-func (s *Service) anyRef(ctx context.Context, r config.Repo, p policy.Policy, head, sha string, interval int, acting bool, result *watchResult) (string, bool, error) {
+func (s *watchStream) anyRef(ctx context.Context, r config.Repo, p policy.Policy, head, sha string, interval int, acting bool, result *watchResult) (string, bool, error) {
 	st, e := s.loadAnyRef(r.Name)
 	if e != nil {
 		return "", false, e
@@ -130,7 +130,7 @@ func (s *Service) anyRef(ctx context.Context, r config.Repo, p policy.Policy, he
 	if e = s.saveAnyRef(r.Name, st); e != nil {
 		return "", false, e
 	}
-	e = d.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, map[string]string{"ref": sha})
+	e = s.dispatch(ctx, d, r, p, sha)
 	if github.DispatchRefused(e) {
 		st.Dispatches = st.Dispatches[:len(st.Dispatches)-1]
 		st.Refused = "any-ref CI dispatch refused for " + short7(sha) + ": " + e.Error()

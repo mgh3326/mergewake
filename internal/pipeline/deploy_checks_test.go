@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -270,9 +271,8 @@ func TestRolloutDenyFileRejectsMalformedSHA(t *testing.T) {
 	}
 }
 
-// TestWatchIgnoresMissingDeployOK is (e): watch judges main by the main checks
-// and never asks for deploy evidence.
-func TestWatchIgnoresMissingDeployOK(t *testing.T) {
+// A missing deploy result does not prevent the independent main checkpoint.
+func TestWatchMainGreenWithMissingDeployOK(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	g.required = []string{"ci-ok"}
@@ -286,7 +286,7 @@ func TestWatchIgnoresMissingDeployOK(t *testing.T) {
 	if e := s.Watch(context.Background(), r, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(adapter.reads) != 1 || adapter.reads[0] != "ci-ok" {
+	if !slices.Contains(adapter.reads, "ci-ok") || !slices.Contains(adapter.reads, "deploy-ok") {
 		t.Fatalf("watch reads %v", adapter.reads)
 	}
 	b, e := os.ReadFile(filepath.Join(s.state(r.Name), "last-green"))
