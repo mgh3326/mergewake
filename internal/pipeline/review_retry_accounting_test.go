@@ -61,8 +61,8 @@ func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+reset.Format(time.RFC3339))
 	s.Config.Daemon.PR.ReviewRetry.Maximum = "24h" // above the wait, so the reset is not capped
 	old := readReviewerJob(t, s, r, 1)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatal(err)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) {
+		t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 	}
 	st := retryStateOf(t, s, r)
 	if st.Failures != 0 || st.Escalated || !st.Next.Equal(reset) {
@@ -85,7 +85,7 @@ func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	// Before the reset nothing runs; at the reset a fresh reviewer is placed
 	// with its one replacement unspent.
 	c.t = reset.Add(-time.Second)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil || len(runner.spawns) != 1 {
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 1 {
 		t.Fatalf("before the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 	c.t = reset
@@ -114,8 +114,8 @@ func TestRetryQuotaStopWithoutResetWaitsInitial(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, r, runner, c := quotaStopped(t, reason)
-			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-				t.Fatal(err)
+			if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) {
+				t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 			}
 			st := retryStateOf(t, s, r)
 			if st.Failures != 0 || !st.Next.Equal(c.t.Add(time.Minute)) || len(runner.spawns) != 1 {
@@ -129,8 +129,8 @@ func TestRetryQuotaStopWithoutResetWaitsInitial(t *testing.T) {
 // most the maximum backoff, since panewire skips a pool it measures exhausted.
 func TestRetryQuotaStopFarResetWaitsAtMostMaximum(t *testing.T) {
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC).Format(time.RFC3339))
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatal(err)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) {
+		t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 	}
 	st := retryStateOf(t, s, r)
 	if st.Failures != 0 || !st.Next.Equal(c.t.Add(30*time.Minute)) || len(runner.spawns) != 1 {
@@ -144,12 +144,12 @@ func TestRetryQuotaStopSurvivesRestart(t *testing.T) {
 	reset := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+reset.Format(time.RFC3339))
 	s.Config.Daemon.PR.ReviewRetry.Maximum = "24h" // above the wait, so the reset is not capped
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatal(err)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) {
+		t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 	}
 	restarted := *s
 	c.t = reset.Add(-time.Minute)
-	if err := restarted.RetryReview(context.Background(), r, g.pull, Options{}); err != nil || len(runner.spawns) != 1 {
+	if err := restarted.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 1 {
 		t.Fatalf("restarted before the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 	if st := retryStateOf(t, &restarted, r); !st.Next.Equal(reset) {

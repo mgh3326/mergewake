@@ -25,6 +25,10 @@ type reviewRetryState struct {
 	// Held is set while the last evaluation ended held: nothing failed, but no
 	// review completed, so the daemon must not settle the PR as unchanged.
 	Held bool `json:"held,omitempty"`
+	// QuotaStopped is set while the last evaluation ended on a quota stop with
+	// nothing else wrong: nothing failed, but no review completed, so the
+	// daemon must not settle the PR as unchanged.
+	QuotaStopped bool `json:"quota_stopped,omitempty"`
 }
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
@@ -106,8 +110,11 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		}
 	}
 	if s.now().Before(state.Next) {
-		if state.Held {
+		switch {
+		case state.Held:
 			return ErrReviewHeld
+		case state.QuotaStopped:
+			return ErrReviewQuotaStopped
 		}
 		return nil
 	}
@@ -124,7 +131,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		// A reviewer that no earlier run had placed starts a new attempt: the
 		// count of the earlier one must not hold it. Backoffs stay, so a
 		// spawn-and-lose loop still slows down.
-		state.Failures, state.Escalated, state.Held = 0, false, false
+		state.Failures, state.Escalated, state.Held, state.QuotaStopped = 0, false, false, false
 		if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 			return errors.Join(err, saveErr)
 		}
@@ -186,9 +193,12 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			state.Next = at
 		}
 	}
-	// Only a held evaluation with nothing else wrong is marked held: a real
-	// failure supersedes it, and the daemon must not settle this evaluation.
+	// Only a held or quota-stopped evaluation with nothing else wrong is marked
+	// so: a real failure supersedes it, and the daemon must not settle this
+	// evaluation. A hold is the stronger marker, so a run with both waits for
+	// the hold.
 	state.Held = len(class.held) > 0 && !class.real && !class.collection
+	state.QuotaStopped = len(class.quotas) > 0 && !class.real && !class.collection && !state.Held
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
 	}
@@ -196,6 +206,9 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		// Only quota stops and holds: the audit row says it, and nothing failed.
 		if state.Held {
 			return ErrReviewHeld
+		}
+		if state.QuotaStopped {
+			return ErrReviewQuotaStopped
 		}
 		return nil
 	}

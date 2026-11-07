@@ -329,21 +329,22 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 // reviewPR runs one PR's review, then settles it under settling unless the
 // caller already settled its reviewed head. A review the retry reran there is
 // settled by the next evaluation of the PR.
-func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean, reviewed, held bool) {
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean, reviewed, unreviewed bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
 	e := s.RetryReview(reviewCtx, r, pr, o)
 	tracing.Finish(reviewSpan)
 	// A review that failed for any reason but an unavailable reviewer may not
-	// have reached its reviewers. A held review reached the hub but completed
-	// nothing: it is no failure, and the head must not be settled.
-	held = errors.Is(e, pipeline.ErrReviewHeld)
-	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable) || held
+	// have reached its reviewers. A held or quota-stopped review produced no
+	// result: it is no failure, it counts as no review, and the head must not
+	// be settled.
+	unreviewed = errors.Is(e, pipeline.ErrReviewHeld) || errors.Is(e, pipeline.ErrReviewQuotaStopped)
+	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable)
 	if e != nil {
 		switch {
-		case held:
-			// No failure and nothing to settle: the reviewer-held audit row
-			// already records it.
+		case unreviewed:
+			// No failure and nothing to settle: the reviewer-held or
+			// review-quota-stopped audit row already records it.
 		case errors.Is(e, pipeline.ErrReviewUnavailable):
 			clean = false
 			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
@@ -354,11 +355,11 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 		}
 	}
-	// A held review posts nothing, so it must not settle either: running
-	// DeliverFindings, NotifyPR or Land for it would report and act on a review
-	// that did not happen.
-	if !settle || held {
-		return errs, clean, reviewed, held
+	// A held or quota-stopped review posts nothing, so it must not settle
+	// either: running DeliverFindings, NotifyPR or Land for it would report and
+	// act on a review that did not happen.
+	if !settle || unreviewed {
+		return errs, clean, reviewed, unreviewed
 	}
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseLockWait)
@@ -366,7 +367,7 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	defer settling.Unlock()
 	ph.Enter(daemon.PhaseSettle)
 	settleErrs := settlePR(ctx, s, r, pr.Number, o)
-	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed, held
+	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed, unreviewed
 }
 
 // settlePR delivers findings to the author lane before the verdict, so the
