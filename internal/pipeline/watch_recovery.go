@@ -785,31 +785,40 @@ func (s *Service) fixWon(ctx context.Context, r config.Repo, head string) error 
 	if e != nil {
 		return e
 	}
-	outcome := "recovery-fix-won"
+	// Keys are per revert PR: a later incident's revert must still be closed
+	// and recorded. The comment has its own key, so a close that failed after
+	// the comment does not post it twice.
+	outcome := "recovery-fix-won:" + strconv.Itoa(pr.Number)
+	commentKey := outcome + ":comment"
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	if pr.State == "open" && !sent.has(commentKey) {
+		comment := "main is green again at " + head + "; revert not needed"
+		if e = s.GH.PostIssueComment(reportCtx, r.Name, pr.Number, comment); e != nil {
+			return e
+		}
+		if e = sent.add(commentKey); e != nil {
+			return e
+		}
+	}
+	if pr.State == "open" {
+		closer, ok := s.GH.(revertCloser)
+		if !ok {
+			return nil
+		}
+		if e = closer.ClosePull(reportCtx, r.Name, pr.Number); e != nil {
+			return e
+		}
+	}
 	if !sent.has(outcome) {
 		culprit, culpritPR := culpritFromRevertBody(pr.Body)
-		reportCtx, cancel := reportContext(ctx)
-		defer cancel()
-		if pr.State == "open" {
-			comment := "main is green again at " + head + "; revert not needed"
-			if e = s.GH.PostIssueComment(reportCtx, r.Name, pr.Number, comment); e != nil {
-				return e
-			}
-			closer, ok := s.GH.(revertCloser)
-			if !ok {
-				return nil
-			}
-			if e = closer.ClosePull(reportCtx, r.Name, pr.Number); e != nil {
-				return e
-			}
-		}
 		row := struct {
 			Culprit   string `json:"culprit,omitempty"`
 			CulpritPR int    `json:"culprit_pr,omitempty"`
 			RevertPR  int    `json:"revert_pr"`
 			Head      string `json:"head"`
 		}{Culprit: culprit, CulpritPR: culpritPR, RevertPR: pr.Number, Head: head}
-		if e = s.audit(r.Name, outcome, row, false); e != nil {
+		if e = s.audit(r.Name, "recovery-fix-won", row, false); e != nil {
 			return e
 		}
 		if e = sent.add(outcome); e != nil {

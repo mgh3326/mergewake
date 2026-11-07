@@ -44,6 +44,12 @@ func (g *recoveryGH) Merge(_ context.Context, _ string, n int, sha string) error
 	}
 	return g.fakeGH.Merge(context.Background(), "", n, sha)
 }
+func (g *recoveryGH) ClosePull(ctx context.Context, repo string, n int) error {
+	if n == g.revert.Number {
+		g.revert.State = "closed"
+	}
+	return g.fakeGH.ClosePull(ctx, repo, n)
+}
 func (g *recoveryGH) RecoveryRevert(context.Context, string) (*github.Pull, error) {
 	p := g.revert
 	return &p, nil
@@ -492,6 +498,35 @@ func TestWatchFixPRMergesGreenClosesRevert(t *testing.T) {
 	}
 	if lines := designLaneEvents(n); len(lines) != 0 {
 		t.Fatalf("fix-won notified the design lane: %v", lines)
+	}
+}
+
+// Fix-won is per revert PR: a later incident's revert is still closed and
+// recorded, and a repeated pass does not comment twice.
+func TestFixWonPerRevert(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[l.head] = github.Green
+	})
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" || len(g.closed) != 1 || g.closed[0] != 9 {
+		t.Fatalf("%+v closed=%v", got, g.closed)
+	}
+	g.latch = true
+	g.revert.Number, g.revert.State = 10, "open"
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" || len(g.closed) != 2 || g.closed[1] != 10 {
+		t.Fatalf("%+v closed=%v", got, g.closed)
+	}
+	if len(g.comments) != 2 {
+		t.Fatalf("comments %v", g.comments)
+	}
+	// The same revert PR seen again is quiet.
+	g.latch = true
+	recoveryWatch(t, s, r)
+	if len(g.comments) != 2 || len(g.closed) != 2 {
+		t.Fatalf("repeat: comments %v closed %v", g.comments, g.closed)
 	}
 }
 
