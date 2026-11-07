@@ -222,11 +222,11 @@ func TestReviewerHeldIsNotASkip(t *testing.T) {
 	c := &clock{t: time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)}
 	s.Now = c.now
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatalf("retry err=%v", err)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("retry err=%v, want ErrReviewHeld", err)
 	}
 	var state reviewRetryState
-	if _, err := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), &state); err != nil || state.Failures != 0 || state.Backoffs != 0 || runner.headless != 0 {
+	if _, err := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), &state); err != nil || state.Failures != 0 || state.Backoffs != 0 || !state.Held || runner.headless != 0 {
 		t.Fatalf("retry state %+v err=%v headless=%d", state, err, runner.headless)
 	}
 }

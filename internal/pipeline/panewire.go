@@ -230,6 +230,12 @@ var sweepReviewers = func(ctx context.Context, s *Service, r config.Repo, n int,
 // errSweepCannotAct is why no sweep ran: reap is disabled or does not act.
 var errSweepCannotAct = errors.New("reviewer sweep needs reap.enabled and reap.act")
 
+// heldSweepTimeout bounds the held path's reviewer sweep. The sweep is a
+// cleanup, not the review itself, so a slow host must not eat the evaluation's
+// review budget. An expired sweep is a failed one: no immediate respawn. A var
+// so tests can shorten it.
+var heldSweepTimeout = 60 * time.Second
+
 // reapOlderHeadReviewers runs the reviewer sweep of the PR once per review run
 // and returns its outcome to every pass: it closes the finished panes of
 // earlier heads' reviewers, which frees the hub's reservation. It acts only
@@ -243,7 +249,9 @@ func (x *panewireExecutor) reapOlderHeadReviewers(ctx context.Context) error {
 		if reap := x.s.Config.Reap; !reap.Enabled || !reap.Act {
 			x.sweepErr = errSweepCannotAct
 		} else {
-			x.sweepErr = sweepReviewers(ctx, x.s, x.repo, x.pr.Number, x.opts)
+			sweepCtx, cancel := context.WithTimeout(ctx, heldSweepTimeout)
+			defer cancel()
+			x.sweepErr = sweepReviewers(sweepCtx, x.s, x.repo, x.pr.Number, x.opts)
 		}
 	}
 	return x.sweepErr

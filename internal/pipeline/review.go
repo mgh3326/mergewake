@@ -26,6 +26,11 @@ import (
 
 var ErrReviewUnavailable = errors.New("review unavailable")
 
+// ErrReviewHeld reports an evaluation that ended held: another reviewer job
+// holds the reservation. Nothing failed, but no review completed, so the PR
+// must be evaluated again once the hold clears, not settled as unchanged.
+var ErrReviewHeld = errors.New("review held")
+
 const familyRequired = "author family required via --author-family, a Mergewake-Author-Family trailer in the PR body or head commit, or a known commit author"
 
 var familyValue = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)

@@ -905,6 +905,38 @@ func TestReapReviewersOnlyOfOpenPR(t *testing.T) {
 	}
 }
 
+// (l) The PR merges while a review run is still in flight: the held path's
+// reviewersOnly sweep closes the reviewer pane, but the merged-PR cleanup
+// (the author's job pane, worktree and branch) does not run at all.
+func TestReapReviewersOnlyOfMergedPRSkipsCleanup(t *testing.T) {
+	f := newReviewerFix(t)
+	merged := reviewerNow.Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "closed", Merged: true, MergedAt: &merged,
+		Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
+	// The author's pane sits in the merged PR's own worktree, so the merged path
+	// would close it and remove the worktree and branch.
+	f.addPane("w1:p1", "wk-7", "/repo.wt")
+	label := reviewerLabelFor(12, time.Hour)
+	f.addReviewer(label, "w1:p5")
+	ctx := context.WithValue(context.Background(), reviewersOnlyKey{}, true)
+	if err := f.s.Reap(ctx, testRepo, 12, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	closes := f.hub.ops("pane.close")
+	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p5" {
+		t.Fatalf("closes=%v, want only the reviewer pane", closes)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label {
+		t.Fatalf("removes=%v, want only the reviewer worktree", removes)
+	}
+	for _, v := range f.rows(t) {
+		if v.Label != label {
+			t.Fatalf("merged-PR cleanup receipted: %v", rowSummary(f.rows(t)))
+		}
+	}
+}
+
 // parseReviewerLabel reads the pass of a label.
 func TestParseReviewerLabelPass(t *testing.T) {
 	l, ok := parseReviewerLabel("mwr-283-7e8272c-p2-1700000000")

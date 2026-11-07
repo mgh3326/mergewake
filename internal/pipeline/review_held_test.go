@@ -29,14 +29,20 @@ func heldRetrySetup(t *testing.T, holder, extra string) (*Service, *fakeGH, conf
 	return s, g, r, runner, c
 }
 
-// retryOnce runs one RetryReview attempt with the pass lease long expired.
+// retryOnce runs one RetryReview attempt with the pass lease long expired. A
+// held evaluation is no failure: RetryReview reports ErrReviewHeld, which the
+// held tests treat as the expected outcome rather than an error.
 func retryOnce(t *testing.T, s *Service, g *fakeGH, r config.Repo) error {
 	t.Helper()
 	if g.leaseTimes == nil {
 		g.leaseTimes = map[string]time.Time{}
 	}
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	return s.RetryReview(context.Background(), r, g.pull, Options{})
+	err := s.RetryReview(context.Background(), r, g.pull, Options{})
+	if errors.Is(err, ErrReviewHeld) {
+		return nil
+	}
+	return err
 }
 
 // stubSweep stands in for the reviewer sweep until the test ends.
@@ -116,6 +122,35 @@ func TestRetryHeldByOlderHeadSweepFailsLeavesHold(t *testing.T) {
 	}
 	if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) == 0 {
 		t.Fatalf("sweep failure not audited")
+	}
+}
+
+// (a) A sweep that blocks past its own deadline returns, counted as a failed
+// sweep: the evaluation ends held with no respawn, and the failure is audited.
+func TestRetryHeldSweepIsBounded(t *testing.T) {
+	s, g, r, runner, _ := heldRetrySetup(t, "mwr-7-7e8272c-p1-1700000000", "")
+	old := heldSweepTimeout
+	heldSweepTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { heldSweepTimeout = old })
+	stubSweep(t, func(ctx context.Context, _ int) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	done := make(chan error, 1)
+	go func() { done <- retryOnce(t, s, g, r) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the held-path sweep was not bounded by its own deadline")
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d, want no respawn after a failed sweep", len(runner.spawns))
+	}
+	if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) == 0 {
+		t.Fatal("a timed-out sweep must be audited as a failed sweep")
 	}
 }
 
