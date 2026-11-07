@@ -888,7 +888,7 @@ takes effect without a restart.
 | `pr` | PR opened; a draft counts once it is ready for review | `pr` role | PR |
 | `pr` | PR merged or closed | `pr` role | PR, head |
 | `ci` | Required check failed on an open PR's head | `pr` role | PR, head |
-| `ci` | Required or `watch_checks` check failed on the default branch | `watch` role | head |
+| `ci` | Required, `main_checks` or its alias `watch_checks` check failed on the default branch | `watch` role | head |
 | `deploy` | Release published, or publishing failed | `release` role | commit, result |
 | `deploy` | Rollout finished or failed | `rollout` role | commit, result |
 | `deploy` | Another deployer's report | `mergewake notify deploy` | commit, result |
@@ -970,6 +970,8 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only with `require_up_to_date: true`; without it no PR is updated for a moved base. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
 | `require_up_to_date` | `false` | Hold a head whose base moved ahead as `base_stale` when GitHub reports the PR `behind` (branch protection requires an up-to-date branch), in both the review gate and the bot-patch gate; with `auto_update_branch` on, the branch is then updated. Absent or `false`: a conflict-free PR with a moved base is not held and its branch is not updated; the land and notify records carry `base_behind: true`, and the main-branch CI checks the composed result after the merge. A conflict blocks as `conflict` either way. Must be a boolean. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
+| `main_checks` | `watch_checks`, else `required_checks` | Exact, unique check names that judge a main-branch commit (watch and bisect). `watch_checks` is its legacy name: a policy may set one or both, but both must list the same checks. |
+| `deploy_checks` | Empty | Exact, unique check names of the deploy stage, for example `[deploy-ok]`. When set, `release` requires them green and `rollout` admits only commits that pass them; empty means the repository has no deploy stage and the main checks judge release and rollout. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
@@ -1344,6 +1346,7 @@ For `example/project`, state resides beneath
 | `rollout/container-journal.json` | In-flight container swap; replay restores the previous container before another attempt. |
 | `rollout/container-rollback-*.json` | Rollback audit for an interrupted or failed container deploy. |
 | `rollout/container-rejected.json` | Container digest that failed after mutation. Prevents repeated retries of that digest. |
+| `rollout-deny` | Operator-maintained rollout culprits, one full commit SHA per line. Those commits and everything after them stay uninstalled until main is green again. |
 
 After an interrupted install, confirm no process still owns `rollout/lock`, inspect
 the journal, and remove only that stale lock. The next acting rollout restores the
@@ -2054,10 +2057,35 @@ migration reversals or notifications outbox. Smoke and verification should be
 read-only, and install scripts must be safe to repeat at the same commit.
 
 
-`policy.watch_checks` optionally names main-branch checks when their names differ
-from PR merge checks. Omission reuses `required_checks`. For example a project
-with `Compile and RunPureChecks (PR)` can watch `Compile and RunPureChecks (main)`
-without weakening the PR gate. First-PR CI measurement always uses required_checks.
+`policy.main_checks` names the checks that judge a main-branch commit when their
+names differ from the PR merge checks. `policy.watch_checks` is its legacy name:
+set one, or both with the same list. When neither is set the main set is
+`required_checks`. Watch judges the newest head and bisect candidates by this
+set, never by deploy checks, so a missing `deploy-ok` is not a red main head. For
+example a project with `Compile and RunPureChecks (PR)` can watch
+`Compile and RunPureChecks (main)` without weakening the PR gate. First-PR CI
+measurement always uses required_checks.
+
+`policy.deploy_checks` names the checks of the deploy stage (for example
+`deploy-ok`, posted after the main stage is green on the same commit). When it is
+set, `release` publishes a manifest only for a commit whose deploy checks are
+green; `ci-ok` alone never releases. The published manifest records the
+observation in its `deploy` field: the commit, the git blob revision of the
+policy it was read against, and each check's name, state and run/status URL. An
+empty or absent `deploy_checks` means the repository has no deploy stage, and
+release and rollout judge a commit by the main checks as before.
+
+`rollout` installs the newest published release manifest that is an ancestor of
+the configured branch head, green on the checks named by its own policy (deploy
+checks, or the main checks when there is no deploy stage), and outside a
+recorded red range. A newer candidate that is not an ancestor, not green, or
+denied is skipped; when none is admissible the error names every skipped
+candidate. `state/<repo>/rollout-deny` lists culprits, one full commit SHA per
+line, with blank lines and `#` comments ignored. A listed commit is never
+installed, and every commit after a listed culprit is denied until the branch
+head is green again — the "no intermediate commit between a culprit and a red
+head" rule. Delete a line once a green head has superseded it; a line that is not
+a full SHA is an error, so an unreadable entry can never admit its culprit.
 
 `policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
 that runs the checks bisect judges a commit by for any commit: it has a

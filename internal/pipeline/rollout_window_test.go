@@ -58,10 +58,10 @@ type windowBlockingGH struct {
 	entered, proceed chan struct{}
 }
 
-func (g windowBlockingGH) Latest(context.Context, string) (manifest.Manifest, error) {
+func (g windowBlockingGH) Manifests(context.Context, string) ([]manifest.Manifest, error) {
 	close(g.entered)
 	<-g.proceed
-	return g.m, nil
+	return []manifest.Manifest{g.m}, nil
 }
 func TestRolloutWindowProductionEntry(t *testing.T) {
 	s, g, _, _, r := setup(t)

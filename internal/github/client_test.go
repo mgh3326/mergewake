@@ -282,7 +282,7 @@ func TestLatestRejectsWrongTagCommit(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	})
-	if _, e := c.Latest(context.Background(), "example/project"); e == nil {
+	if _, e := c.Manifests(context.Background(), "example/project"); e == nil {
 		t.Fatal("tag mismatch accepted")
 	}
 }

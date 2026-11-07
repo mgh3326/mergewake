@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/manifest"
@@ -69,7 +70,10 @@ func (c *Client) Publish(ctx context.Context, m manifest.Manifest) error {
 	if e != nil {
 		return e
 	}
-	// Never replace an existing manifest. Interrupted draft publication can resume.
+	// Never replace an existing manifest. Interrupted draft publication can
+	// resume. Deploy evidence is an observation, not content: a re-run may move
+	// a run URL, so a manifest whose release content matches is already
+	// published and keeps the evidence it recorded first.
 	found := false
 	for _, a := range r.Assets {
 		if a.Name == AssetName {
@@ -77,7 +81,11 @@ func (c *Client) Publish(ctx context.Context, m manifest.Manifest) error {
 			if e != nil {
 				return e
 			}
-			if string(old) != string(b) {
+			var prior manifest.Manifest
+			if e = json.Unmarshal(old, &prior); e != nil {
+				return e
+			}
+			if !sameRelease(prior, m) {
 				return errors.New("release manifest already exists with different content")
 			}
 			found = true
@@ -103,43 +111,67 @@ func (c *Client) asset(ctx context.Context, repo string, a Asset) ([]byte, error
 	}
 	return c.request(ctx, "GET", fmt.Sprintf("%s/releases/assets/%d", base(repo), a.ID), "application/octet-stream", nil)
 }
-func (c *Client) Latest(ctx context.Context, repo string) (manifest.Manifest, error) {
+
+// sameRelease reports whether two manifests publish the same release content.
+// Deploy evidence records what was observed of the checks, not what is
+// installed, so it never makes a published release different.
+func sameRelease(a, b manifest.Manifest) bool {
+	a.Deploy, b.Deploy = nil, nil
+	return reflect.DeepEqual(a, b)
+}
+
+// Manifests lists the published release manifests newest first. A malformed
+// release is an error, not a candidate to skip.
+func (c *Client) Manifests(ctx context.Context, repo string) ([]manifest.Manifest, error) {
 	releases, e := list[Release](ctx, c, base(repo)+"/releases")
 	if e != nil {
-		return manifest.Manifest{}, e
+		return nil, e
 	}
+	var out []manifest.Manifest
 	for _, r := range releases {
 		if r.Draft || r.Prerelease || !strings.HasPrefix(r.Tag, "mergewake-") {
 			continue
 		}
 		for _, a := range r.Assets {
-			if a.Name == AssetName {
-				b, e := c.asset(ctx, repo, a)
-				if e != nil {
-					return manifest.Manifest{}, e
-				}
-				var m manifest.Manifest
-				if e = json.Unmarshal(b, &m); e != nil {
-					return m, e
-				}
-				if e = m.Validate(); e != nil {
-					return m, e
-				}
-				if m.Repo != repo || r.Tag != Tag(m.Commit) {
-					return m, errors.New("release identity mismatch")
-				}
-				commit, e := c.Commit(ctx, repo, r.Tag)
-				if e != nil {
-					return m, e
-				}
-				if commit.SHA != m.Commit {
-					return m, errors.New("release tag does not point at manifest commit")
-				}
-				return m, nil
+			if a.Name != AssetName {
+				continue
 			}
+			m, e := c.releaseManifest(ctx, repo, r, a)
+			if e != nil {
+				return nil, e
+			}
+			out = append(out, m)
 		}
 	}
-	return manifest.Manifest{}, errors.New("no mergewake release manifest found")
+	if len(out) == 0 {
+		return nil, errors.New("no mergewake release manifest found")
+	}
+	return out, nil
+}
+
+func (c *Client) releaseManifest(ctx context.Context, repo string, r Release, a Asset) (manifest.Manifest, error) {
+	var m manifest.Manifest
+	b, e := c.asset(ctx, repo, a)
+	if e != nil {
+		return m, e
+	}
+	if e = json.Unmarshal(b, &m); e != nil {
+		return m, e
+	}
+	if e = m.Validate(); e != nil {
+		return m, e
+	}
+	if m.Repo != repo || r.Tag != Tag(m.Commit) {
+		return m, errors.New("release identity mismatch")
+	}
+	commit, e := c.Commit(ctx, repo, r.Tag)
+	if e != nil {
+		return m, e
+	}
+	if commit.SHA != m.Commit {
+		return m, errors.New("release tag does not point at manifest commit")
+	}
+	return m, nil
 }
 
 // ContainerReleaseHead follows stable semver releases; images are selected by

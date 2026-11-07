@@ -80,6 +80,8 @@ type fakeGH struct {
 	latch, headChanged, stale     bool
 	policyReads                   []string
 	m                             manifest.Manifest
+	// ms, when set, is the candidate list Manifests returns instead of m.
+	ms []manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
 	// diffErr, when set, answers every Diff call instead of a patch (for
@@ -407,8 +409,24 @@ func (g *fakeGH) Ancestor(_ context.Context, _, older, newer string) (bool, erro
 	}
 	return !g.stale, nil
 }
-func (g *fakeGH) Publish(context.Context, manifest.Manifest) error          { g.publishCount++; return nil }
-func (g *fakeGH) Latest(context.Context, string) (manifest.Manifest, error) { return g.m, nil }
+func (g *fakeGH) Publish(context.Context, manifest.Manifest) error { g.publishCount++; return nil }
+func (g *fakeGH) Manifests(context.Context, string) ([]manifest.Manifest, error) {
+	if g.ms != nil {
+		return g.ms, nil
+	}
+	return []manifest.Manifest{g.m}, nil
+}
+func (g *fakeGH) CheckEvidence(ctx context.Context, _, sha string, required []string) ([]github.CheckEvidence, error) {
+	states, e := g.CheckStates(ctx, "", sha, required)
+	if e != nil {
+		return nil, e
+	}
+	out := make([]github.CheckEvidence, 0, len(required))
+	for _, n := range required {
+		out = append(out, github.CheckEvidence{Name: n, State: states[n], URL: "https://checks.example/" + n})
+	}
+	return out, nil
+}
 
 type fakeSink struct{ records, reopens int }
 
