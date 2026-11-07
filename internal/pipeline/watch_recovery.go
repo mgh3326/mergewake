@@ -55,6 +55,7 @@ type recoveryIncident struct {
 	RevertPR  int    `json:"revert_pr,omitempty"`
 	RevertURL string `json:"revert_url,omitempty"`
 	FixPR     int    `json:"fix_pr,omitempty"`
+	Yielding  bool   `json:"yielding,omitempty"`
 }
 
 // revertCloser closes an open pull request without merging it.
@@ -151,7 +152,7 @@ func (s *Service) urgentFix(repo string, pr int) bool {
 // evidence. The same culprit keeps its red_since and evidence; a different
 // culprit starts a new incident. culpritCI is the recorded state of the
 // culprit on the bisect checks; known is false when that read was unknown.
-func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, head, baseline, task, checks string, culpritCI github.CI, known, persist bool) (recoveryIncident, error) {
+func (s *watchStream) beginRecovery(r config.Repo, culprit string, culpritPR int, head, baseline, task, checks string, culpritCI github.CI, known, persist bool) (recoveryIncident, error) {
 	st, found, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return st, e
@@ -196,7 +197,7 @@ func (s *Service) beginRecovery(r config.Repo, culprit string, culpritPR int, he
 }
 
 // recordRecoveryRevert binds the revert PR watch opened to the incident.
-func (s *Service) recordRecoveryRevert(repo, url string, pr int) error {
+func (s *watchStream) recordRecoveryRevert(repo, url string, pr int) error {
 	st, found, e := s.loadRecovery(repo)
 	if e != nil || !found {
 		return e
@@ -234,7 +235,7 @@ func culpritFromRevertBody(body string) (string, int) {
 // whether the incident is confirmed and, when it is not, a reason and whether
 // that reason needs the desk (a flaky result, a timed-out re-run or a reached
 // bound) rather than a quiet wait for the next poll.
-func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.Policy, st recoveryIncident, acting, persist bool) (recoveryIncident, bool, string, bool, error) {
+func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p policy.Policy, st recoveryIncident, acting, persist bool) (recoveryIncident, bool, string, bool, error) {
 	save := func(st recoveryIncident) error {
 		if !persist {
 			return nil
@@ -337,7 +338,7 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 		// The re-run repeats the scope the original verdict judged. Narrowing it
 		// to the culprit's changed packages would let a dependent package's
 		// failure pass unseen and read as a flaky culprit.
-		if e := dispatcher.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, map[string]string{"ref": sha}); e != nil {
+		if e := s.dispatch(ctx, dispatcher, r, p, sha); e != nil {
 			if github.DispatchRefused(e) {
 				delete(st.Pending, sha)
 				return hold(st, "any-ref CI dispatch refused for "+short7(sha)+": "+e.Error())
@@ -427,7 +428,7 @@ func namesFix(text string, st recoveryIncident) bool {
 // recorded incident. A green commit between them means main was fixed and broke
 // again, so that red needs a fresh diagnosis rather than the old culprit's
 // revert.
-func (s *Service) incidentCurrent(ctx context.Context, r config.Repo, p policy.Policy, head string, st recoveryIncident) (bool, error) {
+func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p policy.Policy, head string, st recoveryIncident) (bool, error) {
 	if head == st.Head {
 		return true, nil
 	}
@@ -469,7 +470,7 @@ func (s *Service) incidentCurrent(ctx context.Context, r config.Repo, p policy.P
 // reads green because a same-sha re-run passed. It records the mixed result and
 // tells the design lane once; the caller then takes the healthy path, which
 // clears the incident. It reports whether the pass may continue as healthy.
-func (s *Service) settleMixedHead(ctx context.Context, r config.Repo, p policy.Policy, result watchResult, o Options, inc recoveryIncident) (bool, error) {
+func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p policy.Policy, result watchResult, o Options, inc recoveryIncident) (bool, error) {
 	acting := !result.Shadow && !o.DryRun
 	st, confirmed, reason, needsDesk, e := s.confirmRecovery(ctx, r, p, inc, acting, acting)
 	if e != nil {
@@ -500,7 +501,7 @@ func (s *Service) settleMixedHead(ctx context.Context, r config.Repo, p policy.P
 
 // recoverHeadCulprit resolves an incident whose culprit is the current head.
 // An active latch still owns the revert PR, so it keeps the recovery path.
-func (s *Service) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
+func (s *watchStream) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
 	active, e := s.GH.RecoveryActive(ctx, r.Name)
 	if e != nil {
 		return e
@@ -516,7 +517,7 @@ func (s *Service) recoverHeadCulprit(ctx context.Context, r config.Repo, p polic
 // changes the CI picture cannot move the incident's culprit or green boundary,
 // and a re-run that passes at the culprit is recorded as flaky and told to the
 // design lane once instead of blaming a later commit.
-func (s *Service) recoverIncident(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, st recoveryIncident) error {
+func (s *watchStream) recoverIncident(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, st recoveryIncident) error {
 	acting := !result.Shadow && !o.DryRun
 	result.Culprit, result.PR = st.Culprit, st.CulpritPR
 	if st.CulpritPR != 0 {
@@ -544,6 +545,9 @@ func (s *Service) recoverIncident(ctx context.Context, r config.Repo, p policy.P
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
+	if s.blocked {
+		return s.audit(r.Name, "watch", result, o.DryRun)
+	}
 	if st.RevertPR != 0 {
 		result.Action = "recovery-hold"
 		result.Reason = fmt.Sprintf("revert PR #%d exists without a recovery latch", st.RevertPR)
@@ -565,7 +569,7 @@ func (s *Service) recoverIncident(ctx context.Context, r config.Repo, p policy.P
 // and merges the exact revert only when every condition holds. A condition that
 // forbids an automatic merge holds and tells the design lane once. A latch that
 // is not an open revert watch can reason about keeps its old operator hold.
-func (s *Service) recovery(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options) error {
+func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options) error {
 	latch, ok := s.GH.(recoveryLatchGH)
 	if !ok {
 		result.Action = "operator-required-recovery-latch"
@@ -680,7 +684,11 @@ func (s *Service) recovery(ctx context.Context, r config.Repo, p policy.Policy, 
 		result.Reason = "fix window elapsed and the failure is confirmed"
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	if reason := s.revertMergeBlocker(ctx, r, p, checks, head, *pr, st); reason != "" {
+	prChecks := checks
+	if s.deploy && len(p.RequiredChecks) > 0 {
+		prChecks = p.RequiredChecks
+	}
+	if reason := s.revertMergeBlocker(ctx, r, p, prChecks, s.targetHead(head), *pr, st); reason != "" {
 		result.Action = "recovery-hold"
 		result.Reason = reason
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":"+reason, o)
@@ -690,7 +698,7 @@ func (s *Service) recovery(ctx context.Context, r config.Repo, p policy.Policy, 
 
 // revertMergeBlocker names the first condition that forbids merging the revert,
 // or "" when the merge may proceed. It re-reads the evidence a merge depends on.
-func (s *Service) revertMergeBlocker(ctx context.Context, r config.Repo, p policy.Policy, checks []string, head string, pr github.Pull, st recoveryIncident) string {
+func (s *watchStream) revertMergeBlocker(ctx context.Context, r config.Repo, p policy.Policy, checks []string, head string, pr github.Pull, st recoveryIncident) string {
 	if st.Culprit == "" || st.CulpritPR == 0 || st.Baseline == "" {
 		return "recovery state cannot attest the culprit"
 	}
@@ -831,7 +839,7 @@ func sortedKeys(m map[string]bool) []string {
 
 // mergeRevert merges the revert PR at its current head once the evidence has
 // not changed, records the outcome and tells the design lane once.
-func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, checks []string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
+func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head string, checks []string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
 	// Earlier reads in this pass are memoized, and a same-sha re-run can settle
 	// since. The merge turns on the PR, the head and main's CI, so read them
 	// fresh rather than from the pass snapshot.
@@ -849,10 +857,18 @@ func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, c
 	if e != nil {
 		return e
 	}
-	if main != head {
+	if main != s.targetHead(head) {
 		result.Action = "recovery-hold"
 		result.Reason = "main changed during recovery"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-moved", o)
+	}
+	if s.deploy {
+		mainCI, err := s.GH.Check(freshCtx, r.Name, main, s.mainChecks)
+		if err != nil || mainCI != github.Green {
+			result.Action = "recovery-hold"
+			result.Reason = "main CI is not green; deploy recovery waits"
+			return s.reportWatch(ctx, r, result, "deploy:main-not-green", o)
+		}
 	}
 	ci, e := s.GH.Check(freshCtx, r.Name, head, checks)
 	if e != nil {
@@ -886,7 +902,7 @@ func (s *Service) mergeRevert(ctx context.Context, r config.Repo, head string, c
 }
 
 // announceRevert sends the one design-lane line for a merged revert.
-func (s *Service) announceRevert(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int) error {
+func (s *watchStream) announceRevert(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int) error {
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
@@ -900,8 +916,12 @@ func (s *Service) announceRevert(ctx context.Context, r config.Repo, st recovery
 		task = "-"
 	}
 	window := strconv.Itoa(int(fixWindow/time.Minute)) + "m"
-	text := fmt.Sprintf("%s main red since %s by PR #%d; reverted by PR #%d after %s; task %s reopened",
-		r.Name, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, task)
+	stage := "main"
+	if s.deploy {
+		stage = "deploy"
+	}
+	text := fmt.Sprintf("%s %s red since %s by PR #%d; reverted by PR #%d after %s; task %s reopened",
+		r.Name, stage, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, task)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
@@ -918,7 +938,7 @@ func (s *Service) announceRevert(ctx context.Context, r config.Repo, st recovery
 // fixWon runs on a green main: a revert PR the latch belongs to that never
 // merged is no longer needed. It closes the PR with a comment, clears the latch
 // and records the outcome once.
-func (s *Service) fixWon(ctx context.Context, r config.Repo, head string) error {
+func (s *watchStream) fixWon(ctx context.Context, r config.Repo, head string) error {
 	active, e := s.GH.RecoveryActive(ctx, r.Name)
 	if e != nil || !active {
 		return e

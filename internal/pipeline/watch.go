@@ -15,10 +15,12 @@ import (
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 type watchResult struct {
 	Head       string `json:"head"`
+	Stage      string `json:"stage,omitempty"`
 	Action     string `json:"action"`
 	Shadow     bool   `json:"shadow"`
 	Culprit    string `json:"culprit,omitempty"`
@@ -95,12 +97,85 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if e != nil {
 		return e
 	}
-	// The newest head is judged by the whole watch set; bisect judges every
-	// other commit by the checks any-ref CI reports.
+	main := watchStream{Service: s, suites: p.DeployStage(), mainHead: head}
+	if p.DeployStage() {
+		deploy := watchStream{Service: s, deploy: true}
+		if p.Enabled && !o.Shadow && !o.DryRun {
+			if err := deploy.finishMerged(ctx, r, head); err != nil {
+				return err
+			}
+			st, found, err := deploy.loadRecovery(r.Name)
+			if err != nil {
+				return err
+			}
+			if found && st.Yielding {
+				if _, err := deploy.yieldLatch(ctx, r); err != nil {
+					return err
+				}
+			}
+		}
+		owned, err := deploy.ownsLatch(ctx, r)
+		if err != nil {
+			return err
+		}
+		main.otherLatch = owned
+		main.blocked = owned
+		if owned {
+			ci, err := s.GH.Check(ctx, r.Name, head, p.WatchSet())
+			if err != nil {
+				return err
+			}
+			if ci == github.Red && p.Enabled && !o.Shadow && !o.DryRun {
+				yielded, err := deploy.yieldLatch(ctx, r)
+				if err != nil {
+					return err
+				}
+				if yielded {
+					main.otherLatch = false
+					main.blocked = false
+				}
+			}
+		}
+	}
+	if e = main.watch(ctx, r, p, head, o); e != nil {
+		return e
+	}
+	if p.DeployStage() {
+		_, recorded, err := s.loadRecovery(r.Name)
+		if err != nil {
+			return err
+		}
+		ci, err := s.GH.Check(ctx, r.Name, head, p.WatchSet())
+		if err != nil {
+			return err
+		}
+		probe := watchStream{Service: s, deploy: true}
+		owned, err := probe.ownsLatch(ctx, r)
+		if err != nil {
+			return err
+		}
+		active, err := s.GH.RecoveryActive(ctx, r.Name)
+		if err != nil {
+			return err
+		}
+		otherLatch := active && !owned
+		deploy := watchStream{Service: s, deploy: true, suites: true, mainHead: head, mainChecks: p.WatchSet(), otherLatch: otherLatch, blocked: recorded || ci != github.Green || otherLatch}
+		return deploy.watchDeploy(ctx, r, p, head, o)
+	}
+	return nil
+}
+
+func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy, head string, o Options) error {
+
 	checks := p.WatchSet()
 	bisectChecks := p.BisectChecks()
-	s.ciPolicy(ctx, r, head, o)
+	if !s.deploy {
+		s.ciPolicy(ctx, r, head, o)
+	}
 	result := watchResult{Head: head, Action: "waiting-for-ci", Shadow: !p.Enabled || o.Shadow}
+	if s.deploy {
+		result.Stage = "deploy"
+	}
 	inc, recorded, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return e
@@ -117,7 +192,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return e
 	}
-	checkpoint := filepath.Join(s.state(r.Name), "last-green")
+	checkpoint := s.checkpoint(r.Name)
 	if ci == github.Green {
 		// A same-sha re-run can pass beside the head's own failed run. Record
 		// the mixed result once, then close the incident as healthy: a green
@@ -140,11 +215,13 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 				return e
 			}
 			if !result.Shadow {
-				if e = s.fixWon(ctx, r, head); e != nil {
-					return e
-				}
-				if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
-					return e
+				if !s.otherLatch {
+					if e = s.fixWon(ctx, r, head); e != nil {
+						return e
+					}
+					if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
+						return e
+					}
 				}
 				if e = s.clearRecoveryState(r.Name); e != nil {
 					return e
@@ -166,7 +243,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if e != nil {
 		return e
 	}
-	if active {
+	if active && !s.blocked {
 		return s.recovery(ctx, r, p, head, checks, result, o)
 	}
 	// A persisted incident outranks a fresh bisect: its confirmation evidence
@@ -415,13 +492,16 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
+	if s.blocked {
+		return s.audit(r.Name, "watch", result, o.DryRun)
+	}
 	return s.openRevert(ctx, r, head, checks, culprit, *origin, task, result, o)
 }
 
 // openRevert opens the exact-revert PR for a confirmed incident. It re-reads
 // the head and its CI first, so a pass that lost a race does not open a PR for
 // a main that already moved or went green.
-func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
+func (s *watchStream) openRevert(ctx context.Context, r config.Repo, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
 	result.Action = "open-revert-pr"
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
@@ -433,10 +513,19 @@ func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, ch
 	if e != nil {
 		return e
 	}
-	if fresh != head {
+	if fresh != s.targetHead(head) {
 		return errors.New("main changed during diagnosis; rerun watch")
 	}
-	ci, e := s.GH.Check(ctx, r.Name, head, checks)
+	if s.deploy {
+		mainCI, err := s.GH.Check(github.FreshEvidence(ctx), r.Name, fresh, s.mainChecks)
+		if err != nil {
+			return err
+		}
+		if mainCI != github.Green {
+			return nil
+		}
+	}
+	ci, e := s.GH.Check(github.FreshEvidence(ctx), r.Name, head, checks)
 	if e != nil {
 		return e
 	}
@@ -453,7 +542,7 @@ func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, ch
 	if !ok {
 		return errors.New("GitHub client does not support recovery trailers")
 	}
-	result.URL, e = reverter.RevertWithTrailers(ctx, r.Name, r.Branch, head, culprit, origin.Number, trailers)
+	result.URL, e = reverter.RevertWithTrailers(ctx, r.Name, r.Branch, fresh, culprit, origin.Number, trailers)
 	if e != nil {
 		return e
 	}
@@ -468,7 +557,11 @@ func (s *Service) openRevert(ctx context.Context, r config.Repo, head string, ch
 	data, _ := json.Marshal(result)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
-	note := fmt.Sprintf("mergewake: main CI failed after PR #%d; revert PR %s", origin.Number, result.URL)
+	stage := "main"
+	if s.deploy {
+		stage = "deploy"
+	}
+	note := fmt.Sprintf("mergewake: %s CI failed after PR #%d; revert PR %s", stage, origin.Number, result.URL)
 	var reopen error
 	if task != "" {
 		reopen = s.Sink.Reopen(reportCtx, task, note)
@@ -523,7 +616,11 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	data, _ := json.Marshal(result)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
-	note := "mergewake: watch " + result.Action + " on " + r.Name + " " + result.Head
+	stage := ""
+	if result.Stage != "" {
+		stage = result.Stage + " "
+	}
+	note := "mergewake: " + stage + "watch " + result.Action + " on " + r.Name + " " + result.Head
 	if result.Reason != "" {
 		note += ": " + result.Reason
 	}
