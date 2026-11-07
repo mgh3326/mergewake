@@ -354,7 +354,10 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 		}
 	}
-	if !settle {
+	// A held review posts nothing, so it must not settle either: running
+	// DeliverFindings, NotifyPR or Land for it would report and act on a review
+	// that did not happen.
+	if !settle || held {
 		return errs, clean, reviewed, held
 	}
 	ph := daemon.PhasesOf(ctx)

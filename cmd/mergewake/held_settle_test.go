@@ -77,6 +77,35 @@ func cachedEvaluation(k *prSkips, repo string, n int) (prEvaluation, bool) {
 	return p, ok
 }
 
+// A head with no completion marker is not "handled", so the pass would settle
+// it. A held review must not reach settlePR: no findings delivery, no verdict
+// notice and no land decision for a review that posted nothing.
+func TestHeldReviewNeverSettles(t *testing.T) {
+	f := newParallelFixture(t, 1, 1)
+	runner := &heldRunner{}
+	f.s.Runner = runner
+	logs := &syncBuffer{}
+	skips := &prSkips{Dirty: &daemon.Dirty{}, Log: slog.New(slog.NewJSONHandler(logs, nil))}
+
+	if skipped, evaluated := runSkippedPass(t, f, skips, logs); evaluated != 1 || skipped != 0 {
+		t.Fatalf("pass: skipped=%d evaluated=%d", skipped, evaluated)
+	}
+	if runner.count() != 1 {
+		t.Fatalf("spawns=%d, want 1", runner.count())
+	}
+	for _, e := range f.trace.snapshot() {
+		if e == "notify 1" || e == "merge 1" {
+			t.Fatalf("a held review settled: %v", f.trace.snapshot())
+		}
+	}
+	// settlePR always audits through DeliverFindings, NotifyPR and Land.
+	for _, cmd := range []string{`"command":"pr-notify`, `"command":"land`} {
+		if strings.Contains(f.out.String(), cmd) {
+			t.Fatalf("a held review reached settlePR (%s): %s", cmd, f.out)
+		}
+	}
+}
+
 // (c) An evaluation whose only outcome was a held refusal is not cached as
 // settled: the next evaluation runs, and it spawns again once the hold clears.
 func TestHeldOnlyEvaluationIsNotSettled(t *testing.T) {
