@@ -22,6 +22,9 @@ type reviewRetryState struct {
 	// failure plus the collection failures, which never count toward
 	// escalation. A file without it reads as Failures.
 	Backoffs int `json:"backoffs,omitempty"`
+	// Held is set while the last evaluation ended held: nothing failed, but no
+	// review completed, so the daemon must not settle the PR as unchanged.
+	Held bool `json:"held,omitempty"`
 }
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
@@ -103,6 +106,9 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		}
 	}
 	if s.now().Before(state.Next) {
+		if state.Held {
+			return ErrReviewHeld
+		}
 		return nil
 	}
 	fresh, err := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
@@ -118,7 +124,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		// A reviewer that no earlier run had placed starts a new attempt: the
 		// count of the earlier one must not hold it. Backoffs stay, so a
 		// spawn-and-lose loop still slows down.
-		state.Failures, state.Escalated = 0, false
+		state.Failures, state.Escalated, state.Held = 0, false, false
 		if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 			return errors.Join(err, saveErr)
 		}
@@ -180,11 +186,17 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			state.Next = at
 		}
 	}
+	// Only a held evaluation with nothing else wrong is marked held: a real
+	// failure supersedes it, and the daemon must not settle this evaluation.
+	state.Held = len(class.held) > 0 && !class.real && !class.collection
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
 	}
 	if !class.real && !class.collection {
 		// Only quota stops and holds: the audit row says it, and nothing failed.
+		if state.Held {
+			return ErrReviewHeld
+		}
 		return nil
 	}
 	// Escalate after persisting the failure, including the first poll at K.

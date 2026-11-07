@@ -317,6 +317,8 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 // review is a PR's review and settle. A head whose review is done is settled
 // first, then its evidence is checked; any other is reviewed, then settled.
 // handled reports the first. reviewed is false when the review itself failed.
+// A head whose only outcome was a held refusal is not settled, whatever its
+// marker says: the next evaluation must retry once the hold clears.
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseReview)
@@ -348,11 +350,11 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 	c.reviewing++
 	c.peak = max(c.peak, c.reviewing)
 	e.mu.Unlock()
-	reviewErrs, ok, reviewed := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
+	reviewErrs, ok, reviewed, held := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
 	e.mu.Lock()
 	e.counts(r.Name).reviewing--
 	e.mu.Unlock()
-	return append(errs, reviewErrs...), ok && len(errs) == 0, handled, reviewed
+	return append(errs, reviewErrs...), ok && len(errs) == 0, handled && !held, reviewed
 }
 
 // sweep is one pass over repo r: it puts the open PRs on the queue and

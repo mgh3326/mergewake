@@ -507,7 +507,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
 	}
-
 	// Errors are counted once, from errs: note itself appends every "error"
 	// row, so no row-level failure can be missing from the summary.
 	scanned, closed, planned, removed, deleted, skipped, archived, jobsDone := 0, 0, 0, 0, 0, 0, 0, 0
@@ -603,6 +602,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		return ok
 	}
 
+	// A call that wants only the reviewer sweep (the review path) never runs
+	// the merged-PR cleanup, even if the PR merged while the review ran: a held
+	// reviewer spawn must not close the author's job pane, remove its worktree,
+	// delete its branch or archive its job.
+	if reviewersOnly(ctx) && prNum > 0 {
+		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)...)
+	}
+
 	for _, p := range pulls {
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
@@ -612,9 +619,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
 				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
-				if reviewersOnly(ctx) {
-					return errors.Join(errs...)
-				}
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue
