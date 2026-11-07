@@ -62,8 +62,8 @@ func (p *pendingFixture) event(t *testing.T, src daemon.Source) (skipped, evalua
 	return after.skipped - before.skipped, after.evaluated - before.evaluated
 }
 
-func (p *pendingFixture) notified() bool {
-	return slices.Contains(p.f.trace.snapshot(), "notify 1")
+func (p *pendingFixture) settled() bool {
+	return slices.Contains(p.f.trace.snapshot(), "merge 1")
 }
 
 // A pending async pass is unreviewed like a held or quota-stopped one: it
@@ -83,7 +83,7 @@ func TestPendingAsyncPassUnderStaleDoneMarkerIsNotSettled(t *testing.T) {
 	if _, ok := cachedEvaluation(p.e.skips, p.f.repo.Name, 1); ok {
 		t.Fatal("a pending pass was cached as settled")
 	}
-	if p.notified() {
+	if p.settled() {
 		t.Fatalf("a pending pass settled the PR: %v", p.f.trace.snapshot())
 	}
 
@@ -119,7 +119,7 @@ func TestPendingAsyncPassUnderStaleDoneMarkerIsNotSettled(t *testing.T) {
 	if skipped, evaluated := p.event(t, daemon.SourceSweep); skipped != 0 || evaluated != 1 {
 		t.Fatalf("evaluation after the posted pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
-	if !p.notified() {
+	if !p.settled() {
 		t.Fatalf("the finished reviewer did not settle the PR: %v", p.f.trace.snapshot())
 	}
 }
