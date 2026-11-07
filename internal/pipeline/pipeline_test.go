@@ -89,6 +89,46 @@ type fakeGH struct {
 	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
 	commitErr   map[string]error
 	notAncestor map[[2]string]bool
+	// comments and closed record PostIssueComment and ClosePull calls.
+	comments []string
+	closed   []int
+	// any-ref confirmation: dispatched counts re-runs per sha, statuses are
+	// the newest commit status per (sha, name), openPulls answers OpenPulls.
+	dispatched map[string]int
+	statuses   map[[2]string]statusRecord
+	openPulls  []github.Pull
+}
+
+type statusRecord struct {
+	ci github.CI
+	at time.Time
+}
+
+func (g *fakeGH) DispatchWorkflow(_ context.Context, _, workflow, _ string, inputs map[string]string) error {
+	if workflow != "ci-any-ref.yml" {
+		return &github.APIError{Code: 404}
+	}
+	if g.dispatched == nil {
+		g.dispatched = map[string]int{}
+	}
+	g.dispatched[inputs["ref"]]++
+	return nil
+}
+func (g *fakeGH) LatestStatus(_ context.Context, _, sha, name string) (github.CI, time.Time, bool, error) {
+	v, ok := g.statuses[[2]string{sha, name}]
+	return v.ci, v.at, ok, nil
+}
+func (g *fakeGH) OpenPulls(context.Context, string, string) ([]github.Pull, error) {
+	return g.openPulls, nil
+}
+
+func (g *fakeGH) PostIssueComment(_ context.Context, _ string, _ int, body string) error {
+	g.comments = append(g.comments, body)
+	return nil
+}
+func (g *fakeGH) ClosePull(_ context.Context, _ string, n int) error {
+	g.closed = append(g.closed, n)
+	return nil
 }
 
 func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
@@ -801,6 +841,12 @@ func TestWatchRecoveryLatchAndAdapters(t *testing.T) {
 			g.pull.MergeCommitSHA = shaB
 			g.pull.Body = "Mergewake-Task: 42"
 			s.Config.Sink.Type = "handoffkeep"
+			if e := s.saveRecovery(r.Name, recoveryIncident{
+				RedSince: time.Now(), Culprit: shaB, CulpritPR: 7, Head: shaC, Baseline: shaA, Task: "42",
+				Runs: map[string][]bool{shaA: {true, true}, shaB: {false, false}}, Confirmed: true,
+			}); e != nil {
+				t.Fatal(e)
+			}
 			if e := s.Watch(context.Background(), r, Options{DryRun: tt.dry}); e != nil {
 				t.Fatal(e)
 			}

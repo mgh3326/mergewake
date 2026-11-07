@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -115,7 +116,13 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 				return e
 			}
 			if !result.Shadow {
+				if e = s.fixWon(ctx, r, head); e != nil {
+					return e
+				}
 				if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
+					return e
+				}
+				if e = s.clearRecoveryState(r.Name); e != nil {
 					return e
 				}
 			}
@@ -131,8 +138,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	if active {
-		result.Action = "operator-required-recovery-latch"
-		return s.audit(r.Name, "watch", result, o.DryRun)
+		return s.recovery(ctx, r, p, head, checks, result, o)
 	}
 	baselineBytes, e := os.ReadFile(checkpoint)
 	if e != nil && !os.IsNotExist(e) {
@@ -335,6 +341,32 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if s.Config.Sink.Type == "handoffkeep" && !integrations.TaskID.MatchString(task) {
 		return errors.New("origin task missing; add Mergewake-Task trailer or repo task")
 	}
+	culpritCI, culpritKnown := github.CI(""), false
+	if v, ce := check(culprit); ce == nil && (v == github.Green || v == github.Red) {
+		culpritCI, culpritKnown = v, true
+	}
+	persist := !result.Shadow && !o.DryRun
+	st, e := s.beginRecovery(r, culprit, origin.Number, head, green, task, culpritCI, culpritKnown, persist)
+	if e != nil {
+		return e
+	}
+	if st.RevertPR != 0 {
+		result.Action = "recovery-hold"
+		result.Reason = fmt.Sprintf("revert PR #%d exists without a recovery latch", st.RevertPR)
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(st.RevertPR)+":unlatched", o)
+	}
+	st, confirmed, reason, needsDesk, e := s.confirmRecovery(ctx, r, p, st, persist, persist)
+	if e != nil {
+		return e
+	}
+	if !confirmed {
+		result.Action = "recovery-confirming"
+		result.Reason = reason
+		if needsDesk {
+			return s.reportWatch(ctx, r, result, head+":confirm:"+reason, o)
+		}
+		return s.audit(r.Name, "watch", result, o.DryRun)
+	}
 	result.Action = "open-revert-pr"
 	if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
@@ -371,6 +403,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		return e
 	}
 	if e = s.recordRevert(r.Name, origin.Number, result.URL); e != nil {
+		return e
+	}
+	if e = s.recordRecoveryRevert(r.Name, result.URL, pullNumber(result.URL)); e != nil {
 		return e
 	}
 	result.Action = "opened-revert-pr"
@@ -438,7 +473,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		note += ": " + result.Reason
 	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.designLane(r)}))
 	if e != nil {
 		return e
 	}
