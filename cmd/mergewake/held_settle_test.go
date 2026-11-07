@@ -53,8 +53,19 @@ func (r *heldRunner) count() int {
 // counts from the pass line.
 func runSkippedPass(t *testing.T, f *parallelFixture, skips *prSkips, logs *syncBuffer) (skipped, evaluated int) {
 	t.Helper()
-	if err := pollPRsSkipping(context.Background(), f.s, f.gh, f.repo, pipeline.Options{}, skips); err != nil {
-		t.Fatalf("pass: %v", err)
+	return runSkippedPassWithin(t, context.Background(), "pass", f, skips, logs)
+}
+
+// runSkippedPassWithin is runSkippedPass bounded by ctx, so a pass that never
+// returns fails the test with what it was doing instead of at the package
+// timeout.
+func runSkippedPassWithin(t *testing.T, ctx context.Context, what string, f *parallelFixture, skips *prSkips, logs *syncBuffer) (skipped, evaluated int) {
+	t.Helper()
+	if err := pollPRsSkipping(ctx, f.s, f.gh, f.repo, pipeline.Options{}, skips); err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("%s did not finish within its deadline: %v", what, ctx.Err())
+		}
+		t.Fatalf("%s: %v", what, err)
 	}
 	for _, line := range strings.Split(logs.take(), "\n") {
 		var rec struct {
