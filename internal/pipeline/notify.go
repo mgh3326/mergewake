@@ -20,15 +20,17 @@ import (
 
 var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
-// NotifyPR emits one lane event when the merge-gate verdict for a PR head
-// becomes ready or blocked: READY once every required check is green, no
-// review thread is unresolved, the review -done marker exists, the PR is mergeable and,
-// when GitHub requires an up-to-date branch, the base is an ancestor of the head; BLOCKED with the
-// closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
-// (PR, head, verdict) notifies once across restarts, except that a READY PR
-// still open and READY on the same head is notified again every
-// daemon.pr.notify.renotify_after, at most renotify_max times: a READY nobody
-// merged must not vanish. A merged or closed PR is never notified here.
+// NotifyPR acts on the merge-gate verdict for a PR head once it becomes ready
+// or blocked: READY once every required check is green, no review thread is
+// unresolved, the review -done marker exists, the PR is mergeable and, when
+// GitHub requires an up-to-date branch, the base is an ancestor of the head;
+// BLOCKED with the closed-vocabulary reasons that hold it. Pending checks do
+// nothing. BLOCKED is sent as one lane event; READY is only recorded (its sent
+// key, the READY clock ready_too_long counts from, and a pr-notify decision
+// marked "record only"), because mergewake merges on its own gate and no lane
+// has anything to do with it. Each (PR, head, verdict) is handled once across
+// restarts. A READY is never repeated: there are no READY reminders. A merged
+// or closed PR is never notified here.
 //
 // The pr role notifies under shadow too — telling a lane is not merging — while
 // dry-run only prints the decision and writes no keys or events.
@@ -250,7 +252,7 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 var errNotifyDelivery = errors.New("notify delivery failed")
 
 // laneEvent resolves the owning lane and emits one deduped lane event for the
-// verdict: READY, BLOCKED or MERGED. The sent key covers the state, PR, head
+// verdict: BLOCKED is sent, READY and MERGED are only recorded (below). The sent key covers the state, PR, head
 // and summary so a changed reason set re-notifies while an identical verdict
 // stays quiet. A PR with no owning lane routes to the configured fallback
 // lane; a delivery the notifier fails is retried once on that lane, then
@@ -424,7 +426,8 @@ func (s *Service) recordOnlyEvent(ctx context.Context, r config.Repo, pr github.
 }
 
 // eventType is the panewire notification type a verdict is declared with, so
-// a READY or BLOCKED stays unread on the receiving lane until it is acked.
+// a BLOCKED stays unread on the receiving lane until it is acked. READY and
+// MERGED are recorded rather than sent, so their types are only named here.
 func eventType(state string) string {
 	switch state {
 	case "ready", "blocked", "merged":
@@ -433,8 +436,9 @@ func eventType(state string) string {
 	return ""
 }
 
-// readyClock is when a READY verdict was last sent, to which lane, and how
-// many reminders followed it.
+// readyClock is when a READY verdict was recorded, the worker lane it would
+// have gone to, and a reminder count that no longer advances: no READY
+// reminder is sent.
 type readyClock struct {
 	Lane    string    `json:"lane"`
 	First   time.Time `json:"first"`
@@ -467,7 +471,7 @@ func (s *Service) saveReadyClocks(repo string, clocks map[string]readyClock) err
 	return fsutil.WriteJSON(s.readyClocksFile(repo), clocks)
 }
 
-// startReadyClock records a first READY send for key.
+// startReadyClock records the first READY for key; nothing is sent.
 func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
 	clocks, e := s.loadReadyClocks(r.Name)
 	if e != nil {

@@ -73,7 +73,7 @@ sink:
 # needs --apply; land/watch still obey the repository policy.
 daemon:
   act: false
-  # notify defaults to enabled; READY/BLOCKED lane events fire even in shadow.
+  # notify defaults to enabled; BLOCKED lane events fire even in shadow; READY is recorded only.
   pr: {enabled: false, interval: 60s, notify: {enabled: true}}
   watch: {enabled: false, interval: 60s}
   release: {enabled: false, interval: 2m}

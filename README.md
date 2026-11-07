@@ -134,15 +134,13 @@ records a hand-started container; `status` reports its digest and health. See
 
 While the `pr` role is enabled, each poll recomputes the land decision for every
 open PR at its current head and tells the owning lane once that head becomes
-mergeable or blocked — workers do not need to watch CI. Notification is
+blocked, and records when it becomes mergeable — workers do not need to watch CI. Notification is
 observation, not merging, so it also runs while the daemon is in shadow mode;
 `--dry-run` only prints the decision.
 
 ```text
-[mergewake] READY example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
 [mergewake] BLOCKED example/project#7 head=a1b2c3d | check_failed:vet; check_failed:test | lane=worker-lane via task 2252
 [mergewake] BLOCKED example/project#7 head=a1b2c3d | threads_open:1; base_stale | lane=operator-desk via config
-[mergewake] MERGED example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
 ```
 
 READY means the merge gate passed: every `required_checks` entry green on the
@@ -186,7 +184,7 @@ failure threshold. See [review recovery](docs/config.md#review-recovery).
 Auto-merge is opt-in per repository with `enabled: true` in
 `.mergewake/policy.yaml` (default off). While the daemon acts
 (`daemon.act` + `--apply`), a READY verdict merges exactly like the repo
-session — squash, pinned to the gated head — and emits MERGED. A head that
+session — squash, pinned to the gated head — and records MERGED (no lane event). A head that
 moves between gate and merge is re-gated, never merged blind.
 
 The lane is resolved, never guessed, in this order — the choosing rule is
