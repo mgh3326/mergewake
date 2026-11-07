@@ -44,12 +44,48 @@ type CommandTarget struct {
 	Kind   string `json:"kind"`
 	Digest string `json:"digest,omitempty"`
 }
+
+// CheckEvidence is one deploy check's state on a release commit and where it
+// ran. URL is the check run or commit status the state was read from.
+type CheckEvidence struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+	URL   string `json:"url,omitempty"`
+}
+
+// DeployEvidence records the deploy-stage observation a release was published
+// on, so a release states why it is deployable instead of only that CI passed.
+type DeployEvidence struct {
+	SHA            string          `json:"sha"`
+	PolicyRevision string          `json:"policy_revision"`
+	Checks         []CheckEvidence `json:"checks"`
+}
+
+// Validate binds the evidence to the commit it was read for and refuses an
+// observation that names no check or repeats one.
+func (d DeployEvidence) Validate(commit string) error {
+	if d.SHA != commit || !SHA.MatchString(d.PolicyRevision) || len(d.Checks) == 0 {
+		return errors.New("invalid deploy evidence identity")
+	}
+	seen := map[string]bool{}
+	for _, c := range d.Checks {
+		if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.State) == "" || seen[c.Name] {
+			return errors.New("invalid deploy evidence check")
+		}
+		seen[c.Name] = true
+	}
+	return nil
+}
+
 type Manifest struct {
 	Version  int             `json:"version"`
 	Repo     string          `json:"repo"`
 	Commit   string          `json:"commit"`
 	Files    []File          `json:"files"`
 	Commands []CommandTarget `json:"commands,omitempty"`
+	// Deploy is the deploy-ok evidence Release published the manifest on. It
+	// is absent for a repository with no deploy stage.
+	Deploy *DeployEvidence `json:"deploy,omitempty"`
 }
 
 func SafePath(p string) bool {
@@ -59,6 +95,11 @@ func Sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:
 func (m Manifest) Validate() error {
 	if (m.Version != 1 && m.Version != 2) || !SHA.MatchString(m.Commit) || !config.ValidRepo(m.Repo) || len(m.Files)+len(m.Commands) == 0 {
 		return errors.New("invalid manifest identity or empty file list")
+	}
+	if m.Deploy != nil {
+		if e := m.Deploy.Validate(m.Commit); e != nil {
+			return e
+		}
 	}
 	if len(m.Commands) > 0 {
 		if m.Version != 2 || len(m.Files) > 0 {
