@@ -789,9 +789,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				res.skips[len(res.skips)-1].withCause(e)
 				return res, errors.Join(fmt.Errorf("panewire reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
 			}
-			// The job was spawned and may still run: the record stays and the
-			// next run resumes it rather than spawning another reviewer.
-			if resumed || code == panewireWaitTimeout {
+			// Only a wait that ended on its own deadline leaves the job
+			// pending: it may still run, so the record stays and the next run
+			// resumes it rather than spawning another reviewer. Every other
+			// exit failed the pass, a resumed pass included: the job it
+			// re-attached to produced no result.
+			if code == panewireWaitTimeout {
 				accepted()
 				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
