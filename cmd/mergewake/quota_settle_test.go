@@ -98,14 +98,21 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 	sink := &quotaSink{rec: integrations.JobRecord{State: "running", Host: "node-a", PaneID: "p1"}}
 	f.s.Runner, f.s.Sink = runner, sink
 
-	now := time.Date(2026, 11, 7, 8, 0, 0, 0, time.UTC)
+	// The fixture clock starts now: a revisit deadline this test pins in the
+	// past is already overdue when the queue arms its real timer, and the PR
+	// is then queued again at once, forever.
+	now := time.Now().UTC().Truncate(time.Second)
 	f.s.Now = func() time.Time { return now }
 	logs := &syncBuffer{}
 	skips := &prSkips{Dirty: &daemon.Dirty{}, Log: slog.New(slog.NewJSONHandler(logs, nil))}
+	// A regression that leaves an evaluation running must fail this test with
+	// the pass that hung, not at the package timeout ten minutes later.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	// The first evaluation places a reviewer; its pass ends pending and is not
 	// settled, so nothing is cached.
-	if skipped, evaluated := runSkippedPass(t, f, skips, logs); evaluated != 1 || skipped != 0 {
+	if skipped, evaluated := runSkippedPassWithin(t, ctx, "first pass", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("first pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
 	if runner.count() != 1 {
@@ -118,7 +125,7 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 	reset := now.Add(10 * time.Minute)
 	f.hub.refs["mergewake/reviews/1/"+hubHead(1)+"-done"] = hubHead(1)
 	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset.Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
-	if skipped, evaluated := runSkippedPass(t, f, skips, logs); evaluated != 1 || skipped != 0 {
+	if skipped, evaluated := runSkippedPassWithin(t, ctx, "quota pass", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("quota pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
 	if _, ok := cachedEvaluation(skips, f.repo.Name, 1); ok {
@@ -127,7 +134,7 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 
 	// Inside the wait the PR is still evaluated: it must not be skipped as
 	// unchanged until the retry runs.
-	if skipped, evaluated := runSkippedPass(t, f, skips, logs); evaluated != 1 || skipped != 0 {
+	if skipped, evaluated := runSkippedPassWithin(t, ctx, "quota wait pass", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("quota wait pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
 	if _, ok := cachedEvaluation(skips, f.repo.Name, 1); ok {
@@ -136,7 +143,7 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 
 	// At the reset the retry runs and places a fresh reviewer.
 	now = reset.Add(time.Second)
-	if skipped, evaluated := runSkippedPass(t, f, skips, logs); evaluated != 1 || skipped != 0 {
+	if skipped, evaluated := runSkippedPassWithin(t, ctx, "after the reset", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("after the reset: skipped=%d evaluated=%d", skipped, evaluated)
 	}
 	if runner.count() != 2 {
