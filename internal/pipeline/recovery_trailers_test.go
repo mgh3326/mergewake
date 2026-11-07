@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
 )
@@ -62,6 +63,12 @@ func TestWatchPassesRecoveryTrailers(t *testing.T) {
 	g.pull.MergedAt = &merged
 	g.pull.MergeCommitSHA = shaB
 	g.pull.Body = "Mergewake-Task: 42\nMergewake-Grade: B\nMergewake-Tier: T1"
+	if err := s.saveRecovery(r.Name, recoveryIncident{
+		RedSince: time.Now(), Culprit: shaB, CulpritPR: 7, Head: shaC, Baseline: shaA, Task: "42",
+		Runs: map[string][]bool{shaA: {true, true}, shaB: {false, false}}, Confirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Watch(context.Background(), r, Options{}); err != nil {
 		t.Fatal(err)
 	}

@@ -47,6 +47,10 @@ var reviewPriorityTimeout = 5 * time.Second
 // none. It reads each at most once and never fails: a sink without priorities
 // or any failed read gives the PR no priority, which keeps today's order.
 func (s *Service) ReviewPriority(ctx context.Context, r config.Repo, pr github.Pull) ReviewPriority {
+	// A PR watch named as the fix for a red main is reviewed first.
+	if s.urgentFix(r.Name, pr.Number) {
+		return ReviewPriority{Value: 1, Source: "recovery-fix"}
+	}
 	reader, ok := s.Sink.(priorityReader)
 	if !ok {
 		return ReviewPriority{Source: "none"}

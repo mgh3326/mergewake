@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 )
 
 const RecoveryBranch = "mergewake/recovery"
@@ -199,6 +200,44 @@ func (c *Client) RecoveryRevert(ctx context.Context, repo string) (*Pull, error)
 		return &full, e
 	}
 	return nil, nil
+}
+
+// LatestStatus returns the newest commit status named name on sha: its state,
+// when it was updated, and whether one exists. It reads the statuses API, not
+// check runs, so a re-run an any-ref workflow posts is distinguishable from the
+// original run of the same name.
+func (c *Client) LatestStatus(ctx context.Context, repo, sha, name string) (CI, time.Time, bool, error) {
+	statuses, e := list[status](ctx, c, base(repo)+"/commits/"+sha+"/statuses")
+	if e != nil {
+		return Pending, time.Time{}, false, e
+	}
+	var state CI
+	var at time.Time
+	found := false
+	for _, s := range statuses {
+		if s.Context != name {
+			continue
+		}
+		if !found || s.UpdatedAt.After(at) {
+			state, at, found = statusState(s.State), s.UpdatedAt, true
+		}
+	}
+	return state, at, found, nil
+}
+
+func statusState(state string) CI {
+	switch state {
+	case "success":
+		return Green
+	case "failure", "error":
+		return Red
+	}
+	return Pending
+}
+
+// ClosePull closes an open pull request without merging it.
+func (c *Client) ClosePull(ctx context.Context, repo string, n int) error {
+	return c.json(ctx, "PATCH", fmt.Sprintf("%s/pulls/%d", base(repo), n), map[string]string{"state": "closed"}, nil)
 }
 
 // ClearRecovery deletes the recovery tag and branch. A ref that is already gone
