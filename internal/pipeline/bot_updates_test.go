@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
@@ -71,9 +70,6 @@ func notices(n *fakeNotifier) (out []string) {
 // to the head, with no review, and says so in the land record.
 func TestBotUpdateLandsPatchBoundToHead(t *testing.T) {
 	s, g, n, out, land := botSetup(t, "")
-	// MERGED goes to the PR author's worker lane: bind the PR's task to a job.
-	g.pull.Body += "\nMergewake-Task: 42\n"
-	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
 	if e := land(context.Background(), Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -84,8 +80,8 @@ func TestBotUpdateLandsPatchBoundToHead(t *testing.T) {
 	if !strings.Contains(out.String(), `"command":"land"`) || !strings.Contains(out.String(), `"reason":"bot-patch"`) {
 		t.Fatalf("land record: %s", out)
 	}
-	if len(n.events) != 1 || !strings.Contains(n.events[0].Text, "MERGED") {
-		t.Fatalf("want one MERGED event: %+v", n.events)
+	if len(n.events) != 0 || !sentKeyHas(t, s, testRepoFor(s), verdictKey("merged", 7, g.pull.Head.SHA)) {
+		t.Fatalf("MERGED is recorded, not sent: %+v", n.events)
 	}
 }
 

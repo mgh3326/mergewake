@@ -69,7 +69,7 @@ func TestBaseBehindCleanPRIsReadyAndLands(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(g.updateHeads) != 0 || n.count != 1 {
+	if len(g.updateHeads) != 0 || n.count != 0 {
 		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
 	}
 	if got := baseBehindFlag(t, out, "pr-notify", false); got != true {
@@ -117,7 +117,7 @@ func TestBaseBehindDefaultPolicyLandsBehindHead(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(g.updateHeads) != 0 || n.count != 1 {
+	if len(g.updateHeads) != 0 || n.count != 0 {
 		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
 	}
 	if got := baseBehindFlag(t, out, "pr-notify", false); got != true {

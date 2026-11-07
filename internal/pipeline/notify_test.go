@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -34,51 +33,46 @@ func lastEvent(t *testing.T, n *fakeNotifier) string {
 	return n.events[len(n.events)-1].Text
 }
 
-// A checked-green, reviewed and mergeable head emits READY once to the author
-// worker lane; a repeat poll at the same head stays quiet, including across a
-// service restart.
+// A checked-green, reviewed and mergeable head records READY once and sends
+// nothing; a repeat poll at the same head logs nothing more, including across
+// a service restart, and a new head is a new record.
 func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 	s, g, n, r := workerNotifySetup(t)
-	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if n.count != 1 {
-		t.Fatalf("events=%d", n.count)
-	}
-	text := lastEvent(t, n)
-	if !strings.HasPrefix(text, "[mergewake] READY example/project#7 head=aaaaaaa | Add feature") {
-		t.Fatal(text)
-	}
-	if !strings.Contains(text, "lane=worker-lane via task 42 job w-7") {
-		t.Fatal(text)
-	}
-	if n.events[0].ID != "mergewake-ready-example/project-7-"+shaA || n.events[0].Lane != "worker-lane" {
-		t.Fatalf("%+v", n.events[0])
+	rows := func() int {
+		b, e := os.ReadFile(filepath.Join(s.state(r.Name), "decisions.jsonl"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		return len(auditRecords(t, b, "pr-notify"))
 	}
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 1 {
-		t.Fatal("repeat poll re-notified")
+	if n.count != 0 || rows() != 1 || !sentKeyHas(t, s, r, verdictKey("ready", 7, shaA)) {
+		t.Fatalf("events=%+v rows=%d", n.events, rows())
+	}
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if rows() != 1 {
+		t.Fatal("repeat poll recorded again")
 	}
 	// A restart keeps sent keys: a fresh service on the same state dir is quiet.
 	s2 := *s
-	n2 := &fakeNotifier{}
-	s2.Notifier = n2
 	if e := s2.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n2.count != 0 {
-		t.Fatal("restart re-notified")
+	if rows() != 1 {
+		t.Fatal("restart recorded again")
 	}
-	// A new head resets: the next head notifies again.
+	// A new head resets: the next head is recorded again.
 	g.pull.Head.SHA = shaC
 	markReviewed(g)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 2 || !strings.Contains(lastEvent(t, n), "head=ccccccc") {
-		t.Fatalf("new head not notified: %d", n.count)
+	if n.count != 0 || rows() != 2 || !sentKeyHas(t, s, r, verdictKey("ready", 7, shaC)) {
+		t.Fatalf("new head not recorded: %d rows", rows())
 	}
 }
 
@@ -86,6 +80,7 @@ func TestNotifyReadyOncePerHeadAndRestart(t *testing.T) {
 // prefix are distinct events, matching the dedupe key's granularity.
 func TestNotifyEventIDUsesFullHead(t *testing.T) {
 	s, g, n, r := workerNotifySetup(t)
+	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -93,13 +88,14 @@ func TestNotifyEventIDUsesFullHead(t *testing.T) {
 	// under a distinct event ID rather than colliding with the first.
 	g.pull.Head.SHA = shaA[:7] + strings.Repeat("d", 33)
 	markReviewed(g)
+	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
 	if n.count != 2 {
 		t.Fatalf("prefix-colliding head not notified: %d", n.count)
 	}
-	if n.events[0].ID == n.events[1].ID || !strings.HasSuffix(n.events[1].ID, shaA[:7]+strings.Repeat("d", 33)) {
+	if n.events[0].ID == n.events[1].ID || !strings.Contains(n.events[1].ID, shaA[:7]+strings.Repeat("d", 33)) {
 		t.Fatalf("%+v", n.events)
 	}
 }
@@ -244,14 +240,14 @@ func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 2 || !strings.Contains(lastEvent(t, n), "READY") {
-		t.Fatal("recovery did not notify")
+	if n.count != 1 || !sentKeyHas(t, s, r, verdictKey("ready", 7, shaA)) {
+		t.Fatal("recovery did not record READY")
 	}
 	g.findings = 1
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 2 {
+	if n.count != 1 {
 		t.Fatal("repeated blocked state re-notified")
 	}
 	// A different BLOCKED reason set at the same head is a new verdict and a
@@ -260,7 +256,7 @@ func TestNotifyStateChangesGuardsAndDryRun(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 3 || n.events[2].ID == n.events[0].ID {
+	if n.count != 2 || n.events[1].ID == n.events[0].ID {
 		t.Fatalf("changed blocked verdict not re-notified: %+v", n.events)
 	}
 
@@ -412,81 +408,6 @@ func TestNotifyLaneRepoLane(t *testing.T) {
 				t.Fatalf("%+v", n.events)
 			}
 		})
-	}
-}
-
-// A READY PR that stays open and READY on the same head is notified again to
-// its author worker lane after daemon.pr.notify.renotify_after and stops after
-// renotify_max repeats; every READY to a worker lane is declared --type info
-// (mergewake owns the merge). A merged PR gets no reminder.
-func TestNotifyReadyRenotifiesUntilMergedOrBound(t *testing.T) {
-	s, g, n, r := workerNotifySetup(t)
-	now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	s.Now = func() time.Time { return now }
-	poll := func(d time.Duration) {
-		t.Helper()
-		now = now.Add(d)
-		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	poll(0)
-	if n.count != 1 || n.events[0].Type != "info" {
-		t.Fatalf("first READY: %+v", n.events)
-	}
-	poll(29 * time.Minute)
-	if n.count != 1 {
-		t.Fatal("re-notified inside the interval")
-	}
-	poll(time.Minute)
-	if n.count != 2 {
-		t.Fatalf("no reminder after 30m: %d events", n.count)
-	}
-	e := n.events[1]
-	if e.Type != "info" || e.ID != "mergewake-ready-example/project-7-"+shaA+"-reminder-1" || !strings.Contains(e.Text, "[mergewake] READY example/project#7") || !strings.Contains(e.Text, "reminder 1/3, unmerged for 30m0s") {
-		t.Fatalf("reminder %+v", e)
-	}
-	for i := 0; i < 5; i++ {
-		poll(30 * time.Minute)
-	}
-	if n.count != 4 {
-		t.Fatalf("reminders not bounded at 3: %d events", n.count)
-	}
-
-	// A merged PR gets none, however long it has been.
-	s2, g2, n2, r2 := workerNotifySetup(t)
-	s2.Now = func() time.Time { return now }
-	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil || n2.count != 1 {
-		t.Fatal(e, n2.count)
-	}
-	g2.pull.State = "closed"
-	now = now.Add(2 * time.Hour)
-	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil || n2.count != 1 {
-		t.Fatalf("merged PR re-notified: %v %d", e, n2.count)
-	}
-	_ = g
-}
-
-// renotify_after: off keeps one READY per head; renotify_max bounds repeats.
-func TestNotifyReadyRenotifyConfig(t *testing.T) {
-	for _, tt := range []struct {
-		after string
-		max   int
-		want  int
-	}{{"off", 0, 1}, {"10m", 1, 2}, {"", 0, 4}} {
-		s, _, n, r := workerNotifySetup(t)
-		s.Config.Daemon.PR.Notify.RenotifyAfter, s.Config.Daemon.PR.Notify.RenotifyMax = tt.after, tt.max
-		now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-		s.Now = func() time.Time { return now }
-		for i := 0; i < 8; i++ {
-			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
-				t.Fatal(e)
-			}
-			now = now.Add(time.Hour)
-		}
-		if n.count != tt.want {
-			t.Fatalf("%+v: %d events", tt, n.count)
-		}
 	}
 }
 

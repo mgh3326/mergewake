@@ -719,9 +719,9 @@ func TestLandSameFamilyReviewLands(t *testing.T) {
 	}
 }
 
-// A merged PR emits one MERGED event to its author worker lane, deduped like
-// the other verdict events.
-func TestLandMergedEventOnce(t *testing.T) {
+// A merged PR records one MERGED verdict and sends nothing, deduped like the
+// other verdict events.
+func TestLandMergedRecordedOnce(t *testing.T) {
 	s, g, _, n, r := setup(t)
 	g.enabled = true
 	markReviewed(g)
@@ -732,45 +732,16 @@ func TestLandMergedEventOnce(t *testing.T) {
 	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if g.mergeCount != 1 || n.count != 1 {
-		t.Fatalf("merges=%d events=%d", g.mergeCount, n.count)
-	}
-	text := n.events[0].Text
-	if !strings.HasPrefix(text, "[mergewake] MERGED example/project#7 head=aaaaaaa | Add feature") ||
-		!strings.Contains(text, "lane=worker-lane via task 42 job w-7") || n.events[0].Lane != "worker-lane" {
-		t.Fatalf("%+v", n.events[0])
+	if g.mergeCount != 1 || n.count != 0 || !sentKeyHas(t, s, r, verdictKey("merged", 7, shaA)) {
+		t.Fatalf("merges=%d events=%+v", g.mergeCount, n.events)
 	}
 	// A merged PR is closed on the next poll: nothing further happens.
 	g.pull.State = "closed"
 	if e := s.Land(context.Background(), r, 7, Options{}); e == nil {
 		t.Fatal("closed PR landed again")
 	}
-	if n.count != 1 {
-		t.Fatal("merged event re-emitted")
-	}
-}
-
-// A failed MERGED emit never strands the observation of an already-merged PR:
-// the error is audited and the outcome ledger still records the merge.
-func TestLandMergedNotifyFailureObserved(t *testing.T) {
-	s, g, _, n, r := setup(t)
-	g.enabled = true
-	markReviewed(g)
-	g.pull.Body = "Mergewake-Task: 42\n"
-	s.Sink = &jobSink{jobs: map[string]string{"42": "w-7"}, recs: map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}}}
-	n.err = errors.New("notifier offline")
-	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if g.mergeCount != 1 {
-		t.Fatal("merge did not run")
-	}
-	state, e := s.ledger().Read()
-	if e != nil {
-		t.Fatal(e)
-	}
-	if v := state.Latest["https://github.com/"+r.Name+"/pull/7"]; v.Action != "merge" {
-		t.Fatalf("action=%s", v.Action)
+	if n.count != 0 {
+		t.Fatal("merged event sent")
 	}
 }
 

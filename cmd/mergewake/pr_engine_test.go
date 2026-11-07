@@ -9,7 +9,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
-	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 )
 
@@ -44,45 +43,42 @@ func TestEventQueueEngineEvaluatesAnEventPRWhileAnotherReviewIsBlocked(t *testin
 }
 
 // (d) Two PRs of one repo that reach their land decision at once are settled
-// one after the other: the fake notifier, called inside each settle, never
-// sees two at a time.
+// one after the other: the merge request, made inside each settle, never has
+// a second one in flight beside it.
 func TestEventQueueLandsOfOneRepoRunOneAfterTheOther(t *testing.T) {
 	e, f := engineFixture(t, 2)
-	// A worker binding, so each READY settles through the notifier.
-	f.s.Sink = workerSink{}
 	close(f.runner.release)
-	g := &settleGauge{trace: f.trace}
-	f.s.Notifier = g
+	g := &settleGauge{}
+	f.hub.mergeProbe = g.probe
 	e.q.Enqueue(daemon.SourceWebhook, daemon.PRKey{Repo: f.repo.Name, PR: 1}, daemon.PRKey{Repo: f.repo.Name, PR: 2})
 	e.q.Wait()
 	if g.entered != 2 {
-		t.Fatalf("%d settles reached the notifier, want both PRs: %v", g.entered, f.trace.snapshot())
+		t.Fatalf("%d settles reached the merge, want both PRs: %v", g.entered, f.trace.snapshot())
 	}
 	if g.peak != 1 {
 		t.Fatalf("%d settles ran at once, want one after the other", g.peak)
 	}
 }
 
-// settleGauge is a notifier that takes a while, to give a second settle the
-// time to overlap the first if nothing serializes them.
+// settleGauge counts merge requests in flight; each takes a while, to give a
+// second settle the time to overlap the first if nothing serializes them.
 type settleGauge struct {
-	trace              *eventLog
 	mu                 sync.Mutex
 	now, peak, entered int
 }
 
-func (g *settleGauge) Notify(_ context.Context, ev integrations.Event) error {
+func (g *settleGauge) probe() func() {
 	g.mu.Lock()
 	g.now++
 	g.entered++
 	g.peak = max(g.peak, g.now)
 	g.mu.Unlock()
 	time.Sleep(150 * time.Millisecond)
-	g.trace.add("notify")
-	g.mu.Lock()
-	g.now--
-	g.mu.Unlock()
-	return nil
+	return func() {
+		g.mu.Lock()
+		g.now--
+		g.mu.Unlock()
+	}
 }
 
 // (g) The sweep puts the open PRs on the queue and returns: it does not wait

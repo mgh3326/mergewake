@@ -177,7 +177,7 @@ func (a *asyncEngine) finish(label string) {
 }
 
 func (a *asyncEngine) notified(n int) bool {
-	return slices.Contains(a.f.trace.snapshot(), "notify "+strconv.Itoa(n))
+	return slices.Contains(a.f.trace.snapshot(), "merge "+strconv.Itoa(n))
 }
 
 // (a), (b) A queue item that starts a reviewer ends while it runs; the

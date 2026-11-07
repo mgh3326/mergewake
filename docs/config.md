@@ -1330,7 +1330,7 @@ For `example/project`, state resides beneath
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
-| `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
+| `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
 | `discord-baseline` | When the feed first ran for this repo. Older PRs do not post. |
@@ -1550,17 +1550,18 @@ inside the grace described under `check_absent` below. A READY verdict under act
 `enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
 verdict)` emits once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
-head re-arms notification, and a restart does not resend. READY, BLOCKED, and MERGED are
-declared with `panewire emit --type ready|blocked|merged`, so they stay unread on the
+head re-arms notification, and a restart does not resend. BLOCKED is
+declared with `panewire emit --type blocked`, so it stays unread on the
 receiving lane until it runs `panewire inbox ack` (panewire
 `docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
-event untyped). A READY PR that stays open and READY on the same head is not
-deduped forever: it is notified again `renotify_after` (default `30m`, `off`
-disables) after the last send, at most `renotify_max` times (default 3), with
-`reminder <k>/<max>, unmerged for <d>` after `via` and event id
-`…-reminder-<k>`. The clock is `<state_dir>/<repo>/pr-ready-renotify.json`; a
-READY sent before it existed starts its clock on the next poll. A merged or
-closed PR gets no reminder. The event
+event untyped). READY and MERGED are recorded, never sent: nobody acts on either,
+because mergewake merges on its own gate. Each writes its `pr-notify-sent` key and
+one `pr-notify` decision row with `"suppressed":"record only"`, the head's
+summary, and the author worker lane (job bound to the task, else the author
+pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
+clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
+counts `ready_too_long` from. No READY reminder is sent; `renotify_after` and
+`renotify_max` are accepted and have no effect. The BLOCKED event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
 (`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
@@ -1596,9 +1597,8 @@ the push time alone would.
 
 A mixed reason set is sent when any reason is author or human, and its text
 lists only those reasons. A set made only of internal waits sends nothing.
-`READY` and `MERGED` routing, types and the READY reminders are unchanged, so the
-design session otherwise hears `READY`, `MERGED`, and the BLOCKED reasons that
-need its decision.
+`READY` and `MERGED` are recorded, not sent, so the design session hears only the
+BLOCKED reasons that need its decision.
 
 A head that keeps `review_missing` for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
