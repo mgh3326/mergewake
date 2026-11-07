@@ -140,8 +140,10 @@ type Repo struct {
 	Smoke         Command   `yaml:"smoke"`
 	SmokeTimeout  string    `yaml:"smoke_timeout"`
 	Task          string    `yaml:"task"`
-	// Lane receives this repo's PR events when neither the task trailer nor a
-	// Mergewake-Notify-Lane trailer names one; empty uses notifier.fallback_lane.
+	// Lane is the repo's design-session (owner) lane: it receives this repo's
+	// PR events when neither trailer names one, and its human-judgment notices
+	// and holds; empty falls back to the desk (notifier.fallback_lane, else
+	// notifier.lane).
 	Lane string `yaml:"lane"`
 	// HKTaskEvents sends PR, review, merge and revert events to hk's
 	// POST /v1/task-events. Absent means on; false keeps a repo whose hk

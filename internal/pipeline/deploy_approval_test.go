@@ -189,10 +189,10 @@ type approvalLockGH struct {
 	entered, proceed chan struct{}
 }
 
-func (g approvalLockGH) Latest(context.Context, string) (manifest.Manifest, error) {
+func (g approvalLockGH) Manifests(context.Context, string) ([]manifest.Manifest, error) {
 	close(g.entered)
 	<-g.proceed
-	return g.m, nil
+	return []manifest.Manifest{g.m}, nil
 }
 func TestRolloutSerializesApprovalRange(t *testing.T) {
 	s, g, _, _, r := setup(t)

@@ -277,10 +277,23 @@ func (r *repoState) evictPR() {
 	delete(r.Reviews, oldest)
 }
 
+func (h *Head) initMaps() {
+	if h.Runs == nil {
+		h.Runs = map[string]Run{}
+	}
+	if h.Statuses == nil {
+		h.Statuses = map[string]Status{}
+	}
+	if h.Suites == nil {
+		h.Suites = map[int64]Suite{}
+	}
+}
+
 func (r *repoState) head(sha string, now time.Time) *Head {
 	h := r.Heads[sha]
 	if h == nil {
-		h = &Head{Runs: map[string]Run{}, Statuses: map[string]Status{}, Suites: map[int64]Suite{}}
+		h = &Head{}
+		h.initMaps()
 		r.Heads[sha] = h
 	}
 	h.Touched = now
@@ -338,6 +351,9 @@ func (s Status) newerThan(o Status) bool {
 }
 
 func (h *Head) putRun(run Run, api bool) bool {
+	if h.Runs == nil {
+		h.Runs = map[string]Run{}
+	}
 	key := fmt.Sprintf("%d/%s", run.SuiteID, run.Name)
 	old, ok := h.Runs[key]
 	if ok && (old.newerThan(run) || (!api && !run.newerThan(old))) {
@@ -351,6 +367,9 @@ func (h *Head) putRun(run Run, api bool) bool {
 }
 
 func (h *Head) putStatus(st Status, api bool) bool {
+	if h.Statuses == nil {
+		h.Statuses = map[string]Status{}
+	}
 	old, ok := h.Statuses[st.Context]
 	if ok && (old.newerThan(st) || (!api && !st.newerThan(old))) {
 		return false
@@ -360,6 +379,9 @@ func (h *Head) putStatus(st Status, api bool) bool {
 }
 
 func (h *Head) putSuite(su Suite) bool {
+	if h.Suites == nil {
+		h.Suites = map[int64]Suite{}
+	}
 	if old, ok := h.Suites[su.ID]; ok && !su.UpdatedAt.After(old.UpdatedAt) {
 		return false
 	}

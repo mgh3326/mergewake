@@ -560,6 +560,20 @@ func authorAction(summary string) bool {
 	return false
 }
 
+// ownerLane is the repo's design-session (owner) lane: this repo's
+// human-judgment notices and holds go here. An empty repo lane falls back to
+// the desk (notifier.fallback_lane, else notifier.lane).
+func (s *Service) ownerLane(r config.Repo) string {
+	if laneName.MatchString(r.Lane) {
+		return r.Lane
+	}
+	desk := s.Config.Notifier.FallbackLane
+	if desk == "" {
+		desk = s.Config.Notifier.Lane
+	}
+	return desk
+}
+
 // isDeskLane reports whether lane is the desk lane (notifier.fallback_lane, else
 // notifier.lane). An empty lane goes to the notifier's own default, the desk.
 func (s *Service) isDeskLane(lane string) bool {

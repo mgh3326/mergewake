@@ -57,7 +57,14 @@ configuration: operator bootstrap is required. Runtime hashes env files locally 
 For long path lists, the complete evidence is written to a content-addressed hk
 document referenced by the question, preserving hk's notification size limit.
 
-For repositories with different PR and main check names, release/rollout use
-`watch_checks` when present, otherwise `required_checks`. This preserves full
-main/exact-release CI requirements for applications whose PR gate is selective.
-Approval never overrides a failing release CI check.
+For repositories with a deploy stage, release and rollout read the policy's
+`deploy_checks` (for example `deploy-ok`, posted after the main stage is green on
+the same commit); a repository without one uses its main set, `main_checks`
+(`watch_checks` is its legacy alias), else `required_checks`. `ci-ok` alone does
+not release a deploy-stage repository, and the manifest records the deploy
+observation it was published on. Approval never overrides a failing release CI
+check.
+
+Rollout also skips a release on a commit listed in `state/<repo>/rollout-deny`,
+and every commit after a listed culprit while the branch head is not green, so an
+intermediate commit between a culprit and a red head is never installed.

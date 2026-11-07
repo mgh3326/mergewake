@@ -63,8 +63,8 @@ type pendingFinding struct {
 // findingsRoute is where a PR's findings go: the author lane and the owning
 // lane escalations and out-of-scope findings go to.
 type findingsRoute struct {
-	lane, via   string
-	owner, oVia string
+	lane, via string
+	owner     string
 }
 
 // DeliverFindings sends the PR's undelivered review findings to its author
@@ -252,13 +252,14 @@ func (s *Service) boundJobLane(ctx context.Context, task string) (lane, via stri
 // findingsRoute uses the same task/job binding as reap, without caching an
 // open PR's binding. A worker or lead keeps its author lane after completion.
 // With no job binding the PR's author pane (see authorPane) is next. Missing
-// ownership routes to the desk; a read error retries without guessing.
+// ownership routes to the repo's owner lane, the desk when it names none; a
+// read error retries without guessing.
 func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pull) (findingsRoute, error) {
 	desk := s.Config.Notifier.FallbackLane
 	if desk == "" {
 		desk = s.Config.Notifier.Lane
 	}
-	rt := findingsRoute{owner: desk, oVia: "desk"}
+	rt := findingsRoute{owner: s.ownerLane(r)}
 	// Open PR bindings may change, so share the reap binding interface without
 	// its merged-PR cache.
 	task, e := s.prTask(ctx, r, pr)
@@ -450,12 +451,9 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			d.AckedAt, d.AckBy, changed = now, "disposition", true
 			continue
 		}
-		desk := s.Config.Notifier.FallbackLane
-		if desk == "" {
-			desk = s.Config.Notifier.Lane
-		}
-		if d.Owner != desk {
-			d.Owner = desk
+		owner := s.ownerLane(r)
+		if d.Owner != owner {
+			d.Owner = owner
 			changed = true
 		}
 		if len(d.Heads) == 0 {

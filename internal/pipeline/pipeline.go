@@ -31,6 +31,7 @@ type GitHub interface {
 	RecoveryActive(context.Context, string) (bool, error)
 	Check(context.Context, string, string, []string) (github.CI, error)
 	CheckStates(context.Context, string, string, []string) (map[string]github.CI, error)
+	CheckEvidence(context.Context, string, string, []string) ([]github.CheckEvidence, error)
 	Reviewed(context.Context, string, int, string, string) (bool, error)
 	ReviewPasses(context.Context, string, int, string, string) ([]github.PassReceipt, error)
 	ReviewHistory(context.Context, string, int, string) ([]github.ReviewedPass, error)
@@ -49,7 +50,7 @@ type GitHub interface {
 	ReadFile(context.Context, string, string, string) ([]byte, error)
 	Revert(context.Context, string, string, string, string, int) (string, error)
 	Publish(context.Context, manifest.Manifest) error
-	Latest(context.Context, string) (manifest.Manifest, error)
+	Manifests(context.Context, string) ([]manifest.Manifest, error)
 }
 type Service struct {
 	Config   config.Config
@@ -317,20 +318,31 @@ func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Opti
 	if e != nil {
 		return e
 	}
-	checks := p.RequiredChecks
-	if len(p.WatchChecks) > 0 {
-		checks = p.WatchChecks
-	}
-	ci, e := s.GH.Check(ctx, r.Name, sha, checks)
+	evidence, e := s.GH.CheckEvidence(ctx, r.Name, sha, p.DeploySet())
 	if e != nil {
 		return e
 	}
-	if ci != github.Green {
-		return errors.New("release requires green CI at the manifest commit")
+	for _, c := range evidence {
+		if c.State != github.Green {
+			return fmt.Errorf("release requires green %s checks at the manifest commit", checkStage(p))
+		}
 	}
 	m, e := manifest.Build(r.Name, sha, r.Install, func(name string) ([]byte, error) { return s.GH.ReadFile(ctx, r.Name, sha, name) })
 	if e != nil {
 		return e
+	}
+	// A deploy stage states what it observed: the commit and policy revision it
+	// promised on, and where each check's green came from. A repository with no
+	// deploy stage publishes the same manifest as before.
+	if p.DeployStage() {
+		revision, e := s.policyRevision(ctx, r, sha)
+		if e != nil {
+			return e
+		}
+		m.Deploy = &manifest.DeployEvidence{SHA: sha, PolicyRevision: revision, Checks: deploymentChecks(evidence)}
+		if e = m.Validate(); e != nil {
+			return e
+		}
 	}
 	if e = s.Print(m); e != nil {
 		return e
@@ -422,63 +434,22 @@ func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
 	if !containerOnly && (r.Root == "" || r.Smoke.Command == "") {
 		return errors.New("rollout requires root and a smoke command")
 	}
-	var m manifest.Manifest
 	var e error
 	binaryOnly := len(r.Install) > 0
 	for _, spec := range r.Install {
 		binaryOnly = binaryOnly && spec.Kind == "release"
 	}
-	if binaryOnly {
-		source, ok := s.GH.(interface {
-			BinaryHead(context.Context, string) (string, error)
-		})
-		if !ok {
-			return errors.New("GitHub adapter lacks binary releases")
-		}
-		sha, err := source.BinaryHead(ctx, r.Name)
-		if err != nil {
-			return err
-		}
-		m, e = manifest.Build(r.Name, sha, r.Install, nil)
-	} else if containerOnly && r.FollowRelease {
-		m, e = s.containerRelease(ctx, r)
-	} else {
-		m, e = s.GH.Latest(ctx, r.Name)
-	}
+	candidates, e := s.rolloutCandidates(ctx, r, binaryOnly, containerOnly)
 	if e != nil {
-		return e
-	}
-	if m.Repo != r.Name {
-		return errors.New("manifest repo mismatch")
-	}
-	if e = m.Validate(); e != nil {
 		return e
 	}
 	head, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
 	}
-	ok, e := s.GH.Ancestor(ctx, r.Name, m.Commit, head)
+	m, e := s.admitCandidate(ctx, r, head, candidates)
 	if e != nil {
 		return e
-	}
-	if !ok {
-		return errors.New("manifest commit is no longer on main")
-	}
-	p, e := s.Policy(ctx, r, m.Commit)
-	if e != nil {
-		return e
-	}
-	checks := p.RequiredChecks
-	if len(p.WatchChecks) > 0 {
-		checks = p.WatchChecks
-	}
-	ci, e := s.GH.Check(ctx, r.Name, m.Commit, checks)
-	if e != nil {
-		return e
-	}
-	if ci != github.Green {
-		return errors.New("manifest commit CI is not green")
 	}
 
 	approvedIdentity := s.deploymentIdentity(r, m, o)

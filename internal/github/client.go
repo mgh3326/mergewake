@@ -387,10 +387,12 @@ type status struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// checkEvidence is the per-name state of a head's checks plus, for each name
-// whose latest run is cancelled, when that run completed.
+// checkEvidence is the per-name state of a head's checks plus the run or
+// status URL it was read from, and, for each name whose latest run is
+// cancelled, when that run completed.
 type checkEvidence struct {
 	states    map[string]CI
+	urls      map[string]string
 	cancelled map[string]time.Time
 }
 
@@ -433,6 +435,7 @@ func (c *Client) checkEvidence(ctx context.Context, repo, sha string, preserveVe
 // a read from stored webhook state cannot disagree about how.
 func foldChecks(runs []checkRun, statuses []status, preserveVerdicts bool) (checkEvidence, error) {
 	states := map[string]CI{}
+	urls := map[string]string{}
 	cancelledAt := map[string]time.Time{}
 	ids := map[string]int64{}
 	ran := map[string]bool{}
@@ -475,6 +478,7 @@ func foldChecks(runs []checkRun, statuses []status, preserveVerdicts bool) (chec
 		}
 		// Check treats cancelled evidence as pending for aggregate consumers.
 		states[r.Name] = state
+		urls[r.Name] = r.DetailsURL
 	}
 	latest := map[string]status{}
 	for _, s := range statuses {
@@ -505,9 +509,10 @@ func foldChecks(runs []checkRun, statuses []status, preserveVerdicts bool) (chec
 			}
 		}
 		states[name] = v
+		urls[name] = s.TargetURL
 		delete(cancelledAt, name)
 	}
-	return checkEvidence{states, cancelledAt}, nil
+	return checkEvidence{states, urls, cancelledAt}, nil
 }
 
 func (c *Client) Check(ctx context.Context, repo, sha string, required []string) (CI, error) {
@@ -546,6 +551,32 @@ func (c *Client) CheckStates(ctx context.Context, repo, sha string, required []s
 			v = Absent
 		}
 		out[n] = v
+	}
+	return out, nil
+}
+
+// CheckEvidence is CheckStates plus the run or status URL each state was read
+// from, so a caller can record where a verdict came from.
+type CheckEvidence struct {
+	Name  string
+	State CI
+	URL   string
+}
+
+// CheckEvidence resolves each required name with the URL of the evidence that
+// decided it. A name with no run or status on the head is Absent.
+func (c *Client) CheckEvidence(ctx context.Context, repo, sha string, required []string) ([]CheckEvidence, error) {
+	ev, e := c.headChecks(context.WithValue(ctx, requiredChecksKey{}, required), repo, sha)
+	if e != nil {
+		return nil, e
+	}
+	out := make([]CheckEvidence, 0, len(required))
+	for _, n := range required {
+		state, ok := ev.states[n]
+		if !ok {
+			state = Absent
+		}
+		out = append(out, CheckEvidence{Name: n, State: state, URL: ev.urls[n]})
 	}
 	return out, nil
 }

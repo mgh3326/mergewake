@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -367,14 +368,22 @@ type Policy struct {
 	// ahead (GitHub reports the PR "behind") as base_stale. Absent or false
 	// lands such a head and records Review.BaseBehind; post-merge CI checks the
 	// composed result.
-	RequireUpToDate bool        `yaml:"require_up_to_date"`
-	Version         int         `yaml:"version"`
-	Enabled         bool        `yaml:"enabled"`
-	RequiredChecks  []string    `yaml:"required_checks"`
-	WatchChecks     []string    `yaml:"watch_checks"`
-	Blocking        []Rule      `yaml:"blocking"`
-	ReviewGate      *ReviewGate `yaml:"review_gate"`
-	FastLane        *FastLane   `yaml:"fast_lane"`
+	RequireUpToDate bool     `yaml:"require_up_to_date"`
+	Version         int      `yaml:"version"`
+	Enabled         bool     `yaml:"enabled"`
+	RequiredChecks  []string `yaml:"required_checks"`
+	WatchChecks     []string `yaml:"watch_checks"`
+	// MainChecks names the checks that judge a main-branch commit. It defaults
+	// to watch_checks, its legacy name; a policy may set both only with the
+	// same list.
+	MainChecks []string `yaml:"main_checks"`
+	// DeployChecks names the checks that judge a release commit on the deploy
+	// stage. Empty means the repository has no deploy stage: release and
+	// rollout judge a commit by its main checks.
+	DeployChecks []string    `yaml:"deploy_checks"`
+	Blocking     []Rule      `yaml:"blocking"`
+	ReviewGate   *ReviewGate `yaml:"review_gate"`
+	FastLane     *FastLane   `yaml:"fast_lane"`
 	// BotUpdates opts the repository into landing a dependency bot's patch
 	// updates without review. Absent keeps every bot PR out of the land path.
 	BotUpdates *BotUpdates `yaml:"bot_updates"`
@@ -396,14 +405,29 @@ type Policy struct {
 // DefaultAnyRefTimeout is how long watch waits for one any-ref CI result.
 const DefaultAnyRefTimeout = 45 * time.Minute
 
-// WatchSet is the checks that judge the newest main head: watch_checks, else
-// required_checks.
+// WatchSet is the checks that judge the newest main head: main_checks, its
+// alias watch_checks, else required_checks.
 func (p Policy) WatchSet() []string {
-	if len(p.WatchChecks) > 0 {
-		return p.WatchChecks
+	for _, set := range [][]string{p.MainChecks, p.WatchChecks} {
+		if len(set) > 0 {
+			return set
+		}
 	}
 	return p.RequiredChecks
 }
+
+// DeploySet is the checks that judge a release commit: deploy_checks, else the
+// main set. A repository with no deploy stage keeps releasing and rolling out
+// on its main checks.
+func (p Policy) DeploySet() []string {
+	if len(p.DeployChecks) > 0 {
+		return p.DeployChecks
+	}
+	return p.WatchSet()
+}
+
+// DeployStage reports whether the repository has a deploy stage.
+func (p Policy) DeployStage() bool { return len(p.DeployChecks) > 0 }
 
 // BisectChecks is the checks that judge a bisect candidate: any_ref_checks,
 // else the watch set.
@@ -454,6 +478,23 @@ func (p Policy) Validate() error {
 			return errors.New("watch_checks must be nonempty and unique")
 		}
 		watchSeen[n] = true
+	}
+	for _, set := range []struct {
+		key    string
+		checks []string
+	}{{"main_checks", p.MainChecks}, {"deploy_checks", p.DeployChecks}} {
+		seen := map[string]bool{}
+		for _, n := range set.checks {
+			if strings.TrimSpace(n) == "" || seen[n] {
+				return fmt.Errorf("%s must be nonempty and unique", set.key)
+			}
+			seen[n] = true
+		}
+	}
+	// watch_checks is the legacy name of main_checks. Keeping both is allowed
+	// only while they agree, so no policy reads two different main sets.
+	if len(p.MainChecks) > 0 && len(p.WatchChecks) > 0 && !slices.Equal(p.MainChecks, p.WatchChecks) {
+		return errors.New("main_checks and watch_checks are the same key; set one or give both the same list")
 	}
 	// An empty list is an error, not "unset": it would silently mean every
 	// candidate is judged by no check.
