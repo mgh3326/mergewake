@@ -343,7 +343,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)
-	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family}
+	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family, opts: o}
 	// The review event is posted when the run ends, so a slow hk never
 	// spends the reviewers' deadline.
 	var reviewStarted *time.Time

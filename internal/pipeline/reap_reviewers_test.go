@@ -886,6 +886,33 @@ func TestReapReviewerLabelParse(t *testing.T) {
 	}
 }
 
+// The review path sweeps an open PR's reviewers through Reap and wants no
+// "not a merged PR" refusal, and no reap-error audit row for it.
+func TestReapReviewersOnlyOfOpenPR(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.GH = &closedGH{}
+	label := reviewerLabelFor(34, time.Hour)
+	f.addReviewer(label, "w1:p5")
+	ctx := context.WithValue(context.Background(), reviewersOnlyKey{}, true)
+	if err := f.s.Reap(ctx, testRepo, 34, Options{}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if rows := f.rows(t); len(rows) != 2 || rows[0].Result != "closed" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+	if b, err := os.ReadFile(filepath.Join(f.s.state(testRepo.Name), "decisions.jsonl")); err == nil && strings.Contains(string(b), "reap-error") {
+		t.Fatalf("reap-error audited: %s", b)
+	}
+}
+
+// parseReviewerLabel reads the pass of a label.
+func TestParseReviewerLabelPass(t *testing.T) {
+	l, ok := parseReviewerLabel("mwr-283-7e8272c-p2-1700000000")
+	if !ok || l.pr != 283 || l.sha7 != "7e8272c" || l.pass != 2 {
+		t.Fatalf("label=%+v ok=%v", l, ok)
+	}
+}
+
 // (a) A hub replacement label <old>-q<n> parses to the same PR, head, pass and
 // start as the original, and keeps n.
 func TestReapReviewerLabel_ReplacementSuffixParses(t *testing.T) {

@@ -399,6 +399,12 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	return hs, errs
 }
 
+type reviewersOnlyKey struct{}
+
+// reviewersOnly marks a Reap call that only wants an open PR's reviewer sweep:
+// the call then ends without the "not a merged PR" refusal.
+func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey{}) != nil }
+
 // Reap closes agent panes sitting in worktrees of merged-PR head branches, then
 // removes the worktree and local branch once the merge is older than
 // reap.worktree_after and no watch recovery PR landed. Anything dirty, unknown
@@ -606,6 +612,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
 				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
+				if reviewersOnly(ctx) {
+					return errors.Join(errs...)
+				}
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue

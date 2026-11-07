@@ -25,11 +25,13 @@ type reviewRetryState struct {
 }
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
-// for it: a quota stop waits for its reset and is no failure, a collection
+// for it: a quota stop waits for its reset and is no failure, a held reviewer
+// waits for the time panewire named, if any, and is no failure, a collection
 // failure backs off without counting toward escalation, and anything else is a
 // real review failure.
 type reviewFailureClass struct {
 	quotas     []*reviewQuotaStopped
+	held       []*reviewerHeld
 	collection bool
 	real       bool
 }
@@ -42,11 +44,14 @@ func (c *reviewFailureClass) add(err error) {
 		return
 	}
 	var quota *reviewQuotaStopped
+	var held *reviewerHeld
 	var collect *collectionFailure
 	var lost *reviewResultLost
 	switch {
 	case errors.As(err, &quota):
 		c.quotas = append(c.quotas, quota)
+	case errors.As(err, &held):
+		c.held = append(c.held, held)
 	case errors.As(err, &collect), errors.As(err, &lost):
 		c.collection = true
 	default:
@@ -167,11 +172,19 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			state.Next = at
 		}
 	}
+	for _, h := range class.held {
+		// The hold frees by itself. Wait for the time panewire named, however
+		// often it repeats; a refusal that named none retries at the next
+		// evaluation. No failure, backoff or escalation comes from a hold.
+		if at := s.now().Add(h.retryAfter); h.retryAfter > 0 && at.After(state.Next) {
+			state.Next = at
+		}
+	}
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
 	}
 	if !class.real && !class.collection {
-		// Only quota stops: the audit row says it, and nothing failed.
+		// Only quota stops and holds: the audit row says it, and nothing failed.
 		return nil
 	}
 	// Escalate after persisting the failure, including the first poll at K.
