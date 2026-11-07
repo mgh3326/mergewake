@@ -217,6 +217,25 @@ func (s *Store) repo(repo string) (*repoState, error) {
 	if r.Gone == nil {
 		r.Gone = map[int]time.Time{}
 	}
+	for n, pr := range r.PRs {
+		if pr == nil {
+			delete(r.PRs, n)
+		}
+	}
+	for sha, h := range r.Heads {
+		if h == nil {
+			delete(r.Heads, sha)
+			continue
+		}
+		h.initMaps()
+	}
+	for n, set := range r.Reviews {
+		if set == nil {
+			delete(r.Reviews, n)
+		} else if set.Reviews == nil {
+			set.Reviews = map[int64]Review{}
+		}
+	}
 	s.repos[repo] = r
 	return r, nil
 }
