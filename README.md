@@ -134,15 +134,13 @@ records a hand-started container; `status` reports its digest and health. See
 
 While the `pr` role is enabled, each poll recomputes the land decision for every
 open PR at its current head and tells the owning lane once that head becomes
-mergeable or blocked — workers do not need to watch CI. Notification is
+blocked, and records when it becomes mergeable — workers do not need to watch CI. Notification is
 observation, not merging, so it also runs while the daemon is in shadow mode;
 `--dry-run` only prints the decision.
 
 ```text
-[mergewake] READY example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
 [mergewake] BLOCKED example/project#7 head=a1b2c3d | check_failed:vet; check_failed:test | lane=worker-lane via task 2252
 [mergewake] BLOCKED example/project#7 head=a1b2c3d | threads_open:1; base_stale | lane=operator-desk via config
-[mergewake] MERGED example/project#7 head=a1b2c3d | Add retry to rollout smoke | lane=worker-lane via task 2252
 ```
 
 READY means the merge gate passed: every `required_checks` entry green on the
@@ -158,10 +156,12 @@ head and the repo sets `require_up_to_date: true`, and `conflict` when GitHub re
 check evidence emits nothing. When acting and `base_stale` is the only blocker (it needs `require_up_to_date: true`), `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
-across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. READY, BLOCKED, and MERGED are declared `--type ready|blocked|merged`, so they stay unread on the lane
-until `panewire inbox ack`, and a READY PR nobody merged is notified again every
-`daemon.pr.notify.renotify_after` (default 30m), at most `renotify_max` times
-(default 3).
+across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. BLOCKED is declared `--type blocked`, so it stays unread on the lane until
+`panewire inbox ack`. READY and MERGED are recorded, not sent: mergewake merges
+on its own gate, so each writes its sent key and one `pr-notify` decision marked
+`"suppressed":"record only"` (naming the author worker lane it would have used,
+if any), and READY starts the clock `merge_overdue` counts `ready_too_long` from.
+No READY reminder is sent; `renotify_after` and `renotify_max` no longer have an effect.
 
 A `review_missing` BLOCKED with no block detail is mergewake's own queue state and
 sends nothing; a head that keeps it for more than 60 minutes gets one
@@ -184,7 +184,7 @@ failure threshold. See [review recovery](docs/config.md#review-recovery).
 Auto-merge is opt-in per repository with `enabled: true` in
 `.mergewake/policy.yaml` (default off). While the daemon acts
 (`daemon.act` + `--apply`), a READY verdict merges exactly like the repo
-session — squash, pinned to the gated head — and emits MERGED. A head that
+session — squash, pinned to the gated head — and records MERGED (no lane event). A head that
 moves between gate and merge is re-gated, never merged blind.
 
 The lane is resolved, never guessed, in this order — the choosing rule is

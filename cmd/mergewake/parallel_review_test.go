@@ -47,6 +47,9 @@ type reviewHub struct {
 	// changedFiles is the changed_files every PR reports; zero means 1, the
 	// number of files the hub lists.
 	changedFiles int
+	// mergeProbe, when set, runs around each merge request before the hub
+	// takes its lock: the returned func runs when the request ends.
+	mergeProbe func() func()
 }
 
 func (h *reviewHub) repoName() string {
@@ -73,6 +76,9 @@ func (h *reviewHub) pull(n int) string {
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)
 
 func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.mergeProbe != nil && strings.HasSuffix(r.URL.Path, "/merge") {
+		defer h.mergeProbe()()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	path := r.URL.Path

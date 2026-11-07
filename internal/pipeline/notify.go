@@ -20,15 +20,17 @@ import (
 
 var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
-// NotifyPR emits one lane event when the merge-gate verdict for a PR head
-// becomes ready or blocked: READY once every required check is green, no
-// review thread is unresolved, the review -done marker exists, the PR is mergeable and,
-// when GitHub requires an up-to-date branch, the base is an ancestor of the head; BLOCKED with the
-// closed-vocabulary reasons that hold it. Pending checks emit nothing. Each
-// (PR, head, verdict) notifies once across restarts, except that a READY PR
-// still open and READY on the same head is notified again every
-// daemon.pr.notify.renotify_after, at most renotify_max times: a READY nobody
-// merged must not vanish. A merged or closed PR is never notified here.
+// NotifyPR acts on the merge-gate verdict for a PR head once it becomes ready
+// or blocked: READY once every required check is green, no review thread is
+// unresolved, the review -done marker exists, the PR is mergeable and, when
+// GitHub requires an up-to-date branch, the base is an ancestor of the head;
+// BLOCKED with the closed-vocabulary reasons that hold it. Pending checks do
+// nothing. BLOCKED is sent as one lane event; READY is only recorded (its sent
+// key, the READY clock ready_too_long counts from, and a pr-notify decision
+// marked "record only"), because mergewake merges on its own gate and no lane
+// has anything to do with it. Each (PR, head, verdict) is handled once across
+// restarts. A READY is never repeated: there are no READY reminders. A merged
+// or closed PR is never notified here.
 //
 // The pr role notifies under shadow too — telling a lane is not merging — while
 // dry-run only prints the decision and writes no keys or events.
@@ -157,7 +159,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		// checks the dismissal's evidence before merging.
 		summary += fmt.Sprintf(" | %d critical/high dismissed: check the evidence", n)
 	}
-	lane, via, sent, e := s.laneEvent(ctx, r, pr, v.State, summary)
+	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, v.Review.BaseBehind)
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -250,7 +252,7 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 var errNotifyDelivery = errors.New("notify delivery failed")
 
 // laneEvent resolves the owning lane and emits one deduped lane event for the
-// verdict: READY, BLOCKED or MERGED. The sent key covers the state, PR, head
+// verdict: BLOCKED is sent, READY and MERGED are only recorded (below). The sent key covers the state, PR, head
 // and summary so a changed reason set re-notifies while an identical verdict
 // stays quiet. A PR with no owning lane routes to the configured fallback
 // lane; a delivery the notifier fails is retried once on that lane, then
@@ -258,23 +260,27 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // every loop. An empty via means a decision was already logged and the
 // caller stays silent.
 //
-// READY and MERGED go only to the PR author's worker lane: the job bound to
-// its task, else its author pane. Design and desk lanes have nothing to do
-// with either verdict — mergewake merges on its own gate — so with neither
-// lane the event is recorded but not sent (see suppressWorkerEvent).
+// READY and MERGED are never sent: mergewake merges on its own gate, so no
+// lane has anything to do with either verdict. They are recorded instead (see
+// recordOnlyEvent), which keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
+	return s.verdictEvent(ctx, r, pr, state, summary, false)
+}
+
+// verdictEvent is laneEvent for a verdict whose gate result is known: a
+// recorded READY carries baseBehind into its decision row.
+func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string, baseBehind bool) (string, string, bool, error) {
 	var lane, via string
 	var e error
-	workerOnly := state == "ready" || state == "merged"
 	switch {
+	case state == "ready" || state == "merged":
+		// Recorded below, once the sent key is known; no lane to resolve.
 	case state == "blocked" && authorAction(summary):
 		route, err := s.findingsRoute(ctx, r, pr)
 		if err != nil {
 			return "", "", false, err
 		}
 		lane, via = route.lane, route.via
-	case workerOnly:
-		lane, via, e = s.workerLane(ctx, r, pr)
 	default:
 		lane, via, e = s.notifyLane(ctx, r, pr)
 	}
@@ -302,17 +308,13 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		key += " " + summary
 	}
 	if sent.has(key) {
-		// A suppressed READY has a clock but no lane: it never re-notifies.
-		if state == "ready" && lane != "" {
-			return s.renotifyReady(ctx, r, pr, key, lane, via, textFor)
-		}
 		return lane, via, false, nil
+	}
+	if state == "ready" || state == "merged" {
+		return s.recordOnlyEvent(ctx, r, pr, state, summary, key, baseBehind, sent)
 	}
 	if sent.has("decided " + key) {
 		return "", "", false, nil
-	}
-	if workerOnly && lane == "" {
-		return s.suppressWorkerEvent(ctx, r, pr, state, key, sent)
 	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
@@ -328,28 +330,22 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
-		Type: verdictType(state, via, s.isDeskLane(lane)),
+		Type: verdictType(state, via),
 	}); e != nil {
 		fallback := s.Config.Notifier.FallbackLane
-		// A worker-only verdict never falls back to the desk: that would put a
-		// READY or MERGED on a lane that must not receive it. It is parked
-		// with the decided key, as an author-action BLOCKED is.
-		if fallback != "" && fallback != lane && !workerOnly && !(state == "blocked" && authorAction(summary)) {
+		// An author-action BLOCKED never falls back to the desk: it is parked
+		// with the decided key.
+		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
 			// The resolved lane may not exist on this host; the fallback lane
 			// gets one try under a distinct ID before the verdict is parked.
 			if fb := s.Notifier.Notify(reportCtx, integrations.Event{
 				ID:   id + "-fallback",
 				Text: textFor(fallback, via+"+fallback"),
 				Lane: fallback,
-				Type: verdictType(state, via, s.isDeskLane(fallback)),
+				Type: verdictType(state, via),
 			}); fb == nil {
 				if ae := sent.add(key); ae != nil {
 					return "", "", false, ae
-				}
-				if state == "ready" {
-					if ae := s.startReadyClock(r, key, fallback); ae != nil {
-						return "", "", false, ae
-					}
 				}
 				return fallback, via + "+fallback", true, nil
 			}
@@ -361,11 +357,6 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 	}
 	if e = sent.add(key); e != nil {
 		return "", "", false, e
-	}
-	if state == "ready" {
-		if e = s.startReadyClock(r, key, lane); e != nil {
-			return "", "", false, e
-		}
 	}
 	return lane, via, true, nil
 }
@@ -398,14 +389,14 @@ func (s *Service) workerLane(ctx context.Context, r config.Repo, pr github.Pull)
 	return "", "", nil
 }
 
-// suppressWorkerEvent records a READY or MERGED with no author worker lane to
-// send it to. The decision is recorded as if it had been sent — the sent key
-// so it is not retried every pass, and the READY clock so ready_too_long
-// still counts from the verdict — with one logged pr-notify row naming the
-// lane and via the older rules would have used and why nothing went out. The
-// empty lane tells the caller the decision was already logged.
-func (s *Service) suppressWorkerEvent(ctx context.Context, r config.Repo, pr github.Pull, state, key string, sent *sentKeys) (string, string, bool, error) {
-	wouldLane, wouldVia, e := s.notifyLane(ctx, r, pr)
+// recordOnlyEvent records a READY or MERGED without sending it. The decision
+// is recorded as if it had been sent — the sent key so it is not retried every
+// pass, and the READY clock so ready_too_long still counts from the verdict —
+// with one logged pr-notify row naming the author worker lane the event would
+// have gone to, if any. The empty lane tells the caller the decision was
+// already logged.
+func (s *Service) recordOnlyEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, key string, baseBehind bool, sent *sentKeys) (string, string, bool, error) {
+	workerLane, workerVia, e := s.workerLane(ctx, r, pr)
 	if e != nil {
 		return "", "", false, e
 	}
@@ -413,7 +404,7 @@ func (s *Service) suppressWorkerEvent(ctx context.Context, r config.Repo, pr git
 		return "", "", false, e
 	}
 	if state == "ready" {
-		if e = s.startReadyClock(r, key, wouldLane); e != nil {
+		if e = s.startReadyClock(r, key, workerLane); e != nil {
 			return "", "", false, e
 		}
 	}
@@ -421,11 +412,13 @@ func (s *Service) suppressWorkerEvent(ctx context.Context, r config.Repo, pr git
 		PR         int    `json:"pr"`
 		Head       string `json:"head"`
 		State      string `json:"state"`
+		Summary    string `json:"summary,omitempty"`
+		BaseBehind bool   `json:"base_behind,omitempty"`
 		Lane       string `json:"lane,omitempty"`
 		Via        string `json:"via,omitempty"`
 		Sent       bool   `json:"sent"`
-		Suppressed string `json:"suppressed,omitempty"`
-	}{PR: pr.Number, Head: pr.Head.SHA, State: state, Lane: wouldLane, Via: wouldVia, Suppressed: "no worker lane"}
+		Suppressed string `json:"suppressed"`
+	}{PR: pr.Number, Head: pr.Head.SHA, State: state, Summary: summary, BaseBehind: baseBehind, Lane: workerLane, Via: workerVia, Suppressed: "record only"}
 	if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
 		return "", "", false, e
 	}
@@ -433,7 +426,8 @@ func (s *Service) suppressWorkerEvent(ctx context.Context, r config.Repo, pr git
 }
 
 // eventType is the panewire notification type a verdict is declared with, so
-// a READY or BLOCKED stays unread on the receiving lane until it is acked.
+// a BLOCKED stays unread on the receiving lane until it is acked. READY and
+// MERGED are recorded rather than sent, so their types are only named here.
 func eventType(state string) string {
 	switch state {
 	case "ready", "blocked", "merged":
@@ -442,8 +436,9 @@ func eventType(state string) string {
 	return ""
 }
 
-// readyClock is when a READY verdict was last sent, to which lane, and how
-// many reminders followed it.
+// readyClock is when a READY verdict was recorded, the worker lane it would
+// have gone to, and a reminder count that no longer advances: no READY
+// reminder is sent.
 type readyClock struct {
 	Lane    string    `json:"lane"`
 	First   time.Time `json:"first"`
@@ -476,7 +471,7 @@ func (s *Service) saveReadyClocks(repo string, clocks map[string]readyClock) err
 	return fsutil.WriteJSON(s.readyClocksFile(repo), clocks)
 }
 
-// startReadyClock records a first READY send for key.
+// startReadyClock records the first READY for key; nothing is sent.
 func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
 	clocks, e := s.loadReadyClocks(r.Name)
 	if e != nil {
@@ -485,50 +480,6 @@ func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
 	now := s.now().UTC()
 	clocks[key] = readyClock{Lane: lane, First: now, Last: now}
 	return s.saveReadyClocks(r.Name, clocks)
-}
-
-// renotifyReady repeats an already sent READY for a PR that is still open and
-// READY on the same head, once renotify_after has passed since the last send
-// and at most renotify_max times. A READY sent before the clock existed
-// starts its clock now, so an upgrade does not burst reminders. A failed
-// reminder counts against the bound, so delivery trouble cannot loop.
-func (s *Service) renotifyReady(ctx context.Context, r config.Repo, pr github.Pull, key, lane, via string, textFor func(l, v string) string) (string, string, bool, error) {
-	every, max := s.Config.Daemon.PR.Notify.Renotify()
-	if every <= 0 || max <= 0 {
-		return lane, via, false, nil
-	}
-	clocks, e := s.loadReadyClocks(r.Name)
-	if e != nil {
-		return "", "", false, e
-	}
-	now := s.now().UTC()
-	c, ok := clocks[key]
-	if !ok {
-		clocks[key] = readyClock{Lane: lane, First: now, Last: now}
-		return lane, via, false, s.saveReadyClocks(r.Name, clocks)
-	}
-	if c.Repeats >= max || now.Sub(c.Last) < every {
-		return lane, via, false, nil
-	}
-	c.Repeats++
-	c.Last = now
-	clocks[key] = c
-	if e = s.saveReadyClocks(r.Name, clocks); e != nil {
-		return "", "", false, e
-	}
-	reportCtx, cancel := reportContext(ctx)
-	defer cancel()
-	rvia := fmt.Sprintf("%s; reminder %d/%d, unmerged for %s", via, c.Repeats, max, now.Sub(c.First).Round(time.Minute))
-	e = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-ready-%s-%d-%s-reminder-%d", r.Name, pr.Number, pr.Head.SHA, c.Repeats),
-		Text: textFor(lane, rvia),
-		Lane: lane,
-		Type: verdictType("ready", via, s.isDeskLane(lane)),
-	})
-	if e != nil {
-		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
-	}
-	return lane, rvia, true, nil
 }
 
 // notifyLane resolves the destination lane without guessing: the PR's author
@@ -619,20 +570,15 @@ func (s *Service) isDeskLane(lane string) bool {
 	return lane == "" || lane == desk
 }
 
-// verdictType is the panewire type a lane event is declared with. READY and
-// BLOCKED interrupt and must be acked, so only the verdicts that need action
-// from their receiver keep them: an author lane gets READY as info (mergewake
-// merges it itself). A BLOCKED never reaches here for mergewake's own review
-// wait: NotifyPR sends that only as the review-stalled alert.
-func verdictType(state, via string, desk bool) string {
+// verdictType is the panewire type a lane event is declared with. BLOCKED
+// interrupts and must be acked. A BLOCKED never reaches here for mergewake's
+// own review wait: NotifyPR sends that only as the review-stalled alert.
+func verdictType(state, via string) string {
 	if state == botNoticeState {
 		return "decision"
 	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
-	}
-	if state == "ready" && !desk {
-		return "info"
 	}
 	return eventType(state)
 }

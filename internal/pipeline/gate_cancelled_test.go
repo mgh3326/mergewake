@@ -61,7 +61,10 @@ func TestGateCancelledRequiredCheck(t *testing.T) {
 					t.Fatalf("land record=%s", output.String())
 				}
 			}
-			if tt.summary != "" && !strings.Contains(lastEvent(t, n), tt.summary) {
+			if tt.state == "ready" && n.count != 0 {
+				t.Fatalf("READY is recorded, not sent: %+v", n.events)
+			}
+			if tt.summary != "" && tt.state != "ready" && !strings.Contains(lastEvent(t, n), tt.summary) {
 				t.Fatalf("notice=%s", lastEvent(t, n))
 			}
 			if tt.state == "pending" && n.count != 0 {

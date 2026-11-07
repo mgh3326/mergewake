@@ -27,8 +27,8 @@ const (
 	// overdueLandAfter: the head's review is done and the PR is still open
 	// this long after.
 	overdueLandAfter = 10 * time.Minute
-	// overdueReadyAfter: the PR is still open this long after mergewake sent
-	// its READY verdict for the head.
+	// overdueReadyAfter: the PR is still open this long after mergewake
+	// recorded its READY verdict for the head.
 	overdueReadyAfter = 45 * time.Minute
 	// overdueLeadLane is the one shared lane merge_overdue goes to first.
 	overdueLeadLane = "lead"
@@ -47,7 +47,7 @@ type overdueClock struct {
 	HeadSeen   time.Time `json:"head_seen,omitzero"`
 	ChecksDone time.Time `json:"checks_done,omitzero"`
 	ReviewDone time.Time `json:"review_done,omitzero"`
-	// Ready is when mergewake sent the READY verdict for the head; no READY,
+	// Ready is when mergewake recorded the READY verdict for the head; no READY,
 	// no ready_too_long.
 	Ready time.Time `json:"ready,omitzero"`
 	// CarriedFrom is the head this entry inherited HeadSeen and Ready from,
@@ -149,7 +149,7 @@ func reviewCompleted(v gateVerdict) bool {
 // pr-overdue-clocks.json, so a restart keeps them; a new head has its own
 // entry, except a head mergewake made itself by updating a stale branch: that
 // one inherits the old head's HeadSeen and Ready. The READY time comes from the
-// READY verdict mergewake sent for the head (notify.go laneEvent). Entries
+// READY verdict mergewake recorded for the head (notify.go recordOnlyEvent). Entries
 // untouched for a week are dropped.
 func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
 	file := s.overdueClocksFile(r.Name)
@@ -261,7 +261,7 @@ func (s *Service) recordBranchUpdate(repo string, pr int, oldHead string) error 
 	return writeOverdueState(file, st)
 }
 
-// readySent is when the READY verdict for this head was sent, if it was.
+// readySent is when the READY verdict for this head was recorded, if it was.
 func (s *Service) readySent(repo string, pr github.Pull) (time.Time, bool, error) {
 	clocks, e := s.loadReadyClocks(repo)
 	if e != nil {

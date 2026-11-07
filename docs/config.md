@@ -1007,7 +1007,7 @@ grades each thread by the author and severity of its first comment instead:
 
 A thread answered with a disposition counts as answered whether or not it is
 resolved. A dismissed critical/high no longer holds the gate; the land record
-counts it as `dismissed_blocking`, and the READY event says
+counts it as `dismissed_blocking`, and the READY decision row's summary says
 `<n> critical/high dismissed: check the evidence` so the desk checks the
 dismissal before merging (`fleet-review` §Triage rubric).
 
@@ -1330,7 +1330,7 @@ For `example/project`, state resides beneath
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
-| `pr-ready-renotify.json` | Per READY key: lane, first and last send, reminders sent; kept a week. Deleting it restarts the reminder clocks. |
+| `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
 | `discord-baseline` | When the feed first ran for this repo. Older PRs do not post. |
@@ -1395,7 +1395,7 @@ fleet spawners can be wrapped around this protocol without importing their code.
 ```yaml
 daemon:
   act: false
-  pr: {enabled: true, interval: 60s, notify: {enabled: true, renotify_after: 30m, renotify_max: 3}, findings: {enabled: true, ack_after: 15m}, stall_after: 30m}
+  pr: {enabled: true, interval: 60s, notify: {enabled: true}, findings: {enabled: true, ack_after: 15m}, stall_after: 30m}
   watch: {enabled: true, interval: 60s}
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
@@ -1533,10 +1533,11 @@ roles woken — never the body, the signature or other headers.
 Only enabled roles wake, and only for repositories in `repos`.
 
 `daemon.pr.notify` defaults to enabled and accepts `enabled`, `renotify_after`
-and `renotify_max`. While the
-`pr` role runs, each poll runs the merge gate for every open, non-draft PR at
-its current head and emits one lane event for that head's verdict — the notify
-path observes rather than merges, so it also runs in shadow mode. `READY`
+and `renotify_max` (the last two have no effect since READY is no longer sent).
+While the `pr` role runs, each poll runs the merge gate for every open,
+non-draft PR at its current head and sends one lane event for a BLOCKED verdict
+and records a READY one — the notify path observes rather than merges, so it
+also runs in shadow mode. `READY`
 requires every required check green on the head, zero unresolved review
 threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
 `review.login` it attests (on the head, or on a head with the same patch id), the base branch an ancestor of the
@@ -1547,20 +1548,22 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path is not in the diff; a person's `Disposition: dismiss: <reason>` PR comment naming the head's SHA clears it), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Queued or running
 check evidence emits nothing, and neither does a required check that has not reported yet
 inside the grace described under `check_absent` below. A READY verdict under acting mode with
-`enabled` repository policy merges the gated head and emits `MERGED`. Each `(PR, head,
-verdict)` emits once per the `pr-notify-sent` state file; a changed
+`enabled` repository policy merges the gated head and records `MERGED`; no lane
+event is sent for either. Each `(PR, head,
+verdict)` is handled once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
-head re-arms notification, and a restart does not resend. READY, BLOCKED, and MERGED are
-declared with `panewire emit --type ready|blocked|merged`, so they stay unread on the
+head re-arms notification, and a restart does not resend. BLOCKED is
+declared with `panewire emit --type blocked`, so it stays unread on the
 receiving lane until it runs `panewire inbox ack` (panewire
 `docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
-event untyped). A READY PR that stays open and READY on the same head is not
-deduped forever: it is notified again `renotify_after` (default `30m`, `off`
-disables) after the last send, at most `renotify_max` times (default 3), with
-`reminder <k>/<max>, unmerged for <d>` after `via` and event id
-`…-reminder-<k>`. The clock is `<state_dir>/<repo>/pr-ready-renotify.json`; a
-READY sent before it existed starts its clock on the next poll. A merged or
-closed PR gets no reminder. The event
+event untyped). READY and MERGED are recorded, never sent: nobody acts on either,
+because mergewake merges on its own gate. Each writes its `pr-notify-sent` key and
+one `pr-notify` decision row with `"suppressed":"record only"`, the head's
+summary, and the author worker lane (job bound to the task, else the author
+pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
+clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
+counts `ready_too_long` from. No READY reminder is sent; `renotify_after` and
+`renotify_max` are accepted and have no effect. The BLOCKED event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
 (`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
@@ -1596,9 +1599,8 @@ the push time alone would.
 
 A mixed reason set is sent when any reason is author or human, and its text
 lists only those reasons. A set made only of internal waits sends nothing.
-`READY` and `MERGED` routing, types and the READY reminders are unchanged, so the
-design session otherwise hears `READY`, `MERGED`, and the BLOCKED reasons that
-need its decision.
+`READY` and `MERGED` are recorded, not sent, so the design session hears only the
+BLOCKED reasons that need its decision.
 
 A head that keeps `review_missing` for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
@@ -1626,7 +1628,7 @@ does not reset them: `head_seen` (the first pass that saw the head, after the PR
 left draft), `checks_done` (every required check completed: green, red or
 skipped), `review_done` (the head's done marker and all needed passes, or an
 earlier head's review of the same patch) and `ready` (the READY verdict
-mergewake sent for the head). A new head starts its own clocks, with one
+mergewake recorded for the head). A new head starts its own clocks, with one
 exception: a head mergewake made itself by updating a stale branch inherits the
 old head's `head_seen` and `ready`, because only the author's push resets that
 clock. mergewake records the update in the same file when the call succeeds and
@@ -1728,8 +1730,9 @@ daemon:
       failures: 3
 ```
 
-Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. READY,
-BLOCKED, and MERGED declare `ready`, `blocked`, and `merged`. Watch holds declare
+Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. BLOCKED
+declares `blocked`; READY and MERGED are recorded, not sent, so they declare
+no event. Watch holds declare
 `watch-hold`; culprit recovery declares `culprit-hold`. Deployment decisions
 continue through the handoffkeep approval adapter. Panewire's reviewed desk
 policy keeps routine events in its inbox and decision events as interrupts.

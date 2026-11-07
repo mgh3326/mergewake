@@ -7,8 +7,8 @@ GitHub call.
 
 ## Snapshot
 
-Each time the `pr` role's gate decides a PR (the same pass that sends the
-READY or BLOCKED notice, so `daemon.pr.notify` must be on), it writes
+Each time the `pr` role's gate decides a PR (the same pass that records READY or
+sends the BLOCKED notice, so `daemon.pr.notify` must be on), it writes
 `<state_dir>/<owner>/<name>/pr-status/<n>.json` atomically. A dry run writes
 nothing. A PR that left the open list gets a final snapshot: its last gate
 fields under `state` `merged` or `closed`.

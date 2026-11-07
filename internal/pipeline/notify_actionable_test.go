@@ -184,8 +184,8 @@ func TestNotifyActionableReviewMissingWithBlockIsAuthorRoute(t *testing.T) {
 	}
 }
 
-// (g) READY and MERGED go to the author worker lane with their own types.
-func TestNotifyActionableReadyAndMergedToWorkerLane(t *testing.T) {
+// (g) READY and MERGED are recorded, not sent, even with an author worker lane.
+func TestNotifyActionableReadyAndMergedAreRecordedOnly(t *testing.T) {
 	s, g, n, _, r, _ := deliverSetup(t)
 	markReviewed(g)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
@@ -194,7 +194,7 @@ func TestNotifyActionableReadyAndMergedToWorkerLane(t *testing.T) {
 	if _, _, _, e := s.laneEvent(context.Background(), r, g.pull, "merged", g.pull.Title); e != nil {
 		t.Fatal(e)
 	}
-	if n.count != 2 || n.events[0].Lane != "w-7" || n.events[0].Type != "info" || n.events[1].Lane != "w-7" || n.events[1].Type != "merged" {
+	if n.count != 0 || !sentKeyHas(t, s, r, verdictKey("ready", 7, g.pull.Head.SHA)) || !sentKeyHas(t, s, r, verdictKey("merged", 7, g.pull.Head.SHA)) {
 		t.Fatalf("%+v", n.events)
 	}
 }
