@@ -318,9 +318,9 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 // review is a PR's review and settle. A head whose review is done is settled
 // first, then its evidence is checked; any other is reviewed, then settled.
 // handled reports the first. reviewed is false when the review itself failed
-// or did not run. A head whose only outcome was a held refusal or a quota stop
-// is not settled, whatever its marker says: the next evaluation must retry
-// once the hold clears or the pool resets.
+// or did not run. A head whose only outcome was a held refusal, a quota stop or
+// a pending pass is not settled, whatever its marker says: the next evaluation
+// must retry once the hold clears, the pool resets or the reviewer finishes.
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseReview)

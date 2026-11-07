@@ -335,16 +335,18 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	e := s.RetryReview(reviewCtx, r, pr, o)
 	tracing.Finish(reviewSpan)
 	// A review that failed for any reason but an unavailable reviewer may not
-	// have reached its reviewers. A held or quota-stopped review produced no
-	// result: it is no failure, it counts as no review, and the head must not
-	// be settled.
-	unreviewed = errors.Is(e, pipeline.ErrReviewHeld) || errors.Is(e, pipeline.ErrReviewQuotaStopped)
-	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable)
+	// have reached its reviewers. A held, quota-stopped or pending review
+	// produced no result: it is no failure, it counts as no review, and the
+	// head must not be settled.
+	unreviewed = errors.Is(e, pipeline.ErrReviewHeld) || errors.Is(e, pipeline.ErrReviewQuotaStopped) || errors.Is(e, pipeline.ErrReviewPending)
+	// A pending pass did reach its reviewer and asked for its timer, so the
+	// timers it did not ask for belong to reviewers it dropped or replaced.
+	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable) || errors.Is(e, pipeline.ErrReviewPending)
 	if e != nil {
 		switch {
 		case unreviewed:
-			// No failure and nothing to settle: the reviewer-held or
-			// review-quota-stopped audit row already records it.
+			// No failure and nothing to settle: the reviewer-held,
+			// review-quota-stopped or review-pending audit row already records it.
 		case errors.Is(e, pipeline.ErrReviewUnavailable):
 			clean = false
 			if printErr := s.Print(map[string]any{"action": "review-unavailable", "repo": r.Name, "pr": pr.Number, "reason": e.Error()}); printErr != nil {
@@ -355,9 +357,9 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 		}
 	}
-	// A held or quota-stopped review posts nothing, so it must not settle
-	// either: running DeliverFindings, NotifyPR or Land for it would report and
-	// act on a review that did not happen.
+	// A held, quota-stopped or pending review posts nothing, so it must not
+	// settle either: running DeliverFindings, NotifyPR or Land for it would
+	// report and act on a review that did not happen.
 	if !settle || unreviewed {
 		return errs, clean, reviewed, unreviewed
 	}
