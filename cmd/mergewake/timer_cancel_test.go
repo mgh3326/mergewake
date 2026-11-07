@@ -134,6 +134,121 @@ func TestEnginePendingReviewerTimerStillFires(t *testing.T) {
 	}
 }
 
+// holdSpawns is the async fixture's runner with a switch: once hold is set,
+// every spawn is refused as held, as the hub does while a job holds the
+// reviewer reservation.
+type holdSpawns struct {
+	*asyncRunner
+	mu   sync.Mutex
+	held bool
+}
+
+func (h *holdSpawns) hold() {
+	h.mu.Lock()
+	h.held = true
+	h.mu.Unlock()
+}
+
+func (h *holdSpawns) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	h.mu.Lock()
+	held := h.held
+	h.mu.Unlock()
+	if held && command == "panewire" && len(args) > 0 && args[0] == "spawn" {
+		return nil, &integrations.CommandError{Command: "panewire", Err: heldSpawnExit{}, Stderr: heldSpawnBody}
+	}
+	return h.asyncRunner.Run(ctx, command, args, input, dir)
+}
+
+// (a) A pass that ends held places no reviewer and collects nothing. It must
+// leave the holder reviewer's pending deadline timer armed: the holder's
+// finish event may be missed, and only that timer revisits the PR at its
+// deadline.
+func TestEngineHeldPassLeavesThePendingTimerArmed(t *testing.T) {
+	a := asyncEngineFixture(t, 1, 1)
+	repo := a.f.repo.Name
+	a.e.q.EnqueueNamed(daemon.SourceWebhook, repo, 1, "")
+	a.idle(t, "its reviewer runs")
+	label := a.runner.label(1)
+	calls := a.timers.calls()
+	if len(calls) != 1 || !slices.Equal(a.e.q.TimerIDs(repo, 1), []string{label}) {
+		t.Fatalf("timers %d, ids %v, want the reviewer's timer pending", len(calls), a.e.q.TimerIDs(repo, 1))
+	}
+	// The reviewer's job record is gone, but its reservation still holds: the
+	// next pass is refused as held and finishes held.
+	a.sink.mu.Lock()
+	delete(a.sink.jobs, label)
+	a.sink.mu.Unlock()
+	holder := &holdSpawns{asyncRunner: a.runner}
+	holder.hold()
+	a.f.s.Runner = holder
+	a.e.q.EnqueueNamed(daemon.SourceWebhook, repo, 1, "")
+	a.idle(t, "the held pass ends")
+
+	if ids := a.e.q.TimerIDs(repo, 1); !slices.Equal(ids, []string{label}) {
+		t.Fatalf("timer ids %v after a held pass, want the holder's still armed", ids)
+	}
+	if calls[0].stopped.Load() {
+		t.Fatal("a held pass cancelled the holder reviewer's timer")
+	}
+	if a.notified(1) {
+		t.Fatalf("a held pass settled the PR: %v", a.f.trace.snapshot())
+	}
+}
+
+// (c) A quota-stop-only pass produced no result and must leave the pending
+// deadline timer of another reviewer armed: the stop is no failure and no
+// review.
+func TestEngineQuotaStoppedPassLeavesThePendingTimerArmed(t *testing.T) {
+	a := asyncEngineFixture(t, 1, 1)
+	repo := a.f.repo.Name
+	a.e.q.EnqueueNamed(daemon.SourceWebhook, repo, 1, "")
+	a.idle(t, "its reviewer runs")
+	label := a.runner.label(1)
+	calls := a.timers.calls()
+	if len(calls) != 1 || !slices.Equal(a.e.q.TimerIDs(repo, 1), []string{label}) {
+		t.Fatalf("timers %d, ids %v, want the reviewer's timer pending", len(calls), a.e.q.TimerIDs(repo, 1))
+	}
+	// The reviewer's hk record says panewire stopped it on an exhausted pool.
+	reset := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	a.sink.set(label, integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset, Host: "node-a", PaneID: "p1"})
+	a.e.q.EnqueueNamed(daemon.SourceReviewer, repo, 1, "")
+	a.idle(t, "the quota-stop pass ends")
+
+	if ids := a.e.q.TimerIDs(repo, 1); !slices.Equal(ids, []string{label}) {
+		t.Fatalf("timer ids %v after a quota stop, want the pending timer still armed", ids)
+	}
+	if calls[0].stopped.Load() {
+		t.Fatal("a quota-stopped pass cancelled the pending timer")
+	}
+	if a.notified(1) {
+		t.Fatalf("a quota-stopped pass settled the PR: %v", a.f.trace.snapshot())
+	}
+}
+
+// (d) A pass that collected its reviewer's result arms no timer of its own and
+// still cancels the pending deadline timer of a reviewer that is gone (#184).
+func TestEngineCompletedReviewStillCancelsUnarmedTimers(t *testing.T) {
+	a := asyncEngineFixture(t, 1, 1)
+	repo := a.f.repo.Name
+	a.e.q.EnqueueNamed(daemon.SourceWebhook, repo, 1, "")
+	a.idle(t, "its reviewer runs")
+	label := a.runner.label(1)
+	calls := a.timers.calls()
+	if len(calls) != 1 || !slices.Equal(a.e.q.TimerIDs(repo, 1), []string{label}) {
+		t.Fatalf("timers %d, ids %v, want the reviewer's timer pending", len(calls), a.e.q.TimerIDs(repo, 1))
+	}
+	a.finish(label)
+	a.e.q.EnqueueNamed(daemon.SourceReviewer, repo, 1, "")
+	a.idle(t, "the finish event settles the PR")
+
+	if ids := a.e.q.TimerIDs(repo, 1); len(ids) != 0 || !calls[0].stopped.Load() {
+		t.Fatalf("timer ids %v stopped=%v after a collected pass", ids, calls[0].stopped.Load())
+	}
+	if !a.notified(1) {
+		t.Fatalf("the PR did not settle: %v", a.f.trace.snapshot())
+	}
+}
+
 func TestEngineQuotaReplacementCancelsOldTimer(t *testing.T) {
 	a := asyncEngineFixture(t, 1, 1)
 	repo := a.f.repo.Name

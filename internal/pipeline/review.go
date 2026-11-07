@@ -31,6 +31,12 @@ var ErrReviewUnavailable = errors.New("review unavailable")
 // must be evaluated again once the hold clears, not settled as unchanged.
 var ErrReviewHeld = errors.New("review held")
 
+// ErrReviewQuotaStopped reports an evaluation whose only outcome was a quota
+// stop: panewire stopped its reviewer on an exhausted pool before it produced
+// a result. Nothing failed, but no review completed, so the retry waits for
+// the pool's reset and the PR must not be settled as unchanged.
+var ErrReviewQuotaStopped = errors.New("review quota stopped")
+
 const familyRequired = "author family required via --author-family, a Mergewake-Author-Family trailer in the PR body or head commit, or a known commit author"
 
 var familyValue = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)

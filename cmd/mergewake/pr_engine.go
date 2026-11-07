@@ -286,8 +286,9 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 // context, and the pass asks again each time it finds the reviewer still
 // running. A pass that collected, dropped or replaced a reviewer asks for
 // nothing, so the timers it did not ask for belong to reviewers that are gone:
-// endPass(reviewed) cancels them. A pass whose review failed cancels none,
-// since it may not have reached its reviewers.
+// endPass(reviewed) cancels them. A pass that did not review (held,
+// quota-stopped, or failed) cancels none, since its reviewers may still be
+// running.
 func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (context.Context, func(reviewed bool)) {
 	if e.revisit == nil {
 		return ctx, func(bool) {}
@@ -316,9 +317,10 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 
 // review is a PR's review and settle. A head whose review is done is settled
 // first, then its evidence is checked; any other is reviewed, then settled.
-// handled reports the first. reviewed is false when the review itself failed.
-// A head whose only outcome was a held refusal is not settled, whatever its
-// marker says: the next evaluation must retry once the hold clears.
+// handled reports the first. reviewed is false when the review itself failed
+// or did not run. A head whose only outcome was a held refusal or a quota stop
+// is not settled, whatever its marker says: the next evaluation must retry
+// once the hold clears or the pool resets.
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseReview)
@@ -350,11 +352,11 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 	c.reviewing++
 	c.peak = max(c.peak, c.reviewing)
 	e.mu.Unlock()
-	reviewErrs, ok, reviewed, held := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
+	reviewErrs, ok, reviewed, unreviewed := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
 	e.mu.Lock()
 	e.counts(r.Name).reviewing--
 	e.mu.Unlock()
-	return append(errs, reviewErrs...), ok && len(errs) == 0, handled && !held, reviewed
+	return append(errs, reviewErrs...), ok && len(errs) == 0, handled && !unreviewed, reviewed
 }
 
 // sweep is one pass over repo r: it puts the open PRs on the queue and
