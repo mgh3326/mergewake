@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // lostPaneHub stands a fake hub in front of the lost reviewer's pane and gives
@@ -115,16 +116,19 @@ func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
 	}
 }
 
-// (e) A forced close whose capture names a skip (the pane is no fleet job: its
-// job dir is missing) is a refusal: the pane stays open, the skip and its
-// reason are audited, and the replacement still runs.
+// (e) A forced close whose capture names a pane that is not a fleet job (its
+// job dir is missing) or that no longer matches is a refusal: the pane stays
+// open, the skip and its reason are audited, no worktree is removed, and the
+// replacement still runs.
 func TestLostOverdueReviewerCaptureSkipKeepsPane(t *testing.T) {
-	for _, skip := range []string{"not-a-job", "pane-gone", "pane-changed"} {
+	for _, skip := range []string{reap.CaptureNotAJob, reap.CapturePaneChanged} {
 		t.Run(skip, func(t *testing.T) {
 			s, g, r, runner, c := interruptedReviewer(t)
 			old := readReviewerJob(t, s, r, 1)
 			hub := lostPaneHub(t, s, runner, old, "working")
 			hub.capture = map[string]any{"outcome": skip}
+			hub.detached = map[string]bool{"/repo/" + old.Label: true}
+			hub.wtHead = shaA
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
 			pastBudget(g, c)
 			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
@@ -136,6 +140,9 @@ func TestLostOverdueReviewerCaptureSkipKeepsPane(t *testing.T) {
 			if closes := hub.ops("pane.close"); len(closes) != 0 {
 				t.Fatalf("a pane the capture skipped was closed: %v", closes)
 			}
+			if removes := hub.ops("worktree.remove"); len(removes) != 0 {
+				t.Fatalf("a pane the capture skipped had its worktree removed: %v", removes)
+			}
 			rows := auditRows(t, s, r, "reviewer-close-skipped")
 			if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), skip) || rows[0]["pane"] != "p1" {
 				t.Fatalf("reviewer-close-skipped = %v", rows)
@@ -144,5 +151,51 @@ func TestLostOverdueReviewerCaptureSkipKeepsPane(t *testing.T) {
 				t.Fatalf("spawns = %v", runner.spawns)
 			}
 		})
+	}
+}
+
+// (f) A capture that names the pane gone is not a refusal: no pane is left, so
+// the close counts as done and both the guarded remote worktree removal and
+// the local mirror checkout removal run.
+func TestLostOverdueReviewerGonePaneCountsAsClosed(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, r, 1)
+	hub := lostPaneHub(t, s, runner, old, "working")
+	hub.capture = map[string]any{"outcome": reap.CapturePaneGone}
+	// The pass's detached checkout is still on the node at the reviewed head.
+	hub.detached = map[string]bool{"/repo/" + old.Label: true}
+	hub.wtHead = shaA
+	// afterRun fires inside the replacement's spawn, so the mirror is seen as
+	// removed before the replacement runs, not by the pass's own cleanup.
+	mirror := false
+	runner.afterRun = func() {
+		for _, call := range gitCalls(runner, r.Root) {
+			mirror = mirror || call == "worktree remove --force "+old.Checkout
+		}
+	}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	pastBudget(g, c)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+old.Label || removes[0]["detached"] != true {
+		t.Fatalf("worktree.remove = %v", removes)
+	}
+	if !mirror {
+		t.Fatalf("the local mirror checkout was still there before the replacement: git %v", gitCalls(runner, r.Root))
+	}
+	var removed bool
+	for _, row := range auditRows(t, s, r, "reviewer-cleanup") {
+		removed = removed || row["result"] == "removed"
+	}
+	if !removed {
+		t.Fatalf("reviewer-cleanup = %v", auditRows(t, s, r, "reviewer-cleanup"))
+	}
+	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 0 {
+		t.Fatalf("a gone pane counted as a skipped close: %v", rows)
+	}
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
+		t.Fatalf("spawns = %v", runner.spawns)
 	}
 }

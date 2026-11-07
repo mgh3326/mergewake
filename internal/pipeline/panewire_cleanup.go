@@ -261,7 +261,16 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 			c.record("error", "pane screen: "+err.Error())
 			return "", false
 		}
-		if saved.Skip != "" {
+		// A pane that is gone counts as closed, exactly as it does when the
+		// pane list no longer carries it, so the guarded worktree removal still
+		// runs. Any other skip keeps the pane open: not-a-job names an
+		// operator's pane, and pane-changed no longer carries this pass's.
+		switch saved.Skip {
+		case "":
+		case reap.CapturePaneGone:
+			c.paneGone = true
+			return pane.Cwd, true
+		default:
 			c.record("kept", "pane screen skipped: "+saved.Skip)
 			return "", false
 		}
