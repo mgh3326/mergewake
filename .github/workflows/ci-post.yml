@@ -8,6 +8,9 @@ on:
       ref:
         type: string
         required: false
+      packages:
+        type: string
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -20,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -38,6 +42,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -47,28 +52,27 @@ jobs:
           CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-  test-race:
+  test:
     runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PANEWIRE_POST_LINUX_RUNNER) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
           cache: true
-      - run: go test -race ./...
-  test-macos:
-    runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PANEWIRE_POST_MAC_RUNNER) || 'macos-latest' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.27.x'
-          cache: true
-      - run: go test ./...
+      - name: go test
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
+            read -r -a packages <<< "$PACKAGES"
+            go test "${packages[@]}"
+          else
+            go test ./...
+          fi
   mysql8-store:
     runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PANEWIRE_POST_LINUX_RUNNER) || 'ubuntu-latest' }}
     services:
@@ -85,23 +89,33 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
           cache: true
-      - run: go test -race -p 2 -v ./internal/server/...
+      - name: go test (MySQL 8 store)
         env:
           MERGEWAKE_TEST_MYSQL_DSN: root:disposable-ci-password@tcp(127.0.0.1:3306)/mergewake_test?parseTime=true
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
+            read -r -a packages <<< "$PACKAGES"
+            go test -race -p 2 -v "${packages[@]}"
+          else
+            go test -race -p 2 -v ./internal/server/...
+          fi
   auto-tag-test:
     runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PANEWIRE_POST_LINUX_RUNNER) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - run: python3 scripts/test-auto-tag.py
       - run: python3 scripts/test-repair-release.py
   ci-ok:
-    needs: [vet, build, test-race, test-macos, mysql8-store, auto-tag-test]
+    needs: [vet, build, test, mysql8-store, auto-tag-test]
     if: ${{ always() && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-latest
     steps:

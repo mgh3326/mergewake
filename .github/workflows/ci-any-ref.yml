@@ -6,9 +6,19 @@ on:
         description: Exact 40-hex commit SHA to test
         required: true
         type: string
+      suite:
+        description: CI stage to run
+        required: false
+        default: main
+        type: choice
+        options: [main, deploy]
+      packages:
+        description: 'Space-separated go test package patterns; empty, all or ./... run the full suite'
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
-  statuses: write
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -18,6 +28,7 @@ jobs:
         run: '[[ "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]'
   ci:
     needs: validate
+    if: ${{ inputs.suite == 'main' }}
     concurrency:
       group: ci-any-ref-ci-${{ inputs.ref }}
       cancel-in-progress: true
@@ -26,24 +37,73 @@ jobs:
     uses: ./.github/workflows/ci-post.yml
     with:
       ref: ${{ inputs.ref }}
+      packages: ${{ inputs.packages }}
+  deploy:
+    needs: validate
+    if: ${{ inputs.suite == 'deploy' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ inputs.ref }}
+      packages: ${{ inputs.packages }}
   status:
-    if: ${{ always() && needs.validate.result == 'success' && needs.ci.result != 'cancelled' }}
-    needs: [validate, ci]
+    if: ${{ always() && needs.validate.result == 'success' }}
+    needs: [validate, ci, deploy]
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
     concurrency:
       group: ci-any-ref-status-${{ inputs.ref }}
       cancel-in-progress: true
     env:
       GH_TOKEN: ${{ github.token }}
       TARGET_SHA: ${{ inputs.ref }}
-      RESULT: ${{ needs.ci.result }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PACKAGES: ${{ inputs.packages }}
     steps:
-      - run: |
+      # Release admission and rollout read ci-ok/deploy-ok as "the full suite
+      # is green", so a run that tested only some packages must not publish
+      # them. No filter, all and ./... all select the whole suite.
+      - name: Decide whether the full suite ran
+        run: |
+          case "$PACKAGES" in
+            ''|all|./...) echo "FULL=true" >> "$GITHUB_ENV" ;;
+            *)            echo "FULL=false" >> "$GITHUB_ENV" ;;
+          esac
+      - name: Post ci status
+        if: ${{ inputs.suite == 'main' && needs.ci.result != 'cancelled' }}
+        env:
+          RESULT: ${{ needs.ci.result }}
+        run: |
           case "$RESULT" in
             success) STATE=success ;;
             *) STATE=failure ;;
           esac
-          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state="$STATE" -f context=ci-ok -f target_url="$RUN_URL" \
-            -f description="exact-head CI: $RESULT"
+          if [ "$FULL" = true ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=ci-ok -f target_url="$RUN_URL" \
+              -f description="exact-head CI: $RESULT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=ci-partial -f target_url="$RUN_URL" \
+              -f description="exact-head partial CI: $RESULT"
+          fi
+      - name: Post deploy status
+        if: ${{ inputs.suite == 'deploy' && needs.deploy.result != 'cancelled' }}
+        env:
+          RESULT: ${{ needs.deploy.result }}
+        run: |
+          case "$RESULT" in
+            success) STATE=success ;;
+            *) STATE=failure ;;
+          esac
+          if [ "$FULL" = true ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=deploy-ok -f target_url="$RUN_URL" \
+              -f description="exact-head deploy: $RESULT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=deploy-partial -f target_url="$RUN_URL" \
+              -f description="exact-head partial deploy: $RESULT"
+          fi
