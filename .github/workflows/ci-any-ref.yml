@@ -13,7 +13,7 @@ on:
         type: choice
         options: [main, deploy]
       packages:
-        description: Space-separated go test package patterns (default ./...)
+        description: 'Space-separated go test package patterns; empty, all or ./... run the full suite'
         required: false
         default: ''
         type: string
@@ -60,8 +60,18 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TARGET_SHA: ${{ inputs.ref }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PACKAGES: ${{ inputs.packages }}
     steps:
-      - name: Post ci-ok
+      # Release admission and rollout read ci-ok/deploy-ok as "the full suite
+      # is green", so a run that tested only some packages must not publish
+      # them. No filter, all and ./... all select the whole suite.
+      - name: Decide whether the full suite ran
+        run: |
+          case "$PACKAGES" in
+            ''|all|./...) echo "FULL=true" >> "$GITHUB_ENV" ;;
+            *)            echo "FULL=false" >> "$GITHUB_ENV" ;;
+          esac
+      - name: Post ci status
         if: ${{ inputs.suite == 'main' && needs.ci.result != 'cancelled' }}
         env:
           RESULT: ${{ needs.ci.result }}
@@ -70,10 +80,16 @@ jobs:
             success) STATE=success ;;
             *) STATE=failure ;;
           esac
-          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state="$STATE" -f context=ci-ok -f target_url="$RUN_URL" \
-            -f description="exact-head CI: $RESULT"
-      - name: Post deploy-ok
+          if [ "$FULL" = true ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=ci-ok -f target_url="$RUN_URL" \
+              -f description="exact-head CI: $RESULT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=ci-partial -f target_url="$RUN_URL" \
+              -f description="exact-head partial CI: $RESULT"
+          fi
+      - name: Post deploy status
         if: ${{ inputs.suite == 'deploy' && needs.deploy.result != 'cancelled' }}
         env:
           RESULT: ${{ needs.deploy.result }}
@@ -82,6 +98,12 @@ jobs:
             success) STATE=success ;;
             *) STATE=failure ;;
           esac
-          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state="$STATE" -f context=deploy-ok -f target_url="$RUN_URL" \
-            -f description="exact-head deploy: $RESULT"
+          if [ "$FULL" = true ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=deploy-ok -f target_url="$RUN_URL" \
+              -f description="exact-head deploy: $RESULT"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$STATE" -f context=deploy-partial -f target_url="$RUN_URL" \
+              -f description="exact-head partial deploy: $RESULT"
+          fi

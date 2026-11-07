@@ -34,7 +34,7 @@ jobs:
         env:
           PACKAGES: ${{ inputs.packages }}
         run: |
-          if [ -n "$PACKAGES" ]; then
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
             read -r -a packages <<< "$PACKAGES"
             go test -race "${packages[@]}"
           else
@@ -56,7 +56,7 @@ jobs:
         env:
           PACKAGES: ${{ inputs.packages }}
         run: |
-          if [ -n "$PACKAGES" ]; then
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
             read -r -a packages <<< "$PACKAGES"
             go test "${packages[@]}"
           else

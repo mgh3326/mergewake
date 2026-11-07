@@ -67,7 +67,7 @@ jobs:
         env:
           PACKAGES: ${{ inputs.packages }}
         run: |
-          if [ -n "$PACKAGES" ]; then
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
             read -r -a packages <<< "$PACKAGES"
             go test "${packages[@]}"
           else
@@ -99,7 +99,7 @@ jobs:
           MERGEWAKE_TEST_MYSQL_DSN: root:disposable-ci-password@tcp(127.0.0.1:3306)/mergewake_test?parseTime=true
           PACKAGES: ${{ inputs.packages }}
         run: |
-          if [ -n "$PACKAGES" ]; then
+          if [ -n "$PACKAGES" ] && [ "$PACKAGES" != all ]; then
             read -r -a packages <<< "$PACKAGES"
             go test -race -p 2 -v "${packages[@]}"
           else
