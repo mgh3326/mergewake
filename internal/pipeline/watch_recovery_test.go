@@ -11,6 +11,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 const revertHead = "dddddddddddddddddddddddddddddddddddddddd"
@@ -491,6 +492,37 @@ func TestWatchFixPRMergesGreenClosesRevert(t *testing.T) {
 	}
 	if lines := designLaneEvents(n); len(lines) != 0 {
 		t.Fatalf("fix-won notified the design lane: %v", lines)
+	}
+}
+
+// A repo whose any-ref workflow accepts packages is re-run for the culprit's
+// changed Go packages; one that does not gets the ref only.
+type packagesGH struct{ *fakeGH }
+
+func (g *packagesGH) ReadFile(_ context.Context, _, _, name string) ([]byte, error) {
+	if name == ".github/workflows/ci-any-ref.yml" {
+		return []byte("on:\n  workflow_dispatch:\n    inputs:\n      packages:\n        type: string\n"), nil
+	}
+	return g.fakeGH.ReadFile(context.Background(), "", "", name)
+}
+
+func TestRecoveryConfirmInputsPackages(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.files = []policy.File{
+		{Path: "internal/mcp/a.go", Kind: "modified"},
+		{Path: "cmd/tool/b.go", Kind: "added"},
+		{Path: "docs/a.md", Kind: "modified"},
+	}
+	p := policy.Policy{AnyRefWorkflow: "ci-any-ref.yml"}
+	st := recoveryIncident{CulpritPR: 7}
+
+	if got := s.confirmInputs(context.Background(), r, p, st, shaB); got["packages"] != "" || got["ref"] != shaB {
+		t.Fatalf("no workflow input: %v", got)
+	}
+	s.GH = &packagesGH{fakeGH: g}
+	got := s.confirmInputs(context.Background(), r, p, st, shaB)
+	if got["packages"] != "./cmd/tool/ ./internal/mcp/" || got["ref"] != shaB {
+		t.Fatalf("packages %v", got)
 	}
 }
 

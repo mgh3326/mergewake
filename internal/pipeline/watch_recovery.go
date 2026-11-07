@@ -314,7 +314,7 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 		if e := save(st); e != nil {
 			return st, false, "", false, e
 		}
-		if e := dispatcher.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, map[string]string{"ref": sha}); e != nil {
+		if e := dispatcher.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, s.confirmInputs(ctx, r, p, st, sha)); e != nil {
 			if github.DispatchRefused(e) {
 				delete(st.Pending, sha)
 				return hold(st, "any-ref CI dispatch refused for "+short7(sha)+": "+e.Error())
@@ -328,6 +328,47 @@ func (s *Service) confirmRecovery(ctx context.Context, r config.Repo, p policy.P
 	return st, false, fmt.Sprintf("confirming the failure: %d/%d at %s, %d/%d at %s",
 		len(st.Runs[st.Baseline]), confirmRuns, short7(st.Baseline),
 		len(st.Runs[st.Culprit]), confirmRuns, short7(st.Culprit)), false, nil
+}
+
+// confirmInputs is the dispatch payload for a confirmation re-run: the commit
+// always, and the culprit's changed Go packages when the repo's any-ref
+// workflow accepts a `packages` input, so the re-run isolates the failing
+// packages instead of repeating the whole suite.
+func (s *Service) confirmInputs(ctx context.Context, r config.Repo, p policy.Policy, st recoveryIncident, sha string) map[string]string {
+	inputs := map[string]string{"ref": sha}
+	if st.CulpritPR == 0 {
+		return inputs
+	}
+	workflow, e := s.GH.ReadFile(ctx, r.Name, sha, ".github/workflows/"+p.AnyRefWorkflow)
+	if e != nil || !strings.Contains(string(workflow), "packages:") {
+		return inputs
+	}
+	files, e := s.GH.Files(ctx, r.Name, st.CulpritPR)
+	if e != nil {
+		return inputs
+	}
+	dirs := map[string]bool{}
+	for _, f := range files {
+		if !strings.HasSuffix(f.Path, ".go") || f.Kind == "removed" {
+			continue
+		}
+		dir := strings.TrimSuffix(filepath.Dir(f.Path), "/")
+		if dir == "." || dir == "" {
+			dirs["./"] = true
+			continue
+		}
+		dirs["./"+dir+"/"] = true
+	}
+	if len(dirs) == 0 {
+		return inputs
+	}
+	patterns := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		patterns = append(patterns, dir)
+	}
+	sort.Strings(patterns)
+	inputs["packages"] = strings.Join(patterns, " ")
+	return inputs
 }
 
 // rerunOutcome reads the any-ref statuses a dispatch posted after at. ready is
