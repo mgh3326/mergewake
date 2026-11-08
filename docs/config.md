@@ -360,6 +360,7 @@ A single PR's fetch failure never aborts the pass.
 | `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
 | `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
+| `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
 unit, never its worktree — that is in git and is cleaned by the worktree
@@ -371,8 +372,15 @@ local job dir and reports the step:
    never tilde-expand, and a relative one is refused as
    `jobs-dir-not-absolute`. A job dir that is itself a symlink is refused as
    `job-dir-symlink` (checked again right before the delete); otherwise
-   list every non-directory entry. Credential-like
-   paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
+   list every non-directory entry. A job is eligible only when its `events/`
+   contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
+   `job.placement` event (a reused name has started again); bookkeeping events
+   do not affect that decision. Jobs without an events directory are skipped.
+   `reap.archive.exclude` is a list of shell globs matched against job names;
+   it defaults to `["pw-rollout-*", "pw-hk*", "events-lane"]`, while an
+   explicit empty list disables name exclusions. Matching jobs are skipped as
+   `excluded-name` before per-job host inspection. Credential-like paths — any
+   path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
    case-insensitively — are excluded from Drive and hk and named in the
    record. A regular file larger than a positive `drive_max_file_bytes` is
    listed as oversized instead of being moved; it is not counted in the

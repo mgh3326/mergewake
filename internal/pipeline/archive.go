@@ -17,7 +17,7 @@ import (
 
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
-	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
+	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
 }
 
 // archiveRetry spaces retries of a job whose archive failed, so a persistent
@@ -166,6 +166,8 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 		}
 		rec := reapReceipt{Action: "archive-job", Repo: r.Name, PR: c.PR, Host: k.host, Job: k.job}
 		switch {
+		case archive.ExcludedName(s.Config.Reap.Archive.Exclude, k.job):
+			rec.Result, rec.Reason = "skipped", "excluded-name"
 		case hs.viaHub:
 			rec.Result, rec.Reason = "skipped", "archive-over-hub"
 		case hs.usageUnknown:
@@ -250,6 +252,8 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			row := archiveRow{Action: "archive-job", Host: h.Name, Job: job}
 			if !reap.ValidJobName(job) {
 				row.Result, row.Reason = "skipped", "job-name-invalid"
+			} else if archive.ExcludedName(s.Config.Reap.Archive.Exclude, job) {
+				row.Result, row.Reason = "skipped", "excluded-name"
 			} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 				row.Result, row.Reason = "skipped", "pane-live"
 			} else if p, e := a.Plan(ctx, h, job); e != nil {

@@ -24,12 +24,14 @@ import (
 // fake script on PATH. hk is reached over HTTP (hktest), never as a
 // subprocess: an hk CLI call is recorded and refused.
 type fakeRunner struct {
+	calls  int
 	failRm bool
 	rms    [][]string // delete argv, recorded
 	hkCLI  [][]string // hk CLI calls, which must not happen
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	f.calls++
 	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
 		f.hkCLI = append(f.hkCLI, append([]string{name}, args...))
 		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
@@ -148,6 +150,7 @@ func job(t *testing.T, jobs, name string) string {
 	write(t, filepath.Join(dir, "report.md"), "# report\n")
 	write(t, filepath.Join(dir, "events", "00001-job.claim.json"), `{"payload":{"task_id":11}}`)
 	write(t, filepath.Join(dir, "events", "00004-job.task_link.json"), `{"kind":"job.task_link","payload":{"task_id":"2402"}}`)
+	write(t, filepath.Join(dir, "events", "00005-job.completed.json"), `{}`)
 	write(t, filepath.Join(dir, "build", "game.bin"), strings.Repeat("x", 4096))
 	write(t, filepath.Join(dir, "notes with space.md"), "spaced\n")
 	write(t, filepath.Join(dir, ".env.local"), "SECRET=1\n")
@@ -161,6 +164,11 @@ func job(t *testing.T, jobs, name string) string {
 	return dir
 }
 
+func finishJob(t *testing.T, dir string) {
+	t.Helper()
+	write(t, filepath.Join(dir, "events", "00005-job.completed.json"), `{}`)
+}
+
 func archiver(e env, ssh string) *Archiver {
 	return &Archiver{Runner: e.run, DriveDir: e.drive, SSH: ssh, TextMax: 1024}
 }
@@ -172,13 +180,14 @@ func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "report.md"), strings.Repeat("r", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(p.Move, ",") != "events/00001-job.task_link.json,small.bin" || p.Files != 2 || p.Bytes != 78 {
+	if strings.Join(p.Move, ",") != "events/00001-job.task_link.json,events/00005-job.completed.json,small.bin" || p.Files != 3 || p.Bytes != 80 {
 		t.Fatalf("moves = %v, files=%d bytes=%d", p.Move, p.Files, p.Bytes)
 	}
 	if len(p.Oversized) != 2 || p.Oversized[0].Path != "large.bin" || p.Oversized[0].Size != 150 || p.Oversized[1].Path != "report.md" || p.Oversized[1].Size != 150 || p.OversizedBytes != 300 {
@@ -207,6 +216,7 @@ func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "report.md"), strings.Repeat("r", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
@@ -217,7 +227,7 @@ func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Deleted || res.Files != 2 || res.Bytes != 78 {
+	if !res.Deleted || res.Files != 3 || res.Bytes != 80 {
 		t.Fatalf("result = %+v", res)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "large.bin")); !os.IsNotExist(err) {
@@ -243,7 +253,7 @@ func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
 			t.Errorf("comment lacks %q:\n%s", want, note)
 		}
 	}
-	if len(e.uploads()) != 2 || e.uploads()["report.md"] != nil { // small task-link text file and manifest; oversized report is not uploaded.
+	if len(e.uploads()) != 3 || e.uploads()["report.md"] != nil { // task-link, completion and manifest; oversized report is not uploaded.
 		t.Fatalf("uploads = %v", e.uploads())
 	}
 }
@@ -253,6 +263,7 @@ func TestApplyKeepsChangedOversizedFile(t *testing.T) {
 	dir := filepath.Join(e.jobs, "wk-oversized")
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
@@ -276,6 +287,7 @@ func TestApplyKeepsOversizedContentChangedWithoutMetadataChange(t *testing.T) {
 	large := filepath.Join(dir, "large.bin")
 	write(t, large, strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized-same-metadata")
@@ -327,8 +339,9 @@ func TestApplyOnlyOversizedFiles(t *testing.T) {
 	dir := filepath.Join(e.jobs, "wk-oversized")
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	a := archiver(e, "")
-	a.DriveMaxFileBytes = 100
+	a.DriveMaxFileBytes = 1
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402,"padding":"`+strings.Repeat("x", 100)+`"}}`)
+	finishJob(t, dir)
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
 	if err != nil {
 		t.Fatal(err)
@@ -337,7 +350,7 @@ func TestApplyOnlyOversizedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Move) != 0 || len(p.Oversized) != 2 || !res.Deleted {
+	if len(p.Move) != 0 || len(p.Oversized) != 3 || !res.Deleted {
 		t.Fatalf("plan=%+v result=%+v", p, res)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -345,7 +358,7 @@ func TestApplyOnlyOversizedFiles(t *testing.T) {
 	}
 	var m manifest
 	b, err := os.ReadFile(filepath.Join(res.Dest, "manifest.json"))
-	if err != nil || json.Unmarshal(b, &m) != nil || len(m.Oversized) != 2 {
+	if err != nil || json.Unmarshal(b, &m) != nil || len(m.Oversized) != 3 {
 		t.Fatalf("manifest oversized=%+v err=%v", m.Oversized, err)
 	}
 }
@@ -356,6 +369,7 @@ func TestResumeIgnoresRecordedOversizedFilesForArchiveMatch(t *testing.T) {
 	write(t, filepath.Join(dir, "small.bin"), "small")
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
 	h := reap.Host{Name: "h1", Jobs: e.jobs}
@@ -396,6 +410,7 @@ func TestResumeRejectsChangedOversizedManifestEntries(t *testing.T) {
 			write(t, filepath.Join(dir, "small.bin"), "small")
 			write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 			write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+			finishJob(t, dir)
 			a := archiver(e, "")
 			a.DriveMaxFileBytes = 100
 			h := reap.Host{Name: "h1", Jobs: e.jobs}
@@ -426,8 +441,9 @@ func TestDriveMaxFileBytesZeroPreservesExistingBehavior(t *testing.T) {
 	dir := filepath.Join(e.jobs, "wk-oversized")
 	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	finishJob(t, dir)
 	p, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
-	if err != nil || len(p.Move) != 2 || len(p.Oversized) != 0 || p.Files != 2 {
+	if err != nil || len(p.Move) != 3 || len(p.Oversized) != 0 || p.Files != 3 {
 		t.Fatalf("plan=%+v err=%v", p, err)
 	}
 }
@@ -465,10 +481,10 @@ func TestPlanExcludesCredentialsAndListsThem(t *testing.T) {
 		t.Fatalf("skipped = %v", p.Skipped)
 	}
 	// build/game.bin is over the 1 KiB text cap and not markdown/JSON: Drive only.
-	if strings.Join(p.Text, ",") != "brief.md,events/00001-job.claim.json,events/00004-job.task_link.json,notes with space.md,report.md" {
+	if strings.Join(p.Text, ",") != "brief.md,events/00001-job.claim.json,events/00004-job.task_link.json,events/00005-job.completed.json,notes with space.md,report.md" {
 		t.Fatalf("text = %v", p.Text)
 	}
-	if p.Task != "2402" || p.Files != 6 || p.Delete != filepath.Join(e.jobs, "wk-7") {
+	if p.Task != "2402" || p.Files != 7 || p.Delete != filepath.Join(e.jobs, "wk-7") {
 		t.Fatalf("plan = %+v", p)
 	}
 	if !strings.HasPrefix(p.Dest, filepath.Join(e.drive, "h1")+"/") || filepath.Base(p.Dest) != "wk-7" {
@@ -479,10 +495,12 @@ func TestPlanExcludesCredentialsAndListsThem(t *testing.T) {
 func TestPlanSkips(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
-	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	h := reap.Host{Jobs: e.jobs}
 	write(t, filepath.Join(e.jobs, "notask", "report.md"), "r\n")
+	write(t, filepath.Join(e.jobs, "notask", "events", "00005-job.completed.json"), `{}`)
 	write(t, filepath.Join(e.jobs, "own-manifest", "manifest.json"), "{}")
 	write(t, filepath.Join(e.jobs, "own-manifest", "events", "00004-job.task_link.json"), `{"payload":{"task_id":5}}`)
+	write(t, filepath.Join(e.jobs, "own-manifest", "events", "00005-job.completed.json"), `{}`)
 	for job, reason := range map[string]string{"gone": "job-gone", "notask": "task-unknown", "own-manifest": "manifest-collision", "../x": "job-name-invalid"} {
 		_, err := a.Plan(context.Background(), h, job)
 		var s *Skip
@@ -492,6 +510,89 @@ func TestPlanSkips(t *testing.T) {
 	}
 	if _, err := a.Plan(context.Background(), reap.Host{Name: "h1"}, "x"); err == nil || err.Error() != "skipped: jobs-dir-unset" {
 		t.Errorf("jobs unset: %v", err)
+	}
+}
+
+func TestPlanRequiresFinishedLifecycle(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	h := reap.Host{Jobs: e.jobs}
+	writeEvents := func(job string, events ...string) {
+		for i, event := range events {
+			write(t, filepath.Join(e.jobs, job, "events", fmt.Sprintf("%05d-%s.json", i+1, event)), `{}`)
+		}
+		write(t, filepath.Join(e.jobs, job, "events", "00010-job.task_link.json"), `{"payload":{"task_id":"2402"}}`)
+	}
+	for i, tc := range []struct {
+		name   string
+		events []string
+		want   string
+	}{
+		{"completed then bookkeeping", []string{"job.claim", "job.spawned", "job.completed", "quota_pool.release", "job.reaped"}, "planned"},
+		{"lost", []string{"job.claim", "job.lost"}, "planned"},
+		{"placement unfinished", []string{"job.placement"}, "not-finished"},
+		{"joined unfinished", []string{"job.joined"}, "not-finished"},
+		{"restarted after completion", []string{"job.claim", "job.completed", "job.spawned"}, "not-finished"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jobName := fmt.Sprintf("lifecycle-%d", i)
+			writeEvents(jobName, tc.events...)
+			_, err := a.Plan(context.Background(), h, jobName)
+			if tc.want == "planned" && err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			if tc.want != "planned" {
+				var skip *Skip
+				if !errors.As(err, &skip) || skip.Reason != tc.want {
+					t.Fatalf("Plan() error = %v, want skipped %s", err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestPlanSkipsJobWithoutEvents(t *testing.T) {
+	e := setup(t)
+	job(t, e.jobs, "no-events")
+	if err := os.RemoveAll(filepath.Join(e.jobs, "no-events", "events")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Jobs: e.jobs}, "no-events")
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "no-events" {
+		t.Fatalf("Plan() error = %v, want skipped no-events", err)
+	}
+}
+
+func TestPlanEmptyEventsDirectoryIsNotFinished(t *testing.T) {
+	e := setup(t)
+	if err := os.MkdirAll(filepath.Join(e.jobs, "empty-events", "events"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Jobs: e.jobs}, "empty-events")
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "not-finished" {
+		t.Fatalf("Plan() error = %v, want skipped not-finished", err)
+	}
+}
+
+func TestPlanExcludesNamesBeforeHostRead(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	a.Exclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
+	for _, name := range []string{"pw-rollout-x", "pw-hk1", "events-lane"} {
+		_, err := a.Plan(context.Background(), reap.Host{Jobs: e.jobs}, name)
+		var skip *Skip
+		if !errors.As(err, &skip) || skip.Reason != "excluded-name" {
+			t.Errorf("%s: error = %v", name, err)
+		}
+	}
+	if e.run.calls != 0 {
+		t.Fatalf("excluded names caused %d host commands", e.run.calls)
+	}
+	a.Exclude = []string{}
+	if ExcludedName(a.Exclude, "pw-rollout-x") {
+		t.Fatal("explicit empty exclude matched a name")
 	}
 }
 
@@ -513,7 +614,7 @@ func checkArchived(t *testing.T, e env, res *Result, dir string) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if len(m.Files) != 6 || res.Files != 6 {
+	if len(m.Files) != 7 || res.Files != 7 {
 		t.Fatalf("manifest files = %d", len(m.Files))
 	}
 	for _, f := range m.Files {
@@ -544,17 +645,17 @@ func checkArchived(t *testing.T, e env, res *Result, dir string) {
 		}
 	}
 	note := e.comment(2402)
-	for _, want := range []string{res.Dest, "files: 6", "manifest: ", res.Manifest, ".env.local", "gh_token.txt", "API_KEY.json", "build/game.bin", "deleted after this record"} {
+	for _, want := range []string{res.Dest, "files: 7", "manifest: ", res.Manifest, ".env.local", "gh_token.txt", "API_KEY.json", "build/game.bin", "deleted after this record"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("hk comment lacks %q:\n%s", want, note)
 		}
 	}
-	if len(res.Attachments) != 5 || uploads["manifest.json"] == nil {
+	if len(res.Attachments) != 6 || uploads["manifest.json"] == nil {
 		t.Fatalf("attachments = %+v", res.Attachments)
 	}
-	// Five job text files and the manifest go up as attachments, one comment
+	// Six job text files and the manifest go up as attachments, one comment
 	// records them; each goes to hk over HTTP with the svc token (setup).
-	if got := e.routes(); got["PUT /v1/attachments"] != 6 || got["POST /v1/tasks/2402/comments"] != 1 || len(got) != 2 {
+	if got := e.routes(); got["PUT /v1/attachments"] != 7 || got["POST /v1/tasks/2402/comments"] != 1 || len(got) != 2 {
 		t.Fatalf("hk routes = %v", got)
 	}
 	if a := e.hk.Attachments()[res.Manifest]; a.Name != "manifest.json" || a.MIME != "application/json" {
@@ -713,8 +814,10 @@ func TestApplyNothingToMove(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-12")
 	write(t, filepath.Join(dir, "events", "00004-token-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	finishJob(t, dir)
 	write(t, filepath.Join(dir, ".env"), "SECRET=1\n")
 	a := archiver(e, "")
+	a.DriveMaxFileBytes = 1
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-12")
 	if err != nil || len(p.Move) != 0 || p.Task != "9" {
 		t.Fatalf("plan: %+v %v", p, err)
