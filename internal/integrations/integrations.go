@@ -152,6 +152,9 @@ func (s Stdout) Notify(_ context.Context, e Event) error {
 type Panewire struct {
 	Runner        Runner
 	Command, Lane string
+	// Hub is reap.hub: the inbox reads and acks run with its service
+	// credential (see InboxArgv).
+	Hub config.ReapHub
 }
 
 func (p Panewire) Notify(ctx context.Context, e Event) error {
@@ -178,11 +181,28 @@ func (p Panewire) Notify(ctx context.Context, e Event) error {
 	return err
 }
 
+// InboxArgv is the argv of one `panewire inbox` call; sub is the subcommand
+// and its arguments. When reap.hub's URL and token file are both set, the
+// call carries the hub's service credential paths (the cf file too, when set),
+// so the scoped service reads and acks the lane. Otherwise the argv is the
+// bare inbox call. Only paths are passed; the files are never read here.
+func InboxArgv(hub config.ReapHub, sub ...string) []string {
+	argv := append([]string{"inbox"}, sub...)
+	if hub.URL == "" || hub.TokenFile == "" {
+		return argv
+	}
+	argv = append(argv, "--hub-url", hub.URL, "--hub-token-env", hub.TokenFile)
+	if hub.CFFile != "" {
+		argv = append(argv, "--hub-cf-env", hub.CFFile)
+	}
+	return argv
+}
+
 // AckedEvents reads lane's inbox and maps each lane event's id to whether its
 // receiver acknowledged it (`panewire inbox ack`). An id the hub has no item
 // for is absent.
 func (p Panewire) AckedEvents(ctx context.Context, lane string) (map[string]bool, error) {
-	raw, err := p.Runner.Run(ctx, p.Command, []string{"inbox", "list", "--lane", lane, "--json"}, "", "")
+	raw, err := p.Runner.Run(ctx, p.Command, InboxArgv(p.Hub, "list", "--lane", lane, "--json"), "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +421,7 @@ func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {
 		if cmd == "" {
 			cmd = "panewire"
 		}
-		n = Panewire{r, cmd, c.Notifier.Lane}
+		n = Panewire{r, cmd, c.Notifier.Lane, c.Reap.Hub}
 	}
 	return s, n
 }

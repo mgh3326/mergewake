@@ -3,8 +3,11 @@ package integrations
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/mgh3326/mergewake/internal/config"
 )
 
 type call struct {
@@ -107,7 +110,7 @@ func TestNotifyLaneOverrideAndTaskLane(t *testing.T) {
 
 func TestAdapterErrorsPropagate(t *testing.T) {
 	r := &fakeRunner{fail: true}
-	if (Panewire{r, "panewire", "lane-a"}).Notify(context.Background(), Event{}) == nil {
+	if (Panewire{Runner: r, Command: "panewire", Lane: "lane-a"}).Notify(context.Background(), Event{}) == nil {
 		t.Fatal("notify failure hidden")
 	}
 	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "in_progress"}
@@ -295,6 +298,77 @@ func TestPanewireAckedReadsTheLaneInbox(t *testing.T) {
 		t.Fatal("absent event reported")
 	}
 	if got := strings.Join(r.calls[0], " "); got != "inbox list --lane w-7 --json" {
+		t.Fatal(got)
+	}
+}
+
+// inboxNotifier builds the panewire notifier the daemon builds from config,
+// with the reap.hub credential set as given. The paths are fakes; the fake
+// Runner never reads them.
+func inboxNotifier(t *testing.T, r Runner, hub config.ReapHub) Panewire {
+	t.Helper()
+	var c config.Config
+	c.Notifier = config.Notifier{Type: "panewire", Command: "panewire", Lane: "desk"}
+	c.Reap.Hub = hub
+	_, n := New(c, r, io.Discard)
+	p, ok := n.(Panewire)
+	if !ok {
+		t.Fatalf("notifier is %T, not Panewire", n)
+	}
+	return p
+}
+
+var fakeHub = config.ReapHub{URL: "https://hub.example.test", TokenFile: "/fake/svc-mergewake.env", CFFile: "/fake/cf.env"}
+
+const fakeHubFlags = " --hub-url https://hub.example.test --hub-token-env /fake/svc-mergewake.env"
+
+func TestInboxReadCarriesTheReapHubCredential(t *testing.T) {
+	r := &typeRunner{inbox: `[{"id":4,"acked_at_ms":1700,"event":{"event_id":"done"}}]`}
+	if _, err := inboxNotifier(t, r, fakeHub).AckedEvents(context.Background(), "w-7"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(r.calls[0], " "), "inbox list --lane w-7 --json"+fakeHubFlags+" --hub-cf-env /fake/cf.env"; got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestInboxReadWithoutCFFileOmitsItsFlag(t *testing.T) {
+	r := &typeRunner{inbox: `[]`}
+	hub := fakeHub
+	hub.CFFile = ""
+	if _, err := inboxNotifier(t, r, hub).AckedEvents(context.Background(), "w-7"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(r.calls[0], " "), "inbox list --lane w-7 --json"+fakeHubFlags; got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+}
+
+// Either credential path unset leaves the inbox argv as it was before the
+// reap.hub credential was passed.
+func TestInboxReadWithoutTheHubKeepsTheBareArgv(t *testing.T) {
+	for _, hub := range []config.ReapHub{
+		{},
+		{URL: "https://hub.example.test"},
+		{TokenFile: "/fake/svc-mergewake.env", CFFile: "/fake/cf.env"},
+	} {
+		r := &typeRunner{inbox: `[]`}
+		if _, err := inboxNotifier(t, r, hub).AckedEvents(context.Background(), "w-7"); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(r.calls[0], " "); got != "inbox list --lane w-7 --json" {
+			t.Fatalf("hub %+v: got %q", hub, got)
+		}
+	}
+}
+
+// emit (the lane event) never carries the inbox credential.
+func TestEmitIgnoresTheReapHubCredential(t *testing.T) {
+	r := &typeRunner{}
+	if err := inboxNotifier(t, r, fakeHub).Notify(context.Background(), Event{ID: "e1", Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(r.calls[0], " "); got != "emit --kind lane.event --lane desk --event-id e1 --text x" {
 		t.Fatal(got)
 	}
 }
