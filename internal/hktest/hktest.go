@@ -1,8 +1,9 @@
 // Package hktest is an in-process fake of the hk /v1 routes mergewake's task
-// sink and job archive call: task read, comment and reopen, decision ask,
-// attachment put and get, and document put. It records every request and points mergewake's
-// hk credential (HANDOFFKEEP_URL, HANDOFFKEEP_TOKEN_SVC_MERGEWAKE) at itself,
-// so a test drives the real hk client over HTTP. Only tests import it.
+// sink and job archive call: task read, comment and reopen, record-only
+// decision request, attachment put and get, and document put. It records
+// every request and points mergewake's hk credential (HANDOFFKEEP_URL,
+// HANDOFFKEEP_TOKEN_SVC_MERGEWAKE) at itself, so a test drives the real hk
+// client over HTTP. Only tests import it.
 package hktest
 
 import (
@@ -58,7 +59,7 @@ type Reopen struct {
 	Reason string
 }
 
-// DecisionAsk is the body of one decision ask, with the fields of hk's
+// DecisionAsk is the body of one decision request, with the fields of hk's
 // store.DecisionRequestInput, which the server decodes strictly.
 type DecisionAsk struct {
 	Question string `json:"question"`
@@ -83,7 +84,8 @@ type DecisionAsk struct {
 	AnswerPolicy   string     `json:"answer_policy,omitempty"`
 }
 
-// Ask is one decision ask on a task and the request id the fake gave it.
+// Ask is one record-only decision request on a task
+// (POST /v1/tasks/{id}/decision-request) and the request id the fake gave it.
 type Ask struct {
 	Task      int64
 	Input     DecisionAsk
@@ -135,7 +137,7 @@ func New(t testing.TB) *Server {
 	mux.HandleFunc("GET /v1/tasks/{id}", s.task)
 	mux.HandleFunc("POST /v1/tasks/{id}/comments", s.comment)
 	mux.HandleFunc("POST /v1/tasks/{id}/reopen", s.reopen)
-	mux.HandleFunc("POST /v1/tasks/{id}/decision-request/ask", s.decisionAsk)
+	mux.HandleFunc("POST /v1/tasks/{id}/decision-request", s.decisionRequest)
 	mux.HandleFunc("PUT /v1/attachments", s.attachmentPut)
 	mux.HandleFunc("GET /v1/attachments/{sha}", s.attachmentGet)
 	mux.HandleFunc("PUT /v1/documents/{key}", s.documentPut)
@@ -208,7 +210,7 @@ func (s *Server) Reopens() []Reopen {
 	return append([]Reopen(nil), s.reopens...)
 }
 
-// Asks returns the decision asks received so far.
+// Asks returns the record-only decision requests received so far.
 func (s *Server) Asks() []Ask {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -428,11 +430,12 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
 }
 
-// decisionAsk records the request on the task as hk does: the task's
-// refs.decision_request becomes an open request with the next revision, id
-// dr-<task>-<revision>. An open request with the same question is answered
-// as a duplicate and left as it is.
-func (s *Server) decisionAsk(w http.ResponseWriter, r *http.Request) {
+// decisionRequest records the request on the task as hk's record-only route
+// does, opening no Linear issue: the task's refs.decision_request becomes an
+// open request with the next revision, id dr-<task>-<revision>, answered 201.
+// An open request with the same question is answered 200 as a duplicate and
+// left as it is. The fake serves no /decision-request/ask route.
+func (s *Server) decisionRequest(w http.ResponseWriter, r *http.Request) {
 	if s.failed(w, r) {
 		return
 	}
@@ -483,6 +486,9 @@ func (s *Server) decisionAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	rid, _ := request["id"].(string)
 	s.asks = append(s.asks, Ask{Task: id, Input: in, RequestID: rid, Duplicate: duplicate})
-	writeJSON(w, http.StatusCreated, map[string]any{"task": task, "request": request, "decision_ref": "decision:" + rid, "ver": "v1",
-		"duplicate": duplicate, "issue_created": !duplicate})
+	status := http.StatusCreated
+	if duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"task": task, "request": request, "duplicate": duplicate})
 }

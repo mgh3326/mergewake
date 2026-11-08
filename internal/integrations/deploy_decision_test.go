@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -46,16 +47,49 @@ func (q decisionRequest) refs() string {
 	return string(b)
 }
 
-func decisionTask(q *decisionRequest) string {
+func decisionTask(q *decisionRequest) string { return decisionTaskOn(1, q) }
+
+// decisionTaskOn is deploy task id with q as its current decision request.
+func decisionTaskOn(id int64, q *decisionRequest) string {
 	refs := `{}`
 	if q != nil {
 		refs = q.refs()
 	}
-	return hkTask(1, "unstarted", "mergewake-design", "Deploy approval for repo on host", 2, refs)
+	return hkTask(id, "unstarted", "mergewake-design", "Deploy approval for repo on host", 2, refs)
 }
 
-// writeDecisionRecord is the durable record a previous run left.
-func writeDecisionRecord(t *testing.T, path, task, question, id string) {
+// noLinearAsk fails the test if any call reached hk's /decision-request/ask
+// route, which opens a Linear issue and Discord post: the deploy decision
+// records its request only (POST /v1/tasks/{id}/decision-request).
+func noLinearAsk(t *testing.T, hk *hktest.Server) {
+	t.Helper()
+	for _, req := range hk.Requests() {
+		if strings.HasSuffix(req.Path, "/decision-request/ask") {
+			t.Fatalf("deploy decision called %s", req.Route())
+		}
+	}
+}
+
+// recordEntry is one task's entry in the durable decision record.
+type recordEntry struct{ task, question, id string }
+
+// writeDecisionRecord is the durable record a previous run left: one entry
+// per deploy task.
+func writeDecisionRecord(t *testing.T, path string, entries ...recordEntry) {
+	t.Helper()
+	tasks := map[string]map[string]string{}
+	for _, x := range entries {
+		tasks[x.task] = map[string]string{"question": x.question, "request_id": x.id}
+	}
+	b, _ := json.Marshal(map[string]any{"by_task": tasks})
+	if e := os.WriteFile(path, b, 0o600); e != nil {
+		t.Fatal(e)
+	}
+}
+
+// writeV1DecisionRecord is the single-record shape an unreleased build of
+// hk 3555 wrote: {task, question, request_id}.
+func writeV1DecisionRecord(t *testing.T, path, task, question, id string) {
 	t.Helper()
 	b, _ := json.Marshal(map[string]string{"task": task, "question": question, "request_id": id})
 	if e := os.WriteFile(path, b, 0o600); e != nil {
@@ -63,9 +97,12 @@ func writeDecisionRecord(t *testing.T, path, task, question, id string) {
 	}
 }
 
-func readDecisionRecord(t *testing.T, path string) map[string]string {
+// readDecisionRecords returns every task's entry in the durable record.
+func readDecisionRecords(t *testing.T, path string) map[string]map[string]string {
 	t.Helper()
-	var out map[string]string
+	var out struct {
+		Tasks map[string]map[string]string `json:"by_task"`
+	}
 	b, e := os.ReadFile(path)
 	if e != nil {
 		t.Fatal(e)
@@ -73,7 +110,13 @@ func readDecisionRecord(t *testing.T, path string) map[string]string {
 	if e = json.Unmarshal(b, &out); e != nil {
 		t.Fatal(e)
 	}
-	return out
+	return out.Tasks
+}
+
+// readDecisionRecord returns task's entry: its question and request_id.
+func readDecisionRecord(t *testing.T, path, task string) map[string]string {
+	t.Helper()
+	return readDecisionRecords(t, path)[task]
 }
 
 // The approval table runs over HTTP against a fake hk in four store states:
@@ -84,7 +127,13 @@ func readDecisionRecord(t *testing.T, path string) map[string]string {
 //   - foreign: the record names dr-1-9 for this task and question, so a
 //     request with the matching question but id dr-1-1 is never adopted;
 //   - elsewhere: the record names another question, so the one-time
-//     adoption by question text is already spent.
+//     adoption by question text is already spent;
+//   - othertask: the record has an entry for task 2 only, so task 1 has no
+//     entry, the one-time rule applies to it and the outcome is legacy's;
+//     task 2's entry is left as it was;
+//   - v1: the record is in the unreleased single-record shape naming
+//     dr-1-1 for this task and question, read as a one-entry map, so the
+//     outcome is recorded's.
 //
 // Outcomes: "true"/"false" (no ask), "ask", "ask+supersede", "open" (the
 // "another deployment decision is open" refusal).
@@ -111,19 +160,24 @@ func TestDeployDecisionOverHTTP(t *testing.T) {
 		{"new release after withdrawn expiry", &decisionRequest{ID: "dr-1-1", Status: "withdrawn", Question: "old release", Option: "A", Human: true, Expired: true}, same("ask")},
 		{"not human", &decisionRequest{ID: "dr-1-1", Status: "answered", Question: "release", Option: "A"}, same("ask")},
 	} {
-		for _, mode := range []string{"legacy", "recorded", "foreign", "elsewhere"} {
-			want := map[string]string{"legacy": tc.want.legacy, "recorded": tc.want.recorded, "foreign": tc.want.foreign, "elsewhere": tc.want.elsewhere}[mode]
+		for _, mode := range []string{"legacy", "recorded", "foreign", "elsewhere", "othertask", "v1"} {
+			want := map[string]string{"legacy": tc.want.legacy, "recorded": tc.want.recorded, "foreign": tc.want.foreign, "elsewhere": tc.want.elsewhere,
+				"othertask": tc.want.legacy, "v1": tc.want.recorded}[mode]
 			t.Run(tc.name+"/"+mode, func(t *testing.T) {
 				hk := hktest.New(t)
 				hk.SetTask(1, decisionTask(tc.req))
 				record := filepath.Join(t.TempDir(), "deploy-decision.json")
 				switch mode {
 				case "recorded":
-					writeDecisionRecord(t, record, "1", "release", "dr-1-1")
+					writeDecisionRecord(t, record, recordEntry{"1", "release", "dr-1-1"})
 				case "foreign":
-					writeDecisionRecord(t, record, "1", "release", "dr-1-9")
+					writeDecisionRecord(t, record, recordEntry{"1", "release", "dr-1-9"})
 				case "elsewhere":
-					writeDecisionRecord(t, record, "1", "old release", "dr-1-1")
+					writeDecisionRecord(t, record, recordEntry{"1", "old release", "dr-1-1"})
+				case "othertask":
+					writeDecisionRecord(t, record, recordEntry{"2", "release on host b", "dr-2-5"})
+				case "v1":
+					writeV1DecisionRecord(t, record, "1", "release", "dr-1-1")
 				}
 				h := Handoffkeep{Runner: noSubprocess{t}, Command: "handoffkeep"}
 				got, e := h.DeployDecision(context.Background(), "1", "release", record, decisionNow)
@@ -157,13 +211,19 @@ func TestDeployDecisionOverHTTP(t *testing.T) {
 						t.Fatalf("ask input = %+v", in)
 					}
 					// The asked request's id is what the store now names.
-					if r := readDecisionRecord(t, record); r["task"] != "1" || r["question"] != "release" || r["request_id"] != a.RequestID {
+					if r := readDecisionRecord(t, record, "1"); r["question"] != "release" || r["request_id"] != a.RequestID {
 						t.Fatalf("record after ask = %v, asked %s", r, a.RequestID)
 					}
 				}
 				for _, req := range hk.Requests() {
 					if req.Auth != "Bearer "+hktest.Token {
 						t.Fatalf("%s: Authorization %q", req.Route(), req.Auth)
+					}
+				}
+				noLinearAsk(t, hk)
+				if mode == "othertask" {
+					if r := readDecisionRecord(t, record, "2"); r["question"] != "release on host b" || r["request_id"] != "dr-2-5" {
+						t.Fatalf("task 2's entry after a task 1 poll = %v", r)
 					}
 				}
 			})
@@ -207,7 +267,7 @@ func TestDeployDecisionAdoptsLegacyRequestOnceThenMatchesByID(t *testing.T) {
 
 	hk.SetTask(1, decisionTask(&decisionRequest{ID: "dr-1-4", Status: "open", Question: "release", Human: true}))
 	decide(false, "legacy open request")
-	if r := readDecisionRecord(t, record); r["request_id"] != "dr-1-4" || r["task"] != "1" || r["question"] != "release" {
+	if r := readDecisionRecord(t, record, "1"); r["request_id"] != "dr-1-4" || r["question"] != "release" {
 		t.Fatalf("adopted record = %v", r)
 	}
 	if n := len(hk.Asks()); n != 0 {
@@ -226,14 +286,14 @@ func TestDeployDecisionAdoptsLegacyRequestOnceThenMatchesByID(t *testing.T) {
 		t.Fatalf("asks after a foreign answered request = %+v", asks)
 	}
 	asked := asks[0].RequestID
-	if r := readDecisionRecord(t, record); r["request_id"] != asked {
+	if r := readDecisionRecord(t, record, "1"); r["request_id"] != asked {
 		t.Fatalf("record after ask = %v, asked %s", r, asked)
 	}
 
 	// A request that supersedes the recorded one is followed, and recorded.
 	hk.SetTask(1, decisionTask(&decisionRequest{ID: "dr-1-9", Supersedes: asked, Status: "answered", Question: "release", Option: "A", Human: true}))
 	decide(true, "superseding request answered A")
-	if r := readDecisionRecord(t, record); r["request_id"] != "dr-1-9" {
+	if r := readDecisionRecord(t, record, "1"); r["request_id"] != "dr-1-9" {
 		t.Fatalf("record after supersession = %v", r)
 	}
 
@@ -277,6 +337,125 @@ func TestDeployDecisionRecordSurvivesRestart(t *testing.T) {
 	if got, e := after.DeployDecision(ctx, "1", "release", record, decisionNow); got || e != nil {
 		t.Fatalf("after restart, other id = %v, %v; want not approved", got, e)
 	}
+}
+
+// The ask is the record-only route (the hk CLI's `decisions ask` without
+// --linear), never /decision-request/ask, and its body is the one the CLI
+// sends for mergewake's old flags: human_only, options A and B with a free
+// answer allowed and none recommended, the hold default action, and
+// supersedes only when an expired open request is replaced.
+func TestDeployDecisionRecordsRequestOnlyWithCLIInput(t *testing.T) {
+	const cli = `{"question":"release","options":{"options":[{"key":"A","label":"Approve this deployment"},{"key":"B","label":"Keep the current version"}],"allow_free":true},` +
+		`"default_action":"Hold; keep the current version","human_only":true`
+	for _, tc := range []struct {
+		name string
+		req  *decisionRequest
+		body string
+	}{
+		{"first ask", nil, cli + `}`},
+		{"supersede expired open", &decisionRequest{ID: "dr-1-3", Status: "open", Question: "old release", Human: true, Expired: true}, cli + `,"supersedes":"dr-1-3"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hk := hktest.New(t)
+			hk.SetTask(1, decisionTask(tc.req))
+			h := Handoffkeep{Runner: noSubprocess{t}, Command: "handoffkeep"}
+			if got, e := h.DeployDecision(context.Background(), "1", "release", filepath.Join(t.TempDir(), "deploy-decision.json"), decisionNow); got || e != nil {
+				t.Fatalf("DeployDecision = %v, %v; want held after asking", got, e)
+			}
+			noLinearAsk(t, hk)
+			var posts []hktest.Request
+			for _, req := range hk.Requests() {
+				if req.Method == "POST" {
+					posts = append(posts, req)
+				}
+			}
+			if len(posts) != 1 || posts[0].Route() != "POST /v1/tasks/1/decision-request" {
+				t.Fatalf("POSTs = %v; want one POST /v1/tasks/1/decision-request", routes(posts))
+			}
+			var got, want any
+			if e := json.Unmarshal(posts[0].Body, &got); e != nil {
+				t.Fatal(e)
+			}
+			if e := json.Unmarshal([]byte(tc.body), &want); e != nil {
+				t.Fatal(e)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ask body\n got %s\nwant %s", posts[0].Body, tc.body)
+			}
+		})
+	}
+}
+
+func routes(reqs []hktest.Request) []string {
+	out := []string{}
+	for _, r := range reqs {
+		out = append(out, r.Route())
+	}
+	return out
+}
+
+// One repository's record holds an entry per deploy task (one per target
+// host), so two tasks' requests neither overwrite nor block each other: a
+// task with no entry yet still gets its one-time adoption by question text,
+// and each task's answer is matched by its own recorded id.
+func TestDeployDecisionTwoTasksInOneRepository(t *testing.T) {
+	hk := hktest.New(t)
+	record := filepath.Join(t.TempDir(), "deploy-decision.json")
+	h := Handoffkeep{Runner: noSubprocess{t}, Command: "handoffkeep"}
+	decide := func(task, question string, want bool, step string) {
+		t.Helper()
+		if got, e := h.DeployDecision(context.Background(), task, question, record, decisionNow); got != want || e != nil {
+			t.Fatalf("%s: DeployDecision(%s) = %v, %v; want %v", step, task, got, e, want)
+		}
+	}
+	entries := func(step string, want map[string]map[string]string) {
+		t.Helper()
+		if got := readDecisionRecords(t, record); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: record = %v, want %v", step, got, want)
+		}
+	}
+
+	// Task 1 has no request: mergewake asks and records it.
+	hk.SetTask(1, decisionTask(nil))
+	// Task 2 has a request opened by question text before the upgrade.
+	hk.SetTask(2, decisionTaskOn(2, &decisionRequest{ID: "dr-2-4", Status: "open", Question: "release on b", Human: true}))
+	decide("1", "release on a", false, "task 1 asks")
+	asks := hk.Asks()
+	if len(asks) != 1 || asks[0].Task != 1 {
+		t.Fatalf("asks = %+v", asks)
+	}
+	one := asks[0].RequestID
+	decide("2", "release on b", false, "task 2 adopts its open request")
+	if n := len(hk.Asks()); n != 1 {
+		t.Fatalf("task 2's adoption asked: %d asks", n)
+	}
+	entries("both open", map[string]map[string]string{
+		"1": {"question": "release on a", "request_id": one},
+		"2": {"question": "release on b", "request_id": "dr-2-4"},
+	})
+
+	// Task 1 is answered A; task 2 stays open and is neither approved nor
+	// refused because of task 1.
+	hk.SetTask(1, decisionTask(&decisionRequest{ID: one, Status: "answered", Question: "release on a", Option: "A", Human: true}))
+	decide("1", "release on a", true, "task 1 answered A")
+	decide("2", "release on b", false, "task 2 still open")
+
+	// Task 2 is answered B; task 1 stays approved.
+	hk.SetTask(2, decisionTaskOn(2, &decisionRequest{ID: "dr-2-4", Status: "answered", Question: "release on b", Option: "B", Human: true}))
+	decide("2", "release on b", false, "task 2 answered B")
+	decide("1", "release on a", true, "task 1 after task 2's answer")
+
+	// A new release on task 1 asks again and moves only task 1's entry.
+	decide("1", "release 2 on a", false, "task 1 new release")
+	asks = hk.Asks()
+	if len(asks) != 2 || asks[1].Task != 1 {
+		t.Fatalf("asks = %+v", asks)
+	}
+	entries("after task 1's new release", map[string]map[string]string{
+		"1": {"question": "release 2 on a", "request_id": asks[1].RequestID},
+		"2": {"question": "release on b", "request_id": "dr-2-4"},
+	})
+	noLinearAsk(t, hk)
 }
 
 func TestDeployDecisionRefusesNonTaskID(t *testing.T) {
