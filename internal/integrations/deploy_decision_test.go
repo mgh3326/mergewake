@@ -608,6 +608,12 @@ func TestDeployDecisionCorruptRecordHolds(t *testing.T) {
 		`{"task":1,"question":"release","request_id":"dr-1-1"}`,
 		`{"task":"1","question":"release","request_id":"dr-1-1","extra":"x"}`,
 		`{"by_task":`,
+		`{"by_task":{}}]`,
+		`{"by_task":{}}}`,
+		`{}]`,
+		`{"by_task":{"1":{"question":"release","request_id":"dr-1-1"}}}]`,
+		`{"by_task":{"1":{"question":"release","request_id":"dr-1-1"}}}{}`,
+		`{"by_task":{}} x`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			hk := hktest.New(t)
@@ -632,6 +638,7 @@ func TestDeployDecisionCorruptRecordHolds(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"absent", ""},
 		{"empty map", `{"by_task":{}}`},
+		{"empty map then whitespace", "{\"by_task\":{}}\n\t \n"},
 		{"other task only", `{"by_task":{"2":{"question":"release on b","request_id":"dr-2-5"}}}`},
 	} {
 		t.Run("adopts/"+tc.name, func(t *testing.T) {
