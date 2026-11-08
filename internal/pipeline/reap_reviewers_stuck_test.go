@@ -202,7 +202,7 @@ func TestReapReviewerAbandonsSpawnedJob(t *testing.T) {
 				}
 				return
 			}
-			want := []string{"job", "close", label, "--lane", "lane-x", "--outcome", "abandoned", "--reason", tt.abandon}
+			want := append([]string{"job", "close", label, "--lane", "lane-x", "--outcome", "abandoned", "--reason", tt.abandon}, hubFlagArgs(f.s.Config.Reap.Hub)...)
 			if len(closes) != 1 || strings.Join(closes[0], " ") != strings.Join(want, " ") {
 				t.Fatalf("job closes=%v, want %v", closes, want)
 			}

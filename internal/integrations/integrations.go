@@ -182,20 +182,26 @@ func (p Panewire) Notify(ctx context.Context, e Event) error {
 }
 
 // InboxArgv is the argv of one `panewire inbox` call; sub is the subcommand
-// and its arguments. When reap.hub's URL and token file are both set, the
-// call carries the hub's service credential paths (the cf file too, when set),
-// so the scoped service reads and acks the lane. Otherwise the argv is the
-// bare inbox call. Only paths are passed; the files are never read here.
+// and its arguments. The call carries reap.hub's service credential (see
+// HubArgv), so the scoped service reads and acks the lane.
 func InboxArgv(hub config.ReapHub, sub ...string) []string {
-	argv := append([]string{"inbox"}, sub...)
+	return HubArgv(hub, append([]string{"inbox"}, sub...)...)
+}
+
+// HubArgv is the argv of one panewire call that reaches the hub. When reap.hub's
+// URL and token file are both set, it appends the hub's service credential
+// paths (the cf file too, when set), so the scoped service runs the call.
+// Otherwise argv is returned as given. Only paths are passed; the files are
+// never read here. The result never shares argv's backing array.
+func HubArgv(hub config.ReapHub, argv ...string) []string {
 	if hub.URL == "" || hub.TokenFile == "" {
 		return argv
 	}
-	argv = append(argv, "--hub-url", hub.URL, "--hub-token-env", hub.TokenFile)
+	out := append(argv[:len(argv):len(argv)], "--hub-url", hub.URL, "--hub-token-env", hub.TokenFile)
 	if hub.CFFile != "" {
-		argv = append(argv, "--hub-cf-env", hub.CFFile)
+		out = append(out, "--hub-cf-env", hub.CFFile)
 	}
-	return argv
+	return out
 }
 
 // AckedEvents reads lane's inbox and maps each lane event's id to whether its

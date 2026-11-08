@@ -20,8 +20,12 @@ import (
 func collectedClosedOnce(t *testing.T, runner *panewireRunner, label string) {
 	t.Helper()
 	want := []string{"job", "close", label, "--lane", "owner", "--outcome", "completed", "--reason", "result collected by mergewake"}
-	if len(runner.closes) != 1 || !slices.Equal(runner.closes[0], want) {
+	if len(runner.closes) != 1 || len(runner.closes[0]) < len(want) || !slices.Equal(runner.closes[0][:len(want)], want) {
 		t.Fatalf("closes=%v, want one %v", runner.closes, want)
+	}
+	// Past the close itself only the reap.hub credential flags may follow.
+	if rest := runner.closes[0][len(want):]; len(rest) > 0 && rest[0] != "--hub-url" {
+		t.Fatalf("close carries %v after %v", rest, want)
 	}
 }
 

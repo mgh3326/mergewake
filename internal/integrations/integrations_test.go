@@ -372,3 +372,32 @@ func TestEmitIgnoresTheReapHubCredential(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// HubArgv appends the reap.hub credential paths only when the URL and token
+// file are both set, and never writes into the slice it was given.
+func TestHubArgvAppendsTheCredentialOnlyWhenSet(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		hub  config.ReapHub
+		want string
+	}{
+		{"hub", fakeHub, "job close w-7" + fakeHubFlags + " --hub-cf-env /fake/cf.env"},
+		{"hub without cf", config.ReapHub{URL: fakeHub.URL, TokenFile: fakeHub.TokenFile}, "job close w-7" + fakeHubFlags},
+		{"no hub", config.ReapHub{}, "job close w-7"},
+		{"url only", config.ReapHub{URL: fakeHub.URL}, "job close w-7"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := strings.Join(HubArgv(tt.hub, "job", "close", "w-7"), " "); got != tt.want {
+				t.Fatalf("got  %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHubArgvDoesNotWriteIntoItsInput(t *testing.T) {
+	base := append(make([]string, 0, 16), "job", "close", "w-7")
+	_ = HubArgv(fakeHub, base...)
+	if got := base[:cap(base)][3]; got != "" {
+		t.Fatalf("input slice was written past its length: %q", got)
+	}
+}
