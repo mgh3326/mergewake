@@ -188,3 +188,30 @@ func TestMergedNoticeReportsTheTaskReopenOutcome(t *testing.T) {
 		t.Fatalf("notice: %v", lines)
 	}
 }
+
+// noRevertGH is a repository whose latch no revert PR can be proven to belong
+// to: the latch was replaced, or the recovery branch was force-pushed.
+type noRevertGH struct{ *recoveryGH }
+
+func (noRevertGH) RecoveryRevert(context.Context, string) (*github.Pull, error) { return nil, nil }
+
+// A green main with a latch no revert PR provably belongs to leaves the latch
+// and the PR recovery.json names alone, for an operator.
+func TestFixWonLeavesAnUnverifiedLatch(t *testing.T) {
+	s, l, _, _, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[l.head] = github.Green
+	})
+	g := noRevertGH{l}
+	s.GH = g
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	if e := s.saveRecovery(r.Name, recoveryIncident{RedSince: now, Culprit: shaB, CulpritPR: 7, Head: shaC, RevertPR: 9, Task: "42"}); e != nil {
+		t.Fatal(e)
+	}
+
+	recoveryWatch(t, s, r)
+	if len(l.closed) != 0 || len(l.comments) != 0 || l.clears != 0 || !l.latch || l.revert.State != "open" {
+		t.Fatalf("an unverified latch was handled: closed=%v comments=%v clears=%d latch=%t", l.closed, l.comments, l.clears, l.latch)
+	}
+}

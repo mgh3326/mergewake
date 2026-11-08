@@ -1034,20 +1034,13 @@ func (s *watchStream) fixWon(ctx context.Context, r config.Repo, head string) er
 	if !ok {
 		return nil
 	}
+	// Only a PR the latch provably belongs to is closed, and only then is the
+	// latch cleared. recovery.json's revert PR number does not prove it: after
+	// a replaced latch or a force-pushed recovery branch it names a PR the
+	// current latch is not for. Such a latch stays for an operator.
 	pr, e := latch.RecoveryRevert(ctx, r.Name)
-	if e != nil {
+	if e != nil || pr == nil {
 		return e
-	}
-	if pr == nil {
-		st, found, e := s.loadRecovery(r.Name)
-		if e != nil || !found || st.RevertPR == 0 {
-			return e
-		}
-		open, e := s.GH.Pull(ctx, r.Name, st.RevertPR)
-		if e != nil {
-			return e
-		}
-		pr = &open
 	}
 	if pr.MergedAt != nil || pr.Merged {
 		return nil
