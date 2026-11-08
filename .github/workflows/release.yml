@@ -2,12 +2,15 @@ name: Release
 
 # A v* tag builds the four CGO-disabled release binaries (linux/darwin x
 # amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
-# with GITHUB_TOKEN. A test tag v0.0.0* (e.g. v0.0.0-test.1) runs the same
-# build and checks on the tag but is never published.
+# with GITHUB_TOKEN, but only after the tag commit's checks named by
+# .mergewake/policy.yaml (deploy_checks, else main_checks/watch_checks) are
+# green: release judges the same evidence as rollout. A test tag v0.0.0*
+# (e.g. v0.0.0-test.1) runs the same build and checks on the tag but is never
+# published.
 # Manual runs build the same assets for a
 # dry-run tag (v0.0.0-dryrun.<run>) and check checksums and `mergewake --version`
-# without publishing anything. Hosts pull published assets themselves; this
-# workflow never reaches a host.
+# without publishing anything or waiting. Hosts pull published assets
+# themselves; this workflow never reaches a host.
 on:
   push:
     tags: ['v*']
@@ -23,6 +26,9 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
+env:
+  # How long publish waits for the tag commit's policy checks before failing.
+  RELEASE_CHECKS_TIMEOUT_SECONDS: '3600'
 
 jobs:
   build:
@@ -89,8 +95,33 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-  publish:
+  checks:
+    # Release publishes the same evidence rollout requires: the checks named by
+    # the policy at the tag must be green before any asset goes out. Dry runs
+    # and test tags never reach this job.
     needs: [build, test]
+    if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Wait for the tag commit's policy checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/release-wait-checks.sh "$GITHUB_SHA"
+
+  publish:
+    needs: [build, test, checks]
     if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
     runs-on: ubuntu-latest
     permissions:

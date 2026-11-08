@@ -13,11 +13,17 @@
 3. `.github/workflows/release.yml` builds CGO-disabled (`CGO_ENABLED=0`, `-trimpath`) binaries named `mergewake-<os>-<arch>`. It builds four targets: linux/amd64,
    linux/arm64, darwin/amd64 and darwin/arm64. It stamps the tag as the
    version and writes `SHA256SUMS`. It checks that `mergewake --version`
-   prints the tag. It runs the tests. Then it publishes the GitHub Release
-   with `GITHUB_TOKEN`.
+   prints the tag. It runs the tests. Before publishing, it waits for the tag
+   commit's checks named by `.mergewake/policy.yaml` at the tag
+   (`deploy_checks`, else `main_checks`/`watch_checks`, the same set rollout
+   uses) and publishes only when every one is green; a name may be a check run
+   or a commit status. A failing check fails the release with its name and URL,
+   and a check not reported within the bound (`RELEASE_CHECKS_TIMEOUT_SECONDS`,
+   default 60 minutes) fails it with what is missing, so a later rerun can
+   publish. Then it publishes the GitHub Release with `GITHUB_TOKEN`.
 
 Pushing a test tag `v0.0.0-<anything>` (for example `v0.0.0-test.1`) runs
-the same build and checks on a real tag and publishes nothing.
+the same build and checks on a real tag, publishes nothing and does not wait.
 
 Every pull request runs the same build and checks for the dry-run tag
 `v0.0.0-dryrun.<run>`, and publishes nothing. To run the same check locally:
