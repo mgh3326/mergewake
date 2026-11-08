@@ -350,8 +350,13 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 }
 
 func (m *manifest) matches(p *Plan) bool {
-	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) {
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) {
 		return false
+	}
+	for i, f := range m.Oversized {
+		if f.Path != p.Oversized[i].Path || f.Size != p.Oversized[i].Size {
+			return false
+		}
 	}
 	size := map[string]int64{}
 	for _, f := range p.entries {

@@ -325,6 +325,49 @@ func TestResumeIgnoresRecordedOversizedFilesForArchiveMatch(t *testing.T) {
 	}
 }
 
+func TestResumeRejectsChangedOversizedManifestEntries(t *testing.T) {
+	for _, change := range []struct {
+		name string
+		edit func(*testing.T, string)
+	}{
+		{"size changed", func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "large.bin"), strings.Repeat("g", 151))
+		}},
+		{"new oversized file", func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "new-large.bin"), strings.Repeat("n", 175))
+		}},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			e := setup(t)
+			dir := filepath.Join(e.jobs, "wk-resume-oversized-change")
+			write(t, filepath.Join(dir, "small.bin"), "small")
+			write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+			write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+			a := archiver(e, "")
+			a.DriveMaxFileBytes = 100
+			h := reap.Host{Name: "h1", Jobs: e.jobs}
+			p, err := a.Plan(context.Background(), h, "wk-resume-oversized-change")
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.run.failRm = true
+			if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+				t.Fatal("expected simulated delete failure")
+			}
+			e.run.failRm = false
+			change.edit(t, dir)
+			p, err = a.Plan(context.Background(), h, "wk-resume-oversized-change")
+			var s *Skip
+			if !errors.As(err, &s) || s.Reason != "drive-dir-exists" || (p != nil && p.Resume) {
+				t.Fatalf("resume plan=%+v err=%v", p, err)
+			}
+			if _, err := os.Stat(dir); err != nil {
+				t.Fatalf("job dir was deleted or lost: %v", err)
+			}
+		})
+	}
+}
+
 func TestDriveMaxFileBytesZeroPreservesExistingBehavior(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-oversized")
