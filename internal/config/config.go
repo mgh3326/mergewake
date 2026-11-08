@@ -374,11 +374,14 @@ type Archive struct {
 	DriveDir string `yaml:"drive_dir"`
 	// ArchiveHost is an ssh destination reachable from this machine; empty or
 	// "local" means the Drive folder is on this machine.
-	ArchiveHost       string `yaml:"archive_host"`
-	TextMaxBytes      int64  `yaml:"text_max_bytes"`
-	DriveMaxFileBytes int64  `yaml:"drive_max_file_bytes"`
-	MinAge            string `yaml:"min_age"`
+	ArchiveHost       string   `yaml:"archive_host"`
+	TextMaxBytes      int64    `yaml:"text_max_bytes"`
+	DriveMaxFileBytes int64    `yaml:"drive_max_file_bytes"`
+	MinAge            string   `yaml:"min_age"`
+	Exclude           []string `yaml:"exclude"`
 }
+
+var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
 
 // ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
 // output limit, since each text file is read back through it.
@@ -1134,6 +1137,14 @@ func Age(s string) (time.Duration, error) {
 }
 
 func validateArchive(a *Archive) error {
+	if a.Exclude == nil {
+		a.Exclude = append([]string(nil), DefaultArchiveExclude...)
+	}
+	for _, pattern := range a.Exclude {
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("reap.archive.exclude: invalid glob %q: %w", pattern, err)
+		}
+	}
 	if a.DriveMaxFileBytes < 0 {
 		return errors.New("reap.archive.drive_max_file_bytes must be non-negative")
 	}

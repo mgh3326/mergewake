@@ -60,6 +60,7 @@ func jobDir(t *testing.T, jobs, name string, age time.Duration) string {
 	writeFile(t, filepath.Join(dir, "brief.md"), "# brief\n")
 	writeFile(t, filepath.Join(dir, "report.md"), "# report\n")
 	writeFile(t, filepath.Join(dir, "events", "00004-job.task_link.json"), `{"payload":{"task_id":"77"}}`)
+	writeFile(t, filepath.Join(dir, "events", "00005-job.completed.json"), `{}`)
 	writeFile(t, filepath.Join(dir, ".env"), "SECRET=1\n")
 	old := time.Now().Add(-age)
 	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, _ error) error { return os.Chtimes(p, old, old) })
@@ -125,7 +126,20 @@ func (f archiveFixture) seedClose(t *testing.T, job, result string, at time.Time
 	t.Helper()
 	b, _ := json.Marshal(reapReceipt{Time: at, Action: "close-pane", Repo: "example/project", PR: 12, Host: "local",
 		Pane: "w1:p1", Cwd: "/repo.wt", Worktree: "/repo.wt", Branch: "wk/x", Saved: filepath.Join(f.jobs, job, "report.md"), Job: job, Result: result})
-	writeFile(t, f.s.reapLog("example/project"), string(b)+"\n")
+	p := f.s.reapLog("example/project")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(append(b, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f archiveFixture) rows(t *testing.T) []reapReceipt {
@@ -268,6 +282,63 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	f.s.Config.Reap.Archive.Enabled = false
 	if err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{}); err == nil {
 		t.Fatal("archive-jobs ran with archive disabled")
+	}
+}
+
+func TestArchiveExcludesAndFinishedJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.Exclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
+	for _, name := range []string{"pw-rollout-x", "pw-hk1", "events-lane", "done-job", "open-job"} {
+		jobDir(t, f.jobs, name, 20*24*time.Hour)
+	}
+	writeFile(t, filepath.Join(f.jobs, "done-job", "events", "00005-job.completed.json"), `{}`)
+	if err := os.Remove(filepath.Join(f.jobs, "open-job", "events", "00005-job.completed.json")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(f.jobs, "open-job", "events", "00005-job.placement.json"), `{}`)
+	// The reap-stage path must apply the same name and event checks.
+	f.seedClose(t, "pw-hk1", "closed", time.Now().Add(-48*time.Hour))
+	f.seedClose(t, "done-job", "closed", time.Now().Add(-48*time.Hour))
+	f.seedClose(t, "open-job", "closed", time.Now().Add(-48*time.Hour))
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	got := map[string]string{}
+	for _, row := range rows {
+		if row.Action == "archive-job" {
+			got[row.Job] = row.Result + "|" + row.Reason
+		}
+	}
+	if got["pw-hk1"] != "skipped|excluded-name" || got["done-job"] != "archived|" || got["open-job"] != "skipped|not-finished" {
+		t.Fatalf("reap archive outcomes = %v", got)
+	}
+}
+
+func TestArchiveJobsSkipsExcludedAndUnfinished(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.Exclude = config.DefaultArchiveExclude
+	for _, name := range []string{"pw-rollout-x", "pw-hk1", "events-lane", "unfinished"} {
+		jobDir(t, f.jobs, name, 20*24*time.Hour)
+	}
+	if err := os.Remove(filepath.Join(f.jobs, "unfinished", "events", "00005-job.completed.json")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(f.jobs, "unfinished", "events", "00005-job.placement.json"), `{}`)
+	if err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"pw-rollout-x", "pw-hk1", "events-lane"} {
+		if !strings.Contains(string(log), `"job":"`+name+`","result":"skipped","reason":"excluded-name"`) {
+			t.Errorf("missing exclude row for %s: %s", name, log)
+		}
+	}
+	if !strings.Contains(string(log), `"job":"unfinished","result":"skipped","reason":"not-finished"`) {
+		t.Errorf("missing not-finished row: %s", log)
 	}
 }
 

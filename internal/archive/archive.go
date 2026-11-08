@@ -43,8 +43,19 @@ type Archiver struct {
 	Runner            reap.Runner
 	DriveDir          string
 	SSH               string
+	Exclude           []string
 	TextMax           int64
 	DriveMaxFileBytes int64
+}
+
+// ExcludedName reports whether a job name matches any configured shell glob.
+func ExcludedName(patterns []string, job string) bool {
+	for _, pattern := range patterns {
+		if ok, _ := path.Match(pattern, job); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // File is one non-directory entry of a job dir, relative to it.
@@ -271,6 +282,8 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		return nil, &Skip{"jobs-dir-unset"}
 	case !reap.ValidJobName(job):
 		return nil, &Skip{"job-name-invalid"}
+	case ExcludedName(a.Exclude, job):
+		return nil, &Skip{"excluded-name"}
 	}
 	jobs, err := a.Jobs(ctx, h)
 	if err != nil {
@@ -287,6 +300,16 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	files, err := a.list(ctx, h, dir)
 	if err != nil {
 		return nil, err
+	}
+	hasEvents, err := a.exists(ctx, h.SSH, path.Join(dir, "events"))
+	if err != nil {
+		return nil, err
+	}
+	if !hasEvents {
+		return nil, &Skip{"no-events"}
+	}
+	if !finished(files) {
+		return nil, &Skip{"not-finished"}
 	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
 		Move: []string{}, Text: []string{}, Excluded: []string{}, Skipped: []string{}}
@@ -355,6 +378,46 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		p.Resume, p.done, p.doneRaw = true, &m, raw
 	}
 	return p, nil
+}
+
+func finished(files []File) bool {
+	type event struct {
+		seq  int
+		kind string
+	}
+	var events []event
+	for _, f := range files {
+		if f.kind != 'f' || path.Dir(f.Path) != "events" {
+			continue
+		}
+		base := path.Base(f.Path)
+		parts := strings.SplitN(base, "-", 2)
+		if len(parts) != 2 || len(parts[0]) != 5 {
+			continue
+		}
+		seq, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		if !strings.HasSuffix(parts[1], ".json") {
+			continue
+		}
+		kind := strings.TrimSuffix(parts[1], ".json")
+		events = append(events, event{seq, kind})
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
+	terminal, laterStart := false, false
+	for _, e := range events {
+		switch e.kind {
+		case "job.completed", "job.lost":
+			terminal, laterStart = true, false
+		case "job.claim", "job.spawned", "job.joined", "job.placement":
+			if terminal {
+				laterStart = true
+			}
+		}
+	}
+	return terminal && !laterStart
 }
 
 func (m *manifest) matches(p *Plan) bool {

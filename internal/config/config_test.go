@@ -82,6 +82,8 @@ func TestReapConfig(t *testing.T) {
 		{"archive local", "reap:\n  archive: {enabled: true, drive_dir: '~/Drive/jobs', min_age: 14d}\n", false},
 		{"archive ssh", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: /Users/ops/Drive/jobs, text_max_bytes: 4096}\n", false},
 		{"archive drive cap", "reap:\n  archive: {drive_max_file_bytes: 104857600}\n", false},
+		{"archive invalid exclude", "reap:\n  archive: {exclude: ['[']}\n", true},
+		{"archive empty exclude", "reap:\n  archive: {exclude: []}\n", false},
 		{"archive negative drive cap", "reap:\n  archive: {drive_max_file_bytes: -1}\n", true},
 		{"archive no dir", "reap:\n  archive: {enabled: true}\n", true},
 		{"archive ssh home", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: '~/Drive'}\n", true},
@@ -106,6 +108,12 @@ func TestReapConfig(t *testing.T) {
 				}
 				if tt.name == "archive drive cap" && c.Reap.Archive.DriveMaxFileBytes != 104857600 {
 					t.Fatalf("drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
+				}
+				if tt.name == "archive local" && len(c.Reap.Archive.Exclude) != 3 {
+					t.Fatalf("default exclude = %v", c.Reap.Archive.Exclude)
+				}
+				if tt.name == "archive empty exclude" && len(c.Reap.Archive.Exclude) != 0 {
+					t.Fatalf("empty exclude = %v", c.Reap.Archive.Exclude)
 				}
 				if tt.name == "defaults" && c.Reap.Archive.DriveMaxFileBytes != 0 {
 					t.Fatalf("default drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
