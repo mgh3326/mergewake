@@ -1,6 +1,6 @@
 // Package hktest is an in-process fake of the hk /v1 routes mergewake's task
-// sink and job archive call: task read, comment and reopen, attachment put
-// and get, and document put. It records every request and points mergewake's
+// sink and job archive call: task read, comment and reopen, decision ask,
+// attachment put and get, and document put. It records every request and points mergewake's
 // hk credential (HANDOFFKEEP_URL, HANDOFFKEEP_TOKEN_SVC_MERGEWAKE) at itself,
 // so a test drives the real hk client over HTTP. Only tests import it.
 package hktest
@@ -58,6 +58,39 @@ type Reopen struct {
 	Reason string
 }
 
+// DecisionAsk is the body of one decision ask, with the fields of hk's
+// store.DecisionRequestInput, which the server decodes strictly.
+type DecisionAsk struct {
+	Question string `json:"question"`
+	Options  struct {
+		Options []struct {
+			Key         string `json:"key"`
+			Label       string `json:"label"`
+			Recommended bool   `json:"recommended,omitempty"`
+		} `json:"options"`
+		AllowFree bool `json:"allow_free"`
+	} `json:"options"`
+	Reason         string     `json:"reason,omitempty"`
+	DefaultAction  string     `json:"default_action"`
+	DefaultOption  string     `json:"default_option,omitempty"`
+	DefaultTrigger string     `json:"default_trigger,omitempty"`
+	DueAt          *time.Time `json:"due_at,omitempty"`
+	Doc            string     `json:"doc,omitempty"`
+	Refs           []string   `json:"refs,omitempty"`
+	Supersedes     string     `json:"supersedes,omitempty"`
+	Block          bool       `json:"block,omitempty"`
+	HumanOnly      bool       `json:"human_only,omitempty"`
+	AnswerPolicy   string     `json:"answer_policy,omitempty"`
+}
+
+// Ask is one decision ask on a task and the request id the fake gave it.
+type Ask struct {
+	Task      int64
+	Input     DecisionAsk
+	RequestID string
+	Duplicate bool
+}
+
 // Attachment is one stored attachment.
 type Attachment struct {
 	Name, MIME string
@@ -86,6 +119,7 @@ type Server struct {
 	documents   map[string]Document
 	comments    []Comment
 	reopens     []Reopen
+	asks        []Ask
 	requests    []Request
 	fails       map[string]failure
 }
@@ -101,6 +135,7 @@ func New(t testing.TB) *Server {
 	mux.HandleFunc("GET /v1/tasks/{id}", s.task)
 	mux.HandleFunc("POST /v1/tasks/{id}/comments", s.comment)
 	mux.HandleFunc("POST /v1/tasks/{id}/reopen", s.reopen)
+	mux.HandleFunc("POST /v1/tasks/{id}/decision-request/ask", s.decisionAsk)
 	mux.HandleFunc("PUT /v1/attachments", s.attachmentPut)
 	mux.HandleFunc("GET /v1/attachments/{sha}", s.attachmentGet)
 	mux.HandleFunc("PUT /v1/documents/{key}", s.documentPut)
@@ -171,6 +206,13 @@ func (s *Server) Reopens() []Reopen {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Reopen(nil), s.reopens...)
+}
+
+// Asks returns the decision asks received so far.
+func (s *Server) Asks() []Ask {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Ask(nil), s.asks...)
 }
 
 // Attachments returns the stored attachments by sha256.
@@ -384,4 +426,63 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	sum := sha256.Sum256([]byte(in.Body))
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
+}
+
+// decisionAsk records the request on the task as hk does: the task's
+// refs.decision_request becomes an open request with the next revision, id
+// dr-<task>-<revision>. An open request with the same question is answered
+// as a duplicate and left as it is.
+func (s *Server) decisionAsk(w http.ResponseWriter, r *http.Request) {
+	if s.failed(w, r) {
+		return
+	}
+	id, ok := s.taskID(w, r)
+	if !ok {
+		return
+	}
+	var in DecisionAsk
+	if e := strict(r, &in); e != nil || in.Question == "" || len(in.Options.Options) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var task map[string]any
+	if e := json.Unmarshal([]byte(s.tasks[id]), &task); e != nil {
+		writeError(w, http.StatusInternalServerError, "fake task is not JSON")
+		return
+	}
+	refs, _ := task["refs"].(map[string]any)
+	if refs == nil {
+		refs = map[string]any{}
+	}
+	prior, _ := refs["decision_request"].(map[string]any)
+	duplicate := prior != nil && prior["status"] == "open" && prior["question"] == in.Question
+	request := prior
+	if !duplicate {
+		revision := 0
+		if prior != nil {
+			if n, ok := prior["revision"].(float64); ok {
+				revision = int(n)
+			} else if pid, ok := prior["id"].(string); ok {
+				_, _ = fmt.Sscanf(pid, fmt.Sprintf("dr-%d-%%d", id), &revision)
+			}
+		}
+		request = map[string]any{"id": fmt.Sprintf("dr-%d-%d", id, revision+1), "revision": revision + 1, "status": "open",
+			"question": in.Question, "requested_by": Author, "requested_at": time.Now().UTC(), "human_only": in.HumanOnly}
+		if in.Supersedes != "" {
+			request["supersedes"] = in.Supersedes
+		}
+		if in.DueAt != nil {
+			request["due_at"] = in.DueAt
+		}
+		refs["decision_request"] = request
+		task["refs"] = refs
+		raw, _ := json.Marshal(task)
+		s.tasks[id] = string(raw)
+	}
+	rid, _ := request["id"].(string)
+	s.asks = append(s.asks, Ask{Task: id, Input: in, RequestID: rid, Duplicate: duplicate})
+	writeJSON(w, http.StatusCreated, map[string]any{"task": task, "request": request, "decision_ref": "decision:" + rid, "ver": "v1",
+		"duplicate": duplicate, "issue_created": !duplicate})
 }

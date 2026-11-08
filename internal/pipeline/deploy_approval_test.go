@@ -33,10 +33,12 @@ type deploySink struct {
 	fakeSink
 	approved  bool
 	questions []string
+	records   []string
 }
 
-func (d *deploySink) DeployDecision(_ context.Context, _ string, q string, _ time.Time) (bool, error) {
+func (d *deploySink) DeployDecision(_ context.Context, _ string, q, record string, _ time.Time) (bool, error) {
 	d.questions = append(d.questions, q)
+	d.records = append(d.records, record)
 	return d.approved, nil
 }
 func TestRolloutDeployApproval(t *testing.T) {
@@ -104,6 +106,13 @@ func TestRolloutDeployApproval(t *testing.T) {
 			}
 			if tc.wantQuestion && (!strings.Contains(sink.questions[0], shaB) || !strings.Contains(sink.questions[0], r.Name)) {
 				t.Fatal("unbound question")
+			}
+			// The asked request id is kept in the rollout's durable state,
+			// beside its receipts and approved inventory (hk 3555).
+			for _, record := range sink.records {
+				if record != filepath.Join(state, "deploy-decision.json") {
+					t.Fatalf("decision record %q, want in rollout state %q", record, state)
+				}
 			}
 		})
 	}
