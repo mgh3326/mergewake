@@ -8,7 +8,9 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 const fleetBody = "Mergewake-Author-Family: anthropic\n"
@@ -358,5 +360,162 @@ func TestLaterPassClearsBlockedOutcome(t *testing.T) {
 				t.Fatalf("posts=%d refs=%v", f.gh.posts, f.g.refs)
 			}
 		})
+	}
+}
+
+// blockRouter answers the herdr and worktree reads of the author-pane scan
+// from lister and every other command from the panewire fake.
+type blockRouter struct {
+	lister *scriptRunner
+	pane   *panewireRunner
+}
+
+func (r blockRouter) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if _, ok := r.lister.outs[key(name, args...)]; ok || name == "herdr" {
+		return r.lister.Run(ctx, name, args, input, dir)
+	}
+	return r.pane.Run(ctx, name, args, input, dir)
+}
+
+// withAuthorPane puts one live worker on the PR's branch (feat/thing, the head
+// of blockSetup) on a local host. Its job w-9 has lane author-route.
+func (f blockFixture) withAuthorPane(t *testing.T) *scriptRunner {
+	t.Helper()
+	lister := authorHost(aPane{"pane-author", "w-9", "/wt/a", "feat/thing", projectOrigin})
+	f.s.Runner = blockRouter{lister, f.runner}
+	f.s.Config.Hosts = []reap.Host{{Name: "local"}}
+	f.runner.sink.jobs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "author-route"}
+	return lister
+}
+
+// (a) A missing trailer is the author's to fix: with a live author pane on the
+// PR's branch the block goes to that pane's lane, not the repo's owner lane.
+func TestAuthorFixableBlockGoesToTheAuthorPane(t *testing.T) {
+	f := blockSetup(t)
+	f.withAuthorPane(t)
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "author-route" || ev.Type != "decision" || !strings.HasSuffix(ev.Text, "| lane=author-route via author pane pane-author job w-9") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+	if f.gh.posts != 1 {
+		t.Fatalf("comments posted %d times, want 1", f.gh.posts)
+	}
+}
+
+// (b) An unknown family is fixed by the author too: with no pane, the valid
+// Notify-Lane trailer names the author's lane.
+func TestAuthorFamilyBlockGoesToTheNotifyLaneTrailer(t *testing.T) {
+	f := familyBlockSetup(t)
+	f.g.pull.Body = "Mergewake-Task: 42\nMergewake-Notify-Lane: trailer-route\n"
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if got := f.blocked(t, 7); got != blockUnknownFamily {
+		t.Fatalf("outcome row: %q", got)
+	}
+	if f.n.count != 1 || f.n.events[0].Lane != "trailer-route" || !strings.HasSuffix(f.n.events[0].Text, "| lane=trailer-route via notify-lane trailer") {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+}
+
+// (c) No author, no trailer, no task: the owner lane gets it, and the desk
+// gets nothing when the repo names a lane.
+func TestAuthorlessBlockGoesToOwnerLaneNotDesk(t *testing.T) {
+	f := blockSetup(t)
+	f.r.Lane = "owner-route"
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "owner-route" || !strings.HasSuffix(ev.Text, "| lane=owner-route via owner lane") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+	desk := f.s.Config.Notifier.FallbackLane
+	for _, e := range f.n.events {
+		if e.Lane == desk {
+			t.Fatalf("desk got the block: %+v", f.n.events)
+		}
+	}
+}
+
+// (d) The task title and the secret-like content belong to a human: they stay
+// with the owner lane even when a live author pane could take them.
+func TestTaskAndSecretBlocksStayWithOwnerLane(t *testing.T) {
+	for name, arrange := range map[string]func(*testing.T, blockFixture){
+		"task-missing-T-marker": func(t *testing.T, f blockFixture) {
+			f.g.pull.Body = "Mergewake-Task: 42\n" + fleetBody
+			f.runner.sink.title = "Fix the thing"
+		},
+		"secret-like-content": func(t *testing.T, f blockFixture) {
+			f.g.pull.Body = "Mergewake-Task: 42\n" + fleetBody
+			if e := f.s.recordReviewBlock(f.r.Name, 7, shaA, blockSecretLike, false); e != nil {
+				t.Fatal(e)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := blockSetup(t)
+			f.r.Lane = "owner-route"
+			f.withAuthorPane(t)
+			arrange(t, f)
+			if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+				t.Fatal(e)
+			}
+			if f.n.count != 1 {
+				t.Fatalf("events: %+v", f.n.events)
+			}
+			ev := f.n.events[0]
+			if ev.Lane != "owner-route" || !strings.HasSuffix(ev.Text, "| lane=owner-route via owner lane") {
+				t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+			}
+		})
+	}
+}
+
+// (e) A pane read error sends nothing and records no sent key, and the next
+// pass with a working lister sends once. The comment is still posted once.
+func TestAuthorRouteReadErrorSendsNothingThenRetries(t *testing.T) {
+	f := blockSetup(t)
+	lister := f.withAuthorPane(t)
+	lister.errs = map[string]error{key("herdr", "agent", "list"): errors.New("herdr down")}
+	if e := f.review(t); e == nil || errors.Is(e, ErrReviewBlocked) {
+		t.Fatalf("a failed pane read must stay a retryable error: %v", e)
+	}
+	if f.n.count != 0 {
+		t.Fatalf("events after a read error: %+v", f.n.events)
+	}
+	lister.errs = nil
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 || f.n.events[0].Lane != "author-route" {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	if f.gh.posts != 1 {
+		t.Fatalf("comments posted %d times, want 1", f.gh.posts)
+	}
+}
+
+// (f) The same (PR, head, reason) twice is one event, even when routed to the
+// author pane.
+func TestAuthorFixableBlockSendsOnce(t *testing.T) {
+	f := blockSetup(t)
+	f.withAuthorPane(t)
+	for range 2 {
+		if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+			t.Fatal(e)
+		}
+	}
+	if f.n.count != 1 || f.gh.posts != 1 {
+		t.Fatalf("events=%+v posts=%d", f.n.events, f.gh.posts)
 	}
 }

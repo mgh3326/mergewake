@@ -149,8 +149,8 @@ func (s *Service) commentReviewBlock(ctx context.Context, r config.Repo, pr gith
 	return s.GH.PostIssueComment(ctx, r.Name, pr.Number, body)
 }
 
-// notifyReviewBlock tells the repo's owner lane once per (PR, head, reason).
-// The event ID lets the notifier dedupe a send from another host.
+// notifyReviewBlock tells one lane once per (PR, head, reason). The event ID
+// lets the notifier dedupe a send from another host.
 func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr github.Pull, b reviewBlock) error {
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "review-blocked-sent"), 255)
 	if e != nil {
@@ -160,20 +160,41 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 	if sent.has(key) {
 		return nil
 	}
-	owner := s.ownerLane(r)
+	lane, via, e := s.blockLane(ctx, r, pr, b)
+	if e != nil {
+		return e
+	}
 	code := strings.TrimPrefix(b.reason, "blocked: ")
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(nctx, integrations.Event{
 		ID:   fmt.Sprintf("mergewake-review-blocked-%s-%d-%s-%s", r.Name, pr.Number, pr.Head.SHA, code),
-		Text: clip(fmt.Sprintf("[mergewake] REVIEW BLOCKED %s#%d head=%s | %s | the PR comment names the fix", r.Name, pr.Number, short7(pr.Head.SHA), b.reason), findingsLaneText),
-		Lane: owner,
+		Text: clip(fmt.Sprintf("[mergewake] REVIEW BLOCKED %s#%d head=%s | %s | the PR comment names the fix | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), b.reason, lane, via), findingsLaneText),
+		Lane: lane,
 		Type: "decision",
 	}); e != nil {
-		return fmt.Errorf("review block event to %s: %w", owner, e)
+		return fmt.Errorf("review block event to %s: %w", lane, e)
 	}
 	if e = sent.add(key); e != nil {
 		return e
 	}
-	return s.audit(r.Name, "review-blocked", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "outcome": b.reason, "lane": owner}, false)
+	return s.audit(r.Name, "review-blocked", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "outcome": b.reason, "lane": lane, "via": via}, false)
+}
+
+// blockLane is the lane a review block goes to. A missing trailer and an
+// unknown family are fixed by the PR's author, so the author's lane is found
+// first (findingsRoute); with none found, and for the other reasons, which a
+// human judges, it is the repo's owner lane. A route read error is returned,
+// so nothing is sent and the next pass retries.
+func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, b reviewBlock) (lane, via string, err error) {
+	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
+		route, e := s.findingsRoute(ctx, r, pr)
+		if e != nil {
+			return "", "", fmt.Errorf("review block route: %w", e)
+		}
+		if route.via != "unknown author; desk" {
+			return route.lane, route.via, nil
+		}
+	}
+	return s.ownerLane(r), "owner lane", nil
 }
