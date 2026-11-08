@@ -1529,7 +1529,7 @@ func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath stri
 // attachment it names. No event yet is (nil, nil).
 func (x *panewireExecutor) announced(ctx context.Context, lane, label string) ([]byte, error) {
 	s := x.s
-	raw, e := s.Runner.Run(ctx, s.Config.Review.Panewire.Command, []string{"inbox", "list", "--lane", lane, "--json"}, "", "")
+	raw, e := s.Runner.Run(ctx, s.Config.Review.Panewire.Command, integrations.InboxArgv(s.Config.Reap.Hub, "list", "--lane", lane, "--json"), "", "")
 	if e != nil {
 		return nil, fmt.Errorf("inbox: %v", integrations.Detail(e))
 	}
@@ -1547,7 +1547,7 @@ func (x *panewireExecutor) announced(ctx context.Context, lane, label string) ([
 	ack := func(id int64) {
 		// Read is enough; acknowledging keeps the item out of the lane's
 		// unread digest.
-		_, _ = s.Runner.Run(ctx, s.Config.Review.Panewire.Command, []string{"inbox", "ack", strconv.FormatInt(id, 10), "--lane", lane, "--json"}, "", "")
+		_, _ = s.Runner.Run(ctx, s.Config.Review.Panewire.Command, integrations.InboxArgv(s.Config.Reap.Hub, "ack", strconv.FormatInt(id, 10), "--lane", lane, "--json"), "", "")
 	}
 	for _, it := range items {
 		if it.Kind != "lane.event" || it.Event.EventID != label+"-findings" {
