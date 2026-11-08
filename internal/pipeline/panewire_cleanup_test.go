@@ -25,6 +25,8 @@ type cleanupOpts struct {
 	waitTimeout      bool                      // the spawn's --wait timed out after its pane started
 	refuseAll        bool                      // both the reviewer and the worker seat are refused before any pane starts
 	noPlacement      bool                      // the spawn's OK line names no placement receipt
+	jobState         string                    // the job record's state after the spawn; "completed" when empty
+	noJobPlacement   bool                      // the completed job record names no host and pane either
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
 	spawnOut         string                    // the spawn's whole stdout, replacing the OK line
 	unnamedPanes     bool                      // the full pane list carries no names, as on a hub node
@@ -84,7 +86,14 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 		if o.paneName != nil {
 			name = o.paneName(label)
 		}
-		runner.sink.jobs[label] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`), Host: "node-a", PaneID: "w1:p1", Cwd: cwd}
+		job := integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`), Host: "node-a", PaneID: "w1:p1", Cwd: cwd}
+		if o.jobState != "" {
+			job.State = o.jobState
+		}
+		if o.noJobPlacement {
+			job.Host, job.PaneID, job.Cwd = "", "", ""
+		}
+		runner.sink.jobs[label] = job
 		pane := map[string]any{"pane_id": "w1:p1", "name": name, "agent_status": "idle", "agent": "claude", "cwd": cwd}
 		hub.agents["agents"] = []any{pane}
 		hub.agents["panes"] = []any{pane}
@@ -412,10 +421,11 @@ func TestSpawnPlacementKeepsHostWhenPlacementOmitsIt(t *testing.T) {
 	}
 }
 
-// Without a placement the pane's host is unknown, so the pass cannot rule out
-// a pane running in the local checkout. The checkout stays, named for later.
+// Without a placement, from the spawn or from the job record, the pane's host
+// is unknown, so the pass cannot rule out a pane running in the local checkout.
+// The checkout stays, named for later.
 func TestReviewerCleanupKeepsCheckoutWhenPlacementUnconfirmed(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true})
+	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true, noJobPlacement: true})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
@@ -429,6 +439,34 @@ func TestReviewerCleanupKeepsCheckoutWhenPlacementUnconfirmed(t *testing.T) {
 	}
 	receipts := res.receipts(t)
 	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || !strings.Contains(receipts[0].Worktree, "checkouts") {
+		t.Fatalf("receipts = %+v", receipts)
+	}
+}
+
+// A spawn whose placement receipt came late still ran: when the completed job
+// record names the host and pane, the pass cleans up as if the spawn had named
+// them.
+func TestReviewerCleanupResolvesUnconfirmedPlacementFromJobRecord(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true})
+	if res.err != nil {
+		t.Fatalf("error=%v", res.err)
+	}
+	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || !strings.HasPrefix(receipts[0].Worktree, "/repo/") {
+		t.Fatalf("receipts = %+v", receipts)
+	}
+}
+
+// A job record that is not completed does not confirm a placement.
+func TestReviewerCleanupIgnoresPlacementOfJobNotCompleted(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true, jobState: "running"})
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("hub ops = %v", res.hubOps())
+	}
+	if receipts := res.receipts(t); len(receipts) != 1 || receipts[0].Result != "pending-cleanup" {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 }
