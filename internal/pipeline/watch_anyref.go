@@ -38,8 +38,9 @@ type anyRefIncident struct {
 	// later passes only shrink the interval.
 	Limit      int              `json:"limit"`
 	Dispatches []anyRefDispatch `json:"dispatches"`
-	// Refused holds GitHub's refusal for the rest of the incident, so a 403
-	// does not repeat (and re-arm the client's backoff) on every pass.
+	// Refused holds the reason this incident cannot dispatch for the rest of
+	// it: GitHub's refusal, so a 403 does not repeat (and re-arm the client's
+	// backoff) on every pass, or a suite input the workflow does not accept.
 	Refused string `json:"refused,omitempty"`
 }
 
@@ -139,6 +140,19 @@ func (s *watchStream) anyRef(ctx context.Context, r config.Repo, p policy.Policy
 		return "", false, e
 	}
 	_, e = s.dispatch(ctx, d, r, p, sha)
+	var unsupported *anyRefSuiteError
+	if errors.As(e, &unsupported) {
+		// Nothing was sent: drop the record and hold the incident. The evidence
+		// stays unknown, so the stream is neither green nor red, and the audit
+		// row is written once, when the incident starts holding.
+		if e = s.audit(r.Name, "anyref-suite-unsupported", map[string]any{"repo": r.Name, "stream": unsupported.Stream, "options": unsupported.Options}, false); e != nil {
+			return "", false, e
+		}
+		st.Dispatches = st.Dispatches[:len(st.Dispatches)-1]
+		st.Refused = "any-ref CI cannot run " + unsupported.Stream + " on " + short7(sha) + ": " + unsupported.Error()
+		result.AnyRefDispatch = ""
+		return st.Refused, true, s.saveAnyRef(r.Name, st)
+	}
 	if github.DispatchRefused(e) {
 		st.Dispatches = st.Dispatches[:len(st.Dispatches)-1]
 		st.Refused = "any-ref CI dispatch refused for " + short7(sha) + ": " + e.Error()
