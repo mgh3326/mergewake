@@ -356,6 +356,18 @@ func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error 
 	_, _, e = c.PutDocument(ctx, client.Document{Key: key, Kind: "note", Body: string(data)})
 	return e
 }
+
+// PutBrief stores a reviewer brief as the hk document key: kind brief, the
+// reviewer's job, its task (nil for none) and origin class job, so
+// `panewire spawn -p hk:doc/<key>` reads it on any host.
+func (h Handoffkeep) PutBrief(ctx context.Context, key, job string, task *int64, body []byte) error {
+	c, e := hkClient()
+	if e != nil {
+		return e
+	}
+	_, _, e = c.PutDocument(ctx, client.Document{Key: key, Kind: "brief", Job: job, Body: string(body), TaskID: task, OriginClass: "job"})
+	return e
+}
 func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {
 	var s Sink = Noop{}
 	var n Notifier = Noop{}

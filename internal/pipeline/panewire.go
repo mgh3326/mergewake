@@ -476,12 +476,19 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			cleanup()
 		}
 	}()
+	// Only a fresh pass publishes its brief: a resumed one replays the
+	// recorded spawn arguments, -p included, and never PUTs it again.
 	if !resumed {
-		if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
-			return skip("write brief: %v", e)
-		}
-		if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
-			return skip("publish brief: %v", e)
+		text := x.brief(plan, label, jobDir, builderFamily)
+		if doc, ok := x.briefDoc(ctx, plan, label, task, text); ok {
+			briefPath = doc
+		} else {
+			if e = os.WriteFile(briefPath, []byte(text), 0600); e != nil {
+				return skip("write brief: %v", e)
+			}
+			if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
+				return skip("publish brief: %v", e)
+			}
 		}
 	}
 
@@ -1287,6 +1294,50 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	plan.replacements = rj.Replacements + 1
 	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+}
+
+// briefDocTimeout bounds the brief's hk PUT: hkClientTimeout's 30 s, the
+// bound of one hk public-client call. briefDoc also keeps it to a quarter of
+// the pass time left, as the pane wait keeps time for posting, so a stalled
+// hk cannot eat the reviewer's wait.
+const briefDocTimeout = 30 * time.Second
+
+// briefDoc stores an in-limit brief as hk doc review/<label> and returns the
+// spawn's -p for it, `hk:doc/review/<label>` (panewire v0.0.200 reads it on
+// any host). A brief over inlineBriefLimit is left to spawnBrief's
+// attachment path. A PUT that fails for any reason (no doc-capable sink, an
+// unconfigured credential, a refusal, a timeout, an unreadable answer) is no
+// review failure (decision fleet-dependency-boundaries §1): ok is false and
+// the caller writes review-brief.md and spawns from it as before. Each try
+// leaves one review-brief-hk row, status hk or fallback with the redacted
+// reason; the row is best-effort and never stops the pass.
+func (x *panewireExecutor) briefDoc(ctx context.Context, plan *passPlan, label, task, text string) (string, bool) {
+	if len(text) > inlineBriefLimit {
+		return "", false
+	}
+	key := "review/" + label
+	e := errors.New("task sink cannot store an hk brief document")
+	if docs, ok := x.s.Sink.(interface {
+		PutBrief(context.Context, string, string, *int64, []byte) error
+	}); ok {
+		var taskID *int64
+		if n, err := strconv.ParseInt(task, 10, 64); err == nil && n > 0 {
+			taskID = &n
+		}
+		bound := briefDocTimeout
+		if deadline, ok := ctx.Deadline(); ok {
+			bound = min(bound, time.Until(deadline)/4)
+		}
+		c, cancel := context.WithTimeout(ctx, bound)
+		e = docs.PutBrief(c, key, label, taskID, []byte(text))
+		cancel()
+	}
+	row := map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label, "key": key, "status": "hk"}
+	if e != nil {
+		row["status"], row["reason"] = "fallback", fleetevent.Redact(integrations.Detail(e))
+	}
+	_ = x.s.audit(x.repo.Name, "review-brief-hk", row, false)
+	return "hk:doc/" + key, e == nil
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
