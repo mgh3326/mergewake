@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -62,26 +63,33 @@ type Reopen struct {
 // DecisionAsk is the body of one decision request, with the fields of hk's
 // store.DecisionRequestInput, which the server decodes strictly.
 type DecisionAsk struct {
-	Question string `json:"question"`
-	Options  struct {
-		Options []struct {
-			Key         string `json:"key"`
-			Label       string `json:"label"`
-			Recommended bool   `json:"recommended,omitempty"`
-		} `json:"options"`
-		AllowFree bool `json:"allow_free"`
-	} `json:"options"`
-	Reason         string     `json:"reason,omitempty"`
-	DefaultAction  string     `json:"default_action"`
-	DefaultOption  string     `json:"default_option,omitempty"`
-	DefaultTrigger string     `json:"default_trigger,omitempty"`
-	DueAt          *time.Time `json:"due_at,omitempty"`
-	Doc            string     `json:"doc,omitempty"`
-	Refs           []string   `json:"refs,omitempty"`
-	Supersedes     string     `json:"supersedes,omitempty"`
-	Block          bool       `json:"block,omitempty"`
-	HumanOnly      bool       `json:"human_only,omitempty"`
-	AnswerPolicy   string     `json:"answer_policy,omitempty"`
+	Question       string          `json:"question"`
+	Options        DecisionOptions `json:"options"`
+	Reason         string          `json:"reason,omitempty"`
+	DefaultAction  string          `json:"default_action"`
+	DefaultOption  string          `json:"default_option,omitempty"`
+	DefaultTrigger string          `json:"default_trigger,omitempty"`
+	DueAt          *time.Time      `json:"due_at,omitempty"`
+	Doc            string          `json:"doc,omitempty"`
+	Refs           []string        `json:"refs,omitempty"`
+	Supersedes     string          `json:"supersedes,omitempty"`
+	Block          bool            `json:"block,omitempty"`
+	HumanOnly      bool            `json:"human_only,omitempty"`
+	AnswerPolicy   string          `json:"answer_policy,omitempty"`
+}
+
+// DecisionOptions are a request's choices, as hk stores them in the task's
+// refs.decision_options.
+type DecisionOptions struct {
+	Options   []DecisionOption `json:"options"`
+	AllowFree bool             `json:"allow_free"`
+}
+
+// DecisionOption is one choice.
+type DecisionOption struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Recommended bool   `json:"recommended,omitempty"`
 }
 
 // Ask is one record-only decision request on a task
@@ -124,6 +132,8 @@ type Server struct {
 	asks        []Ask
 	requests    []Request
 	fails       map[string]failure
+	// afterRead is the task each id becomes once its next GET is served.
+	afterRead map[int64]string
 }
 
 // New starts a fake hk for t and points the svc-mergewake credential at it:
@@ -132,7 +142,7 @@ type Server struct {
 func New(t testing.TB) *Server {
 	t.Helper()
 	s := &Server{MaxAttachmentBytes: DefaultMaxAttachmentBytes, tasks: map[int64]string{}, attachments: map[string]Attachment{},
-		documents: map[string]Document{}, fails: map[string]failure{}}
+		documents: map[string]Document{}, fails: map[string]failure{}, afterRead: map[int64]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/tasks/{id}", s.task)
 	mux.HandleFunc("POST /v1/tasks/{id}/comments", s.comment)
@@ -169,6 +179,15 @@ func (s *Server) SetTask(id int64, raw string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tasks[id] = raw
+}
+
+// SetTaskAfterRead makes task id become raw once its next GET has been
+// served, as if another writer changed it between a client's read and its
+// next request.
+func (s *Server) SetTaskAfterRead(id int64, raw string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.afterRead[id] = raw
 }
 
 // SetAttachment stores body under its sha256 and returns the sha.
@@ -298,6 +317,10 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	raw := s.tasks[id]
+	if next, ok := s.afterRead[id]; ok {
+		s.tasks[id] = next
+		delete(s.afterRead, id)
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, raw)
@@ -430,11 +453,55 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
 }
 
+// storedRequest is the part of refs.decision_request hk's duplicate rule
+// reads.
+type storedRequest struct {
+	ID             string     `json:"id"`
+	Supersedes     string     `json:"supersedes"`
+	Root           string     `json:"root"`
+	Question       string     `json:"question"`
+	Reason         string     `json:"reason"`
+	DefaultAction  string     `json:"default_action"`
+	DefaultOption  string     `json:"default_option"`
+	DefaultTrigger string     `json:"default_trigger"`
+	DueAt          *time.Time `json:"due_at"`
+	Doc            string     `json:"doc"`
+	Refs           []string   `json:"refs"`
+	HumanOnly      bool       `json:"human_only"`
+	AnswerPolicy   string     `json:"answer_policy"`
+}
+
+// sameDecisionRequest is hk's store.sameDecisionRequest (handoffkeep
+// 67fa878, internal/store/decision_request.go): in re-sends the current
+// request when its question and every body field match. Neither the
+// current request's status nor its requester is compared.
+func sameDecisionRequest(cur storedRequest, curOptions *DecisionOptions, in DecisionAsk) bool {
+	policy := func(p string) string {
+		if p == "" {
+			return "operator_relay_allowed"
+		}
+		return p
+	}
+	sameDue := cur.DueAt == nil && in.DueAt == nil || cur.DueAt != nil && in.DueAt != nil && cur.DueAt.Equal(*in.DueAt)
+	sameOptions := curOptions != nil && curOptions.AllowFree == in.Options.AllowFree && slices.Equal(curOptions.Options, in.Options.Options)
+	return cur.Question == in.Question && sameOptions && cur.Reason == in.Reason && cur.DefaultAction == in.DefaultAction &&
+		cur.DefaultOption == in.DefaultOption && cur.DefaultTrigger == in.DefaultTrigger && sameDue && cur.Doc == in.Doc &&
+		slices.Equal(cur.Refs, in.Refs) && cur.HumanOnly == in.HumanOnly && policy(cur.AnswerPolicy) == policy(in.AnswerPolicy)
+}
+
 // decisionRequest records the request on the task as hk's record-only route
 // does, opening no Linear issue: the task's refs.decision_request becomes an
-// open request with the next revision, id dr-<task>-<revision>, answered 201.
-// An open request with the same question is answered 200 as a duplicate and
-// left as it is. The fake serves no /decision-request/ask route.
+// open request with the next revision, id dr-<task>-<revision>, answered 201,
+// and refs.decision_options its options. Its root is its own id, or the
+// superseded request's root when it supersedes one.
+//
+// The duplicate rule is hk's (handoffkeep 67fa878): a re-send of the task's
+// current request, with no supersedes or the one it was recorded with, whose
+// question and body are the same, is answered 200 with that request and
+// duplicate true, whatever its status or requester. A request recorded
+// without refs.decision_options (a test's SetTask) is never a duplicate.
+// The fake does not refuse a new request while one is open. It serves no
+// /decision-request/ask route.
 func (s *Server) decisionRequest(w http.ResponseWriter, r *http.Request) {
 	if s.failed(w, r) {
 		return
@@ -451,8 +518,18 @@ func (s *Server) decisionRequest(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var task map[string]any
+	var stored struct {
+		Refs struct {
+			Request *storedRequest   `json:"decision_request"`
+			Options *DecisionOptions `json:"decision_options"`
+		} `json:"refs"`
+	}
 	if e := json.Unmarshal([]byte(s.tasks[id]), &task); e != nil {
 		writeError(w, http.StatusInternalServerError, "fake task is not JSON")
+		return
+	}
+	if e := json.Unmarshal([]byte(s.tasks[id]), &stored); e != nil {
+		writeError(w, http.StatusInternalServerError, "fake task refs do not decode")
 		return
 	}
 	refs, _ := task["refs"].(map[string]any)
@@ -460,7 +537,8 @@ func (s *Server) decisionRequest(w http.ResponseWriter, r *http.Request) {
 		refs = map[string]any{}
 	}
 	prior, _ := refs["decision_request"].(map[string]any)
-	duplicate := prior != nil && prior["status"] == "open" && prior["question"] == in.Question
+	cur := stored.Refs.Request
+	duplicate := cur != nil && (in.Supersedes == "" || in.Supersedes == cur.Supersedes) && sameDecisionRequest(*cur, stored.Refs.Options, in)
 	request := prior
 	if !duplicate {
 		revision := 0
@@ -471,15 +549,26 @@ func (s *Server) decisionRequest(w http.ResponseWriter, r *http.Request) {
 				_, _ = fmt.Sscanf(pid, fmt.Sprintf("dr-%d-%%d", id), &revision)
 			}
 		}
-		request = map[string]any{"id": fmt.Sprintf("dr-%d-%d", id, revision+1), "revision": revision + 1, "status": "open",
-			"question": in.Question, "requested_by": Author, "requested_at": time.Now().UTC(), "human_only": in.HumanOnly}
+		rid := fmt.Sprintf("dr-%d-%d", id, revision+1)
+		request = map[string]any{"id": rid, "revision": revision + 1, "root": rid, "status": "open",
+			"question": in.Question, "requested_by": Author, "requested_at": time.Now().UTC(), "human_only": in.HumanOnly,
+			"reason": in.Reason, "default_action": in.DefaultAction, "default_option": in.DefaultOption,
+			"default_trigger": in.DefaultTrigger, "doc": in.Doc, "refs": in.Refs, "answer_policy": in.AnswerPolicy}
 		if in.Supersedes != "" {
 			request["supersedes"] = in.Supersedes
+			if cur != nil {
+				root := cur.Root
+				if root == "" {
+					root = cur.ID
+				}
+				request["root"] = root
+			}
 		}
 		if in.DueAt != nil {
 			request["due_at"] = in.DueAt
 		}
 		refs["decision_request"] = request
+		refs["decision_options"] = in.Options
 		task["refs"] = refs
 		raw, _ := json.Marshal(task)
 		s.tasks[id] = string(raw)
