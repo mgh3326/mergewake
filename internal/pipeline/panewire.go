@@ -507,7 +507,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		e := recErr
 		state := rec.State
 		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
-			finished, err := x.reviewerFinished(ctx, rec, rj)
+			finished, gone, err := x.reviewerFinished(ctx, rec, rj)
 			if err != nil {
 				return out, err
 			}
@@ -541,6 +541,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 							cause = "reviewer never placed before the review deadline"
 						default:
 							cause = lostOverdue
+						}
+						// A reviewer whose pane is idle or done may only have
+						// its output left to write: nudge it once, and lose the
+						// pass only if it still writes nothing. A vanished pane
+						// is lost as before, unless it was already nudged.
+						if finished && (!gone || rj.NudgedAt != nil) {
+							if err := x.nudgeIdleReviewer(ctx, plan, rj, timeout, revisit); err != nil {
+								return out, err
+							}
 						}
 						return x.replaceLostReviewer(ctx, plan, rj, fresh, cause, leaseSHA)
 					}
@@ -883,6 +892,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 		}
 		rj.Spawned = ""
+		// The replacement is a reviewer of its own: it gets its own nudge.
+		rj.NudgedAt = nil
 		if next.Host != "" || next.PaneID != "" {
 			rj.Spawned = fmt.Sprintf("OK pane=%s host=%s cwd=%s", next.PaneID, next.Host, next.Cwd)
 		}
@@ -997,6 +1008,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// cannot run (or its audit write) is logged and never fails the pass.
 	if cerr := x.closeCollectedJob(ctx, rj, res.rec); cerr != nil {
 		_ = s.Print(map[string]any{"action": "review", "state": "close-failed", "pr": pr.Number, "head": short7(pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "reason": fleetevent.Redact(cerr.Error())})
+	}
+	if rj.NudgedAt != nil {
+		// The findings are accepted: an audit that cannot write is not a reason to fail the pass.
+		_ = s.audit(x.repo.Name, "reviewer-nudge-outcome", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "outcome": "result_found"}, false)
 	}
 	x.note("collected", rj)
 	return out, nil
@@ -1166,6 +1181,61 @@ func (x *panewireExecutor) pending(revisit Revisit, rj reviewerJob, why string) 
 // even while it is working. Every other lost cause leaves the pane alone.
 const lostOverdue = "reviewer still running past the review deadline"
 
+// nudgeWait is how long a reviewer nudged on a finished pane has to write its
+// output before its pass is lost. It is a constant, not a config key.
+const nudgeWait = 2 * time.Minute
+
+// nudgeIdleReviewer answers a finished pane with no result before its pass is
+// lost. The first answer is one nudge to the reviewer, which may only have its
+// two output files left to write; the second is to wait nudgeWait for them.
+// It returns an error that holds the pass while the reviewer may still write,
+// and nil when the pass is lost now: the review budget cannot hold a nudge, the
+// nudge was refused, or the nudged reviewer had its nudgeWait and wrote nothing.
+func (x *panewireExecutor) nudgeIdleReviewer(ctx context.Context, plan *passPlan, rj reviewerJob, timeout time.Duration, revisit Revisit) error {
+	s, cfg, pr := x.s, x.s.Config.Review.Panewire, x.pr
+	now := s.now()
+	if rj.NudgedAt != nil {
+		due := rj.NudgedAt.Add(nudgeWait)
+		if now.Before(due) {
+			return x.awaitNudge(revisit, rj, due)
+		}
+		return nil
+	}
+	skip := func(reason string) error {
+		return s.audit(x.repo.Name, "reviewer-nudge", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "status": "skipped", "reason": reason}, false)
+	}
+	if rj.Recorded.Add(timeout).Sub(now) < nudgeWait {
+		return skip("budget")
+	}
+	findings := filepath.Join(cfg.Jobs, rj.Label, "findings.json")
+	report := filepath.Join(cfg.Jobs, rj.Label, "report.md")
+	text := fmt.Sprintf("mergewake: your review of %s#%d pass %d has no result yet. Write the two files now from the work you have already done: findings.json at %s and report.md at %s. Then run `panewire done %s --result %s --report %s`. Do not start new reading.", x.repo.Name, pr.Number, plan.pass, findings, report, rj.Label, findings, report)
+	c, cancel := reportContext(ctx)
+	defer cancel()
+	if e := s.Notifier.Notify(c, integrations.Event{ID: rj.Label + "-nudge", Lane: rj.Label, Text: text}); e != nil {
+		return skip(fleetevent.Redact(integrations.Detail(e)))
+	}
+	rj.NudgedAt = &now
+	if e := x.saveReviewerJob(rj); e != nil {
+		return e
+	}
+	if e := s.audit(x.repo.Name, "reviewer-nudge", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "status": "sent", "reason": ""}, false); e != nil {
+		return e
+	}
+	x.note("nudged", rj)
+	return x.awaitNudge(revisit, rj, now.Add(nudgeWait))
+}
+
+// awaitNudge holds the pass for a nudged reviewer that may still write its
+// output. A run with a revisit timer comes back at due; any other run comes
+// back at its next resume.
+func (x *panewireExecutor) awaitNudge(revisit Revisit, rj reviewerJob, due time.Time) error {
+	if revisit != nil {
+		revisit(x.repo.Name, x.pr.Number, rj.Label, due.Add(revisitMargin))
+	}
+	return fmt.Errorf("%w: reviewer %s was nudged to write its output; its result or the end of the nudge wait brings the PR back", errPassPending, rj.Label)
+}
+
 // replaceLostReviewer is the lost path for a resumed reviewer that will not
 // return a result: it audits and notifies, tries to close the job so its hub claim
 // is released (a job with no record has none), drops the record and runs the pass
@@ -1202,6 +1272,11 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
 		return out, err
+	}
+	if rj.NudgedAt != nil {
+		if err := s.audit(x.repo.Name, "reviewer-nudge-outcome", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "outcome": "lost"}, false); err != nil {
+			return out, err
+		}
 	}
 	x.note("lost", rj)
 	if rj.Replacements >= 1 {
@@ -1716,10 +1791,12 @@ func exitStatus(e error) int {
 	return -1
 }
 
-// reviewerFinished checks only the recorded pane on its recorded host.
-func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integrations.JobRecord, rj reviewerJob) (bool, error) {
+// reviewerFinished checks only the recorded pane on its recorded host. finished
+// is set when the pane is idle or done, or has disappeared; gone is set only
+// when it has disappeared.
+func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integrations.JobRecord, rj reviewerJob) (finished, gone bool, err error) {
 	if rec.Host == "" || rec.PaneID == "" {
-		return false, nil
+		return false, false, nil
 	}
 	var ops reviewerPanes
 	if rec.Host == "local" || x.localReviewerHost(rec.Host) {
@@ -1727,16 +1804,16 @@ func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integration
 	} else {
 		hub, err := x.s.reapHub()
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		if hub == nil {
-			return false, nil
+			return false, false, nil
 		}
 		ops = reap.HubHost{Hub: hub, Machine: rec.Host}
 	}
 	panes, err := ops.AllPanes(ctx)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	for _, p := range panes {
 		if p.ID != rec.PaneID {
@@ -1744,14 +1821,14 @@ func (x *panewireExecutor) reviewerFinished(ctx context.Context, rec integration
 		}
 		agents, err := ops.Panes(ctx)
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		for _, a := range agents {
 			if a.ID == p.ID && a.Name == rj.Label && a.Cwd == p.Cwd {
-				return closableStatus[a.Status], nil
+				return closableStatus[a.Status], false, nil
 			}
 		}
-		return false, nil
+		return false, false, nil
 	}
-	return true, nil
+	return true, true, nil
 }
