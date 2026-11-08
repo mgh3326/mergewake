@@ -358,6 +358,7 @@ A single PR's fetch failure never aborts the pass.
 | `drive_dir` | Required when enabled | Locally synced Google Drive folder on the archive host. Absolute; a leading `~/` expands only when the archive host is this machine. Never commit the real path. |
 | `archive_host` | Empty / `local` | Where `drive_dir` lives: empty or `local` is this machine, anything else a single `ssh(1)` destination reachable from this machine (options, whitespace and leading `-` are refused). |
 | `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
+| `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
@@ -373,24 +374,32 @@ local job dir and reports the step:
    list every non-directory entry. Credential-like
    paths — any path segment matching `.env*`, `*token*`, `*.pem` or `*key*`,
    case-insensitively — are excluded from Drive and hk and named in the
-   record. Symlinks and special files are not copied (following a link could
+   record. A regular file larger than a positive `drive_max_file_bytes` is
+   listed as oversized instead of being moved; it is not counted in the
+   archived file or byte totals and is not uploaded to hk, even when it is a
+   text file. Oversized contents are fingerprinted on the job host, recorded in
+   the manifest, and checked again before deletion; they are never hashed on
+   Drive. Symlinks and special files are not copied (following a link could
    archive a secret from outside the job dir). The hk task id comes from the
    job's panewire events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
    destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
    job's newest entry. A destination that already holds a `manifest.json` is
    a finished archive: when that manifest names the same job, host and task
-   with the same files and sizes, the plan is a delete-only `resume` (the
-   files must still hash to the manifest); otherwise it is skipped as
+   with the same archived files and oversized paths, sizes and fingerprints,
+   the plan is a delete-only `resume` (contents must still match the manifest);
+   otherwise it is skipped as
    `drive-dir-exists`. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
    from the job host and unpacked straight into the destination on the
    archive host, relayed through this machine (`ssh` on either side as
    configured); the Drive copy is a plain directory, not an archive file. A
-   job with nothing but excluded or non-regular entries copies nothing.
-3. **Verify**: every file's sha256 is computed on both sides and must match;
-   a missing, duplicate or unexpected hash record fails the archive.
+   job with nothing but excluded, oversized or non-regular entries copies
+   nothing.
+3. **Verify**: every archived file's sha256 is computed on both sides and must
+   match; oversized file fingerprints are computed on the job host only. A
+   missing, duplicate or unexpected hash record fails the archive.
 4. **hk attachments**: each text file under `text_max_bytes` is uploaded to
    hk (`PUT /v1/attachments`); the returned sha256 must match. The upload
    has no task reference, so the ids are tied to the task by the comment.
@@ -399,14 +408,17 @@ local job dir and reports the step:
    to hk, then a task comment (`POST /v1/tasks/<task>/comments`) posts the Drive directory,
    file count, total bytes, the manifest's attachment id, every attachment
    id, the excluded and skipped names, and the per-file sha256 list (the
-   first 200; the rest are in `manifest.json`).
+   first 200; the rest are in `manifest.json`). The comment is capped at 64 KiB;
+   when needed, details are truncated with a notice and the full lists remain
+   in `manifest.json`.
 6. **Manifest**: only then is `manifest.json` written beside the files, so a
    failed upload or comment leaves no manifest and the job is retried in
    full.
 7. **Delete**: the job dir is listed again and must be unchanged — a file
    added or modified since the plan was never archived, so the job is kept
-   as `job-changed` — then removed with `rm -rf`. Excluded credential files
-   go with it; their names stay in the record.
+   as `job-changed` — including oversized files — then removed with `rm -rf`.
+   Excluded credential and oversized files go with it; their names and sizes
+   stay in the record.
 
 The uploads and the comment go to hk over HTTP with mergewake's own
 [hk HTTP credential](#hk-http-credential), whatever the sink; no hk CLI runs.

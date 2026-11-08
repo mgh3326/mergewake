@@ -40,10 +40,11 @@ func (s *Skip) Error() string { return "skipped: " + s.Reason }
 // The attachments and the task comment go to hk over HTTP with mergewake's
 // own hk credential (integrations.Handoffkeep), never through the hk CLI.
 type Archiver struct {
-	Runner   reap.Runner
-	DriveDir string
-	SSH      string
-	TextMax  int64
+	Runner            reap.Runner
+	DriveDir          string
+	SSH               string
+	TextMax           int64
+	DriveMaxFileBytes int64
 }
 
 // File is one non-directory entry of a job dir, relative to it.
@@ -57,27 +58,30 @@ type File struct {
 
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
-	Action   string   `json:"action"`
-	Job      string   `json:"job"`
-	Host     string   `json:"host"`
-	Dir      string   `json:"dir"`
-	Task     string   `json:"task"`
-	Dest     string   `json:"drive_dir"`
-	Files    int      `json:"files"`
-	Bytes    int64    `json:"bytes"`
-	Move     []string `json:"move"`
-	Text     []string `json:"hk"`
-	Excluded []string `json:"excluded"`
-	Skipped  []string `json:"skipped"`
-	Delete   string   `json:"delete"`
-	Newest   int64    `json:"newest_mtime"`
+	Action         string   `json:"action"`
+	Job            string   `json:"job"`
+	Host           string   `json:"host"`
+	Dir            string   `json:"dir"`
+	Task           string   `json:"task"`
+	Dest           string   `json:"drive_dir"`
+	Files          int      `json:"files"`
+	Bytes          int64    `json:"bytes"`
+	OversizedBytes int64    `json:"oversized_bytes"`
+	Oversized      []File   `json:"oversized"`
+	Move           []string `json:"move"`
+	Text           []string `json:"hk"`
+	Excluded       []string `json:"excluded"`
+	Skipped        []string `json:"skipped"`
+	Delete         string   `json:"delete"`
+	Newest         int64    `json:"newest_mtime"`
 	// Resume marks a job whose Drive copy and hk record already completed
 	// but whose local delete did not: applying it only deletes.
-	Resume  bool `json:"resume,omitempty"`
-	host    reap.Host
-	entries []File
-	done    *manifest
-	doneRaw []byte
+	Resume          bool `json:"resume,omitempty"`
+	host            reap.Host
+	entries         []File
+	oversizedHashes map[string]string
+	done            *manifest
+	doneRaw         []byte
 }
 
 // Attachment is one handoffkeep attachment id and the job path it holds.
@@ -299,6 +303,9 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
 			p.Skipped = append(p.Skipped, f.Path)
+		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
+			p.Oversized = append(p.Oversized, f)
+			p.OversizedBytes += f.Size
 		default:
 			p.Move = append(p.Move, f.Path)
 			p.Files++
@@ -309,6 +316,13 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		}
 		if f.mtime > p.Newest {
 			p.Newest = f.mtime
+		}
+	}
+	if len(p.Oversized) > 0 {
+		paths := filePaths(p.Oversized)
+		p.oversizedHashes, err = a.hashes(ctx, h.SSH, dir, paths)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if p.Task, err = a.task(ctx, h, dir, files); err != nil {
@@ -344,8 +358,13 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 }
 
 func (m *manifest) matches(p *Plan) bool {
-	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) {
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) {
 		return false
+	}
+	for i, f := range m.Oversized {
+		if f.Path != p.Oversized[i].Path || f.Size != p.Oversized[i].Size || f.SHA256 == "" || f.SHA256 != p.oversizedHashes[f.Path] {
+			return false
+		}
 	}
 	size := map[string]int64{}
 	for _, f := range p.entries {
@@ -438,6 +457,7 @@ type manifest struct {
 	ArchivedAt  string       `json:"archived_at"`
 	Files       []File       `json:"files"`
 	TotalBytes  int64        `json:"total_bytes"`
+	Oversized   []File       `json:"oversized,omitempty"`
 	Excluded    []string     `json:"excluded"`
 	Skipped     []string     `json:"skipped"`
 	Attachments []Attachment `json:"attachments"`
@@ -446,6 +466,9 @@ type manifest struct {
 // commentFiles bounds the per-file sha256 list in the hk comment; the full
 // list is always in manifest.json.
 const commentFiles = 200
+const maxHKCommentBytes = 64 << 10
+
+const commentTruncationNotice = "\n[comment details truncated; complete file lists are in manifest.json]\n"
 
 func comment(p *Plan, m manifest, manifestID string) string {
 	var b strings.Builder
@@ -468,6 +491,12 @@ func comment(p *Plan, m manifest, manifestID string) string {
 			fmt.Fprintf(&b, "- %s\n", x)
 		}
 	}
+	if len(m.Oversized) > 0 {
+		fmt.Fprintf(&b, "over drive_max_file_bytes, not archived, deleted with the job dir (%d, %d bytes):\n", len(m.Oversized), sumFileBytes(m.Oversized))
+		for _, f := range m.Oversized {
+			fmt.Fprintf(&b, "- %s %d\n", f.Path, f.Size)
+		}
+	}
 	fmt.Fprintf(&b, "file sha256 (%d):\n", len(m.Files))
 	for i, f := range m.Files {
 		if i == commentFiles {
@@ -477,7 +506,34 @@ func comment(p *Plan, m manifest, manifestID string) string {
 		fmt.Fprintf(&b, "- %s %d %s\n", f.SHA256, f.Size, f.Path)
 	}
 	fmt.Fprintf(&b, "local job dir %s is deleted after this record\n", p.Dir)
-	return b.String()
+	return boundComment(b.String())
+}
+
+func boundComment(s string) string {
+	if len(s) <= maxHKCommentBytes {
+		return s
+	}
+	limit := maxHKCommentBytes - len(commentTruncationNotice)
+	for limit > 0 && !utf8.ValidString(s[:limit]) {
+		limit--
+	}
+	return s[:limit] + commentTruncationNotice
+}
+
+func filePaths(files []File) []string {
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = f.Path
+	}
+	return paths
+}
+
+func sumFileBytes(files []File) int64 {
+	var total int64
+	for _, f := range files {
+		total += f.Size
+	}
+	return total
 }
 
 func same(a, b []File) bool {
@@ -514,8 +570,12 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 			return nil, err
 		}
 	}
+	oversized := append([]File(nil), p.Oversized...)
+	for i := range oversized {
+		oversized[i].SHA256 = p.oversizedHashes[oversized[i].Path]
+	}
 	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
-		Files: []File{}, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
+		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
 		moving[rel] = true
@@ -588,6 +648,17 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, error) {
 	if _, err := a.jobDir(ctx, p.host.SSH, p.Dir); err != nil {
 		return res, err
+	}
+	if len(p.Oversized) > 0 {
+		current, err := a.hashes(ctx, p.host.SSH, p.Dir, filePaths(p.Oversized))
+		if err != nil {
+			return res, err
+		}
+		for name, sum := range p.oversizedHashes {
+			if current[name] != sum {
+				return res, &Skip{"job-changed"}
+			}
+		}
 	}
 	again, err := a.list(ctx, p.host, p.Dir)
 	if err != nil {

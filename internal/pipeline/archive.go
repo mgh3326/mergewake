@@ -17,7 +17,7 @@ import (
 
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
-	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, TextMax: a.TextMaxBytes}
+	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
 }
 
 // archiveRetry spaces retries of a job whose archive failed, so a persistent
