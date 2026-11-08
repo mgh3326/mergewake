@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -25,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -37,13 +37,13 @@ func (s *Skip) Error() string { return "skipped: " + s.Reason }
 // Archiver holds the archive destination. SSH is the archive host as an
 // ssh(1) destination reachable from this machine; empty or "local" means the
 // Drive folder is on this machine. DriveDir must be absolute on that host.
+// The attachments and the task comment go to hk over HTTP with mergewake's
+// own hk credential (integrations.Handoffkeep), never through the hk CLI.
 type Archiver struct {
 	Runner   reap.Runner
-	HK       string // handoffkeep command
 	DriveDir string
 	SSH      string
 	TextMax  int64
-	TempDir  string // scratch for hk uploads; empty uses the OS default
 }
 
 // File is one non-directory entry of a job dir, relative to it.
@@ -416,33 +416,16 @@ func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 	return nil
 }
 
-func (a *Archiver) put(ctx context.Context, dir, name string, b []byte) (string, error) {
-	f, err := os.CreateTemp(dir, "put-*")
-	if err != nil {
-		return "", err
-	}
-	_, err = f.Write(b)
-	if e := f.Close(); err == nil {
-		err = e
-	}
-	if err != nil {
-		return "", err
-	}
-	out, err := a.Runner.Run(ctx, a.HK, []string{"attach", "put", f.Name(), "--name", name}, "", "")
+func (a *Archiver) put(ctx context.Context, name string, b []byte) (string, error) {
+	id, err := (integrations.Handoffkeep{}).UploadAttachment(ctx, name, b)
 	if err != nil {
 		return "", fmt.Errorf("hk attach put %s: %w", name, err)
 	}
-	var v struct {
-		SHA256 string `json:"sha256"`
-	}
-	if err := json.Unmarshal(out, &v); err != nil || len(v.SHA256) != 64 {
-		return "", fmt.Errorf("hk attach put %s: unexpected output", name)
-	}
 	sum := sha256.Sum256(b)
-	if v.SHA256 != hex.EncodeToString(sum[:]) {
+	if id != hex.EncodeToString(sum[:]) {
 		return "", fmt.Errorf("hk attach put %s: sha256 mismatch", name)
 	}
-	return v.SHA256, nil
+	return id, nil
 }
 
 // manifest is written beside the archived files and attached to hk.
@@ -549,11 +532,6 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		m.TotalBytes += f.Size
 	}
 
-	tmp, err := os.MkdirTemp(a.TempDir, "mergewake-archive-")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmp)
 	for _, rel := range p.Text {
 		b, err := a.on(ctx, p.host.SSH, "", "cat", filepath.Join(p.Dir, rel))
 		if err != nil {
@@ -562,7 +540,7 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		if sum := sha256.Sum256(b); hex.EncodeToString(sum[:]) != src[rel] {
 			return nil, &Skip{"job-changed"}
 		}
-		id, err := a.put(ctx, tmp, path.Base(rel), b)
+		id, err := a.put(ctx, path.Base(rel), b)
 		if err != nil {
 			return nil, err
 		}
@@ -574,11 +552,11 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		return nil, err
 	}
 	mb = append(mb, '\n')
-	mid, err := a.put(ctx, tmp, "manifest.json", mb)
+	mid, err := a.put(ctx, "manifest.json", mb)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.Runner.Run(ctx, a.HK, []string{"tasks", "comment", p.Task, "--file", "-"}, comment(p, m, mid), ""); err != nil {
+	if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p, m, mid)); err != nil {
 		return nil, fmt.Errorf("hk comment: %w", err)
 	}
 	// Published last: Plan treats a dest holding manifest.json as archived

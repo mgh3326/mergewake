@@ -17,11 +17,7 @@ import (
 
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
-	hk := "handoffkeep"
-	if s.Config.Sink.Type == "handoffkeep" && s.Config.Sink.Command != "" {
-		hk = s.Config.Sink.Command
-	}
-	return &archive.Archiver{Runner: s.Runner, HK: hk, DriveDir: a.DriveDir, SSH: a.ArchiveHost, TextMax: a.TextMaxBytes}
+	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, TextMax: a.TextMaxBytes}
 }
 
 // archiveRetry spaces retries of a job whose archive failed, so a persistent
