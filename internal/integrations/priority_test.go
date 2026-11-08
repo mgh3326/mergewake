@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/mgh3326/mergewake/internal/hktest"
 )
 
-func TestTaskPriorityReadsTasksShow(t *testing.T) {
+func TestTaskPriorityReadsTask(t *testing.T) {
 	for _, tc := range []struct {
 		shown string
 		want  int
@@ -16,17 +18,22 @@ func TestTaskPriorityReadsTasksShow(t *testing.T) {
 		{`{"id":42,"priority":0}`, 0},
 		{`{"id":42,"title":"no priority"}`, 0},
 	} {
-		h := Handoffkeep{Runner: &fakeRunner{shown: tc.shown}, Command: "handoffkeep"}
+		hk := hktest.New(t)
+		hk.SetTask(42, tc.shown)
+		h := Handoffkeep{Runner: noCLI(t), Command: "handoffkeep"}
 		got, e := h.TaskPriority(context.Background(), "42")
 		if e != nil || got != tc.want {
 			t.Fatalf("%s: %d %v", tc.shown, got, e)
 		}
 	}
-	if _, e := (Handoffkeep{Runner: &fakeRunner{}}).TaskPriority(context.Background(), "x"); e == nil {
+	if _, e := (Handoffkeep{Runner: noCLI(t)}).TaskPriority(context.Background(), "x"); e == nil {
 		t.Fatal("invalid task accepted")
 	}
-	if _, e := (Handoffkeep{Runner: &fakeRunner{fail: true}}).TaskPriority(context.Background(), "42"); e == nil {
-		t.Fatal("runner failure hidden")
+	hk := hktest.New(t)
+	hk.SetTask(42, `{"id":42,"priority":2}`)
+	hk.Fail("GET /v1/tasks/{id}", http.StatusBadGateway, "")
+	if _, e := (Handoffkeep{Runner: noCLI(t)}).TaskPriority(context.Background(), "42"); e == nil {
+		t.Fatal("hk failure hidden")
 	}
 }
 

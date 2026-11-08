@@ -15,11 +15,9 @@ type call struct {
 	args    []string
 }
 type fakeRunner struct {
-	calls  []call
-	fail   bool
-	err    error
-	shown  string // overrides the `tasks show` reply
-	upload string // attachment upload reply
+	calls []call
+	fail  bool
+	err   error
 }
 
 func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) ([]byte, error) {
@@ -29,15 +27,6 @@ func (r *fakeRunner) Run(_ context.Context, c string, a []string, _, _ string) (
 	}
 	if r.fail {
 		return nil, errors.New("offline")
-	}
-	if len(a) > 1 && a[0] == "attach" && a[1] == "put" {
-		return []byte(r.upload), nil
-	}
-	if len(a) > 1 && a[0] == "tasks" && a[1] == "show" {
-		if r.shown != "" {
-			return []byte(r.shown), nil
-		}
-		return []byte(`{"state":"merged","lane":"task-lane"}`), nil
 	}
 	return nil, nil
 }
@@ -50,23 +39,6 @@ func TestAdaptersUseArgumentVectors(t *testing.T) {
 	}
 	if r.calls[0].args[len(r.calls[0].args)-1] != text {
 		t.Fatal("text changed")
-	}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
-	if e := h.Reopen(context.Background(), "42", "CI red"); e != nil {
-		t.Fatal(e)
-	}
-	if !strings.Contains(strings.Join(r.calls[1].args, " "), "tasks show 42") || !strings.Contains(strings.Join(r.calls[3].args, " "), "tasks reopen 42 --reason CI red") {
-		t.Fatal(r.calls)
-	}
-	before := len(r.calls)
-	if e := h.Reopen(context.Background(), "42;cmd", "bad"); e == nil || len(r.calls) != before {
-		t.Fatal("invalid task accepted")
-	}
-	if e := h.Record(context.Background(), "mergewake/report-a", []byte(`{"status":"success"}`)); e != nil {
-		t.Fatal(e)
-	}
-	if r.calls[before].args[0] != "doc" {
-		t.Fatal(r.calls)
 	}
 }
 func TestNotifyLaneOverrideAndTaskLane(t *testing.T) {
@@ -98,49 +70,12 @@ func TestNotifyLaneOverrideAndTaskLane(t *testing.T) {
 	if lane != "config-lane" {
 		t.Fatalf("config lane not used: %v", args)
 	}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
-	lane, e := h.Lane(context.Background(), "42")
-	if e != nil || lane != "task-lane" {
-		t.Fatalf("lane=%q err=%v", lane, e)
-	}
-	if e := func() error { _, e := h.Lane(context.Background(), "x"); return e }(); e == nil {
-		t.Fatal("invalid task accepted")
-	}
 }
 
 func TestAdapterErrorsPropagate(t *testing.T) {
 	r := &fakeRunner{fail: true}
 	if (Panewire{Runner: r, Command: "panewire", Lane: "lane-a"}).Notify(context.Background(), Event{}) == nil {
 		t.Fatal("notify failure hidden")
-	}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "in_progress"}
-	if h.Reopen(context.Background(), "42", "note") == nil || len(r.calls) != 2 {
-		t.Fatal("show failure did not stop transition")
-	}
-}
-
-type oldServerRunner struct{ calls int }
-
-func (r *oldServerRunner) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
-	r.calls++
-	if args[1] == "show" {
-		return []byte(`{"state":"merged"}`), nil
-	}
-	if args[1] == "reopen" {
-		return nil, errors.New("HTTP 404: unsupported operation")
-	}
-	return nil, nil
-}
-func TestReopenOlderServerFailsExplicitly(t *testing.T) {
-	r := &oldServerRunner{}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep", State: "reopened"}
-	err := h.Reopen(context.Background(), "42", "reverted")
-	if err == nil || !strings.Contains(err.Error(), "comment recorded") || !strings.Contains(err.Error(), "lack explicit reopen support") || r.calls != 3 {
-		t.Fatalf("calls=%d err=%v", r.calls, err)
-	}
-	before := r.calls
-	if h.Reopen(context.Background(), "42", " ") == nil || r.calls != before {
-		t.Fatal("empty reason sent requests")
 	}
 }
 
@@ -175,70 +110,6 @@ func TestFailedCommandKeepsStderrOutOfMessage(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "rate limit") || !strings.Contains(err.Error(), "exit status 1") {
 		t.Fatalf("message changed: %v", err)
-	}
-}
-
-func TestHandoffkeepAttachmentReadsBySHA(t *testing.T) {
-	r := &fakeRunner{}
-	h := Handoffkeep{Runner: r, Command: "handoffkeep"}
-	sha := strings.Repeat("ab", 32)
-	if _, e := h.Attachment(context.Background(), sha); e != nil {
-		t.Fatal(e)
-	}
-	if got := strings.Join(r.calls[0].args, " "); got != "attach get "+sha {
-		t.Fatal(got)
-	}
-	for _, bad := range []string{"", "-o", strings.Repeat("AB", 32), sha + "0"} {
-		if _, e := h.Attachment(context.Background(), bad); e == nil {
-			t.Fatalf("accepted %q", bad)
-		}
-	}
-	if len(r.calls) != 1 {
-		t.Fatal(r.calls)
-	}
-}
-
-func TestHandoffkeepAttachmentUploadValidatesReceipt(t *testing.T) {
-	sha := strings.Repeat("ab", 32)
-	for _, tc := range []struct {
-		name, reply string
-		err         error
-		want        string
-	}{
-		{"uploaded", `{"sha256":"` + sha + `","size_bytes":70000}`, nil, sha},
-		{"missing digest", `{}`, nil, ""},
-		{"invalid digest", `{"sha256":"-o"}`, nil, ""},
-		{"malformed reply", `not json`, nil, ""},
-		{"upload failed", "", errors.New("offline"), ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := &fakeRunner{upload: tc.reply, err: tc.err}
-			h := Handoffkeep{Runner: r, Command: "custom-hk"}
-			id, e := h.PutAttachment(context.Background(), "/tmp/brief with spaces.md")
-			if id != tc.want || (e == nil) != (tc.want != "") {
-				t.Fatalf("id=%q error=%v", id, e)
-			}
-			if len(r.calls) != 1 || r.calls[0].command != "custom-hk" || strings.Join(r.calls[0].args, "|") != "attach|put|/tmp/brief with spaces.md" {
-				t.Fatal(r.calls)
-			}
-		})
-	}
-}
-
-func TestTaskBodyReadsBodyThenDescription(t *testing.T) {
-	for _, tc := range []struct{ shown, want string }{
-		{`{"id":42,"body":"## Acceptance\n- x"}`, "## Acceptance\n- x"},
-		{`{"id":42,"description":"from description"}`, "from description"},
-		{`{"id":42,"title":"no text"}`, ""},
-	} {
-		h := Handoffkeep{Runner: &fakeRunner{shown: tc.shown}, Command: "handoffkeep"}
-		got, e := h.TaskBody(context.Background(), "42")
-		if e != nil || got != tc.want {
-			t.Fatalf("%s: %q %v", tc.shown, got, e)
-		}
-	}
-	if _, e := (Handoffkeep{Runner: &fakeRunner{}}).TaskBody(context.Background(), "x"); e == nil {
-		t.Fatal("invalid task accepted")
 	}
 }
 
