@@ -712,7 +712,9 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 	if fix != nil && s.now().Sub(st.RedSince) >= 2*fixWindow {
 		fix = nil
 	}
-	if fix != nil && st.FixPR != fix.Number {
+	// The recorded fix PR number does not prove the urgent mark was written: a
+	// failed write is retried until the mark reads back.
+	if fix != nil && (st.FixPR != fix.Number || acting && !s.urgentFix(r.Name, fix.Number)) {
 		st.FixPR = fix.Number
 		if acting {
 			if e = s.saveRecovery(r.Name, st); e != nil {

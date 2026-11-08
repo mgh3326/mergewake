@@ -121,3 +121,35 @@ func TestFixPRIsUrgentDuringInitialWindow(t *testing.T) {
 		t.Fatalf("fix PR priority inside the window: %+v", p)
 	}
 }
+
+// A failed write of recovery-urgent.json is retried by the next poll: the fix
+// PR number was already recorded in recovery.json, which must not count as the
+// priority having been published.
+func TestUrgentMarkIsRetriedAfterWriteFailure(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, nil)
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	g.openPulls = []github.Pull{fixPull(shaB)}
+
+	// A directory where the file belongs makes the write fail.
+	if e := os.Mkdir(s.urgentFile(r.Name), 0o755); e != nil {
+		t.Fatal(e)
+	}
+	now = now.Add(5 * time.Minute)
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("the failed write was not reported")
+	}
+	if e := os.Remove(s.urgentFile(r.Name)); e != nil {
+		t.Fatal(e)
+	}
+
+	now = now.Add(time.Minute)
+	recoveryWatch(t, s, r)
+	if p := s.ReviewPriority(context.Background(), r, fixPull(shaB)); p.Value != 1 || p.Source != "recovery-fix" {
+		t.Fatalf("fix PR priority after the retry: %+v", p)
+	}
+}
