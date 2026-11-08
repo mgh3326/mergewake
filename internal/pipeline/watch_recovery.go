@@ -499,20 +499,56 @@ func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p poli
 	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
+// sawConfirmedPass reports whether a check the incident was confirmed on now
+// carries a passing any-ref status: the re-run the confirmation itself read. A
+// check-and-status conflict elsewhere on the head, or a status that still
+// fails, proves nothing about the confirmation.
+func (s *watchStream) sawConfirmedPass(ctx context.Context, r config.Repo, inc recoveryIncident) (bool, error) {
+	reader, ok := s.GH.(statusReader)
+	if !ok || inc.Checks == "" {
+		return false, nil
+	}
+	for _, name := range strings.Split(inc.Checks, ",") {
+		state, _, found, e := reader.LatestStatus(ctx, r.Name, inc.Culprit, name)
+		if e != nil {
+			return false, e
+		}
+		if found && state == github.Green {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // settleConfirmedHead decides a confirmed incident's ambiguous read at its
 // culprit head once. A same-sha re-run that passes beside the head's own failed
-// run is a mixed result, and a mixed result is flaky: that is what this code
-// already does with one before confirmation (confirmRecovery), and a mixed
-// result never justifies blaming a commit. The verdict already reached is not
-// re-litigated, so the incident keeps its culprit, baseline and confirmation
-// and gains the flaky mark; the automatic revert stops and the design lane
-// hears it once. A later pass reads the record instead of deciding again.
+// run on a check the failure was confirmed on is a mixed result, and a mixed
+// result is flaky: that is what this code already does with one before
+// confirmation (confirmRecovery), and a mixed result never justifies blaming a
+// commit. The verdict already reached is not re-litigated, so the incident
+// keeps its culprit, baseline and confirmation and gains the flaky mark; the
+// automatic revert stops and the design lane hears it once. A later pass reads
+// the record instead of deciding again.
+//
+// The ambiguous read is not evidence by itself: Check raises it for any
+// same-name conflict on the head, including a check the failure was never
+// confirmed on, a passing check run with a failing status, or a status that
+// still fails. Only a pass on the confirmed check set is the mixed result; any
+// other conflict stays unresolved and holds, so a confirmed failure is never
+// marked flaky by evidence that says nothing about it.
 func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, result watchResult, o Options, inc recoveryIncident) error {
 	const reason = "the culprit passed a re-run after confirmation"
 	result.Culprit, result.PR = inc.Culprit, inc.CulpritPR
-	result.Action = "recovery-confirming"
-	result.Reason = reason
 	if inc.Flaky == "" {
+		passed, e := s.sawConfirmedPass(ctx, r, inc)
+		if e != nil {
+			return e
+		}
+		if !passed {
+			result.Action = "recovery-hold"
+			result.Reason = "the head's checks conflict without a passing re-run of the confirmation checks"
+			return s.reportWatch(ctx, r, result, "recovery:"+inc.Culprit+":ambiguous-head", o)
+		}
 		inc.Flaky = reason
 		if !result.Shadow && !o.DryRun {
 			if e := s.saveRecovery(r.Name, inc); e != nil {
@@ -529,6 +565,8 @@ func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, re
 			}
 		}
 	}
+	result.Action = "recovery-confirming"
+	result.Reason = reason
 	// One notice per decision: the latch path reports the same record under the
 	// revert PR's key.
 	key := "recovery:" + inc.Culprit + ":confirm:" + reason

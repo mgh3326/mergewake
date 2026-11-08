@@ -108,6 +108,7 @@ func TestWatchConfirmedHeadRerunBeforeRevertHolds(t *testing.T) {
 		l.parents = map[string]string{shaB: shaA}
 		l.pull.MergeCommitSHA = shaB
 		l.ambiguousSHA, l.readResult, l.ambiguousFrom = shaB, github.Red, 2
+		l.statuses = map[[2]string]statusRecord{{shaB, "CI"}: {github.Green, now}}
 	})
 	s.Now = func() time.Time { return now }
 	seedHeadConfirmed(t, s, r, now)
@@ -217,6 +218,55 @@ func TestWatchConfirmedHeadRerunRestartKeepsDecision(t *testing.T) {
 	}
 	if g.revertCount != 0 {
 		t.Fatalf("restart opened a revert: %d", g.revertCount)
+	}
+}
+
+// (g) Check raises the ambiguous read for any same-name conflict on the head,
+// not only the confirmed failure's own re-run. A conflict on another check, or
+// a status that still fails, is not a mixed result: the incident holds
+// unresolved instead of being marked flaky on evidence about another check.
+func TestWatchConfirmedHeadConflictOutsideConfirmationHolds(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	for name, statuses := range map[string]map[[2]string]statusRecord{
+		"other check":   {{shaB, "LINT"}: {github.Green, now}},
+		"still failing": {{shaB, "CI"}: {github.Red, now}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+				l.head = shaB
+				l.parents = map[string]string{shaB: shaA}
+				l.pull.MergeCommitSHA = shaB
+				l.ambiguousSHA, l.readResult, l.ambiguousFrom = shaB, github.Red, 1
+				l.statuses = statuses
+			})
+			s.Now = func() time.Time { return now }
+			seedHeadConfirmed(t, s, r, now)
+
+			got := recoveryWatch(t, s, r)
+			if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "conflict without a passing re-run") {
+				t.Fatalf("%+v", got)
+			}
+			if g.revertCount != 0 {
+				t.Fatalf("opened a revert on an unresolved conflict: %d", g.revertCount)
+			}
+			st, found := recoveryState(t, s, r)
+			if !found || st.Flaky != "" || !st.Confirmed {
+				t.Fatalf("incident %+v found=%t", st, found)
+			}
+			if rows := auditRows(t, s, r, "recovery-mixed-head"); len(rows) != 0 {
+				t.Fatalf("marked a confirmed failure flaky on another check: %v", rows)
+			}
+			if lines := designLaneEvents(n); len(lines) != 1 {
+				t.Fatalf("design-lane lines: %v", lines)
+			}
+
+			if got = recoveryWatch(t, s, r); got.Action != "recovery-hold" {
+				t.Fatalf("repeat: %+v", got)
+			}
+			if lines := designLaneEvents(n); len(lines) != 1 {
+				t.Fatalf("repeat told the design lane: %v", lines)
+			}
+		})
 	}
 }
 
