@@ -3,8 +3,11 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -167,8 +170,68 @@ func (s *watchStream) targetHead(head string) string {
 	return head
 }
 
+// anyRefSuiteError says the any-ref workflow's suite input does not take the
+// value a stream needs. The dispatch is not sent: GitHub would refuse it, and
+// the stream's evidence stays unknown rather than falling back to the default.
+type anyRefSuiteError struct {
+	Stream  string
+	Options []string
+}
+
+func (e *anyRefSuiteError) Error() string {
+	return fmt.Sprintf("any-ref CI suite input does not accept %q (options: %s)", e.Stream, strings.Join(e.Options, ", "))
+}
+
+// suiteInput is the suite input a workflow file declares.
+type suiteInput struct {
+	declared bool
+	// options is nil for a free string: no type, no options list, or an
+	// options list that is not all strings. A declared list is never nil.
+	options []string
+}
+
+func (in suiteInput) accepts(v string) bool {
+	return in.options == nil || slices.Contains(in.options, v)
+}
+
+func parseSuiteInput(raw []byte) (suiteInput, error) {
+	var wf struct {
+		On struct {
+			Dispatch struct {
+				Inputs map[string]any `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		return suiteInput{}, err
+	}
+	spec, declared := wf.On.Dispatch.Inputs["suite"]
+	if !declared {
+		return suiteInput{}, nil
+	}
+	in := suiteInput{declared: true}
+	m, _ := spec.(map[string]any)
+	typ, _ := m["type"].(string)
+	list, ok := m["options"].([]any)
+	if typ == "" || !ok {
+		return in, nil
+	}
+	opts := make([]string, 0, len(list))
+	for _, v := range list {
+		s, isString := v.(string)
+		if !isString {
+			return in, nil
+		}
+		opts = append(opts, s)
+	}
+	in.options = opts
+	return in, nil
+}
+
 // dispatch starts the any-ref workflow for sha and returns the id of the run
-// it started, or zero when the client or GitHub does not report one.
+// it started, or zero when the client or GitHub does not report one. A suite
+// input is sent only when the workflow accepts its value: the main stream
+// omits it otherwise, and the deploy stream returns an *anyRefSuiteError.
 func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r config.Repo, p policy.Policy, sha string) (int64, error) {
 	inputs := map[string]string{"ref": sha}
 	if s.suites {
@@ -176,20 +239,20 @@ func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r conf
 		if err != nil {
 			return 0, err
 		}
-		var wf struct {
-			On struct {
-				Dispatch struct {
-					Inputs map[string]any `yaml:"inputs"`
-				} `yaml:"workflow_dispatch"`
-			} `yaml:"on"`
-		}
-		if err := yaml.Unmarshal(raw, &wf); err != nil {
+		in, err := parseSuiteInput(raw)
+		if err != nil {
 			return 0, err
 		}
-		if _, ok := wf.On.Dispatch.Inputs["suite"]; ok {
-			inputs["suite"] = "main"
+		if in.declared {
+			stream, want := "main", "main"
 			if s.deploy {
-				inputs["suite"] = "deploy"
+				stream, want = "deploy", "deploy"
+			}
+			switch {
+			case in.accepts(want):
+				inputs["suite"] = want
+			case s.deploy:
+				return 0, &anyRefSuiteError{Stream: stream, Options: in.options}
 			}
 		}
 	}
