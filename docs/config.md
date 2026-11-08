@@ -850,8 +850,9 @@ mergewake's own HTTP calls to hk authenticate as the hk client
   reports (`PUT /v1/documents/<key>`), the large review brief upload and the
   findings attachment read (`PUT /v1/attachments`,
   `GET /v1/attachments/<sha256>`), the job archive's attachment uploads
-  and task comment, and the deploy approval's task read and decision ask
-  (`POST /v1/tasks/<id>/decision-request/ask`).
+  and task comment, and the deploy approval's task read and record-only
+  decision request (`POST /v1/tasks/<id>/decision-request`, which opens no
+  Linear issue).
 
 hk records the comments, reopens, decision requests, documents and
 attachments as written by `svc-mergewake`. They read the process environment only:

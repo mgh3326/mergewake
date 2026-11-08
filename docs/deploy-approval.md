@@ -19,12 +19,13 @@ Host environment and credentials remain operator-managed and are never installed
 by automatic rollout.
 
 Configure a dedicated hk task per repository and host with `deploy_task: '123'`.
-Use the handoffkeep sink. The rollout reads the task and asks over hk's HTTP API
-as `svc-mergewake` (`GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/decision-request/ask`)
-with a human-only request; it runs no hk CLI. The ask route also opens the
-request's Linear issue and Discord post, so hk must have Linear decisions
-enabled: hk answers `linear_decisions_disabled` otherwise, and the rollout holds.
-Without the `svc-mergewake` credential the rollout holds too.
+Use the handoffkeep sink. The rollout reads the task and records a human-only
+request over hk's HTTP API as `svc-mergewake` (`GET /v1/tasks/{id}`,
+`POST /v1/tasks/{id}/decision-request`); it runs no hk CLI. This is the
+record-only route of `handoffkeep decisions ask` without `--linear`: it opens
+no Linear issue and needs no Linear decisions setting in hk. The rollout never
+calls `/decision-request/ask`. Without the `svc-mergewake` credential the
+rollout holds.
 Do not share these tasks: a different open question is held without superseding
 it. Polling the same question is idempotent. No response, rejection, expiry,
 withdrawal, or an hk error keeps the current version running. Only option A on
@@ -35,14 +36,22 @@ matched paths, and reasons. A newer release requires a different answer.
 ### Lookup by request id
 
 The rollout looks the answer up by hk request id, not by question text. After
-it asks, it writes the request id, the task and the question to
-`<state_dir>/<repo>/rollout/deploy-decision.json` (mode 0600, replaced atomically),
-beside the rollout receipts. A later poll, including one after a restart,
-counts the task's current request only when all of these hold:
+it asks, it records the request id and the question under the deploy task's id
+in `<state_dir>/<repo>/rollout/deploy-decision.json` (mode 0600, replaced
+atomically), beside the rollout receipts:
 
-- its id is the recorded id, or it supersedes the recorded id (the record then
-  moves to the new id);
-- the record is for the same task and question;
+```json
+{"by_task": {"123": {"question": "Approve deployment ...", "request_id": "dr-123-4"}}}
+```
+
+The file holds one entry per deploy task, so the tasks of one repository (one
+per target host) neither replace nor block each other. A later poll, including
+one after a restart, counts the task's current request only when all of these
+hold:
+
+- its id is the recorded id for that task, or it supersedes the recorded id
+  (the entry then moves to the new id);
+- the entry's question is the question;
 - its question text still equals the question, as an extra check;
 - it is human-only.
 
@@ -50,12 +59,18 @@ A request with the same question text but another id is never approved. If it
 is open and not expired, the rollout holds with "another deployment decision is
 open"; otherwise the rollout asks its own request and records that id.
 
-Compatibility with requests asked before this lookup (one time): while
-`deploy-decision.json` does not exist, the old rule applies. A human-only
-request whose question text equals the question is adopted, and its id is
-recorded. From then on it is matched by id. Once the file exists, adoption by
-question text is over for that repository, for every later question. Do not
-delete the file to approve a request: deleting it reopens the one-time adoption.
+The rollout's repository lock (`decision-lock` in the rollout state) is held
+for the whole poll, so two rollouts never rewrite the file at once.
+
+Compatibility with requests asked before this lookup (one time per task):
+while the file has no entry for a task, the old rule applies to that task. A
+human-only request whose question text equals the question is adopted, and its
+id is recorded. From then on it is matched by id. Once the task has an entry,
+adoption by question text is over for that task, for every later question. Do
+not delete the file or an entry to approve a request: that reopens the
+one-time adoption. A file in the single-record shape
+`{"task", "question", "request_id"}` (written only by an unreleased build) is
+read as a one-entry map and rewritten in the map shape on the next write.
 
 ## Operator rollout
 
@@ -64,9 +79,8 @@ delete the file to approve a request: deleting it reopens the one-time adoption.
    a deployed version through an approved bootstrap. Until then rollout holds.
 3. Create a dedicated hk task for each repository/host, set `deploy_task` in
    the private host inventory, and configure `sink.type: handoffkeep`.
-4. Ensure hk serves `POST /v1/tasks/{id}/decision-request/ask` with Linear
-   decisions enabled and its Discord mirror, and that the host has the
-   `svc-mergewake` hk credential.
+4. Ensure hk serves `POST /v1/tasks/{id}/decision-request` and that the host
+   has the `svc-mergewake` hk credential.
 5. Run `mergewake rollout --help` for inventory selection flags, then a dry run.
    A fresh installation must print `hold` with an unknown previous receipt.
 6. Enable rollout polling only after reviewing the proposed inventory, rollback
