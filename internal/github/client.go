@@ -675,9 +675,8 @@ type Anchor string
 const (
 	// AnchorLine is an inline comment: the line is a new-side line of the diff.
 	AnchorLine Anchor = ""
-	// AnchorFile is a file-level comment: the path is in the diff, the line is not.
-	AnchorFile Anchor = "file"
-	// AnchorOutside is a list in the review body: the path is not in the diff.
+	// AnchorOutside is a list in the review body: the path or the line is not
+	// in the diff, so GitHub cannot hold a review comment there.
 	AnchorOutside Anchor = "outside"
 )
 
@@ -793,7 +792,7 @@ func OutsideDiffSection(findings []Finding) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("\n\nOutside the diff (these paths are not changed by this PR; critical and high hold the merge):\n%s\n%s%d -->", strings.Join(lines, "\n"), OutsideMarker, blocking)
+	return fmt.Sprintf("\n\nOutside the diff (these paths or lines are not changed by this PR; critical and high hold the merge):\n%s\n%s%d -->", strings.Join(lines, "\n"), OutsideMarker, blocking)
 }
 
 func PassMarker(r PassReceipt) string {
@@ -1061,10 +1060,6 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 		switch f.Anchor {
 		case AnchorOutside:
 			continue
-		case AnchorFile:
-			// The line is not one the PR changed: GitHub takes a comment on the
-			// file, which is still a thread the gate counts.
-			comments = append(comments, map[string]any{"path": f.Path, "subject_type": "file", "body": fmt.Sprintf("%s\n\n(Line %d is not changed by this PR.)", body, f.Line)})
 		default:
 			comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 		}

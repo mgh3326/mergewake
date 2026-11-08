@@ -429,6 +429,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if resumed {
 		label, checkout = rj.Label, rj.Checkout
 	}
+	plan.label = label
 	jobDir := filepath.Join(cfg.Jobs, label)
 	findingsPath := filepath.Join(jobDir, "findings.json")
 	reportPath := filepath.Join(jobDir, "report.md")

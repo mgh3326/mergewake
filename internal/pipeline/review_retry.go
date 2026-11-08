@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -29,6 +31,21 @@ type reviewRetryState struct {
 	// nothing else wrong: nothing failed, but no review completed, so the
 	// daemon must not settle the PR as unchanged.
 	QuotaStopped bool `json:"quota_stopped,omitempty"`
+	// LastError is the redacted, clipped text of the last counted failure, for
+	// the escalation notice.
+	LastError string `json:"last_error,omitempty"`
+}
+
+// reviewErrorLimit bounds the error text a failure row and notice carry.
+const reviewErrorLimit = 300
+
+// reviewErrorText is err as one redacted line of at most reviewErrorLimit bytes.
+func reviewErrorText(err error) string {
+	text := strings.Join(strings.Fields(fleetevent.Redact(err.Error())), " ")
+	if len(text) > reviewErrorLimit {
+		text = clip(text, reviewErrorLimit) + "…"
+	}
+	return text
 }
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
@@ -43,6 +60,15 @@ type reviewFailureClass struct {
 	collection bool
 	pending    bool
 	real       bool
+	// failures are the counted failures with the pass and label they came from
+	// (zero and empty when the failure was not one pass's).
+	failures []countedFailure
+}
+
+type countedFailure struct {
+	pass  int
+	label string
+	err   error
 }
 
 func (c *reviewFailureClass) add(err error) {
@@ -67,6 +93,12 @@ func (c *reviewFailureClass) add(err error) {
 		c.collection = true
 	default:
 		c.real = true
+		f := countedFailure{err: err}
+		var pass *passFailure
+		if errors.As(err, &pass) {
+			f.pass, f.label = pass.pass, pass.label
+		}
+		c.failures = append(c.failures, f)
 	}
 }
 
@@ -101,7 +133,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	state.Backoffs = max(state.Backoffs, state.Failures)
 	initial, maximum, threshold := s.Config.Daemon.PR.ReviewRetry.Settings()
 	if state.Failures >= threshold && !state.Escalated {
-		sent, err := s.escalateReviewFailure(ctx, r, pr, state.Failures)
+		sent, err := s.escalateReviewFailure(ctx, r, pr, state.Failures, state.LastError)
 		if err != nil {
 			return err
 		}
@@ -173,6 +205,19 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	}
 	if class.real {
 		state.Failures++
+		// Every counted failure leaves a row: the retry state keeps only counts,
+		// and a failure with no text in the journal cannot be diagnosed.
+		for _, f := range class.failures {
+			row := map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "failures": state.Failures, "error": reviewErrorText(f.err)}
+			if f.pass > 0 {
+				row["pass"] = f.pass
+			}
+			if f.label != "" {
+				row["label"] = f.label
+			}
+			_ = s.audit(r.Name, "review-failed", row, false)
+		}
+		state.LastError = reviewErrorText(class.failures[len(class.failures)-1].err)
 	}
 	for _, q := range class.quotas {
 		// A reset not yet reached is waited for, but never longer than the
@@ -224,7 +269,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	}
 	// Escalate after persisting the failure, including the first poll at K.
 	if state.Failures >= threshold && !state.Escalated {
-		sent, notifyErr := s.escalateReviewFailure(ctx, r, pr, state.Failures)
+		sent, notifyErr := s.escalateReviewFailure(ctx, r, pr, state.Failures, state.LastError)
 		if notifyErr != nil {
 			return errors.Join(err, notifyErr)
 		}
@@ -238,7 +283,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	return err
 }
 
-func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr github.Pull, failures int) (bool, error) {
+func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr github.Pull, failures int, lastError string) (bool, error) {
 	fresh, err := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
 	if err != nil {
 		return false, err
@@ -248,7 +293,7 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	}
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
-	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.ownerLane(r), Type: "automation-failed", Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA))})
+	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.ownerLane(r), Type: "automation-failed", Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA), lastErrorNote(lastError))})
 	return err == nil, err
 }
 
@@ -322,4 +367,13 @@ func (s *Service) reviewPassesNeeded(ctx context.Context, r config.Repo, pr gith
 		return 2, true, nil
 	}
 	return 1, true, nil
+}
+
+// lastErrorNote is the notice clause naming the last failure, or nothing when
+// the state predates the field.
+func lastErrorNote(text string) string {
+	if text == "" {
+		return ""
+	}
+	return "; last error: " + text
 }

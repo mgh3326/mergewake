@@ -23,7 +23,7 @@ import (
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, check_absent:<name> (a required check
 // with no run or status on the head, once the head has had time to start it), threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
-// path is not in the diff), review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
+// path or line is not in the diff), review_missing, base_stale (the base moved on, GitHub reports the PR behind and the policy sets
 // require_up_to_date) and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {

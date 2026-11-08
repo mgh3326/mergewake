@@ -111,7 +111,20 @@ type passPlan struct {
 	lens         string
 	sameFamily   bool
 	replacements int
+	// label is the reviewer label of the pass, once one is placed or resumed.
+	label string
 }
+
+// passFailure is a pass that did not post, with the pass number and the
+// reviewer label RetryReview writes to the failure row.
+type passFailure struct {
+	pass  int
+	label string
+	err   error
+}
+
+func (f *passFailure) Error() string { return f.err.Error() }
+func (f *passFailure) Unwrap() error { return f.err }
 
 // Review runs the required diff-only passes for the PR head: one for routine
 // changes, two for blocking paths. Panewire runs each pass in a reviewer pane. A pass the executor did not produce fails the run with
@@ -601,7 +614,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				held = i
 			}
 		case e != nil:
-			failed = append(failed, e)
+			failed = append(failed, &passFailure{plans[i].pass, plans[i].label, e})
 		}
 	}
 	switch {
@@ -749,13 +762,11 @@ func parseFindings(b []byte, diff string) ([]github.Finding, []droppedFinding, e
 			dropped = append(dropped, droppedFinding{f.Path, f.Line, "body over 4000 bytes"})
 			continue
 		}
-		lines, inDiff := valid[f.Path]
-		switch {
-		case inDiff && lines[f.Line]:
+		// GitHub holds a review comment only on a line of the diff; any other
+		// finding is listed in the review body.
+		if valid[f.Path][f.Line] {
 			f.Anchor = github.AnchorLine
-		case inDiff:
-			f.Anchor = github.AnchorFile
-		default:
+		} else {
 			f.Anchor = github.AnchorOutside
 		}
 		kept = append(kept, f)
