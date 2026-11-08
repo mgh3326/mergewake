@@ -499,10 +499,13 @@ func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p poli
 	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
-// sawConfirmedPass reports whether a check the incident was confirmed on now
-// carries a passing any-ref status: the re-run the confirmation itself read. A
-// check-and-status conflict elsewhere on the head, or a status that still
-// fails, proves nothing about the confirmation.
+// sawConfirmedPass reports whether every check the incident was confirmed on
+// now carries a passing any-ref status: the complete re-run the confirmation
+// itself would read. One green status is not enough, because a confirmation run
+// is red when any of its checks fails, so a green sibling is part of the failed
+// evidence rather than a later pass. A conflict elsewhere on the head, a check
+// that still fails, and a check with no status all prove nothing about the
+// confirmation.
 func (s *watchStream) sawConfirmedPass(ctx context.Context, r config.Repo, inc recoveryIncident) (bool, error) {
 	reader, ok := s.GH.(statusReader)
 	if !ok || inc.Checks == "" {
@@ -513,11 +516,11 @@ func (s *watchStream) sawConfirmedPass(ctx context.Context, r config.Repo, inc r
 		if e != nil {
 			return false, e
 		}
-		if found && state == github.Green {
-			return true, nil
+		if !found || state != github.Green {
+			return false, nil
 		}
 	}
-	return false, nil
+	return true, nil
 }
 
 // settleConfirmedHead decides a confirmed incident's ambiguous read at its

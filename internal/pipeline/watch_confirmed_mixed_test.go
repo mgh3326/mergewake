@@ -30,8 +30,15 @@ func (g *recoveryGH) Check(ctx context.Context, repo, sha string, names []string
 // for an incident whose culprit is also the head.
 func seedHeadConfirmed(t *testing.T, s *Service, r config.Repo, now time.Time) {
 	t.Helper()
+	seedConfirmedChecks(t, s, r, now, "CI")
+}
+
+// seedConfirmedChecks is seedHeadConfirmed for an incident confirmed under the
+// named check set.
+func seedConfirmedChecks(t *testing.T, s *Service, r config.Repo, now time.Time, checks string) {
+	t.Helper()
 	st := recoveryIncident{
-		RedSince: now, Culprit: shaB, CulpritPR: 7, Head: shaB, Baseline: shaA, Task: "42", Checks: "CI",
+		RedSince: now, Culprit: shaB, CulpritPR: 7, Head: shaB, Baseline: shaA, Task: "42", Checks: checks,
 		Runs:      map[string][]bool{shaA: {true, true}, shaB: {false, false}},
 		Confirmed: true,
 	}
@@ -222,14 +229,20 @@ func TestWatchConfirmedHeadRerunRestartKeepsDecision(t *testing.T) {
 }
 
 // (g) Check raises the ambiguous read for any same-name conflict on the head,
-// not only the confirmed failure's own re-run. A conflict on another check, or
-// a status that still fails, is not a mixed result: the incident holds
-// unresolved instead of being marked flaky on evidence about another check.
+// not only the confirmed failure's own re-run. A conflict on another check, a
+// status that still fails, or one green sibling of a confirmation run that was
+// red as a whole is not a mixed result: the incident holds unresolved instead
+// of being marked flaky on evidence about other checks.
 func TestWatchConfirmedHeadConflictOutsideConfirmationHolds(t *testing.T) {
 	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
-	for name, statuses := range map[string]map[[2]string]statusRecord{
-		"other check":   {{shaB, "LINT"}: {github.Green, now}},
-		"still failing": {{shaB, "CI"}: {github.Red, now}},
+	for name, tc := range map[string]struct {
+		checks   string
+		statuses map[[2]string]statusRecord
+	}{
+		"other check":        {"CI", map[[2]string]statusRecord{{shaB, "LINT"}: {github.Green, now}}},
+		"still failing":      {"CI", map[[2]string]statusRecord{{shaB, "CI"}: {github.Red, now}}},
+		"green sibling only": {"CI,LINT", map[[2]string]statusRecord{{shaB, "CI"}: {github.Red, now}, {shaB, "LINT"}: {github.Green, now}}},
+		"incomplete run":     {"CI,LINT", map[[2]string]statusRecord{{shaB, "LINT"}: {github.Green, now}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
@@ -237,10 +250,10 @@ func TestWatchConfirmedHeadConflictOutsideConfirmationHolds(t *testing.T) {
 				l.parents = map[string]string{shaB: shaA}
 				l.pull.MergeCommitSHA = shaB
 				l.ambiguousSHA, l.readResult, l.ambiguousFrom = shaB, github.Red, 1
-				l.statuses = statuses
+				l.statuses = tc.statuses
 			})
 			s.Now = func() time.Time { return now }
-			seedHeadConfirmed(t, s, r, now)
+			seedConfirmedChecks(t, s, r, now, tc.checks)
 
 			got := recoveryWatch(t, s, r)
 			if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "conflict without a passing re-run") {
@@ -296,6 +309,41 @@ func TestWatchConfirmedHeadRerunStopsRevertMerge(t *testing.T) {
 	}
 	if g.merges != 0 {
 		t.Fatalf("merged the revert of a flaky incident: %d", g.merges)
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
+
+// (h) A confirmation under several checks is a mixed result only when the whole
+// set passes again: every check carries a passing status, as the re-run the
+// confirmation reads must.
+func TestWatchConfirmedHeadFullCheckSetRerunHolds(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.head = shaB
+		l.parents = map[string]string{shaB: shaA}
+		l.pull.MergeCommitSHA = shaB
+		l.statuses = map[[2]string]statusRecord{
+			{shaB, "CI"}:   {github.Green, now},
+			{shaB, "LINT"}: {github.Green, now},
+		}
+	})
+	s.Now = func() time.Time { return now }
+	seedConfirmedChecks(t, s, r, now, "CI,LINT")
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "passed a re-run after confirmation") {
+		t.Fatalf("%+v", got)
+	}
+	if g.revertCount != 0 {
+		t.Fatalf("opened a revert on a mixed result: %d", g.revertCount)
+	}
+	if st, found := recoveryState(t, s, r); !found || st.Flaky == "" {
+		t.Fatalf("incident %+v found=%t", st, found)
+	}
+	if rows := auditRows(t, s, r, "recovery-mixed-head"); len(rows) != 1 {
+		t.Fatalf("decision rows %v", rows)
 	}
 	if lines := designLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("design-lane lines: %v", lines)
