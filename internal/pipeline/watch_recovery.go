@@ -703,35 +703,42 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			return s.audit(r.Name, "watch", result, o.DryRun)
 		}
 	}
+	// A fix PR is named and put first in the review queue from the poll that
+	// sees it, inside the initial window too: the window is when it is needed.
+	fix, e := s.fixPR(ctx, r, st)
+	if e != nil {
+		return e
+	}
+	if fix != nil && s.now().Sub(st.RedSince) >= 2*fixWindow {
+		fix = nil
+	}
+	if fix != nil && st.FixPR != fix.Number {
+		st.FixPR = fix.Number
+		if acting {
+			if e = s.saveRecovery(r.Name, st); e != nil {
+				return e
+			}
+			if e = s.markUrgent(r.Name, fix.Number); e != nil {
+				return e
+			}
+		}
+		priority := s.ReviewPriority(ctx, r, *fix)
+		row := struct {
+			PR       int    `json:"pr"`
+			Head     string `json:"head"`
+			Priority int    `json:"priority"`
+			Source   string `json:"priority_source"`
+		}{fix.Number, fix.Head.SHA, priority.Value, priority.Source}
+		if e = s.audit(r.Name, "recovery-fix-pr", row, o.DryRun); e != nil {
+			return e
+		}
+	}
 	if remaining := fixWindow - s.now().Sub(st.RedSince); remaining > 0 {
 		result.Action = "recovery-fix-window"
 		result.Reason = "fix window: " + remaining.Round(time.Minute).String() + " remaining"
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	if fix, e := s.fixPR(ctx, r, st); e != nil {
-		return e
-	} else if fix != nil && s.now().Sub(st.RedSince) < 2*fixWindow {
-		if st.FixPR != fix.Number {
-			st.FixPR = fix.Number
-			if acting {
-				if e = s.saveRecovery(r.Name, st); e != nil {
-					return e
-				}
-				if e = s.markUrgent(r.Name, fix.Number); e != nil {
-					return e
-				}
-			}
-			priority := s.ReviewPriority(ctx, r, *fix)
-			row := struct {
-				PR       int    `json:"pr"`
-				Head     string `json:"head"`
-				Priority int    `json:"priority"`
-				Source   string `json:"priority_source"`
-			}{fix.Number, fix.Head.SHA, priority.Value, priority.Source}
-			if e = s.audit(r.Name, "recovery-fix-pr", row, o.DryRun); e != nil {
-				return e
-			}
-		}
+	if fix != nil {
 		result.Action = "recovery-fix-pr"
 		result.Reason = fmt.Sprintf("fix PR #%d is open; the revert waits", fix.Number)
 		return s.reportWatch(ctx, r, result, "recovery-fix:"+strconv.Itoa(pr.Number)+":"+strconv.Itoa(fix.Number), o)

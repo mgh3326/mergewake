@@ -99,3 +99,25 @@ func TestConfirmationReadsOnlyTheDispatchedRunsStatus(t *testing.T) {
 		t.Fatalf("not confirmed: %+v", st)
 	}
 }
+
+// A fix PR opened while the revert still waits out the initial fix window is
+// reviewed first from the poll that sees it, not only once the window ends.
+func TestFixPRIsUrgentDuringInitialWindow(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, nil)
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	g.openPulls = []github.Pull{fixPull(shaB)}
+
+	now = now.Add(5 * time.Minute)
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-fix-window" || g.merges != 0 {
+		t.Fatalf("%+v merges=%d", got, g.merges)
+	}
+	if p := s.ReviewPriority(context.Background(), r, fixPull(shaB)); p.Value != 1 || p.Source != "recovery-fix" {
+		t.Fatalf("fix PR priority inside the window: %+v", p)
+	}
+}
