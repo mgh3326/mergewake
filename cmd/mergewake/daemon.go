@@ -17,6 +17,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/github/webhookstate"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/prstatus"
@@ -174,6 +175,9 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		return errors.New("daemon requires configured repositories")
 	}
 	d = daemon.Daemon{StateDir: s.Config.StateDir, Host: s.Config.Host, Log: log, RateWait: gh.RateWait}
+	// With the handoffkeep sink the daemon calls hk over HTTP; say at start
+	// which of its credential keys the environment lacks.
+	d.StartupCheck = func() error { return integrations.HKEndpointCheck(s.Config) }
 	if s.Config.Discord.Enabled {
 		s.Feed = pipeline.NewFeed(s.Config, log)
 		s.Feed.Now = s.Now

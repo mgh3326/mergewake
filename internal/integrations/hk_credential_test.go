@@ -9,9 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/config"
 )
 
 // hkCredentialKeys is every variable the hk HTTP credential could come from,
@@ -158,6 +161,73 @@ func TestHKHTTPPathsSendSvcToken(t *testing.T) {
 			t.Errorf("%s: not requested", path)
 		} else if got != "Bearer svc-token" {
 			t.Errorf("%s: got %q", path, got)
+		}
+	}
+}
+
+// The startup check names each unset key of the svc credential and never a
+// value; it is silent for another sink or a complete credential.
+func TestHKEndpointCheckNamesMissingKeys(t *testing.T) {
+	hk := config.Config{Sink: config.Sink{Type: "handoffkeep"}}
+	for name, tc := range map[string]struct {
+		env     map[string]string
+		missing []string
+		present []string
+	}{
+		"nothing set":   {missing: []string{"HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}},
+		"cli token":     {env: map[string]string{"HANDOFFKEEP_URL": "https://hk-url-value.invalid", "HANDOFFKEEP_TOKEN": "cli-token-value"}, missing: []string{"HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}, present: []string{"HANDOFFKEEP_URL"}},
+		"url missing":   {env: map[string]string{"HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "svc-token-value"}, missing: []string{"HANDOFFKEEP_URL"}, present: []string{"HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}},
+		"blank token":   {env: map[string]string{"HANDOFFKEEP_URL": "https://hk-url-value.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "  "}, missing: []string{"HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}, present: []string{"HANDOFFKEEP_URL"}},
+		"complete":      {env: map[string]string{"HANDOFFKEEP_URL": "https://hk-url-value.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "svc-token-value"}},
+		"config.env":    {env: map[string]string{"config.env": "HANDOFFKEEP_URL=https://hk-url-value.invalid\nHANDOFFKEEP_TOKEN_SVC_MERGEWAKE=svc-token-value\n"}, missing: []string{"HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}},
+		"cf pair alone": {env: map[string]string{"HANDOFFKEEP_CF_ACCESS_CLIENT_ID": "cf-id-value", "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET": "cf-secret-value"}, missing: []string{"HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := clearHKEnv(t)
+			var values []string
+			for k, v := range tc.env {
+				if k == "config.env" {
+					writeCLIConfig(t, home, v)
+					values = append(values, "hk-url-value", "svc-token-value")
+					continue
+				}
+				t.Setenv(k, v)
+				if strings.TrimSpace(v) != "" {
+					values = append(values, v)
+				}
+			}
+			e := HKEndpointCheck(hk)
+			if len(tc.missing) == 0 {
+				if e != nil {
+					t.Fatalf("complete credential reported: %v", e)
+				}
+				return
+			}
+			if !errors.Is(e, errEndpointUnconfigured) {
+				t.Fatalf("not an unconfigured error: %v", e)
+			}
+			msg := e.Error()
+			for _, k := range tc.missing {
+				if !strings.Contains(msg, k) {
+					t.Errorf("missing key %s not named: %q", k, msg)
+				}
+			}
+			for _, k := range tc.present {
+				if strings.Contains(msg, k) {
+					t.Errorf("set key %s named as missing: %q", k, msg)
+				}
+			}
+			for _, v := range values {
+				if strings.Contains(msg, v) {
+					t.Errorf("error carries a value: %q", msg)
+				}
+			}
+		})
+	}
+	clearHKEnv(t)
+	for _, sink := range []string{"", "noop"} {
+		if e := HKEndpointCheck(config.Config{Sink: config.Sink{Type: sink}}); e != nil {
+			t.Fatalf("sink %q: %v", sink, e)
 		}
 	}
 }

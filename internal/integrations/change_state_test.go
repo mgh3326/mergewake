@@ -204,7 +204,7 @@ func TestHKChangeOutboxReplaysAfterFailure(t *testing.T) {
 	mu.Unlock()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", srv.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)), dir)

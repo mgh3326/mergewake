@@ -31,7 +31,7 @@ func TestHKChangeThreadsAndPostedFindings(t *testing.T) {
 	defer hk.Close()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", hk.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	fs := []Finding{{Severity: "high", Path: "a.go", Line: 3, Body: "inline bug"}, {Severity: "low", Path: "a.go", Line: 90, Body: "file bug", Anchor: AnchorFile}, {Severity: "medium", Path: "other.go", Line: 2, Body: "outside bug", Anchor: AnchorOutside}}
@@ -120,7 +120,7 @@ func TestWebhookChecksCarryDeliveryID(t *testing.T) {
 	defer hk.Close()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", hk.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{}`) })

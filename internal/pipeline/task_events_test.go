@@ -131,7 +131,7 @@ func (g mergeGH) Merge(ctx context.Context, repo string, n int, sha string) erro
 const testPRURL = "https://github.com/example/project/pull/7"
 
 // hkSetup is setup with a fake hk reached through the sink's real credential
-// convention (HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN) and a PR bound to task 2909.
+// credential (HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN_SVC_MERGEWAKE) and a PR bound to task 2909.
 func hkSetup(t *testing.T) (*Service, *fakeGH, *fakeHK, config.Repo) {
 	t.Helper()
 	s, g, _, _, r := setup(t)
@@ -140,7 +140,7 @@ func hkSetup(t *testing.T) (*Service, *fakeGH, *fakeHK, config.Repo) {
 	t.Cleanup(srv.Close)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", srv.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test-token")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test-token")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	s.Sink = &hkSink{hk: integrations.Handoffkeep{Runner: s.Runner, Command: "handoffkeep", EventAttempts: 3, EventBackoff: time.Millisecond, EventTimeout: 200 * time.Millisecond}}
