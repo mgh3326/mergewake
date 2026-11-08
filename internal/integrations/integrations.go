@@ -234,12 +234,12 @@ func (p Panewire) AckedEvents(ctx context.Context, lane string) (map[string]bool
 	return out, nil
 }
 
-// Handoffkeep is the hk task sink. Its task, comment, reopen, attachment and
-// document calls go to hk over HTTP through the hk public client with
-// mergewake's own svc-mergewake credential (hkClient), never as hk CLI
-// subprocesses (hk 3549). Runner and Command (sink.command) remain for
-// DeployDecision, which still runs the hk CLI, and AttachmentCommand names
-// the CLI a reviewer runs on its own host.
+// Handoffkeep is the hk task sink. Its task, comment, reopen, decision,
+// attachment and document calls go to hk over HTTP through the hk public
+// client with mergewake's own svc-mergewake credential (hkClient), never as
+// hk CLI subprocesses (hk 3549, hk 3555). No hk call uses Runner any more;
+// Command (sink.command) is the CLI AttachmentCommand names for a reviewer
+// on its own host.
 type Handoffkeep struct {
 	Runner         Runner
 	Command, State string

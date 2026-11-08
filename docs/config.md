@@ -849,11 +849,13 @@ mergewake's own HTTP calls to hk authenticate as the hk client
   (`POST /v1/tasks/<id>/comments`, `POST /v1/tasks/<id>/reopen`), structured
   reports (`PUT /v1/documents/<key>`), the large review brief upload and the
   findings attachment read (`PUT /v1/attachments`,
-  `GET /v1/attachments/<sha256>`), and the job archive's attachment uploads
-  and task comment.
+  `GET /v1/attachments/<sha256>`), the job archive's attachment uploads
+  and task comment, and the deploy approval's task read and record-only
+  decision request (`POST /v1/tasks/<id>/decision-request`, which opens no
+  Linear issue).
 
-hk records the comments, reopens, documents and attachments as written by
-`svc-mergewake`. They read the process environment only:
+hk records the comments, reopens, decision requests, documents and
+attachments as written by `svc-mergewake`. They read the process environment only:
 
 | Variable | Meaning |
 | --- | --- |
@@ -862,11 +864,11 @@ hk records the comments, reopens, documents and attachments as written by
 | `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`, `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET` | Optional Cloudflare Access pair. Set both or neither. |
 
 mergewake does not read the hk CLI's `~/.config/handoffkeep/config.env` or
-its machine token `HANDOFFKEEP_TOKEN`. `sink.command` is still accepted but
-runs for one thing only: the deploy approval (`deploy_task`) still runs
-`<sink.command> tasks show` and `decisions ask` with the CLI's own credential
-until that path moves to HTTP too. A large review brief's prompt still tells
-the reviewer to run `<sink.command> attach get` on its own host.
+its machine token `HANDOFFKEEP_TOKEN`. For how the deploy approval matches
+its answer, see [deploy-approval.md](deploy-approval.md#lookup-by-request-id).
+`sink.command` is still accepted, and mergewake runs no hk command with it: a
+large review brief's prompt still tells the reviewer to run
+`<sink.command> attach get` on its own host.
 
 An attachment read returns at most 4 MiB, the cap the CLI path's captured
 output had; a larger findings attachment fails the read. mergewake sets no

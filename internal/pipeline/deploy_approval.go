@@ -20,6 +20,10 @@ import (
 	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
+// deployDecisionName records which hk decision request answers the
+// rollout's deploy question (integrations.Handoffkeep.DeployDecision).
+const deployDecisionName = "deploy-decision.json"
+
 type deployIdentity struct {
 	EnvironmentKnown bool   `json:"environment_known"`
 	Config           string `json:"config"`
@@ -194,12 +198,14 @@ func (s *Service) approveDeploy(ctx context.Context, r config.Repo, m manifest.M
 		}{"hold", review})
 	}
 	decisions, ok := s.Sink.(interface {
-		DeployDecision(context.Context, string, string, time.Time) (bool, error)
+		DeployDecision(context.Context, string, string, string, time.Time) (bool, error)
 	})
 	if !ok {
 		return false, fmt.Errorf("deployment held: handoffkeep decision adapter required (%s)", question)
 	}
-	approved, e := decisions.DeployDecision(ctx, r.DeployTask, question, s.now())
+	// The hk request id that answers this question is kept beside the
+	// rollout's receipts, so the answer is matched by id after a restart.
+	approved, e := decisions.DeployDecision(ctx, r.DeployTask, question, filepath.Join(state, deployDecisionName), s.now())
 	if e != nil {
 		return false, fmt.Errorf("deployment held: %w", e)
 	}
