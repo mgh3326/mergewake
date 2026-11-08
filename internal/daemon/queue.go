@@ -525,6 +525,27 @@ func (q *Queue) order(list []*entry, st *repoState) {
 	}
 }
 
+// Refresh drops what the queue learned about a waiting PR's priority, so its
+// next ordering asks again. Something outside the queue made the PR more
+// urgent (watch named it the fix for a red main) after its lookup answered.
+// A PR that is not waiting is left alone: a running one has started, and one
+// not queued looks its priority up when it arrives.
+func (q *Queue) Refresh(repo string, number int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	e, ok := q.entries[PRKey{Repo: repo, PR: number}]
+	if !ok || e.state != queued || e.prio == prioUnknown {
+		return
+	}
+	if e.timer != nil {
+		e.timer.Stop()
+	}
+	e.gen++
+	e.prio, e.pri, e.detail = prioUnknown, Priority{}, nil
+	q.pump()
+}
+
 // lookup asks for e's priority without blocking the queue. Called with mu held.
 func (q *Queue) lookup(e *entry) {
 	e.prio = prioPending

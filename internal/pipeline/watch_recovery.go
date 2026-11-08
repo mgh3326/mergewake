@@ -737,6 +737,7 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			if e = s.markUrgent(r.Name, fix.Number); e != nil {
 				return e
 			}
+			fixMarkedUrgent(ctx, r.Name, fix.Number)
 		}
 		priority := s.ReviewPriority(ctx, r, *fix)
 		row := struct {

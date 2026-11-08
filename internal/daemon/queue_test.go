@@ -377,3 +377,46 @@ func TestEventQueueStartsNothingAfterCancel(t *testing.T) {
 		t.Fatalf("started %v", got)
 	}
 }
+
+// A waiting PR whose lookup answered "not urgent" is asked again after Refresh:
+// something outside the queue made it urgent, and it must start past the cap
+// instead of waiting for a slot.
+func TestEventQueueRefreshReordersAWaitingPR(t *testing.T) {
+	var mu sync.Mutex
+	urgentNow := map[int]bool{}
+	lookup := func(_ context.Context, k PRKey) (Priority, any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if urgentNow[k.PR] {
+			return Priority{Rank: 1, Urgent: true}, nil
+		}
+		return Priority{Rank: 5}, nil
+	}
+	ev := newEvals()
+	q := &Queue{Cap: 1, Extra: 1, Run: ev.Run, Lookup: lookup}
+	startQueue(t, q)
+	q.Enqueue(SourceSweep, pr(9))
+	ev.waitStarted(t, 1)
+	q.Enqueue(SourceSweep, pr(2), pr(3))
+	time.Sleep(50 * time.Millisecond)
+	if got := ev.started(); len(got) != 1 {
+		t.Fatalf("started %v before the refresh", got)
+	}
+
+	mu.Lock()
+	urgentNow[3] = true
+	mu.Unlock()
+	q.Refresh("o/r", 3)
+	ev.waitStarted(t, 2)
+	if got := ev.started(); got[1] != pr(3) {
+		t.Fatalf("started %v, want PR 3 past the cap", got)
+	}
+	if w := ev.works[pr(3)][0]; !w.Over || !w.Priority.Urgent {
+		t.Fatalf("PR 3 work %+v, want an urgent start past the cap", w)
+	}
+	for range 2 {
+		ev.finishOne(t)
+	}
+	ev.finishOne(t)
+	q.Wait()
+}

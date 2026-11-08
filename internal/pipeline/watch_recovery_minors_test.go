@@ -215,3 +215,32 @@ func TestFixWonLeavesAnUnverifiedLatch(t *testing.T) {
 		t.Fatalf("an unverified latch was handled: closed=%v comments=%v clears=%d latch=%t", l.closed, l.comments, l.clears, l.latch)
 	}
 }
+
+// Marking a fix PR urgent tells the daemon, which re-ranks the PR if its review
+// already waits in the queue under an older priority.
+func TestUrgentMarkTellsTheQueue(t *testing.T) {
+	s, g, _, _, r := recoverySetup(t, nil)
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	if got := recoveryWatch(t, s, r); got.Action != "opened-revert-pr" {
+		t.Fatalf("%+v", got)
+	}
+	g.openPulls = []github.Pull{fixPull(shaB)}
+
+	type told struct {
+		repo string
+		pr   int
+	}
+	var calls []told
+	ctx := WithUrgentHook(context.Background(), func(repo string, pr int) { calls = append(calls, told{repo, pr}) })
+	now = now.Add(5 * time.Minute)
+	for range 2 {
+		if e := s.Watch(ctx, r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if len(calls) != 1 || calls[0] != (told{r.Name, 11}) {
+		t.Fatalf("hook calls %v, want one for PR 11", calls)
+	}
+}
