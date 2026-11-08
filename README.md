@@ -92,11 +92,12 @@ Adapters use only APIs or CLI argument vectors:
 
 - GitHub REST plus a read-only GraphQL query for review-thread resolution.
 - `panewire emit` for notifications, with stdout and no-op alternatives.
-- `handoffkeep tasks show`, `comment`, `reopen`, and `doc put` for task recovery
-  and rollout records; a no-op sink is available.
+- hk task read, comment, reopen and document write for task recovery and
+  rollout records, through hk's public Go client; a no-op sink is available.
 - hk `POST /v1/task-events` for PR, review, merge and revert events on tasks
   named by a `Mergewake-Task` trailer (`hk_task_events`, on by default).
-  This call and mergewake's other hk HTTP calls use only the `svc-mergewake`
+  This call and mergewake's other hk HTTP calls (the sink's task, comment,
+  reopen, document and attachment calls among them) use only the `svc-mergewake`
   credential from the environment (`HANDOFFKEEP_URL`,
   `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE`, from Infisical `/mergewake`), never the
   hk CLI's `config.env`. See [hk HTTP credential](docs/config.md#hk-http-credential).
@@ -109,9 +110,9 @@ Adapters use only APIs or CLI argument vectors:
   terminated (SIGTERM, grace, SIGKILL) and reaped on exit, timeout,
   cancellation or mergewake's own SIGINT/SIGTERM/SIGHUP.
 
-The handoffkeep sink uses explicit `tasks reopen ID --reason TEXT`, entering the
-separate `reopened` state. A recovery comment survives if an older CLI/server
-lacks the operation, and the failure is returned and included in the notification.
+The handoffkeep sink uses hk's explicit reopen (`POST /v1/tasks/ID/reopen` with
+a reason), entering the separate `reopened` state. A recovery comment survives
+if an older server lacks the operation, and the failure is returned and included in the notification.
 The server update must be deployed separately; protected task authority fences
 remain enforced.
 
@@ -195,7 +196,7 @@ The lane is resolved, never guessed, in this order — the choosing rule is
 recorded in the event text after `via`:
 
 1. `Mergewake-Task: <id>` trailer — PR body first, then the head commit
-   message — read through the configured handoffkeep sink (`tasks show`); a
+   message — read through the configured handoffkeep sink (the task's lane); a
    read error retries instead of rerouting.
 2. `Mergewake-Notify-Lane: <lane>` trailer, in the same order.
 3. The configured `notifier.lane`.

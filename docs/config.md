@@ -391,12 +391,12 @@ local job dir and reports the step:
    job with nothing but excluded or non-regular entries copies nothing.
 3. **Verify**: every file's sha256 is computed on both sides and must match;
    a missing, duplicate or unexpected hash record fails the archive.
-4. **hk attachments**: each text file under `text_max_bytes` goes through
-   `handoffkeep attach put`; its returned sha256 must match. `attach put`
+4. **hk attachments**: each text file under `text_max_bytes` is uploaded to
+   hk (`PUT /v1/attachments`); the returned sha256 must match. The upload
    has no task reference, so the ids are tied to the task by the comment.
 5. **Record**: `manifest.json` (job, host, task, source, every file's path,
    size and sha256, excluded and skipped paths, attachment ids) is attached
-   to hk, then `handoffkeep tasks comment <task>` posts the Drive directory,
+   to hk, then a task comment (`POST /v1/tasks/<task>/comments`) posts the Drive directory,
    file count, total bytes, the manifest's attachment id, every attachment
    id, the excluded and skipped names, and the per-file sha256 list (the
    first 200; the rest are in `manifest.json`).
@@ -408,8 +408,12 @@ local job dir and reports the step:
    as `job-changed` — then removed with `rm -rf`. Excluded credential files
    go with it; their names stay in the record.
 
-The hk command is `sink.command` when the sink is `handoffkeep`, otherwise
-`handoffkeep`. The job host needs `find`, `stat`, `tar`, `xargs` and
+The uploads and the comment go to hk over HTTP with mergewake's own
+[hk HTTP credential](#hk-http-credential), whatever the sink; no hk CLI runs.
+Unset, or with hk unreachable, the archive fails as an `error` row, keeps
+the job dir and is retried an hour later. hk refuses an upload over its own
+attachment limit (`HK_ATTACH_MAX_BYTES`, default 50 MiB) the same way. The
+job host needs `find`, `stat`, `tar`, `xargs` and
 `sha256sum` or `shasum`; the archive host `tar` and the same hashing tools;
 this machine `bash`. A job dir whose listing exceeds the 4 MiB command
 output limit fails and is kept.
@@ -674,8 +678,7 @@ on it.
 - **Closed contract.** A PR-body section headed `Acceptance` (`Acceptance
   criteria`, `Acceptance (…)`; any heading level, up to the next heading of the
   same or higher level), else the same section in the body of the task named by
-  the `Mergewake-Task` trailer when the sink can read task text (`tasks show`
-  `body`, else `description`), is capped at 4 KB and passed to the reviewer as
+  the `Mergewake-Task` trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
   the closed list of what the change must do. The reviewer marks a finding
   outside it with `"advisory": true`. mergewake then caps the finding at
   `medium` (unrated becomes `low`), posts it with an `<!-- mergewake-advisory -->`
@@ -818,25 +821,39 @@ Healthy repeated agent polls do not emit a fresh installation notification.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `type` | `noop` (also empty) | `noop` or `handoffkeep`. |
-| `command` | `handoffkeep` for that adapter | Executable path or a compatible CLI wrapper. |
+| `command` | `handoffkeep` for that adapter | The hk CLI: still run for deploy approvals (`deploy_task`), and named to reviewers as the command that reads a large review brief. The task, attachment and document calls below do not run it. |
 | `reopen_state` | `reopened` | Only `reopened` is accepted; terminal tasks use the explicit reason-required operation. |
 
-The handoffkeep adapter calls `tasks show ID`, `tasks comment ID --body TEXT`,
-then `tasks reopen ID --reason TEXT` for a merged or dropped task. An already
-reopened task only receives the comment. Empty reasons are refused. An older
-CLI/server that lacks reopen returns an explicit failure; the recovery comment
-is retained and the watch notification reports the failure. Protected upstream
-authority fences remain enforced. No fallback generic transition is attempted.
-Structured reports use `doc put --key KEY --kind note --file FILE`.
+The handoffkeep adapter reads the task (`GET /v1/tasks/ID`), posts the reason
+as a comment (`POST /v1/tasks/ID/comments`), then reopens a merged or dropped
+task (`POST /v1/tasks/ID/reopen` with the reason). An already reopened task
+only receives the comment. Empty reasons are refused. A server that lacks
+reopen returns an explicit failure; the recovery comment is retained and the
+watch notification reports the failure. Protected upstream authority fences
+remain enforced. No fallback generic transition is attempted. Structured
+reports are `note` documents (`PUT /v1/documents/KEY`). These calls go over
+HTTP with the [hk HTTP credential](#hk-http-credential).
 
 #### hk HTTP credential
 
 mergewake's own HTTP calls to hk authenticate as the hk client
-`svc-mergewake`, never with the hk CLI's credential. These calls are job
-records (`GET /v1/jobs/<id>`), change priority and review records
-(`GET /v1/changes?pr=`), change state (`POST /v1/changes/batch`,
-`PUT /v1/changes/<section>`) and task events (`POST /v1/task-events`). They
-read the process environment only:
+`svc-mergewake`, never with the hk CLI's credential. These calls are:
+
+- job records (`GET /v1/jobs/<id>`);
+- change priority and review records (`GET /v1/changes?pr=`);
+- change state (`POST /v1/changes/batch`, `PUT /v1/changes/<section>`);
+- task events (`POST /v1/task-events`);
+- through the hk public client (`github.com/mgh3326/handoffkeep/client`), the
+  sink's task read for the lane, `refs.job_id`, title, priority and state
+  (`GET /v1/tasks/<id>`), the recovery comment and reopen
+  (`POST /v1/tasks/<id>/comments`, `POST /v1/tasks/<id>/reopen`), structured
+  reports (`PUT /v1/documents/<key>`), the large review brief upload and the
+  findings attachment read (`PUT /v1/attachments`,
+  `GET /v1/attachments/<sha256>`), and the job archive's attachment uploads
+  and task comment.
+
+hk records the comments, reopens, documents and attachments as written by
+`svc-mergewake`. They read the process environment only:
 
 | Variable | Meaning |
 | --- | --- |
@@ -845,9 +862,17 @@ read the process environment only:
 | `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`, `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET` | Optional Cloudflare Access pair. Set both or neither. |
 
 mergewake does not read the hk CLI's `~/.config/handoffkeep/config.env` or
-its machine token `HANDOFFKEEP_TOKEN`. The `sink.command` subprocesses
-(`handoffkeep tasks …`, `doc put`, `attach put`) still run the hk CLI with
-the CLI's own credential.
+its machine token `HANDOFFKEEP_TOKEN`. `sink.command` is still accepted but
+runs for one thing only: the deploy approval (`deploy_task`) still runs
+`<sink.command> tasks show` and `decisions ask` with the CLI's own credential
+until that path moves to HTTP too. A large review brief's prompt still tells
+the reviewer to run `<sink.command> attach get` on its own host.
+
+An attachment read returns at most 4 MiB, the cap the CLI path's captured
+output had; a larger findings attachment fails the read. mergewake sets no
+upload cap of its own: hk refuses an attachment over `HK_ATTACH_MAX_BYTES`
+(default 50 MiB) with `attachment_too_large`, a comment over 64 KiB and a
+document over 512 KiB.
 
 The daemon gets the variables from the unit's `EnvironmentFile`. On oci the
 unit does not load `~/.config/mergewake/environment` (the file does not exist
@@ -863,7 +888,12 @@ If `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` is unset, every hk
 HTTP call behaves as on a host with no hk endpoint. Job records cannot be
 read, so a panewire review pass fails with `hk-unavailable`. Task events and
 change state are not sent, and hk review history and change priority are
-empty. With `sink.type: handoffkeep`, the daemon logs one error line at
+empty. Each sink call (task read, comment, reopen, report document,
+attachment) fails with `handoffkeep endpoint unconfigured`; there is no
+fallback to the hk CLI or its `config.env`. Callers report that failure as
+they reported a failed CLI call before: the watch notification carries a
+failed reopen, a rollout or watch report records the failed write, and a job
+archive is an `error` row retried an hour later. With `sink.type: handoffkeep`, the daemon logs one error line at
 start, `startup check failed`, that names the unset keys and no value. The
 daemon keeps running.
 
@@ -1628,7 +1658,7 @@ counts `ready_too_long` from. No READY reminder is sent; `renotify_after` and
 `renotify_max` are accepted and have no effect. The BLOCKED event
 lane is resolved in order — the choosing rule is recorded in the event text
 after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
-(`tasks show` task lane), a `Mergewake-Notify-Lane` trailer, then the
+(the task's lane), a `Mergewake-Notify-Lane` trailer, then the
 configured `notifier.lane`. Both trailers are read from the PR body first and
 then the head commit message; a task-read error retries rather than rerouting.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
