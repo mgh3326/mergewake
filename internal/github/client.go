@@ -344,6 +344,34 @@ func (c *Client) DispatchWorkflow(ctx context.Context, repo, workflow, ref strin
 	return c.json(ctx, "POST", base(repo)+"/actions/workflows/"+url.PathEscape(workflow)+"/dispatches", map[string]any{"ref": ref, "inputs": inputs}, nil)
 }
 
+// DispatchWorkflowRun dispatches like DispatchWorkflow and returns the id of
+// the run GitHub started, so a later read can tell that run's results from any
+// other run's. The id is zero when GitHub does not report one (a server that
+// predates return_run_details, which answers 204 or refuses the field).
+func (c *Client) DispatchWorkflowRun(ctx context.Context, repo, workflow, ref string, inputs map[string]string) (int64, error) {
+	route := base(repo) + "/actions/workflows/" + url.PathEscape(workflow) + "/dispatches"
+	b, e := c.request(ctx, "POST", route, "application/vnd.github+json", mustJSON(map[string]any{"ref": ref, "inputs": inputs, "return_run_details": true}))
+	var a *APIError
+	if errors.As(e, &a) && (a.Code == 400 || a.Code == 422) {
+		return 0, c.DispatchWorkflow(ctx, repo, workflow, ref, inputs)
+	}
+	if e != nil {
+		return 0, e
+	}
+	var out struct {
+		RunID int64 `json:"workflow_run_id"`
+	}
+	if len(bytes.TrimSpace(b)) > 0 {
+		_ = json.Unmarshal(b, &out)
+	}
+	return out.RunID, nil
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
 // DispatchRefused reports whether GitHub declined a workflow dispatch for a
 // reason a retry cannot fix: missing scope (403), unknown workflow (404), or
 // a workflow without a matching workflow_dispatch trigger (422).

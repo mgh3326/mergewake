@@ -47,6 +47,10 @@ type recoveryIncident struct {
 	// Pending maps a commit watch dispatched any-ref CI for to the dispatch
 	// time; only statuses posted after it count as that run's result.
 	Pending map[string]time.Time `json:"pending,omitempty"`
+	// PendingRuns maps a pending commit to the id of the workflow run its
+	// dispatch started, when GitHub reported one. Only that run's statuses
+	// count as the re-run's result.
+	PendingRuns map[string]int64 `json:"pending_runs,omitempty"`
 	// Dispatches counts the re-runs per commit, bounding them at confirmRuns.
 	Dispatches map[string]int `json:"dispatches,omitempty"`
 	Confirmed  bool           `json:"confirmed,omitempty"`
@@ -74,6 +78,12 @@ type statusReader interface {
 	LatestStatus(context.Context, string, string, string) (github.CI, time.Time, bool, error)
 }
 
+// runStatusReader reads the newest commit status a check name has on a sha
+// from one workflow run, so another run's status for the same sha is not read.
+type runStatusReader interface {
+	LatestRunStatus(context.Context, string, string, string, int64) (github.CI, time.Time, bool, error)
+}
+
 // openLister lists the open pull requests of a repository.
 type openLister interface {
 	OpenPulls(context.Context, string, string) ([]github.Pull, error)
@@ -84,6 +94,7 @@ var (
 	_ revertCloser    = (*github.Client)(nil)
 	_ treeReader      = (*github.Client)(nil)
 	_ statusReader    = (*github.Client)(nil)
+	_ runStatusReader = (*github.Client)(nil)
 	_ openLister      = (*github.Client)(nil)
 )
 
@@ -256,7 +267,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 	// completed mixed result is lost behind the timeout.
 	var timedOut []string
 	for sha, at := range st.Pending {
-		state, ready, e := s.rerunOutcome(ctx, reader, r, sha, names, at)
+		state, ready, e := s.rerunOutcome(ctx, reader, r, sha, names, at, st.PendingRuns[sha])
 		if e != nil {
 			return st, false, "", false, e
 		}
@@ -267,6 +278,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 			continue
 		}
 		delete(st.Pending, sha)
+		delete(st.PendingRuns, sha)
 		st.Runs[sha] = append(st.Runs[sha], state == github.Green)
 	}
 	for _, v := range st.Runs[st.Baseline] {
@@ -288,6 +300,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 	if len(timedOut) > 0 {
 		for _, sha := range timedOut {
 			delete(st.Pending, sha)
+			delete(st.PendingRuns, sha)
 		}
 		return hold(st, "any-ref re-run timed out on "+short7(timedOut[0]))
 	}
@@ -325,12 +338,22 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 		// The re-run repeats the scope the original verdict judged. Narrowing it
 		// to the culprit's changed packages would let a dependent package's
 		// failure pass unseen and read as a flaky culprit.
-		if e := s.dispatch(ctx, dispatcher, r, p, sha); e != nil {
+		run, e := s.dispatch(ctx, dispatcher, r, p, sha)
+		if e != nil {
 			if github.DispatchRefused(e) {
 				delete(st.Pending, sha)
 				return hold(st, "any-ref CI dispatch refused for "+short7(sha)+": "+e.Error())
 			}
 			return st, false, "", false, e
+		}
+		if run != 0 {
+			if st.PendingRuns == nil {
+				st.PendingRuns = map[string]int64{}
+			}
+			st.PendingRuns[sha] = run
+			if e := save(st); e != nil {
+				return st, false, "", false, e
+			}
 		}
 	}
 	if e := save(st); e != nil {
@@ -342,11 +365,20 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 }
 
 // rerunOutcome reads the any-ref statuses a dispatch posted after at. ready is
-// false until every check has a status newer than the dispatch.
-func (s *Service) rerunOutcome(ctx context.Context, reader statusReader, r config.Repo, sha string, names []string, at time.Time) (github.CI, bool, error) {
+// false until every check has a status newer than the dispatch. When GitHub
+// named the dispatch's workflow run, only that run's statuses count.
+func (s *Service) rerunOutcome(ctx context.Context, reader statusReader, r config.Repo, sha string, names []string, at time.Time, run int64) (github.CI, bool, error) {
 	outcome := github.Green
 	for _, name := range names {
-		state, seenAt, ok, e := reader.LatestStatus(ctx, r.Name, sha, name)
+		var state github.CI
+		var seenAt time.Time
+		var ok bool
+		var e error
+		if rr, bound := reader.(runStatusReader); bound && run != 0 {
+			state, seenAt, ok, e = rr.LatestRunStatus(ctx, r.Name, sha, name, run)
+		} else {
+			state, seenAt, ok, e = reader.LatestStatus(ctx, r.Name, sha, name)
+		}
 		if e != nil {
 			return "", false, e
 		}

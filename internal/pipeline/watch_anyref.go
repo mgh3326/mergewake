@@ -20,7 +20,15 @@ type workflowDispatcher interface {
 	DispatchWorkflow(ctx context.Context, repo, workflow, ref string, inputs map[string]string) error
 }
 
-var _ workflowDispatcher = (*github.Client)(nil)
+// runDispatcher is a dispatcher that also learns the id of the run it started.
+type runDispatcher interface {
+	DispatchWorkflowRun(ctx context.Context, repo, workflow, ref string, inputs map[string]string) (int64, error)
+}
+
+var (
+	_ workflowDispatcher = (*github.Client)(nil)
+	_ runDispatcher      = (*github.Client)(nil)
+)
 
 // anyRefIncident is the durable dispatch record for one red head. A new red
 // head starts a new incident; a green head deletes the record.
@@ -130,7 +138,7 @@ func (s *watchStream) anyRef(ctx context.Context, r config.Repo, p policy.Policy
 	if e = s.saveAnyRef(r.Name, st); e != nil {
 		return "", false, e
 	}
-	e = s.dispatch(ctx, d, r, p, sha)
+	_, e = s.dispatch(ctx, d, r, p, sha)
 	if github.DispatchRefused(e) {
 		st.Dispatches = st.Dispatches[:len(st.Dispatches)-1]
 		st.Refused = "any-ref CI dispatch refused for " + short7(sha) + ": " + e.Error()
