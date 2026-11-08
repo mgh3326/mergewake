@@ -138,8 +138,9 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 }
 
 // closeReviewerJob closes a reviewer job with the given outcome so its hub
-// reservation is released, as best effort: the daemon's host often cannot close a job whose
-// pane ran elsewhere (no local events, no claim for the lane). The owner lane
+// reservation is released, as best effort: the daemon's node credential often cannot close a
+// job whose pane ran on another host (no local events, no claim for the lane); the close
+// carries reap.hub's service credential (integrations.HubArgv) when that is set. The owner lane
 // is the hk record's, else the --owner of the recorded spawn arguments, else
 // the configured one. A close that cannot run or fails is audited as
 // reviewer-close-skipped and reported as not closed, never as an error: the
@@ -157,7 +158,8 @@ func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob,
 	}
 	skipped := "no owner lane"
 	if lane != "" {
-		_, e := s.Runner.Run(ctx, cfg.Command, []string{"job", "close", rj.Label, "--lane", lane, "--outcome", outcome, "--reason", reason}, "", "")
+		argv := integrations.HubArgv(s.Config.Reap.Hub, "job", "close", rj.Label, "--lane", lane, "--outcome", outcome, "--reason", reason)
+		_, e := s.Runner.Run(ctx, cfg.Command, argv, "", "")
 		if e == nil {
 			return true, nil
 		}

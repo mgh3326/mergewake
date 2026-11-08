@@ -525,7 +525,8 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		return false
 	}
 	cmd := w.s.Config.Review.Panewire.Command
-	if _, e := w.s.Runner.Run(ctx, cmd, []string{"job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason}, "", ""); e != nil {
+	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
+	if _, e := w.s.Runner.Run(ctx, cmd, argv, "", ""); e != nil {
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
 	}
