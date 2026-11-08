@@ -164,6 +164,178 @@ func archiver(e env, ssh string) *Archiver {
 	return &Archiver{Runner: e.run, DriveDir: e.drive, SSH: ssh, TextMax: 1024}
 }
 
+func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized")
+	write(t, filepath.Join(dir, "small.bin"), strings.Repeat("s", 50))
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "report.md"), strings.Repeat("r", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(p.Move, ",") != "events/00001-job.task_link.json,small.bin" || p.Files != 2 || p.Bytes != 78 {
+		t.Fatalf("moves = %v, files=%d bytes=%d", p.Move, p.Files, p.Bytes)
+	}
+	if len(p.Oversized) != 2 || p.Oversized[0].Path != "large.bin" || p.Oversized[0].Size != 150 || p.Oversized[1].Path != "report.md" || p.Oversized[1].Size != 150 || p.OversizedBytes != 300 {
+		t.Fatalf("oversized = %+v, bytes=%d", p.Oversized, p.OversizedBytes)
+	}
+	if strings.Contains(strings.Join(p.Text, ","), "report.md") {
+		t.Fatalf("oversized text file included in hk list: %v", p.Text)
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var printed map[string]any
+	if err := json.Unmarshal(b, &printed); err != nil {
+		t.Fatal(err)
+	}
+	if printed["oversized_bytes"] != float64(300) {
+		t.Fatalf("plan JSON oversized_bytes = %v", printed["oversized_bytes"])
+	}
+}
+
+func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized")
+	write(t, filepath.Join(dir, "small.bin"), strings.Repeat("s", 50))
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "report.md"), strings.Repeat("r", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Deleted || res.Files != 2 || res.Bytes != 78 {
+		t.Fatalf("result = %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "large.bin")); !os.IsNotExist(err) {
+		t.Fatalf("job dir retained or oversized file remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(res.Dest, "large.bin")); !os.IsNotExist(err) {
+		t.Fatalf("oversized file copied to Drive: %v", err)
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(res.Dest, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(manifestBytes, &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Oversized) != 2 || m.Oversized[0].Path != "large.bin" || m.Oversized[1].Path != "report.md" {
+		t.Fatalf("manifest oversized = %+v", m.Oversized)
+	}
+	note := e.comment(2402)
+	for _, want := range []string{"over drive_max_file_bytes, not archived, deleted with the job dir (2, 300 bytes)", "- large.bin 150", "- report.md 150"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("comment lacks %q:\n%s", want, note)
+		}
+	}
+	if len(e.uploads()) != 2 || e.uploads()["report.md"] != nil { // small task-link text file and manifest; oversized report is not uploaded.
+		t.Fatalf("uploads = %v", e.uploads())
+	}
+}
+
+func TestApplyKeepsChangedOversizedFile(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized")
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("m", 151))
+	res, err := a.Apply(context.Background(), p, time.Now())
+	var s *Skip
+	if !errors.As(err, &s) || s.Reason != "job-changed" || res == nil || res.Deleted {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "large.bin")); err != nil {
+		t.Fatal("changed oversized file's job dir was deleted")
+	}
+}
+
+func TestApplyOnlyOversizedFiles(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized")
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402,"padding":"`+strings.Repeat("x", 100)+`"}}`)
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Move) != 0 || len(p.Oversized) != 2 || !res.Deleted {
+		t.Fatalf("plan=%+v result=%+v", p, res)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("oversized-only job dir retained: %v", err)
+	}
+	var m manifest
+	b, err := os.ReadFile(filepath.Join(res.Dest, "manifest.json"))
+	if err != nil || json.Unmarshal(b, &m) != nil || len(m.Oversized) != 2 {
+		t.Fatalf("manifest oversized=%+v err=%v", m.Oversized, err)
+	}
+}
+
+func TestResumeIgnoresRecordedOversizedFilesForArchiveMatch(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-resume-oversized")
+	write(t, filepath.Join(dir, "small.bin"), "small")
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, "wk-resume-oversized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+		t.Fatal("expected simulated delete failure")
+	}
+	e.run.failRm = false
+	p, err = a.Plan(context.Background(), h, "wk-resume-oversized")
+	if err != nil || !p.Resume {
+		t.Fatalf("oversized entry made finished archive differ: plan=%+v err=%v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("resume result=%+v err=%v", res, err)
+	}
+}
+
+func TestDriveMaxFileBytesZeroPreservesExistingBehavior(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized")
+	write(t, filepath.Join(dir, "large.bin"), strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":9}}`)
+	p, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized")
+	if err != nil || len(p.Move) != 2 || len(p.Oversized) != 0 || p.Files != 2 {
+		t.Fatalf("plan=%+v err=%v", p, err)
+	}
+}
+
 func TestCredential(t *testing.T) {
 	for p, want := range map[string]bool{
 		".env": true, ".env.local": true, "sub/.envrc": true, "gh_token.txt": true, "TOKENS/a": true,

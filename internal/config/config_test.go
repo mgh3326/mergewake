@@ -81,6 +81,8 @@ func TestReapConfig(t *testing.T) {
 		{"archive off", "reap:\n  archive: {drive_dir: rel}\n", false},
 		{"archive local", "reap:\n  archive: {enabled: true, drive_dir: '~/Drive/jobs', min_age: 14d}\n", false},
 		{"archive ssh", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: /Users/ops/Drive/jobs, text_max_bytes: 4096}\n", false},
+		{"archive drive cap", "reap:\n  archive: {drive_max_file_bytes: 104857600}\n", false},
+		{"archive negative drive cap", "reap:\n  archive: {drive_max_file_bytes: -1}\n", true},
 		{"archive no dir", "reap:\n  archive: {enabled: true}\n", true},
 		{"archive ssh home", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: '~/Drive'}\n", true},
 		{"archive root", "reap:\n  archive: {enabled: true, drive_dir: /}\n", true},
@@ -99,6 +101,15 @@ func TestReapConfig(t *testing.T) {
 				t.Fatalf("%+v %v", c, e)
 			}
 			if e == nil {
+				if c.Reap.Archive.DriveMaxFileBytes < 0 {
+					t.Fatalf("negative drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
+				}
+				if tt.name == "archive drive cap" && c.Reap.Archive.DriveMaxFileBytes != 104857600 {
+					t.Fatalf("drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
+				}
+				if tt.name == "defaults" && c.Reap.Archive.DriveMaxFileBytes != 0 {
+					t.Fatalf("default drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
+				}
 				if c.Reap.WorktreeAfter != "168h" {
 					t.Fatal(c.Reap.WorktreeAfter)
 				}
@@ -121,7 +132,8 @@ func TestReapConfig(t *testing.T) {
 				if c.Reap.Transport != want {
 					t.Fatalf("transport %q, want %q", c.Reap.Transport, want)
 				}
-				if a := c.Reap.Archive; a.TextMaxBytes == 0 || a.MinAge == "" {
+				a := c.Reap.Archive
+				if a.TextMaxBytes == 0 || a.MinAge == "" {
 					t.Fatalf("archive defaults missing: %+v", a)
 				}
 				if tt.name == "archive local" && !filepath.IsAbs(c.Reap.Archive.DriveDir) {

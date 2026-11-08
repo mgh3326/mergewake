@@ -374,9 +374,10 @@ type Archive struct {
 	DriveDir string `yaml:"drive_dir"`
 	// ArchiveHost is an ssh destination reachable from this machine; empty or
 	// "local" means the Drive folder is on this machine.
-	ArchiveHost  string `yaml:"archive_host"`
-	TextMaxBytes int64  `yaml:"text_max_bytes"`
-	MinAge       string `yaml:"min_age"`
+	ArchiveHost       string `yaml:"archive_host"`
+	TextMaxBytes      int64  `yaml:"text_max_bytes"`
+	DriveMaxFileBytes int64  `yaml:"drive_max_file_bytes"`
+	MinAge            string `yaml:"min_age"`
 }
 
 // ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
@@ -1133,6 +1134,9 @@ func Age(s string) (time.Duration, error) {
 }
 
 func validateArchive(a *Archive) error {
+	if a.DriveMaxFileBytes < 0 {
+		return errors.New("reap.archive.drive_max_file_bytes must be non-negative")
+	}
 	if a.MinAge == "" {
 		a.MinAge = "24h"
 	}

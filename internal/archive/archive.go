@@ -40,10 +40,11 @@ func (s *Skip) Error() string { return "skipped: " + s.Reason }
 // The attachments and the task comment go to hk over HTTP with mergewake's
 // own hk credential (integrations.Handoffkeep), never through the hk CLI.
 type Archiver struct {
-	Runner   reap.Runner
-	DriveDir string
-	SSH      string
-	TextMax  int64
+	Runner            reap.Runner
+	DriveDir          string
+	SSH               string
+	TextMax           int64
+	DriveMaxFileBytes int64
 }
 
 // File is one non-directory entry of a job dir, relative to it.
@@ -57,20 +58,22 @@ type File struct {
 
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
-	Action   string   `json:"action"`
-	Job      string   `json:"job"`
-	Host     string   `json:"host"`
-	Dir      string   `json:"dir"`
-	Task     string   `json:"task"`
-	Dest     string   `json:"drive_dir"`
-	Files    int      `json:"files"`
-	Bytes    int64    `json:"bytes"`
-	Move     []string `json:"move"`
-	Text     []string `json:"hk"`
-	Excluded []string `json:"excluded"`
-	Skipped  []string `json:"skipped"`
-	Delete   string   `json:"delete"`
-	Newest   int64    `json:"newest_mtime"`
+	Action         string   `json:"action"`
+	Job            string   `json:"job"`
+	Host           string   `json:"host"`
+	Dir            string   `json:"dir"`
+	Task           string   `json:"task"`
+	Dest           string   `json:"drive_dir"`
+	Files          int      `json:"files"`
+	Bytes          int64    `json:"bytes"`
+	OversizedBytes int64    `json:"oversized_bytes"`
+	Oversized      []File   `json:"oversized"`
+	Move           []string `json:"move"`
+	Text           []string `json:"hk"`
+	Excluded       []string `json:"excluded"`
+	Skipped        []string `json:"skipped"`
+	Delete         string   `json:"delete"`
+	Newest         int64    `json:"newest_mtime"`
 	// Resume marks a job whose Drive copy and hk record already completed
 	// but whose local delete did not: applying it only deletes.
 	Resume  bool `json:"resume,omitempty"`
@@ -299,6 +302,9 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
 			p.Skipped = append(p.Skipped, f.Path)
+		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
+			p.Oversized = append(p.Oversized, f)
+			p.OversizedBytes += f.Size
 		default:
 			p.Move = append(p.Move, f.Path)
 			p.Files++
@@ -438,6 +444,7 @@ type manifest struct {
 	ArchivedAt  string       `json:"archived_at"`
 	Files       []File       `json:"files"`
 	TotalBytes  int64        `json:"total_bytes"`
+	Oversized   []File       `json:"oversized,omitempty"`
 	Excluded    []string     `json:"excluded"`
 	Skipped     []string     `json:"skipped"`
 	Attachments []Attachment `json:"attachments"`
@@ -468,6 +475,12 @@ func comment(p *Plan, m manifest, manifestID string) string {
 			fmt.Fprintf(&b, "- %s\n", x)
 		}
 	}
+	if len(m.Oversized) > 0 {
+		fmt.Fprintf(&b, "over drive_max_file_bytes, not archived, deleted with the job dir (%d, %d bytes):\n", len(m.Oversized), sumFileBytes(m.Oversized))
+		for _, f := range m.Oversized {
+			fmt.Fprintf(&b, "- %s %d\n", f.Path, f.Size)
+		}
+	}
 	fmt.Fprintf(&b, "file sha256 (%d):\n", len(m.Files))
 	for i, f := range m.Files {
 		if i == commentFiles {
@@ -478,6 +491,14 @@ func comment(p *Plan, m manifest, manifestID string) string {
 	}
 	fmt.Fprintf(&b, "local job dir %s is deleted after this record\n", p.Dir)
 	return b.String()
+}
+
+func sumFileBytes(files []File) int64 {
+	var total int64
+	for _, f := range files {
+		total += f.Size
+	}
+	return total
 }
 
 func same(a, b []File) bool {
@@ -515,7 +536,7 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		}
 	}
 	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
-		Files: []File{}, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
+		Files: []File{}, Oversized: p.Oversized, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
 		moving[rel] = true
