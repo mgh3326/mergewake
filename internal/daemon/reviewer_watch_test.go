@@ -389,12 +389,31 @@ func TestReviewerWakesDuringPassCoalesce(t *testing.T) {
 		d.TriggerReviewer("pr")
 	}
 	close(release)
-	time.Sleep(400 * time.Millisecond)
+	// Wait for the coalesced pass under a bound instead of a fixed sleep. A
+	// fourth pass fails at once; a missing third pass fails at the deadline.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := count
+		mu.Unlock()
+		if n > 3 {
+			t.Fatalf("passes=%d, want 3: one initial, one woken, one coalesced", n)
+		}
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("passes=%d after deadline, want 3: one initial, one woken, one coalesced", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Hold briefly so a late fourth pass would still be caught.
+	time.Sleep(200 * time.Millisecond)
 	mu.Lock()
 	n := count
 	mu.Unlock()
 	if n != 3 {
-		t.Fatalf("passes=%d, want 3: one initial, one woken, one coalesced", n)
+		t.Fatalf("passes=%d after settle, want 3: one initial, one woken, one coalesced", n)
 	}
 	cancel()
 	<-done
