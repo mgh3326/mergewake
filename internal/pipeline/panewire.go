@@ -54,6 +54,10 @@ func missingHubEnv() []string {
 // for validating and posting its findings.
 const postReserve = time.Minute
 
+// minReviewerWait is the shortest pane wait a pass spawns for: with less, the
+// pass has no time left to wait for a reviewer pane.
+const minReviewerWait = time.Second
+
 // reviewerPassWait bounds how long a pass waits for its reviewer when no
 // reviewer-finished event will bring the PR back (no Revisit on the context, as
 // for `mergewake review`, or a daemon that cannot read hk job records). A
@@ -476,12 +480,19 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			cleanup()
 		}
 	}()
+	// Only a fresh pass publishes its brief: a resumed one replays the
+	// recorded spawn arguments, -p included, and never PUTs it again.
 	if !resumed {
-		if e = os.WriteFile(briefPath, []byte(x.brief(plan, label, jobDir, builderFamily)), 0600); e != nil {
-			return skip("write brief: %v", e)
-		}
-		if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
-			return skip("publish brief: %v", e)
+		text := x.brief(plan, label, jobDir, builderFamily)
+		if doc, ok := x.briefDoc(ctx, plan, label, task, text); ok {
+			briefPath = doc
+		} else {
+			if e = os.WriteFile(briefPath, []byte(text), 0600); e != nil {
+				return skip("write brief: %v", e)
+			}
+			if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
+				return skip("publish brief: %v", e)
+			}
 		}
 	}
 
@@ -627,7 +638,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			wait = min(wait, timeout-s.now().Sub(rj.Recorded))
 		}
-		if wait < time.Second {
+		if wait < minReviewerWait {
 			if resumed {
 				return out, fmt.Errorf("%w: no time left to re-attach reviewer job %s", ErrReviewUnavailable, label)
 			}
@@ -1287,6 +1298,90 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	}
 	plan.replacements = rj.Replacements + 1
 	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+}
+
+// briefDocTimeout bounds the brief's hk PUT. It is the twin of
+// integrations.hkClientTimeout (30 s, the bound of one hk public-client call),
+// which is unexported there; briefDocBound also keeps the PUT off the time the
+// pass needs to spawn.
+const briefDocTimeout = 30 * time.Second
+
+// spawnLeft is the least pass time left at which a fresh pass still spawns.
+// The pane wait is left - min(postReserve, left/4) (runPass), and since
+// postReserve is far above minReviewerWait/3 the wait first reaches
+// minReviewerWait at left = minReviewerWait*4/3.
+const spawnLeft = minReviewerWait * 4 / 3
+
+// briefDocReserve is the pass time a brief PUT never spends: spawnLeft plus a
+// margin for what runs between the PUT and the wait check (the client
+// returning after its context ends, writing review-brief.md, the audit row,
+// the hub check). That is local work of a few milliseconds; the margin keeps
+// two orders of magnitude over it on a loaded host.
+const briefDocReserve = spawnLeft + 250*time.Millisecond
+
+// briefDocFloor is the least spare time (left past briefDocReserve) worth a
+// PUT: with less, the pass keeps the brief local and records reason no-time.
+const briefDocFloor = time.Second
+
+// briefDocBound is how long the brief PUT may take in ctx: briefDocTimeout,
+// or a quarter of the time left past briefDocReserve when that is shorter.
+// ok is false when that spare time is at most briefDocFloor. A PUT within the
+// bound leaves at least briefDocReserve plus three quarters of the spare
+// time, so a pass that would spawn without the PUT still spawns with it.
+func briefDocBound(ctx context.Context) (bound time.Duration, ok bool) {
+	deadline, has := ctx.Deadline()
+	if !has {
+		return briefDocTimeout, true
+	}
+	spare := time.Until(deadline) - briefDocReserve
+	if spare <= briefDocFloor {
+		return 0, false
+	}
+	return min(briefDocTimeout, spare/4), true
+}
+
+// briefDoc stores an in-limit brief as hk doc review/<label> and returns the
+// spawn's -p for it, `hk:doc/review/<label>` (panewire v0.0.200 reads it on
+// any host). A brief over inlineBriefLimit is left to spawnBrief's
+// attachment path. A PUT that fails for any reason (no doc-capable sink, too
+// little time left, an unconfigured credential, a refusal, a timeout, an
+// unreadable or unmatched acknowledgement) is no review failure (decision
+// fleet-dependency-boundaries §1): ok is false and the caller writes
+// review-brief.md and spawns from it as before. Each try leaves one
+// review-brief-hk row, status hk or fallback with the redacted reason; the
+// row is best-effort and never stops the pass.
+func (x *panewireExecutor) briefDoc(ctx context.Context, plan *passPlan, label, task, text string) (string, bool) {
+	if len(text) > inlineBriefLimit {
+		return "", false
+	}
+	key := "review/" + label
+	reason := ""
+	docs, capable := x.s.Sink.(interface {
+		PutBrief(context.Context, string, string, *int64, []byte) error
+	})
+	bound, timely := briefDocBound(ctx)
+	switch {
+	case !capable:
+		reason = "task sink cannot store an hk brief document"
+	case !timely:
+		reason = "no-time"
+	default:
+		var taskID *int64
+		if n, err := strconv.ParseInt(task, 10, 64); err == nil && n > 0 {
+			taskID = &n
+		}
+		c, cancel := context.WithTimeout(ctx, bound)
+		if e := docs.PutBrief(c, key, label, taskID, []byte(text)); e != nil {
+			reason = fleetevent.Redact(integrations.Detail(e))
+		}
+		cancel()
+	}
+	row := map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label, "key": key, "status": "hk"}
+	if reason != "" {
+		row["status"], row["reason"] = "fallback", reason
+	}
+	_ = x.s.audit(x.repo.Name, "review-brief-hk", row, false)
+	return "hk:doc/" + key, reason == ""
 }
 
 // spawnBrief keeps oversized reviews out of the bounded hub spawn envelope.
