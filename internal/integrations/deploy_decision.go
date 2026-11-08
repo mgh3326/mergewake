@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"time"
@@ -103,14 +104,16 @@ func parseDeployDecisionRecord(b []byte) (deployDecisionRecord, string) {
 }
 
 // strictJSON decodes one JSON value from b into v, refusing unknown fields
-// and trailing data.
+// and anything but whitespace after that value. The end is proven by a
+// second Decode reaching io.EOF: Decoder.More reports false before a stray
+// ] or }, so it would accept {"by_task":{}}].
 func strictJSON(b []byte, v any) error {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if e := d.Decode(v); e != nil {
 		return e
 	}
-	if d.More() {
+	if e := d.Decode(&json.RawMessage{}); e != io.EOF {
 		return errors.New("trailing data")
 	}
 	return nil
