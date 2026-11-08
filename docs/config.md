@@ -549,7 +549,9 @@ so spawns a new reviewer pane, and escalates once after
 `daemon.pr.review_retry.failures` failures. A pane cut off by `review.timeout`
 records `review_deadline` instead, and a completed reviewer whose result was
 lost records `review-result-lost` and notifies the desk; both are retried the
-same way. The receipt's `executor` is always `panewire`, and its `fallback`
+same way. Before that, a reviewer whose pane is idle or done with no result is
+nudged once to write its two files (`reviewer-nudge`), and gets two minutes
+to do so (`reviewer-nudge-outcome`), if the review budget still holds them. The receipt's `executor` is always `panewire`, and its `fallback`
 carries only the panewire seat or return-path note from steps 3 and 5.
 
 Under the panewire executor, review does not call the quota tool and does not

@@ -361,7 +361,10 @@ func TestRetrySecondLossIsCollectionFailure(t *testing.T) {
 	budgetPane(t, s, runner, readReviewerJob(t, s, r, 1), "done")
 	pastBudget(g, c)
 	st := retryStateOf(t, s, r)
-	c.t = st.Next.Add(time.Hour)
+	// Retry an hour later. st.Next is zero here (no retry failure is recorded
+	// yet), so moving the clock to it would run the clock back before the
+	// replacement's record.
+	c.t = c.t.Add(time.Hour)
 	err := s.RetryReview(context.Background(), r, g.pull, Options{})
 	if !errors.Is(err, ErrReviewUnavailable) {
 		t.Fatalf("err=%v, want review-unavailable", err)

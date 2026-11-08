@@ -50,6 +50,10 @@ type reviewerJob struct {
 	// Spawned is the spawn's stdout, kept when the spawn did not wait: the
 	// pass that later collects the result closes the pane from its placement.
 	Spawned string `json:"spawned,omitempty"`
+	// NudgedAt is when mergewake asked this reviewer, whose pane finished with
+	// no result, to write its output now. Nil when it was never nudged; a
+	// record written before the field existed reads as not nudged.
+	NudgedAt *time.Time `json:"nudged_at,omitempty"`
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {
