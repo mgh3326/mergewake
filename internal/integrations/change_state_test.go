@@ -106,10 +106,16 @@ func TestHKChangeBurstAndFreshness(t *testing.T) {
 	w, _ := changeTestWriter(t, f)
 	w.outbox = filepath.Join(t.TempDir(), "outbox")
 	now := time.Now().UTC()
+	// The flush timer starts with the first Queue and fires after a fixed
+	// window, so a slow queue loop (persist writes under -race or load) can
+	// split the burst. Holding sendMu makes the flush wait until all 50 are
+	// queued, then send them as one batch.
+	w.sendMu.Lock()
 	for i := 0; i < 50; i++ {
 		at := now.Add(time.Duration(i) * time.Millisecond)
 		w.Queue("o/r", 7, "state", ChangeSection{At: at, Value: map[string]any{"head_sha": "x", "observed_at": at, "source": "webhook", "delivery_id": fmt.Sprint(i)}})
 	}
+	w.sendMu.Unlock()
 	drainChange(t, w)
 	f.mu.Lock()
 	count := f.requests
