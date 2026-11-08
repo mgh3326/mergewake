@@ -90,10 +90,53 @@ func reviewerStream(v reapReceipt) string {
 	return v.Host + "\x00" + v.Worktree
 }
 
+const (
+	// reviewerPathUnknown is the terminal reason of a remote worktree whose path
+	// no record names: the host's own sweep owns it from here.
+	reviewerPathUnknown = "remote worktree path unknown; left for the host's own sweep"
+	// reviewerRefused starts the reason of a removal the hub's guard refused.
+	reviewerRefused = "hub guarded removal refused: "
+	// reviewerRefusalRetry is how long a refused removal waits before the hub is
+	// asked again; reviewerRefusalRetries is how many times it is asked again
+	// before the refusal is final.
+	reviewerRefusalRetry   = 24 * time.Hour
+	reviewerRefusalRetries = 3
+)
+
 // reviewerTerminal reports whether a row ends its stream: nothing is left to
-// do for that pane or worktree.
+// do for that pane or worktree. A kept row is terminal only with the reason of
+// an unknown remote path or a final hub refusal; any other kept row is waiting
+// for something to change.
 func reviewerTerminal(v reapReceipt) bool {
-	return v.Result == "closed" || v.Result == "removed" || v.Result == "skipped" && strings.Contains(v.Reason, "already gone")
+	switch v.Result {
+	case "closed", "removed":
+		return true
+	case "skipped":
+		return strings.Contains(v.Reason, "already gone")
+	case "kept":
+		return v.Worktree != "" && (v.Reason == reviewerPathUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
+	}
+	return false
+}
+
+// refusalRetries reports how many retries a pending refusal row records: the
+// first refusal carries none, each later one ends its reason with
+// " (retry n of 3)". ok is false for a row that is not a pending refusal.
+func refusalRetries(v reapReceipt) (n int, ok bool) {
+	if v.Result != "pending-cleanup" || !strings.HasPrefix(v.Reason, reviewerRefused) {
+		return 0, false
+	}
+	if i := strings.LastIndex(v.Reason, " (retry "); i >= 0 {
+		n, _ = strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(v.Reason[i:], " (retry "), fmt.Sprintf(" of %d)", reviewerRefusalRetries)))
+	}
+	return n, true
+}
+
+// reviewerWaiting reports whether a pending refusal row is younger than the
+// retry interval: the hub is not asked again, and the label is not visited.
+func reviewerWaiting(v reapReceipt, now time.Time) bool {
+	_, ok := refusalRetries(v)
+	return ok && now.Sub(v.Time) < reviewerRefusalRetry
 }
 
 // reviewerLabelOf names the label a reviewer receipt is about: reviewer-reap
@@ -185,15 +228,26 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		// A reviewer-cleanup "closed" row only says the pane closed: the pass
 		// removes its local checkout afterwards and may fail. A checkout still
 		// on disk keeps the label open until its own removal is confirmed.
+		streams := w.streams[label]
+		waiting := false
+		for _, v := range streams {
+			switch {
+			case reviewerTerminal(v):
+			case reviewerWaiting(v, w.now):
+				waiting = true
+			default:
+				return false
+			}
+		}
+		// A refused removal that still waits keeps the local checkout too
+		// (L2): the label is not visited until the hub is due to be asked.
+		if waiting {
+			return true
+		}
 		if w.localCheckout(label) != "" {
 			return false
 		}
-		if streams := w.streams[label]; len(streams) > 0 {
-			for _, v := range streams {
-				if !reviewerTerminal(v) {
-					return false
-				}
-			}
+		if len(streams) > 0 {
 			return true
 		}
 		v, ok := lastCleanup[label]
@@ -554,12 +608,24 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	rec := w.row(l)
 	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
 	if cwd == "" || filepath.Base(filepath.Clean(cwd)) != l.name {
-		// Its own stream: the pane stream must keep its close.
+		// Its own stream: the pane stream must keep its close. The path is not
+		// going to become known, so the outcome is final once the sweep acts;
+		// the host's own sweep owns the worktree. A shadow run stays pending.
 		rec.Worktree = l.name
-		w.record(rec, "pending-cleanup", "remote cwd unavailable or mismatched")
-		if cwd == "" {
-			return remotePathUnknown
+		if w.acting {
+			w.record(rec, "kept", reviewerPathUnknown)
+		} else {
+			w.record(rec, "pending-cleanup", "remote cwd unavailable or mismatched")
 		}
+		return remotePathUnknown
+	}
+	// The stream's newest row says whether the hub was asked already: a final
+	// refusal is not asked again, and a pending one waits out its interval.
+	prior := w.streams[l.name][reviewerStream(rec)]
+	switch {
+	case reviewerTerminal(prior) && prior.Result == "kept":
+		return remoteDone
+	case reviewerWaiting(prior, w.now):
 		return remoteStop
 	}
 	remover, ok := hs.ops.(interface {
@@ -614,7 +680,17 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteDone
 	}
 	rec.Files = removed.Files
-	w.record(rec, "pending-cleanup", "hub guarded removal refused: "+reason)
+	// The hub's refusal is never overridden. It is asked again once a day, and
+	// the refusal after the last retry is final.
+	retries, refused := refusalRetries(prior)
+	switch {
+	case !refused:
+		w.record(rec, "pending-cleanup", reviewerRefused+reason)
+	case retries >= reviewerRefusalRetries-1:
+		w.record(rec, "kept", reviewerRefused+reason)
+	default:
+		w.record(rec, "pending-cleanup", fmt.Sprintf("%s%s (retry %d of %d)", reviewerRefused, reason, retries+1, reviewerRefusalRetries))
+	}
 	return remoteStop
 }
 

@@ -548,9 +548,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 	// reviewerNote is note plus one reviewer-reap audit record per new row: a
-	// deduped repeat writes neither.
+	// repeat of the stream's last result and reason writes neither, and is not
+	// printed either except by a dry run, whose output is the report. A repeated
+	// error still counts, so the pass reports it.
 	reviewerNote := func(v reapReceipt) {
 		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v)
+		if repeat && !o.DryRun && v.Result != "error" {
+			return
+		}
 		note(v)
 		if repeat {
 			return

@@ -559,7 +559,7 @@ func unknownPathFix(t *testing.T) (*reviewerFix, string, string) {
 }
 
 // L1: a completed job on a remote host, pane gone, no cwd anywhere, clean
-// local checkout: the remote side stays pending-cleanup and the local checkout
+// local checkout: the remote side ends kept (final) and the local checkout
 // is removed.
 func TestReapReviewer_L1_UnknownRemotePathDoesNotBlockLocalRemoval(t *testing.T) {
 	f, label, path := unknownPathFix(t)
@@ -582,7 +582,7 @@ func TestReapReviewer_L1_UnknownRemotePathDoesNotBlockLocalRemoval(t *testing.T)
 			remote = &rows[i]
 		}
 	}
-	if remote == nil || remote.Result != "pending-cleanup" || remote.Reason != "remote cwd unavailable or mismatched" {
+	if remote == nil || remote.Result != "kept" || remote.Reason != reviewerPathUnknown {
 		t.Fatalf("remote row missing: %v", rowSummary(rows))
 	}
 	if local == nil || local.Result != "removed" || local.Worktree != path {
@@ -728,8 +728,8 @@ func TestReapReviewer_I_I9_SecondRunIsQuiet(t *testing.T) {
 		if len(rows) != 2 || rows[0].Result != "closed" || rows[1].Result != "pending-cleanup" || len(f.audits(t)) != 2 {
 			t.Fatalf("rows: %v", rowSummary(rows))
 		}
-		// Still pending: each run asks the hub again.
-		if n := len(f.hub.ops("worktree.remove")); n != 3 {
+		// Still pending, but the hub is asked again only once a day.
+		if n := len(f.hub.ops("worktree.remove")); n != 1 {
 			t.Fatalf("removes: %d", n)
 		}
 	})

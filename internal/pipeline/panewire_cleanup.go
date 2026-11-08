@@ -152,12 +152,20 @@ func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerP
 		}
 	}()
 	if !p.confirmed {
-		// The pane's host is unknown, so it may still run in the local checkout.
-		if p.keepLocalCheckout != nil {
-			*p.keepLocalCheckout = true
+		// The spawn's receipt may have come late although the job ran: a
+		// completed job record that names a host and a pane is the placement.
+		job, err := x.job(ctx, p.label)
+		if err != nil || job.State != "completed" || job.Host == "" || job.PaneID == "" {
+			// The pane's host is unknown, so it may still run in the local checkout.
+			if p.keepLocalCheckout != nil {
+				*p.keepLocalCheckout = true
+			}
+			c.record("pending-cleanup", "spawn named no host and pane; checkout kept")
+			return
 		}
-		c.record("pending-cleanup", "spawn named no host and pane; checkout kept")
-		return
+		p.placement, p.confirmed = job, true
+		c.p = p
+		c.row.Host, c.row.Pane = job.Host, job.PaneID
 	}
 	c.local = p.placement.Host == "local" || x.localReviewerHost(p.placement.Host)
 	if p.hold != "" {
