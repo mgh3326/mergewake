@@ -71,6 +71,10 @@ type panewireRunner struct {
 	gitFails     string // a git subcommand (such as "fetch") that exits 128
 	afterRun     func() // called once panewire returns
 	sink         *taskJobSink
+	// hk serves a spawn whose brief is "-p hk:doc/<key>"; jobs is
+	// review.panewire.jobs, where such a spawn's same-host pane writes.
+	hk   *hktest.Server
+	jobs string
 }
 
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -141,7 +145,7 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "panewire":
 		r.spawns = append(r.spawns, args)
-		brief, e := os.ReadFile(arg(args, "-p"))
+		brief, job, e := r.spawnBrief(args)
 		if e != nil {
 			return nil, e
 		}
@@ -162,7 +166,6 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 				return nil, panewireExit(code)
 			}
 		}
-		job := filepath.Dir(args[slices.Index(args, "-p")+1])
 		label := arg(args, "-l")
 		findings := r.findings
 		for key, v := range r.byLabel {
@@ -213,6 +216,25 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 	}
 	r.headless++
 	return r.fakeRunner.Run(ctx, command, args, input, dir)
+}
+
+// spawnBrief reads a spawn's brief as panewire does: "-p hk:doc/<key>" from
+// the hk document, any other -p from the file. job is the directory the
+// same-host pane writes in: the file's directory, or review.panewire.jobs/<label>.
+func (r *panewireRunner) spawnBrief(args []string) ([]byte, string, error) {
+	p := arg(args, "-p")
+	if key, ok := strings.CutPrefix(p, "hk:doc/"); ok {
+		if r.hk == nil {
+			return nil, "", errors.New("hk:doc brief without an hk fake")
+		}
+		d, found := r.hk.Documents()[key]
+		if !found {
+			return nil, "", fmt.Errorf("hk document %s not found", key)
+		}
+		return []byte(d.Body), filepath.Join(r.jobs, arg(args, "-l")), nil
+	}
+	b, e := os.ReadFile(p)
+	return b, filepath.Dir(p), e
 }
 
 type taskJobSink struct {
@@ -288,6 +310,7 @@ func panewireSetup(t *testing.T, runner *panewireRunner) (*Service, *fakeGH, con
 	s.Config.Review.Executor = "panewire"
 	dir := t.TempDir()
 	s.Config.Review.Panewire = config.PanewireReview{Command: "panewire", Workspace: "reviews", Host: "auto", Jobs: filepath.Join(dir, "jobs"), Checkouts: filepath.Join(dir, "checkouts")}
+	runner.jobs = s.Config.Review.Panewire.Jobs
 	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: anthropic\n"
 	g.pull.Base.Ref = "main"
 	g.pull.Head.Ref = "feat/thing"

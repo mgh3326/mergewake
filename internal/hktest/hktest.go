@@ -110,6 +110,10 @@ type Attachment struct {
 // Document is one stored document as the client sent it.
 type Document struct {
 	Kind, Session, Job, Body string
+	// TaskID and OriginClass are the optional task link and origin class
+	// (authored, job or import); nil and "" when the client sent none.
+	TaskID      *int64
+	OriginClass string
 }
 
 type failure struct {
@@ -447,7 +451,7 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 	s.mu.Lock()
-	s.documents[key] = Document{Kind: in.Kind, Session: in.Session, Job: in.Job, Body: in.Body}
+	s.documents[key] = Document{Kind: in.Kind, Session: in.Session, Job: in.Job, Body: in.Body, TaskID: in.TaskID, OriginClass: in.OriginClass}
 	s.mu.Unlock()
 	sum := sha256.Sum256([]byte(in.Body))
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
