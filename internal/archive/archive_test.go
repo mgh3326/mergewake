@@ -372,7 +372,7 @@ func TestResumeIgnoresRecordedOversizedFilesForArchiveMatch(t *testing.T) {
 	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
-	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	h := reap.Host{Jobs: e.jobs}
 	p, err := a.Plan(context.Background(), h, "wk-resume-oversized")
 	if err != nil {
 		t.Fatal(err)
@@ -557,7 +557,7 @@ func TestPlanSkipsJobWithoutEvents(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(e.jobs, "no-events", "events")); err != nil {
 		t.Fatal(err)
 	}
-	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "no-events")
+	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Jobs: e.jobs}, "no-events")
 	var skip *Skip
 	if !errors.As(err, &skip) || skip.Reason != "no-events" {
 		t.Fatalf("Plan() error = %v, want skipped no-events", err)
@@ -569,7 +569,7 @@ func TestPlanEmptyEventsDirectoryIsNotFinished(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.jobs, "empty-events", "events"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "empty-events")
+	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Jobs: e.jobs}, "empty-events")
 	var skip *Skip
 	if !errors.As(err, &skip) || skip.Reason != "not-finished" {
 		t.Fatalf("Plan() error = %v, want skipped not-finished", err)
@@ -581,7 +581,7 @@ func TestPlanExcludesNamesBeforeHostRead(t *testing.T) {
 	a := archiver(e, "")
 	a.Exclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
 	for _, name := range []string{"pw-rollout-x", "pw-hk1", "events-lane"} {
-		_, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, name)
+		_, err := a.Plan(context.Background(), reap.Host{Jobs: e.jobs}, name)
 		var skip *Skip
 		if !errors.As(err, &skip) || skip.Reason != "excluded-name" {
 			t.Errorf("%s: error = %v", name, err)
