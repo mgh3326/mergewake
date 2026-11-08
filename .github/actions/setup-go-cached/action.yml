@@ -1,0 +1,76 @@
+# Installs the Go toolchain selected in go.mod, restoring it from the Actions
+# cache first so setup-go skips the download. On a miss the download retries
+# with backoff. Dependency caches (module and build) stay on via setup-go.
+name: Setup Go (cached toolchain)
+description: Restore the go.mod-selected Go toolchain from the Actions cache, then set it up with setup-go.
+runs:
+  using: composite
+  steps:
+    - name: Resolve pinned Go version
+      id: version
+      shell: bash
+      run: |
+        version=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' go.mod)
+        if [ -z "$version" ]; then
+          version=$(awk '$1 == "go" { print $2; exit }' go.mod)
+        fi
+        case "$version" in
+          [0-9]*.[0-9]*.[0-9]*) ;;
+          *) echo "go.mod must declare an exact toolchain or go version, got: '$version'" >&2; exit 1 ;;
+        esac
+        case "$(uname -m)" in
+          x86_64) arch=x64 ;;
+          arm64|aarch64) arch=arm64 ;;
+          *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+        esac
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+    # The tool cache layout setup-go searches: <tool_cache>/go/<version>/<arch>
+    # plus its <arch>.complete marker. Restoring both makes setup-go find the
+    # toolchain and skip the download.
+    - name: Restore Go toolchain from cache
+      id: toolchain-cache
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: |
+          ${{ runner.tool_cache }}/go/${{ steps.version.outputs.version }}/${{ steps.version.outputs.arch }}
+          ${{ runner.tool_cache }}/go/${{ steps.version.outputs.version }}/${{ steps.version.outputs.arch }}.complete
+        key: go-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
+
+    # On a miss, setup-go downloads the toolchain. Retry with backoff so one
+    # transient 403/5xx does not fail the job. Attempts 2 and 3 run only after
+    # the previous one failed.
+    - name: Set up Go (attempt 1)
+      id: go-attempt-1
+      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      continue-on-error: true
+      with:
+        go-version: ${{ steps.version.outputs.version }}
+        cache: true
+
+    - name: Back off before attempt 2
+      if: steps.go-attempt-1.outcome == 'failure'
+      shell: bash
+      run: sleep 20
+
+    - name: Set up Go (attempt 2)
+      id: go-attempt-2
+      if: steps.go-attempt-1.outcome == 'failure'
+      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      continue-on-error: true
+      with:
+        go-version: ${{ steps.version.outputs.version }}
+        cache: true
+
+    - name: Back off before attempt 3
+      if: steps.go-attempt-2.outcome == 'failure'
+      shell: bash
+      run: sleep 60
+
+    - name: Set up Go (attempt 3)
+      if: steps.go-attempt-2.outcome == 'failure'
+      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      with:
+        go-version: ${{ steps.version.outputs.version }}
+        cache: true
