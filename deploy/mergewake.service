@@ -5,6 +5,11 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/mergewake daemon --config %h/.config/mergewake/config.yaml
+# The environment file below (keep it mode 0600) holds the daemon's
+# credentials, including the hk HTTP pair HANDOFFKEEP_URL and
+# HANDOFFKEEP_TOKEN_SVC_MERGEWAKE (hk client svc-mergewake, from Infisical
+# /mergewake) and the optional CF Access pair. mergewake never reads the hk
+# CLI's config.env. See docs/config.md "hk HTTP credential".
 EnvironmentFile=-%h/.config/mergewake/environment
 Restart=on-failure
 RestartSec=15

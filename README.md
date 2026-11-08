@@ -96,6 +96,10 @@ Adapters use only APIs or CLI argument vectors:
   and rollout records; a no-op sink is available.
 - hk `POST /v1/task-events` for PR, review, merge and revert events on tasks
   named by a `Mergewake-Task` trailer (`hk_task_events`, on by default).
+  This call and mergewake's other hk HTTP calls use only the `svc-mergewake`
+  credential from the environment (`HANDOFFKEEP_URL`,
+  `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE`, from Infisical `/mergewake`), never the
+  hk CLI's `config.env`. See [hk HTTP credential](docs/config.md#hk-http-credential).
 - Independent reviewers (Claude, Codex, Devin, Grok, Kimi, pi, Command Code,
   agy) chosen by pace to reset: free models first, then pools projected to end
   their window well under 100%, then any under 100%; tight or unmeasured pools
