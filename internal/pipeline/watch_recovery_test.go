@@ -27,6 +27,13 @@ type recoveryGH struct {
 	merges  int
 	clears  int
 	entries map[string]map[string]github.TreeEntry
+	// ambiguousSHA names the sha whose Check reads change from readResult to
+	// the ambiguous check/status disagreement on read number ambiguousFrom.
+	// Zero values leave Check as the shared fake.
+	ambiguousSHA  string
+	ambiguousFrom int
+	readResult    github.CI
+	headReads     int
 }
 
 func (g *recoveryGH) Pull(ctx context.Context, repo string, n int) (github.Pull, error) {

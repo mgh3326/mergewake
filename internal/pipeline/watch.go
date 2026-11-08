@@ -122,7 +122,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 		main.blocked = owned
 		if owned {
 			ci, err := s.GH.Check(ctx, r.Name, head, p.WatchSet())
-			if err != nil {
+			// An ambiguous main read is not known red: it neither yields the
+			// deploy latch nor fails the pass, and the incident decides it.
+			if err != nil && !errors.Is(err, github.ErrAmbiguousCheck) {
 				return err
 			}
 			if ci == github.Red && p.Enabled && !o.Shadow && !o.DryRun {
@@ -146,7 +148,9 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 			return err
 		}
 		ci, err := s.GH.Check(ctx, r.Name, head, p.WatchSet())
-		if err != nil {
+		// An ambiguous main read is not known green: deploy waits for main
+		// instead of failing the pass on it.
+		if err != nil && !errors.Is(err, github.ErrAmbiguousCheck) {
 			return err
 		}
 		probe := watchStream{Service: s, deploy: true}
@@ -183,12 +187,20 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	// When the head is the incident's culprit, a passed re-run posts a status
 	// beside the head's own failed run. The incident still gathering evidence
 	// owns that verdict: resolving it records the mixed result instead of
-	// failing on the ambiguous read or clearing the incident as healthy.
+	// failing on the ambiguous read or clearing the incident as healthy. A
+	// confirmed incident owns it too, but its verdict is settled: the mixed
+	// result is decided once and the automatic revert stops.
 	mixedHead := recorded && !inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
+	confirmedHead := recorded && inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
 	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
-		if mixedHead && errors.Is(e, github.ErrAmbiguousCheck) {
-			return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+		if errors.Is(e, github.ErrAmbiguousCheck) {
+			if confirmedHead {
+				return s.settleConfirmedHead(ctx, r, result, o, inc)
+			}
+			if mixedHead {
+				return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
+			}
 		}
 		return e
 	}
@@ -518,7 +530,9 @@ func (s *watchStream) openRevert(ctx context.Context, r config.Repo, head string
 	}
 	if s.deploy {
 		mainCI, err := s.GH.Check(github.FreshEvidence(ctx), r.Name, fresh, s.mainChecks)
-		if err != nil {
+		// An ambiguous main read is not known green, so deploy recovery waits
+		// rather than failing the pass on it.
+		if err != nil && !errors.Is(err, github.ErrAmbiguousCheck) {
 			return err
 		}
 		if mainCI != github.Green {
@@ -527,6 +541,16 @@ func (s *watchStream) openRevert(ctx context.Context, r config.Repo, head string
 	}
 	ci, e := s.GH.Check(github.FreshEvidence(ctx), r.Name, head, checks)
 	if e != nil {
+		// A same-sha re-run can land between the diagnosis and this read. When
+		// it did, the culprit head carries a pass beside its failed run, which
+		// a confirmed incident decides once instead of failing the pass on it.
+		inc, found, le := s.loadRecovery(r.Name)
+		if le != nil {
+			return le
+		}
+		if found && inc.Confirmed && inc.Culprit == head && errors.Is(e, github.ErrAmbiguousCheck) {
+			return s.settleConfirmedHead(ctx, r, result, o, inc)
+		}
 		return e
 	}
 	if ci != github.Red {

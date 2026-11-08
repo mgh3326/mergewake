@@ -499,6 +499,44 @@ func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p poli
 	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
+// settleConfirmedHead records a confirmed incident's ambiguous read at its
+// culprit head once and holds the automatic revert on it. A same-sha re-run
+// that passes beside the head's own failed run is a mixed result, and a mixed
+// result never justifies reverting the commit the failure was confirmed on; the
+// rule the incident was confirmed under already holds on one (confirmRecovery).
+//
+// The read is not proof of a pass, so no flaky mark is written: Check raises it
+// for any same-name check/status conflict on the head, and the statuses it
+// folds cannot be attributed to one run (a confirmation run can leave a sibling
+// green when another check failed, and an overlapping run can post its own
+// statuses; the confirmation's own rerunOutcome reads them the same way). The
+// incident therefore keeps its culprit, baseline and confirmation and resumes
+// the normal recovery path as soon as the head's checks read decisively again.
+func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, result watchResult, o Options, inc recoveryIncident) error {
+	const reason = "the culprit head's checks conflict; the automatic revert is held"
+	result.Culprit, result.PR = inc.Culprit, inc.CulpritPR
+	result.Action, result.Reason = "recovery-hold", reason
+	key := "recovery:" + inc.Culprit + ":ambiguous-head"
+	if !result.Shadow && !o.DryRun {
+		sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
+		if e != nil {
+			return e
+		}
+		if !sent.has(key) {
+			row := struct {
+				Decision  string `json:"decision"`
+				Culprit   string `json:"culprit"`
+				CulpritPR int    `json:"culprit_pr"`
+				Reason    string `json:"reason"`
+			}{"hold-conflicting-head", inc.Culprit, inc.CulpritPR, reason}
+			if e := s.audit(r.Name, "recovery-conflict-head", row, false); e != nil {
+				return e
+			}
+		}
+	}
+	return s.reportWatch(ctx, r, result, key, o)
+}
+
 // recoverHeadCulprit resolves an incident whose culprit is the current head.
 // An active latch still owns the revert PR, so it keeps the recovery path.
 func (s *watchStream) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
