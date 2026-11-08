@@ -2,6 +2,7 @@ package integrations
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/hktest"
@@ -63,5 +64,43 @@ func TestHandoffkeepPutBriefErrors(t *testing.T) {
 	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "")
 	if e := putBrief(t, Handoffkeep{Runner: noCLI(t)}).PutBrief(context.Background(), "review/x", "x", nil, []byte("b")); e == nil {
 		t.Fatal("unconfigured PUT returned nil")
+	}
+}
+
+// ackCases are hk acknowledgements of a brief PUT that do not prove the
+// document holds the brief: each answers 200, yet names no document, another
+// key or another sha256, or cannot be read at all.
+var ackCases = map[string]func(key, sha string) string{
+	"empty":  func(key, sha string) string { return `{}` },
+	"null":   func(key, sha string) string { return `null` },
+	"no sha": func(key, sha string) string { return `{"document":{"key":"` + key + `"},"changed":true}` },
+	"wrong key": func(key, sha string) string {
+		return `{"document":{"key":"` + key + `-other","sha256":"` + sha + `"},"changed":true}`
+	},
+	"wrong sha": func(key, sha string) string {
+		return `{"document":{"key":"` + key + `","sha256":"` + strings.Repeat("0", 64) + `"},"changed":true}`
+	},
+	"unreadable": func(key, sha string) string { return `{"document":` },
+}
+
+// A PUT counts as stored only when hk acknowledges the key sent and the
+// sha256 of the brief sent; any other 200 answer is an error.
+func TestHandoffkeepPutBriefRequiresMatchingAcknowledgement(t *testing.T) {
+	for name, answer := range ackCases {
+		t.Run(name, func(t *testing.T) {
+			hk := hktest.New(t)
+			hk.AnswerDocumentPut(answer)
+			if e := putBrief(t, Handoffkeep{Runner: noCLI(t)}).PutBrief(context.Background(), "review/x", "x", nil, []byte("# Review\n")); e == nil {
+				t.Fatal("an unverified acknowledgement returned nil")
+			}
+		})
+	}
+	// The acknowledgement hk gives for the key and body sent is a success.
+	hk := hktest.New(t)
+	hk.AnswerDocumentPut(func(key, sha string) string {
+		return `{"document":{"key":"` + key + `","sha256":"` + sha + `"},"changed":false}`
+	})
+	if e := putBrief(t, Handoffkeep{Runner: noCLI(t)}).PutBrief(context.Background(), "review/x", "x", nil, []byte("# Review\n")); e != nil {
+		t.Fatal(e)
 	}
 }

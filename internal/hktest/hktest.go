@@ -138,6 +138,8 @@ type Server struct {
 	fails       map[string]failure
 	// afterRead is the task each id becomes once its next GET is served.
 	afterRead map[int64]string
+	// docAnswer, when set, is the raw 200 body a document PUT answers with.
+	docAnswer func(key, sha string) string
 }
 
 // New starts a fake hk for t and points the svc-mergewake credential at it:
@@ -210,6 +212,15 @@ func (s *Server) Fail(pattern string, status int, code string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fails[pattern] = failure{status, code}
+}
+
+// AnswerDocumentPut makes every document PUT store the document as usual but
+// answer 200 with the raw body answer returns, given the key and the hex
+// sha256 of the body sent: an empty, mismatched or unreadable acknowledgement.
+func (s *Server) AnswerDocumentPut(answer func(key, sha string) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.docAnswer = answer
 }
 
 // Requests returns every request received so far.
@@ -452,8 +463,15 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	s.mu.Lock()
 	s.documents[key] = Document{Kind: in.Kind, Session: in.Session, Job: in.Job, Body: in.Body, TaskID: in.TaskID, OriginClass: in.OriginClass}
+	answer := s.docAnswer
 	s.mu.Unlock()
 	sum := sha256.Sum256([]byte(in.Body))
+	if answer != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, answer(key, hex.EncodeToString(sum[:])))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
 }
 

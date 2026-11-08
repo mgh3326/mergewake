@@ -134,14 +134,7 @@ func stalledHK(t *testing.T) {
 // review. The pass writes review-brief.md and spawns from it as before,
 // records one fallback row, and ends exactly like a pass whose PUT landed.
 func TestReviewBriefDocPutFailureFallsBackToLocalBrief(t *testing.T) {
-	// The outcome of a pass whose PUT landed, for comparison.
-	var normal passOutcome
-	{
-		hk := hktest.New(t)
-		runner := &panewireRunner{findings: briefFindings, family: "openai"}
-		s, g, r := briefDocSetup(t, runner, hk)
-		normal, _, _ = runBriefPass(t, s, g, r, 8*time.Second)
-	}
+	normal := normalBriefPass(t)
 	for name, arrange := range map[string]func(t *testing.T) *hktest.Server{
 		"refused": func(t *testing.T) *hktest.Server {
 			hk := hktest.New(t)
@@ -165,31 +158,143 @@ func TestReviewBriefDocPutFailureFallsBackToLocalBrief(t *testing.T) {
 			runner := &panewireRunner{findings: briefFindings, family: "openai"}
 			s, g, r := briefDocSetup(t, runner, hk)
 			out, plan, x := runBriefPass(t, s, g, r, 8*time.Second)
-			if !reflect.DeepEqual(out, normal) {
-				t.Fatalf("fallback outcome %+v, normal pass %+v", out, normal)
-			}
-			jobDir := filepath.Join(s.Config.Review.Panewire.Jobs, plan.label)
-			briefPath := filepath.Join(jobDir, "review-brief.md")
-			if len(runner.spawns) != 1 || arg(runner.spawns[0], "-p") != briefPath {
-				t.Fatalf("spawns %v, want -p %s", runner.spawns, briefPath)
-			}
-			body, e := os.ReadFile(briefPath)
-			if e != nil || string(body) != wantBrief(t, s, x, plan) {
-				t.Fatalf("local brief: %v\n%s", e, body)
-			}
+			assertLocalBriefFallback(t, s, r, runner, out, normal, plan, x)
 			if hk != nil {
 				if _, ok := hk.Documents()["review/"+plan.label]; ok {
 					t.Fatal("a refused PUT stored the doc")
 				}
 			}
-			rows := auditRows(t, s, r, "review-brief-hk")
-			if len(rows) != 1 || rows[0]["status"] != "fallback" || rows[0]["key"] != "review/"+plan.label || rows[0]["reason"] == "" || rows[0]["reason"] == nil {
-				t.Fatalf("audit %v", rows)
-			}
-			if failed := auditRows(t, s, r, "review-failed"); len(failed) != 0 {
-				t.Fatalf("review-failed rows %v", failed)
-			}
 		})
+	}
+}
+
+// assertLocalBriefFallback checks a pass whose brief PUT did not count: it
+// ended exactly like the normal pass, spawned from review-brief.md holding
+// the brief, left one fallback row with a reason and no review-failed row.
+func assertLocalBriefFallback(t *testing.T, s *Service, r config.Repo, runner *panewireRunner, out, normal passOutcome, plan *passPlan, x *panewireExecutor) {
+	t.Helper()
+	if !reflect.DeepEqual(out, normal) {
+		t.Fatalf("fallback outcome %+v, normal pass %+v", out, normal)
+	}
+	jobDir := filepath.Join(s.Config.Review.Panewire.Jobs, plan.label)
+	briefPath := filepath.Join(jobDir, "review-brief.md")
+	if len(runner.spawns) != 1 || arg(runner.spawns[0], "-p") != briefPath {
+		t.Fatalf("spawns %v, want -p %s", runner.spawns, briefPath)
+	}
+	body, e := os.ReadFile(briefPath)
+	if e != nil || string(body) != wantBrief(t, s, x, plan) {
+		t.Fatalf("local brief: %v\n%s", e, body)
+	}
+	rows := auditRows(t, s, r, "review-brief-hk")
+	if len(rows) != 1 || rows[0]["status"] != "fallback" || rows[0]["key"] != "review/"+plan.label || rows[0]["reason"] == "" || rows[0]["reason"] == nil {
+		t.Fatalf("audit %v", rows)
+	}
+	if failed := auditRows(t, s, r, "review-failed"); len(failed) != 0 {
+		t.Fatalf("review-failed rows %v", failed)
+	}
+}
+
+// normalBriefPass is the outcome of a pass whose brief PUT landed.
+func normalBriefPass(t *testing.T) passOutcome {
+	t.Helper()
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	out, _, _ := runBriefPass(t, s, g, r, 8*time.Second)
+	return out
+}
+
+// An hk that answers the brief PUT 200 without acknowledging the key and the
+// sha256 of the brief sent has not proven it holds the brief: the pass
+// spawns from the local review-brief.md, as for a refused PUT.
+func TestReviewBriefDocUnverifiedAcknowledgementFallsBack(t *testing.T) {
+	normal := normalBriefPass(t)
+	for name, answer := range map[string]func(key, sha string) string{
+		"empty": func(key, sha string) string { return `{}` },
+		"null":  func(key, sha string) string { return `null` },
+		"wrong key": func(key, sha string) string {
+			return `{"document":{"key":"review/other","sha256":"` + sha + `"},"changed":true}`
+		},
+		"wrong sha": func(key, sha string) string {
+			return `{"document":{"key":"` + key + `","sha256":"` + strings.Repeat("0", 64) + `"},"changed":true}`
+		},
+		"no sha":     func(key, sha string) string { return `{"document":{"key":"` + key + `"},"changed":true}` },
+		"unreadable": func(key, sha string) string { return `{"document":` },
+	} {
+		t.Run(name, func(t *testing.T) {
+			hk := hktest.New(t)
+			hk.AnswerDocumentPut(answer)
+			runner := &panewireRunner{findings: briefFindings, family: "openai"}
+			s, g, r := briefDocSetup(t, runner, hk)
+			out, plan, x := runBriefPass(t, s, g, r, 8*time.Second)
+			if docPuts(hk) != 1 {
+				t.Fatalf("doc PUTs %d, want 1", docPuts(hk))
+			}
+			assertLocalBriefFallback(t, s, r, runner, out, normal, plan, x)
+		})
+	}
+}
+
+// A task sink that cannot store hk documents leaves the brief local: no PUT
+// is tried and the pass spawns from review-brief.md.
+func TestReviewBriefDocSinkWithoutPutBriefFallsBack(t *testing.T) {
+	normal := normalBriefPass(t)
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	runner.hk = hk
+	if _, ok := s.Sink.(interface {
+		PutBrief(context.Context, string, string, *int64, []byte) error
+	}); ok {
+		t.Fatal("the plain panewire test sink has PutBrief")
+	}
+	out, plan, x := runBriefPass(t, s, g, r, 8*time.Second)
+	assertLocalBriefFallback(t, s, r, runner, out, normal, plan, x)
+	if docPuts(hk) != 0 {
+		t.Fatalf("doc PUTs %d without a doc-capable sink", docPuts(hk))
+	}
+}
+
+// A brief PUT never spends the time the pass needs to spawn. Through
+// RetryReview, a review whose deadline is barely enough to spawn (a pass
+// spawns while at least 4/3 s remain, see minReviewerWait) still spawns its
+// reviewer when hk stalls, and nothing counts as a review failure: no
+// review-failed row, no failure toward escalation. 1.7 s keeps the case
+// stable: without a reserve the stalled PUT takes a quarter of it and leaves
+// the pane wait under a second for any remaining time below 1.77 s, while the
+// pass itself spends only in-memory fakes before the brief.
+func TestReviewBriefDocStalledHKNearDeadlineStillSpawnsThroughRetry(t *testing.T) {
+	stalledHK(t)
+	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, nil)
+	s.Config.Review.Timeout = "1700ms"
+	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "30m", Failures: 1}
+	err := s.RetryReview(context.Background(), r, g.pull, Options{})
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d err=%v review-failed=%v", len(runner.spawns), err, auditRows(t, s, r, "review-failed"))
+	}
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	label := arg(runner.spawns[0], "-l")
+	if got, want := arg(runner.spawns[0], "-p"), filepath.Join(s.Config.Review.Panewire.Jobs, label, "review-brief.md"); got != want {
+		t.Fatalf("-p %q, want %q", got, want)
+	}
+	if failed := auditRows(t, s, r, "review-failed"); len(failed) != 0 {
+		t.Fatalf("review-failed rows %v", failed)
+	}
+	if st := retryStateOf(t, s, r); st.Failures != 0 || st.Escalated {
+		t.Fatalf("retry state %+v", st)
+	}
+	if _, failed := resultLostNotices(s); failed != 0 {
+		t.Fatalf("review-failed notices: %v", s.Notifier.(*fakeNotifier).events)
+	}
+	if g.postCount != 1 {
+		t.Fatalf("posts=%d", g.postCount)
+	}
+	rows := auditRows(t, s, r, "review-brief-hk")
+	if len(rows) != 1 || rows[0]["status"] != "fallback" || rows[0]["key"] != "review/"+label || rows[0]["reason"] != "no-time" {
+		t.Fatalf("audit %v", rows)
 	}
 }
 
