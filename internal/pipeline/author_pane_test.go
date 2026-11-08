@@ -1,13 +1,16 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -56,18 +59,193 @@ func authorPaneSetup(t *testing.T, panes ...aPane) (*Service, *jobSink, *scriptR
 	return s, sink, run
 }
 
-// (a) A task with a bound job routes to the job's lane as before, without
-// reading any pane.
-func TestAuthorPaneJobBindingNeedsNoPaneLookup(t *testing.T) {
-	s, sink, run := authorPaneSetup(t)
-	sink.jobs["2481"] = "w-7"
-	sink.recs["w-7"] = integrations.JobRecord{State: "spawned", Label: "w-7", OwnerLane: "integrator"}
+// A task with a bound job and no other live author on the PR's branch keeps
+// routing to the job's lane. The branch is still scanned for a takeover.
+func TestAuthorPaneJobBindingWithoutAuthorKeepsJob(t *testing.T) {
+	s, _, run := takeoverSetup(t, aPane{"w1:p9", "w-5", "/wt/z", "other-branch", projectOrigin})
 	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if rt.lane != "w-7" || rt.via != "task 2481 job w-7" || len(run.calls) != 0 {
+	if rt.lane != "w-7" || rt.via != "task 2481 job w-7" || len(run.calls) == 0 {
 		t.Fatalf("route %q via %q, runner calls %v", rt.lane, rt.via, run.calls)
+	}
+}
+
+// Takeover (hk 3492): a bound job's lane is the author's lane only while no
+// other live pane on the PR's head branch has taken the PR over. The bound
+// job w-7 has no lane of its own: its label names lane w-7. Panes named w-9
+// and w-8 each carry their own job lane.
+var (
+	paneA = aPane{"w1:p2", "w-7", "/wt/a2", "feature", projectOrigin}
+	paneB = aPane{"w1:p1", "w-9", "/wt/a", "feature", projectOrigin}
+	paneC = aPane{"w1:p3", "w-8", "/wt/c", "feature", projectOrigin}
+)
+
+func takeoverSetup(t *testing.T, panes ...aPane) (*Service, *jobSink, *scriptRunner) {
+	t.Helper()
+	s, sink, run := authorPaneSetup(t, panes...)
+	sink.jobs["2481"] = "w-7"
+	sink.recs["w-7"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-7", OwnerLane: "integrator"}
+	sink.recs["w-8"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-8", HubLane: "w-8-lane"}
+	return s, sink, run
+}
+
+// (takeover a) The bound job's pane is gone and one other live pane is on the
+// PR's branch: that pane is the current author.
+func TestTakeoverRoutesToTheLiveAuthor(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneB)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-9-lane" || rt.via != "takeover pane w-9" {
+		t.Fatalf("route %q via %q", rt.lane, rt.via)
+	}
+}
+
+// (takeover b) The bound job's pane is still live beside the other pane: the
+// bound job is the old author, so the other pane wins.
+func TestTakeoverWithTheBoundPaneLiveRoutesToTheOther(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneA, paneB)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-9-lane" || rt.via != "takeover pane w-9" {
+		t.Fatalf("route %q via %q", rt.lane, rt.via)
+	}
+}
+
+// (takeover c) Only the bound job's own pane, no pane, or no hosts: the bound
+// lane, as before. A terminal bound job keeps its lane the same way.
+func TestTakeoverKeepsTheBoundLaneWithoutAnotherAuthor(t *testing.T) {
+	other := aPane{"w1:p9", "w-5", "/wt/z", "other-branch", projectOrigin}
+	for _, tt := range []struct {
+		name  string
+		panes []aPane
+		hosts bool
+	}{
+		{"only the bound pane", []aPane{paneA}, true},
+		{"no pane on the branch", []aPane{other}, true},
+		{"no host configured", []aPane{paneB}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _, _ := takeoverSetup(t, tt.panes...)
+			if !tt.hosts {
+				s.Config.Hosts = nil
+			}
+			rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if rt.lane != "w-7" || rt.via != "task 2481 job w-7" {
+				t.Fatalf("route %q via %q", rt.lane, rt.via)
+			}
+		})
+	}
+}
+
+// (takeover e) A mergewake reviewer pane (labelled mwr-…) on the branch is not
+// an author: the bound lane stands.
+func TestTakeoverIgnoresReviewerPanes(t *testing.T) {
+	reviewer := aPane{"w1:p4", "mwr-7-abc1234-p1-100", "/wt/r", "feature", projectOrigin}
+	s, sink, _ := takeoverSetup(t, paneA, reviewer)
+	// The reviewer's job has a usable lane: without the exclusion it would take over.
+	sink.recs[reviewer.name] = integrations.JobRecord{State: "spawned", Role: "reviewer", Label: reviewer.name, HubLane: "reviewer-lane"}
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-7" || rt.via != "task 2481 job w-7" {
+		t.Fatalf("route %q via %q", rt.lane, rt.via)
+	}
+}
+
+// (takeover d) Two other live panes on the branch are ambiguous: the bound
+// lane stands and one findings-route-ambiguous row names the candidates.
+func TestTakeoverAmbiguousKeepsTheBoundLaneAndAudits(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneB, paneC)
+	var out bytes.Buffer
+	s.Out = &out
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	n := s.Notifier.(*ackNotifier)
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("%+v", n.events)
+	}
+	rows := auditRecords(t, out.Bytes(), "findings-route-ambiguous")
+	if len(rows) != 1 || rows[0]["pr"] != float64(7) {
+		t.Fatalf("want one findings-route-ambiguous row for PR 7, got %+v", rows)
+	}
+	cands := fmt.Sprint(rows[0]["candidates"])
+	if !strings.Contains(cands, "w-9") || !strings.Contains(cands, "w-8") {
+		t.Fatalf("candidates %s", cands)
+	}
+}
+
+// (takeover f) A delivery stored for the bound job, then another live pane
+// takes over, then a re-send: the re-send goes to the new lane, the stored
+// lane is updated, and one findings-route-changed row records the move.
+func TestTakeoverResendFollowsTheNewAuthor(t *testing.T) {
+	s, _, _ := takeoverSetup(t, aPane{"w1:p9", "w-5", "/wt/z", "other-branch", projectOrigin})
+	var out bytes.Buffer
+	s.Out = &out
+	n := s.Notifier.(*ackNotifier)
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	deliver(t, s, testRepoFor(s))
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("first delivery: %+v", n.events)
+	}
+	s.Runner = authorHost(paneB)
+	base := s.now()
+	s.Now = func() time.Time { return base.Add(s.Config.Daemon.PR.Findings.AckWindow() + time.Minute) }
+	deliver(t, s, testRepoFor(s))
+	if n.count != 2 || n.events[1].Lane != "w-9-lane" || !strings.HasSuffix(n.events[1].ID, "-resend") {
+		t.Fatalf("re-send did not follow the takeover: %+v", n.events)
+	}
+	ledger, e := s.loadDeliveries(testRepoFor(s).Name)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(ledger) != 1 || ledger[0].Lane != "w-9-lane" || !strings.Contains(ledger[0].Text, "for lane w-9-lane") {
+		t.Fatalf("stored delivery %+v", ledger)
+	}
+	rows := auditRecords(t, out.Bytes(), "findings-route-changed")
+	if len(rows) != 1 || rows[0]["from"] != "w-7" || rows[0]["to"] != "w-9-lane" || rows[0]["via"] != "takeover pane w-9" {
+		t.Fatalf("route-changed rows %+v", rows)
+	}
+}
+
+// (takeover g) A host read error during the takeover scan is returned: the
+// pass retries and sends nothing, rather than picking a lane.
+func TestTakeoverScanErrorRetriesWithoutSending(t *testing.T) {
+	s, _, run := takeoverSetup(t, paneB)
+	run.errs = map[string]error{key("herdr", "agent", "list"): errors.New("herdr unreachable")}
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e == nil {
+		t.Fatal("scan error was not returned")
+	}
+	if n := s.Notifier.(*ackNotifier); n.count != 0 {
+		t.Fatalf("event sent during a failed scan: %+v", n.events)
+	}
+	if rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull); e == nil {
+		t.Fatalf("route picked %q via %q", rt.lane, rt.via)
+	}
+}
+
+// (takeover h) The READY/MERGED record names the live author, the same lane
+// FINDINGS goes to.
+func TestTakeoverReadyRecordNamesTheLiveAuthor(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneB)
+	lane, via, e := s.workerLane(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if lane != "w-9-lane" || via != "takeover pane w-9" {
+		t.Fatalf("record lane %q via %q", lane, via)
 	}
 }
 

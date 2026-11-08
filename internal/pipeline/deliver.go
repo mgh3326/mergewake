@@ -65,6 +65,9 @@ type pendingFinding struct {
 type findingsRoute struct {
 	lane, via string
 	owner     string
+	// ambiguous names the several other live panes on the PR's branch when
+	// the bound lane was kept (see boundAuthorLane); the caller audits them.
+	ambiguous []string
 }
 
 // DeliverFindings sends the PR's undelivered review findings to its author
@@ -115,6 +118,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		if e != nil {
 			return e
 		}
+		followErr = errors.Join(followErr, s.auditAmbiguousRoute(r, pr.Number, route, o))
 		for _, batch := range []struct {
 			scope    string
 			findings []pendingFinding
@@ -222,36 +226,57 @@ func terminalJob(state string) bool {
 	return state == "completed" || state == "escalated" || state == "lost"
 }
 
-// boundJobLane is the lane of the job hk bound to task, as the job record
-// names it; empty when the task has no job or the job no usable lane. A read
-// error is returned, never read as "no job".
-func (s *Service) boundJobLane(ctx context.Context, task string) (lane, via string, err error) {
-	jobs, ok := s.Sink.(reapJobs)
-	if task == "" || !ok {
-		return "", "", nil
+// boundJob is the hk job bound to task and its record; ok is false when the
+// task has no job. A read error is returned, never read as "no job".
+func (s *Service) boundJob(ctx context.Context, task string) (job string, rec integrations.JobRecord, ok bool, err error) {
+	jobs, has := s.Sink.(reapJobs)
+	if task == "" || !has {
+		return "", rec, false, nil
 	}
 	job, _, e := jobs.TaskJob(ctx, task)
 	if e != nil || job == "" {
-		return "", "", e
+		return "", rec, false, e
 	}
-	rec, e := jobs.Job(ctx, job)
+	rec, e = jobs.Job(ctx, job)
 	if e != nil {
 		if errors.Is(e, integrations.ErrJobNotFound) {
-			return "", "", nil
+			return "", rec, false, nil
 		}
-		return "", "", e
+		return "", rec, false, e
 	}
+	return job, rec, true, nil
+}
+
+// jobLane is the first usable lane a job record names; empty when none is.
+func jobLane(rec integrations.JobRecord) string {
 	for _, l := range []string{rec.HubLane, rec.Lane, rec.Label} {
 		if laneName.MatchString(l) {
-			return l, "task " + task + " job " + job, nil
+			return l
 		}
+	}
+	return ""
+}
+
+// boundJobLane is the lane of the job hk bound to task, as the job record
+// names it; empty when the task has no job or the job no usable lane. A read
+// error is returned, never read as "no job". It does not look for a takeover;
+// see boundAuthorLane.
+func (s *Service) boundJobLane(ctx context.Context, task string) (lane, via string, err error) {
+	job, rec, ok, e := s.boundJob(ctx, task)
+	if e != nil || !ok {
+		return "", "", e
+	}
+	if lane := jobLane(rec); lane != "" {
+		return lane, "task " + task + " job " + job, nil
 	}
 	return "", "", nil
 }
 
 // findingsRoute uses the same task/job binding as reap, without caching an
-// open PR's binding. A worker or lead keeps its author lane after completion.
-// With no job binding the PR's author pane (see authorPane) is next. Missing
+// open PR's binding. A worker or lead keeps its author lane after completion
+// unless another live pane on the PR's branch has taken the PR over (see
+// boundAuthorLane). With no job binding the PR's author pane (see authorPane)
+// is next. Missing
 // ownership routes to the repo's owner lane, the desk when it names none; a
 // read error retries without guessing.
 func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pull) (findingsRoute, error) {
@@ -266,10 +291,10 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 	if e != nil {
 		return rt, e
 	}
-	if lane, via, e := s.boundJobLane(ctx, task); e != nil {
+	if al, e := s.boundAuthorLane(ctx, r, pr, task); e != nil {
 		return rt, e
-	} else if lane != "" {
-		rt.lane, rt.via = lane, via
+	} else if al.lane != "" {
+		rt.lane, rt.via, rt.ambiguous = al.lane, al.via, al.candidates
 		return rt, nil
 	}
 	if lane, via, ok, e := s.authorPane(ctx, r, pr); e != nil {
@@ -435,6 +460,11 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 	// One inbox read per lane per pass, however many deliveries it holds.
 	inboxes := map[string]map[string]bool{}
 	inboxErr := map[string]error{}
+	// The author route is resolved at most once per pass, and only when a
+	// re-send needs it, so a re-send follows a takeover (see boundAuthorLane).
+	var route findingsRoute
+	var routeErr error
+	routed := false
 	for i := range ledger {
 		d := &ledger[i]
 		if d.PR != pr.Number || d.Scope != "author" || d.AckBy == "disposition" || !d.EscalatedAt.IsZero() {
@@ -503,20 +533,60 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			d.AckedAt, d.AckBy, changed = now, "inbox", true
 			errs = append(errs, s.audit(r.Name, "findings-acked", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
 		case d.ResentAt.IsZero() && now.Sub(d.SentAt) >= window:
+			if !routed {
+				route, routeErr = s.findingsRoute(ctx, r, pr)
+				routed = true
+				if routeErr == nil {
+					errs = append(errs, s.auditAmbiguousRoute(r, pr.Number, route, o))
+				}
+			}
+			if routeErr != nil {
+				// A route read error retries the re-send; it never reroutes it.
+				errs = append(errs, routeErr)
+				continue
+			}
+			to, text, typ := d.Lane, d.Text, "findings"
+			moved := route.lane != d.Lane
+			if moved {
+				to, text = route.lane, retargetLane(d.Text, d.Lane, route.lane)
+				if route.via == "unknown author; desk" {
+					typ = "decision"
+				}
+			}
 			if o.Reporting() {
 				reportCtx, cancel := reportContext(ctx)
-				e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID + "-resend", Text: resendText(d.Text, window), Lane: d.Lane, Type: "findings"})
+				e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID + "-resend", Text: resendText(text, window), Lane: to, Type: typ})
 				cancel()
 				if e != nil {
-					errs = append(errs, fmt.Errorf("findings re-send to %s: %w", d.Lane, e))
+					errs = append(errs, fmt.Errorf("findings re-send to %s: %w", to, e))
 					continue
 				}
+			}
+			if moved {
+				errs = append(errs, s.audit(r.Name, "findings-route-changed", map[string]any{"pr": d.PR, "from": d.Lane, "to": to, "via": route.via}, o.DryRun))
+				d.Lane, d.Via, d.Text = to, route.via, text
 			}
 			d.ResentAt, changed = now, true
 			errs = append(errs, s.audit(r.Name, "findings-resent", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
 		}
 	}
 	return changed, errors.Join(errs...)
+}
+
+// auditAmbiguousRoute records one findings-route-ambiguous row when the route
+// kept its bound lane while several other live panes sat on the PR's branch.
+func (s *Service) auditAmbiguousRoute(r config.Repo, pr int, rt findingsRoute, o Options) error {
+	if len(rt.ambiguous) == 0 {
+		return nil
+	}
+	return s.audit(r.Name, "findings-route-ambiguous", map[string]any{"pr": pr, "candidates": rt.ambiguous}, o.DryRun)
+}
+
+// retargetLane names the new lane in a stored FINDINGS text: the lane in its
+// header and in its ack command.
+func retargetLane(text, from, to string) string {
+	text = strings.Replace(text, "for lane "+from+":", "for lane "+to+":", 1)
+	return strings.ReplaceAll(text, "--lane "+from+" ", "--lane "+to+" ")
 }
 
 // resendText marks a re-send in the event text, within the lane event bound.

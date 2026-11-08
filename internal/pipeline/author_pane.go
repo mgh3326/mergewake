@@ -105,3 +105,83 @@ func (s *Service) authorPane(ctx context.Context, r config.Repo, pr github.Pull)
 	}
 	return "", "", false, nil
 }
+
+// authorRoute is an author lane found from the task's bound job, possibly
+// superseded by a takeover (see boundAuthorLane). candidates names several
+// other live panes when the bound lane was kept.
+type authorRoute struct {
+	lane, via  string
+	candidates []string
+}
+
+// boundAuthorLane is the PR author's lane when the task binds a job with a
+// usable lane. A bound job is the author only until another live pane on the
+// PR's head branch takes the PR over, so the bound lane stands unless exactly
+// one other such pane exists; then that pane's job lane wins, via
+// "takeover pane <label>". Several other panes keep the bound lane and name
+// the candidates for an audit row. A bound job with no usable lane returns no
+// lane, so the caller falls through to authorPane as before. A host or job
+// read error is returned so the caller retries rather than picking a lane.
+func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.Pull, task string) (authorRoute, error) {
+	job, rec, ok, e := s.boundJob(ctx, task)
+	if e != nil || !ok {
+		return authorRoute{}, e
+	}
+	lane := jobLane(rec)
+	if lane == "" {
+		return authorRoute{}, nil
+	}
+	bound := authorRoute{lane: lane, via: "task " + task + " job " + job}
+	others, e := s.takeoverPanes(ctx, r, pr, job, rec.Label)
+	if e != nil {
+		return authorRoute{}, e
+	}
+	switch len(others) {
+	case 0:
+		return bound, nil
+	case 1:
+		jobs := s.Sink.(reapJobs)
+		takeover, e := jobs.Job(ctx, others[0])
+		if errors.Is(e, integrations.ErrJobNotFound) {
+			return bound, nil
+		}
+		if e != nil {
+			return authorRoute{}, e
+		}
+		if l := jobLane(takeover); l != "" {
+			return authorRoute{lane: l, via: "takeover pane " + others[0]}, nil
+		}
+		return bound, nil
+	default:
+		bound.candidates = others
+		return bound, nil
+	}
+}
+
+// takeoverPanes names the live panes on the PR's head branch in repo r that
+// could be a takeover author: not the bound job's own pane (named by its job
+// or its label) and not a mergewake reviewer pane (labelled mwr-…). No hosts,
+// or a PR with no head branch in this repository, scans nothing.
+func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pull, job, label string) ([]string, error) {
+	if len(s.Config.Hosts) == 0 || pr.Head.Ref == "" || !sameRepoHead(pr, r.Name) {
+		return nil, nil
+	}
+	hosts, err := s.authorHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, hs := range hosts {
+		for _, p := range hs.panes {
+			w := hs.trees[p.Cwd]
+			if p.Cwd == "" || w == nil || w.Branch != pr.Head.Ref || !strings.EqualFold(w.Repo, r.Name) {
+				continue
+			}
+			if p.Name == "" || p.Name == job || p.Name == label || strings.HasPrefix(p.Name, "mwr-") {
+				continue
+			}
+			names = append(names, p.Name)
+		}
+	}
+	return names, nil
+}
