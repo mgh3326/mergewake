@@ -21,7 +21,7 @@ func hkEventServer(t *testing.T, h http.HandlerFunc) {
 	t.Cleanup(srv.Close)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", srv.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "tok")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "tok")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 }

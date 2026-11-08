@@ -61,7 +61,7 @@ func TestChangePriority(t *testing.T) {
 			defer srv.Close()
 			t.Setenv("HOME", t.TempDir())
 			t.Setenv("HANDOFFKEEP_URL", srv.URL)
-			t.Setenv("HANDOFFKEEP_TOKEN", "tok")
+			t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "tok")
 			got, e := Handoffkeep{}.ChangePriority(context.Background(), pr)
 			if (e != nil) != tc.wantErr || got != tc.want {
 				t.Fatalf("%d %v", got, e)
@@ -73,7 +73,7 @@ func TestChangePriority(t *testing.T) {
 	}
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", "")
-	t.Setenv("HANDOFFKEEP_TOKEN", "")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "")
 	if _, e := (Handoffkeep{}).ChangePriority(context.Background(), pr); e == nil {
 		t.Fatal("unconfigured endpoint is not an error")
 	}

@@ -48,6 +48,11 @@ type Daemon struct {
 	// by a healthy role while another fails every iteration. It is fail-open:
 	// its error is logged and never counted as a loop failure; nil means off.
 	Healthy func(ctx context.Context) error
+	// StartupCheck runs once when Run starts, before any loop. Its error names
+	// configuration the operator must fix (a missing hk credential key, see
+	// integrations.HKEndpointCheck); it is logged as one error line and the
+	// daemon keeps running. nil means off.
+	StartupCheck func() error
 	// Now stamps status times and Jitter returns a fraction in [0, 1) for the
 	// retry delay; nil means time.Now and math/rand.
 	Now    func() time.Time
@@ -197,6 +202,11 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 		d.mu.Lock()
 		d.wake[l.Role] = make(chan struct{}, 1)
 		d.mu.Unlock()
+	}
+	if d.StartupCheck != nil {
+		if err := d.StartupCheck(); err != nil {
+			d.Log.Error("startup check failed", "err", err.Error())
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

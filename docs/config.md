@@ -482,8 +482,8 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
 1. The PR's `Mergewake-Task` trailer (PR body, then head commit) is read
    through the handoffkeep sink; the task's `refs.job_id` is the author's
    panewire job and its title marker (`(grade A, T2)`) gives `--t`. The
-   author's hk job record (`GET /v1/jobs/<author job>`, read through the same
-   handoffkeep endpoint and credentials the sink's CLI uses) supplies
+   author's hk job record (`GET /v1/jobs/<author job>`, read over HTTP with
+   mergewake's own [hk HTTP credential](#hk-http-credential)) supplies
    `--builder-family`; a builder spawned before job records have no record,
    and the trailer/commit inference answers instead. A task with no bound job
    (the author did not run through panewire) is not skipped: the pass runs as a
@@ -520,7 +520,7 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    which stores the findings on the pane's hk job record in the same write
    as `state: completed`.
 5. After the wait, mergewake reads `GET /v1/jobs/<label>` (same endpoint and
-   credential convention as above) and applies the W4 rule: a completed
+   credential as above) and applies the W4 rule: a completed
    record's `result` is used; a completed record without a result, an
    `escalated` or `lost` record (the receipt records the state), a still
    pending or missing record, and an unreadable hk all fail the pass — the last
@@ -828,6 +828,58 @@ CLI/server that lacks reopen returns an explicit failure; the recovery comment
 is retained and the watch notification reports the failure. Protected upstream
 authority fences remain enforced. No fallback generic transition is attempted.
 Structured reports use `doc put --key KEY --kind note --file FILE`.
+
+#### hk HTTP credential
+
+mergewake's own HTTP calls to hk authenticate as the hk client
+`svc-mergewake`, never with the hk CLI's credential. These calls are job
+records (`GET /v1/jobs/<id>`), change priority and review records
+(`GET /v1/changes?pr=`), change state (`POST /v1/changes/batch`,
+`PUT /v1/changes/<section>`) and task events (`POST /v1/task-events`). They
+read the process environment only:
+
+| Variable | Meaning |
+| --- | --- |
+| `HANDOFFKEEP_URL` | hk base URL. HTTPS is required off loopback and the tailnet. |
+| `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` | Bearer token of `svc-mergewake`, kept in Infisical `/mergewake`. |
+| `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`, `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET` | Optional Cloudflare Access pair. Set both or neither. |
+
+mergewake does not read the hk CLI's `~/.config/handoffkeep/config.env` or
+its machine token `HANDOFFKEEP_TOKEN`. The `sink.command` subprocesses
+(`handoffkeep tasks …`, `doc put`, `attach put`) still run the hk CLI with
+the CLI's own credential.
+
+The daemon gets the variables from the unit's `EnvironmentFile`. On oci the
+unit does not load `~/.config/mergewake/environment` (the file does not exist
+there). A unit drop-in adds `EnvironmentFile=%h/.config/mergewake/hk-svc.env`
+(mode 0600) instead; see
+[deploy/mergewake.service](../deploy/mergewake.service). mergewake reads the
+environment only and knows no file path. A command run from a shell, such as
+`mergewake review` or `mergewake watch`, needs the variables in that shell's
+environment. A mergewake run by macOS launchd (for example a `mergewake
+rollout` LaunchAgent) gets no hk HTTP unless its launcher sets the two keys.
+
+If `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` is unset, every hk
+HTTP call behaves as on a host with no hk endpoint. Job records cannot be
+read, so a panewire review pass fails with `hk-unavailable`. Task events and
+change state are not sent, and hk review history and change priority are
+empty. With `sink.type: handoffkeep`, the daemon logs one error line at
+start, `startup check failed`, that names the unset keys and no value. The
+daemon keeps running.
+
+**Rollout.** Do not roll out the mergewake build that reads only
+`HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` (hk 3545) before
+`~/.config/mergewake/hk-svc.env` exists on the host. Do these in order:
+
+1. The operator or handoffkeep-design writes `HANDOFFKEEP_URL` and
+   `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` (from Infisical `/mergewake`) into
+   `hk-svc.env`, mode 0600. If hk is behind Cloudflare Access, add the CF
+   Access pair too.
+2. Add the unit drop-in `EnvironmentFile=%h/.config/mergewake/hk-svc.env`.
+   The deploying session only adds the drop-in and checks that both key
+   names are in the file.
+3. Restart the daemon.
+4. Check that its log has no `startup check failed` line.
 
 ### `discord`
 

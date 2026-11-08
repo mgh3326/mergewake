@@ -58,7 +58,7 @@ func (f *fakeHK) serve(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", srv.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test-token")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test-token")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 }
@@ -239,7 +239,7 @@ func TestHKReviewHistoryNoHKData(t *testing.T) {
 func TestHKReviewHistoryUnconfiguredEndpoint(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", "")
-	t.Setenv("HANDOFFKEEP_TOKEN", "")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "")
 	gh := &fakeGitHub{posted: twoPasses}
 	c, logs := gh.client(t)
 	AttachReviewHistory(c, Handoffkeep{})

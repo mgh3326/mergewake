@@ -48,9 +48,9 @@ func TestHKJobsGetEndReason(t *testing.T) {
 	}
 }
 
-// Job records go through the sink's credential convention: env wins,
-// config.env fills; an http URL off loopback and the tailnet is refused. Values are never
-// printed.
+// Job records go through mergewake's own hk credential, read from the
+// environment only; an http URL off loopback and the tailnet is refused.
+// Values are never printed.
 func TestHKJobEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
@@ -59,18 +59,18 @@ func TestHKJobEndpoint(t *testing.T) {
 		err string
 	}{
 		"unconfigured":      {env: map[string]string{}, err: "unconfigured"},
-		"http remote":       {env: map[string]string{"HANDOFFKEEP_URL": "http://hk.example.invalid", "HANDOFFKEEP_TOKEN": "t"}, err: "HTTPS"},
-		"http loopback":     {env: map[string]string{"HANDOFFKEEP_URL": "http://127.0.0.1:9", "HANDOFFKEEP_TOKEN": "t"}},
-		"http tailnet ip":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.64.0.1:8800", "HANDOFFKEEP_TOKEN": "t"}},
-		"http tailnet name": {env: map[string]string{"HANDOFFKEEP_URL": "http://hk.example.ts.net:8800", "HANDOFFKEEP_TOKEN": "t"}},
-		"http LOCALHOST":    {env: map[string]string{"HANDOFFKEEP_URL": "http://LOCALHOST:9", "HANDOFFKEEP_TOKEN": "t"}},
-		"http past cgnat":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.128.0.1:8800", "HANDOFFKEEP_TOKEN": "t"}, err: "HTTPS"},
-		"userinfo":          {env: map[string]string{"HANDOFFKEEP_URL": "https://u:p@hk.example.invalid", "HANDOFFKEEP_TOKEN": "t"}, err: "invalid"},
-		"cf half pair":      {env: map[string]string{"HANDOFFKEEP_URL": "https://hk.example.invalid", "HANDOFFKEEP_TOKEN": "t", "HANDOFFKEEP_CF_ACCESS_CLIENT_ID": "id"}, err: "pair"},
-		"https ok":          {env: map[string]string{"HANDOFFKEEP_URL": "https://hk.example.invalid", "HANDOFFKEEP_TOKEN": "t"}},
+		"http remote":       {env: map[string]string{"HANDOFFKEEP_URL": "http://hk.example.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}, err: "HTTPS"},
+		"http loopback":     {env: map[string]string{"HANDOFFKEEP_URL": "http://127.0.0.1:9", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}},
+		"http tailnet ip":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.64.0.1:8800", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}},
+		"http tailnet name": {env: map[string]string{"HANDOFFKEEP_URL": "http://hk.example.ts.net:8800", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}},
+		"http LOCALHOST":    {env: map[string]string{"HANDOFFKEEP_URL": "http://LOCALHOST:9", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}},
+		"http past cgnat":   {env: map[string]string{"HANDOFFKEEP_URL": "http://100.128.0.1:8800", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}, err: "HTTPS"},
+		"userinfo":          {env: map[string]string{"HANDOFFKEEP_URL": "https://u:p@hk.example.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}, err: "invalid"},
+		"cf half pair":      {env: map[string]string{"HANDOFFKEEP_URL": "https://hk.example.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t", "HANDOFFKEEP_CF_ACCESS_CLIENT_ID": "id"}, err: "pair"},
+		"https ok":          {env: map[string]string{"HANDOFFKEEP_URL": "https://hk.example.invalid", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE": "t"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, k := range []string{"HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN", "HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET"} {
+			for _, k := range []string{"HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET"} {
 				t.Setenv(k, "")
 			}
 			for k, v := range tc.env {

@@ -10,10 +10,11 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/config"
 )
 
 // JobRecord is the projection mergewake reads from hk `GET /v1/jobs/{job}`
@@ -55,11 +56,11 @@ var jobRecordID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 func ValidJobRecordID(id string) bool { return jobRecordID.MatchString(id) }
 
-// Job returns the job's hk record through the same handoffkeep endpoint and
-// credentials the CLI sink uses (HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN, the CF
-// Access pair, or ~/.config/handoffkeep/config.env). The jobs API has no CLI
-// subcommand, so the read goes over HTTP; credential values never leave this
-// process. A sink built for tests injects Jobs instead.
+// Job returns the job's hk record over HTTP with mergewake's own hk
+// credential (hkJobEndpoint: HANDOFFKEEP_URL, HANDOFFKEEP_TOKEN_SVC_MERGEWAKE
+// and the optional CF Access pair, from the environment only). The jobs API
+// has no CLI subcommand, so the read goes over HTTP; credential values never
+// leave this process. A sink built for tests injects Jobs instead.
 func (h Handoffkeep) Job(ctx context.Context, id string) (JobRecord, error) {
 	if h.Jobs != nil {
 		return h.Jobs.Job(ctx, id)
@@ -86,36 +87,50 @@ func (h Handoffkeep) ChangePriority(ctx context.Context, pr string) (int, error)
 	return c.changePriority(ctx, pr)
 }
 
+// The process environment is the only source of mergewake's hk HTTP
+// credential: hk client id svc-mergewake, whose token is kept in Infisical
+// /mergewake and reaches the daemon through its EnvironmentFile
+// (deploy/mergewake.service). The hk CLI's config.env and its machine token
+// HANDOFFKEEP_TOKEN are never read (hk 3526 decision §4, §5).
+const (
+	envHKURL      = "HANDOFFKEEP_URL"
+	envHKToken    = "HANDOFFKEEP_TOKEN_SVC_MERGEWAKE"
+	envHKCFID     = "HANDOFFKEEP_CF_ACCESS_CLIENT_ID"
+	envHKCFSecret = "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET"
+)
+
 var errEndpointUnconfigured = errors.New("handoffkeep endpoint unconfigured")
 
-// hkJobEndpoint resolves the handoffkeep base URL and bearer credential with
-// the same convention as the handoffkeep CLI: the environment wins, and
-// ~/.config/handoffkeep/config.env fills keys the environment left unset.
-// https is required off loopback. Nothing is logged.
+// HKEndpointCheck is the daemon's startup check of the hk HTTP credential.
+// With the handoffkeep sink the daemon calls hk over HTTP, so an unset
+// HANDOFFKEEP_URL or HANDOFFKEEP_TOKEN_SVC_MERGEWAKE is an error that names
+// the unset keys and never a value; errors.Is(err, errEndpointUnconfigured)
+// holds for it. Any other sink, or both keys set, is nil.
+func HKEndpointCheck(c config.Config) error {
+	if c.Sink.Type != "handoffkeep" {
+		return nil
+	}
+	var missing []string
+	for _, k := range []string{envHKURL, envHKToken} {
+		if strings.TrimSpace(os.Getenv(k)) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: set %s in the daemon environment", errEndpointUnconfigured, strings.Join(missing, " and "))
+}
+
+// hkJobEndpoint resolves the handoffkeep base URL and the svc-mergewake bearer
+// credential from the process environment only: HANDOFFKEEP_URL,
+// HANDOFFKEEP_TOKEN_SVC_MERGEWAKE and the optional CF Access pair. Either of
+// the first two unset is errEndpointUnconfigured. https is required off
+// loopback and the tailnet. Nothing is logged.
 func hkJobEndpoint() (*hkJobs, error) {
-	envFile := map[string]string{}
-	if home, e := os.UserHomeDir(); e == nil {
-		if b, e := os.ReadFile(filepath.Join(home, ".config", "handoffkeep", "config.env")); e == nil {
-			for _, line := range strings.Split(string(b), "\n") {
-				line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-				k, v, ok := strings.Cut(line, "=")
-				if ok {
-					envFile[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), "\"'")
-				}
-			}
-		}
-	}
-	read := func(k string) string {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-		return envFile[k]
-	}
-	base, token := read("HANDOFFKEEP_URL"), read("HANDOFFKEEP_TOKEN")
-	cfID, cfSecret := read("HANDOFFKEEP_CF_ACCESS_CLIENT_ID"), read("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET")
+	env := func(k string) string { return strings.TrimSpace(os.Getenv(k)) }
+	base, token := env(envHKURL), env(envHKToken)
+	cfID, cfSecret := env(envHKCFID), env(envHKCFSecret)
 	if base == "" || token == "" {
 		return nil, errEndpointUnconfigured
 	}

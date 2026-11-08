@@ -32,7 +32,7 @@ func TestHKChangeWebhookDelivery(t *testing.T) {
 	defer hk.Close()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", hk.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	var triggers []string
@@ -77,7 +77,7 @@ func TestHKChangeUnavailableDoesNotFailDelivery(t *testing.T) {
 	defer hk.Close()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", hk.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	var triggered []string
@@ -119,7 +119,7 @@ func TestHKChangeWebhookChecksKeepOutOfOrderFacts(t *testing.T) {
 	defer hk.Close()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("HANDOFFKEEP_URL", hk.URL)
-	t.Setenv("HANDOFFKEEP_TOKEN", "test")
+	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
 	st := webhookstate.Open(t.TempDir())
