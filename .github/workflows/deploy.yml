@@ -26,7 +26,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.workflow_run.head_sha }}
           persist-credentials: false
-      - uses: ./.github/actions/setup-go-cached
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-source
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - uses: ./.workflow-source/.github/actions/setup-go-cached
       - name: go test -race
         env:
           PACKAGES: ${{ inputs.packages }}
@@ -45,7 +51,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.workflow_run.head_sha }}
           persist-credentials: false
-      - uses: ./.github/actions/setup-go-cached
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-source
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - uses: ./.workflow-source/.github/actions/setup-go-cached
       - name: go test
         env:
           PACKAGES: ${{ inputs.packages }}
@@ -64,7 +76,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.workflow_run.head_sha }}
           persist-credentials: false
-      - uses: ./.github/actions/setup-go-cached
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-source
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - uses: ./.workflow-source/.github/actions/setup-go-cached
       - name: Build and verify release assets
         env:
           TARGET_SHA: ${{ inputs.ref || github.event.workflow_run.head_sha }}
