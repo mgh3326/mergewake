@@ -108,8 +108,9 @@ func TestRecordOnlyReadyAuthorPaneAndNoWorker(t *testing.T) {
 	}
 }
 
-// (b) MERGED is recorded, never sent, with or without a worker lane, and a
-// repeat logs nothing.
+// (b) MERGED with no design lane (no trailer, no repo lane) is never sent, with
+// or without a worker lane: the row says "no design lane", and a repeat logs
+// nothing. The worker lane is not a MERGED destination.
 func TestRecordOnlyMerged(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
@@ -123,7 +124,7 @@ func TestRecordOnlyMerged(t *testing.T) {
 				}
 			}
 			rows := prNotifyRows(t, s, r)
-			if n.count != 0 || !sentKeyHas(t, s, r, verdictKey("merged", 7, shaA)) || len(rows) != 1 || rows[0]["suppressed"] != "record only" || rows[0]["state"] != "merged" {
+			if n.count != 0 || !sentKeyHas(t, s, r, verdictKey("merged", 7, shaA)) || len(rows) != 1 || rows[0]["suppressed"] != "no design lane" || rows[0]["state"] != "merged" {
 				t.Fatalf("events=%+v decisions=%v", n.events, rows)
 			}
 		})

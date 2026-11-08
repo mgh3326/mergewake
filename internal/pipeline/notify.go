@@ -252,7 +252,8 @@ func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr githu
 var errNotifyDelivery = errors.New("notify delivery failed")
 
 // laneEvent resolves the owning lane and emits one deduped lane event for the
-// verdict: BLOCKED is sent, READY and MERGED are only recorded (below). The sent key covers the state, PR, head
+// verdict: BLOCKED is sent, MERGED goes once to the PR's design lane (see
+// mergedEvent), and READY is only recorded (below). The sent key covers the state, PR, head
 // and summary so a changed reason set re-notifies while an identical verdict
 // stays quiet. A PR with no owning lane routes to the configured fallback
 // lane; a delivery the notifier fails is retried once on that lane, then
@@ -260,9 +261,9 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // every loop. An empty via means a decision was already logged and the
 // caller stays silent.
 //
-// READY and MERGED are never sent: mergewake merges on its own gate, so no
-// lane has anything to do with either verdict. They are recorded instead (see
-// recordOnlyEvent), which keeps the sent key and the READY clock.
+// READY is never sent: mergewake merges on its own gate, so no lane has
+// anything to do with it. It is recorded instead (see recordOnlyEvent), which
+// keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
 	return s.verdictEvent(ctx, r, pr, state, summary, false)
 }
@@ -274,7 +275,7 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	var e error
 	switch {
 	case state == "ready" || state == "merged":
-		// Recorded below, once the sent key is known; no lane to resolve.
+		// Recorded or sent below, once the sent key is known; each resolves its own lane.
 	case state == "blocked" && authorAction(summary):
 		route, err := s.findingsRoute(ctx, r, pr)
 		if err != nil {
@@ -310,8 +311,11 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	if sent.has(key) {
 		return lane, via, false, nil
 	}
-	if state == "ready" || state == "merged" {
+	if state == "ready" {
 		return s.recordOnlyEvent(ctx, r, pr, state, summary, key, baseBehind, sent)
+	}
+	if state == "merged" {
+		return s.mergedEvent(ctx, r, pr, summary, key, sent)
 	}
 	if sent.has("decided " + key) {
 		return "", "", false, nil
@@ -390,7 +394,7 @@ func (s *Service) workerLane(ctx context.Context, r config.Repo, pr github.Pull)
 	return "", "", nil
 }
 
-// recordOnlyEvent records a READY or MERGED without sending it. The decision
+// recordOnlyEvent records a READY without sending it. The decision
 // is recorded as if it had been sent — the sent key so it is not retried every
 // pass, and the READY clock so ready_too_long still counts from the verdict —
 // with one logged pr-notify row naming the author worker lane the event would
@@ -426,9 +430,80 @@ func (s *Service) recordOnlyEvent(ctx context.Context, r config.Repo, pr github.
 	return "", "", false, nil
 }
 
+// mergedRecord is the pr-notify row of one MERGED decision.
+type mergedRecord struct {
+	PR         int    `json:"pr"`
+	Head       string `json:"head"`
+	State      string `json:"state"`
+	Summary    string `json:"summary,omitempty"`
+	Lane       string `json:"lane,omitempty"`
+	Via        string `json:"via,omitempty"`
+	Sent       bool   `json:"sent"`
+	Suppressed string `json:"suppressed,omitempty"`
+}
+
+// mergedEvent sends one MERGED per (PR, head) to the PR's design lane: a valid
+// Mergewake-Notify-Lane trailer, else the repo lane. With neither, nothing is
+// sent and the row says "no design lane"; the desk fallback never gets it. The
+// sent key is added only after a successful send, so a failed send is returned
+// (as errNotifyDelivery) and the next pass retries; the merge itself is never
+// blocked by it.
+func (s *Service) mergedEvent(ctx context.Context, r config.Repo, pr github.Pull, summary, key string, sent *sentKeys) (string, string, bool, error) {
+	lane, via, e := s.mergedLane(ctx, r, pr)
+	if e != nil {
+		return "", "", false, e
+	}
+	record := mergedRecord{PR: pr.Number, Head: pr.Head.SHA, State: "merged", Summary: summary}
+	if lane == "" {
+		record.Suppressed = "no design lane"
+		if e = sent.add(key); e != nil {
+			return "", "", false, e
+		}
+		return "", "", false, s.audit(r.Name, "pr-notify", record, false)
+	}
+	merge := ""
+	if pr.MergeCommitSHA != "" {
+		merge = " merge=" + short7(pr.MergeCommitSHA)
+	}
+	text := fmt.Sprintf("[mergewake] MERGED %s#%d head=%s%s | %s | lane=%s via %s",
+		r.Name, pr.Number, short7(pr.Head.SHA), merge, summary, lane, via)
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	if e = s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   fmt.Sprintf("mergewake-merged-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA),
+		Text: clip(text, findingsLaneText),
+		Lane: lane,
+		Type: verdictType("merged", via),
+	}); e != nil {
+		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
+	}
+	if e = sent.add(key); e != nil {
+		return "", "", false, e
+	}
+	record.Lane, record.Via, record.Sent = lane, via, true
+	return lane, via, true, s.audit(r.Name, "pr-notify", record, false)
+}
+
+// mergedLane is the design lane a MERGED goes to: a valid Mergewake-Notify-Lane
+// trailer (the PR body, then the head commit), else the repo's valid lane. Empty
+// when neither names one.
+func (s *Service) mergedLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", func(v string) bool { return laneName.MatchString(v) })
+	if e != nil {
+		return "", "", e
+	}
+	if laneName.MatchString(notify) {
+		return notify, "notify-lane trailer", nil
+	}
+	if laneName.MatchString(r.Lane) {
+		return r.Lane, "repo lane", nil
+	}
+	return "", "", nil
+}
+
 // eventType is the panewire notification type a verdict is declared with, so
-// a BLOCKED stays unread on the receiving lane until it is acked. READY and
-// MERGED are recorded rather than sent, so their types are only named here.
+// a BLOCKED stays unread on the receiving lane until it is acked. READY is
+// recorded rather than sent, so its type is only named here.
 func eventType(state string) string {
 	switch state {
 	case "ready", "blocked", "merged":
