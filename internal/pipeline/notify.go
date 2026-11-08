@@ -367,17 +367,18 @@ func verdictKey(state string, n int, head string) string {
 }
 
 // workerLane resolves the PR author's worker lane: the job hk bound to its
-// task, else the author pane's job (the first two steps of findingsRoute).
+// task, taken over by a live author pane when there is one, else the author
+// pane's job (the first two steps of findingsRoute, through the same helper).
 // Empty when neither gives a lane. A read error retries rather than reroutes.
 func (s *Service) workerLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
 	task, e := s.prTask(ctx, r, pr)
 	if e != nil {
 		return "", "", e
 	}
-	if lane, via, e := s.boundJobLane(ctx, task); e != nil {
+	if al, e := s.boundAuthorLane(ctx, r, pr, task); e != nil {
 		return "", "", e
-	} else if lane != "" {
-		return lane, via, nil
+	} else if al.lane != "" {
+		return al.lane, al.via, nil
 	}
 	lane, via, ok, e := s.authorPane(ctx, r, pr)
 	if e != nil {
