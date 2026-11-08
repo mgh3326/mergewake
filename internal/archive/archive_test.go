@@ -372,7 +372,7 @@ func TestResumeIgnoresRecordedOversizedFilesForArchiveMatch(t *testing.T) {
 	finishJob(t, dir)
 	a := archiver(e, "")
 	a.DriveMaxFileBytes = 100
-	h := reap.Host{Jobs: e.jobs}
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
 	p, err := a.Plan(context.Background(), h, "wk-resume-oversized")
 	if err != nil {
 		t.Fatal(err)
@@ -495,7 +495,7 @@ func TestPlanExcludesCredentialsAndListsThem(t *testing.T) {
 func TestPlanSkips(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
-	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	h := reap.Host{Jobs: e.jobs}
 	write(t, filepath.Join(e.jobs, "notask", "report.md"), "r\n")
 	write(t, filepath.Join(e.jobs, "notask", "events", "00005-job.completed.json"), `{}`)
 	write(t, filepath.Join(e.jobs, "own-manifest", "manifest.json"), "{}")
@@ -516,7 +516,7 @@ func TestPlanSkips(t *testing.T) {
 func TestPlanRequiresFinishedLifecycle(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
-	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	h := reap.Host{Jobs: e.jobs}
 	writeEvents := func(job string, events ...string) {
 		for i, event := range events {
 			write(t, filepath.Join(e.jobs, job, "events", fmt.Sprintf("%05d-%s.json", i+1, event)), `{}`)
