@@ -19,14 +19,43 @@ Host environment and credentials remain operator-managed and are never installed
 by automatic rollout.
 
 Configure a dedicated hk task per repository and host with `deploy_task: '123'`.
-Use the handoffkeep sink. The rollout asks through `handoffkeep decisions ask`
-with `--human-only`, which provides the Linear/Discord mirror when enabled in hk.
+Use the handoffkeep sink. The rollout reads the task and asks over hk's HTTP API
+as `svc-mergewake` (`GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/decision-request/ask`)
+with a human-only request; it runs no hk CLI. The ask route also opens the
+request's Linear issue and Discord post, so hk must have Linear decisions
+enabled: hk answers `linear_decisions_disabled` otherwise, and the rollout holds.
+Without the `svc-mergewake` credential the rollout holds too.
 Do not share these tasks: a different open question is held without superseding
 it. Polling the same question is idempotent. No response, rejection, expiry,
 withdrawal, or an hk error keeps the current version running. Only option A on
 an answered human-only request for the exact question permits installation.
 The question contains host, repository, previous commit, release commit,
 matched paths, and reasons. A newer release requires a different answer.
+
+### Lookup by request id
+
+The rollout looks the answer up by hk request id, not by question text. After
+it asks, it writes the request id, the task and the question to
+`<state_dir>/<repo>/rollout/deploy-decision.json` (mode 0600, replaced atomically),
+beside the rollout receipts. A later poll, including one after a restart,
+counts the task's current request only when all of these hold:
+
+- its id is the recorded id, or it supersedes the recorded id (the record then
+  moves to the new id);
+- the record is for the same task and question;
+- its question text still equals the question, as an extra check;
+- it is human-only.
+
+A request with the same question text but another id is never approved. If it
+is open and not expired, the rollout holds with "another deployment decision is
+open"; otherwise the rollout asks its own request and records that id.
+
+Compatibility with requests asked before this lookup (one time): while
+`deploy-decision.json` does not exist, the old rule applies. A human-only
+request whose question text equals the question is adopted, and its id is
+recorded. From then on it is matched by id. Once the file exists, adoption by
+question text is over for that repository, for every later question. Do not
+delete the file to approve a request: deleting it reopens the one-time adoption.
 
 ## Operator rollout
 
@@ -35,7 +64,9 @@ matched paths, and reasons. A newer release requires a different answer.
    a deployed version through an approved bootstrap. Until then rollout holds.
 3. Create a dedicated hk task for each repository/host, set `deploy_task` in
    the private host inventory, and configure `sink.type: handoffkeep`.
-4. Ensure hk supports `decisions ask` and its Linear and Discord mirrors.
+4. Ensure hk serves `POST /v1/tasks/{id}/decision-request/ask` with Linear
+   decisions enabled and its Discord mirror, and that the host has the
+   `svc-mergewake` hk credential.
 5. Run `mergewake rollout --help` for inventory selection flags, then a dry run.
    A fresh installation must print `hold` with an unknown previous receipt.
 6. Enable rollout polling only after reviewing the proposed inventory, rollback
