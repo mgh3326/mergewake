@@ -111,6 +111,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
       - name: Wait for the tag commit's policy checks
         env:
           GH_TOKEN: ${{ github.token }}
