@@ -649,7 +649,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		note += ": " + result.Reason
 	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.designLane(r)}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}

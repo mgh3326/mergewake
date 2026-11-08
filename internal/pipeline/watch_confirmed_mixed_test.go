@@ -79,7 +79,7 @@ func TestWatchConfirmedHeadConflictHolds(t *testing.T) {
 	if rows := auditRows(t, s, r, "recovery-conflict-head"); len(rows) != 1 {
 		t.Fatalf("decision rows %v", rows)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "checks conflict") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "checks conflict") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 
@@ -90,7 +90,7 @@ func TestWatchConfirmedHeadConflictHolds(t *testing.T) {
 	if rows := auditRows(t, s, r, "recovery-conflict-head"); len(rows) != 1 {
 		t.Fatalf("decision recorded again: %v", rows)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 {
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("repeat told the design lane: %v", lines)
 	}
 	if g.revertCount != 0 || g.merges != 0 {
@@ -130,7 +130,7 @@ func TestWatchConfirmedHeadConflictBeforeRevertHolds(t *testing.T) {
 	if rows := auditRows(t, s, r, "recovery-conflict-head"); len(rows) != 1 {
 		t.Fatalf("decision rows %v", rows)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 {
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -158,7 +158,7 @@ func TestWatchDeployConfirmedHeadConflictHolds(t *testing.T) {
 	if !found || after.Flaky != "" || !after.Confirmed || after.Culprit != shaB || after.RevertPR != 0 {
 		t.Fatalf("deploy incident %+v found=%t", after, found)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "deploy watch") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "deploy watch") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -214,7 +214,7 @@ func TestWatchConfirmedHeadConflictRestartKeepsDecision(t *testing.T) {
 	if rows := auditRows(t, fresh, r, "recovery-conflict-head"); len(rows) != 1 {
 		t.Fatalf("decision rows after restart %v", rows)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 {
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("restart told the design lane again: %v", lines)
 	}
 	if g.revertCount != 0 {

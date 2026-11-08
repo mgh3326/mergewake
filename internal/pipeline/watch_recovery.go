@@ -87,19 +87,6 @@ var (
 	_ openLister      = (*github.Client)(nil)
 )
 
-// designLane is the repository's design-session (owner) lane: repos[].lane
-// when set, else the desk (notifier.fallback_lane, else notifier.lane).
-func (s *Service) designLane(r config.Repo) string {
-	if laneName.MatchString(r.Lane) {
-		return r.Lane
-	}
-	desk := s.Config.Notifier.FallbackLane
-	if desk == "" {
-		desk = s.Config.Notifier.Lane
-	}
-	return desk
-}
-
 func (s *Service) recoveryFile(repo string) string {
 	return filepath.Join(s.state(repo), "recovery.json")
 }
@@ -965,7 +952,7 @@ func (s *watchStream) announceRevert(ctx context.Context, r config.Repo, st reco
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   fmt.Sprintf("mergewake-recovery-merged-%s-%d", r.Name, revertPR),
 		Text: text,
-		Lane: s.designLane(r),
+		Lane: s.ownerLane(r),
 		Type: "info",
 	}); e != nil {
 		return e
