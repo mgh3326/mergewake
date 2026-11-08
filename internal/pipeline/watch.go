@@ -500,7 +500,7 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 		result.Action = "recovery-confirming"
 		result.Reason = reason
 		if needsDesk {
-			return s.reportWatch(ctx, r, result, head+":confirm:"+reason, o)
+			return s.reportWatch(ctx, r, result, "recovery:"+culprit+":confirm:"+reason, o)
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}

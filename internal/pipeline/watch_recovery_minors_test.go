@@ -244,3 +244,24 @@ func TestUrgentMarkTellsTheQueue(t *testing.T) {
 		t.Fatalf("hook calls %v, want one for PR 11", calls)
 	}
 }
+
+// A confirmation hold that needs the desk is reported once per incident, by
+// the incident's key: the first poll, which records the incident, and the polls
+// after it, which read the record, must agree on the key or one hold is
+// announced twice.
+func TestConfirmationHoldIsReportedOncePerIncident(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, _, _, n, r := recoverySetup(t, nil) // no any_ref_workflow: the hold needs the desk
+	s.Now = func() time.Time { return now }
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "no any_ref_workflow") {
+		t.Fatalf("first pass %+v", got)
+	}
+	now = now.Add(time.Minute)
+	if got = recoveryWatch(t, s, r); got.Action != "recovery-confirming" {
+		t.Fatalf("second pass %+v", got)
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("one hold was reported %d times: %v", len(lines), lines)
+	}
+}
