@@ -849,11 +849,15 @@ its machine token `HANDOFFKEEP_TOKEN`. The `sink.command` subprocesses
 (`handoffkeep tasks …`, `doc put`, `attach put`) still run the hk CLI with
 the CLI's own credential.
 
-The daemon gets the variables from `~/.config/mergewake/environment` (mode
-0600), the `EnvironmentFile` of
-[deploy/mergewake.service](../deploy/mergewake.service). A command run from a
-shell, such as `mergewake review` or `mergewake watch`, needs them in that
-shell's environment.
+The daemon gets the variables from the unit's `EnvironmentFile`. On oci the
+unit does not load `~/.config/mergewake/environment` (the file does not exist
+there). A unit drop-in adds `EnvironmentFile=%h/.config/mergewake/hk-svc.env`
+(mode 0600) instead; see
+[deploy/mergewake.service](../deploy/mergewake.service). mergewake reads the
+environment only and knows no file path. A command run from a shell, such as
+`mergewake review` or `mergewake watch`, needs the variables in that shell's
+environment. A mergewake run by macOS launchd (for example a `mergewake
+rollout` LaunchAgent) gets no hk HTTP unless its launcher sets the two keys.
 
 If `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` is unset, every hk
 HTTP call behaves as on a host with no hk endpoint. Job records cannot be
@@ -863,12 +867,19 @@ empty. With `sink.type: handoffkeep`, the daemon logs one error line at
 start, `startup check failed`, that names the unset keys and no value. The
 daemon keeps running.
 
-**Rollout.** Before you deploy the mergewake build that reads only
-`HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` (hk 3545), put `HANDOFFKEEP_URL` and
-`HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` from Infisical `/mergewake` into
-`~/.config/mergewake/environment` on every host that runs the daemon. If hk
-is behind Cloudflare Access, add the CF Access pair too. Restart the daemon,
-then check that its log has no `startup check failed` line.
+**Rollout.** Do not roll out the mergewake build that reads only
+`HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` (hk 3545) before
+`~/.config/mergewake/hk-svc.env` exists on the host. Do these in order:
+
+1. The operator or handoffkeep-design writes `HANDOFFKEEP_URL` and
+   `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` (from Infisical `/mergewake`) into
+   `hk-svc.env`, mode 0600. If hk is behind Cloudflare Access, add the CF
+   Access pair too.
+2. Add the unit drop-in `EnvironmentFile=%h/.config/mergewake/hk-svc.env`.
+   The deploying session only adds the drop-in and checks that both key
+   names are in the file.
+3. Restart the daemon.
+4. Check that its log has no `startup check failed` line.
 
 ### `discord`
 
