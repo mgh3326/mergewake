@@ -43,6 +43,7 @@ jobs:
     if: ${{ inputs.suite == 'deploy' }}
     permissions:
       contents: read
+      statuses: write
     uses: ./.github/workflows/deploy.yml
     with:
       ref: ${{ inputs.ref }}
