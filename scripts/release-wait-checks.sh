@@ -159,7 +159,10 @@ func readStatuses(path string) ([]commitStatus, error) {
 // fold mirrors internal/github/client.go foldChecks with preserveVerdicts
 // false: a skipped or neutral run never overrides a sibling that ran, the
 // highest run ID decides a name, the highest status ID decides a context, and
-// two decisive sources that disagree are an error, not a guess.
+// two decisive sources that disagree are an error, not a guess. Release is
+// stricter in one place: a status success never settles a run that is still in
+// flight, because publishing over a pending run is the race this gate exists
+// to prevent.
 func fold(runs []checkRun, statuses []commitStatus) (map[string]string, map[string]string, error) {
 	states := map[string]string{}
 	urls := map[string]string{}
@@ -216,6 +219,13 @@ func fold(runs []checkRun, statuses []commitStatus) (map[string]string, map[stri
 				return nil, nil, fmt.Errorf("check %q: run and status disagree", name)
 			}
 			if decisive(old) {
+				continue
+			}
+			// A run still in flight is newer evidence than a status with the
+			// same name: a status success must not publish over a pending run.
+			// A cancelled or skipped run holds no verdict, so a status may
+			// settle it as the gate allows, and a status failure still fails.
+			if old == "pending" && state == "success" {
 				continue
 			}
 		}

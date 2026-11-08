@@ -254,6 +254,34 @@ else
 	fail "(j) transient retry -> exit $status: $output"
 fi
 
+# (k) A status success must not settle a run of the same name that is in flight.
+reset
+policy 'version: 1
+required_checks: [vet]
+watch_checks: [ci-ok]'
+run 1 ci-ok in_progress '' https://ci.example/run
+status_line 1 ci-ok success https://ci.example/status
+run_checks 1
+if [ "$status" -ne 0 ] && has 'timed out' && has 'ci-ok'; then
+	pass "(k) status success never settles a pending run -> exit $status"
+else
+	fail "(k) pending run vs status success -> exit $status: $output"
+fi
+
+# (l) A status failure still fails the release while the run is pending.
+reset
+policy 'version: 1
+required_checks: [vet]
+watch_checks: [ci-ok]'
+run 1 ci-ok in_progress '' https://ci.example/run
+status_line 1 ci-ok failure https://ci.example/status
+run_checks 10
+if [ "$status" -ne 0 ] && has 'failure' && has 'https://ci.example/status'; then
+	pass "(l) status failure still fails a pending run -> exit $status"
+else
+	fail "(l) pending run vs status failure -> exit $status: $output"
+fi
+
 if [ "$failures" -ne 0 ]; then
 	printf '%d case(s) failed\n' "$failures"
 	exit 1
