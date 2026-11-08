@@ -172,51 +172,87 @@ func TestReviewerWatchWakesOncePerJob(t *testing.T) {
 }
 
 // (d) hk errors wake nothing, log one line per outage and never stop the role.
+// Ticks are driven explicitly: the number of reads a wall-clock sleep produces
+// depends on the scheduler, so the test counts reads per tick instead.
 func TestReviewerWatchHKOutageLogsOnceAndRoleKeepsRunning(t *testing.T) {
-	h := newHK(WatchedJob{Repo: repo, PR: 7, Label: "rev-7"}, WatchedJob{Repo: repo, PR: 8, Label: "rev-8"})
-	h.err = errors.New("hk unreachable")
-	var buf syncBuf
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", Log: slog.New(slog.NewJSONHandler(&buf, nil)),
-		ReviewerWakeGap: 10 * time.Millisecond, Reviewers: watchFor(h, &buf, &Dirty{}, nil)}
-	d.Reviewers.Every = 10 * time.Millisecond
-	runs := make(chan struct{}, 16)
-	done := make(chan error, 1)
-	go func() {
-		done <- d.Run(ctx, []Loop{{Role: "pr", Interval: time.Hour, Run: func(context.Context) error { runs <- struct{}{}; return nil }}})
-	}()
-	<-runs
-	time.Sleep(300 * time.Millisecond) // ~30 ticks
-	select {
-	case <-runs:
-		t.Fatal("an hk outage woke the role")
-	default:
-	}
-	if n := len(buf.msgs("reviewer watch: hk unreadable; interval and webhook wakes continue")); n != 1 {
-		t.Fatalf("outage log lines=%d, want 1", n)
-	}
-	// The watch stops at the first failed read, so one outage is one read per tick.
-	if reads := h.readCount(); reads > 40 {
-		t.Fatalf("reads=%d", reads)
-	}
-	// The webhook seam still works, and the watch recovers when hk does.
-	d.Trigger("pr")
-	h.mu.Lock()
-	h.err = nil
-	h.mu.Unlock()
-	h.set("rev-7", JobView{State: "completed"})
-	for range 2 {
+	t.Run("one read per tick, one log line per outage, no wake", func(t *testing.T) {
+		h := newHK(WatchedJob{Repo: repo, PR: 7, Label: "rev-7"}, WatchedJob{Repo: repo, PR: 8, Label: "rev-8"})
+		h.err = errors.New("hk unreachable")
+		var buf syncBuf
+		wakes := 0
+		w := watchFor(h, &buf, &Dirty{}, func() { wakes++ })
+		// The tick stops at the first failed read, so a tick reads exactly one
+		// record while hk is down, however much work the two jobs would be.
+		base := h.readCount()
+		for i := range 20 {
+			w.Tick(context.Background())
+			if reads := h.readCount() - base; reads != i+1 {
+				t.Fatalf("after %d ticks reads=%d, want one per tick: the tick must stop at the first failed read", i+1, reads)
+			}
+		}
+		if wakes != 0 {
+			t.Fatalf("an hk outage woke the role: wakes=%d", wakes)
+		}
+		if n := len(buf.msgs("reviewer watch: hk unreadable; interval and webhook wakes continue")); n != 1 {
+			t.Fatalf("outage log lines over 20 ticks=%d, want 1", n)
+		}
+	})
+
+	t.Run("role keeps running, the webhook wakes it and the watch recovers", func(t *testing.T) {
+		h := newHK(WatchedJob{Repo: repo, PR: 7, Label: "rev-7"})
+		h.err = errors.New("hk unreachable")
+		var buf syncBuf
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		d := Daemon{StateDir: t.TempDir(), LockDir: t.TempDir(), Host: "host-a", Log: slog.New(slog.NewJSONHandler(&buf, nil)),
+			ReviewerWakeGap: 10 * time.Millisecond, Reviewers: watchFor(h, &buf, &Dirty{}, nil)}
+		d.Reviewers.Every = 10 * time.Millisecond
+		runs := make(chan struct{}, 16)
+		done := make(chan error, 1)
+		go func() {
+			done <- d.Run(ctx, []Loop{{Role: "pr", Interval: time.Hour, Run: func(context.Context) error { runs <- struct{}{}; return nil }}})
+		}()
+		<-runs
+		// Wait for the running watch to hit the outage, then show it woke nothing.
+		deadline := time.After(3 * time.Second)
+		for len(buf.msgs("reviewer watch: hk unreadable; interval and webhook wakes continue")) == 0 {
+			select {
+			case <-deadline:
+				t.Fatal("the watch did not observe the outage")
+			case <-time.After(time.Millisecond):
+			}
+		}
+		select {
+		case <-runs:
+			t.Fatal("an hk outage woke the role")
+		default:
+		}
+		if n := len(buf.msgs("reviewer watch: hk unreadable; interval and webhook wakes continue")); n != 1 {
+			t.Fatalf("outage log lines=%d, want 1", n)
+		}
+		// The webhook seam still works. Wait for its pass before hk returns, so
+		// the recovery wake is not coalesced into the webhook wake.
+		d.Trigger("pr")
+		select {
+		case <-runs:
+		case <-time.After(3 * time.Second):
+			t.Fatal("webhook wake did not start a pass")
+		}
+		// hk returns; the watch sees the finished job and wakes the role.
+		h.mu.Lock()
+		h.err = nil
+		h.mu.Unlock()
+		h.set("rev-7", JobView{State: "completed"})
 		select {
 		case <-runs:
 		case <-time.After(3 * time.Second):
 			t.Fatal("role stopped waking after the outage")
 		}
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // (e) With no live reviewer jobs the watch reads nothing; and it reads at most 50 per tick.
