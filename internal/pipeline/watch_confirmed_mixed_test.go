@@ -219,3 +219,35 @@ func TestWatchConfirmedHeadRerunRestartKeepsDecision(t *testing.T) {
 		t.Fatalf("restart opened a revert: %d", g.revertCount)
 	}
 }
+
+// (f) The recorded decision also stops a revert that is already open: an
+// incident holding the mixed result does not merge it when a later pass reads
+// the head red again.
+func TestWatchConfirmedHeadRerunStopsRevertMerge(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.head = shaB
+		l.parents = map[string]string{shaB: shaA}
+	})
+	s.Now = func() time.Time { return now }
+	st := recoveryIncident{
+		RedSince: now.Add(-fixWindow), Culprit: shaB, CulpritPR: 7, Head: shaB, Baseline: shaA, Task: "42",
+		Checks: "CI", Runs: map[string][]bool{shaA: {true, true}, shaB: {false, false}},
+		Confirmed: true, Flaky: "the culprit passed a re-run after confirmation", RevertPR: 9,
+	}
+	if e := s.saveRecovery(r.Name, st); e != nil {
+		t.Fatal(e)
+	}
+
+	got := recoveryWatch(t, s, r)
+	if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "passed a re-run after confirmation") {
+		t.Fatalf("%+v", got)
+	}
+	if g.merges != 0 {
+		t.Fatalf("merged the revert of a flaky incident: %d", g.merges)
+	}
+	if lines := designLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines: %v", lines)
+	}
+}
