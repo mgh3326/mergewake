@@ -149,7 +149,7 @@ func recoveryWatch(t *testing.T, s *Service, r config.Repo) watchResult {
 	return got
 }
 
-func designLaneEvents(n *fakeNotifier) []string {
+func ownerLaneEvents(n *fakeNotifier) []string {
 	var out []string
 	for _, e := range n.events {
 		if e.Lane == "design-lane" {
@@ -235,7 +235,7 @@ func TestWatchFixWinsInsideWindow(t *testing.T) {
 	if _, e := os.Stat(s.recoveryFile(r.Name)); !os.IsNotExist(e) {
 		t.Fatalf("recovery state kept: %v", e)
 	}
-	if got := designLaneEvents(n); len(got) != 0 {
+	if got := ownerLaneEvents(n); len(got) != 0 {
 		t.Fatalf("fix-won notified the design lane: %v", got)
 	}
 }
@@ -260,7 +260,7 @@ func TestWatchRevertMergesAfterWindow(t *testing.T) {
 	if sink.reopens != 1 {
 		t.Fatalf("task reopened %d times", sink.reopens)
 	}
-	lines := designLaneEvents(n)
+	lines := ownerLaneEvents(n)
 	if len(lines) != 1 {
 		t.Fatalf("%d design-lane lines: %v", len(lines), lines)
 	}
@@ -273,7 +273,7 @@ func TestWatchRevertMergesAfterWindow(t *testing.T) {
 	if got := recoveryWatch(t, s, r); got.Action != "operator-required-recovery-latch" {
 		t.Fatalf("repeat: %+v", got)
 	}
-	if len(designLaneEvents(n)) != 1 || g.merges != 1 {
+	if len(ownerLaneEvents(n)) != 1 || g.merges != 1 {
 		t.Fatalf("repeat merged or announced again: %d", g.merges)
 	}
 }
@@ -301,7 +301,7 @@ func TestWatchRevertCIBlocksMerge(t *testing.T) {
 			if g.merges != 0 {
 				t.Fatalf("merged with %s revert CI", ci)
 			}
-			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "revert PR CI is "+string(ci)) {
+			if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "revert PR CI is "+string(ci)) {
 				t.Fatalf("%d design-lane lines: %v", len(lines), lines)
 			}
 		})
@@ -327,7 +327,7 @@ func TestWatchRevertNotExactInverse(t *testing.T) {
 	if g.merges != 0 {
 		t.Fatal("merged a revert that is not the exact inverse")
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 {
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("%v", lines)
 	}
 }
@@ -381,7 +381,7 @@ func TestWatchBlockingCulpritReportOnly(t *testing.T) {
 	if _, e := os.Stat(s.recoveryFile(r.Name)); !os.IsNotExist(e) {
 		t.Fatalf("recovery state written: %v", e)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 {
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -448,7 +448,7 @@ func TestWatchFlakyFailureNoRevert(t *testing.T) {
 			if !found || st.Culprit != shaB || st.Baseline != shaA || st.Flaky == "" {
 				t.Fatalf("incident %+v found=%t", st, found)
 			}
-			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+			if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 				t.Fatalf("design-lane lines: %v", lines)
 			}
 			// A later pass reads the flaky record without re-blaming a later
@@ -458,8 +458,8 @@ func TestWatchFlakyFailureNoRevert(t *testing.T) {
 			if got.Action != "recovery-confirming" || !strings.Contains(got.Reason, "culprit passed a re-run") {
 				t.Fatalf("repeat: %+v", got)
 			}
-			if g.revertCount != 0 || len(designLaneEvents(n)) != 1 {
-				t.Fatalf("repeat blamed or notified: reverts=%d lines=%v", g.revertCount, designLaneEvents(n))
+			if g.revertCount != 0 || len(ownerLaneEvents(n)) != 1 {
+				t.Fatalf("repeat blamed or notified: reverts=%d lines=%v", g.revertCount, ownerLaneEvents(n))
 			}
 			if st, _ = recoveryState(t, s, r); st.Culprit != shaB || st.Baseline != shaA {
 				t.Fatalf("culprit or boundary moved: %+v", st)
@@ -553,7 +553,7 @@ func TestWatchFlakyHeadCulpritNoAmbiguity(t *testing.T) {
 			if g.revertCount != 0 || g.merges != 0 {
 				t.Fatal("a flaky failure was blamed")
 			}
-			if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+			if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 				t.Fatalf("design-lane lines: %v", lines)
 			}
 			if failed == "commit-status" {
@@ -609,7 +609,7 @@ func TestWatchNewHeadAfterHeadCulpritRerunKeepsIncident(t *testing.T) {
 	if g.revertCount != 0 {
 		t.Fatal("a flaky failure was blamed")
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -641,7 +641,7 @@ func TestWatchHeadCulpritTimeoutKeepsMixedResult(t *testing.T) {
 	if got.Action != "healthy" {
 		t.Fatalf("%+v", got)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 	if _, found := recoveryState(t, s, r); found {
@@ -690,7 +690,7 @@ func TestWatchPendingSiblingStillResolvesIncident(t *testing.T) {
 	if !found || st.Flaky == "" || st.Culprit != shaC {
 		t.Fatalf("incident %+v found=%t", st, found)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "passed a re-run") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 	if g.revertCount != 0 {
@@ -745,7 +745,7 @@ func TestWatchGreenThenRedWithLatchHolds(t *testing.T) {
 	if g.merges != 0 {
 		t.Fatal("merged a revert for a failure that was already fixed")
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "green after the incident") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "green after the incident") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -780,7 +780,7 @@ func TestWatchFixPRMatchesCurrentHead(t *testing.T) {
 	if priority := s.ReviewPriority(context.Background(), r, fixPull(advancedHead)); priority.Value != 1 || priority.Source != "recovery-fix" {
 		t.Fatalf("fix PR priority %+v", priority)
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "#11") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "#11") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -833,7 +833,7 @@ func TestWatchRevertWrongBaseHeld(t *testing.T) {
 	if g.merges != 0 {
 		t.Fatal("merged a revert into another branch")
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "targets release") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "targets release") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -877,7 +877,7 @@ func TestWatchRevertMergeRechecksMainCI(t *testing.T) {
 	if g.merges != 0 {
 		t.Fatal("merged the revert on a green main")
 	}
-	if lines := designLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "main CI is green") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "main CI is green") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
 }
@@ -955,7 +955,7 @@ func TestWatchFixPRHoldsRevert(t *testing.T) {
 	if got.Action != "recovery-merged" || g.merges != 1 {
 		t.Fatalf("%+v merges=%d", got, g.merges)
 	}
-	lines := designLaneEvents(n)
+	lines := ownerLaneEvents(n)
 	if len(lines) != 2 || !strings.Contains(lines[0], "#11") || !strings.Contains(lines[1], "reverted by PR #9") {
 		t.Fatalf("design-lane lines: %v", lines)
 	}
@@ -980,7 +980,7 @@ func TestWatchFixPRMergesGreenClosesRevert(t *testing.T) {
 	if len(g.closed) != 1 || g.closed[0] != 9 || g.clears != 1 {
 		t.Fatalf("closed=%v clears=%d", g.closed, g.clears)
 	}
-	if lines := designLaneEvents(n); len(lines) != 0 {
+	if lines := ownerLaneEvents(n); len(lines) != 0 {
 		t.Fatalf("fix-won notified the design lane: %v", lines)
 	}
 }

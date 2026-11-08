@@ -47,6 +47,10 @@ type recoveryIncident struct {
 	// Pending maps a commit watch dispatched any-ref CI for to the dispatch
 	// time; only statuses posted after it count as that run's result.
 	Pending map[string]time.Time `json:"pending,omitempty"`
+	// PendingRuns maps a pending commit to the id of the workflow run its
+	// dispatch started, when GitHub reported one. Only that run's statuses
+	// count as the re-run's result.
+	PendingRuns map[string]int64 `json:"pending_runs,omitempty"`
 	// Dispatches counts the re-runs per commit, bounding them at confirmRuns.
 	Dispatches map[string]int `json:"dispatches,omitempty"`
 	Confirmed  bool           `json:"confirmed,omitempty"`
@@ -55,7 +59,11 @@ type recoveryIncident struct {
 	RevertPR  int    `json:"revert_pr,omitempty"`
 	RevertURL string `json:"revert_url,omitempty"`
 	FixPR     int    `json:"fix_pr,omitempty"`
-	Yielding  bool   `json:"yielding,omitempty"`
+	// TaskReopen is the outcome of reopening the culprit's task when the revert
+	// PR opened: "reopened", "failed" or "none" (no task). Empty means the
+	// incident predates the record.
+	TaskReopen string `json:"task_reopen,omitempty"`
+	Yielding   bool   `json:"yielding,omitempty"`
 }
 
 // revertCloser closes an open pull request without merging it.
@@ -74,6 +82,12 @@ type statusReader interface {
 	LatestStatus(context.Context, string, string, string) (github.CI, time.Time, bool, error)
 }
 
+// runStatusReader reads the newest commit status a check name has on a sha
+// from one workflow run, so another run's status for the same sha is not read.
+type runStatusReader interface {
+	LatestRunStatus(context.Context, string, string, string, int64) (github.CI, time.Time, bool, error)
+}
+
 // openLister lists the open pull requests of a repository.
 type openLister interface {
 	OpenPulls(context.Context, string, string) ([]github.Pull, error)
@@ -84,21 +98,9 @@ var (
 	_ revertCloser    = (*github.Client)(nil)
 	_ treeReader      = (*github.Client)(nil)
 	_ statusReader    = (*github.Client)(nil)
+	_ runStatusReader = (*github.Client)(nil)
 	_ openLister      = (*github.Client)(nil)
 )
-
-// designLane is the repository's design-session (owner) lane: repos[].lane
-// when set, else the desk (notifier.fallback_lane, else notifier.lane).
-func (s *Service) designLane(r config.Repo) string {
-	if laneName.MatchString(r.Lane) {
-		return r.Lane
-	}
-	desk := s.Config.Notifier.FallbackLane
-	if desk == "" {
-		desk = s.Config.Notifier.Lane
-	}
-	return desk
-}
 
 func (s *Service) recoveryFile(repo string) string {
 	return filepath.Join(s.state(repo), "recovery.json")
@@ -206,6 +208,16 @@ func (s *watchStream) recordRecoveryRevert(repo, url string, pr int) error {
 	return s.saveRecovery(repo, st)
 }
 
+// recordTaskReopen stores the outcome of reopening the culprit's task.
+func (s *watchStream) recordTaskReopen(repo, outcome string) error {
+	st, found, e := s.loadRecovery(repo)
+	if e != nil || !found {
+		return e
+	}
+	st.TaskReopen = outcome
+	return s.saveRecovery(repo, st)
+}
+
 // pullNumber reads the PR number out of a pull request URL.
 func pullNumber(url string) int {
 	n, _ := strconv.Atoi(url[strings.LastIndex(url, "/")+1:])
@@ -269,7 +281,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 	// completed mixed result is lost behind the timeout.
 	var timedOut []string
 	for sha, at := range st.Pending {
-		state, ready, e := s.rerunOutcome(ctx, reader, r, sha, names, at)
+		state, ready, e := s.rerunOutcome(ctx, reader, r, sha, names, at, st.PendingRuns[sha])
 		if e != nil {
 			return st, false, "", false, e
 		}
@@ -280,6 +292,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 			continue
 		}
 		delete(st.Pending, sha)
+		delete(st.PendingRuns, sha)
 		st.Runs[sha] = append(st.Runs[sha], state == github.Green)
 	}
 	for _, v := range st.Runs[st.Baseline] {
@@ -301,6 +314,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 	if len(timedOut) > 0 {
 		for _, sha := range timedOut {
 			delete(st.Pending, sha)
+			delete(st.PendingRuns, sha)
 		}
 		return hold(st, "any-ref re-run timed out on "+short7(timedOut[0]))
 	}
@@ -338,12 +352,22 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 		// The re-run repeats the scope the original verdict judged. Narrowing it
 		// to the culprit's changed packages would let a dependent package's
 		// failure pass unseen and read as a flaky culprit.
-		if e := s.dispatch(ctx, dispatcher, r, p, sha); e != nil {
+		run, e := s.dispatch(ctx, dispatcher, r, p, sha)
+		if e != nil {
 			if github.DispatchRefused(e) {
 				delete(st.Pending, sha)
 				return hold(st, "any-ref CI dispatch refused for "+short7(sha)+": "+e.Error())
 			}
 			return st, false, "", false, e
+		}
+		if run != 0 {
+			if st.PendingRuns == nil {
+				st.PendingRuns = map[string]int64{}
+			}
+			st.PendingRuns[sha] = run
+			if e := save(st); e != nil {
+				return st, false, "", false, e
+			}
 		}
 	}
 	if e := save(st); e != nil {
@@ -355,11 +379,20 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 }
 
 // rerunOutcome reads the any-ref statuses a dispatch posted after at. ready is
-// false until every check has a status newer than the dispatch.
-func (s *Service) rerunOutcome(ctx context.Context, reader statusReader, r config.Repo, sha string, names []string, at time.Time) (github.CI, bool, error) {
+// false until every check has a status newer than the dispatch. When GitHub
+// named the dispatch's workflow run, only that run's statuses count.
+func (s *Service) rerunOutcome(ctx context.Context, reader statusReader, r config.Repo, sha string, names []string, at time.Time, run int64) (github.CI, bool, error) {
 	outcome := github.Green
 	for _, name := range names {
-		state, seenAt, ok, e := reader.LatestStatus(ctx, r.Name, sha, name)
+		var state github.CI
+		var seenAt time.Time
+		var ok bool
+		var e error
+		if rr, bound := reader.(runStatusReader); bound && run != 0 {
+			state, seenAt, ok, e = rr.LatestRunStatus(ctx, r.Name, sha, name, run)
+		} else {
+			state, seenAt, ok, e = reader.LatestStatus(ctx, r.Name, sha, name)
+		}
 		if e != nil {
 			return "", false, e
 		}
@@ -684,35 +717,45 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			return s.audit(r.Name, "watch", result, o.DryRun)
 		}
 	}
+	// A fix PR is named and put first in the review queue from the poll that
+	// sees it, inside the initial window too: the window is when it is needed.
+	fix, e := s.fixPR(ctx, r, st)
+	if e != nil {
+		return e
+	}
+	if fix != nil && s.now().Sub(st.RedSince) >= 2*fixWindow {
+		fix = nil
+	}
+	// The recorded fix PR number does not prove the urgent mark was written: a
+	// failed write is retried until the mark reads back.
+	if fix != nil && (st.FixPR != fix.Number || acting && !s.urgentFix(r.Name, fix.Number)) {
+		st.FixPR = fix.Number
+		if acting {
+			if e = s.saveRecovery(r.Name, st); e != nil {
+				return e
+			}
+			if e = s.markUrgent(r.Name, fix.Number); e != nil {
+				return e
+			}
+			fixMarkedUrgent(ctx, r.Name, fix.Number)
+		}
+		priority := s.ReviewPriority(ctx, r, *fix)
+		row := struct {
+			PR       int    `json:"pr"`
+			Head     string `json:"head"`
+			Priority int    `json:"priority"`
+			Source   string `json:"priority_source"`
+		}{fix.Number, fix.Head.SHA, priority.Value, priority.Source}
+		if e = s.audit(r.Name, "recovery-fix-pr", row, o.DryRun); e != nil {
+			return e
+		}
+	}
 	if remaining := fixWindow - s.now().Sub(st.RedSince); remaining > 0 {
 		result.Action = "recovery-fix-window"
 		result.Reason = "fix window: " + remaining.Round(time.Minute).String() + " remaining"
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	if fix, e := s.fixPR(ctx, r, st); e != nil {
-		return e
-	} else if fix != nil && s.now().Sub(st.RedSince) < 2*fixWindow {
-		if st.FixPR != fix.Number {
-			st.FixPR = fix.Number
-			if acting {
-				if e = s.saveRecovery(r.Name, st); e != nil {
-					return e
-				}
-				if e = s.markUrgent(r.Name, fix.Number); e != nil {
-					return e
-				}
-			}
-			priority := s.ReviewPriority(ctx, r, *fix)
-			row := struct {
-				PR       int    `json:"pr"`
-				Head     string `json:"head"`
-				Priority int    `json:"priority"`
-				Source   string `json:"priority_source"`
-			}{fix.Number, fix.Head.SHA, priority.Value, priority.Source}
-			if e = s.audit(r.Name, "recovery-fix-pr", row, o.DryRun); e != nil {
-				return e
-			}
-		}
+	if fix != nil {
 		result.Action = "recovery-fix-pr"
 		result.Reason = fmt.Sprintf("fix PR #%d is open; the revert waits", fix.Number)
 		return s.reportWatch(ctx, r, result, "recovery-fix:"+strconv.Itoa(pr.Number)+":"+strconv.Itoa(fix.Number), o)
@@ -958,14 +1001,21 @@ func (s *watchStream) announceRevert(ctx context.Context, r config.Repo, st reco
 	if s.deploy {
 		stage = "deploy"
 	}
-	text := fmt.Sprintf("%s %s red since %s by PR #%d; reverted by PR #%d after %s; task %s reopened",
-		r.Name, stage, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, task)
+	taskNote := "task " + task + " reopened"
+	switch st.TaskReopen {
+	case "failed":
+		taskNote = "task " + task + " reopen failed"
+	case "none":
+		taskNote = "no task to reopen"
+	}
+	text := fmt.Sprintf("%s %s red since %s by PR #%d; reverted by PR #%d after %s; %s",
+		r.Name, stage, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, taskNote)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   fmt.Sprintf("mergewake-recovery-merged-%s-%d", r.Name, revertPR),
 		Text: text,
-		Lane: s.designLane(r),
+		Lane: s.ownerLane(r),
 		Type: "info",
 	}); e != nil {
 		return e
@@ -985,20 +1035,13 @@ func (s *watchStream) fixWon(ctx context.Context, r config.Repo, head string) er
 	if !ok {
 		return nil
 	}
+	// Only a PR the latch provably belongs to is closed, and only then is the
+	// latch cleared. recovery.json's revert PR number does not prove it: after
+	// a replaced latch or a force-pushed recovery branch it names a PR the
+	// current latch is not for. Such a latch stays for an operator.
 	pr, e := latch.RecoveryRevert(ctx, r.Name)
-	if e != nil {
+	if e != nil || pr == nil {
 		return e
-	}
-	if pr == nil {
-		st, found, e := s.loadRecovery(r.Name)
-		if e != nil || !found || st.RevertPR == 0 {
-			return e
-		}
-		open, e := s.GH.Pull(ctx, r.Name, st.RevertPR)
-		if e != nil {
-			return e
-		}
-		pr = &open
 	}
 	if pr.MergedAt != nil || pr.Merged {
 		return nil

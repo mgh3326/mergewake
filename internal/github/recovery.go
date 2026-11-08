@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -216,6 +217,29 @@ func (c *Client) LatestStatus(ctx context.Context, repo, sha, name string) (CI, 
 	found := false
 	for _, s := range statuses {
 		if s.Context != name {
+			continue
+		}
+		if !found || s.UpdatedAt.After(at) {
+			state, at, found = statusState(s.State), s.UpdatedAt, true
+		}
+	}
+	return state, at, found, nil
+}
+
+// LatestRunStatus is LatestStatus restricted to the statuses the workflow run
+// with this id posted: their target_url is that run's page. A status another
+// run posted for the same sha and name is not read.
+func (c *Client) LatestRunStatus(ctx context.Context, repo, sha, name string, run int64) (CI, time.Time, bool, error) {
+	statuses, e := list[status](ctx, c, base(repo)+"/commits/"+sha+"/statuses")
+	if e != nil {
+		return Pending, time.Time{}, false, e
+	}
+	suffix := "/actions/runs/" + strconv.FormatInt(run, 10)
+	var state CI
+	var at time.Time
+	found := false
+	for _, s := range statuses {
+		if s.Context != name || !strings.HasSuffix(strings.TrimRight(s.TargetURL, "/"), suffix) {
 			continue
 		}
 		if !found || s.UpdatedAt.After(at) {

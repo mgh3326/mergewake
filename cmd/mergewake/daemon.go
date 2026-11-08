@@ -132,6 +132,11 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						engine.passLine(r.Name)
 					case "watch":
 						checkCtx, span := tracing.Span(ctx, "mergewake.watch")
+						if engine != nil {
+							// A fix PR watch marks urgent may already wait in the review
+							// queue under the priority it had when it arrived.
+							checkCtx = pipeline.WithUrgentHook(checkCtx, engine.q.Refresh)
+						}
 						err = s.Watch(checkCtx, r, o)
 						tracing.Finish(span)
 					case "release":

@@ -1839,8 +1839,10 @@ watch holds, blames nobody and tells the repo's design-session lane once. So do
 a timed-out re-run, a reached dispatch bound, and a repo with no
 `any_ref_workflow`; in those cases a person bisects.
 
-Once confirmed, the opened revert PR waits out a 30-minute fix window. If main
-turns green inside it, watch closes the revert PR and clears the latch. An open
+The 30-minute fix window counts from the moment watch records the incident
+(`red_since` in `recovery.json`), not from confirmation, so the time spent
+confirming is part of it. Once confirmed, the opened revert PR waits out what is
+left of the window. If main turns green inside it, watch closes the revert PR and clears the latch. An open
 PR whose body or head commit message carries `Fixes-Red-Main: <culprit-or-head-sha>`
 is the fix for this red: the revert waits for it up to twice the window and the
 PR is reviewed with priority 1. After the window, watch merges the revert with

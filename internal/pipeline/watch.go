@@ -500,7 +500,7 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 		result.Action = "recovery-confirming"
 		result.Reason = reason
 		if needsDesk {
-			return s.reportWatch(ctx, r, result, head+":confirm:"+reason, o)
+			return s.reportWatch(ctx, r, result, "recovery:"+culprit+":confirm:"+reason, o)
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
@@ -587,13 +587,20 @@ func (s *watchStream) openRevert(ctx context.Context, r config.Repo, head string
 	}
 	note := fmt.Sprintf("mergewake: %s CI failed after PR #%d; revert PR %s", stage, origin.Number, result.URL)
 	var reopen error
+	outcome := "none"
 	if task != "" {
-		reopen = s.Sink.Reopen(reportCtx, task, note)
+		outcome = "reopened"
+		if reopen = s.Sink.Reopen(reportCtx, task, note); reopen != nil {
+			outcome = "failed"
+		}
 	}
 	if reopen != nil {
 		note += "; task reopen failed (recovery comment retained): " + reopen.Error()
 	}
-	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Type: "culprit-hold", Text: note}))
+	// The outcome is stored before anything announces it: the merged notice
+	// reads it later, on a pass that never saw the reopen.
+	recorded := s.recordTaskReopen(r.Name, outcome)
+	return errors.Join(s.audit(r.Name, "watch", result, false), reopen, recorded, s.Sink.Record(reportCtx, "mergewake/recovery/"+culprit, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-revert-" + culprit, Type: "culprit-hold", Text: note}))
 }
 
 // redOutside names the red checks of sha that are in checks but not in
@@ -649,7 +656,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		note += ": " + result.Reason
 	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.designLane(r)}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}

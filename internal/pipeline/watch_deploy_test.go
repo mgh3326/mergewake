@@ -215,7 +215,7 @@ func TestWatchDeployRevertUsesPRChecks(t *testing.T) {
 	seedDeployIncident(t, s, r, st)
 	g.latch = true
 	recoveryWatch(t, s, r)
-	lines := designLaneEvents(n)
+	lines := ownerLaneEvents(n)
 	if g.merges != 1 || len(lines) != 1 || !strings.Contains(lines[0], "deploy red since") {
 		t.Fatalf("merges=%d notices=%v", g.merges, lines)
 	}

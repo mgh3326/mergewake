@@ -86,3 +86,51 @@ func TestDispatchRefused(t *testing.T) {
 		t.Error("plain error refused")
 	}
 }
+
+func TestDispatchWorkflowRunReturnsRunID(t *testing.T) {
+	for name, tt := range map[string]struct {
+		answer func(w http.ResponseWriter, flagged bool)
+		want   int64
+	}{
+		"run details": {func(w http.ResponseWriter, _ bool) {
+			fmt.Fprint(w, `{"workflow_run_id": 4242, "run_url": "u", "html_url": "h"}`)
+		}, 4242},
+		"no content": {func(w http.ResponseWriter, _ bool) { w.WriteHeader(http.StatusNoContent) }, 0},
+		"field refused": {func(w http.ResponseWriter, flagged bool) {
+			if flagged {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				_, flagged := body["return_run_details"]
+				tt.answer(w, flagged)
+			})
+			got, e := c.DispatchWorkflowRun(context.Background(), "example/project", "ci-any-ref.yml", "main", map[string]string{"ref": testSHA})
+			if e != nil || got != tt.want {
+				t.Fatalf("got %d, %v; want %d", got, e, tt.want)
+			}
+		})
+	}
+}
+
+func TestLatestRunStatusReadsOnlyThatRun(t *testing.T) {
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[
+{"id":1,"context":"ci-ok","state":"success","target_url":"https://github.com/example/project/actions/runs/77","updated_at":"2026-11-07T10:05:00Z"},
+{"id":2,"context":"ci-ok","state":"failure","target_url":"https://github.com/example/project/actions/runs/7","updated_at":"2026-11-07T10:01:00Z"},
+{"id":3,"context":"other","state":"success","target_url":"https://github.com/example/project/actions/runs/7","updated_at":"2026-11-07T10:09:00Z"}]`)
+	})
+	state, at, ok, e := c.LatestRunStatus(context.Background(), "example/project", testSHA, "ci-ok", 7)
+	if e != nil || !ok || state != Red || at.Minute() != 1 {
+		t.Fatalf("run 7: %s %s %v %v", state, at, ok, e)
+	}
+	if _, _, ok, _ = c.LatestRunStatus(context.Background(), "example/project", testSHA, "ci-ok", 8); ok {
+		t.Fatal("run 8 read another run's status")
+	}
+}

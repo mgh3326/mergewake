@@ -167,12 +167,14 @@ func (s *watchStream) targetHead(head string) string {
 	return head
 }
 
-func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r config.Repo, p policy.Policy, sha string) error {
+// dispatch starts the any-ref workflow for sha and returns the id of the run
+// it started, or zero when the client or GitHub does not report one.
+func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r config.Repo, p policy.Policy, sha string) (int64, error) {
 	inputs := map[string]string{"ref": sha}
 	if s.suites {
 		raw, err := s.GH.ReadFile(ctx, r.Name, s.targetHead(sha), filepath.Join(".github/workflows", p.AnyRefWorkflow))
 		if err != nil {
-			return err
+			return 0, err
 		}
 		var wf struct {
 			On struct {
@@ -182,7 +184,7 @@ func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r conf
 			} `yaml:"on"`
 		}
 		if err := yaml.Unmarshal(raw, &wf); err != nil {
-			return err
+			return 0, err
 		}
 		if _, ok := wf.On.Dispatch.Inputs["suite"]; ok {
 			inputs["suite"] = "main"
@@ -191,7 +193,10 @@ func (s *watchStream) dispatch(ctx context.Context, d workflowDispatcher, r conf
 			}
 		}
 	}
-	return d.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, inputs)
+	if rd, ok := d.(runDispatcher); ok {
+		return rd.DispatchWorkflowRun(ctx, r.Name, p.AnyRefWorkflow, r.Branch, inputs)
+	}
+	return 0, d.DispatchWorkflow(ctx, r.Name, p.AnyRefWorkflow, r.Branch, inputs)
 }
 
 func (s *watchStream) ownsLatch(ctx context.Context, r config.Repo) (bool, error) {
