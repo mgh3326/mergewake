@@ -59,7 +59,11 @@ type recoveryIncident struct {
 	RevertPR  int    `json:"revert_pr,omitempty"`
 	RevertURL string `json:"revert_url,omitempty"`
 	FixPR     int    `json:"fix_pr,omitempty"`
-	Yielding  bool   `json:"yielding,omitempty"`
+	// TaskReopen is the outcome of reopening the culprit's task when the revert
+	// PR opened: "reopened", "failed" or "none" (no task). Empty means the
+	// incident predates the record.
+	TaskReopen string `json:"task_reopen,omitempty"`
+	Yielding   bool   `json:"yielding,omitempty"`
 }
 
 // revertCloser closes an open pull request without merging it.
@@ -201,6 +205,16 @@ func (s *watchStream) recordRecoveryRevert(repo, url string, pr int) error {
 		return e
 	}
 	st.RevertPR, st.RevertURL = pr, url
+	return s.saveRecovery(repo, st)
+}
+
+// recordTaskReopen stores the outcome of reopening the culprit's task.
+func (s *watchStream) recordTaskReopen(repo, outcome string) error {
+	st, found, e := s.loadRecovery(repo)
+	if e != nil || !found {
+		return e
+	}
+	st.TaskReopen = outcome
 	return s.saveRecovery(repo, st)
 }
 
@@ -986,8 +1000,15 @@ func (s *watchStream) announceRevert(ctx context.Context, r config.Repo, st reco
 	if s.deploy {
 		stage = "deploy"
 	}
-	text := fmt.Sprintf("%s %s red since %s by PR #%d; reverted by PR #%d after %s; task %s reopened",
-		r.Name, stage, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, task)
+	taskNote := "task " + task + " reopened"
+	switch st.TaskReopen {
+	case "failed":
+		taskNote = "task " + task + " reopen failed"
+	case "none":
+		taskNote = "no task to reopen"
+	}
+	text := fmt.Sprintf("%s %s red since %s by PR #%d; reverted by PR #%d after %s; %s",
+		r.Name, stage, st.RedSince.UTC().Format(time.RFC3339), st.CulpritPR, revertPR, window, taskNote)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{

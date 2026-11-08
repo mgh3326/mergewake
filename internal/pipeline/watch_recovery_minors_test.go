@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -151,5 +152,39 @@ func TestUrgentMarkIsRetriedAfterWriteFailure(t *testing.T) {
 	recoveryWatch(t, s, r)
 	if p := s.ReviewPriority(context.Background(), r, fixPull(shaB)); p.Value != 1 || p.Source != "recovery-fix" {
 		t.Fatalf("fix PR priority after the retry: %+v", p)
+	}
+}
+
+// reopenFailSink is a sink whose task reopen is refused.
+type reopenFailSink struct{ *fakeSink }
+
+func (reopenFailSink) Reopen(context.Context, string, string) error {
+	return errors.New("hk unreachable")
+}
+
+// The merged-revert notice says the task was reopened only when the reopen
+// that happened when the revert PR opened succeeded; the outcome is recorded
+// with the incident before the notice reads it.
+func TestMergedNoticeReportsTheTaskReopenOutcome(t *testing.T) {
+	s, g, sink, n, r := recoverySetup(t, nil)
+	s.Sink = reopenFailSink{sink}
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	seedConfirmed(t, s, r, now)
+	// The failed reopen is returned with the pass; the revert PR is open.
+	_ = s.Watch(context.Background(), r, Options{})
+	if g.revertCount != 1 {
+		t.Fatalf("reverts %d", g.revertCount)
+	}
+	if st, _ := recoveryState(t, s, r); st.TaskReopen != "failed" {
+		t.Fatalf("recorded reopen outcome %q", st.TaskReopen)
+	}
+	now = now.Add(fixWindow)
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-merged" {
+		t.Fatalf("%+v", got)
+	}
+	lines := ownerLaneEvents(n)
+	if len(lines) != 1 || strings.Contains(lines[0], "task 42 reopened") || !strings.Contains(lines[0], "task 42 reopen failed") {
+		t.Fatalf("notice: %v", lines)
 	}
 }
