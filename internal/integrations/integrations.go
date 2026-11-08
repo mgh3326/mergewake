@@ -1,4 +1,5 @@
-// Package integrations adapts external CLIs without importing their internals.
+// Package integrations adapts external CLIs and services without importing
+// their internals; hk is reached through its public client package.
 package integrations
 
 import (
@@ -10,10 +11,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mgh3326/handoffkeep/client"
 
 	"github.com/mgh3326/mergewake/internal/config"
 )
@@ -230,11 +234,17 @@ func (p Panewire) AckedEvents(ctx context.Context, lane string) (map[string]bool
 	return out, nil
 }
 
+// Handoffkeep is the hk task sink. Its task, comment, reopen, attachment and
+// document calls go to hk over HTTP through the hk public client with
+// mergewake's own svc-mergewake credential (hkClient), never as hk CLI
+// subprocesses (hk 3549). Runner and Command (sink.command) remain for
+// DeployDecision, which still runs the hk CLI, and AttachmentCommand names
+// the CLI a reviewer runs on its own host.
 type Handoffkeep struct {
 	Runner         Runner
 	Command, State string
 	// Jobs, when set, reads job records (tests inject it); nil resolves the
-	// handoffkeep HTTP endpoint from the CLI's own credential convention.
+	// handoffkeep HTTP endpoint from the svc-mergewake environment.
 	Jobs JobReader
 	// EventAttempts, EventBackoff and EventTimeout tune PostTaskEvent: the
 	// tries in total, the first retry's wait (doubling after), and each
@@ -246,25 +256,24 @@ type Handoffkeep struct {
 
 var TaskID = regexp.MustCompile(`^[1-9][0-9]*$`)
 
+// Reopen reads the task, records note as a comment, then reopens a merged or
+// dropped task with note as the reason. An already reopened task only gets
+// the comment; any other state is refused after the comment.
 func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if strings.TrimSpace(note) == "" {
 		return errors.New("reopen requires a reason")
 	}
-	if !TaskID.MatchString(task) {
-		return errors.New("task ID must be a positive integer")
-	}
-
-	shown, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	c, id, e := taskClient(task)
 	if e != nil {
 		return e
 	}
-	if _, e = h.Runner.Run(ctx, h.Command, []string{"tasks", "comment", task, "--body", note}, "", ""); e != nil {
+	current, e := getTask(ctx, c, id)
+	if e != nil {
 		return e
 	}
-	var current struct {
-		State string `json:"state"`
+	if _, e = c.CommentTask(ctx, id, note); e != nil {
+		return e
 	}
-	_ = json.Unmarshal(shown, &current)
 	if current.State == "reopened" {
 		return nil
 	}
@@ -272,94 +281,44 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if current.State != "merged" && current.State != "dropped" {
 		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged or dropped", task, current.State)
 	}
-	_, e = h.Runner.Run(ctx, h.Command, []string{"tasks", "reopen", task, "--reason", note}, "", "")
-	if e != nil {
-		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to reopened; server/CLI may lack explicit reopen support: %w", task, current.State, e)
+	if _, e = c.ReopenTask(ctx, id, note); e != nil {
+		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to reopened; server may lack explicit reopen support: %w", task, current.State, e)
 	}
 	return nil
 }
 
-// Lane reads the owning lane from `tasks show`; an absent field means the task
-// has no routing lane and the caller falls back, never guessing.
+// Lane reads the task's owning lane; an absent field means the task has no
+// routing lane and the caller falls back, never guessing.
 func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
-	if !TaskID.MatchString(task) {
-		return "", errors.New("task ID must be a positive integer")
-	}
-	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
-	if e != nil {
-		return "", e
-	}
-	var shown struct {
-		Lane string `json:"lane"`
-	}
-	if e = json.Unmarshal(out, &shown); e != nil {
-		return "", e
-	}
-	return shown.Lane, nil
+	x, e := h.task(ctx, task)
+	return x.Lane, e
 }
 
-// TaskBody reads the task's free text (`body`, else `description`) from `tasks
-// show`; a task record without either yields "".
+// TaskBody reads the task's free text. hk's task answer has never carried a
+// body or description field (a task's body is the document its body_doc
+// names), so the `tasks show` read this replaces always found "" — and so
+// does this one. The read is kept so an unknown task or an unreachable hk
+// is still an error.
 func (h Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
-	if !TaskID.MatchString(task) {
-		return "", errors.New("task ID must be a positive integer")
-	}
-	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
-	if e != nil {
-		return "", e
-	}
-	var shown struct {
-		Body        string `json:"body"`
-		Description string `json:"description"`
-	}
-	if e = json.Unmarshal(out, &shown); e != nil {
-		return "", e
-	}
-	if shown.Body != "" {
-		return shown.Body, nil
-	}
-	return shown.Description, nil
+	_, e := h.task(ctx, task)
+	return "", e
 }
 
 // TaskJob reads the panewire job bound to a task (`refs.job_id`) and the task
 // title, which carries the task's grade and T marker.
 func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, error) {
-	if !TaskID.MatchString(task) {
-		return "", "", errors.New("task ID must be a positive integer")
-	}
-	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
+	x, e := h.task(ctx, task)
 	if e != nil {
 		return "", "", e
 	}
-	var shown struct {
-		Title string `json:"title"`
-		Refs  struct {
-			JobID string `json:"job_id"`
-		} `json:"refs"`
-	}
-	if e = json.Unmarshal(out, &shown); e != nil {
-		return "", "", e
-	}
-	return shown.Refs.JobID, shown.Title, nil
+	return x.Refs.JobID, x.Title, nil
 }
 
-// TaskPriority reads the task's priority from `tasks show`: 1 is urgent and 4
-// low; 0 means the task has none.
+// TaskPriority reads the task's priority: 1 is urgent and 4 low; 0 means the
+// task has none.
 func (h Handoffkeep) TaskPriority(ctx context.Context, task string) (int, error) {
-	if !TaskID.MatchString(task) {
-		return 0, errors.New("task ID must be a positive integer")
-	}
-	out, e := h.Runner.Run(ctx, h.Command, []string{"tasks", "show", task}, "", "")
-	if e != nil {
-		return 0, e
-	}
-	var shown struct {
-		Priority int `json:"priority"`
-	}
-	if e = json.Unmarshal(out, &shown); e != nil {
-		return 0, e
-	}
-	return shown.Priority, nil
+	x, e := h.task(ctx, task)
+	return x.Priority, e
 }
 
 // Attachment reads one handoffkeep attachment by its sha256 id.
@@ -367,46 +326,34 @@ func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error)
 	if !attachmentID.MatchString(sha) {
 		return nil, errors.New("attachment ID must be a sha256 hex digest")
 	}
-	return h.Runner.Run(ctx, h.Command, []string{"attach", "get", sha}, "", "")
+	return readAttachment(ctx, sha)
 }
 
 // AttachmentCommand names the CLI reviewers use to retrieve an attachment.
 func (h Handoffkeep) AttachmentCommand() string { return h.Command }
 
-// PutAttachment publishes a file for a reviewer on any host.
+// PutAttachment publishes a file for a reviewer on any host, named by its
+// base name.
 func (h Handoffkeep) PutAttachment(ctx context.Context, path string) (string, error) {
-	out, e := h.Runner.Run(ctx, h.Command, []string{"attach", "put", path}, "", "")
+	if _, e := hkClient(); e != nil {
+		return "", e
+	}
+	body, e := os.ReadFile(path)
 	if e != nil {
 		return "", e
 	}
-	var uploaded struct {
-		SHA string `json:"sha256"`
-	}
-	if e = json.Unmarshal(out, &uploaded); e != nil {
-		return "", e
-	}
-	if !attachmentID.MatchString(uploaded.SHA) {
-		return "", errors.New("attachment upload returned an invalid sha256")
-	}
-	return uploaded.SHA, nil
+	return h.UploadAttachment(ctx, filepath.Base(path), body)
 }
 
 var attachmentID = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// Record stores data as the hk note document key.
 func (h Handoffkeep) Record(ctx context.Context, key string, data []byte) error {
-	f, e := os.CreateTemp("", "mergewake-record-*.json")
+	c, e := hkClient()
 	if e != nil {
 		return e
 	}
-	defer os.Remove(f.Name())
-	if _, e = f.Write(data); e != nil {
-		f.Close()
-		return e
-	}
-	if e = f.Close(); e != nil {
-		return e
-	}
-	_, e = h.Runner.Run(ctx, h.Command, []string{"doc", "put", "--key", key, "--kind", "note", "--file", f.Name()}, "", "")
+	_, _, e = c.PutDocument(ctx, client.Document{Key: key, Kind: "note", Body: string(data)})
 	return e
 }
 func New(c config.Config, r Runner, out io.Writer) (Sink, Notifier) {

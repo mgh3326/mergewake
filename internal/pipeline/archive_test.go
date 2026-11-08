@@ -3,8 +3,6 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -15,40 +13,26 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// archiveRunner scripts herdr and git, answers handoffkeep in-process and runs
-// everything else (sh, bash, tar, cat, rm) for real against temp dirs.
+// archiveRunner scripts herdr and git and runs everything else (sh, bash,
+// tar, cat, rm) for real against temp dirs. hk is reached over HTTP
+// (hktest); an hk CLI call is recorded and refused.
 type archiveRunner struct {
-	script   *scriptRunner
-	hkCalls  int
-	comments []string
-	failNote bool
+	script *scriptRunner
+	hkCLI  [][]string
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
+		a.hkCLI = append(a.hkCLI, append([]string{name}, args...))
+		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
+	}
 	switch name {
 	case "herdr", "git":
 		return a.script.Run(ctx, name, args, input, dir)
-	case "handoffkeep":
-		a.hkCalls++
-		if len(args) == 5 && args[0] == "attach" && args[1] == "put" {
-			b, err := os.ReadFile(args[2])
-			if err != nil {
-				return nil, err
-			}
-			sum := sha256.Sum256(b)
-			return json.Marshal(map[string]string{"sha256": hex.EncodeToString(sum[:])})
-		}
-		if len(args) == 5 && args[0] == "tasks" && args[1] == "comment" {
-			if a.failNote {
-				return nil, errors.New("hk comment failed")
-			}
-			a.comments = append(a.comments, input)
-			return []byte("{}"), nil
-		}
-		return nil, errors.New("unexpected handoffkeep " + strings.Join(args, " "))
 	}
 	c := exec.CommandContext(ctx, name, args...)
 	c.Stdin = strings.NewReader(input)
@@ -85,9 +69,22 @@ func jobDir(t *testing.T, jobs, name string, age time.Duration) string {
 type archiveFixture struct {
 	s     *Service
 	run   *archiveRunner
+	hk    *hktest.Server
 	out   *bytes.Buffer
 	jobs  string
 	drive string
+}
+
+// hkCalls counts the requests the fake hk received.
+func (f archiveFixture) hkCalls() int { return len(f.hk.Requests()) }
+
+// comments returns the bodies of the hk comments posted so far.
+func (f archiveFixture) comments() []string {
+	var out []string
+	for _, c := range f.hk.Comments() {
+		out = append(out, c.Body)
+	}
+	return out
 }
 
 func newArchiveFixture(t *testing.T, agents string) archiveFixture {
@@ -98,7 +95,8 @@ func newArchiveFixture(t *testing.T, agents string) archiveFixture {
 		}
 	}
 	root := t.TempDir()
-	f := archiveFixture{jobs: filepath.Join(root, "jobs"), drive: filepath.Join(root, "drive"), out: &bytes.Buffer{}}
+	f := archiveFixture{jobs: filepath.Join(root, "jobs"), drive: filepath.Join(root, "drive"), out: &bytes.Buffer{}, hk: hktest.New(t)}
+	f.hk.SetTask(77, `{"id":77,"state":"merged","refs":{}}`)
 	panes := `{"result":{"panes":[]}}`
 	f.run = &archiveRunner{script: &scriptRunner{outs: map[string]string{
 		key("herdr", "agent", "list"): agents,
@@ -108,6 +106,16 @@ func newArchiveFixture(t *testing.T, agents string) archiveFixture {
 	c.Hosts = []reap.Host{{Name: "local", Jobs: f.jobs}}
 	c.Reap.Archive = config.Archive{Enabled: true, DriveDir: f.drive, TextMaxBytes: 1 << 20, MinAge: "24h"}
 	f.s = &Service{Config: c, GH: &reapGH{}, Runner: f.run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: f.out}
+	t.Cleanup(func() {
+		if len(f.run.hkCLI) > 0 {
+			t.Errorf("hk CLI subprocesses run: %q", f.run.hkCLI)
+		}
+		for _, r := range f.hk.Requests() {
+			if r.Auth != "Bearer "+hktest.Token {
+				t.Errorf("%s: Authorization %q", r.Route(), r.Auth)
+			}
+		}
+	})
 	return f
 }
 
@@ -158,14 +166,14 @@ func TestReapArchivesClosedJobOnceAndDeletesIt(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rows[0].Archive.Dest, ".env")); !os.IsNotExist(err) {
 		t.Fatal("credential file reached drive")
 	}
-	if len(f.run.comments) != 1 || !strings.Contains(f.run.comments[0], ".env") {
-		t.Fatalf("hk comments = %q", f.run.comments)
+	if c := f.comments(); len(c) != 1 || !strings.Contains(c[0], ".env") {
+		t.Fatalf("hk comments = %q", c)
 	}
-	calls := f.run.hkCalls
+	calls := f.hkCalls()
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if f.run.hkCalls != calls || len(f.rows(t)) != 1 {
+	if f.hkCalls() != calls || len(f.rows(t)) != 1 {
 		t.Fatal("an archived job was processed again")
 	}
 }
@@ -180,7 +188,7 @@ func TestReapArchiveShadowOnlyPlans(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 		t.Fatal("shadow reap touched the job dir")
 	}
-	if f.run.hkCalls != 0 {
+	if f.hkCalls() != 0 {
 		t.Fatal("shadow reap called hk")
 	}
 	if rows := f.rows(t); len(rows) != 1 || rows[0].Result != "would-archive" {
@@ -222,8 +230,8 @@ func TestReapArchiveWaitsAndKeeps(t *testing.T) {
 			if len(rows) > 0 {
 				got = rows[0].Result + "|" + rows[0].Reason
 			}
-			if got != tc.want || f.run.hkCalls != 0 {
-				t.Fatalf("row = %q, hk calls = %d", got, f.run.hkCalls)
+			if got != tc.want || f.hkCalls() != 0 {
+				t.Fatalf("row = %q, hk calls = %d", got, f.hkCalls())
 			}
 		})
 	}
@@ -237,7 +245,7 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
-	if f.run.hkCalls != 0 {
+	if f.hkCalls() != 0 {
 		t.Fatal("plan-only run called hk")
 	}
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
@@ -276,8 +284,8 @@ func TestReapArchiveUsesNewestClose(t *testing.T) {
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil || f.run.hkCalls != 0 {
-		t.Fatalf("job dir archived before min_age of its newest close: %v, hk=%d", err, f.run.hkCalls)
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil || f.hkCalls() != 0 {
+		t.Fatalf("job dir archived before min_age of its newest close: %v, hk=%d", err, f.hkCalls())
 	}
 	// Once the newest close ages out, the earlier job's row does not block it.
 	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
@@ -300,7 +308,7 @@ func TestArchiveJobsReportsUnreadableJobsDir(t *testing.T) {
 // One failed archive is one error in the reap summary, kept for retry.
 func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
-	f.run.failNote = true
+	f.hk.Fail("POST /v1/tasks/{id}/comments", 500, "internal")
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
 	f.seedClose(t, "wk-7", "closed", time.Now().Add(-48*time.Hour))
 	err := f.s.Reap(context.Background(), testRepo, 0, Options{})

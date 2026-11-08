@@ -20,6 +20,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -395,9 +396,12 @@ func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {
 	}
 }
 
+// mergewake uploads the brief over HTTP with its own hk credential; the
+// reviewer, on any host, reads it back with the configured hk command.
 func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 	for _, name := range []string{"custom-hk", "custom hk's"} {
 		t.Run(name, func(t *testing.T) {
+			hk := hktest.New(t)
 			job := t.TempDir()
 			path := filepath.Join(job, "review-brief.md")
 			body := []byte(strings.Repeat("complete brief\n", 5000))
@@ -406,14 +410,17 @@ func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 			}
 			id := fmt.Sprintf("%x", sha256.Sum256(body))
 			command := filepath.Join(job, name)
-			script := fmt.Sprintf("#!/bin/sh\ncase \"$1 $2\" in\n'attach put') printf '%%s\\n' '{\"sha256\":\"%s\"}';;\n'attach get') test \"$3\" = '%s' && cat %s;;\n*) exit 1;;\nesac\n", id, id, shellQuote(path))
+			script := fmt.Sprintf("#!/bin/sh\ncase \"$1 $2\" in\n'attach get') test \"$3\" = '%s' && cat %s;;\n*) exit 1;;\nesac\n", id, shellQuote(path))
 			if e := os.WriteFile(command, []byte(script), 0700); e != nil {
 				t.Fatal(e)
 			}
-			x := &panewireExecutor{s: &Service{Sink: integrations.Handoffkeep{Runner: integrations.Exec{}, Command: command}}}
+			x := &panewireExecutor{s: &Service{Sink: integrations.Handoffkeep{Runner: refuseHKCLI{t}, Command: command}}}
 			pointer, e := x.spawnBrief(context.Background(), path, job)
 			if e != nil {
 				t.Fatal(e)
+			}
+			if a, ok := hk.Attachments()[id]; !ok || !bytes.Equal(a.Body, body) || a.Name != "review-brief.md" {
+				t.Fatalf("brief not uploaded over HTTP: %+v %t", a.Name, ok)
 			}
 			prompt, e := os.ReadFile(pointer)
 			if e != nil {
@@ -434,6 +441,14 @@ func TestPanewireLargeBriefUsesConfiguredAttachmentCommand(t *testing.T) {
 			}
 		})
 	}
+}
+
+// refuseHKCLI fails the test on any hk CLI subprocess.
+type refuseHKCLI struct{ t *testing.T }
+
+func (r refuseHKCLI) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
+	r.t.Errorf("subprocess run: %s %s", command, strings.Join(args, " "))
+	return nil, errors.New("no subprocess in this test")
 }
 
 // The builder's hk job record supplies --builder-family; a builder without a

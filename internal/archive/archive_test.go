@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,42 +15,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// fakeRunner executes real commands against temp dirs except handoffkeep,
-// which it answers in-process; ssh resolves to the fake script on PATH.
+// fakeRunner executes real commands against temp dirs; ssh resolves to the
+// fake script on PATH. hk is reached over HTTP (hktest), never as a
+// subprocess: an hk CLI call is recorded and refused.
 type fakeRunner struct {
-	puts     map[string][]byte // --name -> bytes
-	comments map[string]string // task -> body
-	failPut  string            // --name whose put fails
-	failNote bool
-	failRm   bool
-	rms      [][]string // delete argv, recorded
+	failRm bool
+	rms    [][]string // delete argv, recorded
+	hkCLI  [][]string // hk CLI calls, which must not happen
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
-	if name == "handoffkeep" {
-		switch {
-		case len(args) == 5 && args[0] == "attach" && args[1] == "put" && args[3] == "--name":
-			if args[4] == f.failPut {
-				return nil, errors.New("hk put failed")
-			}
-			b, err := os.ReadFile(args[2])
-			if err != nil {
-				return nil, err
-			}
-			f.puts[args[4]] = b
-			sum := sha256.Sum256(b)
-			return json.Marshal(map[string]any{"sha256": hex.EncodeToString(sum[:]), "size_bytes": len(b), "created": true})
-		case len(args) == 5 && args[0] == "tasks" && args[1] == "comment" && args[3] == "--file" && args[4] == "-":
-			if f.failNote {
-				return nil, errors.New("hk comment failed")
-			}
-			f.comments[args[2]] = input
-			return []byte("{}"), nil
-		}
-		return nil, errors.New("unexpected handoffkeep call: " + strings.Join(args, " "))
+	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
+		f.hkCLI = append(f.hkCLI, append([]string{name}, args...))
+		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
 	}
 	if name == "sh" && len(args) > 1 && strings.HasPrefix(args[1], "rm ") {
 		f.rms = append(f.rms, args)
@@ -80,6 +62,7 @@ exec sh -c "$*"
 type env struct {
 	jobs, drive, sshLog string
 	run                 *fakeRunner
+	hk                  *hktest.Server
 }
 
 func setup(t *testing.T) env {
@@ -99,9 +82,51 @@ func setup(t *testing.T) env {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	e := env{jobs: filepath.Join(root, "jobs"), drive: filepath.Join(root, "drive"), sshLog: filepath.Join(root, "ssh.log"),
-		run: &fakeRunner{puts: map[string][]byte{}, comments: map[string]string{}}}
+		run: &fakeRunner{}, hk: hktest.New(t)}
+	for _, id := range []int64{2402, 9, 11} {
+		e.hk.SetTask(id, fmt.Sprintf(`{"id":%d,"state":"merged","refs":{}}`, id))
+	}
 	t.Setenv("FAKE_SSH_LOG", e.sshLog)
+	t.Cleanup(func() {
+		if len(e.run.hkCLI) > 0 {
+			t.Errorf("hk CLI subprocesses run: %q", e.run.hkCLI)
+		}
+		for _, r := range e.hk.Requests() {
+			if r.Auth != "Bearer "+hktest.Token {
+				t.Errorf("%s: Authorization %q", r.Route(), r.Auth)
+			}
+		}
+	})
 	return e
+}
+
+// uploads maps each uploaded attachment's name to its bytes.
+func (e env) uploads() map[string][]byte {
+	out := map[string][]byte{}
+	for _, a := range e.hk.Attachments() {
+		out[a.Name] = a.Body
+	}
+	return out
+}
+
+// comment returns the hk comment bodies posted to task, joined.
+func (e env) comment(task int64) string {
+	var b strings.Builder
+	for _, c := range e.hk.Comments() {
+		if c.Task == task {
+			b.WriteString(c.Body)
+		}
+	}
+	return b.String()
+}
+
+// routes counts the hk requests by method and escaped path.
+func (e env) routes() map[string]int {
+	out := map[string]int{}
+	for _, r := range e.hk.Requests() {
+		out[r.Route()]++
+	}
+	return out
 }
 
 func write(t *testing.T, p, body string) {
@@ -136,7 +161,7 @@ func job(t *testing.T, jobs, name string) string {
 }
 
 func archiver(e env, ssh string) *Archiver {
-	return &Archiver{Runner: e.run, HK: "handoffkeep", DriveDir: e.drive, SSH: ssh, TextMax: 1024, TempDir: ""}
+	return &Archiver{Runner: e.run, DriveDir: e.drive, SSH: ssh, TextMax: 1024}
 }
 
 func TestCredential(t *testing.T) {
@@ -244,19 +269,28 @@ func checkArchived(t *testing.T, e env, res *Result, dir string) {
 		}
 		return nil
 	})
-	for name, body := range e.run.puts {
+	uploads := e.uploads()
+	for name, body := range uploads {
 		if Credential(name) || strings.Contains(string(body), "SECRET") {
 			t.Errorf("credential-like upload %s", name)
 		}
 	}
-	note := e.run.comments["2402"]
+	note := e.comment(2402)
 	for _, want := range []string{res.Dest, "files: 6", "manifest: ", res.Manifest, ".env.local", "gh_token.txt", "API_KEY.json", "build/game.bin", "deleted after this record"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("hk comment lacks %q:\n%s", want, note)
 		}
 	}
-	if len(res.Attachments) != 5 || e.run.puts["manifest.json"] == nil {
+	if len(res.Attachments) != 5 || uploads["manifest.json"] == nil {
 		t.Fatalf("attachments = %+v", res.Attachments)
+	}
+	// Five job text files and the manifest go up as attachments, one comment
+	// records them; each goes to hk over HTTP with the svc token (setup).
+	if got := e.routes(); got["PUT /v1/attachments"] != 6 || got["POST /v1/tasks/2402/comments"] != 1 || len(got) != 2 {
+		t.Fatalf("hk routes = %v", got)
+	}
+	if a := e.hk.Attachments()[res.Manifest]; a.Name != "manifest.json" || a.MIME != "application/json" {
+		t.Fatalf("manifest attachment = %q %q", a.Name, a.MIME)
 	}
 }
 
@@ -308,10 +342,14 @@ func TestApplyRemoteHostsStreamOverSSH(t *testing.T) {
 }
 
 func TestApplyFailuresKeepJobDir(t *testing.T) {
-	for name, mut := range map[string]func(*fakeRunner, *Archiver){
-		"hk-put":     func(r *fakeRunner, _ *Archiver) { r.failPut = "report.md" },
-		"hk-comment": func(r *fakeRunner, _ *Archiver) { r.failNote = true },
-		"drive":      func(_ *fakeRunner, a *Archiver) { a.DriveDir = "/dev/null/drive" },
+	for name, mut := range map[string]func(*testing.T, env, *Archiver){
+		"hk-put": func(_ *testing.T, e env, _ *Archiver) {
+			e.hk.Fail("PUT /v1/attachments", 503, "attachment_r2_unavailable")
+		},
+		"hk-too-big": func(_ *testing.T, e env, _ *Archiver) { e.hk.MaxAttachmentBytes = 4 },
+		"hk-comment": func(_ *testing.T, e env, _ *Archiver) { e.hk.Fail("POST /v1/tasks/{id}/comments", 500, "internal") },
+		"hk-unset":   func(t *testing.T, _ env, _ *Archiver) { t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "") },
+		"drive":      func(_ *testing.T, _ env, a *Archiver) { a.DriveDir = "/dev/null/drive" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setup(t)
@@ -321,11 +359,16 @@ func TestApplyFailuresKeepJobDir(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			mut(e.run, a)
+			mut(t, e, a)
 			p.Dest = filepath.Join(a.DriveDir, "h1", "m", "wk-9")
 			res, err := a.Apply(context.Background(), p, time.Now())
 			if err == nil || (res != nil && res.Deleted) {
 				t.Fatalf("res=%+v err=%v", res, err)
+			}
+			// An hk failure is an error, never a skip: the reap stage retries
+			// an error row after archiveRetry and leaves a skip for a person.
+			if result, reason := Reason(err); result != "error" {
+				t.Fatalf("%s failure recorded as %s %s", name, result, reason)
 			}
 			if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 				t.Fatalf("job dir lost after %s failure: %v", name, err)
@@ -374,7 +417,7 @@ func TestApplyResumesFailedDelete(t *testing.T) {
 		t.Fatal("delete failure not reported")
 	}
 	e.run.failRm = false
-	puts := len(e.run.puts)
+	puts := e.routes()["PUT /v1/attachments"]
 	p, err = a.Plan(context.Background(), h, "wk-11")
 	if err != nil || !p.Resume {
 		t.Fatalf("resume plan: %+v %v", p, err)
@@ -386,7 +429,7 @@ func TestApplyResumesFailedDelete(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("job dir kept after resume")
 	}
-	if len(e.run.puts) != puts || len(e.run.comments) != 1 {
+	if e.routes()["PUT /v1/attachments"] != puts || len(e.hk.Comments()) != 1 {
 		t.Fatal("resume uploaded or commented again")
 	}
 	// A different job under the same name and month never resumes.
@@ -415,7 +458,7 @@ func TestApplyNothingToMove(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(res.Dest, "manifest.json")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(e.run.comments["9"], ".env") {
+	if !strings.Contains(e.comment(9), ".env") {
 		t.Fatal("excluded files not recorded")
 	}
 }
