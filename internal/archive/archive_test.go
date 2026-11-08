@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -266,6 +267,58 @@ func TestApplyKeepsChangedOversizedFile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "large.bin")); err != nil {
 		t.Fatal("changed oversized file's job dir was deleted")
+	}
+}
+
+func TestApplyKeepsOversizedContentChangedWithoutMetadataChange(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-oversized-same-metadata")
+	large := filepath.Join(dir, "large.bin")
+	write(t, large, strings.Repeat("l", 150))
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	a := archiver(e, "")
+	a.DriveMaxFileBytes = 100
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-oversized-same-metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, large, strings.Repeat("m", 150))
+	if err := os.Chtimes(large, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	var s *Skip
+	if !errors.As(err, &s) || s.Reason != "job-changed" || res == nil || res.Deleted {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(large); err != nil {
+		t.Fatal("changed oversized file's job dir was deleted")
+	}
+}
+
+func TestCommentBoundsBytesAndSignalsTruncation(t *testing.T) {
+	p := &Plan{Job: "wk-large", Host: "h1", Dest: "/drive/archive", Dir: "/jobs/wk-large"}
+	oversized := make([]File, 1200)
+	for i := range oversized {
+		oversized[i] = File{Path: fmt.Sprintf("build/output-%04d-%s.bin", i, strings.Repeat("x", 64)), Size: 150}
+	}
+	m := manifest{Files: []File{}, Oversized: oversized, Attachments: []Attachment{}}
+	note := comment(p, m, "manifest-sha")
+	if len(note) > 64<<10 {
+		t.Fatalf("comment is %d bytes, limit is %d", len(note), 64<<10)
+	}
+	if !utf8.ValidString(note) {
+		t.Fatal("comment truncation produced invalid UTF-8")
+	}
+	if !strings.Contains(note, "comment details truncated; complete file lists are in manifest.json") {
+		t.Fatalf("comment has no truncation notice:\n%s", note)
+	}
+	if len(m.Oversized) != 1200 {
+		t.Fatalf("manifest oversized list lost entries: %d", len(m.Oversized))
 	}
 }
 

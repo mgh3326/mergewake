@@ -377,15 +377,18 @@ local job dir and reports the step:
    record. A regular file larger than a positive `drive_max_file_bytes` is
    listed as oversized instead of being moved; it is not counted in the
    archived file or byte totals and is not uploaded to hk, even when it is a
-   text file. Symlinks and special files are not copied (following a link could
+   text file. Oversized contents are fingerprinted on the job host, recorded in
+   the manifest, and checked again before deletion; they are never hashed on
+   Drive. Symlinks and special files are not copied (following a link could
    archive a secret from outside the job dir). The hk task id comes from the
    job's panewire events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
    destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
    job's newest entry. A destination that already holds a `manifest.json` is
    a finished archive: when that manifest names the same job, host and task
-   with the same files and sizes, the plan is a delete-only `resume` (the
-   files must still hash to the manifest); otherwise it is skipped as
+   with the same archived files and oversized paths, sizes and fingerprints,
+   the plan is a delete-only `resume` (contents must still match the manifest);
+   otherwise it is skipped as
    `drive-dir-exists`. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
@@ -394,8 +397,9 @@ local job dir and reports the step:
    configured); the Drive copy is a plain directory, not an archive file. A
    job with nothing but excluded, oversized or non-regular entries copies
    nothing.
-3. **Verify**: every file's sha256 is computed on both sides and must match;
-   a missing, duplicate or unexpected hash record fails the archive.
+3. **Verify**: every archived file's sha256 is computed on both sides and must
+   match; oversized file fingerprints are computed on the job host only. A
+   missing, duplicate or unexpected hash record fails the archive.
 4. **hk attachments**: each text file under `text_max_bytes` is uploaded to
    hk (`PUT /v1/attachments`); the returned sha256 must match. The upload
    has no task reference, so the ids are tied to the task by the comment.
@@ -404,7 +408,9 @@ local job dir and reports the step:
    to hk, then a task comment (`POST /v1/tasks/<task>/comments`) posts the Drive directory,
    file count, total bytes, the manifest's attachment id, every attachment
    id, the excluded and skipped names, and the per-file sha256 list (the
-   first 200; the rest are in `manifest.json`).
+   first 200; the rest are in `manifest.json`). The comment is capped at 64 KiB;
+   when needed, details are truncated with a notice and the full lists remain
+   in `manifest.json`.
 6. **Manifest**: only then is `manifest.json` written beside the files, so a
    failed upload or comment leaves no manifest and the job is retried in
    full.
