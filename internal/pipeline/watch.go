@@ -196,7 +196,7 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	if e != nil {
 		if errors.Is(e, github.ErrAmbiguousCheck) {
 			if confirmedHead {
-				return s.settleConfirmedHead(ctx, r, p, result, o, inc)
+				return s.settleConfirmedHead(ctx, r, result, o, inc)
 			}
 			if mixedHead {
 				return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
@@ -507,13 +507,13 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	if s.blocked {
 		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
-	return s.openRevert(ctx, r, p, head, checks, culprit, *origin, task, result, o)
+	return s.openRevert(ctx, r, head, checks, culprit, *origin, task, result, o)
 }
 
 // openRevert opens the exact-revert PR for a confirmed incident. It re-reads
 // the head and its CI first, so a pass that lost a race does not open a PR for
 // a main that already moved or went green.
-func (s *watchStream) openRevert(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
+func (s *watchStream) openRevert(ctx context.Context, r config.Repo, head string, checks []string, culprit string, origin github.Pull, task string, result watchResult, o Options) error {
 	result.Action = "open-revert-pr"
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
@@ -549,7 +549,7 @@ func (s *watchStream) openRevert(ctx context.Context, r config.Repo, p policy.Po
 			return le
 		}
 		if found && inc.Confirmed && inc.Culprit == head && errors.Is(e, github.ErrAmbiguousCheck) {
-			return s.settleConfirmedHead(ctx, r, p, result, o, inc)
+			return s.settleConfirmedHead(ctx, r, result, o, inc)
 		}
 		return e
 	}

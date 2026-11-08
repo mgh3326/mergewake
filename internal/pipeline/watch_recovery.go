@@ -499,137 +499,42 @@ func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p poli
 	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
-// settleConfirmedHead decides a confirmed incident's ambiguous read at its
-// culprit head once. A same-sha re-run that passes beside the head's own failed
-// run is a mixed result, and a mixed result is flaky: that is what this code
-// already does with one before confirmation (confirmRecovery), and a mixed
-// result never justifies blaming a commit. The verdict already reached is not
-// re-litigated, so the incident keeps its culprit, baseline and confirmation
-// and gains the flaky mark; the automatic revert stops and the design lane
-// hears it once. A later pass reads the record instead of deciding again.
+// settleConfirmedHead records a confirmed incident's ambiguous read at its
+// culprit head once and holds the automatic revert on it. A same-sha re-run
+// that passes beside the head's own failed run is a mixed result, and a mixed
+// result never justifies reverting the commit the failure was confirmed on; the
+// rule the incident was confirmed under already holds on one (confirmRecovery).
 //
-// The ambiguous read alone is not evidence of a pass: Check raises it for any
-// same-name conflict on the head, and the statuses it folds can belong to
-// different runs, so a green one may be a sibling of the confirmed failure
-// rather than a later pass. Only a complete any-ref run started after the
-// conflict can show that, which is the same evidence confirmRecovery reads;
-// until then the incident holds unresolved, and a run that fails too leaves the
-// head plainly red for the next pass.
-func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, p policy.Policy, result watchResult, o Options, inc recoveryIncident) error {
-	const passed = "the culprit passed a re-run after confirmation"
+// The read is not proof of a pass, so no flaky mark is written: Check raises it
+// for any same-name check/status conflict on the head, and the statuses it
+// folds cannot be attributed to one run (a confirmation run can leave a sibling
+// green when another check failed, and an overlapping run can post its own
+// statuses; the confirmation's own rerunOutcome reads them the same way). The
+// incident therefore keeps its culprit, baseline and confirmation and resumes
+// the normal recovery path as soon as the head's checks read decisively again.
+func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, result watchResult, o Options, inc recoveryIncident) error {
+	const reason = "the culprit head's checks conflict; the automatic revert is held"
 	result.Culprit, result.PR = inc.Culprit, inc.CulpritPR
-	hold := "recovery:" + inc.Culprit + ":ambiguous-head"
-	holdAs := func(action, reason string, notify bool) error {
-		result.Action, result.Reason = action, reason
-		if notify {
-			return s.reportWatch(ctx, r, result, hold, o)
-		}
-		return s.audit(r.Name, "watch", result, o.DryRun)
-	}
-	if inc.Flaky != "" {
-		result.Action, result.Reason = "recovery-confirming", passed
-		// One notice per decision: the latch path reports the same record under
-		// the revert PR's key.
-		key := "recovery:" + inc.Culprit + ":confirm:" + passed
-		if inc.RevertPR != 0 {
-			key = "recovery:" + strconv.Itoa(inc.RevertPR) + ":confirm:" + passed
-		}
-		return s.reportWatch(ctx, r, result, key, o)
-	}
-	if inc.Checks != "" && inc.Checks != strings.Join(p.BisectChecks(), ",") {
-		return holdAs("recovery-hold", "the confirmation check set changed; rediagnose", true)
-	}
-	reader, ok := s.GH.(statusReader)
-	if !ok {
-		return holdAs("recovery-hold", "GitHub client cannot read any-ref statuses", true)
-	}
-	acting := !result.Shadow && !o.DryRun
-	save := func(st recoveryIncident) error {
-		if !acting {
-			return nil
-		}
-		return s.saveRecovery(r.Name, st)
-	}
-	if at, pending := inc.Pending[inc.Culprit]; pending {
-		state, ready, e := s.rerunOutcome(ctx, reader, r, inc.Culprit, p.BisectChecks(), at)
+	result.Action, result.Reason = "recovery-hold", reason
+	key := "recovery:" + inc.Culprit + ":ambiguous-head"
+	if !result.Shadow && !o.DryRun {
+		sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 		if e != nil {
 			return e
 		}
-		if !ready {
-			if s.now().Sub(at) < p.AnyRefWait() {
-				return holdAs("recovery-confirming", "waiting for a complete re-run of the confirmation checks", false)
-			}
-			delete(inc.Pending, inc.Culprit)
-			if e := save(inc); e != nil {
-				return e
-			}
-			return holdAs("recovery-hold", "the re-run timed out on "+short7(inc.Culprit), true)
-		}
-		delete(inc.Pending, inc.Culprit)
-		if state != github.Green {
-			// The re-run fails too: the head's own run and its newest status now
-			// agree on red, so the next pass takes the normal recovery path.
-			if e := save(inc); e != nil {
-				return e
-			}
-			return holdAs("recovery-hold", "the re-run failed too; the confirmed failure stands", true)
-		}
-		inc.Flaky = passed
-		if e := save(inc); e != nil {
-			return e
-		}
-		if acting {
+		if !sent.has(key) {
 			row := struct {
 				Decision  string `json:"decision"`
 				Culprit   string `json:"culprit"`
 				CulpritPR int    `json:"culprit_pr"`
 				Reason    string `json:"reason"`
-			}{"mixed-after-confirmation", inc.Culprit, inc.CulpritPR, passed}
-			if e := s.audit(r.Name, "recovery-mixed-head", row, false); e != nil {
+			}{"hold-conflicting-head", inc.Culprit, inc.CulpritPR, reason}
+			if e := s.audit(r.Name, "recovery-conflict-head", row, false); e != nil {
 				return e
 			}
 		}
-		result.Action, result.Reason = "recovery-confirming", passed
-		key := "recovery:" + inc.Culprit + ":confirm:" + passed
-		if inc.RevertPR != 0 {
-			key = "recovery:" + strconv.Itoa(inc.RevertPR) + ":confirm:" + passed
-		}
-		return s.reportWatch(ctx, r, result, key, o)
 	}
-	// No complete re-run exists yet. Only one started now can show the culprit
-	// passing, so start it and hold; the result is read on a later pass.
-	if !acting {
-		return holdAs("recovery-confirming", "would re-run any-ref CI on "+short7(inc.Culprit), false)
-	}
-	dispatcher, ok := s.GH.(workflowDispatcher)
-	if !ok || p.AnyRefWorkflow == "" {
-		return holdAs("recovery-hold", "no any_ref_workflow to re-run the culprit", true)
-	}
-	if inc.Dispatches[inc.Culprit] >= confirmRuns {
-		return holdAs("recovery-hold", "re-run bound reached on "+short7(inc.Culprit), true)
-	}
-	if inc.Pending == nil {
-		inc.Pending = map[string]time.Time{}
-	}
-	if inc.Dispatches == nil {
-		inc.Dispatches = map[string]int{}
-	}
-	inc.Pending[inc.Culprit] = s.now().UTC()
-	inc.Dispatches[inc.Culprit]++
-	if e := save(inc); e != nil {
-		return e
-	}
-	if e := s.dispatch(ctx, dispatcher, r, p, inc.Culprit); e != nil {
-		if github.DispatchRefused(e) {
-			delete(inc.Pending, inc.Culprit)
-			if e := save(inc); e != nil {
-				return e
-			}
-			return holdAs("recovery-hold", "any-ref CI dispatch refused for "+short7(inc.Culprit)+": "+e.Error(), true)
-		}
-		return e
-	}
-	return holdAs("recovery-confirming", "re-running the culprit to decide the head's check conflict", false)
+	return s.reportWatch(ctx, r, result, key, o)
 }
 
 // recoverHeadCulprit resolves an incident whose culprit is the current head.
@@ -694,7 +599,7 @@ func (s *watchStream) recoverIncident(ctx context.Context, r config.Repo, p poli
 	if task == "" {
 		task = r.Task
 	}
-	return s.openRevert(ctx, r, p, head, checks, st.Culprit, origin, task, result, o)
+	return s.openRevert(ctx, r, head, checks, st.Culprit, origin, task, result, o)
 }
 
 // recovery handles a red main while a recovery latch is active. It resolves the
@@ -762,9 +667,7 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			}
 		}
 	}
-	// A flaky record stops the automatic revert even when the failure was
-	// confirmed earlier: the merge below turns on the same evidence.
-	if !st.Confirmed || st.Flaky != "" {
+	if !st.Confirmed {
 		var confirmed, needsDesk bool
 		var reason string
 		var ce error
