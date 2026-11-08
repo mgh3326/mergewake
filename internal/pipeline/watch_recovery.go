@@ -499,6 +499,45 @@ func (s *watchStream) settleMixedHead(ctx context.Context, r config.Repo, p poli
 	return false, s.audit(r.Name, "watch", result, o.DryRun)
 }
 
+// settleConfirmedHead decides a confirmed incident's ambiguous read at its
+// culprit head once. A same-sha re-run that passes beside the head's own failed
+// run is a mixed result, and a mixed result is flaky: that is what this code
+// already does with one before confirmation (confirmRecovery), and a mixed
+// result never justifies blaming a commit. The verdict already reached is not
+// re-litigated, so the incident keeps its culprit, baseline and confirmation
+// and gains the flaky mark; the automatic revert stops and the design lane
+// hears it once. A later pass reads the record instead of deciding again.
+func (s *watchStream) settleConfirmedHead(ctx context.Context, r config.Repo, result watchResult, o Options, inc recoveryIncident) error {
+	const reason = "the culprit passed a re-run after confirmation"
+	result.Culprit, result.PR = inc.Culprit, inc.CulpritPR
+	result.Action = "recovery-confirming"
+	result.Reason = reason
+	if inc.Flaky == "" {
+		inc.Flaky = reason
+		if !result.Shadow && !o.DryRun {
+			if e := s.saveRecovery(r.Name, inc); e != nil {
+				return e
+			}
+			row := struct {
+				Decision  string `json:"decision"`
+				Culprit   string `json:"culprit"`
+				CulpritPR int    `json:"culprit_pr"`
+				Reason    string `json:"reason"`
+			}{"mixed-after-confirmation", inc.Culprit, inc.CulpritPR, reason}
+			if e := s.audit(r.Name, "recovery-mixed-head", row, false); e != nil {
+				return e
+			}
+		}
+	}
+	// One notice per decision: the latch path reports the same record under the
+	// revert PR's key.
+	key := "recovery:" + inc.Culprit + ":confirm:" + reason
+	if inc.RevertPR != 0 {
+		key = "recovery:" + strconv.Itoa(inc.RevertPR) + ":confirm:" + reason
+	}
+	return s.reportWatch(ctx, r, result, key, o)
+}
+
 // recoverHeadCulprit resolves an incident whose culprit is the current head.
 // An active latch still owns the revert PR, so it keeps the recovery path.
 func (s *watchStream) recoverHeadCulprit(ctx context.Context, r config.Repo, p policy.Policy, head string, checks []string, result watchResult, o Options, inc recoveryIncident) error {
@@ -629,7 +668,9 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			}
 		}
 	}
-	if !st.Confirmed {
+	// A flaky record stops the automatic revert even when the failure was
+	// confirmed earlier: the merge below turns on the same evidence.
+	if !st.Confirmed || st.Flaky != "" {
 		var confirmed, needsDesk bool
 		var reason string
 		var ce error

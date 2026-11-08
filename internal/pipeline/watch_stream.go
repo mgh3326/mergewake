@@ -90,10 +90,15 @@ func (s *watchStream) watchDeploy(ctx context.Context, r config.Repo, p policy.P
 	current, terminal := mainHead, ""
 	for i := 0; i < s.Config.WatchLimit; i++ {
 		ci, err := s.GH.Check(ctx, r.Name, current, p.WatchSet())
-		if err != nil {
+		// A same-sha re-run leaves a pass beside the commit's failed run. That
+		// read is not green, not red and not a reason to walk past the commit:
+		// the newest such commit is the terminal one, and its incident decides
+		// the mixed result.
+		ambiguous := errors.Is(err, github.ErrAmbiguousCheck)
+		if err != nil && !ambiguous {
 			return err
 		}
-		if terminal == "" && (ci == github.Green || ci == github.Red) {
+		if terminal == "" && (ci == github.Green || ci == github.Red || ambiguous) {
 			terminal = current
 		}
 		if recorded && current != st.Head && ci == github.Green {
@@ -137,7 +142,8 @@ func (s *watchStream) watchDeploy(ctx context.Context, r config.Repo, p policy.P
 			}
 		}
 		ci, err := s.GH.Check(ctx, r.Name, terminal, p.WatchSet())
-		if err != nil {
+		// The terminal commit's mixed read is decided by its incident, not here.
+		if err != nil && !errors.Is(err, github.ErrAmbiguousCheck) {
 			return err
 		}
 		// A passed re-run at the failing commit is confirmation evidence,
