@@ -80,8 +80,10 @@ func TestBotUpdateLandsPatchBoundToHead(t *testing.T) {
 	if !strings.Contains(out.String(), `"command":"land"`) || !strings.Contains(out.String(), `"reason":"bot-patch"`) {
 		t.Fatalf("land record: %s", out)
 	}
-	if len(n.events) != 0 || !sentKeyHas(t, s, testRepoFor(s), verdictKey("merged", 7, g.pull.Head.SHA)) {
-		t.Fatalf("MERGED is recorded, not sent: %+v", n.events)
+	r := testRepoFor(s)
+	r.Lane = "desk" // botSetup's repo lane
+	if len(n.events) != 1 || n.events[0].Type != "merged" || n.events[0].Lane != "desk" || !sentKeyHas(t, s, r, verdictKey("merged", 7, g.pull.Head.SHA)) {
+		t.Fatalf("MERGED is sent once to the repo lane: %+v", n.events)
 	}
 }
 
