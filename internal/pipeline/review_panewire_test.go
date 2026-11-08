@@ -43,6 +43,8 @@ type panewireRunner struct {
 	// refuseStderr, when set, is the stderr a refused spawn wrote.
 	refuseStderr string
 	findings     string // "" writes no findings file
+	// byLabel overrides findings for the pass whose reviewer label contains the key.
+	byLabel      map[string]string
 	family       string
 	noEvents     bool   // the pane ran on another host: no spawn events in the local job dir
 	placement    string // optional " placement=<base64url>" appended to the spawn's OK line
@@ -162,16 +164,22 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		}
 		job := filepath.Dir(args[slices.Index(args, "-p")+1])
 		label := arg(args, "-l")
+		findings := r.findings
+		for key, v := range r.byLabel {
+			if strings.Contains(label, key) {
+				findings = v
+			}
+		}
 		switch {
-		case r.findings == "":
+		case findings == "":
 		case r.remote != nil:
-			sum := sha256.Sum256([]byte(r.findings))
+			sum := sha256.Sum256([]byte(findings))
 			sha := hex.EncodeToString(sum[:])
-			r.remote.files[sha] = []byte(r.findings)
+			r.remote.files[sha] = []byte(findings)
 			r.inbox = append(r.inbox, `{"id":8,"kind":"lane.event","event":{"event_id":"`+label+`-findings","text":"[`+label+`] findings"}}`)
 			r.inbox = append(r.inbox, `{"id":9,"kind":"lane.event","event":{"event_id":"`+label+`-findings","text":"[`+label+`] findings attachment=`+sha+`"}}`)
 		default:
-			if e := os.WriteFile(filepath.Join(job, "findings.json"), []byte(r.findings), 0600); e != nil {
+			if e := os.WriteFile(filepath.Join(job, "findings.json"), []byte(findings), 0600); e != nil {
 				return nil, e
 			}
 		}

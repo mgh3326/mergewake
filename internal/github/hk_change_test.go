@@ -34,7 +34,7 @@ func TestHKChangeThreadsAndPostedFindings(t *testing.T) {
 	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
-	fs := []Finding{{Severity: "high", Path: "a.go", Line: 3, Body: "inline bug"}, {Severity: "low", Path: "a.go", Line: 90, Body: "file bug", Anchor: AnchorFile}, {Severity: "medium", Path: "other.go", Line: 2, Body: "outside bug", Anchor: AnchorOutside}}
+	fs := []Finding{{Severity: "high", Path: "a.go", Line: 3, Body: "inline bug"}, {Severity: "low", Path: "a.go", Line: 90, Body: "file bug"}, {Severity: "medium", Path: "other.go", Line: 2, Body: "outside bug", Anchor: AnchorOutside}}
 	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" {
 			fmt.Fprint(w, `{}`)
@@ -43,7 +43,7 @@ func TestHKChangeThreadsAndPostedFindings(t *testing.T) {
 		node := func(id, body string, line int) map[string]any {
 			return map[string]any{"id": id, "path": "a.go", "line": line, "comments": map[string]any{"nodes": []any{map[string]any{"author": map[string]any{"login": "review-bot", "__typename": "Bot"}, "body": body}}, "pageInfo": map[string]any{"hasNextPage": false}}}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"author": map[string]any{"login": "author"}, "headRefOid": testSHA, "reviews": map[string]any{"nodes": []any{}}, "reviewThreads": map[string]any{"nodes": []any{node("T1", FindingBody(fs[0]), 3), node("T2", FindingBody(fs[1])+"\n\n(Line 90 is not changed by this PR.)", 0)}, "pageInfo": map[string]any{"hasNextPage": false}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"author": map[string]any{"login": "author"}, "headRefOid": testSHA, "reviews": map[string]any{"nodes": []any{}}, "reviewThreads": map[string]any{"nodes": []any{node("T1", FindingBody(fs[0]), 3), node("T2", FindingBody(fs[1]), 90)}, "pageInfo": map[string]any{"hasNextPage": false}}}}}})
 	})
 	c.ChangeLogin = "review-bot"
 	c.Changes = integrations.NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))

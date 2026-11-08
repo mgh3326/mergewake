@@ -35,14 +35,14 @@ func anchors(g *fakeGH) []string {
 }
 
 // (a) One finding on a changed line and one on an unchanged line of the same
-// file: the pass is posted, the second as a file-level comment.
-func TestOutsideDiffLineBecomesFileComment(t *testing.T) {
+// file: the pass is posted, the second listed in the review body.
+func TestOutsideDiffLineIsListedInTheBody(t *testing.T) {
 	_, g, _ := reviewWith(t, `{"findings":[{"path":"tool","line":1,"body":"in the diff","severity":"high"},{"path":"tool","line":40,"body":"unchanged line","severity":"high"}]}`)
 	if g.postCount != 1 || !g.refs[doneRef(7, shaA)] {
 		t.Fatalf("posts=%d refs=%v", g.postCount, g.refs)
 	}
 	got := anchors(g)
-	if len(got) != 2 || got[0] != `tool:1:""` || got[1] != `tool:40:"file"` {
+	if len(got) != 2 || got[0] != `tool:1:""` || got[1] != `tool:40:"outside"` {
 		t.Fatalf("anchors=%v", got)
 	}
 }

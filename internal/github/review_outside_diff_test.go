@@ -46,25 +46,20 @@ func comments(t *testing.T, sent map[string]any) []map[string]any {
 }
 
 // An in-diff finding stays an inline comment; a finding on a line the PR did
-// not change is a file-level comment, so it is still a thread.
-func TestPostReviewFileLevelComment(t *testing.T) {
-	sent, _ := postAndReadBack(t, []Finding{
+// not change is listed in the review body, because the create-review endpoint
+// takes comments only on lines of the diff.
+func TestPostReviewLineOutsideHunksIsListed(t *testing.T) {
+	sent, history := postAndReadBack(t, []Finding{
 		{Path: "a.go", Line: 3, Severity: "high", Body: "inline bug", Anchor: AnchorLine},
-		{Path: "a.go", Line: 90, Severity: "high", Body: "unchanged line bug", Anchor: AnchorFile},
+		{Path: "a.go", Line: 90, Severity: "high", Body: "unchanged line bug", Anchor: AnchorOutside},
 	}, PassReceipt{Pass: 1, Lens: "default"})
 	got := comments(t, sent)
-	if len(got) != 2 {
+	if len(got) != 1 || got[0]["line"] != float64(3) || got[0]["side"] != "RIGHT" || got[0]["subject_type"] != nil {
 		t.Fatalf("comments=%v", got)
 	}
-	if got[0]["line"] != float64(3) || got[0]["side"] != "RIGHT" || got[0]["subject_type"] != nil {
-		t.Errorf("inline comment=%v", got[0])
-	}
-	if got[1]["subject_type"] != "file" || got[1]["line"] != nil || got[1]["side"] != nil || got[1]["path"] != "a.go" {
-		t.Errorf("file comment=%v", got[1])
-	}
-	body := got[1]["body"].(string)
-	if !strings.HasPrefix(body, "<!-- mergewake-severity:high -->\n") || !strings.Contains(body, "unchanged line bug") || !strings.Contains(body, "Line 90") {
-		t.Errorf("file comment body=%q", body)
+	body := sent["body"].(string)
+	if !strings.Contains(body, "`a.go:90` (high): unchanged line bug") || len(history) != 1 || history[0].OutsideBlocking != 1 {
+		t.Errorf("body=%q history=%+v", body, history)
 	}
 }
 
