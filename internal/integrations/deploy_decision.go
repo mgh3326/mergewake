@@ -1,8 +1,13 @@
 package integrations
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"time"
 
 	"github.com/mgh3326/handoffkeep/client"
@@ -11,10 +16,13 @@ import (
 )
 
 // deployDecisionEntry is the hk decision request mergewake asked, or
-// adopted, for one deploy task's question.
+// adopted, for one deploy task's question. Root is the root hk gave that
+// request (the first revision of its chain); an entry written before roots
+// were recorded has none.
 type deployDecisionEntry struct {
 	Question  string `json:"question"`
 	RequestID string `json:"request_id"`
+	Root      string `json:"root,omitempty"`
 }
 
 // deployDecisionRecord is the rollout's durable record of deploy decision
@@ -26,43 +34,107 @@ type deployDecisionRecord struct {
 	Tasks map[string]deployDecisionEntry `json:"by_task"`
 }
 
-// readDeployDecisionRecord reads the record at path; a missing file is an
-// empty record. The single-record shape {task, question, request_id}, which
-// only an unreleased build wrote, is read as a one-entry map.
+// readDeployDecisionRecord reads the record at path. Only a missing file is
+// an empty record. A present file must be the map shape {"by_task": {...}}
+// with a question and a request id in every entry, or the complete
+// single-record shape {task, question, request_id} that only an unreleased
+// build wrote, read as a one-entry map. Anything else (null, {}, a null
+// map, an empty entry, a wrong type or an unknown field) is corrupt: an
+// error, so the rollout holds instead of reopening question-text adoption.
 func readDeployDecisionRecord(path string) (deployDecisionRecord, error) {
-	var raw struct {
-		Tasks     map[string]deployDecisionEntry `json:"by_task"`
-		Task      string                         `json:"task"`
-		Question  string                         `json:"question"`
-		RequestID string                         `json:"request_id"`
+	b, e := os.ReadFile(path)
+	if errors.Is(e, fs.ErrNotExist) {
+		return deployDecisionRecord{Tasks: map[string]deployDecisionEntry{}}, nil
 	}
-	if _, e := fsutil.ReadJSON(path, &raw); e != nil {
+	if e != nil {
 		return deployDecisionRecord{}, e
 	}
-	out := deployDecisionRecord{Tasks: raw.Tasks}
-	if out.Tasks == nil {
-		out.Tasks = map[string]deployDecisionEntry{}
-		if raw.Task != "" {
-			out.Tasks[raw.Task] = deployDecisionEntry{raw.Question, raw.RequestID}
-		}
+	out, why := parseDeployDecisionRecord(b)
+	if why != "" {
+		return deployDecisionRecord{}, fmt.Errorf("deploy decision record %s is corrupt (%s); hold", path, why)
 	}
 	return out, nil
+}
+
+func parseDeployDecisionRecord(b []byte) (deployDecisionRecord, string) {
+	var top map[string]json.RawMessage
+	if e := strictJSON(b, &top); e != nil {
+		return deployDecisionRecord{}, e.Error()
+	}
+	if top == nil {
+		return deployDecisionRecord{}, "not an object"
+	}
+	if raw, ok := top["by_task"]; ok {
+		if len(top) != 1 {
+			return deployDecisionRecord{}, "by_task beside other fields"
+		}
+		var tasks map[string]json.RawMessage
+		if e := strictJSON(raw, &tasks); e != nil {
+			return deployDecisionRecord{}, "by_task: " + e.Error()
+		}
+		if tasks == nil {
+			return deployDecisionRecord{}, "by_task is not an object"
+		}
+		out := deployDecisionRecord{Tasks: make(map[string]deployDecisionEntry, len(tasks))}
+		for task, raw := range tasks {
+			var x deployDecisionEntry
+			if e := strictJSON(raw, &x); e != nil {
+				return deployDecisionRecord{}, fmt.Sprintf("task %q: %v", task, e)
+			}
+			if x.Question == "" || x.RequestID == "" {
+				return deployDecisionRecord{}, fmt.Sprintf("task %q: question and request_id required", task)
+			}
+			out.Tasks[task] = x
+		}
+		return out, ""
+	}
+	var v1 struct {
+		Task      string `json:"task"`
+		Question  string `json:"question"`
+		RequestID string `json:"request_id"`
+	}
+	if e := strictJSON(b, &v1); e != nil {
+		return deployDecisionRecord{}, e.Error()
+	}
+	if v1.Task == "" || v1.Question == "" || v1.RequestID == "" {
+		return deployDecisionRecord{}, "neither by_task nor a complete task, question and request_id"
+	}
+	return deployDecisionRecord{Tasks: map[string]deployDecisionEntry{v1.Task: {Question: v1.Question, RequestID: v1.RequestID}}}, ""
+}
+
+// strictJSON decodes one JSON value from b into v, refusing unknown fields
+// and trailing data.
+func strictJSON(b []byte, v any) error {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if e := d.Decode(v); e != nil {
+		return e
+	}
+	if d.More() {
+		return errors.New("trailing data")
+	}
+	return nil
 }
 
 // DeployDecision only consumes an operator answer to this exact immutable
 // host/range/release question, read and recorded over hk's HTTP API as
 // svc-mergewake. It asks on the record-only route (the hk CLI's `decisions
 // ask` without --linear), which opens no Linear issue. The task's current
-// request counts only when its id is the one recorded in the file record
-// for this task and question, or a request that supersedes it, and its
-// question text is still question.
+// request counts only when it is human-only, its question text is still
+// question, and it belongs to the request recorded in the file record for
+// this task and question: it is that request, it supersedes it, or hk gives
+// it the recorded request's chain root (so a request superseded any number
+// of times is still followed).
 //
 // While record has no entry for task (the first decision after the upgrade
 // from question-text lookup, or a task new to this repository), a
 // human-only request whose question text is question is adopted once, as
 // the old lookup found it: its id is recorded and matched from then on.
 // Once task has an entry, a request with the same text but another id is
-// never adopted. Entries of other tasks are left as they are.
+// never adopted, including one hk returns as a duplicate of the ask (hk
+// compares neither status nor requester): the rollout then holds with an
+// error. Entries of other tasks are left as they are. A record file that is
+// present but not a valid record holds the rollout before hk is read.
 //
 // The read-modify-write of record is not locked here: its one caller,
 // pipeline.Service.Rollout, holds the repository's rollout decision-lock,
@@ -94,22 +166,32 @@ func (h Handoffkeep) DeployDecision(ctx context.Context, task, question, record 
 		r = *current.Refs.DecisionRequest
 	}
 	expired := r.DueAt != nil && !now.Before(*r.DueAt)
-	save := func(requestID string) error {
-		records.Tasks[task] = deployDecisionEntry{question, requestID}
+
+	prior, recorded := records.Tasks[task]
+	var known deployDecisionEntry
+	if recorded && prior.Question == question {
+		known = prior
+	}
+	// counts is whether x is this rollout's request for question: in the
+	// recorded request's chain or, while task has no entry, the one-time
+	// adoption by question text.
+	counts := func(x client.DecisionRequest) bool {
+		inChain := known.RequestID != "" && (x.ID == known.RequestID || x.Supersedes == known.RequestID ||
+			x.Root != "" && (x.Root == known.RequestID || x.Root == known.Root))
+		return x.ID != "" && x.HumanOnly && x.Question == question && (!recorded || inChain)
+	}
+	save := func(x client.DecisionRequest) error {
+		entry := deployDecisionEntry{question, x.ID, x.Root}
+		if recorded && entry == prior {
+			return nil
+		}
+		records.Tasks[task] = entry
 		return fsutil.WriteJSON(record, records)
 	}
 
-	prior, recorded := records.Tasks[task]
-	known := ""
-	if recorded && prior.Question == question {
-		known = prior.RequestID
-	}
-	ours := !recorded || (known != "" && (r.ID == known || r.Supersedes == known))
-	if ours && r.ID != "" && r.HumanOnly && r.Question == question {
-		if r.ID != known {
-			if e = save(r.ID); e != nil {
-				return false, e
-			}
+	if counts(r) {
+		if e = save(r); e != nil {
+			return false, e
 		}
 		if expired {
 			return false, nil
@@ -143,5 +225,12 @@ func (h Handoffkeep) DeployDecision(ctx context.Context, task, question, record 
 	if asked.Request.ID == "" {
 		return false, errors.New("handoffkeep decision request returned no request id")
 	}
-	return false, save(asked.Request.ID)
+	// hk answers a re-send of the task's current request with that request
+	// and duplicate set, whatever its status or requester. Only this
+	// rollout's own request (or, before the task has an entry, one the old
+	// question-text rule adopts) is recorded from a duplicate.
+	if asked.Duplicate && !counts(asked.Request) {
+		return false, fmt.Errorf("deployment decision: hk returned an existing request this rollout did not ask (duplicate %s); hold", asked.Request.ID)
+	}
+	return false, save(asked.Request)
 }
