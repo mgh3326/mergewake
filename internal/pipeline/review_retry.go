@@ -215,6 +215,9 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			if f.label != "" {
 				row["label"] = f.label
 			}
+			if d := errorDetailOf(f.err); d != "" {
+				row["detail"] = d
+			}
 			_ = s.audit(r.Name, "review-failed", row, false)
 		}
 		state.LastError = reviewErrorText(class.failures[len(class.failures)-1].err)

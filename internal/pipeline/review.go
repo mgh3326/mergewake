@@ -473,14 +473,14 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if out.reviewer == "" && ctx.Err() != nil {
 			s.reviewerEvents(r.Name, n, plan.pass, skips)
 			s.reviewMissingEvent(r.Name, n, plan.pass, "review_deadline", skips, "")
-			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), ctx.Err())
+			return errors.Join(withErrorDetail(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), skipsDetail(skips)), ctx.Err())
 		}
 		s.reviewerEvents(r.Name, n, plan.pass, skips)
 		selected := out.reviewer
 		if selected == "" {
 			s.reviewMissingEvent(r.Name, n, plan.pass, "review_missing", skips, "")
 			e = s.audit(r.Name, "review-skipped", map[string]any{"pr": n, "head": pr.Head.SHA, "pass": plan.pass, "skipped": skips}, false)
-			return errors.Join(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), e)
+			return errors.Join(withErrorDetail(fmt.Errorf("%w: no reviewer produced pass %d (%s)", ErrReviewUnavailable, plan.pass, describeSkips(skips)), skipsDetail(skips)), e)
 		}
 		// A finding the other pass kept first is dropped here, as when the
 		// passes ran one after the other.
@@ -656,6 +656,10 @@ type reviewSkip struct {
 	ExitCode   *int   `json:"exit_code,omitempty"`
 	StderrTail string `json:"stderr_tail,omitempty"`
 	Cause      string `json:"cause,omitempty"`
+	// Detail is the redacted, bounded stderr of a git command that failed a
+	// PR-head checkout. The reason keeps the command's bare exit; Detail holds
+	// what git said and stays in the local audit rows.
+	Detail string `json:"detail,omitempty"`
 }
 
 func describeSkips(skips []reviewSkip) string {

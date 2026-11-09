@@ -302,11 +302,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// profile is the launch profile in the reviewer's hk job record; it stays
 	// empty until a spawned pane's record has been read.
 	profile := ""
-	skip := func(format string, args ...any) (passOutcome, error) {
+	// skipWith records a skip whose detail is git's redacted stderr tail. The
+	// detail stays out of the reason, which reaches comments and events.
+	skipWith := func(detail, format string, args ...any) (passOutcome, error) {
 		// Reasons can carry a command's stderr and reach the decision log
 		// and the review-skipped audit: redact them here.
-		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Host: cfg.Host, Profile: profile})
+		out.skips = append(out.skips, reviewSkip{Reviewer: "panewire", Reason: fleetevent.Redact(fmt.Sprintf(format, args...)), Detail: detail, Host: cfg.Host, Profile: profile})
 		return out, nil
+	}
+	skip := func(format string, args ...any) (passOutcome, error) {
+		return skipWith("", format, args...)
 	}
 	// panewire places the reviewer through the hub it reads from these
 	// variables. A daemon inherits them from its host wrapper; a manual run
@@ -424,7 +429,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if acquired && !resumed {
 		defer func() {
 			if !reviewerRecorded && len(out.skips) > 0 {
-				x.releaseLease(ctx, plan, leaseSHA, out.skips[len(out.skips)-1].Reason)
+				last := out.skips[len(out.skips)-1]
+				x.releaseLease(ctx, plan, leaseSHA, last.Reason, last.Detail)
 			}
 		}()
 	}
@@ -464,14 +470,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// ref. fetchPRHead falls back to the branch when GitHub has no
 		// pull/<n>/head, and only while the branch is at the exact head.
 		if e = s.fetchPRHead(ctx, root, x.repo.Name, pr); e != nil {
-			return skip("%v", e)
+			return skipWith(errorDetailOf(e), "%v", e)
 		}
 		// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head"
 		// or the branch) from this worktree and prepares the same detached
 		// worktree remotely.
 		if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
 			cleanup()
-			return skip("checkout PR head %s: %v", short7(pr.Head.SHA), e)
+			return skipWith(gitStderrDetail(e), "checkout PR head %s: %v", short7(pr.Head.SHA), e)
 		}
 	}
 	// A local pane runs in this checkout: closeReviewerPane keeps it until the
@@ -724,7 +730,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				// The refusal stays a hold: a failed re-close is no review failure.
 				// As for any held refusal, the pass lease goes back, so the next
 				// evaluation can spawn, and the hold and the close error are audited.
-				x.releaseLease(ctx, plan, leaseSHA, "reviewer-held")
+				x.releaseLease(ctx, plan, leaseSHA, "reviewer-held", "")
 				detail := integrations.Detail(e)
 				auditErr := errors.Join(
 					s.audit(x.repo.Name, "reviewer-held", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "task": task, "resumed": resumed}, false),
@@ -770,7 +776,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			if code == 81 && (strings.Contains(string(stdout), "secret_like_content") || strings.Contains(stderr, "secret_like_content")) {
 				if !resumed && ctx.Err() == nil {
-					x.releaseLease(ctx, plan, leaseSHA, "secret-like-brief")
+					x.releaseLease(ctx, plan, leaseSHA, "secret-like-brief", "")
 				}
 				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
 					return out, dropErr
@@ -783,7 +789,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// pass at once instead of waiting out the lease. An exit that may
 			// follow a placed pane, such as a timed-out wait, keeps the lease.
 			if reason, never := spawnNeverPlaced(code); never && !resumed && ctx.Err() == nil {
-				x.releaseLease(ctx, plan, leaseSHA, reason)
+				x.releaseLease(ctx, plan, leaseSHA, reason, "")
 			}
 			// A refused fresh spawn created no job: its record goes.
 			if !resumed && (code == panewireRefused || code == panewireHeld) {
@@ -931,7 +937,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if e := s.audit(x.repo.Name, "review-quota-stopped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "pool": pool, "reset_at": stopped.resetText()}, false); e != nil {
 			return out, errors.Join(stopped, e)
 		}
-		x.releaseLease(ctx, plan, leaseSHA, "reviewer-quota-stopped")
+		x.releaseLease(ctx, plan, leaseSHA, "reviewer-quota-stopped", "")
 		x.note("quota-stopped", rj)
 		return out, stopped
 	case res.reason == "escalated" || res.reason == "lost":
@@ -1073,7 +1079,7 @@ func spawnNeverPlaced(code int) (string, bool) {
 // sits at leaseSHA (a compare-and-swap), so a lease another host renewed stays.
 // It is best effort:
 // when the release fails the lease expires by its TTL, as it did before.
-func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, leaseSHA, reason string) {
+func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, leaseSHA, reason, detail string) {
 	releaser, ok := x.s.GH.(interface {
 		ReleaseReviewLease(context.Context, string, string, string) (bool, error)
 	})
@@ -1086,7 +1092,11 @@ func (x *panewireExecutor) releaseLease(ctx context.Context, plan *passPlan, lea
 	if err != nil || !released {
 		return
 	}
-	_ = x.s.audit(x.repo.Name, "review-lease-released", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "reason": reason}, false)
+	row := map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "reason": reason}
+	if detail != "" {
+		row["detail"] = detail
+	}
+	_ = x.s.audit(x.repo.Name, "review-lease-released", row, false)
 }
 
 // hkReadFailed reports an hk job read that failed for a reason other than a
@@ -1280,7 +1290,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	x.note("lost", rj)
 	if rj.Replacements >= 1 {
 		// No pass follows this record: its lease is released, not left to expire.
-		x.releaseLease(ctx, plan, leaseSHA, "reviewer-lost")
+		x.releaseLease(ctx, plan, leaseSHA, "reviewer-lost", "")
 		return out, &collectionFailure{fmt.Errorf("%w: %v", ErrReviewUnavailable, lost)}
 	}
 	plan.replacements = rj.Replacements + 1

@@ -52,18 +52,18 @@ func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.
 func (s *Service) fetchBranchAtHead(ctx context.Context, root, ref string, pr github.Pull, firstText string) (result string, err error) {
 	tracking := "refs/remotes/origin/" + ref
 	if _, e := s.gitIn(ctx, root, "fetch", "--no-tags", "origin", "+refs/heads/"+ref+":"+tracking, pr.Base.Ref); e != nil {
-		return "fetch-failed", fmt.Errorf("fetch PR head: %s; fetch branch %s: %s", firstText, ref, boundedGitError(e))
+		return "fetch-failed", withErrorDetail(fmt.Errorf("fetch PR head: %s; fetch branch %s: %s", firstText, ref, boundedGitError(e)), gitStderrDetail(e))
 	}
 	out, e := s.gitIn(ctx, root, "rev-parse", "--verify", tracking)
 	if e != nil {
-		return "head-moved", fmt.Errorf("fetch PR head: %s; read branch %s: %s", firstText, ref, boundedGitError(e))
+		return "head-moved", withErrorDetail(fmt.Errorf("fetch PR head: %s; read branch %s: %s", firstText, ref, boundedGitError(e)), gitStderrDetail(e))
 	}
 	if tip := strings.TrimSpace(string(out)); !strings.EqualFold(tip, pr.Head.SHA) {
 		return "head-moved", fmt.Errorf("fetch PR head: %s; branch %s is at %s, not head %s", firstText, ref, short7(tip), short7(pr.Head.SHA))
 	}
 	pull := fmt.Sprintf("refs/remotes/origin/pull/%d/head", pr.Number)
 	if _, e := s.gitIn(ctx, root, "update-ref", "-d", pull); e != nil {
-		return "pull-ref-kept", fmt.Errorf("fetch PR head: %s; delete stale %s: %s", firstText, pull, boundedGitError(e))
+		return "pull-ref-kept", withErrorDetail(fmt.Errorf("fetch PR head: %s; delete stale %s: %s", firstText, pull, boundedGitError(e)), gitStderrDetail(e))
 	}
 	return "ok", nil
 }
