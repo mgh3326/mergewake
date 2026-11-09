@@ -1,11 +1,17 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -387,6 +393,142 @@ func TestLegacyIgnoredRetryClasses(t *testing.T) {
 			}
 			if st.Failures != 1 || !st.Escalated || lost != 0 || failed != 1 || lostRows != 0 {
 				t.Fatalf("state=%+v lost=%d failed=%d rows=%d", st, lost, failed, lostRows)
+			}
+		})
+	}
+}
+
+// cancelOnReviewerRead cancels the review when the resumed reviewer's hk
+// record is read, and that read returns the cancellation.
+type cancelOnReviewerRead struct {
+	*taskJobSink
+	label  string
+	cancel context.CancelFunc
+}
+
+func (s cancelOnReviewerRead) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
+	if id == s.label {
+		s.cancel()
+		return integrations.JobRecord{}, context.Canceled
+	}
+	return s.taskJobSink.Job(ctx, id)
+}
+
+// cancelOnHubJobResult puts a proxy in front of s's reap hub that cancels the
+// review when a reviewer node is asked for job.result: that read never
+// answers, and fails with the cancellation. Every other hub call goes through.
+func cancelOnHubJobResult(t *testing.T, s *Service, cancel context.CancelFunc) {
+	t.Helper()
+	target, err := url.Parse(s.Config.Reap.Hub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte(`"job.result"`)) {
+			cancel()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	s.Config.Reap.Hub.URL = server.URL
+}
+
+// cancellable gives f's next evaluations a context that cancel ends.
+func cancellable(f *unreadableFixture) context.CancelFunc {
+	ctx, cancel := context.WithCancel(f.ctx)
+	f.ctx = ctx
+	return cancel
+}
+
+// keptAfterCancel checks that a resumed evaluation cut short by its context
+// returned the cancellation and decided nothing about the reviewer: its record
+// stays, nothing is lost, noticed, closed, replaced or posted.
+func keptAfterCancel(t *testing.T, f *unreadableFixture, err error, notices int) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want the cancellation", err)
+	}
+	if got := readReviewerJob(t, f.s, f.r, 1); got.Label != f.old.Label || got.Replacements != 0 {
+		t.Fatalf("record=%+v, want %s kept", got, f.old.Label)
+	}
+	n := f.s.Notifier.(*fakeNotifier)
+	if lost, _ := resultLostNotices(f.s); lost != 0 || n.count != notices {
+		t.Fatalf("lost notices=%d notices=%d, want %d: %+v", lost, n.count, notices, n.events)
+	}
+	if rows := auditRows(t, f.s, f.r, "review-result-lost"); len(rows) != 0 {
+		t.Fatalf("lost rows=%v", rows)
+	}
+	if len(f.runner.spawns) != 1 || len(f.runner.closes) != 0 || f.g.postCount != 0 {
+		t.Fatalf("spawns=%d closes=%v posts=%d", len(f.runner.spawns), f.runner.closes, f.g.postCount)
+	}
+}
+
+// A resumed review whose read of the reviewer's hk record is cancelled,
+// within the review budget or past it, returns the cancellation: no unreadable
+// hk is assumed, no wait is scheduled in its place, and the reviewer is not
+// lost or replaced.
+func TestResumedHkReadCancelledKeepsTheReviewer(t *testing.T) {
+	for name, past := range map[string]bool{"within budget": false, "over budget": true} {
+		t.Run(name, func(t *testing.T) {
+			f := unreadableReviewer(t, remoteFound)
+			f.runner.sink.jobErr = nil
+			cancel := cancellable(f)
+			defer cancel()
+			f.s.Sink = cancelOnReviewerRead{f.runner.sink, f.old.Label, cancel}
+			notices := f.s.Notifier.(*fakeNotifier).count
+			now := f.old.Recorded.Add(time.Minute)
+			if past {
+				now = f.timer
+			}
+			err := f.again(t, now)
+			keptAfterCancel(t, f, err, notices)
+			if calls := f.hub.ops("job.result"); len(calls) != 0 {
+				t.Fatalf("node read after the cancellation: %v", calls)
+			}
+		})
+	}
+}
+
+// A resumed review cancelled while the reviewer's node is read for its result
+// returns the cancellation, whether the node was read for a finished pane
+// whose record is still claimed or for a record hk cannot read: the read is
+// no missing result, so the reviewer is neither waited for in its place,
+// nudged, lost nor replaced.
+func TestResumedNodeReadCancelledKeepsTheReviewer(t *testing.T) {
+	for name, tc := range map[string]struct {
+		hkUnreadable, past bool
+	}{
+		"pane finished within budget": {},
+		"pane finished over budget":   {past: true},
+		"hk unreadable within budget": {hkUnreadable: true},
+		"hk unreadable over budget":   {hkUnreadable: true, past: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := unreadableReviewer(t, remoteFound)
+			if !tc.hkUnreadable {
+				f.runner.sink.jobErr = nil
+			}
+			cancel := cancellable(f)
+			defer cancel()
+			cancelOnHubJobResult(t, f.s, cancel)
+			notices := f.s.Notifier.(*fakeNotifier).count
+			now := f.old.Recorded.Add(time.Minute)
+			if tc.past {
+				now = f.timer
+			}
+			err := f.again(t, now)
+			keptAfterCancel(t, f, err, notices)
+			if events := nudgeEvents(f.s.Notifier.(*fakeNotifier)); len(events) != 0 || len(auditRows(t, f.s, f.r, "reviewer-nudge")) != 0 {
+				t.Fatalf("nudged after the cancellation: %+v", events)
 			}
 		})
 	}

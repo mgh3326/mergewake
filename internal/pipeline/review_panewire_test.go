@@ -902,7 +902,6 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 		"spawn refused":    {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
 		"refused twice":    {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
 		"no findings file": {"", &panewireRunner{}, "no findings: job record no job record"},
-		"findings invalid": {"", &panewireRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x","severity":"urgent"}]}`}, "findings rejected"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, r := panewireSetup(t, tc.runner)
@@ -916,6 +915,65 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 				t.Fatalf("claims=%d", g.claimCount)
 			}
 		})
+	}
+}
+
+// invalidFindings is a result whose one finding has a severity no review
+// accepts.
+const invalidFindings = `{"findings":[{"path":"other","line":9,"body":"x","severity":"urgent"}]}`
+
+// A pane publishes its findings as the result of its completed hk record, so
+// a result that fails validation is a completed reviewer's lost result: a
+// typed lost result naming the validation error, its audit row, nothing
+// posted and no headless reviewer. It is not a skip.
+func TestPanewireInvalidRecordResultIsLost(t *testing.T) {
+	runner := &panewireRunner{findings: invalidFindings}
+	s, g, r := panewireSetup(t, runner)
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	label := arg(runner.spawns[0], "-l")
+	var lost *reviewResultLost
+	if !errors.As(e, &lost) || lost.label != label || !strings.Contains(e.Error(), "invalid finding severity") || strings.Contains(e.Error(), "findings rejected") {
+		t.Fatalf("err=%v, want %s's lost result naming the invalid severity", e, label)
+	}
+	if runner.headless != 0 || g.postCount != 0 || g.refs[doneRef(7, shaA)] || len(g.passes[shaA]) != 0 {
+		t.Fatalf("headless=%d posts=%d refs=%v passes=%+v", runner.headless, g.postCount, g.refs, g.passes[shaA])
+	}
+	if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label || !strings.Contains(fmt.Sprint(rows[0]["collect_error"]), "invalid finding severity") {
+		t.Fatalf("lost rows=%v", rows)
+	}
+}
+
+// cancelOnRecordRead cancels the review as soon as a reviewer's hk record has
+// been read: the deadline runs out just after hk answers.
+type cancelOnRecordRead struct {
+	*taskJobSink
+	cancel context.CancelFunc
+}
+
+func (s cancelOnRecordRead) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
+	rec, err := s.taskJobSink.Job(ctx, id)
+	if strings.HasPrefix(id, "mwr-") {
+		s.cancel()
+	}
+	return rec, err
+}
+
+// The one path left to "findings rejected": an invalid record result read as
+// the review's context ends is a skip of the cut-short pass, not a lost
+// result, so no lost row or notice is written for a review that was stopped.
+func TestPanewireInvalidRecordResultAfterCancelIsRejected(t *testing.T) {
+	runner := &panewireRunner{findings: invalidFindings}
+	s, g, r := panewireSetup(t, runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Sink = cancelOnRecordRead{runner.sink, cancel}
+	e := s.Review(ctx, r, 7, "openai", Options{})
+	var lost *reviewResultLost
+	if !errors.Is(e, ErrReviewUnavailable) || !errors.Is(e, context.Canceled) || errors.As(e, &lost) || !strings.Contains(e.Error(), "findings rejected: invalid finding severity") {
+		t.Fatalf("err=%v, want the cancelled pass's findings-rejected skip", e)
+	}
+	if runner.headless != 0 || g.postCount != 0 || g.refs[doneRef(7, shaA)] || len(auditRows(t, s, r, "review-result-lost")) != 0 {
+		t.Fatalf("headless=%d posts=%d lost rows=%v", runner.headless, g.postCount, auditRows(t, s, r, "review-result-lost"))
 	}
 }
 

@@ -294,3 +294,38 @@ func TestReviewerRecordWithoutNudgedAtIsNudgedOnce(t *testing.T) {
 		t.Fatalf("nudge events=%d, want one", len(nudgeEvents(n)))
 	}
 }
+
+// (i) The nudge wait holds only a record that is still open. A nudged
+// reviewer whose record turns completed without a result inside the wait is
+// read on its host at once, and without the result there it is lost and
+// replaced once, with no second nudge.
+func TestReviewerNudgedRecordCompletedWithoutResultIsReplaced(t *testing.T) {
+	s, g, r, runner, c, old, hub, n := nudgeSetup(t, "done")
+	reviewWaits(t, s, r)
+	before := len(hub.ops("job.result"))
+	hub.mu.Lock()
+	hub.jobResult = json.RawMessage(`{"found":false}`)
+	hub.mu.Unlock()
+	runner.sink.jobs[old.Label] = integrations.JobRecord{State: "completed", Family: "openai", Host: "node-a", PaneID: "p1", OwnerLane: "owner"}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	resumeAfter(g, c, 30*time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := hub.ops("job.result")[before:]; len(calls) != 1 || calls[0]["job"] != old.Label {
+		t.Fatalf("host reads=%v, want one of %s", calls, old.Label)
+	}
+	rows := auditRows(t, s, r, "review-result-lost")
+	if len(rows) != 1 || rows[0]["label"] != old.Label || !strings.Contains(rows[0]["collect_error"].(string), "not_found") {
+		t.Fatalf("lost rows=%v", rows)
+	}
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label || g.postCount != 1 {
+		t.Fatalf("spawns=%v posts=%d, want one replacement that posts", runner.spawns, g.postCount)
+	}
+	if len(nudgeEvents(n)) != 1 {
+		t.Fatalf("nudge events=%d, want the first one only", len(nudgeEvents(n)))
+	}
+	if rows := auditRows(t, s, r, "reviewer-nudge-outcome"); len(rows) != 1 || rows[0]["outcome"] != "lost" {
+		t.Fatalf("outcome rows=%v", rows)
+	}
+}
