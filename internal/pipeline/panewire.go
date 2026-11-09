@@ -1637,14 +1637,19 @@ var fallbackAuditLog = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 // countLegacy counts and audits one use of legacy lane/file findings as the
 // pass's result on the pass receipt. Every use, on every entry point, comes
-// through here exactly once (docs/config.md, review-inbox-fallback).
+// through here exactly once (docs/config.md, review-inbox-fallback); a use
+// whose audit cannot be written logs review-inbox-fallback-audit-lost.
 func (x *panewireExecutor) countLegacy(plan *passPlan, label, record string, use legacyUse, note *string) {
 	fallbackMu.Lock()
 	x.s.inboxFallbacks++
 	fallbacks := x.s.inboxFallbacks
 	fallbackMu.Unlock()
 	*note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", *note, fallbacks), "; ")
-	_ = x.s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "record": record, "count": fallbacks, "entry": use.entry, "source": use.source}, false)
+	// A lost audit leaves the use uncounted: it never changes the review, but
+	// it is logged once so a zero count is never read as no use.
+	if err := x.s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "record": record, "count": fallbacks, "entry": use.entry, "source": use.source}, false); err != nil {
+		fallbackAuditLog.Warn("review-inbox-fallback-audit-lost", "repo", x.repo.Name, "pr", x.pr.Number, "pass", plan.pass, "label", label, "entry", use.entry, "source", use.source, "error", fleetevent.Redact(err.Error()))
+	}
 }
 
 // availableFindings checks the legacy sources once for a finished pane and

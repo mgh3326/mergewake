@@ -563,9 +563,17 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    `pass`, `label`, `record` and `count` are as before. Bytes read but beaten
    by an hk or node result are not counted. Records before this change
    (hk 3652) missed the `resumed-hk-unreadable` uses, so only a count taken
-   after it is complete: zero `review-inbox-fallback` records over N days
-   counted from its deploy is the removal gate for the legacy path (unit
-   6-7b). The
+   after it is complete. A use whose audit cannot be written — stdout fails,
+   or the record reaches stdout but its `decisions.jsonl` append fails —
+   still returns the legacy findings unchanged, and logs one
+   `review-inbox-fallback-audit-lost` line (JSON on the daemon's stderr,
+   with `repo`, `pr`, `pass`, `label`, `entry`, `source` and the redacted
+   `error`). The removal gate for the legacy path (unit 6-7b) is zero
+   `review-inbox-fallback` records **and** zero
+   `review-inbox-fallback-audit-lost` lines over N days counted from the
+   deploy of this change; a known outage of any capture (stdout,
+   `decisions.jsonl` or the stderr log) restarts the N days, since a lost
+   marker line is not detected. The
    findings go through validation (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
    claim and done marker. The receipt adds `"executor":"panewire"`, the
