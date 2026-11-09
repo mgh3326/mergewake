@@ -443,6 +443,45 @@ func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
 	}
 }
 
+func TestArchiveInvalidCheckoutMarkerCannotFallBackToParentRepo(t *testing.T) {
+	e := setup(t)
+	repo := t.TempDir()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	c := exec.Command("git", "init", "--bare", remote)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %v: %s", err, out)
+	}
+	c = exec.Command("git", "init", "-b", "main", repo)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init parent repo: %v: %s", err, out)
+	}
+	gitRun(t, repo, "config", "user.name", "Archive Test")
+	gitRun(t, repo, "config", "user.email", "archive-test@example.invalid")
+	write(t, filepath.Join(repo, ".gitignore"), "jobs/\n")
+	gitRun(t, repo, "add", ".gitignore")
+	gitRun(t, repo, "commit", "-m", "ignore jobs")
+	gitRun(t, repo, "remote", "add", "origin", remote)
+	gitRun(t, repo, "push", "-u", "origin", "main")
+	e.jobs = filepath.Join(repo, "jobs")
+	dir := job(t, e.jobs, "wk-invalid-checkout")
+	write(t, filepath.Join(dir, "wt", ".git", "config"), "[core]\nrepositoryformatversion = 0\n")
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Deleted || len(res.Retained) != 1 || res.Retained[0].Reason != "git-error" {
+		t.Fatalf("invalid checkout fell back to parent repo: result=%+v", res)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("uncheckable source was deleted: %v", err)
+	}
+}
+
 func TestArchiveKeepsRootGitCheckout(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-root-checkout")
