@@ -323,14 +323,6 @@ func (h Handoffkeep) TaskPriority(ctx context.Context, task string) (int, error)
 	return x.Priority, e
 }
 
-// Attachment reads one handoffkeep attachment by its sha256 id.
-func (h Handoffkeep) Attachment(ctx context.Context, sha string) ([]byte, error) {
-	if !attachmentID.MatchString(sha) {
-		return nil, errors.New("attachment ID must be a sha256 hex digest")
-	}
-	return readAttachment(ctx, sha)
-}
-
 // AttachmentCommand names the CLI reviewers use to retrieve an attachment.
 func (h Handoffkeep) AttachmentCommand() string { return h.Command }
 
