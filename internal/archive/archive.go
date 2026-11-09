@@ -378,6 +378,11 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if err != nil {
 		return nil, err
 	}
+	// A .git entry at the job root makes the whole job dir a checkout. There
+	// is no safe archive subset to infer, so keep the source for explicit cleanup.
+	if checkouts["."] {
+		return nil, &Skip{"job-root-git-checkout"}
+	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
 		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}}
 	for checkout := range checkouts {

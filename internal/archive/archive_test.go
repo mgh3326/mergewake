@@ -291,6 +291,27 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	}
 }
 
+func TestArchiveKeepsRootGitCheckout(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-root-checkout")
+	write(t, filepath.Join(dir, ".git"), "gitdir: .git/worktrees/x\n")
+	write(t, filepath.Join(dir, "report.md"), "retain this source\n")
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
+	a := archiver(e, "")
+	_, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-root-checkout")
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "job-root-git-checkout" {
+		t.Fatalf("plan error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatalf("source removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.drive, "tasks", "2402", "wk-root-checkout", "manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("manifest published: %v", err)
+	}
+}
+
 func TestSecretPatternsMatchPinnedGuard(t *testing.T) {
 	cases := map[string][2]string{
 		"openai_key":                {"sk-proj-abcdefghijklmnopqrstuvwxyz", "SK-PROJ-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
