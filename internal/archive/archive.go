@@ -402,36 +402,86 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 
 const archiveLockTTL = int64(24 * 60 * 60)
 
-// claim serializes publication for one task/job destination across hosts.
-// Locks live outside the task/job namespace and carry an owner and creation
-// time so a later run can reclaim one left by a dead process.
-func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
-	sum := sha256.Sum256([]byte(dest))
-	lock := path.Join(a.DriveDir, ".locks", hex.EncodeToString(sum[:]))
-	owner := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
-	b, err := a.on(ctx, a.SSH, "", "sh", "-c", `mkdir -p "$2" || exit 1
+// claimScript is one claim attempt. It never moves or removes an existing lock:
+// it takes a free lock, reports a live one as busy, and reports an expired one
+// as "stale <born> <owner>" so claim can confirm it under the guard in
+// reclaimScript. Args: $1 lock dir, $2 locks dir, $3 this claim's owner,
+// $4 TTL seconds.
+const claimScript = `mkdir -p "$2" || exit 1
 now=$(date +%s) || exit 1
-claim_owner="$3"
-acquire() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$claim_owner" "$now" > "$1/owner"; }
-if acquire "$1"; then echo acquired; exit 0; fi
+if mkdir "$1" 2>/dev/null; then
+  if printf '%s %s\n' "$3" "$now" > "$1/owner"; then echo acquired; else echo busy; fi
+  exit 0
+fi
 old_owner=; born=
 if [ -r "$1/owner" ]; then read old_owner born < "$1/owner"; else born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1") || { echo busy; exit 0; }; fi
 case "$born" in ''|*[!0-9]*) echo busy; exit 0;; esac
 if [ "$((now-born))" -lt "$4" ]; then echo busy; exit 0; fi
-stale="$1.stale.$3"
-if ! mv "$1" "$stale" 2>/dev/null; then echo busy; exit 0; fi
-moved_owner=; moved_born=
-if [ -r "$stale/owner" ]; then read moved_owner moved_born < "$stale/owner"; fi
-if [ "$moved_owner" != "$old_owner" ] || [ "$moved_born" != "$born" ]; then
-  if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi
-  echo busy; exit 0
+echo "stale $born $old_owner"`
+
+// reclaimScript takes the lock's guard, then removes the lock only if it is
+// still the expired claim that claimScript reported. Reclaimers serialize on
+// the guard, so no other reclaimer can remove or re-create the lock while this
+// one reads it. A lock that a live claimer took after the stale report is
+// fresh here and left alone. Args: $1 lock dir, $2 the stale claim's owner,
+// $3 its time, $4 this claim's owner, $5 TTL seconds (also the age after which
+// a guard left by a dead reclaimer is broken).
+const reclaimScript = `now=$(date +%s) || exit 1
+guard="$1.guard"
+take() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$2" "$3" > "$1/owner"; }
+tries=0
+until mkdir "$guard" 2>/dev/null; do
+  held=$(stat -c %Y "$guard" 2>/dev/null || stat -f %m "$guard" 2>/dev/null)
+  case "$held" in ''|*[!0-9]*) held= ;; esac
+  if [ -n "$held" ] && [ "$((now-held))" -ge "$5" ]; then
+    mv "$guard" "$guard.dead.$4" 2>/dev/null && rm -rf "$guard.dead.$4"
+  fi
+  tries=$((tries+1))
+  if [ "$tries" -ge 200 ]; then echo busy; exit 0; fi
+  sleep 0.05
+done
+result=busy
+if take "$1" "$4" "$now"; then
+  result=acquired
+else
+  cur_owner=; cur_born=
+  if [ -r "$1/owner" ]; then read cur_owner cur_born < "$1/owner"; else cur_born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"); fi
+  case "$cur_born" in ''|*[!0-9]*) ;; *)
+    if [ "$cur_owner" = "$2" ] && [ "$cur_born" = "$3" ] && [ "$((now-cur_born))" -ge "$5" ]; then
+      if rm -rf "$1" && take "$1" "$4" "$now"; then result=acquired; fi
+    fi;;
+  esac
 fi
-if acquire "$1"; then rm -rf "$stale"; echo acquired
-else if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi; echo busy; fi`, "sh", lock, path.Join(a.DriveDir, ".locks"), owner, strconv.FormatInt(archiveLockTTL, 10))
+rm -rf "$guard"
+echo "$result"`
+
+// claim serializes publication for one task/job destination across hosts.
+// Locks live outside the task/job namespace and carry an owner and creation
+// time so a later run can reclaim one left by a dead process. Only a lock older
+// than archiveLockTTL is reclaimable, and reclaiming it happens under the guard
+// in reclaimScript, so one expired lock has exactly one winner and a live lock
+// is never moved or removed by another claim.
+func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
+	sum := sha256.Sum256([]byte(dest))
+	locks := path.Join(a.DriveDir, ".locks")
+	lock := path.Join(locks, hex.EncodeToString(sum[:]))
+	owner := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	ttl := strconv.FormatInt(archiveLockTTL, 10)
+	b, err := a.on(ctx, a.SSH, "", "sh", "-c", claimScript, "sh", lock, locks, owner, ttl)
 	if err != nil {
 		return nil, fmt.Errorf("claim archive destination: %w", err)
 	}
-	if strings.TrimSpace(string(b)) != "acquired" {
+	out := strings.TrimRight(string(b), "\n")
+	if rest, ok := strings.CutPrefix(out, "stale "); ok {
+		// rest is "<born> <owner>"; the owner is empty for a lock dir without one.
+		born, staleOwner, _ := strings.Cut(rest, " ")
+		b, err = a.on(ctx, a.SSH, "", "sh", "-c", reclaimScript, "sh", lock, staleOwner, born, owner, ttl)
+		if err != nil {
+			return nil, fmt.Errorf("claim archive destination: %w", err)
+		}
+		out = strings.TrimRight(string(b), "\n")
+	}
+	if out != "acquired" {
 		return nil, &Skip{"archive-lock-busy"}
 	}
 	return func() {
