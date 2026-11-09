@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -13,7 +14,7 @@ import (
 )
 
 // refusedReps is a reps CLI whose every add fails with a long, multibyte
-// message ending in an invalid byte.
+// message carrying an invalid byte inside the retained prefix.
 type refusedReps struct{ adds int }
 
 const refusedText = "publish refused: "
@@ -21,7 +22,7 @@ const refusedText = "publish refused: "
 func (r *refusedReps) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
 	if len(args) > 1 && args[1] == "add" {
 		r.adds++
-		return nil, errors.New(refusedText + strings.Repeat("가", 400) + "\xff")
+		return nil, errors.New(refusedText + "\xff" + strings.Repeat("가", 400))
 	}
 	return nil, nil
 }
@@ -72,6 +73,45 @@ func TestFlushOutcomesAuditsPublishFailure(t *testing.T) {
 	}
 	if len(state.Published) != 0 {
 		t.Fatalf("failed publication acknowledged: %v", state.Published)
+	}
+}
+
+// The audit keeps the publication error as valid UTF-8 cut on a character
+// boundary to 512 bytes. The checks read the value before JSON encoding,
+// which would otherwise mask invalid bytes.
+func TestOutcomePublishDetail(t *testing.T) {
+	han := func(n int) string { return strings.Repeat("가", n) }
+	for _, tt := range []struct{ name, in, want string }{
+		{"short input kept", "publish refused", "publish refused"},
+		{"invalid byte in prefix replaced", "publish refused: \xff tail", "publish refused: \uFFFD tail"},
+		// 1 + 3*170 = 511 bytes: byte 512 would split the 171st character.
+		{"cut backs off a split character", "a" + han(300), "a" + han(170)},
+		// Replacement grows \xff to 3 bytes before the cut: 3 + 3*169 = 510.
+		{"replacement counted before the cut", "\xff" + han(200), "\uFFFD" + han(169)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := outcomePublishDetail(tt.in)
+			if !utf8.ValidString(got) || len(got) > 512 || got != tt.want {
+				t.Fatalf("detail valid=%v bytes=%d, want %d bytes exactly", utf8.ValidString(got), len(got), len(tt.want))
+			}
+		})
+	}
+}
+
+// A publication failure whose outcome-publish-error audit cannot be written
+// fails the pass with the audit error, not the publication error.
+func TestFlushOutcomesReturnsAuditFailure(t *testing.T) {
+	s, _, _, _, repo := setup(t)
+	finalRow(t, s, repo, 7)
+	s.Runner = &refusedReps{}
+	s.Out = failingWriter{}
+	err := s.FlushOutcomes(context.Background(), repo.Name)
+	if err == nil {
+		t.Fatal("pass succeeded without its outcome-publish-error audit")
+	}
+	var failed *outcomes.PublishError
+	if !errors.Is(err, os.ErrClosed) || errors.As(err, &failed) || !strings.Contains(err.Error(), "outcome-publish-error") {
+		t.Fatalf("FlushOutcomes returned %v, want the wrapped audit error only", err)
 	}
 }
 

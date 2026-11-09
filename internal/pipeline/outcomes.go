@@ -397,6 +397,13 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 // keeps, in bytes.
 const outcomePublishErrorMax = 512
 
+// outcomePublishDetail is the error text an outcome-publish-error audit
+// keeps: invalid UTF-8 replaced, then cut on a character boundary to
+// outcomePublishErrorMax bytes.
+func outcomePublishDetail(msg string) string {
+	return clip(strings.ToValidUTF8(msg, "\uFFFD"), outcomePublishErrorMax)
+}
+
 // FlushOutcomes is the automatic flush at the end of a repo pass and after a
 // land. A publication failure does not fail the pass: it is audited as
 // outcome-publish-error and logged, and the outcomes stay in the outbox for
@@ -415,7 +422,7 @@ func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	if !errors.As(err, &failed) {
 		return err
 	}
-	detail := clip(strings.ToValidUTF8(failed.Error(), "\uFFFD"), outcomePublishErrorMax)
+	detail := outcomePublishDetail(failed.Error())
 	slog.Warn("outcome publish failed; retained in outbox", "repo", repo, "count", failed.Count, "error", detail)
 	if e := s.audit(repo, "outcome-publish-error", map[string]any{"repo": repo, "count": failed.Count, "error": detail}, false); e != nil {
 		slog.Warn("outcome-publish-error audit not written", "repo", repo, "error", e)
