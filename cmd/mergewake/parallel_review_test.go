@@ -50,6 +50,20 @@ type reviewHub struct {
 	// mergeProbe, when set, runs around each merge request before the hub
 	// takes its lock: the returned func runs when the request ends.
 	mergeProbe func() func()
+	// conflicting makes every PR report mergeable false and state dirty;
+	// draft makes every PR a draft.
+	conflicting, draft bool
+	// heads moves a PR to another head SHA (hubHead(n) otherwise). A moved PR
+	// also gets a diff of its own, so the new head is a new patch.
+	heads map[int]string
+}
+
+// head is PR n's current head SHA.
+func (h *reviewHub) head(n int) string {
+	if sha, ok := h.heads[n]; ok {
+		return sha
+	}
+	return hubHead(n)
 }
 
 func (h *reviewHub) repoName() string {
@@ -70,7 +84,11 @@ func (h *reviewHub) pull(n int) string {
 	if h.taskPerPR {
 		task = 1000 + n
 	}
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":%d,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":true,"mergeable_state":"clean"}`, n, n, task, max(h.changedFiles, 1), hubHead(n), n, h.repoName(), hubBase)
+	mergeable, state := true, "clean"
+	if h.conflicting {
+		mergeable, state = false, "dirty"
+	}
+	return fmt.Sprintf(`{"number":%d,"state":"open","draft":%t,"title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":%d,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":%t,"mergeable_state":%q}`, n, h.draft, n, task, max(h.changedFiles, 1), h.head(n), n, h.repoName(), hubBase, mergeable, state)
 }
 
 var prPath = regexp.MustCompile(`/(?:pulls|issues)/(\d+)(/|$)`)
@@ -92,7 +110,7 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		head := hubBase
 		if m := regexp.MustCompile(`"number":(\d+)`).FindSubmatch(body); m != nil {
 			n, _ := strconv.Atoi(string(m[1]))
-			head = hubHead(n)
+			head = h.head(n)
 		}
 		fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"author":{"login":"author","__typename":"User"},"headRefOid":%q,"reviewDecision":"","reviews":{"nodes":[]},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, head)
 	case strings.HasSuffix(path, "/pulls") && r.Method == "GET":
@@ -126,6 +144,10 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"Method Not Allowed"}`, 405)
 	case regexp.MustCompile(`/pulls/\d+$`).MatchString(path):
 		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			if sha, moved := h.heads[number]; moved {
+				fmt.Fprintf(w, "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old %d\n+new %s\n", number, sha)
+				return
+			}
 			fmt.Fprintf(w, "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old %d\n+new %d\n", number, number)
 			return
 		}

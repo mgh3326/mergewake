@@ -133,25 +133,27 @@ func TestNotifyPendingSilentAndFailingNames(t *testing.T) {
 
 // With checks green, BLOCKED names the closed-vocabulary reason that holds the
 // head: open threads, a stale base or a conflict. A missing review is
-// mergewake's own wait and sends nothing (TestNotifyActionable*).
+// mergewake's own wait and sends nothing (TestNotifyActionable*). A conflict is
+// told by its ESC instead of a BLOCKED (hk 3712).
 func TestNotifyBlockedReasons(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		prepare func(*fakeGH)
 		reason  string
+		marker  string
 	}{
 		{"threads open", func(g *fakeGH) {
 			g.findings = 2
-		}, "threads_open:2"},
+		}, "threads_open:2", "BLOCKED"},
 		{"stale base", func(g *fakeGH) {
 			g.stale = true
 			g.pull.MergeableState = "behind"
-		}, "base_stale"},
+		}, "base_stale", "BLOCKED"},
 		{"conflict", func(g *fakeGH) {
 			no := false
 			g.pull.Mergeable = &no
 			g.pull.MergeableState = "dirty"
-		}, "conflict"},
+		}, "conflict", "ESC "},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
@@ -160,7 +162,7 @@ func TestNotifyBlockedReasons(t *testing.T) {
 			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
-			if n.count != 1 || !strings.Contains(lastEvent(t, n), "BLOCKED") || !strings.Contains(lastEvent(t, n), tt.reason) {
+			if n.count != 1 || !strings.Contains(lastEvent(t, n), tt.marker) || !strings.Contains(lastEvent(t, n), tt.reason) {
 				t.Fatalf("%+v", n.events)
 			}
 		})

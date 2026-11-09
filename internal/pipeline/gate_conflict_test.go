@@ -68,9 +68,10 @@ func TestGateMergeableQueuedCheckStaysPending(t *testing.T) {
 	}
 }
 
-// The blocked notice for a conflicting PR goes to the author's lane through
-// findingsRoute, once per head.
-func TestNotifyConflictNoChecksRoutesToAuthorOnce(t *testing.T) {
+// A conflicting PR is told once per head by the conflict ESC, on the task's
+// lane (hk 3712): the conflict-only BLOCKED that went to the author's job lane
+// through findingsRoute is no longer sent.
+func TestNotifyConflictNoChecksEscalatesOnce(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	g.required = []string{"vet", "test"}
 	g.ci = github.Pending
@@ -91,7 +92,7 @@ func TestNotifyConflictNoChecksRoutesToAuthorOnce(t *testing.T) {
 		t.Fatalf("%d events, want 1: %+v", n.count, n.events)
 	}
 	ev := n.events[0]
-	if ev.Lane != "w-7" || !strings.Contains(ev.Text, "BLOCKED example/project#7 head=aaaaaaa | conflict | lane=w-7 via task 2481 job w-7") {
+	if ev.Lane != "operator-desk" || ev.Type != "decision" || !strings.HasPrefix(ev.Text, "ESC ") || !strings.Contains(ev.Text, "example/project#7 head=aaaaaaa conflict") || !strings.Contains(ev.Text, "lane=operator-desk via task 2481") {
 		t.Fatalf("%+v", ev)
 	}
 }

@@ -155,8 +155,9 @@ func TestRecordOnlyReadyStillOverdue(t *testing.T) {
 	}
 }
 
-// (d) BLOCKED keeps today's routing: a conflict goes to the lane the task
-// names, and a review stall goes to the desk.
+// (d) BLOCKED keeps today's routing: a review stall goes to the desk. A
+// conflict is told by its ESC on the lane the task names, also when a worker
+// job is bound (hk 3712).
 func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 	t.Run("conflict", func(t *testing.T) {
 		s, g, n, r := notifySetup(t)
@@ -167,18 +168,18 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
 		}
-		if n.count != 1 || n.events[0].Lane != "design-lane" || !strings.Contains(n.events[0].Text, "BLOCKED") || !strings.Contains(n.events[0].Text, "conflict") {
+		if n.count != 1 || n.events[0].Lane != "design-lane" || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
 			t.Fatalf("%+v", n.events)
 		}
 	})
-	t.Run("conflict to the author lane", func(t *testing.T) {
+	t.Run("conflict to the task lane, not the worker lane", func(t *testing.T) {
 		s, g, n, r := workerNotifySetup(t)
 		no := false
 		g.pull.Mergeable, g.pull.MergeableState = &no, "dirty"
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
 		}
-		if n.count != 1 || n.events[0].Lane != "worker-lane" || n.events[0].Type != "blocked" || !strings.Contains(n.events[0].Text, "conflict") {
+		if n.count != 1 || n.events[0].Lane != "design-lane" || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
 			t.Fatalf("%+v", n.events)
 		}
 	})
