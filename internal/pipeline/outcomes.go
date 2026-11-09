@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"maps"
 	"regexp"
 	"slices"
@@ -391,6 +392,16 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 	errs = append(errs, s.FlushOutcomes(ctx, r.Name))
 	return errors.Join(errs...)
 }
+
+// outcomePublishErrorMax bounds the error an outcome-publish-error audit
+// keeps, in bytes.
+const outcomePublishErrorMax = 512
+
+// FlushOutcomes is the automatic flush at the end of a repo pass and after a
+// land. A publication failure does not fail the pass: it is audited as
+// outcome-publish-error and logged, and the outcomes stay in the outbox for
+// the next flush. A ledger or IO failure is still returned. The operator's
+// `mergewake outcomes sync` calls Ledger.Flush directly and stays strict.
 func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	command := s.Config.Outcomes.Command
 	if command == "" {
@@ -399,5 +410,15 @@ func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	if command == "" {
 		command = "scopefuel"
 	}
-	return s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
+	err := s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
+	var failed *outcomes.PublishError
+	if !errors.As(err, &failed) {
+		return err
+	}
+	detail := clip(strings.ToValidUTF8(failed.Error(), "\uFFFD"), outcomePublishErrorMax)
+	slog.Warn("outcome publish failed; retained in outbox", "repo", repo, "count", failed.Count, "error", detail)
+	if e := s.audit(repo, "outcome-publish-error", map[string]any{"repo": repo, "count": failed.Count, "error": detail}, false); e != nil {
+		slog.Warn("outcome-publish-error audit not written", "repo", repo, "error", e)
+	}
+	return nil
 }
