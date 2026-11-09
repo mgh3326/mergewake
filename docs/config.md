@@ -1388,7 +1388,9 @@ task trailer cannot be resolved to a lane; then the repo's `repos[].lane`; the c
 (`notifier.fallback_lane`, defaulting to the operator lane) is the last
 resort, and a delivery the notifier refuses is retried there once before the
 verdict is parked with one logged decision. The task and notify-lane trailers
-are also read from the head commit message when absent from the body.
+are also read from the head commit message when absent from the body. The
+conflict ESC reads `Mergewake-Notify-Lane` from the PR body only and ranks it
+first (see "Conflict ESC" under `daemon.pr.notify`).
 
 Use `daemon` for complete polling, or invoke individual commands from optional
 webhook/scheduler adapters. The binary never installs or enables service units;
@@ -1548,6 +1550,7 @@ For `example/project`, state resides beneath
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
+| `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, a lane pinned after an ambiguous failure, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
@@ -1803,7 +1806,7 @@ gate can emit falls in one of three classes:
 |---|---|---|
 | `check_failed:<name>`, `check_cancelled:<name>`, `check_absent:<name>` | author | Live job lane first (the findings route); with no live job, the `Mergewake-Notify-Lane` trailer, then the task lane unless it is the desk, then the desk as a `decision` (unknown author). |
 | `blocking_findings:<n>`, `triage_unanswered:<n>` | author | Same route. |
-| `conflict` | author | Same route. |
+| `conflict` | author | Not sent as BLOCKED: the conflict ESC below tells it, once per head. |
 | `review_missing (<block detail>)`, for example `missing-task-trailer` | author | Same route: the review waits on something only the author can add. |
 | `review_missing` with no block detail | mergewake-internal wait | Nothing is sent. Only the stall alert below. |
 | `threads_open:<n>`, `base_stale`, `update_failed:<status>` | needs a human decision | Unchanged: the task lane, trailer or notifier lane, in the `notifyLane` order, type `blocked`. |
@@ -1820,7 +1823,11 @@ state, so a commit made long before it was pushed reaches the grace sooner than
 the push time alone would.
 
 A mixed reason set is sent when any reason is author or human, and its text
-lists only those reasons. A set made only of internal waits sends nothing.
+lists only those reasons. A set made only of internal waits sends nothing. A
+`conflict` is left out of the BLOCKED text; a verdict whose only reason is the
+conflict (with or without an internal wait) sends no BLOCKED and logs its
+`pr-notify` row with `"suppressed":"conflict ESC"`, and a mixed verdict keeps
+the author route the conflict gave it.
 `READY` and `MERGED` are recorded, not sent, so the design session hears only the
 BLOCKED reasons that need its decision.
 
@@ -1837,6 +1844,52 @@ elapsed-time `STALLED review` alarm, which the daemon stopped calling when
 reviews moved to retry accounting, is removed with its `review-wait.json` and
 `review-stall-sent` state, and `daemon.pr.stall_after` is read but sets nothing.
 
+
+##### Conflict ESC
+
+A PR that conflicts with its base (GitHub reports `mergeable: false` or
+`mergeable_state: dirty`) gets one ESC per head, before and independent of its
+review. The `pr` role checks every evaluated open PR on the configured base,
+drafts included, before the unchanged-PR skip and before review, so a head whose
+review is held, quota-stopped, still running or not started is told too;
+`NotifyPR` checks the same way before its draft and gate returns. A listed
+dependency bot's PR is left to its `bot_update` desk notice. Mergeability GitHub
+has not computed yet (`null` or `unknown`) neither sends nor clears anything. The
+ESC never changes review placement, the gate or the merge: the gate and
+`mergewake status` still say `blocked`/`conflict`, and a new head or a resolved
+conflict gets its missing review passes through the normal queue whether or not
+the ESC was delivered.
+
+Once per head: the identity is repository, PR, `conflict` and the full head
+SHA, and the event id is derived from that alone (no summary, lane or time). A
+head whose ESC a lane accepted is never sent again — not after a restart, a
+force-push from A to B and back to A, a conflict that flaps through unknown or
+clean, or a change to the routing trailers. A new head that conflicts gets its
+own ESC. The receipts live in `<state_dir>/<repo>/conflict-esc/<pr>.json`,
+read, decided, sent and written under a file lock, separate from the bounded
+`pr-notify-sent` ledger.
+
+Routing, in order: a valid `Mergewake-Notify-Lane` line in the PR body (one
+line, a valid lane name; the head commit is not read for it), else the current
+lane of the hk task the PR names (`Mergewake-Task`), else the desk
+(`notifier.fallback_lane`, else `notifier.lane`). Job lanes, author panes and
+`repos[].lane` are not used. A body lane needs no hk read; a failed task-lane
+read is retried at the next evaluation, never taken as "no task lane". The event
+is a `decision` whose text starts with `ESC` and names the PR, the short head,
+the conflict, what to do ("rebase or merge base, then push") and the lane and
+rule it went to. A lane panewire refuses outright (`emit: invalid --lane`,
+nothing recorded) moves to the next destination; any other failure may have
+landed, so the same lane is retried under the same event id, which panewire
+answers as delivered if it did. A head is recorded delivered only after a lane
+accepted it. When no destination takes it, the head stays pending with a
+doubling wait (1 to 30 minutes) and a `conflict-esc-failed` audit row; it is
+never parked. Each accepted ESC writes a `conflict-esc` audit row (repo, PR,
+head, lane, event id).
+
+It honours `notify: {enabled: false}`; a dry run sends and records nothing;
+shadow mode sends. Whether the PR's owner (the worker or session that wrote it)
+is still alive is not detected: the ESC goes to the routed lane whether or not
+anyone is behind it.
 
 #### Overdue notice (`merge_overdue`)
 
