@@ -505,6 +505,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	var collected []byte
 	var remoteRecord *integrations.JobRecord
 	if resumed {
+		// A done context decides nothing about the reviewer: an hk or node read
+		// it cut short is no unreadable hk and no missing result. The record
+		// stays, with no lost notice, wait, nudge or replacement, and the next
+		// run reads again. The same check follows each node read below.
+		if err := ctx.Err(); err != nil {
+			return out, fmt.Errorf("panewire reviewer %s: %w", label, err)
+		}
 		// The record is answered in this order, and the total budget comes after
 		// the first two: a completed job or an available result is collected, a
 		// finished pane without one is replaced, and only then does a record older
@@ -535,6 +542,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					state, spawn = fresh.State, false
 				} else if b, retry, _ := x.remoteFindings(ctx, plan, fresh, label); b != nil {
 					collected, remoteRecord, spawn = b, &fresh, false
+				} else if err := ctx.Err(); err != nil {
+					return out, fmt.Errorf("panewire reviewer %s: %w", label, err)
 					// Give transient read errors one additional review budget to recover.
 				} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
 					return out, errPassPending
@@ -576,6 +585,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			case b != nil:
 				// The result stands in for the record, as a remote result does.
 				collected, remoteRecord, spawn = b, &integrations.JobRecord{Host: host}, false
+			case ctx.Err() != nil:
+				return out, fmt.Errorf("panewire reviewer %s: %w", label, ctx.Err())
 			case overBudget:
 				return x.replaceLostReviewer(ctx, plan, rj, integrations.JobRecord{}, "reviewer job unreadable in hk past the review deadline", leaseSHA)
 			case async:
