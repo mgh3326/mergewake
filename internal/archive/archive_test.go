@@ -29,6 +29,23 @@ type fakeRunner struct {
 	hkCLI  [][]string // hk CLI calls, which must not happen
 }
 
+type mutateBeforeSnapshotWrite struct {
+	reap.Runner
+	source      string
+	replacement []byte
+	mutated     bool
+}
+
+func (r *mutateBeforeSnapshotWrite) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `cat > "$1.partial"`) {
+		if err := os.WriteFile(r.source, r.replacement, 0o644); err != nil {
+			return nil, err
+		}
+		r.mutated = true
+	}
+	return r.Runner.Run(ctx, name, args, input, dir)
+}
+
 func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	f.calls++
 	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
@@ -216,6 +233,10 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	write(t, filepath.Join(dir, "wt-dir", ".git", "config"), "[core]\n")
 	write(t, filepath.Join(dir, "wt-dir", "docs", "b.md"), "tracked directory copy\n")
 	write(t, filepath.Join(dir, "notes.md"), "TO"+"KEN="+"abcdefghijklmnopqrstuvwxyz\n")
+	newest := time.Unix(1800000000, 0)
+	if err := os.Chtimes(filepath.Join(dir, "notes.md"), newest, newest); err != nil {
+		t.Fatal(err)
+	}
 	write(t, filepath.Join(dir, "report.md"), "ordinary report\n")
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
 	finishJob(t, dir)
@@ -229,6 +250,9 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(p.Move, ","), "wt/") || strings.Contains(strings.Join(p.Move, ","), "wt-dir/") || strings.Contains(strings.Join(p.Move, ","), "notes.md") {
 		t.Fatalf("unsafe move list: %v", p.Move)
+	}
+	if p.Newest != newest.Unix() {
+		t.Fatalf("newest=%d, want excluded file time %d", p.Newest, newest.Unix())
 	}
 	e.run.failRm = true
 	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
@@ -376,13 +400,15 @@ func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
 		t.Fatalf("manifest oversized = %+v", m.Oversized)
 	}
 	note := e.comment(2402)
-	for _, want := range []string{"over drive_max_file_bytes, not archived, deleted with the job dir (2, 300 bytes)", "- large.bin 150", "- report.md 150"} {
-		if !strings.Contains(note, want) {
-			t.Errorf("comment lacks %q:\n%s", want, note)
-		}
+	if strings.Contains(note, "large.bin") || strings.Contains(note, "report.md") {
+		t.Fatalf("comment should stay concise: %s", note)
 	}
-	if len(e.uploads()) != 3 || e.uploads()["report.md"] != nil { // task-link, completion and manifest; oversized report is not uploaded.
-		t.Fatalf("uploads = %v", e.uploads())
+	doc := e.hk.Documents()["archive/2402/wk-oversized"]
+	if doc.Kind != "note" || !strings.Contains(doc.Body, "large.bin oversized") || !strings.Contains(doc.Body, "report.md oversized") {
+		t.Fatalf("document=%+v", doc)
+	}
+	if len(e.uploads()) != 0 {
+		t.Fatalf("attachments uploaded: %v", e.uploads())
 	}
 }
 
@@ -441,9 +467,9 @@ func TestApplyKeepsOversizedContentChangedWithoutMetadataChange(t *testing.T) {
 }
 
 func TestCommentBoundsBytesAndSignalsTruncation(t *testing.T) {
-	p := &Plan{Job: "wk-large", Host: "h1", Dest: "/drive/archive", Dir: "/jobs/wk-large"}
+	p := &Plan{Job: "wk-large", Task: "2402", Host: "h1", Dest: "/drive/archive", Dir: "/jobs/wk-large"}
 	note := comment(p, "manifest-sha")
-	if !strings.Contains(note, "archive/wk-large/") || !strings.Contains(note, "manifest-sha") {
+	if !strings.Contains(note, "archive/2402/wk-large") || !strings.Contains(note, "manifest-sha") {
 		t.Fatalf("comment=%s", note)
 	}
 }
@@ -601,7 +627,7 @@ func TestPlanExcludesCredentialsAndListsThem(t *testing.T) {
 	if p.Task != "2402" || p.Files != 7 || p.Delete != filepath.Join(e.jobs, "wk-7") {
 		t.Fatalf("plan = %+v", p)
 	}
-	if !strings.HasPrefix(p.Dest, filepath.Join(e.drive, "h1")+"/") || filepath.Base(p.Dest) != "wk-7" {
+	if p.Dest != filepath.Join(e.drive, "tasks", "2402", "wk-7") {
 		t.Fatalf("dest = %s", p.Dest)
 	}
 }
@@ -820,12 +846,104 @@ func TestApplyRemoteHostsStreamOverSSH(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsStalePlanFromAnotherHost(t *testing.T) {
+	e := setup(t)
+	jobs2 := filepath.Join(filepath.Dir(e.jobs), "jobs-second-host")
+	dir1 := job(t, e.jobs, "wk-collision")
+	dir2 := job(t, jobs2, "wk-collision")
+	write(t, filepath.Join(dir1, "payload.bin"), "source-one")
+	write(t, filepath.Join(dir2, "payload.bin"), "source-two")
+	a := archiver(e, "")
+	p1, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := a.Plan(context.Background(), reap.Host{Name: "h2", Jobs: jobs2}, "wk-collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.Dest != p2.Dest {
+		t.Fatalf("layout changed: %s != %s", p1.Dest, p2.Dest)
+	}
+	if _, err := a.Apply(context.Background(), p1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p2, time.Now())
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" || (res != nil && res.Deleted) {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir2, "payload.bin")); err != nil {
+		t.Fatalf("second source lost: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(p1.Dest, "payload.bin"))
+	if err != nil || string(got) != "source-one" {
+		t.Fatalf("archive overwritten: %q %v", got, err)
+	}
+}
+
+func TestArchiveCopiesOnlyInspectedTextSnapshot(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-snapshot")
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "report.md"), "TO"+"KEN="+strings.Repeat("z", 24)+"\n")
+	res, err := a.Apply(context.Background(), p, time.Now())
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "job-changed" || (res != nil && res.Deleted) {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatalf("source lost: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.Dest, "report.md")); !os.IsNotExist(err) {
+		t.Fatalf("changed report copied: %v", err)
+	}
+}
+
+func TestArchiveSnapshotWriteDoesNotCopyConcurrentSecretChange(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-snapshot-race")
+	report := filepath.Join(dir, "report.md")
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-snapshot-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("TO" + "KEN=" + strings.Repeat("q", 24) + "\n")
+	mutator := &mutateBeforeSnapshotWrite{Runner: e.run, source: report, replacement: secret}
+	a.Runner = mutator
+	res, err := a.Apply(context.Background(), p, time.Now())
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "job-changed" || res == nil || res.Deleted {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if !mutator.mutated {
+		t.Fatal("fixture did not mutate source before snapshot write")
+	}
+	got, err := os.ReadFile(filepath.Join(p.Dest, "report.md"))
+	if err != nil || string(got) != "# report\n" {
+		t.Fatalf("Drive copy=%q err=%v", got, err)
+	}
+	if strings.Contains(string(got), string(secret)) {
+		t.Fatal("concurrent secret reached Drive")
+	}
+	if _, err := os.Stat(report); err != nil {
+		t.Fatalf("changed source was deleted: %v", err)
+	}
+}
+
 func TestApplyFailuresKeepJobDir(t *testing.T) {
 	for name, mut := range map[string]func(*testing.T, env, *Archiver){
 		"hk-put": func(_ *testing.T, e env, _ *Archiver) {
-			e.hk.Fail("PUT /v1/attachments", 503, "attachment_r2_unavailable")
+			e.hk.Fail("PUT /v1/documents/{key}", 503, "document_unavailable")
 		},
-		"hk-too-big": func(_ *testing.T, e env, _ *Archiver) { e.hk.MaxAttachmentBytes = 4 },
+		"hk-too-big": func(_ *testing.T, e env, _ *Archiver) {
+			e.hk.Fail("PUT /v1/documents/{key}", 413, "document_too_large")
+		},
 		"hk-comment": func(_ *testing.T, e env, _ *Archiver) { e.hk.Fail("POST /v1/tasks/{id}/comments", 500, "internal") },
 		"hk-unset":   func(t *testing.T, _ env, _ *Archiver) { t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "") },
 		"drive":      func(_ *testing.T, _ env, a *Archiver) { a.DriveDir = "/dev/null/drive" },
@@ -839,7 +957,7 @@ func TestApplyFailuresKeepJobDir(t *testing.T) {
 				t.Fatal(err)
 			}
 			mut(t, e, a)
-			p.Dest = filepath.Join(a.DriveDir, "h1", "m", "wk-9")
+			p.Dest = filepath.Join(a.DriveDir, "tasks", "2402", "wk-9")
 			res, err := a.Apply(context.Background(), p, time.Now())
 			if err == nil || (res != nil && res.Deleted) {
 				t.Fatalf("res=%+v err=%v", res, err)
@@ -896,7 +1014,7 @@ func TestArchiveResumesFailedDelete(t *testing.T) {
 		t.Fatal("delete failure not reported")
 	}
 	e.run.failRm = false
-	puts := e.routes()["PUT /v1/attachments"]
+	puts := e.routes()["PUT /v1/documents/archive%2F2402%2Fwk-11"]
 	p, err = a.Plan(context.Background(), h, "wk-11")
 	if err != nil || !p.Resume {
 		t.Fatalf("resume plan: %+v %v", p, err)
@@ -908,7 +1026,7 @@ func TestArchiveResumesFailedDelete(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("job dir kept after resume")
 	}
-	if e.routes()["PUT /v1/attachments"] != puts || len(e.hk.Comments()) != 1 {
+	if e.routes()["PUT /v1/documents/archive%2F2402%2Fwk-11"] != puts || len(e.hk.Comments()) != 1 {
 		t.Fatal("resume uploaded or commented again")
 	}
 	// A different job under the same name and month never resumes.
@@ -939,8 +1057,15 @@ func TestApplyNothingToMove(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(res.Dest, "manifest.json")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(e.comment(9), ".env") {
-		t.Fatal("excluded files not recorded")
+	if strings.Contains(e.comment(9), ".env") {
+		t.Fatal("comment should not repeat excluded list")
+	}
+	doc := e.hk.Documents()["archive/9/wk-12"]
+	if !strings.Contains(doc.Body, ".env credential-path") || !strings.Contains(doc.Body, "events/00005-job.completed.json oversized") {
+		t.Fatalf("document=%+v", doc)
+	}
+	if len(e.uploads()) != 0 {
+		t.Fatalf("attachments uploaded: %v", e.uploads())
 	}
 }
 

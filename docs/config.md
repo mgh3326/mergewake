@@ -375,7 +375,8 @@ local job dir and reports the step:
    list every non-directory entry. A job is eligible only when its `events/`
    contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
    `job.placement` event (a reused name has started again); bookkeeping events
-   do not affect that decision. Jobs without an events directory are skipped.
+   do not affect that decision. Every listed entry, including excluded entries,
+   contributes to the newest-entry time used by `--older-than`. Jobs without an events directory are skipped.
    `reap.archive.exclude` is a list of shell globs matched against job names;
    it defaults to `["pw-rollout-*", "pw-hk*", "events-lane"]`, while an
    explicit empty list disables name exclusions. Matching jobs are skipped as
@@ -401,12 +402,16 @@ local job dir and reports the step:
    with the same archived files and oversized paths, sizes and fingerprints,
    the plan is a delete-only `resume` (contents must still match the manifest);
    otherwise it is skipped as
-   `drive-dir-exists`. A job with its own top-level `manifest.json` is
+   `drive-dir-exists`. Publication is serialized; if hosts present the same
+   task/job key, a stale or different-host plan remains `drive-dir-exists` and
+   cannot overwrite the completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
    from the job host and unpacked straight into the destination on the
    archive host, relayed through this machine (`ssh` on either side as
-   configured); the Drive copy is a plain directory, not an archive file. A
+   configured); inspected text files are copied from the exact snapshot scanned
+   during planning. If a text source changes before deletion, the job is kept.
+   The Drive copy is a plain directory, not an archive file. A
    job with nothing but excluded, oversized or non-regular entries copies
    nothing.
 3. **Verify**: every archived file's sha256 is computed on both sides and must

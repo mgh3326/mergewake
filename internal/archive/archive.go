@@ -111,6 +111,7 @@ type Plan struct {
 	host            reap.Host
 	entries         []File
 	oversizedHashes map[string]string
+	textSnapshots   map[string][]byte
 	done            *manifest
 	doneRaw         []byte
 }
@@ -314,6 +315,40 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// claim serializes publication for one task/job destination across hosts.
+// The exact task/job layout has one destination, so a competing or stale plan
+// must fail closed instead of overwriting a copy that may already be complete.
+func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
+	lock := dest + ".lock"
+	b, err := a.on(ctx, a.SSH, "", "sh", "-c", `mkdir -p "$2" || exit 1
+if mkdir "$1" 2>/dev/null; then echo acquired; else echo busy; fi`, "sh", lock, path.Dir(dest))
+	if err != nil {
+		return nil, fmt.Errorf("claim archive destination: %w", err)
+	}
+	if strings.TrimSpace(string(b)) != "acquired" {
+		return nil, &Skip{"drive-dir-exists"}
+	}
+	return func() { _, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `rmdir "$1"`, "sh", lock) }, nil
+}
+
+func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {
+	mpath := path.Join(p.Dest, "manifest.json")
+	done, err := a.exists(ctx, a.SSH, mpath)
+	if err != nil || !done {
+		return done, err
+	}
+	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
+	if err != nil {
+		return false, err
+	}
+	var m manifest
+	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
+		return false, &Skip{"drive-dir-exists"}
+	}
+	p.Resume, p.done, p.doneRaw = true, &m, raw
+	return true, nil
+}
+
 // Jobs returns h.Jobs as an absolute path on its own host. Every path is
 // passed to the host shell quoted, and a quoted ~ never expands, so a leading
 // ~/ is replaced with that host's $HOME here. config.Load already refuses ~
@@ -384,7 +419,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		return nil, &Skip{"job-root-git-checkout"}
 	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
-		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}}
+		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}, textSnapshots: map[string][]byte{}}
 	for checkout := range checkouts {
 		count := 0
 		for _, f := range files {
@@ -396,6 +431,9 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	}
 	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
+		if f.mtime > p.Newest {
+			p.Newest = f.mtime
+		}
 		switch {
 		case !safeName(f.Path):
 			return nil, &Skip{"unsafe-file-name"}
@@ -427,20 +465,19 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 				if readErr != nil {
 					return nil, fmt.Errorf("read %s: %w", f.Path, readErr)
 				}
+				if int64(len(body)) != f.Size {
+					return nil, &Skip{"job-changed"}
+				}
 				if name := secretPattern(body); name != "" {
 					p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "secret-like:" + name})
 					continue
 				}
+				p.Text = append(p.Text, f.Path)
+				p.textSnapshots[f.Path] = body
 			}
 			p.Move = append(p.Move, f.Path)
 			p.Files++
 			p.Bytes += f.Size
-			if text(f, a.TextMax) {
-				p.Text = append(p.Text, f.Path)
-			}
-		}
-		if f.mtime > p.Newest {
-			p.Newest = f.mtime
 		}
 	}
 	if len(p.Oversized) > 0 {
@@ -592,16 +629,33 @@ func (a *Archiver) hashes(ctx context.Context, ssh, dir string, paths []string) 
 	return out, nil
 }
 
-// copy streams the move list as an uncompressed tar from the job host and
-// unpacks it straight into the Drive folder on the archive host, relayed by
-// this machine. pipefail makes either side's failure fail the copy.
-// COPYFILE_DISABLE keeps macOS tar from adding ._ metadata entries.
+// copy streams uncaptured regular files as an uncompressed tar from the job
+// host and writes inspected text snapshots directly to Drive. COPYFILE_DISABLE
+// keeps macOS tar from adding ._ metadata entries.
 func (a *Archiver) copy(ctx context.Context, p *Plan) error {
-	prod := wrap(p.host.SSH, []string{"env", "COPYFILE_DISABLE=1", "tar", "-C", p.Dir, "--null", "-T", "-", "-cf", "-"})
-	cons := wrap(a.SSH, []string{"sh", "-c", `mkdir -p "$1" && tar -C "$1" -xf -`, "sh", p.Dest})
-	script := "set -o pipefail; " + reap.Join(prod) + " | " + reap.Join(cons)
-	if _, err := a.Runner.Run(ctx, "bash", []string{"-c", script}, listInput(p.Move), ""); err != nil {
-		return fmt.Errorf("copy to drive: %w", err)
+	snapshots := map[string]bool{}
+	for _, name := range p.Text {
+		snapshots[name] = true
+	}
+	var bulk []string
+	for _, name := range p.Move {
+		if !snapshots[name] {
+			bulk = append(bulk, name)
+		}
+	}
+	if len(bulk) > 0 {
+		prod := wrap(p.host.SSH, []string{"env", "COPYFILE_DISABLE=1", "tar", "-C", p.Dir, "--null", "-T", "-", "-cf", "-"})
+		cons := wrap(a.SSH, []string{"sh", "-c", `mkdir -p "$1" && tar -C "$1" -xf -`, "sh", p.Dest})
+		script := "set -o pipefail; " + reap.Join(prod) + " | " + reap.Join(cons)
+		if _, err := a.Runner.Run(ctx, "bash", []string{"-c", script}, listInput(bulk), ""); err != nil {
+			return fmt.Errorf("copy to drive: %w", err)
+		}
+	}
+	for _, name := range p.Text {
+		dst := path.Join(p.Dest, name)
+		if _, err := a.on(ctx, a.SSH, string(p.textSnapshots[name]), "sh", "-c", `mkdir -p "$(dirname "$1")" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", dst); err != nil {
+			return fmt.Errorf("copy inspected file %s to drive: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -664,6 +718,11 @@ func sumFileBytes(files []File) int64 {
 	return total
 }
 
+func snapshotSHA(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 func same(a, b []File) bool {
 	if len(a) != len(b) {
 		return false
@@ -676,16 +735,37 @@ func same(a, b []File) bool {
 	return true
 }
 
-// Apply runs a plan: copy, verify, hk attachments, manifest, hk comment, then
-// delete. Any failure before the delete returns an error and keeps the job
+// Apply runs a plan under an exclusive destination claim: copy, verify, hk
+// summary document/comment, manifest, then delete. Any failure before the delete keeps the job
 // dir; a job that changed since the plan is kept as *Skip{"job-changed"}.
 func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, error) {
+	if p.done != nil {
+		src, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Move)
+		if err != nil {
+			return nil, err
+		}
+		return a.resume(ctx, p, src)
+	}
+	release, err := a.claim(ctx, p.Dest)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	completed, err := a.existingManifest(ctx, p)
+	if err != nil {
+		return nil, err
+	}
 	src, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Move)
 	if err != nil {
 		return nil, err
 	}
-	if p.done != nil {
+	if completed {
 		return a.resume(ctx, p, src)
+	}
+	for _, rel := range p.Text {
+		if src[rel] != snapshotSHA(p.textSnapshots[rel]) {
+			return nil, &Skip{"job-changed"}
+		}
 	}
 	dst := map[string]string{}
 	// Nothing but excluded or non-regular entries: there is nothing to copy,
@@ -712,10 +792,14 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		if !moving[f.Path] {
 			continue
 		}
-		if src[f.Path] == "" || src[f.Path] != dst[f.Path] {
+		want := src[f.Path]
+		if snapshot, ok := p.textSnapshots[f.Path]; ok {
+			want = snapshotSHA(snapshot)
+		}
+		if want == "" || want != dst[f.Path] {
 			return nil, fmt.Errorf("verify %s: sha256 mismatch on drive copy", f.Path)
 		}
-		f.SHA256 = src[f.Path]
+		f.SHA256 = want
 		m.Files = append(m.Files, f)
 		m.TotalBytes += f.Size
 	}
@@ -779,6 +863,17 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, e
 		}
 		for name, sum := range p.oversizedHashes {
 			if current[name] != sum {
+				return res, &Skip{"job-changed"}
+			}
+		}
+	}
+	if len(p.Text) > 0 {
+		current, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Text)
+		if err != nil {
+			return res, err
+		}
+		for _, name := range p.Text {
+			if current[name] != snapshotSHA(p.textSnapshots[name]) {
 				return res, &Skip{"job-changed"}
 			}
 		}
