@@ -116,9 +116,11 @@ func TestCompletedReviewerWithResultIsUnchanged(t *testing.T) {
 	}
 }
 
-// A completed job without a result whose findings.json is in the local job
-// dir is collected from there, as before.
-func TestCompletedReviewerWithoutResultLocalFileIsUnchanged(t *testing.T) {
+// A completed job without a result whose findings.json sits in the local job
+// dir, and whose host has none, lost its result: the local file is not read.
+// The resumed pass is replaced once, as for any lost result, and the file's
+// findings are never posted.
+func TestCompletedReviewerWithoutResultLocalFileIsIgnored(t *testing.T) {
 	f := completedWithoutResult(t, remoteNotFound)
 	dir := filepath.Join(f.s.Config.Review.Panewire.Jobs, f.old.Label)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -131,10 +133,15 @@ func TestCompletedReviewerWithoutResultLocalFileIsUnchanged(t *testing.T) {
 	if err := f.again(t, f.old.Recorded.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.g.postedFindings) != 1 || f.g.postedFindings[0].Body != "A local bug" {
-		t.Fatalf("posted=%+v", f.g.postedFindings)
+	for _, p := range f.g.postedFindings {
+		if p.Body == "A local bug" {
+			t.Fatalf("the local file was posted: %+v", f.g.postedFindings)
+		}
 	}
-	if len(f.runner.spawns) != 1 || len(auditRows(t, f.s, f.r, "review-result-lost")) != 0 {
-		t.Fatalf("spawns=%d lost=%d", len(f.runner.spawns), len(auditRows(t, f.s, f.r, "review-result-lost")))
+	if len(f.runner.spawns) != 2 || arg(f.runner.spawns[1], "-l") == f.old.Label {
+		t.Fatalf("spawns=%v, want one replacement", f.runner.spawns)
+	}
+	if rows := auditRows(t, f.s, f.r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != f.old.Label {
+		t.Fatalf("lost rows=%v", rows)
 	}
 }

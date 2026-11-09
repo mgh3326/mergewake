@@ -2,15 +2,15 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
 )
 
-// inboxArgvRecorder records the argv of each panewire inbox call the findings
-// lane reads and acks.
+// inboxArgvRecorder records the argv of each panewire inbox call a review
+// makes.
 type inboxArgvRecorder struct {
 	*panewireRunner
 	calls [][]string
@@ -23,39 +23,34 @@ func (r *inboxArgvRecorder) Run(ctx context.Context, command string, args []stri
 	return r.panewireRunner.Run(ctx, command, args, input, dir)
 }
 
-// The findings lane reads and acks its inbox with the reap.hub credential
-// when reap.hub is set; the argv is unchanged when it is not.
-func TestFindingsInboxCallsCarryTheReapHubCredential(t *testing.T) {
-	const announcement = `{"id":9,"kind":"lane.event","event":{"event_id":"lbl-findings","text":"no attachment named here"}}`
+// A review makes no findings inbox call, with or without the reap.hub
+// credential, even with a findings lane configured and the reviewer's
+// findings announced on it: the announcement and the malformed one before it
+// stay unread and unacknowledged.
+func TestReviewMakesNoFindingsInboxCall(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		hub  config.ReapHub
-		flag string
 	}{
-		{"hub", config.ReapHub{URL: "https://hub.example.test", TokenFile: "/fake/svc-mergewake.env", CFFile: "/fake/cf.env"},
-			" --hub-url https://hub.example.test --hub-token-env /fake/svc-mergewake.env --hub-cf-env /fake/cf.env"},
-		{"hub without cf", config.ReapHub{URL: "https://hub.example.test", TokenFile: "/fake/svc-mergewake.env"},
-			" --hub-url https://hub.example.test --hub-token-env /fake/svc-mergewake.env"},
-		{"no hub", config.ReapHub{}, ""},
+		{"hub", config.ReapHub{URL: "https://hub.example.test", TokenFile: "/fake/svc-mergewake.env", CFFile: "/fake/cf.env"}},
+		{"no hub", config.ReapHub{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			runner := &panewireRunner{inbox: []string{announcement}}
-			s, _, _ := panewireSetup(t, runner)
+			runner := legacyPane("lane")
+			s, g, r := panewireSetup(t, runner)
+			s.Config.Review.Panewire.Lane = "w-7"
 			s.Config.Reap.Hub = tc.hub
 			rec := &inboxArgvRecorder{panewireRunner: runner}
 			s.Runner = rec
-			// The announcement names no attachment, so it is consumed by its
-			// ack and nothing is returned.
-			if b, err := (&panewireExecutor{s: s}).announced(context.Background(), "w-7", "lbl"); err != nil || b != nil {
-				t.Fatal(b, err)
+			e := s.Review(context.Background(), r, 7, "", Options{})
+			if !errors.Is(e, ErrReviewUnavailable) || g.postCount != 0 {
+				t.Fatalf("err=%v posts=%d", e, g.postCount)
 			}
-			want := []string{"inbox list --lane w-7 --json" + tc.flag, "inbox ack 9 --lane w-7 --json" + tc.flag}
-			got := make([]string, 0, len(rec.calls))
-			for _, c := range rec.calls {
-				got = append(got, strings.Join(c, " "))
+			if len(runner.inbox) == 0 {
+				t.Fatal("the pane announced nothing on the lane")
 			}
-			if !slices.Equal(got, want) {
-				t.Fatalf("got  %q\nwant %q", got, want)
+			if len(rec.calls) != 0 || runner.sink.attachmentReads != 0 {
+				t.Fatalf("inbox calls %q, attachment reads %d", rec.calls, runner.sink.attachmentReads)
 			}
 		})
 	}

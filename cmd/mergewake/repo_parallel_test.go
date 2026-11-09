@@ -28,6 +28,7 @@ import (
 // repository with a gate holds until the gate is closed; the others return at
 // once. The brief names the repository and PR it reviews.
 type repoRunner struct {
+	results  *paneResults // where a returning pane publishes its findings
 	mu       sync.Mutex
 	gates    map[string]chan struct{}
 	started  map[string]int
@@ -65,6 +66,7 @@ func (r *repoRunner) Run(ctx context.Context, command string, args []string, _, 
 	if err := os.WriteFile(filepath.Join(filepath.Dir(args[i+1]), "findings.json"), []byte(`{"findings":[]}`), 0600); err != nil {
 		return nil, err
 	}
+	r.results.publish(args, `{"findings":[]}`)
 	r.mu.Lock()
 	r.returned[repo]++
 	r.mu.Unlock()
@@ -151,9 +153,10 @@ func newMultiRepo(t *testing.T, names []string, prs, parallel int) *multiRepo {
 	gh.BaseURL = "https://fake.invalid"
 	gh.HTTP = &http.Client{Transport: router}
 	gh.Stderr = io.Discard
-	runner := &repoRunner{gates: map[string]chan struct{}{}, started: map[string]int{}, returned: map[string]int{}, changed: make(chan struct{}, 1)}
+	results := &paneResults{}
+	runner := &repoRunner{results: results, gates: map[string]chan struct{}{}, started: map[string]int{}, returned: map[string]int{}, changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{&eventLog{}}, Out: out}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: resultSink{results: results}, Notifier: recordingNotifier{&eventLog{}}, Out: out}
 	return &multiRepo{s: s, gh: gh, runner: runner, hubs: hubs, router: router, out: out}
 }
 

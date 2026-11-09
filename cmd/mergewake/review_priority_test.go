@@ -15,7 +15,7 @@ import (
 // prioritySink answers hk priority reads for the fixture's PRs. Task 1000+n
 // belongs to PR n; a change is keyed by its PR URL.
 type prioritySink struct {
-	parallelSink
+	resultSink
 	mu          sync.Mutex
 	task        map[int]int // PR number → task priority
 	change      map[int]int // PR number → change priority
@@ -57,7 +57,7 @@ func newPriorityFixture(t *testing.T, prs, parallel int) (*parallelFixture, *pri
 	t.Helper()
 	f := newParallelFixture(t, prs, parallel)
 	f.hub.taskPerPR = true
-	sink := &prioritySink{task: map[int]int{}, change: map[int]int{}, failTask: map[int]bool{}, failChange: map[int]bool{}, hang: map[int]bool{}, taskReads: map[int]int{}, changeReads: map[int]int{}}
+	sink := &prioritySink{resultSink: resultSink{results: f.results}, task: map[int]int{}, change: map[int]int{}, failTask: map[int]bool{}, failChange: map[int]bool{}, hang: map[int]bool{}, taskReads: map[int]int{}, changeReads: map[int]int{}}
 	f.s.Sink = sink
 	return f, sink
 }

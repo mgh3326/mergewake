@@ -80,11 +80,12 @@ func traceFixture(t *testing.T) *parallelFixture {
 	gh.BaseURL = "https://fake.invalid"
 	gh.HTTP = &http.Client{Transport: handlerTransport{hub}}
 	gh.Stderr = io.Discard
-	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
+	results := &paneResults{}
+	runner := &blockingRunner{results: results, trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	close(runner.release)
 	out := &bytes.Buffer{}
-	service := &pipeline.Service{Config: cfg, GH: gh, Runner: traceRunner{runner}, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
-	return &parallelFixture{s: service, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
+	service := &pipeline.Service{Config: cfg, GH: gh, Runner: traceRunner{runner}, Sink: resultSink{results: results}, Notifier: recordingNotifier{trace}, Out: out}
+	return &parallelFixture{results: results, s: service, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
 func TestTracingPassTreeAndPrivacy(t *testing.T) {

@@ -79,12 +79,20 @@ func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, rep
 	e.q = &daemon.Queue{Cap: s.Config.Daemon.PR.Parallel(), Extra: urgentExtra, Run: e.run, Lookup: e.lookup, Grace: reviewPriorityGrace, Seen: e.seen, Log: log}
 	// The reviewer watch reads hk job records. A sink that cannot read them
 	// never reports a finished reviewer, so the passes keep a bounded wait.
-	if _, ok := s.Sink.(integrations.JobReader); ok {
+	if watchesReviewers(s.Sink) {
 		e.revisit = func(repo string, pr int, label string, at time.Time) {
 			e.q.EnqueueAt(daemon.SourceTimer, repo, pr, label, at)
 		}
 	}
 	return e
+}
+
+// watchesReviewers reports whether the reviewer watch can see a reviewer of
+// sink finish: it reads hk job records. A var so tests can keep the bounded
+// wait over a fake sink that answers the job records of its fake panes.
+var watchesReviewers = func(sink integrations.Sink) bool {
+	_, ok := sink.(integrations.JobReader)
+	return ok
 }
 
 // urgentExtra is how many priority-1 evaluations of one repo may run past an

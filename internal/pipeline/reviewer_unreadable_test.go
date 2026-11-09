@@ -3,8 +3,6 @@ package pipeline
 import (
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -65,22 +63,37 @@ func TestReviewerUnreadableHkResultOnHostIsCollected(t *testing.T) {
 	reviewerJobGone(t, f.s, f.r, 1)
 }
 
-// (a, disk) The result file of a local reviewer is collected the same way.
-func TestReviewerUnreadableHkResultOnDiskIsCollected(t *testing.T) {
-	f := unreadableReviewer(t, remoteNotFound)
-	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
-	dir := filepath.Join(f.s.Config.Review.Panewire.Jobs, f.old.Label)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "findings.json"), []byte(findings), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.again(t, f.old.Recorded.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.g.postedFindings) != 1 || len(f.runner.spawns) != 1 || len(auditRows(t, f.s, f.r, "review-result-lost")) != 0 {
-		t.Fatalf("posted=%+v spawns=%d", f.g.postedFindings, len(f.runner.spawns))
+// (a, legacy) A result left only in the legacy places, the findings lane or
+// the local job-dir file, is not read: within the budget the pass waits for
+// its reviewer as when nothing was found, and past the budget it is replaced
+// once, without the planted findings ever being posted.
+func TestReviewerUnreadableHkLegacyResultIsIgnored(t *testing.T) {
+	for _, source := range legacySources {
+		t.Run(source, func(t *testing.T) {
+			f := unreadableReviewer(t, remoteNotFound)
+			plantLegacy(t, f.s, f.runner.panewireRunner, f.old.Label, source)
+			if err := f.again(t, f.old.Recorded.Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			noLegacyRead(t, f.s, f.r, f.runner.panewireRunner, f.g)
+			if calls := f.hub.ops("job.result"); len(calls) != 1 || calls[0]["job"] != f.old.Label {
+				t.Fatalf("job.result calls=%v", calls)
+			}
+			if len(f.v.got) != 2 || f.v.got[1].label != f.old.Label || !f.v.got[1].at.Equal(f.timer) {
+				t.Fatalf("revisits=%v, want a second timer at %v", f.v.got, f.timer)
+			}
+			if len(f.runner.spawns) != 1 || f.g.postCount != 0 || readReviewerJob(t, f.s, f.r, 1).Label != f.old.Label {
+				t.Fatalf("spawns=%d posts=%d", len(f.runner.spawns), f.g.postCount)
+			}
+			if err := f.again(t, f.timer); err != nil {
+				t.Fatal(err)
+			}
+			noLegacyRead(t, f.s, f.r, f.runner.panewireRunner, f.g)
+			rows := auditRows(t, f.s, f.r, "review-result-lost")
+			if len(rows) != 1 || rows[0]["label"] != f.old.Label || len(f.runner.spawns) != 2 || f.g.postCount != 0 {
+				t.Fatalf("lost rows=%v spawns=%d posts=%d", rows, len(f.runner.spawns), f.g.postCount)
+			}
+		})
 	}
 }
 

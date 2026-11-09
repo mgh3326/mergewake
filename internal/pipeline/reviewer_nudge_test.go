@@ -103,14 +103,14 @@ func TestReviewerNudgedOnceWhenPaneFinishedWithoutResult(t *testing.T) {
 	}
 }
 
-// (b) The next resume finds the output the nudged reviewer wrote: it is
-// collected with no replacement, and the outcome is result_found.
+// (b) The next resume finds the output the nudged reviewer wrote on its host:
+// it is collected with no replacement, and the outcome is result_found.
 func TestReviewerNudgedResultFoundIsCollected(t *testing.T) {
-	s, g, r, runner, c, old, _, _ := nudgeSetup(t, "done")
+	s, g, r, runner, c, _, hub, _ := nudgeSetup(t, "done")
 	reviewWaits(t, s, r)
-	if err := os.WriteFile(filepath.Join(jobDirOf(s, old.Label), "findings.json"), []byte(`{"findings":[]}`), 0600); err != nil {
-		t.Fatal(err)
-	}
+	hub.mu.Lock()
+	hub.jobResult = json.RawMessage(`{"found":true,"findings":{"findings":[]}}`)
+	hub.mu.Unlock()
 	resumeAfter(g, c, 30*time.Second)
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
@@ -126,6 +126,34 @@ func TestReviewerNudgedResultFoundIsCollected(t *testing.T) {
 		t.Fatal("a collected result was reported lost")
 	}
 	reviewerJobGone(t, s, r, 1)
+}
+
+// (b') A nudged reviewer that writes only its local findings file and runs no
+// `panewire done --result` has produced nothing mergewake reads: the pass
+// keeps waiting until nudgeWait is over, and is then lost and replaced.
+func TestReviewerNudgedLocalFileOnlyIsLost(t *testing.T) {
+	s, g, r, runner, c, old, _, _ := nudgeSetup(t, "done")
+	reviewWaits(t, s, r)
+	if err := os.WriteFile(filepath.Join(jobDirOf(s, old.Label), "findings.json"), []byte(legacyBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resumeAfter(g, c, 30*time.Second)
+	reviewWaits(t, s, r)
+	if len(runner.spawns) != 1 || len(runner.closes) != 0 || g.postCount != 0 {
+		t.Fatalf("spawns=%d closes=%v posts=%d", len(runner.spawns), runner.closes, g.postCount)
+	}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	resumeAfter(g, c, nudgeWait)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	noLegacyRead(t, s, r, runner, g)
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label || len(auditRows(t, s, r, "review-result-lost")) != 1 {
+		t.Fatalf("spawns=%v lost=%v", runner.spawns, auditRows(t, s, r, "review-result-lost"))
+	}
+	if rows := auditRows(t, s, r, "reviewer-nudge-outcome"); len(rows) != 1 || rows[0]["outcome"] != "lost" {
+		t.Fatalf("outcome rows=%v", rows)
+	}
 }
 
 // (c) The reviewer still idle once nudgeWait has passed is lost exactly as

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -460,10 +461,11 @@ func TestReviewerCleanupResolvesUnconfirmedPlacementFromJobRecord(t *testing.T) 
 	}
 }
 
-// A job record that is not completed does not confirm a placement.
+// A job record that is not completed does not confirm a placement: no pane
+// op reaches its host. (Its result is still looked for there: job.result.)
 func TestReviewerCleanupIgnoresPlacementOfJobNotCompleted(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true, jobState: "running"})
-	if len(res.hubOps()) != 0 {
+	if ops := slices.DeleteFunc(res.hubOps(), func(op string) bool { return op == "job.result" }); len(ops) != 0 {
 		t.Fatalf("hub ops = %v", res.hubOps())
 	}
 	if receipts := res.receipts(t); len(receipts) != 1 || receipts[0].Result != "pending-cleanup" {
