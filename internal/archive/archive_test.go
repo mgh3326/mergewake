@@ -213,6 +213,8 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	dir := filepath.Join(e.jobs, "wk-layout-repro")
 	write(t, filepath.Join(dir, "wt", ".git"), "gitdir: ../.git/worktrees/wt\n")
 	write(t, filepath.Join(dir, "wt", "docs", "a.md"), "tracked copy\n")
+	write(t, filepath.Join(dir, "wt-dir", ".git", "config"), "[core]\n")
+	write(t, filepath.Join(dir, "wt-dir", "docs", "b.md"), "tracked directory copy\n")
 	write(t, filepath.Join(dir, "notes.md"), "TOKEN=abcdefghijklmnopqrstuvwxyz\n")
 	write(t, filepath.Join(dir, "report.md"), "ordinary report\n")
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
@@ -225,7 +227,7 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	if p.Dest != filepath.Join(e.drive, "tasks", "2402", "wk-layout-repro") {
 		t.Fatalf("dest=%s", p.Dest)
 	}
-	if strings.Contains(strings.Join(p.Move, ","), "wt/") || strings.Contains(strings.Join(p.Move, ","), "notes.md") {
+	if strings.Contains(strings.Join(p.Move, ","), "wt/") || strings.Contains(strings.Join(p.Move, ","), "wt-dir/") || strings.Contains(strings.Join(p.Move, ","), "notes.md") {
 		t.Fatalf("unsafe move list: %v", p.Move)
 	}
 	e.run.failRm = true
@@ -252,16 +254,19 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)
 	}
-	foundGit, foundSecret := false, false
+	foundGit, foundGitDir, foundSecret := false, false, false
 	for _, x := range m.ExcludedEntries {
 		if x.Path == "wt" && x.Reason == "git-tracked" && x.Files == 2 {
 			foundGit = true
+		}
+		if x.Path == "wt-dir" && x.Reason == "git-tracked" && x.Files == 2 {
+			foundGitDir = true
 		}
 		if x.Path == "notes.md" && x.Reason == "secret-like:token_assignment" {
 			foundSecret = true
 		}
 	}
-	if !foundGit || !foundSecret {
+	if !foundGit || !foundGitDir || !foundSecret {
 		t.Fatalf("excluded entries: %+v", m.ExcludedEntries)
 	}
 	if len(e.uploads()) != 0 {
