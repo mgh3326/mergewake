@@ -568,7 +568,12 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    findings lane by a pane from before `panewire done --result`, are
    ignored: no findings inbox is listed or acknowledged and no attachment is
    fetched. A host read that the review deadline cuts short keeps the
-   reviewer for the next run. The
+   reviewer for the next run, and so does any read of a resumed reviewer's
+   hk record or host that a cancelled or expired run cuts short: such a run
+   returns the context error and sends no lost notice, schedules no wait,
+   nudges nothing and replaces nothing. A completed record whose `result`
+   fails validation is a lost result, like one without a result; only a
+   run whose context has already ended skips it as rejected findings. The
    findings go through validation (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
    claim and done marker. The receipt adds `"executor":"panewire"`, the
@@ -596,11 +601,16 @@ record or its host, is lost at once; a resumed one is replaced once by a new
 reviewer, and only a lost replacement fails the pass. A pass that fails
 because its record answered without findings (no record, `hk-unavailable`,
 a state that is not terminal) is a skip, counted like any other. A
-resumed reviewer whose pane is idle or done with no result is not lost
-before it is nudged once to write its two files and run `panewire done
---result` (`reviewer-nudge`) and has had two minutes to do so
-(`reviewer-nudge-outcome`), if the review budget still holds them. Files it
-writes count only once its record or its host returns them. The receipt's
+resumed reviewer whose record is still open (not terminal) and whose pane
+is idle or done with no result is not lost before it is nudged once to
+write its two files and run `panewire done --result` (`reviewer-nudge`) and
+has had two minutes to do so (`reviewer-nudge-outcome`), if the review
+budget still holds them. Files it writes count only once its record or its
+host returns them. The wait holds only an open record: a nudged reviewer
+whose record becomes completed without a result, even inside the two
+minutes, is read on its host and, without the result there, lost and
+replaced once like any completed reviewer without a result, with no second
+nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
 
