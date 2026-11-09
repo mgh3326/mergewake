@@ -86,6 +86,15 @@ type File struct {
 	kind   byte // f regular, l symlink, o anything else
 }
 
+// HostJobSummary is the compact metadata needed to decide host-wide skips.
+type HostJobSummary struct {
+	Kind         byte
+	HasEvents    bool
+	Finished     bool
+	Newest       int64
+	NeedsRefresh bool
+}
+
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
 	Action          string      `json:"action"`
@@ -227,6 +236,61 @@ func inCheckout(p string, checkouts map[string]bool) bool {
 const listScript = `cd "$1" || exit 1
 find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
 
+// refreshListScript treats entries that vanish during the eligible-job
+// refresh as absent from that snapshot. Plan's original listScript stays strict.
+const refreshListScript = `cd "$1" || exit 1
+find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
+
+// hostListScript emits one compact summary per job, avoiding output growth with
+// each job's file count. Per-job refresh supplies full file metadata only for
+// jobs that pass these skip checks.
+const hostListScript = `cd "$1" || exit 1
+for d in *; do
+  if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0 0; continue; fi
+  [ -d "$d" ] || continue
+  has=0; done=0; uncertain=0
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then uncertain=1; fi
+  if [ -e "$d/events" ]; then
+    has=1
+    eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $1+0 >= max {max=$1+0; latestKind=$2} END {print (latestKind == "T"), rc+0}')
+    set -- $eventSummary; done=$1; rc=$2
+    if [ "$rc" -ne 0 ]; then uncertain=1; fi
+  fi
+  newestSummary=$({ find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} NR == 1 || $1+0 > max {max=$1+0} END {printf "%.0f %d\n", max, rc+0}')
+  set -- $newestSummary; newest=$1; rc=$2
+  if [ "$rc" -ne 0 ]; then uncertain=1; fi
+  if [ "$uncertain" -eq 1 ]; then has=1; done=1; newest=0; fi
+  printf '%s\0d\0%s\0%s\0%s\0%s\0' "$d" "$has" "$done" "$newest" "$uncertain"
+done`
+
+// HostJobs returns compact per-job summaries from one host call.
+func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[string]HostJobSummary, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", hostListScript, "sh", root)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs tree %s: %w", root, err)
+	}
+	fields := strings.Split(string(b), "\x00")
+	if fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%6 != 0 {
+		return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
+	}
+	out := make(map[string]HostJobSummary, len(fields)/6)
+	for i := 0; i < len(fields); i += 6 {
+		job, kind, hasEvents, finished, newest, uncertain := fields[i], fields[i+1], fields[i+2], fields[i+3], fields[i+4], fields[i+5]
+		if job == "" || len(kind) != 1 || (kind[0] != 'd' && kind[0] != 'l') || (hasEvents != "0" && hasEvents != "1") || (finished != "0" && finished != "1") || (uncertain != "0" && uncertain != "1") {
+			return nil, fmt.Errorf("list jobs tree %s: malformed summary %q", root, fields[i:i+6])
+		}
+		mtime, e := strconv.ParseInt(newest, 10, 64)
+		if e != nil {
+			return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
+		}
+		out[job] = HostJobSummary{Kind: kind[0], HasEvents: hasEvents == "1", Finished: finished == "1", Newest: mtime, NeedsRefresh: uncertain == "1"}
+	}
+	return out, nil
+}
+
 // hashScript reads NUL-separated ./paths on stdin and prints "sha256 ./path"
 // records, using sha256sum or macOS shasum. A path that cannot be hashed
 // prints "!./path" and exits 0: the runner drops the output of a failed
@@ -239,6 +303,18 @@ func (a *Archiver) list(ctx context.Context, h reap.Host, dir string) ([]File, e
 	if err != nil {
 		return nil, fmt.Errorf("list %s: %w", dir, err)
 	}
+	return parseFiles(dir, b)
+}
+
+func (a *Archiver) refreshList(ctx context.Context, h reap.Host, dir string) ([]File, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", refreshListScript, "sh", dir)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	return parseFiles(dir, b)
+}
+
+func parseFiles(dir string, b []byte) ([]File, error) {
 	var out []File
 	for _, rec := range strings.Split(string(b), "\x00") {
 		if rec == "" {
@@ -441,6 +517,46 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if !finished(files) {
 		return nil, &Skip{"not-finished"}
 	}
+	return a.planListed(ctx, h, job, dir, files)
+}
+
+// RefreshJob rechecks a preliminarily eligible host-scan job immediately
+// before planning, so a job that restarted after HostJobs cannot use stale
+// completion or age metadata to publish an archive.
+func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string) ([]File, string, int64, error) {
+	kind, err := a.jobDir(ctx, h.SSH, dir)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if kind != "dir" {
+		reason, newest := HostSkipReason(HostJobSummary{})
+		return nil, reason, newest, nil
+	}
+	files, err := a.refreshList(ctx, h, dir)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	hasEvents, err := a.exists(ctx, h.SSH, path.Join(dir, "events"))
+	if err != nil {
+		return nil, "", 0, err
+	}
+	summary := HostJobSummary{Kind: 'd', HasEvents: hasEvents, Finished: finished(files)}
+	for _, f := range files {
+		if f.mtime > summary.Newest {
+			summary.Newest = f.mtime
+		}
+	}
+	reason, newest := HostSkipReason(summary)
+	return files, reason, newest, nil
+}
+
+// PlanListed performs the expensive planning from refreshed listing metadata at an already-resolved job
+// path, avoiding another remote tilde expansion for eligible jobs.
+func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {
+	return a.planListed(ctx, h, job, dir, files)
+}
+
+func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {
 	checkouts, err := gitCheckouts(ctx, a, h, dir)
 	if err != nil {
 		return nil, err
@@ -594,6 +710,27 @@ func finished(files []File) bool {
 		}
 	}
 	return terminal && !laterStart
+}
+
+// HostSkipReason applies the archive-jobs checks that can be decided from a
+// host-wide listing. newest is zero when the job has no non-directory entries.
+func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
+	if job.Kind == 'l' {
+		return "job-dir-symlink", 0
+	}
+	if job.Kind != 'd' {
+		return "job-gone", 0
+	}
+	if job.NeedsRefresh {
+		return "", 0
+	}
+	if !job.HasEvents {
+		return "no-events", 0
+	}
+	if !job.Finished {
+		return "not-finished", 0
+	}
+	return "", job.Newest
 }
 
 func (m *manifest) matches(p *Plan) bool {

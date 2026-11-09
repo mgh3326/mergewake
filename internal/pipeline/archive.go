@@ -247,12 +247,15 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
 			continue
 		}
-		b, e := hs.exec.Run(ctx, "sh", "-c", `cd "$1" || exit 1; for d in *; do if [ -d "$d" ] && [ ! -L "$d" ]; then printf '%s\0' "$d"; fi; done`, "sh", root)
+		jobsByName, e := a.HostJobs(ctx, h, root)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
 		}
-		jobs := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+		jobs := make([]string, 0, len(jobsByName))
+		for job := range jobsByName {
+			jobs = append(jobs, job)
+		}
 		sort.Strings(jobs)
 		for _, job := range jobs {
 			if e := ctx.Err(); e != nil {
@@ -268,10 +271,18 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Result, row.Reason = "skipped", "excluded-name"
 			} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 				row.Result, row.Reason = "skipped", "pane-live"
-			} else if p, e := a.Plan(ctx, h, job); e != nil {
-				row.Result, row.Reason = archive.Reason(e)
-			} else if now.Sub(time.Unix(p.Newest, 0)) < olderThan {
+			} else if reason, newest := archive.HostSkipReason(jobsByName[job]); reason != "" {
+				row.Result, row.Reason = "skipped", reason
+			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
+			} else if files, reason, newest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
+				row.Result, row.Reason = archive.Reason(e)
+			} else if reason != "" {
+				row.Result, row.Reason = "skipped", reason
+			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
+				row.Result, row.Reason = "skipped", "too-new"
+			} else if p, e := a.PlanListed(ctx, h, job, filepath.Join(root, job), files); e != nil {
+				row.Result, row.Reason = archive.Reason(e)
 			} else if e := s.Print(p); e != nil {
 				return errors.Join(append(errs, e)...)
 			} else if !acting {
