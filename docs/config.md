@@ -481,7 +481,7 @@ needs no GitHub token.
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
 | `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the reviewer pane is closed (only when its name, cwd and composer still match) and its remote detached worktree is removed through the hub's guarded removal; a refusal is recorded as `pending-cleanup`. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. A pane whose wait timed out is never closed here. |
-| `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result; each use is counted. Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
+| `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result or cannot be read; each use is counted by one `review-inbox-fallback` audit record with its `entry` and `source` (see the panewire executor's step 5). Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 | `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. |
 
@@ -552,7 +552,20 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    deadline), an unreadable hk reporting reason `hk-unavailable`. A historical pane from before `runtug done --result` (runtug was replaced by panewire) has no result on its record, so the lane announcement + `handoffkeep attach get` (or, on this
    host, `<jobs>/<label>/findings.json`) is still tried and each use is
    counted: the receipt's `fallback` notes it and a
-   `review-inbox-fallback` audit record carries the running count. The
+   `review-inbox-fallback` audit record carries the running count. Every
+   pass whose result is taken from either legacy source writes exactly one
+   such record, on every entry point: `entry` names it
+   (`resumed-finished`: a resumed reviewer whose pane finished or whose
+   budget is spent; `resumed-hk-unreadable`: a resumed reviewer whose hk job
+   cannot be read; `completed-no-result`: a completed record without a
+   result whose host has none either; `record-outcome`: any other record
+   that answers without findings), `source` is `lane` or `file`, and `pr`,
+   `pass`, `label`, `record` and `count` are as before. Bytes read but beaten
+   by an hk or node result are not counted. Records before this change
+   (hk 3652) missed the `resumed-hk-unreadable` uses, so only a count taken
+   after it is complete: zero `review-inbox-fallback` records over N days
+   counted from its deploy is the removal gate for the legacy path (unit
+   6-7b). The
    findings go through validation (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
    claim and done marker. The receipt adds `"executor":"panewire"`, the
