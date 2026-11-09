@@ -26,6 +26,7 @@ type archiveRunner struct {
 	script *scriptRunner
 	hkCLI  [][]string
 	calls  int
+	path   string
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -39,6 +40,9 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 		return a.script.Run(ctx, name, args, input, dir)
 	}
 	c := exec.CommandContext(ctx, name, args...)
+	if a.path != "" {
+		c.Env = replaceEnv(os.Environ(), "PATH", a.path)
+	}
 	c.Stdin = strings.NewReader(input)
 	var out, stderr bytes.Buffer
 	c.Stdout, c.Stderr = &out, &stderr
@@ -46,6 +50,17 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 		return nil, errors.New(name + ": " + err.Error() + ": " + stderr.String())
 	}
 	return out.Bytes(), nil
+}
+
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, item := range env {
+		if !strings.HasPrefix(item, prefix) {
+			out = append(out, item)
+		}
+	}
+	return append(out, prefix+value)
 }
 
 func TestArchiveJobsPreflightCallCountDoesNotScaleWithSkippedJobs(t *testing.T) {
@@ -95,6 +110,18 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(noEvents, "events")); err != nil {
 		t.Fatal(err)
 	}
+	danglingEvents := jobDir(t, f.jobs, "dangling-events", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(danglingEvents, "events")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(danglingEvents, "missing-events-target"), filepath.Join(danglingEvents, "events")); err != nil {
+		t.Fatal(err)
+	}
+	fileEvents := jobDir(t, f.jobs, "file-events", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(fileEvents, "events")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(fileEvents, "events"), "not a directory")
 	jobDir(t, f.jobs, "pane-live", 20*24*time.Hour)
 	target, err := os.MkdirTemp(filepath.Dir(f.jobs), "symlink-target")
 	if err != nil {
@@ -118,12 +145,40 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 			plan = v
 		}
 	}
-	want := []string{"eligible|would-archive|", "no-events|skipped|no-events", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
+	want := []string{"dangling-events|skipped|no-events", "eligible|would-archive|", "file-events|skipped|not-finished", "no-events|skipped|no-events", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("rows = %v, want %v", got, want)
 	}
 	if plan == nil || plan["job"] != "eligible" || plan["task"] != "77" || plan["files"] != float64(4) {
 		t.Fatalf("eligible plan = %v", plan)
+	}
+}
+
+func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "volatile", 20*24*time.Hour)
+	writeFile(t, filepath.Join(dir, "vanishing.tmp"), "temporary")
+	shimDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in */vanishing.tmp) rm -f \"$last\"; exit 1;; esac\nexec " + realStat + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shimDir, "stat"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.run.path = shimDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.out.String(), `"action":"archive-job","host":"local","job":"volatile","result":"error"`) {
+		t.Fatalf("entry race failed the job scan: %s", f.out.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "vanishing.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("stat shim did not remove test entry: %v", err)
 	}
 }
 

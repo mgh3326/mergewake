@@ -230,7 +230,7 @@ find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f"
 // hostListScript includes directories so an empty events directory remains
 // distinguishable from a missing one. Its records cover the whole jobs tree.
 const hostListScript = `cd "$1" || exit 1
-find . -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -d "$f" ]; then t=d; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
+find . -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -d "$f" ]; then t=d; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; e=-; case "$f" in */events) if [ -e "$f" ]; then e=1; else e=0; fi;; esac; printf "%s %s %s %s %s\0" "$t" "${m%% *}" "${m#* }" "$e" "$f"; done' sh {} +`
 
 // HostJobs lists metadata once and groups regular job entries for the
 // archive-jobs preflight. The returned root kinds include symlinks.
@@ -244,8 +244,8 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 		if rec == "" {
 			continue
 		}
-		parts := strings.SplitN(rec, " ", 4)
-		if len(parts) != 4 || len(parts[0]) != 1 || (parts[3] != "." && !strings.HasPrefix(parts[3], "./")) {
+		parts := strings.SplitN(rec, " ", 5)
+		if len(parts) != 5 || len(parts[0]) != 1 || (parts[4] != "." && !strings.HasPrefix(parts[4], "./")) {
 			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
 		}
 		size, e1 := strconv.ParseInt(parts[1], 10, 64)
@@ -253,7 +253,7 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 		if e1 != nil || e2 != nil {
 			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
 		}
-		rel := strings.TrimPrefix(parts[3], "./")
+		rel := strings.TrimPrefix(parts[4], "./")
 		if rel == "." {
 			continue
 		}
@@ -270,7 +270,7 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 		if kinds[job] == 0 {
 			continue
 		}
-		if sub == "events" && (parts[0][0] == 'd' || parts[0][0] == 'l') {
+		if sub == "events" && parts[3] == "1" {
 			events[job] = true
 		}
 		if parts[0][0] != 'd' {
