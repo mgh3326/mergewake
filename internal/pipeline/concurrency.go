@@ -45,9 +45,10 @@ func lockPath(name string) func() {
 // gitIn runs git in the repo checkout at root. Concurrent reviews share that
 // checkout: a fetch updates the same remote-tracking refs and a worktree add
 // or remove edits the same worktree list, and git fails a second writer on
-// its ref and index locks. Those commands take root's lock; reads do not.
+// its ref and index locks. Those commands, and an update-ref that deletes a
+// remote-tracking ref, take root's lock; reads do not.
 func (s *Service) gitIn(ctx context.Context, root string, args ...string) ([]byte, error) {
-	if len(args) > 0 && (args[0] == "fetch" || args[0] == "worktree") {
+	if len(args) > 0 && (args[0] == "fetch" || args[0] == "worktree" || args[0] == "update-ref") {
 		defer lockPath("git:" + root)()
 	}
 	return s.Runner.Run(ctx, "git", append([]string{"-C", root}, args...), "", "")

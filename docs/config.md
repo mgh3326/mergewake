@@ -564,6 +564,23 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
    branch, and the author's branch being checked out in another worktree is no
    obstacle. The worktree is removed after the wait.
+   GitHub can lose `refs/pull/<n>/head` for an open PR while its branch is
+   intact. When that fetch fails (for any reason), a same-repo PR whose head
+   ref is a plain branch name (no leading `-`, `..`, `:`, whitespace, `*`, `^`,
+   `~`, `?`, `[` or `\`, not under `pull/`, at most 200 bytes: the names
+   panewire's transport carries) fetches
+   `+refs/heads/<ref>:refs/remotes/origin/<ref> <base>` instead, and the pass
+   continues only when that branch's tip **equals** the head: the remote
+   reviewer fetches the branch and requires it to be the head, so a branch
+   that moved on (or was force-pushed) skips the pass, naming both errors, and
+   the next pass reviews the new head. A taken fallback deletes a local
+   `refs/remotes/origin/pull/<n>/head` left by an earlier fetch, which
+   panewire would otherwise prefer; panewire then builds the remote spec from
+   the branch. The 406 local-diff path uses the same fetch. Each attempt writes
+   one `pr-head-fallback` row (repo, PR, head, ref, first error redacted and up
+   to 512 bytes, `result`: `ok`, `fetch-failed`, `head-moved` or
+   `pull-ref-kept`) to `decisions.jsonl`; a fork PR or an invalid ref name
+   skips the pass as before, with no row.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings and operator decisions), then runs
