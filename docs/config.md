@@ -375,10 +375,13 @@ these steps in order:
 
 1. **Plan** (read-only): the jobs dir is resolved on its own host — a
    leading `~/` is expanded with that host's `$HOME`, since quoted paths
-   never tilde-expand, and a relative one is refused as
-   `jobs-dir-not-absolute`. A job dir that is itself a symlink is refused as
-   `job-dir-symlink` (checked again right before the delete); otherwise
-   list every non-directory entry. A job is eligible only when its `events/`
+  never tilde-expand, and a relative one is refused as
+  `jobs-dir-not-absolute`. In the host-wide `archive-jobs` scan, one listing
+  supplies each job's root kind, events directory and entry metadata; symlink,
+  missing, no-events, unfinished and too-new jobs are skipped before per-job
+  planning. A job dir that is itself a symlink is refused as
+  `job-dir-symlink` (checked again right before the delete); otherwise
+  list every non-directory entry. A job is eligible only when its `events/`
    contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
    `job.placement` event (a reused name has started again); bookkeeping events
    do not affect that decision. Every listed entry, including excluded entries,

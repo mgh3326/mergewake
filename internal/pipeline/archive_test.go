@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,9 +25,11 @@ import (
 type archiveRunner struct {
 	script *scriptRunner
 	hkCLI  [][]string
+	calls  int
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	a.calls++
 	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
 		a.hkCLI = append(a.hkCLI, append([]string{name}, args...))
 		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
@@ -42,6 +46,85 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 		return nil, errors.New(name + ": " + err.Error() + ": " + stderr.String())
 	}
 	return out.Bytes(), nil
+}
+
+func TestArchiveJobsPreflightCallCountDoesNotScaleWithSkippedJobs(t *testing.T) {
+	for _, count := range []int{40, 80} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			f := newArchiveFixture(t, noAgents)
+			for i := 0; i < count; i++ {
+				name := fmt.Sprintf("too-new-%03d", i)
+				jobDir(t, f.jobs, name, time.Hour)
+			}
+			// Include representative other preflight skips in the same host scan.
+			for i := 0; i < 5; i++ {
+				name := fmt.Sprintf("no-events-%03d", i)
+				dir := jobDir(t, f.jobs, name, 20*24*time.Hour)
+				if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := 0; i < 5; i++ {
+				name := fmt.Sprintf("unfinished-%03d", i)
+				dir := jobDir(t, f.jobs, name, 20*24*time.Hour)
+				if err := os.Remove(filepath.Join(dir, "events", "00005-job.completed.json")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.run.calls = 0
+			if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("host runner calls = %d", f.run.calls)
+			if f.run.calls > 5 {
+				t.Fatalf("host calls = %d, want <= 5", f.run.calls)
+			}
+		})
+	}
+}
+
+func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
+	f := newArchiveFixture(t, `{"result":{"agents":[{"pane_id":"w2:p1","name":"pane-live","agent_status":"working","cwd":"/x"}]}}`)
+	jobDir(t, f.jobs, "eligible", 20*24*time.Hour)
+	jobDir(t, f.jobs, "too-new", time.Hour)
+	jobDir(t, f.jobs, "unfinished", 20*24*time.Hour)
+	if err := os.Remove(filepath.Join(f.jobs, "unfinished", "events", "00005-job.completed.json")); err != nil {
+		t.Fatal(err)
+	}
+	noEvents := jobDir(t, f.jobs, "no-events", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(noEvents, "events")); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, f.jobs, "pane-live", 20*24*time.Hour)
+	target, err := os.MkdirTemp(filepath.Dir(f.jobs), "symlink-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(f.jobs, "symlink-job")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	var plan map[string]any
+	for _, line := range strings.Split(f.out.String(), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" {
+			got = append(got, row.Job+"|"+row.Result+"|"+row.Reason)
+		}
+		var v map[string]any
+		if json.Unmarshal([]byte(line), &v) == nil && v["action"] == "archive-plan" {
+			plan = v
+		}
+	}
+	want := []string{"eligible|would-archive|", "no-events|skipped|no-events", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("rows = %v, want %v", got, want)
+	}
+	if plan == nil || plan["job"] != "eligible" || plan["task"] != "77" || plan["files"] != float64(4) {
+		t.Fatalf("eligible plan = %v", plan)
+	}
 }
 
 func writeFile(t *testing.T, p, body string) {

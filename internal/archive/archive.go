@@ -227,6 +227,62 @@ func inCheckout(p string, checkouts map[string]bool) bool {
 const listScript = `cd "$1" || exit 1
 find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
 
+// hostListScript includes directories so an empty events directory remains
+// distinguishable from a missing one. Its records cover the whole jobs tree.
+const hostListScript = `cd "$1" || exit 1
+find . -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -d "$f" ]; then t=d; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
+
+// HostJobs lists metadata once and groups regular job entries for the
+// archive-jobs preflight. The returned root kinds include symlinks.
+func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[string]byte, map[string][]File, map[string]bool, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", hostListScript, "sh", root)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list jobs tree %s: %w", root, err)
+	}
+	kinds, grouped, events := map[string]byte{}, map[string][]File{}, map[string]bool{}
+	for _, rec := range strings.Split(string(b), "\x00") {
+		if rec == "" {
+			continue
+		}
+		parts := strings.SplitN(rec, " ", 4)
+		if len(parts) != 4 || len(parts[0]) != 1 || (parts[3] != "." && !strings.HasPrefix(parts[3], "./")) {
+			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
+		}
+		size, e1 := strconv.ParseInt(parts[1], 10, 64)
+		mtime, e2 := strconv.ParseInt(parts[2], 10, 64)
+		if e1 != nil || e2 != nil {
+			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
+		}
+		rel := strings.TrimPrefix(parts[3], "./")
+		if rel == "." {
+			continue
+		}
+		if rel == "" {
+			continue
+		}
+		job, sub, nested := strings.Cut(rel, "/")
+		if !nested {
+			if parts[0][0] == 'd' || parts[0][0] == 'l' {
+				kinds[job] = parts[0][0]
+			}
+			continue
+		}
+		if kinds[job] == 0 {
+			continue
+		}
+		if sub == "events" && parts[0][0] == 'd' {
+			events[job] = true
+		}
+		if parts[0][0] != 'd' {
+			grouped[job] = append(grouped[job], File{Path: sub, Size: size, mtime: mtime, kind: parts[0][0]})
+		}
+	}
+	for job := range grouped {
+		sort.Slice(grouped[job], func(i, j int) bool { return grouped[job][i].Path < grouped[job][j].Path })
+	}
+	return kinds, grouped, events, nil
+}
+
 // hashScript reads NUL-separated ./paths on stdin and prints "sha256 ./path"
 // records, using sha256sum or macOS shasum. A path that cannot be hashed
 // prints "!./path" and exits 0: the runner drops the output of a failed
@@ -441,6 +497,20 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if !finished(files) {
 		return nil, &Skip{"not-finished"}
 	}
+	return a.planListed(ctx, h, job, dir, files)
+}
+
+// PlanListed performs the expensive planning for a job whose root and basic
+// skip checks were already decided from a host-wide listing.
+func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job string, files []File) (*Plan, error) {
+	jobs, err := a.Jobs(ctx, h)
+	if err != nil {
+		return nil, err
+	}
+	return a.planListed(ctx, h, job, path.Join(jobs, job), files)
+}
+
+func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {
 	checkouts, err := gitCheckouts(ctx, a, h, dir)
 	if err != nil {
 		return nil, err
@@ -594,6 +664,29 @@ func finished(files []File) bool {
 		}
 	}
 	return terminal && !laterStart
+}
+
+// HostSkipReason applies the archive-jobs checks that can be decided from a
+// host-wide listing. newest is zero when the job has no non-directory entries.
+func HostSkipReason(kind byte, files []File, hasEvents bool) (reason string, newest int64) {
+	if kind == 'l' {
+		return "job-dir-symlink", 0
+	}
+	if kind != 'd' {
+		return "job-gone", 0
+	}
+	if !hasEvents {
+		return "no-events", 0
+	}
+	if !finished(files) {
+		return "not-finished", 0
+	}
+	for _, f := range files {
+		if f.mtime > newest {
+			newest = f.mtime
+		}
+	}
+	return "", newest
 }
 
 func (m *manifest) matches(p *Plan) bool {
