@@ -564,6 +564,17 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
    branch, and the author's branch being checked out in another worktree is no
    obstacle. The worktree is removed after the wait.
+   GitHub can lose `refs/pull/<n>/head` for an open PR while its branch is
+   intact. When that fetch fails (for any reason), a same-repo PR whose head
+   ref is a plain branch name (no leading `-`, `..`, `:`, whitespace, `*`, `^`,
+   `~`, `?`, `[` or `\`) fetches
+   `+refs/heads/<ref>:refs/remotes/origin/<ref> <base>` instead, and the pass
+   continues only when that branch contains the exact head
+   (`git merge-base --is-ancestor`); panewire then builds the remote spec from
+   the branch. The fallback writes a `pr-head-fallback` row (repo, PR, head,
+   ref, first error up to 512 bytes) to `decisions.jsonl`. A fork PR, an
+   invalid ref name or a branch force-pushed past the head skips the pass as
+   before, naming both errors when the branch was tried.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings and operator decisions), then runs
