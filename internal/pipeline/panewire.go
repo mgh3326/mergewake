@@ -457,15 +457,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
 		// exact reviewed head. C creates no local branch, and the author's branch
 		// checked out in another worktree is no obstacle. The head lands in a
-		// real ref: panewire builds the detached spec for another host only from a
+		// real ref: panewire builds the detached spec for another host from a
 		// local refs/remotes/origin/pull/<n>/head that points at the checkout's
-		// HEAD, and FETCH_HEAD is not one. The leading "+" lets a force-pushed
-		// PR move the ref.
-		if _, e = git(ctx, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref); e != nil {
-			return skip("fetch PR head: %v", e)
+		// HEAD, or else from a refs/remotes/origin/<branch> that contains it, and
+		// FETCH_HEAD is neither. The leading "+" lets a force-pushed PR move the
+		// ref. fetchPRHead falls back to the branch when GitHub has no
+		// pull/<n>/head.
+		if e = s.fetchPRHead(ctx, root, x.repo.Name, pr); e != nil {
+			return skip("%v", e)
 		}
-		// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head")
-		// from this worktree and prepares the same detached worktree remotely.
+		// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head"
+		// or the branch) from this worktree and prepares the same detached
+		// worktree remotely.
 		if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
 			cleanup()
 			return skip("checkout PR head %s: %v", short7(pr.Head.SHA), e)

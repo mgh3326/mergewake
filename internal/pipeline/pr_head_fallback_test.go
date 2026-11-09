@@ -237,3 +237,33 @@ func TestPRHeadFallbackRejectsInvalidRefName(t *testing.T) {
 		})
 	}
 }
+
+// The fallback itself refuses a fork's branch, whatever its caller checked
+// first: origin's branch of that name is not the PR's.
+func TestFetchPRHeadNoFallbackForForkPR(t *testing.T) {
+	o := seedPROrigin(t, false)
+	runner := &panewireRunner{realGit: true}
+	s, g, r := panewireSetup(t, runner)
+	pr := g.pull
+	pr.Head.SHA = o.head
+	pr.Head.Repo.FullName = "fork/project"
+	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	if e == nil || !strings.Contains(e.Error(), "fetch PR head") {
+		t.Fatalf("err=%v, want the pull/<n>/head failure", e)
+	}
+	if f := branchFetches(runner.git); len(f) != 0 {
+		t.Fatalf("branch fetched for a fork PR: %q", f)
+	}
+	if rows := auditRows(t, s, r, "pr-head-fallback"); len(rows) != 0 {
+		t.Fatalf("pr-head-fallback rows=%v", rows)
+	}
+}
+
+// Real branch names stay eligible for the fallback.
+func TestFallbackBranchAcceptsBranchNames(t *testing.T) {
+	for _, ref := range []string{"feat/thing", "wk/hk3697-yt-oplog", "lead/pr-head-fallback", "v1.2_fix", "mergewake/recovery"} {
+		if !fallbackBranch(ref) {
+			t.Errorf("fallbackBranch(%q) = false", ref)
+		}
+	}
+}
