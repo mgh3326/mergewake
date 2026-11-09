@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +33,10 @@ var laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 // restarts. A READY is never repeated: there are no READY reminders. A merged
 // or closed PR is never notified here.
 //
+// A conflict is told by its ESC (EscalateConflict), sent first, drafts
+// included; the BLOCKED event carries only the verdict's other reasons and is
+// not sent when the conflict is the whole verdict.
+//
 // The pr role notifies under shadow too — telling a lane is not merging — while
 // dry-run only prints the decision and writes no keys or events.
 func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
@@ -49,6 +54,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if e != nil {
 		return e
 	}
+	// The ESC never holds up the verdict: its error is returned with the rest.
+	escErr := s.EscalateConflict(ctx, r, pr, o)
+	defer func() { retErr = errors.Join(retErr, escErr) }()
 	if pr.State != "open" || pr.Draft || pr.Base.Ref != r.Branch {
 		return nil
 	}
@@ -81,6 +89,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		FailedHosts     []string `json:"failed_hosts,omitempty"`
 		Sent            bool     `json:"sent"`
 		Deduped         bool     `json:"deduped,omitempty"`
+		Suppressed      string   `json:"suppressed,omitempty"`
 		Error           string   `json:"error,omitempty"`
 	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ChecksSkipped: v.Review.ChecksSkipped, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
 	if !o.Reporting() {
@@ -111,14 +120,18 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		record.Reasons = v.Reasons
 	}
 	summary := pr.Title
+	conflicted := false
 	if v.State == "blocked" {
 		reasons, waiting := splitInternalWaits(v.Reasons, v.Review.Block)
+		// The conflict went out as its ESC; the BLOCKED carries the rest.
+		conflicted = slices.Contains(reasons, "conflict")
+		reasons = slices.DeleteFunc(reasons, func(reason string) bool { return reason == "conflict" })
 		if waiting {
 			since, e := s.reviewWaitSince(r, pr)
 			if e != nil {
 				return e
 			}
-			if len(reasons) == 0 {
+			if len(reasons) == 0 && !conflicted {
 				// Only mergewake's own queue holds the head: nothing for any
 				// session to do until the wait outlasts reviewStallAfter.
 				lane, via, sent, e := s.reviewStalled(ctx, r, pr, v, since)
@@ -135,6 +148,10 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 				record.Reasons, record.Lane, record.Via, record.Sent = []string{"review_stalled"}, lane, via, true
 				return s.audit(r.Name, "pr-notify", record, false)
 			}
+		}
+		if conflicted && len(reasons) == 0 {
+			record.Suppressed = "conflict ESC"
+			return s.audit(r.Name, "pr-notify", record, false)
 		}
 		cancelled := make(map[string]bool, len(v.Review.ChecksCancelled))
 		for _, name := range v.Review.ChecksCancelled {
@@ -160,7 +177,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		// checks the dismissal's evidence before merging.
 		summary += fmt.Sprintf(" | %d critical/high dismissed: check the evidence", n)
 	}
-	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, v.Review.BaseBehind)
+	// A mixed verdict keeps the route its conflict gave it: the author's.
+	author := v.State == "blocked" && (conflicted || authorAction(summary))
+	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, v.Review.BaseBehind, author)
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -269,18 +288,21 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // anything to do with it. It is recorded instead (see recordOnlyEvent), which
 // keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
-	return s.verdictEvent(ctx, r, pr, state, summary, false)
+	return s.verdictEvent(ctx, r, pr, state, summary, false, state == "blocked" && authorAction(summary))
 }
 
 // verdictEvent is laneEvent for a verdict whose gate result is known: a
-// recorded READY carries baseBehind into its decision row.
-func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string, baseBehind bool) (string, string, bool, error) {
+// recorded READY carries baseBehind into its decision row. author routes a
+// BLOCKED the author acts on through findingsRoute; NotifyPR decides it on
+// the whole reason set, which may hold a conflict the summary leaves to the
+// ESC.
+func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string, baseBehind, author bool) (string, string, bool, error) {
 	var lane, via string
 	var e error
 	switch {
 	case state == "ready" || state == "merged":
 		// Recorded or sent below, once the sent key is known; each resolves its own lane.
-	case state == "blocked" && authorAction(summary):
+	case state == "blocked" && author:
 		route, err := s.findingsRoute(ctx, r, pr)
 		if err != nil {
 			return "", "", false, err
@@ -343,7 +365,7 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 		fallback := s.Config.Notifier.FallbackLane
 		// An author-action BLOCKED never falls back to the desk: it is parked
 		// with the decided key.
-		if fallback != "" && fallback != lane && !(state == "blocked" && authorAction(summary)) {
+		if fallback != "" && fallback != lane && !(state == "blocked" && author) {
 			// The resolved lane may not exist on this host; the fallback lane
 			// gets one try under a distinct ID before the verdict is parked.
 			if fb := s.Notifier.Notify(reportCtx, integrations.Event{
