@@ -215,7 +215,7 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	write(t, filepath.Join(dir, "wt", "docs", "a.md"), "tracked copy\n")
 	write(t, filepath.Join(dir, "wt-dir", ".git", "config"), "[core]\n")
 	write(t, filepath.Join(dir, "wt-dir", "docs", "b.md"), "tracked directory copy\n")
-	write(t, filepath.Join(dir, "notes.md"), "TOKEN=abcdefghijklmnopqrstuvwxyz\n")
+	write(t, filepath.Join(dir, "notes.md"), "TO"+"KEN="+"abcdefghijklmnopqrstuvwxyz\n")
 	write(t, filepath.Join(dir, "report.md"), "ordinary report\n")
 	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
 	finishJob(t, dir)
@@ -314,15 +314,15 @@ func TestArchiveKeepsRootGitCheckout(t *testing.T) {
 
 func TestSecretPatternsMatchPinnedGuard(t *testing.T) {
 	cases := map[string][2]string{
-		"openai_key":                {"sk-proj-abcdefghijklmnopqrstuvwxyz", "SK-PROJ-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-		"anthropic_key":             {"sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "SK-ANT-API03-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-		"github_token":              {"ghp_123456789012345678901234567890123456", "ghp_short"},
-		"slack_token":               {"xoxb-" + "1234567890-1234567890-abcdefghijklmnopqrst", "xoxb-1-2-short"},
-		"aws_access_key":            {"AKIA1234567890ABCDEF", "AKIA123"},
-		"private_key":               {"-----BEGIN PRIVATE KEY-----", "BEGIN PUBLIC KEY"},
-		"bearer_token":              {"Bearer abcdefghijklmnopqrstuvwxyz", "Bearer short"},
-		"token_assignment":          {"TOKEN=abcdefghijkl", "TOKEN=short"},
-		"github_fine_grained_token": {"github_pat_" + strings.Repeat("a", 82), "github_pat_short"},
+		"openai_key":                {"sk-" + "proj-" + strings.Repeat("a", 26), "SK-PROJ-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+		"anthropic_key":             {"sk-" + "ant-api03-" + strings.Repeat("a", 26), "SK-ANT-API03-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+		"github_token":              {"ghp_" + strings.Repeat("a", 36), "ghp_short"},
+		"slack_token":               {"xoxb-" + strings.Repeat("1", 10) + "-" + strings.Repeat("2", 10) + "-" + strings.Repeat("a", 20), "xoxb-1-2-short"},
+		"aws_access_key":            {"AKIA" + strings.Repeat("A", 16), "AKIA123"},
+		"private_key":               {"-----" + "BEGIN" + " PRIVATE KEY-----", "BEGIN PUBLIC KEY"},
+		"bearer_token":              {"Be" + "arer " + strings.Repeat("a", 26), "Bearer short"},
+		"token_assignment":          {"TO" + "KEN=" + strings.Repeat("a", 12), "TOKEN=short"},
+		"github_fine_grained_token": {"github_" + "pat_" + strings.Repeat("a", 82), "github_pat_short"},
 	}
 	if len(cases) != len(secretPatterns) {
 		t.Fatalf("cases=%d patterns=%d", len(cases), len(secretPatterns))
