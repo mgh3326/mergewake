@@ -219,52 +219,132 @@ type Reps interface {
 type CLI struct {
 	Runner  integrations.Runner
 	Command string
+	// Environ is the environment an outcomes child starts from; nil means
+	// os.Environ.
+	Environ func() []string
+}
+
+// childEnvDropped names the daemon's own hk service variables. An outcomes
+// child never inherits them: pacelever skips its own config.env when
+// HANDOFFKEEP_URL or HANDOFFKEEP_TOKEN is set, and its rep then stays local
+// (origin:N). See docs/config.md, "Outcomes".
+var childEnvDropped = []string{
+	"HANDOFFKEEP_URL",
+	"HANDOFFKEEP_TOKEN",
+	"HANDOFFKEEP_TOKEN_SVC_MERGEWAKE",
+	"HANDOFFKEEP_CF_ACCESS_CLIENT_ID",
+	"HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET",
+}
+
+// childEnv is environ without every entry whose name, before the first "=",
+// is in childEnvDropped. It is never nil: a nil environment would inherit the
+// daemon's whole environment.
+func childEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.Contains(childEnvDropped, name) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// envRunner is a Runner that can replace a child's environment, as
+// integrations.Exec does.
+type envRunner interface {
+	RunEnv(context.Context, string, []string, string, string, []string) ([]byte, error)
+}
+
+// run invokes the outcomes command with childEnv. A Runner without RunEnv (a
+// test fake) gets a plain Run.
+func (c CLI) run(ctx context.Context, args []string) ([]byte, error) {
+	r, ok := c.Runner.(envRunner)
+	if !ok {
+		return c.Runner.Run(ctx, c.Command, args, "", "")
+	}
+	environ := c.Environ
+	if environ == nil {
+		environ = os.Environ
+	}
+	return r.RunEnv(ctx, c.Command, args, "", "", childEnv(environ()))
+}
+
+// repRow parses one line of `reps list` text output: the rep ref after "id="
+// (srv:N, origin:N or local:N) and the mergewake outcome its notes carry.
+func repRow(line string) (ref string, v Outcome, ok bool) {
+	rest, found := strings.CutPrefix(line, "id=")
+	if !found {
+		return "", Outcome{}, false
+	}
+	ref, _, _ = strings.Cut(rest, " ")
+	i := strings.Index(line, " notes=")
+	if i < 0 {
+		return "", Outcome{}, false
+	}
+	var envelope struct {
+		Source   string         `json:"source"`
+		Observed map[string]int `json:"observed_findings_by_severity"`
+		Outcome  Outcome        `json:"outcome"`
+	}
+	d := json.NewDecoder(strings.NewReader(line[i+7:]))
+	if d.Decode(&envelope) != nil || envelope.Source != "mergewake" || envelope.Outcome.ID == "" {
+		return "", Outcome{}, false
+	}
+	if envelope.Outcome.Findings == nil && envelope.Observed != nil {
+		envelope.Outcome.Findings = envelope.Observed
+	}
+	return ref, envelope.Outcome, true
 }
 
 func decodeNotes(b []byte) []Outcome {
 	out := []Outcome{}
 	for _, line := range strings.Split(string(b), "\n") {
 		// Only confirmed server rows count; local pending/lost records are not a receipt.
-		if !strings.HasPrefix(line, "id=srv:") {
-			continue
+		if ref, v, ok := repRow(line); ok && strings.HasPrefix(ref, "srv:") {
+			out = append(out, v)
 		}
-		i := strings.Index(line, " notes=")
-		if i < 0 {
-			continue
-		}
-		var envelope struct {
-			Source   string         `json:"source"`
-			Observed map[string]int `json:"observed_findings_by_severity"`
-			Outcome  Outcome        `json:"outcome"`
-		}
-		d := json.NewDecoder(strings.NewReader(line[i+7:]))
-		if d.Decode(&envelope) != nil || envelope.Source != "mergewake" || envelope.Outcome.ID == "" {
-			continue
-		}
-		if envelope.Outcome.Findings == nil && envelope.Observed != nil {
-			envelope.Outcome.Findings = envelope.Observed
-		}
-		out = append(out, envelope.Outcome)
 	}
 	return out
 }
+
+// earlierRep finds a row an earlier add left for outcome id. shared is true
+// for a srv: row, the shared store's receipt. Otherwise ref is the first
+// origin: or local: row: a rep that stayed on this machine. That is no
+// receipt, but another add would only make another local copy.
+func earlierRep(b []byte, id string) (ref string, shared bool) {
+	for _, line := range strings.Split(string(b), "\n") {
+		r, v, ok := repRow(line)
+		if !ok || v.ID != id {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(r, "srv:"):
+			return r, true
+		case ref == "" && (strings.HasPrefix(r, "origin:") || strings.HasPrefix(r, "local:")):
+			ref = r
+		}
+	}
+	return ref, false
+}
 func (c CLI) Read(ctx context.Context) ([]Outcome, error) {
-	b, err := c.Runner.Run(ctx, c.Command, []string{"reps", "list", "--limit", "100000"}, "", "")
+	b, err := c.run(ctx, []string{"reps", "list", "--limit", "100000"})
 	if err != nil {
 		return nil, err
 	}
 	return decodeNotes(b), nil
 }
 func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
-	// Checking the stable event ID closes the success-before-local-ack crash window.
-	b, err := c.Runner.Run(ctx, c.Command, []string{"reps", "list", "--profile", v.Profile, "--limit", "100000"}, "", "")
+	// Checking the stable event ID closes the success-before-local-ack crash
+	// window, and stops another add after a reply that stayed local.
+	b, err := c.run(ctx, []string{"reps", "list", "--profile", v.Profile, "--limit", "100000"})
 	if err != nil {
 		return "", err
 	}
-	for _, old := range decodeNotes(b) {
-		if old.ID == v.ID {
-			return "confirmed:" + v.ID, nil
-		}
+	if ref, shared := earlierRep(b, v.ID); shared {
+		return "confirmed:" + v.ID, nil
+	} else if ref != "" {
+		return "", fmt.Errorf("rep delivered locally only (%s), not shared; retained in outbox", ref)
 	}
 	if v.Profile == "" || v.Model == "" || v.Grade == "" || v.Tier == "" {
 		return "", errors.New("outcome attribution incomplete; retained in outbox")
@@ -294,7 +374,7 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 		args = append(args, "--effort", v.Effort)
 	}
 	args = append(args, "--task", v.Task, "--tier", v.Tier, "--role", "impl", "--grade", v.Grade, "--rounds", "1", "--blockers-found", strconv.Itoa(v.Blockers()), "--completed", completed, "--notes", string(notes))
-	b, err = c.Runner.Run(ctx, c.Command, args, "", "")
+	b, err = c.run(ctx, args)
 	if err != nil {
 		return "", err
 	}
@@ -309,6 +389,7 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 // same event payload. A newer terminal snapshot supersedes older local revisions.
 // repo limits a flush to one repository's outcomes; an empty repo flushes all,
 // so a per-repo loop never publishes (or reports) another repo's records.
+// Failed publishes return a *PublishError once every outcome was tried.
 func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
 	return l.locked(func(f *os.File, s State) error {
 		keys := make([]string, 0, len(s.Latest))
@@ -336,9 +417,23 @@ func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
 				return err
 			}
 		}
-		return errors.Join(errs...)
+		if len(errs) == 0 {
+			return nil
+		}
+		return &PublishError{Count: len(errs), Err: errors.Join(errs...)}
 	})
 }
+
+// PublishError is a Flush whose ledger reads and writes succeeded but whose
+// publication of Count outcomes failed; they stay in the outbox for the next
+// flush. Any other Flush error is a ledger or IO failure.
+type PublishError struct {
+	Count int
+	Err   error
+}
+
+func (e *PublishError) Error() string { return e.Err.Error() }
+func (e *PublishError) Unwrap() error { return e.Err }
 
 type Aggregate struct {
 	AttributionMissing int            `json:"attribution_missing"`

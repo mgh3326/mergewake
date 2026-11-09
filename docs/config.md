@@ -874,6 +874,45 @@ before retrying to cover successful writes followed by a crash before local ack;
 unconfirmed/pending CLI responses remain buffered. Inspect and retry errors with
 `outcomes sync`; no test writes fabricated reps into the shared store.
 
+Every outcomes CLI call (`reps list`, `reps list --profile`, `reps add`) runs
+with the daemon's environment minus these variables, every occurrence, matched
+on the whole name before `=`:
+
+- `HANDOFFKEEP_URL`
+- `HANDOFFKEEP_TOKEN`
+- `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE`
+- `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`
+- `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET`
+
+They carry the daemon's own [hk HTTP credential](#hk-http-credential). When
+pacelever sees `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN` it skips its own
+`config.env`, has no token, and keeps the rep local (`recorded rep
+id=origin:N`). Everything else is kept, including `PATH`, `HOME`, `XDG_*`,
+`HANDOFFKEEP_CONFIG`, `PACELEVER_*` and `GH_TOKEN`, so the CLI reaches the
+bench through its own configuration. The daemon's own environment is not
+changed; its hk HTTP clients keep these variables.
+
+Only a `srv:` row is a receipt. Before each `reps add`, mergewake lists the
+profile's reps and looks for a row whose notes carry the same outcome id:
+
+| Earlier row | Result |
+|---|---|
+| `id=srv:N` | Confirmed and recorded as published; no add. |
+| `id=origin:N` or `id=local:N` | No add. The outcome is not published and stays in the outbox: `rep delivered locally only (origin:N), not shared; retained in outbox`. |
+| None | `reps add`. A reply other than `recorded rep id=srv:N` stays in the outbox, and the next flush finds its row. |
+
+A local-only row stops duplicate adds but is never counted as shared:
+`outcomes report --source hk` reads `srv:` rows only.
+
+The automatic flush at the end of each repo pass and after each land does not
+fail the pass when publication fails. It writes one `outcome-publish-error`
+audit row to the repo's `decisions.jsonl` (`repo`, `count` of failed outcomes,
+and `error` cut to 512 bytes of valid UTF-8), logs a warning, and keeps the
+outcomes in the outbox for the next flush. A ledger read or write failure,
+or an `outcome-publish-error` row that cannot be written, still fails the
+pass. `mergewake outcomes sync` stays strict: it exits
+non-zero when any outcome fails to publish.
+
 ```sh
 mergewake outcomes report --since 2026-10-01
 mergewake outcomes report --since 168h --source hk

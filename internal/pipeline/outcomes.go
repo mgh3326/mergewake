@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"maps"
 	"regexp"
 	"slices"
@@ -391,6 +393,24 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 	errs = append(errs, s.FlushOutcomes(ctx, r.Name))
 	return errors.Join(errs...)
 }
+
+// outcomePublishErrorMax bounds the error an outcome-publish-error audit
+// keeps, in bytes.
+const outcomePublishErrorMax = 512
+
+// outcomePublishDetail is the error text an outcome-publish-error audit
+// keeps: invalid UTF-8 replaced, then cut on a character boundary to
+// outcomePublishErrorMax bytes.
+func outcomePublishDetail(msg string) string {
+	return clip(strings.ToValidUTF8(msg, "\uFFFD"), outcomePublishErrorMax)
+}
+
+// FlushOutcomes is the automatic flush at the end of a repo pass and after a
+// land. A publication failure does not fail the pass: it is audited as
+// outcome-publish-error and logged, and the outcomes stay in the outbox for
+// the next flush. A ledger or IO failure, or an audit row that cannot be
+// written, is still returned. The operator's `mergewake outcomes sync` calls
+// Ledger.Flush directly and stays strict.
 func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	command := s.Config.Outcomes.Command
 	if command == "" {
@@ -399,5 +419,16 @@ func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	if command == "" {
 		command = "scopefuel"
 	}
-	return s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
+	err := s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
+	var failed *outcomes.PublishError
+	if !errors.As(err, &failed) {
+		return err
+	}
+	detail := outcomePublishDetail(failed.Error())
+	slog.Warn("outcome publish failed; retained in outbox", "repo", repo, "count", failed.Count, "error", detail)
+	if e := s.audit(repo, "outcome-publish-error", map[string]any{"repo": repo, "count": failed.Count, "error": detail}, false); e != nil {
+		slog.Warn("outcome-publish-error audit not written", "repo", repo, "error", e)
+		return fmt.Errorf("outcome-publish-error audit for %s: %w", repo, e)
+	}
+	return nil
 }
