@@ -21,9 +21,11 @@ import (
 // result — including a read error — is reused by every route lookup under the
 // same context, so FINDINGS and READY for one PR cost one pane list per host.
 type authorScan struct {
-	once  sync.Once
-	hosts []*reapHost
-	err   error
+	once        sync.Once
+	hosts       []*reapHost
+	failedHosts []string
+	readHosts   int
+	err         error
 }
 
 type authorScanKey struct{}
@@ -36,6 +38,13 @@ func WithAuthorScan(ctx context.Context) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, authorScanKey{}, &authorScan{})
+}
+
+func authorScanFailures(ctx context.Context) []string {
+	if scan, ok := ctx.Value(authorScanKey{}).(*authorScan); ok {
+		return append([]string(nil), scan.failedHosts...)
+	}
+	return nil
 }
 
 func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
@@ -54,6 +63,9 @@ func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 			hs, _ := s.reapScanHost(ctx, hub, h)
 			if hs.failed {
 				errs = append(errs, fmt.Errorf("author pane scan: host %s: pane list failed", h.Name))
+				scan.failedHosts = append(scan.failedHosts, h.Name)
+			} else {
+				scan.readHosts++
 			}
 			scan.hosts = append(scan.hosts, hs)
 		}
@@ -110,8 +122,9 @@ func (s *Service) authorPane(ctx context.Context, r config.Repo, pr github.Pull)
 // superseded by a takeover (see boundAuthorLane). candidates names several
 // other live panes when the bound lane was kept.
 type authorRoute struct {
-	lane, via  string
-	candidates []string
+	lane, via   string
+	candidates  []string
+	failedHosts []string
 }
 
 // boundAuthorLane is the PR author's lane when the task binds a job with a
@@ -134,7 +147,12 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	bound := authorRoute{lane: lane, via: "task " + task + " job " + job}
 	others, e := s.takeoverPanes(ctx, r, pr, job, rec.Label)
 	if e != nil {
-		return authorRoute{}, e
+		scan, _ := ctx.Value(authorScanKey{}).(*authorScan)
+		if scan == nil || scan.readHosts == 0 {
+			return authorRoute{}, e
+		}
+		bound.failedHosts = append([]string(nil), scan.failedHosts...)
+		bound.via += " (partial pane scan)"
 	}
 	switch len(others) {
 	case 0:
@@ -149,13 +167,20 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 			return authorRoute{}, e
 		}
 		if l := jobLane(takeover); l != "" {
-			return authorRoute{lane: l, via: "takeover pane " + others[0]}, nil
+			return authorRoute{lane: l, via: "takeover pane " + others[0] + partialVia(bound), failedHosts: bound.failedHosts}, nil
 		}
 		return bound, nil
 	default:
 		bound.candidates = others
 		return bound, nil
 	}
+}
+
+func partialVia(route authorRoute) string {
+	if len(route.failedHosts) > 0 {
+		return " (partial pane scan)"
+	}
+	return ""
 }
 
 // takeoverPanes names the live panes on the PR's head branch in repo r that
@@ -167,9 +192,6 @@ func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pu
 		return nil, nil
 	}
 	hosts, err := s.authorHosts(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var names []string
 	for _, hs := range hosts {
 		for _, p := range hs.panes {
@@ -183,5 +205,5 @@ func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pu
 			names = append(names, p.Name)
 		}
 	}
-	return names, nil
+	return names, err
 }

@@ -219,6 +219,124 @@ func TestTakeoverResendFollowsTheNewAuthor(t *testing.T) {
 	}
 }
 
+// A bound author lane is durable when one configured host cannot be scanned.
+// FINDINGS must use the healthy host result and record the partial routing choice.
+func TestPartialAuthorScanDeliversBoundLane(t *testing.T) {
+	s, _, run := takeoverSetup(t, paneA)
+	setPartialAuthorScan(s, run)
+	var out bytes.Buffer
+	s.Out = &out
+	n := s.Notifier.(*ackNotifier)
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("want one event on bound lane w-7, got %+v", n.events)
+	}
+	rows := auditRecords(t, out.Bytes(), "findings-route-partial")
+	if len(rows) != 1 || rows[0]["lane"] != "w-7" || !strings.Contains(fmt.Sprint(rows[0]["failed_hosts"]), "unavailable") {
+		t.Fatalf("partial-route audit rows %+v", rows)
+	}
+}
+
+func setPartialAuthorScan(s *Service, run *scriptRunner) {
+	s.Config.Hosts = []reap.Host{{Name: "healthy"}, {Name: "unavailable", SSH: "unavailable"}}
+	run.errs = map[string]error{key("ssh", "-o", "BatchMode=yes", "-T", "-n", "unavailable", reap.Join([]string{"herdr", "agent", "list"})): errors.New("pane list failed")}
+}
+
+func TestPartialAuthorScanStillUsesUniqueTakeover(t *testing.T) {
+	s, _, run := takeoverSetup(t, paneB)
+	setPartialAuthorScan(s, run)
+	var out bytes.Buffer
+	s.Out = &out
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	n := s.Notifier.(*ackNotifier)
+	if n.count != 1 || n.events[0].Lane != "w-9-lane" {
+		t.Fatalf("unique healthy-host takeover not selected: %+v calls=%v", n.events, run.calls)
+	}
+	rows := auditRecords(t, out.Bytes(), "findings-route-partial")
+	if len(rows) != 1 || rows[0]["lane"] != "w-9-lane" {
+		t.Fatalf("partial takeover audit rows %+v", rows)
+	}
+}
+
+func TestPartialAuthorScanWithoutBoundJobRetries(t *testing.T) {
+	s, sink, run := takeoverSetup(t, paneB)
+	delete(sink.jobs, "2481")
+	setPartialAuthorScan(s, run)
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e == nil {
+		t.Fatal("partial scan without a bound job did not return an error")
+	}
+	if n := s.Notifier.(*ackNotifier); n.count != 0 {
+		t.Fatalf("event sent without a bound author lane: %+v", n.events)
+	}
+}
+
+func TestPartialAuthorScanWorkerVerdictRouteAndReadyAudit(t *testing.T) {
+	s, _, _, r := workerNotifySetup(t)
+	run := authorHost()
+	s.Runner = run
+	setPartialAuthorScan(s, run)
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	rows := prNotifyRows(t, s, r)
+	if len(rows) != 1 || rows[0]["lane"] != "worker-lane" || !strings.Contains(fmt.Sprint(rows[0]["via"]), "partial pane scan") || !strings.Contains(fmt.Sprint(rows[0]["failed_hosts"]), "unavailable") {
+		t.Fatalf("partial READY route missing from audit: %+v", rows)
+	}
+
+	s3, g3, n3, r3 := workerNotifySetup(t)
+	run3 := authorHost()
+	s3.Runner = run3
+	setPartialAuthorScan(s3, run3)
+	no3 := false
+	g3.pull.Mergeable = &no3
+	g3.pull.MergeableState = "dirty"
+	if e := s3.NotifyPR(context.Background(), r3, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n3.count != 1 || n3.events[0].Lane != "worker-lane" {
+		t.Fatalf("partial author verdict did not reach bound lane: %+v", n3.events)
+	}
+	rows = prNotifyRows(t, s3, r3)
+	if len(rows) != 1 || !strings.Contains(fmt.Sprint(rows[0]["via"]), "partial pane scan") || !strings.Contains(fmt.Sprint(rows[0]["failed_hosts"]), "unavailable") {
+		t.Fatalf("partial verdict route missing from audit: %+v", rows)
+	}
+
+	s2, _, _, r2 := workerNotifySetup(t)
+	run2 := authorHost()
+	s2.Runner = run2
+	setPartialAuthorScan(s2, run2)
+	delete(s2.Sink.(*jobSink).jobs, "42")
+	no := false
+	s2.GH.(*fakeGH).pull.Mergeable = &no
+	s2.GH.(*fakeGH).pull.MergeableState = "dirty"
+	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e == nil {
+		t.Fatal("author verdict without a bound job did not retry on partial scan")
+	}
+	if n := s2.Notifier.(*fakeNotifier); n.count != 0 {
+		t.Fatalf("verdict delivered without a bound author lane: %+v", n.events)
+	}
+}
+
+func TestAuthorPaneHubErrorStillRetriesBoundLane(t *testing.T) {
+	s, _, run := takeoverSetup(t)
+	s.Runner = run
+	s.Config.Reap.Transport = config.ReapTransportPanewire
+	s.Config.Reap.Hub = config.ReapHub{URL: "://invalid"}
+	if rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull); e == nil {
+		t.Fatalf("hub error selected %q via %q", rt.lane, rt.via)
+	}
+	if len(run.calls) != 0 {
+		t.Fatalf("host scan began despite hub setup error: %v", run.calls)
+	}
+}
+
 // (takeover g) A host read error during the takeover scan is returned: the
 // pass retries and sends nothing, rather than picking a lane.
 func TestTakeoverScanErrorRetriesWithoutSending(t *testing.T) {
