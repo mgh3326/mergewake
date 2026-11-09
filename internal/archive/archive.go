@@ -765,7 +765,7 @@ func (a *Archiver) checkoutSafety(ctx context.Context, p *Plan) ([]Retention, er
 		b, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `
 set -eu
 git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { echo git-error; exit 0; }
-status=$(git -C "$1" status --porcelain 2>/dev/null) || { echo git-error; exit 0; }
+status=$(git -C "$1" status --porcelain --untracked-files=all 2>/dev/null) || { echo git-error; exit 0; }
 [ -z "$status" ] || { echo dirty; exit 0; }
 stash=$(git -C "$1" stash list 2>/dev/null) || { echo git-error; exit 0; }
 [ -z "$stash" ] || { echo stash; exit 0; }

@@ -369,6 +369,10 @@ func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
 	}{
 		{name: "modified", reason: "dirty", mutate: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "tracked.txt"), "changed\n") }},
 		{name: "untracked", reason: "dirty", mutate: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "new.txt"), "new\n") }},
+		{name: "untracked-hidden-by-config", reason: "dirty", mutate: func(t *testing.T, dir string) {
+			gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+			write(t, filepath.Join(dir, "new.txt"), "new\n")
+		}},
 		{name: "stash", reason: "stash", mutate: func(t *testing.T, dir string) {
 			write(t, filepath.Join(dir, "tracked.txt"), "changed\n")
 			gitRun(t, dir, "stash", "push", "-m", "test")
