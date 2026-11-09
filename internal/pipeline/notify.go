@@ -78,6 +78,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		BaseBehind      bool     `json:"base_behind,omitempty"`
 		Lane            string   `json:"lane,omitempty"`
 		Via             string   `json:"via,omitempty"`
+		FailedHosts     []string `json:"failed_hosts,omitempty"`
 		Sent            bool     `json:"sent"`
 		Deduped         bool     `json:"deduped,omitempty"`
 		Error           string   `json:"error,omitempty"`
@@ -174,6 +175,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return nil
 	}
 	record.Lane, record.Via, record.Sent, record.Deduped = lane, via, sent, !sent
+	if len(authorScanFailures(ctx)) > 0 {
+		record.FailedHosts = authorScanFailures(ctx)
+	}
 	return s.audit(r.Name, "pr-notify", record, false)
 }
 
@@ -414,16 +418,17 @@ func (s *Service) recordOnlyEvent(ctx context.Context, r config.Repo, pr github.
 		}
 	}
 	record := struct {
-		PR         int    `json:"pr"`
-		Head       string `json:"head"`
-		State      string `json:"state"`
-		Summary    string `json:"summary,omitempty"`
-		BaseBehind bool   `json:"base_behind,omitempty"`
-		Lane       string `json:"lane,omitempty"`
-		Via        string `json:"via,omitempty"`
-		Sent       bool   `json:"sent"`
-		Suppressed string `json:"suppressed"`
-	}{PR: pr.Number, Head: pr.Head.SHA, State: state, Summary: summary, BaseBehind: baseBehind, Lane: workerLane, Via: workerVia, Suppressed: "record only"}
+		PR          int      `json:"pr"`
+		Head        string   `json:"head"`
+		State       string   `json:"state"`
+		Summary     string   `json:"summary,omitempty"`
+		BaseBehind  bool     `json:"base_behind,omitempty"`
+		Lane        string   `json:"lane,omitempty"`
+		Via         string   `json:"via,omitempty"`
+		FailedHosts []string `json:"failed_hosts,omitempty"`
+		Sent        bool     `json:"sent"`
+		Suppressed  string   `json:"suppressed"`
+	}{PR: pr.Number, Head: pr.Head.SHA, State: state, Summary: summary, BaseBehind: baseBehind, Lane: workerLane, Via: workerVia, FailedHosts: authorScanFailures(ctx), Suppressed: "record only"}
 	if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
 		return "", "", false, e
 	}

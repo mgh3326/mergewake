@@ -63,8 +63,9 @@ type pendingFinding struct {
 // findingsRoute is where a PR's findings go: the author lane and the owning
 // lane escalations and out-of-scope findings go to.
 type findingsRoute struct {
-	lane, via string
-	owner     string
+	lane, via   string
+	owner       string
+	failedHosts []string
 	// ambiguous names the several other live panes on the PR's branch when
 	// the bound lane was kept (see boundAuthorLane); the caller audits them.
 	ambiguous []string
@@ -294,7 +295,7 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 	if al, e := s.boundAuthorLane(ctx, r, pr, task); e != nil {
 		return rt, e
 	} else if al.lane != "" {
-		rt.lane, rt.via, rt.ambiguous = al.lane, al.via, al.candidates
+		rt.lane, rt.via, rt.ambiguous, rt.failedHosts = al.lane, al.via, al.candidates, al.failedHosts
 		return rt, nil
 	}
 	if lane, via, ok, e := s.authorPane(ctx, r, pr); e != nil {
@@ -435,7 +436,13 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 			return d, fmt.Errorf("findings delivery to %s: %w", lane, e)
 		}
 	}
-	return d, s.audit(r.Name, "findings-delivered", d, o.DryRun)
+	if e := s.audit(r.Name, "findings-delivered", d, o.DryRun); e != nil {
+		return d, e
+	}
+	if len(rt.failedHosts) > 0 {
+		return d, s.audit(r.Name, "findings-route-partial", map[string]any{"pr": pr.Number, "failed_hosts": rt.failedHosts, "lane": lane, "via": via}, o.DryRun)
+	}
+	return d, nil
 }
 
 // ackReader is the notifier side that can tell which events a lane
