@@ -1084,13 +1084,50 @@ func TestFindingValidation(t *testing.T) {
 	for _, tt := range []struct {
 		body string
 		fail bool
-	}{{`{"findings":[{"path":"a","line":11,"body":"bug"}]}`, false}, {`{"findings":[]}`, false}, {`{"findings":[{"path":"a","line":12,"body":"bug"}]}`, false}, {`{"findings":null}`, true}, {`{"findings":[]} garbage`, true}, {`{"findings":[],"extra":true}`, true}, {`{"findings":[],"summary":"reviewed the diff, no issues"}`, false}, {`{"findings":[{"path":"a","line":11,"body":"bug","summary":"x"}]}`, true}} {
+	}{{`{"findings":[{"path":"a","line":11,"body":"bug"}]}`, false}, {`{"findings":[]}`, false}, {`{"findings":[{"path":"a","line":12,"body":"bug"}]}`, false}, {`{"findings":null}`, true}, {`{"findings":[]} garbage`, true}, {`{"findings":[],"extra":true}`, true}, {`{"findings":[],"summary":"reviewed the diff, no issues"}`, false}, {`{"findings":[{"path":"a","line":11,"body":"bug","summary":"x"}]}`, false}} {
 		_, _, e := parseFindings([]byte(tt.body), diff)
 		if (e != nil) != tt.fail {
 			t.Errorf("%s: %v", tt.body, e)
 		}
 	}
 }
+
+func TestFindingExtraKeysAreIgnored(t *testing.T) {
+	diff := "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -10,1 +10,1 @@\n-old\n+new\n"
+
+	t.Run("keeps finding with extra keys", func(t *testing.T) {
+		input := `{"findings":[{"path":"a","line":10,"body":"bug","severity":"high","category":"correctness","failure_scenario":"bad outcome","short_summary":"summary","summary":"extra detail"}]}`
+		kept, dropped, err := parseFindings([]byte(input), diff)
+		if err != nil {
+			t.Fatalf("parseFindings() error = %v", err)
+		}
+		if len(kept) != 1 || len(dropped) != 0 {
+			t.Fatalf("kept=%+v dropped=%+v", kept, dropped)
+		}
+		if got := kept[0]; got.Path != "a" || got.Line != 10 || got.Body != "bug" || got.Severity != "high" {
+			t.Fatalf("finding = %+v", got)
+		}
+	})
+
+	t.Run("unknown top-level key remains an error", func(t *testing.T) {
+		input := `{"findings":[],"unexpected":true}`
+		if _, _, err := parseFindings([]byte(input), diff); err == nil {
+			t.Fatal("parseFindings() accepted an unknown top-level key")
+		}
+	})
+
+	t.Run("extra keys do not change empty-body dropping", func(t *testing.T) {
+		input := `{"findings":[{"path":"a","line":10,"body":"","category":"correctness","summary":"not a body"}]}`
+		kept, dropped, err := parseFindings([]byte(input), diff)
+		if err != nil {
+			t.Fatalf("parseFindings() error = %v", err)
+		}
+		if len(kept) != 0 || len(dropped) != 1 || dropped[0].Path != "a" || dropped[0].Line != 10 || dropped[0].Reason != "empty body" {
+			t.Fatalf("kept=%+v dropped=%+v", kept, dropped)
+		}
+	})
+}
+
 func TestReleaseAndRolloutAdapters(t *testing.T) {
 	s, g, sink, n, r := setup(t)
 	r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}

@@ -209,12 +209,12 @@ func TestMalformedResultIsStillRejected(t *testing.T) {
 	diff := outsideToolDiff
 	many := strings.Repeat(`{"path":"tool","line":1,"body":"b"},`, 50) + `{"path":"tool","line":1,"body":"b"}`
 	for name, body := range map[string]string{
-		"unknown field":   `{"findings":[{"path":"tool","line":1,"body":"b","surprise":1}]}`,
-		"51 findings":     `{"findings":[` + many + `]}`,
-		"bad severity":    `{"findings":[{"path":"tool","line":1,"body":"ok"},{"path":"tool","line":1,"body":"b","severity":"urgent"}]}`,
-		"not JSON":        `findings`,
-		"trailing data":   `{"findings":[]} x`,
-		"findings absent": `{}`,
+		"unknown top-level field": `{"findings":[],"surprise":1}`,
+		"51 findings":             `{"findings":[` + many + `]}`,
+		"bad severity":            `{"findings":[{"path":"tool","line":1,"body":"ok"},{"path":"tool","line":1,"body":"b","severity":"urgent"}]}`,
+		"not JSON":                `findings`,
+		"trailing data":           `{"findings":[]} x`,
+		"findings absent":         `{}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if kept, dropped, e := parseFindings([]byte(body), diff); e == nil {
@@ -226,9 +226,11 @@ func TestMalformedResultIsStillRejected(t *testing.T) {
 	if _, _, e := parseFindings([]byte(`{"findings":[`+many[:len(many)-len(`,{"path":"tool","line":1,"body":"b"}`)]+`]}`), diff); e != nil {
 		t.Fatalf("50 findings rejected: %v", e)
 	}
-	// The reviewer cannot choose an anchor.
-	if _, _, e := parseFindings([]byte(`{"findings":[{"path":"tool","line":1,"body":"b","anchor":"file"}]}`), diff); e == nil {
-		t.Fatal("anchor accepted from the reviewer")
+	// The reviewer cannot choose an anchor; unknown finding keys are ignored
+	// and the pipeline computes the anchor from the diff.
+	kept, _, e := parseFindings([]byte(`{"findings":[{"path":"tool","line":1,"body":"b","anchor":"file"}]}`), diff)
+	if e != nil || len(kept) != 1 || kept[0].Anchor != github.AnchorLine {
+		t.Fatalf("reviewer anchor was not ignored: kept=%+v err=%v", kept, e)
 	}
 }
 

@@ -693,8 +693,9 @@ func (s *Service) markDone(ctx context.Context, repo string, n int, sha string) 
 var hunk = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
 
 // parseFindings validates a reviewer's result. A malformed document (not JSON,
-// unknown fields, more than 50 findings, an invalid severity) rejects the whole
-// result. A single bad finding does not: an empty or over-long body is dropped
+// an unknown top-level field, more than 50 findings, an invalid severity)
+// rejects the whole result. Unknown keys in a finding are ignored. A single bad
+// finding does not: an empty or over-long body is dropped
 // and reported, and every other finding is kept with the anchor GitHub can
 // give it: its line when that is a new-side line of the diff, else its file
 // when the path is in the diff, else the review body.
@@ -702,14 +703,20 @@ func parseFindings(b []byte, diff string) ([]github.Finding, []droppedFinding, e
 	// Summary is the job result's short summary that workers write on
 	// completion (hk job result summary); it carries no findings and is not
 	// used here, but its presence must not make a finished review look lost.
-	var v struct {
-		Findings []github.Finding `json:"findings"`
-		Summary  string           `json:"summary"`
+	var document struct {
+		Findings json.RawMessage `json:"findings"`
+		Summary  string          `json:"summary"`
 	}
-	if e := configJSON(b, &v); e != nil {
+	if e := configJSON(b, &document); e != nil {
 		return nil, nil, e
 	}
-	if v.Findings == nil || len(v.Findings) > 50 {
+	var findings []github.Finding
+	if len(document.Findings) != 0 {
+		if e := json.Unmarshal(document.Findings, &findings); e != nil {
+			return nil, nil, e
+		}
+	}
+	if findings == nil || len(findings) > 50 {
 		return nil, nil, errors.New("review must contain a findings array of at most 50 items")
 	}
 	valid := map[string]map[int]bool{}
@@ -747,7 +754,7 @@ func parseFindings(b []byte, diff string) ([]github.Finding, []droppedFinding, e
 	}
 	var kept []github.Finding
 	var dropped []droppedFinding
-	for _, f := range v.Findings {
+	for _, f := range findings {
 		switch f.Severity {
 		case "", "blocking", "major", "minor", "critical", "high", "medium", "low":
 		default:
