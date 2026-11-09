@@ -402,9 +402,12 @@ local job dir and reports the step:
    with the same archived files and oversized paths, sizes and fingerprints,
    the plan is a delete-only `resume` (contents must still match the manifest);
    otherwise it is skipped as
-   `drive-dir-exists`. Publication is serialized; if hosts present the same
-   task/job key, a stale or different-host plan remains `drive-dir-exists` and
-   cannot overwrite the completed copy. A job with its own top-level `manifest.json` is
+   `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
+   under the archive's `.locks` directory, outside task/job names; a lock older
+   than 24 hours is reclaimable, and a live lock is reported as
+   `archive-lock-busy`. If hosts present the same task/job key, a stale or
+   different-host plan remains `drive-dir-exists` and cannot overwrite the
+   completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
    from the job host and unpacked straight into the destination on the

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -315,20 +316,36 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+const archiveLockTTL = int64(24 * 60 * 60)
+
 // claim serializes publication for one task/job destination across hosts.
-// The exact task/job layout has one destination, so a competing or stale plan
-// must fail closed instead of overwriting a copy that may already be complete.
+// Locks live outside the task/job namespace and carry an owner and creation
+// time so a later run can reclaim one left by a dead process.
 func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
-	lock := dest + ".lock"
+	sum := sha256.Sum256([]byte(dest))
+	lock := path.Join(a.DriveDir, ".locks", hex.EncodeToString(sum[:]))
+	owner := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
 	b, err := a.on(ctx, a.SSH, "", "sh", "-c", `mkdir -p "$2" || exit 1
-if mkdir "$1" 2>/dev/null; then echo acquired; else echo busy; fi`, "sh", lock, path.Dir(dest))
+now=$(date +%s) || exit 1
+claim_owner="$3"
+acquire() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$claim_owner" "$now" > "$1/owner"; }
+if acquire "$1"; then echo acquired; exit 0; fi
+old_owner=; born=
+if [ -r "$1/owner" ]; then read old_owner born < "$1/owner"; else born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1") || { echo busy; exit 0; }; fi
+case "$born" in ''|*[!0-9]*) echo busy; exit 0;; esac
+if [ "$((now-born))" -lt "$4" ]; then echo busy; exit 0; fi
+stale="$1.stale.$3"
+if ! mv "$1" "$stale" 2>/dev/null; then echo busy; exit 0; fi
+if acquire "$1"; then rm -rf "$stale"; echo acquired; else mv "$stale" "$1" 2>/dev/null; echo busy; fi`, "sh", lock, path.Join(a.DriveDir, ".locks"), owner, strconv.FormatInt(archiveLockTTL, 10))
 	if err != nil {
 		return nil, fmt.Errorf("claim archive destination: %w", err)
 	}
 	if strings.TrimSpace(string(b)) != "acquired" {
-		return nil, &Skip{"drive-dir-exists"}
+		return nil, &Skip{"archive-lock-busy"}
 	}
-	return func() { _, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `rmdir "$1"`, "sh", lock) }, nil
+	return func() {
+		_, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `if [ -r "$1/owner" ]; then read current created < "$1/owner"; if [ "$current" = "$2" ]; then rm -rf "$1"; fi; fi`, "sh", lock, owner)
+	}, nil
 }
 
 func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {

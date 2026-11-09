@@ -882,6 +882,43 @@ func TestArchiveRejectsStalePlanFromAnotherHost(t *testing.T) {
 	}
 }
 
+func TestArchiveClaimUsesExternalExpiringLocks(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "X")
+	release, err := a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.claim(context.Background(), dest); err == nil || err.Error() != "skipped: archive-lock-busy" {
+		t.Fatalf("busy claim err=%v", err)
+	}
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("lock not outside destination namespace: %v", err)
+	}
+	other, err := a.claim(context.Background(), dest+".lock")
+	if err != nil {
+		t.Fatalf("job ending in .lock collided with another lock: %v", err)
+	}
+	other()
+	release()
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte("dead 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	release, err = a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("stale lock was not reclaimed: %v", err)
+	}
+	release()
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("released lock remains: %v", err)
+	}
+}
+
 func TestArchiveCopiesOnlyInspectedTextSnapshot(t *testing.T) {
 	e := setup(t)
 	dir := job(t, e.jobs, "wk-snapshot")
