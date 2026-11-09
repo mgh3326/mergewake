@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -83,6 +84,7 @@ type Plan struct {
 	Text           []string `json:"hk"`
 	Excluded       []string `json:"excluded"`
 	Skipped        []string `json:"skipped"`
+	AppleDouble    []string `json:"appledouble"`
 	Delete         string   `json:"delete"`
 	Newest         int64    `json:"newest_mtime"`
 	// Resume marks a job whose Drive copy and hk record already completed
@@ -157,9 +159,11 @@ const listScript = `cd "$1" || exit 1
 find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
 
 // hashScript reads NUL-separated ./paths on stdin and prints "sha256 ./path"
-// records, using sha256sum or macOS shasum.
+// records, using sha256sum or macOS shasum. A path that cannot be hashed
+// prints "!./path" and exits 0: the runner drops the output of a failed
+// command, so the name must travel on stdout for the error to carry it.
 const hashScript = `cd "$1" || exit 1
-xargs -0 sh -c 'for f; do s=$(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") || exit 1; printf "%s %s\0" "${s%% *}" "$f"; done' sh`
+xargs -0 sh -c 'for f; do s=$(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null) || { printf "!%s\0" "$f"; exit 0; }; printf "%s %s\0" "${s%% *}" "$f"; done' sh`
 
 func (a *Archiver) list(ctx context.Context, h reap.Host, dir string) ([]File, error) {
 	b, err := a.on(ctx, h.SSH, "", "sh", "-c", listScript, "sh", dir)
@@ -312,7 +316,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		return nil, &Skip{"not-finished"}
 	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
-		Move: []string{}, Text: []string{}, Excluded: []string{}, Skipped: []string{}}
+		Move: []string{}, Text: []string{}, Excluded: []string{}, Skipped: []string{}, AppleDouble: []string{}}
 	for _, f := range files {
 		switch {
 		case !safeName(f.Path):
@@ -326,6 +330,10 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
 			p.Skipped = append(p.Skipped, f.Path)
+		case appleDouble(f.Path):
+			// macOS writes ._X beside X. Copied to a Drive folder, a ._X
+			// whose X is absent can fold into X's metadata and vanish.
+			p.AppleDouble = append(p.AppleDouble, f.Path)
 		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
 			p.Oversized = append(p.Oversized, f)
 			p.OversizedBytes += f.Size
@@ -378,6 +386,12 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		p.Resume, p.done, p.doneRaw = true, &m, raw
 	}
 	return p, nil
+}
+
+// appleDouble reports whether the base name of a job-relative path starts with
+// "._", the AppleDouble metadata file macOS writes beside every file it tags.
+func appleDouble(p string) bool {
+	return strings.HasPrefix(path.Base(p), "._")
 }
 
 func finished(files []File) bool {
@@ -465,6 +479,9 @@ func (a *Archiver) hashes(ctx context.Context, ssh, dir string, paths []string) 
 		if rec == "" {
 			continue
 		}
+		if bad, failed := strings.CutPrefix(rec, "!"); failed {
+			return nil, fmt.Errorf("sha256 %s: cannot hash %s", dir, fleetevent.Redact(strings.TrimPrefix(bad, "./")))
+		}
 		sum, p, ok := strings.Cut(rec, " ")
 		p = strings.TrimPrefix(p, "./")
 		switch {
@@ -523,6 +540,7 @@ type manifest struct {
 	Oversized   []File       `json:"oversized,omitempty"`
 	Excluded    []string     `json:"excluded"`
 	Skipped     []string     `json:"skipped"`
+	AppleDouble []string     `json:"appledouble"`
 	Attachments []Attachment `json:"attachments"`
 }
 
@@ -551,6 +569,12 @@ func comment(p *Plan, m manifest, manifestID string) string {
 	if len(m.Skipped) > 0 {
 		fmt.Fprintf(&b, "skipped non-regular entries, not archived (%d):\n", len(m.Skipped))
 		for _, x := range m.Skipped {
+			fmt.Fprintf(&b, "- %s\n", x)
+		}
+	}
+	if len(m.AppleDouble) > 0 {
+		fmt.Fprintf(&b, "AppleDouble metadata files, not archived (%d):\n", len(m.AppleDouble))
+		for _, x := range m.AppleDouble {
 			fmt.Fprintf(&b, "- %s\n", x)
 		}
 	}
@@ -638,7 +662,7 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		oversized[i].SHA256 = p.oversizedHashes[oversized[i].Path]
 	}
 	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
-		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, Skipped: p.Skipped, Attachments: []Attachment{}}
+		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, Skipped: p.Skipped, AppleDouble: p.AppleDouble, Attachments: []Attachment{}}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
 		moving[rel] = true

@@ -868,12 +868,13 @@ func TestHashesFailClosed(t *testing.T) {
 		out string
 		ok  bool
 	}{
-		"complete":  {sum + " ./a\x00" + sum + " ./b\x00", true},
-		"missing":   {sum + " ./a\x00", false},
-		"duplicate": {sum + " ./a\x00" + sum + " ./a\x00", false},
-		"extra":     {sum + " ./a\x00" + sum + " ./b\x00" + sum + " ./c\x00", false},
-		"swapped":   {sum + " ./a\x00" + sum + " ./c\x00", false},
-		"malformed": {"abc ./a\x00" + sum + " ./b\x00", false},
+		"complete":   {sum + " ./a\x00" + sum + " ./b\x00", true},
+		"missing":    {sum + " ./a\x00", false},
+		"duplicate":  {sum + " ./a\x00" + sum + " ./a\x00", false},
+		"extra":      {sum + " ./a\x00" + sum + " ./b\x00" + sum + " ./c\x00", false},
+		"swapped":    {sum + " ./a\x00" + sum + " ./c\x00", false},
+		"malformed":  {"abc ./a\x00" + sum + " ./b\x00", false},
+		"unhashable": {"!./b\x00", false},
 	} {
 		a := &Archiver{Runner: stubRunner(tc.out)}
 		got, err := a.hashes(context.Background(), "", "/x", []string{"a", "b"})

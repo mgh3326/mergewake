@@ -388,7 +388,10 @@ local job dir and reports the step:
    text file. Oversized contents are fingerprinted on the job host, recorded in
    the manifest, and checked again before deletion; they are never hashed on
    Drive. Symlinks and special files are not copied (following a link could
-   archive a secret from outside the job dir). The hk task id comes from the
+   archive a secret from outside the job dir). A regular file whose base name
+   starts with `._` is macOS AppleDouble metadata: it is not copied to Drive
+   or uploaded to hk, and is named in the manifest's `appledouble` list and
+   the hk comment. It is deleted with the job dir. The hk task id comes from the
    job's panewire events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
    destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
@@ -407,7 +410,9 @@ local job dir and reports the step:
    nothing.
 3. **Verify**: every archived file's sha256 is computed on both sides and must
    match; oversized file fingerprints are computed on the job host only. A
-   missing, duplicate or unexpected hash record fails the archive.
+   missing, duplicate or unexpected hash record fails the archive. A path
+   that cannot be hashed on the Drive side is named in the error (redacted),
+   so the row shows which file the copy lost.
 4. **hk attachments**: each text file under `text_max_bytes` is uploaded to
    hk (`PUT /v1/attachments`); the returned sha256 must match. The upload
    has no task reference, so the ids are tied to the task by the comment.
