@@ -28,6 +28,7 @@ type archiveRunner struct {
 	calls            int
 	path             string
 	afterTreeListing func()
+	treeBytes        int
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -50,10 +51,13 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 	if err := c.Run(); err != nil {
 		return nil, errors.New(name + ": " + err.Error() + ": " + stderr.String())
 	}
-	if a.afterTreeListing != nil && name == "sh" && strings.Contains(strings.Join(args, " "), "find . -exec sh -c") {
-		after := a.afterTreeListing
-		a.afterTreeListing = nil
-		after()
+	if name == "sh" && strings.Contains(strings.Join(args, " "), "for d in *; do") {
+		a.treeBytes = out.Len()
+		if a.afterTreeListing != nil {
+			after := a.afterTreeListing
+			a.afterTreeListing = nil
+			after()
+		}
 	}
 	return out.Bytes(), nil
 }
@@ -205,6 +209,23 @@ func TestArchiveJobsRefreshesFinishedStateBeforePlanning(t *testing.T) {
 	}
 	if f.run.script.called("git") {
 		t.Fatal("refreshed unfinished job entered remaining planning")
+	}
+}
+
+func TestArchiveJobsHostListingOutputDoesNotScaleWithJobFiles(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "many-files", time.Hour)
+	for i := 0; i < 500; i++ {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("file-%04d.txt", i)), "x")
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if f.run.treeBytes > 1024 {
+		t.Fatalf("host listing summary bytes = %d, want <= 1024", f.run.treeBytes)
+	}
+	if !strings.Contains(f.out.String(), `"job":"many-files","result":"skipped","reason":"too-new"`) {
+		t.Fatalf("missing too-new row: %s", f.out.String())
 	}
 }
 

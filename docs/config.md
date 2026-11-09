@@ -379,8 +379,10 @@ these steps in order:
   `jobs-dir-not-absolute`. In the host-wide `archive-jobs` scan, one listing
   supplies each job's root kind, events directory and entry metadata; symlink,
   missing, no-events, unfinished and too-new jobs are skipped before per-job
-  planning. Candidates that pass those checks are refreshed per job and the
-  completion and age gates are repeated immediately before remaining planning.
+  planning. The shared listing returns one compact summary per job, so its
+  output does not grow with the number of files. Candidates that pass those
+  checks are refreshed per job and the completion and age gates are repeated
+  immediately before remaining planning.
   A job dir that is itself a symlink is refused as
   `job-dir-symlink` (checked again right before the delete); otherwise
   list every non-directory entry. A job is eligible only when its `events/`

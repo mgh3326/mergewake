@@ -86,6 +86,14 @@ type File struct {
 	kind   byte // f regular, l symlink, o anything else
 }
 
+// HostJobSummary is the compact metadata needed to decide host-wide skips.
+type HostJobSummary struct {
+	Kind      byte
+	HasEvents bool
+	Finished  bool
+	Newest    int64
+}
+
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
 	Action          string      `json:"action"`
@@ -227,60 +235,48 @@ func inCheckout(p string, checkouts map[string]bool) bool {
 const listScript = `cd "$1" || exit 1
 find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
 
-// hostListScript includes directories so an empty events directory remains
-// distinguishable from a missing one. Its records cover the whole jobs tree.
+// hostListScript emits one compact summary per job, avoiding output growth with
+// each job's file count. Per-job refresh supplies full file metadata only for
+// jobs that pass these skip checks.
 const hostListScript = `cd "$1" || exit 1
-find . -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -d "$f" ]; then t=d; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; e=-; case "$f" in */events) if [ -e "$f" ]; then e=1; else e=0; fi;; esac; printf "%s %s %s %s %s\0" "$t" "${m%% *}" "${m#* }" "$e" "$f"; done' sh {} +`
+for d in *; do
+  if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0; continue; fi
+  [ -d "$d" ] || continue
+  has=0; done=0
+  if [ -e "$d/events" ]; then
+    has=1
+    done=$(find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null | awk '$1+0 >= max {max=$1+0; last=$2} END {if (last == "T") print 1; else print 0}')
+  fi
+  newest=$(find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null | awk 'NR == 1 || $1+0 > max {max=$1+0} END {if (NR) printf "%.0f", max; else print 0}')
+  printf '%s\0d\0%s\0%s\0%s\0' "$d" "$has" "$done" "$newest"
+done`
 
-// HostJobs lists metadata once and groups regular job entries for the
-// archive-jobs preflight. The returned root kinds include symlinks.
-func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[string]byte, map[string][]File, map[string]bool, error) {
+// HostJobs returns compact per-job summaries from one host call.
+func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[string]HostJobSummary, error) {
 	b, err := a.on(ctx, h.SSH, "", "sh", "-c", hostListScript, "sh", root)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("list jobs tree %s: %w", root, err)
+		return nil, fmt.Errorf("list jobs tree %s: %w", root, err)
 	}
-	kinds, grouped, events := map[string]byte{}, map[string][]File{}, map[string]bool{}
-	for _, rec := range strings.Split(string(b), "\x00") {
-		if rec == "" {
-			continue
-		}
-		parts := strings.SplitN(rec, " ", 5)
-		if len(parts) != 5 || len(parts[0]) != 1 || (parts[4] != "." && !strings.HasPrefix(parts[4], "./")) {
-			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
-		}
-		size, e1 := strconv.ParseInt(parts[1], 10, 64)
-		mtime, e2 := strconv.ParseInt(parts[2], 10, 64)
-		if e1 != nil || e2 != nil {
-			return nil, nil, nil, fmt.Errorf("list jobs tree %s: malformed record", root)
-		}
-		rel := strings.TrimPrefix(parts[4], "./")
-		if rel == "." {
-			continue
-		}
-		if rel == "" {
-			continue
-		}
-		job, sub, nested := strings.Cut(rel, "/")
-		if !nested {
-			if !strings.HasPrefix(job, ".") && (parts[0][0] == 'd' || parts[0][0] == 'l') {
-				kinds[job] = parts[0][0]
-			}
-			continue
-		}
-		if kinds[job] == 0 {
-			continue
-		}
-		if sub == "events" && parts[3] == "1" {
-			events[job] = true
-		}
-		if parts[0][0] != 'd' {
-			grouped[job] = append(grouped[job], File{Path: sub, Size: size, mtime: mtime, kind: parts[0][0]})
-		}
+	fields := strings.Split(string(b), "\x00")
+	if fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
 	}
-	for job := range grouped {
-		sort.Slice(grouped[job], func(i, j int) bool { return grouped[job][i].Path < grouped[job][j].Path })
+	if len(fields)%5 != 0 {
+		return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
 	}
-	return kinds, grouped, events, nil
+	out := make(map[string]HostJobSummary, len(fields)/5)
+	for i := 0; i < len(fields); i += 5 {
+		job, kind, hasEvents, finished, newest := fields[i], fields[i+1], fields[i+2], fields[i+3], fields[i+4]
+		if job == "" || len(kind) != 1 || (kind[0] != 'd' && kind[0] != 'l') || (hasEvents != "0" && hasEvents != "1") || (finished != "0" && finished != "1") {
+			return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
+		}
+		mtime, e := strconv.ParseInt(newest, 10, 64)
+		if e != nil {
+			return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
+		}
+		out[job] = HostJobSummary{Kind: kind[0], HasEvents: hasEvents == "1", Finished: finished == "1", Newest: mtime}
+	}
+	return out, nil
 }
 
 // hashScript reads NUL-separated ./paths on stdin and prints "sha256 ./path"
@@ -511,7 +507,7 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 		return nil, "", 0, err
 	}
 	if kind != "dir" {
-		reason, newest := HostSkipReason(0, nil, false)
+		reason, newest := HostSkipReason(HostJobSummary{})
 		return nil, reason, newest, nil
 	}
 	files, err := a.list(ctx, h, dir)
@@ -522,7 +518,13 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	reason, newest := HostSkipReason('d', files, hasEvents)
+	summary := HostJobSummary{Kind: 'd', HasEvents: hasEvents, Finished: finished(files)}
+	for _, f := range files {
+		if f.mtime > summary.Newest {
+			summary.Newest = f.mtime
+		}
+	}
+	reason, newest := HostSkipReason(summary)
 	return files, reason, newest, nil
 }
 
@@ -690,25 +692,20 @@ func finished(files []File) bool {
 
 // HostSkipReason applies the archive-jobs checks that can be decided from a
 // host-wide listing. newest is zero when the job has no non-directory entries.
-func HostSkipReason(kind byte, files []File, hasEvents bool) (reason string, newest int64) {
-	if kind == 'l' {
+func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
+	if job.Kind == 'l' {
 		return "job-dir-symlink", 0
 	}
-	if kind != 'd' {
+	if job.Kind != 'd' {
 		return "job-gone", 0
 	}
-	if !hasEvents {
+	if !job.HasEvents {
 		return "no-events", 0
 	}
-	if !finished(files) {
+	if !job.Finished {
 		return "not-finished", 0
 	}
-	for _, f := range files {
-		if f.mtime > newest {
-			newest = f.mtime
-		}
-	}
-	return "", newest
+	return "", job.Newest
 }
 
 func (m *manifest) matches(p *Plan) bool {

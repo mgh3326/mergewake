@@ -247,13 +247,13 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
 			continue
 		}
-		kinds, filesByJob, events, e := a.HostJobs(ctx, h, root)
+		jobsByName, e := a.HostJobs(ctx, h, root)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
 		}
-		jobs := make([]string, 0, len(kinds))
-		for job := range kinds {
+		jobs := make([]string, 0, len(jobsByName))
+		for job := range jobsByName {
 			jobs = append(jobs, job)
 		}
 		sort.Strings(jobs)
@@ -271,7 +271,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Result, row.Reason = "skipped", "excluded-name"
 			} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 				row.Result, row.Reason = "skipped", "pane-live"
-			} else if reason, newest := archive.HostSkipReason(kinds[job], filesByJob[job], events[job]); reason != "" {
+			} else if reason, newest := archive.HostSkipReason(jobsByName[job]); reason != "" {
 				row.Result, row.Reason = "skipped", reason
 			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
