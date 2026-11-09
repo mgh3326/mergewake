@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -505,6 +506,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	placed := true
 	var collected []byte
 	var remoteRecord *integrations.JobRecord
+	// legacy names the entry and source of collected when it came from a
+	// legacy source; it is audited only where collected becomes the result.
+	var legacy legacyUse
 	if resumed {
 		// The record is answered in this order, and the total budget comes after
 		// the first two: a completed job or an available result is collected, a
@@ -526,13 +530,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// An escalated or lost job is held for the operator by the switch below,
 			// whatever its age.
 			if finished || (overBudget && state != "escalated" && state != "lost") {
-				var found bool
-				collected, found, e = x.availableFindings(ctx, plan, label, findingsPath)
+				var source string
+				collected, source, e = x.availableFindings(ctx, plan, label, findingsPath)
 				if e != nil {
 					return out, e
 				}
-				if found {
+				if source != "" {
 					spawn = false
+					legacy = legacyUse{entry: "resumed-finished", source: source}
 				} else {
 					fresh, err := x.job(ctx, label)
 					if err != nil {
@@ -575,11 +580,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// hk cannot answer for this job, which says nothing about the
 			// reviewer: its result may already sit on disk or on its host.
 			host := x.logJobReadError(rj, e)
-			b, found, err := x.availableFindings(ctx, plan, label, findingsPath)
+			b, source, err := x.availableFindings(ctx, plan, label, findingsPath)
 			if err != nil {
 				return out, err
 			}
-			if !found && host != "" {
+			found := source != ""
+			if found {
+				legacy = legacyUse{entry: "resumed-hk-unreadable", source: source}
+			} else if host != "" {
 				b, _, _ = x.remoteFindings(ctx, plan, integrations.JobRecord{Host: host}, label)
 				found = b != nil
 			}
@@ -884,6 +892,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	switch {
 	case res.result != nil:
 		b = res.result
+		// A remote record carries collected as its result: legacy bytes read
+		// while hk was unreadable are used here, and counted here.
+		if remoteRecord != nil && legacy.source != "" {
+			x.countLegacy(plan, label, "unreadable in hk", legacy, &note)
+		}
 	case quota && replacement != "":
 		keepJob, keepCheckout, closePane = true, true, false
 		next, err := x.job(ctx, replacement)
@@ -941,14 +954,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// source has is lost and logged, never a silent skip.
 		if collected != nil {
 			b = collected
-			x.countLegacy(plan, label, res.reason, &note)
+			x.countLegacy(plan, label, res.reason, legacy, &note)
 			break
 		}
 		var why string
 		if b, why = x.completedHost(collectCtx, plan, res.rec, label); b != nil {
 			break
 		}
-		b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, &note)
+		b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, "completed-no-result", &note)
 		if e == nil {
 			break
 		}
@@ -972,9 +985,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// release; each use is counted on the receipt and audited.
 		if collected != nil {
 			b = collected
-			x.countLegacy(plan, label, res.reason, &note)
+			x.countLegacy(plan, label, res.reason, legacy, &note)
 		} else {
-			b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, &note)
+			b, e = x.legacyFindings(collectCtx, plan, label, findingsPath, res.reason, "record-outcome", &note)
 		}
 		if e != nil {
 			if ctx.Err() != nil {
@@ -1592,55 +1605,82 @@ func (x *panewireExecutor) completedHost(ctx context.Context, plan *passPlan, re
 	return nil, fmt.Sprintf("host %s read %s", rec.Host, outcome)
 }
 
+// legacyUse names where a pass took legacy findings: entry is the runPass
+// entry point that took them, source the legacy source (legacyLane or
+// legacyFile) they came from. The zero value is no legacy use.
+type legacyUse struct {
+	entry, source string
+}
+
+// The legacy findings sources: the attachment announced on the findings lane,
+// and findings.json in this host's job directory.
+const (
+	legacyLane = "lane"
+	legacyFile = "file"
+)
+
 // legacyFindings is the legacy lane/file collection of a finished pane, kept
-// for one release; each use is counted on the receipt and audited.
-func (x *panewireExecutor) legacyFindings(ctx context.Context, plan *passPlan, label, findingsPath, record string, note *string) ([]byte, error) {
-	b, e := x.collect(ctx, label, findingsPath)
+// for one release; each use is counted on the receipt and audited under entry.
+func (x *panewireExecutor) legacyFindings(ctx context.Context, plan *passPlan, label, findingsPath, record, entry string, note *string) ([]byte, error) {
+	b, source, e := x.collect(ctx, label, findingsPath)
 	if e != nil {
 		return nil, e
 	}
-	x.countLegacy(plan, label, record, note)
+	x.countLegacy(plan, label, record, legacyUse{entry: entry, source: source}, note)
 	return b, nil
 }
 
-// countLegacy counts and audits one legacy lane/file collection on the pass
-// receipt.
-func (x *panewireExecutor) countLegacy(plan *passPlan, label, record string, note *string) {
+// fallbackAuditLog gets the review-inbox-fallback-audit-lost line: JSON on
+// the process stderr, where the daemon's operational log goes
+// (cmd/mergewake/daemon.go). A variable so a test can read the line.
+var fallbackAuditLog = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+// countLegacy counts and audits one use of legacy lane/file findings as the
+// pass's result on the pass receipt. Every use, on every entry point, comes
+// through here exactly once (docs/config.md, review-inbox-fallback); a use
+// whose audit cannot be written logs review-inbox-fallback-audit-lost.
+func (x *panewireExecutor) countLegacy(plan *passPlan, label, record string, use legacyUse, note *string) {
 	fallbackMu.Lock()
 	x.s.inboxFallbacks++
 	fallbacks := x.s.inboxFallbacks
 	fallbackMu.Unlock()
 	*note = strings.Trim(fmt.Sprintf("%s; findings returned through the legacy lane/file path (inbox fallback %d)", *note, fallbacks), "; ")
-	_ = x.s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "record": record, "count": fallbacks}, false)
+	// A lost audit leaves the use uncounted: it never changes the review, but
+	// it is logged once so a zero count is never read as no use.
+	if err := x.s.audit(x.repo.Name, "review-inbox-fallback", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "record": record, "count": fallbacks, "entry": use.entry, "source": use.source}, false); err != nil {
+		fallbackAuditLog.Warn("review-inbox-fallback-audit-lost", "repo", x.repo.Name, "pr", x.pr.Number, "pass", plan.pass, "label", label, "entry", use.entry, "source", use.source, "error", fleetevent.Redact(err.Error()))
+	}
 }
 
-// availableFindings checks the legacy sources once for a finished pane. A
-// findings-lane read error means "not available from that source": it is
+// availableFindings checks the legacy sources once for a finished pane and
+// returns the bytes with the source they came from ("" when neither has them).
+// A findings-lane read error means "not available from that source": it is
 // audited with its class and the local file is still tried, so the job result
 // and the replacement path after it stay reachable. Only a local file read
-// error other than not-exist, or a cancelled context, is returned.
-func (x *panewireExecutor) availableFindings(ctx context.Context, plan *passPlan, label, path string) ([]byte, bool, error) {
+// error other than not-exist, or a cancelled context, is returned. Reading is
+// not a use: the caller audits the bytes where they become the result.
+func (x *panewireExecutor) availableFindings(ctx context.Context, plan *passPlan, label, path string) ([]byte, string, error) {
 	lane := x.s.Config.Review.Panewire.Lane
 	if lane != "" {
 		b, err := x.announced(ctx, lane, label)
 		if err != nil {
 			// Cancellation or a spent deadline is not a lane read failure.
 			if ctx.Err() != nil {
-				return nil, false, ctx.Err()
+				return nil, "", ctx.Err()
 			}
 			_ = x.s.audit(x.repo.Name, "reviewer-lane-unreadable", map[string]any{"pr": x.pr.Number, "pass": plan.pass, "label": label, "class": laneErrorClass(err), "error": fleetevent.Redact(err.Error())}, false)
 		} else if b != nil {
-			return b, true, nil
+			return b, legacyLane, nil
 		}
 	}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
+		return nil, "", nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, "", err
 	}
-	return b, true, nil
+	return b, legacyFile, nil
 }
 
 // laneErrorClass names why the findings lane could not be read, for the audit line.
@@ -1656,7 +1696,8 @@ func laneErrorClass(err error) string {
 // findings lane, else the file in the local job directory, which exists only
 // when the pane ran on this host. Both are
 // looked for until findingsGrace (bounded by half the remaining deadline).
-func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath string) ([]byte, error) {
+// It returns the bytes with the source they came from.
+func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath string) ([]byte, string, error) {
 	lane := x.s.Config.Review.Panewire.Lane
 	grace := findingsGrace
 	if deadline, ok := ctx.Deadline(); ok {
@@ -1668,14 +1709,14 @@ func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath stri
 		if lane != "" {
 			b, e := x.announced(ctx, lane, label)
 			if e == nil && b != nil {
-				return b, nil
+				return b, legacyLane, nil
 			}
 			if e != nil {
 				announced = e
 			}
 		}
 		if b, e := os.ReadFile(findingsPath); e == nil {
-			return b, nil
+			return b, legacyFile, nil
 		}
 		wait := min(findingsPoll, time.Until(until))
 		if wait <= 0 {
@@ -1683,17 +1724,17 @@ func (x *panewireExecutor) collect(ctx context.Context, label, findingsPath stri
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, "", ctx.Err()
 		case <-time.After(wait):
 		}
 	}
 	switch {
 	case lane == "":
-		return nil, errors.New("wrote no findings file and no findings lane is configured")
+		return nil, "", errors.New("wrote no findings file and no findings lane is configured")
 	case announced != nil:
-		return nil, fmt.Errorf("no findings: lane %s unreadable (%v) and no local findings file", lane, announced)
+		return nil, "", fmt.Errorf("no findings: lane %s unreadable (%v) and no local findings file", lane, announced)
 	}
-	return nil, fmt.Errorf("no findings: no %s-findings event on lane %s and no local findings file", label, lane)
+	return nil, "", fmt.Errorf("no findings: no %s-findings event on lane %s and no local findings file", label, lane)
 }
 
 // announced looks for the pane's findings event on lane and fetches the
