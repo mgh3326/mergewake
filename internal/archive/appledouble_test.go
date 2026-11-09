@@ -95,7 +95,7 @@ func TestApplyArchivesAppleDoubleWithoutCopying(t *testing.T) {
 
 // A Drive-side hash failure names the first path it could not hash, and the
 // job dir stays.
-func TestApplyDriveHashFailureNamesPath(t *testing.T) {
+func TestArchiveDriveHashFailureNamesPath(t *testing.T) {
 	e := setup(t)
 	dir := job(t, e.jobs, "wk-hash")
 	write(t, filepath.Join(dir, "refs", "x.png"), "png\n")

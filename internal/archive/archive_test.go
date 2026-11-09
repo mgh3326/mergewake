@@ -856,7 +856,7 @@ func TestApplyKeepsJobChangedAfterPlan(t *testing.T) {
 
 // A delete that failed after the archive and hk record completed resumes to
 // a delete-only pass instead of being stuck as drive-dir-exists.
-func TestApplyResumesFailedDelete(t *testing.T) {
+func TestArchiveResumesFailedDelete(t *testing.T) {
 	e := setup(t)
 	dir := job(t, e.jobs, "wk-11")
 	a := archiver(e, "")
