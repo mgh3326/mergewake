@@ -502,12 +502,34 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 
 // PlanListed performs the expensive planning for a job whose root and basic
 // skip checks were already decided from a host-wide listing.
-func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job string, files []File) (*Plan, error) {
-	jobs, err := a.Jobs(ctx, h)
+// RefreshJob rechecks a preliminarily eligible host-scan job immediately
+// before planning, so a job that restarted after HostJobs cannot use stale
+// completion or age metadata to publish an archive.
+func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string) ([]File, string, int64, error) {
+	kind, err := a.jobDir(ctx, h.SSH, dir)
 	if err != nil {
-		return nil, err
+		return nil, "", 0, err
 	}
-	return a.planListed(ctx, h, job, path.Join(jobs, job), files)
+	if kind != "dir" {
+		reason, newest := HostSkipReason(0, nil, false)
+		return nil, reason, newest, nil
+	}
+	files, err := a.list(ctx, h, dir)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	hasEvents, err := a.exists(ctx, h.SSH, path.Join(dir, "events"))
+	if err != nil {
+		return nil, "", 0, err
+	}
+	reason, newest := HostSkipReason('d', files, hasEvents)
+	return files, reason, newest, nil
+}
+
+// PlanListed plans from refreshed listing metadata at an already-resolved job
+// path, avoiding another remote tilde expansion for eligible jobs.
+func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {
+	return a.planListed(ctx, h, job, dir, files)
 }
 
 func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {

@@ -275,7 +275,13 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Result, row.Reason = "skipped", reason
 			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
-			} else if p, e := a.PlanListed(ctx, h, job, filesByJob[job]); e != nil {
+			} else if files, reason, newest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
+				row.Result, row.Reason = archive.Reason(e)
+			} else if reason != "" {
+				row.Result, row.Reason = "skipped", reason
+			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
+				row.Result, row.Reason = "skipped", "too-new"
+			} else if p, e := a.PlanListed(ctx, h, job, filepath.Join(root, job), files); e != nil {
 				row.Result, row.Reason = archive.Reason(e)
 			} else if e := s.Print(p); e != nil {
 				return errors.Join(append(errs, e)...)

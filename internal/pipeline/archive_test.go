@@ -23,10 +23,11 @@ import (
 // tar, cat, rm) for real against temp dirs. hk is reached over HTTP
 // (hktest); an hk CLI call is recorded and refused.
 type archiveRunner struct {
-	script *scriptRunner
-	hkCLI  [][]string
-	calls  int
-	path   string
+	script           *scriptRunner
+	hkCLI            [][]string
+	calls            int
+	path             string
+	afterTreeListing func()
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -48,6 +49,11 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 	c.Stdout, c.Stderr = &out, &stderr
 	if err := c.Run(); err != nil {
 		return nil, errors.New(name + ": " + err.Error() + ": " + stderr.String())
+	}
+	if a.afterTreeListing != nil && name == "sh" && strings.Contains(strings.Join(args, " "), "find . -exec sh -c") {
+		after := a.afterTreeListing
+		a.afterTreeListing = nil
+		after()
 	}
 	return out.Bytes(), nil
 }
@@ -179,6 +185,26 @@ func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) 
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vanishing.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("stat shim did not remove test entry: %v", err)
+	}
+}
+
+func TestArchiveJobsRefreshesFinishedStateBeforePlanning(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "restarted", 20*24*time.Hour)
+	f.run.afterTreeListing = func() {
+		if err := os.Remove(filepath.Join(dir, "events", "00005-job.completed.json")); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, "events", "00006-job.placement.json"), `{}`)
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), `"job":"restarted","result":"skipped","reason":"not-finished"`) {
+		t.Fatalf("refreshed restart was not skipped: %s", f.out.String())
+	}
+	if f.run.script.called("git") {
+		t.Fatal("refreshed unfinished job entered remaining planning")
 	}
 }
 
