@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,13 +12,15 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // prOrigin is a bare "origin" with main at base and feat/thing at head, and a
 // clone of only main: the PR head reaches the clone through a fetch alone.
 type prOrigin struct {
 	work, origin, root string
-	head               string
+	base, head         string
 }
 
 func seedPROrigin(t *testing.T, pullRef bool) prOrigin {
@@ -33,7 +36,7 @@ func seedPROrigin(t *testing.T, pullRef bool) prOrigin {
 	gitAt(t, o.work, "init", "-b", "main")
 	gitAt(t, o.work, "config", "user.email", "t@example.com")
 	gitAt(t, o.work, "config", "user.name", "t")
-	o.commit(t, "base")
+	o.base = o.commit(t, "base")
 	gitAt(t, o.work, "checkout", "-b", "feat/thing")
 	o.commit(t, "head")
 	o.head = gitAt(t, o.work, "rev-parse", "HEAD")
@@ -134,9 +137,32 @@ func (p fallbackPass) assertSkipped(t *testing.T, reasons ...string) {
 	if len(p.runner.spawns) != 0 || worktreeAdds(p.runner.git) != 0 {
 		t.Fatalf("spawns=%v git=%q", p.runner.spawns, p.runner.git)
 	}
-	if rows := auditRows(t, p.s, p.r, "pr-head-fallback"); len(rows) != 0 {
-		t.Fatalf("pr-head-fallback audit on a skip: %v", rows)
+}
+
+// assertNoFallback: an ineligible PR never reaches a branch fetch and leaves
+// no pr-head-fallback row.
+func (p fallbackPass) assertNoFallback(t *testing.T) {
+	t.Helper()
+	if f := branchFetches(p.runner.git); len(f) != 0 {
+		t.Fatalf("branch fetched: %q", f)
 	}
+	if rows := auditRows(t, p.s, p.r, "pr-head-fallback"); len(rows) != 0 {
+		t.Fatalf("pr-head-fallback rows=%v", rows)
+	}
+}
+
+// fallbackRow is the one pr-head-fallback row an attempted fallback writes,
+// whatever its outcome.
+func fallbackRow(t *testing.T, s *Service, r config.Repo, result string) map[string]any {
+	t.Helper()
+	rows := auditRows(t, s, r, "pr-head-fallback")
+	if len(rows) != 1 {
+		t.Fatalf("pr-head-fallback rows=%v, want exactly one", rows)
+	}
+	if rows[0]["result"] != result {
+		t.Fatalf("row=%v, want result %q", rows[0], result)
+	}
+	return rows[0]
 }
 
 // GitHub can lose refs/pull/<n>/head for a same-repo PR while its branch is
@@ -153,11 +179,7 @@ func TestPRHeadFallbackBranchAtHead(t *testing.T) {
 	if n := len(branchFetches(p.runner.git)); n != 1 {
 		t.Fatalf("branch fetches=%d git=%q", n, p.runner.git)
 	}
-	rows := auditRows(t, p.s, p.r, "pr-head-fallback")
-	if len(rows) != 1 {
-		t.Fatalf("pr-head-fallback rows=%v", rows)
-	}
-	row := rows[0]
+	row := fallbackRow(t, p.s, p.r, "ok")
 	if row["repo"] != p.r.Name || row["pr"] != float64(7) || row["head"] != o.head || row["ref"] != "feat/thing" {
 		t.Fatalf("row=%v", row)
 	}
@@ -166,20 +188,21 @@ func TestPRHeadFallbackBranchAtHead(t *testing.T) {
 	}
 }
 
-// The author pushed again after the reviewed head: the branch contains it,
-// and the pass still reviews the exact head, not the branch tip.
+// The author pushed again after the reviewed head. panewire would build the
+// remote spec {sha: head, fetch: refs/heads/<branch>} and the remote node
+// requires FETCH_HEAD to equal that sha, so a branch past the head cannot
+// carry the remote reviewer: the pass skips and the next pass reviews the new
+// head.
 func TestPRHeadFallbackBranchAdvancedPastHead(t *testing.T) {
 	o := seedPROrigin(t, false)
 	tip := o.commit(t, "later")
 	gitAt(t, o.work, "push", o.origin, "feat/thing")
 	p := runFallbackPass(t, o, nil)
-	p.assertReviewed(t, o.head)
+	p.assertSkipped(t, "fetch PR head", "branch feat/thing is at "+short7(tip)+", not head "+short7(o.head))
 	if got := gitAt(t, o.root, "rev-parse", "refs/remotes/origin/feat/thing"); got != tip {
 		t.Fatalf("refs/remotes/origin/feat/thing=%s want the branch tip %s", got, tip)
 	}
-	if rows := auditRows(t, p.s, p.r, "pr-head-fallback"); len(rows) != 1 {
-		t.Fatalf("pr-head-fallback rows=%v", rows)
-	}
+	fallbackRow(t, p.s, p.r, "head-moved")
 }
 
 // A branch force-pushed since the reviewed head no longer stands for it, even
@@ -193,7 +216,39 @@ func TestPRHeadFallbackForcePushedBranchSkips(t *testing.T) {
 	o.commit(t, "rewritten")
 	gitAt(t, o.work, "push", "--force", o.origin, "feat/thing")
 	p := runFallbackPass(t, o, nil)
-	p.assertSkipped(t, "fetch PR head", "feat/thing does not contain head "+short7(o.head))
+	p.assertSkipped(t, "fetch PR head", "branch feat/thing is at ", "not head "+short7(o.head))
+	fallbackRow(t, p.s, p.r, "head-moved")
+}
+
+// A PR whose branch is gone as well: one fallback row records the attempt and
+// the pass skips naming both fetch failures.
+func TestPRHeadFallbackBranchFetchFailsSkips(t *testing.T) {
+	o := seedPROrigin(t, false)
+	p := runFallbackPass(t, o, func(g *fakeGH) { g.pull.Head.Ref = "feat/gone" })
+	p.assertSkipped(t, "fetch PR head", "fetch branch feat/gone")
+	if n := len(branchFetches(p.runner.git)); n != 1 {
+		t.Fatalf("branch fetches=%d git=%q", n, p.runner.git)
+	}
+	fallbackRow(t, p.s, p.r, "fetch-failed")
+}
+
+// A local refs/remotes/origin/pull/<n>/head fetched before GitHub lost the
+// ref still points at the head, and panewire prefers it over the branch: the
+// remote reviewer would then fetch the missing pull/<n>/head. A taken
+// fallback deletes it, so the remote spec names the branch.
+func TestPRHeadFallbackDeletesStalePullRef(t *testing.T) {
+	o := seedPROrigin(t, true)
+	gitAt(t, o.root, "fetch", "origin", "+refs/pull/7/head:refs/remotes/origin/pull/7/head")
+	gitAt(t, o.origin, "update-ref", "-d", "refs/pull/7/head")
+	p := runFallbackPass(t, o, nil)
+	p.assertReviewed(t, o.head)
+	if b, e := exec.Command("git", "-C", o.root, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/pull/7/head").CombinedOutput(); e == nil {
+		t.Fatalf("refs/remotes/origin/pull/7/head still at %s after the fallback", strings.TrimSpace(string(b)))
+	}
+	if got := gitAt(t, o.root, "rev-parse", "refs/remotes/origin/feat/thing"); got != o.head {
+		t.Fatalf("refs/remotes/origin/feat/thing=%s want %s", got, o.head)
+	}
+	fallbackRow(t, p.s, p.r, "ok")
 }
 
 // A fork's branch is not origin's: the pass skips before any fetch, as it
@@ -202,9 +257,7 @@ func TestPRHeadFallbackForkPRSkips(t *testing.T) {
 	o := seedPROrigin(t, false)
 	p := runFallbackPass(t, o, func(g *fakeGH) { g.pull.Head.Repo.FullName = "fork/project" })
 	p.assertSkipped(t, "fork PR")
-	if f := branchFetches(p.runner.git); len(f) != 0 {
-		t.Fatalf("branch fetched for a fork PR: %q", f)
-	}
+	p.assertNoFallback(t)
 }
 
 // With refs/pull/<n>/head present nothing changes: one fetch, no branch
@@ -224,16 +277,17 @@ func TestPRHeadFallbackNotTakenWhenPullRefExists(t *testing.T) {
 	}
 }
 
-// A head ref that is not a plain branch name never reaches a refspec.
+// A head ref that is not a plain branch name never reaches a refspec, and
+// neither does one panewire's transport would not carry: a refs/remotes/
+// origin/pull/* ref is skipped in its branch discovery, and the remote node
+// refuses a branch name over 200 bytes.
 func TestPRHeadFallbackRejectsInvalidRefName(t *testing.T) {
-	for _, ref := range []string{"-x", "a..b", "x:y", "a b", "a*", "a^", "a~1", "a?", "a[b", `a\b`} {
-		t.Run(ref, func(t *testing.T) {
+	for _, ref := range []string{"-x", "a..b", "x:y", "a b", "a*", "a^", "a~1", "a?", "a[b", `a\b`, "pull/7/head", "pull/x", strings.Repeat("a", 201)} {
+		t.Run(clip(ref, 16), func(t *testing.T) {
 			o := seedPROrigin(t, false)
 			p := runFallbackPass(t, o, func(g *fakeGH) { g.pull.Head.Ref = ref })
 			p.assertSkipped(t, "fetch PR head")
-			if f := branchFetches(p.runner.git); len(f) != 0 {
-				t.Fatalf("branch fetched for head ref %q: %q", ref, f)
-			}
+			p.assertNoFallback(t)
 		})
 	}
 }
@@ -261,9 +315,71 @@ func TestFetchPRHeadNoFallbackForForkPR(t *testing.T) {
 
 // Real branch names stay eligible for the fallback.
 func TestFallbackBranchAcceptsBranchNames(t *testing.T) {
-	for _, ref := range []string{"feat/thing", "wk/hk3697-yt-oplog", "lead/pr-head-fallback", "v1.2_fix", "mergewake/recovery"} {
+	for _, ref := range []string{"feat/thing", "wk/hk3697-yt-oplog", "lead/pr-head-fallback", "v1.2_fix", "mergewake/recovery", "fix/pull/7", "pulls", strings.Repeat("a", 200)} {
 		if !fallbackBranch(ref) {
 			t.Errorf("fallbackBranch(%q) = false", ref)
 		}
 	}
+}
+
+// pullFetchErrRunner fails the pull/<n>/head fetch with err and runs every
+// other command through the wrapped runner.
+type pullFetchErrRunner struct {
+	integrations.Runner
+	err error
+}
+
+func (r pullFetchErrRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" && slices.Contains(args, "fetch") && slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "+pull/") }) {
+		return nil, r.err
+	}
+	return r.Runner.Run(ctx, command, args, input, dir)
+}
+
+// The first fetch error enters the audit row redacted and cut to 512 bytes:
+// git's stderr can carry a credentialed remote URL and run long.
+func TestPRHeadFallbackAuditErrorIsBoundedAndRedacted(t *testing.T) {
+	o := seedPROrigin(t, false)
+	runner := &panewireRunner{realGit: true}
+	s, g, r := panewireSetup(t, runner)
+	long := "fatal: couldn't find remote ref refs/pull/7/head " + fakeSecretText + "\n" + strings.Repeat("hint: the remote ref is gone; retry later\n", 40)
+	s.Runner = pullFetchErrRunner{Runner: runner, err: errors.New(long)}
+	pr := g.pull
+	pr.Head.SHA = o.head
+	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+		t.Fatalf("fetchPRHead: %v", e)
+	}
+	msg, _ := fallbackRow(t, s, r, "ok")["error"].(string)
+	if len(msg) == 0 || len(msg) > 512 {
+		t.Fatalf("error is %d bytes, want 1..512: %q", len(msg), msg)
+	}
+	if !strings.Contains(msg, "[redacted]") {
+		t.Fatalf("error %q: want the credential redacted", msg)
+	}
+	for _, secret := range fakeSecrets {
+		if strings.Contains(msg, secret) {
+			t.Fatalf("error leaks %q: %q", secret, msg)
+		}
+	}
+}
+
+// GitHub's 406 sends the diff to the local checkout, which fetches the same
+// PR head: a lost pull/<n>/head falls back to the same-repo branch there too.
+func TestLocalDiffFallsBackToBranchWithoutPullRef(t *testing.T) {
+	o := seedPROrigin(t, false)
+	s, g, _, _, r := reviewSetup(t)
+	s.Runner = &realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}
+	r.Root = o.root
+	g.diffErr = &github.APIError{Code: http.StatusNotAcceptable, Method: "GET", Path: "/repos/example/project/pulls/7"}
+	g.pull.Base = github.Ref{Ref: "main", SHA: o.base}
+	g.pull.Head = github.Ref{SHA: o.head, Ref: "feat/thing"}
+	g.pull.Head.Repo.FullName = r.Name
+	d, err := s.reviewDiff(context.Background(), r, g.pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.source != "local" || !strings.Contains(d.text, "+head") {
+		t.Fatalf("diff source=%q text=%q", d.source, d.text)
+	}
+	fallbackRow(t, s, r, "ok")
 }
