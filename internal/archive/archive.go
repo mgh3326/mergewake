@@ -235,6 +235,11 @@ func inCheckout(p string, checkouts map[string]bool) bool {
 const listScript = `cd "$1" || exit 1
 find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || exit 1; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
 
+// refreshListScript treats entries that vanish during the eligible-job
+// refresh as absent from that snapshot. Plan's original listScript stays strict.
+const refreshListScript = `cd "$1" || exit 1
+find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f" ]; then t=f; else t=o; fi; m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s %s %s\0" "$t" "$m" "$f"; done' sh {} +`
+
 // hostListScript emits one compact summary per job, avoiding output growth with
 // each job's file count. Per-job refresh supplies full file metadata only for
 // jobs that pass these skip checks.
@@ -291,6 +296,18 @@ func (a *Archiver) list(ctx context.Context, h reap.Host, dir string) ([]File, e
 	if err != nil {
 		return nil, fmt.Errorf("list %s: %w", dir, err)
 	}
+	return parseFiles(dir, b)
+}
+
+func (a *Archiver) refreshList(ctx context.Context, h reap.Host, dir string) ([]File, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", refreshListScript, "sh", dir)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	return parseFiles(dir, b)
+}
+
+func parseFiles(dir string, b []byte) ([]File, error) {
 	var out []File
 	for _, rec := range strings.Split(string(b), "\x00") {
 		if rec == "" {
@@ -496,8 +513,6 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	return a.planListed(ctx, h, job, dir, files)
 }
 
-// PlanListed performs the expensive planning for a job whose root and basic
-// skip checks were already decided from a host-wide listing.
 // RefreshJob rechecks a preliminarily eligible host-scan job immediately
 // before planning, so a job that restarted after HostJobs cannot use stale
 // completion or age metadata to publish an archive.
@@ -510,7 +525,7 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 		reason, newest := HostSkipReason(HostJobSummary{})
 		return nil, reason, newest, nil
 	}
-	files, err := a.list(ctx, h, dir)
+	files, err := a.refreshList(ctx, h, dir)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -528,7 +543,7 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 	return files, reason, newest, nil
 }
 
-// PlanListed plans from refreshed listing metadata at an already-resolved job
+// PlanListed performs the expensive planning from refreshed listing metadata at an already-resolved job
 // path, avoiding another remote tilde expansion for eligible jobs.
 func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {
 	return a.planListed(ctx, h, job, dir, files)

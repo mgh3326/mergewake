@@ -176,7 +176,8 @@ func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	shim := "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in */vanishing.tmp) rm -f \"$last\"; exit 1;; esac\nexec " + realStat + " \"$@\"\n"
+	seen := filepath.Join(shimDir, "seen")
+	shim := "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in */vanishing.tmp) if [ ! -e " + seen + " ]; then : > " + seen + "; exec " + realStat + " \"$@\"; fi; rm -f \"$last\"; exit 1;; esac\nexec " + realStat + " \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(shimDir, "stat"), []byte(shim), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +190,28 @@ func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) 
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vanishing.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("stat shim did not remove test entry: %v", err)
+	}
+}
+
+func TestArchiveJobsUnreadableSubtreeDoesNotSkipOtherJobs(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-000 directories")
+	}
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	private := filepath.Join(bad, "private")
+	writeFile(t, filepath.Join(private, "contents.txt"), "inaccessible")
+	if err := os.Chmod(private, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(private, 0o755) })
+	jobDir(t, f.jobs, "good-job", 20*24*time.Hour)
+	err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true})
+	if err == nil {
+		t.Fatal("unreadable job should have an error row")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || !strings.Contains(f.out.String(), `"job":"good-job","result":"would-archive"`) {
+		t.Fatalf("one unreadable job affected other rows: %s", f.out.String())
 	}
 }
 
