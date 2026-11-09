@@ -120,12 +120,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		record.Reasons = v.Reasons
 	}
 	summary := pr.Title
+	// identity is the summary as it was before the conflict ESC took the
+	// conflict out of the BLOCKED text: the sent key and event id still carry
+	// the conflict, so a verdict that gains or loses it is a new verdict.
+	identity := ""
 	conflicted := false
 	if v.State == "blocked" {
 		reasons, waiting := splitInternalWaits(v.Reasons, v.Review.Block)
+		all := reasons
 		// The conflict went out as its ESC; the BLOCKED carries the rest.
 		conflicted = slices.Contains(reasons, "conflict")
-		reasons = slices.DeleteFunc(reasons, func(reason string) bool { return reason == "conflict" })
+		reasons = slices.DeleteFunc(slices.Clone(reasons), func(reason string) bool { return reason == "conflict" })
 		if waiting {
 			since, e := s.reviewWaitSince(r, pr)
 			if e != nil {
@@ -157,17 +162,21 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		for _, name := range v.Review.ChecksCancelled {
 			cancelled["check_cancelled:"+name] = true
 		}
-		annotated := make([]string, 0, len(reasons))
-		for _, reason := range reasons {
-			if cancelled[reason] {
-				reason += " (rerun it)"
+		blockedSummary := func(reasons []string) string {
+			annotated := make([]string, 0, len(reasons))
+			for _, reason := range reasons {
+				if cancelled[reason] {
+					reason += " (rerun it)"
+				}
+				annotated = append(annotated, reason)
 			}
-			annotated = append(annotated, reason)
+			out := strings.Join(annotated, "; ")
+			if v.Review.Block != "" {
+				out = strings.Replace(out, "review_missing", "review_missing ("+v.Review.Block+")", 1)
+			}
+			return out
 		}
-		summary = strings.Join(annotated, "; ")
-		if v.Review.Block != "" {
-			summary = strings.Replace(summary, "review_missing", "review_missing ("+v.Review.Block+")", 1)
-		}
+		summary, identity = blockedSummary(reasons), blockedSummary(all)
 	}
 	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
 		summary += fmt.Sprintf(" | %d required check(s) skipped: %s", n, strings.Join(v.Review.ChecksSkipped, ", "))
@@ -179,7 +188,10 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	// A mixed verdict keeps the route its conflict gave it: the author's.
 	author := v.State == "blocked" && (conflicted || authorAction(summary))
-	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, v.Review.BaseBehind, author)
+	if identity == "" {
+		identity = summary
+	}
+	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author)
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -288,15 +300,16 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // anything to do with it. It is recorded instead (see recordOnlyEvent), which
 // keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
-	return s.verdictEvent(ctx, r, pr, state, summary, false, state == "blocked" && authorAction(summary))
+	return s.verdictEvent(ctx, r, pr, state, summary, summary, false, state == "blocked" && authorAction(summary))
 }
 
 // verdictEvent is laneEvent for a verdict whose gate result is known: a
 // recorded READY carries baseBehind into its decision row. author routes a
 // BLOCKED the author acts on through findingsRoute; NotifyPR decides it on
 // the whole reason set, which may hold a conflict the summary leaves to the
-// ESC.
-func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string, baseBehind, author bool) (string, string, bool, error) {
+// ESC. identity stands for summary in a BLOCKED's sent key and event id:
+// the reason set with the conflict the text leaves out.
+func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author bool) (string, string, bool, error) {
 	var lane, via string
 	var e error
 	switch {
@@ -332,7 +345,7 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	// counts ready_too_long from it.
 	key := verdictKey(state, pr.Number, pr.Head.SHA)
 	if state == "blocked" {
-		key += " " + summary
+		key += " " + identity
 	}
 	if sent.has(key) {
 		return lane, via, false, nil
@@ -353,7 +366,7 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	// while the sent key records delivery.
 	id := fmt.Sprintf("mergewake-%s-%s-%d-%s", state, r.Name, pr.Number, pr.Head.SHA)
 	if state == "blocked" {
-		sum := sha256.Sum256([]byte(summary))
+		sum := sha256.Sum256([]byte(identity))
 		id += "-" + hex.EncodeToString(sum[:4])
 	}
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{

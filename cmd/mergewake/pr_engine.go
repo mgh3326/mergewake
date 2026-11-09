@@ -236,13 +236,11 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 		return errs, res
 	}
 	// A conflicting head gets its one ESC here, before the unchanged skip and
-	// whatever the draft, review or settle below does: a held, quota-stopped
-	// or pending review never reaches NotifyPR. A listed bot's PR keeps its
-	// own desk notice (bot_update). The ESC changes nothing below.
-	if !isListedBot(pr, listed) {
-		if err := e.s.EscalateConflict(ctx, r, pr, e.o); err != nil {
-			errs = append(errs, fmt.Errorf("PR %d conflict ESC: %w", n, err))
-		}
+	// whatever the draft, review, settle or bot landing below does: a held,
+	// quota-stopped or pending review never reaches NotifyPR, and a listed
+	// bot's PR never does. The ESC changes nothing below.
+	if err := e.s.EscalateConflict(ctx, r, pr, e.o); err != nil {
+		errs = append(errs, fmt.Errorf("PR %d conflict ESC: %w", n, err))
 	}
 	prCtx, prSpan := tracing.Span(ctx, "mergewake.pr")
 	tracing.Data(prSpan, "pr", n)

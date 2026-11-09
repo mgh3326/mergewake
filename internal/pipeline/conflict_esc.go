@@ -39,10 +39,12 @@ type conflictEscPending struct {
 	EventID  string    `json:"event_id"`
 	Attempts int       `json:"attempts"`
 	Next     time.Time `json:"next"`
-	// Pinned is the lane of a delivery that failed without saying whether
-	// the event landed. Only that lane is tried again, under the same event
-	// id, until it accepts (panewire answers a repeat as delivered) or
-	// refuses outright.
+	// Pinned is the lane the ESC was last offered to, written before the
+	// offer: a delivery that failed without saying whether the event landed,
+	// or a process that died before it wrote the receipt, leaves it set. Only
+	// that lane is tried again, under the same event id, until it accepts
+	// (panewire answers a repeat as delivered) or refuses outright; the route
+	// is not read again while it is set.
 	Pinned string `json:"pinned,omitempty"`
 	// PinnedVia is the rule that chose Pinned.
 	PinnedVia string `json:"pinned_via,omitempty"`
@@ -146,7 +148,13 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 		return nil
 	}
 	p.EventID = conflictEscID(r.Name, pr.Number, head)
-	lane, via, tried, err := s.deliverConflictEsc(ctx, r, fresh, p.EventID, &p)
+	// pin makes a destination durable before it is offered the ESC.
+	pin := func(lane, via string) error {
+		p.Pinned, p.PinnedVia = lane, via
+		st.Pending[head] = p
+		return fsutil.WriteJSON(file, st)
+	}
+	lane, via, tried, err := s.deliverConflictEsc(ctx, r, fresh, &p, pin)
 	if lane != "" {
 		delete(st.Pending, head)
 		st.Delivered[head] = conflictEscReceipt{EventID: p.EventID, Lane: lane, Via: via, At: now}
@@ -159,18 +167,18 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 		// No destination at all: not even a desk lane is configured.
 		err = errors.New("no destination: no body lane, no task lane and no desk lane configured")
 	}
-	var route *conflictEscRouteError
-	if errors.As(err, &route) {
-		// A route source could not be read (hk or GitHub): unknown, not
-		// absent. No lane took the ESC and no wait starts; the next
-		// observation reads the route again.
-		if p.Pinned != "" || waiting {
+	var halt *conflictEscHaltError
+	if errors.As(err, &halt) {
+		// A route source could not be read (hk or GitHub), unknown rather
+		// than absent, or a pin could not be written. No lane took the ESC
+		// and no wait starts; the next observation tries again.
+		if _, ok := st.Pending[head]; ok {
 			st.Pending[head] = p
 			if e := fsutil.WriteJSON(file, st); e != nil {
-				return errors.Join(route.err, e)
+				return errors.Join(halt.err, e)
 			}
 		}
-		return route.err
+		return halt.err
 	}
 	p.Attempts++
 	p.Next = now.Add(conflictEscBackoff(p.Attempts))
@@ -225,36 +233,39 @@ func conflictEscBackoff(attempts int) time.Duration {
 	return min(d, conflictEscRetryMax)
 }
 
-// conflictEscRouteError is a route source that could not be read.
-type conflictEscRouteError struct{ err error }
+// conflictEscHaltError stops an attempt before a destination could fail it:
+// a route source that could not be read, or a pin that could not be written.
+type conflictEscHaltError struct{ err error }
 
-func (e *conflictEscRouteError) Error() string { return e.err.Error() }
+func (e *conflictEscHaltError) Error() string { return e.err.Error() }
 
 // deliverConflictEsc offers the ESC to each destination in order until one
-// takes it, and returns that lane and its rule. A pinned lane is offered
-// alone first. The route is read lazily: a body lane that takes the ESC
-// costs no hk or commit read. tried lists the lanes offered. A failure that
-// may have landed pins its lane and stops; a route read failure stops with a
-// *conflictEscRouteError.
-func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr github.Pull, id string, p *conflictEscPending) (lane, via string, tried []string, err error) {
+// takes it, and returns that lane and its rule. Each destination is pinned
+// (written to the state file) before it is offered; a pinned lane is offered
+// alone first, without reading the route. The route is read lazily: a body
+// lane that takes the ESC costs no hk or commit read. tried lists the lanes
+// offered. A failure that may have landed keeps its pin and stops; a refusal
+// clears it and moves on; a route read or pin write failure stops with a
+// *conflictEscHaltError.
+func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr github.Pull, p *conflictEscPending, pin func(lane, via string) error) (lane, via string, tried []string, err error) {
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	offer := func(l, v string) (bool, error) {
+		if p.Pinned != l {
+			if e := pin(l, v); e != nil {
+				return false, &conflictEscHaltError{e}
+			}
+		}
 		tried = append(tried, l)
 		text := fmt.Sprintf("ESC [mergewake] %s#%d head=%s conflict with %s: rebase or merge base, then push | lane=%s via %s",
 			r.Name, pr.Number, short7(pr.Head.SHA), pr.Base.Ref, l, v)
-		e := s.Notifier.Notify(reportCtx, integrations.Event{ID: id, Text: text, Lane: l, Type: "decision"})
+		e := s.Notifier.Notify(reportCtx, integrations.Event{ID: p.EventID, Text: text, Lane: l, Type: "decision"})
 		if e == nil {
-			p.Pinned, p.PinnedVia = "", ""
 			return true, nil
 		}
 		if conflictEscRefused(e) {
-			if p.Pinned == l {
-				p.Pinned, p.PinnedVia = "", ""
-			}
-			return false, e
+			p.Pinned, p.PinnedVia = "", ""
 		}
-		p.Pinned, p.PinnedVia = l, v
 		return false, e
 	}
 	if pinned, pinnedVia := p.Pinned, p.PinnedVia; pinned != "" {
@@ -284,7 +295,7 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 	for _, source := range sources {
 		l, v, e := source()
 		if e != nil {
-			return "", "", tried, &conflictEscRouteError{e}
+			return "", "", tried, &conflictEscHaltError{e}
 		}
 		if l == "" || seen[l] {
 			continue
@@ -295,7 +306,8 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 			return l, v, tried, nil
 		}
 		err = e
-		if p.Pinned != "" {
+		var halt *conflictEscHaltError
+		if p.Pinned != "" || errors.As(e, &halt) {
 			return "", "", tried, err
 		}
 	}
