@@ -290,13 +290,13 @@ func TestPartialAuthorScanWorkerVerdictRouteAndReadyAudit(t *testing.T) {
 		t.Fatalf("partial READY route missing from audit: %+v", rows)
 	}
 
+	// A failed check is the author verdict here: a conflict is told by its
+	// ESC, which never scans for author panes (hk 3712).
 	s3, g3, n3, r3 := workerNotifySetup(t)
 	run3 := authorHost()
 	s3.Runner = run3
 	setPartialAuthorScan(s3, run3)
-	no3 := false
-	g3.pull.Mergeable = &no3
-	g3.pull.MergeableState = "dirty"
+	g3.ci = github.Red
 	if e := s3.NotifyPR(context.Background(), r3, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -313,9 +313,7 @@ func TestPartialAuthorScanWorkerVerdictRouteAndReadyAudit(t *testing.T) {
 	s2.Runner = run2
 	setPartialAuthorScan(s2, run2)
 	delete(s2.Sink.(*jobSink).jobs, "42")
-	no := false
-	s2.GH.(*fakeGH).pull.Mergeable = &no
-	s2.GH.(*fakeGH).pull.MergeableState = "dirty"
+	s2.GH.(*fakeGH).ci = github.Red
 	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e == nil {
 		t.Fatal("author verdict without a bound job did not retry on partial scan")
 	}
