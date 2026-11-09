@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1112,16 +1113,307 @@ func TestArchiveStaleLockReclaimHasSingleWinner(t *testing.T) {
 		}()
 	}
 	close(start)
+	// Winners are released only after both claims return. Releasing as
+	// results arrive would let the second claim take the freed lock later and
+	// count as a second winner while the first is not holding anything.
 	wins := 0
+	var held []func()
 	for i := 0; i < 2; i++ {
 		result := <-results
 		if result.err == nil {
 			wins++
-			result.release()
+			held = append(held, result.release)
 		}
+	}
+	for _, release := range held {
+		release()
 	}
 	if wins != 1 {
 		t.Fatalf("stale lock claim winners=%d, want exactly one", wins)
+	}
+}
+
+// pauseAtStale runs onStale once, after a claim has read an expired lock and
+// before that same claim reclaims it. It is the one point where another
+// claimer can run in the middle of a reclaim.
+type pauseAtStale struct {
+	reap.Runner
+	onStale func()
+}
+
+func (r *pauseAtStale) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	out, err := r.Runner.Run(ctx, name, args, input, dir)
+	if err == nil && r.onStale != nil && strings.HasPrefix(string(out), "stale ") {
+		fn := r.onStale
+		r.onStale = nil
+		fn()
+	}
+	return out, err
+}
+
+// staleLockDir writes a lock for dest whose owner file holds owner, as a
+// claimer left it.
+func staleLockDir(t *testing.T, e env, dest, owner string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(dest))
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sum))
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte(owner+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return lock
+}
+
+// claimConcurrently runs n claims of dest at once and returns their results
+// in order. Every claim has returned before this returns, so a caller that
+// releases winners afterwards measures holders at one time, not in sequence.
+func claimConcurrently(e env, dest string, n int) (releases []func(), busy int, err error) {
+	type result struct {
+		release func()
+		err     error
+	}
+	results := make([]result, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+			<-start
+			release, err := a.claim(context.Background(), dest)
+			results[i] = result{release, err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for _, r := range results {
+		var skip *Skip
+		switch {
+		case r.err == nil:
+			releases = append(releases, r.release)
+		case errors.As(r.err, &skip) && skip.Reason == "archive-lock-busy":
+			busy++
+		default:
+			return releases, busy, r.err
+		}
+	}
+	return releases, busy, nil
+}
+
+// moveShim pauses a claim just after its first `mv` of an armed lock path, so
+// a test can run another claimer while that lock is in a moved-away state. Claims that never move the lock path never pause here.
+type moveShim struct {
+	armed, paused, resume string
+}
+
+func installMoveShim(t *testing.T) moveShim {
+	t.Helper()
+	realMv, err := exec.LookPath("mv")
+	if err != nil {
+		t.Skip("mv not available")
+	}
+	dir := t.TempDir()
+	ms := moveShim{
+		armed:  filepath.Join(dir, "armed"),
+		paused: filepath.Join(dir, "paused"),
+		resume: filepath.Join(dir, "resume"),
+	}
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := `#!/bin/sh
+hit=
+if [ -e "$ARCHIVE_TEST_ARMED" ] && [ "$1" = "$(cat "$ARCHIVE_TEST_ARMED")" ]; then hit=1; fi
+"$ARCHIVE_TEST_MV" "$@"
+rc=$?
+if [ -n "$hit" ]; then
+  rm -f "$ARCHIVE_TEST_ARMED"
+  : > "$ARCHIVE_TEST_PAUSED"
+  while [ ! -e "$ARCHIVE_TEST_RESUME" ]; do sleep 0.01; done
+fi
+exit $rc
+`
+	if err := os.WriteFile(filepath.Join(bin, "mv"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ARCHIVE_TEST_MV", realMv)
+	t.Setenv("ARCHIVE_TEST_ARMED", ms.armed)
+	t.Setenv("ARCHIVE_TEST_PAUSED", ms.paused)
+	t.Setenv("ARCHIVE_TEST_RESUME", ms.resume)
+	return ms
+}
+
+func (ms moveShim) arm(t *testing.T, lock string) {
+	t.Helper()
+	if err := os.WriteFile(ms.armed, []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArchiveStaleLockReclaimInterleavedRaceKeepsFirstWinner(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "interleaved")
+	lock := staleLockDir(t, e, dest, "expired 1")
+	shim := installMoveShim(t)
+
+	// The first claimer reads the expired lock and is held at its reclaim
+	// decision. A second claimer reclaims the same expired lock and wins. Then
+	// the first claimer resumes. If it moves the lock path, a third claimer runs
+	// in that moved-away window; the first claimer must not turn that into a
+	// second winner or disturb the second winner's lock.
+	var (
+		fired       bool
+		second      func()
+		secondErr   error
+		afterSecond []byte
+	)
+	first := &Archiver{Runner: &pauseAtStale{Runner: &fakeRunner{}, onStale: func() {
+		fired = true
+		a2 := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+		second, secondErr = a2.claim(context.Background(), dest)
+		afterSecond, _ = os.ReadFile(filepath.Join(lock, "owner"))
+		shim.arm(t, lock)
+	}}, DriveDir: e.drive}
+	type outcome struct {
+		release func()
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		release, err := first.claim(context.Background(), dest)
+		done <- outcome{release, err}
+	}()
+	var (
+		firstOut outcome
+		third    func()
+		thirdErr error
+		thirdRan bool
+	)
+	for waiting := true; waiting; {
+		select {
+		case firstOut = <-done:
+			waiting = false
+		case <-time.After(5 * time.Millisecond):
+			if _, err := os.Stat(shim.paused); err == nil && !thirdRan {
+				thirdRan = true
+				a3 := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+				third, thirdErr = a3.claim(context.Background(), dest)
+				if err := os.WriteFile(shim.resume, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if !fired {
+		t.Fatal("first claim never reached its reclaim decision")
+	}
+	if secondErr != nil {
+		t.Fatalf("second claimer did not reclaim the expired lock: %v", secondErr)
+	}
+	if thirdRan && thirdErr == nil {
+		third()
+		t.Fatal("third claimer won inside the first claimer's reclaim")
+	}
+	if firstOut.release != nil {
+		firstOut.release()
+		t.Fatal("first claimer won while the second held the lock")
+	}
+	var skip *Skip
+	if !errors.As(firstOut.err, &skip) || skip.Reason != "archive-lock-busy" {
+		t.Fatalf("first claim err=%v, want archive-lock-busy", firstOut.err)
+	}
+	if len(afterSecond) == 0 || string(afterSecond) == "expired 1\n" {
+		t.Fatalf("second claimer's lock was not written: %q", afterSecond)
+	}
+	got, err := os.ReadFile(filepath.Join(lock, "owner"))
+	if err != nil || string(got) != string(afterSecond) {
+		t.Fatalf("second winner's lock changed: before=%q after=%q err=%v", afterSecond, got, err)
+	}
+	second()
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("second winner's release left the lock: %v", err)
+	}
+}
+
+func TestArchiveStaleLockReclaimDeadOwnerOneOfN(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "dead-owner")
+	staleLockDir(t, e, dest, "dead 1")
+	releases, busy, err := claimConcurrently(e, dest, 8)
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	for _, release := range releases {
+		release()
+	}
+	if len(releases) != 1 || busy != 7 {
+		t.Fatalf("winners=%d busy=%d, want 1 and 7", len(releases), busy)
+	}
+}
+
+func TestArchiveLockReclaimFreshLockStaysBusy(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "fresh")
+	release, err := a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	before, _ := os.ReadFile(filepath.Join(lock, "owner"))
+	releases, busy, err := claimConcurrently(e, dest, 6)
+	if err != nil || len(releases) != 0 || busy != 6 {
+		t.Fatalf("fresh lock: releases=%d busy=%d err=%v, want 0 and 6", len(releases), busy, err)
+	}
+	after, _ := os.ReadFile(filepath.Join(lock, "owner"))
+	if string(before) != string(after) {
+		t.Fatalf("fresh lock was rewritten: before=%q after=%q", before, after)
+	}
+	release()
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("released lock remains: %v", err)
+	}
+}
+
+func TestArchiveLockReclaimOwnerlessYoungLockStaysBusy(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "ownerless")
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.claim(context.Background(), dest)
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "archive-lock-busy" {
+		t.Fatalf("young ownerless lock: err=%v, want archive-lock-busy", err)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("young ownerless lock was removed: %v", err)
+	}
+}
+
+func TestArchiveLockReclaimReleaseByNonOwnerKeepsLock(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "non-owner")
+	release, err := a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte("other 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	got, err := os.ReadFile(filepath.Join(lock, "owner"))
+	if err != nil || string(got) != "other 1\n" {
+		t.Fatalf("release by a non-owner touched the lock: %q %v", got, err)
 	}
 }
 
