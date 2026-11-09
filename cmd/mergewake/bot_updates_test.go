@@ -58,6 +58,10 @@ type botHub struct {
 	reviews []string
 	touched []string
 	policy  string
+	// conflicting makes the PRs report mergeable false and state dirty;
+	// trailer is appended to their bodies.
+	conflicting bool
+	trailer     string
 }
 
 const (
@@ -68,7 +72,11 @@ const (
 
 func (h *botHub) pull(n int, head, login string) string {
 	body := "| Package | Update | Change |\\n|---|---|---|\\n| vite | patch | [`8.3.4` -> `8.3.6`](https://example.test) |\\n"
-	return fmt.Sprintf(`{"number":%d,"state":"open","title":"update vite","body":%q,"changed_files":1,"head":{"sha":%q,"ref":"deps%d"},"base":{"ref":"main","sha":%q},"user":{"login":%q,"type":"Bot"},"mergeable":true,"mergeable_state":"clean"}`, n, strings.ReplaceAll(body, "\\n", "\n"), head, n, botBase, login)
+	mergeable, state := true, "clean"
+	if h.conflicting {
+		mergeable, state = false, "dirty"
+	}
+	return fmt.Sprintf(`{"number":%d,"state":"open","title":"update vite","body":%q,"changed_files":1,"head":{"sha":%q,"ref":"deps%d"},"base":{"ref":"main","sha":%q},"user":{"login":%q,"type":"Bot"},"mergeable":%t,"mergeable_state":%q}`, n, strings.ReplaceAll(body, "\\n", "\n")+h.trailer, head, n, botBase, login, mergeable, state)
 }
 
 func (h *botHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {

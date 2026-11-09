@@ -771,3 +771,164 @@ func TestConflictEscKeepsNonConflictAuthorRouting(t *testing.T) {
 		}
 	})
 }
+
+// crashNotifier is panewire taking the next ESC and the process dying before
+// mergewake hears back: it records the event, then panics.
+type crashNotifier struct {
+	*escNotifier
+	crash bool
+}
+
+func (n *crashNotifier) Notify(ctx context.Context, e integrations.Event) error {
+	err := n.escNotifier.Notify(ctx, e)
+	if n.crash && err == nil && isConflictEsc(e) {
+		n.crash = false
+		panic("crashed after panewire accepted the ESC")
+	}
+	return err
+}
+
+// (P1, mergewake#247 r1) A lane accepts the ESC and the process dies before
+// the receipt is written; the route changes before the next attempt. The next
+// attempt replays the same event id to the lane that took it, never to the new
+// route, and the head is then delivered.
+func TestConflictEscCrashAfterAcceptanceKeepsLane(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		edit func(*escRig)
+	}{
+		{"body lane edited", func(rig *escRig) { rig.g.pull.Body = "Mergewake-Notify-Lane: lane-y\n" }},
+		{"body lane dropped for a task lane", func(rig *escRig) {
+			rig.g.pull.Body = "Mergewake-Task: 42\n"
+			rig.s.Sink = &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newEscRig(t)
+			rig.g.pull.Body = "Mergewake-Notify-Lane: lane-x\n"
+			rig.s.Notifier = &crashNotifier{escNotifier: rig.n, crash: true}
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("the notifier did not crash")
+					}
+				}()
+				_ = rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{})
+			}()
+			wantEscs(t, rig.n, 1)
+
+			tt.edit(rig)
+			if e := rig.restart().EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
+				t.Fatal(e)
+			}
+			tries := rig.n.tries()
+			if len(tries) != 2 || tries[1].Lane != "lane-x" || tries[1].ID != tries[0].ID {
+				t.Fatalf("the attempt after the crash left the lane that took the ESC: %+v", tries)
+			}
+			wantEsc(t, wantEscs(t, rig.n, 1)[0], "lane-x", "notify-lane trailer", shaA)
+			if rows := rig.rows(t, "conflict-esc"); len(rows) != 1 || rows[0]["lane"] != "lane-x" {
+				t.Fatalf("conflict-esc rows: %+v", rows)
+			}
+			if e := rig.restart().EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
+				t.Fatal(e)
+			}
+			wantTries(t, rig.n, 2)
+		})
+	}
+}
+
+// blockedNotices are the accepted BLOCKED notices, in order.
+func blockedNotices(n *escNotifier) []integrations.Event {
+	var out []integrations.Event
+	for _, e := range n.others() {
+		if strings.Contains(e.Text, "BLOCKED") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// (P2, mergewake#247 r1) The conflict is left out of the BLOCKED text, not out
+// of the verdict: a head whose other reasons were already told still hears,
+// once, on the author's route, when it starts to conflict; and a head whose
+// conflict clears is told its remaining reasons as before hk 3712 — once per
+// distinct reason set, with no resend loop.
+func TestConflictEscMixedVerdictIdentity(t *testing.T) {
+	conflict := func(g *fakeGH) {
+		no := false
+		g.pull.Mergeable, g.pull.MergeableState = &no, "dirty"
+	}
+	clean := func(g *fakeGH) {
+		yes := true
+		g.pull.Mergeable, g.pull.MergeableState = &yes, "clean"
+	}
+	notify := func(t *testing.T, s *Service, r config.Repo) {
+		t.Helper()
+		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	wantBlocked := func(t *testing.T, got integrations.Event, lane string) {
+		t.Helper()
+		if got.Lane != lane || got.Type != "blocked" || !strings.Contains(got.Text, "threads_open:2") || strings.Contains(got.Text, "conflict") {
+			t.Fatalf("BLOCKED %+v, want threads_open:2 without the conflict to %s", got, lane)
+		}
+	}
+	t.Run("conflict joins a told head", func(t *testing.T) {
+		s, g, _, r := workerNotifySetup(t)
+		n := newEscNotifier()
+		s.Notifier = n
+		g.findings = 2
+		notify(t, s, r)
+		blocked := blockedNotices(n)
+		if len(blocked) != 1 {
+			t.Fatalf("BLOCKED before the conflict: %+v", blocked)
+		}
+		wantBlocked(t, blocked[0], "design-lane")
+
+		conflict(g)
+		notify(t, s, r)
+		notify(t, s, r)
+		wantEsc(t, wantEscs(t, n, 1)[0], "design-lane", "task 42", shaA)
+		blocked = blockedNotices(n)
+		if len(blocked) != 2 {
+			t.Fatalf("%d BLOCKED notices, want the author's once the head conflicts: %+v", len(blocked), blocked)
+		}
+		wantBlocked(t, blocked[1], "worker-lane")
+		if blocked[1].ID == blocked[0].ID {
+			t.Fatalf("the author's BLOCKED reused the earlier event id %q", blocked[0].ID)
+		}
+	})
+	t.Run("conflict leaves the head", func(t *testing.T) {
+		s, g, _, r := workerNotifySetup(t)
+		n := newEscNotifier()
+		s.Notifier = n
+		g.findings = 2
+		conflict(g)
+		notify(t, s, r)
+		blocked := blockedNotices(n)
+		if len(blocked) != 1 {
+			t.Fatalf("BLOCKED while conflicting: %+v", blocked)
+		}
+		wantBlocked(t, blocked[0], "worker-lane")
+
+		clean(g)
+		notify(t, s, r)
+		notify(t, s, r)
+		blocked = blockedNotices(n)
+		if len(blocked) != 2 {
+			t.Fatalf("%d BLOCKED notices, want the remaining reasons told once the conflict clears: %+v", len(blocked), blocked)
+		}
+		wantBlocked(t, blocked[1], "design-lane")
+
+		// The same reason sets again: each was told once already.
+		conflict(g)
+		notify(t, s, r)
+		clean(g)
+		notify(t, s, r)
+		if blocked := blockedNotices(n); len(blocked) != 2 {
+			t.Fatalf("a reason set already told was sent again: %+v", blocked)
+		}
+		wantEscs(t, n, 1)
+	})
+}

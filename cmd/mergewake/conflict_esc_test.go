@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/pipeline"
 )
 
 // escRecorder is the fixture notifier with the conflict ESCs kept apart so a
@@ -210,4 +215,99 @@ func TestConflictEscEngineNewHeadReviewedAfterEsc(t *testing.T) {
 			}
 		})
 	}
+}
+
+// (P3, mergewake#247 r1) A listed dependency bot's PR that conflicts gets its
+// ESC like any other PR, routed by its body lane: every destination refusing
+// leaves it pending, and a later pass delivers exactly one. It keeps its
+// reviewer exemption: no review is claimed or started.
+func TestConflictEscEngineListedBot(t *testing.T) {
+	h := &botHub{
+		policy:      "version: 1\nenabled: true\nrequired_checks: [CI]\nbot_updates:\n  authors: [\"renovate[bot]\"]\n  paths: [\"**/package-lock.json\"]\n  land: patch\n",
+		conflicting: true,
+		trailer:     "\nMergewake-Notify-Lane: bot-lane\n",
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml"}
+	cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10, Review: config.Review{Login: "reviewer"}}
+	cfg.Daemon.PR.SkipBots = true
+	cfg.Notifier.Lane = "desk"
+	gh := github.New("")
+	gh.BaseURL = srv.URL
+	gh.Stderr = io.Discard
+	n := &escRecorder{trace: &eventLog{}, refuse: true}
+	out := &syncBuffer{}
+	now := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: n, Out: out, Now: func() time.Time { return now }}
+	pass := func(what string) {
+		t.Helper()
+		if err := pollPRs(context.Background(), s, gh, repo, pipeline.Options{}); err != nil && strings.Contains(err.Error(), "conflict ESC") {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+
+	pass("refused pass")
+	if tries, escs := n.counts(); tries == 0 || len(escs) != 0 {
+		t.Fatalf("listed bot PR: %d ESC deliveries attempted, %d accepted; want attempts and none accepted", tries, len(escs))
+	}
+	if got := out.take(); !strings.Contains(got, `"command":"conflict-esc-failed"`) {
+		t.Fatalf("the refused ESC was not audited: %s", got)
+	}
+
+	n.mu.Lock()
+	n.refuse = false
+	n.mu.Unlock()
+	now = now.Add(2 * time.Minute)
+	pass("recovery pass")
+	now = now.Add(time.Hour)
+	pass("later pass")
+	_, escs := n.counts()
+	if len(escs) != 1 {
+		t.Fatalf("%d ESCs accepted for the listed bot PR, want 1: %+v", len(escs), escs)
+	}
+	if e := escs[0]; e.Lane != "bot-lane" || e.Type != "decision" || !strings.Contains(e.Text, "o/one#1 ") || !strings.Contains(e.Text, "conflict") {
+		t.Fatalf("ESC %+v", e)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.reviews) != 0 {
+		t.Fatalf("a review was claimed or started for the listed bot PR: %v", h.reviews)
+	}
+}
+
+// (B2, quota, mergewake#247 r1) A PR whose reviewer is already stopped on an
+// exhausted pool when its conflict is first observed still gets its first
+// ESC, once, and no other reviewer.
+func TestConflictEscEngineQuotaStoppedWhenConflictAppears(t *testing.T) {
+	f := newParallelFixture(t, 1, 1)
+	runner := &quotaRunner{}
+	sink := &quotaSink{rec: integrations.JobRecord{State: "running", Host: "node-a", PaneID: "p1"}}
+	f.s.Runner, f.s.Sink = runner, sink
+	n := &escRecorder{trace: f.trace}
+	f.s.Notifier = n
+	now := time.Now().UTC().Truncate(time.Second)
+	f.s.Now = func() time.Time { return now }
+	skips, logs := escSkips()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	runSkippedPassWithin(t, ctx, "pending pass", f, skips, logs)
+	if runner.count() != 1 {
+		t.Fatalf("spawns=%d, want 1", runner.count())
+	}
+	wantEngineEscs(t, n, 0)
+
+	reset := now.Add(10 * time.Minute)
+	f.hub.mu.Lock()
+	f.hub.refs["mergewake/reviews/1/"+hubHead(1)+"-done"] = hubHead(1)
+	f.hub.conflicting = true
+	f.hub.mu.Unlock()
+	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset.Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
+	runSkippedPassWithin(t, ctx, "quota pass", f, skips, logs)
+	runSkippedPassWithin(t, ctx, "quota wait pass", f, skips, logs)
+	if runner.count() != 1 {
+		t.Fatalf("spawns=%d, want 1", runner.count())
+	}
+	wantEngineEscs(t, n, 1)
 }
