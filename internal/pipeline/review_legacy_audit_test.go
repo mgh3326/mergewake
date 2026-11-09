@@ -1,16 +1,23 @@
 package pipeline
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -274,4 +281,166 @@ func TestLegacyAuditNoneWhenNodeResultWins(t *testing.T) {
 		t.Fatalf("posted=%+v lane looks=%d", f.g.postedFindings, f.runner.looks)
 	}
 	noLegacyAudit(t, f.s, f.r)
+}
+
+// failFallbackOut fails every Out line that carries the review-inbox-fallback
+// audit and takes the rest.
+type failFallbackOut struct{}
+
+func (failFallbackOut) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"command":"review-inbox-fallback"`)) {
+		return 0, errors.New("stdout closed for ops@example.com")
+	}
+	return len(p), nil
+}
+
+// fallbackAppendFails takes every Out line, and while the review-inbox-fallback
+// audit is written it turns decisions.jsonl into a directory: that record
+// reaches Out and fails its append, and the next audit's Out line puts the
+// file back before its own append, so only that one record is lost.
+type fallbackAppendFails struct {
+	t      *testing.T
+	path   string
+	broken bool
+}
+
+func (f *fallbackAppendFails) Write(p []byte) (int, error) {
+	keep := f.path + ".keep"
+	if f.broken {
+		if err := os.Remove(f.path); err != nil {
+			f.t.Error(err)
+		}
+		if err := os.Rename(keep, f.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			f.t.Error(err)
+		}
+		f.broken = false
+	}
+	if bytes.Contains(p, []byte(`"command":"review-inbox-fallback"`)) {
+		if err := os.Rename(f.path, keep); err != nil && !errors.Is(err, os.ErrNotExist) {
+			f.t.Error(err)
+		}
+		if err := os.MkdirAll(f.path, 0o700); err != nil {
+			f.t.Error(err)
+		}
+		f.broken = true
+	}
+	return len(p), nil
+}
+
+// legacyOutcome is what a legacy use does to the PR and its receipt.
+type legacyOutcome struct {
+	posted   []github.Finding
+	fallback string
+}
+
+// captureAuditLost points fallbackAuditLog at a buffer for the test and
+// returns a reader of its review-inbox-fallback-audit-lost lines.
+func captureAuditLost(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := fallbackAuditLog
+	fallbackAuditLog = slog.New(slog.NewJSONHandler(&buf, nil))
+	t.Cleanup(func() { fallbackAuditLog = prev })
+	return func() []map[string]any {
+		var lines []map[string]any
+		sc := bufio.NewScanner(bytes.NewReader(buf.Bytes()))
+		for sc.Scan() {
+			var line map[string]any
+			if err := json.Unmarshal(sc.Bytes(), &line); err != nil {
+				t.Fatalf("log line %q: %v", sc.Text(), err)
+			}
+			if line["msg"] == "review-inbox-fallback-audit-lost" {
+				lines = append(lines, line)
+			}
+		}
+		return lines
+	}
+}
+
+// A review-inbox-fallback audit that cannot be written, on Out or in
+// decisions.jsonl, changes nothing about the review: the legacy findings are
+// posted and noted exactly as when the audit is written. The lost audit is
+// logged once under a fixed marker instead, so a zero count is only trusted
+// next to zero such lines (docs/config.md, review-inbox-fallback).
+func TestLegacyAuditLostIsLogged(t *testing.T) {
+	run := func(t *testing.T, source string, breakAudit func(*testing.T, *Service, config.Repo)) (legacyOutcome, string, []map[string]any, *Service, config.Repo) {
+		t.Helper()
+		lost := captureAuditLost(t)
+		runner := &panewireRunner{findings: legacyBody, family: "openai"}
+		if source == "lane" {
+			runner.remote = &taskJobSink{}
+		}
+		s, g, r := panewireSetup(t, runner)
+		s.Config.Review.Panewire.Lane = "review-desk"
+		if breakAudit != nil {
+			breakAudit(t, s, r)
+		}
+		if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(runner.spawns) != 1 {
+			t.Fatalf("spawns=%d", len(runner.spawns))
+		}
+		out := legacyOutcome{posted: g.postedFindings}
+		if got := g.passes[shaA]; len(got) == 1 {
+			out.fallback = got[0].Fallback
+		}
+		return out, arg(runner.spawns[0], "-l"), lost(), s, r
+	}
+	for _, source := range legacySources {
+		t.Run(source, func(t *testing.T) {
+			var want legacyOutcome
+			t.Run("audit written", func(t *testing.T) {
+				got, label, lost, s, r := run(t, source, nil)
+				if len(got.posted) != 1 || got.posted[0].Body != "A legacy bug" || got.fallback == "" {
+					t.Fatalf("outcome=%+v", got)
+				}
+				oneLegacyAudit(t, s, r, label, "no job record", "record-outcome", source)
+				if len(lost) != 0 {
+					t.Fatalf("lost lines=%v, want none", lost)
+				}
+				want = got
+			})
+			for name, c := range map[string]struct {
+				breakAudit func(*testing.T, *Service, config.Repo)
+				cause      string
+			}{
+				"out fails": {
+					breakAudit: func(_ *testing.T, s *Service, _ config.Repo) { s.Out = failFallbackOut{} },
+					cause:      "stdout closed for [redacted]",
+				},
+				"decisions append fails": {
+					breakAudit: func(t *testing.T, s *Service, r config.Repo) {
+						s.Out = &fallbackAppendFails{t: t, path: filepath.Join(s.state(r.Name), "decisions.jsonl")}
+					},
+					cause: "is a directory",
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					if want.posted == nil {
+						t.Skip("no baseline outcome: the audit-written case failed")
+					}
+					got, label, lost, s, r := run(t, source, c.breakAudit)
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("outcome=%+v, want the audit-written outcome %+v", got, want)
+					}
+					if rows := auditRows(t, s, r, "review-inbox-fallback"); len(rows) != 0 {
+						t.Fatalf("review-inbox-fallback rows=%v: the audit was not lost", rows)
+					}
+					if len(lost) != 1 {
+						t.Fatalf("lost lines=%v, want one", lost)
+					}
+					line := lost[0]
+					for k, v := range map[string]any{"level": "WARN", "pr": float64(7), "pass": float64(1), "label": label, "entry": "record-outcome", "source": source} {
+						if line[k] != v {
+							t.Errorf("%s=%v, want %v (line %v)", k, line[k], v, line)
+						}
+					}
+					if e, _ := line["error"].(string); !strings.Contains(e, c.cause) || strings.Contains(e, "ops@example.com") {
+						t.Errorf("error=%q, want the redacted cause %q", e, c.cause)
+					}
+				})
+			}
+		})
+	}
 }

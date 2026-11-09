@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1628,6 +1629,11 @@ func (x *panewireExecutor) legacyFindings(ctx context.Context, plan *passPlan, l
 	x.countLegacy(plan, label, record, legacyUse{entry: entry, source: source}, note)
 	return b, nil
 }
+
+// fallbackAuditLog gets the review-inbox-fallback-audit-lost line: JSON on
+// the process stderr, where the daemon's operational log goes
+// (cmd/mergewake/daemon.go). A variable so a test can read the line.
+var fallbackAuditLog = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 // countLegacy counts and audits one use of legacy lane/file findings as the
 // pass's result on the pass receipt. Every use, on every entry point, comes
