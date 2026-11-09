@@ -273,7 +273,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Result, row.Reason = "skipped", "pane-live"
 			} else if reason, newest := archive.HostSkipReason(jobsByName[job]); reason != "" {
 				row.Result, row.Reason = "skipped", reason
-			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
+			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
 			} else if files, reason, newest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
 				row.Result, row.Reason = archive.Reason(e)

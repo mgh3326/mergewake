@@ -23,12 +23,12 @@ import (
 // tar, cat, rm) for real against temp dirs. hk is reached over HTTP
 // (hktest); an hk CLI call is recorded and refused.
 type archiveRunner struct {
-	script           *scriptRunner
-	hkCLI            [][]string
-	calls            int
-	path             string
-	afterTreeListing func()
-	treeBytes        int
+	script              *scriptRunner
+	hkCLI               [][]string
+	calls               int
+	vanishDuringRefresh string
+	afterTreeListing    func()
+	treeBytes           int
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
@@ -41,10 +41,18 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 	case "herdr", "git":
 		return a.script.Run(ctx, name, args, input, dir)
 	}
-	c := exec.CommandContext(ctx, name, args...)
-	if a.path != "" {
-		c.Env = replaceEnv(os.Environ(), "PATH", a.path)
+	if name == "sh" && a.vanishDuringRefresh != "" {
+		for i, arg := range args {
+			if strings.Contains(arg, "find . ! -type d -exec sh -c") && strings.Contains(arg, "|| continue") {
+				old := `for f; do if [ -L "$f" ]; then`
+				new := `for f; do if [ "$f" = "` + a.vanishDuringRefresh + `" ]; then rm -f "$f"; fi; if [ -L "$f" ]; then`
+				args[i] = strings.Replace(arg, old, new, 1)
+				a.vanishDuringRefresh = ""
+				break
+			}
+		}
 	}
+	c := exec.CommandContext(ctx, name, args...)
 	c.Stdin = strings.NewReader(input)
 	var out, stderr bytes.Buffer
 	c.Stdout, c.Stderr = &out, &stderr
@@ -60,17 +68,6 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 		}
 	}
 	return out.Bytes(), nil
-}
-
-func replaceEnv(env []string, key, value string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(env)+1)
-	for _, item := range env {
-		if !strings.HasPrefix(item, prefix) {
-			out = append(out, item)
-		}
-	}
-	return append(out, prefix+value)
 }
 
 func TestArchiveJobsPreflightCallCountDoesNotScaleWithSkippedJobs(t *testing.T) {
@@ -167,29 +164,24 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "volatile", 20*24*time.Hour)
-	writeFile(t, filepath.Join(dir, "vanishing.tmp"), "temporary")
-	shimDir := filepath.Join(t.TempDir(), "bin")
-	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+	vanishing := filepath.Join(dir, "vanishing.tmp")
+	writeFile(t, vanishing, "temporary")
+	old := time.Now().Add(-20 * 24 * time.Hour)
+	if err := os.Chtimes(vanishing, old, old); err != nil {
 		t.Fatal(err)
 	}
-	realStat, err := exec.LookPath("stat")
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := filepath.Join(shimDir, "seen")
-	shim := "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in */vanishing.tmp) if [ ! -e " + seen + " ]; then : > " + seen + "; exec " + realStat + " \"$@\"; fi; rm -f \"$last\"; exit 1;; esac\nexec " + realStat + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(shimDir, "stat"), []byte(shim), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	f.run.path = shimDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	f.run.vanishDuringRefresh = "./vanishing.tmp"
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
+	}
+	if f.run.vanishDuringRefresh != "" {
+		t.Fatalf("refresh race hook did not run; output: %s", f.out.String())
 	}
 	if strings.Contains(f.out.String(), `"action":"archive-job","host":"local","job":"volatile","result":"error"`) {
 		t.Fatalf("entry race failed the job scan: %s", f.out.String())
 	}
-	if _, err := os.Stat(filepath.Join(dir, "vanishing.tmp")); !os.IsNotExist(err) {
-		t.Fatalf("stat shim did not remove test entry: %v", err)
+	if _, err := os.Stat(vanishing); !os.IsNotExist(err) {
+		t.Fatalf("refresh race did not remove test entry: %v", err)
 	}
 }
 
@@ -205,12 +197,18 @@ func TestArchiveJobsUnreadableSubtreeDoesNotSkipOtherJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(private, 0o755) })
+	badEvents := jobDir(t, f.jobs, "bad-events", 20*24*time.Hour)
+	eventsDir := filepath.Join(badEvents, "events")
+	if err := os.Chmod(eventsDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(eventsDir, 0o755) })
 	jobDir(t, f.jobs, "good-job", 20*24*time.Hour)
 	err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true})
 	if err == nil {
 		t.Fatal("unreadable job should have an error row")
 	}
-	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || !strings.Contains(f.out.String(), `"job":"good-job","result":"would-archive"`) {
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || !strings.Contains(f.out.String(), `"job":"bad-events","result":"error"`) || !strings.Contains(f.out.String(), `"job":"good-job","result":"would-archive"`) {
 		t.Fatalf("one unreadable job affected other rows: %s", f.out.String())
 	}
 }

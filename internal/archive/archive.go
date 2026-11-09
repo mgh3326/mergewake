@@ -88,10 +88,11 @@ type File struct {
 
 // HostJobSummary is the compact metadata needed to decide host-wide skips.
 type HostJobSummary struct {
-	Kind      byte
-	HasEvents bool
-	Finished  bool
-	Newest    int64
+	Kind         byte
+	HasEvents    bool
+	Finished     bool
+	Newest       int64
+	NeedsRefresh bool
 }
 
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
@@ -245,15 +246,21 @@ find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f"
 // jobs that pass these skip checks.
 const hostListScript = `cd "$1" || exit 1
 for d in *; do
-  if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0; continue; fi
+  if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0 0; continue; fi
   [ -d "$d" ] || continue
-  has=0; done=0
+  has=0; done=0; uncertain=0
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then uncertain=1; fi
   if [ -e "$d/events" ]; then
     has=1
-    done=$(find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null | awk '$1+0 >= max {max=$1+0; last=$2} END {if (last == "T") print 1; else print 0}')
+    eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $1+0 >= max {max=$1+0; latestKind=$2} END {print (latestKind == "T"), rc+0}')
+    set -- $eventSummary; done=$1; rc=$2
+    if [ "$rc" -ne 0 ]; then uncertain=1; fi
   fi
-  newest=$(find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null | awk 'NR == 1 || $1+0 > max {max=$1+0} END {if (NR) printf "%.0f", max; else print 0}')
-  printf '%s\0d\0%s\0%s\0%s\0' "$d" "$has" "$done" "$newest"
+  newestSummary=$({ find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} NR == 1 || $1+0 > max {max=$1+0} END {printf "%.0f %d\n", max, rc+0}')
+  set -- $newestSummary; newest=$1; rc=$2
+  if [ "$rc" -ne 0 ]; then uncertain=1; fi
+  if [ "$uncertain" -eq 1 ]; then has=1; done=1; newest=0; fi
+  printf '%s\0d\0%s\0%s\0%s\0%s\0' "$d" "$has" "$done" "$newest" "$uncertain"
 done`
 
 // HostJobs returns compact per-job summaries from one host call.
@@ -266,20 +273,20 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 	if fields[len(fields)-1] == "" {
 		fields = fields[:len(fields)-1]
 	}
-	if len(fields)%5 != 0 {
+	if len(fields)%6 != 0 {
 		return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
 	}
-	out := make(map[string]HostJobSummary, len(fields)/5)
-	for i := 0; i < len(fields); i += 5 {
-		job, kind, hasEvents, finished, newest := fields[i], fields[i+1], fields[i+2], fields[i+3], fields[i+4]
-		if job == "" || len(kind) != 1 || (kind[0] != 'd' && kind[0] != 'l') || (hasEvents != "0" && hasEvents != "1") || (finished != "0" && finished != "1") {
-			return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
+	out := make(map[string]HostJobSummary, len(fields)/6)
+	for i := 0; i < len(fields); i += 6 {
+		job, kind, hasEvents, finished, newest, uncertain := fields[i], fields[i+1], fields[i+2], fields[i+3], fields[i+4], fields[i+5]
+		if job == "" || len(kind) != 1 || (kind[0] != 'd' && kind[0] != 'l') || (hasEvents != "0" && hasEvents != "1") || (finished != "0" && finished != "1") || (uncertain != "0" && uncertain != "1") {
+			return nil, fmt.Errorf("list jobs tree %s: malformed summary %q", root, fields[i:i+6])
 		}
 		mtime, e := strconv.ParseInt(newest, 10, 64)
 		if e != nil {
 			return nil, fmt.Errorf("list jobs tree %s: malformed summary", root)
 		}
-		out[job] = HostJobSummary{Kind: kind[0], HasEvents: hasEvents == "1", Finished: finished == "1", Newest: mtime}
+		out[job] = HostJobSummary{Kind: kind[0], HasEvents: hasEvents == "1", Finished: finished == "1", Newest: mtime, NeedsRefresh: uncertain == "1"}
 	}
 	return out, nil
 }
@@ -713,6 +720,9 @@ func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
 	}
 	if job.Kind != 'd' {
 		return "job-gone", 0
+	}
+	if job.NeedsRefresh {
+		return "", 0
 	}
 	if !job.HasEvents {
 		return "no-events", 0
