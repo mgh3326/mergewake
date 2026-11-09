@@ -219,6 +219,9 @@ type Reps interface {
 type CLI struct {
 	Runner  integrations.Runner
 	Command string
+	// Environ is the environment an outcomes child starts from; nil means
+	// os.Environ.
+	Environ func() []string
 }
 
 func decodeNotes(b []byte) []Outcome {

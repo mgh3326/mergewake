@@ -425,11 +425,11 @@ func revertSetup(t *testing.T, mergedAgo time.Duration) (*Service, *outcomeGH, *
 	return s, source, hk, r
 }
 
-// reconcile runs ReconcileOutcomes, tolerating only the outcome publish
-// error of the fake store, which these tests do not exercise.
+// reconcile runs ReconcileOutcomes. The fake store's outcome publish failure
+// is audited, not returned, so a clean pass returns nil.
 func reconcile(t *testing.T, s *Service, r config.Repo, o Options) {
 	t.Helper()
-	if e := s.ReconcileOutcomes(context.Background(), r, map[int]bool{}, o); e != nil && !strings.Contains(e.Error(), "retained in outbox") {
+	if e := s.ReconcileOutcomes(context.Background(), r, map[int]bool{}, o); e != nil {
 		t.Fatal(e)
 	}
 }
