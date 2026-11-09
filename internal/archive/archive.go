@@ -1,9 +1,9 @@
 // Package archive moves a finished panewire job directory off its session host.
 // The job's regular files are copied uncompressed into a locally synced Google
 // Drive folder on the archive host, every copy is verified by sha256 against
-// the source, a manifest.json is written beside them, the job's text files are
-// stored as handoffkeep attachments, and the job's hk task gets a comment that
-// records all of it. Only after every step succeeded, and a re-listing shows
+// the source, a manifest.json is written beside them, and an hk document records
+// its summary. No file bytes are sent to hk; the task gets a short comment.
+// Only after every step succeeded, and a re-listing shows
 // the job dir unchanged, is the local job dir deleted. Credential-like files
 // are never copied or uploaded; they are named in the record instead.
 package archive
@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,23 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
+
+// Secret patterns are pinned copies of handoffkeep@8673725 internal/guard/guard.go:20-41.
+// Keep hk as the single source of these patterns; archive reports only names.
+var secretPatterns = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9]{20,}\b`)},
+	{"anthropic_key", regexp.MustCompile(`\bsk-ant-(?:api03-)?[A-Za-z0-9]{20,}\b`)},
+	{"github_token", regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`)},
+	{"slack_token", regexp.MustCompile(`\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{20,}\b`)},
+	{"aws_access_key", regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`)},
+	{"private_key", regexp.MustCompile(strings.Join([]string{"-----", "BEGIN"}, ""))},
+	{"bearer_token", regexp.MustCompile(`(?i)\bBearer [A-Za-z0-9._-]{20,}`)},
+	{"token_assignment", regexp.MustCompile(`(?m)\b[A-Z_]*(?:TOKEN|SECRET|KEY)=[^\s]{12,}`)},
+	{"github_fine_grained_token", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{82}\b`)},
+}
 
 // Skip is a refusal that keeps the local job dir: the reason is stable so a
 // receipt row can dedupe on it.
@@ -70,31 +88,46 @@ type File struct {
 
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
-	Action         string   `json:"action"`
-	Job            string   `json:"job"`
-	Host           string   `json:"host"`
-	Dir            string   `json:"dir"`
-	Task           string   `json:"task"`
-	Dest           string   `json:"drive_dir"`
-	Files          int      `json:"files"`
-	Bytes          int64    `json:"bytes"`
-	OversizedBytes int64    `json:"oversized_bytes"`
-	Oversized      []File   `json:"oversized"`
-	Move           []string `json:"move"`
-	Text           []string `json:"hk"`
-	Excluded       []string `json:"excluded"`
-	Skipped        []string `json:"skipped"`
-	AppleDouble    []string `json:"appledouble"`
-	Delete         string   `json:"delete"`
-	Newest         int64    `json:"newest_mtime"`
+	Action          string      `json:"action"`
+	Job             string      `json:"job"`
+	Host            string      `json:"host"`
+	Dir             string      `json:"dir"`
+	Task            string      `json:"task"`
+	Dest            string      `json:"drive_dir"`
+	Files           int         `json:"files"`
+	Bytes           int64       `json:"bytes"`
+	OversizedBytes  int64       `json:"oversized_bytes"`
+	Oversized       []File      `json:"oversized"`
+	Move            []string    `json:"move"`
+	Text            []string    `json:"hk"`
+	Excluded        []string    `json:"excluded"`
+	ExcludedEntries []Exclusion `json:"excluded_entries,omitempty"`
+	Skipped         []string    `json:"skipped"`
+	AppleDouble     []string    `json:"appledouble"`
+	Delete          string      `json:"delete"`
+	Newest          int64       `json:"newest_mtime"`
 	// Resume marks a job whose Drive copy and hk record already completed
 	// but whose local delete did not: applying it only deletes.
 	Resume          bool `json:"resume,omitempty"`
 	host            reap.Host
 	entries         []File
 	oversizedHashes map[string]string
+	textSnapshots   map[string][]byte
+	checkouts       []string
 	done            *manifest
 	doneRaw         []byte
+}
+
+type Exclusion struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+	Files  int    `json:"files,omitempty"`
+}
+
+type Retention struct {
+	Path   string `json:"path"`
+	Class  string `json:"class"`
+	Reason string `json:"reason"`
 }
 
 // Attachment is one handoffkeep attachment id and the job path it holds.
@@ -112,6 +145,7 @@ type Result struct {
 	Manifest    string       `json:"manifest_sha256"`
 	Attachments []Attachment `json:"attachments,omitempty"`
 	Excluded    []string     `json:"excluded,omitempty"`
+	Retained    []Retention  `json:"retained,omitempty"`
 	Deleted     bool         `json:"deleted"`
 }
 
@@ -150,6 +184,41 @@ func Credential(p string) bool {
 func text(f File, max int64) bool {
 	ext := strings.ToLower(path.Ext(f.Path))
 	return f.kind == 'f' && (ext == ".md" || ext == ".json") && f.Size <= max
+}
+
+func secretPattern(b []byte) string {
+	for _, p := range secretPatterns {
+		if p.re.Match(b) {
+			return p.name
+		}
+	}
+	return ""
+}
+
+const gitDirScript = `cd "$1" || exit 1
+find . -name .git -print0`
+
+func gitCheckouts(ctx context.Context, a *Archiver, h reap.Host, dir string) (map[string]bool, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", gitDirScript, "sh", dir)
+	if err != nil {
+		return nil, fmt.Errorf("find git metadata %s: %w", dir, err)
+	}
+	out := map[string]bool{}
+	for _, p := range strings.Split(string(b), "\x00") {
+		if p != "" {
+			out[strings.TrimPrefix(path.Dir(strings.TrimPrefix(p, "./")), "./")] = true
+		}
+	}
+	return out, nil
+}
+
+func inCheckout(p string, checkouts map[string]bool) bool {
+	for root := range checkouts {
+		if root == "." || p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // listScript prints one NUL-terminated "kind size mtime ./path" record per
@@ -255,6 +324,63 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+const archiveLockTTL = int64(24 * 60 * 60)
+
+// claim serializes publication for one task/job destination across hosts.
+// Locks live outside the task/job namespace and carry an owner and creation
+// time so a later run can reclaim one left by a dead process.
+func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
+	sum := sha256.Sum256([]byte(dest))
+	lock := path.Join(a.DriveDir, ".locks", hex.EncodeToString(sum[:]))
+	owner := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	b, err := a.on(ctx, a.SSH, "", "sh", "-c", `mkdir -p "$2" || exit 1
+now=$(date +%s) || exit 1
+claim_owner="$3"
+acquire() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$claim_owner" "$now" > "$1/owner"; }
+if acquire "$1"; then echo acquired; exit 0; fi
+old_owner=; born=
+if [ -r "$1/owner" ]; then read old_owner born < "$1/owner"; else born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1") || { echo busy; exit 0; }; fi
+case "$born" in ''|*[!0-9]*) echo busy; exit 0;; esac
+if [ "$((now-born))" -lt "$4" ]; then echo busy; exit 0; fi
+stale="$1.stale.$3"
+if ! mv "$1" "$stale" 2>/dev/null; then echo busy; exit 0; fi
+moved_owner=; moved_born=
+if [ -r "$stale/owner" ]; then read moved_owner moved_born < "$stale/owner"; fi
+if [ "$moved_owner" != "$old_owner" ] || [ "$moved_born" != "$born" ]; then
+  if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi
+  echo busy; exit 0
+fi
+if acquire "$1"; then rm -rf "$stale"; echo acquired
+else if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi; echo busy; fi`, "sh", lock, path.Join(a.DriveDir, ".locks"), owner, strconv.FormatInt(archiveLockTTL, 10))
+	if err != nil {
+		return nil, fmt.Errorf("claim archive destination: %w", err)
+	}
+	if strings.TrimSpace(string(b)) != "acquired" {
+		return nil, &Skip{"archive-lock-busy"}
+	}
+	return func() {
+		_, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `if [ -r "$1/owner" ]; then read current created < "$1/owner"; if [ "$current" = "$2" ]; then rm -rf "$1"; fi; fi`, "sh", lock, owner)
+	}, nil
+}
+
+func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {
+	mpath := path.Join(p.Dest, "manifest.json")
+	done, err := a.exists(ctx, a.SSH, mpath)
+	if err != nil || !done {
+		return done, err
+	}
+	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
+	if err != nil {
+		return false, err
+	}
+	var m manifest
+	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
+		return false, &Skip{"drive-dir-exists"}
+	}
+	p.Resume, p.done, p.doneRaw = true, &m, raw
+	return true, nil
+}
+
 // Jobs returns h.Jobs as an absolute path on its own host. Every path is
 // passed to the host shell quoted, and a quoted ~ never expands, so a leading
 // ~/ is replaced with that host's $HOME here. config.Load already refuses ~
@@ -315,38 +441,77 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if !finished(files) {
 		return nil, &Skip{"not-finished"}
 	}
+	checkouts, err := gitCheckouts(ctx, a, h, dir)
+	if err != nil {
+		return nil, err
+	}
+	// A .git entry at the job root makes the whole job dir a checkout. There
+	// is no safe archive subset to infer, so keep the source for explicit cleanup.
+	if checkouts["."] {
+		return nil, &Skip{"job-root-git-checkout"}
+	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
-		Move: []string{}, Text: []string{}, Excluded: []string{}, Skipped: []string{}, AppleDouble: []string{}}
+		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}, textSnapshots: map[string][]byte{}}
+	for checkout := range checkouts {
+		p.checkouts = append(p.checkouts, checkout)
+		count := 0
+		for _, f := range files {
+			if f.Path == checkout || strings.HasPrefix(f.Path, checkout+"/") {
+				count++
+			}
+		}
+		p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: checkout, Reason: "git-tracked", Files: count})
+	}
+	sort.Strings(p.checkouts)
+	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
+		if f.mtime > p.Newest {
+			p.Newest = f.mtime
+		}
 		switch {
 		case !safeName(f.Path):
 			return nil, &Skip{"unsafe-file-name"}
 		case f.Path == "manifest.json":
 			// The archive's own manifest goes there; never overwrite one.
 			return nil, &Skip{"manifest-collision"}
+		case inCheckout(f.Path, checkouts):
+			continue
 		case Credential(f.Path):
 			p.Excluded = append(p.Excluded, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "credential-path"})
 		case f.kind != 'f':
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
 			p.Skipped = append(p.Skipped, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "non-regular"})
 		case appleDouble(f.Path):
 			// macOS writes ._X beside X. Copied to a Drive folder, a ._X
 			// whose X is absent can fold into X's metadata and vanish.
 			p.AppleDouble = append(p.AppleDouble, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "appledouble"})
 		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
 			p.Oversized = append(p.Oversized, f)
 			p.OversizedBytes += f.Size
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "oversized"})
 		default:
+			if text(f, a.TextMax) {
+				body, readErr := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, f.Path))
+				if readErr != nil {
+					return nil, fmt.Errorf("read %s: %w", f.Path, readErr)
+				}
+				if int64(len(body)) != f.Size {
+					return nil, &Skip{"job-changed"}
+				}
+				if name := secretPattern(body); name != "" {
+					p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "secret-like:" + name})
+					continue
+				}
+				p.Text = append(p.Text, f.Path)
+				p.textSnapshots[f.Path] = body
+			}
 			p.Move = append(p.Move, f.Path)
 			p.Files++
 			p.Bytes += f.Size
-			if text(f, a.TextMax) {
-				p.Text = append(p.Text, f.Path)
-			}
-		}
-		if f.mtime > p.Newest {
-			p.Newest = f.mtime
 		}
 	}
 	if len(p.Oversized) > 0 {
@@ -362,10 +527,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if p.Task == "" {
 		return nil, &Skip{"task-unknown"}
 	}
-	// Month of the job's last activity, so Drive folders group by when the
-	// work happened and a rerun lands in the same place.
-	month := time.Unix(p.Newest, 0).UTC().Format("2006-01")
-	p.Dest = path.Join(a.DriveDir, h.Name, month, job)
+	p.Dest = path.Join(a.DriveDir, "tasks", p.Task, job)
 	mpath := path.Join(p.Dest, "manifest.json")
 	done, err := a.exists(ctx, a.SSH, mpath)
 	if err != nil {
@@ -501,47 +663,53 @@ func (a *Archiver) hashes(ctx context.Context, ssh, dir string, paths []string) 
 	return out, nil
 }
 
-// copy streams the move list as an uncompressed tar from the job host and
-// unpacks it straight into the Drive folder on the archive host, relayed by
-// this machine. pipefail makes either side's failure fail the copy.
-// COPYFILE_DISABLE keeps macOS tar from adding ._ metadata entries.
+// copy streams uncaptured regular files as an uncompressed tar from the job
+// host and writes inspected text snapshots directly to Drive. COPYFILE_DISABLE
+// keeps macOS tar from adding ._ metadata entries.
 func (a *Archiver) copy(ctx context.Context, p *Plan) error {
-	prod := wrap(p.host.SSH, []string{"env", "COPYFILE_DISABLE=1", "tar", "-C", p.Dir, "--null", "-T", "-", "-cf", "-"})
-	cons := wrap(a.SSH, []string{"sh", "-c", `mkdir -p "$1" && tar -C "$1" -xf -`, "sh", p.Dest})
-	script := "set -o pipefail; " + reap.Join(prod) + " | " + reap.Join(cons)
-	if _, err := a.Runner.Run(ctx, "bash", []string{"-c", script}, listInput(p.Move), ""); err != nil {
-		return fmt.Errorf("copy to drive: %w", err)
+	snapshots := map[string]bool{}
+	for _, name := range p.Text {
+		snapshots[name] = true
+	}
+	var bulk []string
+	for _, name := range p.Move {
+		if !snapshots[name] {
+			bulk = append(bulk, name)
+		}
+	}
+	if len(bulk) > 0 {
+		prod := wrap(p.host.SSH, []string{"env", "COPYFILE_DISABLE=1", "tar", "-C", p.Dir, "--null", "-T", "-", "-cf", "-"})
+		cons := wrap(a.SSH, []string{"sh", "-c", `mkdir -p "$1" && tar -C "$1" -xf -`, "sh", p.Dest})
+		script := "set -o pipefail; " + reap.Join(prod) + " | " + reap.Join(cons)
+		if _, err := a.Runner.Run(ctx, "bash", []string{"-c", script}, listInput(bulk), ""); err != nil {
+			return fmt.Errorf("copy to drive: %w", err)
+		}
+	}
+	for _, name := range p.Text {
+		dst := path.Join(p.Dest, name)
+		if _, err := a.on(ctx, a.SSH, string(p.textSnapshots[name]), "sh", "-c", `mkdir -p "$(dirname "$1")" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", dst); err != nil {
+			return fmt.Errorf("copy inspected file %s to drive: %w", name, err)
+		}
 	}
 	return nil
 }
 
-func (a *Archiver) put(ctx context.Context, name string, b []byte) (string, error) {
-	id, err := (integrations.Handoffkeep{}).UploadAttachment(ctx, name, b)
-	if err != nil {
-		return "", fmt.Errorf("hk attach put %s: %w", name, err)
-	}
-	sum := sha256.Sum256(b)
-	if id != hex.EncodeToString(sum[:]) {
-		return "", fmt.Errorf("hk attach put %s: sha256 mismatch", name)
-	}
-	return id, nil
-}
-
-// manifest is written beside the archived files and attached to hk.
+// manifest is written beside the archived files.
 type manifest struct {
-	Version     int          `json:"version"`
-	Job         string       `json:"job"`
-	Host        string       `json:"host"`
-	Task        string       `json:"task"`
-	Source      string       `json:"source"`
-	ArchivedAt  string       `json:"archived_at"`
-	Files       []File       `json:"files"`
-	TotalBytes  int64        `json:"total_bytes"`
-	Oversized   []File       `json:"oversized,omitempty"`
-	Excluded    []string     `json:"excluded"`
-	Skipped     []string     `json:"skipped"`
-	AppleDouble []string     `json:"appledouble"`
-	Attachments []Attachment `json:"attachments"`
+	Version         int         `json:"version"`
+	Job             string      `json:"job"`
+	Host            string      `json:"host"`
+	Task            string      `json:"task"`
+	Source          string      `json:"source"`
+	ArchivedAt      string      `json:"archived_at"`
+	Files           []File      `json:"files"`
+	TotalBytes      int64       `json:"total_bytes"`
+	Oversized       []File      `json:"oversized,omitempty"`
+	Excluded        []string    `json:"excluded"`
+	ExcludedEntries []Exclusion `json:"excluded_entries,omitempty"`
+	Skipped         []string    `json:"skipped"`
+	AppleDouble     []string    `json:"appledouble"`
+	Retained        []Retention `json:"retained,omitempty"`
 }
 
 // commentFiles bounds the per-file sha256 list in the hk comment; the full
@@ -551,48 +719,9 @@ const maxHKCommentBytes = 64 << 10
 
 const commentTruncationNotice = "\n[comment details truncated; complete file lists are in manifest.json]\n"
 
-func comment(p *Plan, m manifest, manifestID string) string {
+func comment(p *Plan) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "mergewake archive: job %s on %s moved to Google Drive\n", p.Job, p.Host)
-	fmt.Fprintf(&b, "drive_dir: %s\nfiles: %d  total_bytes: %d\n", p.Dest, len(m.Files), m.TotalBytes)
-	fmt.Fprintf(&b, "manifest: %s/manifest.json (hk attachment %s)\n", p.Dest, manifestID)
-	fmt.Fprintf(&b, "hk attachments (%d):\n", len(m.Attachments))
-	for _, x := range m.Attachments {
-		fmt.Fprintf(&b, "- %s %s\n", x.SHA256, x.Path)
-	}
-	if len(m.Excluded) > 0 {
-		fmt.Fprintf(&b, "excluded credential-like files, not archived (%d):\n", len(m.Excluded))
-		for _, x := range m.Excluded {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.Skipped) > 0 {
-		fmt.Fprintf(&b, "skipped non-regular entries, not archived (%d):\n", len(m.Skipped))
-		for _, x := range m.Skipped {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.AppleDouble) > 0 {
-		fmt.Fprintf(&b, "AppleDouble metadata files, not archived (%d):\n", len(m.AppleDouble))
-		for _, x := range m.AppleDouble {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.Oversized) > 0 {
-		fmt.Fprintf(&b, "over drive_max_file_bytes, not archived, deleted with the job dir (%d, %d bytes):\n", len(m.Oversized), sumFileBytes(m.Oversized))
-		for _, f := range m.Oversized {
-			fmt.Fprintf(&b, "- %s %d\n", f.Path, f.Size)
-		}
-	}
-	fmt.Fprintf(&b, "file sha256 (%d):\n", len(m.Files))
-	for i, f := range m.Files {
-		if i == commentFiles {
-			fmt.Fprintf(&b, "- ... %d more in manifest.json\n", len(m.Files)-commentFiles)
-			break
-		}
-		fmt.Fprintf(&b, "- %s %d %s\n", f.SHA256, f.Size, f.Path)
-	}
-	fmt.Fprintf(&b, "local job dir %s is deleted after this record\n", p.Dir)
+	fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/%s/%s\n", p.Job, p.Dest, p.Task, p.Job)
 	return boundComment(b.String())
 }
 
@@ -623,6 +752,88 @@ func sumFileBytes(files []File) int64 {
 	return total
 }
 
+func snapshotSHA(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// checkoutSafety checks Git state immediately before source deletion.
+func (a *Archiver) checkoutSafety(ctx context.Context, p *Plan) ([]Retention, error) {
+	var retained []Retention
+	for _, checkout := range p.checkouts {
+		dir := path.Join(p.Dir, checkout)
+		b, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `
+set -eu
+expected=$(CDPATH= cd "$1" && pwd -P) || { echo git-error; exit 0; }
+GIT_CEILING_DIRECTORIES=$(dirname "$expected")
+export GIT_CEILING_DIRECTORIES
+top=$(git -C "$expected" rev-parse --show-toplevel 2>/dev/null) || { echo git-error; exit 0; }
+[ "$top" = "$expected" ] || { echo git-error; exit 0; }
+status=$(git -C "$expected" status --porcelain --untracked-files=all 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$status" ] || { echo dirty; exit 0; }
+stash=$(git -C "$expected" stash list 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$stash" ] || { echo stash; exit 0; }
+unpushed=$(git -C "$expected" rev-list --all --not --remotes 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$unpushed" ] || { echo unpushed; exit 0; }
+echo safe
+`, "sh", dir)
+		reason := strings.TrimSpace(string(b))
+		if err != nil || (reason != "safe" && reason != "dirty" && reason != "stash" && reason != "unpushed" && reason != "git-error") {
+			reason = "git-error"
+		}
+		if reason != "safe" {
+			retained = append(retained, Retention{Path: checkout, Class: "checkout-unsafe", Reason: reason})
+		}
+	}
+	return retained, nil
+}
+
+func sameRetained(a, b []Retention) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Archiver) publish(ctx context.Context, p *Plan, m *manifest, addComment bool) (string, error) {
+	mb, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	mb = append(mb, '\n')
+	sum := sha256.Sum256(mb)
+	manifestSHA := hex.EncodeToString(sum[:])
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "job: %s\ntask: %s\ndrive_dir: %s\nmanifest_sha256: %s\nfiles: %d\ntotal_bytes: %d\nexcluded (%d):\n", p.Job, p.Task, p.Dest, manifestSHA, len(m.Files), m.TotalBytes, len(m.ExcludedEntries))
+	for _, x := range m.ExcludedEntries {
+		fmt.Fprintf(&summary, "- %s %s", x.Path, x.Reason)
+		if x.Files > 0 {
+			fmt.Fprintf(&summary, " files=%d", x.Files)
+		}
+		summary.WriteByte('\n')
+	}
+	for _, x := range m.Retained {
+		fmt.Fprintf(&summary, "retained: checkout-unsafe %s %s\n", x.Path, x.Reason)
+	}
+	if err := (integrations.Handoffkeep{}).Record(ctx, "archive/"+p.Task+"/"+p.Job, []byte(summary.String())); err != nil {
+		return "", fmt.Errorf("hk archive document: %w", err)
+	}
+	if addComment {
+		if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p)); err != nil {
+			return "", fmt.Errorf("hk comment: %w", err)
+		}
+	}
+	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", path.Join(p.Dest, "manifest.json"), p.Dest); err != nil {
+		return "", fmt.Errorf("write manifest: %w", err)
+	}
+	return manifestSHA, nil
+}
+
 func same(a, b []File) bool {
 	if len(a) != len(b) {
 		return false
@@ -635,16 +846,57 @@ func same(a, b []File) bool {
 	return true
 }
 
-// Apply runs a plan: copy, verify, hk attachments, manifest, hk comment, then
-// delete. Any failure before the delete returns an error and keeps the job
+func sameOutsideCheckouts(a, b []File, checkouts []string) bool {
+	filter := func(files []File) []File {
+		out := files[:0]
+		for _, f := range files {
+			excluded := false
+			for _, checkout := range checkouts {
+				if f.Path == checkout || strings.HasPrefix(f.Path, checkout+"/") {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	return same(filter(append([]File(nil), a...)), filter(append([]File(nil), b...)))
+}
+
+// Apply runs a plan under an exclusive destination claim: copy, verify, hk
+// summary document/comment, manifest, then delete. Any failure before the delete keeps the job
 // dir; a job that changed since the plan is kept as *Skip{"job-changed"}.
 func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, error) {
+	if p.done != nil {
+		src, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Move)
+		if err != nil {
+			return nil, err
+		}
+		return a.resume(ctx, p, src)
+	}
+	release, err := a.claim(ctx, p.Dest)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	completed, err := a.existingManifest(ctx, p)
+	if err != nil {
+		return nil, err
+	}
 	src, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Move)
 	if err != nil {
 		return nil, err
 	}
-	if p.done != nil {
+	if completed {
 		return a.resume(ctx, p, src)
+	}
+	for _, rel := range p.Text {
+		if src[rel] != snapshotSHA(p.textSnapshots[rel]) {
+			return nil, &Skip{"job-changed"}
+		}
 	}
 	dst := map[string]string{}
 	// Nothing but excluded or non-regular entries: there is nothing to copy,
@@ -661,8 +913,8 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	for i := range oversized {
 		oversized[i].SHA256 = p.oversizedHashes[oversized[i].Path]
 	}
-	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
-		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, Skipped: p.Skipped, AppleDouble: p.AppleDouble, Attachments: []Attachment{}}
+	m := manifest{Version: 2, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
+		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, ExcludedEntries: p.ExcludedEntries, Skipped: p.Skipped, AppleDouble: p.AppleDouble}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
 		moving[rel] = true
@@ -671,49 +923,28 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		if !moving[f.Path] {
 			continue
 		}
-		if src[f.Path] == "" || src[f.Path] != dst[f.Path] {
+		want := src[f.Path]
+		if snapshot, ok := p.textSnapshots[f.Path]; ok {
+			want = snapshotSHA(snapshot)
+		}
+		if want == "" || want != dst[f.Path] {
 			return nil, fmt.Errorf("verify %s: sha256 mismatch on drive copy", f.Path)
 		}
-		f.SHA256 = src[f.Path]
+		f.SHA256 = want
 		m.Files = append(m.Files, f)
 		m.TotalBytes += f.Size
 	}
 
-	for _, rel := range p.Text {
-		b, err := a.on(ctx, p.host.SSH, "", "cat", filepath.Join(p.Dir, rel))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", rel, err)
-		}
-		if sum := sha256.Sum256(b); hex.EncodeToString(sum[:]) != src[rel] {
-			return nil, &Skip{"job-changed"}
-		}
-		id, err := a.put(ctx, path.Base(rel), b)
-		if err != nil {
-			return nil, err
-		}
-		m.Attachments = append(m.Attachments, Attachment{Path: rel, SHA256: id})
-	}
-
-	mb, err := json.MarshalIndent(m, "", "  ")
+	m.Retained, err = a.checkoutSafety(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	mb = append(mb, '\n')
-	mid, err := a.put(ctx, "manifest.json", mb)
+	manifestSHA, err := a.publish(ctx, p, &m, true)
 	if err != nil {
 		return nil, err
 	}
-	if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p, m, mid)); err != nil {
-		return nil, fmt.Errorf("hk comment: %w", err)
-	}
-	// Published last: Plan treats a dest holding manifest.json as archived
-	// and recorded, so a failed put or comment must leave none behind.
-	mpath := path.Join(p.Dest, "manifest.json")
-	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", mpath, p.Dest); err != nil {
-		return nil, fmt.Errorf("write manifest: %w", err)
-	}
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: mid, Attachments: m.Attachments, Excluded: p.Excluded}
-	return a.remove(ctx, p, res)
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: manifestSHA, Excluded: p.Excluded, Retained: m.Retained}
+	return a.remove(ctx, p, res, &m)
 }
 
 // resume finishes an archive whose Drive copy and hk record completed but
@@ -726,13 +957,13 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 		}
 	}
 	sum := sha256.Sum256(p.doneRaw)
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Attachments: m.Attachments, Excluded: m.Excluded}
-	return a.remove(ctx, p, res)
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
+	return a.remove(ctx, p, res, m)
 }
 
 // remove deletes the job dir only when a re-listing shows it unchanged: a
 // file written after the plan was never archived.
-func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, error) {
+func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest) (*Result, error) {
 	if _, err := a.jobDir(ctx, p.host.SSH, p.Dir); err != nil {
 		return res, err
 	}
@@ -747,12 +978,39 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, e
 			}
 		}
 	}
+	if len(p.Text) > 0 {
+		current, err := a.hashes(ctx, p.host.SSH, p.Dir, p.Text)
+		if err != nil {
+			return res, err
+		}
+		for _, name := range p.Text {
+			if current[name] != snapshotSHA(p.textSnapshots[name]) {
+				return res, &Skip{"job-changed"}
+			}
+		}
+	}
 	again, err := a.list(ctx, p.host, p.Dir)
 	if err != nil {
 		return res, err
 	}
-	if !same(again, p.entries) {
+	if !sameOutsideCheckouts(again, p.entries, p.checkouts) {
 		return res, &Skip{"job-changed"}
+	}
+	retained, err := a.checkoutSafety(ctx, p)
+	if err != nil {
+		return res, err
+	}
+	if !sameRetained(retained, m.Retained) {
+		m.Retained = retained
+		sum, err := a.publish(ctx, p, m, false)
+		if err != nil {
+			return res, err
+		}
+		res.Manifest = sum
+		res.Retained = retained
+	}
+	if len(retained) != 0 {
+		return res, nil
 	}
 	// p.Dir is absolute (Jobs), so it can never be read as an rm option and
 	// no "--" is needed.

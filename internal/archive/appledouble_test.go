@@ -88,14 +88,14 @@ func TestApplyArchivesAppleDoubleWithoutCopying(t *testing.T) {
 		t.Fatal("AppleDouble text file uploaded to hk")
 	}
 	note := e.comment(2402)
-	if !strings.Contains(note, "AppleDouble metadata files, not archived (2):") || !strings.Contains(note, "refs/._x.png") {
-		t.Fatalf("hk comment lacks AppleDouble list:\n%s", note)
+	if !strings.Contains(note, "archive/2402/wk-ad") {
+		t.Fatalf("hk comment lacks archive record:\n%s", note)
 	}
 }
 
 // A Drive-side hash failure names the first path it could not hash, and the
 // job dir stays.
-func TestApplyDriveHashFailureNamesPath(t *testing.T) {
+func TestArchiveDriveHashFailureNamesPath(t *testing.T) {
 	e := setup(t)
 	dir := job(t, e.jobs, "wk-hash")
 	write(t, filepath.Join(dir, "refs", "x.png"), "png\n")

@@ -357,15 +357,21 @@ A single PR's fetch failure never aborts the pass.
 | `enabled` | `false` | Gates the reap archive stage and `mergewake archive-jobs`. |
 | `drive_dir` | Required when enabled | Locally synced Google Drive folder on the archive host. Absolute; a leading `~/` expands only when the archive host is this machine. Never commit the real path. |
 | `archive_host` | Empty / `local` | Where `drive_dir` lives: empty or `local` is this machine, anything else a single `ssh(1)` destination reachable from this machine (options, whitespace and leading `-` are refused). |
-| `text_max_bytes` | `1048576` | Size cap for job text files (`*.md`, `*.json` — brief, report, events) stored as hk attachments; at most 3 MiB. |
+| `text_max_bytes` | `1048576` | Maximum size of `*.md` and `*.json` files inspected locally for hk guard patterns; at most 3 MiB. It does not control Drive copying. |
 | `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
-unit, never its worktree — that is in git and is cleaned by the worktree
-rules above. Archiving runs these steps in order, and any failure keeps the
-local job dir and reports the step:
+unit. Directories containing a `.git` file or directory are named as
+`git-tracked` exclusions and none of their files are copied. The source job dir
+is deleted only when every nested checkout is verified clean and pushed at the
+delete boundary; otherwise the archive completes with result
+`archived-retained`, records each `retained: checkout-unsafe <dir> <reason>`,
+and keeps the whole source dir. Reasons are `dirty`, `stash`, `unpushed`, or
+`git-error`. A later run repeats the safety checks and deletes only after all
+checkouts pass. Ignored files do not make a checkout dirty. Archiving runs
+these steps in order:
 
 1. **Plan** (read-only): the jobs dir is resolved on its own host — a
    leading `~/` is expanded with that host's `$HOME`, since quoted paths
@@ -375,7 +381,8 @@ local job dir and reports the step:
    list every non-directory entry. A job is eligible only when its `events/`
    contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
    `job.placement` event (a reused name has started again); bookkeeping events
-   do not affect that decision. Jobs without an events directory are skipped.
+   do not affect that decision. Every listed entry, including excluded entries,
+   contributes to the newest-entry time used by `--older-than`. Jobs without an events directory are skipped.
    `reap.archive.exclude` is a list of shell globs matched against job names;
    it defaults to `["pw-rollout-*", "pw-hk*", "events-lane"]`, while an
    explicit empty list disables name exclusions. Matching jobs are skipped as
@@ -390,22 +397,30 @@ local job dir and reports the step:
    Drive. Symlinks and special files are not copied (following a link could
    archive a secret from outside the job dir). A regular file whose base name
    starts with `._` is macOS AppleDouble metadata: it is not copied to Drive
-   or uploaded to hk, and is named in the manifest's `appledouble` list and
-   the hk comment. It is deleted with the job dir. The hk task id comes from the
+   or uploaded to hk, and is named in the manifest's `appledouble` list.
+   It is deleted with the job dir. The hk task id comes from the
    job's panewire events (`events/*-job.task_link.json`, falling back to
    `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
-   destination is `<drive_dir>/<host>/<YYYY-MM>/<job>/`, the month of the
-   job's newest entry. A destination that already holds a `manifest.json` is
+   destination is `<drive_dir>/tasks/<task-id>/<job>/`.
+   A job without an hk task is skipped as `task-unknown`; no `no-task/` archive
+   is created. A destination that already holds a `manifest.json` is
    a finished archive: when that manifest names the same job, host and task
    with the same archived files and oversized paths, sizes and fingerprints,
    the plan is a delete-only `resume` (contents must still match the manifest);
    otherwise it is skipped as
-   `drive-dir-exists`. A job with its own top-level `manifest.json` is
+   `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
+   under the archive's `.locks` directory, outside task/job names; a lock older
+   than 24 hours is reclaimable, and a live lock is reported as
+   `archive-lock-busy`. If hosts present the same task/job key, a stale or
+   different-host plan remains `drive-dir-exists` and cannot overwrite the
+   completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
 2. **Copy**: the remaining regular files are streamed as an uncompressed tar
    from the job host and unpacked straight into the destination on the
    archive host, relayed through this machine (`ssh` on either side as
-   configured); the Drive copy is a plain directory, not an archive file. A
+   configured); inspected text files are copied from the exact snapshot scanned
+   during planning. If a text source changes before deletion, the job is kept.
+   The Drive copy is a plain directory, not an archive file. A
    job with nothing but excluded, oversized or non-regular entries copies
    nothing.
 3. **Verify**: every archived file's sha256 is computed on both sides and must
@@ -413,23 +428,37 @@ local job dir and reports the step:
    missing, duplicate or unexpected hash record fails the archive. A path
    that cannot be hashed on the Drive side is named in the error (redacted),
    so the row shows which file the copy lost.
-4. **hk attachments**: each text file under `text_max_bytes` is uploaded to
-   hk (`PUT /v1/attachments`); the returned sha256 must match. The upload
-   has no task reference, so the ids are tied to the task by the comment.
-5. **Record**: `manifest.json` (job, host, task, source, every file's path,
-   size and sha256, excluded and skipped paths, attachment ids) is attached
-   to hk, then a task comment (`POST /v1/tasks/<task>/comments`) posts the Drive directory,
-   file count, total bytes, the manifest's attachment id, every attachment
-   id, the excluded and skipped names, and the per-file sha256 list (the
-   first 200; the rest are in `manifest.json`). The comment is capped at 64 KiB;
-   when needed, details are truncated with a notice and the full lists remain
-   in `manifest.json`.
-6. **Manifest**: only then is `manifest.json` written beside the files, so a
-   failed upload or comment leaves no manifest and the job is retried in
-   full.
-7. **Delete**: the job dir is listed again and must be unchanged — a file
-   added or modified since the plan was never archived, so the job is kept
-   as `job-changed` — including oversized files — then removed with `rm -rf`.
+4. **Filter**: `text_max_bytes` bounds local secret-pattern inspection for
+   regular `*.md` and `*.json` files. The nine patterns are pinned from
+   `handoffkeep@8673725 internal/guard/guard.go:20-41`. Matches are excluded
+   by pattern name only (`secret-like:<name>`); matched bytes are never
+   recorded or sent to hk. A directory containing a `.git` entry is excluded
+   as one `git-tracked` entry with its file count. Credential paths, non-regular
+   entries, AppleDouble files and oversized files retain their existing rules.
+5. **Record**: no file bytes are uploaded to hk. The Drive `manifest.json`
+   keeps the existing fields and meanings (`job`, `host`, `task`, `source`,
+   `files`, `total_bytes`, `oversized`, `excluded`, `skipped`, `appledouble`)
+   and adds `excluded_entries`, with path, reason and optional file count.
+   Reasons include `credential-path`, `git-tracked`, `secret-like:<pattern>`,
+   `appledouble`, `oversized`, and `non-regular`. One hk note document per
+   job (`archive/<task-id>/<job>`) contains counts, bytes, excluded names and
+   reasons, Drive path and manifest sha256. Unsafe checkouts add a
+   `retained` manifest entry and a matching `retained: checkout-unsafe <dir>
+   <reason>` line to the hk note and archive-job row. A short task comment names that
+   document and Drive path. Replays after the published manifest resume only
+   the delete and do not rewrite either hk record unless the final checkout
+   safety check changes the retained state.
+6. **Manifest**: after both hk records succeed, `manifest.json` is written
+   beside the files as the final publication marker; a failed record leaves
+   no manifest and the job is retried.
+7. **Delete**: the job dir is listed again and must be unchanged outside
+   nested checkouts — a file added or modified since the plan was never
+   archived, so the job is kept as `job-changed`, including oversized files.
+   Each checkout must also pass `git status --porcelain` (untracked files count,
+   ignored files do not), `git stash list`, and
+   `git rev-list --all --not --remotes`. Any command error or nonempty result
+   retains the entire source dir as `archived-retained`; otherwise it is
+   removed with `rm -rf`.
    Excluded credential and oversized files go with it; their names and sizes
    stay in the record.
 

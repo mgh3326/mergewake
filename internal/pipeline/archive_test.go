@@ -180,7 +180,7 @@ func TestReapArchivesClosedJobOnceAndDeletesIt(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rows[0].Archive.Dest, ".env")); !os.IsNotExist(err) {
 		t.Fatal("credential file reached drive")
 	}
-	if c := f.comments(); len(c) != 1 || !strings.Contains(c[0], ".env") {
+	if c := f.comments(); len(c) != 1 || !strings.Contains(c[0], "archive/77/wk-7") {
 		t.Fatalf("hk comments = %q", c)
 	}
 	calls := f.hkCalls()
@@ -282,6 +282,27 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	f.s.Config.Reap.Archive.Enabled = false
 	if err := f.s.ArchiveJobs(context.Background(), "", time.Hour, Options{}); err == nil {
 		t.Fatal("archive-jobs ran with archive disabled")
+	}
+}
+
+func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "unsafe-checkout", 20*24*time.Hour)
+	writeFile(t, filepath.Join(dir, "wt", ".git"), "gitdir: missing\n")
+	old := time.Now().Add(-20 * 24 * time.Hour)
+	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, _ error) error { return os.Chtimes(p, old, old) })
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("unsafe source was removed: %v", err)
+	}
+	log, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), `"result":"archived-retained"`) || !strings.Contains(string(log), `retained: checkout-unsafe wt git-error`) {
+		t.Fatalf("retention row missing: %s", log)
 	}
 }
 

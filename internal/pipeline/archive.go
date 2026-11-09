@@ -97,7 +97,19 @@ func (s *Service) archiveJob(ctx context.Context, h reap.Host, job string, actin
 		rec.Result, rec.Reason = archive.Reason(e)
 		return
 	}
-	rec.Result = "archived"
+	if len(res.Retained) != 0 {
+		rec.Result, rec.Reason = "archived-retained", retentionReason(res.Retained)
+	} else {
+		rec.Result = "archived"
+	}
+}
+
+func retentionReason(retained []archive.Retention) string {
+	var parts []string
+	for _, x := range retained {
+		parts = append(parts, "retained: checkout-unsafe "+x.Path+" "+x.Reason)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // reapArchive archives the job dirs of panes reap closed once the close is
@@ -159,7 +171,7 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			// One shadow plan per job is enough for the daemon; an explicit
 			// --pr run still prints it again.
 			continue
-		case tried && prev.Result == "error" && now.Sub(prev.Time) < archiveRetry:
+		case tried && (prev.Result == "error" || prev.Result == "archived-retained") && now.Sub(prev.Time) < archiveRetry:
 			continue
 		case now.Sub(c.Time) < minAge:
 			continue
@@ -189,7 +201,7 @@ type archiveRow struct {
 	Action  string          `json:"action"`
 	Host    string          `json:"host"`
 	Job     string          `json:"job"`
-	Result  string          `json:"result"` // archived, would-archive, skipped, error
+	Result  string          `json:"result"` // archived, archived-retained, would-archive, skipped, error
 	Reason  string          `json:"reason,omitempty"`
 	Archive *archive.Result `json:"archive,omitempty"`
 }
@@ -269,6 +281,8 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Archive = res
 				if e != nil {
 					row.Result, row.Reason = archive.Reason(e)
+				} else if len(res.Retained) != 0 {
+					row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 				} else {
 					row.Result = "archived"
 				}
@@ -290,10 +304,11 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		Shadow    bool   `json:"shadow"`
 		OlderThan string `json:"older_than"`
 		Archived  int    `json:"archived"`
+		Retained  int    `json:"archived_retained"`
 		Planned   int    `json:"planned"`
 		Skipped   int    `json:"skipped"`
 		ErrCount  int    `json:"errors"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["would-archive"], counts["skipped"], len(errs)}
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs)}
 	return errors.Join(append(errs, s.Print(summary))...)
 }
 
