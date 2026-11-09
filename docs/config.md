@@ -364,8 +364,14 @@ A single PR's fetch failure never aborts the pass.
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
 unit. Directories containing a `.git` file or directory are named as
-`git-tracked` exclusions and none of their files are copied. Archiving runs these steps in order, and any failure keeps the
-local job dir and reports the step:
+`git-tracked` exclusions and none of their files are copied. The source job dir
+is deleted only when every nested checkout is verified clean and pushed at the
+delete boundary; otherwise the archive completes with result
+`archived-retained`, records each `retained: checkout-unsafe <dir> <reason>`,
+and keeps the whole source dir. Reasons are `dirty`, `stash`, `unpushed`, or
+`git-error`. A later run repeats the safety checks and deletes only after all
+checkouts pass. Ignored files do not make a checkout dirty. Archiving runs
+these steps in order:
 
 1. **Plan** (read-only): the jobs dir is resolved on its own host — a
    leading `~/` is expanded with that host's `$HOME`, since quoted paths
@@ -436,15 +442,23 @@ local job dir and reports the step:
    Reasons include `credential-path`, `git-tracked`, `secret-like:<pattern>`,
    `appledouble`, `oversized`, and `non-regular`. One hk note document per
    job (`archive/<task-id>/<job>`) contains counts, bytes, excluded names and
-   reasons, Drive path and manifest sha256. A short task comment names that
+   reasons, Drive path and manifest sha256. Unsafe checkouts add a
+   `retained` manifest entry and a matching `retained: checkout-unsafe <dir>
+   <reason>` line to the hk note and archive-job row. A short task comment names that
    document and Drive path. Replays after the published manifest resume only
-   the delete and do not rewrite either hk record.
+   the delete and do not rewrite either hk record unless the final checkout
+   safety check changes the retained state.
 6. **Manifest**: after both hk records succeed, `manifest.json` is written
    beside the files as the final publication marker; a failed record leaves
    no manifest and the job is retried.
-7. **Delete**: the job dir is listed again and must be unchanged — a file
-   added or modified since the plan was never archived, so the job is kept
-   as `job-changed` — including oversized files — then removed with `rm -rf`.
+7. **Delete**: the job dir is listed again and must be unchanged outside
+   nested checkouts — a file added or modified since the plan was never
+   archived, so the job is kept as `job-changed`, including oversized files.
+   Each checkout must also pass `git status --porcelain` (untracked files count,
+   ignored files do not), `git stash list`, and
+   `git rev-list --all --not --remotes`. Any command error or nonempty result
+   retains the entire source dir as `archived-retained`; otherwise it is
+   removed with `rm -rf`.
    Excluded credential and oversized files go with it; their names and sizes
    stay in the record.
 

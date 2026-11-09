@@ -158,6 +158,38 @@ func write(t *testing.T, p, body string) {
 	}
 }
 
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+func pushedCheckout(t *testing.T, dir string) {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	c := exec.Command("git", "init", "--bare", remote)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %v: %s", err, out)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c = exec.Command("git", "init", "-b", "main", dir)
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init checkout: %v: %s", err, out)
+	}
+	gitRun(t, dir, "config", "user.name", "Archive Test")
+	gitRun(t, dir, "config", "user.email", "archive-test@example.invalid")
+	write(t, filepath.Join(dir, "tracked.txt"), "tracked\n")
+	write(t, filepath.Join(dir, ".gitignore"), "ignored.tmp\n")
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "initial")
+	gitRun(t, dir, "remote", "add", "origin", remote)
+	gitRun(t, dir, "push", "-u", "origin", "main")
+}
+
 // job lays out a panewire-shaped job dir with credential-like files mixed in.
 func job(t *testing.T, jobs, name string) string {
 	t.Helper()
@@ -254,11 +286,16 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	if p.Newest != newest.Unix() {
 		t.Fatalf("newest=%d, want excluded file time %d", p.Newest, newest.Unix())
 	}
-	e.run.failRm = true
-	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
-		t.Fatal("expected delete failure fixture")
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
-	e.run.failRm = false
+	if res.Deleted || len(res.Retained) != 2 || res.Retained[0].Reason != "git-error" || res.Retained[1].Reason != "git-error" {
+		t.Fatalf("unsafe checkout result=%+v", res)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("unsafe source not retained: %v", err)
+	}
 	for _, rel := range []string{"report.md", "events/00001-job.task_link.json", "events/00005-job.completed.json"} {
 		if _, err := os.Stat(filepath.Join(p.Dest, rel)); err != nil {
 			t.Fatalf("missing copied %s: %v", rel, err)
@@ -312,6 +349,93 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	}
 	if len(e.hk.Comments()) != 1 || len(e.hk.Documents()) != 1 {
 		t.Fatal("resume changed hk record")
+	}
+	res, err = a.Apply(context.Background(), plan, time.Now())
+	if err != nil || res.Deleted || len(res.Retained) != 2 {
+		t.Fatalf("unsafe resume=%+v err=%v", res, err)
+	}
+	if !strings.Contains(e.hk.Documents()["archive/2402/wk-layout-repro"].Body, "retained: checkout-unsafe wt git-error") {
+		t.Fatal("retention missing from hk doc")
+	}
+	if !strings.Contains(string(raw), `"reason": "git-error"`) {
+		t.Fatal("retention missing from manifest")
+	}
+}
+
+func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		mutate       func(*testing.T, string)
+	}{
+		{name: "modified", reason: "dirty", mutate: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "tracked.txt"), "changed\n") }},
+		{name: "untracked", reason: "dirty", mutate: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "new.txt"), "new\n") }},
+		{name: "stash", reason: "stash", mutate: func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "tracked.txt"), "changed\n")
+			gitRun(t, dir, "stash", "push", "-m", "test")
+		}},
+		{name: "unpushed", reason: "unpushed", mutate: func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "next.txt"), "next\n")
+			gitRun(t, dir, "add", ".")
+			gitRun(t, dir, "commit", "-m", "local")
+		}},
+		{name: "git-error", reason: "git-error", mutate: func(t *testing.T, dir string) {
+			os.RemoveAll(filepath.Join(dir, ".git"))
+			write(t, filepath.Join(dir, ".git"), "gitdir: missing\n")
+		}},
+		{name: "clean-pushed", mutate: func(t *testing.T, dir string) {}},
+		{name: "ignored-only", mutate: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "ignored.tmp"), "ignored\n") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setup(t)
+			dir := job(t, e.jobs, "wk-checkout-"+tc.name)
+			checkout := filepath.Join(dir, "wt")
+			pushedCheckout(t, checkout)
+			tc.mutate(t, checkout)
+			a := archiver(e, "")
+			p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := a.Apply(context.Background(), p, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.reason != "" {
+				if res.Deleted || len(res.Retained) != 1 || res.Retained[0] != (Retention{Path: "wt", Class: "checkout-unsafe", Reason: tc.reason}) {
+					t.Fatalf("result=%+v", res)
+				}
+				if _, err := os.Stat(dir); err != nil {
+					t.Fatalf("source not retained: %v", err)
+				}
+				var m manifest
+				b, err := os.ReadFile(filepath.Join(p.Dest, "manifest.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(b, &m); err != nil {
+					t.Fatal(err)
+				}
+				if len(m.Retained) != 1 || m.Retained[0].Class != "checkout-unsafe" || m.Retained[0].Reason != tc.reason {
+					t.Fatalf("manifest retained=%+v", m.Retained)
+				}
+				if !strings.Contains(e.hk.Documents()["archive/2402/"+filepath.Base(dir)].Body, "retained: checkout-unsafe wt "+tc.reason) {
+					t.Fatal("hk record lacks retention reason")
+				}
+				if tc.name == "modified" {
+					gitRun(t, checkout, "checkout", "--", "tracked.txt")
+					resume, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+					if err != nil || !resume.Resume {
+						t.Fatalf("safe resume plan=%+v err=%v", resume, err)
+					}
+					res, err = a.Apply(context.Background(), resume, time.Now())
+					if err != nil || !res.Deleted {
+						t.Fatalf("safe resume result=%+v err=%v", res, err)
+					}
+				}
+			} else if !res.Deleted || len(res.Retained) != 0 {
+				t.Fatalf("safe checkout result=%+v", res)
+			}
+		})
 	}
 }
 
@@ -468,8 +592,8 @@ func TestApplyKeepsOversizedContentChangedWithoutMetadataChange(t *testing.T) {
 
 func TestCommentBoundsBytesAndSignalsTruncation(t *testing.T) {
 	p := &Plan{Job: "wk-large", Task: "2402", Host: "h1", Dest: "/drive/archive", Dir: "/jobs/wk-large"}
-	note := comment(p, "manifest-sha")
-	if !strings.Contains(note, "archive/2402/wk-large") || !strings.Contains(note, "manifest-sha") {
+	note := comment(p)
+	if !strings.Contains(note, "archive/2402/wk-large") || !strings.Contains(note, p.Dest) {
 		t.Fatalf("comment=%s", note)
 	}
 }
@@ -786,7 +910,7 @@ func checkArchived(t *testing.T, e env, res *Result, dir string) {
 	}
 	note := e.comment(2402)
 	jobName := filepath.Base(res.Dest)
-	for _, want := range []string{res.Dest, "archive/2402/" + jobName, "manifest sha256: " + res.Manifest} {
+	for _, want := range []string{res.Dest, "archive/2402/" + jobName} {
 		if !strings.Contains(note, want) {
 			t.Errorf("hk comment lacks %q:\n%s", want, note)
 		}
@@ -916,6 +1040,45 @@ func TestArchiveClaimUsesExternalExpiringLocks(t *testing.T) {
 	release()
 	if _, err := os.Stat(lock); !os.IsNotExist(err) {
 		t.Fatalf("released lock remains: %v", err)
+	}
+}
+
+func TestArchiveStaleLockReclaimHasSingleWinner(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "race")
+	sum := sha256.Sum256([]byte(dest))
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sum))
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte("expired 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	type claimResult struct {
+		release func()
+		err     error
+	}
+	results := make(chan claimResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+			<-start
+			release, err := a.claim(context.Background(), dest)
+			results <- claimResult{release, err}
+		}()
+	}
+	close(start)
+	wins := 0
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err == nil {
+			wins++
+			result.release()
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("stale lock claim winners=%d, want exactly one", wins)
 	}
 }
 

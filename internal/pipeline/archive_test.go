@@ -285,6 +285,27 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "unsafe-checkout", 20*24*time.Hour)
+	writeFile(t, filepath.Join(dir, "wt", ".git"), "gitdir: missing\n")
+	old := time.Now().Add(-20 * 24 * time.Hour)
+	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, _ error) error { return os.Chtimes(p, old, old) })
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("unsafe source was removed: %v", err)
+	}
+	log, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), `"result":"archived-retained"`) || !strings.Contains(string(log), `retained: checkout-unsafe wt git-error`) {
+		t.Fatalf("retention row missing: %s", log)
+	}
+}
+
 func TestArchiveExcludesAndFinishedJobs(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.Exclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}

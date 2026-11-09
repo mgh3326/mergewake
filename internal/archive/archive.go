@@ -113,6 +113,7 @@ type Plan struct {
 	entries         []File
 	oversizedHashes map[string]string
 	textSnapshots   map[string][]byte
+	checkouts       []string
 	done            *manifest
 	doneRaw         []byte
 }
@@ -121,6 +122,12 @@ type Exclusion struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
 	Files  int    `json:"files,omitempty"`
+}
+
+type Retention struct {
+	Path   string `json:"path"`
+	Class  string `json:"class"`
+	Reason string `json:"reason"`
 }
 
 // Attachment is one handoffkeep attachment id and the job path it holds.
@@ -138,6 +145,7 @@ type Result struct {
 	Manifest    string       `json:"manifest_sha256"`
 	Attachments []Attachment `json:"attachments,omitempty"`
 	Excluded    []string     `json:"excluded,omitempty"`
+	Retained    []Retention  `json:"retained,omitempty"`
 	Deleted     bool         `json:"deleted"`
 }
 
@@ -336,7 +344,14 @@ case "$born" in ''|*[!0-9]*) echo busy; exit 0;; esac
 if [ "$((now-born))" -lt "$4" ]; then echo busy; exit 0; fi
 stale="$1.stale.$3"
 if ! mv "$1" "$stale" 2>/dev/null; then echo busy; exit 0; fi
-if acquire "$1"; then rm -rf "$stale"; echo acquired; else mv "$stale" "$1" 2>/dev/null; echo busy; fi`, "sh", lock, path.Join(a.DriveDir, ".locks"), owner, strconv.FormatInt(archiveLockTTL, 10))
+moved_owner=; moved_born=
+if [ -r "$stale/owner" ]; then read moved_owner moved_born < "$stale/owner"; fi
+if [ "$moved_owner" != "$old_owner" ] || [ "$moved_born" != "$born" ]; then
+  if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi
+  echo busy; exit 0
+fi
+if acquire "$1"; then rm -rf "$stale"; echo acquired
+else if [ ! -e "$1" ]; then mv "$stale" "$1" 2>/dev/null || true; else rm -rf "$stale"; fi; echo busy; fi`, "sh", lock, path.Join(a.DriveDir, ".locks"), owner, strconv.FormatInt(archiveLockTTL, 10))
 	if err != nil {
 		return nil, fmt.Errorf("claim archive destination: %w", err)
 	}
@@ -438,6 +453,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
 		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}, textSnapshots: map[string][]byte{}}
 	for checkout := range checkouts {
+		p.checkouts = append(p.checkouts, checkout)
 		count := 0
 		for _, f := range files {
 			if f.Path == checkout || strings.HasPrefix(f.Path, checkout+"/") {
@@ -446,6 +462,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		}
 		p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: checkout, Reason: "git-tracked", Files: count})
 	}
+	sort.Strings(p.checkouts)
 	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
 		if f.mtime > p.Newest {
@@ -692,6 +709,7 @@ type manifest struct {
 	ExcludedEntries []Exclusion `json:"excluded_entries,omitempty"`
 	Skipped         []string    `json:"skipped"`
 	AppleDouble     []string    `json:"appledouble"`
+	Retained        []Retention `json:"retained,omitempty"`
 }
 
 // commentFiles bounds the per-file sha256 list in the hk comment; the full
@@ -701,10 +719,9 @@ const maxHKCommentBytes = 64 << 10
 
 const commentTruncationNotice = "\n[comment details truncated; complete file lists are in manifest.json]\n"
 
-func comment(p *Plan, manifestSHA string) string {
+func comment(p *Plan) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/%s/%s\n", p.Job, p.Dest, p.Task, p.Job)
-	fmt.Fprintf(&b, "manifest sha256: %s\n", manifestSHA)
 	return boundComment(b.String())
 }
 
@@ -740,6 +757,79 @@ func snapshotSHA(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// checkoutSafety checks Git state immediately before source deletion.
+func (a *Archiver) checkoutSafety(ctx context.Context, p *Plan) ([]Retention, error) {
+	var retained []Retention
+	for _, checkout := range p.checkouts {
+		dir := path.Join(p.Dir, checkout)
+		b, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `
+set -eu
+git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { echo git-error; exit 0; }
+status=$(git -C "$1" status --porcelain 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$status" ] || { echo dirty; exit 0; }
+stash=$(git -C "$1" stash list 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$stash" ] || { echo stash; exit 0; }
+unpushed=$(git -C "$1" rev-list --all --not --remotes 2>/dev/null) || { echo git-error; exit 0; }
+[ -z "$unpushed" ] || { echo unpushed; exit 0; }
+echo safe
+`, "sh", dir)
+		reason := strings.TrimSpace(string(b))
+		if err != nil || (reason != "safe" && reason != "dirty" && reason != "stash" && reason != "unpushed" && reason != "git-error") {
+			reason = "git-error"
+		}
+		if reason != "safe" {
+			retained = append(retained, Retention{Path: checkout, Class: "checkout-unsafe", Reason: reason})
+		}
+	}
+	return retained, nil
+}
+
+func sameRetained(a, b []Retention) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Archiver) publish(ctx context.Context, p *Plan, m *manifest, addComment bool) (string, error) {
+	mb, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	mb = append(mb, '\n')
+	sum := sha256.Sum256(mb)
+	manifestSHA := hex.EncodeToString(sum[:])
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "job: %s\ntask: %s\ndrive_dir: %s\nmanifest_sha256: %s\nfiles: %d\ntotal_bytes: %d\nexcluded (%d):\n", p.Job, p.Task, p.Dest, manifestSHA, len(m.Files), m.TotalBytes, len(m.ExcludedEntries))
+	for _, x := range m.ExcludedEntries {
+		fmt.Fprintf(&summary, "- %s %s", x.Path, x.Reason)
+		if x.Files > 0 {
+			fmt.Fprintf(&summary, " files=%d", x.Files)
+		}
+		summary.WriteByte('\n')
+	}
+	for _, x := range m.Retained {
+		fmt.Fprintf(&summary, "retained: checkout-unsafe %s %s\n", x.Path, x.Reason)
+	}
+	if err := (integrations.Handoffkeep{}).Record(ctx, "archive/"+p.Task+"/"+p.Job, []byte(summary.String())); err != nil {
+		return "", fmt.Errorf("hk archive document: %w", err)
+	}
+	if addComment {
+		if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p)); err != nil {
+			return "", fmt.Errorf("hk comment: %w", err)
+		}
+	}
+	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", path.Join(p.Dest, "manifest.json"), p.Dest); err != nil {
+		return "", fmt.Errorf("write manifest: %w", err)
+	}
+	return manifestSHA, nil
+}
+
 func same(a, b []File) bool {
 	if len(a) != len(b) {
 		return false
@@ -750,6 +840,26 @@ func same(a, b []File) bool {
 		}
 	}
 	return true
+}
+
+func sameOutsideCheckouts(a, b []File, checkouts []string) bool {
+	filter := func(files []File) []File {
+		out := files[:0]
+		for _, f := range files {
+			excluded := false
+			for _, checkout := range checkouts {
+				if f.Path == checkout || strings.HasPrefix(f.Path, checkout+"/") {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	return same(filter(append([]File(nil), a...)), filter(append([]File(nil), b...)))
 }
 
 // Apply runs a plan under an exclusive destination claim: copy, verify, hk
@@ -821,36 +931,16 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		m.TotalBytes += f.Size
 	}
 
-	mb, err := json.MarshalIndent(m, "", "  ")
+	m.Retained, err = a.checkoutSafety(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	mb = append(mb, '\n')
-	manifestSum := sha256.Sum256(mb)
-	manifestSHA := hex.EncodeToString(manifestSum[:])
-	var summary strings.Builder
-	fmt.Fprintf(&summary, "job: %s\ntask: %s\ndrive_dir: %s\nmanifest_sha256: %s\nfiles: %d\ntotal_bytes: %d\nexcluded (%d):\n", p.Job, p.Task, p.Dest, manifestSHA, len(m.Files), m.TotalBytes, len(m.ExcludedEntries))
-	for _, x := range m.ExcludedEntries {
-		fmt.Fprintf(&summary, "- %s %s", x.Path, x.Reason)
-		if x.Files > 0 {
-			fmt.Fprintf(&summary, " files=%d", x.Files)
-		}
-		summary.WriteByte('\n')
+	manifestSHA, err := a.publish(ctx, p, &m, true)
+	if err != nil {
+		return nil, err
 	}
-	if err := (integrations.Handoffkeep{}).Record(ctx, "archive/"+p.Task+"/"+p.Job, []byte(summary.String())); err != nil {
-		return nil, fmt.Errorf("hk archive document: %w", err)
-	}
-	if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p, manifestSHA)); err != nil {
-		return nil, fmt.Errorf("hk comment: %w", err)
-	}
-	// Published last: Plan treats a dest holding manifest.json as archived
-	// and recorded, so a failed put or comment must leave none behind.
-	mpath := path.Join(p.Dest, "manifest.json")
-	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", mpath, p.Dest); err != nil {
-		return nil, fmt.Errorf("write manifest: %w", err)
-	}
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: manifestSHA, Excluded: p.Excluded}
-	return a.remove(ctx, p, res)
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: manifestSHA, Excluded: p.Excluded, Retained: m.Retained}
+	return a.remove(ctx, p, res, &m)
 }
 
 // resume finishes an archive whose Drive copy and hk record completed but
@@ -863,13 +953,13 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 		}
 	}
 	sum := sha256.Sum256(p.doneRaw)
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded}
-	return a.remove(ctx, p, res)
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
+	return a.remove(ctx, p, res, m)
 }
 
 // remove deletes the job dir only when a re-listing shows it unchanged: a
 // file written after the plan was never archived.
-func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, error) {
+func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest) (*Result, error) {
 	if _, err := a.jobDir(ctx, p.host.SSH, p.Dir); err != nil {
 		return res, err
 	}
@@ -899,8 +989,24 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result) (*Result, e
 	if err != nil {
 		return res, err
 	}
-	if !same(again, p.entries) {
+	if !sameOutsideCheckouts(again, p.entries, p.checkouts) {
 		return res, &Skip{"job-changed"}
+	}
+	retained, err := a.checkoutSafety(ctx, p)
+	if err != nil {
+		return res, err
+	}
+	if !sameRetained(retained, m.Retained) {
+		m.Retained = retained
+		sum, err := a.publish(ctx, p, m, false)
+		if err != nil {
+			return res, err
+		}
+		res.Manifest = sum
+		res.Retained = retained
+	}
+	if len(retained) != 0 {
+		return res, nil
 	}
 	// p.Dir is absolute (Jobs), so it can never be read as an rm option and
 	// no "--" is needed.
