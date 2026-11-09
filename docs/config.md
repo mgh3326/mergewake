@@ -908,8 +908,9 @@ The automatic flush at the end of each repo pass and after each land does not
 fail the pass when publication fails. It writes one `outcome-publish-error`
 audit row to the repo's `decisions.jsonl` (`repo`, `count` of failed outcomes,
 and `error` cut to 512 bytes of valid UTF-8), logs a warning, and keeps the
-outcomes in the outbox for the next flush. A ledger read or write failure
-still fails the pass. `mergewake outcomes sync` stays strict: it exits
+outcomes in the outbox for the next flush. A ledger read or write failure,
+or an `outcome-publish-error` row that cannot be written, still fails the
+pass. `mergewake outcomes sync` stays strict: it exits
 non-zero when any outcome fails to publish.
 
 ```sh

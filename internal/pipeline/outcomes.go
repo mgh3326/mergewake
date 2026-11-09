@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"regexp"
@@ -407,8 +408,9 @@ func outcomePublishDetail(msg string) string {
 // FlushOutcomes is the automatic flush at the end of a repo pass and after a
 // land. A publication failure does not fail the pass: it is audited as
 // outcome-publish-error and logged, and the outcomes stay in the outbox for
-// the next flush. A ledger or IO failure is still returned. The operator's
-// `mergewake outcomes sync` calls Ledger.Flush directly and stays strict.
+// the next flush. A ledger or IO failure, or an audit row that cannot be
+// written, is still returned. The operator's `mergewake outcomes sync` calls
+// Ledger.Flush directly and stays strict.
 func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	command := s.Config.Outcomes.Command
 	if command == "" {
@@ -426,6 +428,7 @@ func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
 	slog.Warn("outcome publish failed; retained in outbox", "repo", repo, "count", failed.Count, "error", detail)
 	if e := s.audit(repo, "outcome-publish-error", map[string]any{"repo": repo, "count": failed.Count, "error": detail}, false); e != nil {
 		slog.Warn("outcome-publish-error audit not written", "repo", repo, "error", e)
+		return fmt.Errorf("outcome-publish-error audit for %s: %w", repo, e)
 	}
 	return nil
 }
