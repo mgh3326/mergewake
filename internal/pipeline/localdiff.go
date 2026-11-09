@@ -76,11 +76,13 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 	if _, e := field("rev-parse", "--git-dir"); e != nil {
 		return diffResult{}, errors.New("repo root is not a git checkout")
 	}
-	baseRef := pr.Base.Ref
-	if baseRef == "" {
-		baseRef = pr.Base.SHA
+	// The same PR-head fetch the review checkout uses, branch fallback
+	// included; an empty base ref asks for the base commit instead.
+	fetch := pr
+	if fetch.Base.Ref == "" {
+		fetch.Base.Ref = pr.Base.SHA
 	}
-	if _, e := field("fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), baseRef); e != nil {
+	if e := s.fetchPRHead(ctx, root, r.Name, fetch); e != nil {
 		return diffResult{}, fmt.Errorf("fetch PR refs: %w", e)
 	}
 	have := func(sha string) bool {

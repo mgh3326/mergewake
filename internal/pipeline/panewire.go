@@ -462,7 +462,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// HEAD, or else from a refs/remotes/origin/<branch> that contains it, and
 		// FETCH_HEAD is neither. The leading "+" lets a force-pushed PR move the
 		// ref. fetchPRHead falls back to the branch when GitHub has no
-		// pull/<n>/head.
+		// pull/<n>/head, and only while the branch is at the exact head.
 		if e = s.fetchPRHead(ctx, root, x.repo.Name, pr); e != nil {
 			return skip("%v", e)
 		}
