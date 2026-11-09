@@ -262,7 +262,7 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 		}
 		job, sub, nested := strings.Cut(rel, "/")
 		if !nested {
-			if parts[0][0] == 'd' || parts[0][0] == 'l' {
+			if !strings.HasPrefix(job, ".") && (parts[0][0] == 'd' || parts[0][0] == 'l') {
 				kinds[job] = parts[0][0]
 			}
 			continue
@@ -270,7 +270,7 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 		if kinds[job] == 0 {
 			continue
 		}
-		if sub == "events" && parts[0][0] == 'd' {
+		if sub == "events" && (parts[0][0] == 'd' || parts[0][0] == 'l') {
 			events[job] = true
 		}
 		if parts[0][0] != 'd' {
