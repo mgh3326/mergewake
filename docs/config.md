@@ -484,9 +484,9 @@ needs no GitHub token.
 | `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
-| `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. |
+| `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. mergewake never reads those findings from there: they come back on the job record, or from the host through `panewire node job-result` (step 5). |
 | `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the reviewer pane is closed (only when its name, cwd and composer still match) and its remote detached worktree is removed through the hub's guarded removal; a refusal is recorded as `pending-cleanup`. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. A pane whose wait timed out is never closed here. |
-| `panewire.lane` | `panewire.owner` | panewire lane a pre-`--result` pane announces its findings attachment on (`--deliver inbox`), read with `<panewire> inbox list --lane <lane> --json`. Kept for one release as the fallback when the reviewer job record has no result or cannot be read; each use is counted by one `review-inbox-fallback` audit record with its `entry` and `source` (see the panewire executor's step 5). Prefer a lane dedicated to mergewake: hub policy may still deliver the event to an idle pane on that lane. Empty (and no owner): only a pane on this host can return findings through the fallback. |
+| `panewire.lane` | `panewire.owner` | Retired: findings are no longer read from a lane. The key is still accepted, so existing configs keep loading, and its value is still kept out of traces. mergewake lists and acknowledges no findings inbox, so findings events a pre-`--result` pane announced there stay as they are. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 | `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. |
 
@@ -554,31 +554,26 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    `escalated` or `lost` record (the receipt records the state), a still
    pending or missing record, and an unreadable hk all fail the pass — the last
    three after polling every 5s for up to 30s (at most half the remaining
-   deadline), an unreadable hk reporting reason `hk-unavailable`. A historical pane from before `runtug done --result` (runtug was replaced by panewire) has no result on its record, so the lane announcement + `handoffkeep attach get` (or, on this
-   host, `<jobs>/<label>/findings.json`) is still tried and each use is
-   counted: the receipt's `fallback` notes it and a
-   `review-inbox-fallback` audit record carries the running count. Every
-   pass whose result is taken from either legacy source writes exactly one
-   such record, on every entry point: `entry` names it
-   (`resumed-finished`: a resumed reviewer whose pane finished or whose
-   budget is spent; `resumed-hk-unreadable`: a resumed reviewer whose hk job
-   cannot be read; `completed-no-result`: a completed record without a
-   result whose host has none either; `record-outcome`: any other record
-   that answers without findings), `source` is `lane` or `file`, and `pr`,
-   `pass`, `label`, `record` and `count` are as before. Bytes read but beaten
-   by an hk or node result are not counted. Records before this change
-   (hk 3652) missed the `resumed-hk-unreadable` uses, so only a count taken
-   after it is complete. A use whose audit cannot be written — stdout fails,
-   or the record reaches stdout but its `decisions.jsonl` append fails —
-   still returns the legacy findings unchanged, and logs one
-   `review-inbox-fallback-audit-lost` line (JSON on the daemon's stderr,
-   with `repo`, `pr`, `pass`, `label`, `entry`, `source` and the redacted
-   `error`). The removal gate for the legacy path (unit 6-7b) is zero
-   `review-inbox-fallback` records **and** zero
-   `review-inbox-fallback-audit-lost` lines over N days counted from the
-   deploy of this change; a known outage of any capture (stdout,
-   `decisions.jsonl` or the stderr log) restarts the N days, since a lost
-   marker line is not detected. The
+   deadline), an unreadable hk reporting reason `hk-unavailable`.
+   Before a completed record without a result is lost, or a still pending
+   record fails the pass, the host the record names is read: `job.result`
+   through the hub, or `panewire node job-result` for this host, returns the
+   `findings.json` the pane wrote there, and a result found there is used
+   like a record's. An `escalated` or `lost` record is held as above, and a
+   missing record or an unreadable hk names no host. A resumed reviewer is
+   read the same way (`reviewer_job.go`): a finished or overdue reviewer's
+   record is read again and then its host, and a reviewer hk cannot read is
+   looked for on the host its spawn receipt names. Nothing else is read. Findings left only in
+   mergewake's own `<jobs>/<label>/findings.json`, or announced on a
+   findings lane by a pane from before `panewire done --result`, are
+   ignored: no findings inbox is listed or acknowledged and no attachment is
+   fetched. A host read that the review deadline cuts short keeps the
+   reviewer for the next run, and so does any read of a resumed reviewer's
+   hk record or host that a cancelled or expired run cuts short: such a run
+   returns the context error and sends no lost notice, schedules no wait,
+   nudges nothing and replaces nothing. A completed record whose `result`
+   fails validation is a lost result, like one without a result; only a
+   run whose context has already ended skips it as rejected findings. The
    findings go through validation (new-side
    diff lines, severities, at most 50) and are posted with the same receipt,
    claim and done marker. The receipt adds `"executor":"panewire"`, the
@@ -599,10 +594,25 @@ so spawns a new reviewer pane, and escalates once after
 `daemon.pr.review_retry.failures` failures. A pane cut off by `review.timeout`
 records `review_deadline` instead, and a completed reviewer whose result was
 lost records `review-result-lost` and notifies the desk; both are retried the
-same way. Before that, a reviewer whose pane is idle or done with no result is
-nudged once to write its two files (`reviewer-nudge`), and gets two minutes
-to do so (`reviewer-nudge-outcome`), if the review budget still holds them. The receipt's `executor` is always `panewire`, and its `fallback`
-carries only the panewire seat or return-path note from steps 3 and 5.
+same way, with one difference: a lost result is mergewake's collection
+failure, not the review's, so its retries back off without counting toward
+the escalation. A fresh pass whose completed record has no result, on the
+record or its host, is lost at once; a resumed one is replaced once by a new
+reviewer, and only a lost replacement fails the pass. A pass that fails
+because its record answered without findings (no record, `hk-unavailable`,
+a state that is not terminal) is a skip, counted like any other. A
+resumed reviewer whose record is still open (not terminal) and whose pane
+is idle or done with no result is not lost before it is nudged once to
+write its two files and run `panewire done --result` (`reviewer-nudge`) and
+has had two minutes to do so (`reviewer-nudge-outcome`), if the review
+budget still holds them. Files it writes count only once its record or its
+host returns them. The wait holds only an open record: a nudged reviewer
+whose record becomes completed without a result, even inside the two
+minutes, is read on its host and, without the result there, lost and
+replaced once like any completed reviewer without a result, with no second
+nudge. The receipt's
+`executor` is always `panewire`, and its `fallback` carries only the
+worker-seat note from step 3.
 
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles`, `review.pairings`, `review.select` or `review.quota`
@@ -893,9 +903,8 @@ mergewake's own HTTP calls to hk authenticate as the hk client
   sink's task read for the lane, `refs.job_id`, title, priority and state
   (`GET /v1/tasks/<id>`), the recovery comment and reopen
   (`POST /v1/tasks/<id>/comments`, `POST /v1/tasks/<id>/reopen`), structured
-  reports (`PUT /v1/documents/<key>`), the large review brief upload and the
-  findings attachment read (`PUT /v1/attachments`,
-  `GET /v1/attachments/<sha256>`), the job archive's attachment uploads
+  reports (`PUT /v1/documents/<key>`), the large review brief upload
+  (`PUT /v1/attachments`), the job archive's attachment uploads
   and task comment, and the deploy approval's task read and record-only
   decision request (`POST /v1/tasks/<id>/decision-request`, which opens no
   Linear issue).
@@ -916,11 +925,9 @@ its answer, see [deploy-approval.md](deploy-approval.md#lookup-by-request-id).
 large review brief's prompt still tells the reviewer to run
 `<sink.command> attach get` on its own host.
 
-An attachment read returns at most 4 MiB, the cap the CLI path's captured
-output had; a larger findings attachment fails the read. mergewake sets no
-upload cap of its own: hk refuses an attachment over `HK_ATTACH_MAX_BYTES`
-(default 50 MiB) with `attachment_too_large`, a comment over 64 KiB and a
-document over 512 KiB.
+mergewake reads no attachment and sets no upload cap of its own: hk refuses
+an attachment over `HK_ATTACH_MAX_BYTES` (default 50 MiB) with
+`attachment_too_large`, a comment over 64 KiB and a document over 512 KiB.
 
 The daemon gets the variables from the unit's `EnvironmentFile`. On oci the
 unit does not load `~/.config/mergewake/environment` (the file does not exist

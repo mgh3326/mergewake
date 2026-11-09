@@ -508,7 +508,12 @@ func (g *fakeGH) CheckEvidence(ctx context.Context, _, sha string, required []st
 
 type fakeSink struct{ records, reopens int }
 
-type reviewSink struct{ *fakeSink }
+// reviewSink is a task sink for reviews: its task title carries the T
+// marker, and its job records are what the fake panes publish (paneRecords).
+type reviewSink struct {
+	*fakeSink
+	paneRecords
+}
 
 func (s *reviewSink) TaskJob(context.Context, string) (string, string, error) {
 	return "", "fixture (grade B, T2)", nil
@@ -637,7 +642,7 @@ func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Re
 func reviewSetup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Repo) {
 	s, g, sink, n, r := setup(t)
 	g.fixtureTask = true
-	s.Sink = &reviewSink{sink}
+	s.Sink = &reviewSink{sink, paneRecords{s}}
 	return s, g, sink, n, r
 }
 

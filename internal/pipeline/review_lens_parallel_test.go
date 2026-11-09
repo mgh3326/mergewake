@@ -185,7 +185,7 @@ func TestSingleLensPostIsUnchanged(t *testing.T) {
 	if gate.peak != 1 || len(runner.pane.spawns) != 1 || g.postCount != 1 {
 		t.Fatalf("peak %d spawns %d posts %d", gate.peak, len(runner.pane.spawns), g.postCount)
 	}
-	want := github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "anthropic", Executor: "panewire", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1}
+	want := github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "anthropic", Executor: "panewire", Round: 1}
 	got := g.passes[shaA][0]
 	got.Patch, got.DiffSource = "", ""
 	if got != want {

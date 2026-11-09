@@ -105,6 +105,7 @@ func (h *fakeHK) received() []integrations.TaskEvent {
 // hkSink is the test sink with the real hk task-event client.
 type hkSink struct {
 	fakeSink
+	paneRecords
 	hk integrations.Handoffkeep
 }
 
@@ -143,7 +144,7 @@ func hkSetup(t *testing.T) (*Service, *fakeGH, *fakeHK, config.Repo) {
 	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test-token")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
-	s.Sink = &hkSink{hk: integrations.Handoffkeep{Runner: s.Runner, Command: "handoffkeep", EventAttempts: 3, EventBackoff: time.Millisecond, EventTimeout: 200 * time.Millisecond}}
+	s.Sink = &hkSink{paneRecords: paneRecords{s}, hk: integrations.Handoffkeep{Runner: s.Runner, Command: "handoffkeep", EventAttempts: 3, EventBackoff: time.Millisecond, EventTimeout: 200 * time.Millisecond}}
 	g.pull.Body = "Change.\n\nMergewake-Task: 2909\n"
 	g.pull.CreatedAt = time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
 	return s, g, hk, r

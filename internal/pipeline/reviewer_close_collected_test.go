@@ -2,9 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -29,9 +28,10 @@ func collectedClosedOnce(t *testing.T, runner *panewireRunner, label string) {
 	}
 }
 
-// fileCollected is a resumed reviewer whose hk job is in a given state and
-// whose findings are only in its job-dir file: the fallback collection path.
-type fileCollected struct {
+// nodeCollected is a resumed reviewer whose pane is done, whose hk job is in a
+// given state, and whose findings are on its host: a nonterminal job's result
+// is read there (job.result), a completed one's from its record.
+type nodeCollected struct {
 	s      *Service
 	g      *fakeGH
 	r      config.Repo
@@ -39,36 +39,35 @@ type fileCollected struct {
 	old    reviewerJob
 }
 
-func collectFromFile(t *testing.T, state string) fileCollected {
+func collectFromNode(t *testing.T, state string) nodeCollected {
 	t.Helper()
 	s, g, r, runner, _ := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
-	runner.sink.jobs[old.Label] = integrations.JobRecord{State: state, OwnerLane: "owner"}
-	dir := filepath.Join(s.Config.Review.Panewire.Jobs, old.Label)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
+	hub := budgetPane(t, s, runner, old, "done")
+	findings := `{"findings":[{"path":"tool","line":1,"body":"Found on the host","severity":"high"}]}`
+	hub.jobResult = json.RawMessage(`{"found":true,"findings":` + findings + `}`)
+	job := integrations.JobRecord{State: state, OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
+	if terminalJob(state) {
+		job.Result = json.RawMessage(findings)
 	}
-	findings := `{"findings":[{"path":"tool","line":1,"body":"Found locally","severity":"high"}]}`
-	if err := os.WriteFile(filepath.Join(dir, "findings.json"), []byte(findings), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return fileCollected{s, g, r, runner, old}
+	runner.sink.jobs[old.Label] = job
+	return nodeCollected{s, g, r, runner, old}
 }
 
-func (f fileCollected) review(t *testing.T) {
+func (f nodeCollected) review(t *testing.T) {
 	t.Helper()
 	if err := f.s.Review(context.Background(), f.r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.g.postedFindings) != 1 || f.g.postedFindings[0].Body != "Found locally" {
+	if len(f.g.postedFindings) != 1 || f.g.postedFindings[0].Body != "Found on the host" {
 		t.Fatalf("posted=%+v", f.g.postedFindings)
 	}
 }
 
-// (a) Findings collected from the job-dir file while the hk job is still
+// (a) Findings collected from the reviewer's host while the hk job is still
 // spawned close that job as completed, once.
 func TestCollectedFindingsCloseSpawnedJob(t *testing.T) {
-	f := collectFromFile(t, "spawned")
+	f := collectFromNode(t, "spawned")
 	f.review(t)
 	collectedClosedOnce(t, f.runner, f.old.Label)
 	if rows := auditRows(t, f.s, f.r, "reviewer-close-skipped"); len(rows) != 0 {
@@ -76,9 +75,9 @@ func TestCollectedFindingsCloseSpawnedJob(t *testing.T) {
 	}
 }
 
-// (b) A job that already ended is not closed again.
+// (b) A job that already ended, its result on its record, is not closed again.
 func TestCollectedFindingsLeaveCompletedJobAlone(t *testing.T) {
-	f := collectFromFile(t, "completed")
+	f := collectFromNode(t, "completed")
 	f.review(t)
 	if len(f.runner.closes) != 0 {
 		t.Fatalf("closes=%v", f.runner.closes)
@@ -87,7 +86,7 @@ func TestCollectedFindingsLeaveCompletedJobAlone(t *testing.T) {
 
 // (c) A close that fails is audited and the pass still posts its findings.
 func TestCollectedFindingsCloseFailureIsAudited(t *testing.T) {
-	f := collectFromFile(t, "spawned")
+	f := collectFromNode(t, "spawned")
 	f.runner.closeErrs = []error{panewireExit(1)}
 	f.review(t)
 	collectedClosedOnce(t, f.runner, f.old.Label)
@@ -145,7 +144,7 @@ func (w *auditOut) String() string {
 // aborts the pass: the collected findings are still posted, and the failure is
 // logged once with the reviewer's label and a reason.
 func TestCollectedCloseFailureAndDeadAuditKeepFindings(t *testing.T) {
-	f := collectFromFile(t, "spawned")
+	f := collectFromNode(t, "spawned")
 	out := &auditOut{fail: "reviewer-close-skipped"}
 	f.s.Out = out
 	f.runner.closeErrs = []error{panewireExit(1)}
@@ -160,7 +159,7 @@ func TestCollectedCloseFailureAndDeadAuditKeepFindings(t *testing.T) {
 // (f) A review context that is already past its deadline does not skip the
 // collected close: it runs on reportContext instead.
 func TestCollectedCloseRunsPastReviewDeadline(t *testing.T) {
-	f := collectFromFile(t, "spawned")
+	f := collectFromNode(t, "spawned")
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
 	defer cancel()
 	x := &panewireExecutor{s: f.s, repo: f.r, pr: f.g.pull}
@@ -172,7 +171,7 @@ func TestCollectedCloseRunsPastReviewDeadline(t *testing.T) {
 
 // (g) The success path is unchanged: one completed close and no failure line.
 func TestCollectedCloseSuccessUnchanged(t *testing.T) {
-	f := collectFromFile(t, "spawned")
+	f := collectFromNode(t, "spawned")
 	out := &auditOut{}
 	f.s.Out = out
 	f.review(t)

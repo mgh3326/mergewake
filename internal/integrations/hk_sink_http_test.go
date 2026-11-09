@@ -53,7 +53,6 @@ func hkTask(id int64, state, lane, title string, priority int, refs string) stri
 func TestHKSinkCallsGoOverHTTPWithSvcToken(t *testing.T) {
 	hk := hktest.New(t)
 	hk.SetTask(42, hkTask(42, "merged", "mergewake-design", "Fix the watch (grade B, T2)", 2, `{"job_id":"wk-3549-a"}`))
-	findings := hk.SetAttachment("findings.json", "application/json", []byte(`{"findings":[]}`))
 	brief := filepath.Join(t.TempDir(), "review-brief.md")
 	briefBody := []byte(strings.Repeat("complete brief\n", 5000))
 	if e := os.WriteFile(brief, briefBody, 0o600); e != nil {
@@ -77,9 +76,6 @@ func TestHKSinkCallsGoOverHTTPWithSvcToken(t *testing.T) {
 	if e := h.Reopen(ctx, "42", "CI red on main"); e != nil {
 		t.Fatalf("Reopen: %v", e)
 	}
-	if b, e := h.Attachment(ctx, findings); e != nil || string(b) != `{"findings":[]}` {
-		t.Fatalf("Attachment = %q %v", b, e)
-	}
 	id, e := h.PutAttachment(ctx, brief)
 	if sum := sha256.Sum256(briefBody); e != nil || id != hex.EncodeToString(sum[:]) {
 		t.Fatalf("PutAttachment = %q %v", id, e)
@@ -99,7 +95,6 @@ func TestHKSinkCallsGoOverHTTPWithSvcToken(t *testing.T) {
 		"GET /v1/tasks/42":                                 5, // Lane, TaskBody, TaskJob, TaskPriority, Reopen's read
 		"POST /v1/tasks/42/comments":                       1,
 		"POST /v1/tasks/42/reopen":                         1,
-		"GET /v1/attachments/" + findings:                  1,
 		"PUT /v1/attachments":                              1,
 		"PUT /v1/documents/mergewake%2Fhost-a%2Frollout-1": 1,
 	}
@@ -136,14 +131,12 @@ func TestHKSinkUnconfiguredRunsNoSubprocess(t *testing.T) {
 	r := noCLI(t)
 	h := Handoffkeep{Runner: r, Command: "handoffkeep"}
 	ctx := context.Background()
-	sha := strings.Repeat("ab", 32)
 	for name, call := range map[string]func() error{
 		"Lane":          func() error { _, e := h.Lane(ctx, "42"); return e },
 		"TaskBody":      func() error { _, e := h.TaskBody(ctx, "42"); return e },
 		"TaskJob":       func() error { _, _, e := h.TaskJob(ctx, "42"); return e },
 		"TaskPriority":  func() error { _, e := h.TaskPriority(ctx, "42"); return e },
 		"Reopen":        func() error { return h.Reopen(ctx, "42", "reason") },
-		"Attachment":    func() error { _, e := h.Attachment(ctx, sha); return e },
 		"PutAttachment": func() error { _, e := h.PutAttachment(ctx, brief); return e },
 		"Record":        func() error { return h.Record(ctx, "mergewake/k", []byte("{}")) },
 	} {
@@ -208,9 +201,9 @@ func TestHKSinkCLIHTTPParity(t *testing.T) {
 }
 
 // Attachment ids and bytes are the CLI's: `attach put` printed the stored
-// sha256 (cliUploadSHA parses that output) and `attach get` the bytes.
+// sha256 (cliUploadSHA parses that output), and hk stores the bytes as given.
 func TestHKSinkAttachmentParity(t *testing.T) {
-	hktest.New(t)
+	hk := hktest.New(t)
 	h := Handoffkeep{Runner: noCLI(t), Command: "handoffkeep"}
 	ctx := context.Background()
 	body := []byte("# findings\n\nbody with ünïcode\n")
@@ -227,13 +220,12 @@ func TestHKSinkAttachmentParity(t *testing.T) {
 	if want, we := cliUploadSHA(cliOut); we != nil || id != want {
 		t.Fatalf("sha: http %q, cli %q %v", id, want, we)
 	}
-	got, e := h.Attachment(ctx, id)
-	if e != nil || !bytes.Equal(got, body) {
-		t.Fatalf("bytes: %q %v", got, e)
+	if got := hk.Attachments()[id]; !bytes.Equal(got.Body, body) {
+		t.Fatalf("bytes: %q", got.Body)
 	}
 }
 
-// Not found stays an error: an unknown task or attachment fails the call.
+// Not found stays an error: an unknown task fails the call.
 func TestHKSinkNotFoundIsError(t *testing.T) {
 	hk := hktest.New(t)
 	h := Handoffkeep{Runner: noCLI(t), Command: "handoffkeep"}
@@ -244,7 +236,6 @@ func TestHKSinkNotFoundIsError(t *testing.T) {
 		"TaskJob":      func() error { _, _, e := h.TaskJob(ctx, "7"); return e },
 		"TaskPriority": func() error { _, e := h.TaskPriority(ctx, "7"); return e },
 		"Reopen":       func() error { return h.Reopen(ctx, "7", "reason") },
-		"Attachment":   func() error { _, e := h.Attachment(ctx, strings.Repeat("cd", 32)); return e },
 	} {
 		if e := call(); e == nil || !strings.Contains(e.Error(), "not_found") {
 			t.Errorf("%s: err = %v, want a not_found error", name, e)
@@ -255,22 +246,12 @@ func TestHKSinkNotFoundIsError(t *testing.T) {
 	}
 }
 
-// Attachment size limits stay as with the CLI (contract point 5): a read is
-// capped at the 4 MiB the CLI's captured stdout was (Exec), an upload has no
-// mergewake cap and is refused only by hk's own attachment_too_large.
+// Attachment size limits stay as with the CLI (contract point 5): an upload
+// has no mergewake cap and is refused only by hk's own attachment_too_large.
 func TestHKSinkAttachmentLimits(t *testing.T) {
 	hk := hktest.New(t)
 	h := Handoffkeep{Runner: noCLI(t), Command: "handoffkeep"}
 	ctx := context.Background()
-	atCap := hk.SetAttachment("at-cap.json", "application/json", bytes.Repeat([]byte("a"), 4<<20))
-	overCap := hk.SetAttachment("over-cap.json", "application/json", bytes.Repeat([]byte("b"), 4<<20+1))
-	if b, e := h.Attachment(ctx, atCap); e != nil || len(b) != 4<<20 {
-		t.Fatalf("4 MiB read: %d bytes, %v", len(b), e)
-	}
-	if b, e := h.Attachment(ctx, overCap); e == nil {
-		t.Fatalf("read over 4 MiB accepted: %d bytes", len(b))
-	}
-
 	dir := t.TempDir()
 	big := filepath.Join(dir, "big.md")
 	if e := os.WriteFile(big, bytes.Repeat([]byte("c"), 5<<20), 0o600); e != nil {
@@ -376,11 +357,6 @@ func TestHKSinkReopenOutcomes(t *testing.T) {
 		}
 		if _, e := h.Lane(ctx, "x"); e == nil {
 			t.Fatal("invalid task accepted")
-		}
-		for _, bad := range []string{"", "-o", strings.Repeat("AB", 32), strings.Repeat("ab", 32) + "0"} {
-			if _, e := h.Attachment(ctx, bad); e == nil {
-				t.Fatalf("attachment id %q accepted", bad)
-			}
 		}
 		if len(hk.Requests()) != 0 {
 			t.Fatalf("requests = %d", len(hk.Requests()))

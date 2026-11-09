@@ -213,6 +213,7 @@ func (l *eventLog) snapshot() []string {
 
 // blockingRunner holds each fake panewire spawn until released.
 type blockingRunner struct {
+	results  *paneResults // where a returning pane publishes its findings
 	trace    *eventLog
 	release  chan struct{}
 	mu       sync.Mutex
@@ -255,6 +256,7 @@ func (b *blockingRunner) Run(ctx context.Context, command string, args []string,
 	if err := os.WriteFile(filepath.Join(filepath.Dir(args[i+1]), "findings.json"), []byte(`{"findings":[]}`), 0600); err != nil {
 		return nil, err
 	}
+	b.results.publish(args, `{"findings":[]}`)
 	b.trace.add("reviewed " + pr)
 	b.mu.Lock()
 	b.inFlight--
@@ -311,19 +313,68 @@ func (n recordingNotifier) Notify(_ context.Context, e integrations.Event) error
 }
 
 type parallelFixture struct {
-	hub    *reviewHub
-	s      *pipeline.Service
-	gh     *github.Client
-	repo   config.Repo
-	runner *blockingRunner
-	trace  *eventLog
-	out    *bytes.Buffer
+	results *paneResults
+	hub     *reviewHub
+	s       *pipeline.Service
+	gh      *github.Client
+	repo    config.Repo
+	runner  *blockingRunner
+	trace   *eventLog
+	out     *bytes.Buffer
 }
 
 type parallelSink struct{ integrations.Noop }
 
 func (parallelSink) TaskJob(context.Context, string) (string, string, error) {
 	return "", "fixture (grade B, T2)", nil
+}
+
+// paneResults stands for hk's job records of the fixture's reviewers: a fake
+// pane whose spawn waited for it publishes its findings under its label, as
+// `panewire done --result` stores them as the job record's result.
+type paneResults struct{ m sync.Map }
+
+func (p *paneResults) publish(args []string, findings string) {
+	if p == nil || !slices.Contains(args, "--wait") {
+		return
+	}
+	if i := slices.Index(args, "-l"); i >= 0 && i+1 < len(args) {
+		p.m.Store(args[i+1], findings)
+	}
+}
+
+// resultSink is parallelSink with the job records its fixture's panes
+// publish. Its reviews still wait for their reviewers within the pass
+// (boundedWait): the engine schedules no revisit for it, as for a sink that
+// reads no job records.
+type resultSink struct {
+	parallelSink
+	results *paneResults
+}
+
+func (s resultSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+	if s.results != nil {
+		if v, ok := s.results.m.Load(id); ok {
+			return integrations.JobRecord{State: "completed", Result: json.RawMessage(v.(string))}, nil
+		}
+	}
+	return integrations.JobRecord{}, integrations.ErrJobNotFound
+}
+
+func (resultSink) boundedWait() {}
+
+// boundedWaitSink is a fixture sink whose reviews wait for their reviewers
+// although it answers job records.
+type boundedWaitSink interface{ boundedWait() }
+
+func init() {
+	watches := watchesReviewers
+	watchesReviewers = func(sink integrations.Sink) bool {
+		if _, ok := sink.(boundedWaitSink); ok {
+			return false
+		}
+		return watches(sink)
+	}
 }
 
 // fixtureJob is the hk job the fixture task binds to: the PR author's worker
@@ -368,10 +419,11 @@ func newParallelFixtureForRepo(t *testing.T, prs, parallel int, name string) *pa
 	gh := github.New("")
 	gh.BaseURL = srv.URL
 	gh.Stderr = io.Discard
-	runner := &blockingRunner{trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
+	results := &paneResults{}
+	runner := &blockingRunner{results: results, trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: parallelSink{}, Notifier: recordingNotifier{trace}, Out: out}
-	return &parallelFixture{hub: hub, s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: resultSink{results: results}, Notifier: recordingNotifier{trace}, Out: out}
+	return &parallelFixture{results: results, hub: hub, s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
 func (f *parallelFixture) poll(ctx context.Context) chan error {

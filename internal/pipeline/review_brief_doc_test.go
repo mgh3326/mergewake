@@ -400,19 +400,20 @@ func TestReviewBriefDocResumedReplayKeepsRecordedArgs(t *testing.T) {
 	}
 }
 
-// Contract (e): with the brief in hk, a same-host reviewer that writes
-// cfg.Jobs/<label>/findings.json while its record carries no result is
-// still found by the legacy path, because the J= line still names that dir.
-func TestReviewBriefDocLegacyFindingsStillFoundInJobDir(t *testing.T) {
+// Contract (e): with the brief in hk, the J= line still names the job dir a
+// same-host reviewer writes findings.json in, but a file left there while the
+// record carries no result is not read: with no host on the record the
+// result is lost, and the file's findings are never posted.
+func TestReviewBriefDocJobDirFindingsAreNotRead(t *testing.T) {
 	hk := hktest.New(t)
-	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	runner := &panewireRunner{findings: briefFindings, family: "openai", legacyOnly: true}
 	s, g, r := briefDocSetup(t, runner, hk)
+	s.Config.Notifier.Lane = "desk"
 	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai"}
-	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if len(runner.spawns) != 1 || g.postCount != 1 {
-		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	e := s.Review(context.Background(), r, 7, "", Options{})
+	var lost *reviewResultLost
+	if !errors.As(e, &lost) || len(runner.spawns) != 1 || g.postCount != 0 || len(g.passes[shaA]) != 0 {
+		t.Fatalf("err=%v spawns=%d posts=%d", e, len(runner.spawns), g.postCount)
 	}
 	sp := runner.spawns[0]
 	label := arg(sp, "-l")
@@ -426,8 +427,7 @@ func TestReviewBriefDocLegacyFindingsStillFoundInJobDir(t *testing.T) {
 	if !strings.Contains(hk.Documents()["review/"+label].Body, "J='"+jobDir+"'") {
 		t.Fatal("the brief's J= line no longer names the job dir")
 	}
-	got := g.passes[shaA]
-	if len(got) != 1 || !strings.Contains(got[0].Fallback, "legacy lane/file path") || got[0].Executor != "panewire" {
-		t.Fatalf("%+v", got)
+	if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label {
+		t.Fatalf("lost rows=%v", rows)
 	}
 }

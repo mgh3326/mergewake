@@ -323,6 +323,7 @@ func TestAdvisoryClaimIsIgnoredWithoutAContract(t *testing.T) {
 
 type bodySink struct {
 	fakeSink
+	paneRecords
 	body string
 }
 
@@ -340,7 +341,7 @@ func (b *bodySink) TaskBody(_ context.Context, task string) (string, error) {
 func TestContractComesFromTheLinkedTask(t *testing.T) {
 	s, g, run, r := roundSetup(t, nil, "", patchTwo, fsjson())
 	g.pull.Body = "no acceptance here\n\nMergewake-Task: 12\n"
-	s.Sink = &bodySink{body: "intro\n## Acceptance\n- exits 0 on success\n"}
+	s.Sink = &bodySink{paneRecords: paneRecords{s}, body: "intro\n## Acceptance\n- exits 0 on success\n"}
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}

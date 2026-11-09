@@ -34,6 +34,9 @@ func (e panewireExit) ExitCode() int { return int(e) }
 // panewire. A spawn writes the configured findings file and spawn receipt into
 // the job dir named by its brief path, unless refuse lists its role; a remote
 // spawn instead uploads the findings to sink and announces them on the inbox.
+// A spawn whose wait saw its pane finish also publishes the findings as its
+// hk record's result, as `panewire done --result` does (hkResults), unless
+// legacyOnly says the pane never ran it.
 type panewireRunner struct {
 	fakeRunner
 	paneMu sync.Mutex     // the passes of a head call the runner at once
@@ -43,6 +46,10 @@ type panewireRunner struct {
 	// refuseStderr, when set, is the stderr a refused spawn wrote.
 	refuseStderr string
 	findings     string // "" writes no findings file
+	// legacyOnly is a pane that left its findings only in the legacy places
+	// (the job-dir file, or a findings-lane announcement when remote is set)
+	// and never ran `panewire done --result`: its hk record gets no result.
+	legacyOnly bool
 	// byLabel overrides findings for the pass whose reviewer label contains the key.
 	byLabel      map[string]string
 	family       string
@@ -66,11 +73,15 @@ type panewireRunner struct {
 	acks         [][]string
 	late         int // inbox looks that still show nothing
 	looks        int
-	addFails     bool
-	realGit      bool   // run git for real (against a test repository)
-	gitFails     string // a git subcommand (such as "fetch") that exits 128
-	afterRun     func() // called once panewire returns
-	sink         *taskJobSink
+	// nodeResult answers `panewire node job-result` ({"found":false} when
+	// empty); nodeReads are the --job labels it was asked for.
+	nodeResult string
+	nodeReads  []string
+	addFails   bool
+	realGit    bool   // run git for real (against a test repository)
+	gitFails   string // a git subcommand (such as "fetch") that exits 128
+	afterRun   func() // called once panewire returns
+	sink       *taskJobSink
 	// hk serves a spawn whose brief is "-p hk:doc/<key>"; jobs is
 	// review.panewire.jobs, where such a spawn's same-host pane writes.
 	hk   *hktest.Server
@@ -88,6 +99,10 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "node" && args[1] == "job-result" {
+		r.nodeReads = append(r.nodeReads, arg(args, "--job"))
+		if r.nodeResult != "" {
+			return []byte(r.nodeResult), nil
+		}
 		return []byte(`{"found":false}`), nil
 	}
 	if command == "panewire" && len(args) > 1 && args[0] == "job" && args[1] == "close" {
@@ -173,6 +188,11 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 				findings = v
 			}
 		}
+		// The pane ran `panewire done --result` once its wait saw it finish:
+		// a placed-only spawn or a timed-out wait has not finished yet.
+		if findings != "" && !r.legacyOnly && !r.waitTimeout && slices.Contains(args, "--wait") {
+			hkResults.Store(job, findings)
+		}
 		switch {
 		case findings == "":
 		case r.remote != nil:
@@ -237,15 +257,53 @@ func (r *panewireRunner) spawnBrief(args []string) ([]byte, string, error) {
 	return b, filepath.Dir(p), e
 }
 
+// hkResults is the fake hk's half of `panewire done --result`: a fake pane
+// whose wait saw it finish stores its findings here under its job directory,
+// and a fake sink answers that reviewer's hk record as completed with them
+// (publishedRecord). A job directory is a test's own temporary directory, so
+// no test reads another's results.
+var hkResults sync.Map // job dir → findings
+
+// publishedRecord is the completed record a fake pane's `panewire done
+// --result` left for job id, a reviewer label under svc's review.panewire.jobs.
+func publishedRecord(svc *Service, id string) (integrations.JobRecord, bool) {
+	if svc == nil || id == "" {
+		return integrations.JobRecord{}, false
+	}
+	v, ok := hkResults.Load(filepath.Join(svc.Config.Review.Panewire.Jobs, id))
+	if !ok {
+		return integrations.JobRecord{}, false
+	}
+	return integrations.JobRecord{State: "completed", Result: json.RawMessage(v.(string))}, true
+}
+
+// paneRecords gives a fake sink hk job records: a reviewer whose fake pane
+// published a result reads as completed with it, and any other id as a sink
+// without job records reads (errJobRecords), as before the sink had them.
+type paneRecords struct{ svc *Service }
+
+func (p paneRecords) Job(_ context.Context, id string) (integrations.JobRecord, error) {
+	if rec, ok := publishedRecord(p.svc, id); ok {
+		return rec, nil
+	}
+	return integrations.JobRecord{}, errJobRecords
+}
+
 type taskJobSink struct {
 	fakeLaneSink
 	job, title string
 	files      map[string][]byte
 	jobs       map[string]integrations.JobRecord // per-id records
-	missing    *integrations.JobRecord           // record for any unlisted id
-	jobErr     error
-	gets       []string
-	uploadErr  error
+	// missing is the record of any unlisted id. A reviewer whose fake pane
+	// published a result is completed with it unless missing is terminal.
+	missing   *integrations.JobRecord
+	jobErr    error
+	gets      []string
+	uploadErr error
+	// svc is the service whose fake panes publish results (publishedRecord).
+	svc *Service
+	// attachmentReads counts the attachment reads of the retired findings lane.
+	attachmentReads int
 }
 
 func (s *taskJobSink) PutAttachment(_ context.Context, path string) (string, error) {
@@ -280,13 +338,27 @@ func (s *taskJobSink) Job(_ context.Context, id string) (integrations.JobRecord,
 	if rec, ok := s.jobs[id]; ok {
 		return rec, nil
 	}
+	if rec, ok := publishedRecord(s.svc, id); ok && (s.missing == nil || !terminalJob(s.missing.State)) {
+		if s.missing != nil {
+			// `panewire done --result` completes the record it finds.
+			done := *s.missing
+			done.State, done.Result = rec.State, rec.Result
+			rec = done
+		}
+		return rec, nil
+	}
 	if s.missing != nil {
 		return *s.missing, nil
 	}
 	return integrations.JobRecord{}, integrations.ErrJobNotFound
 }
 
+// Attachment is the read the retired findings lane made of an announced
+// attachment. No review reads one now; attachmentReads shows one that does.
 func (s *taskJobSink) Attachment(_ context.Context, sha string) ([]byte, error) {
+	fakeGHMu.Lock()
+	s.attachmentReads++
+	fakeGHMu.Unlock()
 	if b, ok := s.files[sha]; ok {
 		return b, nil
 	}
@@ -298,7 +370,7 @@ func panewireSetup(t *testing.T, runner *panewireRunner) (*Service, *fakeGH, con
 	s, g, _, _, r := setup(t)
 	g.fixtureTask = false
 	s.Runner = runner
-	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}, jobs: map[string]integrations.JobRecord{}}
+	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}, jobs: map[string]integrations.JobRecord{}, svc: s}
 	s.Sink = sink
 	runner.sink = sink
 	if runner.remote != nil {
@@ -374,7 +446,7 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	}
 	got := g.passes[shaA][0]
 	diff, _ := g.Diff(context.Background(), "", 0)
-	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", Executor: "panewire", Fallback: "findings returned through the legacy lane/file path (inbox fallback 1)", Round: 1, Patch: reviewPatchID(diff)}) {
+	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", Executor: "panewire", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
 	}
 }
@@ -523,34 +595,26 @@ func gitCalls(r *panewireRunner, root string) []string {
 	return out
 }
 
-// A pane on another host returns its findings on its hk job record. A pane
-// from before `panewire done --result` leaves a record without one and its
-// findings still arrive as an attachment announced on the findings lane:
-// mergewake fetches, validates and posts them through the legacy fallback,
-// counts the use and acknowledges the event.
-func TestPanewireRemotePaneReturnsFindingsByAttachment(t *testing.T) {
+// A pane on another host returns its findings on its hk job record, and
+// mergewake reads them there: no findings lane is listed, acknowledged or
+// fetched from. A pane that only announced its findings on the lane, with a
+// record completed without a result and nothing on its host, lost its
+// result: nothing is posted, and the loss is audited and announced.
+func TestPanewireRemotePaneReturnsFindingsOnRecord(t *testing.T) {
+	findings := `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`
 	for name, record := range map[string]integrations.JobRecord{
-		"record result":      {State: "completed", Family: "google", Result: json.RawMessage(`{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`)},
-		"legacy inbox reply": {State: "completed", Family: "google"},
+		"record result":          {State: "completed", Family: "google", Result: json.RawMessage(findings)},
+		"lane announcement only": {State: "completed", Family: "google"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			runner := &panewireRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`, family: "openai", remote: &taskJobSink{}}
+			runner := &panewireRunner{findings: findings, family: "openai", remote: &taskJobSink{}, legacyOnly: true}
 			s, g, r := panewireSetup(t, runner)
+			s.Config.Notifier.Lane = "desk"
 			s.Config.Review.Panewire.Lane = "review-desk"
 			s.Config.Review.Panewire.Command = "panewire"
 			s.Config.Review.Panewire.ExcludeHosts = []string{"slow-host", "other-host"}
 			runner.sink.missing = &record
-			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-				t.Fatal(e)
-			}
-			got := g.passes[shaA]
-			if runner.headless != 0 || len(got) != 1 || got[0].Executor != "panewire" || got[0].Reviewer != "panewire:seat-x" || g.postCount != 1 {
-				t.Fatalf("headless=%d %+v", runner.headless, got)
-			}
-			// The record's family wins over the guessed remote family.
-			if got[0].Family != "google" {
-				t.Fatalf("receipt family %+v", got[0])
-			}
+			e := s.Review(context.Background(), r, 7, "", Options{})
 			sp := runner.spawns[0]
 			if arg(sp, "--exclude-host") != "slow-host,other-host" {
 				t.Fatal(sp)
@@ -563,19 +627,29 @@ func TestPanewireRemotePaneReturnsFindingsByAttachment(t *testing.T) {
 			if strings.Contains(string(brief), "attach put") || strings.Contains(string(brief), "panewire emit") {
 				t.Fatalf("brief still teaches the lane return:\n%s", brief)
 			}
+			if runner.looks != 0 || len(runner.acks) != 0 || runner.sink.attachmentReads != 0 {
+				t.Fatalf("findings lane read: looks=%d acks=%v attachment reads=%d", runner.looks, runner.acks, runner.sink.attachmentReads)
+			}
+			got := g.passes[shaA]
 			if name == "record result" {
-				if runner.looks != 0 || s.inboxFallbacks != 0 || got[0].Fallback != "" {
-					t.Fatalf("looks=%d fallbacks=%d receipt=%+v", runner.looks, s.inboxFallbacks, got[0])
+				if e != nil || runner.headless != 0 || len(got) != 1 || got[0].Executor != "panewire" || got[0].Reviewer != "panewire:seat-x" || g.postCount != 1 {
+					t.Fatalf("err=%v headless=%d %+v", e, runner.headless, got)
+				}
+				// The record's family wins over the guessed remote family.
+				if got[0].Family != "google" || got[0].Fallback != "" {
+					t.Fatalf("receipt %+v", got[0])
 				}
 				return
 			}
-			// A malformed announcement ahead of the real one is consumed and
-			// skipped, and the fallback use is counted.
-			if len(runner.acks) != 2 || strings.Join(runner.acks[0], " ") != "inbox ack 8 --lane review-desk --json" || strings.Join(runner.acks[1], " ") != "inbox ack 9 --lane review-desk --json" {
-				t.Fatal(runner.acks)
+			var lost *reviewResultLost
+			if !errors.As(e, &lost) || lost.label != label || g.postCount != 0 || len(got) != 0 || g.refs[doneRef(7, shaA)] {
+				t.Fatalf("err=%v posts=%d passes=%+v", e, g.postCount, got)
 			}
-			if s.inboxFallbacks != 1 || !strings.Contains(got[0].Fallback, "inbox fallback 1") {
-				t.Fatalf("count=%d fallback=%q", s.inboxFallbacks, got[0].Fallback)
+			if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label {
+				t.Fatalf("lost rows=%v", rows)
+			}
+			if n := s.Notifier.(*fakeNotifier); n.count != 1 || !strings.Contains(n.events[0].Text, "result was lost") {
+				t.Fatalf("notices=%+v", n.events)
 			}
 		})
 	}
@@ -631,38 +705,45 @@ func TestPanewireDeletedForkFailsPass(t *testing.T) {
 	assertPanewirePassFailed(t, s, g, r, runner, e, "deleted fork")
 }
 
-// An announcement that trails panewire's completion is waited for.
-func TestPanewireWaitsForLateAnnouncement(t *testing.T) {
-	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", remote: &taskJobSink{}, late: 2}
+// A findings announcement that trails a completed record without a result is
+// not waited for: the lane is never read, and the result is lost at once.
+func TestPanewireLateAnnouncementIsNotAwaited(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", remote: &taskJobSink{}, late: 2, legacyOnly: true}
 	s, g, r := panewireSetup(t, runner)
+	s.Config.Notifier.Lane = "desk"
 	s.Config.Review.Panewire.Lane = "review-desk"
 	s.Config.Review.Panewire.Command = "panewire"
 	runner.sink.missing = &integrations.JobRecord{State: "completed"}
 	poll := findingsPoll
 	findingsGrace, findingsPoll = time.Minute, time.Millisecond
 	t.Cleanup(func() { findingsPoll = poll })
-	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if got := g.passes[shaA]; runner.looks != 3 || runner.headless != 0 || got[0].Executor != "panewire" {
-		t.Fatalf("looks=%d headless=%d %+v", runner.looks, runner.headless, got)
+	e := s.Review(context.Background(), r, 7, "", Options{})
+	var lost *reviewResultLost
+	if !errors.As(e, &lost) || runner.looks != 0 || len(runner.acks) != 0 || g.postCount != 0 || len(g.passes[shaA]) != 0 {
+		t.Fatalf("err=%v looks=%d acks=%v posts=%d", e, runner.looks, runner.acks, g.postCount)
 	}
 }
 
-// With a findings lane configured, a pane on this host that left only the
-// local file is still read; a lane that cannot be read falls back to it too.
-func TestPanewireLocalFindingsFileStillRead(t *testing.T) {
+// A pane on this host that left only the local findings file, with a findings
+// lane configured and readable or not, produced no result: the file is not
+// read, the lane is not listed, and the pass fails with its record's reason.
+func TestPanewireLocalFindingsFileIsIgnored(t *testing.T) {
 	for name, inboxErr := range map[string]error{"no event": nil, "inbox down": errors.New("hub unavailable")} {
 		t.Run(name, func(t *testing.T) {
-			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", inboxErr: inboxErr}
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", inboxErr: inboxErr, legacyOnly: true}
 			s, g, r := panewireSetup(t, runner)
 			s.Config.Review.Panewire.Lane = "review-desk"
 			s.Config.Review.Panewire.Command = "panewire"
-			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
-				t.Fatal(e)
+			e := s.Review(context.Background(), r, 7, "", Options{})
+			label := arg(runner.spawns[0], "-l")
+			if _, err := os.Stat(filepath.Join(s.Config.Review.Panewire.Jobs, label, "findings.json")); err != nil {
+				t.Fatalf("the pane wrote no local file: %v", err)
 			}
-			if got := g.passes[shaA]; runner.headless != 0 || len(got) != 1 || got[0].Executor != "panewire" || len(runner.acks) != 0 {
-				t.Fatalf("headless=%d %+v", runner.headless, got)
+			if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "no findings: job record no job record") {
+				t.Fatalf("err=%v", e)
+			}
+			if got := g.passes[shaA]; runner.headless != 0 || len(got) != 0 || g.postCount != 0 || runner.looks != 0 || len(runner.acks) != 0 {
+				t.Fatalf("headless=%d passes=%+v posts=%d looks=%d acks=%v", runner.headless, got, g.postCount, runner.looks, runner.acks)
 			}
 		})
 	}
@@ -820,8 +901,7 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 		"no task trailer":  {"Mergewake-Author-Family: openai\n", &panewireRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
 		"spawn refused":    {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
 		"refused twice":    {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
-		"no findings file": {"", &panewireRunner{}, "wrote no findings file"},
-		"findings invalid": {"", &panewireRunner{findings: `{"findings":[{"path":"other","line":9,"body":"x","severity":"urgent"}]}`}, "findings rejected"},
+		"no findings file": {"", &panewireRunner{}, "no findings: job record no job record"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, g, r := panewireSetup(t, tc.runner)
@@ -835,6 +915,65 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 				t.Fatalf("claims=%d", g.claimCount)
 			}
 		})
+	}
+}
+
+// invalidFindings is a result whose one finding has a severity no review
+// accepts.
+const invalidFindings = `{"findings":[{"path":"other","line":9,"body":"x","severity":"urgent"}]}`
+
+// A pane publishes its findings as the result of its completed hk record, so
+// a result that fails validation is a completed reviewer's lost result: a
+// typed lost result naming the validation error, its audit row, nothing
+// posted and no headless reviewer. It is not a skip.
+func TestPanewireInvalidRecordResultIsLost(t *testing.T) {
+	runner := &panewireRunner{findings: invalidFindings}
+	s, g, r := panewireSetup(t, runner)
+	e := s.Review(context.Background(), r, 7, "openai", Options{})
+	label := arg(runner.spawns[0], "-l")
+	var lost *reviewResultLost
+	if !errors.As(e, &lost) || lost.label != label || !strings.Contains(e.Error(), "invalid finding severity") || strings.Contains(e.Error(), "findings rejected") {
+		t.Fatalf("err=%v, want %s's lost result naming the invalid severity", e, label)
+	}
+	if runner.headless != 0 || g.postCount != 0 || g.refs[doneRef(7, shaA)] || len(g.passes[shaA]) != 0 {
+		t.Fatalf("headless=%d posts=%d refs=%v passes=%+v", runner.headless, g.postCount, g.refs, g.passes[shaA])
+	}
+	if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label || !strings.Contains(fmt.Sprint(rows[0]["collect_error"]), "invalid finding severity") {
+		t.Fatalf("lost rows=%v", rows)
+	}
+}
+
+// cancelOnRecordRead cancels the review as soon as a reviewer's hk record has
+// been read: the deadline runs out just after hk answers.
+type cancelOnRecordRead struct {
+	*taskJobSink
+	cancel context.CancelFunc
+}
+
+func (s cancelOnRecordRead) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
+	rec, err := s.taskJobSink.Job(ctx, id)
+	if strings.HasPrefix(id, "mwr-") {
+		s.cancel()
+	}
+	return rec, err
+}
+
+// The one path left to "findings rejected": an invalid record result read as
+// the review's context ends is a skip of the cut-short pass, not a lost
+// result, so no lost row or notice is written for a review that was stopped.
+func TestPanewireInvalidRecordResultAfterCancelIsRejected(t *testing.T) {
+	runner := &panewireRunner{findings: invalidFindings}
+	s, g, r := panewireSetup(t, runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Sink = cancelOnRecordRead{runner.sink, cancel}
+	e := s.Review(ctx, r, 7, "openai", Options{})
+	var lost *reviewResultLost
+	if !errors.Is(e, ErrReviewUnavailable) || !errors.Is(e, context.Canceled) || errors.As(e, &lost) || !strings.Contains(e.Error(), "findings rejected: invalid finding severity") {
+		t.Fatalf("err=%v, want the cancelled pass's findings-rejected skip", e)
+	}
+	if runner.headless != 0 || g.postCount != 0 || g.refs[doneRef(7, shaA)] || len(auditRows(t, s, r, "review-result-lost")) != 0 {
+		t.Fatalf("headless=%d posts=%d lost rows=%v", runner.headless, g.postCount, auditRows(t, s, r, "review-result-lost"))
 	}
 }
 
@@ -879,7 +1018,7 @@ func TestPanewirePassWithoutDeadlineUsesReviewTimeout(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	s.Config.Review.Timeout = "10m"
-	runner.sink.missing = &integrations.JobRecord{State: "completed"}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Result: json.RawMessage(`{"findings":[]}`)}
 	diff, _ := g.Diff(context.Background(), r.Name, 7)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, authorFamily: "anthropic"}
 	out, e := x.runPass(context.Background(), &passPlan{pass: 1, lens: "default"}, func() (string, bool, error) { return "lease", true, nil })

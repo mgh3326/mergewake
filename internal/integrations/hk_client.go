@@ -1,11 +1,9 @@
 package integrations
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -16,7 +14,7 @@ import (
 )
 
 // hkClientTimeout bounds one hk public-client call: a task read, comment or
-// reopen, an attachment upload or read, or a document write.
+// reopen, an attachment upload, or a document write.
 const hkClientTimeout = 30 * time.Second
 
 // hkClient returns mergewake's hk public client, built from hkJobEndpoint:
@@ -77,10 +75,6 @@ func (Handoffkeep) Comment(ctx context.Context, task, body string) error {
 	return e
 }
 
-// attachmentReadMax caps an attachment read at what the hk CLI path could
-// return: Exec keeps at most 4 MiB of a command's stdout.
-const attachmentReadMax = 4 << 20
-
 // UploadAttachment stores body in hk as an attachment named name and returns
 // its sha256. The MIME type is chosen as the hk CLI's `attach put` chooses
 // it, because hk's attachment allowlist judges it. mergewake sets no size
@@ -109,25 +103,4 @@ func attachmentMIME(name string, body []byte) string {
 		return m
 	}
 	return http.DetectContentType(body)
-}
-
-// readAttachment reads one attachment's bytes, at most attachmentReadMax.
-func readAttachment(ctx context.Context, sha string) ([]byte, error) {
-	c, e := hkClient()
-	if e != nil {
-		return nil, e
-	}
-	_, body, e := c.GetAttachment(ctx, sha)
-	if e != nil {
-		return nil, e
-	}
-	defer body.Close()
-	var b bytes.Buffer
-	if _, e = io.Copy(&b, io.LimitReader(body, attachmentReadMax+1)); e != nil {
-		return nil, e
-	}
-	if b.Len() > attachmentReadMax {
-		return nil, fmt.Errorf("attachment exceeds the %d byte read limit", attachmentReadMax)
-	}
-	return b.Bytes(), nil
 }
