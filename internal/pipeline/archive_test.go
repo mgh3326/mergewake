@@ -180,7 +180,7 @@ func TestReapArchivesClosedJobOnceAndDeletesIt(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rows[0].Archive.Dest, ".env")); !os.IsNotExist(err) {
 		t.Fatal("credential file reached drive")
 	}
-	if c := f.comments(); len(c) != 1 || !strings.Contains(c[0], ".env") {
+	if c := f.comments(); len(c) != 1 || !strings.Contains(c[0], "archive/77/wk-7") {
 		t.Fatalf("hk comments = %q", c)
 	}
 	calls := f.hkCalls()

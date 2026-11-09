@@ -1,9 +1,9 @@
 // Package archive moves a finished panewire job directory off its session host.
 // The job's regular files are copied uncompressed into a locally synced Google
 // Drive folder on the archive host, every copy is verified by sha256 against
-// the source, a manifest.json is written beside them, the job's text files are
-// stored as handoffkeep attachments, and the job's hk task gets a comment that
-// records all of it. Only after every step succeeded, and a re-listing shows
+// the source, a manifest.json is written beside them, and an hk document records
+// its summary. No file bytes are sent to hk; the task gets a short comment.
+// Only after every step succeeded, and a re-listing shows
 // the job dir unchanged, is the local job dir deleted. Credential-like files
 // are never copied or uploaded; they are named in the record instead.
 package archive
@@ -28,6 +28,23 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
+
+// Secret patterns are pinned copies of handoffkeep@8673725 internal/guard/guard.go:20-41.
+// Keep hk as the single source of these patterns; archive reports only names.
+var secretPatterns = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9]{20,}\b`)},
+	{"anthropic_key", regexp.MustCompile(`\bsk-ant-(?:api03-)?[A-Za-z0-9]{20,}\b`)},
+	{"github_token", regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`)},
+	{"slack_token", regexp.MustCompile(`\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{20,}\b`)},
+	{"aws_access_key", regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`)},
+	{"private_key", regexp.MustCompile(`-----BEGIN`)},
+	{"bearer_token", regexp.MustCompile(`(?i)\bBearer [A-Za-z0-9._-]{20,}`)},
+	{"token_assignment", regexp.MustCompile(`(?m)\b[A-Z_]*(?:TOKEN|SECRET|KEY)=[^\s]{12,}`)},
+	{"github_fine_grained_token", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{82}\b`)},
+}
 
 // Skip is a refusal that keeps the local job dir: the reason is stable so a
 // receipt row can dedupe on it.
@@ -70,23 +87,24 @@ type File struct {
 
 // Plan is what archiving one job would do; it is printed as-is for dry runs.
 type Plan struct {
-	Action         string   `json:"action"`
-	Job            string   `json:"job"`
-	Host           string   `json:"host"`
-	Dir            string   `json:"dir"`
-	Task           string   `json:"task"`
-	Dest           string   `json:"drive_dir"`
-	Files          int      `json:"files"`
-	Bytes          int64    `json:"bytes"`
-	OversizedBytes int64    `json:"oversized_bytes"`
-	Oversized      []File   `json:"oversized"`
-	Move           []string `json:"move"`
-	Text           []string `json:"hk"`
-	Excluded       []string `json:"excluded"`
-	Skipped        []string `json:"skipped"`
-	AppleDouble    []string `json:"appledouble"`
-	Delete         string   `json:"delete"`
-	Newest         int64    `json:"newest_mtime"`
+	Action          string      `json:"action"`
+	Job             string      `json:"job"`
+	Host            string      `json:"host"`
+	Dir             string      `json:"dir"`
+	Task            string      `json:"task"`
+	Dest            string      `json:"drive_dir"`
+	Files           int         `json:"files"`
+	Bytes           int64       `json:"bytes"`
+	OversizedBytes  int64       `json:"oversized_bytes"`
+	Oversized       []File      `json:"oversized"`
+	Move            []string    `json:"move"`
+	Text            []string    `json:"hk"`
+	Excluded        []string    `json:"excluded"`
+	ExcludedEntries []Exclusion `json:"excluded_entries,omitempty"`
+	Skipped         []string    `json:"skipped"`
+	AppleDouble     []string    `json:"appledouble"`
+	Delete          string      `json:"delete"`
+	Newest          int64       `json:"newest_mtime"`
 	// Resume marks a job whose Drive copy and hk record already completed
 	// but whose local delete did not: applying it only deletes.
 	Resume          bool `json:"resume,omitempty"`
@@ -95,6 +113,12 @@ type Plan struct {
 	oversizedHashes map[string]string
 	done            *manifest
 	doneRaw         []byte
+}
+
+type Exclusion struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+	Files  int    `json:"files,omitempty"`
 }
 
 // Attachment is one handoffkeep attachment id and the job path it holds.
@@ -150,6 +174,41 @@ func Credential(p string) bool {
 func text(f File, max int64) bool {
 	ext := strings.ToLower(path.Ext(f.Path))
 	return f.kind == 'f' && (ext == ".md" || ext == ".json") && f.Size <= max
+}
+
+func secretPattern(b []byte) string {
+	for _, p := range secretPatterns {
+		if p.re.Match(b) {
+			return p.name
+		}
+	}
+	return ""
+}
+
+const gitDirScript = `cd "$1" || exit 1
+find . -name .git -print0`
+
+func gitCheckouts(ctx context.Context, a *Archiver, h reap.Host, dir string) (map[string]bool, error) {
+	b, err := a.on(ctx, h.SSH, "", "sh", "-c", gitDirScript, "sh", dir)
+	if err != nil {
+		return nil, fmt.Errorf("find git metadata %s: %w", dir, err)
+	}
+	out := map[string]bool{}
+	for _, p := range strings.Split(string(b), "\x00") {
+		if p != "" {
+			out[strings.TrimPrefix(path.Dir(strings.TrimPrefix(p, "./")), "./")] = true
+		}
+	}
+	return out, nil
+}
+
+func inCheckout(p string, checkouts map[string]bool) bool {
+	for root := range checkouts {
+		if root == "." || p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // listScript prints one NUL-terminated "kind size mtime ./path" record per
@@ -315,8 +374,22 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if !finished(files) {
 		return nil, &Skip{"not-finished"}
 	}
+	checkouts, err := gitCheckouts(ctx, a, h, dir)
+	if err != nil {
+		return nil, err
+	}
 	p := &Plan{Action: "archive-plan", Job: job, Host: h.Name, Dir: dir, Delete: dir, host: h, entries: files,
-		Move: []string{}, Text: []string{}, Excluded: []string{}, Skipped: []string{}, AppleDouble: []string{}}
+		Move: []string{}, Text: []string{}, Excluded: []string{}, ExcludedEntries: []Exclusion{}, Skipped: []string{}, AppleDouble: []string{}}
+	for checkout := range checkouts {
+		count := 0
+		for _, f := range files {
+			if f.Path == checkout || strings.HasPrefix(f.Path, checkout+"/") {
+				count++
+			}
+		}
+		p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: checkout, Reason: "git-tracked", Files: count})
+	}
+	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
 		switch {
 		case !safeName(f.Path):
@@ -324,20 +397,36 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 		case f.Path == "manifest.json":
 			// The archive's own manifest goes there; never overwrite one.
 			return nil, &Skip{"manifest-collision"}
+		case inCheckout(f.Path, checkouts):
+			continue
 		case Credential(f.Path):
 			p.Excluded = append(p.Excluded, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "credential-path"})
 		case f.kind != 'f':
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
 			p.Skipped = append(p.Skipped, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "non-regular"})
 		case appleDouble(f.Path):
 			// macOS writes ._X beside X. Copied to a Drive folder, a ._X
 			// whose X is absent can fold into X's metadata and vanish.
 			p.AppleDouble = append(p.AppleDouble, f.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "appledouble"})
 		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
 			p.Oversized = append(p.Oversized, f)
 			p.OversizedBytes += f.Size
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "oversized"})
 		default:
+			if text(f, a.TextMax) {
+				body, readErr := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, f.Path))
+				if readErr != nil {
+					return nil, fmt.Errorf("read %s: %w", f.Path, readErr)
+				}
+				if name := secretPattern(body); name != "" {
+					p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "secret-like:" + name})
+					continue
+				}
+			}
 			p.Move = append(p.Move, f.Path)
 			p.Files++
 			p.Bytes += f.Size
@@ -362,10 +451,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if p.Task == "" {
 		return nil, &Skip{"task-unknown"}
 	}
-	// Month of the job's last activity, so Drive folders group by when the
-	// work happened and a rerun lands in the same place.
-	month := time.Unix(p.Newest, 0).UTC().Format("2006-01")
-	p.Dest = path.Join(a.DriveDir, h.Name, month, job)
+	p.Dest = path.Join(a.DriveDir, "tasks", p.Task, job)
 	mpath := path.Join(p.Dest, "manifest.json")
 	done, err := a.exists(ctx, a.SSH, mpath)
 	if err != nil {
@@ -515,33 +601,21 @@ func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 	return nil
 }
 
-func (a *Archiver) put(ctx context.Context, name string, b []byte) (string, error) {
-	id, err := (integrations.Handoffkeep{}).UploadAttachment(ctx, name, b)
-	if err != nil {
-		return "", fmt.Errorf("hk attach put %s: %w", name, err)
-	}
-	sum := sha256.Sum256(b)
-	if id != hex.EncodeToString(sum[:]) {
-		return "", fmt.Errorf("hk attach put %s: sha256 mismatch", name)
-	}
-	return id, nil
-}
-
-// manifest is written beside the archived files and attached to hk.
+// manifest is written beside the archived files.
 type manifest struct {
-	Version     int          `json:"version"`
-	Job         string       `json:"job"`
-	Host        string       `json:"host"`
-	Task        string       `json:"task"`
-	Source      string       `json:"source"`
-	ArchivedAt  string       `json:"archived_at"`
-	Files       []File       `json:"files"`
-	TotalBytes  int64        `json:"total_bytes"`
-	Oversized   []File       `json:"oversized,omitempty"`
-	Excluded    []string     `json:"excluded"`
-	Skipped     []string     `json:"skipped"`
-	AppleDouble []string     `json:"appledouble"`
-	Attachments []Attachment `json:"attachments"`
+	Version         int         `json:"version"`
+	Job             string      `json:"job"`
+	Host            string      `json:"host"`
+	Task            string      `json:"task"`
+	Source          string      `json:"source"`
+	ArchivedAt      string      `json:"archived_at"`
+	Files           []File      `json:"files"`
+	TotalBytes      int64       `json:"total_bytes"`
+	Oversized       []File      `json:"oversized,omitempty"`
+	Excluded        []string    `json:"excluded"`
+	ExcludedEntries []Exclusion `json:"excluded_entries,omitempty"`
+	Skipped         []string    `json:"skipped"`
+	AppleDouble     []string    `json:"appledouble"`
 }
 
 // commentFiles bounds the per-file sha256 list in the hk comment; the full
@@ -551,48 +625,10 @@ const maxHKCommentBytes = 64 << 10
 
 const commentTruncationNotice = "\n[comment details truncated; complete file lists are in manifest.json]\n"
 
-func comment(p *Plan, m manifest, manifestID string) string {
+func comment(p *Plan, manifestSHA string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "mergewake archive: job %s on %s moved to Google Drive\n", p.Job, p.Host)
-	fmt.Fprintf(&b, "drive_dir: %s\nfiles: %d  total_bytes: %d\n", p.Dest, len(m.Files), m.TotalBytes)
-	fmt.Fprintf(&b, "manifest: %s/manifest.json (hk attachment %s)\n", p.Dest, manifestID)
-	fmt.Fprintf(&b, "hk attachments (%d):\n", len(m.Attachments))
-	for _, x := range m.Attachments {
-		fmt.Fprintf(&b, "- %s %s\n", x.SHA256, x.Path)
-	}
-	if len(m.Excluded) > 0 {
-		fmt.Fprintf(&b, "excluded credential-like files, not archived (%d):\n", len(m.Excluded))
-		for _, x := range m.Excluded {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.Skipped) > 0 {
-		fmt.Fprintf(&b, "skipped non-regular entries, not archived (%d):\n", len(m.Skipped))
-		for _, x := range m.Skipped {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.AppleDouble) > 0 {
-		fmt.Fprintf(&b, "AppleDouble metadata files, not archived (%d):\n", len(m.AppleDouble))
-		for _, x := range m.AppleDouble {
-			fmt.Fprintf(&b, "- %s\n", x)
-		}
-	}
-	if len(m.Oversized) > 0 {
-		fmt.Fprintf(&b, "over drive_max_file_bytes, not archived, deleted with the job dir (%d, %d bytes):\n", len(m.Oversized), sumFileBytes(m.Oversized))
-		for _, f := range m.Oversized {
-			fmt.Fprintf(&b, "- %s %d\n", f.Path, f.Size)
-		}
-	}
-	fmt.Fprintf(&b, "file sha256 (%d):\n", len(m.Files))
-	for i, f := range m.Files {
-		if i == commentFiles {
-			fmt.Fprintf(&b, "- ... %d more in manifest.json\n", len(m.Files)-commentFiles)
-			break
-		}
-		fmt.Fprintf(&b, "- %s %d %s\n", f.SHA256, f.Size, f.Path)
-	}
-	fmt.Fprintf(&b, "local job dir %s is deleted after this record\n", p.Dir)
+	fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/%s/%s\n", p.Job, p.Dest, p.Task, p.Job)
+	fmt.Fprintf(&b, "manifest sha256: %s\n", manifestSHA)
 	return boundComment(b.String())
 }
 
@@ -661,8 +697,8 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	for i := range oversized {
 		oversized[i].SHA256 = p.oversizedHashes[oversized[i].Path]
 	}
-	m := manifest{Version: 1, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
-		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, Skipped: p.Skipped, AppleDouble: p.AppleDouble, Attachments: []Attachment{}}
+	m := manifest{Version: 2, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
+		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, ExcludedEntries: p.ExcludedEntries, Skipped: p.Skipped, AppleDouble: p.AppleDouble}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
 		moving[rel] = true
@@ -679,31 +715,26 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		m.TotalBytes += f.Size
 	}
 
-	for _, rel := range p.Text {
-		b, err := a.on(ctx, p.host.SSH, "", "cat", filepath.Join(p.Dir, rel))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", rel, err)
-		}
-		if sum := sha256.Sum256(b); hex.EncodeToString(sum[:]) != src[rel] {
-			return nil, &Skip{"job-changed"}
-		}
-		id, err := a.put(ctx, path.Base(rel), b)
-		if err != nil {
-			return nil, err
-		}
-		m.Attachments = append(m.Attachments, Attachment{Path: rel, SHA256: id})
-	}
-
 	mb, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	mb = append(mb, '\n')
-	mid, err := a.put(ctx, "manifest.json", mb)
-	if err != nil {
-		return nil, err
+	manifestSum := sha256.Sum256(mb)
+	manifestSHA := hex.EncodeToString(manifestSum[:])
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "job: %s\ntask: %s\ndrive_dir: %s\nmanifest_sha256: %s\nfiles: %d\ntotal_bytes: %d\nexcluded (%d):\n", p.Job, p.Task, p.Dest, manifestSHA, len(m.Files), m.TotalBytes, len(m.ExcludedEntries))
+	for _, x := range m.ExcludedEntries {
+		fmt.Fprintf(&summary, "- %s %s", x.Path, x.Reason)
+		if x.Files > 0 {
+			fmt.Fprintf(&summary, " files=%d", x.Files)
+		}
+		summary.WriteByte('\n')
 	}
-	if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p, m, mid)); err != nil {
+	if err := (integrations.Handoffkeep{}).Record(ctx, "archive/"+p.Task+"/"+p.Job, []byte(summary.String())); err != nil {
+		return nil, fmt.Errorf("hk archive document: %w", err)
+	}
+	if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p, manifestSHA)); err != nil {
 		return nil, fmt.Errorf("hk comment: %w", err)
 	}
 	// Published last: Plan treats a dest holding manifest.json as archived
@@ -712,7 +743,7 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	if _, err := a.on(ctx, a.SSH, string(mb), "sh", "-c", `mkdir -p "$2" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", mpath, p.Dest); err != nil {
 		return nil, fmt.Errorf("write manifest: %w", err)
 	}
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: mid, Attachments: m.Attachments, Excluded: p.Excluded}
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: manifestSHA, Excluded: p.Excluded}
 	return a.remove(ctx, p, res)
 }
 
@@ -726,7 +757,7 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 		}
 	}
 	sum := sha256.Sum256(p.doneRaw)
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Attachments: m.Attachments, Excluded: m.Excluded}
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded}
 	return a.remove(ctx, p, res)
 }
 

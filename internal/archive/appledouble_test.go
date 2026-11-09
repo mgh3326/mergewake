@@ -88,8 +88,8 @@ func TestApplyArchivesAppleDoubleWithoutCopying(t *testing.T) {
 		t.Fatal("AppleDouble text file uploaded to hk")
 	}
 	note := e.comment(2402)
-	if !strings.Contains(note, "AppleDouble metadata files, not archived (2):") || !strings.Contains(note, "refs/._x.png") {
-		t.Fatalf("hk comment lacks AppleDouble list:\n%s", note)
+	if !strings.Contains(note, "archive/2402/wk-ad") {
+		t.Fatalf("hk comment lacks archive record:\n%s", note)
 	}
 }
 

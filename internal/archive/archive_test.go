@@ -14,7 +14,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -209,6 +208,109 @@ func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
 	}
 }
 
+func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-layout-repro")
+	write(t, filepath.Join(dir, "wt", ".git"), "gitdir: ../.git/worktrees/wt\n")
+	write(t, filepath.Join(dir, "wt", "docs", "a.md"), "tracked copy\n")
+	write(t, filepath.Join(dir, "notes.md"), "TOKEN=abcdefghijklmnopqrstuvwxyz\n")
+	write(t, filepath.Join(dir, "report.md"), "ordinary report\n")
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-layout-repro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Dest != filepath.Join(e.drive, "tasks", "2402", "wk-layout-repro") {
+		t.Fatalf("dest=%s", p.Dest)
+	}
+	if strings.Contains(strings.Join(p.Move, ","), "wt/") || strings.Contains(strings.Join(p.Move, ","), "notes.md") {
+		t.Fatalf("unsafe move list: %v", p.Move)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+		t.Fatal("expected delete failure fixture")
+	}
+	e.run.failRm = false
+	for _, rel := range []string{"report.md", "events/00001-job.task_link.json", "events/00005-job.completed.json"} {
+		if _, err := os.Stat(filepath.Join(p.Dest, rel)); err != nil {
+			t.Fatalf("missing copied %s: %v", rel, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(p.Dest, "notes.md")); !os.IsNotExist(err) {
+		t.Fatalf("secret copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.Dest, "wt")); !os.IsNotExist(err) {
+		t.Fatalf("checkout copied: %v", err)
+	}
+	var m manifest
+	raw, err := os.ReadFile(filepath.Join(p.Dest, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	foundGit, foundSecret := false, false
+	for _, x := range m.ExcludedEntries {
+		if x.Path == "wt" && x.Reason == "git-tracked" && x.Files == 2 {
+			foundGit = true
+		}
+		if x.Path == "notes.md" && x.Reason == "secret-like:token_assignment" {
+			foundSecret = true
+		}
+	}
+	if !foundGit || !foundSecret {
+		t.Fatalf("excluded entries: %+v", m.ExcludedEntries)
+	}
+	if len(e.uploads()) != 0 {
+		t.Fatalf("attachments uploaded: %v", e.uploads())
+	}
+	doc := e.hk.Documents()["archive/2402/wk-layout-repro"]
+	if doc.Kind != "note" || !strings.Contains(doc.Body, "secret-like:token_assignment") || strings.Contains(doc.Body, "abcdefghijklmnopqrstuvwxyz") {
+		t.Fatalf("document=%+v", doc)
+	}
+	if len(e.hk.Comments()) != 1 {
+		t.Fatalf("comments=%d", len(e.hk.Comments()))
+	}
+	plan, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-layout-repro")
+	if err != nil || !plan.Resume {
+		t.Fatalf("resume plan=%+v err=%v", plan, err)
+	}
+	if _, err := a.Apply(context.Background(), plan, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.hk.Comments()) != 1 || len(e.hk.Documents()) != 1 {
+		t.Fatal("resume changed hk record")
+	}
+}
+
+func TestSecretPatternsMatchPinnedGuard(t *testing.T) {
+	cases := map[string][2]string{
+		"openai_key":                {"sk-proj-abcdefghijklmnopqrstuvwxyz", "SK-PROJ-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+		"anthropic_key":             {"sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "SK-ANT-API03-ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+		"github_token":              {"ghp_123456789012345678901234567890123456", "ghp_short"},
+		"slack_token":               {"xoxb-" + "1234567890-1234567890-abcdefghijklmnopqrst", "xoxb-1-2-short"},
+		"aws_access_key":            {"AKIA1234567890ABCDEF", "AKIA123"},
+		"private_key":               {"-----BEGIN PRIVATE KEY-----", "BEGIN PUBLIC KEY"},
+		"bearer_token":              {"Bearer abcdefghijklmnopqrstuvwxyz", "Bearer short"},
+		"token_assignment":          {"TOKEN=abcdefghijkl", "TOKEN=short"},
+		"github_fine_grained_token": {"github_pat_" + strings.Repeat("a", 82), "github_pat_short"},
+	}
+	if len(cases) != len(secretPatterns) {
+		t.Fatalf("cases=%d patterns=%d", len(cases), len(secretPatterns))
+	}
+	for name, pair := range cases {
+		if got := secretPattern([]byte(pair[0])); got != name {
+			t.Errorf("%s positive=%q", name, got)
+		}
+		if got := secretPattern([]byte(pair[1])); got != "" {
+			t.Errorf("%s negative=%q", name, got)
+		}
+	}
+}
+
 func TestApplyRecordsAndDeletesOversizedFiles(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-oversized")
@@ -314,23 +416,9 @@ func TestApplyKeepsOversizedContentChangedWithoutMetadataChange(t *testing.T) {
 
 func TestCommentBoundsBytesAndSignalsTruncation(t *testing.T) {
 	p := &Plan{Job: "wk-large", Host: "h1", Dest: "/drive/archive", Dir: "/jobs/wk-large"}
-	oversized := make([]File, 1200)
-	for i := range oversized {
-		oversized[i] = File{Path: fmt.Sprintf("build/output-%04d-%s.bin", i, strings.Repeat("x", 64)), Size: 150}
-	}
-	m := manifest{Files: []File{}, Oversized: oversized, Attachments: []Attachment{}}
-	note := comment(p, m, "manifest-sha")
-	if len(note) > 64<<10 {
-		t.Fatalf("comment is %d bytes, limit is %d", len(note), 64<<10)
-	}
-	if !utf8.ValidString(note) {
-		t.Fatal("comment truncation produced invalid UTF-8")
-	}
-	if !strings.Contains(note, "comment details truncated; complete file lists are in manifest.json") {
-		t.Fatalf("comment has no truncation notice:\n%s", note)
-	}
-	if len(m.Oversized) != 1200 {
-		t.Fatalf("manifest oversized list lost entries: %d", len(m.Oversized))
+	note := comment(p, "manifest-sha")
+	if !strings.Contains(note, "archive/wk-large/") || !strings.Contains(note, "manifest-sha") {
+		t.Fatalf("comment=%s", note)
 	}
 }
 
@@ -645,21 +733,17 @@ func checkArchived(t *testing.T, e env, res *Result, dir string) {
 		}
 	}
 	note := e.comment(2402)
-	for _, want := range []string{res.Dest, "files: 7", "manifest: ", res.Manifest, ".env.local", "gh_token.txt", "API_KEY.json", "build/game.bin", "deleted after this record"} {
+	jobName := filepath.Base(res.Dest)
+	for _, want := range []string{res.Dest, "archive/2402/" + jobName, "manifest sha256: " + res.Manifest} {
 		if !strings.Contains(note, want) {
 			t.Errorf("hk comment lacks %q:\n%s", want, note)
 		}
 	}
-	if len(res.Attachments) != 6 || uploads["manifest.json"] == nil {
-		t.Fatalf("attachments = %+v", res.Attachments)
+	if len(uploads) != 0 || len(res.Attachments) != 0 {
+		t.Fatalf("hk received file bytes: %v", uploads)
 	}
-	// Six job text files and the manifest go up as attachments, one comment
-	// records them; each goes to hk over HTTP with the svc token (setup).
-	if got := e.routes(); got["PUT /v1/attachments"] != 7 || got["POST /v1/tasks/2402/comments"] != 1 || len(got) != 2 {
+	if got := e.routes(); got["PUT /v1/documents/archive%2F2402%2F"+jobName] != 1 || got["POST /v1/tasks/2402/comments"] != 1 || len(got) != 2 {
 		t.Fatalf("hk routes = %v", got)
-	}
-	if a := e.hk.Attachments()[res.Manifest]; a.Name != "manifest.json" || a.MIME != "application/json" {
-		t.Fatalf("manifest attachment = %q %q", a.Name, a.MIME)
 	}
 }
 
