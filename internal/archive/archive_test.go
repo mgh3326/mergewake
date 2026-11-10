@@ -1681,3 +1681,96 @@ func TestTildeJobsExpandOnJobHost(t *testing.T) {
 		t.Fatalf("relative jobs: %v", err)
 	}
 }
+
+// pauseBeforeReclaimRemove stops after the stale owner comparison, immediately
+// before removing the lock. The marker files coordinate the shell and test.
+type pauseBeforeReclaimRemove struct {
+	reap.Runner
+	paused, resume string
+}
+
+func (r *pauseBeforeReclaimRemove) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], `if rm -rf "$1" && take`) {
+		args = append([]string(nil), args...)
+		pause := fmt.Sprintf(`: > %q; while [ ! -e %q ]; do sleep 0.01; done; `, r.paused, r.resume)
+		args[1] = strings.Replace(args[1], `if rm -rf "$1" && take`, pause+`if rm -rf "$1" && take`, 1)
+	}
+	return r.Runner.Run(ctx, name, args, input, dir)
+}
+
+func TestArchiveLockReclaimReleaseAndNewClaimInterleave(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "release-race")
+	old := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+	releaseOld, err := old.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	owner, err := os.ReadFile(filepath.Join(lock, "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(owner))
+	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte(fields[0]+" 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	paused, resume := filepath.Join(dir, "paused"), filepath.Join(dir, "resume")
+	r := &pauseBeforeReclaimRemove{Runner: &fakeRunner{}, paused: paused, resume: resume}
+	type result struct {
+		release func()
+		err     error
+	}
+	reclaimDone := make(chan result, 1)
+	go func() {
+		a := &Archiver{Runner: r, DriveDir: e.drive}
+		release, err := a.claim(context.Background(), dest)
+		reclaimDone <- result{release, err}
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(resume, nil, 0o644) })
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, err := os.Stat(paused); err == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("reclaimer did not reach removal")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	oldDone := make(chan struct{})
+	go func() { releaseOld(); close(oldDone) }()
+	newDone := make(chan result, 1)
+	go func() {
+		<-oldDone
+		a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+		release, err := a.claim(context.Background(), dest)
+		newDone <- result{release, err}
+	}()
+	var newer result
+	var newReturned bool
+	select {
+	case newer = <-newDone:
+		newReturned = true
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := os.WriteFile(resume, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed := <-reclaimDone
+	if !newReturned {
+		newer = <-newDone
+	}
+	if reclaimed.release != nil {
+		defer reclaimed.release()
+	}
+	if newer.release != nil {
+		defer newer.release()
+	}
+	if reclaimed.err == nil && newer.err == nil {
+		t.Fatal("two claimers acquired simultaneously after release and reclaim")
+	}
+}
