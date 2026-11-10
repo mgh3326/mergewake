@@ -483,8 +483,15 @@ func TestAuthorPaneFindingsTextCarriesLaneInAck(t *testing.T) {
 		t.Fatal(e)
 	}
 	text := findingsText(testRepoFor(s), pr, "author", rt.lane, []pendingFinding{{thread: "T1", severity: "high", path: "tool", line: 3}})
-	if !strings.Contains(text, "ack: panewire inbox list --lane w-9-lane --unread") || !strings.Contains(text, "for lane w-9-lane") {
-		t.Fatalf("text %q", text)
+	for _, want := range []string{
+		"ack: panewire inbox list --lane w-9-lane --unread",
+		"read each item, act on it or record its disposition",
+		"panewire inbox ack <id>", "acknowledging does not resolve a finding",
+		"for lane w-9-lane",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %q", want, text)
+		}
 	}
 }
 

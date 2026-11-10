@@ -352,7 +352,7 @@ func severityRank(s string) int {
 // counted, not dropped silently.
 func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding) string {
 	tag := "FINDINGS"
-	required := `required: fix every critical/high/Major finding; accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition`
+	required := `required: every critical/high/Major finding needs a fix commit or a dismissal with evidence (a command and its output, or the code line that disproves it); accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition`
 	if scope == "owner" {
 		tag = "OUT-OF-SCOPE"
 		required = "the reviewer marked these outside the PR's Acceptance contract: the owner decides (dismiss, defer to an hk task, or widen the contract); they do not block"
@@ -360,7 +360,7 @@ func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendin
 	head := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %d finding(s) for lane %s: ", tag, r.Name, pr.Number, short7(pr.Head.SHA), len(fs), lane)
 	tail := " | " + required
 	if scope == "author" {
-		tail += fmt.Sprintf(" | ack: panewire inbox list --lane %s --unread, then panewire inbox ack <id>", lane)
+		tail += fmt.Sprintf(" | ack: panewire inbox list --lane %s --unread; read each item, act on it or record its disposition, then panewire inbox ack <id>; acknowledging does not resolve a finding", lane)
 	}
 	var b strings.Builder
 	b.WriteString(head)

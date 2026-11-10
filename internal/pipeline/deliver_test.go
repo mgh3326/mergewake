@@ -119,7 +119,8 @@ func TestFindingsRoundIsOneAuthorLaneEvent(t *testing.T) {
 	for _, want := range []string{
 		"[mergewake] FINDINGS example/project#7 head=aaaaaaa", "2 finding(s) for lane w-7",
 		"1) high [blocks merge] tool:9 https://github.example/pr/7#discussion_T2", "2) medium tool:3 https://github.example/pr/7#discussion_T1",
-		"fix every critical/high/Major", "panewire inbox ack",
+		"every critical/high/Major finding needs a fix commit or a dismissal with evidence", "a command and its output", "the code line that disproves it",
+		"panewire inbox list --lane w-7 --unread", "read each item, act on it or record its disposition", "panewire inbox ack <id>", "acknowledging does not resolve a finding",
 		"Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", "Disposition: defer <hk task>", "defer only for nonblocking findings",
 	} {
 		if !strings.Contains(e.Text, want) {

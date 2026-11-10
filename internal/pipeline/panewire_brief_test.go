@@ -16,8 +16,8 @@ func briefExecutor(timeout string) *panewireExecutor {
 	}
 }
 
-// oldBrief is the reviewer brief from before hk 3454. Test (d) removes the two
-// sentences hk 3454 changes and compares the rest against the new brief.
+// oldBrief is the reviewer brief from before hk 3454. Test (d) removes the
+// sections changed by the two prompt updates and compares the rest.
 const oldBrief = `# Review — example/project#7 pass 1 (default lens)
 
 You are the independent reviewer for pull request example/project#7. mergewake posts
@@ -54,9 +54,13 @@ the same directory, then rename it into place):
 
     {"findings":[{"path":"relative/path","line":1,"body":"specific bug, consequence, and fix","severity":"high"}]}
 
-- path: repository-relative path of a file changed by the PR.
-- line: a new-side line inside one of the PR's diff hunks (added or context
-  line); a finding anywhere else rejects the whole file.
+- path: repository-relative path where the defect occurs, even if the PR does not change it.
+- line: the defect's real line; inline anchors require a new-side line in a PR diff hunk (added or context).
+- For a defect caused outside the diff (unchanged caller, config, dependency), report its real path
+  and line. Mergewake lists it in the review body; critical/high findings hold the merge like inline
+  findings. Never invent a changed-line anchor or drop a concrete defect without one.
+- Only malformed JSON, an unknown top-level key, more than 50 findings, or invalid severity rejects
+  the whole result.
 - severity: critical, high, medium or low. body: non-empty, at most 4000 bytes.
 - At most 50 findings. No other keys. If none: {"findings":[]}.
 
@@ -78,6 +82,25 @@ func TestPanewireBriefForbidsRunningTests(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+func TestPanewireBriefExplainsOutsideDiffFindings(t *testing.T) {
+	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	for _, want := range []string{
+		"repository-relative path where the defect occurs, even if the PR does not change it",
+		"report its real path",
+		"and line. Mergewake lists it in the review body",
+		"critical/high findings hold the merge like inline",
+		"Never invent a changed-line anchor or drop a concrete defect without one",
+		"Only malformed JSON, an unknown top-level key, more than 50 findings, or invalid severity rejects",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "a finding anywhere else rejects the whole file") {
+		t.Fatalf("brief still rejects off-diff findings:\n%s", got)
 	}
 }
 

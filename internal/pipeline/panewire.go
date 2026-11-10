@@ -1695,9 +1695,13 @@ the same directory, then rename it into place):
 
     {"findings":[{"path":"relative/path","line":1,"body":"specific bug, consequence, and fix","severity":"high"}]}
 
-- path: repository-relative path of a file changed by the PR.
-- line: a new-side line inside one of the PR's diff hunks (added or context
-  line); a finding anywhere else rejects the whole file.
+- path: repository-relative path where the defect occurs, even if the PR does not change it.
+- line: the defect's real line; inline anchors require a new-side line in a PR diff hunk (added or context).
+- For a defect caused outside the diff (unchanged caller, config, dependency), report its real path
+  and line. Mergewake lists it in the review body; critical/high findings hold the merge like inline
+  findings. Never invent a changed-line anchor or drop a concrete defect without one.
+- Only malformed JSON, an unknown top-level key, more than 50 findings, or invalid severity rejects
+  the whole result.
 - severity: critical, high, medium or low. body: non-empty, at most 4000 bytes.
 - At most 50 findings. No other keys. If none: {"findings":[]}.
 

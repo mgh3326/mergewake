@@ -62,6 +62,24 @@ func TestOutsideDiffPathLowIsPostedAndDoesNotHold(t *testing.T) {
 	}
 }
 
+func TestParseFindingsKeepsUnchangedPathAndLineOutsideChangedHunks(t *testing.T) {
+	diff := outsideToolDiff
+	input := `{"findings":[{"path":"docs/unchanged.md","line":12,"body":"defect in unchanged file","severity":"high"},{"path":"tool","line":40,"body":"defect outside changed hunk","severity":"high"}]}`
+	kept, dropped, err := parseFindings([]byte(input), diff)
+	if err != nil {
+		t.Fatalf("parseFindings() error = %v", err)
+	}
+	if len(dropped) != 0 || len(kept) != 2 {
+		t.Fatalf("kept=%+v dropped=%+v", kept, dropped)
+	}
+	if kept[0].Path != "docs/unchanged.md" || kept[0].Line != 12 || kept[0].Anchor != github.AnchorOutside {
+		t.Errorf("unchanged-path finding = %+v", kept[0])
+	}
+	if kept[1].Path != "tool" || kept[1].Line != 40 || kept[1].Anchor != github.AnchorOutside {
+		t.Errorf("outside-hunk finding = %+v", kept[1])
+	}
+}
+
 // outsideGH answers the history with a posted pass that listed blocking
 // outside-diff findings, and the PR's issue comments.
 type outsideGH struct {
