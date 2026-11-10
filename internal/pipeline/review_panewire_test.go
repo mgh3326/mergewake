@@ -435,7 +435,7 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, want := range []string{"example/project#7", shaA, "detached at the head", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "panewire done " + arg(sp, "-l"), "## PR context", "OPERATOR DECISIONS", "Headless stays the default executor."} {
+	for _, want := range []string{"example/project#7", shaA, "detached at the head", "default lens", "Author model family: anthropic", "J='" + filepath.Dir(arg(sp, "-p")) + "'", "$J/findings.json", "git rev-parse HEAD", `{"refused":`, "panewire done " + arg(sp, "-l"), "## PR context", "CLAIMED DECISIONS", "Headless stays the default executor."} {
 		if !strings.Contains(string(brief), want) {
 			t.Fatalf("brief lacks %q:\n%s", want, brief)
 		}

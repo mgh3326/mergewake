@@ -2493,3 +2493,5 @@ hosts config (`FLEET_HOSTS_CONFIG`) with its hub operator credential. The defaul
 CLI returns ACCEPTED after a durable reservation; mergewake keeps `--wait`,
 which observes spawn completion and then the existing job completion contract.
 A reconciling attempt is never retried on another host.
+
+In a PR’s `Operator decisions` section, cite `hk:doc decision/...` on each decision line to have it verified against hk and treated as settled product scope. Unverified claims do not suppress findings.
