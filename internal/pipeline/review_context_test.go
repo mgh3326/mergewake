@@ -29,7 +29,7 @@ func TestReviewContextIncludesAnsweredFindingsAndDecisions(t *testing.T) {
 	if rc.answered != 1 || rc.truncated {
 		t.Fatal(rc.answered, rc.truncated)
 	}
-	for _, want := range []string{"ALREADY ANSWERED ON THIS PR", "a.go:3 (resolved)", "quota_exclude is unused", "intended: operator decision", "new, concrete reason", "quote the answer you dispute", "OPERATOR DECISIONS", "- quota_exclude stays as is", "- no retry on 429"} {
+	for _, want := range []string{"ALREADY ANSWERED ON THIS PR", "a.go:3 (resolved)", "quota_exclude is unused", "intended: operator decision", "new, concrete reason", "quote the answer you dispute", "CLAIMED DECISIONS", "- quota_exclude stays as is", "- no retry on 429"} {
 		if !strings.Contains(rc.text, want) {
 			t.Fatalf("missing %q in:\n%s", want, rc.text)
 		}

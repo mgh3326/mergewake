@@ -369,7 +369,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if contextErr != nil {
 		feedback = github.ReviewFeedback{}
 	}
-	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login)
+	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login, resolveDecisions(ctx, pr.Body, integrations.Handoffkeep{}))
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)
