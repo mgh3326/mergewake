@@ -402,13 +402,32 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 
 const archiveLockTTL = int64(24 * 60 * 60)
 
+// lockGuard serializes every change to the lock, including release. The
+// arguments are lock path, stale-guard TTL and a unique cleanup suffix.
+const lockGuard = `guard="$1.guard"
+now=$(date +%s) || exit 1
+tries=0
+until mkdir "$guard" 2>/dev/null; do
+  held=$(stat -c %Y "$guard" 2>/dev/null || stat -f %m "$guard" 2>/dev/null)
+  case "$held" in ''|*[!0-9]*) held= ;; esac
+  if [ -n "$held" ] && [ "$((now-held))" -ge "$guard_ttl" ]; then
+    mv "$guard" "$guard.dead.$guard_owner" 2>/dev/null && rm -rf "$guard.dead.$guard_owner"
+  fi
+  tries=$((tries+1))
+  if [ "$tries" -ge 200 ]; then echo busy; exit 0; fi
+  sleep 0.05
+done
+trap 'rm -rf "$guard"' EXIT
+`
+
 // claimScript is one claim attempt. It never moves or removes an existing lock:
 // it takes a free lock, reports a live one as busy, and reports an expired one
 // as "stale <born> <owner>" so claim can confirm it under the guard in
 // reclaimScript. Args: $1 lock dir, $2 locks dir, $3 this claim's owner,
 // $4 TTL seconds.
 const claimScript = `mkdir -p "$2" || exit 1
-now=$(date +%s) || exit 1
+guard_ttl="$4"; guard_owner="$3"
+` + lockGuard + `
 if mkdir "$1" 2>/dev/null; then
   if printf '%s %s\n' "$3" "$now" > "$1/owner"; then echo acquired; else echo busy; fi
   exit 0
@@ -426,20 +445,8 @@ echo "stale $born $old_owner"`
 // fresh here and left alone. Args: $1 lock dir, $2 the stale claim's owner,
 // $3 its time, $4 this claim's owner, $5 TTL seconds (also the age after which
 // a guard left by a dead reclaimer is broken).
-const reclaimScript = `now=$(date +%s) || exit 1
-guard="$1.guard"
-take() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$2" "$3" > "$1/owner"; }
-tries=0
-until mkdir "$guard" 2>/dev/null; do
-  held=$(stat -c %Y "$guard" 2>/dev/null || stat -f %m "$guard" 2>/dev/null)
-  case "$held" in ''|*[!0-9]*) held= ;; esac
-  if [ -n "$held" ] && [ "$((now-held))" -ge "$5" ]; then
-    mv "$guard" "$guard.dead.$4" 2>/dev/null && rm -rf "$guard.dead.$4"
-  fi
-  tries=$((tries+1))
-  if [ "$tries" -ge 200 ]; then echo busy; exit 0; fi
-  sleep 0.05
-done
+const reclaimScript = `guard_ttl="$5"; guard_owner="$4"
+` + lockGuard + `take() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$2" "$3" > "$1/owner"; }
 result=busy
 if take "$1" "$4" "$now"; then
   result=acquired
@@ -452,7 +459,6 @@ else
     fi;;
   esac
 fi
-rm -rf "$guard"
 echo "$result"`
 
 // claim serializes publication for one task/job destination across hosts.
@@ -485,7 +491,8 @@ func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 		return nil, &Skip{"archive-lock-busy"}
 	}
 	return func() {
-		_, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `if [ -r "$1/owner" ]; then read current created < "$1/owner"; if [ "$current" = "$2" ]; then rm -rf "$1"; fi; fi`, "sh", lock, owner)
+		_, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `guard_ttl="$3"; guard_owner="$2"
+`+lockGuard+`if [ -r "$1/owner" ]; then read current created < "$1/owner"; if [ "$current" = "$2" ]; then rm -rf "$1"; fi; fi`, "sh", lock, owner, ttl)
 	}, nil
 }
 
