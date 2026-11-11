@@ -9,12 +9,15 @@
 package archive
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -638,6 +641,23 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		if f.mtime > p.Newest {
 			p.Newest = f.mtime
 		}
+	}
+	// Every entry is classified before any content is read, so the job's text
+	// candidates go to the host as one read. The exclusion entries and the
+	// move list are still built in listing order below, once the read has
+	// judged each body.
+	type decision struct {
+		file        File
+		reason      string // exclusion reason; empty when the entry is archived
+		skip        bool   // non-regular entry, named in Skipped
+		appleDouble bool   // macOS metadata, named in AppleDouble
+		move        bool   // copied to Drive
+		text        bool   // content read and inspected
+	}
+	var decisions []decision
+	var candidates []File
+	for _, f := range files {
+		d := decision{file: f}
 		switch {
 		case !safeName(f.Path):
 			return nil, &Skip{"unsafe-file-name"}
@@ -647,41 +667,59 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		case inCheckout(f.Path, checkouts):
 			continue
 		case Credential(f.Path):
+			d.reason = "credential-path"
 			p.Excluded = append(p.Excluded, f.Path)
-			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "credential-path"})
 		case f.kind != 'f':
 			// Symlinks and special files are not copied: following a link
 			// could archive a secret that lives outside the job dir.
-			p.Skipped = append(p.Skipped, f.Path)
-			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "non-regular"})
+			d.skip = true
 		case appleDouble(f.Path):
 			// macOS writes ._X beside X. Copied to a Drive folder, a ._X
 			// whose X is absent can fold into X's metadata and vanish.
-			p.AppleDouble = append(p.AppleDouble, f.Path)
-			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "appledouble"})
+			d.reason, d.appleDouble = "appledouble", true
 		case a.DriveMaxFileBytes > 0 && f.Size > a.DriveMaxFileBytes:
+			d.reason = "oversized"
 			p.Oversized = append(p.Oversized, f)
 			p.OversizedBytes += f.Size
-			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "oversized"})
 		default:
+			d.move = true
 			if text(f, a.TextMax) {
-				body, readErr := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, f.Path))
-				if readErr != nil {
-					return nil, fmt.Errorf("read %s: %w", f.Path, readErr)
-				}
-				if int64(len(body)) != f.Size {
+				d.text = true
+				candidates = append(candidates, f)
+			}
+		}
+		decisions = append(decisions, d)
+	}
+	bodies, err := a.readText(ctx, h.SSH, dir, candidates)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range decisions {
+		switch {
+		case d.skip:
+			p.Skipped = append(p.Skipped, d.file.Path)
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: d.file.Path, Reason: "non-regular"})
+		case d.reason != "":
+			if d.appleDouble {
+				p.AppleDouble = append(p.AppleDouble, d.file.Path)
+			}
+			p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: d.file.Path, Reason: d.reason})
+		case d.move:
+			if d.text {
+				body := bodies[d.file.Path]
+				if int64(len(body)) != d.file.Size {
 					return nil, &Skip{"job-changed"}
 				}
 				if name := secretPattern(body); name != "" {
-					p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: f.Path, Reason: "secret-like:" + name})
+					p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: d.file.Path, Reason: "secret-like:" + name})
 					continue
 				}
-				p.Text = append(p.Text, f.Path)
-				p.textSnapshots[f.Path] = body
+				p.Text = append(p.Text, d.file.Path)
+				p.textSnapshots[d.file.Path] = body
 			}
-			p.Move = append(p.Move, f.Path)
+			p.Move = append(p.Move, d.file.Path)
 			p.Files++
-			p.Bytes += f.Size
+			p.Bytes += d.file.Size
 		}
 	}
 	if len(p.Oversized) > 0 {
@@ -852,9 +890,62 @@ func (a *Archiver) hashes(ctx context.Context, ssh, dir string, paths []string) 
 	return out, nil
 }
 
+// readText reads every text candidate of one job with one host command: the
+// listed paths go to tar on stdin, NUL-separated, so spaces, unicode and
+// leading dashes need no quoting and the command count does not grow with the
+// file count. COPYFILE_DISABLE keeps macOS tar from adding ._ entries.
+func (a *Archiver) readText(ctx context.Context, ssh, dir string, files []File) (map[string][]byte, error) {
+	if len(files) == 0 {
+		return map[string][]byte{}, nil
+	}
+	b, err := a.on(ctx, ssh, listInput(filePaths(files)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	return parseText(dir, files, b)
+}
+
+// parseText maps a tar stream's regular entries to their bytes. A candidate
+// the stream does not carry could not be read, and is reported like the
+// single-file read it replaces. Each entry is read only up to the size the
+// listing recorded, so a file that grew cannot allocate without bound.
+func parseText(dir string, files []File, b []byte) (map[string][]byte, error) {
+	size := make(map[string]int64, len(files))
+	for _, f := range files {
+		size[f.Path] = f.Size
+	}
+	out := make(map[string][]byte, len(files))
+	tr := tar.NewReader(bytes.NewReader(b))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", dir, err)
+		}
+		name := strings.TrimPrefix(path.Clean(hdr.Name), "./")
+		want, ok := size[name]
+		if !ok || hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(tr, want+1))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		out[name] = body
+	}
+	for _, f := range files {
+		if _, ok := out[f.Path]; !ok {
+			return nil, fmt.Errorf("read %s: not in stream", fleetevent.Redact(f.Path))
+		}
+	}
+	return out, nil
+}
+
 // copy streams uncaptured regular files as an uncompressed tar from the job
-// host and writes inspected text snapshots directly to Drive. COPYFILE_DISABLE
-// keeps macOS tar from adding ._ metadata entries.
+// host and writes inspected text snapshots directly to Drive in one command.
+// COPYFILE_DISABLE keeps macOS tar from adding ._ metadata entries.
 func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 	snapshots := map[string]bool{}
 	for _, name := range p.Text {
@@ -874,14 +965,62 @@ func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 			return fmt.Errorf("copy to drive: %w", err)
 		}
 	}
-	for _, name := range p.Text {
-		dst := path.Join(p.Dest, name)
-		if _, err := a.on(ctx, a.SSH, string(p.textSnapshots[name]), "sh", "-c", `mkdir -p "$(dirname "$1")" && cat > "$1.partial" && mv -f "$1.partial" "$1"`, "sh", dst); err != nil {
-			return fmt.Errorf("copy inspected file %s to drive: %w", name, err)
-		}
+	if len(p.Text) == 0 {
+		return nil
+	}
+	body, err := textArchive(p)
+	if err != nil {
+		return err
+	}
+	if _, err := a.on(ctx, a.SSH, string(body), "sh", "-c", writeTextScript, "sh", p.Dest); err != nil {
+		return fmt.Errorf("copy inspected files to drive: %w", err)
 	}
 	return nil
 }
+
+// textArchive packs every inspected snapshot of one job as a tar stream in
+// plan order, so one command can write them all. Each entry keeps its source
+// mtime, as the bulk tar path does.
+func textArchive(p *Plan) ([]byte, error) {
+	mtime := make(map[string]int64, len(p.entries))
+	for _, f := range p.entries {
+		mtime[f.Path] = f.mtime
+	}
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	for _, name := range p.Text {
+		body := p.textSnapshots[name]
+		hdr := &tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), ModTime: time.Unix(mtime[name], 0), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return nil, fmt.Errorf("pack inspected file %s: %w", name, err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			return nil, fmt.Errorf("pack inspected file %s: %w", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("pack inspected files: %w", err)
+	}
+	return b.Bytes(), nil
+}
+
+// writeTextScript unpacks the tar on stdin into a staging directory beside the
+// destination and renames each file into place, so an interrupted run never
+// leaves a half-written final file. A crashed run's staging directory is
+// removed by the next one. Arg: $1 destination directory.
+const writeTextScript = `dest="$1"
+stage="$dest/.partial"
+mkdir -p "$dest" && rm -rf "$stage" && mkdir -p "$stage" || exit 1
+tar -xf - -C "$stage" || { rm -rf "$stage"; exit 1; }
+export dest stage
+find "$stage" ! -type d -print0 | xargs -0 sh -c '
+for f; do
+  rel=${f#"$stage"/}
+  case "$rel" in ""|/*|..|../*|*/..|*/../*) exit 1;; esac
+  mkdir -p "$dest/$(dirname "$rel")" || exit 1
+  mv -f "$f" "$dest/$rel" || exit 1
+done' sh || { rm -rf "$stage"; exit 1; }
+rm -rf "$stage"`
 
 // manifest is written beside the archived files.
 type manifest struct {

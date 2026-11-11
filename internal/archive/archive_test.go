@@ -38,7 +38,7 @@ type mutateBeforeSnapshotWrite struct {
 }
 
 func (r *mutateBeforeSnapshotWrite) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
-	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `cat > "$1.partial"`) {
+	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `stage="$dest/.partial"`) {
 		if err := os.WriteFile(r.source, r.replacement, 0o644); err != nil {
 			return nil, err
 		}
