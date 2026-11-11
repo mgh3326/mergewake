@@ -53,7 +53,7 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input,
 		f.hkCLI = append(f.hkCLI, append([]string{name}, args...))
 		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
 	}
-	if name == "sh" && len(args) > 1 && strings.HasPrefix(args[1], "rm ") {
+	if name == "sh" && len(args) > 1 && strings.HasPrefix(strings.TrimSpace(args[1]), `rm -rf "$1"`) {
 		f.rms = append(f.rms, args)
 		if f.failRm {
 			return nil, errors.New("rm failed")
@@ -991,7 +991,7 @@ func TestApplyLocalMovesVerifiesAndDeletes(t *testing.T) {
 		t.Fatal("local archive used ssh")
 	}
 	// The delete takes the absolute job dir as a quoted argument, no "--".
-	if len(e.run.rms) != 1 || strings.Join(e.run.rms[0], "|") != `-c|rm -rf "$1"|sh|`+dir {
+	if len(e.run.rms) != 1 || len(e.run.rms[0]) != 4 || e.run.rms[0][0] != "-c" || !strings.Contains(e.run.rms[0][1], `find "$1" -type d`) || e.run.rms[0][2] != "sh" || e.run.rms[0][3] != dir {
 		t.Fatalf("delete argv = %q", e.run.rms)
 	}
 	// A byte-identical job dir under the same name is already archived: it
@@ -999,6 +999,141 @@ func TestApplyLocalMovesVerifiesAndDeletes(t *testing.T) {
 	job(t, e.jobs, "wk-7")
 	if p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-7"); err != nil || !p.Resume {
 		t.Fatalf("rerun: %+v %v", p, err)
+	}
+}
+
+func makeReadOnly(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = filepath.Walk(root, func(name string, info os.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil
+			}
+			mode := info.Mode().Perm()
+			if info.IsDir() {
+				mode |= 0o700
+			} else {
+				mode |= 0o600
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				_ = os.Chmod(name, mode)
+			}
+			return nil
+		})
+	})
+	_ = filepath.Walk(root, func(name string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		mode := os.FileMode(0o555)
+		if !info.IsDir() {
+			mode = 0o444
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			_ = os.Chmod(name, mode)
+		}
+		return nil
+	})
+}
+
+func TestArchiveDeletesReadOnlyTree(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-readonly")
+	write(t, filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "cache", "module.zip"), "module")
+	if err := os.Chmod(filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "cache"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "cache", "module.zip"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// Include a read-only intermediate directory as well as the leaf.
+	if err := os.Chmod(filepath.Join(dir, "tmp", "home", "go", "pkg", "mod"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	makeReadOnly(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-readonly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("archive result=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job dir remains: %v", err)
+	}
+}
+
+func TestArchiveDeleteReadOnlyTreeDoesNotFollowSymlink(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-readonly-link")
+	outside := filepath.Join(filepath.Dir(e.jobs), "outside")
+	write(t, filepath.Join(outside, "keep.txt"), "keep")
+	if err := os.Chmod(outside, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(outside, "keep.txt"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(outside, 0o755)
+		_ = os.Chmod(filepath.Join(outside, "keep.txt"), 0o644)
+	})
+	if err := os.Symlink(outside, filepath.Join(dir, "external")); err != nil {
+		t.Fatal(err)
+	}
+	makeReadOnly(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-readonly-link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("archive result=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job dir remains: %v", err)
+	}
+	for name, want := range map[string]os.FileMode{outside: 0o555, filepath.Join(outside, "keep.txt"): 0o555} {
+		info, err := os.Stat(name)
+		if err != nil || info.Mode().Perm() != want {
+			t.Fatalf("outside target %s mode=%v err=%v, want %v", name, info.Mode().Perm(), err, want)
+		}
+	}
+}
+
+func TestArchiveResumeDeletesReadOnlyTree(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-readonly-resume")
+	write(t, filepath.Join(dir, "readonly", "deep", "data"), "same archived files")
+	if err := os.Chmod(filepath.Join(dir, "readonly", "deep"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "readonly"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, "wk-readonly-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil || !strings.Contains(err.Error(), "delete "+dir+":") {
+		t.Fatalf("initial delete error = %v", err)
+	}
+	e.run.failRm = false
+	if p, err = a.Plan(context.Background(), h, "wk-readonly-resume"); err != nil || !p.Resume {
+		t.Fatalf("resume plan=%+v err=%v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("resume result=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job dir remains: %v", err)
 	}
 }
 

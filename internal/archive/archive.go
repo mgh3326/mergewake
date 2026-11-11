@@ -1353,7 +1353,15 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest
 	if !path.IsAbs(p.Dir) {
 		return res, fmt.Errorf("delete %s: not an absolute path", p.Dir)
 	}
-	if _, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `rm -rf "$1"`, "sh", p.Dir); err != nil {
+	if _, err := a.on(ctx, p.host.SSH, "", "sh", "-c", `
+rm -rf "$1" || {
+	# chmod never follows symlinks; find does not descend through symlinks.
+	# Restore owner write/search only within the checked job tree, then retry.
+	find "$1" -type d -exec chmod u+rwx {} + &&
+	find "$1" ! -type l -type f -exec chmod u+rw {} + &&
+	rm -rf "$1"
+}
+`, "sh", p.Dir); err != nil {
 		return res, fmt.Errorf("delete %s: %w", p.Dir, err)
 	}
 	res.Deleted = true
