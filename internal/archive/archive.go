@@ -1357,7 +1357,8 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest
 rm -rf "$1" || {
 	# chmod never follows symlinks; find does not descend through symlinks.
 	# Restore owner write/search only within the checked job tree, then retry.
-	find "$1" -type d -exec chmod u+rwx {} + &&
+	chmod u+rwx "$1" &&
+	find "$1" -type d -exec chmod u+rwx {} \; &&
 	find "$1" ! -type l -type f -exec chmod u+rw {} + &&
 	rm -rf "$1"
 }
