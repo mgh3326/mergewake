@@ -24,10 +24,11 @@ import (
 // fake script on PATH. hk is reached over HTTP (hktest), never as a
 // subprocess: an hk CLI call is recorded and refused.
 type fakeRunner struct {
-	calls  int
-	failRm bool
-	rms    [][]string // delete argv, recorded
-	hkCLI  [][]string // hk CLI calls, which must not happen
+	calls        int
+	failRm       bool
+	rms          [][]string // delete argv, recorded
+	hkCLI        [][]string // hk CLI calls, which must not happen
+	beforeDelete func()
 }
 
 type mutateBeforeSnapshotWrite struct {
@@ -55,6 +56,9 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input,
 	}
 	if name == "sh" && len(args) > 1 && strings.HasPrefix(strings.TrimSpace(args[1]), `rm -rf "$1"`) {
 		f.rms = append(f.rms, args)
+		if f.beforeDelete != nil {
+			f.beforeDelete()
+		}
 		if f.failRm {
 			return nil, errors.New("rm failed")
 		}
@@ -1055,6 +1059,30 @@ func TestArchiveDeletesReadOnlyTree(t *testing.T) {
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-readonly")
 	if err != nil {
 		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("archive result=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job dir remains: %v", err)
+	}
+}
+
+func TestArchiveDeletesUnreadableDirectory(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-unreadable-dir")
+	write(t, filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "inaccessible", "module.zip"), "module")
+	makeReadOnly(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-unreadable-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.beforeDelete = func() {
+		if err := os.Chmod(filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "inaccessible"), 0); err != nil {
+			t.Errorf("make nested directory inaccessible: %v", err)
+		}
 	}
 	res, err := a.Apply(context.Background(), p, time.Now())
 	if err != nil || res == nil || !res.Deleted {
