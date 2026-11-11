@@ -468,7 +468,9 @@ these steps in order:
    ignored files do not), `git stash list`, and
    `git rev-list --all --not --remotes`. Any command error or nonempty result
    retains the entire source dir as `archived-retained`; otherwise it is
-   removed with `rm -rf`.
+   removed with `rm -rf`. If that first removal fails, owner write and search
+   permissions are restored on directories and regular files inside the job
+   dir (without following symlinks), then removal is retried.
    Excluded credential and oversized files go with it; their names and sizes
    stay in the record.
 
@@ -477,7 +479,7 @@ The uploads and the comment go to hk over HTTP with mergewake's own
 Unset, or with hk unreachable, the archive fails as an `error` row, keeps
 the job dir and is retried an hour later. hk refuses an upload over its own
 attachment limit (`HK_ATTACH_MAX_BYTES`, default 50 MiB) the same way. The
-job host needs `find`, `stat`, `tar`, `xargs` and
+job host needs `find`, `chmod`, `stat`, `tar`, `xargs` and
 `sha256sum` or `shasum`; the archive host `tar` and the same hashing tools;
 this machine `bash`. A job dir whose listing exceeds the 4 MiB command
 output limit fails and is kept.
