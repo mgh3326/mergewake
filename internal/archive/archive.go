@@ -979,13 +979,19 @@ func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 }
 
 // textArchive packs every inspected snapshot of one job as a tar stream in
-// plan order, so one command can write them all.
+// plan order, so one command can write them all. Each entry keeps its source
+// mtime, as the bulk tar path does.
 func textArchive(p *Plan) ([]byte, error) {
+	mtime := make(map[string]int64, len(p.entries))
+	for _, f := range p.entries {
+		mtime[f.Path] = f.mtime
+	}
 	var b bytes.Buffer
 	tw := tar.NewWriter(&b)
 	for _, name := range p.Text {
 		body := p.textSnapshots[name]
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+		hdr := &tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), ModTime: time.Unix(mtime[name], 0), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
 			return nil, fmt.Errorf("pack inspected file %s: %w", name, err)
 		}
 		if _, err := tw.Write(body); err != nil {
