@@ -809,12 +809,17 @@ func TestPlanSkips(t *testing.T) {
 	write(t, filepath.Join(e.jobs, "own-manifest", "manifest.json"), "{}")
 	write(t, filepath.Join(e.jobs, "own-manifest", "events", "00004-job.task_link.json"), `{"payload":{"task_id":5}}`)
 	write(t, filepath.Join(e.jobs, "own-manifest", "events", "00005-job.completed.json"), `{}`)
-	for job, reason := range map[string]string{"gone": "job-gone", "notask": "task-unknown", "own-manifest": "manifest-collision", "../x": "job-name-invalid"} {
+	for job, reason := range map[string]string{"gone": "job-gone", "own-manifest": "manifest-collision", "../x": "job-name-invalid"} {
 		_, err := a.Plan(context.Background(), h, job)
 		var s *Skip
 		if !errors.As(err, &s) || s.Reason != reason {
 			t.Errorf("%s: err = %v, want %s", job, err, reason)
 		}
+	}
+	if p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "notask"); err != nil {
+		t.Fatalf("taskless finished job should plan: %v", err)
+	} else if want := filepath.Join(e.drive, "no-task", time.Unix(p.Newest, 0).UTC().Format("2006-01"), "h1-notask"); p.Dest != want {
+		t.Fatalf("taskless destination = %q, want %q", p.Dest, want)
 	}
 	if _, err := a.Plan(context.Background(), reap.Host{Name: "h1"}, "x"); err == nil || err.Error() != "skipped: jobs-dir-unset" {
 		t.Errorf("jobs unset: %v", err)
@@ -859,16 +864,18 @@ func TestPlanRequiresFinishedLifecycle(t *testing.T) {
 	}
 }
 
-func TestPlanSkipsJobWithoutEvents(t *testing.T) {
+func TestPlanAllowsOldJobWithoutEvents(t *testing.T) {
 	e := setup(t)
 	job(t, e.jobs, "no-events")
 	if err := os.RemoveAll(filepath.Join(e.jobs, "no-events", "events")); err != nil {
 		t.Fatal(err)
 	}
-	_, err := archiver(e, "").Plan(context.Background(), reap.Host{Jobs: e.jobs}, "no-events")
-	var skip *Skip
-	if !errors.As(err, &skip) || skip.Reason != "no-events" {
-		t.Fatalf("Plan() error = %v, want skipped no-events", err)
+	p, err := archiver(e, "").Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "no-events")
+	if err != nil {
+		t.Fatalf("Plan() error = %v, want eligible eventless plan", err)
+	}
+	if p.Task != "" || !strings.Contains(p.Dest, filepath.Join("no-task", time.Unix(p.Newest, 0).UTC().Format("2006-01"), "h1-no-events")) {
+		t.Fatalf("eventless plan = %+v", p)
 	}
 }
 
