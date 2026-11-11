@@ -219,6 +219,8 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	var errs []error
 	found := false
 	counts := map[string]int{}
+	archivedThisRun, eligibleLeft := 0, 0
+	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
 	for _, h := range s.Config.Hosts {
 		if host != "" && h.Name != host {
 			continue
@@ -252,11 +254,24 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
 		}
-		jobs := make([]string, 0, len(jobsByName))
-		for job := range jobsByName {
-			jobs = append(jobs, job)
+		type jobOrder struct {
+			name   string
+			newest int64
 		}
-		sort.Strings(jobs)
+		ordered := make([]jobOrder, 0, len(jobsByName))
+		for job, summary := range jobsByName {
+			ordered = append(ordered, jobOrder{job, summary.Newest})
+		}
+		sort.Slice(ordered, func(i, j int) bool {
+			if ordered[i].newest != ordered[j].newest {
+				return ordered[i].newest < ordered[j].newest
+			}
+			return ordered[i].name < ordered[j].name
+		})
+		jobs := make([]string, len(ordered))
+		for i := range ordered {
+			jobs[i] = ordered[i].name
+		}
 		for _, job := range jobs {
 			if e := ctx.Err(); e != nil {
 				return errors.Join(append(errs, e)...)
@@ -281,6 +296,9 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				row.Result, row.Reason = "skipped", reason
 			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
+			} else if maxJobs > 0 && archivedThisRun >= maxJobs {
+				eligibleLeft++
+				continue
 			} else if p, e := a.PlanListed(ctx, h, job, filepath.Join(root, job), files); e != nil {
 				row.Result, row.Reason = archive.Reason(e)
 			} else if e := s.Print(p); e != nil {
@@ -297,6 +315,9 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				} else {
 					row.Result = "archived"
 				}
+				if row.Result == "archived" || row.Result == "archived-retained" {
+					archivedThisRun++
+				}
 			}
 			if row.Result == "error" {
 				errs = append(errs, fmt.Errorf("%s job %s: %s", h.Name, job, row.Reason))
@@ -311,15 +332,16 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		return fmt.Errorf("no configured host %q", host)
 	}
 	summary := struct {
-		Action    string `json:"action"`
-		Shadow    bool   `json:"shadow"`
-		OlderThan string `json:"older_than"`
-		Archived  int    `json:"archived"`
-		Retained  int    `json:"archived_retained"`
-		Planned   int    `json:"planned"`
-		Skipped   int    `json:"skipped"`
-		ErrCount  int    `json:"errors"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs)}
+		Action       string `json:"action"`
+		Shadow       bool   `json:"shadow"`
+		OlderThan    string `json:"older_than"`
+		Archived     int    `json:"archived"`
+		Retained     int    `json:"archived_retained"`
+		Planned      int    `json:"planned"`
+		Skipped      int    `json:"skipped"`
+		ErrCount     int    `json:"errors"`
+		EligibleLeft int    `json:"eligible_left"`
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft}
 	return errors.Join(append(errs, s.Print(summary))...)
 }
 

@@ -378,6 +378,7 @@ type Archive struct {
 	TextMaxBytes      int64    `yaml:"text_max_bytes"`
 	DriveMaxFileBytes int64    `yaml:"drive_max_file_bytes"`
 	MinAge            string   `yaml:"min_age"`
+	MaxJobsPerRun     int      `yaml:"max_jobs_per_run"`
 	Exclude           []string `yaml:"exclude"`
 }
 
@@ -1137,6 +1138,9 @@ func Age(s string) (time.Duration, error) {
 }
 
 func validateArchive(a *Archive) error {
+	if a.MaxJobsPerRun < 0 {
+		return errors.New("reap.archive.max_jobs_per_run must be non-negative")
+	}
 	if a.Exclude == nil {
 		a.Exclude = append([]string(nil), DefaultArchiveExclude...)
 	}
