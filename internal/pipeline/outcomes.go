@@ -193,6 +193,18 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 				return e
 			}
 			if len(reviews) > 0 {
+				// The review order comes from the review history, never from
+				// the map above, which has none.
+				var order []string
+				if lister, ok := s.GH.(headLister); ok {
+					heads, e := lister.ReviewedHeads(ctx, r.Name, p.Number, s.Config.Review.Login)
+					if e != nil {
+						return e
+					}
+					for _, h := range heads {
+						order = append(order, h.SHA)
+					}
+				}
 				sameFamily := false
 				reviewers := map[string]map[string]string{}
 				for _, head := range slices.Sorted(maps.Keys(reviews)) {
@@ -217,6 +229,7 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 					for head, counts := range reviews {
 						v.Reviews[head] = counts
 					}
+					v.SetReviewedHeadOrder(order)
 					v.Findings = map[string]int{}
 					for _, counts := range v.Reviews {
 						for severity, n := range counts {
@@ -323,6 +336,7 @@ func (s *Service) recordReview(repo string, pr int, head string, findings []gith
 			v.Reviews = map[string]map[string]int{}
 		}
 		v.Reviews[head] = counts
+		v.AddReviewedHead(head)
 		v.Findings = map[string]int{}
 		for _, review := range v.Reviews {
 			for k, n := range review {
