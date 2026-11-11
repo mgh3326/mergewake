@@ -360,6 +360,7 @@ A single PR's fetch failure never aborts the pass.
 | `text_max_bytes` | `1048576` | Maximum size of `*.md` and `*.json` files inspected locally for hk guard patterns; at most 3 MiB. It does not control Drive copying. |
 | `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
+| `max_jobs_per_run` | `0` | Maximum jobs archived or resumed by one `archive-jobs` run; `0` means no limit. Oldest jobs are taken first and the summary reports eligible jobs left. |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
@@ -378,7 +379,7 @@ these steps in order:
   never tilde-expand, and a relative one is refused as
   `jobs-dir-not-absolute`. In the host-wide `archive-jobs` scan, one listing
   supplies each job's root kind, events directory and entry metadata; symlink,
-  missing, no-events, unfinished and too-new jobs are skipped before per-job
+  missing, unfinished and too-new jobs are skipped before per-job
   planning. The shared listing returns one compact summary per job, so its
   output does not grow with the number of files. Candidates that pass those
   checks are refreshed per job and the completion and age gates are repeated
@@ -387,9 +388,10 @@ these steps in order:
   `job-dir-symlink` (checked again right before the delete); otherwise
   list every non-directory entry. A job is eligible only when its `events/`
    contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
-   `job.placement` event (a reused name has started again); bookkeeping events
-   do not affect that decision. Every listed entry, including excluded entries,
-   contributes to the newest-entry time used by `--older-than`. Jobs without an events directory are skipped.
+  `job.placement` event (a reused name has started again); bookkeeping events
+  do not affect that decision. A job without `events/` uses its newest-file age
+  as its completion signal. Every listed entry, including excluded entries,
+  contributes to the newest-entry time used by `--older-than`.
    `reap.archive.exclude` is a list of shell globs matched against job names;
    it defaults to `["pw-rollout-*", "pw-hk*", "events-lane"]`, while an
    explicit empty list disables name exclusions. Matching jobs are skipped as
@@ -406,11 +408,12 @@ these steps in order:
    starts with `._` is macOS AppleDouble metadata: it is not copied to Drive
    or uploaded to hk, and is named in the manifest's `appledouble` list.
    It is deleted with the job dir. The hk task id comes from the
-   job's panewire events (`events/*-job.task_link.json`, falling back to
-   `*-job.claim.json`); a job without one is skipped as `task-unknown`. The
+  job's panewire events (`events/*-job.task_link.json`, falling back to
+  `*-job.claim.json`). The
    destination is `<drive_dir>/tasks/<task-id>/<job>/`.
-   A job without an hk task is skipped as `task-unknown`; no `no-task/` archive
-   is created. A destination that already holds a `manifest.json` is
+  A job without an hk task is stored at
+  `<drive_dir>/no-task/<UTC YYYY-MM>/<host>-<job>/` and recorded as
+  `archive/no-task/<host>-<job>` without a task comment. A destination that already holds a `manifest.json` is
    a finished archive: when that manifest names the same job, host and task
    with the same archived files and oversized paths, sizes and fingerprints,
    the plan is a delete-only `resume` (contents must still match the manifest);
@@ -499,6 +502,8 @@ runs the same plan and apply over a host's existing backlog: every job dir in
 whose pane list cannot be read is skipped whole. Without `--apply` it only
 plans; rows go to `<state_dir>/archive-jobs.jsonl` unless `--dry-run`. It
 needs no GitHub token.
+When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
+to that limit and the summary reports `eligible_left` for a later run.
 
 ### `review`
 

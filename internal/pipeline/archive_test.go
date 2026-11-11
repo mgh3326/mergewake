@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -81,7 +82,7 @@ func TestArchiveJobsPreflightCallCountDoesNotScaleWithSkippedJobs(t *testing.T) 
 			// Include representative other preflight skips in the same host scan.
 			for i := 0; i < 5; i++ {
 				name := fmt.Sprintf("no-events-%03d", i)
-				dir := jobDir(t, f.jobs, name, 20*24*time.Hour)
+				dir := jobDir(t, f.jobs, name, time.Hour)
 				if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
 					t.Fatal(err)
 				}
@@ -130,6 +131,9 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(fileEvents, "events"), "not a directory")
 	jobDir(t, f.jobs, "pane-live", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(f.jobs, "pane-live", "events")); err != nil {
+		t.Fatal(err)
+	}
 	target, err := os.MkdirTemp(filepath.Dir(f.jobs), "symlink-target")
 	if err != nil {
 		t.Fatal(err)
@@ -148,17 +152,92 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 			got = append(got, row.Job+"|"+row.Result+"|"+row.Reason)
 		}
 		var v map[string]any
-		if json.Unmarshal([]byte(line), &v) == nil && v["action"] == "archive-plan" {
+		if json.Unmarshal([]byte(line), &v) == nil && v["action"] == "archive-plan" && v["job"] == "eligible" {
 			plan = v
 		}
 	}
-	want := []string{"dangling-events|skipped|no-events", "eligible|would-archive|", "file-events|skipped|not-finished", "no-events|skipped|no-events", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
+	want := []string{"dangling-events|skipped|too-new", "eligible|would-archive|", "file-events|skipped|not-finished", "no-events|would-archive|", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
+	sort.Strings(got)
+	sort.Strings(want)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("rows = %v, want %v", got, want)
 	}
 	if plan == nil || plan["job"] != "eligible" || plan["task"] != "77" || plan["files"] != float64(4) {
 		t.Fatalf("eligible plan = %v", plan)
 	}
+}
+
+func TestArchiveJobsEventlessDryRunUsesNoTaskDestination(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	old := jobDir(t, f.jobs, "legacy", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(old, "events")); err != nil {
+		t.Fatal(err)
+	}
+	young := jobDir(t, f.jobs, "young", time.Hour)
+	if err := os.RemoveAll(filepath.Join(young, "events")); err != nil {
+		t.Fatal(err)
+	}
+	noTaskLink := jobDir(t, f.jobs, "finished-no-task", 20*24*time.Hour)
+	if err := os.Remove(filepath.Join(noTaskLink, "events", "00004-job.task_link.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), `"job":"legacy","result":"would-archive"`) || !strings.Contains(f.out.String(), filepath.Join(f.drive, "no-task", time.Now().Add(-20*24*time.Hour).UTC().Format("2006-01"), "local-legacy")) {
+		t.Fatalf("missing no-task plan: %s", f.out.String())
+	}
+	if !strings.Contains(f.out.String(), `"job":"young","result":"skipped","reason":"too-new"`) {
+		t.Fatalf("young eventless job not skipped by age: %s", f.out.String())
+	}
+	if !strings.Contains(f.out.String(), filepath.Join(f.drive, "no-task", time.Now().Add(-20*24*time.Hour).UTC().Format("2006-01"), "local-finished-no-task")) {
+		t.Fatalf("finished taskless job missing from no-task plans: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsMaxJobsPerRunArchivesOldestAndCountsRemainder(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxJobsPerRun = 2
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("legacy-%d", i)
+		dir := jobDir(t, f.jobs, name, time.Duration(20+i)*24*time.Hour)
+		if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"legacy-4", "legacy-3"} {
+		age := 20 + indexFor(name)
+		if _, err := os.Stat(filepath.Join(f.drive, "no-task", time.Now().Add(-time.Duration(age)*24*time.Hour).UTC().Format("2006-01"), "local-"+name, "manifest.json")); err != nil {
+			t.Fatalf("oldest %s not archived: %v", name, err)
+		}
+	}
+	for _, name := range []string{"legacy-0", "legacy-1", "legacy-2"} {
+		if _, err := os.Stat(filepath.Join(f.jobs, name)); err != nil {
+			t.Fatalf("capped job %s removed: %v", name, err)
+		}
+	}
+	if !strings.Contains(f.out.String(), `"eligible_left":3`) {
+		t.Fatalf("summary missing eligible remainder: %s", f.out.String())
+	}
+	if len(f.hk.Comments()) != 0 {
+		t.Fatalf("taskless archives wrote task comments: %v", f.hk.Comments())
+	}
+	if _, ok := f.hk.Documents()["archive/no-task/local-legacy-4"]; !ok {
+		t.Fatalf("missing taskless hk record; docs=%v", f.hk.Documents())
+	}
+}
+
+func indexFor(name string) int {
+	switch name {
+	case "legacy-4":
+		return 4
+	case "legacy-3":
+		return 3
+	}
+	return 0
 }
 
 func TestArchiveJobsListingContinuesWhenEntryDisappearsBeforeStat(t *testing.T) {
@@ -494,6 +573,9 @@ func TestArchiveJobsBacklog(t *testing.T) {
 func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "unsafe-checkout", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(dir, "wt", ".git"), "gitdir: missing\n")
 	old := time.Now().Add(-20 * 24 * time.Hour)
 	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, _ error) error { return os.Chtimes(p, old, old) })

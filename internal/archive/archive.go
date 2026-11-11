@@ -568,10 +568,7 @@ func (a *Archiver) Plan(ctx context.Context, h reap.Host, job string) (*Plan, er
 	if err != nil {
 		return nil, err
 	}
-	if !hasEvents {
-		return nil, &Skip{"no-events"}
-	}
-	if !finished(files) {
+	if hasEvents && !finished(files) {
 		return nil, &Skip{"not-finished"}
 	}
 	return a.planListed(ctx, h, job, dir, files)
@@ -698,9 +695,10 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		return nil, err
 	}
 	if p.Task == "" {
-		return nil, &Skip{"task-unknown"}
+		p.Dest = path.Join(a.DriveDir, "no-task", time.Unix(p.Newest, 0).UTC().Format("2006-01"), h.Name+"-"+job)
+	} else {
+		p.Dest = path.Join(a.DriveDir, "tasks", p.Task, job)
 	}
-	p.Dest = path.Join(a.DriveDir, "tasks", p.Task, job)
 	mpath := path.Join(p.Dest, "manifest.json")
 	done, err := a.exists(ctx, a.SSH, mpath)
 	if err != nil {
@@ -781,10 +779,7 @@ func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
 	if job.NeedsRefresh {
 		return "", 0
 	}
-	if !job.HasEvents {
-		return "no-events", 0
-	}
-	if !job.Finished {
+	if job.HasEvents && !job.Finished {
 		return "not-finished", 0
 	}
 	return "", job.Newest
@@ -915,7 +910,11 @@ const commentTruncationNotice = "\n[comment details truncated; complete file lis
 
 func comment(p *Plan) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/%s/%s\n", p.Job, p.Dest, p.Task, p.Job)
+	if p.Task == "" {
+		fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/no-task/%s-%s\n", p.Job, p.Dest, p.Host, p.Job)
+	} else {
+		fmt.Fprintf(&b, "mergewake archived job %s to Drive: %s\nrecord: archive/%s/%s\n", p.Job, p.Dest, p.Task, p.Job)
+	}
 	return boundComment(b.String())
 }
 
@@ -1014,10 +1013,14 @@ func (a *Archiver) publish(ctx context.Context, p *Plan, m *manifest, addComment
 	for _, x := range m.Retained {
 		fmt.Fprintf(&summary, "retained: checkout-unsafe %s %s\n", x.Path, x.Reason)
 	}
-	if err := (integrations.Handoffkeep{}).Record(ctx, "archive/"+p.Task+"/"+p.Job, []byte(summary.String())); err != nil {
+	key := "archive/" + p.Task + "/" + p.Job
+	if p.Task == "" {
+		key = "archive/no-task/" + p.Host + "-" + p.Job
+	}
+	if err := (integrations.Handoffkeep{}).Record(ctx, key, []byte(summary.String())); err != nil {
 		return "", fmt.Errorf("hk archive document: %w", err)
 	}
-	if addComment {
+	if addComment && p.Task != "" {
 		if err := (integrations.Handoffkeep{}).Comment(ctx, p.Task, comment(p)); err != nil {
 			return "", fmt.Errorf("hk comment: %w", err)
 		}
