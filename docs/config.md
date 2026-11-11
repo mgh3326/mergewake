@@ -873,11 +873,17 @@ a grade. Mergewake does not change model grades automatically.
 `outcomes.command` defaults to `review.quota`. Its replaceable reps interface uses
 `scopefuel reps add`, the handoffkeep bench reps store, rather than writing hk
 HTTP/SQL directly. Each finalized merged/closed PR publishes profile, model,
-effort, PR URL as task ref, role `impl`, task grade, tier, rounds `1`, blocking
-findings count, and completed `1` only for a landed PR. Structured notes contain
+effort, PR URL as task ref, role `impl`, task grade, tier, rounds, blocking
+findings count, and completed `1` only for a landed PR. Rounds is the number of
+distinct PR heads that received a mergewake review before the outcome was
+recorded: `1` when the PR merged on its first reviewed head, `0` when no head
+was reviewed. Structured notes contain
 first CI, severity counts (unknown until the landed head is reviewed), seven-day
 revert, merge time, experiment/arm, stable
-outcome/event IDs, revision and rule classification. Shadow suppresses GitHub
+outcome/event IDs, revision and rule classification. `high_by_head` lists the
+critical plus high count of each reviewed head, oldest first; it is left out when
+the review order of the heads is not recorded (an outcome kept before the order
+was). Shadow suppresses GitHub
 mutations while still publishing factual measurement reps.
 
 A seven-day result or later revert is an append-only follow-up rep, since the

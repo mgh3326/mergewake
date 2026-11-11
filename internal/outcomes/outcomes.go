@@ -46,6 +46,9 @@ type Outcome struct {
 	FirstCIGreen *bool                     `json:"first_ci_green"`
 	Findings     map[string]int            `json:"findings_by_severity"`
 	Reviews      map[string]map[string]int `json:"reviews_by_head"`
+	// ReviewedHeads lists the heads that received a review, oldest first, in
+	// the order they were reviewed; Reviews holds no order of its own.
+	ReviewedHeads []string `json:"reviewed_heads,omitempty"`
 	// ReviewersByHead names, by head and pass number, the reviewer each posted
 	// pass ran as, as its receipt records it.
 	ReviewersByHead map[string]map[string]string `json:"reviewers_by_head,omitempty"`
@@ -72,6 +75,44 @@ func (v *Outcome) SetReviewer(head, pass, reviewer string) {
 		v.ReviewersByHead[head] = map[string]string{}
 	}
 	v.ReviewersByHead[head][pass] = reviewer
+}
+
+// AddReviewedHead records that head has just been reviewed. A head is added
+// once, so it keeps the place it was first reviewed in.
+func (v *Outcome) AddReviewedHead(head string) {
+	if !slices.Contains(v.ReviewedHeads, head) {
+		v.ReviewedHeads = append(v.ReviewedHeads, head)
+	}
+}
+
+// SetReviewedHeadOrder takes heads, oldest first, as the review order. A head
+// it does not list keeps its recorded place after them.
+func (v *Outcome) SetReviewedHeadOrder(heads []string) {
+	var out []string
+	for _, h := range slices.Concat(heads, v.ReviewedHeads) {
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	v.ReviewedHeads = out
+}
+
+// reviewedHeads lists the heads with a review, oldest first. A reviewed head
+// with no recorded place (an outcome kept before the order was) follows in
+// sorted order, and ordered is then false: the order is not known for it.
+func (v Outcome) reviewedHeads() (heads []string, ordered bool) {
+	for _, h := range v.ReviewedHeads {
+		if _, ok := v.Reviews[h]; ok && !slices.Contains(heads, h) {
+			heads = append(heads, h)
+		}
+	}
+	ordered = len(heads) == len(v.Reviews)
+	for _, h := range slices.Sorted(maps.Keys(v.Reviews)) {
+		if !slices.Contains(heads, h) {
+			heads = append(heads, h)
+		}
+	}
+	return heads, ordered
 }
 
 func (v Outcome) Attributed() bool {
@@ -357,11 +398,22 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	if !v.ReviewedHead() && v.Blockers() == 0 {
 		wire.Findings = nil
 	}
-	notes, err := json.Marshal(map[string]any{
+	// rounds counts the reviewed heads; high_by_head is their critical+high
+	// counts, oldest first, and is left out when that order is not known.
+	heads, ordered := v.reviewedHeads()
+	fields := map[string]any{
 		"source": "mergewake", "schema": 1, "sample_key": v.Task, "outcome_id": v.ID, "revision": v.Revision, "supersedes": v.Supersedes,
 		"first_ci_green": v.FirstCIGreen, "findings_by_severity": wire.Findings, "reverted_within_7d": v.Reverted, "time_to_merge_s": v.TimeToMerge, "same_family": v.SameFamily,
 		"experiment_id": wire.Experiment, "arm": wire.Arm, "evidence": v.Evidence(), "outcome_rule": "first-ci-green+no-critical-high+no-revert-7d/v1", "outcome": wire, "observed_findings_by_severity": v.Findings, "followup": v.Revision > 1,
-	})
+	}
+	if ordered {
+		highByHead := make([]int, 0, len(heads))
+		for _, h := range heads {
+			highByHead = append(highByHead, v.Reviews[h]["critical"]+v.Reviews[h]["high"])
+		}
+		fields["high_by_head"] = highByHead
+	}
+	notes, err := json.Marshal(fields)
 	if err != nil {
 		return "", err
 	}
@@ -373,7 +425,7 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	if v.Effort != "" {
 		args = append(args, "--effort", v.Effort)
 	}
-	args = append(args, "--task", v.Task, "--tier", v.Tier, "--role", "impl", "--grade", v.Grade, "--rounds", "1", "--blockers-found", strconv.Itoa(v.Blockers()), "--completed", completed, "--notes", string(notes))
+	args = append(args, "--task", v.Task, "--tier", v.Tier, "--role", "impl", "--grade", v.Grade, "--rounds", strconv.Itoa(len(heads)), "--blockers-found", strconv.Itoa(v.Blockers()), "--completed", completed, "--notes", string(notes))
 	b, err = c.run(ctx, args)
 	if err != nil {
 		return "", err
