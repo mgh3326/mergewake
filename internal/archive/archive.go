@@ -1024,11 +1024,17 @@ func textArchive(p *Plan) ([]byte, error) {
 }
 
 // writeTextScript unpacks the tar on stdin into a unique staging directory
-// beside the destination and renames each file into place. Arg: $1 destination.
+// beside the destination and renames each file into place. The destination
+// claim makes it safe to clean stale stages from a crashed prior run. Arg: $1
+// destination.
 const writeTextScript = `dest="$1"
 parent=$(dirname "$dest")
 base=$(basename "$dest")
 mkdir -p "$parent" "$dest" || exit 1
+for stale in "$parent/.$base.text-stage."*; do
+  [ -d "$stale" ] || continue
+  rm -rf "$stale" || exit 1
+done
 stage=$(mktemp -d "$parent/.$base.text-stage.XXXXXX") || exit 1
 cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT HUP INT TERM
