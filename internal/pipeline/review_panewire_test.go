@@ -586,6 +586,62 @@ func TestPanewireBuilderFamilyFromRecord(t *testing.T) {
 	}
 }
 
+func TestPanewireBuilderFamilyArgUsesAcceptedFamilies(t *testing.T) {
+	accepted := []string{"anthropic", "openai", "google", "xai", "deepseek", "meta", "mistral", "other"}
+	cases := map[string]struct {
+		author string
+		record *integrations.JobRecord
+		want   string
+	}{
+		"unsupported author family":  {author: "cognition", want: "other"},
+		"unsupported builder record": {author: "openai", record: &integrations.JobRecord{Family: "moonshot"}, want: "other"},
+		"unknown family":             {author: "some-new-family", want: "other"},
+	}
+	for _, family := range accepted {
+		cases["accepted "+family] = struct {
+			author string
+			record *integrations.JobRecord
+			want   string
+		}{author: family, want: family}
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+			s, g, r := panewireSetup(t, runner)
+			g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: " + tc.author + "\n"
+			if tc.record != nil {
+				runner.sink.jobs["author-job"] = *tc.record
+			}
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := arg(runner.spawns[0], "--builder-family"); got != tc.want {
+				t.Fatalf("--builder-family=%q, want %q; argv=%v", got, tc.want, runner.spawns[0])
+			}
+		})
+	}
+}
+
+func TestPanewireUnsupportedBuilderFamilyPreservesAuthorFamily(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: cognition\n"
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := arg(runner.spawns[0], "--builder-family"); got != "other" {
+		t.Fatalf("--builder-family=%q, want other", got)
+	}
+	passes := g.passes[g.pull.Head.SHA]
+	if len(passes) != 1 || passes[0].Family != "openai" || passes[0].SameFamily {
+		t.Fatalf("pass metadata changed: %+v", passes)
+	}
+	rows := auditRows(t, s, r, "review")
+	if len(rows) != 1 || rows[0]["author_family"] != "cognition" || rows[0]["same_family"] != false {
+		t.Fatalf("review pass audit lost canonical author family: %+v", rows)
+	}
+}
+
 // gitCalls lists the git invocations against root without the -C prefix.
 func gitCalls(r *panewireRunner, root string) []string {
 	out := []string{}
