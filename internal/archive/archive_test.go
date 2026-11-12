@@ -24,10 +24,11 @@ import (
 // fake script on PATH. hk is reached over HTTP (hktest), never as a
 // subprocess: an hk CLI call is recorded and refused.
 type fakeRunner struct {
-	calls  int
-	failRm bool
-	rms    [][]string // delete argv, recorded
-	hkCLI  [][]string // hk CLI calls, which must not happen
+	calls        int
+	failRm       bool
+	rms          [][]string // delete argv, recorded
+	hkCLI        [][]string // hk CLI calls, which must not happen
+	beforeDelete func()
 }
 
 type mutateBeforeSnapshotWrite struct {
@@ -38,7 +39,7 @@ type mutateBeforeSnapshotWrite struct {
 }
 
 func (r *mutateBeforeSnapshotWrite) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
-	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `stage="$dest/.partial"`) {
+	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `stage=$(mktemp -d`) {
 		if err := os.WriteFile(r.source, r.replacement, 0o644); err != nil {
 			return nil, err
 		}
@@ -55,6 +56,9 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args []string, input,
 	}
 	if name == "sh" && len(args) > 1 && strings.HasPrefix(strings.TrimSpace(args[1]), `rm -rf "$1"`) {
 		f.rms = append(f.rms, args)
+		if f.beforeDelete != nil {
+			f.beforeDelete()
+		}
 		if f.failRm {
 			return nil, errors.New("rm failed")
 		}
@@ -744,6 +748,80 @@ func TestResumeRejectsChangedOversizedManifestEntries(t *testing.T) {
 	}
 }
 
+func TestResumeIdentityIncludesExcludedSkippedAndAppleDouble(t *testing.T) {
+	for _, field := range []string{"excluded", "skipped", "appledouble"} {
+		t.Run(field, func(t *testing.T) {
+			e := setup(t)
+			dir := job(t, e.jobs, "wk-resume-lists")
+			write(t, filepath.Join(dir, "._metadata"), "metadata")
+			a := archiver(e, "")
+			h := reap.Host{Name: "h1", Jobs: e.jobs}
+			p, err := a.Plan(context.Background(), h, "wk-resume-lists")
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.run.failRm = true
+			if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+				t.Fatal("expected simulated delete failure")
+			}
+			e.run.failRm = false
+			manifestPath := filepath.Join(p.Dest, "manifest.json")
+			b, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m manifest
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatal(err)
+			}
+			switch field {
+			case "excluded":
+				m.Excluded = append(m.Excluded, "new-excluded.txt")
+			case "skipped":
+				m.Skipped = append(m.Skipped, "new-skipped-link")
+			case "appledouble":
+				m.AppleDouble = append(m.AppleDouble, "._new-metadata")
+			}
+			b, err = json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p, err = a.Plan(context.Background(), h, "wk-resume-lists")
+			var s *Skip
+			if !errors.As(err, &s) || s.Reason != "drive-dir-exists" || (p != nil && p.Resume) {
+				t.Fatalf("resume err=%v, want drive-dir-exists", err)
+			}
+			if _, err := os.Stat(dir); err != nil {
+				t.Fatalf("job dir was deleted or lost: %v", err)
+			}
+		})
+	}
+
+	t.Run("unchanged lists resume", func(t *testing.T) {
+		e := setup(t)
+		dir := job(t, e.jobs, "wk-resume-same-lists")
+		write(t, filepath.Join(dir, "._metadata"), "metadata")
+		a := archiver(e, "")
+		h := reap.Host{Name: "h1", Jobs: e.jobs}
+		p, err := a.Plan(context.Background(), h, "wk-resume-same-lists")
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.run.failRm = true
+		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+			t.Fatal("expected simulated delete failure")
+		}
+		e.run.failRm = false
+		p, err = a.Plan(context.Background(), h, "wk-resume-same-lists")
+		if err != nil || !p.Resume {
+			t.Fatalf("unchanged manifest did not resume: plan=%+v err=%v", p, err)
+		}
+	})
+}
+
 func TestDriveMaxFileBytesZeroPreservesExistingBehavior(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-oversized")
@@ -1055,6 +1133,31 @@ func TestArchiveDeletesReadOnlyTree(t *testing.T) {
 	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-readonly")
 	if err != nil {
 		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res == nil || !res.Deleted {
+		t.Fatalf("archive result=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job dir remains: %v", err)
+	}
+}
+
+func TestArchiveDeletesUnreadableDirectory(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-unreadable-dir")
+	private := filepath.Join(dir, "tmp", "home", "go", "pkg", "mod", "inaccessible")
+	write(t, filepath.Join(private, "module.zip"), "module")
+	makeReadOnly(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-unreadable-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.beforeDelete = func() {
+		if err := os.Chmod(private, 0); err != nil {
+			t.Errorf("make nested directory inaccessible: %v", err)
+		}
 	}
 	res, err := a.Apply(context.Background(), p, time.Now())
 	if err != nil || res == nil || !res.Deleted {

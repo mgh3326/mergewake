@@ -305,6 +305,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				return errors.Join(append(errs, e)...)
 			} else if !acting {
 				row.Result = "would-archive"
+				archivedThisRun++
 			} else {
 				res, e := a.Apply(ctx, p, now)
 				row.Archive = res
