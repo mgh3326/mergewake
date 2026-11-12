@@ -277,3 +277,26 @@ func TestReconcileRecordsRevertInsideWindow(t *testing.T) {
 		t.Fatalf("inside-window revert verdict = %v, want true", v.Reverted)
 	}
 }
+
+func TestObserveReopenedPRReopensOutcomeReconciliation(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	green := true
+	due := time.Now().UTC().Add(time.Hour)
+	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) {
+		v.Final, v.ReconcileFinished, v.ReconcileDueAt, v.FirstCIGreen = true, true, &due, &green
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = &outcomeGH{fakeGH: g, first: true}
+	if err := s.ObservePR(context.Background(), repo, g.pull, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]
+	if v.Final || v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("reopened PR reconciliation state = final:%t finished:%t due:%v", v.Final, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}

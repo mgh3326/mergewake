@@ -198,6 +198,8 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 			v.Decision = "blocked"
 		} else {
 			v.Final = false
+			v.ReconcileFinished = false
+			v.ReconcileDueAt = nil
 		}
 	})
 	if err != nil {
