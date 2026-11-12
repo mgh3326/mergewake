@@ -84,12 +84,23 @@ func TestPostReviewOutsideDiffList(t *testing.T) {
 				t.Fatalf("an outside finding was posted as %d comments", n)
 			}
 			body := sent["body"].(string)
-			want := fmt.Sprintf("- `docs/other.md:7` (%s): stale claim\n%s%d -->", tt.severity, OutsideMarker, tt.blocking)
+			wantSev := tt.severity
+			if tt.advisory {
+				wantSev += ", advisory"
+			}
+			want := fmt.Sprintf("- `docs/other.md:7` (%s): stale claim\n%s%d -->", wantSev, OutsideMarker, tt.blocking)
 			if !strings.Contains(body, "Outside the diff") || !strings.HasSuffix(body, want) {
 				t.Fatalf("body=%q", body)
 			}
 			if len(history) != 1 || history[0].Pass != 1 || history[0].OutsideBlocking != tt.blocking {
 				t.Fatalf("history=%+v", history)
+			}
+			if len(history[0].Outside) != 1 {
+				t.Fatalf("outside=%+v", history[0].Outside)
+			}
+			got := history[0].Outside[0]
+			if got.Path != "docs/other.md" || got.Line != 7 || got.Severity != tt.severity || got.Advisory != tt.advisory || got.Ref != OutsideRef(got.Path, got.Line, got.Severity, got.Advisory, got.Body) || got.Body != "stale claim" {
+				t.Fatalf("outside finding=%+v", got)
 			}
 		})
 	}
@@ -115,6 +126,40 @@ func TestPostReviewBodyUnchangedWithoutOutsideFindings(t *testing.T) {
 		"One independent diff-only pass (lens: state-risk). Findings are advisory except under blocking policy."
 	if sent["body"] != want {
 		t.Fatalf("body=%q\nwant %q", sent["body"], want)
+	}
+}
+
+// Bodies posted before advisory outside findings carried the ", advisory"
+// tag list them with a bare severity, so they parse back as blocking and
+// outnumber the marker's count. The parsed set is then unusable — the pass
+// keeps only the opaque count rather than tracking findings the receipt
+// never held.
+func TestOutsideUnmarkedAdvisoryFallsBackToCount(t *testing.T) {
+	body := "<!-- mergewake-review:" + testSHA + " -->\n" +
+		"One independent diff-only pass.\n\n" +
+		"Outside the diff (these paths or lines are not changed by this PR; critical and high hold the merge):\n" +
+		"- `docs/a.md:3` (high): an advisory finding the old body did not mark\n" +
+		"- `docs/b.md:5` (high): a real blocking finding\n" +
+		OutsideMarker + "1 -->"
+	b, _ := json.Marshal(body)
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id":1,"body":%s,"commit_id":%q,"state":"COMMENTED","user":{"login":"review-bot"}}]`, b, testSHA)
+	})
+	history, err := c.ReviewHistory(context.Background(), "example/project", 7, "review-bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].OutsideBlocking != 1 || len(history[0].Outside) != 0 {
+		t.Fatalf("history=%+v", history)
+	}
+}
+
+// A path may itself contain a backtick or a colon: the line parser anchors on
+// the last ":<line>" before the closing backtick.
+func TestParseOutsideFindingPathWithBacktick(t *testing.T) {
+	got := parseOutsideFindings("intro\n\nOutside the diff (x):\n- `a`b.md:3` (high): odd path\n<!-- mergewake-outside-diff:1 -->")
+	if len(got) != 1 || got[0].Path != "a`b.md" || got[0].Line != 3 || got[0].Severity != "high" {
+		t.Fatalf("outside=%+v", got)
 	}
 }
 
