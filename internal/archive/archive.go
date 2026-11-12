@@ -251,18 +251,25 @@ const hostListScript = `cd "$1" || exit 1
 for d in *; do
   if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0 0; continue; fi
   [ -d "$d" ] || continue
-  has=0; done=0; uncertain=0
+  has=0; done=0; uncertain=0; invalidEvents=0
   if [ ! -r "$d" ] || [ ! -x "$d" ]; then uncertain=1; fi
-  if [ -e "$d/events" ]; then
+  if [ -e "$d/events" ] || [ -L "$d/events" ]; then
     has=1
-    eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $1+0 >= max {max=$1+0; latestKind=$2} END {print (latestKind == "T"), rc+0}')
-    set -- $eventSummary; done=$1; rc=$2
-    if [ "$rc" -ne 0 ]; then uncertain=1; fi
+    if [ ! -d "$d/events" ] || [ ! -r "$d/events" ] || [ ! -x "$d/events" ]; then
+      done=0; invalidEvents=1
+    else
+      eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $1+0 >= max {max=$1+0; latestKind=$2} END {print (latestKind == "T"), rc+0}')
+      set -- $eventSummary; done=$1; rc=$2
+      if [ "$rc" -ne 0 ]; then uncertain=1; fi
+    fi
   fi
   newestSummary=$({ find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} NR == 1 || $1+0 > max {max=$1+0} END {printf "%.0f %d\n", max, rc+0}')
   set -- $newestSummary; newest=$1; rc=$2
   if [ "$rc" -ne 0 ]; then uncertain=1; fi
-  if [ "$uncertain" -eq 1 ]; then has=1; done=1; newest=0; fi
+  if [ "$uncertain" -eq 1 ]; then
+    has=1; newest=0
+    if [ "$invalidEvents" -eq 1 ]; then done=0; else done=1; fi
+  fi
   printf '%s\0d\0%s\0%s\0%s\0%s\0' "$d" "$has" "$done" "$newest" "$uncertain"
 done`
 
@@ -824,7 +831,7 @@ func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
 }
 
 func (m *manifest) matches(p *Plan) bool {
-	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) {
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) || !sameStrings(m.Excluded, p.Excluded) || !sameStrings(m.Skipped, p.Skipped) || !sameStrings(m.AppleDouble, p.AppleDouble) {
 		return false
 	}
 	for i, f := range m.Oversized {
@@ -838,6 +845,18 @@ func (m *manifest) matches(p *Plan) bool {
 	}
 	for i, f := range m.Files {
 		if f.Path != p.Move[i] || f.Size != size[f.Path] || len(f.SHA256) != 64 {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -1004,14 +1023,16 @@ func textArchive(p *Plan) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// writeTextScript unpacks the tar on stdin into a staging directory beside the
-// destination and renames each file into place, so an interrupted run never
-// leaves a half-written final file. A crashed run's staging directory is
-// removed by the next one. Arg: $1 destination directory.
+// writeTextScript unpacks the tar on stdin into a unique staging directory
+// beside the destination and renames each file into place. Arg: $1 destination.
 const writeTextScript = `dest="$1"
-stage="$dest/.partial"
-mkdir -p "$dest" && rm -rf "$stage" && mkdir -p "$stage" || exit 1
-tar -xf - -C "$stage" || { rm -rf "$stage"; exit 1; }
+parent=$(dirname "$dest")
+base=$(basename "$dest")
+mkdir -p "$parent" "$dest" || exit 1
+stage=$(mktemp -d "$parent/.$base.text-stage.XXXXXX") || exit 1
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT HUP INT TERM
+tar -xf - -C "$stage" || exit 1
 export dest stage
 find "$stage" ! -type d -print0 | xargs -0 sh -c '
 for f; do
@@ -1019,8 +1040,7 @@ for f; do
   case "$rel" in ""|/*|..|../*|*/..|*/../*) exit 1;; esac
   mkdir -p "$dest/$(dirname "$rel")" || exit 1
   mv -f "$f" "$dest/$rel" || exit 1
-done' sh || { rm -rf "$stage"; exit 1; }
-rm -rf "$stage"`
+done' sh`
 
 // manifest is written beside the archived files.
 type manifest struct {

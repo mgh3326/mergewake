@@ -360,7 +360,7 @@ A single PR's fetch failure never aborts the pass.
 | `text_max_bytes` | `1048576` | Maximum size of `*.md` and `*.json` files inspected locally for hk guard patterns; at most 3 MiB. It does not control Drive copying. |
 | `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
 | `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
-| `max_jobs_per_run` | `0` | Maximum jobs archived or resumed by one `archive-jobs` run; `0` means no limit. Oldest jobs are taken first and the summary reports eligible jobs left. |
+| `max_jobs_per_run` | `0` | Maximum jobs selected for archive or resume by one `archive-jobs` run; `0` means no limit. Dry-run and shadow use the same cap and selection as apply. Oldest jobs are taken first and the summary reports eligible jobs left. |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
@@ -389,8 +389,9 @@ these steps in order:
   list every non-directory entry. A job is eligible only when its `events/`
    contains `job.completed` or `job.lost` and no later `job.claim`, `job.spawned`, `job.joined` or
   `job.placement` event (a reused name has started again); bookkeeping events
-  do not affect that decision. A job without `events/` uses its newest-file age
-  as its completion signal. Every listed entry, including excluded entries,
+  do not affect that decision. An `events` entry that is present but is not a
+  readable directory is treated as unfinished; only an absent `events/` uses
+  newest-file age as its completion signal. Every listed entry, including excluded entries,
   contributes to the newest-entry time used by `--older-than`.
    `reap.archive.exclude` is a list of shell globs matched against job names;
    it defaults to `["pw-rollout-*", "pw-hk*", "events-lane"]`, while an
@@ -415,8 +416,9 @@ these steps in order:
   `<drive_dir>/no-task/<UTC YYYY-MM>/<host>-<job>/` and recorded as
   `archive/no-task/<host>-<job>` without a task comment. A destination that already holds a `manifest.json` is
    a finished archive: when that manifest names the same job, host and task
-   with the same archived files and oversized paths, sizes and fingerprints,
-   the plan is a delete-only `resume` (contents must still match the manifest);
+   with the same archived files, oversized paths, sizes and fingerprints, and
+   the same excluded, skipped and AppleDouble lists, the plan is a delete-only
+   `resume` (contents must still match the manifest);
    otherwise it is skipped as
    `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
    under the archive's `.locks` directory, outside task/job names; a lock older

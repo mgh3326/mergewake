@@ -792,7 +792,7 @@ func TestResumeIdentityIncludesExcludedSkippedAndAppleDouble(t *testing.T) {
 			p, err = a.Plan(context.Background(), h, "wk-resume-lists")
 			var s *Skip
 			if !errors.As(err, &s) || s.Reason != "drive-dir-exists" || (p != nil && p.Resume) {
-				t.Fatalf("resume plan=%+v err=%v", p, err)
+				t.Fatalf("resume err=%v, want drive-dir-exists", err)
 			}
 			if _, err := os.Stat(dir); err != nil {
 				t.Fatalf("job dir was deleted or lost: %v", err)
