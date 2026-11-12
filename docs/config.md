@@ -826,8 +826,10 @@ on it.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
     and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
     round count, open findings, and the two choices: cut the scope or request one SS consult on the design.
-  - **Releasing the hold:** The hold ends when an authorized account (non-bot, other than the review login)
-    replies with a PR comment matching `Mergewake-Round-Hold: release` posted after the hold began. Once released, review and gate resume.
+  - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began
+    by a non-bot account — the review login counts, since it is also the operator's account. Comments mergewake generated
+    (they carry a `<!-- mergewake` marker, including the hold decision text itself) never count. Once released, review and gate resume;
+    the release is audited with the releasing login.
 
 Round, `delta_base`, `quiet`, `prior_context`, `advisory` and the drop counts
 are on the `review` audit event.

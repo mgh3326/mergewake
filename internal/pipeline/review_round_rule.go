@@ -311,9 +311,14 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 	}
 }
 
-func checkRoundHoldRelease(comments []github.IssueComment, reviewLogin string) (bool, string) {
+// checkRoundHoldRelease finds the first comment that releases the round hold:
+// it matches the release phrase, is not from a bot, and is not a comment
+// mergewake generated — those carry a `<!-- mergewake` marker. The review
+// login is not skipped: it is also the operator's account, and only its
+// mergewake-marked comments are excluded.
+func checkRoundHoldRelease(comments []github.IssueComment) (bool, string) {
 	for _, c := range comments {
-		if c.User.Type == "Bot" || strings.HasSuffix(c.User.Login, "[bot]") || (reviewLogin != "" && c.User.Login == reviewLogin) {
+		if c.User.Type == "Bot" || strings.HasSuffix(c.User.Login, "[bot]") || strings.Contains(c.Body, "<!-- mergewake") {
 			continue
 		}
 		if roundHoldReleaseRegex.MatchString(c.Body) {
@@ -345,7 +350,7 @@ func (s *Service) designLane(ctx context.Context, r config.Repo, pr github.Pull)
 }
 
 func round5DecisionText(r config.Repo, pr github.Pull, rounds int, open []github.ReviewThread) string {
-	head := fmt.Sprintf("[mergewake] ESC %s#%d | round %d ended without a pass (%d open finding(s))", r.Name, pr.Number, rounds, len(open))
+	head := "<!-- mergewake-round-hold -->\n" + fmt.Sprintf("[mergewake] ESC %s#%d | round %d ended without a pass (%d open finding(s))", r.Name, pr.Number, rounds, len(open))
 	choices := " | choices: 1) cut the scope (the part that keeps drawing findings goes to a follow-up task, the rest merges) or 2) one SS consult on the design | reply with PR comment: Mergewake-Round-Hold: release"
 
 	var details strings.Builder
@@ -393,9 +398,10 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		return true
 	}
 	if len(comments) > st.commentCount() {
-		if released, by := checkRoundHoldRelease(comments[st.commentCount():], s.Config.Review.Login); released {
+		if released, by := checkRoundHoldRelease(comments[st.commentCount():]); released {
 			st.setReleased(true, by)
 			_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+			_ = s.audit(r.Name, "round-hold-release", map[string]any{"pr": pr.Number, "by": by}, false)
 			return false
 		}
 	}
@@ -423,9 +429,10 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 				st.setHeld(true, st.HoldAt, len(comments), true)
 				_ = s.saveRoundRuleState(r.Name, pr.Number, st)
 			} else if len(comments) > st.commentCount() {
-				if released, by := checkRoundHoldRelease(comments[st.commentCount():], s.Config.Review.Login); released {
+				if released, by := checkRoundHoldRelease(comments[st.commentCount():]); released {
 					st.setReleased(true, by)
 					_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+					_ = s.audit(r.Name, "round-hold-release", map[string]any{"pr": pr.Number, "by": by}, false)
 					return false
 				}
 			}
