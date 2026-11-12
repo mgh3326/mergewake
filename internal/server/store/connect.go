@@ -3,9 +3,15 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -15,6 +21,8 @@ import (
 )
 
 const queryTimeout = 10 * time.Second
+const privateCATLSName = "mergewake-ca"
+const maxCAFileSize = 64 * 1024
 
 var (
 	ErrUnavailable = errors.New("server database unavailable")
@@ -39,11 +47,23 @@ func Connect(ctx context.Context) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	caFile, serverName := os.Getenv("MERGEWAKE_MYSQL_CA_FILE"), os.Getenv("MERGEWAKE_MYSQL_SERVER_NAME")
+	if caFile != "" {
+		if serverName == "" {
+			return nil, ErrConfig
+		}
+		tlsConfig, err := privateCATLSConfig(caFile, serverName)
+		if err != nil || mysql.RegisterTLSConfig(privateCATLSName, tlsConfig) != nil {
+			return nil, ErrConfig
+		}
+	} else if serverName != "" {
+		return nil, ErrConfig
+	}
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return nil, ErrConfig
 	}
-	if cfg.DBName == "" || cfg.TLSConfig != "true" || cfg.AllowFallbackToPlaintext || cfg.AllowCleartextPasswords || cfg.MultiStatements || cfg.InterpolateParams {
+	if cfg.DBName == "" || validateTLSMode(cfg.TLSConfig, caFile, serverName) != nil || cfg.AllowFallbackToPlaintext || cfg.AllowCleartextPasswords || cfg.MultiStatements || cfg.InterpolateParams {
 		return nil, ErrConfig
 	}
 	cfg.ParseTime, cfg.Loc = true, time.UTC
@@ -66,6 +86,107 @@ func Connect(ctx context.Context) (*Store, error) {
 		return nil, ErrUnavailable
 	}
 	return s, nil
+}
+
+func validateTLSMode(tlsValue, caFile, serverName string) error {
+	if caFile == "" {
+		if serverName == "" && tlsValue == "true" {
+			return nil
+		}
+		return ErrConfig
+	}
+	if serverName != "" && tlsValue == privateCATLSName {
+		return nil
+	}
+	return ErrConfig
+}
+
+func privateCATLSConfig(path, serverName string) (*tls.Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ErrConfig
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || (info.Mode().Perm() != 0600 && info.Mode().Perm() != 0644) || info.Size() > maxCAFileSize {
+		return nil, ErrConfig
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maxCAFileSize+1))
+	if err != nil || len(contents) > maxCAFileSize {
+		return nil, ErrConfig
+	}
+	roots := x509.NewCertPool()
+	count := 0
+	for len(bytes.TrimSpace(contents)) > 0 {
+		contents = bytes.TrimSpace(contents)
+		if !bytes.HasPrefix(contents, []byte("-----BEGIN CERTIFICATE-----")) {
+			return nil, ErrConfig
+		}
+		block, rest := pem.Decode(contents)
+		if block == nil {
+			return nil, ErrConfig
+		}
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, ErrConfig
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil || !cert.IsCA || !cert.BasicConstraintsValid || (cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0) {
+			return nil, ErrConfig
+		}
+		roots.AddCert(cert)
+		count++
+		contents = rest
+	}
+	if count == 0 {
+		return nil, ErrConfig
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: serverName,
+		// The callback below replaces Go's default hostname check so legacy
+		// CN-only certificates can be pinned while still verifying the chain.
+		InsecureSkipVerify: true, //nolint:gosec
+		VerifyConnection:   pinnedCertificateVerifier(roots, serverName),
+	}, nil
+}
+
+func pinnedCertificateVerifier(roots *x509.CertPool, serverName string) func(tls.ConnectionState) error {
+	return func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 || roots == nil || serverName == "" {
+			return fmt.Errorf("certificate verification failed")
+		}
+		leaf := state.PeerCertificates[0]
+		intermediates := x509.NewCertPool()
+		for _, cert := range state.PeerCertificates[1:] {
+			intermediates.AddCert(cert)
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots: roots, Intermediates: intermediates,
+			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err != nil {
+			return fmt.Errorf("certificate verification failed")
+		}
+		var hasSAN bool
+		for _, extension := range leaf.Extensions {
+			if extension.Id.Equal([]int{2, 5, 29, 17}) {
+				hasSAN = true
+				break
+			}
+		}
+		if hasSAN {
+			for _, name := range leaf.DNSNames {
+				if name == serverName {
+					return nil
+				}
+			}
+			return fmt.Errorf("certificate verification failed")
+		}
+		if leaf.Subject.CommonName != serverName {
+			return fmt.Errorf("certificate verification failed")
+		}
+		return nil
+	}
 }
 
 func Open(ctx context.Context) (*Store, error) {
