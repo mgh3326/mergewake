@@ -173,6 +173,11 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 
 	checks := p.WatchSet()
 	bisectChecks := p.BisectChecks()
+	// With any_ref_deploy_checks the deploy stream's candidates are judged by
+	// the any-ref deploy run, which reports the deploy stage as a whole under
+	// names the real deploy run never posts. The head is judged by the deploy
+	// set alone, so the head-versus-candidate subset guard below cannot apply.
+	deployAnyRef := s.deploy && len(p.AnyRefChecks) > 0
 	if !s.deploy {
 		s.ciPolicy(ctx, r, head, o)
 	}
@@ -318,7 +323,7 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 		if v, ok := cache[sha]; ok {
 			return v, nil
 		}
-		v, e := s.GH.Check(ctx, r.Name, sha, bisectChecks)
+		v, e := s.candidateCI(ctx, r.Name, sha, p)
 		if e == nil {
 			cache[sha] = v
 		}
@@ -327,7 +332,7 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	// A head that is red only on checks outside any_ref_checks cannot be
 	// bisected: no commit can be shown green or red on them. Never blame a
 	// commit on partial evidence.
-	if len(bisectChecks) < len(checks) {
+	if len(bisectChecks) < len(checks) && !deployAnyRef {
 		v, e := s.GH.Check(ctx, r.Name, head, bisectChecks)
 		if e != nil {
 			return e

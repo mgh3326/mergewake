@@ -457,6 +457,14 @@ func namesFix(text string, st recoveryIncident) bool {
 	return false
 }
 
+// checkSetChanged reports whether a deploy incident was recorded under a
+// different bisect check set than the policy now names. Such an incident is held
+// and keeps the head it was last validated at: moving the head past commits
+// that were never read under its own set would hide a fix among them.
+func (s *watchStream) checkSetChanged(p policy.Policy, st recoveryIncident) bool {
+	return s.deploy && st.Checks != "" && st.Checks != strings.Join(p.BisectChecks(), ",")
+}
+
 // incidentCurrent reports whether the current red head still belongs to the
 // recorded incident. A green commit between them means main was fixed and broke
 // again, so that red needs a fresh diagnosis rather than the old culprit's
@@ -465,7 +473,14 @@ func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p poli
 	if head == st.Head {
 		return true, nil
 	}
-	names := p.BisectChecks()
+	// A recorded deploy incident whose check set differs from the current one
+	// stays current: confirmRecovery holds it for rediagnosis. Reading the
+	// intervening commits by the new set could otherwise call it fixed and
+	// discard its culprit and evidence. Its head is not advanced meanwhile (see
+	// checkSetChanged), so the range is examined once the set matches again.
+	if s.checkSetChanged(p, st) {
+		return true, nil
+	}
 	current := head
 	for i := 0; i < s.Config.WatchLimit; i++ {
 		c, e := s.GH.Commit(ctx, r.Name, current)
@@ -476,7 +491,7 @@ func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p poli
 			return false, nil
 		}
 		current = c.Parents[0].SHA
-		v, e := s.GH.Check(ctx, r.Name, current, names)
+		v, e := s.candidateCI(ctx, r.Name, current, p)
 		if e != nil {
 			if !errors.Is(e, github.ErrAmbiguousCheck) {
 				return false, e
@@ -595,8 +610,8 @@ func (s *watchStream) recoverIncident(ctx context.Context, r config.Repo, p poli
 		result.Candidates = []int{st.CulpritPR}
 	}
 	// The culprit and the window stay, but the head the fix is named against
-	// moves with main.
-	if st.Head != head {
+	// moves with main, unless the incident is held for a changed check set.
+	if st.Head != head && !s.checkSetChanged(p, st) {
 		st.Head = head
 		if acting {
 			if e := s.saveRecovery(r.Name, st); e != nil {
@@ -691,8 +706,9 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 		}
 	}
 	// The culprit and the window stay, but the red head moves: a fix PR names
-	// the current head, not the one the incident started at.
-	if st.Head != head {
+	// the current head, not the one the incident started at, unless the incident
+	// is held for a changed check set.
+	if st.Head != head && !s.checkSetChanged(p, st) {
 		st.Head = head
 		if acting {
 			if e = s.saveRecovery(r.Name, st); e != nil {

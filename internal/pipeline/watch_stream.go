@@ -83,7 +83,9 @@ func (s *watchStream) endAnyRef(repo string) error {
 func (s *watchStream) watchDeploy(ctx context.Context, r config.Repo, p policy.Policy, mainHead string, o Options) error {
 	p.MainChecks = p.DeploySet()
 	p.WatchChecks = nil
-	p.AnyRefChecks = nil
+	// A dispatched candidate is judged by the checks its any-ref deploy run
+	// posts; unset, by the deploy set as before.
+	p.AnyRefChecks = p.AnyRefDeployChecks
 	st, recorded, err := s.loadRecovery(r.Name)
 	if err != nil {
 		return err
@@ -168,6 +170,21 @@ func (s *watchStream) targetHead(head string) string {
 		return s.mainHead
 	}
 	return head
+}
+
+// candidateCI is a commit's verdict for bisect. The deploy stream with
+// any_ref_deploy_checks reads the commit's own deploy run first (a decisive
+// result there is today's verdict), and only a commit with no decisive deploy
+// result is judged by the checks its any-ref deploy run posts. Every other
+// stream judges by BisectChecks.
+func (s *watchStream) candidateCI(ctx context.Context, repo, sha string, p policy.Policy) (github.CI, error) {
+	if s.deploy && len(p.AnyRefChecks) > 0 {
+		v, err := s.GH.Check(ctx, repo, sha, p.WatchSet())
+		if err != nil || v == github.Green || v == github.Red {
+			return v, err
+		}
+	}
+	return s.GH.Check(ctx, repo, sha, p.BisectChecks())
 }
 
 // anyRefSuiteError says the any-ref workflow's suite input does not take the
