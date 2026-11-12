@@ -207,12 +207,28 @@ type Loop struct {
 // `notify: {enabled: false}` silences them.
 type PRNotify struct {
 	Enabled *bool `yaml:"enabled"`
+	// ConflictOwnerAfter delays the owner's conflict notice while the author
+	// route is active and the PR keeps the same conflicting head. Empty means 30m.
+	ConflictOwnerAfter string `yaml:"conflict_owner_after"`
 	// RenotifyAfter is how long after the last READY event a PR that is still
 	// open and READY on the same head is notified again. Empty means 30m;
 	// "off" keeps one READY per head.
 	RenotifyAfter string `yaml:"renotify_after"`
 	// RenotifyMax bounds those repeats per head. 0 means 3.
 	RenotifyMax int `yaml:"renotify_max"`
+}
+
+const DefaultConflictOwnerAfter = 30 * time.Minute
+
+func (n PRNotify) ConflictOwnerWindow() time.Duration {
+	if n.ConflictOwnerAfter == "" {
+		return DefaultConflictOwnerAfter
+	}
+	d, err := Duration(n.ConflictOwnerAfter)
+	if err != nil {
+		return DefaultConflictOwnerAfter
+	}
+	return d
 }
 
 func (n PRNotify) On() bool { return n.Enabled == nil || *n.Enabled }
@@ -717,6 +733,11 @@ func validateDaemon(c *Config) error {
 	}
 	if c.Daemon.PR.Notify.RenotifyMax < 0 {
 		return errors.New("daemon.pr.notify.renotify_max must not be negative")
+	}
+	if v := c.Daemon.PR.Notify.ConflictOwnerAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return fmt.Errorf("daemon.pr.notify.conflict_owner_after: %w", e)
+		}
 	}
 	if v := c.Daemon.PR.Findings.AckAfter; v != "" {
 		if _, e = Duration(v); e != nil {

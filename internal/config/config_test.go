@@ -44,6 +44,36 @@ func TestValidGradeScale(t *testing.T) {
 	}
 }
 
+func TestConflictOwnerAfterConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        time.Duration
+		bad         bool
+	}{
+		{name: "default", want: DefaultConflictOwnerAfter},
+		{name: "override", value: "45m", want: 45 * time.Minute},
+		{name: "invalid", value: "later", bad: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			contents := "version: 1\nhost: host-a\n"
+			if tc.value != "" {
+				contents += "daemon:\n  pr:\n    notify:\n      conflict_owner_after: " + tc.value + "\n"
+			}
+			if err := os.WriteFile(p, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := Load(p)
+			if (err != nil) != tc.bad {
+				t.Fatalf("Load error = %v, bad = %v", err, tc.bad)
+			}
+			if err == nil && c.Daemon.PR.Notify.ConflictOwnerWindow() != tc.want {
+				t.Fatalf("window = %v, want %v", c.Daemon.PR.Notify.ConflictOwnerWindow(), tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadReviewDefaultGradeSS(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\nreview:\n  default_grade: SS\n"), 0600); err != nil {

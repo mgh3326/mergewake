@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
@@ -393,8 +394,12 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		gate = *p.ReviewGate
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	deferRule := s.deferTaskRule(ctx, r, pr)
 	var holding map[string]bool
-	_, _, v.Review.Findings, holding = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+	_, _, v.Review.Findings, holding = gradeThreadsDetailedWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
+	if deferRule != nil && deferRule.err != nil {
+		return v, fmt.Errorf("defer task lookup: %w", deferRule.err)
+	}
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -402,7 +407,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+		blocking, triage := gradeThreadsWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
 		v.Status.Threads = prstatus.Threads{Blocking: blocking, Other: triage + v.Review.Findings.Advisory}
 		v.Holds = holdingThreads(fb, holding)
 		if blocking > 0 {
@@ -667,10 +672,19 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class st
 	return blocking, triage
 }
 
+func gradeThreadsWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int) {
+	blocking, triage, _, _ = gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, deferRule, fleet...)
+	return blocking, triage
+}
+
 // gradeThreadsDetailed is gradeThreads together with how every graded thread
 // stands, for the review record, and the ids of the unresolved threads that
 // count as blocking findings.
 func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
+	return gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, nil, fleet...)
+}
+
+func gradeThreadsDetailedWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
 	holding = map[string]bool{}
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
@@ -722,7 +736,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			switch {
 			case f.Resolved:
 				d.Resolved++
-			case answered(t, f.OwnReview, fleet...):
+			case answeredWithDefer(t, f.OwnReview, deferRule, fleet...):
 				d.Answered++
 			case !fastLane || unreadable:
 				triage++
@@ -788,7 +802,133 @@ var (
 	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
+	deferIntent  = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\b`)
+	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+([0-9]+)\b`)
 )
+
+type deferTaskRule struct {
+	own       string
+	ownTask   func() (string, error)
+	ownLoaded bool
+	exists    func(string) (bool, error)
+	seen      map[string]bool
+	failed    map[string]error
+	err       error
+}
+
+func (s *Service) deferTaskRule(ctx context.Context, r config.Repo, pr github.Pull) *deferTaskRule {
+	jobs, ok := s.Sink.(interface {
+		TaskJob(context.Context, string) (string, string, error)
+	})
+	rule := &deferTaskRule{seen: map[string]bool{}, failed: map[string]error{}, ownTask: func() (string, error) {
+		return s.prTask(ctx, r, pr)
+	}}
+	if ok {
+		rule.exists = func(id string) (bool, error) {
+			_, _, err := jobs.TaskJob(ctx, id)
+			return err == nil, err
+		}
+	}
+	return rule
+}
+
+func (r *deferTaskRule) isOwnTask(id string) (bool, error) {
+	if r == nil {
+		return true, nil
+	}
+	if !r.ownLoaded && r.ownTask != nil {
+		own, err := r.ownTask()
+		r.ownLoaded = true
+		if err != nil {
+			return false, err
+		}
+		r.own = own
+	}
+	return id == r.own, nil
+}
+
+func (r *deferTaskRule) taskExists(id string) (bool, error) {
+	if r == nil || r.exists == nil {
+		return false, nil
+	}
+	if r.seen == nil {
+		r.seen = map[string]bool{}
+	}
+	if r.failed == nil {
+		r.failed = map[string]error{}
+	}
+	if exists, ok := r.seen[id]; ok {
+		return exists, nil
+	}
+	if err, ok := r.failed[id]; ok {
+		return false, err
+	}
+	exists, err := r.exists(id)
+	if err != nil {
+		if isTaskNotFound(err) {
+			r.seen[id] = false
+			return false, nil
+		}
+		r.failed[id] = err
+		return false, err
+	}
+	r.seen[id] = exists
+	return exists, nil
+}
+
+// TaskJob's public adapter wraps hk's not_found answer with this stable reason.
+// It is a missing disposition target, not a failed lookup of the verdict inputs.
+func isTaskNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "handoffkeep task not_found:")
+}
+
+func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRule, fleet ...[]string) bool {
+	if len(t.Comments) == 0 {
+		return false
+	}
+	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	answered := false
+	var lookupErr error
+	for i := 1; i < len(t.Comments); i++ {
+		c := t.Comments[i]
+		if !answeredBy(c, author, ownReview, fleet...) {
+			continue
+		}
+		if !deferIntent.MatchString(c.Body) {
+			answered = true
+			lookupErr = nil
+			continue
+		}
+		match := deferReply.FindStringSubmatch(c.Body)
+		if match == nil {
+			continue
+		}
+		if rule == nil || rule.exists == nil || answered {
+			continue
+		}
+		own, err := rule.isOwnTask(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if own {
+			continue
+		}
+		exists, err := rule.taskExists(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if exists {
+			answered = true
+			lookupErr = nil
+		}
+	}
+	if !answered && lookupErr != nil && rule != nil {
+		rule.err = errors.Join(rule.err, lookupErr)
+	}
+	return answered
+}
 
 // fixCheck reports whether sha, named in a fix reply, is a real fix for a
 // finding posted on head posted (fixVerifier.verified).

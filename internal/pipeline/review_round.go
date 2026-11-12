@@ -39,8 +39,11 @@ type roundPlan struct {
 	round int
 	// base is the previously reviewed head whose interdiff diff holds; empty
 	// when diff is the whole PR.
-	base string
-	diff string
+	base              string
+	diff              string
+	firstReviewedHead string
+	addedAfterFirst   map[string]map[int]bool
+	firstDiffKnown    bool
 	// quiet limits findings to critical and high: the budget is spent, or no
 	// hunk changed since the last reviewed head.
 	quiet bool
@@ -105,6 +108,7 @@ func (s *Service) planRound(ctx context.Context, r config.Repo, pr github.Pull, 
 		}
 		return rp
 	}
+	rp.firstReviewedHead = prior[0].SHA
 	rp.round = priorRound + 1
 	if curRound > 0 {
 		rp.round = curRound
@@ -150,6 +154,13 @@ func (s *Service) planRound(ctx context.Context, r config.Repo, pr github.Pull, 
 		return rp
 	}
 	rp.base, rp.diff = last, delta
+	first, firstErr := differ.CompareDiff(ctx, r.Name, pr.Base.Ref, rp.firstReviewedHead)
+	if firstErr == nil {
+		rp.addedAfterFirst = diffNewAddedLocations(first, full)
+		rp.firstDiffKnown = true
+	} else {
+		rp.note = "first reviewed head diff unreadable: " + firstErr.Error()
+	}
 	return rp
 }
 
