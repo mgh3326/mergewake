@@ -659,7 +659,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}
-			args = append(args, "--builder-family", builderFamily, "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
+			args = append(args, "--builder-family", panewireBuilderFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
 			if cfg.Owner != "" {
 				args = append(args, "--owner", cfg.Owner)
 			}
@@ -1431,6 +1431,17 @@ func (x *panewireExecutor) builderFamily(ctx context.Context, parent string) str
 		return rec.Family
 	}
 	return x.authorFamily
+}
+
+// panewireBuilderFamily bounds the builder family to the values accepted by
+// panewire. Mergewake keeps the canonical family for its own review logic.
+func panewireBuilderFamily(family string) string {
+	switch family {
+	case "anthropic", "openai", "google", "xai", "deepseek", "meta", "mistral", "other":
+		return family
+	default:
+		return "other"
+	}
 }
 
 // prHeadRefspec fetches a PR head into the remote-tracking ref panewire looks
