@@ -410,16 +410,24 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		return err
 	}
 	var errs []error
-	// A final row is visited again while its revert event is unsettled.
+	var closedRowsRead, closedRowsSkippedNotDue int
+	// A row is revisited at its due time while its revert verdict or event is unsettled.
 	sent, _ := s.taskEventKeys(r.Name)
 	for _, key := range slices.Sorted(maps.Keys(state.Latest)) {
 		v := state.Latest[key]
 		if v.Repo != r.Name || open[v.PR] {
 			continue
 		}
-		if v.Final && v.Attributed() && v.FirstCIGreen != nil && (v.MergedAt == nil || v.Reverted != nil) && !s.revertEventPending(r, v, o, sent) {
+		pendingEvent := s.revertEventPending(r, v, o, sent)
+		if v.ReconcileFinished && !pendingEvent {
+			closedRowsSkippedNotDue++
 			continue
 		}
+		if v.ReconcileDueAt != nil && s.now().Before(*v.ReconcileDueAt) {
+			closedRowsSkippedNotDue++
+			continue
+		}
+		closedRowsRead++
 		p, e := s.GH.Pull(ctx, r.Name, v.PR)
 		if e == nil {
 			s.finalizeStatus(r, p)
@@ -427,8 +435,36 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		}
 		if e != nil {
 			errs = append(errs, e)
+			continue
+		}
+		latest, readErr := s.ledger().Read()
+		if readErr != nil {
+			errs = append(errs, readErr)
+			continue
+		}
+		v = latest.Latest[key]
+		if v.MergedAt == nil || v.Reverted != nil || !v.Attributed() || v.FirstCIGreen == nil {
+			v.ReconcileFinished = true
+		} else {
+			v.ReconcileFinished = false
+		}
+		// Re-read sent keys because ObservePR can settle a revert event during
+		// this visit. A pending event remains eligible at the same hourly cadence.
+		sent, _ = s.taskEventKeys(r.Name)
+		if v.ReconcileFinished && !s.revertEventPending(r, v, o, sent) {
+			v.ReconcileDueAt = nil
+		} else {
+			due := s.now().Add(time.Hour)
+			v.ReconcileDueAt = &due
+		}
+		if err := s.ledger().Update(r.Name, v.PR, func(current *outcomes.Outcome) {
+			current.ReconcileFinished = v.ReconcileFinished
+			current.ReconcileDueAt = v.ReconcileDueAt
+		}); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	slog.Info("closed PR outcome reconciliation", "repo", r.Name, "closed_rows_read", closedRowsRead, "closed_rows_skipped_not_due", closedRowsSkippedNotDue)
 	errs = append(errs, s.FlushOutcomes(ctx, r.Name))
 	return errors.Join(errs...)
 }
