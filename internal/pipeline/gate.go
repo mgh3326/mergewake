@@ -69,6 +69,7 @@ type reviewRecord struct {
 	Reviewed        []string     `json:"reviewed_patch_ids,omitempty"`
 	Inherited       string       `json:"inherited_from,omitempty"`
 	Findings        dispositions `json:"dispositions"`
+	Hold            string       `json:"hold,omitempty"`
 }
 
 // dispositions counts the PR's review threads by how they stand: blocking and
@@ -438,6 +439,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
 	v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
+	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, &v)
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if errors.Is(e, github.ErrPollSkipped) {
 		// The done-marker probe is inside its poll interval: hold the verdict

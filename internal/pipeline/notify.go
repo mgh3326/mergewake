@@ -72,6 +72,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if e != nil {
 		return e
 	}
+	if slices.Contains(v.Reasons, "round_hold") {
+		if fb, fbErr := s.GH.ReviewFeedback(ctx, r.Name, n); fbErr == nil {
+			_ = s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o)
+		}
+	}
 	if !o.DryRun {
 		s.recordStatus(r, pr, v, started)
 	}
