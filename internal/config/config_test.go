@@ -452,9 +452,6 @@ func TestReviewExecutor(t *testing.T) {
 	if _, e := load("review:\n  executor: headless\n"); e == nil || e.Error() != "review.executor: headless was retired; use panewire (the default)" {
 		t.Fatalf("headless error: %v", e)
 	}
-	if c, e := load("review:\n  quota: /x/pacelever\n"); e != nil || c.Outcomes.Command != "/x/pacelever" {
-		t.Fatalf("outcomes fallback: %q %v", c.Outcomes.Command, e)
-	}
 	c, e = load("review:\n  executor: panewire\n  panewire: {owner: review-desk, host: host-b, checkouts: /work/reviews}\n")
 	if e != nil || c.Review.Executor != "panewire" || c.Review.Panewire.Owner != "review-desk" || c.Review.Panewire.Host != "host-b" || c.Review.Panewire.Checkouts != "/work/reviews" {
 		t.Fatalf("%+v %v", c.Review, e)
@@ -482,6 +479,32 @@ func TestReviewExecutor(t *testing.T) {
 		if _, e = load(bad); e == nil {
 			t.Fatalf("accepted %q", bad)
 		}
+	}
+}
+
+func TestOutcomesCommandDefault(t *testing.T) {
+	load := func(extra string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(p, []byte("version: 1\nhost: host-a\nstate_dir: /state\n"+extra), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return Load(p)
+	}
+	cases := []struct {
+		name, extra, want string
+	}{
+		{"no review or outcomes keys", "", "panewire"},
+		{"review.panewire.command", "review:\n  panewire: {command: /opt/pw}\n", "/opt/pw"},
+		{"retired review.quota and review.scopefuel", "review:\n  quota: /x/pacelever\n  scopefuel: /y\n", "panewire"},
+		{"explicit outcomes.command beats retired quota", "outcomes:\n  command: /x/explicit\nreview:\n  quota: /x/pacelever\n", "/x/explicit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, e := load(tc.extra)
+			if e != nil || c.Outcomes.Command != tc.want {
+				t.Fatalf("outcomes.command %q, want %q: %v", c.Outcomes.Command, tc.want, e)
+			}
+		})
 	}
 }
 

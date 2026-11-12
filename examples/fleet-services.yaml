@@ -45,7 +45,6 @@ repos:
 review:
   login: review-bot
   timeout: 10m
-  quota: scopefuel
   default_grade: B
   profiles:
     claude:
@@ -54,7 +53,7 @@ review:
       args: [--provider, anthropic, --model, claude-model-id]
       gate_profile: example-claude-profile
 outcomes:
-  command: scopefuel
+  command: panewire
   default_tier: T1
 notifier:
   type: stdout

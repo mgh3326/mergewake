@@ -1,17 +1,15 @@
 # Binary fleet inventory and enablement
 
-Use examples/fleet-binaries.yaml for mergewake and pacelever. The release adapter
-now derives `<repository>-<os>-<arch>` asset names, so pacelever can use the same
-checksummed v-tag flow as mergewake. The pacelever verify wrapper reads only
-`--version` and emits its full build commit. Both version paths exit before
-loading application configuration.
+Use examples/fleet-binaries.yaml for mergewake. The release adapter
+now derives `<repository>-<os>-<arch>` asset names for checksummed v-tag
+releases. The `commit` and `--version` paths exit before loading application
+configuration.
 
 The dry runs against published releases resolved:
 
 | Repository | Published release | Full commit | Plan |
 |---|---|---|---|
 | mgh3326/mergewake | v0.5.30 | 0de64bbbaa1102f2afd07c542a97a49173dbd108 | bin/mergewake |
-| mgh3326/pacelever | v0.3.18 | 47e28f900ae5f637ba58391b90f9d97a6c49f206 | bin/pacelever |
 
 These are real GitHub reads and actual `rollout --dry-run` output, not install
 proof. The companion approval gate correctly holds a fresh state directory
@@ -21,11 +19,9 @@ installed version and must be replaced privately.
 ## Desk steps
 
 1. Merge/release the approval gate and this PR in that order. Keep rollout disabled.
-2. Install the reviewed mergewake binary and pacelever binary under `/opt/fleet/bin`
-   using the desk's checksummed release procedure. Preserve the prior binaries.
-   Install scripts/verify-pacelever-commit.sh at `/opt/fleet/libexec/` executable.
-3. Read `/opt/fleet/bin/mergewake commit` and
-   `/opt/fleet/libexec/verify-pacelever-commit.sh /opt/fleet/bin/pacelever`.
+2. Install the reviewed mergewake binary under `/opt/fleet/bin` using the desk's
+   checksummed release procedure. Preserve the prior binary.
+3. Read `/opt/fleet/bin/mergewake commit`.
    Replace each `initial_sha` with that exact full SHA; verify a published release
    exists for it, since rollback fetches that commit's release assets.
 4. Copy examples/fleet-binaries.yaml to the private daemon config, preserving the
@@ -40,7 +36,6 @@ installed version and must be replaced privately.
 6. Run:
    ```sh
    mergewake rollout --config <private-config> --repo mgh3326/mergewake --dry-run
-   mergewake rollout --config <private-config> --repo mgh3326/pacelever --dry-run
    ```
    Inspect full release commits, selected targets and any hold. These dry runs
    never execute smoke, restart a daemon, or alter receipts.

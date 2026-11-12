@@ -40,9 +40,10 @@ type Review struct {
 	FleetAuthors []string            `yaml:"fleet_authors"`
 	Pairings     map[string][]string `yaml:"pairings"`
 	Profiles     map[string]Reviewer `yaml:"profiles"`
-	Scopefuel    string              `yaml:"scopefuel"`
-	Quota        string              `yaml:"quota"`
-	DefaultGrade string              `yaml:"default_grade"`
+	// Scopefuel and Quota are accepted for compatibility and unused.
+	Scopefuel    string `yaml:"scopefuel"`
+	Quota        string `yaml:"quota"`
+	DefaultGrade string `yaml:"default_grade"`
 	// DefaultFamily is the reviewer family used when the PR carries no
 	// author-family trailer and the head commit identities yield no known
 	// model alias. Reviewed heads record that the family was inferred.
@@ -577,7 +578,7 @@ func Load(name string) (Config, error) {
 		return c, e
 	}
 	// Order matters: later sections default from earlier ones (hosts read the
-	// reap transport, outcomes the review quota tool, repos and review the
+	// reap transport, outcomes the panewire command, repos and review the
 	// state directory).
 	for _, section := range []func(*Config) error{
 		validateBasics, validateGitHubApp, validateDaemon, validateReap, validateHosts, validateReview,
@@ -797,13 +798,7 @@ func validateReview(c *Config) error {
 	if !ValidGrade(c.Review.DefaultGrade) {
 		return errors.New("invalid review.default_grade")
 	}
-	if c.Review.Quota == "" {
-		c.Review.Quota = c.Review.Scopefuel
-	}
-	if c.Review.Quota == "" {
-		c.Review.Quota = "scopefuel"
-	}
-	c.Review.Quota = Expand(c.Review.Quota)
+	// review.quota and review.scopefuel are accepted and unused; nothing reads them.
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return e
 	}
@@ -855,10 +850,10 @@ func validateReview(c *Config) error {
 	return nil
 }
 
-// validateOutcomes defaults the outcomes command to the review quota tool, so it runs after validateReview.
+// validateOutcomes defaults the outcomes command to the panewire command, so it runs after validateReview.
 func validateOutcomes(c *Config) error {
 	if c.Outcomes.Command == "" {
-		c.Outcomes.Command = c.Review.Quota
+		c.Outcomes.Command = c.Review.Panewire.Command
 	}
 	c.Outcomes.Command = Expand(c.Outcomes.Command)
 	if c.Outcomes.Tier == "" {
