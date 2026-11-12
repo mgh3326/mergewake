@@ -16,6 +16,8 @@ blocking:
     reason: Reap closes live panes; a wrong close loses a worker's context that git revert cannot restore
   - paths: [internal/policy/**, .mergewake/**, .github/workflows/**]
     reason: Verification controls can admit unsafe actions before recovery
+  - paths: [internal/pipeline/watch*.go]
+    reason: Watch opens revert PRs and holds recovery; a wrong or missed revert leaves main red until a person steps in
 review_gate:
   land: graded
 fast_lane:
