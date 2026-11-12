@@ -156,7 +156,7 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 			plan = v
 		}
 	}
-	want := []string{"dangling-events|skipped|too-new", "eligible|would-archive|", "file-events|skipped|not-finished", "no-events|would-archive|", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
+	want := []string{"dangling-events|skipped|not-finished", "eligible|would-archive|", "file-events|skipped|not-finished", "no-events|would-archive|", "pane-live|skipped|pane-live", "symlink-job|skipped|job-dir-symlink", "too-new|skipped|too-new", "unfinished|skipped|not-finished"}
 	sort.Strings(got)
 	sort.Strings(want)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -164,6 +164,45 @@ func TestArchiveJobsHostPreflightRowsAndEligiblePlan(t *testing.T) {
 	}
 	if plan == nil || plan["job"] != "eligible" || plan["task"] != "77" || plan["files"] != float64(4) {
 		t.Fatalf("eligible plan = %v", plan)
+	}
+}
+
+func TestArchiveJobsDryRunAndShadowRespectMaxJobsPerRun(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		o    Options
+	}{
+		{name: "apply"},
+		{name: "dry-run", o: Options{DryRun: true}},
+		{name: "shadow", o: Options{Shadow: true}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			f := newArchiveFixture(t, noAgents)
+			f.s.Config.Reap.Archive.MaxJobsPerRun = 2
+			for i := 0; i < 5; i++ {
+				dir := jobDir(t, f.jobs, fmt.Sprintf("legacy-%d", i), time.Duration(20+i)*24*time.Hour)
+				if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, mode.o); err != nil {
+				t.Fatal(err)
+			}
+			var selected []string
+			for _, line := range strings.Split(f.out.String(), "\n") {
+				var row archiveRow
+				if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && (row.Result == "would-archive" || row.Result == "archived") {
+					selected = append(selected, row.Job)
+				}
+			}
+			sort.Strings(selected)
+			if strings.Join(selected, ",") != "legacy-3,legacy-4" {
+				t.Fatalf("selected = %v, want oldest two", selected)
+			}
+			if !strings.Contains(f.out.String(), `"eligible_left":3`) {
+				t.Fatalf("summary missing eligible remainder: %s", f.out.String())
+			}
+		})
 	}
 }
 

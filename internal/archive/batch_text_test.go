@@ -110,6 +110,31 @@ func TestArchiveTextWriteUsesConstantHostCommands(t *testing.T) {
 	}
 }
 
+func TestArchiveTextStagingDoesNotCollideWithPartialPaths(t *testing.T) {
+	e := setup(t)
+	dir := batchJob(t, e.jobs, "wk-partial-paths", 0)
+	write(t, filepath.Join(dir, ".partial", "data.bin"), "binary in archived .partial\n")
+	write(t, filepath.Join(dir, ".partial", "note.md"), "# text in archived .partial\n")
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-partial-paths")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{
+		".partial/data.bin": "binary in archived .partial\n",
+		".partial/note.md":  "# text in archived .partial\n",
+	} {
+		got, err := os.ReadFile(filepath.Join(res.Dest, rel))
+		if err != nil || string(got) != want {
+			t.Errorf("archived %s = %q, err=%v; want %q", rel, got, err, want)
+		}
+	}
+}
+
 // changeBeforeTextRead rewrites one source just before the job's text read
 // runs, so the listing still holds the old size.
 type changeBeforeTextRead struct {
