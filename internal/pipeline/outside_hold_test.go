@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -117,6 +118,9 @@ func TestOutsideHoldAnswerForms(t *testing.T) {
 		{"names it by title", holdComment("pr-author", "User", "Dismiss: the stale claim about the config is intended"), false},
 		{"a reply without an accepted form holds", holdComment("pr-author", "User", "noted, will look: "+f.Ref), true},
 		{"an accepted form naming nothing holds", holdComment("pr-author", "User", "Dismiss: unrelated thread"), true},
+		{"a negated dismiss does not answer", holdComment("pr-author", "User", "Do not dismiss: docs/x.md:3 — still broken"), true},
+		{"a disposition mid-sentence does not answer", holdComment("pr-author", "User", "reminder: Dismiss: "+f.Ref+" later"), true},
+		{"Disposition dismiss evidence answers", holdComment("pr-author", "User", "Disposition: dismiss "+f.Ref+" — generated file"), false},
 		{"a bot cannot answer", holdComment("ci[bot]", "Bot", "Dismiss: "+f.Ref), true},
 		{"the review identity cannot answer itself", holdComment("review-bot", "User", "Dismiss: "+f.Ref), true},
 	} {
@@ -152,6 +156,27 @@ func TestOutsideHoldReReviewedClears(t *testing.T) {
 	v = holdVerdict(t, history, nil, true, f)
 	if got := reasons(v); !strings.Contains(got, "finding_outside_diff:1") {
 		t.Fatalf("re-report reasons=%q want the hold", got)
+	}
+}
+
+// (i) An answer written before the finding was first reported cannot settle
+// it: a dismissal of an earlier finding at the same location does not carry
+// over to a new one.
+func TestOutsideHoldAnswerMustPostdateFinding(t *testing.T) {
+	f := holdFinding("docs/x.md", 3, "high", "the stale claim about the config")
+	reported := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	p := outsidePass(shaC, "p-old", 1, 1, f)
+	p.SubmittedAt = &reported
+	c := holdComment("pr-author", "User", "Dismiss: docs/x.md:3 — earlier thread")
+	c[0].CreatedAt = reported.Add(-time.Hour)
+	v := holdVerdict(t, []github.ReviewedPass{p}, c, false)
+	if got := reasons(v); !strings.Contains(got, "finding_outside_diff:1") {
+		t.Fatalf("reasons=%q want the hold — the answer predates the finding", got)
+	}
+	c[0].CreatedAt = reported.Add(time.Hour)
+	v = holdVerdict(t, []github.ReviewedPass{p}, c, false)
+	if got := reasons(v); strings.Contains(got, "finding_outside_diff") {
+		t.Fatalf("reasons=%q want the hold cleared by a later answer", got)
 	}
 }
 
@@ -240,7 +265,8 @@ func TestRoundTwoPromptCarriesOpenOutsideFinding(t *testing.T) {
 	}
 	ctx := run.prompt[:strings.Index(run.prompt, "## Delta to review")]
 	for _, want := range []string{
-		"docs/x.md:3", "outside the diff", "the stale claim about the config", "none yet (still open)",
+		"OUTSIDE-DIFF FINDINGS STILL OPEN", "docs/x.md:3", "outside the diff",
+		"the stale claim about the config", "staying silent lifts its merge hold",
 	} {
 		if !strings.Contains(ctx, want) {
 			t.Fatalf("missing %q in:\n%s", want, ctx)

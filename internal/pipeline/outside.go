@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -30,7 +31,9 @@ const (
 )
 
 // outsideFinding is one tracked outside-diff finding. Head is the head whose
-// pass most recently reported it; State is open, answered or re-reviewed.
+// pass most recently reported it; State is open, answered or re-reviewed;
+// FirstAt is when the finding was first posted, so an answer written before
+// it cannot settle it.
 type outsideFinding struct {
 	Ref      string
 	Path     string
@@ -41,6 +44,7 @@ type outsideFinding struct {
 	Head     string
 	State    string
 	Via      string
+	FirstAt  time.Time
 }
 
 // foldOutside replays the posted passes oldest first and returns every
@@ -80,6 +84,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 		reported := map[string]github.OutsideFinding{}
 		var repOrder []string
 		shown := map[string]bool{}
+		reportedAt := map[string]time.Time{}
 		for _, p := range passes {
 			if current && patch != "" && p.Patch != patch {
 				continue
@@ -90,6 +95,11 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 			for _, f := range p.Outside {
 				if !f.Blocking() {
 					continue
+				}
+				if p.SubmittedAt != nil {
+					if t, ok := reportedAt[f.Ref]; !ok || p.SubmittedAt.Before(t) {
+						reportedAt[f.Ref] = *p.SubmittedAt
+					}
 				}
 				if _, ok := reported[f.Ref]; !ok {
 					reported[f.Ref] = f
@@ -127,6 +137,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 			out = append(out, outsideFinding{
 				Ref: f.Ref, Path: f.Path, Line: f.Line, Severity: f.Severity,
 				Advisory: f.Advisory, Body: f.Body, Head: h, State: outsideOpen,
+				FirstAt: reportedAt[ref],
 			})
 			open[ref] = len(out) - 1
 		}
@@ -161,12 +172,15 @@ func outsideLegacy(history []github.ReviewedPass, head, patch, inherited string)
 }
 
 var (
-	// outsideFixForm is the fix disposition in a PR comment.
-	outsideFixForm = regexp.MustCompile(`(?i)\bfixed\s+in\b`)
-	// outsideDismissForm is the dismiss disposition with its reason.
-	outsideDismissForm = regexp.MustCompile(`(?i)\bdismiss\w*\s*:\s*\S`)
+	// outsideFixForm is the fix disposition in a PR comment. The forms are
+	// anchored to a line start so "do not dismiss:" or "not fixed in" mid-
+	// sentence cannot pass for an answer.
+	outsideFixForm = regexp.MustCompile(`(?im)^\W*fixed\s+in\b`)
+	// outsideDismissForm is the dismiss disposition with its reason, bare
+	// ("Dismiss: …") or under "Disposition:" ("Disposition: dismiss …").
+	outsideDismissForm = regexp.MustCompile(`(?im)^\W*(?:disposition\s*:\s*)?dismiss\w*\s*:?\s*\S`)
 	// outsideDeferForm is the defer disposition naming its task.
-	outsideDeferForm = regexp.MustCompile(`(?i)\bdisposition\s*:\s*defer\s+\S*\d\S*`)
+	outsideDeferForm = regexp.MustCompile(`(?im)^\W*disposition\s*:\s*defer\s+\S*\d\S*`)
 )
 
 // outsideTitle is the short text BLOCKED and answers show for a finding.
@@ -250,6 +264,12 @@ func answerOutside(comments []github.IssueComment, records []outsideFinding, ver
 			if !outsideAnswerable(c, reviewLogin) || !outsideNames(c.Body, *f) {
 				continue
 			}
+			// An answer written before the finding was first reported —
+			// e.g. a dismissal of an earlier finding at the same path:line —
+			// cannot settle this one.
+			if !f.FirstAt.IsZero() && !c.CreatedAt.IsZero() && c.CreatedAt.Before(f.FirstAt) {
+				continue
+			}
 			if outsideAnsweredBy(c.Body, *f, verify) {
 				f.State = outsideAnswered
 				f.Via = "comment"
@@ -270,7 +290,7 @@ func outsidePriorItems(open []outsideFinding) []priorItem {
 		}
 		out = append(out, priorItem{
 			path: f.Path, line: f.Line, severity: f.Severity,
-			outside: true, ref: f.Ref,
+			ref:     f.Ref,
 			finding: excerpt(f.Body, excerptLimit), disposition: priorOpen,
 		})
 	}
@@ -311,12 +331,15 @@ func (s *Service) outsideGate(ctx context.Context, r config.Repo, pr github.Pull
 // openOutsideForPrompt lists the outside-diff findings still open for the
 // reviewer prompt. The gated head's own in-progress passes cannot settle a
 // re-review, so nothing here is inherited and the current review is not
-// settled; answers apply with a permissive fix check — the gate verifies fix
-// claims itself.
+// settled; answers apply with the real fix verifier, so an unverifiable
+// "Fixed in" claim leaves the finding visible.
 func (s *Service) openOutsideForPrompt(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, patch string) []outsideFinding {
 	records := foldOutside(history, pr.Head.SHA, patch, "", false)
 	comments, _ := s.issueComments(ctx, r.Name, pr.Number)
-	answerOutside(comments, records, func(string, string) bool { return true }, s.Config.Review.Login)
+	// Fix claims verify for real here too: an unverifiable "Fixed in" must
+	// not hide a finding from every later prompt, or its re-review exit
+	// becomes unreachable and the hold never lifts on its own.
+	answerOutside(comments, records, s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified, s.Config.Review.Login)
 	var open []outsideFinding
 	for _, f := range records {
 		if f.State == outsideOpen {
@@ -370,12 +393,14 @@ func (s *Service) auditOutsideFindings(r config.Repo, pr github.Pull, v gateVerd
 	_, _ = fsutil.ReadJSON(path, &prev)
 	next := make(map[string]string, len(v.Outside))
 	var errs []error
+	changed := false
 	for _, f := range v.Outside {
 		next[f.Ref] = f.State
 		if prev[f.Ref] == f.State {
 			continue
 		}
-		errs = append(errs, s.audit(r.Name, "outside-finding", map[string]any{
+		changed = true
+		if err := s.audit(r.Name, "outside-finding", map[string]any{
 			"pr":       pr.Number,
 			"ref":      f.Ref,
 			"path":     f.Path,
@@ -384,14 +409,19 @@ func (s *Service) auditOutsideFindings(r config.Repo, pr github.Pull, v gateVerd
 			"head":     f.Head,
 			"state":    f.State,
 			"via":      f.Via,
-		}, false))
+		}, false); err != nil {
+			// A failed transition keeps its previous state — or none for a
+			// new ref — so the next pass retries the audit line.
+			errs = append(errs, err)
+			delete(next, f.Ref)
+		}
 	}
 	for ref, state := range prev {
 		if _, ok := next[ref]; !ok {
 			next[ref] = state
 		}
 	}
-	if len(errs) > 0 {
+	if changed {
 		if err := fsutil.WriteJSON(path, next); err != nil {
 			errs = append(errs, err)
 		}

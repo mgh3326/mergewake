@@ -154,6 +154,15 @@ func TestOutsideUnmarkedAdvisoryFallsBackToCount(t *testing.T) {
 	}
 }
 
+// A path may itself contain a backtick or a colon: the line parser anchors on
+// the last ":<line>" before the closing backtick.
+func TestParseOutsideFindingPathWithBacktick(t *testing.T) {
+	got := parseOutsideFindings("intro\n\nOutside the diff (x):\n- `a`b.md:3` (high): odd path\n<!-- mergewake-outside-diff:1 -->")
+	if len(got) != 1 || got[0].Path != "a`b.md" || got[0].Line != 3 || got[0].Severity != "high" {
+		t.Fatalf("outside=%+v", got)
+	}
+}
+
 func TestOutsideDiffBodyIsBounded(t *testing.T) {
 	var findings []Finding
 	for i := 0; i < 50; i++ {

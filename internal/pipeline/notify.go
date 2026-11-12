@@ -86,7 +86,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	if !o.DryRun {
 		s.recordStatus(r, pr, v, started)
-		retErr = errors.Join(retErr, s.auditOutsideFindings(r, pr, v))
+		// Joined in a defer so a later return cannot drop the audit error;
+		// it still lands in the pr-notify-error audit below.
+		if e := s.auditOutsideFindings(r, pr, v); e != nil {
+			defer func() { retErr = errors.Join(retErr, e) }()
+		}
 	}
 	record := struct {
 		PR              int      `json:"pr"`

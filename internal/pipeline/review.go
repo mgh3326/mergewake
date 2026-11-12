@@ -373,7 +373,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if contextErr != nil {
 		feedback = github.ReviewFeedback{}
 	}
-	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login, resolveDecisions(ctx, pr.Body, integrations.Handoffkeep{}), s.openOutsideForPrompt(ctx, r, pr, history, patch)...)
+	// The outside-findings read gets the same short child deadline as the
+	// feedback read: a slow comment list must not spend the reviewers' time.
+	// Its error is ignored inside, leaving the list empty — the safer side.
+	outsideCtx, cancelOutside := context.WithTimeout(ctx, feedbackTimeout(timeout))
+	outside := s.openOutsideForPrompt(outsideCtx, r, pr, history, patch)
+	cancelOutside()
+	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login, resolveDecisions(ctx, pr.Body, integrations.Handoffkeep{}), outside...)
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)

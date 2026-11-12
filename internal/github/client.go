@@ -865,8 +865,10 @@ func OutsideDiffSection(findings []Finding) string {
 }
 
 // outsideLine is one finding line of the outside-diff section:
-// "- `path:line` (severity[, advisory]): folded body".
-var outsideLine = regexp.MustCompile("^- `([^`]+)` \\(([^)]*)\\): (.*)$")
+// "- `path:line` (severity[, advisory]): folded body". The path group is
+// lazy up to the last ":<line>" before the closing backtick, so a path may
+// itself contain backticks or colons.
+var outsideLine = regexp.MustCompile("^- `(.+?:[0-9]+)` \\(([^)]*)\\): (.*)$")
 
 // parseOutsideFindings reads the outside-diff section back out of a review
 // body, last section wins. It returns nil when the body has no section.
@@ -1205,8 +1207,9 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 
 // IssueComment is one comment on a PR's conversation.
 type IssueComment struct {
-	Body string   `json:"body"`
-	User PullUser `json:"user"`
+	Body      string    `json:"body"`
+	User      PullUser  `json:"user"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (c *Client) IssueComments(ctx context.Context, repo string, n int) ([]IssueComment, error) {

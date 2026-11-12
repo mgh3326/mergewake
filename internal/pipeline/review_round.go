@@ -341,7 +341,6 @@ type priorItem struct {
 	line        int
 	severity    string
 	advisory    bool
-	outside     bool
 	ref         string // outside-diff finding ref, for OutsideShown
 	finding     string
 	disposition string

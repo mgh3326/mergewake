@@ -283,11 +283,36 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 	// fits reserves room for the truncation notice so the bound holds with it.
 	fits := func(entry string) bool { return len(contextHeader)+b.Len()+len(entry)+120 <= contextBudget }
 	if rp.round > 1 && own != "" {
-		// Outside-diff findings lead: they hold the merge gate, so the
-		// context budget drops thread priors before them.
-		outsideItems := outsidePriorItems(outside)
-		items := append(outsideItems, priorFindings(fb, own)...)
-		if len(items) > 0 {
+		// Outside-diff findings lead, in their own section: they are not
+		// threads, carry no disposition, and can never gain evidence from a
+		// changed line, so the prior-findings rules do not apply to them.
+		// Their contract is re-list-or-verified-gone: silence is a judgment.
+		if outsideItems := outsidePriorItems(outside); len(outsideItems) > 0 {
+			b.WriteString("OUTSIDE-DIFF FINDINGS STILL OPEN (reported by earlier passes; their paths or lines are not in this diff). Each carries no thread disposition. Re-list one in your findings whenever its defect still stands — staying silent lifts its merge hold. Omit one only when the code shows it no longer holds.\n")
+			shown := 0
+			for i, it := range outsideItems {
+				label := it.severity
+				if label == "" {
+					label = "unrated"
+				}
+				if it.advisory {
+					label += ", advisory"
+				}
+				entry := fmt.Sprintf("%d. %s:%d (%s, outside the diff)\n   finding: %s\n", i+1, it.path, it.line, label, it.finding)
+				if !fits(entry) {
+					break
+				}
+				b.WriteString(entry)
+				shown++
+				rc.outside = append(rc.outside, it.ref)
+			}
+			if shown < len(outsideItems) {
+				rc.truncated = true
+				fmt.Fprintf(&b, "[Truncated at the size bound: %d of %d outside-diff findings omitted.]\n", len(outsideItems)-shown, len(outsideItems))
+			}
+			b.WriteString("\n")
+		}
+		if items := priorFindings(fb, own); len(items) > 0 {
 			fmt.Fprintf(&b, "PRIOR FINDINGS (rounds 1-%d of this PR, newest first), each with its disposition. Do not reopen, restate or re-rank any of them. Raise one again only if a line changed in the diff below gives new evidence, and then quote the disposition you dispute. A finding marked \"none yet\" is still open: do not repeat it.\n", rp.round-1)
 			used, disposed := 0, 0
 			for i, it := range items {
@@ -298,18 +323,12 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 				if it.advisory {
 					label += ", advisory"
 				}
-				if it.outside {
-					label += ", outside the diff"
-				}
 				entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   disposition: %s\n", i+1, it.path, it.line, label, it.finding, it.disposition)
 				if !fits(entry) {
 					break
 				}
 				b.WriteString(entry)
 				used++
-				if i < len(outsideItems) {
-					rc.outside = append(rc.outside, outsideItems[i].ref)
-				}
 				if it.disposition != priorOpen {
 					disposed++
 				}
