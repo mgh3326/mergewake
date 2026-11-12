@@ -348,3 +348,23 @@ func TestReconcileMergedRowWithoutCIOrAttributionKeepsRevertCheck(t *testing.T) 
 		t.Fatalf("expired no-evidence row state: reverted:%v finished:%t due:%v", v.Reverted, v.ReconcileFinished, v.ReconcileDueAt)
 	}
 }
+
+func TestReconcilePullThatIsOpenDoesNotFinishRow(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	source := &outcomeGH{fakeGH: g, first: true}
+	s.GH = source
+	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.ReconcileFinished = true, "blocked", false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]
+	if v.Final || v.ReconcileFinished {
+		t.Fatalf("open PR was finalized by reconciliation: final=%t finished=%t", v.Final, v.ReconcileFinished)
+	}
+}

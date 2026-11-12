@@ -445,7 +445,11 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 			continue
 		}
 		v = latest.Latest[key]
-		if v.MergedAt == nil || v.Reverted != nil {
+		if !v.Final {
+			v.ReconcileFinished = false
+			due := s.now().Add(time.Hour)
+			v.ReconcileDueAt = &due
+		} else if v.MergedAt == nil || v.Reverted != nil {
 			v.ReconcileFinished = true
 		} else {
 			v.ReconcileFinished = false
