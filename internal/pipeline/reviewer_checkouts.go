@@ -1,12 +1,11 @@
 package pipeline
 
 import (
-	"encoding/json"
-	"errors"
-	"os"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 // reviewerSummaryDay is the UTC day layout of a reviewer checkout summary.
@@ -23,84 +22,81 @@ type reviewerSummaryState struct {
 }
 
 // reviewerDailySummary writes one reviewer-checkouts-daily audit row per host
-// for each UTC day after that host's last summary, up to yesterday. The first
-// summary covers yesterday only. The state is saved right after each row, so a
-// crash between the two repeats at most that one row. Counts come from the
-// reviewer rows in receipts (see reviewerDayCounts).
+// for each UTC day after that host's last summary, up to the host's last day
+// (see reviewerSummaryEnds). The first summary covers yesterday only. The state
+// is read, advanced and saved under the repo's state lock, so concurrent passes
+// write each day once. The state is saved right after each row, so a crash
+// between the two repeats at most that one row. Counts come from the reviewer
+// rows in receipts (see reviewerDayCounts).
 func (s *Service) reviewerDailySummary(repo string, receipts []reapReceipt, hosts []*reapHost, now time.Time) error {
 	path := filepath.Join(s.state(repo), "reviewer-summary.json")
-	st := reviewerSummaryState{Hosts: map[string]string{}}
-	b, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
+	defer lockPath(path)()
+	unlock, err := fsutil.Lock(path+".lock", true)
+	if err != nil {
 		return err
-	default:
-		if err := json.Unmarshal(b, &st); err != nil {
-			return err
-		}
-		if st.Hosts == nil {
-			st.Hosts = map[string]string{}
-		}
+	}
+	defer unlock()
+	st := reviewerSummaryState{Hosts: map[string]string{}}
+	if _, err := fsutil.ReadJSON(path, &st); err != nil {
+		return err
+	}
+	if st.Hosts == nil {
+		st.Hosts = map[string]string{}
 	}
 	now = now.UTC()
 	yesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC)
-	for _, name := range reviewerSummaryHosts(hosts, receipts) {
+	ends := reviewerSummaryEnds(hosts, receipts, yesterday)
+	names := make([]string, 0, len(ends))
+	for name := range ends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		day := yesterday
 		if last, e := time.Parse(reviewerSummaryDay, st.Hosts[name]); e == nil {
 			day = last.AddDate(0, 0, 1)
 		}
-		for ; !day.After(yesterday); day = day.AddDate(0, 0, 1) {
+		for ; !day.After(ends[name]); day = day.AddDate(0, 0, 1) {
 			removed, kept, reasons := reviewerDayCounts(receipts, hosts, name, day)
 			value := map[string]any{"host": name, "day": day.Format(reviewerSummaryDay), "removed": removed, "kept": kept, "kept_reasons": reasons}
-			if e := s.audit(repo, "reviewer-checkouts-daily", value, false); e != nil {
-				return e
+			if err := s.audit(repo, "reviewer-checkouts-daily", value, false); err != nil {
+				return err
 			}
 			st.Hosts[name] = day.Format(reviewerSummaryDay)
-			if e := saveReviewerSummaryState(path, st); e != nil {
-				return e
+			if err := fsutil.WriteJSON(path, st); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// saveReviewerSummaryState writes st through a temp file and a rename, so a
-// crash leaves the previous state, never a torn file.
-func saveReviewerSummaryState(path string, st reviewerSummaryState) error {
-	out, err := json.Marshal(st)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// reviewerSummaryHosts are the host names to summarize: each configured host,
-// plus each name a reviewer row is counted under (the local fallback's "local",
-// a host recorded by machine id, unattributed rows). Sorted for a stable order.
-func reviewerSummaryHosts(hosts []*reapHost, receipts []reapReceipt) []string {
-	seen := map[string]bool{}
+// reviewerSummaryEnds maps each host name to its last UTC day to summarize. A
+// configured host runs through yesterday, so a quiet host still gets a row each
+// day. A name seen only on reviewer rows (the local fallback, a machine id, a
+// host since removed from config, unattributed) runs through the day of its
+// latest row, capped at yesterday. Once that day is summarized the name gets no
+// more rows, so a stale name stops emitting.
+func reviewerSummaryEnds(hosts []*reapHost, receipts []reapReceipt, yesterday time.Time) map[string]time.Time {
+	ends := map[string]time.Time{}
 	for _, h := range hosts {
-		seen[h.host.Name] = true
+		ends[h.host.Name] = yesterday
 	}
 	for _, v := range receipts {
-		if reviewerRow(v) {
-			seen[reviewerSummaryHost(v.Host, hosts)] = true
+		if !reviewerRow(v) {
+			continue
+		}
+		name := reviewerSummaryHost(v.Host, hosts)
+		t := v.Time.UTC()
+		day := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		if day.After(yesterday) {
+			day = yesterday
+		}
+		if cur, ok := ends[name]; !ok || day.After(cur) {
+			ends[name] = day
 		}
 	}
-	names := make([]string, 0, len(seen))
-	for name := range seen {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
+	return ends
 }
 
 // reviewerSummaryHost is the host name a reviewer row is counted under: the
@@ -121,12 +117,15 @@ func reviewerSummaryHost(recorded string, hosts []*reapHost) string {
 
 // reviewerDayCounts counts host's reviewer checkouts with rows on day, keyed by
 // reviewerLabelOf, so cleanup rows without a label count too. A label with a
-// removed row that day counts as removed. Otherwise a label whose last row that
-// day is kept or pending-cleanup counts as kept, grouped by the reason on that row.
+// removed row that day counts as removed. Otherwise a label with a kept or
+// pending-cleanup row that day counts as kept, under the reason of its last such
+// row. A later row with another result (a shadow pass's would-remove, an error)
+// does not hide a checkout that is still kept.
 func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, day time.Time) (removed, kept int, reasons map[string]int) {
 	type labelState struct {
 		removed bool
-		last    reapReceipt
+		kept    bool
+		reason  string
 	}
 	byLabel := map[string]*labelState{}
 	want := day.Format(reviewerSummaryDay)
@@ -140,9 +139,12 @@ func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, d
 			st = &labelState{}
 			byLabel[label] = st
 		}
-		st.last = v
-		if v.Result == "removed" {
+		switch v.Result {
+		case "removed":
 			st.removed = true
+		case "kept", "pending-cleanup":
+			st.kept = true
+			st.reason = v.Reason
 		}
 	}
 	reasons = map[string]int{}
@@ -150,9 +152,9 @@ func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, d
 		switch {
 		case st.removed:
 			removed++
-		case st.last.Result == "kept" || st.last.Result == "pending-cleanup":
+		case st.kept:
 			kept++
-			reasons[st.last.Reason]++
+			reasons[st.reason]++
 		}
 	}
 	return removed, kept, reasons

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,4 +191,81 @@ func dailySummaries(t *testing.T, f *reviewerFix) []map[string]any {
 		}
 	}
 	return out
+}
+
+// Concurrent passes on one repo write each day's summary once: the state is
+// read and advanced under the repo lock.
+func TestReviewerCheckoutDailySummaryConcurrentPassesWriteOnce(t *testing.T) {
+	f := newReviewerFix(t)
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	receipts := []reapReceipt{{Time: now.Add(-20 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 13, Worktree: "/repo/" + reviewerLabelFor(13, 30*time.Hour), Result: "pending-cleanup", Reason: "spawn ended before a pane result"}}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- f.s.reviewerDailySummary(testRepo.Name, receipts, nil, now)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := 0
+	for _, row := range dailySummaries(t, f) {
+		if row["host"] == "unattributed" && row["day"] == "2026-11-03" {
+			rows++
+		}
+	}
+	if rows != 1 {
+		t.Fatalf("unattributed summaries for 2026-11-03: %d, want 1", rows)
+	}
+}
+
+// A host name seen only on reviewer rows gets rows through the day of its last
+// row and no more: later passes write nothing for it.
+func TestReviewerCheckoutDailySummaryStaleHostStopsEmitting(t *testing.T) {
+	f := newReviewerFix(t)
+	last := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	receipts := []reapReceipt{{Time: last, Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 21, Worktree: "/repo/" + reviewerLabelFor(21, 30*time.Hour), Host: "gone-host", Result: "removed"}}
+	for _, day := range []int{3, 4, 10} {
+		now := time.Date(2026, 11, day, 10, 0, 0, 0, time.UTC)
+		if err := f.s.reviewerDailySummary(testRepo.Name, receipts, nil, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows []map[string]any
+	for _, row := range dailySummaries(t, f) {
+		if row["host"] == "gone-host" {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) != 1 || rows[0]["day"] != "2026-11-02" || rows[0]["removed"] != float64(1) {
+		t.Fatalf("gone-host summaries: %v, want one row for 2026-11-02", rows)
+	}
+}
+
+// A checkout kept earlier in the day stays counted as kept when a later row for
+// it that day has another result: a shadow pass's would-remove, or an error.
+func TestReviewerCheckoutDayCountsKeepLastKeptOverLaterOutcome(t *testing.T) {
+	day := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	row := func(pr, hour int, result, reason string) reapReceipt {
+		return reapReceipt{Time: day.Add(time.Duration(hour) * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: pr, Worktree: "/repo/" + reviewerLabelFor(pr, 30*time.Hour), Host: "local", Result: result, Reason: reason}
+	}
+	receipts := []reapReceipt{
+		row(31, 10, "kept", "job:running"),
+		row(31, 15, "would-remove", ""),
+		row(32, 9, "kept", "job:running"),
+		row(32, 11, "error", ""),
+		row(33, 8, "kept", "composer-text"),
+		row(33, 12, "removed", ""),
+	}
+	removed, kept, reasons := reviewerDayCounts(receipts, nil, "local", day)
+	if removed != 1 || kept != 2 || reasons["job:running"] != 2 {
+		t.Fatalf("removed=%d kept=%d reasons=%v; want removed 1, kept 2 (job:running 2)", removed, kept, reasons)
+	}
 }
