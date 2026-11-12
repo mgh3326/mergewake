@@ -12,9 +12,40 @@ in [server.md](server.md).
 
 After the desk provisions a database and a migration account, supply credentials
 through exactly one of `MERGEWAKE_MYSQL_DSN` and `MERGEWAKE_MYSQL_DSN_FILE`.
-The secret file must be a regular mode-0600 file, at most 64 KiB. The DSN must
-select a database and use `tls=true`, which verifies the server with system roots.
-No credentials belong in YAML, command arguments, source control or logs.
+The DSN file must be a regular mode-0600 file, at most 64 KiB. The DSN must
+select a database and use `tls=true`, which verifies the server with system roots,
+or use `tls=mergewake-ca` with the private CA configuration below. The store
+refuses plaintext fallback and every other TLS mode. No credentials belong in
+YAML, command arguments, source control or logs.
+
+### Private CA and HeatWave
+
+Set `MERGEWAKE_MYSQL_CA_FILE` to a regular PEM file containing one or more CA
+certificates. The file must be mode 0600 or 0644 and at most 64 KiB. Set
+`MERGEWAKE_MYSQL_SERVER_NAME` to the exact DNS SAN or, only when the certificate
+has no SAN extension, the exact subject CN. With this CA file configured, the
+DSN must use the registered TLS name `tls=mergewake-ca`; `tls=true` is refused.
+The store builds the server chain against only the certificates in this CA file,
+checks certificate validity and server authentication usage, and does not consult
+system roots. A missing server name, invalid CA file, expired certificate, chain
+failure or name mismatch refuses the connection.
+
+This supports the MySQL HeatWave `mergewake` endpoint when its certificate is
+signed by the private `MySQL_Endpoint_CA`, has CN `MySQL_Endpoint_Server` and no
+subjectAltName, and the connection address is an IP. Configure the expected name
+as `MySQL_Endpoint_Server`; do not use the IP address as the certificate name.
+The CA and server certificates are deployment inputs and must never be copied
+into the repository or logs.
+
+The DSN may come from `MERGEWAKE_MYSQL_DSN` or the existing mode-0600 file
+selected by `MERGEWAKE_MYSQL_DSN_FILE`. For example, its TLS parameter is:
+
+```text
+user:password@tcp(203.0.113.10:3306)/mergewake?tls=mergewake-ca
+```
+
+Supply the DSN as a protected environment value or through the DSN file; do not
+put a real credential in a command line or documentation.
 
 ```sh
 mergewake server migrate
