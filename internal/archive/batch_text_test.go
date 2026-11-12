@@ -120,9 +120,14 @@ func TestArchiveTextStagingDoesNotCollideWithPartialPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	staleStage := filepath.Join(filepath.Dir(p.Dest), "."+filepath.Base(p.Dest)+".text-stage.stale")
+	write(t, filepath.Join(staleStage, "note.md"), "stale staging content")
 	res, err := a.Apply(context.Background(), p, time.Now())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(staleStage); !os.IsNotExist(err) {
+		t.Fatalf("stale text staging dir remains: %v", err)
 	}
 	for rel, want := range map[string]string{
 		".partial/data.bin": "binary in archived .partial\n",
