@@ -516,7 +516,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
 | `quota` | Empty | Accepted and unused; `outcomes.command` no longer falls back to it. |
 | `scopefuel` | Empty | Accepted and unused. |
-| `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
+| `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Accepted grades, weakest to strongest: `C`, `B`, `A`, `A+`, `S`, `S+`, `SS`. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
 | `select` | `pace` | Accepted for compatibility; unused. |

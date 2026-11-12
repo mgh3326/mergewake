@@ -47,9 +47,34 @@ func authorProfile(value string) (profile, effort string) {
 	return name, ""
 }
 
+func titleGradePattern() string {
+	grades := config.Grades()
+	for i, grade := range grades {
+		grades[i] = regexp.QuoteMeta(grade)
+	}
+	return strings.Join(grades, "|")
+}
+
 // taskMarker reads both halves of the `(grade X, Tn)` routing marker in an hk
-// task title; taskScale, which panewire routes by, captures only the T.
-var taskMarker = regexp.MustCompile(`(?i)(?:\(|\b)grade (S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
+// task title. Its grade alternatives come from the config grade scale.
+var taskMarker = regexp.MustCompile(`(?i)(?:\(|\b)grade (` + titleGradePattern() + `),\s*(T[0-3])\b`)
+
+func taskMarkerMatch(title string) []string {
+	m := taskMarker.FindStringSubmatch(title)
+	if m == nil || !config.ValidGrade(strings.ToUpper(m[1])) {
+		return nil
+	}
+	return m
+}
+
+// taskScale extracts the tier from a valid task title marker for panewire.
+func taskScale(title string) (string, bool) {
+	m := taskMarkerMatch(title)
+	if m == nil {
+		return "", false
+	}
+	return strings.ToUpper(m[2]), true
+}
 
 // taskTitleScale reads the grade and tier from the title of the hk task the PR
 // names. found is false when the PR names no task or the sink cannot read one;
@@ -70,7 +95,7 @@ func (s *Service) taskTitleScale(ctx context.Context, r config.Repo, p github.Pu
 	if err != nil {
 		return "", "", false, err
 	}
-	if m := taskMarker.FindStringSubmatch(title); m != nil {
+	if m := taskMarkerMatch(title); m != nil {
 		return strings.ToUpper(m[1]), strings.ToUpper(m[2]), true, nil
 	}
 	return "", "", true, nil

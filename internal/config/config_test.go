@@ -30,6 +30,34 @@ func TestStrictConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidGradeScale(t *testing.T) {
+	for _, grade := range []string{"C", "B", "A", "A+", "S", "S+", "SS"} {
+		if !ValidGrade(grade) {
+			t.Errorf("ValidGrade(%q) = false", grade)
+		}
+	}
+	for _, grade := range []string{"SSS", "S++", "D"} {
+		if ValidGrade(grade) {
+			t.Errorf("ValidGrade(%q) = true", grade)
+		}
+	}
+}
+
+func TestLoadReviewDefaultGradeSS(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\nreview:\n  default_grade: SS\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Review.DefaultGrade != "SS" {
+		t.Fatalf("review.default_grade = %q", c.Review.DefaultGrade)
+	}
+}
+
 func TestReviewerArgs(t *testing.T) {
 	for _, args := range [][]string{{"--continue"}, {"--tools", "read"}, {"--model", "x", "--resume", "old"}, {"--model"}} {
 		if ValidateReviewArgs(args) == nil {

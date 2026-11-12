@@ -1066,10 +1066,18 @@ func validateProfiles(c *Config) error {
 	return nil
 }
 
+var grades = []string{"SS", "S+", "S", "A+", "A", "B", "C"}
+
+// Grades returns the accepted grades, ordered from strongest to weakest.
+func Grades() []string {
+	return slices.Clone(grades)
+}
+
 func ValidGrade(s string) bool {
-	switch s {
-	case "S+", "S", "A+", "A", "B", "C":
-		return true
+	for _, grade := range grades {
+		if s == grade {
+			return true
+		}
 	}
 	return false
 }
