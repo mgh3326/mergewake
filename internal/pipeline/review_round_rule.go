@@ -34,12 +34,13 @@ type roundRuleState struct {
 	Round3At            time.Time `json:"round3_at,omitzero"`
 
 	// Round 5
-	Round5Held         bool      `json:"round5_held,omitempty"`
-	Round5EventSent    bool      `json:"round5_event_sent,omitempty"`
-	Round5Released     bool      `json:"round5_released,omitempty"`
-	Round5ReleasedBy   string    `json:"round5_released_by,omitempty"`
-	Round5At           time.Time `json:"round5_at,omitzero"`
-	Round5CommentCount int       `json:"round5_comment_count,omitempty"`
+	Round5Held             bool      `json:"round5_held,omitempty"`
+	Round5EventSent        bool      `json:"round5_event_sent,omitempty"`
+	Round5Released         bool      `json:"round5_released,omitempty"`
+	Round5ReleasedBy       string    `json:"round5_released_by,omitempty"`
+	Round5At               time.Time `json:"round5_at,omitzero"`
+	Round5CommentCount     int       `json:"round5_comment_count,omitempty"`
+	Round5BaselineCaptured bool      `json:"round5_baseline_captured,omitempty"`
 }
 
 func (s *Service) roundRuleFile(repo string, pr int) string {
@@ -284,7 +285,7 @@ func (s *Service) issueComments(ctx context.Context, repo string, n int) (commen
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			comments, err = nil, nil
+			comments, err = nil, fmt.Errorf("panic fetching issue comments: %v", r)
 		}
 	}()
 	return s.GH.IssueComments(ctx, repo, n)
@@ -297,7 +298,16 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		return false
 	}
 	comments, err := s.issueComments(ctx, r.Name, pr.Number)
-	if err == nil && len(comments) > st.Round5CommentCount {
+	if err != nil {
+		return true
+	}
+	if !st.Round5BaselineCaptured {
+		st.Round5CommentCount = len(comments)
+		st.Round5BaselineCaptured = true
+		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+		return true
+	}
+	if len(comments) > st.Round5CommentCount {
 		if released, by := checkRoundHoldRelease(comments[st.Round5CommentCount:], s.Config.Review.Login); released {
 			st.Round5Released = true
 			st.Round5ReleasedBy = by
@@ -318,12 +328,18 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 			return false
 		}
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
-		if err == nil && len(comments) > st.Round5CommentCount {
-			if released, by := checkRoundHoldRelease(comments[st.Round5CommentCount:], s.Config.Review.Login); released {
-				st.Round5Released = true
-				st.Round5ReleasedBy = by
+		if err == nil {
+			if !st.Round5BaselineCaptured {
+				st.Round5CommentCount = len(comments)
+				st.Round5BaselineCaptured = true
 				_ = s.saveRoundRuleState(r.Name, pr.Number, st)
-				return false
+			} else if len(comments) > st.Round5CommentCount {
+				if released, by := checkRoundHoldRelease(comments[st.Round5CommentCount:], s.Config.Review.Login); released {
+					st.Round5Released = true
+					st.Round5ReleasedBy = by
+					_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+					return false
+				}
 			}
 		}
 		v.Reasons = append(v.Reasons, "round_hold")
@@ -334,10 +350,13 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 	}
 
 	if reviewed && rounds >= 5 && open {
-		comments, _ := s.issueComments(ctx, r.Name, pr.Number)
+		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		st.Round5Held = true
 		st.Round5At = s.now().UTC()
-		st.Round5CommentCount = len(comments)
+		if err == nil {
+			st.Round5CommentCount = len(comments)
+			st.Round5BaselineCaptured = true
+		}
 		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
 
 		v.Reasons = append(v.Reasons, "round_hold")

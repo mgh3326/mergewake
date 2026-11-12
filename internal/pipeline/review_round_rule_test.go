@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -604,5 +605,54 @@ func TestRoundRule_DryRunDoesNotPersistSentFlags(t *testing.T) {
 	st5 := s5.loadRoundRuleState(r5.Name, 7)
 	if st5.Round5EventSent {
 		t.Fatalf("dry run persisted Round5EventSent = true")
+	}
+}
+
+func TestRoundRule_LegacyHoldBackfillAndSnapshotFailure(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 5)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+	p := policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}}
+	baseSHA := shaB
+
+	// Simulate legacy hold state persisted without baseline
+	_ = s.saveRoundRuleState(r.Name, 7, roundRuleState{
+		Round5Held: true,
+	})
+
+	// Pre-existing release comment in PR history
+	g.issueComments = []github.IssueComment{
+		{
+			User: github.PullUser{Login: "operator", Type: "User"},
+			Body: "Mergewake-Round-Hold: release",
+		},
+	}
+
+	// Legacy hold evaluation: must backfill baseline and remain held
+	v, err := s.mergeGate(context.Background(), r, g.pull, p, baseSHA)
+	if err != nil {
+		t.Fatalf("mergeGate err: %v", err)
+	}
+	if v.State != "blocked" {
+		t.Fatalf("legacy hold unexpectedly unblocked by pre-existing release comment")
+	}
+
+	st := s.loadRoundRuleState(r.Name, 7)
+	if !st.Round5BaselineCaptured || st.Round5CommentCount != 1 {
+		t.Fatalf("expected baseline backfilled with count=1, captured=true, got %+v", st)
+	}
+
+	// Post fresh release comment after backfill
+	g.issueComments = append(g.issueComments, github.IssueComment{
+		User: github.PullUser{Login: "operator", Type: "User"},
+		Body: "Mergewake-Round-Hold: release",
+	})
+	v2, err := s.mergeGate(context.Background(), r, g.pull, p, baseSHA)
+	if err != nil {
+		t.Fatalf("mergeGate err: %v", err)
+	}
+	if slices.Contains(v2.Reasons, "round_hold") {
+		t.Fatalf("gate still held after fresh post-backfill release comment")
 	}
 }
