@@ -16,6 +16,9 @@ type Source string
 const (
 	// SourceWebhook is a verified delivery that names the PR.
 	SourceWebhook Source = "webhook"
+	// SourceCheck is a check or status delivery that names the PR's head: the
+	// check result is the new fact, not the PR itself.
+	SourceCheck Source = "check"
 	// SourceReviewer is a reviewer job of the PR that finished.
 	SourceReviewer Source = "reviewer"
 	// SourceBase is a push to the repository's base branch.
@@ -47,6 +50,11 @@ type Work struct {
 	Key PRKey
 	// Sources are what queued the item, in arrival order, without repeats.
 	Sources []Source
+	// CheckSHA is the head commit a check or status delivery named when it
+	// queued the item, or "" when no check delivery did. An evaluation whose
+	// only sources are check deliveries reads the PR without fresh evidence
+	// when it is the head the queue knows: the check is the new fact.
+	CheckSHA string
 	// Waited is the time from the event to the start of the evaluation.
 	Waited time.Duration
 	// Known says Priority and Detail came from Lookup. An item that started
@@ -141,11 +149,14 @@ type entry struct {
 	seq     uint64
 	at      time.Time
 	sources []Source
+	// checkSHA is the head the last check delivery named (see Work.CheckSHA).
+	checkSHA string
 	// again says an event arrived while the item ran; againAt and againSources
-	// become the next queued item.
-	again        bool
-	againAt      time.Time
-	againSources []Source
+	// become the next queued item, and againCheckSHA its check head.
+	again         bool
+	againAt       time.Time
+	againSources  []Source
+	againCheckSHA string
 
 	prio   prioState
 	gen    uint64
@@ -241,23 +252,26 @@ func (q *Queue) Enqueue(src Source, keys ...PRKey) {
 	defer q.mu.Unlock()
 	q.init()
 	for _, k := range keys {
-		q.add(src, k)
+		q.add(src, k, "")
 	}
 	q.pump()
 }
 
-// add is called with mu held.
-func (q *Queue) add(src Source, k PRKey) {
+// add is called with mu held. sha is the head a check delivery named, or "".
+func (q *Queue) add(src Source, k PRKey, sha string) {
 	now := q.now()
 	e, ok := q.entries[k]
 	if !ok {
 		q.seq++
-		q.entries[k] = &entry{key: k, state: queued, seq: q.seq, at: now, sources: []Source{src}}
+		q.entries[k] = &entry{key: k, state: queued, seq: q.seq, at: now, sources: []Source{src}, checkSHA: sha}
 		return
 	}
 	if e.state == queued {
 		if !slices.Contains(e.sources, src) {
 			e.sources = append(e.sources, src)
+		}
+		if sha != "" {
+			e.checkSHA = sha
 		}
 		return
 	}
@@ -266,6 +280,9 @@ func (q *Queue) add(src Source, k PRKey) {
 	}
 	if !slices.Contains(e.againSources, src) {
 		e.againSources = append(e.againSources, src)
+	}
+	if sha != "" {
+		e.againCheckSHA = sha
 	}
 }
 
@@ -282,14 +299,16 @@ func (q *Queue) EnqueueNamed(src Source, repo string, number int, sha string) {
 	q.init()
 	switch {
 	case number > 0:
-		if sha != "" {
+		// Only a delivery that names the PR and its head says the PR is at
+		// that head. A check names the head it ran on, which may be older.
+		if src == SourceWebhook && sha != "" {
 			q.learn(repo, number, sha)
 		}
-		q.add(src, PRKey{repo, number})
+		q.add(src, PRKey{repo, number}, sha)
 	case sha != "":
 		for n, head := range q.open[repo] {
 			if head == sha {
-				q.add(src, PRKey{repo, n})
+				q.add(src, PRKey{repo, n}, sha)
 			}
 		}
 	}
@@ -323,7 +342,7 @@ func (q *Queue) EnqueueAt(src Source, repo string, number int, id string, at tim
 			return
 		}
 		delete(q.timers, tk)
-		q.add(src, tk.key)
+		q.add(src, tk.key, "")
 		q.pump()
 	})
 }
@@ -374,7 +393,7 @@ func (q *Queue) EnqueueRepo(src Source, repo string) {
 	defer q.mu.Unlock()
 	q.init()
 	for n := range q.open[repo] {
-		q.add(src, PRKey{repo, n})
+		q.add(src, PRKey{repo, n}, "")
 	}
 	q.pump()
 }
@@ -398,6 +417,15 @@ func (q *Queue) Learn(repo string, n int, sha string) {
 	defer q.mu.Unlock()
 	q.init()
 	q.learn(repo, n, sha)
+}
+
+// Head is the head commit the queue knows for PR n of repo, or "" when it
+// knows none: the head the last delivery or evaluation named.
+func (q *Queue) Head(repo string, n int) string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	return q.open[repo][n]
 }
 
 func (q *Queue) learn(repo string, n int, sha string) {
@@ -589,7 +617,7 @@ func (q *Queue) start(e *entry, over bool) {
 	e.state, e.over = running, over
 	waited := q.now().Sub(e.at)
 	st.waitMax = max(st.waitMax, waited)
-	w := Work{Key: e.key, Sources: slices.Clone(e.sources), Waited: waited, Known: e.prio == prioKnown, Priority: e.pri, Detail: e.detail, Expired: e.prio == prioExpired, Over: over, Phases: newPhases(q.now)}
+	w := Work{Key: e.key, Sources: slices.Clone(e.sources), CheckSHA: e.checkSHA, Waited: waited, Known: e.prio == prioKnown, Priority: e.pri, Detail: e.detail, Expired: e.prio == prioExpired, Over: over, Phases: newPhases(q.now)}
 	ctx := q.ctx
 	q.wg.Add(1)
 	go func() {
@@ -618,7 +646,8 @@ func (q *Queue) finish(e *entry, w Work, took time.Duration) {
 	if e.again {
 		q.seq++
 		e.state, e.seq, e.at, e.sources = queued, q.seq, e.againAt, e.againSources
-		e.again, e.againAt, e.againSources = false, time.Time{}, nil
+		e.checkSHA = e.againCheckSHA
+		e.again, e.againAt, e.againSources, e.againCheckSHA = false, time.Time{}, nil, ""
 		e.prio, e.pri, e.detail, e.over = prioUnknown, Priority{}, nil, false
 		e.gen++
 	} else {

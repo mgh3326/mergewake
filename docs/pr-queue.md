@@ -7,20 +7,21 @@ other.
 ## What the queue holds
 
 The queue holds items of the form (repository, PR). An item enters it from one
-of six sources. The `source` field of the `pr evaluated` log line names them.
+of seven sources. The `source` field of the `pr evaluated` log line names them.
 
 | Source | What puts the PR on the queue |
 | --- | --- |
-| `webhook` | A signed delivery that names the PR: a `pull_request*` event by PR number, or a `check_run`, `check_suite` or `status` event by the PR numbers it lists or by its head commit. A commit that no known open PR has as its head names nothing. |
+| `webhook` | A signed `pull_request*` delivery that names the PR, by PR number and head commit. |
+| `check` | A signed `check_run` or `check_suite` delivery that completed, or a `status` delivery, naming the PR by the numbers it lists or by its head commit. A commit that no known open PR has as its head names nothing. A check that has not completed enqueues nothing: it has no result to evaluate, and its completed delivery follows. |
 | `reviewer` | A reviewer job of the PR finished (the reviewer watch). |
 | `base` | A push to the repository's base branch (`repos[].branch`). Every open PR of the repository is queued, because its merge gate reads the base. |
 | `status` | A fresh `GET /v1/pr-status?fresh=1` read found the PR changed. |
 | `timer` | A reviewer's deadline: the PR is evaluated once its reviewer is past `review.timeout`, so a reviewer that never finishes is replaced. |
 | `sweep` | The periodic pass, below. |
 
-The `webhook` and `base` sources need `daemon.webhook`. The `reviewer` source
-needs a recorded reviewer job. The queue and the sweep run whenever the `pr`
-role is enabled.
+The `webhook`, `check` and `base` sources need `daemon.webhook`. The `reviewer`
+source needs a recorded reviewer job. The queue and the sweep run whenever the
+`pr` role is enabled.
 
 An item that is already waiting absorbs a repeat: five deliveries for one PR
 produce one evaluation, and its `source` lists each source once. An item that
@@ -39,8 +40,12 @@ head, then deliver findings, notify and land. It never waits for another PR.
 - Lands stay one at a time per repository. The settle step of each PR (findings,
   notice, land) takes the repository's settle lock, so each land sees the base
   the previous one left.
-- An event-driven evaluation reads the PR past the GitHub poll windows and
-  caches. A sweep evaluation reads it as the pass did.
+- An evaluation that only check deliveries queued reads the PR without forcing
+  fresh evidence when the check ran on the head the queue knows for it: the
+  check result is the new fact, not the PR. Any other source, and a check that
+  named another head, reads the PR past the GitHub poll windows and caches, as
+  every event-driven evaluation did. A sweep evaluation reads it as the pass
+  did.
 
 When more PRs wait than a bound lets run, the daemon looks up their hk
 priorities, waits for the lookups at most two seconds, and starts the PRs in
@@ -74,7 +79,7 @@ later pass sweeps the repository normally.
 | `pr evaluated` | One per evaluation: `repo`, `pr`, `source`, `queue_wait_ms` (event to start), `eval_ms`, and the phase fields below. |
 | `review-start latency` | One per reviewer pass whose spawn panewire accepted, see below. |
 | `pr pass` | One per repository after each sweep, as before (`prs_skipped`, `prs_evaluated`, `evaluated_reasons`, `reviews_concurrent_max`), now counting every evaluation since the last line, plus `queue_depth` (items waiting), `queue_wait_max` and `merge_overdue` (the overdue notices delivered since the last line, see `docs/config.md`). |
-| `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max`, `eval_requests` (requests the evaluations made since the last line) and `gate_wait_ms` (the longest wait one of them spent queued for its credential's gate). |
+| `github requests` (role `pr`) | The sweep's own requests, plus `queue_depth`, `queue_wait_max`, `eval_requests` (requests the evaluations made since the last line), `eval_routes` (those requests broken down by route, method and status, busiest ten first, as `routes` does for the sweep) and `gate_wait_ms` (the longest wait one of them spent queued for its credential's gate). |
 
 ### Where an evaluation spends its time
 

@@ -252,7 +252,7 @@ func TestEventQueueDeliveryNamingOnlyACommitFindsItsPR(t *testing.T) {
 	startQueue(t, q)
 	q.SetOpen("o/r", map[int]string{1: "aaa", 2: "bbb"})
 	url := webhookServer(t, q)
-	deliverEvent(t, url, "check_run", `{"repository":{"full_name":"o/r"},"check_run":{"head_sha":"bbb"}}`)
+	deliverEvent(t, url, "check_run", `{"action":"completed","repository":{"full_name":"o/r"},"check_run":{"head_sha":"bbb"}}`)
 	deliverEvent(t, url, "status", `{"repository":{"full_name":"o/r"},"sha":"unknown"}`)
 	q.Wait()
 	if got := ev.started(); !slices.Equal(got, []PRKey{pr(2)}) {

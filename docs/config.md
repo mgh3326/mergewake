@@ -1695,9 +1695,15 @@ An HTTP status of `0` counts a request that received no response.
 
 Each event also puts the PR it names on the [PR event queue](pr-queue.md), which
 evaluates that PR at once; the pass the signals below start is the sweep that
-queues every open PR. The `pr` role starts a pass for one of three reasons. The pass log line
-(`loop completed`) names it in its `wake` field: `webhook`, `reviewer` or
-`interval` (the first pass after a start counts as `interval`).
+queues every open PR. A `pull_request*` delivery wakes the `pr` and `watch`
+roles. A `check_run`, `check_suite` or `status` delivery never wakes the `pr`
+sweep: it queues the PRs it names (a check only once it completed), and it wakes
+`watch` at once only for the head of the branch that repository's `watch` role
+reads (`repos[].branch`, else the repository's default branch), so the reaction
+to main CI stays event-driven. The `pr` role starts a pass for one of three
+reasons. The pass log line (`loop completed`) names it in its `wake` field:
+`webhook`, `reviewer` or `interval` (the first pass after a start counts as
+`interval`).
 
 | Signal | What it is | Earliest start after the last pass ended |
 | --- | --- | --- |

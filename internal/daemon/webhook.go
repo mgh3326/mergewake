@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +42,10 @@ type Webhook struct {
 	// Queue, when set, evaluates the PRs a delivery names (see deliveryPayload.refs)
 	// at once, and every open PR of a repo when its base branch (Branches) is
 	// pushed to.
-	Queue    *Queue
+	Queue *Queue
+	// Branches is the branch each repository's watch role reads. A check or
+	// status delivery wakes watch for that branch's head (see wakesWatch), and
+	// a push to it queues every open PR (SourceBase).
 	Branches map[string]string
 	// State, when set, keeps what each delivery carries (see webhookstate). A
 	// payload it cannot parse is logged once per event type and never changes
@@ -59,18 +63,26 @@ type Webhook struct {
 const StatusPath = "/v1/pr-status"
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping
-// and unlisted events wake none.
+// and unlisted events wake none. A check or status event wakes watch only for
+// the head of the branch the watch role reads (see wakesWatch), and the PR it
+// names is evaluated from the queue, so it wakes no full pr sweep.
 var webhookEventRoles = map[string][]string{
 	"pull_request":                {"pr", "watch"},
 	"pull_request_review":         {"pr", "watch"},
 	"pull_request_review_thread":  {"pr", "watch"},
 	"pull_request_review_comment": {"pr", "watch"},
-	"check_suite":                 {"pr", "watch"},
-	"check_run":                   {"pr", "watch"},
-	"status":                      {"pr", "watch"},
+	"check_suite":                 {"watch"},
+	"check_run":                   {"watch"},
+	"status":                      {"watch"},
 	"release":                     {"release", "rollout"},
 	"workflow_run":                {"release", "rollout"},
 	"push":                        {"release", "rollout"},
+}
+
+// checkEvent reports whether event carries a check or status result, whose
+// wake and evaluation rules differ from a pull_request's.
+func checkEvent(event string) bool {
+	return event == "check_run" || event == "check_suite" || event == "status"
 }
 
 // serve runs the receiver until ctx ends. The listener opens first so a bad
@@ -156,7 +168,7 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	triggered := []string{}
 	if wh.Repos[delivery.Repository.FullName] {
 		event := r.Header.Get("X-GitHub-Event")
-		if event == "pull_request" || strings.HasPrefix(event, "pull_request_review") || event == "check_suite" || event == "check_run" || event == "status" {
+		if event == "pull_request" || strings.HasPrefix(event, "pull_request_review") || checkEvent(event) {
 			if wh.State != nil {
 				if applied, e := wh.State.ApplyObserved(delivery.Repository.FullName, event, r.Header.Get("X-GitHub-Delivery"), payload); e != nil {
 					if _, seen := wh.parseWarned.LoadOrStore(event, true); !seen {
@@ -174,9 +186,13 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 			}
 			// After the marks and the invalidation: the evaluation reads what
 			// the delivery changed.
-			if wh.Queue != nil {
+			if wh.Queue != nil && delivery.evaluates(event) {
+				src := SourceWebhook
+				if checkEvent(event) {
+					src = SourceCheck
+				}
 				for _, ref := range delivery.refs(event) {
-					wh.Queue.EnqueueNamed(SourceWebhook, delivery.Repository.FullName, ref.number, ref.sha)
+					wh.Queue.EnqueueNamed(src, delivery.Repository.FullName, ref.number, ref.sha)
 				}
 			}
 		}
@@ -186,6 +202,9 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, role := range webhookEventRoles[event] {
+			if role == "watch" && checkEvent(event) && !delivery.wakesWatch(event, wh.watchedBranch(delivery.Repository.FullName, delivery.Repository.DefaultBranch)) {
+				continue
+			}
 			if trigger(role) {
 				triggered = append(triggered, role)
 			}
@@ -204,8 +223,11 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 // commit.
 type deliveryPayload struct {
 	Repository struct {
-		FullName string `json:"full_name"`
+		FullName      string `json:"full_name"`
+		DefaultBranch string `json:"default_branch"`
 	} `json:"repository"`
+	// Action is set by check_run and check_suite; a status has none.
+	Action string `json:"action"`
 	// Number is set by pull_request; SHA by status.
 	Number int    `json:"number"`
 	SHA    string `json:"sha"`
@@ -219,10 +241,20 @@ type deliveryPayload struct {
 	} `json:"pull_request"`
 	CheckRun   checkPayload `json:"check_run"`
 	CheckSuite checkPayload `json:"check_suite"`
+	// Branches are the branches a status commit is on.
+	Branches []struct {
+		Name string `json:"name"`
+	} `json:"branches"`
 }
 
 type checkPayload struct {
-	HeadSHA      string `json:"head_sha"`
+	HeadSHA    string `json:"head_sha"`
+	HeadBranch string `json:"head_branch"`
+	// CheckSuite is the suite of a check_run; a check_suite carries the branch
+	// itself.
+	CheckSuite struct {
+		HeadBranch string `json:"head_branch"`
+	} `json:"check_suite"`
 	PullRequests []struct {
 		Number int `json:"number"`
 	} `json:"pull_requests"`
@@ -237,7 +269,9 @@ type prRef struct {
 // refs lists every PR the delivery names: by number for the pull_request*
 // events and the PRs a check payload lists, and by head commit for check_run,
 // check_suite and status, whose payload leaves the PR out for a fork or a
-// re-run. Only those PRs are named; their siblings are not.
+// re-run. Only those PRs are named; their siblings are not. A check event
+// names the commit its result is about with every PR it lists, so the
+// evaluation can tell whether the check ran on the PR's own head.
 func (p deliveryPayload) refs(event string) []prRef {
 	switch event {
 	case "check_run", "check_suite":
@@ -247,7 +281,7 @@ func (p deliveryPayload) refs(event string) []prRef {
 		}
 		out := []prRef{{0, c.HeadSHA}}
 		for _, pr := range c.PullRequests {
-			out = append(out, prRef{pr.Number, ""})
+			out = append(out, prRef{pr.Number, c.HeadSHA})
 		}
 		return out
 	case "status":
@@ -255,6 +289,59 @@ func (p deliveryPayload) refs(event string) []prRef {
 	default:
 		return []prRef{{max(p.PullRequest.Number, p.Number), p.PullRequest.Head.SHA}}
 	}
+}
+
+// evaluates reports whether the delivery queues an evaluation of the PRs it
+// names. A check that has not completed has no result to evaluate, and the
+// completed delivery follows; a status carries no action and always counts.
+func (p deliveryPayload) evaluates(event string) bool {
+	switch event {
+	case "check_run", "check_suite":
+		return p.Action == "completed"
+	}
+	return true
+}
+
+// watchedBranch is the branch the repository's watch role reads: the
+// configured base branch, or the repository's default branch when none is
+// configured.
+func (wh *Webhook) watchedBranch(repo, defaultBranch string) string {
+	if branch := wh.Branches[repo]; branch != "" {
+		return branch
+	}
+	return defaultBranch
+}
+
+// checkBranches lists the branches a check or status delivery names: the
+// branch the check suite ran on, or the branches a status commit is on.
+func (p deliveryPayload) checkBranches(event string) []string {
+	var out []string
+	add := func(branch string) {
+		if branch != "" {
+			out = append(out, branch)
+		}
+	}
+	switch event {
+	case "check_run":
+		add(p.CheckRun.HeadBranch)
+		add(p.CheckRun.CheckSuite.HeadBranch)
+	case "check_suite":
+		add(p.CheckSuite.HeadBranch)
+	case "status":
+		for _, branch := range p.Branches {
+			add(branch.Name)
+		}
+	}
+	return out
+}
+
+// wakesWatch reports whether a check or status delivery is about the head of
+// the watched branch. A delivery that names no branch, or a repository whose
+// watched branch is unknown, cannot be ruled out, so it wakes watch too: the
+// reaction to main CI must not wait for the sweep.
+func (p deliveryPayload) wakesWatch(event, watched string) bool {
+	branches := p.checkBranches(event)
+	return len(branches) == 0 || watched == "" || slices.Contains(branches, watched)
 }
 
 // mark records, on d, every PR the delivery names (see refs). Only those PRs

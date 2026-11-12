@@ -164,9 +164,12 @@ func TestWebhookEventRoles(t *testing.T) {
 		{"pull_request", []string{"pr", "watch"}},
 		{"pull_request_review", []string{"pr", "watch"}},
 		{"pull_request_review_thread", []string{"pr", "watch"}},
-		{"check_suite", []string{"pr", "watch"}},
-		{"check_run", []string{"pr", "watch"}},
-		{"status", []string{"pr", "watch"}},
+		// A check or status delivery wakes watch, never the full pr sweep; the
+		// PR it names is evaluated from the queue. These payloads name no
+		// branch, so watch cannot be ruled out.
+		{"check_suite", []string{"watch"}},
+		{"check_run", []string{"watch"}},
+		{"status", []string{"watch"}},
 		{"release", []string{"release", "rollout"}},
 		{"workflow_run", []string{"release", "rollout"}},
 		{"push", []string{"release", "rollout"}},
@@ -327,7 +330,7 @@ func TestWebhookKeepsDeliveryStateAndSurvivesMalformedPayloads(t *testing.T) {
 		t.Fatalf("head = %q, want h1", got.HeadSHA)
 	}
 
-	// (h) malformed payloads answer as before and still wake the roles.
+	// (h) malformed payloads answer as before and still wake the roles they name.
 	triggered = nil
 	for i, tt := range []struct{ event, body string }{
 		{"pull_request", `{"repository":{"full_name":"o/r"},"pull_request":{"number":7,"updated_at":"never"}}`},
@@ -339,8 +342,8 @@ func TestWebhookKeepsDeliveryStateAndSurvivesMalformedPayloads(t *testing.T) {
 			t.Fatalf("%s: status=%d", tt.event, code)
 		}
 	}
-	if len(triggered) != 8 {
-		t.Fatalf("malformed deliveries woke %v, want pr and watch for each of 4", triggered)
+	if got, want := triggered, []string{"pr", "watch", "watch", "watch", "pr", "watch"}; !slices.Equal(got, want) {
+		t.Fatalf("malformed deliveries woke %v, want %v", got, want)
 	}
 	if got, _ := state.PR("o/r", 7); got.HeadSHA != "h1" {
 		t.Fatalf("a malformed delivery changed the state: %+v", got)

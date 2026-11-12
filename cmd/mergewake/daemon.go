@@ -105,8 +105,8 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				// queued run on their own and report what they cost here.
 				var queue []any
 				if role == "pr" {
-					depth, wait, evaluated := engine.queueTotals()
-					queue = []any{"queue_depth", depth, "queue_wait_max", wait.String(), "eval_requests", evaluated}
+					depth, wait, evaluated, evalRoutes := engine.queueTotals()
+					queue = []any{"queue_depth", depth, "queue_wait_max", wait.String(), "eval_requests", evaluated, "eval_routes", evalRoutes[:min(len(evalRoutes), 10)]}
 				}
 				log.Info("github requests", append(queue, "hk_state_writes", state.Writes, "hk_state_stale", state.Stale, "hk_state_rejected", state.Rejected, "hk_state_unavailable", state.Unavailable, "hk_state_merged_skipped", state.Skipped, "role", role, "total", total, "cache_hits", cache.Hits, "cache_misses", cache.Misses, "memo_hits", cache.MemoHits, "not_modified", cache.NotModified, "by_credential", counts.ByCredential(), "rate_remaining", gh.RateRemaining(), "gate_wait_ms", counts.GateWaitMax().Milliseconds(), "hk_review_hits", reviews.Hits, "hk_review_misses", reviews.Misses, "hk_review_mismatches", reviews.Mismatches, "routes", requests[:min(len(requests), 10)])...)
 			}()
