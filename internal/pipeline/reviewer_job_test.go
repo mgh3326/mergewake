@@ -121,6 +121,43 @@ func TestReviewerJobResumeReplaysSpawn(t *testing.T) {
 	reviewerJobGone(t, s, r, 1)
 }
 
+func TestReviewerJobResumeBoundsBuilderFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name, saved, want string
+	}{
+		{name: "unaccepted", saved: "cognition", want: "other"},
+		{name: "accepted", saved: "google", want: "google"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, r, runner, c := interruptedReviewer(t)
+			job := readReviewerJob(t, s, r, 1)
+			job.Args[slices.Index(job.Args, "--builder-family")+1] = tc.saved
+			if err := fsutil.WriteJSON(s.reviewerJobPath(r.Name, 7, 1), job); err != nil {
+				t.Fatal(err)
+			}
+			c.t = c.t.Add(2 * time.Second)
+			runner.afterRun = func() {
+				runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			}
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.spawns) != 2 {
+				t.Fatalf("spawns=%d, want resumed launch", len(runner.spawns))
+			}
+			first, replay := runner.spawns[0], runner.spawns[1]
+			if got := arg(replay, "--builder-family"); got != tc.want {
+				t.Fatalf("replayed --builder-family=%q, want %q; args=%v", got, tc.want, replay)
+			}
+			want := slices.Clone(first)
+			want[slices.Index(want, "--builder-family")+1] = tc.want
+			if !slices.Equal(withoutWait(want), withoutWait(replay)) || arg(first, "-l") != arg(replay, "-l") {
+				t.Fatalf("replay changed saved arguments beyond family and wait timeout:\nwant %v\ngot  %v", want, replay)
+			}
+		})
+	}
+}
+
 // (b) A recorded job that completed with a result is read and posted without
 // any spawn.
 func TestReviewerJobCompletedPostsWithoutSpawn(t *testing.T) {

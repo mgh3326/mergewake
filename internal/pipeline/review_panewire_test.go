@@ -1193,6 +1193,25 @@ func TestPanewireTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
 	}
 }
 
+func TestPanewireWorkerSeatSpawnCarriesAcceptedBuilderFamily(t *testing.T) {
+	runner := &panewireRunner{
+		findings: `{"findings":[]}`,
+		family:   "openai",
+		refuse:   map[string]int{"reviewer": panewireRefused},
+	}
+	s, _, r := panewireSetup(t, runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 2 {
+		t.Fatalf("spawns=%d, want reviewer refusal and worker-seat spawn", len(runner.spawns))
+	}
+	spawn := runner.spawns[1]
+	if arg(spawn, "--role") != "worker" || arg(spawn, "--builder-family") != "anthropic" {
+		t.Fatalf("worker-seat spawn missing accepted builder family: %v", spawn)
+	}
+}
+
 // The reviewer's family comes from its hk job record when the pane ran on
 // another host and left no spawn events in the local job directory.
 func TestPanewireReviewerFamilyFromRecordWithoutLocalEvents(t *testing.T) {

@@ -106,6 +106,21 @@ func workerSeatArgs(args []string) []string {
 	return append(out, "--role", "worker")
 }
 
+// panewireSpawnArgs bounds the builder family on every spawn, including
+// arguments replayed from reviewer-job records written by older versions.
+func panewireSpawnArgs(args []string) []string {
+	out := slices.Clone(args)
+	if i := slices.Index(out, "--builder-family"); i >= 0 {
+		if i+1 < len(out) {
+			out[i+1] = panewireBuilderFamily(out[i+1])
+		} else {
+			out = append(out, "other")
+		}
+		return out
+	}
+	return append(out, "--builder-family", "other")
+}
+
 // panewireExecutor spawns the pass as a visible reviewer pane through panewire.
 // panewire picks host and model; the pane reviews a worktree detached at the
 // PR head, which panewire replicates on a remote host, and returns its findings
@@ -692,6 +707,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		var spawnTook time.Duration
 		defer func() { phases.Spawned(spawnTook) }()
 		launch := func(c context.Context, a []string) ([]byte, error) {
+			a = panewireSpawnArgs(a)
 			if async {
 				a = placeOnly(a)
 			}
