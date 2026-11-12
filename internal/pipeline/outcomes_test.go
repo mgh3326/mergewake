@@ -177,7 +177,6 @@ func TestReconcileClosedRowsAreThrottledAndFinished(t *testing.T) {
 	s.Now = func() time.Time { return now }
 	mergedAt := now.Add(-24 * time.Hour)
 	merged := mergedAt.Format(time.RFC3339)
-	closed := now.Add(-time.Hour).Format(time.RFC3339)
 	makePull := func(number int, mergeAt *string) github.Pull {
 		p := g.pull
 		p.Number, p.State, p.MergedAt = number, "closed", mergeAt
@@ -186,8 +185,8 @@ func TestReconcileClosedRowsAreThrottledAndFinished(t *testing.T) {
 		return p
 	}
 	mergedPull := makePull(1, &merged)
-	noCIPull := makePull(3, &closed)
-	unattributedPull := makePull(2, &closed)
+	noCIPull := makePull(3, nil)
+	unattributedPull := makePull(2, nil)
 	unattributedPull.Body = ""
 	newlyClosedPull := makePull(4, nil)
 	source := &outcomeGH{fakeGH: g, first: true, pulls: map[int]github.Pull{
