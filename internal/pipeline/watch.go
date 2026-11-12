@@ -33,12 +33,6 @@ type watchResult struct {
 	AnyRefDispatch string `json:"any_ref_dispatch,omitempty"`
 }
 
-type watchHoldEpisode struct {
-	ID         string          `json:"id"`
-	Notified   bool            `json:"notified"`
-	Suppressed map[string]bool `json:"suppressed,omitempty"`
-}
-
 // UnknownEvidenceError names the bracket commit whose CI evidence Bisect
 // needed but could not read as green or red.
 type UnknownEvidenceError struct {
@@ -217,11 +211,6 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	}
 	checkpoint := s.checkpoint(r.Name)
 	if ci == github.Green {
-		if !s.deploy && !o.DryRun {
-			if e = s.clearWatchHoldEpisode(r.Name); e != nil {
-				return e
-			}
-		}
 		// A same-sha re-run can pass beside the head's own failed run. Record
 		// the mixed result once, then close the incident as healthy: a green
 		// main needs no revert, and a stale record would block a later red.
@@ -642,9 +631,9 @@ func (s *Service) redOutside(ctx context.Context, repo, sha string, checks, insi
 	return red, nil
 }
 
-// reportWatch audits every watch outcome, sends one notice per main-hold
-// episode, and records each held head once. Repeat polls keep the episode
-// quiet while retaining an audit trail.
+// reportWatch audits a held or reported watch outcome once per head and key,
+// then notifies and records when the host is acting. Repeat polls on the same
+// head with the same key stay quiet.
 func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchResult, key string, o Options) error {
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
@@ -653,44 +642,11 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		return nil
 	}
 	s.feedWatch(r, result, o)
-	isMainHold := result.Action == "hold" && result.Stage == ""
-	var episode watchHoldEpisode
-	if isMainHold {
-		var err error
-		episode, err = s.readWatchHoldEpisode(r.Name)
-		if err != nil {
-			return err
-		}
-		if episode.ID != "" && episode.Notified {
-			key := result.Head + " " + result.Reason
-			if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
-				return err
-			}
-			if episode.Suppressed[key] {
-				return nil
-			}
-			data, _ := json.Marshal(result)
-			reportCtx, cancel := reportContext(ctx)
-			defer cancel()
-			if err = s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data); err != nil {
-				return err
-			}
-			episode.Suppressed[key] = true
-			return s.writeWatchHoldEpisode(r.Name, episode)
-		}
-		if episode.ID == "" {
-			episode.ID = fmt.Sprintf("%d-%s", s.now().UTC().UnixNano(), short7(result.Head))
-			episode.Suppressed = map[string]bool{}
-			if err = s.writeWatchHoldEpisode(r.Name, episode); err != nil {
-				return err
-			}
-		}
-	}
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
 	}
-	if sent.has(key) && !isMainHold {
+	if sent.has(key) {
 		return nil
 	}
 	data, _ := json.Marshal(result)
@@ -704,50 +660,12 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Reason != "" {
 		note += ": " + result.Reason
 	}
-	eventID := "mergewake-" + result.Action + "-" + result.Head
-	if isMainHold {
-		eventID = "mergewake-watch-hold-" + episode.ID
-	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: eventID, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}
-	if e = sent.add(key); e != nil {
-		return e
-	}
-	if isMainHold {
-		episode.Notified = true
-		episode.Suppressed[result.Head+" "+result.Reason] = true
-		return s.writeWatchHoldEpisode(r.Name, episode)
-	}
-	return nil
-}
-
-func (s *Service) readWatchHoldEpisode(repo string) (watchHoldEpisode, error) {
-	var episode watchHoldEpisode
-	file := filepath.Join(s.state(repo), "watch-hold-active.json")
-	if found, err := fsutil.ReadJSON(file, &episode); found && err != nil {
-		return episode, err
-	} else if err != nil {
-		return episode, err
-	}
-	if episode.Suppressed == nil {
-		episode.Suppressed = map[string]bool{}
-	}
-	return episode, nil
-}
-
-func (s *Service) writeWatchHoldEpisode(repo string, episode watchHoldEpisode) error {
-	return fsutil.WriteJSON(filepath.Join(s.state(repo), "watch-hold-active.json"), episode)
-}
-
-func (s *Service) clearWatchHoldEpisode(repo string) error {
-	file := filepath.Join(s.state(repo), "watch-hold-active.json")
-	if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return sent.add(key)
 }
 
 // bracketCandidates lists merged PRs in the inspected interval, excluding a

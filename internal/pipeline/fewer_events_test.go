@@ -159,52 +159,6 @@ func TestLostReplacementUsesDurableReviewerReplacementCount(t *testing.T) {
 	}
 }
 
-func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
-	s, _, _, r, _ := feedSetup(t)
-	sink := &fakeSink{}
-	s.Sink = sink
-	n := newEscNotifier()
-	s.Notifier = n
-	for _, head := range []string{"red-a", "red-b", "red-c"} {
-		result := watchResult{Head: head, Action: "hold", Reason: "main is red"}
-		if err := s.reportWatch(context.Background(), r, result, head+":hold", Options{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(n.accepted) != 1 {
-		t.Fatalf("red episode notifications = %d, want 1", len(n.accepted))
-	}
-	if sink.records != 3 {
-		t.Fatalf("red episode sink records = %d, want one per held head", sink.records)
-	}
-	if err := s.reportWatch(context.Background(), r, watchResult{Head: "red-c", Action: "hold", Reason: "main is red"}, "red-c:hold", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if sink.records != 3 {
-		t.Fatalf("same held head wrote another sink record: %d", sink.records)
-	}
-	if rows := auditRows(t, s, r, "watch-hold-suppressed"); len(rows) != 3 {
-		t.Fatalf("suppressed hold audit rows = %v, want one for each held head and repeat", rows)
-	}
-	if got := outboxLen(t, s.Feed); got != 3 {
-		t.Fatalf("red-head watch feed entries = %d, want 3", got)
-	}
-	if err := s.clearWatchHoldEpisode(r.Name); err != nil {
-		t.Fatal(err)
-	}
-	nextAt := feedNow.Add(time.Second)
-	s.Now = func() time.Time { return nextAt }
-	if err := s.reportWatch(context.Background(), r, watchResult{Head: "red-a", Action: "hold", Reason: "main is red"}, "red-a:hold", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(n.accepted) != 2 {
-		t.Fatalf("next red episode notifications = %d, want 2", len(n.accepted))
-	}
-	if n.accepted[0].ID == n.accepted[1].ID {
-		t.Fatalf("same-head red episode reused event id %q", n.accepted[0].ID)
-	}
-}
-
 func TestRoundFactsRecordNewCodeAndRepeatedThread(t *testing.T) {
 	prior := []github.ReviewThread{{Path: "a.go", Line: 5, Comments: []github.ReviewComment{{Body: "<!-- mergewake-severity:high -->\nSame bug title"}}}}
 	findings := []github.Finding{{Path: "a.go", Line: 5, Severity: "high", Body: "Same bug title"}}

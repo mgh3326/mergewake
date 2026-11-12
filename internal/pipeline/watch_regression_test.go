@@ -139,9 +139,6 @@ func TestWatchReportedBounded(t *testing.T) {
 	if sink.records != 1 || n.count != 1 {
 		t.Fatal("repeat report not deduplicated")
 	}
-	if rows := auditRows(t, s, r, "watch-hold-suppressed"); len(rows) != 1 {
-		t.Fatalf("suppressed repeat hold audit rows = %v, want one", rows)
-	}
 	after, err := os.ReadFile(file)
 	if err != nil || !reflect.DeepEqual(b, after) {
 		t.Fatal("dedupe changed keys", err)
