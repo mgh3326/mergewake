@@ -811,6 +811,21 @@ on it.
   receipt carries `quiet: true`, and every pass records `round` and, for a delta
   round, `delta` (the previous reviewed head). Reviews posted before round
   counting count one round per reviewed head.
+- **Review-round rule (rounds 3 and 5).** A round ends without a pass when its review
+  leaves at least one critical or high finding still open (not fixed or dismissed
+  with evidence) after the verdict.
+  - **Round 3:** The findings delivery to the worker carries the directive once:
+    `stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause.`
+    mergewake also runs, once per (task, PR, round 3), on the daemon host bounded at 60 s:
+    `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round 3 --findings-file <path>`,
+    where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
+    rc 0 logs `job=<id> rung=<profile@effort>`; rc 2 logs `no_rung` or `quota_refused`; any other rc, timeout
+    or missing command is logged and review continues. Nothing is sent to the design lane at round 3.
+  - **Round 5:** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
+    and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
+    round count, open findings, and the two choices: cut the scope or request one SS consult on the design.
+  - **Releasing the hold:** The hold ends when an authorized account (non-bot, other than the review login)
+    replies with a PR comment matching `Mergewake-Round-Hold: release`. Once released, review and gate resume.
 
 Round, `delta_base`, `quiet`, `prior_context`, `advisory` and the drop counts
 are on the `review` audit event.

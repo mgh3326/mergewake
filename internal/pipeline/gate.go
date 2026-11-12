@@ -69,6 +69,7 @@ type reviewRecord struct {
 	Reviewed        []string     `json:"reviewed_patch_ids,omitempty"`
 	Inherited       string       `json:"inherited_from,omitempty"`
 	Findings        dispositions `json:"dispositions"`
+	Hold            string       `json:"hold,omitempty"`
 }
 
 // dispositions counts the PR's review threads by how they stand: blocking and
@@ -465,6 +466,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 			}
 		}
 	}
+	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
 	outside := outsideBlocking(history, pr.Head.SHA, v.Review.PatchID, v.Review.Inherited)
 	if outside > 0 {
 		comments, e := s.GH.IssueComments(github.FreshEvidence(ctx), r.Name, pr.Number)

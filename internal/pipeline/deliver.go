@@ -121,6 +121,23 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
+	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
+	rounds, _ := reviewRounds(history)
+	openBlocking, openThreads := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	st := s.loadRoundRuleState(r.Name, n)
+	if done && rounds == 3 && openBlocking && !st.Round3DirectiveSent && len(inScope) == 0 {
+		for _, t := range openThreads {
+			first := t.Comments[0]
+			inScope = append(inScope, pendingFinding{
+				thread:   t.ID,
+				severity: github.ThreadSeverity(first.Author, first.Body),
+				path:     t.Path,
+				line:     t.Line,
+				link:     first.URL,
+				blocking: true,
+			})
+		}
+	}
 	if len(inScope)+len(outScope) > 0 {
 		route, e := s.findingsRoute(ctx, r, pr)
 		if e != nil {
@@ -134,7 +151,11 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			if len(batch.findings) == 0 {
 				continue
 			}
-			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o)
+			directive := ""
+			if batch.scope == "author" && done && rounds == 3 && openBlocking && !st.Round3DirectiveSent {
+				directive = Round3Directive
+			}
+			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive)
 			if e != nil {
 				// Keep what was already delivered; a retry of the failed batch
 				// reuses its event ID, which panewire dedupes.
@@ -143,9 +164,17 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				}
 				return errors.Join(followErr, e)
 			}
+			if directive != "" && o.Reporting() {
+				st.Round3DirectiveSent = true
+				_ = s.saveRoundRuleState(r.Name, n, st)
+				s.escalateAuthorRound3(ctx, r, pr, fb, o, &st)
+			}
 			ledger = append(ledger, d)
 			changed = true
 		}
+	}
+	if done && rounds == 3 && openBlocking && !st.Round3Escalated && st.Round3DirectiveSent {
+		s.escalateAuthorRound3(ctx, r, pr, fb, o, &st)
 	}
 	if changed && o.Reporting() {
 		followErr = errors.Join(followErr, s.saveDeliveries(r.Name, ledger))
@@ -369,7 +398,7 @@ func severityRank(s string) int {
 // findingsText renders one delivery: what was found, what is required and how
 // to acknowledge, within the lane event bound. Findings that do not fit are
 // counted, not dropped silently.
-func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding) string {
+func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding, directives ...string) string {
 	tag := "FINDINGS"
 	required := `required: every critical/high/Major finding needs a fix commit or a dismissal with evidence (a command and its output, or the code line that disproves it); accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition`
 	if scope == "owner" {
@@ -378,6 +407,9 @@ func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendin
 	}
 	head := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %d finding(s) for lane %s: ", tag, r.Name, pr.Number, short7(pr.Head.SHA), len(fs), lane)
 	tail := " | " + required
+	if len(directives) > 0 && directives[0] != "" {
+		tail = " | directive: " + directives[0] + tail
+	}
 	if scope == "author" {
 		tail += fmt.Sprintf(" | ack: panewire inbox list --lane %s --unread; read each item, act on it or record its disposition, then panewire inbox ack <id>; acknowledging does not resolve a finding", lane)
 	}
@@ -412,7 +444,7 @@ func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendin
 
 // sendFindings emits one delivery and returns its ledger record. Dry-run
 // records the decision only.
-func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pull, rt findingsRoute, scope string, fs []pendingFinding, o Options) (findingsDelivery, error) {
+func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pull, rt findingsRoute, scope string, fs []pendingFinding, o Options, directives ...string) (findingsDelivery, error) {
 	slices.SortStableFunc(fs, func(a, b pendingFinding) int {
 		if d := severityRank(a.severity) - severityRank(b.severity); d != 0 {
 			return d
@@ -426,7 +458,11 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	for i, f := range fs {
 		ids[i] = f.thread
 	}
-	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
+	key := strings.Join(ids, "\n")
+	if len(directives) > 0 {
+		key += "\n" + strings.Join(directives, "\n")
+	}
+	sum := sha256.Sum256([]byte(key))
 	lane, via := rt.lane, rt.via
 	d := findingsDelivery{
 		ID:      fmt.Sprintf("mergewake-%s-%s-%d-%s", map[string]string{"author": "findings", "owner": "out-of-scope"}[scope], r.Name, pr.Number, hex.EncodeToString(sum[:6])),
@@ -437,7 +473,7 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 		Lane:    lane,
 		Via:     via,
 		Owner:   rt.owner,
-		Text:    findingsText(r, pr, scope, lane, fs),
+		Text:    findingsText(r, pr, scope, lane, fs, directives...),
 		SentAt:  s.now().UTC(),
 		Heads:   []string{pr.Head.SHA},
 	}

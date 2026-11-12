@@ -147,6 +147,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if pr.State != "open" || pr.Draft {
 		return errors.New("review requires an open, ready PR")
 	}
+	if s.isRoundHoldActive(ctx, r, pr) {
+		return ErrReviewHeld
+	}
 	needed, settled, e := s.reviewPassesNeeded(ctx, r, pr)
 	if e != nil {
 		return e
