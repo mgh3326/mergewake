@@ -120,11 +120,16 @@ func (s *Service) authorPane(ctx context.Context, r config.Repo, pr github.Pull)
 
 // authorRoute is an author lane found from the task's bound job, possibly
 // superseded by a takeover (see boundAuthorLane). candidates names several
-// other live panes when the bound lane was kept.
+// other live panes when the bound lane was kept. finished names the bound lane
+// when its job is terminal and no host shows a pane for it; it is set whether
+// or not a takeover then won. unknown is set when a terminal job could not be
+// checked against every host.
 type authorRoute struct {
 	lane, via   string
 	candidates  []string
 	failedHosts []string
+	finished    string
+	unknown     bool
 }
 
 // boundAuthorLane is the PR author's lane when the task binds a job with a
@@ -132,9 +137,11 @@ type authorRoute struct {
 // PR's head branch takes the PR over, so the bound lane stands unless exactly
 // one other such pane exists; then that pane's job lane wins, via
 // "takeover pane <label>". Several other panes keep the bound lane and name
-// the candidates for an audit row. A bound job with no usable lane returns no
-// lane, so the caller falls through to authorPane as before. A host or job
-// read error is returned so the caller retries rather than picking a lane.
+// the candidates for an audit row. A bound job that is terminal and that no
+// read host shows a pane for is finished: its lane is not returned (the caller
+// falls through to authorPane and the trailer), and the route names it in
+// finished so a delivery still on it can be rerouted. A host or job read error
+// is returned so the caller retries rather than picking a lane.
 func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.Pull, task string) (authorRoute, error) {
 	job, rec, ok, e := s.boundJob(ctx, task)
 	if e != nil || !ok {
@@ -143,6 +150,10 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	lane := jobLane(rec)
 	if lane == "" {
 		return authorRoute{}, nil
+	}
+	finished, unknown, e := s.authorFinished(ctx, job, rec)
+	if e != nil {
+		return authorRoute{}, e
 	}
 	bound := authorRoute{lane: lane, via: "task " + task + " job " + job}
 	others, e := s.takeoverPanes(ctx, r, pr, job, rec.Label)
@@ -154,26 +165,66 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 		bound.failedHosts = append([]string(nil), scan.failedHosts...)
 		bound.via += " (partial pane scan)"
 	}
+	route, takenOver := bound, false
 	switch len(others) {
 	case 0:
-		return bound, nil
 	case 1:
 		jobs := s.Sink.(reapJobs)
 		takeover, e := jobs.Job(ctx, others[0])
-		if errors.Is(e, integrations.ErrJobNotFound) {
-			return bound, nil
-		}
-		if e != nil {
+		if e != nil && !errors.Is(e, integrations.ErrJobNotFound) {
 			return authorRoute{}, e
 		}
-		if l := jobLane(takeover); l != "" {
-			return authorRoute{lane: l, via: "takeover pane " + others[0] + partialVia(bound), failedHosts: bound.failedHosts}, nil
+		if e == nil {
+			if l := jobLane(takeover); l != "" {
+				route = authorRoute{lane: l, via: "takeover pane " + others[0] + partialVia(bound), failedHosts: bound.failedHosts}
+				takenOver = true
+			}
 		}
-		return bound, nil
 	default:
 		bound.candidates = others
-		return bound, nil
+		route = bound
 	}
+	if finished {
+		route.finished = lane
+		if !takenOver {
+			route.lane, route.via = "", ""
+		}
+	}
+	route.unknown = unknown
+	return route, nil
+}
+
+// authorFinished reports whether a bound job that is terminal has left no pane
+// on the configured hosts. finished is true only when every host was read and
+// none shows a pane named for the job, its label, or its recorded pane id.
+// unknown is set for a terminal job whose hosts were not all read, or with no
+// hosts configured: liveness is then unknown and the bound lane stands. A job
+// that is not terminal is never finished.
+func (s *Service) authorFinished(ctx context.Context, job string, rec integrations.JobRecord) (finished, unknown bool, err error) {
+	if !terminalJob(rec.State) {
+		return false, false, nil
+	}
+	if len(s.Config.Hosts) == 0 {
+		return false, true, nil
+	}
+	hosts, e := s.authorHosts(ctx)
+	if len(hosts) == 0 && e != nil {
+		return false, false, e
+	}
+	for _, hs := range hosts {
+		if hs.failed {
+			return false, true, nil
+		}
+		for _, p := range hs.panes {
+			if p.Name == job || (rec.Label != "" && p.Name == rec.Label) || (rec.PaneID != "" && p.ID == rec.PaneID) {
+				return false, false, nil
+			}
+		}
+	}
+	if len(hosts) < len(s.Config.Hosts) {
+		return false, true, nil
+	}
+	return true, false, nil
 }
 
 func partialVia(route authorRoute) string {
