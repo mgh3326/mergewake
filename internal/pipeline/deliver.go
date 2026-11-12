@@ -152,7 +152,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				continue
 			}
 			directive := ""
-			if batch.scope == "author" && rounds == 3 && openBlocking && !st.Round3DirectiveSent {
+			if batch.scope == "author" && done && rounds == 3 && openBlocking && !st.Round3DirectiveSent {
 				directive = Round3Directive
 			}
 			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive)
@@ -164,7 +164,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				}
 				return errors.Join(followErr, e)
 			}
-			if directive != "" {
+			if directive != "" && o.Reporting() {
 				st.Round3DirectiveSent = true
 				_ = s.saveRoundRuleState(r.Name, n, st)
 				s.escalateAuthorRound3(ctx, r, pr, fb, o, &st)
@@ -458,7 +458,11 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	for i, f := range fs {
 		ids[i] = f.thread
 	}
-	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
+	key := strings.Join(ids, "\n")
+	if len(directives) > 0 {
+		key += "\n" + strings.Join(directives, "\n")
+	}
+	sum := sha256.Sum256([]byte(key))
 	lane, via := rt.lane, rt.via
 	d := findingsDelivery{
 		ID:      fmt.Sprintf("mergewake-%s-%s-%d-%s", map[string]string{"author": "findings", "owner": "out-of-scope"}[scope], r.Name, pr.Number, hex.EncodeToString(sum[:6])),

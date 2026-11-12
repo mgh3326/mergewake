@@ -121,7 +121,7 @@ func buildFindingsFile(fb github.ReviewFeedback) ([]byte, error) {
 
 // escalateAuthorRound3 executes `panewire escalate-author` once per (task, PR, round 3).
 func (s *Service) escalateAuthorRound3(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState) {
-	if st.Round3Escalated {
+	if o.DryRun || st.Round3Escalated {
 		return
 	}
 	st.Round3Escalated = true
@@ -309,7 +309,7 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 }
 
 // checkRound5Gate evaluates the round 5 hold condition during gate evaluation.
-func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, v *gateVerdict) bool {
+func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
 
@@ -333,7 +333,7 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 		return true
 	}
 
-	if rounds >= 5 && open {
+	if reviewed && rounds >= 5 && open {
 		comments, _ := s.issueComments(ctx, r.Name, pr.Number)
 		st.Round5Held = true
 		st.Round5At = s.now().UTC()
@@ -376,7 +376,8 @@ func (s *Service) sendRound5Decision(ctx context.Context, r config.Repo, pr gith
 		}); err != nil {
 			return err
 		}
+		st.Round5EventSent = true
+		return s.saveRoundRuleState(r.Name, pr.Number, st)
 	}
-	st.Round5EventSent = true
-	return s.saveRoundRuleState(r.Name, pr.Number, st)
+	return nil
 }

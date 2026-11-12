@@ -545,3 +545,64 @@ func TestRoundRule_StaleReleaseCommentDoesNotReleaseNewHold(t *testing.T) {
 		t.Fatalf("isRoundHoldActive returned true after fresh release, want false")
 	}
 }
+
+func TestRoundRule_DirectiveEventIDDistinctFromPriorFindings(t *testing.T) {
+	s, _, _, _, _, r := roundRuleSetup(t, 3)
+	fs := []pendingFinding{
+		{thread: "T1", severity: "high", path: "a.go", line: 10},
+	}
+	route := findingsRoute{lane: "author-lane", via: "author"}
+
+	d1, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{})
+	if err != nil {
+		t.Fatalf("sendFindings without directive: %v", err)
+	}
+
+	d2, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{}, Round3Directive)
+	if err != nil {
+		t.Fatalf("sendFindings with directive: %v", err)
+	}
+
+	if d1.ID == d2.ID {
+		t.Fatalf("expected directive delivery to have distinct event ID from earlier findings event, got both = %s", d1.ID)
+	}
+}
+
+func TestRoundRule_DryRunDoesNotPersistSentFlags(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+
+	// Deliver with DryRun: true
+	if err := s.DeliverFindings(context.Background(), r, 7, Options{DryRun: true}); err != nil {
+		t.Fatalf("DeliverFindings dry run err: %v", err)
+	}
+
+	st := s.loadRoundRuleState(r.Name, 7)
+	if st.Round3DirectiveSent {
+		t.Fatalf("dry run persisted Round3DirectiveSent = true")
+	}
+	if st.Round3Escalated {
+		t.Fatalf("dry run persisted Round3Escalated = true")
+	}
+	run.callsMu.Lock()
+	calls := run.escalateCalls
+	run.callsMu.Unlock()
+	if calls != 0 {
+		t.Fatalf("dry run called escalate-author %d times, want 0", calls)
+	}
+
+	// Round 5 decision dry run
+	s5, g5, _, _, _, r5 := roundRuleSetup(t, 5)
+	g5.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+	if err := s5.NotifyPR(context.Background(), r5, 7, Options{DryRun: true}); err != nil {
+		t.Fatalf("NotifyPR dry run err: %v", err)
+	}
+	st5 := s5.loadRoundRuleState(r5.Name, 7)
+	if st5.Round5EventSent {
+		t.Fatalf("dry run persisted Round5EventSent = true")
+	}
+}
