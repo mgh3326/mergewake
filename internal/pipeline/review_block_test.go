@@ -168,7 +168,7 @@ func TestBlockedRerunPostsNoSecondComment(t *testing.T) {
 	if e := f.s.RetryReview(context.Background(), f.r, f.g.pull, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if f.gh.posts != 2 || f.n.count != 2 || f.blocked(t, 7) != blockMissingTrailer {
+	if f.gh.posts != 2 || f.n.count != 1 || f.blocked(t, 7) != blockMissingTrailer {
 		t.Fatalf("posts=%d events=%+v", f.gh.posts, f.n.events)
 	}
 }

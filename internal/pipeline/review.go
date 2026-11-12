@@ -2,11 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
@@ -492,8 +493,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		findings := shape.kept
 		known = append(known, knownFromFindings(findings)...)
 		mu.Unlock()
+		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil)
 		plan.sameFamily = out.family == "" || out.family == family
 		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
+		if e = s.auditRoundFindingFacts(r.Name, n, pr.Head.SHA, plan.pass, rp.round, findingFacts); e != nil {
+			return e
+		}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
 			return e
 		}
@@ -525,13 +530,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			// is the only one that can carry its record.
 			if stored, readErr := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login); readErr == nil && slices.ContainsFunc(stored, func(p github.PassReceipt) bool { return p.Pass == plan.pass }) {
 				mu.Lock()
-				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
 				mu.Unlock()
 			}
 			return e
 		}
 		mu.Lock()
-		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
 		mu.Unlock()
 		// The pass is posted: its reviewer job record, if any, is spent. A
 		// record left behind is never resumed, since a posted pass is not run
@@ -812,23 +817,89 @@ func configJSON(b []byte, v any) error {
 }
 
 func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr github.Pull, plan *passPlan, lost *reviewResultLost) error {
-	sent, err := loadSentKeys(filepath.Join(s.state(r.Name), "review-result-lost-sent"), math.MaxInt)
+	file := filepath.Join(s.state(r.Name), "review-result-lost-incidents.json")
+	defer lockPath(file)()
+	unlock, err := fsutil.Lock(file+".lock", true)
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%d %s %d", pr.Number, pr.Head.SHA, plan.pass)
-	if sent.has(key) {
-		return nil
+	defer unlock()
+	var incidents map[string]lostReviewIncident
+	if _, err = fsutil.ReadJSON(file, &incidents); err != nil {
+		return err
+	}
+	if incidents == nil {
+		incidents = map[string]lostReviewIncident{}
+	}
+	cause := strings.Join(strings.Fields(lost.cause.Error()), " ")
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(cause)))
+	now := s.now().UTC()
+	incident := incidents[digest]
+	if incident.ID != "" && now.Sub(incident.First) <= 10*time.Minute && incident.Notified {
+		incident.Last = now
+		incidents[digest] = incident
+		if err = fsutil.WriteJSON(file, incidents); err != nil {
+			return err
+		}
+		auditErr := s.audit(r.Name, "review-result-lost-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "cause": cause, "incident": incident.ID}, false)
+		if plan.replacements >= 1 {
+			return errors.Join(auditErr, s.notifyLostReviewOwner(ctx, file, digest, &incidents, &incident, r, pr, plan, cause))
+		}
+		return auditErr
+	}
+	if incident.ID == "" || now.Sub(incident.First) > 10*time.Minute {
+		incident = lostReviewIncident{ID: fmt.Sprintf("mergewake-review-result-lost-%s-%d", digest[:16], now.UnixNano()), First: now, Last: now}
+	}
+	incidents[digest] = incident
+	if err = fsutil.WriteJSON(file, incidents); err != nil {
+		return err
 	}
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	err = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-review-result-lost-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, plan.pass),
-		Lane: s.ownerLane(r), Type: "automation-failed",
-		Text: fmt.Sprintf("[mergewake] reviewer finished but its result was lost for %s#%d head=%s pass=%d lens=%s reviewer=%s report=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, lost.label, lost.report),
+		ID:   incident.ID,
+		Lane: s.deskLane(), Type: "automation-failed",
+		Text: fmt.Sprintf("[mergewake] reviewer finished but its result was lost for %s#%d head=%s pass=%d lens=%s reviewer=%s report=%s cause=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, lost.label, lost.report, cause),
 	})
 	if err != nil {
 		return err
 	}
-	return sent.add(key)
+	incident.Notified = true
+	incidents[digest] = incident
+	if err = fsutil.WriteJSON(file, incidents); err != nil {
+		return err
+	}
+	if plan.replacements >= 1 {
+		return s.notifyLostReviewOwner(ctx, file, digest, &incidents, &incident, r, pr, plan, cause)
+	}
+	return nil
+}
+
+func (s *Service) notifyLostReviewOwner(ctx context.Context, file, digest string, incidents *map[string]lostReviewIncident, incident *lostReviewIncident, r config.Repo, pr github.Pull, plan *passPlan, cause string) error {
+	key := strconv.Itoa(pr.Number)
+	if incident.OwnerNotified == nil {
+		incident.OwnerNotified = map[string]bool{}
+	}
+	if incident.OwnerNotified[key] {
+		return nil
+	}
+	event := integrations.Event{
+		ID:   incident.ID + "-owner-pr-" + key,
+		Lane: s.ownerLane(r), Type: "automation-failed",
+		Text: fmt.Sprintf("[mergewake] review retries are exhausted after a reviewer result was lost for %s#%d head=%s pass=%d lens=%s cause=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, cause),
+	}
+	if err := s.Notifier.Notify(ctx, event); err != nil {
+		return err
+	}
+	incident.OwnerNotified[key] = true
+	(*incidents)[digest] = *incident
+	return fsutil.WriteJSON(file, *incidents)
+}
+
+type lostReviewIncident struct {
+	ID            string          `json:"id"`
+	First         time.Time       `json:"first"`
+	Last          time.Time       `json:"last"`
+	Notified      bool            `json:"notified"`
+	OwnerNotified map[string]bool `json:"owner_notified,omitempty"`
 }

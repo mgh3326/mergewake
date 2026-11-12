@@ -92,7 +92,11 @@ func TestNotifyConflictNoChecksEscalatesOnce(t *testing.T) {
 		t.Fatalf("%d events, want 1: %+v", n.count, n.events)
 	}
 	ev := n.events[0]
-	if ev.Lane != "operator-desk" || ev.Type != "decision" || !strings.HasPrefix(ev.Text, "ESC ") || !strings.Contains(ev.Text, "example/project#7 head=aaaaaaa conflict") || !strings.Contains(ev.Text, "lane=operator-desk via task 2481") {
+	route, err := s.findingsRoute(context.Background(), r, g.pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Lane != route.lane || ev.Type != "decision" || !strings.HasPrefix(ev.Text, "ESC ") || !strings.Contains(ev.Text, "example/project#7 head=aaaaaaa conflict") || !strings.Contains(ev.Text, "lane="+route.lane) || !strings.Contains(ev.Text, "task 2481") {
 		t.Fatalf("%+v", ev)
 	}
 }

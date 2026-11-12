@@ -999,6 +999,28 @@ func TestPanewireInvalidRecordResultIsLost(t *testing.T) {
 	}
 }
 
+func TestPanewireInvalidResumedReplacementResultNotifiesOwner(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	r.Lane = "owner-lane"
+	rj := readReviewerJob(t, s, r, 1)
+	rj.Replacements = 1
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull}
+	if err := x.saveReviewerJob(rj); err != nil {
+		t.Fatal(err)
+	}
+	c.t = c.t.Add(2 * time.Second)
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(invalidFindings)}
+	err := s.Review(context.Background(), r, 7, "openai", Options{})
+	var lost *reviewResultLost
+	if !errors.As(err, &lost) || !strings.Contains(err.Error(), "invalid finding severity") {
+		t.Fatalf("err=%v, want lost malformed result", err)
+	}
+	n := s.Notifier.(*fakeNotifier)
+	if n.count != 2 || n.events[0].Lane != s.deskLane() || n.events[1].Lane != s.ownerLane(r) || !strings.Contains(n.events[1].Text, "retries are exhausted") {
+		t.Fatalf("lost result notices = %+v, want design notice followed by exhausted owner escalation", n.events)
+	}
+}
+
 // cancelOnRecordRead cancels the review as soon as a reviewer's hk record has
 // been read: the deadline runs out just after hk answers.
 type cancelOnRecordRead struct {
