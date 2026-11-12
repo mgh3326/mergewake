@@ -642,9 +642,9 @@ func (s *Service) redOutside(ctx context.Context, repo, sha string, checks, insi
 	return red, nil
 }
 
-// reportWatch audits a held or reported watch outcome once per head and key,
-// then notifies and records when the host is acting. Repeat polls on the same
-// head with the same key stay quiet.
+// reportWatch audits every watch outcome, sends one notice per main-hold
+// episode, and records each held head once. Repeat polls keep the episode
+// quiet while retaining an audit trail.
 func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchResult, key string, o Options) error {
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
@@ -663,11 +663,11 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		}
 		if episode.ID != "" && episode.Notified {
 			key := result.Head + " " + result.Reason
-			if episode.Suppressed[key] {
-				return nil
-			}
 			if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
 				return err
+			}
+			if episode.Suppressed[key] {
+				return nil
 			}
 			data, _ := json.Marshal(result)
 			reportCtx, cancel := reportContext(ctx)
@@ -718,6 +718,7 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	}
 	if isMainHold {
 		episode.Notified = true
+		episode.Suppressed[result.Head+" "+result.Reason] = true
 		return s.writeWatchHoldEpisode(r.Name, episode)
 	}
 	return nil

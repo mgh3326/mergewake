@@ -990,6 +990,14 @@ func TestWatchCulpritMergeCommitAndUnknownEvidence(t *testing.T) {
 				if sink.records != tt.reports || n.count != tt.reports {
 					t.Fatal("repeat report was not deduplicated")
 				}
+				if tt.action == "hold" {
+					if len(auditRows(t, s, r, "watch-hold-suppressed")) != 1 {
+						t.Fatal("suppressed repeat hold was not audited")
+					}
+					if len(n.events) != 1 || !strings.HasPrefix(n.events[0].ID, "mergewake-watch-hold-") {
+						t.Fatalf("hold notice = %+v, want one per-episode notice", n.events)
+					}
+				}
 			}
 		})
 	}

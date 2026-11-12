@@ -165,15 +165,10 @@ func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	s.Sink = sink
 	n := newEscNotifier()
 	s.Notifier = n
-	for i, head := range []string{"red-a", "red-b", "red-c"} {
+	for _, head := range []string{"red-a", "red-b", "red-c"} {
 		result := watchResult{Head: head, Action: "hold", Reason: "main is red"}
 		if err := s.reportWatch(context.Background(), r, result, head+":hold", Options{}); err != nil {
 			t.Fatal(err)
-		}
-		if i == 2 {
-			if rows := auditRows(t, s, r, "watch-hold-suppressed"); len(rows) != 2 {
-				t.Fatalf("suppressed hold audit rows = %v, want two", rows)
-			}
 		}
 	}
 	if len(n.accepted) != 1 {
@@ -187,6 +182,9 @@ func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	}
 	if sink.records != 3 {
 		t.Fatalf("same held head wrote another sink record: %d", sink.records)
+	}
+	if rows := auditRows(t, s, r, "watch-hold-suppressed"); len(rows) != 3 {
+		t.Fatalf("suppressed hold audit rows = %v, want one for each held head and repeat", rows)
 	}
 	if got := outboxLen(t, s.Feed); got != 3 {
 		t.Fatalf("red-head watch feed entries = %d, want 3", got)
