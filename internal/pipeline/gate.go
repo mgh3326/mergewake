@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
@@ -38,6 +39,12 @@ type gateVerdict struct {
 	// Status is what the gate saw, kept for the PR status snapshot. It never
 	// feeds a decision.
 	Status gateEvidence
+	// Holds names the block-class threads holding the head under
+	// blocking_findings, and PassClean says the head's review pass is complete
+	// and no holding finding was posted on the head itself. Both feed the
+	// BLOCKED notice only; they never feed a decision.
+	Holds     []holdingThread
+	PassClean bool
 }
 
 // gateEvidence is the part of a gate pass the PR status snapshot carries
@@ -383,8 +390,12 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		gate = *p.ReviewGate
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	deferRule := s.deferTaskRule(ctx, r, pr)
 	var holding map[string]bool
-	_, _, v.Review.Findings, holding = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+	_, _, v.Review.Findings, holding = gradeThreadsDetailedWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
+	if deferRule != nil && deferRule.err != nil {
+		return v, fmt.Errorf("defer task lookup: %w", deferRule.err)
+	}
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -392,8 +403,9 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+		blocking, triage := gradeThreadsWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
 		v.Status.Threads = prstatus.Threads{Blocking: blocking, Other: triage + v.Review.Findings.Advisory}
+		v.Holds = holdingThreads(fb, holding)
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
 		}
@@ -466,6 +478,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 			}
 		}
 	}
+	v.PassClean = reviewed && !holdsPostedOn(v.Holds, pr.Head.SHA)
 	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
 	outside := outsideBlocking(history, pr.Head.SHA, v.Review.PatchID, v.Review.Inherited)
 	if outside > 0 {
@@ -580,19 +593,74 @@ func postedOn(c github.ReviewComment) string {
 	return c.CommitSHA
 }
 
+// holdingThread is one block-class thread holding the head, as the BLOCKED
+// notice names it. It never feeds a decision.
+type holdingThread struct {
+	Ref       string // thread URL, or the thread id when GitHub gives none
+	Author    string // normalized login of the finding's author
+	Severity  string // "" when the finding carries no readable severity
+	Location  string // path:line
+	Posted    string // the head the finding was posted on
+	ReplyBy   string // normalized login of the latest reply, "" when none
+	ReplyBody string // body of the latest reply
+}
+
+// holdingThreads names the threads in holding, in thread order.
+func holdingThreads(fb github.ReviewFeedback, holding map[string]bool) []holdingThread {
+	var out []holdingThread
+	for _, t := range fb.Threads {
+		if !holding[t.ID] {
+			continue
+		}
+		h := holdingThread{Ref: t.ID, Location: t.Path + ":" + strconv.Itoa(t.Line)}
+		if len(t.Comments) > 0 {
+			first := t.Comments[0]
+			if first.URL != "" {
+				h.Ref = first.URL
+			}
+			h.Author = policy.NormalizeAuthor(first.Author)
+			h.Severity = github.ThreadSeverity(first.Author, first.Body)
+			h.Posted = postedOn(first)
+		}
+		if n := len(t.Comments); n > 1 {
+			h.ReplyBy = policy.NormalizeAuthor(t.Comments[n-1].Author)
+			h.ReplyBody = t.Comments[n-1].Body
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// holdsPostedOn reports whether a holding thread's finding was posted on head.
+func holdsPostedOn(holds []holdingThread, head string) bool {
+	for _, h := range holds {
+		if h.Posted == head {
+			return true
+		}
+	}
+	return false
+}
+
 // gradeThreads folds review threads into the two counts the graded gate holds
-// on. A block-class finding (mergewake critical/high, CodeRabbit Critical)
-// blocks, whoever wrote it and at any age, until it is resolved or carries a
-// block disposition: a reply that names the fixing commit or dismisses it with
-// a reason (blockDisposition). Neither needs a new head. A triage finding
-// (CodeRabbit Major) holds until it has a disposition: a reply from someone
-// other than its author (a fix SHA, a dismissal with its reason, a follow-up
-// task) or a resolution. Answered counts either whether or not it is resolved. Advisory findings never block, and the fast lane drops triage
-// except for unreadable review.login evidence. Outdated findings clear as
-// ReviewGate.OutdatedCleared allows. Reviewers still requesting changes, and
-// unresolved threads with no comment to grade, count as blocking findings.
+// on. A block-class finding (mergewake critical/high, CodeRabbit Critical or
+// Major) blocks, whoever wrote it and at any age, until it is resolved or
+// carries a block disposition: a reply that names the fixing commit or
+// dismisses it with a reason (blockDisposition). Neither needs a new head. A
+// triage finding (codex P2, or a severity the rules cannot read) holds until it
+// has a disposition: a reply from someone other than its author (a fix SHA, a
+// dismissal with its reason, a follow-up task) or a resolution. Answered counts
+// either whether or not it is resolved. Advisory findings never block, and the
+// fast lane drops triage except for unreadable review.login evidence. Outdated
+// findings clear as ReviewGate.OutdatedCleared allows. Reviewers still
+// requesting changes, and unresolved threads with no comment to grade, count as
+// blocking findings.
 func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int) {
 	blocking, triage, _, _ = gradeThreadsDetailed(fb, g, login, class, fastLane, verify, fleet...)
+	return blocking, triage
+}
+
+func gradeThreadsWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int) {
+	blocking, triage, _, _ = gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, deferRule, fleet...)
 	return blocking, triage
 }
 
@@ -600,6 +668,10 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class st
 // stands, for the review record, and the ids of the unresolved threads that
 // count as blocking findings.
 func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
+	return gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, nil, fleet...)
+}
+
+func gradeThreadsDetailedWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
 	holding = map[string]bool{}
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
@@ -651,7 +723,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			switch {
 			case f.Resolved:
 				d.Resolved++
-			case answered(t, f.OwnReview, fleet...):
+			case answeredWithDefer(t, f.OwnReview, deferRule, fleet...):
 				d.Answered++
 			case !fastLane || unreadable:
 				triage++
@@ -717,7 +789,133 @@ var (
 	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
+	deferIntent  = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\b`)
+	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+([0-9]+)\b`)
 )
+
+type deferTaskRule struct {
+	own       string
+	ownTask   func() (string, error)
+	ownLoaded bool
+	exists    func(string) (bool, error)
+	seen      map[string]bool
+	failed    map[string]error
+	err       error
+}
+
+func (s *Service) deferTaskRule(ctx context.Context, r config.Repo, pr github.Pull) *deferTaskRule {
+	jobs, ok := s.Sink.(interface {
+		TaskJob(context.Context, string) (string, string, error)
+	})
+	rule := &deferTaskRule{seen: map[string]bool{}, failed: map[string]error{}, ownTask: func() (string, error) {
+		return s.prTask(ctx, r, pr)
+	}}
+	if ok {
+		rule.exists = func(id string) (bool, error) {
+			_, _, err := jobs.TaskJob(ctx, id)
+			return err == nil, err
+		}
+	}
+	return rule
+}
+
+func (r *deferTaskRule) isOwnTask(id string) (bool, error) {
+	if r == nil {
+		return true, nil
+	}
+	if !r.ownLoaded && r.ownTask != nil {
+		own, err := r.ownTask()
+		r.ownLoaded = true
+		if err != nil {
+			return false, err
+		}
+		r.own = own
+	}
+	return id == r.own, nil
+}
+
+func (r *deferTaskRule) taskExists(id string) (bool, error) {
+	if r == nil || r.exists == nil {
+		return false, nil
+	}
+	if r.seen == nil {
+		r.seen = map[string]bool{}
+	}
+	if r.failed == nil {
+		r.failed = map[string]error{}
+	}
+	if exists, ok := r.seen[id]; ok {
+		return exists, nil
+	}
+	if err, ok := r.failed[id]; ok {
+		return false, err
+	}
+	exists, err := r.exists(id)
+	if err != nil {
+		if isTaskNotFound(err) {
+			r.seen[id] = false
+			return false, nil
+		}
+		r.failed[id] = err
+		return false, err
+	}
+	r.seen[id] = exists
+	return exists, nil
+}
+
+// TaskJob's public adapter wraps hk's not_found answer with this stable reason.
+// It is a missing disposition target, not a failed lookup of the verdict inputs.
+func isTaskNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "handoffkeep task not_found:")
+}
+
+func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRule, fleet ...[]string) bool {
+	if len(t.Comments) == 0 {
+		return false
+	}
+	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	answered := false
+	var lookupErr error
+	for i := 1; i < len(t.Comments); i++ {
+		c := t.Comments[i]
+		if !answeredBy(c, author, ownReview, fleet...) {
+			continue
+		}
+		if !deferIntent.MatchString(c.Body) {
+			answered = true
+			lookupErr = nil
+			continue
+		}
+		match := deferReply.FindStringSubmatch(c.Body)
+		if match == nil {
+			continue
+		}
+		if rule == nil || rule.exists == nil || answered {
+			continue
+		}
+		own, err := rule.isOwnTask(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if own {
+			continue
+		}
+		exists, err := rule.taskExists(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if exists {
+			answered = true
+			lookupErr = nil
+		}
+	}
+	if !answered && lookupErr != nil && rule != nil {
+		rule.err = errors.Join(rule.err, lookupErr)
+	}
+	return answered
+}
 
 // fixCheck reports whether sha, named in a fix reply, is a real fix for a
 // finding posted on head posted (fixVerifier.verified).

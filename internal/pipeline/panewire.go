@@ -386,6 +386,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if e != nil {
 		return out, e
 	}
+	if resumed {
+		// The plan is rebuilt on each evaluation, while a resumed reviewer job
+		// retains the durable replacement count used by every lost-result path.
+		plan.replacements = max(plan.replacements, rj.Replacements)
+	}
 	// A fresh pass fails before the claim and the reviewer record; a resumed
 	// one checks where it would re-attach, below.
 	if reason := hubMissing(); !resumed && reason != "" {
@@ -1271,6 +1276,9 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	out := passOutcome{}
 	reportPath := filepath.Join(cfg.Jobs, rj.Label, "report.md")
 	lost := &reviewResultLost{rj.Label, cause, job.Profile, reportPath, errors.New(cause)}
+	// A resumed pass may have been rebuilt from scratch; the job record is the
+	// durable source for how many replacements this reviewer has used.
+	plan.replacements = max(plan.replacements, rj.Replacements)
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
 	if auditErr != nil || noticeErr != nil {

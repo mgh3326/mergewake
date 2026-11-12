@@ -168,7 +168,11 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
 		}
-		if n.count != 1 || n.events[0].Lane != "design-lane" || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
+		route, err := s.findingsRoute(context.Background(), r, g.pull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n.count != 1 || n.events[0].Lane != route.lane || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
 			t.Fatalf("%+v", n.events)
 		}
 	})
@@ -179,7 +183,11 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
 		}
-		if n.count != 1 || n.events[0].Lane != "design-lane" || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
+		route, err := s.findingsRoute(context.Background(), r, g.pull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n.count != 1 || n.events[0].Lane != route.lane || n.events[0].Type != "decision" || !strings.HasPrefix(n.events[0].Text, "ESC ") || !strings.Contains(n.events[0].Text, "conflict") {
 			t.Fatalf("%+v", n.events)
 		}
 	})
