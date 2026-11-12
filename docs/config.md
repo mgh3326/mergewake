@@ -1667,6 +1667,49 @@ release, rollout and agent need `--apply` to mutate. `--shadow` forces the daemo
 back to observation, and `--dry-run` suppresses pipeline state too. The daemon
 still maintains its supervision locks and status in shadow/dry-run modes.
 
+### `daemon.mirror`
+
+```yaml
+daemon:
+  mirror:
+    enabled: true
+    dir: /var/lib/mergewake/mirrors
+    serve_diff: false
+```
+
+The daemon keeps one bare git mirror per configured repository under `dir`
+(default `<state_dir>/mirrors`), with the repository's branch heads and PR
+heads. A background loop fetches each mirror at most once every ten minutes,
+one fetch per repository at a time; a second request joins the running fetch. A
+fetch is bounded at 60 seconds and runs `git gc --auto` after it succeeds. A
+fetch authenticates only with the GitHub App installation token, passed to git
+in the environment (`GIT_CONFIG_*` `http.extraHeader`, with the user credential
+helper reset and no terminal prompt); the token is never on argv or on disk. A
+repository the App cannot serve is not fetched at all: the user token is never
+used for a mirror. A mirror that fails three fetches in a row is skipped for an
+hour, with one WARN per hour rather than per call. The mirror needs
+`github_app`; a host without it keeps none. `enabled: false` turns it off, and
+`mergewake daemon --dry-run` keeps no mirror and starts no fetch.
+
+**Shadow compare (this slice).** `Diff` still returns GitHub's answer. After it
+returns, on its own goroutine and bounded at 10 seconds, the same patch is built
+from the mirror (`git diff <merge-base>...<head>`) and compared with the API
+patch by the patch hashes mergewake uses for patch ids. The result is counted
+and logged in its own line, never in `github requests`:
+
+```json
+{"level":"INFO","msg":"mirror shadow","repo":"o/r","pr":7,"head":"…","result":"equal","compare_ms":12,"shadow_equal":1,"shadow_mismatch":0,"mirror_fetches":1,"mirror_failures":0,"mirror_fetch_ms":480}
+```
+
+`result` is `equal` or `mismatch`; a mismatch adds a short `reason`: `missing
+object` (the mirror lacks a commit; a missing head asks for a fetch), `timeout`,
+`rename`, `binary`, `hunk shape`, `text` (the stable patch id matches but the
+exact changed text or a header line does not), `content` or `empty`. A mismatch
+changes nothing for the review.
+
+`serve_diff` is reserved for serving the mirror's patch instead of GitHub's. It
+is off by default and nothing reads it in this slice.
+
 ### `daemon.webhook`
 
 ```yaml

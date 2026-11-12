@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
+	"github.com/mgh3326/mergewake/internal/mirror"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/rollout"
 )
@@ -74,6 +76,13 @@ type Service struct {
 	// reapBinds caches each merged PR's task/job binding for reap (see
 	// reapBinding), guarded by reapBindMu.
 	reapBinds map[string]reapBinding
+	// Mirror, when set, is the local bare mirror the diff shadow compare
+	// reads. Nil means no shadow compare.
+	Mirror *mirror.Mirror
+	// Log receives the mirror shadow lines; nil discards them.
+	Log *slog.Logger
+	// shadow is the diff shadow counter state, shared by the observers.
+	shadow *shadowState
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
