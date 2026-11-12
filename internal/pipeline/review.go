@@ -373,7 +373,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if contextErr != nil {
 		feedback = github.ReviewFeedback{}
 	}
-	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login, resolveDecisions(ctx, pr.Body, integrations.Handoffkeep{}))
+	// The outside-findings read gets the same short child deadline as the
+	// feedback read: a slow comment list must not spend the reviewers' time.
+	// Its error is ignored inside, leaving the list empty — the safer side.
+	outsideCtx, cancelOutside := context.WithTimeout(ctx, feedbackTimeout(timeout))
+	outside := s.openOutsideForPrompt(outsideCtx, r, pr, history, patch)
+	cancelOutside()
+	prContext = buildRoundContext(pr.Body, feedback, rp, s.Config.Review.Login, resolveDecisions(ctx, pr.Body, integrations.Handoffkeep{}), outside...)
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)
@@ -495,7 +501,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		mu.Unlock()
 		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil)
 		plan.sameFamily = out.family == "" || out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, OutsideShown: strings.Join(prContext.outside, " "), Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
 		if e = s.auditRoundFindingFacts(r.Name, n, pr.Head.SHA, plan.pass, rp.round, findingFacts); e != nil {
 			return e
 		}

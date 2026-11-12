@@ -520,7 +520,7 @@ func TestPRRoleSweepDeadlineLetsOtherReposRunAndSkipsUntilReturn(t *testing.T) {
 
 func TestPRRoleSweepDeadlineCancelsContextHonoringOperation(t *testing.T) {
 	oldTimeout := prSweepTimeout
-	prSweepTimeout = 35 * time.Millisecond
+	prSweepTimeout = 2 * time.Second
 	t.Cleanup(func() { prSweepTimeout = oldTimeout })
 	m := newMultiRepo(t, []string{"o/one"}, 1, 1)
 	gate := make(chan struct{})
@@ -540,16 +540,40 @@ func TestPRRoleSweepDeadlineCancelsContextHonoringOperation(t *testing.T) {
 			}
 		}
 	})
+	started := time.Now()
 	cancel, _, wait = m.daemonPass(t)
 	waitFor(t, "repo A pull-list request to start", func() bool {
 		_, active := m.router.counts("o/one")
 		return active == 1
 	})
-	waitForBriefly(t, "the deadline error to be recorded", func() bool {
-		var st daemon.Status
+	deadline := time.After(20 * time.Second)
+	for {
+		calls, active := m.router.counts("o/one")
+		if calls == 1 && active == 0 {
+			break
+		}
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("context-honoring pull-list calls=%d active=%d, want one returned call", calls, active)
+		}
+	}
+	if elapsed := time.Since(started); elapsed < prSweepTimeout {
+		t.Fatalf("context-honoring pull-list returned after %s, before %s deadline", elapsed, prSweepTimeout)
+	}
+	waitFor(t, "the deadline pass to be recorded", func() bool {
+		var state daemon.Status
 		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
-		return err == nil && json.Unmarshal(b, &st) == nil && strings.Contains(st.LastError, "context deadline exceeded")
+		return err == nil && json.Unmarshal(b, &state) == nil && !state.Running && state.LastFinish.After(started)
 	})
+	var st daemon.Status
+	statusBytes, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+	if err != nil || json.Unmarshal(statusBytes, &st) != nil {
+		t.Fatalf("read pr.json after deadline: %v", err)
+	}
+	if st.Running || st.Failures != 1 || st.LastError == "" {
+		t.Fatalf("deadline pass status: %+v", st)
+	}
 	if calls, active := m.router.counts("o/one"); calls != 1 || active != 0 {
 		t.Fatalf("context-honoring pull-list calls=%d active=%d, want one returned call", calls, active)
 	}

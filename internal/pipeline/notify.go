@@ -86,6 +86,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	if !o.DryRun {
 		s.recordStatus(r, pr, v, started)
+		// Joined in a defer so a later return cannot drop the audit error;
+		// it still lands in the pr-notify-error audit below.
+		if e := s.auditOutsideFindings(r, pr, v); e != nil {
+			defer func() { retErr = errors.Join(retErr, e) }()
+		}
 	}
 	record := struct {
 		PR              int      `json:"pr"`
@@ -189,6 +194,12 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			return out
 		}
 		summary, identity = blockedSummary(reasons), blockedSummary(all)
+		if text := outsideBlockedText(v.Outside); text != "" {
+			// The open outside-diff findings are named so the author can
+			// answer each; a changed set is a changed verdict.
+			summary += " | " + text
+			identity += " | " + text
+		}
 	}
 	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
 		summary += fmt.Sprintf(" | %d required check(s) skipped: %s", n, strings.Join(v.Review.ChecksSkipped, ", "))
