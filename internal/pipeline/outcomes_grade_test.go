@@ -80,6 +80,65 @@ func TestOutcomeGradeAndTierFromTaskTitle(t *testing.T) {
 	}
 }
 
+func TestOutcomeGradeAndTierFromSSTaskTitle(t *testing.T) {
+	_, _, v, err := observeGrade(t, gradeTrailerBody, &titleSink{title: "do it (grade SS, T2)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Grade != "SS" || v.Tier != "T2" {
+		t.Fatalf("grade=%q tier=%q", v.Grade, v.Tier)
+	}
+}
+
+func TestOutcomeAcceptsSSTrailer(t *testing.T) {
+	_, _, v, err := observeGrade(t, gradeTrailerBody+"Mergewake-Grade: SS\nMergewake-Tier: T2\n", &titleSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Grade != "SS" || v.Tier != "T2" {
+		t.Fatalf("grade=%q tier=%q", v.Grade, v.Tier)
+	}
+}
+
+func TestTaskGradeMarkerScale(t *testing.T) {
+	for _, grade := range []string{"C", "B", "A", "A+", "S", "S+", "SS"} {
+		t.Run(grade, func(t *testing.T) {
+			title := "task (grade " + grade + ", T2)"
+			marker := taskMarkerMatch(title)
+			if marker == nil || strings.ToUpper(marker[1]) != grade || strings.ToUpper(marker[2]) != "T2" {
+				t.Fatalf("taskMarker(%q) = %v", title, marker)
+			}
+			scale, ok := taskScale(title)
+			if !ok || scale != "T2" {
+				t.Fatalf("taskScale(%q) = %q, %v", title, scale, ok)
+			}
+		})
+	}
+	for _, grade := range []string{"SSS", "S++", "D"} {
+		t.Run(grade, func(t *testing.T) {
+			title := "task (grade " + grade + ", T2)"
+			if marker := taskMarkerMatch(title); marker != nil {
+				t.Errorf("taskMarker(%q) = %v, want no match", title, marker)
+			}
+			if scale, ok := taskScale(title); ok {
+				t.Errorf("taskScale(%q) = %q, want no match", title, scale)
+			}
+		})
+	}
+}
+
+func TestTaskGradeMarkerIsCaseInsensitive(t *testing.T) {
+	title := "task (gRaDe ss, t2)"
+	marker := taskMarkerMatch(title)
+	if marker == nil || strings.ToUpper(marker[1]) != "SS" || strings.ToUpper(marker[2]) != "T2" {
+		t.Fatalf("taskMarker(%q) = %v", title, marker)
+	}
+	scale, ok := taskScale(title)
+	if !ok || scale != "T2" {
+		t.Fatalf("taskScale(%q) = %q, %v", title, scale, ok)
+	}
+}
+
 func TestOutcomeGradeUnknownIsNotPublished(t *testing.T) {
 	// A configured default must not stand in for the PR's own evidence.
 	s, g, _, _, repo := setup(t)
