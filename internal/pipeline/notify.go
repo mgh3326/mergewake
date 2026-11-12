@@ -200,6 +200,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	// A mixed verdict keeps the route its conflict gave it: the author's.
 	author := v.State == "blocked" && (conflicted || authorAction(summary))
+	if v.State == "blocked" {
+		if notice := holdingNotice(v, pr.Head.SHA); notice != "" {
+			summary += " | " + notice
+		}
+	}
 	if identity == "" {
 		identity = summary
 	}
@@ -692,6 +697,65 @@ func authorAction(summary string) bool {
 		}
 	}
 	return false
+}
+
+// holdLimit and holdBudget bound the list of holding threads in the BLOCKED
+// notice: at most holdLimit threads, and at most holdBudget bytes of list text,
+// so the lane event stays under panewire's 2048-byte limit.
+const (
+	holdLimit  = 10
+	holdBudget = 1200
+)
+
+// holdingNotice renders the threads holding head for the BLOCKED notice: the
+// threads that fit, the reply forms that clear a block-class thread, and
+// whether the head's latest review pass is clean. It only adds text: reasons,
+// the identity and the sent key stay as they were.
+func holdingNotice(v gateVerdict, head string) string {
+	if len(v.Holds) == 0 {
+		return ""
+	}
+	var items []string
+	size := 0
+	for _, h := range v.Holds {
+		if len(items) == holdLimit {
+			break
+		}
+		sev := h.Severity
+		if sev == "" {
+			sev = "unrated"
+		}
+		item := fmt.Sprintf("%d) %s %s %s %s", len(items)+1, h.Ref, h.Author, sev, h.Location)
+		if h.ReplyBy != "" {
+			item += fmt.Sprintf(", latest reply by %s: %q (reply not accepted)", h.ReplyBy, replyLine(h.ReplyBody))
+		} else {
+			item += ", no reply"
+		}
+		if size+len(item) > holdBudget {
+			break
+		}
+		items = append(items, item)
+		size += len(item)
+	}
+	more := ""
+	if rest := len(v.Holds) - len(items); rest > 0 {
+		more = fmt.Sprintf("; and %d more", rest)
+	}
+	out := fmt.Sprintf("holding threads (%d): %s%s", len(v.Holds), strings.Join(items, "; "), more)
+	out += " | a block-class thread clears only with a reply of Fixed in <sha> or Dismiss: <evidence>"
+	if v.PassClean {
+		out += fmt.Sprintf(" | latest review pass on %s raised no new findings; the threads above hold from earlier passes", head[:7])
+	}
+	return out
+}
+
+// replyLine is the first line of a reply, cut to 80 runes.
+func replyLine(body string) string {
+	line, _, _ := strings.Cut(body, "\n")
+	if r := []rune(line); len(r) > 80 {
+		return string(r[:80]) + "..."
+	}
+	return line
 }
 
 // ownerLane is the repo's design-session (owner) lane: this repo's
