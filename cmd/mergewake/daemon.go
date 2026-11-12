@@ -129,7 +129,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 					ctx := repoCtx
 					switch role {
 					case "pr":
-						err = engine.sweep(ctx, r)
+						err = engine.sweepBounded(ctx, r)
 						engine.passLine(r.Name)
 					case "watch":
 						checkCtx, span := tracing.Span(ctx, "mergewake.watch")

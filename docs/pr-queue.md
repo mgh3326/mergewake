@@ -57,6 +57,16 @@ errors of the evaluations that ended since its last run. The interval therefore
 bounds how long a missed delivery goes unnoticed. It does not bound how soon a
 PR is looked at.
 
+Each repository's sweep has a five-minute deadline. A timeout returns an error
+for that repository naming the step (`open_pulls`, `bot_policy`, `feed` or
+`reconcile`), while the other repositories finish their results and the pass
+records its finish. The deadline is fixed in the package; there is no config
+key. If a sweep is still running after its deadline because an operation did
+not return on cancellation, later passes skip that repository and log `pr
+sweep still running` with its repo, step and age. The sweep is never started a
+second time for that repository while it remains in flight. Once it returns, a
+later pass sweeps the repository normally.
+
 ## What it logs
 
 | Line | Fields |

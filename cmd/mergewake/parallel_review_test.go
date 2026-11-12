@@ -50,6 +50,10 @@ type reviewHub struct {
 	// mergeProbe, when set, runs around each merge request before the hub
 	// takes its lock: the returned func runs when the request ends.
 	mergeProbe func() func()
+	// closeOnMerge makes selected sweep tests model GitHub closing a PR after
+	// an accepted merge, so later list calls do not offer it again.
+	closeOnMerge bool
+	closed       map[int]bool
 	// conflicting makes every PR report mergeable false and state dirty;
 	// draft makes every PR a draft.
 	conflicting, draft bool
@@ -120,6 +124,9 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		var all []string
 		for i := max(h.first, 1); i < max(h.first, 1)+h.n; i++ {
+			if h.closed[i] {
+				continue
+			}
 			all = append(all, h.pull(i))
 		}
 		fmt.Fprintf(w, "[%s]", strings.Join(all, ","))
@@ -141,6 +148,11 @@ func (h *reviewHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `[{"filename":"tool","status":"modified","additions":1,"deletions":0,"changes":1}]`)
 	case strings.HasSuffix(path, "/merge") && number > 0:
 		h.trace.add(fmt.Sprintf("merge %d", number))
+		if h.closeOnMerge {
+			h.closed[number] = true
+			fmt.Fprint(w, `{"merged":true}`)
+			return
+		}
 		http.Error(w, `{"message":"Method Not Allowed"}`, 405)
 	case regexp.MustCompile(`/pulls/\d+$`).MatchString(path):
 		if strings.Contains(r.Header.Get("Accept"), "diff") {
