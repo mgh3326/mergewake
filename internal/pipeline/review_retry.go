@@ -50,13 +50,15 @@ func reviewErrorText(err error) string {
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
 // for it: a quota stop waits for its reset and is no failure, a held reviewer
-// waits for the time panewire named, if any, and is no failure, a pending pass
-// whose reviewer runs on or whose claim another host holds is no failure, a
-// collection failure backs off without counting toward escalation, and
-// anything else is a real review failure.
+// waits for the time panewire named, if any, and is no failure, a round hold
+// waits for its release and is no failure, a pending pass whose reviewer runs
+// on or whose claim another host holds is no failure, a collection failure
+// backs off without counting toward escalation, and anything else is a real
+// review failure.
 type reviewFailureClass struct {
 	quotas     []*reviewQuotaStopped
 	held       []*reviewerHeld
+	roundHold  bool
 	collection bool
 	pending    bool
 	real       bool
@@ -87,6 +89,8 @@ func (c *reviewFailureClass) add(err error) {
 		c.quotas = append(c.quotas, quota)
 	case errors.As(err, &held):
 		c.held = append(c.held, held)
+	case errors.Is(err, ErrReviewHeld):
+		c.roundHold = true
 	case errors.Is(err, errPassPending), errors.Is(err, ErrReviewPending):
 		c.pending = true
 	case errors.As(err, &collect), errors.As(err, &lost):
@@ -251,7 +255,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	// so: a real failure supersedes it, and the daemon must not settle this
 	// evaluation. A hold is the stronger marker, so a run with both waits for
 	// the hold.
-	state.Held = len(class.held) > 0 && !class.real && !class.collection
+	state.Held = (len(class.held) > 0 || class.roundHold) && !class.real && !class.collection
 	state.QuotaStopped = len(class.quotas) > 0 && !class.real && !class.collection && !state.Held
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
