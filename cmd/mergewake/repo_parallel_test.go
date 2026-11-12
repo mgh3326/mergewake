@@ -100,16 +100,59 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+func waitForBriefly(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(750 * time.Millisecond)
+	for !cond() {
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+}
+
 // repoRouter sends each request to the hub of the repository its path names.
 // A repository in failList answers its pull list with a server error.
 type repoRouter struct {
-	hubs     map[string]*reviewHub
-	failList map[string]bool
+	hubs      map[string]*reviewHub
+	failList  map[string]bool
+	holdList  map[string]chan struct{}
+	ignoreCtx map[string]bool
+	mu        *sync.Mutex
+	listCalls map[string]int
+	active    map[string]int
 }
 
 func (rt repoRouter) RoundTrip(r *http.Request) (*http.Response, error) {
 	for name, hub := range rt.hubs {
 		if strings.HasPrefix(r.URL.Path, "/repos/"+name+"/") {
+			if strings.HasSuffix(r.URL.Path, "/pulls") {
+				rt.mu.Lock()
+				rt.listCalls[name]++
+				gate := rt.holdList[name]
+				ignoreCtx := rt.ignoreCtx[name]
+				if gate != nil {
+					rt.active[name]++
+				}
+				rt.mu.Unlock()
+				if gate != nil {
+					defer func() {
+						rt.mu.Lock()
+						rt.active[name]--
+						rt.mu.Unlock()
+					}()
+					if ignoreCtx {
+						<-gate
+					} else {
+						select {
+						case <-gate:
+						case <-r.Context().Done():
+							return nil, r.Context().Err()
+						}
+					}
+				}
+			}
 			if rt.failList[name] && strings.HasSuffix(r.URL.Path, "/pulls") {
 				return &http.Response{StatusCode: 500, Status: "500", Body: io.NopCloser(strings.NewReader(`{"message":"down"}`)), Header: http.Header{}, Request: r}, nil
 			}
@@ -117,6 +160,29 @@ func (rt repoRouter) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	return handlerTransport{rt.hubs[slices.Sorted(maps.Keys(rt.hubs))[0]]}.RoundTrip(r)
+}
+
+func (rt *repoRouter) counts(repo string) (calls, active int) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.listCalls[repo], rt.active[repo]
+}
+
+type repoLogBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *repoLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *repoLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
 }
 
 // multiRepo is one Service over several repositories, each with its own fake
@@ -128,6 +194,7 @@ type multiRepo struct {
 	hubs   map[string]*reviewHub
 	router repoRouter
 	out    *bytes.Buffer
+	stderr repoLogBuffer
 }
 
 func newMultiRepo(t *testing.T, names []string, prs, parallel int) *multiRepo {
@@ -148,7 +215,7 @@ func newMultiRepo(t *testing.T, names []string, prs, parallel int) *multiRepo {
 	cfg.Daemon.PR.Loop = config.Loop{Enabled: true, Interval: "1h"}
 	on := true
 	cfg.Daemon.PR.Notify.Enabled = &on
-	router := repoRouter{hubs: hubs, failList: map[string]bool{}}
+	router := repoRouter{hubs: hubs, failList: map[string]bool{}, holdList: map[string]chan struct{}{}, ignoreCtx: map[string]bool{}, mu: &sync.Mutex{}, listCalls: map[string]int{}, active: map[string]int{}}
 	gh := github.New("")
 	gh.BaseURL = "https://fake.invalid"
 	gh.HTTP = &http.Client{Transport: router}
@@ -177,7 +244,7 @@ func (m *multiRepo) daemonPass(t *testing.T) (cancel context.CancelFunc, passDon
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	exit := make(chan error, 1)
-	go func() { exit <- runDaemonLoops(ctx, m.s, m.gh, "", pipeline.Options{}, io.Discard) }()
+	go func() { exit <- runDaemonLoops(ctx, m.s, m.gh, "", pipeline.Options{}, &m.stderr) }()
 	status := func() daemon.Status {
 		var st daemon.Status
 		if b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json")); err == nil {
@@ -357,4 +424,137 @@ func TestPRRoleJoinsErrorsFromEveryRepo(t *testing.T) {
 	if len(m.merged("o/two")) != 1 {
 		t.Fatal("a failing repo stopped the healthy one")
 	}
+}
+
+func TestPRRoleSweepDeadlineLetsOtherReposRunAndSkipsUntilReturn(t *testing.T) {
+	oldTimeout := prSweepTimeout
+	prSweepTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { prSweepTimeout = oldTimeout })
+	m := newMultiRepo(t, []string{"o/one", "o/two"}, 1, 1)
+	m.s.Config.Daemon.PR.Loop.Interval = "500ms"
+	for _, name := range []string{"o/one", "o/two"} {
+		m.hubs[name].closeOnMerge = true
+		m.hubs[name].closed = map[int]bool{}
+	}
+	gate := make(chan struct{})
+	m.router.holdList["o/one"] = gate
+	m.router.ignoreCtx["o/one"] = true
+	released := false
+	var cancel context.CancelFunc
+	var wait func() daemon.Status
+	stopped := false
+	t.Cleanup(func() {
+		if !released {
+			close(gate)
+		}
+		if cancel != nil {
+			cancel()
+			if !stopped {
+				wait()
+			}
+		}
+	})
+	cancel, _, wait = m.daemonPass(t)
+
+	waitFor(t, "repo A pull list to block", func() bool {
+		calls, active := m.router.counts("o/one")
+		return calls == 1 && active == 1
+	})
+	waitFor(t, "repo B to merge during repo A's held pull list", func() bool { return len(m.merged("o/two")) == 1 })
+	waitForBriefly(t, "the first pass to record its deadline", func() bool {
+		var st daemon.Status
+		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+		return err == nil && json.Unmarshal(b, &st) == nil && strings.Contains(st.LastError, "open_pulls")
+	})
+	var st daemon.Status
+	statusBytes, _ := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+	_ = json.Unmarshal(statusBytes, &st)
+	if st.Running || !strings.Contains(st.LastError, "o/one") || !strings.Contains(st.LastError, "deadline") || !strings.Contains(st.LastError, "context deadline exceeded") {
+		t.Fatalf("pr.json pass status: %+v", st)
+	}
+	firstFinish := st.LastFinish
+
+	// A PR arriving in another repository remains eligible while the stuck
+	// repository is skipped on later passes.
+	m.hubs["o/two"].mu.Lock()
+	m.hubs["o/two"].n = 2
+	m.hubs["o/two"].mu.Unlock()
+	waitFor(t, "repo B's later PR to merge", func() bool { return len(m.merged("o/two")) == 2 })
+	waitFor(t, "the still-running sweep skip log", func() bool { return strings.Contains(m.stderr.String(), "pr sweep still running") })
+	logLine := m.stderr.String()
+	if !strings.Contains(logLine, `"repo":"o/one"`) || !strings.Contains(logLine, `"step":"open_pulls"`) || !strings.Contains(logLine, `"age":`) {
+		t.Fatalf("still-running log lacks repo, step or age: %s", logLine)
+	}
+	waitFor(t, "a later pass to finish", func() bool {
+		var state daemon.Status
+		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+		return err == nil && json.Unmarshal(b, &state) == nil && state.LastFinish.After(firstFinish)
+	})
+	statusBytes, _ = os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+	_ = json.Unmarshal(statusBytes, &st)
+	if st.Running || st.Failures != 0 || st.LastError != "" {
+		t.Fatalf("skipped pass recorded a role failure: %+v; log=%s", st, m.stderr.String())
+	}
+	if calls, active := m.router.counts("o/one"); calls != 1 || active != 1 {
+		t.Fatalf("repo A pull-list calls=%d active=%d, want one active call", calls, active)
+	}
+
+	close(gate)
+	released = true
+	waitFor(t, "repo A to merge after its held sweep returns", func() bool { return len(m.merged("o/one")) == 1 })
+	waitFor(t, "repo A's sweep goroutine to return", func() bool {
+		_, active := m.router.counts("o/one")
+		return active == 0
+	})
+	waitFor(t, "a later sweep of repo A", func() bool {
+		calls, _ := m.router.counts("o/one")
+		return calls >= 2
+	})
+	if calls, _ := m.router.counts("o/one"); calls < 2 {
+		t.Fatalf("repo A pull-list calls=%d, want another sweep after release", calls)
+	}
+	cancel()
+	wait()
+	stopped = true
+}
+
+func TestPRRoleSweepDeadlineCancelsContextHonoringOperation(t *testing.T) {
+	oldTimeout := prSweepTimeout
+	prSweepTimeout = 35 * time.Millisecond
+	t.Cleanup(func() { prSweepTimeout = oldTimeout })
+	m := newMultiRepo(t, []string{"o/one"}, 1, 1)
+	gate := make(chan struct{})
+	m.router.holdList["o/one"] = gate
+	released := false
+	var cancel context.CancelFunc
+	var wait func() daemon.Status
+	stopped := false
+	t.Cleanup(func() {
+		if !released {
+			close(gate)
+		}
+		if cancel != nil {
+			cancel()
+			if !stopped {
+				wait()
+			}
+		}
+	})
+	cancel, _, wait = m.daemonPass(t)
+	waitFor(t, "repo A pull-list request to start", func() bool {
+		_, active := m.router.counts("o/one")
+		return active == 1
+	})
+	waitForBriefly(t, "the deadline error to be recorded", func() bool {
+		var st daemon.Status
+		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
+		return err == nil && json.Unmarshal(b, &st) == nil && strings.Contains(st.LastError, "context deadline exceeded")
+	})
+	if calls, active := m.router.counts("o/one"); calls != 1 || active != 0 {
+		t.Fatalf("context-honoring pull-list calls=%d active=%d, want one returned call", calls, active)
+	}
+	released = true
+	cancel()
+	wait()
+	stopped = true
 }

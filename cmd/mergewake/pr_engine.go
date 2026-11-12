@@ -48,6 +48,8 @@ type prEngine struct {
 	revisit pipeline.Revisit
 
 	mu       sync.Mutex
+	sweepMu  sync.Mutex
+	sweeping map[string]*prSweepState
 	settling map[string]*sync.Mutex
 	// since is what happened per repo after the last pass line.
 	since map[string]*passCounts
@@ -55,6 +57,32 @@ type prEngine struct {
 	// taken is the queue state each repo's last sweep saw.
 	taken        map[string]daemon.Stats
 	evalRequests int
+}
+
+type prSweepState struct {
+	started time.Time
+	mu      sync.Mutex
+	step    string
+}
+
+type prSweepStateKey struct{}
+
+func (s *prSweepState) setStep(step string) {
+	s.mu.Lock()
+	s.step = step
+	s.mu.Unlock()
+}
+
+func (s *prSweepState) currentStep() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.step
+}
+
+func setPRSweepStep(ctx context.Context, step string) {
+	if state, ok := ctx.Value(prSweepStateKey{}).(*prSweepState); ok {
+		state.setStep(step)
+	}
 }
 
 // passCounts is what the evaluations of one repo did since the last pass line.
@@ -67,7 +95,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{}}
+		sweeping: map[string]*prSweepState{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{}}
 	for _, r := range repos {
 		e.repos[r.Name] = r
 	}
@@ -104,6 +132,10 @@ const urgentExtra = 2
 // as one without a priority, so a slow hk delays no other PR beyond this. A
 // var so tests can shorten it.
 var reviewPriorityGrace = 2 * time.Second
+
+// prSweepTimeout bounds how long one repository can hold a PR pass. Tests
+// shorten it to exercise the timeout and still-running paths.
+var prSweepTimeout = 5 * time.Minute
 
 func (e *prEngine) repoLock(repo string) *sync.Mutex {
 	e.mu.Lock()
@@ -378,8 +410,12 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 // returns the errors the evaluations since the last sweep ended with. It does
 // not wait for them.
 func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
+	setPRSweepStep(ctx, "open_pulls")
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	var errs []error
@@ -392,24 +428,82 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	e.q.SetOpen(r.Name, heads)
 	var listed []string
 	if hasBotPull(prs) {
+		setPRSweepStep(ctx, "bot_policy")
 		var err error
 		if listed, err = e.s.BotUpdateAuthors(ctx, r); err != nil {
 			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	}
 	prs = skipBotPulls(prs, e.s.Config.Daemon.PR.SkipBots, listed...)
 	// PRs a fresh status read marked go first.
 	prs = dirtyFirst(prs, prstatus.DirtyPRs(e.s.Config.StateDir, r.Name))
+	setPRSweepStep(ctx, "feed")
 	e.s.FeedPRs(ctx, r, prs, e.o)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	keys := make([]daemon.PRKey, len(prs))
 	for i, pr := range prs {
 		keys[i] = daemon.PRKey{Repo: r.Name, PR: pr.Number}
 	}
 	e.q.Enqueue(daemon.SourceSweep, keys...)
 	e.skips.forget(r.Name, seen)
+	setPRSweepStep(ctx, "reconcile")
 	errs = append(errs, e.s.ReconcileOutcomes(ctx, r, seen, e.o))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	errs = append(errs, e.takeErrors(r.Name)...)
 	return errors.Join(errs...)
+}
+
+// sweepBounded keeps one repository's in-flight sweep registered until the
+// worker really returns, even if its deadline lets this pass move on.
+func (e *prEngine) sweepBounded(ctx context.Context, r config.Repo) error {
+	e.sweepMu.Lock()
+	if state := e.sweeping[r.Name]; state != nil {
+		age := time.Since(state.started)
+		step := state.currentStep()
+		e.sweepMu.Unlock()
+		if e.log != nil {
+			e.log.Warn("pr sweep still running", "repo", r.Name, "step", step, "age", age.String())
+		}
+		return nil
+	}
+	state := &prSweepState{started: time.Now(), step: "open_pulls"}
+	e.sweeping[r.Name] = state
+	e.sweepMu.Unlock()
+
+	sweepCtx, cancel := context.WithTimeout(ctx, prSweepTimeout)
+	done := make(chan error, 1)
+	go func() {
+		err := e.sweep(context.WithValue(sweepCtx, prSweepStateKey{}, state), r)
+		e.sweepMu.Lock()
+		if e.sweeping[r.Name] == state {
+			delete(e.sweeping, r.Name)
+		}
+		e.sweepMu.Unlock()
+		done <- err
+		cancel()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-sweepCtx.Done():
+		select {
+		case err := <-done:
+			return err
+		default:
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("pr sweep deadline exceeded during %s: %w", state.currentStep(), context.DeadlineExceeded)
+	}
 }
 
 func (e *prEngine) takeErrors(repo string) []error {
