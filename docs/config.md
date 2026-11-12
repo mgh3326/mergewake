@@ -1909,7 +1909,10 @@ line, a valid lane name; the head commit is not read for it), else the current
 lane of the hk task the PR names (`Mergewake-Task`), else the desk
 (`notifier.fallback_lane`, else `notifier.lane`). Job lanes, author panes and
 `repos[].lane` are not used. A body lane needs no hk read; a failed task-lane
-read is retried at the next evaluation, never taken as "no task lane". The event
+read is retried at the next evaluation, never taken as "no task lane". After
+three task-lane reads that fail in a row (`task_halts` in the receipt), or 30
+minutes after the first of them, the task lane is skipped and the ESC goes to
+the desk as `desk (task lookup failed)`; a successful read resets both. The event
 is a `decision` whose text starts with `ESC` and names the PR, the short head,
 the conflict, what to do ("rebase or merge base, then push") and the lane and
 rule it went to. Each destination is written to the PR's state file, under
@@ -2005,10 +2008,17 @@ disposition for every other) and how to acknowledge.
 
 The author lane uses the same binding as reap: `Mergewake-Task`, the task's
 `refs.job_id`, then the job's `hub_lane`, `lane`, or `label`. Worker and builder
-jobs keep their recorded author lane after completion. An explicit
-`Mergewake-Notify-Lane` trailer also identifies the author. Without either
-binding, the event goes to `notifier.fallback_lane`, or `notifier.lane`, as a
-`decision`. A task or job read error retries without rerouting.
+jobs keep their recorded author lane after completion, but only while the job
+is live. A terminal job whose pane is gone is a finished author: once every
+configured host has been read and none shows a pane for the job, its label, or
+its recorded pane id, the event does not go to that lane. It goes to the
+`Mergewake-Notify-Lane` trailer's lane, else the task's lane (not the desk) as a
+`findings` event, else the desk as a `decision`. An unacknowledged delivery
+already sent to the finished lane is resent once to the new lane under the event
+id `<id>-reroute`, audited as `findings-route-changed`; an acknowledged one is
+never rerouted. A terminal job whose hosts could not all be read keeps its
+lane and is audited as `findings-route-partial` with `"liveness":"unknown"`.
+A task or job read error retries without rerouting.
 
 `BLOCKED` notices for `blocking_findings`, `triage_unanswered`, or `check_failed`
 use this author route too. They do not use the task's operator lane. An author

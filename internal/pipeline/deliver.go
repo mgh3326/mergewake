@@ -42,6 +42,7 @@ type findingsDelivery struct {
 	Text        string    `json:"text"`
 	SentAt      time.Time `json:"sent_at"`
 	ResentAt    time.Time `json:"resent_at,omitzero"`
+	ReroutedAt  time.Time `json:"rerouted_at,omitzero"`
 	EscalatedAt time.Time `json:"escalated_at,omitzero"`
 	AckedAt     time.Time `json:"acked_at,omitzero"`
 	// AckBy is "inbox" for a `panewire inbox ack`, "disposition" when every
@@ -69,6 +70,12 @@ type findingsRoute struct {
 	// ambiguous names the several other live panes on the PR's branch when
 	// the bound lane was kept (see boundAuthorLane); the caller audits them.
 	ambiguous []string
+	// finished names the bound lane when its job is terminal and no host shows
+	// a pane for it, whether or not a takeover then won (see boundAuthorLane).
+	finished string
+	// unknown is set when the bound job's liveness could not be checked on
+	// every host, so the bound lane was kept without knowing it is live.
+	unknown bool
 }
 
 // DeliverFindings sends the PR's undelivered review findings to its author
@@ -276,15 +283,13 @@ func (s *Service) boundJobLane(ctx context.Context, task string) (lane, via stri
 // findingsRoute uses the same task/job binding as reap, without caching an
 // open PR's binding. A worker or lead keeps its author lane after completion
 // unless another live pane on the PR's branch has taken the PR over (see
-// boundAuthorLane). With no job binding the PR's author pane (see authorPane)
-// is next. Missing
-// ownership routes to the repo's owner lane, the desk when it names none; a
-// read error retries without guessing.
+// boundAuthorLane). A finished author (terminal job, no pane on any host) has
+// no lane of its own, so the route falls through to the author pane, the
+// explicit lane (see explicitLane), then the repo's desk. A route whose
+// liveness cannot be checked keeps the bound lane and sets unknown. A read
+// error retries without guessing.
 func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pull) (findingsRoute, error) {
-	desk := s.Config.Notifier.FallbackLane
-	if desk == "" {
-		desk = s.Config.Notifier.Lane
-	}
+	desk := s.deskLane()
 	rt := findingsRoute{owner: s.ownerLane(r)}
 	// Open PR bindings may change, so share the reap binding interface without
 	// its merged-PR cache.
@@ -292,10 +297,13 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 	if e != nil {
 		return rt, e
 	}
-	if al, e := s.boundAuthorLane(ctx, r, pr, task); e != nil {
+	al, e := s.boundAuthorLane(ctx, r, pr, task)
+	if e != nil {
 		return rt, e
-	} else if al.lane != "" {
-		rt.lane, rt.via, rt.ambiguous, rt.failedHosts = al.lane, al.via, al.candidates, al.failedHosts
+	}
+	rt.failedHosts, rt.finished, rt.unknown = al.failedHosts, al.finished, al.unknown
+	if al.lane != "" {
+		rt.lane, rt.via, rt.ambiguous = al.lane, al.via, al.candidates
 		return rt, nil
 	}
 	if lane, via, ok, e := s.authorPane(ctx, r, pr); e != nil {
@@ -304,30 +312,41 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 		rt.lane, rt.via = lane, via
 		return rt, nil
 	}
-	// Explicit PR routing is evidence of ownership: a Notify-Lane trailer, then
-	// the task's lane unless it is the desk. A repo/desk default is not.
-	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	lane, via, e := s.explicitLane(ctx, r, pr, task, desk)
 	if e != nil {
 		return rt, e
 	}
-	if laneName.MatchString(notify) {
-		rt.lane, rt.via = notify, "notify-lane trailer"
+	if lane != "" {
+		rt.lane, rt.via = lane, via
 		return rt, nil
+	}
+	rt.lane, rt.via = desk, "unknown author; desk"
+	return rt, nil
+}
+
+// explicitLane is the lane a PR names outright: its Mergewake-Notify-Lane
+// trailer, else its task's lane unless that lane is the desk. A repo or desk
+// default is not explicit. Empty when neither names a valid lane.
+func (s *Service) explicitLane(ctx context.Context, r config.Repo, pr github.Pull, task, desk string) (lane, via string, err error) {
+	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	if e != nil {
+		return "", "", e
+	}
+	if laneName.MatchString(notify) {
+		return notify, "notify-lane trailer", nil
 	}
 	if l, ok := s.Sink.(interface {
 		Lane(context.Context, string) (string, error)
 	}); task != "" && ok {
 		lane, e := l.Lane(ctx, task)
 		if e != nil {
-			return rt, e
+			return "", "", e
 		}
 		if laneName.MatchString(lane) && lane != desk {
-			rt.lane, rt.via = lane, "task "+task
-			return rt, nil
+			return lane, "task " + task, nil
 		}
 	}
-	rt.lane, rt.via = desk, "unknown author; desk"
-	return rt, nil
+	return "", "", nil
 }
 
 // severityRank orders findings most severe first.
@@ -439,8 +458,12 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	if e := s.audit(r.Name, "findings-delivered", d, o.DryRun); e != nil {
 		return d, e
 	}
-	if len(rt.failedHosts) > 0 {
-		return d, s.audit(r.Name, "findings-route-partial", map[string]any{"pr": pr.Number, "failed_hosts": rt.failedHosts, "lane": lane, "via": via}, o.DryRun)
+	if len(rt.failedHosts) > 0 || rt.unknown {
+		fields := map[string]any{"pr": pr.Number, "failed_hosts": rt.failedHosts, "lane": lane, "via": via}
+		if rt.unknown {
+			fields["liveness"] = "unknown"
+		}
+		return d, s.audit(r.Name, "findings-route-partial", fields, o.DryRun)
 	}
 	return d, nil
 }
@@ -472,6 +495,16 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 	var route findingsRoute
 	var routeErr error
 	routed := false
+	resolve := func() error {
+		if !routed {
+			route, routeErr = s.findingsRoute(ctx, r, pr)
+			routed = true
+			if routeErr == nil {
+				errs = append(errs, s.auditAmbiguousRoute(r, pr.Number, route, o))
+			}
+		}
+		return routeErr
+	}
 	for i := range ledger {
 		d := &ledger[i]
 		if d.PR != pr.Number || d.Scope != "author" || d.AckBy == "disposition" || !d.EscalatedAt.IsZero() {
@@ -534,22 +567,15 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			// Without an ACK reading, re-sending or escalating would guess.
 			continue
 		}
-		acked := inbox[d.ID] || inbox[d.ID+"-resend"]
+		acked := inbox[d.ID] || inbox[d.ID+"-resend"] || inbox[d.ID+"-reroute"]
 		switch {
 		case acked:
 			d.AckedAt, d.AckBy, changed = now, "inbox", true
 			errs = append(errs, s.audit(r.Name, "findings-acked", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
 		case d.ResentAt.IsZero() && now.Sub(d.SentAt) >= window:
-			if !routed {
-				route, routeErr = s.findingsRoute(ctx, r, pr)
-				routed = true
-				if routeErr == nil {
-					errs = append(errs, s.auditAmbiguousRoute(r, pr.Number, route, o))
-				}
-			}
-			if routeErr != nil {
+			if err := resolve(); err != nil {
 				// A route read error retries the re-send; it never reroutes it.
-				errs = append(errs, routeErr)
+				errs = append(errs, err)
 				continue
 			}
 			to, text, typ := d.Lane, d.Text, "findings"
@@ -575,6 +601,31 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 			}
 			d.ResentAt, changed = now, true
 			errs = append(errs, s.audit(r.Name, "findings-resent", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane}, o.DryRun))
+		case !d.ResentAt.IsZero() && d.ReroutedAt.IsZero():
+			// The author this delivery went to has finished and left no pane:
+			// send it once to the lane the route names now.
+			if err := resolve(); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if route.finished != d.Lane || route.lane == "" || route.lane == d.Lane {
+				continue
+			}
+			text, typ := retargetLane(d.Text, d.Lane, route.lane), "findings"
+			if route.via == "unknown author; desk" {
+				typ = "decision"
+			}
+			if o.Reporting() {
+				reportCtx, cancel := reportContext(ctx)
+				e := s.Notifier.Notify(reportCtx, integrations.Event{ID: d.ID + "-reroute", Text: resendText(text, window), Lane: route.lane, Type: typ})
+				cancel()
+				if e != nil {
+					errs = append(errs, fmt.Errorf("findings reroute to %s: %w", route.lane, e))
+					continue
+				}
+			}
+			errs = append(errs, s.audit(r.Name, "findings-route-changed", map[string]any{"pr": d.PR, "from": d.Lane, "to": route.lane, "via": route.via}, o.DryRun))
+			d.Lane, d.Via, d.Text, d.ReroutedAt, changed = route.lane, route.via, text, now, true
 		}
 	}
 	return changed, errors.Join(errs...)

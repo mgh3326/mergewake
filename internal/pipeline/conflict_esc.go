@@ -21,6 +21,11 @@ import (
 const (
 	conflictEscRetryFirst = time.Minute
 	conflictEscRetryMax   = 30 * time.Minute
+	// conflictEscTaskHalts and conflictEscTaskWindow bound a failing task
+	// lookup: after that many halts in a row, or that long since the first,
+	// the ESC skips the task and goes to the desk.
+	conflictEscTaskHalts  = 3
+	conflictEscTaskWindow = 30 * time.Minute
 	// conflictEscErrorMax bounds the error kept in the state file and audit.
 	conflictEscErrorMax = 512
 )
@@ -49,6 +54,10 @@ type conflictEscPending struct {
 	// PinnedVia is the rule that chose Pinned.
 	PinnedVia string `json:"pinned_via,omitempty"`
 	LastError string `json:"last_error,omitempty"`
+	// TaskHalts counts task-lookup halts in a row; TaskHaltFirst is the first
+	// of them. A successful lookup clears both.
+	TaskHalts     int       `json:"task_halts,omitempty"`
+	TaskHaltFirst time.Time `json:"task_halt_first,omitzero"`
 }
 
 // conflictEscState is <state_dir>/<repo>/conflict-esc/<pr>.json. Receipts are
@@ -169,6 +178,17 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	}
 	var halt *conflictEscHaltError
 	if errors.As(err, &halt) {
+		if halt.task {
+			if p.TaskHalts == 0 {
+				p.TaskHaltFirst = now
+			}
+			p.TaskHalts++
+			st.Pending[head] = p
+			if e := fsutil.WriteJSON(file, st); e != nil {
+				return errors.Join(halt.err, e)
+			}
+			return halt.err
+		}
 		// A route source could not be read (hk or GitHub), unknown rather
 		// than absent, or a pin could not be written. No lane took the ESC
 		// and no wait starts; the next observation tries again.
@@ -233,9 +253,21 @@ func conflictEscBackoff(attempts int) time.Duration {
 	return min(d, conflictEscRetryMax)
 }
 
+// conflictEscTaskDown reports whether the task lookup has halted enough times
+// in a row, or for long enough since its first halt, that the ESC stops
+// waiting for it and goes to the desk.
+func conflictEscTaskDown(p conflictEscPending, now time.Time) bool {
+	return p.TaskHalts > 0 && (p.TaskHalts >= conflictEscTaskHalts || now.Sub(p.TaskHaltFirst) >= conflictEscTaskWindow)
+}
+
 // conflictEscHaltError stops an attempt before a destination could fail it:
 // a route source that could not be read, or a pin that could not be written.
-type conflictEscHaltError struct{ err error }
+type conflictEscHaltError struct {
+	err error
+	// task marks a failed task-lane lookup: it counts toward the desk
+	// fallback (see conflictEscTaskDown).
+	task bool
+}
 
 func (e *conflictEscHaltError) Error() string { return e.err.Error() }
 
@@ -253,7 +285,7 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 	offer := func(l, v string) (bool, error) {
 		if p.Pinned != l {
 			if e := pin(l, v); e != nil {
-				return false, &conflictEscHaltError{e}
+				return false, &conflictEscHaltError{err: e}
 			}
 		}
 		tried = append(tried, l)
@@ -278,6 +310,7 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 		}
 		err = e
 	}
+	taskDown := conflictEscTaskDown(*p, s.now().UTC())
 	sources := []func() (string, string, error){
 		func() (string, string, error) {
 			if v := trailer(pr.Body, "Mergewake-Notify-Lane"); laneName.MatchString(v) {
@@ -285,8 +318,23 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 			}
 			return "", "", nil
 		},
-		func() (string, string, error) { return s.conflictEscTaskLane(ctx, r, pr) },
-		func() (string, string, error) { return s.deskLane(), "desk", nil },
+		func() (string, string, error) {
+			if taskDown {
+				return "", "", nil
+			}
+			l, v, e := s.conflictEscTaskLane(ctx, r, pr)
+			if e != nil {
+				return "", "", &conflictEscHaltError{err: e, task: true}
+			}
+			p.TaskHalts, p.TaskHaltFirst = 0, time.Time{}
+			return l, v, nil
+		},
+		func() (string, string, error) {
+			if taskDown {
+				return s.deskLane(), "desk (task lookup failed)", nil
+			}
+			return s.deskLane(), "desk", nil
+		},
 	}
 	seen := map[string]bool{}
 	for _, l := range tried {
@@ -295,7 +343,11 @@ func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr gith
 	for _, source := range sources {
 		l, v, e := source()
 		if e != nil {
-			return "", "", tried, &conflictEscHaltError{e}
+			var halt *conflictEscHaltError
+			if errors.As(e, &halt) {
+				return "", "", tried, halt
+			}
+			return "", "", tried, &conflictEscHaltError{err: e}
 		}
 		if l == "" || seen[l] {
 			continue
