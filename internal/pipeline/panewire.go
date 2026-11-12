@@ -386,6 +386,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if e != nil {
 		return out, e
 	}
+	if resumed {
+		// The plan is rebuilt on each evaluation, while a resumed reviewer job
+		// retains the durable replacement count used by every lost-result path.
+		plan.replacements = max(plan.replacements, rj.Replacements)
+	}
 	// A fresh pass fails before the claim and the reviewer record; a resumed
 	// one checks where it would re-attach, below.
 	if reason := hubMissing(); !resumed && reason != "" {
