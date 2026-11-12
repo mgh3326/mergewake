@@ -73,9 +73,14 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return e
 	}
 	if slices.Contains(v.Reasons, "round_hold") {
-		if fb, fbErr := s.GH.ReviewFeedback(ctx, r.Name, n); fbErr == nil {
+		fb, fbErr := s.GH.ReviewFeedback(ctx, r.Name, n)
+		if fbErr != nil {
+			if s.Log != nil {
+				s.Log.Warn("round-hold review feedback failed", "pr", n, "error", fbErr)
+			}
+		} else {
 			if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil && s.Log != nil {
-				s.Log.Warn("round-5 decision notify failed", "pr", n, "error", err)
+				s.Log.Warn("round-hold decision notify failed", "pr", n, "error", err)
 			}
 		}
 	}
