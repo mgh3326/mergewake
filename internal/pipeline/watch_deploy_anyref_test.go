@@ -232,24 +232,55 @@ func TestWatchDeployAnyRefDeployChecksKeepsRealDeployVerdict(t *testing.T) {
 	}
 }
 
-// Adding the key while a deploy incident is recorded must hold the incident's
-// confirmation, not let the new check set read an intervening commit as a fix
-// and discard the recorded culprit.
-func TestWatchDeployAnyRefDeployChecksAddedMidIncidentHolds(t *testing.T) {
-	e := newDepEnv(t, true)
-	depX := strings.Repeat("8", 40)
-	old := confirmedDeploy(*e.now)
-	old.Baseline, old.Checks = shaA, "ci-ok,deploy-ok"
-	seedDeployIncident(t, e.s, e.r, old)
-	e.g.head = advancedHead
-	e.g.parents[advancedHead] = depX
-	e.g.parents[depX] = shaC
-	e.g.checkNames[advancedHead] = map[string]github.CI{"CI": github.Green, "ci-ok": github.Green, "deploy-ok": github.Red}
-	e.g.checkNames[depX] = map[string]github.CI{"CI": github.Green}
-	e.post(depX, github.Green)
-	got := e.pass()
-	st, found := readDeployIncident(t, e.s, e.r)
-	if !found || st.Culprit != shaB || !st.Confirmed || len(e.g.reverts) != 0 || !strings.Contains(got.Reason, "the confirmation check set changed") {
-		t.Fatalf("incident=%+v found=%v reverts=%v result=%+v", st, found, e.g.reverts, got)
+// A deploy incident recorded under one any_ref_deploy_checks set must hold
+// while the policy reads another, not let the other set read an intervening
+// commit as a fix and discard the recorded culprit. The incident keeps the head
+// it was last validated at, so restoring the policy still examines the whole
+// range a fix may sit in.
+func TestWatchDeployAnyRefDeployChecksChangedMidIncidentHolds(t *testing.T) {
+	for _, revertOpen := range []bool{false, true} {
+		name := "recoverIncident"
+		if revertOpen {
+			name = "recovery"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newDepEnv(t, true)
+			withKey := e.g.policyExtra
+			depX := strings.Repeat("8", 40)
+			old := confirmedDeploy(*e.now)
+			old.Checks = anyRefDeployCheck
+			if revertOpen {
+				old.RevertPR = 9
+				e.g.latch = true
+			}
+			seedDeployIncident(t, e.s, e.r, old)
+			e.g.head = advancedHead
+			e.g.parents[advancedHead] = depX
+			e.g.parents[depX] = shaC
+			e.g.checkNames[advancedHead] = map[string]github.CI{"CI": github.Green, "ci-ok": github.Green, "deploy-ok": github.Red}
+			e.g.checkNames[depX] = map[string]github.CI{"CI": github.Green}
+			// depX's any-ref deploy run passed: a fix under the recorded set.
+			e.post(depX, github.Green)
+			// The key is dropped: the recorded set no longer matches.
+			e.g.policyExtra = strings.Replace(withKey, "any_ref_deploy_checks: ["+anyRefDeployCheck+"]\n", "", 1)
+			got := e.pass()
+			st, found := readDeployIncident(t, e.s, e.r)
+			if !found || st.Culprit != shaB || st.Head != shaC || !st.Confirmed || len(e.g.reverts) != 0 || e.g.merges != 0 {
+				t.Fatalf("incident=%+v found=%v reverts=%v merges=%d result=%+v", st, found, e.g.reverts, e.g.merges, got)
+			}
+			if !revertOpen && !strings.Contains(got.Reason, "the confirmation check set changed") {
+				t.Fatalf("result = %+v", got)
+			}
+			// The key returns: the commit skipped while holding is seen now.
+			e.g.policyExtra = withKey
+			e.advance(time.Minute)
+			got = e.pass()
+			st, found = readDeployIncident(t, e.s, e.r)
+			discarded := !found || st.Culprit != shaB
+			stale := strings.Contains(got.Reason, "main was green after the incident")
+			if !(discarded || stale) || len(e.g.reverts) != 0 || e.g.merges != 0 {
+				t.Fatalf("a fix behind the held head was skipped: incident=%+v found=%v reverts=%v merges=%d result=%+v", st, found, e.g.reverts, e.g.merges, got)
+			}
+		})
 	}
 }
