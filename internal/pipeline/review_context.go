@@ -233,7 +233,7 @@ func buildReviewContext(body string, fb github.ReviewFeedback, own string) revie
 // budget instructions lead, the Acceptance contract follows the operator
 // decisions, and from round two the review login's own earlier findings are
 // listed with their dispositions ahead of the other answered findings.
-func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own string, verified verifiedDecisions) reviewContext {
+func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own string, verified verifiedDecisions, outside ...outsideFinding) reviewContext {
 	var rc reviewContext
 	var b strings.Builder
 	b.WriteString(rp.notes())
@@ -282,7 +282,7 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 	// fits reserves room for the truncation notice so the bound holds with it.
 	fits := func(entry string) bool { return len(contextHeader)+b.Len()+len(entry)+120 <= contextBudget }
 	if rp.round > 1 && own != "" {
-		items := priorFindings(fb, own)
+		items := append(priorFindings(fb, own), outsidePriorItems(outside)...)
 		if len(items) > 0 {
 			fmt.Fprintf(&b, "PRIOR FINDINGS (rounds 1-%d of this PR, newest first), each with its disposition. Do not reopen, restate or re-rank any of them. Raise one again only if a line changed in the diff below gives new evidence, and then quote the disposition you dispute. A finding marked \"none yet\" is still open: do not repeat it.\n", rp.round-1)
 			used, disposed := 0, 0
@@ -293,6 +293,9 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 				}
 				if it.advisory {
 					label += ", advisory"
+				}
+				if it.outside {
+					label += ", outside the diff"
 				}
 				entry := fmt.Sprintf("%d. %s:%d (%s)\n   finding: %s\n   disposition: %s\n", i+1, it.path, it.line, label, it.finding, it.disposition)
 				if !fits(entry) {

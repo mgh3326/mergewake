@@ -84,12 +84,23 @@ func TestPostReviewOutsideDiffList(t *testing.T) {
 				t.Fatalf("an outside finding was posted as %d comments", n)
 			}
 			body := sent["body"].(string)
-			want := fmt.Sprintf("- `docs/other.md:7` (%s): stale claim\n%s%d -->", tt.severity, OutsideMarker, tt.blocking)
+			wantSev := tt.severity
+			if tt.advisory {
+				wantSev += ", advisory"
+			}
+			want := fmt.Sprintf("- `docs/other.md:7` (%s): stale claim\n%s%d -->", wantSev, OutsideMarker, tt.blocking)
 			if !strings.Contains(body, "Outside the diff") || !strings.HasSuffix(body, want) {
 				t.Fatalf("body=%q", body)
 			}
 			if len(history) != 1 || history[0].Pass != 1 || history[0].OutsideBlocking != tt.blocking {
 				t.Fatalf("history=%+v", history)
+			}
+			if len(history[0].Outside) != 1 {
+				t.Fatalf("outside=%+v", history[0].Outside)
+			}
+			got := history[0].Outside[0]
+			if got.Path != "docs/other.md" || got.Line != 7 || got.Severity != tt.severity || got.Advisory != tt.advisory || got.Ref != OutsideRef(got.Path, got.Line, got.Severity, got.Advisory, got.Body) || got.Body != "stale claim" {
+				t.Fatalf("outside finding=%+v", got)
 			}
 		})
 	}

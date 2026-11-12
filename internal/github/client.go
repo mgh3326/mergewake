@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -740,6 +742,41 @@ type ReviewedPass struct {
 	// OutsideBlocking counts the critical, high and blocking findings the pass
 	// listed in its review body because their path is not in the diff.
 	OutsideBlocking int
+	// Outside is those findings parsed back out of the review body, empty for
+	// reviews posted before the body listed them and for hk-served history.
+	Outside []OutsideFinding
+}
+
+// OutsideFinding is one outside-diff finding a pass listed in its review
+// body, parsed back so the merge gate can track it across heads.
+type OutsideFinding struct {
+	// Ref is OutsideRef of the posted line's fields: the same finding content
+	// on any head names the same ref, so an answer or a re-review finds it.
+	Ref      string
+	Path     string
+	Line     int
+	Severity string
+	Advisory bool
+	// Body is the folded, clipped text the review body carried.
+	Body string
+}
+
+// Blocking reports whether the finding holds the merge gate: critical, high
+// or blocking, and not advisory.
+func (f OutsideFinding) Blocking() bool {
+	return blockingFinding(f.Severity) && !f.Advisory
+}
+
+// OutsideRef is the stable identity of one outside-diff finding as posted:
+// path, line, severity, advisory flag and folded body. It is computed from
+// the review-body line, so every parse of the same review yields the same ref.
+func OutsideRef(path string, line int, severity string, advisory bool, body string) string {
+	adv := "0"
+	if advisory {
+		adv = "1"
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s\n%s\n%s", path, line, severity, adv, body)))
+	return "od-" + hex.EncodeToString(sum[:])[:10]
 }
 
 // OutsideMarker opens the line that records how many of a review's outside-diff
@@ -798,12 +835,61 @@ func OutsideDiffSection(findings []Finding) string {
 		if severity == "" {
 			severity = "unspecified"
 		}
+		if f.Advisory {
+			severity += ", advisory"
+		}
 		lines = append(lines, fmt.Sprintf("- `%s:%d` (%s): %s", oneLine(f.Path, 200), f.Line, severity, oneLine(f.Body, outsideBodyLimit)))
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 	return fmt.Sprintf("\n\nOutside the diff (these paths or lines are not changed by this PR; critical and high hold the merge):\n%s\n%s%d -->", strings.Join(lines, "\n"), OutsideMarker, blocking)
+}
+
+// outsideLine is one finding line of the outside-diff section:
+// "- `path:line` (severity[, advisory]): folded body".
+var outsideLine = regexp.MustCompile("^- `([^`]+)` \\(([^)]*)\\): (.*)$")
+
+// parseOutsideFindings reads the outside-diff section back out of a review
+// body, last section wins. It returns nil when the body has no section.
+func parseOutsideFindings(body string) []OutsideFinding {
+	idx := strings.LastIndex(body, "\nOutside the diff (")
+	if idx < 0 {
+		return nil
+	}
+	var out []OutsideFinding
+	for _, line := range strings.Split(body[idx:], "\n") {
+		m := outsideLine.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		at := strings.LastIndex(m[1], ":")
+		if at < 0 {
+			continue
+		}
+		lineNo, err := strconv.Atoi(m[1][at+1:])
+		if err != nil {
+			continue
+		}
+		severity := strings.TrimSpace(m[2])
+		advisory := false
+		if i := strings.Index(severity, ","); i >= 0 {
+			for _, p := range strings.Split(severity[i+1:], ",") {
+				advisory = advisory || strings.TrimSpace(p) == "advisory"
+			}
+			severity = strings.TrimSpace(severity[:i])
+		}
+		f := OutsideFinding{
+			Path:     m[1][:at],
+			Line:     lineNo,
+			Severity: severity,
+			Advisory: advisory,
+			Body:     m[3],
+		}
+		f.Ref = OutsideRef(f.Path, f.Line, f.Severity, f.Advisory, f.Body)
+		out = append(out, f)
+	}
+	return out
 }
 
 func PassMarker(r PassReceipt) string {
@@ -905,6 +991,7 @@ func passesFrom(reviews []Review, login string) ([]ReviewedPass, error) {
 		// from the diff summary, not ours.
 		if all := outsideCount.FindAllStringSubmatch(r.Body, -1); len(all) > 0 && strings.HasSuffix(r.Body, all[len(all)-1][0]) {
 			pass.OutsideBlocking, _ = strconv.Atoi(all[len(all)-1][1])
+			pass.Outside = parseOutsideFindings(r.Body)
 		}
 		out = append(out, pass)
 	}

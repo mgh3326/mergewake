@@ -38,6 +38,10 @@ type gateVerdict struct {
 	// Status is what the gate saw, kept for the PR status snapshot. It never
 	// feeds a decision.
 	Status gateEvidence
+	// Outside is every outside-diff finding the gate folded from the review
+	// history, each in its current state; nil when the pass did not evaluate
+	// them. The notify path audits the state changes and lists the open ones.
+	Outside []outsideFinding
 }
 
 // gateEvidence is the part of a gate pass the PR status snapshot carries
@@ -467,18 +471,27 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		}
 	}
 	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
-	outside := outsideBlocking(history, pr.Head.SHA, v.Review.PatchID, v.Review.Inherited)
-	if outside > 0 {
-		comments, e := s.GH.IssueComments(github.FreshEvidence(ctx), r.Name, pr.Number)
-		if e != nil {
-			return v, e
-		}
-		if outsideDismissed(comments, pr.Head.SHA, s.Config.Review.Login) {
-			outside = 0
-		}
+	records, legacyOutside, e := s.outsideGate(ctx, r, pr, history, v.Review.PatchID, v.Review.Inherited, reviewed, fixes)
+	if e != nil {
+		return v, e
 	}
-	if outside > 0 {
-		v.Reasons = append(v.Reasons, "finding_outside_diff:"+strconv.Itoa(outside))
+	v.Outside = records
+	openOutside := 0
+	for _, f := range records {
+		if f.State != outsideOpen {
+			continue
+		}
+		openOutside++
+		v.Status.Findings = append(v.Status.Findings, prstatus.Finding{
+			ID:       f.Ref,
+			Location: f.Path + ":" + strconv.Itoa(f.Line),
+			Severity: f.Severity,
+			Blocking: true,
+			Summary:  outsideTitle(f.Body),
+		})
+	}
+	if n := openOutside + legacyOutside; n > 0 {
+		v.Reasons = append(v.Reasons, "finding_outside_diff:"+strconv.Itoa(n))
 	}
 	if !reviewed {
 		v.Reasons = append(v.Reasons, "review_missing")

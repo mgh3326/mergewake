@@ -330,6 +330,7 @@ type priorItem struct {
 	line        int
 	severity    string
 	advisory    bool
+	outside     bool
 	finding     string
 	disposition string
 }
