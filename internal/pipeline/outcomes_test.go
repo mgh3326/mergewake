@@ -15,16 +15,26 @@ type outcomeGH struct {
 	recovery github.Pull
 	first    bool
 	calls    int
+	pullIDs  []int
+	pulls    map[int]github.Pull
+	firstCI  map[int]*bool
 }
 
-func (g *outcomeGH) FirstPRCI(context.Context, string, github.Pull, []string) (*bool, error) {
+func (g *outcomeGH) FirstPRCI(_ context.Context, _ string, p github.Pull, _ []string) (*bool, error) {
 	g.calls++
+	if v, ok := g.firstCI[p.Number]; ok {
+		return v, nil
+	}
 	v := g.first
 	return &v, nil
 }
 func (g *outcomeGH) Pull(_ context.Context, _ string, n int) (github.Pull, error) {
+	g.pullIDs = append(g.pullIDs, n)
 	if n == 9 {
 		return g.recovery, nil
+	}
+	if p, ok := g.pulls[n]; ok {
+		return p, nil
 	}
 	return g.pull, nil
 }
@@ -158,5 +168,203 @@ func TestReconcileBackfillsProfileWithoutEffort(t *testing.T) {
 	}
 	if v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]; v.Profile != "opus" || v.Model != "opus-model" {
 		t.Fatalf("profile=%q model=%q", v.Profile, v.Model)
+	}
+}
+
+func TestReconcileClosedRowsAreThrottledAndFinished(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	mergedAt := now.Add(-24 * time.Hour)
+	merged := mergedAt.Format(time.RFC3339)
+	makePull := func(number int, mergeAt *string) github.Pull {
+		p := g.pull
+		p.Number, p.State, p.MergedAt = number, "closed", mergeAt
+		p.CreatedAt = now.Add(-48 * time.Hour).Format(time.RFC3339)
+		p.Body = "Mergewake-Author-Profile: claude\nMergewake-Author-Model: model\nMergewake-Grade: B\nMergewake-Tier: T1\n"
+		return p
+	}
+	mergedPull := makePull(1, &merged)
+	noCIPull := makePull(3, nil)
+	unattributedPull := makePull(2, nil)
+	unattributedPull.Body = ""
+	newlyClosedPull := makePull(4, nil)
+	source := &outcomeGH{fakeGH: g, first: true, pulls: map[int]github.Pull{
+		1: mergedPull, 2: unattributedPull, 3: noCIPull, 4: newlyClosedPull,
+	}, firstCI: map[int]*bool{3: nil}}
+	s.GH = source
+	green := true
+	for _, row := range []struct {
+		pr      int
+		merged  *time.Time
+		ci      *bool
+		profile string
+	}{
+		{1, &mergedAt, &green, "claude"},
+		{2, nil, &green, ""},
+		{3, nil, nil, "claude"},
+		{4, nil, &green, "claude"},
+	} {
+		if err := s.ledger().Update(repo.Name, row.pr, func(v *outcomes.Outcome) {
+			v.Final, v.Decision, v.Profile, v.Model, v.Grade, v.Tier = row.pr != 4, "landed", row.profile, "model", "B", "T1"
+			v.MergedAt, v.FirstCIGreen = row.merged, row.ci
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reconcile(t, s, repo, Options{Shadow: true})
+	if got := source.pullIDs; len(got) != 4 {
+		t.Fatalf("first sweep Pull calls = %v, want one per closed row", got)
+	}
+	source.pullIDs = nil
+	now = now.Add(time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 0 {
+		t.Errorf("second sweep read closed rows: %v", source.pullIDs)
+	}
+
+	source.pullIDs = nil
+	now = now.Add(time.Hour)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 1 || source.pullIDs[0] != 1 {
+		t.Errorf("hourly sweep Pull calls = %v, want only pending merged row 1", source.pullIDs)
+	}
+
+	source.pullIDs = nil
+	now = mergedAt.Add(7*24*time.Hour + time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, 1)]
+	if v.Reverted == nil || *v.Reverted {
+		t.Fatalf("seven-day verdict = %v, want false", v.Reverted)
+	}
+	source.pullIDs = nil
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 0 {
+		t.Errorf("settled rows read again: %v", source.pullIDs)
+	}
+}
+
+func TestReconcileRecordsRevertInsideWindow(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	mergedAt := now.Add(-2 * 24 * time.Hour)
+	revertedAt := now.Add(-time.Hour).Format(time.RFC3339)
+	merged := mergedAt.Format(time.RFC3339)
+	p := g.pull
+	p.Number, p.State, p.MergedAt, p.MergeCommitSHA = 8, "closed", &merged, "merge-sha"
+	source := &outcomeGH{fakeGH: g, recovery: github.Pull{Number: 9, State: "closed", MergedAt: &revertedAt}, pulls: map[int]github.Pull{8: p}}
+	s.GH = source
+	green := true
+	if err := s.ledger().Update(repo.Name, 8, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.Profile, v.Model, v.Grade, v.Tier = true, "landed", "claude", "model", "B", "T1"
+		v.MergedAt, v.FirstCIGreen, v.RevertPR = &mergedAt, &green, 9
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := state.Latest[outcomes.Key(repo.Name, 8)]; v.Reverted == nil || !*v.Reverted {
+		t.Fatalf("inside-window revert verdict = %v, want true", v.Reverted)
+	}
+}
+
+func TestObserveReopenedPRReopensOutcomeReconciliation(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	green := true
+	due := time.Now().UTC().Add(time.Hour)
+	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) {
+		v.Final, v.ReconcileFinished, v.ReconcileDueAt, v.FirstCIGreen = true, true, &due, &green
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = &outcomeGH{fakeGH: g, first: true}
+	if err := s.ObservePR(context.Background(), repo, g.pull, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]
+	if v.Final || v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("reopened PR reconciliation state = final:%t finished:%t due:%v", v.Final, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}
+
+func TestReconcileMergedRowWithoutCIOrAttributionKeepsRevertCheck(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	mergedAt := now.Add(-24 * time.Hour)
+	merged := mergedAt.Format(time.RFC3339)
+	p := g.pull
+	p.Number, p.State, p.MergedAt = 5, "closed", &merged
+	p.Body = ""
+	source := &outcomeGH{fakeGH: g, pulls: map[int]github.Pull{5: p}, firstCI: map[int]*bool{5: nil}}
+	s.GH = source
+	if err := s.ledger().Update(repo.Name, 5, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.MergedAt = true, "landed", &mergedAt
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, 5)]
+	if v.Attributed() || v.FirstCIGreen != nil || v.ReconcileFinished || v.ReconcileDueAt == nil {
+		t.Fatalf("merged pending row state: attributed:%t ci:%v finished:%t due:%v", v.Attributed(), v.FirstCIGreen, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+	source.pullIDs = nil
+	now = now.Add(time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 0 {
+		t.Fatalf("not-due merged row read: %v", source.pullIDs)
+	}
+	now = now.Add(time.Hour)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 1 || source.pullIDs[0] != 5 {
+		t.Fatalf("hourly merged-row Pull calls = %v, want [5]", source.pullIDs)
+	}
+	source.pullIDs = nil
+	now = mergedAt.Add(7*24*time.Hour + time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err = s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v = state.Latest[outcomes.Key(repo.Name, 5)]
+	if v.Reverted == nil || *v.Reverted || !v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("expired no-evidence row state: reverted:%v finished:%t due:%v", v.Reverted, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}
+
+func TestReconcilePullThatIsOpenDoesNotFinishRow(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	source := &outcomeGH{fakeGH: g, first: true}
+	s.GH = source
+	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.ReconcileFinished = true, "blocked", false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, g.pull.Number)]
+	if v.Final || v.ReconcileFinished {
+		t.Fatalf("open PR was finalized by reconciliation: final=%t finished=%t", v.Final, v.ReconcileFinished)
 	}
 }

@@ -252,6 +252,95 @@ func notesOf(t *testing.T, args []string) (top, nested map[string]any) {
 	return top, nested
 }
 
+func TestReconciliationMetadataDoesNotReviseOrPublish(t *testing.T) {
+	at := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	ledger := Ledger{Dir: t.TempDir(), Now: func() time.Time { return at }}
+	if err := ledger.Update("example/project", 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	due := at.Add(time.Hour)
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReconcileFinished = true
+		v.ReconcileDueAt = &due
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := state.Latest[Key("example/project", 1)]
+	if first.Revision != 1 || !first.UpdatedAt.Equal(at) || first.ReconcileDueAt == nil || !first.ReconcileDueAt.Equal(due) {
+		t.Errorf("schedule update changed outcome revision or was not persisted: rev=%d updated=%s due=%v", first.Revision, first.UpdatedAt, first.ReconcileDueAt)
+	}
+	r := &recordRunner{}
+	cli := CLI{Runner: r, Command: "pacelever"}
+	if err := ledger.Flush(context.Background(), cli, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.adds) != 1 {
+		t.Fatalf("initial publish calls=%d, want 1", len(r.adds))
+	}
+	_, nested := notesOf(t, r.adds[0])
+	if _, ok := nested["reconcile_due_at"]; ok {
+		t.Error("published outcome contains reconciliation due time")
+	}
+	if _, ok := nested["reconcile_finished"]; ok {
+		t.Error("published outcome contains reconciliation completion marker")
+	}
+	due = due.Add(time.Hour)
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReconcileFinished = false
+		v.ReconcileDueAt = &due
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := state.Latest[Key("example/project", 1)]
+	if second.ID != first.ID || second.Revision != first.Revision || second.ReconcileDueAt == nil || !second.ReconcileDueAt.Equal(due) {
+		t.Errorf("next schedule update changed published identity: first=%+v second=%+v", first, second)
+	}
+	if err := ledger.Flush(context.Background(), cli, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.adds) != 1 {
+		t.Errorf("schedule-only update created %d rep publications, want 0 additional", len(r.adds)-1)
+	}
+}
+
+func TestLedgerRevisionTracksInPlaceMapChanges(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReviewBlocked = map[string]string{"head": "blocked"}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := state.Latest[Key("example/project", 1)]
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReviewBlocked["head"] = "clear"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := state.Latest[Key("example/project", 1)]
+	if after.ReviewBlocked["head"] != "clear" || after.ID == before.ID || after.Revision != before.Revision+1 {
+		t.Fatalf("in-place map update did not create a revision: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestPublishWithoutEffortSendsNoExperiment(t *testing.T) {
 	ledger := Ledger{Dir: t.TempDir()}
 	if err := ledger.Update("example/project", 1, func(v *Outcome) { inExperiment(v); v.Effort = "" }); err != nil {

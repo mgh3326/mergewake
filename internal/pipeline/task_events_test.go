@@ -443,6 +443,8 @@ func mergeRevert(g *outcomeGH, ago time.Duration) {
 // event: the next acting reconciliation posts it, once.
 func TestTaskEventRevertAfterShadowPass(t *testing.T) {
 	s, g, hk, r := revertSetup(t, 2*time.Hour)
+	now := time.Now().UTC()
+	s.Now = func() time.Time { return now }
 	mergeRevert(g, time.Hour)
 	reconcile(t, s, r, Options{Shadow: true})
 	state, _ := s.ledger().Read()
@@ -452,9 +454,8 @@ func TestTaskEventRevertAfterShadowPass(t *testing.T) {
 	if len(hk.received()) != 0 {
 		t.Fatal("shadow pass posted")
 	}
-	for range 2 {
-		reconcile(t, s, r, Options{})
-	}
+	now = now.Add(time.Hour)
+	reconcile(t, s, r, Options{})
 	got := hk.received()
 	if len(got) != 1 {
 		t.Fatalf("events %+v", got)
@@ -467,6 +468,8 @@ func TestTaskEventRevertAfterShadowPass(t *testing.T) {
 // posts its event.
 func TestTaskEventRevertAfterWindow(t *testing.T) {
 	s, g, hk, r := revertSetup(t, 8*24*time.Hour)
+	now := time.Now().UTC()
+	s.Now = func() time.Time { return now }
 	reconcile(t, s, r, Options{})
 	state, _ := s.ledger().Read()
 	if v := state.Latest[outcomes.Key(r.Name, 7)]; v.Reverted == nil || *v.Reverted {
@@ -476,6 +479,7 @@ func TestTaskEventRevertAfterWindow(t *testing.T) {
 		t.Fatal("an open revert PR posted")
 	}
 	mergeRevert(g, time.Minute)
+	now = now.Add(time.Hour)
 	reconcile(t, s, r, Options{})
 	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceRevert {
 		t.Fatalf("events %+v", got)
@@ -553,11 +557,14 @@ func TestTaskEventTaskIDOverflow(t *testing.T) {
 // the read failure is audited each poll instead of the row being skipped.
 func TestTaskEventRevertKeysUnreadable(t *testing.T) {
 	s, g, hk, r := revertSetup(t, 2*time.Hour)
+	now := time.Now().UTC()
+	s.Now = func() time.Time { return now }
 	mergeRevert(g, time.Hour)
 	reconcile(t, s, r, Options{Shadow: true}) // finalizes the row
 	if e := os.MkdirAll(filepath.Join(s.state(r.Name), "hk-task-events"), 0700); e != nil {
 		t.Fatal(e)
 	}
+	now = now.Add(time.Hour)
 	reconcile(t, s, r, Options{})
 	rows := taskEventAudit(t, s, r.Name)
 	if len(rows) != 1 || !strings.Contains(rows[0].Error, "sent keys unreadable") || len(hk.received()) != 0 {
@@ -566,6 +573,7 @@ func TestTaskEventRevertKeysUnreadable(t *testing.T) {
 	if e := os.Remove(filepath.Join(s.state(r.Name), "hk-task-events")); e != nil {
 		t.Fatal(e)
 	}
+	now = now.Add(time.Hour)
 	reconcile(t, s, r, Options{})
 	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceRevert {
 		t.Fatalf("events %+v", got)

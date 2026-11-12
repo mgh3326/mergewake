@@ -60,10 +60,21 @@ type Outcome struct {
 	Reverted        *bool                        `json:"reverted_within_7d"`
 	RevertPR        int                          `json:"revert_pr,omitempty"`
 	RevertURL       string                       `json:"revert_url,omitempty"`
-	UpdatedAt       time.Time                    `json:"updated_at"`
+	// ReconcileFinished means this closed PR has no remaining outcome work.
+	ReconcileFinished bool       `json:"reconcile_finished,omitempty"`
+	ReconcileDueAt    *time.Time `json:"reconcile_due_at,omitempty"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 	// ReviewBlocked holds, by head, why that head's review cannot start, such
 	// as "blocked: missing-task-trailer". A blocked head has no review.
 	ReviewBlocked map[string]string `json:"review_blocked_by_head,omitempty"`
+}
+
+// revisionContent omits reconciliation-only state, which is persisted in the
+// ledger but must not change an outcome's identity or published representation.
+func (v Outcome) revisionContent() Outcome {
+	v.ReconcileFinished = false
+	v.ReconcileDueAt = nil
+	return v
 }
 
 // SetReviewer records the reviewer of one pass on a head.
@@ -235,17 +246,22 @@ func (l Ledger) Update(repo string, pr int, fn func(*Outcome)) error {
 		if v.Task == "" {
 			v = Outcome{Repo: repo, PR: pr, Task: key, Decision: "unknown", Reviews: map[string]map[string]int{}}
 		}
-		before, _ := json.Marshal(v)
+		beforeRevision, _ := json.Marshal(v.revisionContent())
+		beforeData, _ := json.Marshal(v)
 		fn(&v)
-		after, _ := json.Marshal(v)
-		if string(before) == string(after) {
+		afterData, _ := json.Marshal(v)
+		if string(beforeData) == string(afterData) {
 			return nil
+		}
+		afterRevision, _ := json.Marshal(v.revisionContent())
+		if string(beforeRevision) == string(afterRevision) {
+			return appendEvent(f, Event{Version: 1, ID: v.ID, At: v.UpdatedAt, Kind: "outcome", Outcome: &v})
 		}
 		v.Revision++
 		v.UpdatedAt = l.now().UTC()
 		v.Supersedes = v.ID
 		v.ID = ""
-		data, _ := json.Marshal(v)
+		data, _ := json.Marshal(v.revisionContent())
 		sum := sha256.Sum256(data)
 		v.ID = hex.EncodeToString(sum[:])
 		return appendEvent(f, Event{Version: 1, ID: v.ID, At: v.UpdatedAt, Kind: "outcome", Outcome: &v})
@@ -390,7 +406,7 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	if v.Profile == "" || v.Model == "" || v.Grade == "" || v.Tier == "" {
 		return "", errors.New("outcome attribution incomplete; retained in outbox")
 	}
-	wire := v
+	wire := v.revisionContent()
 	if v.Effort == "" {
 		// An effort-less rep gets an inferred default rung downstream, so it must not count in an experiment arm.
 		wire.Experiment, wire.Arm = "", ""
