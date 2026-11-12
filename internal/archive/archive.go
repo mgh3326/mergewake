@@ -253,7 +253,7 @@ for d in *; do
   [ -d "$d" ] || continue
   has=0; done=0; uncertain=0; invalidEvents=0
   if [ ! -r "$d" ] || [ ! -x "$d" ]; then uncertain=1; fi
-  if [ -e "$d/events" ]; then
+  if [ -e "$d/events" ] || [ -L "$d/events" ]; then
     has=1
     if [ ! -d "$d/events" ] || [ ! -r "$d/events" ] || [ ! -x "$d/events" ]; then
       done=0; invalidEvents=1
