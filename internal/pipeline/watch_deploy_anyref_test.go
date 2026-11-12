@@ -231,3 +231,25 @@ func TestWatchDeployAnyRefDeployChecksKeepsRealDeployVerdict(t *testing.T) {
 		t.Fatalf("bisect dispatched for a commit with a real deploy verdict: found=%v err=%v %+v", found, err, dispatch)
 	}
 }
+
+// Adding the key while a deploy incident is recorded must hold the incident's
+// confirmation, not let the new check set read an intervening commit as a fix
+// and discard the recorded culprit.
+func TestWatchDeployAnyRefDeployChecksAddedMidIncidentHolds(t *testing.T) {
+	e := newDepEnv(t, true)
+	depX := strings.Repeat("8", 40)
+	old := confirmedDeploy(*e.now)
+	old.Baseline, old.Checks = shaA, "ci-ok,deploy-ok"
+	seedDeployIncident(t, e.s, e.r, old)
+	e.g.head = advancedHead
+	e.g.parents[advancedHead] = depX
+	e.g.parents[depX] = shaC
+	e.g.checkNames[advancedHead] = map[string]github.CI{"CI": github.Green, "ci-ok": github.Green, "deploy-ok": github.Red}
+	e.g.checkNames[depX] = map[string]github.CI{"CI": github.Green}
+	e.post(depX, github.Green)
+	got := e.pass()
+	st, found := readDeployIncident(t, e.s, e.r)
+	if !found || st.Culprit != shaB || !st.Confirmed || len(e.g.reverts) != 0 || !strings.Contains(got.Reason, "the confirmation check set changed") {
+		t.Fatalf("incident=%+v found=%v reverts=%v result=%+v", st, found, e.g.reverts, got)
+	}
+}

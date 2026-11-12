@@ -465,6 +465,13 @@ func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p poli
 	if head == st.Head {
 		return true, nil
 	}
+	// A recorded deploy incident whose check set differs from the current one
+	// stays current: confirmRecovery holds it for rediagnosis. Reading the
+	// intervening commits by the new set could otherwise call it fixed and
+	// discard its culprit and evidence.
+	if s.deploy && st.Checks != "" && st.Checks != strings.Join(p.BisectChecks(), ",") {
+		return true, nil
+	}
 	current := head
 	for i := 0; i < s.Config.WatchLimit; i++ {
 		c, e := s.GH.Commit(ctx, r.Name, current)
