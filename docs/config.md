@@ -826,8 +826,10 @@ on it.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
     and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
     round count, open findings, and the two choices: cut the scope or request one SS consult on the design.
-  - **Releasing the hold:** The hold ends when an authorized account (non-bot, other than the review login)
-    replies with a PR comment matching `Mergewake-Round-Hold: release` posted after the hold began. Once released, review and gate resume.
+  - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began
+    by a non-bot account — the review login counts, since it is also the operator's account. Comments mergewake generated
+    (they carry a `<!-- mergewake` marker, including the hold decision text itself) never count. Once released, review and gate resume;
+    the release is audited with the releasing login.
 
 Round, `delta_base`, `quiet`, `prior_context`, `advisory` and the drop counts
 are on the `review` audit event.
@@ -2605,3 +2607,23 @@ which observes spawn completion and then the existing job completion contract.
 A reconciling attempt is never retried on another host.
 
 In a PR’s `Operator decisions` section, cite `hk:doc decision/...` on each decision line to have it verified against hk and treated as settled product scope. Unverified claims do not suppress findings.
+
+## Server store connection
+
+The server store reads its MySQL DSN from exactly one of
+`MERGEWAKE_MYSQL_DSN` and `MERGEWAKE_MYSQL_DSN_FILE`. The DSN must select a
+database and set `tls=true` to use system roots. To trust a private CA, set
+`MERGEWAKE_MYSQL_CA_FILE` to a regular PEM file containing CA certificates
+(mode 0600 or 0644, at most 64 KiB), and set
+`MERGEWAKE_MYSQL_SERVER_NAME` to the expected exact DNS SAN or, only when there
+is no SAN extension, the certificate CN. The DSN must then use
+`tls=mergewake-ca`. The private CA pool is pinned: system roots are not used.
+Missing names, unsupported TLS modes, invalid chains and certificate name or
+validity failures refuse the connection; plaintext fallback is never allowed.
+
+For the MySQL HeatWave `mergewake` endpoint with a private CA named
+`MySQL_Endpoint_CA` and a CN-only server certificate named
+`MySQL_Endpoint_Server`, set `MERGEWAKE_MYSQL_SERVER_NAME=MySQL_Endpoint_Server`
+and use `tls=mergewake-ca` in the DSN, even when the connection address is an IP.
+Keep DSNs and certificate contents out of YAML, source control, logs and command
+arguments.
