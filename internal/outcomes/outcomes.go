@@ -246,14 +246,13 @@ func (l Ledger) Update(repo string, pr int, fn func(*Outcome)) error {
 		if v.Task == "" {
 			v = Outcome{Repo: repo, PR: pr, Task: key, Decision: "unknown", Reviews: map[string]map[string]int{}}
 		}
-		before := v
+		beforeRevision, _ := json.Marshal(v.revisionContent())
 		beforeData, _ := json.Marshal(v)
 		fn(&v)
 		afterData, _ := json.Marshal(v)
 		if string(beforeData) == string(afterData) {
 			return nil
 		}
-		beforeRevision, _ := json.Marshal(before.revisionContent())
 		afterRevision, _ := json.Marshal(v.revisionContent())
 		if string(beforeRevision) == string(afterRevision) {
 			return appendEvent(f, Event{Version: 1, ID: v.ID, At: v.UpdatedAt, Kind: "outcome", Outcome: &v})

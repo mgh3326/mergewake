@@ -311,6 +311,36 @@ func TestReconciliationMetadataDoesNotReviseOrPublish(t *testing.T) {
 	}
 }
 
+func TestLedgerRevisionTracksInPlaceMapChanges(t *testing.T) {
+	ledger := Ledger{Dir: t.TempDir()}
+	if err := ledger.Update("example/project", 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReviewBlocked = map[string]string{"head": "blocked"}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := state.Latest[Key("example/project", 1)]
+	if err := ledger.Update("example/project", 1, func(v *Outcome) {
+		v.ReviewBlocked["head"] = "clear"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = ledger.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := state.Latest[Key("example/project", 1)]
+	if after.ReviewBlocked["head"] != "clear" || after.ID == before.ID || after.Revision != before.Revision+1 {
+		t.Fatalf("in-place map update did not create a revision: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestPublishWithoutEffortSendsNoExperiment(t *testing.T) {
 	ledger := Ledger{Dir: t.TempDir()}
 	if err := ledger.Update("example/project", 1, func(v *Outcome) { inExperiment(v); v.Effort = "" }); err != nil {
