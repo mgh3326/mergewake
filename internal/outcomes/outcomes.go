@@ -252,7 +252,7 @@ func (l Ledger) Update(repo string, pr int, fn func(*Outcome)) error {
 	})
 }
 
-// Reps is replaceable by pacelever or another shared bench transport.
+// Reps is replaceable by panewire or another shared bench transport.
 type Reps interface {
 	Publish(context.Context, Outcome) (string, error)
 	Read(context.Context) ([]Outcome, error)
@@ -266,9 +266,9 @@ type CLI struct {
 }
 
 // childEnvDropped names the daemon's own hk service variables. An outcomes
-// child never inherits them: pacelever skips its own config.env when
-// HANDOFFKEEP_URL or HANDOFFKEEP_TOKEN is set, and its rep then stays local
-// (origin:N). See docs/config.md, "Outcomes".
+// child never inherits them. panewire reads HANDOFFKEEP_URL with
+// HANDOFFKEEP_TOKEN_SVC_PANEWIRE or its own hk-svc.env, not hk's config.env.
+// See docs/config.md, "Outcomes".
 var childEnvDropped = []string{
 	"HANDOFFKEEP_URL",
 	"HANDOFFKEEP_TOKEN",

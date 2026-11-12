@@ -514,8 +514,8 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `login` | Required | GitHub identity posting the independent exact-head review. |
 | `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
 | `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
-| `quota` | `scopefuel` | Default executable for `outcomes.command`; review does not call it. |
-| `scopefuel` | Empty | Legacy alias used for the `outcomes.command` fallback when `quota` is omitted. |
+| `quota` | Empty | Accepted and unused; `outcomes.command` no longer falls back to it. |
+| `scopefuel` | Empty | Accepted and unused. |
 | `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Accepted grades, weakest to strongest: `C`, `B`, `A`, `A+`, `S`, `S+`, `SS`. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
@@ -680,8 +680,8 @@ to choose reviewers: panewire selects the reviewer. The keys are still
 accepted, so existing configs keep loading. `review.profiles` is still read for
 the author's model and family from a `Mergewake-Author-Profile` trailer, for
 the author model on the outcomes record, and to name the family of a seat whose
-job record and spawn events carry none; `review.quota` is still the default
-`outcomes.command`. Passes of a blocking PR are separate panes; panewire
+job record and spawn events carry none. `review.quota` and `review.scopefuel` are
+accepted and unused. Passes of a blocking PR are separate panes; panewire
 enforces only the author-family exclusion between them.
 
 panewire fails closed when the remote host cannot stand at the head: an
@@ -877,8 +877,8 @@ The conservative rule is shared by ledger reports and structured rep notes:
 Merge time is an efficiency metric and never changes evidence classification or
 a grade. Mergewake does not change model grades automatically.
 
-`outcomes.command` defaults to `review.quota`. Its replaceable reps interface uses
-`scopefuel reps add`, the handoffkeep bench reps store, rather than writing hk
+`outcomes.command` defaults to `review.panewire.command`, which is `panewire`. Its replaceable reps interface uses
+`panewire reps add`, the handoffkeep bench reps store, rather than writing hk
 HTTP/SQL directly. Each finalized merged/closed PR publishes profile, model,
 effort, PR URL as task ref, role `impl`, task grade, tier, rounds, blocking
 findings count, and completed `1` only for a landed PR. Rounds is the number of
@@ -914,12 +914,13 @@ on the whole name before `=`:
 - `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`
 - `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET`
 
-They carry the daemon's own [hk HTTP credential](#hk-http-credential). When
-pacelever sees `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN` it skips its own
-`config.env`, has no token, and keeps the rep local (`recorded rep
-id=origin:N`). Everything else is kept, including `PATH`, `HOME`, `XDG_*`,
-`HANDOFFKEEP_CONFIG`, `PACELEVER_*` and `GH_TOKEN`, so the CLI reaches the
-bench through its own configuration. The daemon's own environment is not
+They carry the daemon's own [hk HTTP credential](#hk-http-credential). The child
+never receives `HANDOFFKEEP_URL`, `HANDOFFKEEP_TOKEN`, `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE`
+or the Cloudflare Access ids. panewire reads `HANDOFFKEEP_URL` with
+`HANDOFFKEEP_TOKEN_SVC_PANEWIRE` or its own `hk-svc.env`, not hk's `config.env`.
+Everything else is kept, including `PATH`, `HOME`, `XDG_*`,
+`HANDOFFKEEP_CONFIG`, `PANEWIRE_*` and `GH_TOKEN`, so panewire reaches the bench
+through its own configuration. The daemon's own environment is not
 changed; its hk HTTP clients keep these variables.
 
 Only a `srv:` row is a receipt. Before each `reps add`, mergewake lists the

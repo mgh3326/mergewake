@@ -24,7 +24,6 @@ repos:
 review:
   login: review-bot
   timeout: 10m
-  quota: scopefuel
   default_grade: B
   # pace (default): free models, then pools projected well under 100% at their
   # reset (otherwise wasted), then the rest under 100%; tight or unmeasured
@@ -59,7 +58,7 @@ review:
       gate_profile: example-grok-profile
       gate_effort: high
 outcomes:
-  command: scopefuel
+  command: panewire
   default_tier: T1
 notifier:
   type: stdout

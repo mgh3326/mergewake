@@ -451,14 +451,7 @@ func outcomePublishDetail(msg string) string {
 // written, is still returned. The operator's `mergewake outcomes sync` calls
 // Ledger.Flush directly and stays strict.
 func (s *Service) FlushOutcomes(ctx context.Context, repo string) error {
-	command := s.Config.Outcomes.Command
-	if command == "" {
-		command = s.Config.Review.Quota
-	}
-	if command == "" {
-		command = "scopefuel"
-	}
-	err := s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: command}, repo)
+	err := s.ledger().Flush(ctx, outcomes.CLI{Runner: s.Runner, Command: s.Config.Outcomes.Command}, repo)
 	var failed *outcomes.PublishError
 	if !errors.As(err, &failed) {
 		return err
