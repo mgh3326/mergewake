@@ -200,15 +200,14 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	// A mixed verdict keeps the route its conflict gave it: the author's.
 	author := v.State == "blocked" && (conflicted || authorAction(summary))
+	var notice func(room int) string
 	if v.State == "blocked" {
-		if notice := holdingNotice(v, pr.Head.SHA); notice != "" {
-			summary += " | " + notice
-		}
+		notice = func(room int) string { return holdingNotice(v, pr.Head.SHA, room) }
 	}
 	if identity == "" {
 		identity = summary
 	}
-	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author)
+	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author, notice)
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -317,7 +316,7 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // anything to do with it. It is recorded instead (see recordOnlyEvent), which
 // keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
-	return s.verdictEvent(ctx, r, pr, state, summary, summary, false, state == "blocked" && authorAction(summary))
+	return s.verdictEvent(ctx, r, pr, state, summary, summary, false, state == "blocked" && authorAction(summary), nil)
 }
 
 // verdictEvent is laneEvent for a verdict whose gate result is known: a
@@ -326,7 +325,9 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 // the whole reason set, which may hold a conflict the summary leaves to the
 // ESC. identity stands for summary in a BLOCKED's sent key and event id:
 // the reason set with the conflict the text leaves out.
-func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author bool) (string, string, bool, error) {
+// notice, when set, renders the BLOCKED notice into the text with the room the
+// rest of the text leaves under findingsLaneText.
+func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author bool, notice func(room int) string) (string, string, bool, error) {
 	var lane, via string
 	var e error
 	switch {
@@ -349,8 +350,17 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 		if shown == "" {
 			shown = "-"
 		}
-		return fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s | lane=%s via %s",
-			strings.ToUpper(state), r.Name, pr.Number, short7(pr.Head.SHA), summary, shown, v)
+		head := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %s",
+			strings.ToUpper(state), r.Name, pr.Number, short7(pr.Head.SHA), summary)
+		tail := fmt.Sprintf(" | lane=%s via %s", shown, v)
+		if notice != nil {
+			// The notice gets the room the rest of this lane's text leaves under
+			// findingsLaneText; " | " is its separator.
+			if n := notice(findingsLaneText - len(head) - len(tail) - len(" | ")); n != "" {
+				head += " | " + n
+			}
+		}
+		return head + tail
 	}
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
 	if e != nil {
@@ -699,24 +709,33 @@ func authorAction(summary string) bool {
 	return false
 }
 
-// holdLimit and holdBudget bound the list of holding threads in the BLOCKED
-// notice: at most holdLimit threads, and at most holdBudget bytes of list text,
-// so the lane event stays under panewire's 2048-byte limit.
+// holdLimit bounds the threads the BLOCKED notice lists. holdReserve is the room
+// kept for the list header and the "; and N more" marker.
 const (
-	holdLimit  = 10
-	holdBudget = 1200
+	holdLimit   = 10
+	holdReserve = 48
 )
 
-// holdingNotice renders the threads holding head for the BLOCKED notice: the
-// threads that fit, the reply forms that clear a block-class thread, and
-// whether the head's latest review pass is clean. It only adds text: reasons,
-// the identity and the sent key stay as they were.
-func holdingNotice(v gateVerdict, head string) string {
+// holdingNotice renders the threads holding head for the BLOCKED notice in at
+// most room bytes: the threads that fit, the reply forms that clear a
+// block-class thread, and whether the head's latest review pass is clean. It
+// returns "" when room cannot hold the fixed text, so the event is sent without
+// the list rather than refused by panewire. It only adds text: reasons, the
+// identity and the sent key stay as they were.
+func holdingNotice(v gateVerdict, head string, room int) string {
 	if len(v.Holds) == 0 {
 		return ""
 	}
+	tail := " | a block-class thread clears only with a reply of Fixed in <sha> or Dismiss: <evidence>"
+	if v.PassClean {
+		tail += fmt.Sprintf(" | latest review pass on %s raised no new findings; the threads above hold from earlier passes", head[:7])
+	}
+	budget := room - len(tail) - holdReserve
+	if budget < 0 {
+		return ""
+	}
 	var items []string
-	size := 0
+	used := 0
 	for _, h := range v.Holds {
 		if len(items) == holdLimit {
 			break
@@ -731,22 +750,21 @@ func holdingNotice(v gateVerdict, head string) string {
 		} else {
 			item += ", no reply"
 		}
-		if size+len(item) > holdBudget {
+		add := len(item)
+		if len(items) > 0 {
+			add += len("; ")
+		}
+		if used+add > budget {
 			break
 		}
 		items = append(items, item)
-		size += len(item)
+		used += add
 	}
 	more := ""
 	if rest := len(v.Holds) - len(items); rest > 0 {
 		more = fmt.Sprintf("; and %d more", rest)
 	}
-	out := fmt.Sprintf("holding threads (%d): %s%s", len(v.Holds), strings.Join(items, "; "), more)
-	out += " | a block-class thread clears only with a reply of Fixed in <sha> or Dismiss: <evidence>"
-	if v.PassClean {
-		out += fmt.Sprintf(" | latest review pass on %s raised no new findings; the threads above hold from earlier passes", head[:7])
-	}
-	return out
+	return fmt.Sprintf("holding threads (%d): %s%s", len(v.Holds), strings.Join(items, "; "), more) + tail
 }
 
 // replyLine is the first line of a reply, cut to 80 runes.

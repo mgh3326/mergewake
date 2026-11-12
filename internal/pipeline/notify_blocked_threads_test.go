@@ -133,3 +133,28 @@ func TestBlockedNoticeKeepsReasonsAndID(t *testing.T) {
 		t.Fatalf("reason summary changed:\n%s", ev.Text)
 	}
 }
+
+// (e) The notice never exceeds the room it is given: the list drops threads
+// before the fixed text, and the notice is empty when the fixed text alone
+// does not fit.
+func TestHoldingNoticeFitsRoom(t *testing.T) {
+	var holds []holdingThread
+	for i := 1; i <= 12; i++ {
+		holds = append(holds, holdingThread{
+			Ref: fmt.Sprintf("https://example.test/pull/7#r%02d", i), Author: "review-bot",
+			Severity: "high", Location: "tool/a.go:12", ReplyBy: "dev", ReplyBody: strings.Repeat("x", 200),
+		})
+	}
+	v := gateVerdict{Holds: holds, PassClean: true}
+	for _, room := range []int{0, 200, 400, 800, 1600, 2000} {
+		if got := holdingNotice(v, shaA, room); len(got) > room {
+			t.Fatalf("room %d: notice is %d bytes:\n%s", room, len(got), got)
+		}
+	}
+	if got := holdingNotice(v, shaA, 2000); !strings.Contains(got, "a block-class thread clears") || !strings.Contains(got, "raised no new findings") {
+		t.Fatalf("fixed text missing at room 2000:\n%s", got)
+	}
+	if got := holdingNotice(v, shaA, 100); got != "" {
+		t.Fatalf("notice at room 100 should be empty:\n%s", got)
+	}
+}
