@@ -57,6 +57,9 @@ type prEngine struct {
 	// taken is the queue state each repo's last sweep saw.
 	taken        map[string]daemon.Stats
 	evalRequests int
+	// evalCounts is the requests the evaluations made since the last "github
+	// requests" line, broken down by route like the sweep's.
+	evalCounts *github.RequestCounts
 }
 
 type prSweepState struct {
@@ -95,7 +98,8 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		sweeping: map[string]*prSweepState{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{}}
+		sweeping: map[string]*prSweepState{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
 	}
@@ -194,6 +198,7 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.evalRequests += total
+	e.evalCounts.Add(requests)
 	if ctx.Err() != nil {
 		return
 	}
@@ -224,14 +229,31 @@ type evalResult struct {
 	reasons []string
 }
 
+// freshRead reports whether an evaluation must read past the poll windows and
+// caches. Only check deliveries say the PR itself did not change: their result
+// is the new fact, when the check ran on the head the queue knows for the PR.
+// Any other source says GitHub changed the PR, as it always did.
+func (e *prEngine) freshRead(w daemon.Work) bool {
+	onlyChecks := len(w.Sources) > 0
+	for _, s := range w.Sources {
+		if s != daemon.SourceCheck {
+			onlyChecks = false
+		}
+	}
+	if onlyChecks {
+		head := e.q.Head(w.Key.Repo, w.Key.PR)
+		return w.CheckSHA == "" || head == "" || w.CheckSHA != head
+	}
+	return slices.ContainsFunc(w.Sources, func(s daemon.Source) bool { return s != daemon.SourceSweep })
+}
+
 // evaluate is the single-PR path: read the PR, then observe it, review it and
 // settle it as one PR of the old pass was.
 func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (errs []error, res evalResult) {
 	n := w.Key.PR
 	evalStart := w.Phases.Now()
-	// An event says GitHub changed: read it past the poll windows and caches.
 	readCtx := ctx
-	if slices.ContainsFunc(w.Sources, func(s daemon.Source) bool { return s != daemon.SourceSweep }) {
+	if e.freshRead(w) {
 		readCtx = github.FreshEvidence(ctx)
 	}
 	pr, err := e.gh.Pull(readCtx, r.Name, n)
@@ -534,8 +556,8 @@ func (e *prEngine) passLine(repo string) {
 }
 
 // queueTotals is what the sweeps of all repos last saw of the queue, and the
-// requests the evaluations since the last call made.
-func (e *prEngine) queueTotals() (depth int, waitMax time.Duration, evalRequests int) {
+// requests the evaluations since the last call made, by route.
+func (e *prEngine) queueTotals() (depth int, waitMax time.Duration, evalRequests int, routes []github.RequestCount) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, st := range e.taken {
@@ -543,5 +565,6 @@ func (e *prEngine) queueTotals() (depth int, waitMax time.Duration, evalRequests
 		waitMax = max(waitMax, st.WaitMax)
 	}
 	evalRequests, e.evalRequests = e.evalRequests, 0
-	return depth, waitMax, evalRequests
+	routes, e.evalCounts = e.evalCounts.Snapshot(), github.NewRequestCounts("pr")
+	return depth, waitMax, evalRequests, routes
 }

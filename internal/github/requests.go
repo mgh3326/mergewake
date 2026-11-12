@@ -40,8 +40,42 @@ type requestCountsKey struct{}
 // CountRequests attributes all HTTP responses under ctx to this run and starts
 // its first pass (see NewPass).
 func CountRequests(ctx context.Context, role string) (context.Context, *RequestCounts) {
-	c := &RequestCounts{role: role, counts: map[requestKey]int{}, byCredential: map[string]int{}}
+	c := NewRequestCounts(role)
 	return NewPass(context.WithValue(ctx, requestCountsKey{}, c)), c
+}
+
+// NewRequestCounts is an empty accounting for role, which Add can grow.
+func NewRequestCounts(role string) *RequestCounts {
+	return &RequestCounts{role: role, counts: map[requestKey]int{}, byCredential: map[string]int{}}
+}
+
+// Add merges another run's accounting into c, so a caller that reports many
+// runs together (a pass and the evaluations it queued) totals them here and
+// reads one Snapshot. The other run's role does not replace c's.
+func (c *RequestCounts) Add(other *RequestCounts) {
+	if other == nil {
+		return
+	}
+	other.mu.Lock()
+	counts, byCredential := maps.Clone(other.counts), maps.Clone(other.byCredential)
+	hits, misses, memoHits, notModified, gateWait := other.hits, other.misses, other.memoHits, other.notModified, other.gateWait
+	other.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts == nil {
+		c.counts = map[requestKey]int{}
+	}
+	if c.byCredential == nil {
+		c.byCredential = map[string]int{}
+	}
+	for k, n := range counts {
+		c.counts[k] += n
+	}
+	for k, n := range byCredential {
+		c.byCredential[k] += n
+	}
+	c.hits, c.misses, c.memoHits, c.notModified = c.hits+hits, c.misses+misses, c.memoHits+memoHits, c.notModified+notModified
+	c.gateWait = max(c.gateWait, gateWait)
 }
 
 // ContinueRequests is CountRequests for work that may run inside a run that is
