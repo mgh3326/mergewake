@@ -687,6 +687,25 @@ func TestConflictEscTaskLookupErrorRetries(t *testing.T) {
 	wantEsc(t, wantEscs(t, rig.n, 1)[0], "task-lane", "task 42", shaA)
 }
 
+func TestConflictEscUnreadableRouteGetsOwnerAfterWindow(t *testing.T) {
+	rig := newEscRig(t)
+	rig.g.pull.Body = "Mergewake-Task: 42\n"
+	rig.s.Sink = &hkDownSink{}
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("unreadable author route was not returned")
+	}
+	rig.after(rig.s.Config.Daemon.PR.Notify.ConflictOwnerWindow())
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rig.n.accepted) != 1 || rig.n.accepted[0].Lane != rig.s.ownerLane(rig.r) {
+		t.Fatalf("owner notice after unreadable route = %+v", rig.n.accepted)
+	}
+	if rows := rig.rows(t, "conflict-esc-owner"); len(rows) != 1 || rows[0]["reason"] != "author route unreadable after conflict window" {
+		t.Fatalf("owner audit after unreadable route = %+v", rows)
+	}
+}
+
 // (E1) A conflict is told once, by the ESC: a BLOCKED whose only reason is the
 // conflict is not sent, while a mixed verdict still sends its other reasons on
 // the route they took before, without the conflict.

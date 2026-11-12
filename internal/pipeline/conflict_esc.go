@@ -54,11 +54,17 @@ type conflictEscPending struct {
 // kept for the life of the file, so a head that returns, a PR that is
 // reopened or a restart never re-sends.
 type conflictEscState struct {
-	Delivered  map[string]conflictEscReceipt `json:"delivered,omitempty"`
-	Pending    map[string]conflictEscPending `json:"pending,omitempty"`
-	OwnerHead  string                        `json:"owner_head,omitempty"`
-	OwnerSince time.Time                     `json:"owner_since,omitzero"`
-	OwnerSent  bool                          `json:"owner_sent,omitempty"`
+	Delivered          map[string]conflictEscReceipt `json:"delivered,omitempty"`
+	Pending            map[string]conflictEscPending `json:"pending,omitempty"`
+	OwnerHead          string                        `json:"owner_head,omitempty"`
+	OwnerSince         time.Time                     `json:"owner_since,omitzero"`
+	OwnerPending       *conflictEscPending           `json:"owner_pending,omitempty"`
+	OwnerPendingHead   string                        `json:"owner_pending_head,omitempty"`
+	OwnerPendingReason string                        `json:"owner_pending_reason,omitempty"`
+	OwnerSuppressed    map[string]bool               `json:"owner_suppressed,omitempty"`
+	AuthorSuppressed   map[string]bool               `json:"author_suppressed,omitempty"`
+	Suppressed         map[string]bool               `json:"suppressed,omitempty"`
+	OwnerSent          bool                          `json:"owner_sent,omitempty"`
 }
 
 func (s *Service) conflictEscFile(repo string, n int) string {
@@ -75,6 +81,15 @@ func readConflictEsc(file string) (conflictEscState, error) {
 	}
 	if st.Pending == nil {
 		st.Pending = map[string]conflictEscPending{}
+	}
+	if st.OwnerSuppressed == nil {
+		st.OwnerSuppressed = map[string]bool{}
+	}
+	if st.AuthorSuppressed == nil {
+		st.AuthorSuppressed = map[string]bool{}
+	}
+	if st.Suppressed == nil {
+		st.Suppressed = map[string]bool{}
 	}
 	return st, nil
 }
@@ -126,6 +141,21 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	}
 	p, waiting := st.Pending[head]
 	now := s.now().UTC()
+	_, authorDelivered := st.Delivered[head]
+	if st.OwnerSent && (authorDelivered || st.Suppressed[head]) {
+		if st.OwnerHead == head && now.Sub(st.OwnerSince) >= s.Config.Daemon.PR.Notify.ConflictOwnerWindow() && !st.OwnerSuppressed[head] {
+			st.OwnerSuppressed[head] = true
+			if e = fsutil.WriteJSON(file, st); e != nil {
+				return e
+			}
+			return s.audit(r.Name, "conflict-esc-owner-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner was already notified for PR"}, false)
+		}
+		return nil
+	}
+	ownerTimerDue := st.OwnerHead == head && now.Sub(st.OwnerSince) >= s.Config.Daemon.PR.Notify.ConflictOwnerWindow()
+	if waiting && now.Before(p.Next) && !ownerTimerDue {
+		return nil
+	}
 	// The observation may be old by now: send only for a PR GitHub still
 	// reports open, on this base and head, and conflicting.
 	fresh, e := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
@@ -135,24 +165,43 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	if !escalable(r, fresh) || fresh.Head.SHA != head || !conflicting(fresh) {
 		return nil
 	}
-	route, e := s.findingsRoute(ctx, r, fresh)
-	if e != nil {
-		return fmt.Errorf("conflict author route: %w", e)
-	}
 	if st.OwnerHead != head {
 		st.OwnerHead, st.OwnerSince = head, now
+		if e = fsutil.WriteJSON(file, st); e != nil {
+			return e
+		}
 	}
-	authorGone := route.via == "unknown author; desk" || route.finished != ""
-	ownerDue := authorGone || now.Sub(st.OwnerSince) >= s.Config.Daemon.PR.Notify.ConflictOwnerWindow()
+	ownerDue := now.Sub(st.OwnerSince) >= s.Config.Daemon.PR.Notify.ConflictOwnerWindow()
+	route := findingsRoute{}
+	authorGone := false
+	if waiting && p.Pinned != "" {
+		route.lane, route.via = p.Pinned, p.PinnedVia
+		authorGone = p.PinnedVia == "owner lane (author route gone)"
+	} else {
+		route, e = s.findingsRoute(ctx, r, fresh)
+		if e != nil {
+			if ownerDue && !st.OwnerSent {
+				if e = s.sendConflictOwner(ctx, file, &st, r, pr.Number, head, "author route unreadable after conflict window", now); e != nil {
+					return e
+				}
+				st.Suppressed[head] = true
+				if e = fsutil.WriteJSON(file, st); e != nil {
+					return e
+				}
+				return s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "author route unreadable; owner notified"}, false)
+			}
+			return fmt.Errorf("conflict author route: %w", e)
+		}
+		authorGone = route.via == "unknown author; desk"
+	}
+	ownerDue = authorGone || ownerDue
 	var err error
-	_, authorDelivered := st.Delivered[head]
+	ownerDeliveredThisCall := false
 	shouldSendAuthor := !authorDelivered && !(authorGone && st.OwnerSent) && (!waiting || !now.Before(p.Next))
 	if shouldSendAuthor {
 		p.EventID = conflictEscID(r.Name, pr.Number, head)
 		lane, via := route.lane, route.via
-		if p.Pinned != "" {
-			lane, via = p.Pinned, p.PinnedVia
-		} else if authorGone {
+		if authorGone {
 			lane, via = s.ownerLane(r), "owner lane (author route gone)"
 		}
 		p.Pinned, p.PinnedVia = lane, via
@@ -174,8 +223,9 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 		}
 		delete(st.Pending, head)
 		st.Delivered[head] = conflictEscReceipt{EventID: p.EventID, Lane: lane, Via: via, At: now}
-		if authorGone {
+		if via == "owner lane (author route gone)" {
 			st.OwnerSent = true
+			ownerDeliveredThisCall = true
 		}
 		if err = fsutil.WriteJSON(file, st); err != nil {
 			return err
@@ -183,33 +233,67 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 		if err = s.audit(r.Name, "conflict-esc", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "lane": lane, "via": via, "event_id": p.EventID}, false); err != nil {
 			return err
 		}
-	} else if authorDelivered || (authorGone && st.OwnerSent) {
-		if err = s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "author route already notified"}, false); err != nil {
-			return err
-		}
-	} else if err = fsutil.WriteJSON(file, st); err != nil {
-		return err
-	}
-	if ownerDue && !authorGone && !st.OwnerSent {
-		lane := s.ownerLane(r)
-		eventID := fmt.Sprintf("mergewake-esc-%s-%d-owner", r.Name, pr.Number)
-		text := fmt.Sprintf("ESC [mergewake] %s#%d remains conflicted at head=%s after the author route was notified | lane=%s via owner follow-up", r.Name, pr.Number, short7(head), lane)
-		if err = s.Notifier.Notify(ctx, integrations.Event{ID: eventID, Text: text, Lane: lane, Type: "decision"}); err != nil {
-			return err
-		}
-		st.OwnerSent = true
+	} else if authorDelivered && !st.AuthorSuppressed[head] {
+		st.AuthorSuppressed[head] = true
 		if err = fsutil.WriteJSON(file, st); err != nil {
 			return err
 		}
-		return s.audit(r.Name, "conflict-esc-owner", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "lane": lane, "event_id": eventID, "reason": map[bool]string{true: "author route gone", false: "conflict persisted"}[authorGone]}, false)
+		if err = s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "author already notified for head"}, false); err != nil {
+			return err
+		}
+	} else if authorGone && st.OwnerSent && !authorDelivered && !st.Suppressed[head] {
+		st.Suppressed[head] = true
+		if err = fsutil.WriteJSON(file, st); err != nil {
+			return err
+		}
+		if err = s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner already notified while author route was gone"}, false); err != nil {
+			return err
+		}
 	}
-	if st.OwnerSent {
+	if ownerDue && !st.OwnerSent {
+		return s.sendConflictOwner(ctx, file, &st, r, pr.Number, head, map[bool]string{true: "author route gone", false: "conflict persisted"}[authorGone], now)
+	}
+	if ownerDue && st.OwnerSent && !ownerDeliveredThisCall && !st.OwnerSuppressed[head] {
+		st.OwnerSuppressed[head] = true
+		if err = fsutil.WriteJSON(file, st); err != nil {
+			return err
+		}
 		return s.audit(r.Name, "conflict-esc-owner-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner was already notified for PR"}, false)
 	}
-	if ownerDue {
-		return s.audit(r.Name, "conflict-esc-owner-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner notice already recorded"}, false)
-	}
 	return nil
+}
+
+func (s *Service) sendConflictOwner(ctx context.Context, file string, st *conflictEscState, r config.Repo, pr int, head, reason string, now time.Time) error {
+	if st.OwnerPending == nil {
+		st.OwnerPending = &conflictEscPending{EventID: fmt.Sprintf("mergewake-esc-%s-%d-owner", r.Name, pr), Pinned: s.ownerLane(r), PinnedVia: "owner follow-up"}
+		st.OwnerPendingHead, st.OwnerPendingReason = head, reason
+		if err := fsutil.WriteJSON(file, st); err != nil {
+			return err
+		}
+	}
+	p := st.OwnerPending
+	if now.Before(p.Next) {
+		return nil
+	}
+	head, reason = st.OwnerPendingHead, st.OwnerPendingReason
+	text := fmt.Sprintf("ESC [mergewake] %s#%d remains conflicted at head=%s | lane=%s via %s", r.Name, pr, short7(head), p.Pinned, p.PinnedVia)
+	if err := s.Notifier.Notify(ctx, integrations.Event{ID: p.EventID, Text: text, Lane: p.Pinned, Type: "decision"}); err != nil {
+		p.Attempts++
+		p.Next = now.Add(conflictEscBackoff(p.Attempts))
+		p.LastError = clip(integrations.Detail(err), conflictEscErrorMax)
+		if writeErr := fsutil.WriteJSON(file, st); writeErr != nil {
+			return errors.Join(err, writeErr)
+		}
+		return errors.Join(err, s.audit(r.Name, "conflict-esc-failed", map[string]any{"repo": r.Name, "pr": pr, "head": head, "event_id": p.EventID, "lane": p.Pinned, "kind": "owner", "error": p.LastError}, false))
+	}
+	eventID, lane := p.EventID, p.Pinned
+	st.OwnerPending = nil
+	st.OwnerPendingHead, st.OwnerPendingReason = "", ""
+	st.OwnerSent = true
+	if err := fsutil.WriteJSON(file, st); err != nil {
+		return err
+	}
+	return s.audit(r.Name, "conflict-esc-owner", map[string]any{"repo": r.Name, "pr": pr, "head": head, "lane": lane, "event_id": eventID, "reason": reason}, false)
 }
 
 // escalable reports whether pr is one the ESC is for: open, not merged, and
@@ -223,26 +307,28 @@ func escalable(r config.Repo, pr github.Pull) bool {
 // retried there if the head conflicts again. A delivered head stays
 // delivered.
 func (s *Service) resolveConflictEsc(file, head string) error {
-	st, e := readConflictEsc(file)
-	if e != nil {
-		return e
-	}
-	if p, ok := st.Pending[head]; !ok || p.Pinned != "" {
-		return nil
-	}
 	defer lockPath(file)()
 	unlock, e := fsutil.Lock(file+".lock", true)
 	if e != nil {
 		return e
 	}
 	defer unlock()
-	if st, e = readConflictEsc(file); e != nil {
+	st, e := readConflictEsc(file)
+	if e != nil {
 		return e
 	}
-	if p, ok := st.Pending[head]; !ok || p.Pinned != "" {
+	changed := false
+	if p, ok := st.Pending[head]; ok && p.Pinned == "" {
+		delete(st.Pending, head)
+		changed = true
+	}
+	if st.OwnerHead == head && !st.OwnerSent {
+		st.OwnerHead, st.OwnerSince = "", time.Time{}
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
-	delete(st.Pending, head)
 	return fsutil.WriteJSON(file, st)
 }
 

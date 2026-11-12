@@ -493,9 +493,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		findings := shape.kept
 		known = append(known, knownFromFindings(findings)...)
 		mu.Unlock()
-		findingFacts := roundFindingFacts(findings, feedback.Threads, rp)
+		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil)
 		plan.sameFamily = out.family == "" || out.family == family
 		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
+		if e = s.auditRoundFindingFacts(r.Name, n, pr.Head.SHA, plan.pass, rp.round, findingFacts); e != nil {
+			return e
+		}
 		if e = s.recordReview(r.Name, n, pr.Head.SHA, findings, receipt, o.DryRun); e != nil {
 			return e
 		}
@@ -529,18 +532,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				mu.Lock()
 				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
 				mu.Unlock()
-				if auditErr := s.auditRoundFindingFacts(r.Name, n, rp.round, findingFacts); auditErr != nil {
-					return errors.Join(e, auditErr)
-				}
 			}
 			return e
 		}
 		mu.Lock()
 		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
 		mu.Unlock()
-		if e = s.auditRoundFindingFacts(r.Name, n, rp.round, findingFacts); e != nil {
-			return e
-		}
 		// The pass is posted: its reviewer job record, if any, is spent. A
 		// record left behind is never resumed, since a posted pass is not run
 		// again for this head.

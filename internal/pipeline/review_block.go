@@ -161,12 +161,24 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 		return e
 	}
 	key := fmt.Sprintf("%d %s %s", pr.Number, pr.Head.SHA, b.reason)
+	eventKey := pr.Head.SHA
 	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
 		bodyDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(pr.Body)))
-		key = fmt.Sprintf("%d body:%s", pr.Number, bodyDigest)
+		key = fmt.Sprintf("%d body:%s %s", pr.Number, bodyDigest, b.reason)
+		eventKey = "body-" + bodyDigest
 	}
 	if sent.has(key) {
-		return s.audit(r.Name, "review-blocked-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "outcome": b.reason, "reason": "same PR body already notified"}, false)
+		audited, e := loadSentKeys(filepath.Join(s.state(r.Name), "review-blocked-suppressed-sent"), 1023)
+		if e != nil {
+			return e
+		}
+		if audited.has(key) {
+			return nil
+		}
+		if e = s.audit(r.Name, "review-blocked-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "outcome": b.reason, "reason": "same PR body already notified"}, false); e != nil {
+			return e
+		}
+		return audited.add(key)
 	}
 	lane, via, e := s.blockLane(ctx, r, pr, b)
 	if e != nil {
@@ -176,7 +188,7 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(nctx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-review-blocked-%s-%d-%s-%s", r.Name, pr.Number, pr.Head.SHA, code),
+		ID:   fmt.Sprintf("mergewake-review-blocked-%s-%d-%s-%s", r.Name, pr.Number, eventKey, code),
 		Text: clip(fmt.Sprintf("[mergewake] REVIEW BLOCKED %s#%d head=%s | %s | the PR comment names the fix | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), b.reason, lane, via), findingsLaneText),
 		Lane: lane,
 		Type: "decision",

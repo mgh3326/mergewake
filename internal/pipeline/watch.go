@@ -33,6 +33,12 @@ type watchResult struct {
 	AnyRefDispatch string `json:"any_ref_dispatch,omitempty"`
 }
 
+type watchHoldEpisode struct {
+	ID         string          `json:"id"`
+	Notified   bool            `json:"notified"`
+	Suppressed map[string]bool `json:"suppressed,omitempty"`
+}
+
 // UnknownEvidenceError names the bracket commit whose CI evidence Bisect
 // needed but could not read as green or red.
 type UnknownEvidenceError struct {
@@ -646,32 +652,39 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Shadow || o.DryRun {
 		return nil
 	}
+	s.feedWatch(r, result, o)
 	isMainHold := result.Action == "hold" && result.Stage == ""
+	var episode watchHoldEpisode
 	if isMainHold {
-		episode, err := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
+		var err error
+		episode, err = s.readWatchHoldEpisode(r.Name)
 		if err != nil {
 			return err
 		}
-		if episode.has("red-main") {
-			return s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": "red-main"}, false)
+		if episode.ID != "" && episode.Notified {
+			key := result.Head + " " + result.Reason
+			if episode.Suppressed[key] {
+				return nil
+			}
+			if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
+				return err
+			}
+			episode.Suppressed[key] = true
+			return s.writeWatchHoldEpisode(r.Name, episode)
+		}
+		if episode.ID == "" {
+			episode.ID = fmt.Sprintf("%d-%s", s.now().UTC().UnixNano(), short7(result.Head))
+			episode.Suppressed = map[string]bool{}
+			if err = s.writeWatchHoldEpisode(r.Name, episode); err != nil {
+				return err
+			}
 		}
 	}
-	s.feedWatch(r, result, o)
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
 	}
-	if sent.has(key) {
-		if isMainHold {
-			episode, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
-			if e != nil {
-				return e
-			}
-			if e = episode.add("red-main"); e != nil {
-				return e
-			}
-			return s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": "red-main"}, false)
-		}
+	if sent.has(key) && !isMainHold {
 		return nil
 	}
 	data, _ := json.Marshal(result)
@@ -685,8 +698,12 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Reason != "" {
 		note += ": " + result.Reason
 	}
+	eventID := "mergewake-" + result.Action + "-" + result.Head
+	if isMainHold {
+		eventID = "mergewake-watch-hold-" + episode.ID
+	}
 	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: eventID, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}
@@ -694,25 +711,36 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		return e
 	}
 	if isMainHold {
-		episode, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
-		if e != nil {
-			return e
-		}
-		return episode.add("red-main")
+		episode.Notified = true
+		return s.writeWatchHoldEpisode(r.Name, episode)
 	}
 	return nil
 }
 
+func (s *Service) readWatchHoldEpisode(repo string) (watchHoldEpisode, error) {
+	var episode watchHoldEpisode
+	file := filepath.Join(s.state(repo), "watch-hold-active.json")
+	if found, err := fsutil.ReadJSON(file, &episode); found && err != nil {
+		return episode, err
+	} else if err != nil {
+		return episode, err
+	}
+	if episode.Suppressed == nil {
+		episode.Suppressed = map[string]bool{}
+	}
+	return episode, nil
+}
+
+func (s *Service) writeWatchHoldEpisode(repo string, episode watchHoldEpisode) error {
+	return fsutil.WriteJSON(filepath.Join(s.state(repo), "watch-hold-active.json"), episode)
+}
+
 func (s *Service) clearWatchHoldEpisode(repo string) error {
-	file := filepath.Join(s.state(repo), "watch-hold-active")
-	episode, err := loadSentKeys(file, 1)
-	if err != nil {
+	file := filepath.Join(s.state(repo), "watch-hold-active.json")
+	if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if !episode.has("red-main") {
-		return nil
-	}
-	return episode.remove("red-main")
+	return nil
 }
 
 // bracketCandidates lists merged PRs in the inspected interval, excluding a

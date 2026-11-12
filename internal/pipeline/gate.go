@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
@@ -386,6 +387,9 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	deferRule := s.deferTaskRule(ctx, r, pr)
 	var holding map[string]bool
 	_, _, v.Review.Findings, holding = gradeThreadsDetailedWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
+	if deferRule != nil && deferRule.err != nil {
+		return v, fmt.Errorf("defer task lookup: %w", deferRule.err)
+	}
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -727,29 +731,77 @@ var (
 	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
+	deferIntent  = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\b`)
 	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+([0-9]+)\b`)
 )
 
 type deferTaskRule struct {
-	own    string
-	exists func(string) bool
+	own       string
+	ownTask   func() (string, error)
+	ownLoaded bool
+	exists    func(string) (bool, error)
+	seen      map[string]bool
+	failed    map[string]error
+	err       error
 }
 
 func (s *Service) deferTaskRule(ctx context.Context, r config.Repo, pr github.Pull) *deferTaskRule {
-	own, err := s.prTask(ctx, r, pr)
-	if err != nil {
-		return nil
-	}
 	jobs, ok := s.Sink.(interface {
 		TaskJob(context.Context, string) (string, string, error)
 	})
-	if !ok {
-		return nil
-	}
-	return &deferTaskRule{own: own, exists: func(id string) bool {
-		_, _, err := jobs.TaskJob(ctx, id)
-		return err == nil
+	rule := &deferTaskRule{seen: map[string]bool{}, failed: map[string]error{}, ownTask: func() (string, error) {
+		return s.prTask(ctx, r, pr)
 	}}
+	if ok {
+		rule.exists = func(id string) (bool, error) {
+			_, _, err := jobs.TaskJob(ctx, id)
+			return err == nil, err
+		}
+	}
+	return rule
+}
+
+func (r *deferTaskRule) isOwnTask(id string) bool {
+	if r == nil {
+		return true
+	}
+	if !r.ownLoaded && r.ownTask != nil {
+		own, err := r.ownTask()
+		r.ownLoaded = true
+		if err != nil {
+			r.err = errors.Join(r.err, err)
+			return true
+		}
+		r.own = own
+	}
+	return id == r.own
+}
+
+func (r *deferTaskRule) taskExists(id string) bool {
+	if r == nil || r.exists == nil {
+		return false
+	}
+	if r.seen == nil {
+		r.seen = map[string]bool{}
+	}
+	if r.failed == nil {
+		r.failed = map[string]error{}
+	}
+	if exists, ok := r.seen[id]; ok {
+		return exists
+	}
+	if err, ok := r.failed[id]; ok {
+		r.err = errors.Join(r.err, err)
+		return false
+	}
+	exists, err := r.exists(id)
+	if err != nil {
+		r.failed[id] = err
+		r.err = errors.Join(r.err, err)
+		return false
+	}
+	r.seen[id] = exists
+	return exists
 }
 
 func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRule, fleet ...[]string) bool {
@@ -757,21 +809,26 @@ func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRul
 		return false
 	}
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
-	for i := len(t.Comments) - 1; i > 0; i-- {
+	answered := false
+	for i := 1; i < len(t.Comments); i++ {
 		c := t.Comments[i]
 		if !answeredBy(c, author, ownReview, fleet...) {
 			continue
 		}
+		if !deferIntent.MatchString(c.Body) {
+			answered = true
+			continue
+		}
 		match := deferReply.FindStringSubmatch(c.Body)
 		if match == nil {
-			return true
+			continue
 		}
-		if rule == nil || match[1] == rule.own || rule.exists == nil {
-			return false
+		if rule == nil || rule.isOwnTask(match[1]) || rule.exists == nil {
+			continue
 		}
-		return rule.exists(match[1])
+		answered = rule.taskExists(match[1]) || answered
 	}
-	return false
+	return answered
 }
 
 // fixCheck reports whether sha, named in a fix reply, is a real fix for a

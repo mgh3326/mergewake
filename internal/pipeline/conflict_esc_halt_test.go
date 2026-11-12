@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// An unreadable author route is not treated as an absent route. The notice
-// remains pending until findingsRoute can be resolved.
+// An unreadable author route is retried; when the same conflict outlasts the
+// owner window, its owner gets one notice.
 func TestConflictEscTaskLookupErrorDoesNotReroute(t *testing.T) {
 	t.Run("three halts", func(t *testing.T) {
 		rig := newEscRig(t)
@@ -34,9 +34,22 @@ func TestConflictEscTaskLookupErrorDoesNotReroute(t *testing.T) {
 			t.Fatal("a failed task-lane read was not returned")
 		}
 		rig.after(31 * time.Minute)
-		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e == nil {
-			t.Fatal("unreadable route was treated as absent after waiting")
+		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
+			t.Fatal(e)
 		}
 		wantEscs(t, rig.n, 0)
+		if len(rig.n.accepted) != 1 || rig.n.accepted[0].Lane != rig.s.ownerLane(rig.r) {
+			t.Fatalf("owner notice after unreadable route = %+v", rig.n.accepted)
+		}
+		pulls := rig.g.pullCalls
+		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		if rig.g.pullCalls != pulls {
+			t.Fatalf("completed unreadable route retried GitHub pull: %d→%d", pulls, rig.g.pullCalls)
+		}
+		if rows := auditRows(t, rig.s, rig.r, "conflict-esc-suppressed"); len(rows) != 1 {
+			t.Fatalf("unreadable route suppression audit = %v, want one", rows)
+		}
 	})
 }

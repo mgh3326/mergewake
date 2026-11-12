@@ -712,10 +712,10 @@ For a blocked head, mergewake:
   head key in the comments of `review.login`;
 - emits one `decision` event per head and outcome to the repo's owner lane
   (`repos[].lane`), or to `notifier.fallback_lane` (else `notifier.lane`) when
-  the repo names none. Missing-trailer and unknown-family notices go to the PR
-  author route once per PR and body, independent of head; each suppressed
-  repeat remains in the audit log. The owner lane hears only when the author
-  route is gone.
+  the repo names none, except missing-trailer and unknown-family notices. Those
+  go to the PR author route once per PR body, independent of head; one audit
+  row records each distinct suppressed repeat. The owner lane hears only when
+  the author route is gone.
 
 mergewake takes no pass claim and writes no receipt or `-done` marker, so the
 merge gate reports `review_missing`. A block is not a review failure: it adds no
@@ -1901,6 +1901,9 @@ is unknown. The owner lane gets one follow-up per PR only when the author route
 is gone or the same conflicting head remains for `conflict_owner_after`; a
 changed head restarts that timer. Each head's author notice and each suppressed
 owner follow-up have audit records. The conflict notice uses this same route.
+Route lookup errors are retried; they do not count as an absent author. The
+owner timer still runs, so an owner notice is sent if the same conflict remains
+unreadable through `conflict_owner_after`.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
 other roles.
 
@@ -1990,7 +1993,9 @@ deadline. Later owner notices are audit-only. The event is a `decision` whose
 text names the PR, short head, conflict and rebase action. The event id stays
 stable across retries so an accepted delivery can be replayed without losing
 its destination. Delivery failures leave pending state and a
-`conflict-esc-failed` audit row.
+`conflict-esc-failed` audit row. An unreadable author route is retried, not
+treated as absent; the owner still hears once if that head remains conflicted
+through `conflict_owner_after`.
 
 It honours `notify: {enabled: false}`; a dry run sends and records nothing;
 shadow mode sends.
@@ -2548,7 +2553,8 @@ set changed; rediagnose`.
 
 Main watch notifications are deduplicated by red episode, from the first held
 red main head until the next green main head. Later held heads remain in the
-audit log with no repeated lane event; a green main clears the episode key.
+audit log with no repeated lane event; each distinct held head still writes
+its `revert.hold` feed event. A green main clears the episode key.
 
 When the newest head is red only on checks outside `any_ref_checks`, no commit
 can be shown green or red on them, so bisect would blame on partial evidence.
