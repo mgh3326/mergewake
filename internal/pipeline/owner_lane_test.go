@@ -47,7 +47,7 @@ func TestOwnerLaneRoutesHumanJudgmentNotices(t *testing.T) {
 					t.Fatal("want a lost result")
 				}
 				n := s.Notifier.(*fakeNotifier)
-				if n.count != 1 || n.events[0].Lane != tt.want || !strings.Contains(n.events[0].Text, "result was lost") {
+				if n.count != 1 || n.events[0].Lane != s.deskLane() || !strings.Contains(n.events[0].Text, "result was lost") {
 					t.Fatalf("events: %+v", n.events)
 				}
 			})

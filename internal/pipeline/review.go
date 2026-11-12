@@ -841,7 +841,11 @@ func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr 
 		if err = fsutil.WriteJSON(file, incidents); err != nil {
 			return err
 		}
-		return s.audit(r.Name, "review-result-lost-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "cause": cause, "incident": incident.ID}, false)
+		auditErr := s.audit(r.Name, "review-result-lost-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "cause": cause, "incident": incident.ID}, false)
+		if plan.replacements >= 1 {
+			return errors.Join(auditErr, s.notifyLostReviewOwner(ctx, file, digest, &incidents, &incident, r, pr, plan, cause))
+		}
+		return auditErr
 	}
 	if incident.ID == "" || now.Sub(incident.First) > 10*time.Minute {
 		incident = lostReviewIncident{ID: fmt.Sprintf("mergewake-review-result-lost-%s-%d", digest[:16], now.UnixNano()), First: now, Last: now}
@@ -862,12 +866,40 @@ func (s *Service) notifyReviewResultLost(ctx context.Context, r config.Repo, pr 
 	}
 	incident.Notified = true
 	incidents[digest] = incident
-	return fsutil.WriteJSON(file, incidents)
+	if err = fsutil.WriteJSON(file, incidents); err != nil {
+		return err
+	}
+	if plan.replacements >= 1 {
+		return s.notifyLostReviewOwner(ctx, file, digest, &incidents, &incident, r, pr, plan, cause)
+	}
+	return nil
+}
+
+func (s *Service) notifyLostReviewOwner(ctx context.Context, file, digest string, incidents *map[string]lostReviewIncident, incident *lostReviewIncident, r config.Repo, pr github.Pull, plan *passPlan, cause string) error {
+	key := strconv.Itoa(pr.Number)
+	if incident.OwnerNotified == nil {
+		incident.OwnerNotified = map[string]bool{}
+	}
+	if incident.OwnerNotified[key] {
+		return nil
+	}
+	event := integrations.Event{
+		ID:   incident.ID + "-owner-pr-" + key,
+		Lane: s.ownerLane(r), Type: "automation-failed",
+		Text: fmt.Sprintf("[mergewake] review retries are exhausted after a reviewer result was lost for %s#%d head=%s pass=%d lens=%s cause=%s", r.Name, pr.Number, pr.Head.SHA, plan.pass, plan.lens, cause),
+	}
+	if err := s.Notifier.Notify(ctx, event); err != nil {
+		return err
+	}
+	incident.OwnerNotified[key] = true
+	(*incidents)[digest] = *incident
+	return fsutil.WriteJSON(file, *incidents)
 }
 
 type lostReviewIncident struct {
-	ID       string    `json:"id"`
-	First    time.Time `json:"first"`
-	Last     time.Time `json:"last"`
-	Notified bool      `json:"notified"`
+	ID            string          `json:"id"`
+	First         time.Time       `json:"first"`
+	Last          time.Time       `json:"last"`
+	Notified      bool            `json:"notified"`
+	OwnerNotified map[string]bool `json:"owner_notified,omitempty"`
 }

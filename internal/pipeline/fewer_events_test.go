@@ -115,6 +115,33 @@ func TestLostReviewBurstNotifiesOneDesignIncident(t *testing.T) {
 	}
 }
 
+func TestLostReviewExhaustedReplacementNotifiesOwnerOnce(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	r.Lane = "owner-lane"
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	lost := &reviewResultLost{label: "reviewer", cause: errors.New("result file missing")}
+	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, &passPlan{pass: 1, lens: "default"}, lost); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || n.events[0].Lane != s.deskLane() {
+		t.Fatalf("initial lost-review notice = %+v, want one design-lane incident", n.events)
+	}
+	plan := &passPlan{pass: 1, lens: "default", replacements: 1}
+	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, plan, lost); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, plan, lost); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 2 || n.events[1].Lane != s.ownerLane(r) || !strings.Contains(n.events[1].Text, "retries are exhausted") {
+		t.Fatalf("exhausted lost-review notices = %+v, want one owner follow-up", n.events)
+	}
+	if rows := auditRows(t, s, r, "review-result-lost-suppressed"); len(rows) != 2 {
+		t.Fatalf("lost-review suppression audit rows = %v, want two", rows)
+	}
+}
+
 func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	s, _, _, r, _ := feedSetup(t)
 	sink := &fakeSink{}
