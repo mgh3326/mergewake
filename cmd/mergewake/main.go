@@ -270,9 +270,10 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
 	// The mirror is a daemon feature: its refresh loop runs beside the roles,
-	// and the PR diff shadow compare is fed by the GitHub client. A host with
-	// no App can serve no mirror fetch, so it keeps none.
-	if command == "daemon" && c.Daemon.Mirror.On() && c.GitHubApp != nil {
+	// and the PR diff shadow compare is fed by the GitHub client. A dry run
+	// writes nothing and fetches nothing, so it keeps no mirror; a host with
+	// no App can serve no mirror fetch, so it keeps none either.
+	if command == "daemon" && !*dry && c.Daemon.Mirror.On() && c.GitHubApp != nil {
 		log := slog.New(slog.NewJSONHandler(stderr, nil))
 		s.Mirror = mirror.New(mirror.Options{
 			Dir:   c.Daemon.Mirror.DirFor(c.StateDir),

@@ -1688,7 +1688,8 @@ helper reset and no terminal prompt); the token is never on argv or on disk. A
 repository the App cannot serve is not fetched at all: the user token is never
 used for a mirror. A mirror that fails three fetches in a row is skipped for an
 hour, with one WARN per hour rather than per call. The mirror needs
-`github_app`; a host without it keeps none. `enabled: false` turns it off.
+`github_app`; a host without it keeps none. `enabled: false` turns it off, and
+`mergewake daemon --dry-run` keeps no mirror and starts no fetch.
 
 **Shadow compare (this slice).** `Diff` still returns GitHub's answer. After it
 returns, on its own goroutine and bounded at 10 seconds, the same patch is built
