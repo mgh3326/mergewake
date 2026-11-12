@@ -397,6 +397,13 @@ type Policy struct {
 	// name must be in the watch set. The newest main head is still judged by
 	// the whole watch set.
 	AnyRefChecks []string `yaml:"any_ref_checks"`
+	// AnyRefDeployChecks names the checks the any-ref workflow posts when it
+	// runs the deploy suite (for example ci-ok-deploy): the deploy stream
+	// judges a dispatched bisect candidate by them. Unset keeps the deploy
+	// stream judging candidates by deploy_checks. It needs any_ref_workflow and
+	// deploy_checks; the names are not required to be in deploy_checks, because
+	// the deploy run reports under its own names.
+	AnyRefDeployChecks []string `yaml:"any_ref_deploy_checks"`
 	// AnyRefTimeout bounds the wait for one dispatched commit's result, as a
 	// Go duration. Empty means DefaultAnyRefTimeout.
 	AnyRefTimeout string `yaml:"any_ref_timeout"`
@@ -515,6 +522,26 @@ func (p Policy) Validate() error {
 				return fmt.Errorf("any_ref_checks: %q is not in the watch set (watch_checks, else required_checks)", n)
 			}
 			anySeen[n] = true
+		}
+	}
+	// The deploy stream reads this set only to judge a commit its any-ref run
+	// reported on, so it means nothing without that workflow or a deploy stage.
+	if p.AnyRefDeployChecks != nil {
+		if len(p.AnyRefDeployChecks) == 0 {
+			return errors.New("any_ref_deploy_checks must name at least one check")
+		}
+		if p.AnyRefWorkflow == "" {
+			return errors.New("any_ref_deploy_checks requires any_ref_workflow")
+		}
+		if len(p.DeployChecks) == 0 {
+			return errors.New("any_ref_deploy_checks requires deploy_checks")
+		}
+		deploySeen := map[string]bool{}
+		for _, n := range p.AnyRefDeployChecks {
+			if strings.TrimSpace(n) == "" || deploySeen[n] {
+				return errors.New("any_ref_deploy_checks must be nonempty and unique")
+			}
+			deploySeen[n] = true
 		}
 	}
 	if w := p.AnyRefWorkflow; w != "" && (strings.TrimSpace(w) != w || strings.Contains(w, "/") || !(strings.HasSuffix(w, ".yml") || strings.HasSuffix(w, ".yaml"))) {

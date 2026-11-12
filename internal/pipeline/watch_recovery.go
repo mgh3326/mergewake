@@ -465,7 +465,6 @@ func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p poli
 	if head == st.Head {
 		return true, nil
 	}
-	names := p.BisectChecks()
 	current := head
 	for i := 0; i < s.Config.WatchLimit; i++ {
 		c, e := s.GH.Commit(ctx, r.Name, current)
@@ -476,7 +475,7 @@ func (s *watchStream) incidentCurrent(ctx context.Context, r config.Repo, p poli
 			return false, nil
 		}
 		current = c.Parents[0].SHA
-		v, e := s.GH.Check(ctx, r.Name, current, names)
+		v, e := s.candidateCI(ctx, r.Name, current, p)
 		if e != nil {
 			if !errors.Is(e, github.ErrAmbiguousCheck) {
 				return false, e

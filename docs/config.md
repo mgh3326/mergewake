@@ -2531,6 +2531,24 @@ whole watch set, so it decides healthy or red as before. `any_ref_checks` applie
 to the commits bisect reads, including the green ancestor search and the commits
 an any-ref run reports on.
 
+`policy.any_ref_deploy_checks` optionally lists the checks the any-ref workflow
+posts when it runs the `deploy` suite, for a repo whose deploy run reports under
+names the real deploy stage never posts (for example `deploy_checks: [ci-ok,
+deploy-ok]` with `any_ref_deploy_checks: [ci-ok-deploy]`). It applies to the
+deploy stream only: a commit bisect needs is judged by its own deploy run
+(`deploy_checks`) when that is green or red, and otherwise by these checks, so a
+dispatched candidate whose run posted `ci-ok-deploy` is green or red instead of
+holding until `any_ref_timeout`. The deploy head is still judged by
+`deploy_checks` alone, the head-versus-candidate guard above does not apply to
+it, and the confirmation re-runs read these checks. The revert PR, the recovery
+latch and `last-deploy-revert` work as before. The key needs
+`any_ref_workflow` and a non-empty `deploy_checks`, must not be an empty list or
+repeat a name, and the names need not be in `deploy_checks`; otherwise the
+policy is invalid and the error names `any_ref_deploy_checks`. Unset, the deploy
+stream judges candidates by `deploy_checks` as before. Adding the key while a
+deploy incident is recorded holds its confirmation with `the confirmation check
+set changed; rediagnose`.
+
 When the newest head is red only on checks outside `any_ref_checks`, no commit
 can be shown green or red on them, so bisect would blame on partial evidence.
 Watch holds instead, queries no ancestor and notifies once per head, with the
