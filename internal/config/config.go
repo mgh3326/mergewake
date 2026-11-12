@@ -58,6 +58,40 @@ type Review struct {
 	// report only critical and high findings. 0 means 3; a negative value turns
 	// the budget off.
 	BudgetRounds int `yaml:"budget_rounds"`
+	// RoundRule configures the review-round thresholds for consult directive,
+	// escalation ladder, and review hold.
+	RoundRule RoundRuleConfig `yaml:"round_rule"`
+}
+
+// RoundRuleConfig configures the review-round thresholds.
+type RoundRuleConfig struct {
+	Consult int `yaml:"consult"`
+	Ladder  int `yaml:"ladder"`
+	Hold    int `yaml:"hold"`
+}
+
+// RoundRuleConsult returns the consult round threshold (default 3).
+func (r Review) RoundRuleConsult() int {
+	if r.RoundRule.Consult > 0 {
+		return r.RoundRule.Consult
+	}
+	return 3
+}
+
+// RoundRuleLadder returns the ladder escalation round threshold (default 5).
+func (r Review) RoundRuleLadder() int {
+	if r.RoundRule.Ladder > 0 {
+		return r.RoundRule.Ladder
+	}
+	return 5
+}
+
+// RoundRuleHold returns the hold round threshold (default 7).
+func (r Review) RoundRuleHold() int {
+	if r.RoundRule.Hold > 0 {
+		return r.RoundRule.Hold
+	}
+	return 7
 }
 
 // PanewireReview configures the panewire review executor. A reviewer pane uploads

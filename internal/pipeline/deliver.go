@@ -125,7 +125,9 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	rounds, _ := reviewRounds(history)
 	openBlocking, openThreads := s.roundEndsWithoutPass(ctx, r, pr, fb)
 	st := s.loadRoundRuleState(r.Name, n)
-	if done && rounds == 3 && openBlocking && !st.Round3DirectiveSent && len(inScope) == 0 {
+	consultRound := s.Config.Review.RoundRuleConsult()
+	ladderRound := s.Config.Review.RoundRuleLadder()
+	if done && rounds == consultRound && openBlocking && !st.directiveSent() && len(inScope) == 0 {
 		for _, t := range openThreads {
 			first := t.Comments[0]
 			inScope = append(inScope, pendingFinding{
@@ -152,8 +154,8 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				continue
 			}
 			directive := ""
-			if batch.scope == "author" && done && rounds == 3 && openBlocking && !st.Round3DirectiveSent {
-				directive = Round3Directive
+			if batch.scope == "author" && done && rounds == consultRound && openBlocking && !st.directiveSent() {
+				directive = RoundDirective
 			}
 			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive)
 			if e != nil {
@@ -165,16 +167,15 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				return errors.Join(followErr, e)
 			}
 			if directive != "" && o.Reporting() {
-				st.Round3DirectiveSent = true
+				st.setDirectiveSent(true, s.now().UTC())
 				_ = s.saveRoundRuleState(r.Name, n, st)
-				s.escalateAuthorRound3(ctx, r, pr, fb, o, &st)
 			}
 			ledger = append(ledger, d)
 			changed = true
 		}
 	}
-	if done && rounds == 3 && openBlocking && !st.Round3Escalated && st.Round3DirectiveSent {
-		s.escalateAuthorRound3(ctx, r, pr, fb, o, &st)
+	if done && rounds == ladderRound && openBlocking && !st.escalated() {
+		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
 		followErr = errors.Join(followErr, s.saveDeliveries(r.Name, ledger))
