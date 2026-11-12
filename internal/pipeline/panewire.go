@@ -72,8 +72,6 @@ const revisitMargin = 10 * time.Second
 // Leave room for panewire's policy preamble below the hub's 64 KiB limit.
 const inlineBriefLimit = 48 << 10
 
-var taskScale = regexp.MustCompile(`(?i)(?:\(|\b)grade (?:S\+|S|A\+|A|B|C),\s*(T[0-3])\b`)
-
 var spawnedSeat = regexp.MustCompile(`(?m)^OK pane=\S+ model=(\S+)`)
 
 // findingsGrace bounds how long a finished pane's hk job record is polled for
@@ -347,11 +345,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if e != nil {
 		return skip("task %s unreadable: %v", task, e)
 	}
-	m := taskScale.FindStringSubmatch(title)
-	if m == nil {
+	tier, ok := taskScale(title)
+	if !ok {
 		return skip("task %s title has no grade/T marker", task)
 	}
-	scale := strings.ToUpper(m[1])
+	scale := tier
 	// The builder's hk job record carries the family panewire actually launched
 	// with; a builder from before job records leaves none, and the
 	// trailer/commit inference still answers. A task with no bound job (a

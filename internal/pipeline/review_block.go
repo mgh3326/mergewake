@@ -70,7 +70,10 @@ func (s *Service) reviewBlockFor(ctx context.Context, r config.Repo, pr github.P
 		return reviewBlock{}, false
 	}
 	_, title, e := jobs.TaskJob(ctx, task)
-	if e != nil || taskScale.MatchString(title) {
+	if e != nil {
+		return reviewBlock{}, false
+	}
+	if _, ok := taskScale(title); ok {
 		return reviewBlock{}, false
 	}
 	return reviewBlock{blockMissingMarker, fmt.Sprintf("Add `(grade X, Tn)` to the title of hk task %s, for example `(grade B, T1)`.", task)}, true
