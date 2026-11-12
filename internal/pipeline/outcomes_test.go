@@ -222,14 +222,14 @@ func TestReconcileClosedRowsAreThrottledAndFinished(t *testing.T) {
 	now = now.Add(time.Minute)
 	reconcile(t, s, repo, Options{Shadow: true})
 	if len(source.pullIDs) != 0 {
-		t.Fatalf("second sweep read closed rows: %v", source.pullIDs)
+		t.Errorf("second sweep read closed rows: %v", source.pullIDs)
 	}
 
 	source.pullIDs = nil
 	now = now.Add(time.Hour)
 	reconcile(t, s, repo, Options{Shadow: true})
 	if len(source.pullIDs) != 1 || source.pullIDs[0] != 1 {
-		t.Fatalf("hourly sweep Pull calls = %v, want only pending merged row 1", source.pullIDs)
+		t.Errorf("hourly sweep Pull calls = %v, want only pending merged row 1", source.pullIDs)
 	}
 
 	source.pullIDs = nil
@@ -246,7 +246,7 @@ func TestReconcileClosedRowsAreThrottledAndFinished(t *testing.T) {
 	source.pullIDs = nil
 	reconcile(t, s, repo, Options{Shadow: true})
 	if len(source.pullIDs) != 0 {
-		t.Fatalf("settled rows read again: %v", source.pullIDs)
+		t.Errorf("settled rows read again: %v", source.pullIDs)
 	}
 }
 
