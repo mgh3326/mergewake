@@ -484,3 +484,64 @@ func TestRoundRule_h_QuietModeAfterRound3Unchanged(t *testing.T) {
 		t.Fatalf("round 4 quiet = false, want true")
 	}
 }
+
+func TestRoundRule_StaleReleaseCommentDoesNotReleaseNewHold(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 5)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+	p := policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}}
+	baseSHA := shaB
+
+	// Stale release comment posted prior to round-5 hold creation
+	g.issueComments = []github.IssueComment{
+		{
+			User: github.PullUser{Login: "operator", Type: "User"},
+			Body: "Mergewake-Round-Hold: release",
+		},
+	}
+
+	// First evaluation: hold is entered at round 5. The stale comment must NOT release it.
+	v1, err := s.mergeGate(context.Background(), r, g.pull, p, baseSHA)
+	if err != nil {
+		t.Fatalf("mergeGate err: %v", err)
+	}
+	if v1.State != "blocked" {
+		t.Fatalf("gate state = %q, want blocked (stale comment should not release)", v1.State)
+	}
+	hasRoundHold := false
+	for _, reason := range v1.Reasons {
+		if strings.Contains(reason, "round_hold") {
+			hasRoundHold = true
+			break
+		}
+	}
+	if !hasRoundHold {
+		t.Fatalf("gate reasons missing round_hold: %v", v1.Reasons)
+	}
+
+	// Verify isRoundHoldActive also considers it active
+	if !s.isRoundHoldActive(context.Background(), r, g.pull) {
+		t.Fatalf("isRoundHoldActive returned false with stale comment, want true")
+	}
+
+	// Post a fresh release comment after the hold was created
+	g.issueComments = append(g.issueComments, github.IssueComment{
+		User: github.PullUser{Login: "operator", Type: "User"},
+		Body: "Mergewake-Round-Hold: release",
+	})
+
+	// Now hold should be lifted
+	v2, err := s.mergeGate(context.Background(), r, g.pull, p, baseSHA)
+	if err != nil {
+		t.Fatalf("mergeGate err: %v", err)
+	}
+	for _, reason := range v2.Reasons {
+		if strings.Contains(reason, "round_hold") {
+			t.Fatalf("gate still has round_hold after fresh release: %v", v2.Reasons)
+		}
+	}
+	if s.isRoundHoldActive(context.Background(), r, g.pull) {
+		t.Fatalf("isRoundHoldActive returned true after fresh release, want false")
+	}
+}

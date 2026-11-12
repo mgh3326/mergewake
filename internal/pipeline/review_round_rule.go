@@ -34,11 +34,12 @@ type roundRuleState struct {
 	Round3At            time.Time `json:"round3_at,omitzero"`
 
 	// Round 5
-	Round5Held       bool      `json:"round5_held,omitempty"`
-	Round5EventSent  bool      `json:"round5_event_sent,omitempty"`
-	Round5Released   bool      `json:"round5_released,omitempty"`
-	Round5ReleasedBy string    `json:"round5_released_by,omitempty"`
-	Round5At         time.Time `json:"round5_at,omitzero"`
+	Round5Held         bool      `json:"round5_held,omitempty"`
+	Round5EventSent    bool      `json:"round5_event_sent,omitempty"`
+	Round5Released     bool      `json:"round5_released,omitempty"`
+	Round5ReleasedBy   string    `json:"round5_released_by,omitempty"`
+	Round5At           time.Time `json:"round5_at,omitzero"`
+	Round5CommentCount int       `json:"round5_comment_count,omitempty"`
 }
 
 func (s *Service) roundRuleFile(repo string, pr int) string {
@@ -296,8 +297,8 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		return false
 	}
 	comments, err := s.issueComments(ctx, r.Name, pr.Number)
-	if err == nil {
-		if released, by := checkRoundHoldRelease(comments, s.Config.Review.Login); released {
+	if err == nil && len(comments) > st.Round5CommentCount {
+		if released, by := checkRoundHoldRelease(comments[st.Round5CommentCount:], s.Config.Review.Login); released {
 			st.Round5Released = true
 			st.Round5ReleasedBy = by
 			_ = s.saveRoundRuleState(r.Name, pr.Number, st)
@@ -311,24 +312,19 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, v *gateVerdict) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
-	if !st.Round5Held && !(rounds >= 5 && open) {
-		return false
-	}
-	comments, _ := s.issueComments(ctx, r.Name, pr.Number)
-	if released, by := checkRoundHoldRelease(comments, s.Config.Review.Login); released {
-		if !st.Round5Released {
-			st.Round5Released = true
-			st.Round5ReleasedBy = by
-			_ = s.saveRoundRuleState(r.Name, pr.Number, st)
-		}
-		return false
-	}
 
-	if st.Round5Held || (rounds >= 5 && open) {
-		if !st.Round5Held {
-			st.Round5Held = true
-			st.Round5At = s.now().UTC()
-			_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+	if st.Round5Held {
+		if st.Round5Released {
+			return false
+		}
+		comments, err := s.issueComments(ctx, r.Name, pr.Number)
+		if err == nil && len(comments) > st.Round5CommentCount {
+			if released, by := checkRoundHoldRelease(comments[st.Round5CommentCount:], s.Config.Review.Login); released {
+				st.Round5Released = true
+				st.Round5ReleasedBy = by
+				_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+				return false
+			}
 		}
 		v.Reasons = append(v.Reasons, "round_hold")
 		v.Review.Block = "round_hold"
@@ -336,6 +332,21 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 		v.State = "blocked"
 		return true
 	}
+
+	if rounds >= 5 && open {
+		comments, _ := s.issueComments(ctx, r.Name, pr.Number)
+		st.Round5Held = true
+		st.Round5At = s.now().UTC()
+		st.Round5CommentCount = len(comments)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+
+		v.Reasons = append(v.Reasons, "round_hold")
+		v.Review.Block = "round_hold"
+		v.Review.Hold = "round_hold"
+		v.State = "blocked"
+		return true
+	}
+
 	return false
 }
 
