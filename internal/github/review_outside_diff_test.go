@@ -129,6 +129,31 @@ func TestPostReviewBodyUnchangedWithoutOutsideFindings(t *testing.T) {
 	}
 }
 
+// Bodies posted before advisory outside findings carried the ", advisory"
+// tag list them with a bare severity, so they parse back as blocking and
+// outnumber the marker's count. The parsed set is then unusable — the pass
+// keeps only the opaque count rather than tracking findings the receipt
+// never held.
+func TestOutsideUnmarkedAdvisoryFallsBackToCount(t *testing.T) {
+	body := "<!-- mergewake-review:" + testSHA + " -->\n" +
+		"One independent diff-only pass.\n\n" +
+		"Outside the diff (these paths or lines are not changed by this PR; critical and high hold the merge):\n" +
+		"- `docs/a.md:3` (high): an advisory finding the old body did not mark\n" +
+		"- `docs/b.md:5` (high): a real blocking finding\n" +
+		OutsideMarker + "1 -->"
+	b, _ := json.Marshal(body)
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id":1,"body":%s,"commit_id":%q,"state":"COMMENTED","user":{"login":"review-bot"}}]`, b, testSHA)
+	})
+	history, err := c.ReviewHistory(context.Background(), "example/project", 7, "review-bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].OutsideBlocking != 1 || len(history[0].Outside) != 0 {
+		t.Fatalf("history=%+v", history)
+	}
+}
+
 func TestOutsideDiffBodyIsBounded(t *testing.T) {
 	var findings []Finding
 	for i := 0; i < 50; i++ {

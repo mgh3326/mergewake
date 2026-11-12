@@ -54,11 +54,13 @@ type outsideFinding struct {
 // A finding stays open until a settled later head does not report it again:
 // settled means the head is not the gated one, or the gated head's own review
 // completed (settledCurrent). A settling pass could only stay silent on a
-// finding it was shown — round counting puts every finding still open into
-// later rounds' prompts — and a pass that predates round counting (Round 0)
-// or a first-round whole-diff fallback never saw the list, so it cannot
-// re-review anything away. Terminal states are sticky: once answered or
-// re-reviewed, a later report of the same ref does not reopen it.
+// finding it was shown — the prompt lists every finding still open and the
+// pass receipt records which refs it rendered — so only a ref in a pass's
+// OutsideShown can be re-reviewed away. Passes posted before outside findings
+// entered prompts carry no OutsideShown and can clear nothing, and neither
+// can a pass whose context budget dropped the finding. Terminal states are
+// sticky: once answered or re-reviewed, a later report of the same ref does
+// not reopen it.
 func foldOutside(history []github.ReviewedPass, head, patch, inherited string, settledCurrent bool) []outsideFinding {
 	var order []string
 	groups := map[string][]github.ReviewedPass{}
@@ -77,13 +79,13 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 		settled := !current || settledCurrent
 		reported := map[string]github.OutsideFinding{}
 		var repOrder []string
-		canClear := false
+		shown := map[string]bool{}
 		for _, p := range passes {
 			if current && patch != "" && p.Patch != patch {
 				continue
 			}
-			if p.Round > 1 {
-				canClear = true
+			for _, ref := range strings.Fields(p.OutsideShown) {
+				shown[ref] = true
 			}
 			for _, f := range p.Outside {
 				if !f.Blocking() {
@@ -102,10 +104,11 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 				out[idx].Head = h
 			}
 		}
-		// A settled review that does not report an open finding re-reviews it.
-		if settled && canClear {
+		// A settled review that does not report an open finding re-reviews it,
+		// but only a finding one of its passes was actually shown.
+		if settled {
 			for ref, idx := range open {
-				if _, ok := reported[ref]; !ok {
+				if _, ok := reported[ref]; !ok && shown[ref] {
 					out[idx].State = outsideReviewed
 					out[idx].Via = "rereview"
 					closed[ref] = true
@@ -175,11 +178,37 @@ func outsideNames(comment string, f outsideFinding) bool {
 	if strings.Contains(comment, f.Ref) {
 		return true
 	}
-	if f.Path != "" && f.Line > 0 && strings.Contains(comment, f.Path+":"+strconv.Itoa(f.Line)) {
+	if f.Path != "" && f.Line > 0 && outsidePathLine(comment, f.Path, f.Line) {
 		return true
 	}
 	title := outsideTitle(f.Body)
 	return utf8.RuneCountInString(title) >= 12 && strings.Contains(comment, title)
+}
+
+// outsidePathLine reports whether comment carries "path:line" as a whole
+// token: not glued to more path on the left ("xdocs/a.go:3") nor to more of
+// the number or a word on the right ("docs/a.go:30", "docs/a.go:3x").
+func outsidePathLine(comment, path string, line int) bool {
+	needle := path + ":" + strconv.Itoa(line)
+	for at := 0; at+len(needle) <= len(comment); {
+		i := strings.Index(comment[at:], needle)
+		if i < 0 {
+			return false
+		}
+		i += at
+		end := i + len(needle)
+		leftOK := i == 0 || !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-", rune(comment[i-1]))
+		rightOK := end == len(comment) || !isNameByte(comment[end])
+		if leftOK && rightOK {
+			return true
+		}
+		at = i + 1
+	}
+	return false
+}
+
+func isNameByte(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b == '_'
 }
 
 // outsideAnswerable is the person check an answer needs: not a bot, and not
@@ -241,8 +270,8 @@ func outsidePriorItems(open []outsideFinding) []priorItem {
 		}
 		out = append(out, priorItem{
 			path: f.Path, line: f.Line, severity: f.Severity,
-			finding: excerpt(f.Body, excerptLimit), outside: true,
-			disposition: priorOpen,
+			outside: true, ref: f.Ref,
+			finding: excerpt(f.Body, excerptLimit), disposition: priorOpen,
 		})
 	}
 	return out

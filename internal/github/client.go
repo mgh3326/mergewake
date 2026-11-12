@@ -710,6 +710,12 @@ type PassReceipt struct {
 	// AnsweredContext counts the already-answered findings the prompt carried,
 	// so the effect of that context can be measured later.
 	AnsweredContext int `json:"answered_context"`
+	// OutsideShown lists the refs of the open outside-diff findings the
+	// prompt actually rendered, space separated — a string keeps
+	// PassReceipt comparable. Only a pass shown a finding may later stay
+	// silent on it as a re-review; passes posted before the list entered
+	// prompts carry none and can clear nothing.
+	OutsideShown string `json:"outside_shown,omitempty"`
 	// Executor names a non-default pass executor ("panewire"); Fallback records
 	// why a configured panewire pass ran headless instead.
 	Executor string `json:"executor,omitempty"`
@@ -815,6 +821,18 @@ func OutsideBlockingCount(findings []Finding) int {
 	n := 0
 	for _, f := range findings {
 		if f.Anchor == AnchorOutside && blockingFinding(f.Severity) && !f.Advisory {
+			n++
+		}
+	}
+	return n
+}
+
+// blockingOutside counts the parsed outside-diff findings the gate would
+// hold on.
+func blockingOutside(findings []OutsideFinding) int {
+	n := 0
+	for _, f := range findings {
+		if f.Blocking() {
 			n++
 		}
 	}
@@ -992,6 +1010,14 @@ func passesFrom(reviews []Review, login string) ([]ReviewedPass, error) {
 		if all := outsideCount.FindAllStringSubmatch(r.Body, -1); len(all) > 0 && strings.HasSuffix(r.Body, all[len(all)-1][0]) {
 			pass.OutsideBlocking, _ = strconv.Atoi(all[len(all)-1][1])
 			pass.Outside = parseOutsideFindings(r.Body)
+			// Bodies from before advisory outside findings carried the
+			// ", advisory" tag list them with a bare severity, so they parse
+			// as blocking and outnumber the marker's count. The parsed set
+			// is then unusable: fall back to the opaque count, which keeps
+			// its current-head-only semantics.
+			if blockingOutside(pass.Outside) > pass.OutsideBlocking {
+				pass.Outside = nil
+			}
 		}
 		out = append(out, pass)
 	}

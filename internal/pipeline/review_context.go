@@ -45,8 +45,9 @@ type answeredItem struct {
 // reviewContext is the PR-specific text a reviewer sees ahead of the diff.
 type reviewContext struct {
 	text      string
-	answered  int // answered findings included in text
-	prior     int // earlier-round findings included in text
+	answered  int      // answered findings included in text
+	prior     int      // earlier-round findings included in text
+	outside   []string // refs of outside-diff findings text actually rendered
 	truncated bool
 }
 
@@ -282,7 +283,10 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 	// fits reserves room for the truncation notice so the bound holds with it.
 	fits := func(entry string) bool { return len(contextHeader)+b.Len()+len(entry)+120 <= contextBudget }
 	if rp.round > 1 && own != "" {
-		items := append(priorFindings(fb, own), outsidePriorItems(outside)...)
+		// Outside-diff findings lead: they hold the merge gate, so the
+		// context budget drops thread priors before them.
+		outsideItems := outsidePriorItems(outside)
+		items := append(outsideItems, priorFindings(fb, own)...)
 		if len(items) > 0 {
 			fmt.Fprintf(&b, "PRIOR FINDINGS (rounds 1-%d of this PR, newest first), each with its disposition. Do not reopen, restate or re-rank any of them. Raise one again only if a line changed in the diff below gives new evidence, and then quote the disposition you dispute. A finding marked \"none yet\" is still open: do not repeat it.\n", rp.round-1)
 			used, disposed := 0, 0
@@ -303,6 +307,9 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 				}
 				b.WriteString(entry)
 				used++
+				if i < len(outsideItems) {
+					rc.outside = append(rc.outside, outsideItems[i].ref)
+				}
 				if it.disposition != priorOpen {
 					disposed++
 				}
