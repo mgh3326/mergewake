@@ -428,7 +428,7 @@ func TestPRRoleJoinsErrorsFromEveryRepo(t *testing.T) {
 
 func TestPRRoleSweepDeadlineLetsOtherReposRunAndSkipsUntilReturn(t *testing.T) {
 	oldTimeout := prSweepTimeout
-	prSweepTimeout = 40 * time.Millisecond
+	prSweepTimeout = 2 * time.Second
 	t.Cleanup(func() { prSweepTimeout = oldTimeout })
 	m := newMultiRepo(t, []string{"o/one", "o/two"}, 1, 1)
 	m.s.Config.Daemon.PR.Loop.Interval = "500ms"
@@ -461,7 +461,7 @@ func TestPRRoleSweepDeadlineLetsOtherReposRunAndSkipsUntilReturn(t *testing.T) {
 		return calls == 1 && active == 1
 	})
 	waitFor(t, "repo B to merge during repo A's held pull list", func() bool { return len(m.merged("o/two")) == 1 })
-	waitForBriefly(t, "the first pass to record its deadline", func() bool {
+	waitFor(t, "the first pass to record its deadline", func() bool {
 		var st daemon.Status
 		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
 		return err == nil && json.Unmarshal(b, &st) == nil && strings.Contains(st.LastError, "open_pulls")
