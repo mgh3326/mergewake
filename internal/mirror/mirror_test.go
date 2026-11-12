@@ -150,8 +150,37 @@ func TestFetchPublishesBranchesAndPRHeads(t *testing.T) {
 	if !strings.Contains(text, "diff --git a/f b/f") || !strings.Contains(text, "+head") {
 		t.Fatalf("diff does not describe the change:\n%s", text)
 	}
+	if !strings.HasSuffix(text, "\n") {
+		t.Fatalf("diff lost its final newline: %q", text)
+	}
 	if st := m.Stats(); st.Fetches != 1 || st.Failures != 0 {
 		t.Fatalf("stats = %+v", st)
+	}
+}
+
+// A patch's final newline and trailing spaces are part of what the shadow
+// compare hashes; Diff must return git's bytes untouched.
+func TestDiffKeepsTrailingWhitespace(t *testing.T) {
+	origin, work, base, _ := seedOrigin(t)
+	if e := os.WriteFile(filepath.Join(work, "f"), []byte("head   \n"), 0o644); e != nil {
+		t.Fatal(e)
+	}
+	gitAt(t, work, "commit", "-am", "trailing")
+	head := gitAt(t, work, "rev-parse", "HEAD")
+	gitAt(t, work, "push", origin, "feat/thing", "HEAD:refs/pull/7/head")
+	m := realMirror(t, origin)
+	if e := m.Fetch(context.Background(), "o/r"); e != nil {
+		t.Fatalf("fetch: %v", e)
+	}
+	text, reason, e := m.Diff(context.Background(), "o/r", base, head)
+	if e != nil || reason != "" {
+		t.Fatalf("diff: %v reason=%q", e, reason)
+	}
+	if !strings.HasSuffix(text, "\n") {
+		t.Fatalf("diff lost its final newline: %q", text)
+	}
+	if !strings.Contains(text, "+head   \n") {
+		t.Fatalf("diff lost a line's trailing spaces:\n%s", text)
 	}
 }
 

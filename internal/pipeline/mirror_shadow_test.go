@@ -81,13 +81,24 @@ func shadowOrigin(t *testing.T, edit func(work, base string) string) (origin, wo
 	return origin, work, base, head
 }
 
+// gitRaw is git's stdout untouched: GitHub's diff body keeps its final newline
+// and any trailing spaces, so a fixture that trims them is not the API's text.
+func gitRaw(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	b, e := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	if e != nil {
+		t.Fatalf("git %v: %v", args, e)
+	}
+	return string(b)
+}
+
 func TestMirrorShadowEqual(t *testing.T) {
 	origin, work, base, head := shadowOrigin(t, nil)
 	m := shadowMirror(t, origin, integrations.Exec{})
 	if e := m.Fetch(context.Background(), shadowRepo); e != nil {
 		t.Fatalf("fetch: %v", e)
 	}
-	api := gitAt(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
+	api := gitRaw(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
 	var logs bytes.Buffer
 	s := &Service{GH: &fakeGH{pull: shadowPull(base, head)}, Mirror: m, Log: slog.New(slog.NewJSONHandler(&logs, nil))}
 	s.ShadowDiff(context.Background(), shadowRepo, 7, api)
@@ -115,7 +126,7 @@ func TestMirrorShadowRenameMismatch(t *testing.T) {
 		t.Fatalf("fetch: %v", e)
 	}
 	// GitHub did not detect the rename; the mirror's git did.
-	api := gitAt(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base+"..."+head)
+	api := gitRaw(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base+"..."+head)
 	s := &Service{GH: &fakeGH{pull: shadowPull(base, head)}, Mirror: m}
 	s.ShadowDiff(context.Background(), shadowRepo, 7, api)
 	st := s.ShadowStats()
@@ -228,7 +239,7 @@ func TestDiffReturnsBeforeShadowCompare(t *testing.T) {
 	if e := m.Fetch(context.Background(), shadowRepo); e != nil {
 		t.Fatalf("fetch: %v", e)
 	}
-	api := gitAt(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
+	api := gitRaw(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
 	gh := shadowAPI(t, api, base, head)
 	s := &Service{GH: gh, Mirror: m}
 	gh.DiffObserver = s.ShadowDiff
@@ -281,7 +292,7 @@ func TestMirrorFetchTimeoutLeavesDiffUnaffected(t *testing.T) {
 	if e := m.Fetch(context.Background(), shadowRepo); e != nil {
 		t.Fatalf("fetch: %v", e)
 	}
-	api := gitAt(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
+	api := gitRaw(t, work, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base+"..."+head)
 	gh := shadowAPI(t, api, base, head)
 	s := &Service{GH: gh, Mirror: m}
 	gh.DiffObserver = s.ShadowDiff

@@ -407,7 +407,7 @@ func (m *Mirror) Diff(ctx context.Context, repo, base, head string) (text, reaso
 		}
 		return "", "missing object", nil
 	}
-	text, e = m.out(ctx, path, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", mergeBase+"..."+head)
+	text, e = m.raw(ctx, path, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", mergeBase+"..."+head)
 	if e != nil {
 		if ctx.Err() != nil {
 			return "", "timeout", nil
@@ -425,11 +425,18 @@ func (m *Mirror) has(ctx context.Context, path, sha string) bool {
 	return e == nil
 }
 
-// out runs one read-only git command in the mirror and returns its trimmed
-// output. The token is not part of it: only a fetch needs the App credential.
+// out is raw with the output trimmed, for a value read on one line.
 func (m *Mirror) out(ctx context.Context, path string, args ...string) (string, error) {
+	s, e := m.raw(ctx, path, args...)
+	return strings.TrimSpace(s), e
+}
+
+// raw is out without trimming: a patch's final newline and trailing spaces are
+// part of what the shadow compare hashes, so the diff must come through as git
+// wrote it.
+func (m *Mirror) raw(ctx context.Context, path string, args ...string) (string, error) {
 	b, e := m.run.RunEnv(ctx, "git", append([]string{"-C", path}, args...), "", "", m.env(""))
-	return strings.TrimSpace(string(b)), e
+	return string(b), e
 }
 
 // env is the environment one git command runs with: the parent environment
