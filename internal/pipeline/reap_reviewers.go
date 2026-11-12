@@ -90,6 +90,10 @@ func reviewerStream(v reapReceipt) string {
 	return v.Host + "\x00" + v.Worktree
 }
 
+// reviewerCheckoutTTL: a checkout no pane uses is revisited until its label is
+// this old, then released even if its job never reached a terminal state.
+const reviewerCheckoutTTL = 24 * time.Hour
+
 const (
 	// reviewerPathUnknown is the terminal reason of a remote worktree whose path
 	// no record names: the host's own sweep owns it from here.
@@ -305,6 +309,11 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 		w.visit(ctx, c)
 	}
+	if acting {
+		if e := s.reviewerDailySummary(r.Name, receipts, hosts, s.now()); e != nil {
+			w.errs = append(w.errs, e)
+		}
+	}
 	return w.errs
 }
 
@@ -364,7 +373,14 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		return
 	}
 	job, e := w.jobs.Job(ctx, l.name)
+	// A label no pane uses is revisited on its own: an ended job, or a label
+	// older than reviewerCheckoutTTL, releases the checkout it holds.
+	unused := c.seen == nil
+	aged := unused && !l.started.Add(reviewerCheckoutTTL).After(w.now)
 	switch {
+	case errors.Is(e, integrations.ErrJobNotFound) && aged:
+		w.removeLocal(ctx, l)
+		return
 	case errors.Is(e, integrations.ErrJobNotFound):
 		w.record(gate, "kept", "job-record-missing")
 		return
@@ -380,8 +396,12 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		}
 		job.State = "completed"
 	}
+	held := job.State != "completed" && !w.abandoned[l.name]
+	if held && unused && (job.State == "escalated" || job.State == "lost" || aged) {
+		held = false
+	}
 	switch {
-	case job.State != "completed" && !w.abandoned[l.name]:
+	case held:
 		st := job.State
 		if st == "" {
 			st = "unknown"
