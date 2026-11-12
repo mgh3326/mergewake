@@ -253,7 +253,11 @@ func TestFetchErrorRedactsTheToken(t *testing.T) {
 	var logs bytes.Buffer
 	runner := &fakeRunner{run: func(ctx context.Context, args []string) ([]byte, error) {
 		if slices.Contains(args, "fetch") {
-			return nil, errors.New("fatal: unable to access https://x-access-token:" + token + "@example.invalid/o/r.git")
+			return nil, &integrations.CommandError{
+				Command: "git",
+				Err:     errors.New("exit status 128"),
+				Stderr:  "fatal: unable to access https://x-access-token:" + token + "@example.invalid/o/r.git",
+			}
 		}
 		return nil, nil
 	}}
@@ -271,6 +275,9 @@ func TestFetchErrorRedactsTheToken(t *testing.T) {
 	}
 	if strings.Contains(e.Error(), token) {
 		t.Fatalf("token in error text: %v", e)
+	}
+	if !strings.Contains(e.Error(), "exit status 128") {
+		t.Fatalf("error lost the command detail: %v", e)
 	}
 	if strings.Contains(logs.String(), token) {
 		t.Fatalf("token in log line: %s", logs.String())
