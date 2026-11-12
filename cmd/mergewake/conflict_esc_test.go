@@ -50,15 +50,15 @@ func (n *escRecorder) counts() (tries int, escs []integrations.Event) {
 	return n.tries, append([]integrations.Event(nil), n.escs...)
 }
 
-// wantEngineEscs checks that want ESCs reached the desk for PR 1.
-func wantEngineEscs(t *testing.T, n *escRecorder, want int) {
+// wantEngineEscs checks that a conflict ESC reached its expected author or owner lane.
+func wantEngineEscs(t *testing.T, n *escRecorder, want int, lane string) {
 	t.Helper()
 	tries, escs := n.counts()
 	if len(escs) != want {
 		t.Fatalf("%d conflict ESCs (%d attempted), want %d: %+v", len(escs), tries, want, escs)
 	}
 	for _, e := range escs {
-		if e.Lane != "desk" || e.Type != "decision" || !strings.Contains(e.Text, "o/one#1 ") || !strings.Contains(e.Text, "conflict") {
+		if e.Lane != lane || e.Type != "decision" || !strings.Contains(e.Text, "o/one#1 ") || !strings.Contains(e.Text, "conflict") {
 			t.Fatalf("ESC %+v", e)
 		}
 	}
@@ -85,12 +85,12 @@ func TestConflictEscEngineHeldReview(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "desk")
 	if strings.Contains(f.out.String(), `"command":"pr-notify`) {
 		t.Fatalf("a held review reached settlePR: %s", f.out)
 	}
 	runSkippedPass(t, f, skips, logs)
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "desk")
 }
 
 // (B2, pending and quota) A conflicting PR whose reviewer is still running,
@@ -114,7 +114,7 @@ func TestConflictEscEnginePendingAndQuotaReview(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "fixture-lane")
 
 	reset := now.Add(10 * time.Minute)
 	f.hub.mu.Lock()
@@ -125,7 +125,7 @@ func TestConflictEscEnginePendingAndQuotaReview(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "fixture-lane")
 }
 
 // (B3) A conflicting draft gets its ESC and no reviewer. Marked ready, it gets
@@ -148,7 +148,7 @@ func TestConflictEscEngineDraftThenReady(t *testing.T) {
 	if runner.count() != 0 {
 		t.Fatalf("a draft got %d reviewers", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "fixture-lane")
 
 	f.hub.mu.Lock()
 	f.hub.draft = false
@@ -157,7 +157,7 @@ func TestConflictEscEngineDraftThenReady(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d once ready, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "fixture-lane")
 }
 
 // reviewsOf counts the reviewer starts for PR pr in a fixture trace.
@@ -183,19 +183,19 @@ func TestConflictEscEngineNewHeadReviewedAfterEsc(t *testing.T) {
 			n := &escRecorder{trace: f.trace, refuse: refuse}
 			f.s.Notifier = n
 
-			if err := <-f.poll(context.Background()); err != nil && !strings.Contains(err.Error(), "land") {
+			if err := <-f.poll(context.Background()); err != nil && !strings.Contains(err.Error(), "land") && !(refuse && strings.Contains(err.Error(), "conflict ESC")) {
 				t.Fatal(err)
 			}
 			if got := reviewsOf(f.trace.snapshot(), 1); got != 1 {
 				t.Fatalf("%d reviews of the conflicting head, want 1: %q", got, f.trace.snapshot())
 			}
 			if refuse {
-				wantEngineEscs(t, n, 0)
+				wantEngineEscs(t, n, 0, "desk")
 				if tries, _ := n.counts(); tries == 0 || !strings.Contains(f.out.String(), `"command":"conflict-esc-failed"`) {
 					t.Fatalf("a refused ESC was not attempted and audited (tries %d): %s", tries, f.out)
 				}
 			} else {
-				wantEngineEscs(t, n, 1)
+				wantEngineEscs(t, n, 1, "desk")
 			}
 
 			f.hub.mu.Lock()
@@ -209,9 +209,9 @@ func TestConflictEscEngineNewHeadReviewedAfterEsc(t *testing.T) {
 				t.Fatalf("%d reviews after the push, want 2 (the new head reviewed): %q", got, f.trace.snapshot())
 			}
 			if refuse {
-				wantEngineEscs(t, n, 0)
+				wantEngineEscs(t, n, 0, "desk")
 			} else {
-				wantEngineEscs(t, n, 1)
+				wantEngineEscs(t, n, 1, "desk")
 			}
 		})
 	}
@@ -242,7 +242,7 @@ func TestConflictEscEngineListedBot(t *testing.T) {
 	s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: n, Out: out, Now: func() time.Time { return now }}
 	pass := func(what string) {
 		t.Helper()
-		if err := pollPRs(context.Background(), s, gh, repo, pipeline.Options{}); err != nil && strings.Contains(err.Error(), "conflict ESC") {
+		if err := pollPRs(context.Background(), s, gh, repo, pipeline.Options{}); err != nil && !strings.Contains(err.Error(), "conflict ESC") {
 			t.Fatalf("%s: %v", what, err)
 		}
 	}
@@ -263,11 +263,14 @@ func TestConflictEscEngineListedBot(t *testing.T) {
 	now = now.Add(time.Hour)
 	pass("later pass")
 	_, escs := n.counts()
-	if len(escs) != 1 {
-		t.Fatalf("%d ESCs accepted for the listed bot PR, want 1: %+v", len(escs), escs)
+	if len(escs) != 2 {
+		t.Fatalf("%d ESCs accepted for the listed bot PR, want author and delayed owner notices: %+v", len(escs), escs)
 	}
 	if e := escs[0]; e.Lane != "bot-lane" || e.Type != "decision" || !strings.Contains(e.Text, "o/one#1 ") || !strings.Contains(e.Text, "conflict") {
-		t.Fatalf("ESC %+v", e)
+		t.Fatalf("author ESC %+v", e)
+	}
+	if e := escs[1]; e.Lane != "desk" || e.Type != "decision" || !strings.Contains(e.Text, "remains conflicted") {
+		t.Fatalf("delayed owner ESC %+v", e)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -296,7 +299,7 @@ func TestConflictEscEngineQuotaStoppedWhenConflictAppears(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 0)
+	wantEngineEscs(t, n, 0, "fixture-lane")
 
 	reset := now.Add(10 * time.Minute)
 	f.hub.mu.Lock()
@@ -309,5 +312,5 @@ func TestConflictEscEngineQuotaStoppedWhenConflictAppears(t *testing.T) {
 	if runner.count() != 1 {
 		t.Fatalf("spawns=%d, want 1", runner.count())
 	}
-	wantEngineEscs(t, n, 1)
+	wantEngineEscs(t, n, 1, "fixture-lane")
 }
