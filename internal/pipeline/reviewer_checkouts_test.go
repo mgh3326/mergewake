@@ -118,14 +118,19 @@ func TestReviewerCheckoutRecordSurvivesRestart(t *testing.T) {
 
 // Each UTC day the pass writes one summary per host: checkouts removed and
 // kept (with reasons) on the day before. A second pass that day writes none.
+// Rows have the shapes the cleanup writers produce: reviewer-cleanup rows carry
+// no label (the worktree base is the label), name their host by machine id, or
+// name none. With no local host configured, the local fallback records "local".
 func TestReviewerCheckoutDailySummaryPerHost(t *testing.T) {
-	f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+	f := newReviewerFix(t)
 	f.run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
 	f.run.outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
 	yesterday := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
 	seedReapRows(t, f.s, testRepo.Name,
 		reapReceipt{Time: yesterday, Action: "reviewer-reap", Repo: testRepo.Name, PR: 11, Label: reviewerLabelFor(11, 30*time.Hour), Host: "local", Result: "removed"},
-		reapReceipt{Time: yesterday, Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Label: reviewerLabelFor(12, 30*time.Hour), Host: "local", Result: "kept", Reason: "job:running"},
+		reapReceipt{Time: yesterday, Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 12, Worktree: "/repo/" + reviewerLabelFor(12, 30*time.Hour), Host: "node-a", Result: "kept", Reason: "job:running"},
+		reapReceipt{Time: yesterday, Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 14, Worktree: "/repo/" + reviewerLabelFor(14, 30*time.Hour), Host: "node-a", Result: "removed"},
+		reapReceipt{Time: yesterday, Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 13, Worktree: "/repo/" + reviewerLabelFor(13, 30*time.Hour), Result: "pending-cleanup", Reason: "spawn ended before a pane result"},
 	)
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -134,22 +139,30 @@ func TestReviewerCheckoutDailySummaryPerHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	summaries := dailySummaries(t, f)
-	if len(summaries) != 2 {
+	if len(summaries) != 3 {
 		t.Fatalf("summaries (one per host, none on the second pass): %v", summaries)
 	}
 	byHost := map[string]map[string]any{}
 	for _, row := range summaries {
 		byHost[row["host"].(string)] = row
 	}
-	got := byHost["local"]
-	if got == nil || got["day"] != "2026-11-03" || got["removed"] != float64(1) || got["kept"] != float64(1) {
-		t.Fatalf("local summary: %v", got)
+	local := byHost["local"]
+	if local == nil || local["day"] != "2026-11-03" || local["removed"] != float64(1) || local["kept"] != float64(0) {
+		t.Fatalf("local summary: %v", local)
 	}
-	if reasons, _ := got["kept_reasons"].(map[string]any); reasons["job:running"] != float64(1) {
-		t.Fatalf("local summary reasons: %v", got)
-	}
-	if node := byHost["node"]; node == nil || node["removed"] != float64(0) || node["kept"] != float64(0) {
+	node := byHost["node"]
+	if node == nil || node["removed"] != float64(1) || node["kept"] != float64(1) {
 		t.Fatalf("node summary: %v", node)
+	}
+	if reasons, _ := node["kept_reasons"].(map[string]any); reasons["job:running"] != float64(1) {
+		t.Fatalf("node summary reasons: %v", node)
+	}
+	unattributed := byHost["unattributed"]
+	if unattributed == nil || unattributed["kept"] != float64(1) {
+		t.Fatalf("unattributed summary: %v", unattributed)
+	}
+	if reasons, _ := unattributed["kept_reasons"].(map[string]any); reasons["spawn ended before a pane result"] != float64(1) {
+		t.Fatalf("unattributed summary reasons: %v", unattributed)
 	}
 }
 
