@@ -79,8 +79,8 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 				s.Log.Warn("round-hold review feedback failed", "pr", n, "error", fbErr)
 			}
 		} else {
-			if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil && s.Log != nil {
-				s.Log.Warn("round-hold decision notify failed", "pr", n, "error", err)
+			if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil {
+				s.roundHoldNotifyFailed(r, pr, v.Review.Rounds, err, o)
 			}
 		}
 	}

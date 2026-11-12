@@ -13,11 +13,41 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
+
+// roundHoldNotifyDetailLimit bounds the detail of a failed decision notify in
+// the log and the audit.
+const roundHoldNotifyDetailLimit = 512
+
+// roundHoldNotifyDetail is a failed notify's error with panewire's stderr,
+// redacted, as one line of at most roundHoldNotifyDetailLimit bytes. The
+// stderr is the reason panewire refused the event; CommandError keeps it out
+// of its own message.
+func roundHoldNotifyDetail(err error) string {
+	detail := err.Error()
+	var ce *integrations.CommandError
+	if errors.As(err, &ce) && strings.TrimSpace(ce.Stderr) != "" {
+		detail += ": " + fleetevent.Redact(strings.TrimSpace(ce.Stderr))
+	}
+	return clip(strings.Join(strings.Fields(detail), " "), roundHoldNotifyDetailLimit)
+}
+
+// roundHoldNotifyFailed records a decision notify that panewire refused: the
+// log and one audit row. The event stays unsent, so a later pass sends it again.
+func (s *Service) roundHoldNotifyFailed(r config.Repo, pr github.Pull, rounds int, err error, o Options) {
+	detail := roundHoldNotifyDetail(err)
+	if s.Log != nil {
+		s.Log.Warn("round-hold decision notify failed", "pr", pr.Number, "error", detail)
+	}
+	if aerr := s.audit(r.Name, "round-hold-notify-failed", map[string]any{"pr": pr.Number, "round": rounds, "error": detail}, o.DryRun); aerr != nil && s.Log != nil {
+		s.Log.Warn("round-hold notify audit failed", "pr", pr.Number, "error", aerr)
+	}
+}
 
 // Round3Directive is sent to the author when round 3 (or configured consult round) ends without a pass.
 const Round3Directive = "stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause"
@@ -349,8 +379,25 @@ func (s *Service) designLane(ctx context.Context, r config.Repo, pr github.Pull)
 	return lane
 }
 
+// emitSafe replaces every control byte and rune (0x00-0x1f, 0x7f-0x9f) with a
+// space: panewire's `emit --text` refuses any of them with exit 2 (emit.go:
+// 481-491 at panewire 1b4d7b7), so a lane event's text is one line of printable
+// runes.
+func emitSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r <= 0x1f || (r >= 0x7f && r <= 0x9f) {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// panewireLaneName is panewire's --lane rule (hub_jobs.go:15 at 1b4d7b7). It
+// has no underscore, unlike laneName.
+var panewireLaneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
 func round5DecisionText(r config.Repo, pr github.Pull, rounds int, open []github.ReviewThread) string {
-	head := "<!-- mergewake-round-hold -->\n" + fmt.Sprintf("[mergewake] ESC %s#%d | round %d ended without a pass (%d open finding(s))", r.Name, pr.Number, rounds, len(open))
+	head := "<!-- mergewake-round-hold --> " + fmt.Sprintf("[mergewake] ESC %s#%d | round %d ended without a pass (%d open finding(s))", r.Name, pr.Number, rounds, len(open))
 	choices := " | choices: 1) cut the scope (the part that keeps drawing findings goes to a follow-up task, the rest merges) or 2) one SS consult on the design | reply with PR comment: Mergewake-Round-Hold: release"
 
 	var details strings.Builder
@@ -366,7 +413,7 @@ func round5DecisionText(r config.Repo, pr github.Pull, rounds int, open []github
 		}
 		details.WriteString(item)
 	}
-	text := head + details.String() + choices
+	text := emitSafe(head + details.String() + choices)
 	return clip(text, findingsLaneText)
 }
 
@@ -483,6 +530,10 @@ func (s *Service) sendRoundHoldDecision(ctx context.Context, r config.Repo, pr g
 	}
 
 	lane := s.designLane(ctx, r, pr)
+	if !panewireLaneName.MatchString(lane) {
+		// panewire refuses a lane outside its rule; the desk takes the event.
+		lane = s.deskLane()
+	}
 	text := round5DecisionText(r, pr, rounds, openThreads)
 	eventID := fmt.Sprintf("mergewake-round-hold-%s-%d-%d", r.Name, pr.Number, holdRound)
 
