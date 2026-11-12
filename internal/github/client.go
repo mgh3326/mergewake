@@ -51,6 +51,10 @@ type Client struct {
 	// files read through a commit) across passes and processes. Nil means every
 	// read goes to GitHub.
 	Objects ObjectCache
+	// DiffObserver, when set, is told each PR diff the API returned, on its own
+	// goroutine after the caller has its answer. It never changes or delays the
+	// result; it is the shadow path.
+	DiffObserver func(ctx context.Context, repo string, n int, diff string)
 	// HKTimeout bounds one hk review read; zero means the default.
 	HKTimeout time.Duration
 	hk        HKReviewSource
@@ -310,7 +314,14 @@ func (c *Client) Files(ctx context.Context, repo string, n int) ([]policy.File, 
 }
 func (c *Client) Diff(ctx context.Context, repo string, n int) (string, error) {
 	b, e := c.request(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), "application/vnd.github.diff", nil)
-	return string(b), e
+	text := string(b)
+	if e == nil && text != "" && c.DiffObserver != nil {
+		// The observer runs after this call returns: its work never delays the
+		// answer the caller reads, and its context carries the caller's values
+		// (the request memo) but not its cancellation.
+		go c.DiffObserver(context.WithoutCancel(ctx), repo, n, text)
+	}
+	return text, e
 }
 func (c *Client) Merge(ctx context.Context, repo string, n int, sha string) error {
 	var result struct {

@@ -156,6 +156,20 @@ func (a *appAuth) credential(ctx context.Context, c *Client, repo string) (crede
 	return credential{id: credApp + ":" + strconv.FormatInt(id, 10), kind: credApp, token: t.token, repo: repo, installation: id}, true
 }
 
+// AppToken returns the App installation token that serves reads of repo, or
+// false when the App cannot serve it. It never returns the user token: a
+// caller that needs App-only access (a mirror fetch) must not fetch at all.
+func (c *Client) AppToken(ctx context.Context, repo string) (string, bool) {
+	if c.app == nil {
+		return "", false
+	}
+	cred, ok := c.app.credential(ctx, c, repo)
+	if !ok || cred.kind != credApp || cred.token == "" {
+		return "", false
+	}
+	return cred.token, true
+}
+
 // fallingBack reports whether any repository currently reads with the user
 // token because the App could not serve it. It never waits on a token fetch.
 func (a *appAuth) fallingBack(now time.Time) bool {
