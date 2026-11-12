@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -179,7 +181,7 @@ func (s *Service) mergeCommit(ctx context.Context, r config.Repo, pr github.Pull
 // passRecord is the hk reviews[] record of one posted pass: what the pass
 // reviewed (head, base, patch), who produced it and how many findings of each
 // severity it posted. Fields mergewake does not know here stay empty.
-func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Finding, contractSource string, started, finished time.Time) integrations.ReviewRecord {
+func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Finding, contractSource string, started, finished time.Time, findingFacts ...[]integrations.ReviewFindingRecord) integrations.ReviewRecord {
 	rec := integrations.ReviewRecord{
 		ReviewedHead:   pr.Head.SHA,
 		ReviewedBase:   integrations.SHA(pr.Base.SHA),
@@ -208,6 +210,9 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 	if digest := patchDigest(receipt.Patch); digest != "" {
 		rec.PatchDigest = &digest
 	}
+	if len(findingFacts) > 0 {
+		rec.FindingFacts = slices.Clone(findingFacts[0])
+	}
 	for _, f := range findings {
 		switch f.Severity {
 		case "critical":
@@ -221,6 +226,77 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 		}
 	}
 	return rec
+}
+
+func roundFindingFacts(findings []github.Finding, earlier []github.ReviewThread, rp roundPlan) []integrations.ReviewFindingRecord {
+	added := diffAddedLocations(rp.addedAfterFirstDiff)
+	facts := make([]integrations.ReviewFindingRecord, 0, len(findings))
+	for _, f := range findings {
+		title := findingTitle(f.Body)
+		repeats := false
+		for _, thread := range earlier {
+			if len(thread.Comments) == 0 {
+				continue
+			}
+			priorTitle := findingTitle(stripFinding(thread.Comments[0].Body))
+			if (thread.Path == f.Path && thread.Line == f.Line) || (title != "" && strings.EqualFold(title, priorTitle)) {
+				repeats = true
+				break
+			}
+		}
+		facts = append(facts, integrations.ReviewFindingRecord{Path: f.Path, Line: f.Line, Title: title, AddedAfterFirst: rp.round > 1 && added[f.Path][f.Line], RepeatsEarlier: repeats})
+	}
+	return facts
+}
+
+func findingTitle(body string) string {
+	body = strings.TrimSpace(stripFinding(body))
+	return firstLine(body)
+}
+
+func diffAddedLocations(diff string) map[string]map[int]bool {
+	locations := map[string]map[int]bool{}
+	file := ""
+	line := 0
+	var hunk = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
+	for _, text := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(text, "diff --git ") {
+			file = ""
+			continue
+		}
+		if strings.HasPrefix(text, "+++ b/") {
+			file = strings.TrimPrefix(text, "+++ b/")
+			continue
+		}
+		if match := hunk.FindStringSubmatch(text); match != nil {
+			line, _ = strconv.Atoi(match[1])
+			continue
+		}
+		if file == "" || text == "" || strings.HasPrefix(text, "\\") {
+			continue
+		}
+		switch text[0] {
+		case '+':
+			if locations[file] == nil {
+				locations[file] = map[int]bool{}
+			}
+			locations[file][line] = true
+			line++
+		case ' ':
+			line++
+		case '-':
+		}
+	}
+	return locations
+}
+
+func (s *Service) auditRoundFindingFacts(repo string, pr, round int, facts []integrations.ReviewFindingRecord) error {
+	for _, fact := range facts {
+		if err := s.audit(repo, "review-round-finding", map[string]any{"pr": pr, "round": round, "path": fact.Path, "line": fact.Line, "title": fact.Title, "added_after_first_head": fact.AddedAfterFirst, "repeats_earlier_thread": fact.RepeatsEarlier}, false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stablePatchID is the part of a receipt's patch ("<git patch-id --stable>:

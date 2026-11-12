@@ -655,8 +655,11 @@ unavailable". The daemon's review retry backs off, runs the review again and
 so spawns a new reviewer pane, and escalates once after
 `daemon.pr.review_retry.failures` failures. A pane cut off by `review.timeout`
 records `review_deadline` instead, and a completed reviewer whose result was
-lost records `review-result-lost` and notifies the desk; both are retried the
-same way, with one difference: a lost result is mergewake's collection
+lost records `review-result-lost` and notifies the design lane once per cause
+incident; losses with the same cause within 10 minutes share one event, and
+each suppressed loss remains in the audit log. Exhausted retries still notify
+the repository owner lane through the normal review-failure escalation. Both
+are retried the same way, with one difference: a lost result is mergewake's collection
 failure, not the review's, so its retries back off without counting toward
 the escalation. A fresh pass whose completed record has no result, on the
 record or its host, is lost at once; a resumed one is replaced once by a new
@@ -709,7 +712,10 @@ For a blocked head, mergewake:
   head key in the comments of `review.login`;
 - emits one `decision` event per head and outcome to the repo's owner lane
   (`repos[].lane`), or to `notifier.fallback_lane` (else `notifier.lane`) when
-  the repo names none.
+  the repo names none. Missing-trailer and unknown-family notices go to the PR
+  author route once per PR and body, independent of head; each suppressed
+  repeat remains in the audit log. The owner lane hears only when the author
+  route is gone.
 
 mergewake takes no pass claim and writes no receipt or `-done` marker, so the
 merge gate reports `review_missing`. A block is not a review failure: it adds no
@@ -1269,7 +1275,7 @@ grades each thread by the author and severity of its first comment instead:
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
 | block | the thread is resolved, or a human reply (not the finding's author, not a bot; for a `review.login` finding, that login's own reply that is not itself a finding) carries a block disposition: it opens with `Fix`/`Fixed`/`Fixes` and names a commit that GitHub knows, that comes after the head the finding was posted on, and that is in the PR head's history; or it opens with `Dismiss`/`Dismissed`/`Dismissal` followed by its reason. The latest answer decides. An acknowledgement, a defer, a bare "Dismissed.", or a fix naming an unknown commit or one outside the PR does not clear it. A commit lookup GitHub cannot answer holds the verdict (an error) rather than passing or blocking it. Neither needs a new head. | `blocking_findings:<n>` |
-| triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason or a follow-up task reference, or the thread is resolved. Neither needs a new head. | `triage_unanswered:<n>` |
+| triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason, or `Disposition: defer <task id>` naming an existing hk task other than the PR's own task; or the thread is resolved. An own-task or missing-task defer is not accepted. Neither needs a new head. | `triage_unanswered:<n>` |
 | advisory | never holds and is not counted as unanswered. Threads from authors no rule names are advisory. | none |
 
 A thread answered with a disposition counts as answered whether or not it is
@@ -1856,8 +1862,9 @@ roles woken — never the body, the signature or other headers.
 
 Only enabled roles wake, and only for repositories in `repos`.
 
-`daemon.pr.notify` defaults to enabled and accepts `enabled`, `renotify_after`
-and `renotify_max` (the last two have no effect since READY is no longer sent).
+`daemon.pr.notify` defaults to enabled and accepts `enabled`, `renotify_after`,
+`renotify_max` and `conflict_owner_after` (`30m` by default). The renotify keys
+have no effect since READY is no longer sent.
 While the `pr` role runs, each poll runs the merge gate for every open,
 non-draft PR at its current head and sends one lane event for a BLOCKED verdict
 and records a READY one — the notify path observes rather than merges, so it
@@ -1888,11 +1895,12 @@ pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
 counts `ready_too_long` from. No READY reminder is sent; `renotify_after` and
 `renotify_max` are accepted and have no effect. The BLOCKED event
-lane is resolved in order — the choosing rule is recorded in the event text
-after `via`: a `Mergewake-Task` trailer read through the handoffkeep sink
-(the task's lane), a `Mergewake-Notify-Lane` trailer, then the
-configured `notifier.lane`. Both trailers are read from the PR body first and
-then the head commit message; a task-read error retries rather than rerouting.
+lane follows the PR author route used for review findings: the bound worker
+job, a live takeover pane, an explicit author lane, or the desk when the author
+is unknown. The owner lane gets one follow-up per PR only when the author route
+is gone or the same conflicting head remains for `conflict_owner_after`; a
+changed head restarts that timer. Each head's author notice and each suppressed
+owner follow-up have audit records. The conflict notice uses this same route.
 Set `notify: {enabled: false}` to silence the events; the key is rejected on
 other roles.
 
@@ -1970,35 +1978,22 @@ own ESC. The receipts live in `<state_dir>/<repo>/conflict-esc/<pr>.json`,
 read, decided, sent and written under a file lock, separate from the bounded
 `pr-notify-sent` ledger.
 
-Routing, in order: a valid `Mergewake-Notify-Lane` line in the PR body (one
-line, a valid lane name; the head commit is not read for it), else the current
-lane of the hk task the PR names (`Mergewake-Task`), else the desk
-(`notifier.fallback_lane`, else `notifier.lane`). Job lanes, author panes and
-`repos[].lane` are not used. A body lane needs no hk read; a failed task-lane
-read is retried at the next evaluation, never taken as "no task lane". After
-three task-lane reads that fail in a row (`task_halts` in the receipt), or 30
-minutes after the first of them, the task lane is skipped and the ESC goes to
-the desk as `desk (task lookup failed)`; a successful read resets both. The event
-is a `decision` whose text starts with `ESC` and names the PR, the short head,
-the conflict, what to do ("rebase or merge base, then push") and the lane and
-rule it went to. Each destination is written to the PR's state file, under
-the lock, before it is offered the ESC. While that pin stands the route is not
-read again: the pinned lane alone is offered, under the same event id, which
-panewire answers as delivered if it already took it. So an ESC a lane accepted
-just before the process died, or before its receipt could be written, goes to
-that lane again after a restart, even if the body or task lane changed
-meanwhile. A lane panewire refuses outright (`emit: invalid --lane`, nothing
-recorded) drops the pin and moves to the next destination, which is pinned in
-turn; any other failure keeps the pin. A head is recorded delivered only after
-a lane accepted it. When no destination takes it, the head stays pending with a
-doubling wait (1 to 30 minutes) and a `conflict-esc-failed` audit row; it is
-never parked. Each accepted ESC writes a `conflict-esc` audit row (repo, PR,
-head, lane, event id).
+Routing follows the same author route as review findings: a task-bound worker
+job, a live takeover pane, an explicit author lane, or the desk when the author
+is unknown. Each head's author event is recorded in the per-PR conflict state
+under a file lock and has a matching `conflict-esc` audit row. A repeat head is
+audit-only. If the author route is gone, the owner lane receives the one
+per-PR owner event immediately. Otherwise `conflict_owner_after` (default
+30m) starts when a conflicting head is first observed; a new head restarts the
+clock, and the owner hears once only if that same head still conflicts at the
+deadline. Later owner notices are audit-only. The event is a `decision` whose
+text names the PR, short head, conflict and rebase action. The event id stays
+stable across retries so an accepted delivery can be replayed without losing
+its destination. Delivery failures leave pending state and a
+`conflict-esc-failed` audit row.
 
 It honours `notify: {enabled: false}`; a dry run sends and records nothing;
-shadow mode sends. Whether the PR's owner (the worker or session that wrote it)
-is still alive is not detected: the ESC goes to the routed lane whether or not
-anyone is behind it.
+shadow mode sends.
 
 #### Overdue notice (`merge_overdue`)
 
@@ -2550,6 +2545,10 @@ policy is invalid and the error names `any_ref_deploy_checks`. Unset, the deploy
 stream judges candidates by `deploy_checks` as before. Adding the key while a
 deploy incident is recorded holds its confirmation with `the confirmation check
 set changed; rediagnose`.
+
+Main watch notifications are deduplicated by red episode, from the first held
+red main head until the next green main head. Later held heads remain in the
+audit log with no repeated lane event; a green main clears the episode key.
 
 When the newest head is red only on checks outside `any_ref_checks`, no commit
 can be shown green or red on them, so bisect would blame on partial evidence.

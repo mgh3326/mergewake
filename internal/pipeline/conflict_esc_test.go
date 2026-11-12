@@ -53,7 +53,7 @@ func (n *escNotifier) Notify(_ context.Context, e integrations.Event) error {
 	return nil
 }
 
-func isConflictEsc(e integrations.Event) bool { return strings.HasPrefix(e.Text, "ESC ") }
+func isConflictEsc(e integrations.Event) bool { return strings.Contains(e.ID, "-conflict-") }
 
 // escs are the conflict ESCs panewire accepted.
 func (n *escNotifier) escs() []integrations.Event {
@@ -88,7 +88,7 @@ func (n *escNotifier) others() []integrations.Event {
 	defer n.mu.Unlock()
 	var out []integrations.Event
 	for _, e := range n.accepted {
-		if !isConflictEsc(e) && e.Lane != overdueLeadLane {
+		if strings.Contains(e.ID, "-owner") == false && !isConflictEsc(e) && e.Lane != overdueLeadLane {
 			out = append(out, e)
 		}
 	}
@@ -187,7 +187,7 @@ func wantEsc(t *testing.T, e integrations.Event, lane, via, head string) {
 	if e.Lane != lane || e.Type != "decision" {
 		t.Fatalf("ESC lane=%q type=%q, want lane %q type decision: %+v", e.Lane, e.Type, lane, e)
 	}
-	for _, part := range []string{"example/project#7", "head=" + head[:7], "conflict", "rebase or merge base, then push", "lane=" + lane + " via " + via} {
+	for _, part := range []string{"example/project#7", "head=" + head[:7], "conflict", "rebase or merge base, then push", "lane=" + lane} {
 		if !strings.Contains(e.Text, part) {
 			t.Fatalf("ESC text %q lacks %q", e.Text, part)
 		}
@@ -212,7 +212,9 @@ func TestConflictEscReasonChurnSendsOncePerHead(t *testing.T) {
 	rig.notify(t)
 	rig.g.pull.Title = "Retitled while conflicting"
 	rig.notify(t)
-	rig.escalate(t)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
 	wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "desk", shaA)
 	wantTries(t, rig.n, 1)
 }
@@ -270,7 +272,9 @@ func TestConflictEscConcurrentAndRestart(t *testing.T) {
 // restart.
 func TestConflictEscSurvivesLedgerChurn(t *testing.T) {
 	rig := newEscRig(t)
-	rig.escalate(t)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
 	wantEscs(t, rig.n, 1)
 	ledger, e := loadSentKeys(filepath.Join(rig.s.state(rig.r.Name), "pr-notify-sent"), 255)
 	if e != nil {
@@ -291,16 +295,14 @@ func TestConflictEscSurvivesLedgerChurn(t *testing.T) {
 }
 
 // (A4) A force-push from A to B and back to A: A has its one ESC and B its
-// own. A's conflict flapping through UNKNOWN and clean back to conflict sends
-// nothing more, and UNKNOWN on a new head sends nothing.
+// own. The owner hears once per PR, even when another head later conflicts.
 func TestConflictEscHeadReturnAndFlap(t *testing.T) {
 	rig := newEscRig(t)
 	rig.escalate(t)
 	rig.g.pull.Head.SHA = shaB
 	rig.escalate(t)
-	escs := wantEscs(t, rig.n, 2)
-	wantEsc(t, escs[0], "desk", "desk", shaA)
-	wantEsc(t, escs[1], "desk", "desk", shaB)
+	escs := wantEscs(t, rig.n, 1)
+	wantEsc(t, escs[0], "desk", "owner lane", shaA)
 
 	rig.g.pull.Head.SHA = shaA
 	rig.escalate(t)
@@ -314,8 +316,8 @@ func TestConflictEscHeadReturnAndFlap(t *testing.T) {
 	rig.g.pull.Head.SHA = shaC
 	rig.mergeable(nil, "")
 	rig.escalate(t)
-	wantEscs(t, rig.n, 2)
-	wantTries(t, rig.n, 2)
+	wantEscs(t, rig.n, 1)
+	wantTries(t, rig.n, 1)
 }
 
 // (A5) The route changes after delivery — another body lane, then only a task
@@ -342,7 +344,9 @@ func TestConflictEscAmbiguousFailureRetriesSameLane(t *testing.T) {
 	rig := newEscRig(t)
 	rig.g.pull.Body = "Mergewake-Notify-Lane: lane-x\n"
 	rig.n.fail["lane-x"] = errors.New("panewire failed: signal: killed")
-	rig.escalate(t)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("author route failure was not returned")
+	}
 	wantTries(t, rig.n, 1)
 	wantEscs(t, rig.n, 0)
 	if rows := rig.rows(t, "conflict-esc-failed"); len(rows) != 1 {
@@ -351,7 +355,9 @@ func TestConflictEscAmbiguousFailureRetriesSameLane(t *testing.T) {
 
 	rig.g.pull.Body = "Mergewake-Notify-Lane: lane-y\n"
 	rig.after(2 * time.Minute)
-	rig.escalate(t)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("pinned author route failure was not returned")
+	}
 	wantTries(t, rig.n, 2)
 
 	delete(rig.n.fail, "lane-x")
@@ -373,7 +379,7 @@ func TestConflictEscInitialObservation(t *testing.T) {
 	rig.g.refs, rig.g.reviewed = map[string]bool{}, false
 	rig.g.ci = github.Pending
 	rig.notify(t)
-	wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "desk", shaA)
+	wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "owner lane", shaA)
 	if others := rig.n.others(); len(others) != 0 {
 		t.Fatalf("a second notice beside the ESC: %+v", others)
 	}
@@ -401,18 +407,19 @@ func TestConflictEscLeadPRBodyLane(t *testing.T) {
 	wantEsc(t, wantEscs(t, rig.n, 1)[0], "lead-l1", "notify-lane trailer", shaA)
 }
 
-// (B5) Every destination refuses: nothing is recorded as delivered, the
-// failure is audited and the head stays pending — across a restart — and a
-// later attempt, once the desk takes events again, delivers exactly one ESC.
+// A refused author lane stays pinned and retries there. After the author route
+// accepts, a persisted conflict produces one delayed owner follow-up.
 func TestConflictEscDeliveryRecovery(t *testing.T) {
 	rig := newEscRig(t)
 	rig.g.pull.Body = "Mergewake-Notify-Lane: gone-lane\n"
-	rig.n.refuse["gone-lane"], rig.n.refuse["desk"] = true, true
-	rig.escalate(t)
+	rig.n.refuse["gone-lane"] = true
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("refused author lane was not returned")
+	}
 	wantEscs(t, rig.n, 0)
-	wantTries(t, rig.n, 2)
-	if tries := rig.n.tries(); tries[0].Lane != "gone-lane" || tries[1].Lane != "desk" || tries[0].ID != tries[1].ID {
-		t.Fatalf("a refused lane did not move to the next destination under the same id: %+v", tries)
+	wantTries(t, rig.n, 1)
+	if tries := rig.n.tries(); tries[0].Lane != "gone-lane" {
+		t.Fatalf("refused lane was not the author route: %+v", tries)
 	}
 	if rows := rig.rows(t, "conflict-esc-failed"); len(rows) != 1 || rows[0]["head"] != shaA {
 		t.Fatalf("conflict-esc-failed rows: %+v", rows)
@@ -424,26 +431,31 @@ func TestConflictEscDeliveryRecovery(t *testing.T) {
 	// Inside the retry wait nothing is attempted.
 	rig.after(10 * time.Second)
 	rig.escalate(t)
-	wantTries(t, rig.n, 2)
+	wantTries(t, rig.n, 1)
 
-	// A restart keeps the head pending, and the next attempt fails again.
+	// A restart keeps the pinned author route, and the next attempt fails there.
 	rig.s = rig.restart()
 	rig.after(2 * time.Minute)
-	rig.escalate(t)
-	wantTries(t, rig.n, 4)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("pinned refusal was not returned")
+	}
+	wantTries(t, rig.n, 2)
 	wantEscs(t, rig.n, 0)
 
-	rig.n.refuse["desk"] = false
+	delete(rig.n.refuse, "gone-lane")
 	rig.after(5 * time.Minute)
 	rig.escalate(t)
-	wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "desk", shaA)
-	if rows := rig.rows(t, "conflict-esc"); len(rows) != 1 || rows[0]["lane"] != "desk" || rows[0]["head"] != shaA || rows[0]["event_id"] == nil {
+	wantEsc(t, wantEscs(t, rig.n, 1)[0], "gone-lane", "notify-lane trailer", shaA)
+	if rows := rig.rows(t, "conflict-esc"); len(rows) != 1 || rows[0]["lane"] != "gone-lane" {
 		t.Fatalf("conflict-esc rows: %+v", rows)
 	}
 	rig.after(time.Hour)
 	rig.escalate(t)
 	wantEscs(t, rig.n, 1)
-	wantTries(t, rig.n, 6)
+	wantTries(t, rig.n, 3)
+	if len(rig.n.accepted) != 2 || rig.n.accepted[1].Lane != rig.s.ownerLane(rig.r) {
+		t.Fatalf("owner follow-up = %+v", rig.n.accepted)
+	}
 }
 
 // (B6) Mergeability GitHub has not computed is neither a conflict nor a
@@ -464,19 +476,18 @@ func TestConflictEscUnknownSequence(t *testing.T) {
 
 	rig.n.refuse["desk"] = true
 	rig.conflict()
-	rig.escalate(t)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("refused owner route was not returned")
+	}
 	wantTries(t, rig.n, 1)
 	rig.after(10 * time.Second)
 	rig.mergeable(nil, "unknown")
 	rig.escalate(t)
-	rig.after(10 * time.Second)
+	rig.after(time.Minute)
 	rig.conflict()
+	delete(rig.n.refuse, "desk")
 	rig.escalate(t)
-	wantTries(t, rig.n, 1)
-
-	rig.n.refuse["desk"] = false
-	rig.after(2 * time.Minute)
-	rig.escalate(t)
+	wantTries(t, rig.n, 2)
 	wantEscs(t, rig.n, 1)
 	rig.mergeable(nil, "unknown")
 	rig.escalate(t)
@@ -570,7 +581,7 @@ func TestConflictEscRoutingPrecedence(t *testing.T) {
 	}{
 		{"body lane", "Mergewake-Task: 42\nMergewake-Notify-Lane: design-lane\n", "design-lane", "notify-lane trailer"},
 		{"task lane", "Mergewake-Task: 42\n", "task-lane", "task 42"},
-		{"desk", "", "desk", "desk"},
+		{"desk", "", "", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rig := newEscRig(t)
@@ -582,7 +593,15 @@ func TestConflictEscRoutingPrecedence(t *testing.T) {
 				recs:  map[string]integrations.JobRecord{"w-7": {State: "spawned", Role: "worker", Label: "worker-lane"}},
 			}
 			rig.escalate(t)
-			wantEsc(t, wantEscs(t, rig.n, 1)[0], tt.lane, tt.via, shaA)
+			route, err := rig.s.findingsRoute(context.Background(), rig.r, rig.g.pull)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lane := route.lane
+			if route.via == "unknown author; desk" {
+				lane = rig.s.ownerLane(rig.r)
+			}
+			wantEsc(t, wantEscs(t, rig.n, 1)[0], lane, route.via, shaA)
 		})
 	}
 }
@@ -606,7 +625,11 @@ func TestConflictEscBodyTrailerMatrix(t *testing.T) {
 			rig.g.messages = map[string]string{shaA: tt.commit}
 			rig.s.Sink = &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}}
 			rig.escalate(t)
-			wantEsc(t, wantEscs(t, rig.n, 1)[0], tt.lane, tt.via, shaA)
+			route, err := rig.s.findingsRoute(context.Background(), rig.r, rig.g.pull)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantEsc(t, wantEscs(t, rig.n, 1)[0], route.lane, route.via, shaA)
 		})
 	}
 }
@@ -632,17 +655,18 @@ func (s *hkDownSink) Job(context.Context, string) (integrations.JobRecord, error
 	return integrations.JobRecord{}, s.read()
 }
 
-// (C3) A valid body lane needs nothing else: no hk read, no commit read, even
-// when hk is down and the PR names a task.
-func TestConflictEscBodyLaneAvoidsHK(t *testing.T) {
+// Conflict routing uses findingsRoute, so an unreadable task binding holds
+// the notice instead of falling through to a body lane.
+func TestConflictEscUnreadableAuthorRouteWaits(t *testing.T) {
 	rig := newEscRig(t)
-	rig.g.pull.Body = "Mergewake-Task: 42\nMergewake-Notify-Lane: design-lane\n"
+	rig.g.pull.Body = "Mergewake-Task: 42\n"
 	sink := &hkDownSink{}
 	rig.s.Sink = sink
-	rig.escalate(t)
-	wantEsc(t, wantEscs(t, rig.n, 1)[0], "design-lane", "notify-lane trailer", shaA)
-	if sink.reads != 0 || rig.g.commitCalls != 0 {
-		t.Fatalf("a body-lane ESC read hk %d times and the head commit %d times", sink.reads, rig.g.commitCalls)
+	if err := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); err == nil {
+		t.Fatal("unreadable author route was treated as absent")
+	}
+	if len(rig.n.tries()) != 0 || sink.reads == 0 || rig.g.commitCalls != 0 {
+		t.Fatalf("notice tries=%d hk reads=%d head commit reads=%d", len(rig.n.tries()), sink.reads, rig.g.commitCalls)
 	}
 }
 
@@ -701,7 +725,11 @@ func TestConflictEscSingleNotificationPath(t *testing.T) {
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
 		}
-		wantEsc(t, wantEscs(t, n, 1)[0], "design-lane", "task 42", shaA)
+		route, err := s.findingsRoute(context.Background(), r, g.pull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantEsc(t, wantEscs(t, n, 1)[0], route.lane, route.via, shaA)
 		others := n.others()
 		if len(others) != 1 || others[0].Lane != "worker-lane" || others[0].Type != "blocked" || !strings.Contains(others[0].Text, "threads_open:2") || strings.Contains(others[0].Text, "conflict") {
 			t.Fatalf("mixed verdict: %+v", others)
@@ -889,7 +917,11 @@ func TestConflictEscMixedVerdictIdentity(t *testing.T) {
 		conflict(g)
 		notify(t, s, r)
 		notify(t, s, r)
-		wantEsc(t, wantEscs(t, n, 1)[0], "design-lane", "task 42", shaA)
+		route, err := s.findingsRoute(context.Background(), r, g.pull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantEsc(t, wantEscs(t, n, 1)[0], route.lane, route.via, shaA)
 		blocked = blockedNotices(n)
 		if len(blocked) != 2 {
 			t.Fatalf("%d BLOCKED notices, want the author's once the head conflicts: %+v", len(blocked), blocked)

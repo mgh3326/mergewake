@@ -383,8 +383,9 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		gate = *p.ReviewGate
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	deferRule := s.deferTaskRule(ctx, r, pr)
 	var holding map[string]bool
-	_, _, v.Review.Findings, holding = gradeThreadsDetailed(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+	_, _, v.Review.Findings, holding = gradeThreadsDetailedWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
 	if fixes.err != nil {
 		// A fix claim GitHub could not check holds the verdict; it neither
 		// passes nor blocks on a guess.
@@ -392,7 +393,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	if (p.ReviewGate != nil && p.ReviewGate.Land == "graded") || fastLane {
 		// Graded: findings are weighed by severity instead of counted.
-		blocking, triage := gradeThreads(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, s.Config.Review.FleetAuthors)
+		blocking, triage := gradeThreadsWithDefer(fb, gate.WithOwnLogin(login), login, class, fastLane, fixes.verified, deferRule, s.Config.Review.FleetAuthors)
 		v.Status.Threads = prstatus.Threads{Blocking: blocking, Other: triage + v.Review.Findings.Advisory}
 		if blocking > 0 {
 			v.Reasons = append(v.Reasons, "blocking_findings:"+strconv.Itoa(blocking))
@@ -596,10 +597,19 @@ func gradeThreads(fb github.ReviewFeedback, g policy.ReviewGate, login, class st
 	return blocking, triage
 }
 
+func gradeThreadsWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int) {
+	blocking, triage, _, _ = gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, deferRule, fleet...)
+	return blocking, triage
+}
+
 // gradeThreadsDetailed is gradeThreads together with how every graded thread
 // stands, for the review record, and the ids of the unresolved threads that
 // count as blocking findings.
 func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
+	return gradeThreadsDetailedWithDefer(fb, g, login, class, fastLane, verify, nil, fleet...)
+}
+
+func gradeThreadsDetailedWithDefer(fb github.ReviewFeedback, g policy.ReviewGate, login, class string, fastLane bool, verify fixCheck, deferRule *deferTaskRule, fleet ...[]string) (blocking, triage int, d dispositions, holding map[string]bool) {
 	holding = map[string]bool{}
 	blocking = fb.ChangesRequested
 	d.OpenBlocking = fb.ChangesRequested
@@ -651,7 +661,7 @@ func gradeThreadsDetailed(fb github.ReviewFeedback, g policy.ReviewGate, login, 
 			switch {
 			case f.Resolved:
 				d.Resolved++
-			case answered(t, f.OwnReview, fleet...):
+			case answeredWithDefer(t, f.OwnReview, deferRule, fleet...):
 				d.Answered++
 			case !fastLane || unreadable:
 				triage++
@@ -717,7 +727,52 @@ var (
 	commitToken = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
+	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+([0-9]+)\b`)
 )
+
+type deferTaskRule struct {
+	own    string
+	exists func(string) bool
+}
+
+func (s *Service) deferTaskRule(ctx context.Context, r config.Repo, pr github.Pull) *deferTaskRule {
+	own, err := s.prTask(ctx, r, pr)
+	if err != nil {
+		return nil
+	}
+	jobs, ok := s.Sink.(interface {
+		TaskJob(context.Context, string) (string, string, error)
+	})
+	if !ok {
+		return nil
+	}
+	return &deferTaskRule{own: own, exists: func(id string) bool {
+		_, _, err := jobs.TaskJob(ctx, id)
+		return err == nil
+	}}
+}
+
+func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRule, fleet ...[]string) bool {
+	if len(t.Comments) == 0 {
+		return false
+	}
+	author := policy.NormalizeAuthor(t.Comments[0].Author)
+	for i := len(t.Comments) - 1; i > 0; i-- {
+		c := t.Comments[i]
+		if !answeredBy(c, author, ownReview, fleet...) {
+			continue
+		}
+		match := deferReply.FindStringSubmatch(c.Body)
+		if match == nil {
+			return true
+		}
+		if rule == nil || match[1] == rule.own || rule.exists == nil {
+			return false
+		}
+		return rule.exists(match[1])
+	}
+	return false
+}
 
 // fixCheck reports whether sha, named in a fix reply, is a real fix for a
 // finding posted on head posted (fixVerifier.verified).

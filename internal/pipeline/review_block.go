@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -160,8 +161,12 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 		return e
 	}
 	key := fmt.Sprintf("%d %s %s", pr.Number, pr.Head.SHA, b.reason)
+	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
+		bodyDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(pr.Body)))
+		key = fmt.Sprintf("%d body:%s", pr.Number, bodyDigest)
+	}
 	if sent.has(key) {
-		return nil
+		return s.audit(r.Name, "review-blocked-suppressed", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "outcome": b.reason, "reason": "same PR body already notified"}, false)
 	}
 	lane, via, e := s.blockLane(ctx, r, pr, b)
 	if e != nil {

@@ -211,6 +211,11 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	}
 	checkpoint := s.checkpoint(r.Name)
 	if ci == github.Green {
+		if !s.deploy && !o.DryRun {
+			if e = s.clearWatchHoldEpisode(r.Name); e != nil {
+				return e
+			}
+		}
 		// A same-sha re-run can pass beside the head's own failed run. Record
 		// the mixed result once, then close the incident as healthy: a green
 		// main needs no revert, and a stale record would block a later red.
@@ -641,12 +646,32 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Shadow || o.DryRun {
 		return nil
 	}
+	isMainHold := result.Action == "hold" && result.Stage == ""
+	if isMainHold {
+		episode, err := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
+		if err != nil {
+			return err
+		}
+		if episode.has("red-main") {
+			return s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": "red-main"}, false)
+		}
+	}
 	s.feedWatch(r, result, o)
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
 	}
 	if sent.has(key) {
+		if isMainHold {
+			episode, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
+			if e != nil {
+				return e
+			}
+			if e = episode.add("red-main"); e != nil {
+				return e
+			}
+			return s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": "red-main"}, false)
+		}
 		return nil
 	}
 	data, _ := json.Marshal(result)
@@ -665,7 +690,29 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if e != nil {
 		return e
 	}
-	return sent.add(key)
+	if e = sent.add(key); e != nil {
+		return e
+	}
+	if isMainHold {
+		episode, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-hold-active"), 1)
+		if e != nil {
+			return e
+		}
+		return episode.add("red-main")
+	}
+	return nil
+}
+
+func (s *Service) clearWatchHoldEpisode(repo string) error {
+	file := filepath.Join(s.state(repo), "watch-hold-active")
+	episode, err := loadSentKeys(file, 1)
+	if err != nil {
+		return err
+	}
+	if !episode.has("red-main") {
+		return nil
+	}
+	return episode.remove("red-main")
 }
 
 // bracketCandidates lists merged PRs in the inspected interval, excluding a

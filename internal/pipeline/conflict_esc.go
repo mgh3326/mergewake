@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -21,11 +20,6 @@ import (
 const (
 	conflictEscRetryFirst = time.Minute
 	conflictEscRetryMax   = 30 * time.Minute
-	// conflictEscTaskHalts and conflictEscTaskWindow bound a failing task
-	// lookup: after that many halts in a row, or that long since the first,
-	// the ESC skips the task and goes to the desk.
-	conflictEscTaskHalts  = 3
-	conflictEscTaskWindow = 30 * time.Minute
 	// conflictEscErrorMax bounds the error kept in the state file and audit.
 	conflictEscErrorMax = 512
 )
@@ -54,18 +48,17 @@ type conflictEscPending struct {
 	// PinnedVia is the rule that chose Pinned.
 	PinnedVia string `json:"pinned_via,omitempty"`
 	LastError string `json:"last_error,omitempty"`
-	// TaskHalts counts task-lookup halts in a row; TaskHaltFirst is the first
-	// of them. A successful lookup clears both.
-	TaskHalts     int       `json:"task_halts,omitempty"`
-	TaskHaltFirst time.Time `json:"task_halt_first,omitzero"`
 }
 
 // conflictEscState is <state_dir>/<repo>/conflict-esc/<pr>.json. Receipts are
 // kept for the life of the file, so a head that returns, a PR that is
 // reopened or a restart never re-sends.
 type conflictEscState struct {
-	Delivered map[string]conflictEscReceipt `json:"delivered,omitempty"`
-	Pending   map[string]conflictEscPending `json:"pending,omitempty"`
+	Delivered  map[string]conflictEscReceipt `json:"delivered,omitempty"`
+	Pending    map[string]conflictEscPending `json:"pending,omitempty"`
+	OwnerHead  string                        `json:"owner_head,omitempty"`
+	OwnerSince time.Time                     `json:"owner_since,omitzero"`
+	OwnerSent  bool                          `json:"owner_sent,omitempty"`
 }
 
 func (s *Service) conflictEscFile(repo string, n int) string {
@@ -99,14 +92,6 @@ func mergeabilityKnown(pr github.Pull) bool {
 	return conflicting(pr) || (pr.Mergeable != nil && pr.MergeableState != "unknown")
 }
 
-// conflictEscRefused reports whether a delivery failed before panewire
-// recorded anything for the lane, so the next destination can be tried
-// without the same event landing twice. Any other failure may have landed.
-func conflictEscRefused(err error) bool {
-	var ce *integrations.CommandError
-	return errors.As(err, &ce) && strings.Contains(ce.Stderr, "emit: invalid --lane")
-}
-
 // EscalateConflict sends the one ESC of a PR head that conflicts with its
 // base (hk 3712; docs/config.md, "Conflict ESC"). The pr role calls it for
 // every evaluated open PR before review and settle, and NotifyPR calls it
@@ -114,12 +99,12 @@ func conflictEscRefused(err error) bool {
 // its review is held, pending, quota-stopped or not started, and also as a
 // draft. It never changes review, gate or merge.
 //
-// The ESC goes to the PR body's Mergewake-Notify-Lane, else the hk task's
-// lane, else the desk, as a `decision`. A destination that refuses the lane
-// outright moves to the next; any other failure retries the same lane under
-// the same event id after a doubling wait. The head is recorded delivered
-// only once a lane took it. Unknown mergeability neither sends nor clears.
-// A dry run, or notify switched off, does nothing.
+// The ESC first goes to the PR author's findings route. The owner lane gets
+// one notice for the PR if that route is gone, or after the same conflicting
+// head persists for the configured window. A destination that refuses the
+// lane outright is not silently rerouted; delivery retries the pinned route
+// under the same event id. Unknown mergeability neither sends nor clears. A
+// dry run, or notify switched off, does nothing.
 func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
 	if !s.Config.Daemon.PR.Notify.On() || !o.Reporting() || !escalable(r, pr) || !mergeabilityKnown(pr) {
 		return nil
@@ -139,14 +124,8 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	if e != nil {
 		return e
 	}
-	if _, done := st.Delivered[head]; done {
-		return nil
-	}
 	p, waiting := st.Pending[head]
 	now := s.now().UTC()
-	if waiting && now.Before(p.Next) {
-		return nil
-	}
 	// The observation may be old by now: send only for a PR GitHub still
 	// reports open, on this base and head, and conflicting.
 	fresh, e := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
@@ -156,58 +135,81 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	if !escalable(r, fresh) || fresh.Head.SHA != head || !conflicting(fresh) {
 		return nil
 	}
-	p.EventID = conflictEscID(r.Name, pr.Number, head)
-	// pin makes a destination durable before it is offered the ESC.
-	pin := func(lane, via string) error {
+	route, e := s.findingsRoute(ctx, r, fresh)
+	if e != nil {
+		return fmt.Errorf("conflict author route: %w", e)
+	}
+	if st.OwnerHead != head {
+		st.OwnerHead, st.OwnerSince = head, now
+	}
+	authorGone := route.via == "unknown author; desk" || route.finished != ""
+	ownerDue := authorGone || now.Sub(st.OwnerSince) >= s.Config.Daemon.PR.Notify.ConflictOwnerWindow()
+	var err error
+	_, authorDelivered := st.Delivered[head]
+	shouldSendAuthor := !authorDelivered && !(authorGone && st.OwnerSent) && (!waiting || !now.Before(p.Next))
+	if shouldSendAuthor {
+		p.EventID = conflictEscID(r.Name, pr.Number, head)
+		lane, via := route.lane, route.via
+		if p.Pinned != "" {
+			lane, via = p.Pinned, p.PinnedVia
+		} else if authorGone {
+			lane, via = s.ownerLane(r), "owner lane (author route gone)"
+		}
 		p.Pinned, p.PinnedVia = lane, via
 		st.Pending[head] = p
-		return fsutil.WriteJSON(file, st)
-	}
-	lane, via, tried, err := s.deliverConflictEsc(ctx, r, fresh, &p, pin)
-	if lane != "" {
+		if err = fsutil.WriteJSON(file, st); err != nil {
+			return err
+		}
+		text := fmt.Sprintf("ESC [mergewake] %s#%d head=%s conflict with %s: rebase or merge base, then push | lane=%s via %s",
+			r.Name, pr.Number, short7(fresh.Head.SHA), fresh.Base.Ref, lane, via)
+		if err = s.Notifier.Notify(ctx, integrations.Event{ID: p.EventID, Text: text, Lane: lane, Type: "decision"}); err != nil {
+			p.Attempts++
+			p.Next = now.Add(conflictEscBackoff(p.Attempts))
+			p.LastError = clip(integrations.Detail(err), conflictEscErrorMax)
+			st.Pending[head] = p
+			if writeErr := fsutil.WriteJSON(file, st); writeErr != nil {
+				return errors.Join(err, writeErr)
+			}
+			return errors.Join(err, s.audit(r.Name, "conflict-esc-failed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "event_id": p.EventID, "lane": lane, "error": p.LastError}, false))
+		}
 		delete(st.Pending, head)
 		st.Delivered[head] = conflictEscReceipt{EventID: p.EventID, Lane: lane, Via: via, At: now}
-		if e := fsutil.WriteJSON(file, st); e != nil {
-			return e
+		if authorGone {
+			st.OwnerSent = true
 		}
-		return s.audit(r.Name, "conflict-esc", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "lane": lane, "via": via, "event_id": p.EventID}, false)
-	}
-	if err == nil {
-		// No destination at all: not even a desk lane is configured.
-		err = errors.New("no destination: no body lane, no task lane and no desk lane configured")
-	}
-	var halt *conflictEscHaltError
-	if errors.As(err, &halt) {
-		if halt.task {
-			if p.TaskHalts == 0 {
-				p.TaskHaltFirst = now
-			}
-			p.TaskHalts++
-			st.Pending[head] = p
-			if e := fsutil.WriteJSON(file, st); e != nil {
-				return errors.Join(halt.err, e)
-			}
-			return halt.err
+		if err = fsutil.WriteJSON(file, st); err != nil {
+			return err
 		}
-		// A route source could not be read (hk or GitHub), unknown rather
-		// than absent, or a pin could not be written. No lane took the ESC
-		// and no wait starts; the next observation tries again.
-		if _, ok := st.Pending[head]; ok {
-			st.Pending[head] = p
-			if e := fsutil.WriteJSON(file, st); e != nil {
-				return errors.Join(halt.err, e)
-			}
+		if err = s.audit(r.Name, "conflict-esc", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "lane": lane, "via": via, "event_id": p.EventID}, false); err != nil {
+			return err
 		}
-		return halt.err
+	} else if authorDelivered || (authorGone && st.OwnerSent) {
+		if err = s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "author route already notified"}, false); err != nil {
+			return err
+		}
+	} else if err = fsutil.WriteJSON(file, st); err != nil {
+		return err
 	}
-	p.Attempts++
-	p.Next = now.Add(conflictEscBackoff(p.Attempts))
-	p.LastError = clip(integrations.Detail(err), conflictEscErrorMax)
-	st.Pending[head] = p
-	if e := fsutil.WriteJSON(file, st); e != nil {
-		return e
+	if ownerDue && !authorGone && !st.OwnerSent {
+		lane := s.ownerLane(r)
+		eventID := fmt.Sprintf("mergewake-esc-%s-%d-owner", r.Name, pr.Number)
+		text := fmt.Sprintf("ESC [mergewake] %s#%d remains conflicted at head=%s after the author route was notified | lane=%s via owner follow-up", r.Name, pr.Number, short7(head), lane)
+		if err = s.Notifier.Notify(ctx, integrations.Event{ID: eventID, Text: text, Lane: lane, Type: "decision"}); err != nil {
+			return err
+		}
+		st.OwnerSent = true
+		if err = fsutil.WriteJSON(file, st); err != nil {
+			return err
+		}
+		return s.audit(r.Name, "conflict-esc-owner", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "lane": lane, "event_id": eventID, "reason": map[bool]string{true: "author route gone", false: "conflict persisted"}[authorGone]}, false)
 	}
-	return s.audit(r.Name, "conflict-esc-failed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "event_id": p.EventID, "tried": tried, "pinned": p.Pinned, "attempts": p.Attempts, "next": p.Next, "error": p.LastError}, false)
+	if st.OwnerSent {
+		return s.audit(r.Name, "conflict-esc-owner-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner was already notified for PR"}, false)
+	}
+	if ownerDue {
+		return s.audit(r.Name, "conflict-esc-owner-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "owner notice already recorded"}, false)
+	}
+	return nil
 }
 
 // escalable reports whether pr is one the ESC is for: open, not merged, and
@@ -251,143 +253,6 @@ func conflictEscBackoff(attempts int) time.Duration {
 		d *= 2
 	}
 	return min(d, conflictEscRetryMax)
-}
-
-// conflictEscTaskDown reports whether the task lookup has halted enough times
-// in a row, or for long enough since its first halt, that the ESC stops
-// waiting for it and goes to the desk.
-func conflictEscTaskDown(p conflictEscPending, now time.Time) bool {
-	return p.TaskHalts > 0 && (p.TaskHalts >= conflictEscTaskHalts || now.Sub(p.TaskHaltFirst) >= conflictEscTaskWindow)
-}
-
-// conflictEscHaltError stops an attempt before a destination could fail it:
-// a route source that could not be read, or a pin that could not be written.
-type conflictEscHaltError struct {
-	err error
-	// task marks a failed task-lane lookup: it counts toward the desk
-	// fallback (see conflictEscTaskDown).
-	task bool
-}
-
-func (e *conflictEscHaltError) Error() string { return e.err.Error() }
-
-// deliverConflictEsc offers the ESC to each destination in order until one
-// takes it, and returns that lane and its rule. Each destination is pinned
-// (written to the state file) before it is offered; a pinned lane is offered
-// alone first, without reading the route. The route is read lazily: a body
-// lane that takes the ESC costs no hk or commit read. tried lists the lanes
-// offered. A failure that may have landed keeps its pin and stops; a refusal
-// clears it and moves on; a route read or pin write failure stops with a
-// *conflictEscHaltError.
-func (s *Service) deliverConflictEsc(ctx context.Context, r config.Repo, pr github.Pull, p *conflictEscPending, pin func(lane, via string) error) (lane, via string, tried []string, err error) {
-	reportCtx, cancel := reportContext(ctx)
-	defer cancel()
-	offer := func(l, v string) (bool, error) {
-		if p.Pinned != l {
-			if e := pin(l, v); e != nil {
-				return false, &conflictEscHaltError{err: e}
-			}
-		}
-		tried = append(tried, l)
-		text := fmt.Sprintf("ESC [mergewake] %s#%d head=%s conflict with %s: rebase or merge base, then push | lane=%s via %s",
-			r.Name, pr.Number, short7(pr.Head.SHA), pr.Base.Ref, l, v)
-		e := s.Notifier.Notify(reportCtx, integrations.Event{ID: p.EventID, Text: text, Lane: l, Type: "decision"})
-		if e == nil {
-			return true, nil
-		}
-		if conflictEscRefused(e) {
-			p.Pinned, p.PinnedVia = "", ""
-		}
-		return false, e
-	}
-	if pinned, pinnedVia := p.Pinned, p.PinnedVia; pinned != "" {
-		ok, e := offer(pinned, pinnedVia)
-		if ok {
-			return pinned, pinnedVia, tried, nil
-		}
-		if p.Pinned != "" {
-			return "", "", tried, e
-		}
-		err = e
-	}
-	taskDown := conflictEscTaskDown(*p, s.now().UTC())
-	sources := []func() (string, string, error){
-		func() (string, string, error) {
-			if v := trailer(pr.Body, "Mergewake-Notify-Lane"); laneName.MatchString(v) {
-				return v, "notify-lane trailer", nil
-			}
-			return "", "", nil
-		},
-		func() (string, string, error) {
-			if taskDown {
-				return "", "", nil
-			}
-			l, v, e := s.conflictEscTaskLane(ctx, r, pr)
-			if e != nil {
-				return "", "", &conflictEscHaltError{err: e, task: true}
-			}
-			p.TaskHalts, p.TaskHaltFirst = 0, time.Time{}
-			return l, v, nil
-		},
-		func() (string, string, error) {
-			if taskDown {
-				return s.deskLane(), "desk (task lookup failed)", nil
-			}
-			return s.deskLane(), "desk", nil
-		},
-	}
-	seen := map[string]bool{}
-	for _, l := range tried {
-		seen[l] = true
-	}
-	for _, source := range sources {
-		l, v, e := source()
-		if e != nil {
-			var halt *conflictEscHaltError
-			if errors.As(e, &halt) {
-				return "", "", tried, halt
-			}
-			return "", "", tried, &conflictEscHaltError{err: e}
-		}
-		if l == "" || seen[l] {
-			continue
-		}
-		seen[l] = true
-		ok, e := offer(l, v)
-		if ok {
-			return l, v, tried, nil
-		}
-		err = e
-		var halt *conflictEscHaltError
-		if p.Pinned != "" || errors.As(e, &halt) {
-			return "", "", tried, err
-		}
-	}
-	return "", "", tried, err
-}
-
-// conflictEscTaskLane is the current lane of the hk task the PR names
-// (Mergewake-Task, body then head commit). Empty when the PR names no task
-// or the task no valid lane; a read error is returned, never read as absence.
-func (s *Service) conflictEscTaskLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
-	task, e := s.prTask(ctx, r, pr)
-	if e != nil || task == "" {
-		return "", "", e
-	}
-	l, ok := s.Sink.(interface {
-		Lane(context.Context, string) (string, error)
-	})
-	if !ok {
-		return "", "", nil
-	}
-	lane, e := l.Lane(ctx, task)
-	if e != nil {
-		return "", "", e
-	}
-	if !laneName.MatchString(lane) {
-		return "", "", nil
-	}
-	return lane, "task " + task, nil
 }
 
 // deskLane is the desk: notifier.fallback_lane, else notifier.lane.

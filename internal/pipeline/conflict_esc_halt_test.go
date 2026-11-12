@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// (h) A task lookup that keeps failing does not hold a conflict ESC forever:
-// after three halts the ESC goes to the desk. Each halt is still returned.
-func TestConflictEscTaskLookupHaltsReachTheDesk(t *testing.T) {
+// An unreadable author route is not treated as an absent route. The notice
+// remains pending until findingsRoute can be resolved.
+func TestConflictEscTaskLookupErrorDoesNotReroute(t *testing.T) {
 	t.Run("three halts", func(t *testing.T) {
 		rig := newEscRig(t)
 		rig.g.pull.Body = "Mergewake-Task: 42\n"
@@ -21,8 +21,10 @@ func TestConflictEscTaskLookupHaltsReachTheDesk(t *testing.T) {
 			rig.after(time.Minute)
 		}
 		wantTries(t, rig.n, 0)
-		rig.escalate(t)
-		wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "desk (task lookup failed)", shaA)
+		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e == nil {
+			t.Fatal("unreadable route was treated as absent")
+		}
+		wantEscs(t, rig.n, 0)
 	})
 	t.Run("thirty minutes", func(t *testing.T) {
 		rig := newEscRig(t)
@@ -32,7 +34,9 @@ func TestConflictEscTaskLookupHaltsReachTheDesk(t *testing.T) {
 			t.Fatal("a failed task-lane read was not returned")
 		}
 		rig.after(31 * time.Minute)
-		rig.escalate(t)
-		wantEsc(t, wantEscs(t, rig.n, 1)[0], "desk", "desk (task lookup failed)", shaA)
+		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e == nil {
+			t.Fatal("unreadable route was treated as absent after waiting")
+		}
+		wantEscs(t, rig.n, 0)
 	})
 }

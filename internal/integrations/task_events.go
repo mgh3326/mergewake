@@ -81,12 +81,23 @@ type ReviewRecord struct {
 	// Review-history fields (hk 3296). A nil pointer is "unknown" and is left
 	// out of the JSON: hk reads a missing field as unknown and an explicit
 	// false or 0 as a fact, so mergewake sends one only for a value it knows.
-	Reviewer            *string `json:"reviewer,omitempty"`
-	SameFamily          *bool   `json:"same_family,omitempty"`
-	Delta               *bool   `json:"delta,omitempty"`
-	Quiet               *bool   `json:"quiet,omitempty"`
-	OutsideDiffBlocking *int    `json:"outside_diff_blocking,omitempty"`
-	PatchDigest         *string `json:"patch_digest,omitempty"`
+	Reviewer            *string               `json:"reviewer,omitempty"`
+	SameFamily          *bool                 `json:"same_family,omitempty"`
+	Delta               *bool                 `json:"delta,omitempty"`
+	Quiet               *bool                 `json:"quiet,omitempty"`
+	OutsideDiffBlocking *int                  `json:"outside_diff_blocking,omitempty"`
+	PatchDigest         *string               `json:"patch_digest,omitempty"`
+	FindingFacts        []ReviewFindingRecord `json:"finding_facts,omitempty"`
+}
+
+// ReviewFindingRecord records each finding's relationship to new code and
+// earlier threads for the round that posted it.
+type ReviewFindingRecord struct {
+	Path            string `json:"path"`
+	Line            int    `json:"line"`
+	Title           string `json:"title"`
+	AddedAfterFirst bool   `json:"added_after_first_head"`
+	RepeatsEarlier  bool   `json:"repeats_earlier_thread"`
 }
 
 var (
