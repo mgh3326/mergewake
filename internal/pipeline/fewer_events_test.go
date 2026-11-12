@@ -142,6 +142,23 @@ func TestLostReviewExhaustedReplacementNotifiesOwnerOnce(t *testing.T) {
 	}
 }
 
+func TestLostReplacementUsesDurableReviewerReplacementCount(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	plan := &passPlan{pass: 1, lens: "default"}
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull}
+	rj := reviewerJob{PR: g.pull.Number, Head: g.pull.Head.SHA, Pass: 1, Label: "replacement", Replacements: 1}
+	_, err := x.replaceLostReviewer(context.Background(), plan, rj, integrations.JobRecord{}, "result missing", "")
+	if err == nil {
+		t.Fatal("exhausted replacement unexpectedly continued")
+	}
+	if plan.replacements != 1 {
+		t.Fatalf("plan replacement count = %d, want durable count 1", plan.replacements)
+	}
+	if n.count != 2 || n.events[0].Lane != s.deskLane() || n.events[1].Lane != s.ownerLane(r) {
+		t.Fatalf("lost result notices = %+v, want design then owner", n.events)
+	}
+}
+
 func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	s, _, _, r, _ := feedSetup(t)
 	sink := &fakeSink{}
