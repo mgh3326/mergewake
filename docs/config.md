@@ -1931,6 +1931,19 @@ new verdict and its other reasons are told again, once. A verdict whose only
 reason is the conflict (with or without an internal wait) sends no BLOCKED and
 logs its `pr-notify` row with `"suppressed":"conflict ESC"`, and a mixed verdict
 keeps the author route the conflict gave it.
+
+When `blocking_findings` is a reason, the BLOCKED text also lists the threads
+holding the head: up to ten, then `and N more`, within a byte budget that keeps
+the event under panewire's 2048-byte limit. Each entry names the thread (its URL,
+else its id), the finding's author, its severity (`unrated` when none is
+readable), and `path:line`. A thread with a reply names the latest one and says
+`reply not accepted`, since only a reply of `Fixed in <sha>` or `Dismiss: <evidence>`
+clears a block-class thread. When the head's review pass is complete and no
+holding finding was posted on the head, the text says the latest review pass
+raised no new findings. The list can be shorter than the `blocking_findings:<n>`
+count, because a reviewer still requesting changes counts toward the count but
+is not a thread.
+
 `READY` and `MERGED` are recorded, not sent, so the design session hears only the
 BLOCKED reasons that need its decision.
 
