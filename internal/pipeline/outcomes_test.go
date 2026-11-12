@@ -300,3 +300,52 @@ func TestObserveReopenedPRReopensOutcomeReconciliation(t *testing.T) {
 		t.Fatalf("reopened PR reconciliation state = final:%t finished:%t due:%v", v.Final, v.ReconcileFinished, v.ReconcileDueAt)
 	}
 }
+
+func TestReconcileMergedRowWithoutCIOrAttributionKeepsRevertCheck(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	mergedAt := now.Add(-24 * time.Hour)
+	merged := mergedAt.Format(time.RFC3339)
+	p := g.pull
+	p.Number, p.State, p.MergedAt = 5, "closed", &merged
+	p.Body = ""
+	source := &outcomeGH{fakeGH: g, pulls: map[int]github.Pull{5: p}, firstCI: map[int]*bool{5: nil}}
+	s.GH = source
+	if err := s.ledger().Update(repo.Name, 5, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.MergedAt = true, "landed", &mergedAt
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, 5)]
+	if v.Attributed() || v.FirstCIGreen != nil || v.ReconcileFinished || v.ReconcileDueAt == nil {
+		t.Fatalf("merged pending row state: attributed:%t ci:%v finished:%t due:%v", v.Attributed(), v.FirstCIGreen, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+	source.pullIDs = nil
+	now = now.Add(time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 0 {
+		t.Fatalf("not-due merged row read: %v", source.pullIDs)
+	}
+	now = now.Add(time.Hour)
+	reconcile(t, s, repo, Options{Shadow: true})
+	if len(source.pullIDs) != 1 || source.pullIDs[0] != 5 {
+		t.Fatalf("hourly merged-row Pull calls = %v, want [5]", source.pullIDs)
+	}
+	source.pullIDs = nil
+	now = mergedAt.Add(7*24*time.Hour + time.Minute)
+	reconcile(t, s, repo, Options{Shadow: true})
+	state, err = s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v = state.Latest[outcomes.Key(repo.Name, 5)]
+	if v.Reverted == nil || *v.Reverted || !v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("expired no-evidence row state: reverted:%v finished:%t due:%v", v.Reverted, v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}

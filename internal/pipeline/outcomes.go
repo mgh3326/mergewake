@@ -445,7 +445,7 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 			continue
 		}
 		v = latest.Latest[key]
-		if v.MergedAt == nil || v.Reverted != nil || !v.Attributed() || v.FirstCIGreen == nil {
+		if v.MergedAt == nil || v.Reverted != nil {
 			v.ReconcileFinished = true
 		} else {
 			v.ReconcileFinished = false
