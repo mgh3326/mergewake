@@ -29,7 +29,8 @@ func TestConflictEscTaskLookupErrorDoesNotReroute(t *testing.T) {
 	t.Run("thirty minutes", func(t *testing.T) {
 		rig := newEscRig(t)
 		rig.g.pull.Body = "Mergewake-Task: 42\n"
-		rig.s.Sink = &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}, err: errors.New("hk: timeout")}
+		sink := &fakeLaneSink{lanes: map[string]string{"42": "task-lane"}, err: errors.New("hk: timeout")}
+		rig.s.Sink = sink
 		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e == nil {
 			t.Fatal("a failed task-lane read was not returned")
 		}
@@ -41,15 +42,19 @@ func TestConflictEscTaskLookupErrorDoesNotReroute(t *testing.T) {
 		if len(rig.n.accepted) != 1 || rig.n.accepted[0].Lane != rig.s.ownerLane(rig.r) {
 			t.Fatalf("owner notice after unreadable route = %+v", rig.n.accepted)
 		}
+		sink.err = nil
+		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		if len(rig.n.accepted) != 2 || rig.n.accepted[1].Lane != "task-lane" {
+			t.Fatalf("author route was not retried after hk recovered: %+v", rig.n.accepted)
+		}
 		pulls := rig.g.pullCalls
 		if e := rig.s.EscalateConflict(context.Background(), rig.r, rig.g.pull, Options{}); e != nil {
 			t.Fatal(e)
 		}
 		if rig.g.pullCalls != pulls {
-			t.Fatalf("completed unreadable route retried GitHub pull: %d→%d", pulls, rig.g.pullCalls)
-		}
-		if rows := auditRows(t, rig.s, rig.r, "conflict-esc-suppressed"); len(rows) != 1 {
-			t.Fatalf("unreadable route suppression audit = %v, want one", rows)
+			t.Fatalf("delivered author route caused repeated GitHub reads: %d→%d", pulls, rig.g.pullCalls)
 		}
 	})
 }

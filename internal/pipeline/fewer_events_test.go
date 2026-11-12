@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 func TestBlockNoticeOncePerPRUntilBodyChanges(t *testing.T) {
@@ -69,6 +70,31 @@ func TestWorkerDeferTaskReadErrorIsRetained(t *testing.T) {
 	}
 }
 
+func TestWorkerDeferMissingTaskIsUnansweredWithoutHoldingGate(t *testing.T) {
+	thread := ownFinding("T1", "low", 3, github.ReviewComment{Author: "worker", AuthorType: "User", Body: "Disposition: defer 42"})
+	rule := &deferTaskRule{own: "7", seen: map[string]bool{}, failed: map[string]error{}, exists: func(string) (bool, error) {
+		return false, errors.New("handoffkeep task not_found: 42")
+	}}
+	answered := answeredWithDefer(thread, false, rule)
+	if answered || rule.err != nil {
+		t.Fatalf("missing task disposition should remain unanswered without a lookup failure: %+v", rule)
+	}
+}
+
+func TestWorkerDeferLookupErrorDoesNotEraseEarlierAnswer(t *testing.T) {
+	thread := ownFinding("T1", "low", 3,
+		github.ReviewComment{Author: "worker", AuthorType: "User", Body: "I applied the fix"},
+		github.ReviewComment{Author: "worker", AuthorType: "User", Body: "Disposition: defer 42"},
+	)
+	rule := &deferTaskRule{own: "7", seen: map[string]bool{}, failed: map[string]error{}, exists: func(string) (bool, error) {
+		return false, errors.New("handoffkeep unavailable")
+	}}
+	answered := answeredWithDefer(thread, false, rule)
+	if !answered || rule.err != nil {
+		t.Fatalf("later lookup error erased an earlier answer: answered=%t err=%v", answered, rule.err)
+	}
+}
+
 func TestLostReviewBurstNotifiesOneDesignIncident(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
@@ -91,6 +117,8 @@ func TestLostReviewBurstNotifiesOneDesignIncident(t *testing.T) {
 
 func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	s, _, _, r, _ := feedSetup(t)
+	sink := &fakeSink{}
+	s.Sink = sink
 	n := newEscNotifier()
 	s.Notifier = n
 	for i, head := range []string{"red-a", "red-b", "red-c"} {
@@ -106,6 +134,15 @@ func TestWatchHoldsNotifyOncePerRedEpisode(t *testing.T) {
 	}
 	if len(n.accepted) != 1 {
 		t.Fatalf("red episode notifications = %d, want 1", len(n.accepted))
+	}
+	if sink.records != 3 {
+		t.Fatalf("red episode sink records = %d, want one per held head", sink.records)
+	}
+	if err := s.reportWatch(context.Background(), r, watchResult{Head: "red-c", Action: "hold", Reason: "main is red"}, "red-c:hold", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if sink.records != 3 {
+		t.Fatalf("same held head wrote another sink record: %d", sink.records)
 	}
 	if got := outboxLen(t, s.Feed); got != 3 {
 		t.Fatalf("red-head watch feed entries = %d, want 3", got)
@@ -310,6 +347,77 @@ func TestConflictOwnerFollowupPinsAndAuditsFailure(t *testing.T) {
 	}
 	if len(n.accepted) != 2 || n.accepted[1].Lane != ownerLane {
 		t.Fatalf("owner retry moved destination: %+v", n.accepted)
+	}
+}
+
+func TestConflictOwnerPendingMovesWithHead(t *testing.T) {
+	s, g, _, r := workerNotifySetup(t)
+	n := newEscNotifier()
+	s.Notifier = n
+	s.Config.Daemon.PR.Notify.ConflictOwnerAfter = "30m"
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	no := false
+	g.pull.Mergeable, g.pull.MergeableState = &no, "dirty"
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	ownerLane := s.ownerLane(r)
+	n.fail[ownerLane] = errors.New("delivery ambiguous")
+	now = now.Add(30 * time.Minute)
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err == nil {
+		t.Fatal("owner delivery failure was not returned")
+	}
+	g.pull.Head.SHA = shaB
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Minute)
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err == nil {
+		t.Fatal("second owner delivery failure was not returned")
+	}
+	var ownerAttempts []integrations.Event
+	for _, event := range n.attempts {
+		if strings.Contains(event.ID, "-owner-") {
+			ownerAttempts = append(ownerAttempts, event)
+		}
+	}
+	if len(ownerAttempts) != 2 || !strings.Contains(ownerAttempts[1].Text, "head="+short7(shaB)) || ownerAttempts[1].Lane != ownerLane || ownerAttempts[0].ID == ownerAttempts[1].ID {
+		t.Fatalf("owner retries after head change = %+v, want separate A and B notices", ownerAttempts)
+	}
+}
+
+func TestConflictResolutionClearsPendingOwnerNotice(t *testing.T) {
+	s, g, _, r := workerNotifySetup(t)
+	n := newEscNotifier()
+	s.Notifier = n
+	s.Config.Daemon.PR.Notify.ConflictOwnerAfter = "30m"
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	no := false
+	g.pull.Mergeable, g.pull.MergeableState = &no, "dirty"
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	ownerLane := s.ownerLane(r)
+	n.fail[ownerLane] = errors.New("delivery ambiguous")
+	now = now.Add(30 * time.Minute)
+	if err := s.EscalateConflict(context.Background(), r, g.pull, Options{}); err == nil {
+		t.Fatal("owner delivery failure was not returned")
+	}
+	file := s.conflictEscFile(r.Name, g.pull.Number)
+	state, err := readConflictEsc(file)
+	if err != nil || state.OwnerPending == nil {
+		t.Fatalf("pending owner notice before resolution = %+v, err=%v", state.OwnerPending, err)
+	}
+	yes := true
+	g.pull.Mergeable, g.pull.MergeableState = &yes, "clean"
+	if err = s.EscalateConflict(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = readConflictEsc(file)
+	if err != nil || state.OwnerPending != nil || state.OwnerPendingHead != "" || state.OwnerPendingReason != "" {
+		t.Fatalf("pending owner notice after resolution = %+v, err=%v", state, err)
 	}
 }
 

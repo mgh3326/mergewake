@@ -167,6 +167,10 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 	}
 	if st.OwnerHead != head {
 		st.OwnerHead, st.OwnerSince = head, now
+		if st.OwnerPending != nil && st.OwnerPendingHead != head {
+			st.OwnerPending = nil
+			st.OwnerPendingHead, st.OwnerPendingReason = "", ""
+		}
 		if e = fsutil.WriteJSON(file, st); e != nil {
 			return e
 		}
@@ -181,14 +185,7 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 		route, e = s.findingsRoute(ctx, r, fresh)
 		if e != nil {
 			if ownerDue && !st.OwnerSent {
-				if e = s.sendConflictOwner(ctx, file, &st, r, pr.Number, head, "author route unreadable after conflict window", now); e != nil {
-					return e
-				}
-				st.Suppressed[head] = true
-				if e = fsutil.WriteJSON(file, st); e != nil {
-					return e
-				}
-				return s.audit(r.Name, "conflict-esc-suppressed", map[string]any{"repo": r.Name, "pr": pr.Number, "head": head, "reason": "author route unreadable; owner notified"}, false)
+				return s.sendConflictOwner(ctx, file, &st, r, pr.Number, head, "author route unreadable after conflict window", now)
 			}
 			return fmt.Errorf("conflict author route: %w", e)
 		}
@@ -265,7 +262,7 @@ func (s *Service) EscalateConflict(ctx context.Context, r config.Repo, pr github
 
 func (s *Service) sendConflictOwner(ctx context.Context, file string, st *conflictEscState, r config.Repo, pr int, head, reason string, now time.Time) error {
 	if st.OwnerPending == nil {
-		st.OwnerPending = &conflictEscPending{EventID: fmt.Sprintf("mergewake-esc-%s-%d-owner", r.Name, pr), Pinned: s.ownerLane(r), PinnedVia: "owner follow-up"}
+		st.OwnerPending = &conflictEscPending{EventID: fmt.Sprintf("mergewake-esc-%s-%d-owner-%s", r.Name, pr, short7(head)), Pinned: s.ownerLane(r), PinnedVia: "owner follow-up"}
 		st.OwnerPendingHead, st.OwnerPendingReason = head, reason
 		if err := fsutil.WriteJSON(file, st); err != nil {
 			return err
@@ -324,6 +321,11 @@ func (s *Service) resolveConflictEsc(file, head string) error {
 	}
 	if st.OwnerHead == head && !st.OwnerSent {
 		st.OwnerHead, st.OwnerSince = "", time.Time{}
+		changed = true
+	}
+	if st.OwnerPending != nil && st.OwnerPendingHead == head {
+		st.OwnerPending = nil
+		st.OwnerPendingHead, st.OwnerPendingReason = "", ""
 		changed = true
 	}
 	if !changed {

@@ -669,6 +669,12 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 			if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
 				return err
 			}
+			data, _ := json.Marshal(result)
+			reportCtx, cancel := reportContext(ctx)
+			defer cancel()
+			if err = s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data); err != nil {
+				return err
+			}
 			episode.Suppressed[key] = true
 			return s.writeWatchHoldEpisode(r.Name, episode)
 		}

@@ -761,25 +761,24 @@ func (s *Service) deferTaskRule(ctx context.Context, r config.Repo, pr github.Pu
 	return rule
 }
 
-func (r *deferTaskRule) isOwnTask(id string) bool {
+func (r *deferTaskRule) isOwnTask(id string) (bool, error) {
 	if r == nil {
-		return true
+		return true, nil
 	}
 	if !r.ownLoaded && r.ownTask != nil {
 		own, err := r.ownTask()
 		r.ownLoaded = true
 		if err != nil {
-			r.err = errors.Join(r.err, err)
-			return true
+			return false, err
 		}
 		r.own = own
 	}
-	return id == r.own
+	return id == r.own, nil
 }
 
-func (r *deferTaskRule) taskExists(id string) bool {
+func (r *deferTaskRule) taskExists(id string) (bool, error) {
 	if r == nil || r.exists == nil {
-		return false
+		return false, nil
 	}
 	if r.seen == nil {
 		r.seen = map[string]bool{}
@@ -788,20 +787,28 @@ func (r *deferTaskRule) taskExists(id string) bool {
 		r.failed = map[string]error{}
 	}
 	if exists, ok := r.seen[id]; ok {
-		return exists
+		return exists, nil
 	}
 	if err, ok := r.failed[id]; ok {
-		r.err = errors.Join(r.err, err)
-		return false
+		return false, err
 	}
 	exists, err := r.exists(id)
 	if err != nil {
+		if isTaskNotFound(err) {
+			r.seen[id] = false
+			return false, nil
+		}
 		r.failed[id] = err
-		r.err = errors.Join(r.err, err)
-		return false
+		return false, err
 	}
 	r.seen[id] = exists
-	return exists
+	return exists, nil
+}
+
+// TaskJob's public adapter wraps hk's not_found answer with this stable reason.
+// It is a missing disposition target, not a failed lookup of the verdict inputs.
+func isTaskNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "handoffkeep task not_found:")
 }
 
 func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRule, fleet ...[]string) bool {
@@ -810,6 +817,7 @@ func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRul
 	}
 	author := policy.NormalizeAuthor(t.Comments[0].Author)
 	answered := false
+	var lookupErr error
 	for i := 1; i < len(t.Comments); i++ {
 		c := t.Comments[i]
 		if !answeredBy(c, author, ownReview, fleet...) {
@@ -817,16 +825,36 @@ func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRul
 		}
 		if !deferIntent.MatchString(c.Body) {
 			answered = true
+			lookupErr = nil
 			continue
 		}
 		match := deferReply.FindStringSubmatch(c.Body)
 		if match == nil {
 			continue
 		}
-		if rule == nil || rule.isOwnTask(match[1]) || rule.exists == nil {
+		if rule == nil || rule.exists == nil || answered {
 			continue
 		}
-		answered = rule.taskExists(match[1]) || answered
+		own, err := rule.isOwnTask(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if own {
+			continue
+		}
+		exists, err := rule.taskExists(match[1])
+		if err != nil {
+			lookupErr = errors.Join(lookupErr, err)
+			continue
+		}
+		if exists {
+			answered = true
+			lookupErr = nil
+		}
+	}
+	if !answered && lookupErr != nil && rule != nil {
+		rule.err = errors.Join(rule.err, lookupErr)
 	}
 	return answered
 }
