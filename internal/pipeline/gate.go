@@ -13,6 +13,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/prstatus"
@@ -840,10 +841,10 @@ func (r *deferTaskRule) isOwnTask(id string) (bool, error) {
 	}
 	if !r.ownLoaded && r.ownTask != nil {
 		own, err := r.ownTask()
-		r.ownLoaded = true
 		if err != nil {
 			return false, err
 		}
+		r.ownLoaded = true
 		r.own = own
 	}
 	return id == r.own, nil
@@ -878,6 +879,18 @@ func (r *deferTaskRule) taskExists(id string) (bool, error) {
 	return exists, nil
 }
 
+// deferTaskID reports whether a defer reply's task id is one hk could look
+// up: the client's own id rule and an int64 parse. An id that fails either is
+// an absent target, not a failed lookup — the client refuses it before any
+// call.
+func deferTaskID(id string) bool {
+	if !integrations.TaskID.MatchString(id) {
+		return false
+	}
+	_, e := strconv.ParseInt(id, 10, 64)
+	return e == nil
+}
+
 // TaskJob's public adapter wraps hk's not_found answer with this stable reason.
 // It is a missing disposition target, not a failed lookup of the verdict inputs.
 func isTaskNotFound(err error) bool {
@@ -902,7 +915,7 @@ func answeredWithDefer(t github.ReviewThread, ownReview bool, rule *deferTaskRul
 			continue
 		}
 		match := deferReply.FindStringSubmatch(c.Body)
-		if match == nil {
+		if match == nil || !deferTaskID(match[1]) {
 			continue
 		}
 		if rule == nil || rule.exists == nil || answered {

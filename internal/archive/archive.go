@@ -448,8 +448,14 @@ const archiveLockTTL = int64(24 * 60 * 60)
 // critical sections overlap. A guard held past the TTL is reported as
 // "guard-held <guard>" and the script stops; an operator removes it by hand
 // once no archive run is live. The EXIT trap removes the guard only while it
-// still carries this holder's token.
+// still carries this holder's token. The shell ignores SIGPIPE, so a write to
+// a gone stdout (the ssh client closed) fails and the script runs on to its
+// EXIT trap; HUP, INT and TERM exit through that trap too. Only SIGKILL, a
+// host crash, or a signal between the mkdir and the EXIT trap line can still
+// leave a guard.
 const lockGuard = `guard="$1.guard"
+trap '' PIPE
+trap 'exit 1' HUP INT TERM
 now=$(date +%s) || exit 1
 tries=0
 until mkdir "$guard" 2>/dev/null; do
@@ -565,7 +571,7 @@ func guardHeldError(out string) error {
 	if !ok {
 		return nil
 	}
-	return fmt.Errorf("archive lock guard %s is held past %d s; no archive run should be live, so remove it by hand and rerun", guard, archiveLockTTL)
+	return fmt.Errorf("archive lock guard %s is held past %d s; once no archive run is live, remove it by hand (rm -r) and rerun", guard, archiveLockTTL)
 }
 
 func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {

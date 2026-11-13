@@ -367,7 +367,8 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	// have reached its reviewers. A held, quota-stopped or pending review
 	// produced no result: it is no failure, it counts as no review, and the
 	// head must not be settled.
-	unreviewed = errors.Is(e, pipeline.ErrReviewHeld) || errors.Is(e, pipeline.ErrReviewQuotaStopped) || errors.Is(e, pipeline.ErrReviewPending)
+	// A skipped poll is a wait: no review ran, and the head must not be settled.
+	unreviewed = errors.Is(e, pipeline.ErrReviewHeld) || errors.Is(e, pipeline.ErrReviewQuotaStopped) || errors.Is(e, pipeline.ErrReviewPending) || errors.Is(e, github.ErrPollSkipped)
 	// A pending pass did reach its reviewer and asked for its timer, so the
 	// timers it did not ask for belong to reviewers it dropped or replaced.
 	reviewed = e == nil || errors.Is(e, pipeline.ErrReviewUnavailable) || errors.Is(e, pipeline.ErrReviewPending)

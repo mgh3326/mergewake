@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1780,6 +1781,113 @@ func TestArchiveGuardTrapRemovesOnlyItsOwnGuard(t *testing.T) {
 	})
 }
 
+// guardShell is one shell that runs a guard script. A shell not installed on
+// the host is skipped.
+type guardShell struct {
+	name string
+	args []string
+}
+
+var guardShells = []guardShell{{"sh", nil}, {"dash", nil}, {"bash", []string{"--posix"}}}
+
+// command returns the shell running script as a holder of lock, not yet started.
+func (s guardShell) command(t *testing.T, script, lock string) *exec.Cmd {
+	t.Helper()
+	path, err := exec.LookPath(s.name)
+	if err != nil {
+		t.Skipf("%s not installed", s.name)
+	}
+	args := append(append([]string(nil), s.args...), "-c", script, "sh", lock, "owner-a", "86400")
+	return exec.Command(path, args...)
+}
+
+// guardScript is lockGuard followed by body, run as a holder: $1 lock, $2 owner,
+// $3 TTL seconds.
+func guardScript(body string) string {
+	return "guard_ttl=\"$3\"; guard_owner=\"$2\"\n" + lockGuard + body
+}
+
+// The claim, reclaim and release scripts write to stdout after the guard is
+// taken. When the ssh client is gone, that write meets a closed pipe. The shell
+// must survive it, run to its end, and let the EXIT trap remove the guard.
+func TestArchiveGuardSurvivesClosedStdout(t *testing.T) {
+	for _, sh := range guardShells {
+		t.Run(sh.name, func(t *testing.T) {
+			lock := filepath.Join(t.TempDir(), "lock")
+			cmd := sh.command(t, guardScript("echo held\n: > \"$1.ran\"\n"), lock)
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cmd.Stdout = w
+			err = cmd.Run()
+			_ = w.Close()
+			if err != nil {
+				t.Errorf("holder script died: %v", err)
+			}
+			if _, err := os.Stat(lock + ".ran"); err != nil {
+				t.Errorf("holder script did not run to its end: %v", err)
+			}
+			if _, err := os.Stat(lock + ".guard"); !os.IsNotExist(err) {
+				t.Errorf("guard still present after the holder exited: %v", err)
+			}
+		})
+	}
+}
+
+// A HUP or TERM that arrives while the guard is held runs the EXIT trap: the
+// shell exits with status 1 and the guard is removed.
+func TestArchiveGuardReleasedOnHupAndTerm(t *testing.T) {
+	for _, sh := range guardShells {
+		t.Run(sh.name, func(t *testing.T) {
+			for _, sig := range []syscall.Signal{syscall.SIGHUP, syscall.SIGTERM} {
+				t.Run(sig.String(), func(t *testing.T) {
+					lock := filepath.Join(t.TempDir(), "lock")
+					cmd := sh.command(t, guardScript(": > \"$1.ready\"\nwhile :; do sleep 0.05; done\n"), lock)
+					if err := cmd.Start(); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = cmd.Process.Kill() })
+					done := make(chan error, 1)
+					go func() { done <- cmd.Wait() }()
+					deadline := time.Now().Add(10 * time.Second)
+					for {
+						if _, err := os.Stat(lock + ".ready"); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("holder never marked ready")
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					if _, err := os.Stat(lock + ".guard"); err != nil {
+						t.Fatalf("holder has no guard: %v", err)
+					}
+					if err := cmd.Process.Signal(sig); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					select {
+					case err = <-done:
+					case <-time.After(10 * time.Second):
+						t.Fatal("holder did not exit after the signal")
+					}
+					var exit *exec.ExitError
+					if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+						t.Errorf("holder exit %v, want status 1 through the EXIT trap", err)
+					}
+					if _, err := os.Stat(lock + ".guard"); !os.IsNotExist(err) {
+						t.Errorf("guard still present after %v: %v", sig, err)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestArchiveGuardHeldPastTTLIsReportedNotBroken covers a guard left by a holder
 // that is gone or stuck. The claim fails naming the guard, the lock is untouched,
 // and the guard stays for an operator to remove.
@@ -1801,6 +1909,57 @@ func TestArchiveGuardHeldPastTTLIsReportedNotBroken(t *testing.T) {
 		if release != nil {
 			release()
 		}
+		t.Fatalf("claim err=%v, want an error naming guard %s", err, guard)
+	}
+	var skip *Skip
+	if errors.As(err, &skip) {
+		t.Fatalf("held guard reported as a busy skip: %v", err)
+	}
+	if _, err := os.Stat(guard); err != nil {
+		t.Fatalf("held guard was removed: %v", err)
+	}
+	owner, err := os.ReadFile(lock + "/owner")
+	if err != nil || string(owner) != "dead 1\n" {
+		t.Fatalf("lock changed under a held guard: owner=%q err=%v", owner, err)
+	}
+}
+
+// guardAgedBeforeReclaim ages a guard past the TTL just before the reclaim
+// script runs, as a holder that appeared after the claim script finished would.
+type guardAgedBeforeReclaim struct {
+	reap.Runner
+	guard string
+	aged  time.Time
+}
+
+func (r *guardAgedBeforeReclaim) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], `parked="$1.reclaim.$4"`) {
+		if err := os.Mkdir(r.guard, 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.Chtimes(r.guard, r.aged, r.aged); err != nil {
+			return nil, err
+		}
+	}
+	return r.Runner.Run(ctx, name, args, input, dir)
+}
+
+// A guard held past the TTL that appears between the claim script and the
+// reclaim script is reported by the reclaim script too: claim fails naming the
+// guard, the error is not a busy skip, and the lock is left as it was.
+func TestArchiveGuardHeldAfterReclaimIsReportedNotBroken(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "reclaim-guard-held")
+	lock := staleLockDir(t, e, dest, "dead 1")
+	guard := lock + ".guard"
+	aged := time.Now().Add(-2 * time.Duration(archiveLockTTL) * time.Second)
+	a := &Archiver{Runner: &guardAgedBeforeReclaim{Runner: &fakeRunner{}, guard: guard, aged: aged}, DriveDir: e.drive}
+	release, err := a.claim(context.Background(), dest)
+	if err == nil {
+		release()
+		t.Fatalf("claim acquired the lock under a guard held past the TTL\n%s", lockState(e, dest))
+	}
+	if !strings.Contains(err.Error(), guard) || !strings.Contains(err.Error(), "remove it by hand") {
 		t.Fatalf("claim err=%v, want an error naming guard %s", err, guard)
 	}
 	var skip *Skip

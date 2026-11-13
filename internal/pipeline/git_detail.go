@@ -8,8 +8,9 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// gitDetailBytes bounds the git stderr an audit row or a skip carries. It is
-// the bound integrations.Detail gives an operator report.
+// gitDetailBytes bounds each git stderr an audit row or a skip carries, not the
+// joined detail: a detail that joins two stderrs ("; ") can reach twice this.
+// It is the bound integrations.Detail gives an operator report.
 const gitDetailBytes = 512
 
 // errorDetail is an error whose text is err's, with an operator-facing detail

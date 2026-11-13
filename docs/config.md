@@ -382,8 +382,9 @@ these steps in order:
    than 24 hours is reclaimable, and a live lock is reported as
    `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
    age; a claim that finds one held past 24 hours fails with an error naming the
-   guard path, and the lock is left alone. Remove that guard by hand once no
-   archive run is live. If hosts present the same task/job key, a stale or
+   guard path, and the lock is left alone. Remove that guard by hand, with
+   `rm -r`, once no archive run is live: it is a directory holding an `owner`
+   file. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
@@ -546,8 +547,11 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    the branch. The 406 local-diff path uses the same fetch. Each attempt writes
    one `pr-head-fallback` row (repo, PR, head, ref, first error redacted and up
    to 512 bytes, `result`: `ok`, `fetch-failed`, `head-moved` or
-   `pull-ref-kept`) to `decisions.jsonl`; a fork PR or an invalid ref name
-   skips the pass as before, with no row.
+   `pull-ref-kept`, and `detail`: the first fetch's redacted stderr, at most 512
+   bytes, present only when the first failure was a git command error) to
+   `decisions.jsonl`. A pass skipped after a failed fallback carries as its
+   operator detail the first fetch's stderr, then the fallback's, joined by
+   `; `. A fork PR or an invalid ref name skips the pass as before, with no row.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings and operator decisions), then runs
@@ -1231,7 +1235,7 @@ grades each thread by the author and severity of its first comment instead:
 | Grade | Holds the merge until | Reason |
 | --- | --- | --- |
 | block | the thread is resolved, or a human reply (not the finding's author, not a bot; for a `review.login` finding, that login's own reply that is not itself a finding) carries a block disposition: it opens with `Fix`/`Fixed`/`Fixes` and names a commit that GitHub knows, that comes after the head the finding was posted on, and that is in the PR head's history; or it opens with `Dismiss`/`Dismissed`/`Dismissal` followed by its reason. The latest answer decides. An acknowledgement, a defer, a bare "Dismissed.", or a fix naming an unknown commit or one outside the PR does not clear it. A commit lookup GitHub cannot answer holds the verdict (an error) rather than passing or blocking it. Neither needs a new head. | `blocking_findings:<n>` |
-| triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason, or `Disposition: defer <task id>` naming an existing hk task other than the PR's own task (the id as `4346`, `hk 4346`, `hk:4346` or `#4346`, case-insensitive); or the thread is resolved. An own-task or missing-task defer is not accepted. Neither needs a new head. | `triage_unanswered:<n>` |
+| triage | it has a disposition: someone other than the finding's author (and not a bot) replies on the thread with a fix SHA, a dismissal with its reason, or `Disposition: defer <task id>` naming an existing hk task other than the PR's own task (the id as `4346`, `hk 4346`, `hk:4346` or `#4346`, case-insensitive); or the thread is resolved. An own-task or missing-task defer is not accepted, and neither is an id hk cannot hold (`0`, `007`, or one too large for int64): that reply is not looked up. Neither needs a new head. | `triage_unanswered:<n>` |
 | advisory | never holds and is not counted as unanswered. Threads from authors no rule names are advisory. | none |
 
 A thread answered with a disposition counts as answered whether or not it is
@@ -1675,7 +1679,7 @@ time-based hold can lag: a cancelled check's settling wait, a stall notice and a
 review retry backoff are re-read at most 60 minutes late for a skipped PR.
 
 Only a settled PR is remembered: a draft, or a PR whose head has its review done
-marker, evaluated without an error. A PR still being reviewed, or one whose last
+marker, evaluated without an error. A PR still being reviewed, one whose review poll the GitHub client skipped, or one whose last
 evaluation failed, is evaluated every pass. Memory is in the daemon process: a restart
 evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
 
@@ -2023,6 +2027,8 @@ reason writes a `review-retry-waiting` row, and the count, backoff and last
 error stay as they were until the head can merge cleanly again. These
 counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
+
+A review poll the GitHub client skips inside its poll interval is a wait, not a failure: it counts as no review, does not back off or count toward escalation, and the head is not settled.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` was removed; a config that sets it fails at load. Shadow and
