@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,17 @@ type watchResult struct {
 	// AnyRefDispatch is the commit whose any-ref CI this pass dispatched, or
 	// would dispatch in shadow and dry runs.
 	AnyRefDispatch string `json:"any_ref_dispatch,omitempty"`
+}
+
+type watchHoldEpisode struct {
+	ID             string            `json:"id"`
+	Announced      map[string]bool   `json:"announced,omitempty"`
+	AnnouncedPairs map[string]string `json:"announced_pairs,omitempty"`
+	SuppressedHead string            `json:"suppressed_head,omitempty"`
+	Suppressed     map[string]bool   `json:"suppressed,omitempty"`
+	// Notified reads episode files written by the first implementation and is
+	// migrated to AnnouncedPairs on the next write.
+	Notified map[string]bool `json:"notified,omitempty"`
 }
 
 // UnknownEvidenceError names the bracket commit whose CI evidence Bisect
@@ -211,6 +223,11 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	}
 	checkpoint := s.checkpoint(r.Name)
 	if ci == github.Green {
+		if !s.deploy && !o.DryRun {
+			if e = s.clearWatchHoldEpisode(r.Name); e != nil {
+				return e
+			}
+		}
 		// A same-sha re-run can pass beside the head's own failed run. Record
 		// the mixed result once, then close the incident as healthy: a green
 		// main needs no revert, and a stale record would block a later red.
@@ -289,9 +306,9 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	baseline := string(baselineBytes)
 	chain := []string{head}
 	green := ""
-	// holdAs ends the pass with a hold. A hold that needs the desk is reported
-	// once per head and reason; a quiet hold (waiting for any-ref CI) is only
-	// audited and fed.
+	// holdAs ends the pass with a hold. A notifying main hold is reported once
+	// per red episode and reason class; a quiet hold (waiting for any-ref CI) is
+	// only audited and fed.
 	holdAs := func(reason string, notify bool) error {
 		candidates, e := s.bracketCandidates(ctx, r, chain, green)
 		if e != nil {
@@ -642,6 +659,9 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		return nil
 	}
 	s.feedWatch(r, result, o)
+	if result.Action == "hold" && result.Stage == "" {
+		return s.reportMainWatchHold(ctx, r, result)
+	}
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
@@ -666,6 +686,109 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 		return e
 	}
 	return sent.add(key)
+}
+
+func watchHoldReasonClass(reason string) string {
+	if i := strings.Index(reason, ": "); i >= 0 {
+		return reason[:i]
+	}
+	return reason
+}
+
+func (s *Service) reportMainWatchHold(ctx context.Context, r config.Repo, result watchResult) error {
+	episode, err := s.readWatchHoldEpisode(r.Name)
+	if err != nil {
+		return err
+	}
+	if episode.ID == "" {
+		episode.ID = fmt.Sprintf("%d-%s", s.now().UTC().UnixNano(), short7(result.Head))
+		if err = s.writeWatchHoldEpisode(r.Name, episode); err != nil {
+			return err
+		}
+	}
+	class := watchHoldReasonClass(result.Reason)
+	pair := result.Head + "\x00" + result.Reason
+	if episode.SuppressedHead != result.Head {
+		episode.SuppressedHead = result.Head
+		episode.Suppressed = map[string]bool{}
+	}
+	if episode.Announced[class] {
+		if episode.AnnouncedPairs[class] == pair || episode.Suppressed[pair] {
+			return nil
+		}
+		if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
+			return err
+		}
+		data, _ := json.Marshal(result)
+		reportCtx, cancel := reportContext(ctx)
+		defer cancel()
+		if err = s.Sink.Record(reportCtx, "mergewake/hold/"+result.Head, data); err != nil {
+			return err
+		}
+		episode.Suppressed[pair] = true
+		return s.writeWatchHoldEpisode(r.Name, episode)
+	}
+
+	data, _ := json.Marshal(result)
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	note := "mergewake: watch hold on " + r.Name + " " + result.Head
+	if result.Reason != "" {
+		note += ": " + result.Reason
+	}
+	classHash := fmt.Sprintf("%x", sha256.Sum256([]byte(class)))[:12]
+	eventID := "mergewake-watch-hold-" + episode.ID + "-" + classHash
+	if err = errors.Join(s.Sink.Record(reportCtx, "mergewake/hold/"+result.Head, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: eventID, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)})); err != nil {
+		return err
+	}
+	episode.Announced[class] = true
+	episode.AnnouncedPairs[class] = pair
+	episode.Notified = nil
+	return s.writeWatchHoldEpisode(r.Name, episode)
+}
+
+func (s *Service) readWatchHoldEpisode(repo string) (watchHoldEpisode, error) {
+	var episode watchHoldEpisode
+	file := filepath.Join(s.state(repo), "watch-hold-active.json")
+	if _, err := os.Stat(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return episode, err
+	}
+	if found, err := fsutil.ReadJSON(file, &episode); found && err != nil {
+		return episode, err
+	} else if err != nil {
+		return episode, err
+	}
+	if episode.Announced == nil {
+		episode.Announced = map[string]bool{}
+	}
+	if episode.AnnouncedPairs == nil {
+		episode.AnnouncedPairs = map[string]string{}
+	}
+	for pair := range episode.Notified {
+		if i := strings.IndexByte(pair, '\x00'); i >= 0 {
+			class := watchHoldReasonClass(pair[i+1:])
+			if episode.Announced[class] && episode.AnnouncedPairs[class] == "" {
+				episode.AnnouncedPairs[class] = pair
+			}
+		}
+	}
+	episode.Notified = nil
+	if episode.Suppressed == nil {
+		episode.Suppressed = map[string]bool{}
+	}
+	return episode, nil
+}
+
+func (s *Service) writeWatchHoldEpisode(repo string, episode watchHoldEpisode) error {
+	return fsutil.WriteJSON(filepath.Join(s.state(repo), "watch-hold-active.json"), episode)
+}
+
+func (s *Service) clearWatchHoldEpisode(repo string) error {
+	file := filepath.Join(s.state(repo), "watch-hold-active.json")
+	if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // bracketCandidates lists merged PRs in the inspected interval, excluding a
