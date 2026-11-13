@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -101,6 +103,43 @@ func TestEventQueueSweepQueuesInsteadOfEvaluatingInline(t *testing.T) {
 	}
 	close(f.runner.release)
 	e.q.Wait()
+}
+
+func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "open" {
+			close(entered)
+			<-release
+		}
+		f.hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	e.gh.BaseURL = proxy.URL
+	returned := make(chan error, 1)
+	go func() { returned <- e.sweep(context.Background(), f.repo) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep did not enter OpenPulls")
+	}
+	// This is the queue call made by the webhook handler for a delivery naming
+	// PR 5 and its head while the list response is in flight.
+	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 5, "eee")
+	close(release)
+	if err := <-returned; err != nil {
+		t.Fatal(err)
+	}
+	f.runner.waitFor(t, "listed PR and webhook PR evaluations", func(in, started, _ int) bool { return in == 2 && started == 2 })
+	close(f.runner.release)
+	e.q.Wait()
+	e.q.EnqueueNamed(daemon.SourceCheck, f.repo.Name, 0, "eee")
+	f.runner.waitFor(t, "commit-only check evaluation of PR 5", func(in, started, _ int) bool { return in == 3 && started == 3 })
+	e.q.Wait()
+	if got := strings.Join(f.trace.snapshot(), "\n"); !strings.Contains(got, "review 5") {
+		t.Fatalf("trace does not include PR 5 from the commit-only check: %s", got)
+	}
 }
 
 // (g) A PR whose delivery was dropped is still evaluated by the sweep: nothing

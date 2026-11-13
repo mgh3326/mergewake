@@ -260,6 +260,40 @@ func TestEventQueueDeliveryNamingOnlyACommitFindsItsPR(t *testing.T) {
 	}
 }
 
+func TestSetOpenMergesChangesSinceBeginList(t *testing.T) {
+	t.Run("forgotten PR stays absent", func(t *testing.T) {
+		q := &Queue{}
+		q.SetOpen("o/r", map[int]string{2: "head-2"})
+		q.BeginList("o/r")
+		q.Forget("o/r", 2)
+		q.SetOpen("o/r", map[int]string{2: "head-2"})
+		q.EnqueueNamed(SourceCheck, "o/r", 0, "head-2")
+		if got := q.Take("o/r").Depth; got != 0 {
+			t.Fatalf("forgotten PR was queued by its head: depth %d", got)
+		}
+	})
+	t.Run("newer learned head wins", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Learn("o/r", 1, "new")
+		q.SetOpen("o/r", map[int]string{1: "old"})
+		if got := q.Head("o/r", 1); got != "new" {
+			t.Fatalf("head %q, want new", got)
+		}
+	})
+	t.Run("no mark replaces", func(t *testing.T) {
+		q := &Queue{}
+		q.SetOpen("o/r", map[int]string{1: "a", 2: "b"})
+		q.SetOpen("o/r", map[int]string{3: "c"})
+		if got := q.Head("o/r", 1); got != "" {
+			t.Fatalf("PR 1 head %q", got)
+		}
+		if got := q.Head("o/r", 3); got != "c" {
+			t.Fatalf("PR 3 head %q", got)
+		}
+	})
+}
+
 // (h) More items wait than run: the lowest priority number starts first, ties in
 // arrival order, and an item with no priority last; a priority-1 item starts at
 // once past the cap, up to Extra of them.

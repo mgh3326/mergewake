@@ -120,3 +120,21 @@ func TestTimersOfAPRThatLeftTheOpenSetDoNotQueueIt(t *testing.T) {
 	ck.get(3).f()
 	ev.waitStarted(t, 1)
 }
+
+func TestSetOpenPreservesTimersForPRLearnedDuringList(t *testing.T) {
+	q := &Queue{After: (&fakeTimers{}).after}
+	q.SetOpen("o/one", map[int]string{2: "listed"})
+	clock := &fakeTimers{}
+	q.After = clock.after
+	q.EnqueueAt(SourceTimer, "o/one", 1, "learned", time.Now().Add(time.Hour))
+	q.EnqueueAt(SourceTimer, "o/one", 2, "neither", time.Now().Add(time.Hour))
+	q.BeginList("o/one")
+	q.Learn("o/one", 1, "new")
+	q.SetOpen("o/one", map[int]string{})
+	if got := q.TimerIDs("o/one", 1); len(got) != 1 || got[0] != "learned" {
+		t.Fatalf("learned PR timers %v, want learned", got)
+	}
+	if got := q.TimerIDs("o/one", 2); len(got) != 0 {
+		t.Fatalf("unlisted PR timers %v, want none", got)
+	}
+}
