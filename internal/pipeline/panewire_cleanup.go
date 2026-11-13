@@ -23,9 +23,9 @@ type reviewerPane struct {
 	placement integrations.JobRecord // host and pane id from this spawn's OK line
 	confirmed bool                   // the OK line named a host and a pane
 	hold      string                 // why the pane stays open; empty when the pass is terminal
-	// force closes the pane even while it is working: only a reviewer replaced
-	// past its deadline sets it. The pane's output is saved first, and its name
-	// and cwd must still match.
+	// force closes the pane even while it is working: a reviewer its pass
+	// replaced sets it (lost result, timeout, or moved head). The pane's output
+	// is saved first, and its name and cwd must still match.
 	force bool
 	// keepLocalCheckout is set while a local pane still runs in the checkout.
 	keepLocalCheckout *bool
@@ -49,6 +49,7 @@ type reviewerCleanup struct {
 	local      bool
 	paneClosed bool
 	paneGone   bool
+	attempts   int
 	row        reapReceipt
 }
 
@@ -303,6 +304,13 @@ func (c *reviewerCleanup) closePane(ctx context.Context, ops reviewerPanes) (str
 	if err != nil {
 		c.record("error", "pane close: "+err.Error())
 		return "", false
+	}
+	if outcome == reap.CapturePaneChanged && c.p.force && c.attempts < replacedCloseAttempts-1 {
+		// The pane's status or name moved between the read and the close. A
+		// replaced pane is still owed its close, so read it again and close
+		// what it is now; every attempt repeats the identity check.
+		c.attempts++
+		return c.closePane(ctx, ops)
 	}
 	if outcome != reap.CloseClosed && outcome != reap.CapturePaneGone {
 		c.record("kept", "pane close recheck: "+outcome)

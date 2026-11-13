@@ -152,10 +152,7 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 // audit write is an error.
 func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, outcome, reason string) (bool, error) {
 	s, cfg := x.s, x.s.Config.Review.Panewire
-	lane := job.OwnerLane
-	if i := slices.Index(rj.Args, "--owner"); lane == "" && i >= 0 && i+1 < len(rj.Args) {
-		lane = rj.Args[i+1]
-	}
+	lane := reviewerLane(job, rj)
 	if lane == "" {
 		lane = cfg.Owner
 	}
@@ -172,6 +169,15 @@ func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob,
 		skipped = fleetevent.Redact(integrations.Detail(e))
 	}
 	return false, s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "label": rj.Label, "head": rj.Head, "reason": skipped}, false)
+}
+
+// reviewerLane is the owner lane a reviewer's hk job closes under: the hk
+// record's, else the --owner of the recorded spawn arguments, else "".
+func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
+	if i := slices.Index(rj.Args, "--owner"); job.OwnerLane == "" && i >= 0 && i+1 < len(rj.Args) {
+		return rj.Args[i+1]
+	}
+	return job.OwnerLane
 }
 
 // closeMovedHeadJob closes the reviewer job of a record left by an older head
@@ -191,8 +197,8 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	case terminalJob(job.State):
 		return nil
 	}
-	closed, e := x.closeReviewerJob(ctx, rj, job, "abandoned", "PR head moved")
-	if e != nil || !closed {
+	res, e := x.closeReplaced(ctx, rj, job, "PR head moved")
+	if e != nil || !res.JobClosed {
 		return e
 	}
 	x.mu.Lock()
