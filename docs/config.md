@@ -547,8 +547,11 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    the branch. The 406 local-diff path uses the same fetch. Each attempt writes
    one `pr-head-fallback` row (repo, PR, head, ref, first error redacted and up
    to 512 bytes, `result`: `ok`, `fetch-failed`, `head-moved` or
-   `pull-ref-kept`) to `decisions.jsonl`; a fork PR or an invalid ref name
-   skips the pass as before, with no row.
+   `pull-ref-kept`, and `detail`: the first fetch's redacted stderr, at most 512
+   bytes, present only when the first failure was a git command error) to
+   `decisions.jsonl`. A pass skipped after a failed fallback carries as its
+   operator detail the first fetch's stderr, then the fallback's, joined by
+   `; `. A fork PR or an invalid ref name skips the pass as before, with no row.
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings and operator decisions), then runs

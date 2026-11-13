@@ -501,3 +501,47 @@ func TestLocalDiffFallsBackToBranchWithoutPullRef(t *testing.T) {
 	}
 	fallbackRow(t, s, r, "ok")
 }
+
+// A failed fallback's operator detail starts with the first fetch's stderr and
+// then carries the fallback's own git stderr after "; ": neither is lost. The
+// returned text is the one the fallback always produced.
+func TestFetchPRHeadFallbackFailureDetailKeepsFirstStderr(t *testing.T) {
+	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: "fatal: couldn't find remote ref pull/7/head\n"}
+	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, func(pr *github.Pull) { pr.Head.Ref = "feat/gone" })
+	// panewireRunner's git failures carry no stderr; the branch fetch needs the
+	// real runner's CommandError.
+	s.Runner = pullFetchErrRunner{Runner: integrations.Exec{}, err: ce}
+	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	if e == nil {
+		t.Fatal("fetchPRHead: want the branch fallback failure")
+	}
+	if want := "fetch PR head: " + ce.Error() + "; fetch branch feat/gone: "; !strings.HasPrefix(e.Error(), want) {
+		t.Fatalf("err=%q, want the prefix %q", e.Error(), want)
+	}
+	const first = "fatal: couldn't find remote ref pull/7/head"
+	got := errorDetailOf(e)
+	if !strings.HasPrefix(got, first+"; ") || !strings.Contains(got[len(first)+2:], "feat/gone") {
+		t.Fatalf("errorDetailOf=%q, want the first fetch's stderr then the branch fetch's, joined by \"; \"", got)
+	}
+	fallbackRow(t, s, r, "fetch-failed")
+}
+
+// A branch that moved past the reviewed head: the detail is the first fetch's
+// stderr alone, since the head-moved failure ran no git command that failed.
+func TestFetchPRHeadHeadMovedDetailIsFirstStderr(t *testing.T) {
+	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: "fatal: couldn't find remote ref pull/7/head\n"}
+	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
+	tip := o.commit(t, "later")
+	gitAt(t, o.work, "push", o.origin, "feat/thing")
+	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	if e == nil {
+		t.Fatal("fetchPRHead: want the head-moved failure")
+	}
+	if want := "fetch PR head: " + ce.Error() + "; branch feat/thing is at " + short7(tip) + ", not head " + short7(o.head); e.Error() != want {
+		t.Fatalf("err=%q, want %q", e.Error(), want)
+	}
+	if got, want := errorDetailOf(e), "fatal: couldn't find remote ref pull/7/head"; got != want {
+		t.Fatalf("errorDetailOf=%q, want %q", got, want)
+	}
+	fallbackRow(t, s, r, "head-moved")
+}
