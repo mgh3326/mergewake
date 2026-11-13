@@ -108,3 +108,17 @@ change outbox. A successful or stale response clears its entries; transient
 endpoint or request failures retain them for retry and replay after restart.
 This also preserves queued observations when a bounded shutdown wait expires.
 Each entry is claimed by the process that holds it through an OS file lock on the entry itself. Another mergewake process on the same state directory skips entries it finds locked, so each entry is sent by one process. A failed send keeps the claim, so the same process retries the entry while others skip it. A claim ends when the entry is sent and removed, or when the process exits; the next process then replays the entry.
+
+## Delivery receipts and the delivery check
+
+With `daemon.webhook.enabled`, each verified delivery, repeat or not, appends one line to `<state_dir>/webhook-receipts/<UTC date>.jsonl`:
+
+`{"at":"…","guid":"…","event":"pull_request","repo":"owner/name","hook_id":123}`
+
+`"repeat":true` is added when the GUID was redelivered. A line holds no body, signature or header. Receipt files dated more than three UTC days back are removed on the first write each day. A failed write logs `webhook receipt not written` once per UTC day and never changes the response, so the delivery then reads as missing in the check below.
+
+When an App is configured (`github_app`), the daemon checks the App's webhook delivery log once an hour, at start and then hourly. The check is read-only: it redelivers nothing and writes only its state file. It reads `GET /app/hook/deliveries?per_page=100` with the App JWT, follows `Link: rel="next"` for at most 1,000 pages, and waits at least a second between pages. Each run judges deliveries in `[from, until)`, where `until` is now minus 10 minutes (GitHub logs a delivery late) and `from` is the latest of 24 hours before `until`, the previous run's `until`, and the earliest receipt on disk. Deliveries before the earliest receipt are not counted, since their receipts may have been pruned.
+
+Each run logs one `webhook delivery check` line with `from`, `until`, `pages`, `truncated`, `groups`, `missing_total` and `missing`. `groups` is keyed by UTC day of `delivered_at`, then event, with `sent`, `failed` (status outside 2xx), `redelivery` and `missing` (no receipt with that GUID). `missing` lists at most 20 rows with `guid`, `event`, `delivered_at` and `status_code`; `missing_total` is exact. `truncated: true` means the walk hit the 1,000-page bound before reaching `from`.
+
+After a successful run the check saves `until` to `<state_dir>/webhook-delivery-check.json` as `{"until":"…"}`, written through a temporary file. A failed run (the log request, a non-2xx page, or a cursor that leaves the API host) logs `webhook delivery check failed` with the error text and saves nothing, so the next run judges the same window again. A truncated run still saves `until`. Credentials never reach the log, the state file or an error.

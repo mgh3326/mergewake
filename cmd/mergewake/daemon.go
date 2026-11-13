@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -174,7 +175,11 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		state := webhookstate.Open(s.Config.StateDir)
 		state.Log = log
 		gh.Webhook = state
-		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: known, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery}
+		receipts := &daemon.Receipts{Dir: filepath.Join(s.Config.StateDir, "webhook-receipts"), Log: log}
+		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: known, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery, Receipts: receipts}
+		if s.Config.GitHubApp != nil {
+			d.Webhook.Check = &daemon.DeliveryCheck{Source: gh, Receipts: receipts, StatePath: filepath.Join(s.Config.StateDir, "webhook-delivery-check.json"), Log: log}
+		}
 		if engine != nil {
 			branches := map[string]string{}
 			for _, r := range repos {
