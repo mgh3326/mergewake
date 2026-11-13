@@ -245,7 +245,7 @@ func setPartialAuthorScan(s *Service, run *scriptRunner) {
 	run.errs = map[string]error{key("ssh", "-o", "BatchMode=yes", "-T", "-n", "unavailable", reap.Join([]string{"herdr", "agent", "list"})): errors.New("pane list failed")}
 }
 
-func TestPartialAuthorScanStillUsesUniqueTakeover(t *testing.T) {
+func TestPartialAuthorScanKeepsBoundLaneAndAuditsCandidate(t *testing.T) {
 	s, _, run := takeoverSetup(t, paneB)
 	setPartialAuthorScan(s, run)
 	var out bytes.Buffer
@@ -255,12 +255,59 @@ func TestPartialAuthorScanStillUsesUniqueTakeover(t *testing.T) {
 		t.Fatal(e)
 	}
 	n := s.Notifier.(*ackNotifier)
-	if n.count != 1 || n.events[0].Lane != "w-9-lane" {
-		t.Fatalf("unique healthy-host takeover not selected: %+v calls=%v", n.events, run.calls)
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("partial scan did not keep bound lane: %+v calls=%v", n.events, run.calls)
 	}
 	rows := auditRecords(t, out.Bytes(), "findings-route-partial")
-	if len(rows) != 1 || rows[0]["lane"] != "w-9-lane" {
+	if len(rows) != 1 || rows[0]["lane"] != "w-7" || !strings.Contains(fmt.Sprint(rows[0]["candidates"]), "w-9") {
 		t.Fatalf("partial takeover audit rows %+v", rows)
+	}
+}
+
+func TestPartialAuthorScanReadyRecordKeepsBoundLane(t *testing.T) {
+	s, _, _, r := workerNotifySetup(t)
+	sink := s.Sink.(*jobSink)
+	sink.recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
+	run := authorHost(paneB)
+	s.Runner = run
+	setPartialAuthorScan(s, run)
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	rows := prNotifyRows(t, s, r)
+	if len(rows) != 1 || rows[0]["lane"] != "worker-lane" || !strings.Contains(fmt.Sprint(rows[0]["via"]), "partial pane scan") {
+		t.Fatalf("partial READY route: %+v", rows)
+	}
+}
+
+func TestPartialAuthorScanStoredDeliveryDoesNotResendToCandidate(t *testing.T) {
+	s, _, _ := takeoverSetup(t, aPane{"w1:p9", "w-5", "/wt/z", "other-branch", projectOrigin})
+	var out bytes.Buffer
+	s.Out = &out
+	n := s.Notifier.(*ackNotifier)
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	deliver(t, s, testRepoFor(s))
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("initial delivery: %+v", n.events)
+	}
+	s.Runner = authorHost(paneB)
+	setPartialAuthorScan(s, s.Runner.(*scriptRunner))
+	base := s.now()
+	s.Now = func() time.Time { return base.Add(s.Config.Daemon.PR.Findings.AckWindow() + time.Minute) }
+	deliver(t, s, testRepoFor(s))
+	if n.count != 2 || n.events[1].Lane != "w-7" || !strings.HasSuffix(n.events[1].ID, "-resend") {
+		t.Fatalf("partial re-send moved to candidate: %+v", n.events)
+	}
+}
+
+func TestFullAuthorScanStillTakesOverUniquePane(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneB)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-9-lane" || rt.via != "takeover pane w-9" {
+		t.Fatalf("route %q via %q", rt.lane, rt.via)
 	}
 }
 
@@ -496,3 +543,81 @@ func TestAuthorPaneFindingsTextCarriesLaneInAck(t *testing.T) {
 }
 
 func testRepoFor(*Service) config.Repo { return config.Repo{Name: "example/project", Branch: "main"} }
+
+// hostPaneOuts scripts one configured host's herdr agent and pane lists for
+// panes that carry no cwd, answering locally or through the ssh wrapper a
+// remote host runs under.
+func hostPaneOuts(h reap.Host, panes ...aPane) map[string]string {
+	var agents, all []string
+	for _, p := range panes {
+		agents = append(agents, fmt.Sprintf(`{"pane_id":%q,"name":%q,"agent_status":"working","agent":"claude","cwd":%q}`, p.id, p.name, p.cwd))
+		all = append(all, fmt.Sprintf(`{"pane_id":%q,"cwd":%q}`, p.id, p.cwd))
+	}
+	agentList := `{"result":{"agents":[` + strings.Join(agents, ",") + `]}}`
+	paneList := `{"result":{"panes":[` + strings.Join(all, ",") + `]}}`
+	if h.Local() {
+		return map[string]string{
+			key("herdr", "agent", "list"): agentList,
+			key("herdr", "pane", "list"):  paneList,
+		}
+	}
+	ssh := func(args ...string) string {
+		return key("ssh", append([]string{"-o", "BatchMode=yes", "-T", "-n", h.SSH}, reap.Join(args))...)
+	}
+	return map[string]string{
+		ssh("herdr", "agent", "list"): agentList,
+		ssh("herdr", "pane", "list"):  paneList,
+	}
+}
+
+// (hk 4210) A pane id is local to its host: a terminal job's recorded pane
+// keeps it live only on the host rec.Host names, while the job and label
+// names still count on every host.
+func TestAuthorFinishedPaneIDOnlyOnRecordedHost(t *testing.T) {
+	hostA := reap.Host{Name: "node-a"} // local
+	hostB := reap.Host{Name: "node-b", SSH: "ops@node-b", Machine: "mb-b"}
+	// collision is the recorded pane id w1:p1 held by another job's pane.
+	collision := aPane{id: "w1:p1", name: "w-9"}
+	done := func(host string) integrations.JobRecord {
+		return integrations.JobRecord{State: "completed", Host: host, Label: "w-7", PaneID: "w1:p1"}
+	}
+	for _, tt := range []struct {
+		name     string
+		job      string
+		rec      integrations.JobRecord
+		panesA   []aPane
+		panesB   []aPane
+		finished bool
+	}{
+		// (a) Recorded on A; the same pane id on B is another host's pane.
+		{"pane id on another host", "w-7", done("node-a"), nil, []aPane{collision}, true},
+		// (b) The recorded pane id on its own host keeps the job live.
+		{"pane id on the recorded host", "w-7", done("node-a"), []aPane{collision}, nil, false},
+		// (c) An empty or unplaceable host keeps the pane id matching everywhere.
+		{"empty host", "w-7", done(""), nil, []aPane{collision}, false},
+		{"unknown host on b", "w-7", done("ghost"), nil, []aPane{collision}, false},
+		{"unknown host on a", "w-7", done("ghost"), []aPane{collision}, nil, false},
+		// (d) MachineID and "local" name their host the same way Name does.
+		{"machine id on its host", "w-7", done("mb-b"), nil, []aPane{collision}, false},
+		{"machine id misses other hosts", "w-7", done("mb-b"), []aPane{collision}, nil, true},
+		{"local names the local host", "w-7", done("local"), []aPane{collision}, nil, false},
+		{"local skips remote hosts", "w-7", done("local"), nil, []aPane{collision}, true},
+		// (e) A pane named for the job's label on another host still counts.
+		{"label on another host", "job-1", integrations.JobRecord{State: "completed", Host: "node-a", Label: "w-7", PaneID: "w1:p9"}, nil, []aPane{{id: "w2:p2", name: "w-7"}}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			outs := map[string]string{}
+			for k, v := range hostPaneOuts(hostA, tt.panesA...) {
+				outs[k] = v
+			}
+			for k, v := range hostPaneOuts(hostB, tt.panesB...) {
+				outs[k] = v
+			}
+			s := &Service{Config: config.Config{Hosts: []reap.Host{hostA, hostB}}, Runner: &scriptRunner{outs: outs}}
+			finished, unknown, err := s.authorFinished(context.Background(), tt.job, tt.rec)
+			if err != nil || unknown || finished != tt.finished {
+				t.Fatalf("authorFinished = finished %v, unknown %v, err %v; want finished %v", finished, unknown, err, tt.finished)
+			}
+		})
+	}
+}
