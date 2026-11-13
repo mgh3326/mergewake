@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +141,162 @@ func TestEventQueueSweepQueuesInsteadOfEvaluatingInline(t *testing.T) {
 	}
 	close(f.runner.release)
 	e.q.Wait()
+}
+
+func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
+	f := newParallelFixture(t, 1, 0)
+	e := newPREngine(f.s, f.gh, pipeline.Options{}, []config.Repo{f.repo}, nil, nil, func(string, int) {})
+	works := make(chan daemon.Work, 10)
+	e.q.Run = func(_ context.Context, w daemon.Work) { works <- w }
+	ctx, cancel := context.WithCancel(context.Background())
+	e.q.Start(ctx)
+	t.Cleanup(func() { cancel(); e.q.Wait() })
+	entered, releaseList := make(chan struct{}), make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "open" {
+			close(entered)
+			<-releaseList
+		}
+		f.hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	e.gh.BaseURL = proxy.URL
+	returned := make(chan error, 1)
+	go func() { returned <- e.sweep(context.Background(), f.repo) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep did not enter OpenPulls")
+	}
+	// This is the queue call made by the webhook handler for a delivery naming
+	// PR 5 and its head while the list response is in flight.
+	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 5, "eee")
+	close(releaseList)
+	if err := <-returned; err != nil {
+		t.Fatal(err)
+	}
+	if got := e.q.Head(f.repo.Name, 5); got != "eee" {
+		t.Fatalf("sweep lost learned head: got %q, want eee", got)
+	}
+	e.q.Wait()
+	initial := []daemon.Work{<-works, <-works}
+	for _, want := range []int{1, 5} {
+		found := false
+		for _, w := range initial {
+			found = found || w.Key.PR == want
+		}
+		if !found {
+			t.Fatalf("initial sweep/webhook work %v missing PR %d", initial, want)
+		}
+	}
+	e.q.EnqueueNamed(daemon.SourceCheck, f.repo.Name, 0, "eee")
+	e.q.Wait()
+	var check daemon.Work
+	select {
+	case check = <-works:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit-only check did not queue PR 5")
+	}
+	if check.Key.PR != 5 || !slices.Equal(check.Sources, []daemon.Source{daemon.SourceCheck}) {
+		t.Fatalf("commit-only check work %+v, want only PR 5 from a check", check)
+	}
+}
+
+func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	var releaseRunner sync.Once
+	unblockRunner := func() { releaseRunner.Do(func() { close(f.runner.release) }) }
+	f.hub.mu.Lock()
+	f.hub.first = 5
+	f.hub.n = 1
+	f.hub.heads = map[int]string{5: "old"}
+	f.hub.mu.Unlock()
+	entered, releasePull := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/5") {
+			once.Do(func() {
+				close(entered)
+				select {
+				case <-releasePull:
+				case <-r.Context().Done():
+				}
+			})
+		}
+		f.hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	var releasePullOnce sync.Once
+	releasePullGate := func() { releasePullOnce.Do(func() { close(releasePull) }) }
+	t.Cleanup(func() {
+		releasePullGate()
+		unblockRunner()
+	})
+	e.gh.BaseURL = proxy.URL
+	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 5, "old")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("evaluation did not enter its fake GitHub read")
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "new"
+	f.hub.mu.Unlock()
+	if err := e.sweep(context.Background(), f.repo); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.q.Head(f.repo.Name, 5); got != "new" {
+		t.Fatalf("sweep head %q, want new", got)
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "old"
+	f.hub.mu.Unlock()
+	releasePullGate()
+	f.runner.waitFor(t, "the in-flight evaluation to reach review", func(in, started, _ int) bool { return in == 1 && started == 1 })
+	if got := e.q.Head(f.repo.Name, 5); got != "new" {
+		t.Fatalf("pre-list evaluation overwrote listed head with %q", got)
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "new"
+	f.hub.mu.Unlock()
+	unblockRunner()
+	e.q.Wait()
+}
+
+func TestSweepAbortsOpenListAfterOpenPullsError(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	e.q.SetOpen(f.repo.Name, map[int]string{5: "old"})
+	readMark := e.q.ReadMark(f.repo.Name)
+	entered, releaseList := make(chan struct{}), make(chan struct{})
+	var releaseListOnce sync.Once
+	releaseListGate := func() { releaseListOnce.Do(func() { close(releaseList) }) }
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "open" {
+			close(entered)
+			<-releaseList
+			http.Error(w, "temporary list failure", http.StatusInternalServerError)
+			return
+		}
+		f.hub.ServeHTTP(w, r)
+	}))
+	e.gh.BaseURL = proxy.URL
+	t.Cleanup(proxy.Close)
+	t.Cleanup(releaseListGate)
+	done := make(chan error, 1)
+	go func() { done <- e.sweep(context.Background(), f.repo) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep did not enter OpenPulls")
+	}
+	e.q.Forget(f.repo.Name, 5, readMark)
+	releaseListGate()
+	if err := <-done; err == nil {
+		t.Fatal("sweep succeeded despite OpenPulls failure")
+	}
+	if got := e.q.Head(f.repo.Name, 5); got != "" {
+		t.Fatalf("aborted pre-list Forget left head %q", got)
+	}
 }
 
 // (g) A PR whose delivery was dropped is still evaluated by the sweep: nothing
