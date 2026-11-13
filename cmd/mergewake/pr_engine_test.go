@@ -202,6 +202,56 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 	}
 }
 
+func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	f.hub.mu.Lock()
+	f.hub.first = 5
+	f.hub.n = 1
+	f.hub.heads = map[string]string{5: "old"}
+	f.hub.mu.Unlock()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/5") {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+		f.hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	e.gh.BaseURL = proxy.URL
+	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 5, "old")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("evaluation did not enter its fake GitHub read")
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "new"
+	f.hub.mu.Unlock()
+	if err := e.sweep(context.Background(), f.repo); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.q.Head(f.repo.Name, 5); got != "new" {
+		t.Fatalf("sweep head %q, want new", got)
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "old"
+	f.hub.mu.Unlock()
+	close(release)
+	f.runner.waitFor(t, "the in-flight evaluation to reach review", func(in, started, _ int) bool { return in == 1 && started == 1 })
+	if got := e.q.Head(f.repo.Name, 5); got != "new" {
+		t.Fatalf("pre-list evaluation overwrote listed head with %q", got)
+	}
+	f.hub.mu.Lock()
+	f.hub.heads[5] = "new"
+	f.hub.mu.Unlock()
+	close(f.runner.release)
+	e.q.Wait()
+}
+
 // (g) A PR whose delivery was dropped is still evaluated by the sweep: nothing
 // marks it dirty, its head moved, and the next pass evaluates it, and only it.
 func TestEventQueueSweepRepairsADroppedDelivery(t *testing.T) {

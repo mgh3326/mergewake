@@ -322,6 +322,25 @@ func TestSetOpenMergesChangesSinceBeginList(t *testing.T) {
 	})
 }
 
+func TestSetOpenIgnoresEvaluationReadsStartedBeforeList(t *testing.T) {
+	q := &Queue{}
+	readEpoch := uint64(0)
+	epoch := q.BeginList("o/r")
+	q.Learn("o/r", 5, "old", readEpoch)
+	q.SetOpen("o/r", map[int]string{5: "new"})
+	if got := q.Head("o/r", 5); got != "new" {
+		t.Fatalf("head %q, want listed head new", got)
+	}
+	q.Learn("o/r", 5, "older", readEpoch)
+	q.Forget("o/r", 5, readEpoch)
+	if got := q.Head("o/r", 5); got != "new" {
+		t.Fatalf("stale evaluation changed listed head to %q", got)
+	}
+	if epoch != 1 {
+		t.Fatalf("first list epoch %d, want 1", epoch)
+	}
+}
+
 // (h) More items wait than run: the lowest priority number starts first, ties in
 // arrival order, and an item with no priority last; a priority-1 item starts at
 // once past the cap, up to Extra of them.

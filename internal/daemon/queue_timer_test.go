@@ -138,3 +138,17 @@ func TestSetOpenPreservesTimersForPRLearnedDuringList(t *testing.T) {
 		t.Fatalf("unlisted PR timers %v, want none", got)
 	}
 }
+
+func TestStaleForgetDuringListKeepsListedPRTimer(t *testing.T) {
+	clock := &fakeTimers{}
+	q := &Queue{After: clock.after}
+	q.SetOpen("o/one", map[int]string{5: "old"})
+	q.EnqueueAt(SourceTimer, "o/one", 5, "review", time.Now().Add(time.Hour))
+	readEpoch := uint64(0)
+	q.BeginList("o/one")
+	q.Forget("o/one", 5, readEpoch)
+	q.SetOpen("o/one", map[int]string{5: "new"})
+	if got := q.TimerIDs("o/one", 5); len(got) != 1 || got[0] != "review" {
+		t.Fatalf("listed PR timers %v, want review timer preserved", got)
+	}
+}

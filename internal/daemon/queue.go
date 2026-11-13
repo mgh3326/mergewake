@@ -109,13 +109,16 @@ type Queue struct {
 	open map[string]map[int]string
 	// listing records changes made after a sweep starts reading a repo's open
 	// PRs, so SetOpen can reconcile those changes with the eventual list.
-	listing map[string]*openList
+	listing     map[string]*openList
+	listEpoch   map[string]uint64
+	listedEpoch map[string]uint64
 	// timers are the pending EnqueueAt calls. They live only in memory: a
 	// restart repeats what they would have found through the sweep.
 	timers map[timerKey]*timer
 }
 
 type openList struct {
+	epoch     uint64
 	learned   map[int]string
 	forgotten map[int]struct{}
 }
@@ -207,6 +210,8 @@ func (q *Queue) init() {
 		q.repos = map[string]*repoState{}
 		q.open = map[string]map[int]string{}
 		q.listing = map[string]*openList{}
+		q.listEpoch = map[string]uint64{}
+		q.listedEpoch = map[string]uint64{}
 		q.timers = map[timerKey]*timer{}
 		q.changed = sync.NewCond(&q.mu)
 	}
@@ -405,12 +410,16 @@ func (q *Queue) EnqueueRepo(src Source, repo string) {
 	q.pump()
 }
 
-// BeginList marks the start of a sweep's open PR list read for repo.
-func (q *Queue) BeginList(repo string) {
+// BeginList marks the start of a sweep's open PR list read for repo and returns
+// the epoch to attach to evaluation reads started after the mark.
+func (q *Queue) BeginList(repo string) uint64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
-	q.listing[repo] = &openList{learned: map[int]string{}, forgotten: map[int]struct{}{}}
+	q.listEpoch[repo]++
+	epoch := q.listEpoch[repo]
+	q.listing[repo] = &openList{epoch: epoch, learned: map[int]string{}, forgotten: map[int]struct{}{}}
+	return epoch
 }
 
 // SetOpen replaces the known open PRs of repo with their heads, reconciling
@@ -431,6 +440,7 @@ func (q *Queue) SetOpen(repo string, heads map[int]string) {
 			merged[n] = head
 		}
 		heads = merged
+		q.listedEpoch[repo] = changes.epoch
 		delete(q.listing, repo)
 	}
 	for tk := range q.timers {
@@ -441,11 +451,25 @@ func (q *Queue) SetOpen(repo string, heads map[int]string) {
 	q.open[repo] = heads
 }
 
-// Learn records that PR n of repo is open at head sha.
-func (q *Queue) Learn(repo string, n int, sha string) {
+// Learn records that PR n of repo is open at head sha. When readEpoch is
+// supplied, it identifies the list epoch in which the evaluation read began.
+func (q *Queue) Learn(repo string, n int, sha string, readEpoch ...uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	if len(readEpoch) > 0 {
+		epoch := readEpoch[0]
+		if epoch < q.listedEpoch[repo] {
+			return
+		}
+		if changes := q.listing[repo]; changes != nil && epoch < changes.epoch {
+			if q.open[repo] == nil {
+				q.open[repo] = map[int]string{}
+			}
+			q.open[repo][n] = sha
+			return
+		}
+	}
 	q.learn(repo, n, sha)
 }
 
@@ -470,11 +494,15 @@ func (q *Queue) learn(repo string, n int, sha string) {
 }
 
 // Forget drops PR n of repo from the known open PRs, and its timers with it:
-// a PR that closed or merged is not queued by a timer that was set before.
-func (q *Queue) Forget(repo string, n int) {
+// a PR that closed or merged is not queued by a timer that was set before. A
+// supplied readEpoch prevents an older evaluation read from undoing a newer list.
+func (q *Queue) Forget(repo string, n int, readEpoch ...uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	if len(readEpoch) > 0 && readEpoch[0] < q.listEpoch[repo] {
+		return
+	}
 	if changes := q.listing[repo]; changes != nil {
 		changes.forgotten[n] = struct{}{}
 		delete(changes.learned, n)
