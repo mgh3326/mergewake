@@ -136,15 +136,20 @@ func TestPassRecordUnknownHistoryOmitted(t *testing.T) {
 	if m["patch_id"] != historyPatchID {
 		t.Fatalf("patch_id %v", m)
 	}
-	// reviewPatchID's own 12-hex digest is shorter than hk's 16: hk refuses the
-	// whole record that carries it, so passRecord sends the patch-id half only.
-	rec = passRecord(pr, github.PassReceipt{Pass: 1, Round: 1, Lens: "default", Patch: reviewPatchID(reviewTestDiff)}, nil, "", at, at)
-	if rec.PatchID == "" || rec.PatchDigest != nil {
-		t.Fatalf("patch %q digest %v", rec.PatchID, rec.PatchDigest)
+	// A reviewPatchID receipt's digest is the 12 hex digits hk takes: passRecord
+	// sends it as patch_digest, and the patch-id half stays patch_id.
+	receiptPatch := reviewPatchID(reviewTestDiff)
+	_, want, _ := strings.Cut(receiptPatch, ":")
+	rec = passRecord(pr, github.PassReceipt{Pass: 1, Round: 1, Lens: "default", Patch: receiptPatch}, nil, "", at, at)
+	if len(want) != 12 || rec.PatchID == "" || rec.PatchDigest == nil || *rec.PatchDigest != want {
+		t.Fatalf("patch %q digest %v want %q", rec.PatchID, rec.PatchDigest, want)
+	}
+	if m := recordJSON(t, rec); m["patch_digest"] != want {
+		t.Fatalf("wire patch_digest %v", m["patch_digest"])
 	}
 	// What hk would refuse is cleared, not sent: reviewer text hk rejects, and a
-	// digest shorter than hk's 16 hex digits (mergewake's receipts carry 12).
-	short, empty := "0123456789ab", ""
+	// digest one hex digit short of hk's 12.
+	short, empty := "0123456789a", ""
 	bad := integrations.ReviewRecord{ReviewedHead: shaA, Pass: 1, Round: 1, Lens: "default", Reviewer: &empty, PatchDigest: &short}
 	fit, cleared, drop := bad.ForHK()
 	if drop != "" || fit.Reviewer != nil || fit.PatchDigest != nil || strings.Join(cleared, ",") != "patch_digest,reviewer" {
@@ -168,6 +173,28 @@ func TestTaskEventReviewHistoryOnWire(t *testing.T) {
 	for _, rv := range got[0].Reviews {
 		if rv.Reviewer == nil || *rv.Reviewer == "" || rv.Delta == nil || rv.Quiet == nil || rv.OutsideDiffBlocking == nil {
 			t.Fatalf("history missing: %+v", rv)
+		}
+	}
+}
+
+// A review's receipt carries the 12-hex digest of the reviewed text, and the
+// real path puts it on the wire as patch_digest. An hk holding the full rules
+// accepts the event with it.
+func TestTaskEventReviewPatchDigestOnWire(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	s.Config.Review.Timeout = "60s"
+	hk.rules = true
+	g.blocking = true
+	if e := s.Review(context.Background(), r, 7, "openai", Options{Observed: true}); e != nil {
+		t.Fatal(e)
+	}
+	got := hk.received()
+	if len(got) != 1 || len(got[0].Reviews) != 2 || len(hk.why) != 0 {
+		t.Fatalf("events %+v refusals %v", got, hk.why)
+	}
+	for _, rv := range got[0].Reviews {
+		if rv.PatchDigest == nil || len(*rv.PatchDigest) != 12 {
+			t.Fatalf("patch_digest not sent as 12 hex digits: %+v", rv)
 		}
 	}
 }

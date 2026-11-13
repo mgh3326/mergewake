@@ -122,7 +122,7 @@ func PatchID(s string) string {
 	return ""
 }
 
-// PatchDigest returns s when it is a digest hk takes for patch_digest (16 to
+// PatchDigest returns s when it is a digest hk takes for patch_digest (12 to
 // 128 lower-case hex digits), else "" (omitted).
 func PatchDigest(s string) string {
 	if hkPatchDigest.MatchString(s) {
@@ -146,7 +146,7 @@ var (
 	hkToken   = regexp.MustCompile(`^[a-z0-9_.-]{1,64}$`)
 	hkProfile = regexp.MustCompile(`^[a-z0-9_.@-]{1,64}$`)
 	// hkPatchDigest is hk's rule for patch_digest, the digest half of a patch receipt.
-	hkPatchDigest = regexp.MustCompile(`^[0-9a-f]{16,128}$`)
+	hkPatchDigest = regexp.MustCompile(`^[0-9a-f]{12,128}$`)
 )
 
 // hk's bounds on a review record (handoffkeep internal/store/change_payload.go).
