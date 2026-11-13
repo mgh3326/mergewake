@@ -53,6 +53,7 @@ type ChangeWriter struct {
 	endpoint                             func() (*hkJobs, error)
 	log                                  *slog.Logger
 	unavailableUntil                     time.Time
+	claims                               map[string]*os.File
 	writes, stale, rejected, unavailable atomic.Uint64
 }
 
@@ -83,16 +84,21 @@ func (w *ChangeWriter) Queue(repo string, pr int, name string, s ChangeSection) 
 		return
 	}
 	s.Value = json.RawMessage(raw)
-	file, err := w.persist(repo, pr, name, s)
+	file, claim, err := w.persist(repo, pr, name, s)
 	if err != nil {
 		w.log.Warn("hk change outbox write failed")
 		return
 	}
-	w.add(repo, pr, name, s, file)
-}
-func (w *ChangeWriter) add(repo string, pr int, name string, s ChangeSection, file string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if claim != nil {
+		w.holdLocked(file, claim)
+	}
+	w.addLocked(repo, pr, name, s, file)
+}
+
+// addLocked queues an observation for the next flush. The caller holds w.mu.
+func (w *ChangeWriter) addLocked(repo string, pr int, name string, s ChangeSection, file string) {
 	if file != "" {
 		if w.seen == nil {
 			w.seen = map[string]bool{}
@@ -188,6 +194,8 @@ func (w *ChangeWriter) flush() {
 			if done {
 				if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
 					w.log.Warn("hk change outbox cleanup failed")
+				} else {
+					w.releaseLocked(file)
 				}
 			}
 		}
