@@ -26,6 +26,11 @@ const (
 	DefaultMinInterval    = 10 * time.Minute
 	DefaultCompareTimeout = 10 * time.Second
 
+	// DefaultFirstCloneTimeout bounds the fetch into a mirror that has no
+	// objects yet. It is unmeasured: no first clone of a large repository has
+	// been timed. There is no config knob for it.
+	DefaultFirstCloneTimeout = 10 * time.Minute
+
 	// fetchFailureLimit is how many consecutive failures put one repository's
 	// mirror on cooldown, and skipCooldown is how long it stays there.
 	fetchFailureLimit = 3
@@ -68,8 +73,10 @@ type Options struct {
 	Now func() time.Time
 	// Log receives fetch and skip lines; nil discards them.
 	Log *slog.Logger
-	// FetchTimeout bounds one fetch, MinInterval the time between refreshes
-	// and CompareTimeout one diff build; zero means the defaults.
+	// FetchTimeout bounds one fetch into a mirror that already has objects;
+	// the first clone into an empty mirror gets DefaultFirstCloneTimeout.
+	// MinInterval is the time between refreshes and CompareTimeout one diff
+	// build; zero means the defaults.
 	FetchTimeout, MinInterval, CompareTimeout time.Duration
 }
 
@@ -201,7 +208,7 @@ func (m *Mirror) Fetch(ctx context.Context, repo string) error {
 	st.done = make(chan struct{})
 	st.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, m.fetch)
+	ctx, cancel := context.WithTimeout(ctx, m.fetchBound(repo))
 	e := m.fetchRepo(ctx, repo, st)
 	cancel()
 
@@ -212,6 +219,26 @@ func (m *Mirror) Fetch(ctx context.Context, repo string) error {
 	close(st.done)
 	st.mu.Unlock()
 	return e
+}
+
+// fetchBound is how long one fetch of repo may run. A mirror with no objects
+// yet is being cloned for the first time, and that gets the longer bound.
+func (m *Mirror) fetchBound(repo string) time.Duration {
+	if hasObjects(m.Path(repo)) {
+		return m.fetch
+	}
+	return DefaultFirstCloneTimeout
+}
+
+// hasObjects reports whether a mirror holds any object, as a pack or a loose
+// object directory. A fetch that timed out before git wrote a pack leaves none.
+func hasObjects(path string) bool {
+	packs, _ := filepath.Glob(filepath.Join(path, "objects", "pack", "pack-*.pack"))
+	if len(packs) > 0 {
+		return true
+	}
+	loose, _ := filepath.Glob(filepath.Join(path, "objects", "[0-9a-f][0-9a-f]"))
+	return len(loose) > 0
 }
 
 func (m *Mirror) fetchRepo(ctx context.Context, repo string, st *repoState) error {
@@ -331,9 +358,7 @@ func (m *Mirror) Request(repo string) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), m.fetch)
-		defer cancel()
-		_ = m.Fetch(ctx, repo)
+		_ = m.Fetch(context.Background(), repo)
 	}()
 }
 
@@ -344,9 +369,7 @@ func (m *Mirror) Refresh(ctx context.Context, repos []string) {
 		if !m.due(repo) {
 			continue
 		}
-		fctx, cancel := context.WithTimeout(ctx, m.fetch)
-		_ = m.Fetch(fctx, repo)
-		cancel()
+		_ = m.Fetch(ctx, repo)
 		if ctx.Err() != nil {
 			return
 		}
