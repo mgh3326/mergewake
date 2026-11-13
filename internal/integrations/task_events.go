@@ -286,15 +286,20 @@ func (e *HKError) Error() string {
 	return fmt.Sprintf("handoffkeep HTTP %d %s%s", e.Status, e.Code, msg)
 }
 
-// errorMessage redacts s, drops control characters and cuts it to
-// maxErrorMessage bytes on a rune boundary.
+// hexRun matches a run of 32 or more hex digits. hk text redacts each one
+// whole: a hex credential is kept by neither fleetevent.Redact's exemption for
+// pure-hex runs nor its 48-character floor, and a commit SHA is redacted too.
+var hexRun = regexp.MustCompile(`[0-9a-fA-F]{32,}`)
+
+// errorMessage redacts s (hex runs first, then fleetevent.Redact), drops
+// control characters and cuts it to maxErrorMessage bytes on a rune boundary.
 func errorMessage(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
-	}, fleetevent.Redact(s))
+	}, fleetevent.Redact(hexRun.ReplaceAllString(s, "[redacted]")))
 	s = strings.TrimSpace(s)
 	if len(s) <= maxErrorMessage {
 		return s
@@ -439,7 +444,7 @@ func (c *hkJobs) postEvent(ctx context.Context, client *http.Client, body []byte
 			Reason  string `json:"reason"`
 		}
 		_ = json.NewDecoder(limited).Decode(&answer)
-		if !hkErrorCode.MatchString(answer.Error) {
+		if !hkErrorCode.MatchString(answer.Error) || hexRun.MatchString(answer.Error) {
 			answer.Error = ""
 		}
 		message := answer.Message

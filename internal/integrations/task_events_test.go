@@ -7,12 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/mgh3326/mergewake/internal/fleetevent"
 )
 
 func hkEventServer(t *testing.T, h http.HandlerFunc) {
@@ -273,5 +276,52 @@ func TestReviewRecordForHK(t *testing.T) {
 	}
 	if out.Harness != "x" || out.Lens != "correctness" || out.Round != 2 || out.Critical != 0 || out.Low != 1_000_000 || out.FinishedAt != nil || out.StartedAt == nil {
 		t.Fatalf("%+v", out)
+	}
+}
+
+// hexRunLong matches a run of 32 or more hex digits: the shape of a
+// credential, a sha256 digest or a full commit SHA.
+var hexRunLong = regexp.MustCompile(`[0-9a-fA-F]{32,}`)
+
+const (
+	hex64 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+	hex40 = "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
+	hex32 = "5d41402abc4b2a76b9719d911017c592"
+	hex12 = "a1b2c3d4e5f6"
+)
+
+// Text from an hk answer never carries a run of 32 or more hex digits into an
+// error, whatever its length; a short SHA and the status code stay.
+func TestHKErrorRedactsHexRuns(t *testing.T) {
+	var reply string
+	hkEventServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(reply))
+	})
+	h := Handoffkeep{EventAttempts: 1}
+	ev := TaskEvent{Source: SourcePR, SourceRef: "https://github.com/example/project/pull/7", TaskID: 5}
+	for _, secret := range []string{hex64, hex40, hex32} {
+		reply = `{"message":"bad credential ` + secret + `"}`
+		_, e := h.PostTaskEvent(context.Background(), ev)
+		var hk *HKError
+		if !errors.As(e, &hk) || !strings.Contains(e.Error(), "[redacted]") || hexRunLong.MatchString(e.Error()) {
+			t.Fatalf("%d-hex: %v", len(secret), e)
+		}
+	}
+	reply = `{"message":"stale ` + hex12 + ` HTTP 502"}`
+	_, e := h.PostTaskEvent(context.Background(), ev)
+	if e == nil || !strings.Contains(e.Error(), hex12) || !strings.Contains(e.Error(), "HTTP 502") {
+		t.Fatalf("short sha: %v", e)
+	}
+	// hk's error code is printed too, so a hex-shaped code must not carry the run.
+	reply = `{"error":"` + hex64 + `","message":"x"}`
+	_, e = h.PostTaskEvent(context.Background(), ev)
+	var hk *HKError
+	if !errors.As(e, &hk) || hk.Code != "" || hexRunLong.MatchString(e.Error()) {
+		t.Fatalf("code: %v", e)
+	}
+	// Pins Desired 3: fleetevent keeps full SHAs and digests for its other callers.
+	if got := fleetevent.Redact(hex64); got != hex64 {
+		t.Fatalf("fleetevent.Redact changed a digest: %q", got)
 	}
 }
