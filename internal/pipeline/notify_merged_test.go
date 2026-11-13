@@ -298,6 +298,20 @@ func TestLandMergedLaneReadFailureStaysPending(t *testing.T) {
 	}
 }
 
+func TestLandUsesPostMergeBodyAndGatedHead(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	g.nextBodyPull = 3 // initial read, merge recheck, then the post-merge read
+	g.nextBody = "Mergewake-Notify-Lane: fresh-lane\n"
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || n.events[0].Lane != "fresh-lane" || n.events[0].ID != "mergewake-merged-example/project-7-"+shaA || !strings.Contains(n.events[0].Text, "head=aaaaaaa") {
+		t.Fatalf("events=%+v", n.events)
+	}
+}
+
 func TestMergedRecentExternalCandidateAndLandCandidateShareSentKey(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	r.Lane = "repo-design"
