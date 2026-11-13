@@ -851,7 +851,7 @@ func validateAdapters(c *Config) error {
 	return nil
 }
 
-var panewireLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.:-]{0,127}$`)
+var panewireLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // PanewireLane reports whether lane is accepted by panewire's --lane rule.
 func PanewireLane(lane string) bool {

@@ -36,10 +36,11 @@ func TestNotifierPanewireLaneValidation(t *testing.T) {
 		name, notifier, wantError string
 		wantFallback              string
 	}{
-		{name: "invalid lane", notifier: "type: stdout\nlane: desk_a\n", wantError: "notifier.lane"},
-		{name: "invalid fallback", notifier: "type: stdout\nlane: desk-a\nfallback_lane: desk_b\n", wantError: "notifier.fallback_lane"},
-		{name: "invalid lane for noop", notifier: "type: noop\nlane: desk_a\n", wantError: "notifier.lane"},
+		{name: "invalid lane", notifier: "type: stdout\nlane: desk/a\n", wantError: "notifier.lane"},
+		{name: "invalid fallback", notifier: "type: stdout\nlane: desk-a\nfallback_lane: desk/b\n", wantError: "notifier.fallback_lane"},
+		{name: "invalid lane for noop", notifier: "type: noop\nlane: desk/a\n", wantError: "notifier.lane"},
 		{name: "short valid lanes", notifier: "type: panewire\nlane: desk:1\nfallback_lane: a.b-c\n", wantFallback: "a.b-c"},
+		{name: "underscore lane", notifier: "type: stdout\nlane: desk_a\n", wantFallback: "desk_a"},
 		{name: "128 character lane", notifier: "type: stdout\nlane: " + strings.Repeat("a", 128) + "\n", wantFallback: strings.Repeat("a", 128)},
 		{name: "129 character lane", notifier: "type: stdout\nlane: " + strings.Repeat("a", 129) + "\n", wantError: "notifier.lane"},
 		{name: "stdout without lanes", notifier: "type: stdout\n", wantFallback: ""},
