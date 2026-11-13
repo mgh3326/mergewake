@@ -413,21 +413,26 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 const archiveLockTTL = int64(24 * 60 * 60)
 
 // lockGuard serializes every change to the lock, including release. The
-// arguments are lock path, stale-guard TTL and a unique cleanup suffix.
+// arguments are lock path, guard TTL and a unique owner. A guard is never
+// broken by age: its holder may still be alive, and breaking it would let two
+// critical sections overlap. A guard held past the TTL is reported as
+// "guard-held <guard>" and the script stops; an operator removes it by hand
+// once no archive run is live. The EXIT trap removes the guard only while it
+// still carries this holder's token.
 const lockGuard = `guard="$1.guard"
 now=$(date +%s) || exit 1
 tries=0
 until mkdir "$guard" 2>/dev/null; do
   held=$(stat -c %Y "$guard" 2>/dev/null || stat -f %m "$guard" 2>/dev/null)
   case "$held" in ''|*[!0-9]*) held= ;; esac
-  if [ -n "$held" ] && [ "$((now-held))" -ge "$guard_ttl" ]; then
-    mv "$guard" "$guard.dead.$guard_owner" 2>/dev/null && rm -rf "$guard.dead.$guard_owner"
-  fi
+  if [ -n "$held" ] && [ "$((now-held))" -ge "$guard_ttl" ]; then echo "guard-held $guard"; exit 0; fi
   tries=$((tries+1))
   if [ "$tries" -ge 200 ]; then echo busy; exit 0; fi
   sleep 0.05
 done
-trap 'rm -rf "$guard"' EXIT
+guard_token="$guard_owner.$$.$now"
+if ! printf '%s\n' "$guard_token" > "$guard/owner"; then rm -rf "$guard"; echo busy; exit 0; fi
+trap 'if [ "$(cat "$guard/owner" 2>/dev/null)" = "$guard_token" ]; then rm -rf "$guard"; fi' EXIT
 `
 
 // claimScript is one claim attempt. It never moves or removes an existing lock:
@@ -453,8 +458,8 @@ echo "stale $born $old_owner"`
 // given lock, and the moved copy is checked against the expired claim before it
 // is removed. A moved copy that is not that claim was a live lock; it is put
 // back when the lock path is still free. Args: $1 lock dir, $2 the stale claim's
-// owner, $3 its time, $4 this claim's owner, $5 TTL seconds (also the age after
-// which a guard left by a dead reclaimer is broken).
+// owner, $3 its time, $4 this claim's owner, $5 TTL seconds (the age after which
+// a held guard is reported, not broken).
 const reclaimScript = `guard_ttl="$5"; guard_owner="$4"
 ` + lockGuard + `take() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$2" "$3" > "$1/owner"; }
 result=busy
@@ -485,7 +490,8 @@ echo "$result"`
 // time so a later run can reclaim one left by a dead process. Only a lock older
 // than archiveLockTTL is reclaimable, and reclaiming it happens under the guard
 // in reclaimScript, so one expired lock has exactly one winner and a live lock
-// is never moved or removed by another claim.
+// is never moved or removed by another claim. A guard held past the TTL is
+// reported as an error and never broken.
 func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 	sum := sha256.Sum256([]byte(dest))
 	locks := path.Join(a.DriveDir, ".locks")
@@ -497,6 +503,9 @@ func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 		return nil, fmt.Errorf("claim archive destination: %w", err)
 	}
 	out := strings.TrimRight(string(b), "\n")
+	if err := guardHeldError(out); err != nil {
+		return nil, err
+	}
 	if rest, ok := strings.CutPrefix(out, "stale "); ok {
 		// rest is "<born> <owner>"; the owner is empty for a lock dir without one.
 		born, staleOwner, _ := strings.Cut(rest, " ")
@@ -505,6 +514,9 @@ func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 			return nil, fmt.Errorf("claim archive destination: %w", err)
 		}
 		out = strings.TrimRight(string(b), "\n")
+		if err := guardHeldError(out); err != nil {
+			return nil, err
+		}
 	}
 	if out != "acquired" {
 		return nil, &Skip{"archive-lock-busy"}
@@ -513,6 +525,17 @@ func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 		_, _ = a.on(context.Background(), a.SSH, "", "sh", "-c", `guard_ttl="$3"; guard_owner="$2"
 `+lockGuard+`if [ -r "$1/owner" ]; then read current created < "$1/owner"; if [ "$current" = "$2" ]; then rm -rf "$1"; fi; fi`, "sh", lock, owner, ttl)
 	}, nil
+}
+
+// guardHeldError turns a "guard-held" reply into an error. It is not a busy
+// skip: the guard's holder may still be alive, so the guard stays until an
+// operator removes it.
+func guardHeldError(out string) error {
+	guard, ok := strings.CutPrefix(out, "guard-held ")
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("archive lock guard %s is held past %d s; no archive run should be live, so remove it by hand and rerun", guard, archiveLockTTL)
 }
 
 func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {
