@@ -88,8 +88,12 @@ func startQueue(t *testing.T, q *Queue) {
 }
 
 func deliverEvent(t *testing.T, url, event string, body string) {
+	deliverEventID(t, url, event, "d-"+event, body)
+}
+
+func deliverEventID(t *testing.T, url, event, id, body string) {
 	t.Helper()
-	resp := post(t, http.DefaultClient, url, event, "d-"+event, []byte(body), testSecret)
+	resp := post(t, http.DefaultClient, url, event, id, []byte(body), testSecret)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("%s delivery: status %d", event, resp.StatusCode)
@@ -225,12 +229,12 @@ func TestEventQueueBasePushEnqueuesTheReposOpenPRs(t *testing.T) {
 	q.SetOpen("o/r", map[int]string{1: "a", 2: "b", 3: "c"})
 	q.SetOpen("o/other", map[int]string{7: "z"})
 	url := webhookServer(t, q)
-	deliverEvent(t, url, "push", `{"ref":"refs/heads/feature","repository":{"full_name":"o/r"}}`)
+	deliverEventID(t, url, "push", "d-push-feature", `{"ref":"refs/heads/feature","repository":{"full_name":"o/r"}}`)
 	q.Wait()
 	if got := ev.started(); len(got) != 0 {
 		t.Fatalf("a push to a feature branch started %v", got)
 	}
-	deliverEvent(t, url, "push", `{"ref":"refs/heads/main","repository":{"full_name":"o/r"}}`)
+	deliverEventID(t, url, "push", "d-push-main", `{"ref":"refs/heads/main","repository":{"full_name":"o/r"}}`)
 	q.Wait()
 	got := ev.started()
 	slices.SortFunc(got, func(a, b PRKey) int { return a.PR - b.PR })

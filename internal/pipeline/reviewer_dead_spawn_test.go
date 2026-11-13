@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,6 +129,129 @@ func TestReviewerDeadReplayWithoutTimeRespawnsNextRun(t *testing.T) {
 	}
 	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old || g.postCount != 1 {
 		t.Fatalf("next evaluation spawns=%d posts=%d", len(runner.spawns), g.postCount)
+	}
+}
+
+// deferredDeadReplay is the dead replay of TestReviewerDeadReplayWithoutTimeRespawnsNextRun:
+// too little time is left for the replacement, so the dead record goes and the
+// pass waits for the next run. It returns the dead record as it was.
+func deferredDeadReplay(t *testing.T) (*Service, *fakeGH, config.Repo, *panewireRunner, *clock, reviewerJob) {
+	t.Helper()
+	s, g, r, runner, c, refuse := deadReplayRig(t, panewireQuotaTimeout)
+	refuse.delay = 1200 * time.Millisecond
+	s.Config.Review.Timeout = "2s"
+	dead := readReviewerJob(t, s, r, 1)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("review: %v", err)
+	}
+	if refuse.refused != 1 || len(runner.spawns) != 1 {
+		t.Fatalf("replays=%d spawns=%d, want the replay only", refuse.refused, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 1)
+	return s, g, r, runner, c, dead
+}
+
+// pendingFreshSpawn makes the next spawn's wait end early (exit 85), so the
+// fresh reviewer's record stays for the assertions.
+func pendingFreshSpawn(runner *panewireRunner) {
+	runner.exits = []int{panewireWaitTimeout}
+}
+
+// (a) The next run in the dead label's own second cannot reuse it: the kept
+// marker makes the fresh spawn supersede the dead label, and its record says
+// so. On d830c8c the label is rebuilt from the same clock second and collides.
+func TestReviewerDeadReplayDeferredLabelNextRunSameSecond(t *testing.T) {
+	s, _, r, runner, _, dead := deferredDeadReplay(t)
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("next evaluation: %v", err)
+	}
+	if len(runner.spawns) != 2 {
+		t.Fatalf("spawns=%d, want the fresh replacement", len(runner.spawns))
+	}
+	fresh := arg(runner.spawns[1], "-l")
+	if fresh == dead.Label {
+		t.Fatalf("fresh label %s reused the dead label", fresh)
+	}
+	rj := readReviewerJob(t, s, r, 1)
+	if rj.Label != fresh || rj.Supersedes != dead.Label {
+		t.Fatalf("record %+v, want label %s superseding %s", rj, fresh, dead.Label)
+	}
+}
+
+// (b) One second later the fresh label still differs from the dead one: the
+// marker, not the clock, guarantees it.
+func TestReviewerDeadReplayDeferredLabelNextRunNextSecond(t *testing.T) {
+	s, _, r, runner, c, dead := deferredDeadReplay(t)
+	pendingFreshSpawn(runner)
+	c.t = c.t.Add(time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("next evaluation: %v", err)
+	}
+	if len(runner.spawns) != 2 {
+		t.Fatalf("spawns=%d, want the fresh replacement", len(runner.spawns))
+	}
+	fresh := arg(runner.spawns[1], "-l")
+	if fresh == dead.Label {
+		t.Fatalf("fresh label %s reused the dead label", fresh)
+	}
+	if rj := readReviewerJob(t, s, r, 1); rj.Supersedes != dead.Label {
+		t.Fatalf("record supersedes %q, want the dead label %s", rj.Supersedes, dead.Label)
+	}
+}
+
+// (c) Once the fresh spawn's record is written the marker is gone, and the
+// marker file is never read as a reviewer record.
+func TestReviewerDeadReplayDeferredMarkerCleared(t *testing.T) {
+	s, _, r, runner, _, dead := deferredDeadReplay(t)
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("next evaluation: %v", err)
+	}
+	fresh := arg(runner.spawns[1], "-l")
+	if _, err := os.Stat(s.deadLabelPath(r.Name, 7, 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead-label marker still present: %v", err)
+	}
+	jobs := s.RecordedReviewerJobs(r.Name)
+	if len(jobs) != 1 || jobs[0].Label != fresh || jobs[0].PR != 7 || jobs[0].Pass != 1 {
+		t.Fatalf("recorded jobs %+v, want only the fresh record %s", jobs, fresh)
+	}
+	if jobs[0].Label == dead.Label {
+		t.Fatalf("recorded job reused the dead label %s", dead.Label)
+	}
+}
+
+// (d) A head move before the next run removes the marker: the new head's
+// spawn is unaffected.
+func TestReviewerDeadReplayDeferredHeadMoves(t *testing.T) {
+	s, g, r, runner, c, _ := deferredDeadReplay(t)
+	g.pull.Head.SHA = shaC
+	pendingFreshSpawn(runner)
+	c.t = c.t.Add(time.Second)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("next evaluation: %v", err)
+	}
+	if _, err := os.Stat(s.deadLabelPath(r.Name, 7, 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead-label marker still present: %v", err)
+	}
+	if len(runner.spawns) != 2 {
+		t.Fatalf("spawns=%d, want the new head's spawn", len(runner.spawns))
+	}
+	if fresh := arg(runner.spawns[1], "-l"); !strings.HasPrefix(fresh, "mwr-7-"+shaC[:7]+"-p1-") {
+		t.Fatalf("fresh label %s is not the new head's", fresh)
+	}
+}
+
+// (e) A dead spawn spends none of the lost-result budget: the fresh record's
+// Replacements equals the dead record's.
+func TestReviewerDeadReplayDeferredKeepsReplacements(t *testing.T) {
+	s, _, r, runner, _, dead := deferredDeadReplay(t)
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("next evaluation: %v", err)
+	}
+	if rj := readReviewerJob(t, s, r, 1); rj.Replacements != dead.Replacements {
+		t.Fatalf("fresh record replacements=%d, dead record's=%d", rj.Replacements, dead.Replacements)
 	}
 }
 

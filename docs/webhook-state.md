@@ -107,3 +107,4 @@ Pending observations are stored under the state directory in a private hk
 change outbox. A successful or stale response clears its entries; transient
 endpoint or request failures retain them for retry and replay after restart.
 This also preserves queued observations when a bounded shutdown wait expires.
+Each entry is claimed by the process that holds it through an OS file lock on the entry itself. Another mergewake process on the same state directory skips entries it finds locked, so each entry is sent by one process. A failed send keeps the claim, so the same process retries the entry while others skip it. A claim ends when the entry is sent and removed, or when the process exits; the next process then replays the entry.
