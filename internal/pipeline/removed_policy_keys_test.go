@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -59,5 +61,22 @@ func TestWatchChecksSelectMainChecks(t *testing.T) {
 	}
 	if got := p.WatchSet(); !slices.Equal(got, []string{"ci-ok"}) {
 		t.Fatalf("watch set %v", got)
+	}
+}
+
+// A clocks file an earlier release wrote, with its branch-update records and a
+// carried clock, still loads; the extra fields are not read.
+func TestOverdueStateFromEarlierReleaseStillLoads(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "pr-overdue-clocks.json")
+	old := `{"clocks":{"7 ` + shaA + `":{"head_seen":"2026-11-05T10:00:00Z","carried_from":"` + shaB + `"}},"updates":[{"pr":7,"old_head":"` + shaB + `","at":"2026-11-05T10:00:00Z"}]}`
+	if e := os.WriteFile(file, []byte(old), 0600); e != nil {
+		t.Fatal(e)
+	}
+	st, e := readOverdueState(file)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c := st.Clocks["7 "+shaA]; c.HeadSeen.IsZero() {
+		t.Fatalf("clocks %+v", st.Clocks)
 	}
 }
