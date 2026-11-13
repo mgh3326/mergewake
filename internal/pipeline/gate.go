@@ -797,8 +797,13 @@ var (
 	// dismissReply opens with a dismissal and gives a reason after it.
 	dismissReply = regexp.MustCompile(`(?is)^\W*(?:disposition:\s*)?dismiss(?:ed|al)?\b\W*\w`)
 	deferIntent  = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\b`)
-	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+([0-9]+)\b`)
+	deferReply   = regexp.MustCompile(`(?i)^\W*disposition:\s*defer\s+` + deferTaskRef)
 )
+
+// deferTaskRef names the follow-up hk task after "defer": a bare number, or
+// the same number with "hk " / "hk:" or "#" in front, case-insensitive. Group 1
+// is the task id. Every parser of a defer reply uses this one pattern.
+const deferTaskRef = `(?:hk(?::|\s+)|#)?([0-9]+)\b`
 
 type deferTaskRule struct {
 	own       string
