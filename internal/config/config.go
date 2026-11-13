@@ -313,31 +313,6 @@ type Daemon struct {
 	Rollout Loop    `yaml:"rollout"`
 	Act     bool    `yaml:"act"`
 	Webhook Webhook `yaml:"webhook"`
-	Mirror  Mirror  `yaml:"mirror"`
-}
-
-// Mirror configures the local bare git mirror the daemon keeps for each
-// repository. The mirror is fetched in the background and its PR diff is
-// compared with GitHub's (shadow mode); serving that diff is a later slice.
-type Mirror struct {
-	// Enabled is on unless it is set to false.
-	Enabled *bool `yaml:"enabled"`
-	// Dir holds the mirrors; empty means <state_dir>/mirrors.
-	Dir string `yaml:"dir"`
-	// ServeDiff is reserved for serving the mirror's PR diff instead of
-	// GitHub's. It is off by default and nothing reads it in this slice.
-	ServeDiff bool `yaml:"serve_diff"`
-}
-
-// On reports whether the daemon keeps mirrors.
-func (m Mirror) On() bool { return m.Enabled == nil || *m.Enabled }
-
-// DirFor is the directory the mirrors live under.
-func (m Mirror) DirFor(stateDir string) string {
-	if m.Dir == "" {
-		return filepath.Join(stateDir, "mirrors")
-	}
-	return Expand(m.Dir)
 }
 
 // Webhook configures the optional in-process GitHub delivery receiver. A

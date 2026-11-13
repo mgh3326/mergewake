@@ -893,45 +893,16 @@ func TestHKTaskEventsDefault(t *testing.T) {
 	}
 }
 
-// The mirror is on by default, its serve switch is off, and its directory
-// defaults under the state directory.
-func TestMirrorConfigDefaults(t *testing.T) {
+// The git mirror section is removed: a config that still sets daemon.mirror is
+// refused at load, and the error names the key.
+func TestMirrorConfigRefused(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("version: 1\nhost: host-a\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !c.Daemon.Mirror.On() {
-		t.Fatal("daemon.mirror is off by default")
-	}
-	if c.Daemon.Mirror.ServeDiff {
-		t.Fatal("daemon.mirror.serve_diff is on by default")
-	}
-	if got, want := c.Daemon.Mirror.DirFor(c.StateDir), filepath.Join(c.StateDir, "mirrors"); got != want {
-		t.Fatalf("mirror dir = %q, want %q", got, want)
-	}
-}
-
-func TestMirrorConfigSection(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	body := "version: 1\nhost: host-a\ndaemon:\n  mirror:\n    enabled: false\n    serve_diff: true\n    dir: /var/lib/mergewake/mirrors\n"
+	body := "version: 1\nhost: host-a\ndaemon:\n  mirror:\n    enabled: false\n"
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Daemon.Mirror.On() {
-		t.Fatal("daemon.mirror.enabled: false was ignored")
-	}
-	if !c.Daemon.Mirror.ServeDiff {
-		t.Fatal("daemon.mirror.serve_diff: true was ignored")
-	}
-	if got := c.Daemon.Mirror.DirFor(c.StateDir); got != "/var/lib/mergewake/mirrors" {
-		t.Fatalf("mirror dir = %q", got)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mirror") {
+		t.Fatalf("daemon.mirror was not refused with an error naming the key: %v", err)
 	}
 }
