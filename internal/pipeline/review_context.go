@@ -204,7 +204,10 @@ func markdownSection(body string, match func(heading string) bool) string {
 }
 
 // A citation applies only to the line containing it. Other lines remain claims.
-var decisionCitation = regexp.MustCompile(`hk:doc[ \t]+(decision/[A-Za-z0-9_./-]+)`)
+// The key ends in a non-punctuation character, so a sentence-final ".", or a
+// trailing run of "." and "/", is punctuation rather than part of the key; an
+// inner "." stays in the key.
+var decisionCitation = regexp.MustCompile(`hk:doc[ \t]+(decision/[A-Za-z0-9_./-]*[A-Za-z0-9_-])`)
 
 type verifiedDecisions map[string]integrations.DecisionDocument
 

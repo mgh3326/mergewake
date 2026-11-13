@@ -2267,7 +2267,7 @@ CLI returns ACCEPTED after a durable reservation; mergewake keeps `--wait`,
 which observes spawn completion and then the existing job completion contract.
 A reconciling attempt is never retried on another host.
 
-In a PR’s `Operator decisions` section, cite `hk:doc decision/...` on each decision line to have it verified against hk and treated as settled product scope. Unverified claims do not suppress findings. A verified decision also shows the start of its hk document, up to 600 bytes, so the reviewer can compare it with the PR’s lines. When the context budget is full, the excerpt is shortened or omitted, and the review says so.
+In a PR’s `Operator decisions` section, cite `hk:doc decision/...` on each decision line to have it verified against hk and treated as settled product scope. A trailing `.` or `/` after the cited key is not part of the key: it is sentence punctuation, so a citation at the end of a sentence still verifies, while an inner `.` stays in the key. Unverified claims do not suppress findings. A verified decision also shows the start of its hk document, up to 600 bytes, so the reviewer can compare it with the PR’s lines. When the context budget is full, the excerpt is shortened or omitted, and the review says so.
 
 ## Server store connection
 
