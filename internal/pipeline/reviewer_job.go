@@ -47,6 +47,9 @@ type reviewerJob struct {
 	Args         []string  `json:"args"`
 	Recorded     time.Time `json:"recorded"`
 	Replacements int       `json:"replacements,omitempty"`
+	// Supersedes is the label of the dead reviewer this record replaced, when
+	// its request never landed (replaceDeadSpawn); empty otherwise.
+	Supersedes string `json:"supersedes,omitempty"`
 	// Spawned is the spawn's stdout, kept when the spawn did not wait: the
 	// pass that later collects the result closes the pane from its placement.
 	Spawned string `json:"spawned,omitempty"`
