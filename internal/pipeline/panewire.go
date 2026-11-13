@@ -1809,14 +1809,18 @@ that are ignored.
 		// reproduce (a base merge pollutes `git diff`), so the patch is inline.
 		text = strings.Replace(text, fmt.Sprintf("review the changes in `git diff %s...%s`", x.pr.Base.SHA, x.pr.Head.SHA),
 			fmt.Sprintf("this is review round %d: review only the delta patch at the end of this brief, not `git diff`", x.round), 1)
-		diff, count, paths, patterns := redactDeletedDiff(x.diff)
+		diff, count, paths, patterns, deletedPaths := redactRemovedDiffLines(x.diff)
 		text += "\n## Delta to review (hunks changed since the last reviewed head)\n\n~~~~~~~~diff\n" + strings.TrimRight(diff, "\n") + "\n~~~~~~~~\n"
 		if count > 0 {
 			plural := "s"
 			if count == 1 {
 				plural = ""
 			}
-			text += fmt.Sprintf("\nRedacted %d secret-like string%s in pure-deletion hunks (paths: %s). Full text is in the checkout.\n", count, plural, strings.Join(paths, ", "))
+			source := ""
+			if len(deletedPaths) > 0 {
+				source = fmt.Sprintf(" Deleted-file text is in base revision %s (paths: %s).", x.pr.Base.SHA, strings.Join(deletedPaths, ", "))
+			}
+			text += fmt.Sprintf("\nRedacted %d secret-like string%s in removed lines (paths: %s).%s\n", count, plural, strings.Join(paths, ", "), source)
 			_ = x.s.audit(x.repo.Name, "review-brief-redacted", map[string]any{
 				"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label,
 				"count": count, "paths": paths, "pattern_names": patterns,

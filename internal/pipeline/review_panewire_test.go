@@ -486,12 +486,12 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	}
 }
 
-func TestPanewireBriefRedactsPureDeletionDelta(t *testing.T) {
+func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	token := "gh" + "p_" + strings.Repeat("a", 36)
 	deletedFileValue := "FOO_TOKEN=" + strings.Repeat("b", 16)
 	tests := []struct {
-		name, diff, want, notWant, path, pattern string
-		rows                                     int
+		name, diff, want, notWant, path, pattern, summary string
+		rows                                              int
 	}{
 		{
 			name:    "removed token line",
@@ -507,15 +507,19 @@ func TestPanewireBriefRedactsPureDeletionDelta(t *testing.T) {
 			diff:    "diff --git a/old.env b/old.env\ndeleted file mode 100644\n--- a/old.env\n+++ /dev/null\n@@ -1 +0,0 @@\n-" + deletedFileValue + "\n",
 			want:    "-[redacted token_assignment]",
 			notWant: deletedFileValue,
+			summary: "Deleted-file text is in base revision " + shaB,
 			path:    "old.env",
 			pattern: "token_assignment",
 			rows:    1,
 		},
 		{
-			name: "mixed hunk stays verbatim",
-			diff: "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+replacement\n",
-			want: "-" + token + "\n+replacement",
-			rows: 0,
+			name:    "mixed hunk redacts removed side",
+			diff:    "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+replacement\n",
+			want:    "-[redacted github_token]\n+replacement",
+			notWant: token,
+			path:    "auth.go",
+			pattern: "github_token",
+			rows:    1,
 		},
 		{
 			name: "added token stays verbatim",
@@ -534,16 +538,24 @@ func TestPanewireBriefRedactsPureDeletionDelta(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := &panewireRunner{}
 			s, g, r := panewireSetup(t, runner)
+			g.pull.Base.SHA = shaB
 			x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: tt.diff, delta: true, round: 2}
 			got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 			if tt.name == "ordinary delta unchanged" {
-				redacted, count, paths, patterns := redactDeletedDiff(tt.diff)
-				if redacted != tt.diff || count != 0 || paths != nil || patterns != nil {
-					t.Fatalf("ordinary diff changed: %q %d %v %v", redacted, count, paths, patterns)
+				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLines(tt.diff)
+				if redacted != tt.diff || count != 0 || paths != nil || patterns != nil || deletedPaths != nil {
+					t.Fatalf("ordinary diff changed: %q %d %v %v %v", redacted, count, paths, patterns, deletedPaths)
 				}
 			}
-			if !strings.Contains(got, tt.want) || tt.notWant != "" && strings.Contains(got, tt.notWant) {
-				t.Fatalf("brief did not satisfy want %q / not-want %q:\n%s", tt.want, tt.notWant, got)
+			if !strings.Contains(got, tt.want) || tt.notWant != "" && strings.Contains(got, tt.notWant) || tt.summary != "" && !strings.Contains(got, tt.summary) || tt.summary != "" && strings.Contains(got, "Full text is in the checkout") {
+				t.Fatalf("brief did not satisfy want %q / not-want %q / summary %q:\n%s", tt.want, tt.notWant, tt.summary, got)
+			}
+			if tt.summary != "" {
+				for _, line := range strings.Split(got, "\n") {
+					if strings.Contains(line, "Deleted-file text is in base revision") {
+						t.Logf("deleted-file summary: %s", line)
+					}
+				}
 			}
 			rows := auditRows(t, s, r, "review-brief-redacted")
 			if len(rows) != tt.rows {
@@ -576,7 +588,7 @@ func TestPanewireRoundOneBriefKeepsRemovedSecretVerbatim(t *testing.T) {
 
 func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 	token := "gh" + "p_" + strings.Repeat("c", 36)
-	delta := "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1,2 +1 @@\n-const old = \"" + token + "\"\n keep\n"
+	delta := "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+replacement\n"
 	full := patchOne + delta
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
@@ -592,7 +604,7 @@ func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(brief, []byte("[redacted github_token]")) || bytes.Contains(brief, []byte(token)) || !bytes.Contains(brief, []byte("Redacted 1 secret-like string")) || !bytes.Contains(brief, []byte("Full text is in the checkout.")) {
+	if !bytes.Contains(brief, []byte("[redacted github_token]")) || bytes.Contains(brief, []byte(token)) || !bytes.Contains(brief, []byte("Redacted 1 secret-like string")) || bytes.Contains(brief, []byte("Full text is in the checkout.")) {
 		t.Fatalf("spawned brief does not carry the redacted delta and summary:\n%s", brief)
 	}
 	for _, line := range strings.Split(string(brief), "\n") {
@@ -608,14 +620,14 @@ func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 	t.Logf("redaction audit row: %s", auditJSON)
 	receipts := g.passes[shaA]
 	wantPatch := reviewPatchID(full)
-	redactedFull := patchOne + redactDeletedDiffMust(delta)
+	redactedFull := patchOne + redactRemovedDiffLinesMust(delta)
 	if len(receipts) != 1 || receipts[0].Patch != wantPatch || receipts[0].Patch == reviewPatchID(redactedFull) {
 		t.Fatalf("receipt=%+v; want raw reviewed diff patch %q", receipts, wantPatch)
 	}
 }
 
-func redactDeletedDiffMust(diff string) string {
-	redacted, _, _, _ := redactDeletedDiff(diff)
+func redactRemovedDiffLinesMust(diff string) string {
+	redacted, _, _, _, _ := redactRemovedDiffLines(diff)
 	return redacted
 }
 

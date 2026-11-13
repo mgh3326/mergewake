@@ -8,12 +8,13 @@ import (
 	"github.com/mgh3326/mergewake/internal/archive"
 )
 
-// redactDeletedDiff changes only secret-pattern matches in removed lines of
-// hunks with no additions. Its input is the review delta; callers retain that
-// original for every non-brief use.
-func redactDeletedDiff(diff string) (string, int, []string, []string) {
+// redactRemovedDiffLines changes only secret-pattern matches in removed lines.
+// Its input is the review delta; callers retain that original for every
+// non-brief use.
+func redactRemovedDiffLines(diff string) (string, int, []string, []string, []string) {
 	lines := strings.SplitAfter(diff, "\n")
 	paths := map[string]bool{}
+	deletedPaths := map[string]bool{}
 	patterns := map[string]bool{}
 	count := 0
 	path := ""
@@ -34,6 +35,9 @@ func redactDeletedDiff(diff string) (string, int, []string, []string) {
 			}
 			path = strings.TrimPrefix(path, "a/")
 		}
+		if strings.HasPrefix(plain, "+++ /dev/null") && path != "" {
+			deletedPaths[path] = true
+		}
 		if !strings.HasPrefix(plain, "@@ ") {
 			out.WriteString(line)
 			i++
@@ -47,21 +51,9 @@ func redactDeletedDiff(diff string) (string, int, []string, []string) {
 			}
 			end++
 		}
-		hasAddition, hasDeletion := false, false
-		for _, hunkLine := range lines[i+1 : end] {
-			if len(hunkLine) == 0 {
-				continue
-			}
-			switch hunkLine[0] {
-			case '+':
-				hasAddition = true
-			case '-':
-				hasDeletion = true
-			}
-		}
 		out.WriteString(line)
 		for _, hunkLine := range lines[i+1 : end] {
-			if !hasDeletion || hasAddition || len(hunkLine) == 0 || hunkLine[0] != '-' {
+			if len(hunkLine) == 0 || hunkLine[0] != '-' {
 				out.WriteString(hunkLine)
 				continue
 			}
@@ -83,7 +75,7 @@ func redactDeletedDiff(diff string) (string, int, []string, []string) {
 		i = end
 	}
 	if count == 0 {
-		return diff, 0, nil, nil
+		return diff, 0, nil, nil, nil
 	}
 	pathList := make([]string, 0, len(paths))
 	for p := range paths {
@@ -95,5 +87,12 @@ func redactDeletedDiff(diff string) (string, int, []string, []string) {
 		patternList = append(patternList, name)
 	}
 	sort.Strings(patternList)
-	return out.String(), count, pathList, patternList
+	deletedPathList := make([]string, 0, len(deletedPaths))
+	for p := range deletedPaths {
+		if paths[p] {
+			deletedPathList = append(deletedPathList, p)
+		}
+	}
+	sort.Strings(deletedPathList)
+	return out.String(), count, pathList, patternList, deletedPathList
 }
