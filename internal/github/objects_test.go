@@ -232,6 +232,28 @@ func TestOnlyShaAddressedObjectsAreCached(t *testing.T) {
 	}
 }
 
+func TestCacheableRequiresFullObjectID(t *testing.T) {
+	for _, n := range []int{39, 40, 41, 63, 64, 65} {
+		want := n == 40 || n == 64
+		if got := cacheable(strings.Repeat("a", n), ""); got != want {
+			t.Errorf("cacheable sha length %d = %v, want %v", n, got, want)
+		}
+	}
+	var requests int
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		reply(w, map[string]any{"sha": strings.Repeat("a", 50), "commit": map[string]any{}})
+	})
+	cache := &fakeCache{}
+	c.Objects = cache
+	if _, err := c.Commit(context.Background(), "example/project", strings.Repeat("a", 50)); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || cache.gets != 0 || cache.puts != 0 {
+		t.Fatalf("50-digit commit: %d GitHub requests, %d cache gets, %d puts", requests, cache.gets, cache.puts)
+	}
+}
+
 // GitHub's commit response lists every changed file with its patch text, which
 // runs to megabytes for a lockfile. The cache keeps only the fields Commit
 // decodes.

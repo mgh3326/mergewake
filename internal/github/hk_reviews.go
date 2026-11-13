@@ -85,7 +85,7 @@ func (c *Client) hkChange(ctx context.Context, repo string, n int) HKChange {
 	if c.hk == nil {
 		return HKChange{}
 	}
-	ch, _ := memoized(ctx, c, memoKey{repo, "hk-reviews", strconv.Itoa(n)}, func() (HKChange, error) {
+	ch, _ := memoized(ctx, c, memoKey{client: c, repo: repo, kind: "hk-reviews", id: strconv.Itoa(n)}, func() (HKChange, error) {
 		timeout := cmp.Or(c.HKTimeout, hkReviewTimeout)
 		rctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()

@@ -152,10 +152,7 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 // audit write is an error.
 func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, outcome, reason string) (bool, error) {
 	s, cfg := x.s, x.s.Config.Review.Panewire
-	lane := job.OwnerLane
-	if i := slices.Index(rj.Args, "--owner"); lane == "" && i >= 0 && i+1 < len(rj.Args) {
-		lane = rj.Args[i+1]
-	}
+	lane := reviewerLane(job, rj)
 	if lane == "" {
 		lane = cfg.Owner
 	}
@@ -172,6 +169,15 @@ func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob,
 		skipped = fleetevent.Redact(integrations.Detail(e))
 	}
 	return false, s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "label": rj.Label, "head": rj.Head, "reason": skipped}, false)
+}
+
+// reviewerLane is the owner lane a reviewer's hk job closes under: the hk
+// record's, else the --owner of the recorded spawn arguments, else "".
+func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
+	if i := slices.Index(rj.Args, "--owner"); job.OwnerLane == "" && i >= 0 && i+1 < len(rj.Args) {
+		return rj.Args[i+1]
+	}
+	return job.OwnerLane
 }
 
 // closeMovedHeadJob closes the reviewer job of a record left by an older head
@@ -191,8 +197,8 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	case terminalJob(job.State):
 		return nil
 	}
-	closed, e := x.closeReviewerJob(ctx, rj, job, "abandoned", "PR head moved")
-	if e != nil || !closed {
+	res, e := x.closeReplaced(ctx, rj, job, "PR head moved")
+	if e != nil || !res.JobClosed {
 		return e
 	}
 	x.mu.Lock()
@@ -230,6 +236,49 @@ func (s *Service) dropReviewerJob(repo string, pr, pass int) error {
 		return e
 	}
 	return nil
+}
+
+// deadReviewerLabel is the marker replaceDeadSpawn leaves when it cannot
+// replace a dead spawn in the same run: the next run's fresh spawn for the
+// same head and pass must not reuse the label, whose stamp the clock can
+// still reproduce. It lives outside reviewer-jobs/, so the record globs never
+// match or read it, and it is removed once the replacement's record is
+// written, or when the head moves. Replacements is the dead record's
+// lost-result budget, carried so the replacement neither spends nor resets it.
+type deadReviewerLabel struct {
+	Head         string `json:"head"`
+	Label        string `json:"label"`
+	Replacements int    `json:"replacements"`
+}
+
+func (s *Service) deadLabelPath(repo string, pr, pass int) string {
+	return filepath.Join(s.state(repo), "reviewer-dead", fmt.Sprintf("%d-p%d.json", pr, pass))
+}
+
+func (s *Service) saveDeadLabel(repo string, pr, pass int, d deadReviewerLabel) error {
+	return fsutil.WriteJSON(s.deadLabelPath(repo, pr, pass), d)
+}
+
+func (s *Service) dropDeadLabel(repo string, pr, pass int) error {
+	if e := os.Remove(s.deadLabelPath(repo, pr, pass)); e != nil && !errors.Is(e, fs.ErrNotExist) {
+		return e
+	}
+	return nil
+}
+
+// deadLabel reads the marker kept for this pass of the current head. A marker
+// of another head is stale — the head moved — and is removed; the pass then
+// spawns as if none was kept.
+func (x *panewireExecutor) deadLabel(pass int) (deadReviewerLabel, bool, error) {
+	var d deadReviewerLabel
+	ok, e := fsutil.ReadJSON(x.s.deadLabelPath(x.repo.Name, x.pr.Number, pass), &d)
+	if e != nil || !ok {
+		return d, false, e
+	}
+	if d.Head != x.pr.Head.SHA {
+		return d, false, x.s.dropDeadLabel(x.repo.Name, x.pr.Number, pass)
+	}
+	return d, true, nil
 }
 
 // withWaitTimeout returns the recorded spawn arguments with --wait-timeout

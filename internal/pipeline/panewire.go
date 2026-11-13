@@ -390,6 +390,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// The plan is rebuilt on each evaluation, while a resumed reviewer job
 		// retains the durable replacement count used by every lost-result path.
 		plan.replacements = max(plan.replacements, rj.Replacements)
+	} else if plan.supersedes == "" {
+		// A dead spawn deferred to this run left its label: the fresh spawn
+		// supersedes it instead of reusing it, and inherits the dead record's
+		// replacement budget untouched.
+		if d, ok, e := x.deadLabel(plan.pass); e != nil {
+			return out, e
+		} else if ok {
+			plan.supersedes = d.Label
+			plan.replacements = max(plan.replacements, d.Replacements)
+		}
 	}
 	// A fresh pass fails before the claim and the reviewer record; a resumed
 	// one checks where it would re-attach, below.
@@ -453,9 +463,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}()
 	}
 	stamp := s.now().Unix() + int64(plan.replacements)
+	if supersedes, ok := parseReviewerLabel(plan.supersedes); ok && supersedes.pr == pr.Number && supersedes.sha7 == short7(pr.Head.SHA) && supersedes.pass == plan.pass {
+		stamp = max(stamp, supersedes.started.Unix()+1)
+	}
 	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp)
 	if label == plan.supersedes {
-		// The dead reviewer was labelled in this same second: its replacement takes the next one.
+		// Preserve collision avoidance for supersedes labels whose stamp cannot be parsed.
 		label = fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp+1)
 	}
 	checkout := filepath.Join(cfg.Checkouts, label)
@@ -706,6 +719,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes}
 			if e = x.saveReviewerJob(rj); e != nil {
+				return out, e
+			}
+			// The fresh record is written: a dead-label marker it answered is spent.
+			if e = s.dropDeadLabel(x.repo.Name, pr.Number, plan.pass); e != nil {
 				return out, e
 			}
 			if plan.supersedes != "" {
@@ -1134,6 +1151,20 @@ func (x *panewireExecutor) replaceDeadSpawn(ctx context.Context, plan *passPlan,
 	if e := s.audit(x.repo.Name, "reviewer-spawn-dead", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": rj.Label, "exit": code, "reason": reason}, false); e != nil {
 		return out, e
 	}
+	// A replacement deferred to the next run builds its label from the clock,
+	// which can still read the dead label's second: keep the dead label so that
+	// spawn supersedes it. The marker is written before the record goes, so a
+	// failed write leaves the record to be replayed, and it is removed once the
+	// replacement's record is written or when the head moves.
+	deferNext := false
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < spawnLeft {
+		deferNext = true
+	}
+	if deferNext {
+		if e := s.saveDeadLabel(x.repo.Name, pr.Number, plan.pass, deadReviewerLabel{Head: pr.Head.SHA, Label: rj.Label, Replacements: rj.Replacements}); e != nil {
+			return out, e
+		}
+	}
 	if e := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); e != nil {
 		return out, e
 	}
@@ -1143,7 +1174,7 @@ func (x *panewireExecutor) replaceDeadSpawn(ctx context.Context, plan *passPlan,
 		_, _ = s.gitIn(c, config.Expand(x.repo.Root), "worktree", "remove", "--force", rj.Checkout)
 		cancel()
 	}
-	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < spawnLeft {
+	if deferNext {
 		// Too little time for the replacement to wait for its pane: it spawns on the next run.
 		x.releaseLease(ctx, plan, leaseSHA, "reviewer-spawn-dead", reason)
 		return out, fmt.Errorf("%w: reviewer job %s did not land (panewire exit %d); its replacement spawns on the next run", errPassPending, rj.Label, code)
@@ -1342,21 +1373,17 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if auditErr != nil || noticeErr != nil {
 		return out, errors.Join(lost, auditErr, noticeErr)
 	}
-	if job.State != "" {
-		if _, err := x.closeReviewerJob(ctx, rj, job, "abandoned", cause); err != nil {
-			return out, err
-		}
+	closed, err := x.closeReplaced(ctx, rj, job, cause)
+	if err != nil {
+		return out, err
 	}
-	if cause == lostOverdue && job.Host != "" && job.PaneID != "" {
-		pane := reviewerPane{label: rj.Label, checkout: rj.Checkout, head: pr.Head.SHA, pass: plan.pass, placement: job, confirmed: true, force: true}
-		if x.closeReviewerPane(ctx, pane) && rj.Checkout != "" {
-			// The local checkout is this pass's mirror of the pane's replica;
-			// the pass that would have removed it now runs under another label.
-			if root := config.Expand(x.repo.Root); root != "" {
-				c, cancel := reportContext(ctx)
-				_, _ = s.gitIn(c, root, "worktree", "remove", "--force", rj.Checkout)
-				cancel()
-			}
+	if closed.PaneClosed && rj.Checkout != "" {
+		// The local checkout is this pass's mirror of the pane's replica;
+		// the pass that would have removed it now runs under another label.
+		if root := config.Expand(x.repo.Root); root != "" {
+			c, cancel := reportContext(ctx)
+			_, _ = s.gitIn(c, root, "worktree", "remove", "--force", rj.Checkout)
+			cancel()
 		}
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {

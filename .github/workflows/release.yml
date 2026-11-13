@@ -4,7 +4,9 @@ name: Release
 # amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
 # with GITHUB_TOKEN, but only after the tag commit's checks named by
 # .mergewake/policy.yaml (deploy_checks, else watch_checks, else
-# required_checks) are green. A test tag v0.0.0*
+# required_checks) are green at the tag, or at a newer main head that contains
+# it. A newer release tag on main supersedes this run, which then publishes
+# nothing. A test tag v0.0.0*
 # (e.g. v0.0.0-test.1) runs the same build and checks on the tag but is never
 # published.
 # Manual runs build the same assets for a
@@ -27,7 +29,7 @@ concurrency:
 permissions:
   contents: read
 env:
-  # How long publish waits for the tag commit's policy checks before failing.
+  # How long release checks wait for green policy checks or a newer release.
   RELEASE_CHECKS_TIMEOUT_SECONDS: '3600'
 
 jobs:
@@ -94,6 +96,8 @@ jobs:
     # green: deploy_checks, else watch_checks, else required_checks. Dry runs
     # and test tags never reach this job.
     needs: [build, test]
+    outputs:
+      publish: ${{ steps.wait.outputs.publish }}
     if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
     runs-on: ubuntu-latest
     permissions:
@@ -106,14 +110,25 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-go-cached
-      - name: Wait for the tag commit's policy checks
+      - id: wait
+        name: Wait for release checks or supersession
         env:
           GH_TOKEN: ${{ github.token }}
-        run: sh scripts/release-wait-checks.sh "$GITHUB_SHA"
+        run: |
+          if sh scripts/release-wait-checks.sh "$GITHUB_SHA"; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -eq 3 ]; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            else
+              exit "$status"
+            fi
+          fi
 
   publish:
     needs: [build, test, checks]
-    if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0') && needs.checks.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

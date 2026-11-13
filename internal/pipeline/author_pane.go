@@ -10,6 +10,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // A PR with no job binding still has an author: the worker whose pane sits in
@@ -165,6 +166,14 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 		bound.failedHosts = append([]string(nil), scan.failedHosts...)
 		bound.via += " (partial pane scan)"
 	}
+	// A partial scan cannot establish that one observed pane is the unique
+	// takeover candidate. Keep the bound author lane and report every observed
+	// candidate in the partial-route audit.
+	if len(bound.failedHosts) > 0 && len(others) > 0 && !finished {
+		bound.candidates = others
+		bound.unknown = unknown
+		return bound, nil
+	}
 	route, takenOver := bound, false
 	switch len(others) {
 	case 0:
@@ -196,10 +205,11 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 
 // authorFinished reports whether a bound job that is terminal has left no pane
 // on the configured hosts. finished is true only when every host was read and
-// none shows a pane named for the job, its label, or its recorded pane id.
-// unknown is set for a terminal job whose hosts were not all read, or with no
-// hosts configured: liveness is then unknown and the bound lane stands. A job
-// that is not terminal is never finished.
+// none shows a pane named for the job, its label, or its recorded pane id —
+// the pane id counting only on the host the record names, since a pane id is
+// local to its host. unknown is set for a terminal job whose hosts were not
+// all read, or with no hosts configured: liveness is then unknown and the
+// bound lane stands. A job that is not terminal is never finished.
 func (s *Service) authorFinished(ctx context.Context, job string, rec integrations.JobRecord) (finished, unknown bool, err error) {
 	if !terminalJob(rec.State) {
 		return false, false, nil
@@ -211,12 +221,24 @@ func (s *Service) authorFinished(ctx context.Context, job string, rec integratio
 	if len(hosts) == 0 && e != nil {
 		return false, false, e
 	}
+	// The recorded pane id keeps the job live only on the host rec.Host
+	// names. An empty host, or one that names no configured host, leaves the
+	// id matching on every host: liveness is not given up on a host name
+	// mergewake cannot place.
+	placed := false
+	for _, h := range s.Config.Hosts {
+		if authorHostNamed(rec.Host, h) {
+			placed = true
+			break
+		}
+	}
 	for _, hs := range hosts {
 		if hs.failed {
 			return false, true, nil
 		}
+		paneID := rec.PaneID != "" && (!placed || authorHostNamed(rec.Host, hs.host))
 		for _, p := range hs.panes {
-			if p.Name == job || (rec.Label != "" && p.Name == rec.Label) || (rec.PaneID != "" && p.ID == rec.PaneID) {
+			if p.Name == job || (rec.Label != "" && p.Name == rec.Label) || (paneID && p.ID == rec.PaneID) {
 				return false, false, nil
 			}
 		}
@@ -225,6 +247,13 @@ func (s *Service) authorFinished(ctx context.Context, job string, rec integratio
 		return false, true, nil
 	}
 	return true, false, nil
+}
+
+// authorHostNamed reports whether a job record's host names this configured
+// host: the host's Name or MachineID, or "local" for a host that runs on this
+// machine — the rule localReviewerHost uses for reviewer placements.
+func authorHostNamed(recorded string, h reap.Host) bool {
+	return recorded != "" && (recorded == h.Name || recorded == h.MachineID() || (recorded == "local" && h.Local()))
 }
 
 func partialVia(route authorRoute) string {

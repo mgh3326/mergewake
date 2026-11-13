@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,16 @@ func (m *memoServer) n(route string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.count[route]
+}
+
+func (m *memoServer) total() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	total := 0
+	for _, n := range m.count {
+		total += n
+	}
+	return total
 }
 
 func (m *memoServer) client(t *testing.T) *Client {
@@ -118,6 +129,81 @@ func TestPassMemoHeadAndReviews(t *testing.T) {
 	}
 	if _, e := c.ReviewHistory(ctx, "example/project", 7, ""); e == nil {
 		t.Fatal("empty login accepted")
+	}
+}
+
+func TestPassMemoKeepsNewestStartedRead(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		if n == 1 {
+			close(started)
+			<-release
+			reply(w, map[string]any{"object": Ref{SHA: strings.Repeat("a", 40)}})
+			return
+		}
+		reply(w, map[string]any{"object": Ref{SHA: strings.Repeat("b", 40)}})
+	}))
+	defer srv.Close()
+	c := New("placeholder")
+	c.BaseURL, c.UploadURL, c.HTTP = srv.URL, srv.URL, srv.Client()
+	ctx, _ := CountRequests(context.Background(), "pr")
+	done := make(chan string, 1)
+	go func() {
+		v, _ := c.Head(ctx, "owner/repo", "main")
+		done <- v
+	}()
+	<-started
+	fresh, err := c.Head(FreshEvidence(ctx), "owner/repo", "main")
+	if err != nil || fresh != strings.Repeat("b", 40) {
+		t.Fatalf("fresh read: %q %v", fresh, err)
+	}
+	close(release)
+	if old := <-done; old != strings.Repeat("a", 40) {
+		t.Fatalf("blocked read: %q", old)
+	}
+	later, err := c.Head(ctx, "owner/repo", "main")
+	mu.Lock()
+	n := requests
+	mu.Unlock()
+	if err != nil || later != fresh || n != 2 {
+		t.Fatalf("later read = %q, %v; requests %d", later, err, n)
+	}
+}
+
+func TestPassMemoIsPerClient(t *testing.T) {
+	var first, second memoServer
+	c1, c2 := first.client(t), second.client(t)
+	ctx, _ := CountRequests(context.Background(), "pr")
+	if _, err := c1.Pull(ctx, "example/project", 7); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c2.Pull(ctx, "example/project", 7)
+	if err != nil || second.n(pullRoute) != 1 || got.Title != "v" {
+		t.Fatalf("second client did not make its own request: %+v, %v, %d requests", got, err, second.n(pullRoute))
+	}
+}
+
+func TestPassMemoRepositoryCaseFoldInvalidates(t *testing.T) {
+	var srv memoServer
+	c := srv.client(t)
+	ctx, _ := CountRequests(context.Background(), "pr")
+	if _, err := c.Head(ctx, "owner/repo", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UpdateBranch(ctx, "Owner/Repo", 7, testSHA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Head(ctx, "owner/repo", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.total(); got != 3 {
+		t.Fatalf("case-different write left memo valid: %d total requests", got)
 	}
 }
 

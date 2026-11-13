@@ -88,8 +88,12 @@ func startQueue(t *testing.T, q *Queue) {
 }
 
 func deliverEvent(t *testing.T, url, event string, body string) {
+	deliverEventID(t, url, event, "d-"+event, body)
+}
+
+func deliverEventID(t *testing.T, url, event, id, body string) {
 	t.Helper()
-	resp := post(t, http.DefaultClient, url, event, "d-"+event, []byte(body), testSecret)
+	resp := post(t, http.DefaultClient, url, event, id, []byte(body), testSecret)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("%s delivery: status %d", event, resp.StatusCode)
@@ -225,12 +229,12 @@ func TestEventQueueBasePushEnqueuesTheReposOpenPRs(t *testing.T) {
 	q.SetOpen("o/r", map[int]string{1: "a", 2: "b", 3: "c"})
 	q.SetOpen("o/other", map[int]string{7: "z"})
 	url := webhookServer(t, q)
-	deliverEvent(t, url, "push", `{"ref":"refs/heads/feature","repository":{"full_name":"o/r"}}`)
+	deliverEventID(t, url, "push", "d-push-feature", `{"ref":"refs/heads/feature","repository":{"full_name":"o/r"}}`)
 	q.Wait()
 	if got := ev.started(); len(got) != 0 {
 		t.Fatalf("a push to a feature branch started %v", got)
 	}
-	deliverEvent(t, url, "push", `{"ref":"refs/heads/main","repository":{"full_name":"o/r"}}`)
+	deliverEventID(t, url, "push", "d-push-main", `{"ref":"refs/heads/main","repository":{"full_name":"o/r"}}`)
 	q.Wait()
 	got := ev.started()
 	slices.SortFunc(got, func(a, b PRKey) int { return a.PR - b.PR })
@@ -257,6 +261,121 @@ func TestEventQueueDeliveryNamingOnlyACommitFindsItsPR(t *testing.T) {
 	q.Wait()
 	if got := ev.started(); !slices.Equal(got, []PRKey{pr(2)}) {
 		t.Fatalf("started %v, want only PR 2", got)
+	}
+}
+
+func TestSetOpenMergesChangesSinceBeginList(t *testing.T) {
+	t.Run("forgotten PR stays absent", func(t *testing.T) {
+		q := &Queue{}
+		q.SetOpen("o/r", map[int]string{2: "head-2"})
+		q.BeginList("o/r")
+		q.Forget("o/r", 2)
+		q.SetOpen("o/r", map[int]string{2: "head-2"})
+		q.EnqueueNamed(SourceCheck, "o/r", 0, "head-2")
+		if got := q.Take("o/r").Depth; got != 0 {
+			t.Fatalf("forgotten PR was queued by its head: depth %d", got)
+		}
+	})
+	t.Run("newer learned head wins", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Learn("o/r", 1, "new")
+		q.SetOpen("o/r", map[int]string{1: "old"})
+		if got := q.Head("o/r", 1); got != "new" {
+			t.Fatalf("head %q, want new", got)
+		}
+	})
+	t.Run("forget after learn stays absent", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Learn("o/r", 2, "learned")
+		q.Forget("o/r", 2)
+		q.SetOpen("o/r", map[int]string{2: "listed"})
+		if got := q.Head("o/r", 2); got != "" {
+			t.Fatalf("head after forget %q, want absent", got)
+		}
+		q.EnqueueNamed(SourceCheck, "o/r", 0, "learned")
+		if got := q.Take("o/r").Depth; got != 0 {
+			t.Fatalf("forgotten PR was queued by its learned head: depth %d", got)
+		}
+	})
+	t.Run("learn after forget restores head", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Forget("o/r", 3)
+		q.Learn("o/r", 3, "new")
+		q.SetOpen("o/r", map[int]string{3: "old"})
+		if got := q.Head("o/r", 3); got != "new" {
+			t.Fatalf("head %q, want new", got)
+		}
+	})
+	t.Run("stale learn cannot undo a current forget", func(t *testing.T) {
+		q := &Queue{}
+		q.SetOpen("o/r", map[int]string{5: "old"})
+		readMark := q.ReadMark("o/r")
+		epoch := q.BeginList("o/r")
+		q.Forget("o/r", 5, epoch)
+		q.Learn("o/r", 5, "stale", readMark)
+		if got := q.Head("o/r", 5); got != "" {
+			t.Fatalf("stale learn restored head %q before commit", got)
+		}
+		q.SetOpen("o/r", map[int]string{5: "listed"})
+		if got := q.Head("o/r", 5); got != "" {
+			t.Fatalf("stale learn restored head %q after commit", got)
+		}
+	})
+	t.Run("aborted list applies held stale forget", func(t *testing.T) {
+		clock := &fakeTimers{}
+		q := &Queue{After: clock.after}
+		q.SetOpen("o/r", map[int]string{5: "head"})
+		q.EnqueueAt(SourceTimer, "o/r", 5, "review", time.Now().Add(time.Hour))
+		readMark := q.ReadMark("o/r")
+		epoch := q.BeginList("o/r")
+		q.Forget("o/r", 5, readMark)
+		if got := q.Head("o/r", 5); got != "head" {
+			t.Fatalf("stale forget applied before outcome: head %q", got)
+		}
+		q.AbortList("o/r", epoch)
+		if got := q.Head("o/r", 5); got != "" {
+			t.Fatalf("head after abort %q, want absent", got)
+		}
+		if got := q.TimerIDs("o/r", 5); len(got) != 0 {
+			t.Fatalf("timers after abort %v, want none", got)
+		}
+		q.EnqueueNamed(SourceCheck, "o/r", 0, "head")
+		if got := q.Take("o/r").Depth; got != 0 {
+			t.Fatalf("aborted closed PR was queued by its head: depth %d", got)
+		}
+	})
+	t.Run("no mark replaces", func(t *testing.T) {
+		q := &Queue{}
+		q.SetOpen("o/r", map[int]string{1: "a", 2: "b"})
+		q.SetOpen("o/r", map[int]string{3: "c"})
+		if got := q.Head("o/r", 1); got != "" {
+			t.Fatalf("PR 1 head %q", got)
+		}
+		if got := q.Head("o/r", 3); got != "c" {
+			t.Fatalf("PR 3 head %q", got)
+		}
+	})
+}
+
+func TestSetOpenIgnoresEvaluationReadsStartedBeforeList(t *testing.T) {
+	q := &Queue{}
+	readEpoch := uint64(0)
+	epoch := q.BeginList("o/r")
+	q.Learn("o/r", 5, "old", readEpoch)
+	q.SetOpen("o/r", map[int]string{5: "new"})
+	if got := q.Head("o/r", 5); got != "new" {
+		t.Fatalf("head %q, want listed head new", got)
+	}
+	q.Learn("o/r", 5, "older", readEpoch)
+	q.Forget("o/r", 5, readEpoch)
+	if got := q.Head("o/r", 5); got != "new" {
+		t.Fatalf("stale evaluation changed listed head to %q", got)
+	}
+	if epoch != 1 {
+		t.Fatalf("first list epoch %d, want 1", epoch)
 	}
 }
 
