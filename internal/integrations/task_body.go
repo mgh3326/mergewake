@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/mgh3326/handoffkeep/client"
 )
@@ -59,7 +60,9 @@ func (Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
 	if answer.BodyDoc == "" {
 		return "", nil
 	}
-	doc, found, err := c.GetDocument(ctx, answer.BodyDoc)
+	// The part after '#' is a scroll position only, as in hk: read the document it names.
+	key, _, _ := strings.Cut(answer.BodyDoc, "#")
+	doc, found, err := c.GetDocument(ctx, key)
 	if err != nil {
 		return "", err
 	}
@@ -69,8 +72,8 @@ func (Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
 	return doc.Body, nil
 }
 
-// Reopen reopens tasks settled by hk, including icebox handoffs, while active
-// and already-unstarted tasks only receive the recovery comment.
+// reopenableState reports whether an hk task in state may be reopened: the
+// settled states merged, deployed, completed, dropped, duplicate and icebox.
 func reopenableState(state string) bool {
 	switch state {
 	case "merged", "deployed", "completed", "dropped", "duplicate", "icebox":

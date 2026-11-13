@@ -463,9 +463,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}()
 	}
 	stamp := s.now().Unix() + int64(plan.replacements)
+	if supersedes, ok := parseReviewerLabel(plan.supersedes); ok && supersedes.pr == pr.Number && supersedes.sha7 == short7(pr.Head.SHA) && supersedes.pass == plan.pass {
+		stamp = max(stamp, supersedes.started.Unix()+1)
+	}
 	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp)
 	if label == plan.supersedes {
-		// The dead reviewer was labelled in this same second: its replacement takes the next one.
+		// Preserve collision avoidance for supersedes labels whose stamp cannot be parsed.
 		label = fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp+1)
 	}
 	checkout := filepath.Join(cfg.Checkouts, label)

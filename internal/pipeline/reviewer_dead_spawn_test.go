@@ -67,6 +67,9 @@ func TestReviewerDeadReplayIsDroppedAndRespawned(t *testing.T) {
 	if fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
 		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
 	}
+	if got, want := assertLabelStamp(t, fresh), assertLabelStamp(t, old)+1; got != want {
+		t.Fatalf("same-run replacement stamp=%d, want %d", got, want)
+	}
 	if g.postCount != 1 {
 		t.Fatalf("posts=%d, want the fresh reviewer's findings posted", g.postCount)
 	}
@@ -79,6 +82,72 @@ func TestReviewerDeadReplayIsDroppedAndRespawned(t *testing.T) {
 		t.Fatalf("reviewer-spawn-replaced rows %v, want %s replaced by %s", replaced, old, fresh)
 	}
 	reviewerJobGone(t, s, r, 1)
+}
+
+// A deferred chain in one clock second must advance beyond every dead label,
+// including the replacement that became the newest dead marker.
+func TestReviewerDeferredReplacementLabelsAdvanceMonotonically(t *testing.T) {
+	s, _, r, runner, _, dead := deferredDeadReplay(t)
+	firstStamp := assertLabelStamp(t, dead.Label)
+
+	// The first replacement waits in the reviewer record, under the next stamp.
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("first replacement: %v", err)
+	}
+	first := arg(runner.spawns[1], "-l")
+	if got := assertLabelStamp(t, first); got != firstStamp+1 {
+		t.Fatalf("first replacement stamp=%d, want %d", got, firstStamp+1)
+	}
+
+	// It dies too late in the run to be replaced immediately, so its own label
+	// becomes the marker consumed by the next evaluation.
+	s.Config.Review.Timeout = "2s"
+	s.Runner = &refusingLabel{next: runner, label: first, exit: panewireQuotaTimeout, delay: 1200 * time.Millisecond}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("defer second dead spawn: %v", err)
+	}
+	if _, err := os.Stat(s.deadLabelPath(r.Name, 7, 1)); err != nil {
+		t.Fatalf("second dead-label marker: %v", err)
+	}
+
+	// The fixed clock still says t. The new marker must force the next label
+	// above the first replacement, not merely avoid the original label.
+	s.Runner = runner
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("second replacement: %v", err)
+	}
+	second := arg(runner.spawns[2], "-l")
+	if got := assertLabelStamp(t, second); got != firstStamp+2 {
+		t.Fatalf("second replacement stamp=%d, want %d", got, firstStamp+2)
+	}
+	if dead.Label == first || first == second || dead.Label == second {
+		t.Fatalf("replacement labels are not distinct: %q, %q, %q", dead.Label, first, second)
+	}
+}
+
+// If the clock has already advanced beyond the superseded label, use it.
+func TestReviewerDeferredReplacementUsesLaterClockStamp(t *testing.T) {
+	s, _, r, runner, c, dead := deferredDeadReplay(t)
+	c.t = c.t.Add(10 * time.Second)
+	pendingFreshSpawn(runner)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("replacement: %v", err)
+	}
+	label := arg(runner.spawns[1], "-l")
+	if got, want := assertLabelStamp(t, label), c.t.Unix(); got != want {
+		t.Fatalf("replacement stamp=%d, want clock stamp %d (dead %s)", got, want, dead.Label)
+	}
+}
+
+func assertLabelStamp(t *testing.T, label string) int64 {
+	t.Helper()
+	parsed, ok := parseReviewerLabel(label)
+	if !ok {
+		t.Fatalf("invalid reviewer label %q", label)
+	}
+	return parsed.started.Unix()
 }
 
 // (b) Replays of a dead request add no failure of their own: five evaluations
