@@ -284,7 +284,7 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged, deployed, completed, dropped, duplicate or icebox", task, current.State)
 	}
 	if _, e = c.ReopenTask(ctx, id, note); e != nil {
-		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to unstarted: %w", task, current.State, e)
+		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to unstarted; server may lack explicit reopen support: %w", task, current.State, e)
 	}
 	return nil
 }

@@ -93,7 +93,8 @@ func TestHKSinkCallsGoOverHTTPWithSvcToken(t *testing.T) {
 		}
 	}
 	want := map[string]int{
-		"GET /v1/tasks/42":                                 5, // Lane, TaskBody, TaskJob, TaskPriority, Reopen's read
+		"GET /v1/tasks/42": 5, // Lane, TaskBody, TaskJob, TaskPriority, Reopen's read
+		"GET /v1/documents/design%2F2026-11-08%2Fbody":     1, // TaskBody's linked document
 		"POST /v1/tasks/42/comments":                       1,
 		"POST /v1/tasks/42/reopen":                         1,
 		"PUT /v1/attachments":                              1,
@@ -407,7 +408,7 @@ func TestHKSinkReopenOutcomes(t *testing.T) {
 		hk := hktest.New(t)
 		hk.SetTask(42, hkTask(42, "developing", "l", "t", 0, `{}`))
 		e := (Handoffkeep{Runner: noCLI(t)}).Reopen(ctx, "42", "note")
-		if e == nil || !strings.Contains(e.Error(), "explicit reopen requires merged or dropped") || len(hk.Comments()) != 1 || len(hk.Reopens()) != 0 {
+		if e == nil || !strings.Contains(e.Error(), "explicit reopen requires merged, deployed, completed, dropped, duplicate or icebox") || len(hk.Comments()) != 1 || len(hk.Reopens()) != 0 {
 			t.Fatalf("err=%v comments=%d reopens=%d", e, len(hk.Comments()), len(hk.Reopens()))
 		}
 	})
