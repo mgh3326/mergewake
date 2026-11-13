@@ -19,7 +19,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
-	"github.com/mgh3326/mergewake/internal/mirror"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
@@ -269,20 +268,10 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	// stall on an interval recorded by an earlier request.
 	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
-	// The mirror is a daemon feature: its refresh loop runs beside the roles,
-	// and the PR diff shadow compare is fed by the GitHub client. A dry run
-	// writes nothing and fetches nothing, so it keeps no mirror; a host with
-	// no App can serve no mirror fetch, so it keeps none either.
-	if command == "daemon" && !*dry && c.Daemon.Mirror.On() && c.GitHubApp != nil {
-		log := slog.New(slog.NewJSONHandler(stderr, nil))
-		s.Mirror = mirror.New(mirror.Options{
-			Dir:   c.Daemon.Mirror.DirFor(c.StateDir),
-			Token: gh.AppToken,
-			Run:   exec,
-			Log:   log,
-		})
-		s.Log = log
-		gh.DiffObserver = s.ShadowDiff
+	// The daemon's warnings go to its JSON log on stderr. A dry run writes
+	// nothing, and a host without a GitHub App keeps no logger for it.
+	if command == "daemon" && !*dry && c.GitHubApp != nil {
+		s.Log = slog.New(slog.NewJSONHandler(stderr, nil))
 	}
 	o := pipeline.Options{DryRun: *dry, Shadow: shadowMode(command, *apply, shadow != nil && *shadow, c.Daemon.Act)}
 	if digest != nil {
@@ -296,15 +285,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	switch command {
 	case "daemon":
-		if s.Mirror != nil {
-			var names []string
-			for _, r := range c.Repos {
-				if *repo == "" || r.Name == *repo {
-					names = append(names, r.Name)
-				}
-			}
-			go s.Mirror.RefreshLoop(ctx, names)
-		}
 		return runDaemon(ctx, &s, gh, *repo, o, stderr)
 	case "land":
 		return s.Land(ctx, r, *pr, o)

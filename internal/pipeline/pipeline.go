@@ -18,7 +18,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/manifest"
-	"github.com/mgh3326/mergewake/internal/mirror"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/rollout"
 )
@@ -76,13 +75,8 @@ type Service struct {
 	// reapBinds caches each merged PR's task/job binding for reap (see
 	// reapBinding), guarded by reapBindMu.
 	reapBinds map[string]reapBinding
-	// Mirror, when set, is the local bare mirror the diff shadow compare
-	// reads. Nil means no shadow compare.
-	Mirror *mirror.Mirror
-	// Log receives the mirror shadow lines; nil discards them.
+	// Log receives the pipeline's warnings and notes; nil discards them.
 	Log *slog.Logger
-	// shadow is the diff shadow counter state, shared by the observers.
-	shadow *shadowState
 	// OutcomesChanged, when set, tells the outcome publisher that the ledger
 	// has new outcomes (see OutcomePublisher.Nudge). It must not block. Nil
 	// means nobody is told; the publisher's timer finds them.
