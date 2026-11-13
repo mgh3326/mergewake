@@ -516,8 +516,6 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `login` | Required | GitHub identity posting the independent exact-head review. |
 | `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
 | `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
-| `quota` | Empty | Accepted and unused; `outcomes.command` no longer falls back to it. |
-| `scopefuel` | Empty | Accepted and unused. |
 | `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Accepted grades, weakest to strongest: `C`, `B`, `A`, `A+`, `S`, `S+`, `SS`. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
 | `budget_rounds` | `3` | Review rounds a PR gets before later rounds report only critical and high findings; negative turns the budget off. See "Review rounds, contract and budget". |
@@ -680,13 +678,13 @@ nudge. The receipt's
 worker-seat note from step 3.
 
 Under the panewire executor, review does not call the quota tool and does not
-read `review.profiles`, `review.pairings`, `review.select` or `review.quota`
-to choose reviewers: panewire selects the reviewer. The keys are still
-accepted, so existing configs keep loading. `review.profiles` is still read for
-the author's model and family from a `Mergewake-Author-Profile` trailer, for
-the author model on the outcomes record, and to name the family of a seat whose
-job record and spawn events carry none. `review.quota` and `review.scopefuel` are
-accepted and unused. Passes of a blocking PR are separate panes; panewire
+read `review.profiles` or `review.pairings` to choose reviewers: panewire
+selects the reviewer. `review.profiles` is still read for the author's model
+and family from a `Mergewake-Author-Profile` trailer, for the author model on
+the outcomes record, and to name the family of a seat whose job record and
+spawn events carry none. The keys `review.select`, `review.quota` and
+`review.scopefuel` were removed; a config that sets one fails at load. Passes of
+a blocking PR are separate panes; panewire
 enforces only the author-family exclusion between them.
 
 panewire fails closed when the remote host cannot stand at the head: an
@@ -1691,7 +1689,7 @@ fleet spawners can be wrapped around this protocol without importing their code.
 ```yaml
 daemon:
   act: false
-  pr: {enabled: true, interval: 60s, notify: {enabled: true}, findings: {enabled: true, ack_after: 15m}, stall_after: 30m}
+  pr: {enabled: true, interval: 60s, notify: {enabled: true}, findings: {enabled: true, ack_after: 15m}}
   watch: {enabled: true, interval: 60s}
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
@@ -1727,7 +1725,8 @@ The daemon keeps one bare git mirror per configured repository under `dir`
 (default `<state_dir>/mirrors`), with the repository's branch heads and PR
 heads. A background loop fetches each mirror at most once every ten minutes,
 one fetch per repository at a time; a second request joins the running fetch. A
-fetch is bounded at 60 seconds and runs `git gc --auto` after it succeeds. A
+fetch is bounded at 60 seconds, except the first clone into an empty mirror,
+which gets 10 minutes (unmeasured). It runs `git gc --auto` after it succeeds. A
 fetch authenticates only with the GitHub App installation token, passed to git
 in the environment (`GIT_CONFIG_*` `http.extraHeader`, with the user credential
 helper reset and no terminal prompt); the token is never on argv or on disk. A
@@ -1885,9 +1884,9 @@ roles woken — never the body, the signature or other headers.
 
 Only enabled roles wake, and only for repositories in `repos`.
 
-`daemon.pr.notify` defaults to enabled and accepts `enabled`, `renotify_after`,
-`renotify_max` and `conflict_owner_after` (`30m` by default). The renotify keys
-have no effect since READY is no longer sent.
+`daemon.pr.notify` defaults to enabled and accepts `enabled` and
+`conflict_owner_after` (`30m` by default). `renotify_after` and `renotify_max`
+were removed with the READY reminder; a config that sets either fails at load.
 While the `pr` role runs, each poll runs the merge gate for every open,
 non-draft PR at its current head and sends one lane event for a BLOCKED verdict
 and records a READY one — the notify path observes rather than merges, so it
@@ -1916,8 +1915,7 @@ one `pr-notify` decision row with `"suppressed":"record only"`, the head's
 summary, and the author worker lane (job bound to the task, else the author
 pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
-counts `ready_too_long` from. No READY reminder is sent; `renotify_after` and
-`renotify_max` are accepted and have no effect. The BLOCKED event
+counts `ready_too_long` from. No READY reminder is sent. The BLOCKED event
 lane follows the PR author route used for review findings: the bound worker
 job, a live takeover pane, an explicit author lane, or the desk when the author
 is unknown. The owner lane gets one follow-up per PR only when the author route
@@ -1990,7 +1988,7 @@ restarts by a `stalled <PR> <head>` key in `pr-notify-sent`. It is sent only whi
 again follows the rules above. This is the only stall alert: the older
 elapsed-time `STALLED review` alarm, which the daemon stopped calling when
 reviews moved to retry accounting, is removed with its `review-wait.json` and
-`review-stall-sent` state, and `daemon.pr.stall_after` is read but sets nothing.
+`review-stall-sent` state. The `daemon.pr.stall_after` key was removed; a config that sets it fails at load.
 
 
 ##### Conflict ESC
@@ -2181,8 +2179,8 @@ bounded backoff. These counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
-`stall_after` remains readable for compatibility and no longer controls daemon
-escalation. Shadow and dry-run modes do not retry reviews or write retry state.
+`stall_after` was removed; a config that sets it fails at load. Shadow and
+dry-run modes do not retry reviews or write retry state.
 `daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
 and landing, except a bot the repository's policy lists under `bot_updates`.
 They still count as open for outcome reconciliation.

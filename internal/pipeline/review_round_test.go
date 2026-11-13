@@ -552,17 +552,6 @@ type clock struct{ t time.Time }
 
 func (c *clock) now() time.Time { return c.t }
 
-func TestStallWindowConfig(t *testing.T) {
-	for _, tt := range []struct {
-		in   string
-		want time.Duration
-	}{{"", 30 * time.Minute}, {"45m", 45 * time.Minute}, {"off", 0}, {"junk", 0}} {
-		if got := (config.PRLoop{StallAfter: tt.in}).StallWindow(); got != tt.want {
-			t.Errorf("%q: got %v want %v", tt.in, got, tt.want)
-		}
-	}
-}
-
 func TestRepeatPassOverAnUnchangedHeadKeepsItsRecordedRound(t *testing.T) {
 	heads := []github.ReviewedHead{{SHA: shaB, Round: 1}, {SHA: shaA, Round: 3}}
 	s, g, _, r := roundSetup(t, heads, patchTwo, patchTwo, fsjson())
