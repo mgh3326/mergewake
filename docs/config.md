@@ -382,8 +382,9 @@ these steps in order:
    than 24 hours is reclaimable, and a live lock is reported as
    `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
    age; a claim that finds one held past 24 hours fails with an error naming the
-   guard path, and the lock is left alone. Remove that guard by hand once no
-   archive run is live. If hosts present the same task/job key, a stale or
+   guard path, and the lock is left alone. Remove that guard by hand, with
+   `rm -r`, once no archive run is live: it is a directory holding an `owner`
+   file. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
