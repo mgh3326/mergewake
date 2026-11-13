@@ -737,8 +737,11 @@ on it.
   reports a defect outside the shown hunks only when a changed line causes it,
   anchored on that changed line (`fleet-review` §Rounds); a finding on any other
   line fails the same new-side-line check as before. The panewire brief carries the delta patch inline instead of `git diff`.
-  Secret-like strings in removed lines are redacted, including in mixed hunks;
-  added and context lines are verbatim.
+  Secret-like strings in removed lines are redacted, including in mixed hunks.
+  A removed line outside a known private-key block is also redacted where it
+  holds a run of 40 or more base64 characters (`[A-Za-z0-9+/=]`), because a
+  hunk's context may omit the block's BEGIN marker; added and context lines are
+  verbatim.
   When the previous patch cannot be read, the round reviews the whole diff and
   the audit event says why (`round_note`). When nothing changed at all, the round
   does not count, reviews the whole diff for reference only, and reports only a

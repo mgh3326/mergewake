@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -8,9 +9,14 @@ import (
 	"github.com/mgh3326/mergewake/internal/archive"
 )
 
-// redactRemovedDiffLines changes only secret-pattern matches in removed lines.
-// Its input is the review delta; callers retain that original for every
-// non-brief use.
+// keyBodyRun matches a run of base64-alphabet characters long enough to be key
+// material. A hunk's context may omit the BEGIN marker, so removed lines outside
+// a known PEM block are screened by shape instead of by the old-side blob.
+var keyBodyRun = regexp.MustCompile(`[A-Za-z0-9+/=]{40,}`)
+
+// redactRemovedDiffLines changes only secret-pattern matches and key-body-shaped
+// runs in removed lines. Its input is the review delta; callers retain that
+// original for every non-brief use.
 func redactRemovedDiffLines(diff string) (string, int, []string, []string, []string) {
 	lines := strings.SplitAfter(diff, "\n")
 	paths := map[string]bool{}
@@ -89,6 +95,16 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 				patterns["private_key"] = true
 			} else {
 				redacted, n, names := archive.RedactSecretLike(content)
+				if keyBodyRun.MatchString(redacted) {
+					ending := hunkLine[len(strings.TrimRight(hunkLine, "\r\n")):]
+					if bare := strings.TrimSpace(redacted); keyBodyRun.FindString(bare) == bare {
+						redacted = "[redacted]" + ending
+					} else {
+						redacted = keyBodyRun.ReplaceAllString(redacted, "[redacted]")
+					}
+					n++
+					names = append(names, "key_body")
+				}
 				if n == 0 {
 					out.WriteString(hunkLine)
 				} else {

@@ -523,7 +523,9 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	pgpBegin := strings.Join([]string{"-----", "BEGIN "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
 	pgpBody := strings.Repeat("Ef5/", 16)
 	pgpEnd := strings.Join([]string{"-----", "END "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
-	base64Line := strings.Repeat("Cd4/", 64)
+	base64Line := strings.Repeat("Cd4/", 16)
+	base64Run := strings.Repeat("Gh6+", 12)
+	sha := strings.Repeat("0a1b2c", 5)
 	tests := []struct {
 		name, diff, want, alsoWant, notWant, path, pattern, summary string
 		rows, count                                                 int
@@ -601,9 +603,9 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 		},
 		{
 			name:     "PEM state spans hunks and resets between files",
-			diff:     "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1 +0,0 @@\n-" + pemBegin + "\n@@ -10 +9,0 @@\n-" + pemBody + "\ndiff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
+			diff:     "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1 +0,0 @@\n-" + pemBegin + "\n@@ -10 +9,0 @@\n-" + pemBody + "\ndiff --git a/notes b/notes\n--- a/notes\n+++ b/notes\n@@ -1 +0,0 @@\n-plain text\n",
 			want:     "-[redacted]",
-			alsoWant: "-" + base64Line,
+			alsoWant: "-plain text\n",
 			notWant:  pemBody,
 			path:     "id_rsa",
 			pattern:  "private_key",
@@ -611,10 +613,34 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:    2,
 		},
 		{
-			name:    "long base64 outside PEM stays unchanged",
-			diff:    "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
-			want:    "-" + base64Line,
-			notWant: "[redacted]",
+			name:    "base64 line redacted when context omits the PEM begin",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -12,3 +12,2 @@\n keep\n-" + base64Line + "\n keep\n",
+			want:    " keep\n-[redacted]\n keep",
+			notWant: base64Line,
+			path:    "id_rsa",
+			pattern: "key_body",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "base64 run inside a removed line redacted",
+			diff:    "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1,2 +1 @@\n-key: " + base64Run + " # old\n keep\n",
+			want:    "-key: [redacted] # old\n keep",
+			notWant: base64Run,
+			path:    "blob",
+			pattern: "key_body",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name: "removed short hex value stays verbatim",
+			diff: "diff --git a/lock b/lock\n--- a/lock\n+++ b/lock\n@@ -1,2 +1 @@\n-rev: " + sha + "\n keep\n",
+			want: "-rev: " + sha + "\n keep",
+		},
+		{
+			name: "added base64 stays verbatim",
+			diff: "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -0,0 +1 @@\n+" + base64Line + "\n",
+			want: "+" + base64Line,
 		},
 		{
 			name: "added token stays verbatim",
@@ -659,7 +685,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			}
 			if tt.rows > 0 {
 				body, _ := json.Marshal(rows[0])
-				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) {
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) || strings.Contains(string(body), base64Run) {
 					t.Fatalf("audit contains matched text: %s", body)
 				}
 				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
