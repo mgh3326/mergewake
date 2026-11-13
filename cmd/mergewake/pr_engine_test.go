@@ -107,6 +107,7 @@ func TestEventQueueSweepQueuesInsteadOfEvaluatingInline(t *testing.T) {
 
 func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 	e, f := engineFixture(t, 1)
+	f.hub.heads = map[int]string{5: "eee"}
 	entered, releaseList := make(chan struct{}), make(chan struct{})
 	prEntered, releasePR := make(chan struct{}), make(chan struct{})
 	var prOnce sync.Once
@@ -143,6 +144,9 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.runner.waitFor(t, "listed PR evaluation", func(in, started, _ int) bool { return in == 1 && started == 1 })
+	if got := e.q.Head(f.repo.Name, 5); got != "eee" {
+		t.Fatalf("sweep lost learned head: got %q, want eee", got)
+	}
 	e.q.EnqueueNamed(daemon.SourceCheck, f.repo.Name, 0, "eee")
 	close(releasePR)
 	close(f.runner.release)
