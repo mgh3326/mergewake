@@ -965,7 +965,7 @@ is on. It runs at start, on a nudge after each land and each closed-row
 reconcile that read a row, and on a timer of `poll_interval`; each publish is bounded to 45 seconds and a run
 attempts every pending outcome of every repo (it has no shared deadline that
 slow outcomes could use up), and the publisher stops with the daemon. Land, the PR sweep and the reconcile never publish, so none of them
-waits for a publish and the repo's settle lock is never held across one. A one-shot
+waits for a publish and the repo's merge lock is never held across one. A one-shot
 `mergewake land` leaves its outcome in the outbox for the daemon or
 `mergewake outcomes sync`.
 The ledger lock is held only to read the outbox and to append each receipt, so

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -244,38 +245,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if v.State != "ready" || d.Shadow || o.DryRun {
 		return nil
 	}
-	// Recheck everything immediately before the SHA-bound merge: the head must
-	// be unchanged and must still gate ready under the current base and policy.
-	freshPR, e := s.GH.Pull(ctx, r.Name, n)
-	if e != nil {
-		return e
-	}
-	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft || freshPR.Base.Ref != r.Branch {
-		return errors.New("PR changed during decision")
-	}
-	fresh, e := s.GH.Head(ctx, r.Name, r.Branch)
-	if e != nil {
-		return e
-	}
-	p, e = s.Policy(ctx, r, fresh)
-	if e != nil {
-		return e
-	}
-	if !p.Enabled {
-		return errors.New("landing policy changed during decision")
-	}
-	gate, again := s.gateFor(freshPR, p)
-	if again != reason {
-		return errors.New("landing policy changed during decision")
-	}
-	v, e = gate(ctx, r, freshPR, p, fresh)
-	if e != nil {
-		return e
-	}
-	if v.State != "ready" {
-		return errors.New("gate changed during decision")
-	}
-	if e = s.GH.Merge(ctx, r.Name, n, pr.Head.SHA); e != nil {
+	if e = s.mergePinned(ctx, r, pr, reason); e != nil {
 		return e
 	}
 	s.postTaskEvent(ctx, r, pr, integrations.SourceMerge, nil, s.now())
@@ -296,9 +266,66 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		}
 	}
 	// The merge is observed; publishing its outcome is the daemon's publisher's
-	// job, so a slow publish never holds the repository's settle lock.
+	// job, so a slow publish never holds the repository's merge lock.
 	s.nudgeOutcomes()
 	return nil
+}
+
+// mergeLock is the lock of one repository's merges. It lives in this process:
+// the daemon is the one place two PRs of a repository reach a merge at once.
+func (s *Service) mergeLock(repo string) func() {
+	return lockPath("merge:" + s.state(repo))
+}
+
+// mergePinned rechecks a PR and merges it pinned to the head Land gated. It
+// holds the repository's merge lock from the PR re-read to the end of GH.Merge
+// and nothing else is under that lock.
+//
+// Each line is inside for one reason: a merge moves the base, so the next
+// merge must read the base the previous one left, and must read it after the
+// previous merge returned. The base head, the policy at it and the gate against
+// it are therefore read under the lock. The PR re-read sits beside them so
+// that the "PR changed during decision" check is as fresh as the base: a PR
+// read before a long wait for the lock would be checked against a stale head.
+// GH.Merge is the step being serialised.
+func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull, reason string) error {
+	ph := daemon.PhasesOf(ctx)
+	ph.Enter(daemon.PhaseLockWait)
+	unlock := s.mergeLock(r.Name)
+	defer unlock()
+	ph.Enter(daemon.PhaseSettle)
+	// Recheck everything immediately before the SHA-bound merge: the head must
+	// be unchanged and must still gate ready under the current base and policy.
+	freshPR, e := s.GH.Pull(ctx, r.Name, pr.Number)
+	if e != nil {
+		return e
+	}
+	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft || freshPR.Base.Ref != r.Branch {
+		return errors.New("PR changed during decision")
+	}
+	fresh, e := s.GH.Head(ctx, r.Name, r.Branch)
+	if e != nil {
+		return e
+	}
+	p, e := s.Policy(ctx, r, fresh)
+	if e != nil {
+		return e
+	}
+	if !p.Enabled {
+		return errors.New("landing policy changed during decision")
+	}
+	gate, again := s.gateFor(freshPR, p)
+	if again != reason {
+		return errors.New("landing policy changed during decision")
+	}
+	v, e := gate(ctx, r, freshPR, p, fresh)
+	if e != nil {
+		return e
+	}
+	if v.State != "ready" {
+		return errors.New("gate changed during decision")
+	}
+	return s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA)
 }
 
 // gateFunc decides one PR head against the base head under a policy.
