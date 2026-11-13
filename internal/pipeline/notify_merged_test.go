@@ -294,3 +294,29 @@ func TestLandMergedLaneReadFailureStaysPending(t *testing.T) {
 		t.Fatalf("events=%+v", n.events)
 	}
 }
+
+func TestMergedRecentExternalCandidateAndLandCandidateShareSentKey(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	r.Lane = "repo-design"
+	now := time.Now().UTC()
+	s.Now = func() time.Time { return now }
+	mergedAt := now.Add(-time.Hour).Format(time.RFC3339)
+	g.pull.Merged, g.pull.State, g.pull.MergedAt = true, "closed", &mergedAt
+	if err := s.ObserveMergedCandidate(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryMergedCandidate(context.Background(), r, g.pull, g.pull.Title); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("merged PR got duplicate notices: %+v", n.events)
+	}
+	mergedAt = now.Add(-25 * time.Hour).Format(time.RFC3339)
+	g.pull.Head.SHA, g.pull.MergedAt = shaC, &mergedAt
+	if err := s.ObserveMergedCandidate(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("old external merge was notified: %+v", n.events)
+	}
+}
