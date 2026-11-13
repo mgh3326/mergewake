@@ -756,8 +756,9 @@ on it.
   posted. The `review` audit event counts them as `duplicates_dropped`.
 - **Closed contract.** A PR-body section headed `Acceptance` (`Acceptance
   criteria`, `Acceptance (…)`; any heading level, up to the next heading of the
-  same or higher level), else the same section in the body of the task named by
-  the `Mergewake-Task` trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
+  same or higher level), else the same section in the body document named by
+  the task's `body_doc` field for the task named by the `Mergewake-Task`
+  trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
   the closed list of what the change must do. The reviewer marks a finding
   outside it with `"advisory": true`. mergewake then caps the finding at
   `medium` (unrated becomes `low`), posts it with an `<!-- mergewake-advisory -->`
