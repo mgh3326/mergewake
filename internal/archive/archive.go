@@ -473,7 +473,7 @@ else
       parked="$1.reclaim.$4"
       if mv "$1" "$parked" 2>/dev/null; then
         p_owner=; p_born=
-        if [ -r "$parked/owner" ]; then read p_owner p_born < "$parked/owner"; fi
+        if [ -r "$parked/owner" ]; then read p_owner p_born < "$parked/owner"; else p_born=$(stat -c %Y "$parked" 2>/dev/null || stat -f %m "$parked"); fi
         if [ "$p_owner" = "$2" ] && [ "$p_born" = "$3" ]; then
           if rm -rf "$parked" && take "$1" "$4" "$now"; then result=acquired; fi
         elif [ ! -e "$1" ]; then

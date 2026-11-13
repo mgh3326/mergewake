@@ -1858,6 +1858,31 @@ func TestArchiveLockReclaimOwnerlessYoungLockStaysBusy(t *testing.T) {
 	}
 }
 
+func TestArchiveLockReclaimOwnerlessExpiredLockIsReclaimed(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "ownerless-expired")
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-2 * time.Duration(archiveLockTTL) * time.Second)
+	if err := os.Chtimes(lock, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	release, err := a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("expired ownerless lock: claim err=%v, want acquired", err)
+	}
+	if _, err := os.Stat(lock + "/owner"); err != nil {
+		t.Fatalf("reclaimed lock has no owner: %v", err)
+	}
+	if parked, _ := filepath.Glob(lock + ".reclaim.*"); len(parked) != 0 {
+		t.Fatalf("parked copy left behind: %v", parked)
+	}
+	release()
+}
+
 func TestArchiveLockReclaimReleaseByNonOwnerKeepsLock(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
