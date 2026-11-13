@@ -299,18 +299,40 @@ func escalable(r config.Repo, pr github.Pull) bool {
 	return pr.State == "open" && !pr.Merged && (r.Branch == "" || pr.Base.Ref == r.Branch)
 }
 
+// conflictEscClears reports whether resolving head would change the state:
+// an unpinned pending ESC for it, an owner clock still running for it, or an
+// owner follow-up pending for it.
+func conflictEscClears(st conflictEscState, head string) bool {
+	if p, ok := st.Pending[head]; ok && p.Pinned == "" {
+		return true
+	}
+	if st.OwnerHead == head && !st.OwnerSent {
+		return true
+	}
+	return st.OwnerPending != nil && st.OwnerPendingHead == head
+}
+
 // resolveConflictEsc drops the pending ESC of a head GitHub now reports
 // mergeable, unless a lane may already hold it (Pinned): that one is still
 // retried there if the head conflicts again. A delivered head stays
-// delivered.
+// delivered. The state is read once without the lock; when it has nothing to
+// clear for this head — including a missing file — it returns without taking
+// the lock or creating any file.
 func (s *Service) resolveConflictEsc(file, head string) error {
+	st, e := readConflictEsc(file)
+	if e != nil {
+		return e
+	}
+	if !conflictEscClears(st, head) {
+		return nil
+	}
 	defer lockPath(file)()
 	unlock, e := fsutil.Lock(file+".lock", true)
 	if e != nil {
 		return e
 	}
 	defer unlock()
-	st, e := readConflictEsc(file)
+	st, e = readConflictEsc(file)
 	if e != nil {
 		return e
 	}
