@@ -18,8 +18,8 @@ import (
 
 const prStatusUsage = "usage: mergewake pr-status --repo owner/name --pr N [--fresh] [--json] [--config PATH]"
 
-// runPRStatus prints a PR's last-pass status snapshot from local state, the
-// same answer GET /v1/pr-status gives, with no daemon and no GitHub call.
+// runPRStatus prints a PR's last-pass status snapshot from local state, with
+// no daemon and no GitHub call.
 // --fresh adds the one GraphQL read, and only then resolves a token.
 func runPRStatus(ctx context.Context, args []string, out, stderr io.Writer) error {
 	fs := flag.NewFlagSet("pr-status", flag.ContinueOnError)
@@ -63,7 +63,7 @@ func runPRStatus(ctx context.Context, args []string, out, stderr io.Writer) erro
 func printPRStatus(ctx context.Context, stateDir, repo string, n int, fresh prstatus.Fresher, asJSON bool, out io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	resp, _, e := prstatus.Respond(ctx, stateDir, repo, n, fresh, time.Now().UTC())
+	resp, e := prstatus.Respond(ctx, stateDir, repo, n, fresh, time.Now().UTC())
 	if errors.Is(e, prstatus.ErrNotFound) {
 		return fmt.Errorf("no status snapshot for %s#%d", repo, n)
 	}

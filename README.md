@@ -21,7 +21,6 @@ reviewer CLI on a reviewer host. The binary itself requires no Go installation.
 ```sh
 go build -o mergewake ./cmd/mergewake
 ./mergewake --help
-./mergewake superfan --name ci
 ```
 
 Create an operator-owned host config from [examples/host.yaml](examples/host.yaml).
@@ -67,7 +66,6 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 | `status --daemon` | Show each role’s last run, last error, failure count and next run. |
 | `agent` | Poll all configured repositories for verified rollouts. `--once` runs a single poll; `--repo` selects one. |
 | `status` | Read local receipts and check installed digests and modes. Returns failure on drift; supports `--repo`. |
-| `superfan --name …` | Print a relay, CI, quota, or drift monitor spec. `--launch --runner /path/to/runner` sends it to a trusted session runner on stdin. |
 
 All acting commands support `--dry-run`. There is no merge lock, mandatory
 rebase, multi-round tester loop, or committed manifest/hash-pin file. A fixed
@@ -270,8 +268,7 @@ and experiment arm. See [configuration](docs/config.md#outcomes-and-shared-measu
 for the conservative seven-day rule, outbox recovery and shared follow-up semantics.
 
 Workers can read each PR's last merge-gate verdict without spending GitHub budget:
-the daemon serves `GET /v1/pr-status` on its webhook listener and `mergewake pr-status`
-reads the same snapshot from local state. See [PR status](docs/pr-status.md).
+`mergewake pr-status` reads the snapshot from local state. See [PR status](docs/pr-status.md).
 
 `mergewake ci-policy` checks that each configured repo follows the fleet main-CI default
 (cancel in-progress main runs per ref, name an `any_ref_workflow`), and `watch` warns once per

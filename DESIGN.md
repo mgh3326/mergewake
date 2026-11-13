@@ -70,7 +70,6 @@ rollout likewise require `--apply`.
 | `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `discord` | Webhook message types and limits, one post attempt, rate-limit parsing; never exposes a webhook URL. |
-| `superfan` | Embedded prompts, allowed read-only sources and allowed actions. |
 | `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |
 | `archive` | Job-dir plan, credential exclusion, verified copy to a synced Drive folder, hk attachments and comment, guarded delete. |
 
@@ -322,9 +321,6 @@ operators must give each inventory its own root.
   or rollback of volume-contents or database changes.
 - CI recovery uses recorded checks; any-ref workflow dispatch and flaky-test
   reruns are not implemented. Missing evidence deliberately requires an operator.
-- Superfan contracts guide a trusted session runner; the binary neither enforces
-  an external agent's capability boundary nor manages its session lifetime.
-  There is no autonomous privileged monitor by default.
 - All four builds disable CGO. Linux outputs are statically linked; Darwin outputs
   retain macOS system-library dependencies. Fully static Darwin executables are
   not provided.

@@ -25,7 +25,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/rollout"
 	"github.com/mgh3326/mergewake/internal/server/store"
-	"github.com/mgh3326/mergewake/internal/superfan"
 )
 
 var version = "dev"
@@ -52,7 +51,6 @@ Usage: mergewake <command> [flags]
   status     Read installed receipts and check local drift
   promote    Certify one main commit and its image digest, record it, and advance the deployable pointer
   admit      Print the digest the deployable pointer and its record agree on, or refuse; --deploy hands it to shiftgate
-  superfan   Print or launch an experimental resident monitor spec
 
 All commands accept --help. Acting commands accept --dry-run.
 Config defaults to ~/.config/mergewake/config.yaml.
@@ -121,7 +119,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	command := args[0]
 	switch command {
-	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "superfan", "reap":
+	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "reap":
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
@@ -131,13 +129,11 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	apply := fs.Bool("apply", false, "allow acting review, release, rollout, reap or daemon (daemon also needs daemon.act; reap also needs reap.act)")
 	daemonStatus := fs.Bool("daemon", false, "read loop status (status only)")
 	dry := fs.Bool("dry-run", false, "print planned actions without mutations or model execution")
-	repo := fs.String("repo", "", "configured owner/name (required except agent, status, superfan)")
+	repo := fs.String("repo", "", "configured owner/name (required except agent, status)")
 	var pr *int
 	var family, commit *string
 	var shadow, once, legacy *bool
 	var legacyHost *string
-	var name, runner *string
-	var launch *bool
 	var digest, adopt *string
 	switch command {
 	case "land", "review", "reap":
@@ -163,10 +159,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		adopt = fs.String("adopt", "", "record an already-running container as the current receipt")
 	case "agent":
 		once = fs.Bool("once", false, "poll each repo once")
-	case "superfan":
-		name = fs.String("name", "", "relay, ci, quota, drift; empty lists specs")
-		launch = fs.Bool("launch", false, "launch runner, sending spec JSON on stdin")
-		runner = fs.String("runner", "", "trusted session-runner executable; accepts spec JSON on stdin")
 	}
 	if e := fs.Parse(args[1:]); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
@@ -186,9 +178,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		case *legacy && *apply && *dry:
 			return errors.New("--apply and --dry-run are exclusive")
 		}
-	}
-	if command == "superfan" {
-		return runSuperfan(ctx, *name, *launch, *runner, *dry, out)
 	}
 	c, e := config.Load(config.Expand(*cfg))
 	if e != nil {
@@ -385,44 +374,6 @@ func poll(ctx context.Context, interval string, once bool, fn func(context.Conte
 		case <-timer.C:
 		}
 	}
-}
-func runSuperfan(ctx context.Context, name string, launch bool, runner string, dry bool, out io.Writer) error {
-	if name == "" {
-		if launch {
-			return errors.New("launch requires --name")
-		}
-		for _, n := range superfan.Names() {
-			s, e := superfan.Get(n)
-			if e != nil {
-				return e
-			}
-			if e = json.NewEncoder(out).Encode(s); e != nil {
-				return e
-			}
-		}
-		return nil
-	}
-	spec, e := superfan.Get(name)
-	if e != nil {
-		return e
-	}
-	b, e := json.Marshal(spec)
-	if e != nil {
-		return e
-	}
-	if !launch || dry {
-		_, e = fmt.Fprintln(out, string(b))
-		return e
-	}
-	if runner == "" {
-		return errors.New("--launch requires --runner")
-	}
-	result, e := (integrations.Exec{}).Run(ctx, runner, nil, string(b), "")
-	if e != nil {
-		return e
-	}
-	_, e = out.Write(result)
-	return e
 }
 func status(c config.Config, repo string, out io.Writer) error {
 	var errs []error
