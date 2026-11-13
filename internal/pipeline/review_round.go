@@ -22,7 +22,11 @@ import (
 const defaultBudgetRounds = 3
 
 // contractBudget bounds the Acceptance section carried into the prompt.
-const contractBudget = 4 << 10
+const contractBudget = 3 << 10
+
+// roundNoteLimit bounds the interdiff note carried into the prompt, in bytes.
+// The round_note event field keeps the full text.
+const roundNoteLimit = 300
 
 // headLister and rangeDiffer are optional GitHub capabilities: without them a
 // review is round one over the whole diff, as before.
@@ -311,7 +315,7 @@ func (rp roundPlan) notes() string {
 	case rp.base != "":
 		fmt.Fprintf(&b, "REVIEW ROUND %d (delta). The diff below is NOT the whole PR: it holds only the hunks changed since the last reviewed head %s. Review these changed lines and their impact paths (the callers, config and data they feed); this is not a fresh full review. Report a defect outside the shown hunks only when a changed line causes it, anchor it on that changed line and say so; do not hunt for anything else.\n", rp.round, short7(rp.base))
 	case rp.round > 1:
-		fmt.Fprintf(&b, "REVIEW ROUND %d. The diff below is the whole PR (the interdiff could not be built: %s).\n", rp.round, rp.note)
+		fmt.Fprintf(&b, "REVIEW ROUND %d. The diff below is the whole PR (the interdiff could not be built: %s).\n", rp.round, clip(rp.note, roundNoteLimit))
 	}
 	if rp.quiet {
 		if rp.empty {
