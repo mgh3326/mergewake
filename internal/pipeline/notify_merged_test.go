@@ -249,3 +249,48 @@ func TestMergedNotificationUsesRefreshedBodyAndGatedHead(t *testing.T) {
 		t.Fatalf("events=%+v", n.events)
 	}
 }
+
+func TestLandMergedFailureRetriesFromPendingOnSweep(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	r.Lane = "repo-design"
+	n.err = errors.New("lane offline")
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 1 || len(auditRows(t, s, r, "land-notify-error")) != 1 {
+		t.Fatalf("merges=%d land-notify-error=%v", g.mergeCount, auditRows(t, s, r, "land-notify-error"))
+	}
+	n.err = nil
+	if err := s.RetryMergedPending(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || n.events[0].ID != "mergewake-merged-example/project-7-"+shaA {
+		t.Fatalf("events=%+v", n.events)
+	}
+	if rows := prNotifyRows(t, s, r); len(rows) != 1 || rows[0]["head"] != shaA {
+		t.Fatalf("pr-notify rows=%v", rows)
+	}
+}
+
+func TestLandMergedLaneReadFailureStaysPending(t *testing.T) {
+	s, g, _, n, r := setup(t)
+	g.enabled = true
+	markReviewed(g)
+	r.Lane = "repo-design"
+	g.commitErr = map[string]error{shaA: errors.New("commit read failed")}
+	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if g.mergeCount != 1 || len(auditRows(t, s, r, "land-notify-error")) != 1 {
+		t.Fatalf("merges=%d land-notify-error=%v", g.mergeCount, auditRows(t, s, r, "land-notify-error"))
+	}
+	g.commitErr = nil
+	if err := s.RetryMergedPending(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || n.events[0].Lane != "repo-design" || !strings.Contains(n.events[0].Text, "head=aaaaaaa") {
+		t.Fatalf("events=%+v", n.events)
+	}
+}
