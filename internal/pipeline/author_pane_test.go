@@ -266,6 +266,8 @@ func TestPartialAuthorScanKeepsBoundLaneAndAuditsCandidate(t *testing.T) {
 
 func TestPartialAuthorScanReadyRecordKeepsBoundLane(t *testing.T) {
 	s, _, _, r := workerNotifySetup(t)
+	sink := s.Sink.(*jobSink)
+	sink.recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
 	run := authorHost(paneB)
 	s.Runner = run
 	setPartialAuthorScan(s, run)
