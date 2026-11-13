@@ -18,15 +18,17 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 	patterns := map[string]bool{}
 	count := 0
 	path := ""
-	pemBegin := strings.Join([]string{"-----", "BEGIN"}, "")
-	pemEnd := strings.Join([]string{"-----", "END"}, "")
-	privateKeySuffix := " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
+	pemBegin := strings.Join([]string{"-----", "BEGIN "}, "")
+	pemEnd := strings.Join([]string{"-----", "END "}, "")
+	privateKeyType := "PRIVATE KEY"
+	inPrivateKey := false
 	var out strings.Builder
 	for i := 0; i < len(lines); {
 		line := lines[i]
 		plain := strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(plain, "diff --git ") {
 			path = ""
+			inPrivateKey = false
 		}
 		if strings.HasPrefix(plain, "--- ") && !strings.HasPrefix(plain, "--- /dev/null") {
 			path = strings.TrimSpace(strings.TrimPrefix(plain, "--- "))
@@ -55,7 +57,6 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 			end++
 		}
 		out.WriteString(line)
-		inPrivateKey := false
 		for _, hunkLine := range lines[i+1 : end] {
 			if len(hunkLine) == 0 {
 				out.WriteString(hunkLine)
@@ -67,8 +68,8 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 				continue
 			}
 			content := hunkLine[1:]
-			startsPrivateKey := strings.Contains(content, pemBegin) && strings.Contains(content, privateKeySuffix)
-			endsPrivateKey := strings.Contains(content, pemEnd) && strings.Contains(content, privateKeySuffix)
+			startsPrivateKey := strings.Contains(content, pemBegin) && strings.Contains(content, privateKeyType)
+			endsPrivateKey := strings.Contains(content, pemEnd) && strings.Contains(content, privateKeyType)
 			if startsPrivateKey {
 				inPrivateKey = true
 			}

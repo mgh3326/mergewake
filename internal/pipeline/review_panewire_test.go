@@ -520,10 +520,13 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	pemBegin := strings.Join([]string{"-----", "BEGIN"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
 	pemBody := strings.Repeat("Ab3/", 16)
 	pemEnd := strings.Join([]string{"-----", "END"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
+	pgpBegin := strings.Join([]string{"-----", "BEGIN "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
+	pgpBody := strings.Repeat("Ef5/", 16)
+	pgpEnd := strings.Join([]string{"-----", "END "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
 	base64Line := strings.Repeat("Cd4/", 64)
 	tests := []struct {
-		name, diff, want, notWant, path, pattern, summary string
-		rows, count                                       int
+		name, diff, want, alsoWant, notWant, path, pattern, summary string
+		rows, count                                                 int
 	}{
 		{
 			name:    "removed token line",
@@ -577,6 +580,16 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:   3,
 		},
 		{
+			name:    "fully removed PGP private key block",
+			diff:    "diff --git a/private.asc b/private.asc\n--- a/private.asc\n+++ b/private.asc\n@@ -1,3 +0,0 @@\n-" + pgpBegin + "\n-" + pgpBody + "\n-" + pgpEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n-[redacted]",
+			notWant: pgpBody,
+			path:    "private.asc",
+			pattern: "private_key",
+			rows:    1,
+			count:   3,
+		},
+		{
 			name:    "removed PEM begin with context end",
 			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +1 @@\n-" + pemBegin + "\n-" + pemBody + "\n " + pemEnd + "\n",
 			want:    "-[redacted]\n-[redacted]\n " + pemEnd,
@@ -585,6 +598,17 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			pattern: "private_key",
 			rows:    1,
 			count:   2,
+		},
+		{
+			name:     "PEM state spans hunks and resets between files",
+			diff:     "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1 +0,0 @@\n-" + pemBegin + "\n@@ -10 +9,0 @@\n-" + pemBody + "\ndiff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
+			want:     "-[redacted]",
+			alsoWant: "-" + base64Line,
+			notWant:  pemBody,
+			path:     "id_rsa",
+			pattern:  "private_key",
+			rows:     1,
+			count:    2,
 		},
 		{
 			name:    "long base64 outside PEM stays unchanged",
@@ -619,8 +643,8 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 					t.Fatalf("ordinary diff changed: %q %d %v %v %v", redacted, count, paths, patterns, deletedPaths)
 				}
 			}
-			if !strings.Contains(got, tt.want) || tt.notWant != "" && strings.Contains(got, tt.notWant) || tt.summary != "" && !strings.Contains(got, tt.summary) || tt.summary != "" && strings.Contains(got, "Full text is in the checkout") {
-				t.Fatalf("brief did not satisfy want %q / not-want %q / summary %q:\n%s", tt.want, tt.notWant, tt.summary, got)
+			if !strings.Contains(got, tt.want) || tt.alsoWant != "" && !strings.Contains(got, tt.alsoWant) || tt.notWant != "" && strings.Contains(got, tt.notWant) || tt.summary != "" && !strings.Contains(got, tt.summary) || tt.summary != "" && strings.Contains(got, "Full text is in the checkout") {
+				t.Fatalf("brief did not satisfy want %q / also-want %q / not-want %q / summary %q:\n%s", tt.want, tt.alsoWant, tt.notWant, tt.summary, got)
 			}
 			if tt.summary != "" {
 				for _, line := range strings.Split(got, "\n") {
@@ -635,7 +659,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			}
 			if tt.rows > 0 {
 				body, _ := json.Marshal(rows[0])
-				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), base64Line) {
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) {
 					t.Fatalf("audit contains matched text: %s", body)
 				}
 				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
