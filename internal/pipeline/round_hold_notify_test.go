@@ -71,7 +71,7 @@ func flagValue(args []string, flag string) string {
 
 // panewireLanePattern is panewire's hubAgentLabelPattern, the --lane rule
 // (hub_jobs.go:15 at panewire 1b4d7b7).
-var panewireLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+var panewireLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.:-]{0,127}$`)
 
 // emitTextOK is panewire's validLaneEventText and validLaneEventID rule
 // (emit.go:469-491 at 1b4d7b7): valid UTF-8 and no byte or rune in the
@@ -126,6 +126,27 @@ func TestRoundHoldDecisionEmitPassesPanewireEmitRules(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("decision text missing %q: %q", want, text)
 		}
+	}
+}
+
+func TestRoundHoldInvalidDesignLaneUsesConfiguredDeskLane(t *testing.T) {
+	s, g, _, sink, run, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	sink.lanes["2481"] = "design_a"
+	s.Config.Notifier.Lane = "desk-a"
+	s.Config.Notifier.FallbackLane = "desk-a"
+	rec := &emitRecorder{roundRuleRunner: run}
+	s.Runner = rec
+	wirePanewire(s, rec)
+
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatalf("NotifyPR err: %v", err)
+	}
+	if len(rec.holdArgs) != 1 {
+		t.Fatalf("want one round-hold emit, got %d", len(rec.holdArgs))
+	}
+	if got := flagValue(rec.holdArgs[0], "--lane"); got != "desk-a" {
+		t.Fatalf("round-hold --lane = %q, want desk-a", got)
 	}
 }
 
