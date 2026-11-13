@@ -165,19 +165,31 @@ func (c *panewireSpawnCompatibility) launch(ctx context.Context, runner integrat
 	legacy := now().Before(c.legacyTo)
 	c.mu.Unlock()
 	if legacy {
-		return runner.Run(ctx, command, oldPanewireSpawnArgs(modernArgs), "", "")
+		b, err := runner.Run(ctx, command, oldPanewireSpawnArgs(modernArgs), "", "")
+		if err == nil || !panewireRenamedArgsUsageError(err) {
+			return b, err
+		}
+		b, err = runner.Run(ctx, command, modernArgs, "", "")
+		if err == nil {
+			c.mu.Lock()
+			c.legacyTo = time.Time{}
+			c.mu.Unlock()
+		}
+		return b, err
 	}
 	b, err := runner.Run(ctx, command, modernArgs, "", "")
 	if err == nil || !panewireRenamedArgsUsageError(err) {
 		return b, err
 	}
+	modernErr := err
 	b, err = runner.Run(ctx, command, oldPanewireSpawnArgs(modernArgs), "", "")
 	if err == nil {
 		c.mu.Lock()
 		c.legacyTo = now().Add(panewireSpawnCompatibilityTTL)
 		c.mu.Unlock()
+		return b, nil
 	}
-	return b, err
+	return b, fmt.Errorf("legacy-spelling retry failed after modern-spelling refusal (%s): %w", integrations.Detail(modernErr), err)
 }
 
 var panewireSpawnCompat panewireSpawnCompatibility
@@ -211,8 +223,21 @@ func panewireRenamedArgsUsageError(err error) bool {
 		return false
 	}
 	stderr := commandErr.Stderr
-	for _, renamed := range []string{"--author-family", "--builder-family", "--routing-role", "implementer", "worker", "tester", "counsel", "consult"} {
-		if strings.Contains(stderr, renamed) {
+	for _, renamed := range []string{"--author-family", "--builder-family", "--routing-role"} {
+		if stderrHasFlag(stderr, renamed) {
+			return true
+		}
+	}
+	return renamedRoleUsage.MatchString(stderr)
+}
+
+var renamedRoleUsage = regexp.MustCompile(`(?:--role(?:=|\s+)(?:worker|tester|counsel|implementer|consult)\b|--role\s+value\s+must\s+be\s+(?:worker|tester|counsel|implementer|consult)\b|(?:invalid|unsupported)\s+role[: ]+\s*(?:worker|tester|counsel|implementer|consult)\b)`)
+
+func stderrHasFlag(stderr, flag string) bool {
+	short := "-" + strings.TrimPrefix(flag, "--")
+	for _, word := range strings.Fields(stderr) {
+		word = strings.Trim(word, `"'=:,.;()[]{}<>`)
+		if word == flag || word == short {
 			return true
 		}
 	}

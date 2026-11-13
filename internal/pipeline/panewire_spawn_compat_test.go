@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,8 +14,10 @@ import (
 type compatibilitySpawnRunner struct {
 	spawns       [][]string
 	refuseModern bool
+	refuseLegacy bool
 	refuseAll    bool
 	otherErr     error
+	failures     []error
 }
 
 func (r *compatibilitySpawnRunner) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
@@ -22,8 +25,16 @@ func (r *compatibilitySpawnRunner) Run(_ context.Context, command string, args [
 		return nil, errors.New("unexpected command")
 	}
 	r.spawns = append(r.spawns, slices.Clone(args))
+	if len(r.failures) > 0 {
+		err := r.failures[0]
+		r.failures = r.failures[1:]
+		return nil, err
+	}
 	if r.otherErr != nil {
 		return nil, r.otherErr
+	}
+	if r.refuseLegacy && (slices.Contains(args, "--builder-family") || arg(args, "--role") == "worker") {
+		return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "--builder-family is not a flag the node accepts for a hub spawn"}
 	}
 	if r.refuseAll || r.refuseModern && (slices.Contains(args, "--author-family") || arg(args, "--role") == "implementer") {
 		return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "flag provided but not defined: --author-family"}
@@ -76,8 +87,9 @@ func TestPanewireSpawnCompatibilityRetriesAndRemembersOldVersion(t *testing.T) {
 
 func TestPanewireSpawnCompatibilityDoesNotRetryOtherFailures(t *testing.T) {
 	for name, err := range map[string]error{
-		"non-usage exit":  &integrations.CommandError{Command: "panewire", Err: panewireExit(1), Stderr: "unknown --author-family"},
-		"unrelated usage": &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "--task value is malformed"},
+		"non-usage exit":          &integrations.CommandError{Command: "panewire", Err: panewireExit(1), Stderr: "unknown --author-family"},
+		"unrelated usage":         &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "--task value is malformed"},
+		"role word in other flag": &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "--consult-mode is not a flag"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runner := &compatibilitySpawnRunner{otherErr: err}
@@ -89,6 +101,56 @@ func TestPanewireSpawnCompatibilityDoesNotRetryOtherFailures(t *testing.T) {
 				t.Fatalf("unexpected retry: %v", runner.spawns)
 			}
 		})
+	}
+}
+
+func TestPanewireSpawnCompatibilityRecoversWhenCachedCLIChanges(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	compat := &panewireSpawnCompatibility{now: func() time.Time { return now }}
+	runner := &compatibilitySpawnRunner{refuseModern: true}
+	args := []string{"spawn", "--author-family", "openai", "--role", "reviewer"}
+	if _, err := compat.launch(context.Background(), runner, "panewire", args); err != nil {
+		t.Fatal(err)
+	}
+	runner.refuseModern = false
+	runner.refuseLegacy = true
+	if _, err := compat.launch(context.Background(), runner, "panewire", args); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 4 || !slices.Contains(runner.spawns[2], "--builder-family") || !slices.Contains(runner.spawns[3], "--author-family") {
+		t.Fatalf("cached old CLI did not retry with modern args: %v", runner.spawns)
+	}
+	if _, err := compat.launch(context.Background(), runner, "panewire", args); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 5 || !slices.Contains(runner.spawns[4], "--author-family") {
+		t.Fatalf("modern spelling was not remembered after recovery: %v", runner.spawns)
+	}
+}
+
+func TestPanewireSpawnCompatibilityPreservesRetryFailureAndInitialRefusal(t *testing.T) {
+	modernErr := &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "--author-family is not a flag"}
+	legacyErr := &integrations.CommandError{Command: "panewire", Err: panewireExit(77), Stderr: "reviewer seat refused"}
+	runner := &compatibilitySpawnRunner{failures: []error{modernErr, legacyErr}}
+	compat := &panewireSpawnCompatibility{}
+	_, err := compat.launch(context.Background(), runner, "panewire", []string{"spawn", "--author-family", "openai", "--role", "reviewer"})
+	if err == nil || exitStatus(err) != 77 || !strings.Contains(integrations.Detail(err), "--author-family") || !strings.Contains(integrations.Detail(err), "reviewer seat refused") {
+		t.Fatalf("retry error lost original refusal or retry result: %v (%s)", err, integrations.Detail(err))
+	}
+}
+
+func TestPanewireRenamedArgsUsageErrorRequiresRoleContext(t *testing.T) {
+	for _, stderr := range []string{
+		"--role value must be implementer or reviewer",
+		"invalid role: worker",
+		"panewire: --role=consult is not accepted",
+	} {
+		if !panewireRenamedArgsUsageError(&integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: stderr}) {
+			t.Errorf("role usage error was not recognized: %q", stderr)
+		}
+	}
+	if panewireRenamedArgsUsageError(&integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "unknown --consult-mode flag"}) {
+		t.Fatal("unrelated role-like flag was classified as renamed-role usage")
 	}
 }
 
