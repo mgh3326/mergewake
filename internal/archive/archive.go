@@ -448,13 +448,13 @@ case "$born" in ''|*[!0-9]*) echo busy; exit 0;; esac
 if [ "$((now-born))" -lt "$4" ]; then echo busy; exit 0; fi
 echo "stale $born $old_owner"`
 
-// reclaimScript takes the lock's guard, then removes the lock only if it is
-// still the expired claim that claimScript reported. Reclaimers serialize on
-// the guard, so no other reclaimer can remove or re-create the lock while this
-// one reads it. A lock that a live claimer took after the stale report is
-// fresh here and left alone. Args: $1 lock dir, $2 the stale claim's owner,
-// $3 its time, $4 this claim's owner, $5 TTL seconds (also the age after which
-// a guard left by a dead reclaimer is broken).
+// reclaimScript takes the lock's guard, then moves the lock aside with a single
+// rename. A rename of a directory is atomic, so only one reclaimer can move a
+// given lock, and the moved copy is checked against the expired claim before it
+// is removed. A moved copy that is not that claim was a live lock; it is put
+// back when the lock path is still free. Args: $1 lock dir, $2 the stale claim's
+// owner, $3 its time, $4 this claim's owner, $5 TTL seconds (also the age after
+// which a guard left by a dead reclaimer is broken).
 const reclaimScript = `guard_ttl="$5"; guard_owner="$4"
 ` + lockGuard + `take() { mkdir "$1" 2>/dev/null || return 1; printf '%s %s\n' "$2" "$3" > "$1/owner"; }
 result=busy
@@ -465,7 +465,16 @@ else
   if [ -r "$1/owner" ]; then read cur_owner cur_born < "$1/owner"; else cur_born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"); fi
   case "$cur_born" in ''|*[!0-9]*) ;; *)
     if [ "$cur_owner" = "$2" ] && [ "$cur_born" = "$3" ] && [ "$((now-cur_born))" -ge "$5" ]; then
-      if rm -rf "$1" && take "$1" "$4" "$now"; then result=acquired; fi
+      parked="$1.reclaim.$4"
+      if mv "$1" "$parked" 2>/dev/null; then
+        p_owner=; p_born=
+        if [ -r "$parked/owner" ]; then read p_owner p_born < "$parked/owner"; fi
+        if [ "$p_owner" = "$2" ] && [ "$p_born" = "$3" ]; then
+          if rm -rf "$parked" && take "$1" "$4" "$now"; then result=acquired; fi
+        elif [ ! -e "$1" ]; then
+          mv "$parked" "$1" 2>/dev/null
+        fi
+      fi
     fi;;
   esac
 fi
