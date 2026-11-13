@@ -24,10 +24,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type Command struct {
-	Command string   `yaml:"command" json:"command"`
-	Args    []string `yaml:"args" json:"args"`
-}
 type Reviewer struct {
 	Family      string   `yaml:"family"`
 	Command     string   `yaml:"command"`
@@ -125,51 +121,12 @@ type Sink struct {
 	Command     string `yaml:"command"`
 	ReopenState string `yaml:"reopen_state"`
 }
-type Health struct {
-	URL     string `yaml:"url" json:"url"`
-	Status  int    `yaml:"status" json:"status"`
-	Timeout string `yaml:"timeout" json:"timeout"`
-	Retries int    `yaml:"retries" json:"retries"`
-}
-type Install struct {
-	PreDeploy    *Command `yaml:"pre_deploy" json:"pre_deploy,omitempty"`
-	Kind         string   `yaml:"kind" json:"kind"`
-	Command      Command  `yaml:"command" json:"command"`
-	Verify       Command  `yaml:"verify" json:"verify"`
-	VerifyOutput string   `yaml:"verify_output" json:"verify_output"`
-	InitialSHA   string   `yaml:"initial_sha" json:"initial_sha"`
-	Timeout      string   `yaml:"timeout" json:"timeout"`
-	Serial       []string `yaml:"serial" json:"serial"`
-	Canary       string   `yaml:"canary" json:"canary"`
-	ReceiptsDir  string   `yaml:"receipts_dir" json:"receipts_dir"`
-	Source       string   `yaml:"source"`
-	Target       string   `yaml:"target"`
-	Mode         string   `yaml:"mode"`
-	Image        string   `yaml:"image" json:"image"`
-	Name         string   `yaml:"name" json:"name"`
-	Ports        []string `yaml:"ports" json:"ports"`
-	EnvFile      string   `yaml:"env_file" json:"env_file"`
-	Volumes      []string `yaml:"volumes" json:"volumes"`
-	Restart      string   `yaml:"restart" json:"restart"`
-	Health       *Health  `yaml:"health" json:"health"`
-	Keep         *int     `yaml:"keep" json:"keep"`
-	Runtime      string   `yaml:"runtime" json:"runtime"`
-	User         string   `yaml:"user" json:"user"`
-	Digest       string   `yaml:"digest" json:"digest"`
-}
 type Repo struct {
-	DeployTask    string    `yaml:"deploy_task"`
-	RolloutGroup  string    `yaml:"rollout_group"`
-	FollowRelease bool      `yaml:"follow_release"`
-	Name          string    `yaml:"name"`
-	Root          string    `yaml:"root"`
-	Branch        string    `yaml:"branch"`
-	Policy        string    `yaml:"policy"`
-	Deny          []string  `yaml:"deny"`
-	Install       []Install `yaml:"install"`
-	Smoke         Command   `yaml:"smoke"`
-	SmokeTimeout  string    `yaml:"smoke_timeout"`
-	Task          string    `yaml:"task"`
+	Name   string `yaml:"name"`
+	Root   string `yaml:"root"`
+	Branch string `yaml:"branch"`
+	Policy string `yaml:"policy"`
+	Task   string `yaml:"task"`
 	// Lane is the repo's design-session (owner) lane: it receives this repo's
 	// PR events when neither trailer names one, and its human-judgment notices
 	// and holds; empty falls back to the desk (notifier.fallback_lane, else
@@ -183,15 +140,6 @@ type Repo struct {
 
 // TaskEventsOn reports whether hk_task_events is unset or true.
 func (r Repo) TaskEventsOn() bool { return r.HKTaskEvents == nil || *r.HKTaskEvents }
-
-// RolloutWindowGroup keeps the fleet control-plane peers in one mandatory
-// availability window, independent of which caller constructs the inventory.
-func (r Repo) RolloutWindowGroup() string {
-	if strings.EqualFold(r.Name, "mgh3326/handoffkeep") || strings.EqualFold(r.Name, "mgh3326/panewire") {
-		return "control-plane"
-	}
-	return r.RolloutGroup
-}
 
 type Loop struct {
 	Enabled  bool   `yaml:"enabled"`
@@ -309,8 +257,6 @@ func (r ReviewRetry) Settings() (time.Duration, time.Duration, int) {
 type Daemon struct {
 	PR      PRLoop  `yaml:"pr"`
 	Watch   Loop    `yaml:"watch"`
-	Release Loop    `yaml:"release"`
-	Rollout Loop    `yaml:"rollout"`
 	Act     bool    `yaml:"act"`
 	Webhook Webhook `yaml:"webhook"`
 }
@@ -404,7 +350,6 @@ var DefaultReapRegenerable = []string{
 const (
 	DiscordPR     = "pr"
 	DiscordCI     = "ci"
-	DiscordDeploy = "deploy"
 	DiscordRevert = "revert"
 )
 
@@ -487,9 +432,9 @@ func validateDiscord(d *Discord) error {
 	}
 	for _, kind := range slices.Sorted(maps.Keys(d.Kinds)) {
 		switch kind {
-		case DiscordPR, DiscordCI, DiscordDeploy, DiscordRevert:
+		case DiscordPR, DiscordCI, DiscordRevert:
 		default:
-			return errors.New("discord.kinds keys must be pr, ci, deploy or revert")
+			return errors.New("discord.kinds keys must be pr, ci or revert")
 		}
 		key := d.Kinds[kind]
 		if strings.ContainsAny(key, ":/") {
@@ -617,7 +562,7 @@ func validateBasics(c *Config) error {
 // validateDaemon checks the daemon loops, PR-role retry, notify and findings timing, the webhook and the Discord feed.
 func validateDaemon(c *Config) error {
 	var e error
-	for _, loop := range []*Loop{&c.Daemon.PR.Loop, &c.Daemon.Watch, &c.Daemon.Release, &c.Daemon.Rollout} {
+	for _, loop := range []*Loop{&c.Daemon.PR.Loop, &c.Daemon.Watch} {
 		if loop.Interval == "" {
 			loop.Interval = c.PollInterval
 		}
@@ -851,9 +796,8 @@ func validateOutcomes(c *Config) error {
 	return nil
 }
 
-// validateRepos applies per-repository defaults and checks each install inventory.
+// validateRepos applies per-repository defaults and checks each repository's name, lane and branch.
 func validateRepos(c *Config) error {
-	var e error
 	seen := map[string]bool{}
 	for i := range c.Repos {
 		r := &c.Repos[i]
@@ -861,10 +805,6 @@ func validateRepos(c *Config) error {
 			return errors.New("repos require unique owner/name values")
 		}
 		seen[r.Name] = true
-		if r.RolloutGroup != "" && !laneName.MatchString(r.RolloutGroup) {
-			return errors.New("rollout_group must be a safe lane-style identifier")
-		}
-
 		if r.Lane != "" && !laneName.MatchString(r.Lane) {
 			return fmt.Errorf("repos[%s].lane is not a valid lane name", r.Name)
 		}
@@ -873,92 +813,6 @@ func validateRepos(c *Config) error {
 		}
 		if r.Policy == "" {
 			r.Policy = ".mergewake/policy.yaml"
-		}
-		if r.SmokeTimeout == "" {
-			r.SmokeTimeout = "30s"
-		}
-		if _, e = Duration(r.SmokeTimeout); e != nil {
-			return e
-		}
-		for j := range r.Install {
-			if e = validateInstall(&r.Install[j]); e != nil {
-				return e
-			}
-		}
-		family := ""
-		for _, spec := range r.Install {
-			f := installFamily(spec.Kind)
-			if family == "" {
-				family = f
-			} else if family != f {
-				return errors.New("one repo inventory cannot mix file, command/release and container installs")
-			}
-		}
-		for _, g := range r.Deny {
-			if _, e = policy.Match(g, "probe"); e != nil {
-				return e
-			}
-		}
-	}
-	return nil
-}
-
-// validateInstall defaults one install spec's kind and checks it for that kind.
-func validateInstall(spec *Install) error {
-	var e error
-	if spec.Kind == "" {
-		spec.Kind = "file"
-	}
-	if spec.PreDeploy != nil && (spec.Kind != "container" || spec.PreDeploy.Command == "") {
-		return errors.New("pre_deploy requires a container install and a command")
-	}
-	switch spec.Kind {
-	case "file":
-	case "container":
-		if e = validateContainer(spec); e != nil {
-			return e
-		}
-	case "command", "release":
-		if spec.Verify.Command == "" {
-			return errors.New("command/release installs require verify")
-		}
-		if spec.Kind == "command" && (spec.Command.Command == "" || !strings.Contains(strings.Join(spec.Command.Args, " "), "{sha}")) {
-			return errors.New("command install requires a pinned {sha} argument")
-		}
-		if spec.VerifyOutput == "" {
-			spec.VerifyOutput = "{sha}"
-		}
-		if !strings.Contains(spec.VerifyOutput, "{sha}") {
-			return errors.New("verify_output must include {sha}")
-		}
-		if spec.InitialSHA != "" && !fullSHA.MatchString(spec.InitialSHA) {
-			return errors.New("initial_sha requires a full SHA")
-		}
-		if spec.Timeout == "" {
-			spec.Timeout = "5m"
-		}
-		if _, err := Duration(spec.Timeout); err != nil {
-			return err
-		}
-	default:
-		return errors.New("install kind must be file, command, release or container")
-	}
-	if len(spec.Serial) > 0 || spec.Canary != "" {
-		if spec.ReceiptsDir == "" {
-			return errors.New("serial/canary requires receipts_dir")
-		}
-		names := append(append([]string{}, spec.Serial...), spec.Canary)
-		for _, host := range names {
-			if host != "" && (!hostLabel.MatchString(host)) {
-				return errors.New("invalid serial/canary host label")
-			}
-		}
-		seenHosts := map[string]bool{}
-		for _, host := range spec.Serial {
-			if seenHosts[host] {
-				return errors.New("duplicate serial host")
-			}
-			seenHosts[host] = true
 		}
 	}
 	return nil
@@ -1163,183 +1017,17 @@ func validateArchive(a *Archive) error {
 	return nil
 }
 
-func installFamily(kind string) string {
-	switch kind {
-	case "command", "release":
-		return "command"
-	case "container":
-		return "container"
-	}
-	return "file"
-}
-
-// Container inventories describe a runtime that the host already trusts. Values
-// are validated here so a bad host file fails before any journal or mutation.
+// laneName and hostName bound the panewire lane and panewire host names
+// passed as single arguments (panewire splits --exclude-host on commas).
 var (
-	containerName  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
-	imageName      = regexp.MustCompile(`^(?:[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?(?::[0-9]{1,5})/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
-	imageDigest    = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	restartPolicy  = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[0-9]+)?)$`)
-	containerUser  = regexp.MustCompile(`^[A-Za-z0-9_][-A-Za-z0-9_.:]*$`)
-	volumeValue    = regexp.MustCompile(`^[A-Za-z0-9_./@+-]+$`)
-	containerLabel = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*$`)
-	// laneName and hostName bound the panewire lane and panewire host names
-	// passed as single arguments (panewire splits --exclude-host on commas).
 	laneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	hostName = laneName
 	// hostLabel names this host, configured hosts and serial/canary targets;
-	// machineID is a panewire machine id; fullSHA is a 40-hex commit.
+	// machineID is a panewire machine id.
 	hostLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 	machineID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
-	fullSHA   = regexp.MustCompile(`^[a-f0-9]{40}$`)
 )
 
-func validContainerTarget(p string) bool {
-	return p != "" && p != "." && !path.IsAbs(p) && path.Clean(p) == p && p != ".." &&
-		!strings.HasPrefix(p, "../") && !strings.ContainsAny(p, "\\\x00\r\n") && containerLabel.MatchString(p)
-}
-
-func validateContainer(spec *Install) error {
-	if !validContainerTarget(spec.Target) {
-		return errors.New("container install requires a clean relative target label")
-	}
-	if spec.Image == "" || strings.Contains(spec.Image, "@") || strings.Contains(path.Base(spec.Image), ":") || !imageName.MatchString(spec.Image) {
-		return errors.New("container image must be a registry/repository without a tag or digest")
-	}
-	if !containerName.MatchString(spec.Name) {
-		return errors.New("container name is invalid")
-	}
-	for i, p := range spec.Ports {
-		n, e := normalizePort(p)
-		if e != nil {
-			return e
-		}
-		spec.Ports[i] = n
-	}
-	if spec.EnvFile != "" {
-		env := Expand(spec.EnvFile)
-		if !filepath.IsAbs(env) || strings.ContainsAny(env, "\x00\r\n") {
-			return errors.New("container env_file must be an absolute operator-owned path")
-		}
-	}
-	for _, v := range spec.Volumes {
-		if e := validateVolume(v); e != nil {
-			return e
-		}
-	}
-	if spec.Restart == "" {
-		spec.Restart = "unless-stopped"
-	} else if !restartPolicy.MatchString(spec.Restart) {
-		return errors.New("container restart policy is invalid")
-	}
-	if spec.Health == nil {
-		return errors.New("container install requires health")
-	}
-	if e := validateHealth(spec.Health); e != nil {
-		return e
-	}
-	if spec.Keep == nil {
-		keep := 2
-		spec.Keep = &keep
-	} else if *spec.Keep < 0 || *spec.Keep > 100 {
-		return errors.New("container keep must be 0..100")
-	}
-	switch spec.Runtime {
-	case "":
-		spec.Runtime = "docker"
-	case "docker", "podman":
-	default:
-		return errors.New("container runtime must be docker or podman")
-	}
-	if spec.User != "" && !containerUser.MatchString(spec.User) {
-		return errors.New("container user is invalid")
-	}
-	if spec.Digest != "" && !imageDigest.MatchString(spec.Digest) {
-		return errors.New("container digest must be sha256:<64 hex>")
-	}
-	return nil
-}
-
-func validateHealth(h *Health) error {
-	u, e := url.Parse(h.URL)
-	if e != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-		return errors.New("container health URL must be an absolute http(s) URL without credentials")
-	}
-	if h.Status == 0 {
-		h.Status = 200
-	}
-	if h.Status < 100 || h.Status > 599 {
-		return errors.New("container health status must be 100..599")
-	}
-	if h.Timeout == "" {
-		h.Timeout = "5s"
-	}
-	if _, e = Duration(h.Timeout); e != nil {
-		return e
-	}
-	if h.Retries == 0 {
-		h.Retries = 20
-	}
-	if h.Retries < 1 || h.Retries > 1000 {
-		return errors.New("container health retries must be 1..1000")
-	}
-	return nil
-}
-
-func validateVolume(v string) error {
-	parts := strings.Split(v, ":")
-	if len(parts) < 2 || len(parts) > 3 {
-		return errors.New("container volume must be source:destination[:ro|rw]")
-	}
-	for _, p := range parts {
-		if p == "" || !volumeValue.MatchString(p) {
-			return errors.New("container volume contains an empty or unsupported field")
-		}
-	}
-	if len(parts) == 3 && parts[2] != "ro" && parts[2] != "rw" {
-		return errors.New("container volume mode must be ro or rw")
-	}
-	return nil
-}
-
-// normalizePort accepts host_ip:host_port:container_port and host_port:container_port.
-// The omitted host address is loopback, so a default inventory exposes nothing else.
-func normalizePort(raw string) (string, error) {
-	host, rest := "127.0.0.1", raw
-	if strings.HasPrefix(raw, "[") {
-		end := strings.Index(raw, "]")
-		if end < 0 || end+1 >= len(raw) || raw[end+1] != ':' {
-			return "", errors.New("container port must be host_ip:host_port:container_port")
-		}
-		host, rest = raw[1:end], raw[end+2:]
-	} else {
-		switch parts := strings.Split(raw, ":"); len(parts) {
-		case 3:
-			host, rest = parts[0], parts[1]+":"+parts[2]
-		case 2:
-		default:
-			return "", errors.New("container port must be host_ip:host_port:container_port or host_port:container_port")
-		}
-	}
-	ports := strings.Split(rest, ":")
-	if len(ports) != 2 || host == "" {
-		return "", errors.New("container port must name host and container ports")
-	}
-	if net.ParseIP(host) == nil {
-		return "", errors.New("container port host must be an IP literal")
-	}
-	for _, p := range ports {
-		n, e := strconv.Atoi(p)
-		if e != nil || n < 1 || n > 65535 {
-			return "", errors.New("container port must be 1..65535")
-		}
-	}
-	return net.JoinHostPort(host, ports[0]) + ":" + ports[1], nil
-}
-
-// validateWebhook gates the optional delivery receiver: it binds loopback
-// only, and the shared secret must be present before the daemon starts.
-// Errors name the config key, never the listen value or the secret.
 func validateWebhook(w *Webhook) error {
 	if !w.Enabled {
 		return nil

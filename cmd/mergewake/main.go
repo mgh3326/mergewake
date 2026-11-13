@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,11 +17,8 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
-	"github.com/mgh3326/mergewake/internal/policy"
-	"github.com/mgh3326/mergewake/internal/rollout"
 	"github.com/mgh3326/mergewake/internal/server/store"
 )
 
@@ -35,21 +31,15 @@ Usage: mergewake <command> [flags]
   land       Run the merge gate for a PR and squash-merge the gated head (shadow until policy opts in)
   review     Run one independent diff-only review per PR head
   watch      Watch main CI and open one recovery PR (shadow until opt in)
-  release    Publish a verified manifest as a GitHub Release asset
-  rollout    Pull and install the latest verified manifest once
   daemon     Run enabled pipeline roles (shadow by default)
   server     Migrate or check the durable PR server store
-  agent      Poll configured repositories and perform verified rollouts
   reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   report     Report review latency from state and GitHub
   outcomes   Report or sync the shadow-safe model outcomes ledger
   ci-policy  Check that each configured repo follows the fleet main-CI default (read-only)
   pr-status  Print a PR's last-pass merge-gate snapshot from local state, with no GitHub call unless --fresh
-  notify     Post a deploy from another deployer to the Discord feed (needs discord.enabled)
-  status     Read installed receipts and check local drift
-  promote    Certify one main commit and its image digest, record it, and advance the deployable pointer
-  admit      Print the digest the deployable pointer and its record agree on, or refuse; --deploy hands it to shiftgate
+  status     Read the daemon's loop status (status --daemon)
 
 All commands accept --help. Acting commands accept --dry-run.
 Config defaults to ~/.config/mergewake/config.yaml.
@@ -62,10 +52,6 @@ func main() {
 	defer cancel()
 	if e := run(ctx, os.Args[1:], os.Stdout, os.Stderr); e != nil {
 		fmt.Fprintln(os.Stderr, "mergewake:", e)
-		var x *exitError
-		if errors.As(e, &x) && x.code > 1 {
-			os.Exit(x.code)
-		}
 		os.Exit(1)
 	}
 }
@@ -76,11 +62,8 @@ var ownFlagCommands = map[string]func(context.Context, []string, io.Writer, io.W
 	"report":       runReport,
 	"outcomes":     runOutcomes,
 	"archive-jobs": runArchiveJobs,
-	"notify":       runNotify,
 	"pr-status":    runPRStatus,
 	"ci-policy":    runCIPolicy,
-	"promote":      runPromote,
-	"admit":        runAdmit,
 	"server":       runServerStore,
 }
 
@@ -118,22 +101,21 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	command := args[0]
 	switch command {
-	case "land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "reap":
+	case "land", "review", "watch", "daemon", "status", "reap":
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg := fs.String("config", "~/.config/mergewake/config.yaml", "host YAML config")
-	apply := fs.Bool("apply", false, "allow acting review, release, rollout, reap or daemon (daemon also needs daemon.act; reap also needs reap.act)")
+	apply := fs.Bool("apply", false, "allow acting review, reap or daemon (daemon also needs daemon.act; reap also needs reap.act)")
 	daemonStatus := fs.Bool("daemon", false, "read loop status (status only)")
 	dry := fs.Bool("dry-run", false, "print planned actions without mutations or model execution")
-	repo := fs.String("repo", "", "configured owner/name (required except agent, status)")
+	repo := fs.String("repo", "", "configured owner/name (required except daemon, status)")
 	var pr *int
-	var family, commit *string
+	var family *string
 	var shadow, once, legacy *bool
 	var legacyHost *string
-	var digest, adopt *string
 	switch command {
 	case "land", "review", "reap":
 		pr = fs.Int("pr", 0, "pull request number (reap scans merged PRs when omitted)")
@@ -151,13 +133,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "watch":
 		shadow = fs.Bool("shadow", false, "force decision-only mode")
 		once = fs.Bool("once", false, "inspect once instead of polling")
-	case "release":
-		commit = fs.String("commit", "", "full main commit SHA (default branch head)")
-	case "rollout":
-		digest = fs.String("digest", "", "container digest repo@sha256:... for a single container target")
-		adopt = fs.String("adopt", "", "record an already-running container as the current receipt")
-	case "agent":
-		once = fs.Bool("once", false, "poll each repo once")
 	}
 	if e := fs.Parse(args[1:]); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
@@ -184,7 +159,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	r := config.Repo{}
 	sweepAll := legacy != nil && *legacy && *repo == ""
-	if (command != "agent" && command != "status" && command != "daemon" && !sweepAll) || *repo != "" {
+	if (command != "status" && command != "daemon" && !sweepAll) || *repo != "" {
 		if *repo == "" {
 			return errors.New("--repo is required")
 		}
@@ -194,10 +169,10 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		}
 	}
 	if command == "status" {
-		if *daemonStatus {
-			return daemon.ReadStatus(c.StateDir, out)
+		if !*daemonStatus {
+			return errors.New("status reads the daemon's loop status: use status --daemon")
 		}
-		return status(c, *repo, out)
+		return daemon.ReadStatus(c.StateDir, out)
 	}
 	if command == "daemon" {
 		out = &lockedWriter{out: out}
@@ -255,7 +230,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	// Only looping commands honour X-Poll-Interval; one-shot commands must not
 	// stall on an interval recorded by an earlier request.
-	gh.Polling = command == "daemon" || command == "watch" || command == "agent"
+	gh.Polling = command == "daemon" || command == "watch"
 	s := pipeline.Service{Config: c, GH: gh, Runner: exec, Sink: sink, Notifier: notifier, Out: out}
 	// The daemon's warnings go to its JSON log on stderr. A dry run writes
 	// nothing, and a host without a GitHub App keeps no logger for it.
@@ -263,12 +238,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		s.Log = slog.New(slog.NewJSONHandler(stderr, nil))
 	}
 	o := pipeline.Options{DryRun: *dry, Shadow: shadowMode(command, *apply, shadow != nil && *shadow, c.Daemon.Act)}
-	if digest != nil {
-		o.Digest = *digest
-	}
-	if adopt != nil {
-		o.Adopt = *adopt
-	}
 	if pr != nil && (command == "reap" && *pr < 0 || command != "reap" && *pr <= 0) {
 		return errors.New("--pr must be positive")
 	}
@@ -279,10 +248,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return s.Land(ctx, r, *pr, o)
 	case "review":
 		return s.Review(ctx, r, *pr, *family, o)
-	case "release":
-		return s.Release(ctx, r, *commit, o)
-	case "rollout":
-		return s.Rollout(ctx, r, o)
 	case "watch":
 		return poll(ctx, c.PollInterval, *once || *dry, func(ctx context.Context) error { return s.Watch(ctx, r, o) }, stderr)
 	case "reap":
@@ -296,22 +261,6 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			return runReapLegacy(ctx, &s, c, *repo, *legacyHost, o)
 		}
 		return s.Reap(ctx, r, *pr, o)
-	case "agent":
-		if len(c.Repos) == 0 {
-			return errors.New("agent requires at least one configured repository")
-		}
-		return poll(ctx, c.PollInterval, *once || *dry, func(ctx context.Context) error {
-			var errs []error
-			for _, r := range c.Repos {
-				if *repo != "" && r.Name != *repo {
-					continue
-				}
-				if e := s.Rollout(ctx, r, o); e != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))
-				}
-			}
-			return errors.Join(errs...)
-		}, stderr)
 	}
 	return nil
 }
@@ -355,77 +304,6 @@ func poll(ctx context.Context, interval string, once bool, fn func(context.Conte
 		}
 	}
 }
-func status(c config.Config, repo string, out io.Writer) error {
-	var errs []error
-	for _, r := range c.Repos {
-		if repo != "" && r.Name != repo {
-			continue
-		}
-		if r.Root == "" && !hasContainerTarget(r) {
-			errs = append(errs, fmt.Errorf("%s: root required for status", r.Name))
-			continue
-		}
-		if hasContainerTarget(r) {
-			if err := containerStatus(c, r, out); err != nil {
-				errs = append(errs, err)
-			}
-			continue
-		}
-		commands := false
-		for _, spec := range r.Install {
-			commands = commands || spec.Kind == "command" || spec.Kind == "release"
-		}
-		if commands {
-			if err := commandStatus(c, r, out); err != nil {
-				errs = append(errs, err)
-			}
-			continue
-		}
-		b, e := os.ReadFile(filepath.Join(rollout.StateDir(c.StateDir, r.Name), rollout.FileReceiptName))
-		if e != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))
-			continue
-		}
-		var receipt struct {
-			Manifest manifest.Manifest `json:"manifest"`
-		}
-		if e = json.Unmarshal(b, &receipt); e != nil {
-			errs = append(errs, e)
-			continue
-		}
-		if receipt.Manifest.Repo != r.Name {
-			errs = append(errs, fmt.Errorf("%s: receipt repo mismatch", r.Name))
-			continue
-		}
-		if e = receipt.Manifest.Validate(); e != nil {
-			errs = append(errs, e)
-			continue
-		}
-		files := []map[string]any{}
-		for _, f := range receipt.Manifest.Files {
-			denied, e := policy.MatchAny(r.Deny, f.Target)
-			if e != nil {
-				return e
-			}
-			if denied {
-				files = append(files, map[string]any{"target": f.Target, "status": "denied"})
-				continue
-			}
-			data, mode, e := manifest.ReadRegular(config.Expand(r.Root), f.Target)
-			state := "healthy"
-			if e != nil || manifest.Verify(f, data) != nil || uint32(mode) != f.Mode {
-				state = "drift"
-				errs = append(errs, fmt.Errorf("%s %s: drift", r.Name, f.Target))
-			}
-			files = append(files, map[string]any{"target": f.Target, "status": state, "expected_sha256": f.SHA256, "observed_sha256": manifest.Sum(data)})
-		}
-		if e = json.NewEncoder(out).Encode(map[string]any{"host": c.Host, "repo": r.Name, "commit": receipt.Manifest.Commit, "files": files}); e != nil {
-			return e
-		}
-	}
-	return errors.Join(errs...)
-}
-
 func runOutcomes(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if len(args) == 0 || (args[0] != "report" && args[0] != "sync") {
 		return errors.New("usage: mergewake outcomes report|sync [--config PATH] [--since DATE|RFC3339|DURATION] [--source local|hk]")

@@ -10,7 +10,7 @@ import (
 )
 
 func TestHelpAndFlagValidation(t *testing.T) {
-	for _, cmd := range []string{"land", "review", "watch", "release", "rollout", "agent", "daemon", "status", "reap", "archive-jobs"} {
+	for _, cmd := range []string{"land", "review", "watch", "daemon", "status", "reap", "archive-jobs"} {
 		t.Run(cmd, func(t *testing.T) {
 			var out bytes.Buffer
 			if e := run(context.Background(), []string{cmd, "--help"}, &out, &out); e != nil {
@@ -21,7 +21,8 @@ func TestHelpAndFlagValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, args := range [][]string{{"unknown"}, {"land", "--unknown"}, {"superfan", "--launch"}} {
+	// The deploy commands are gone: each now fails as an unknown command.
+	for _, args := range [][]string{{"unknown"}, {"land", "--unknown"}, {"superfan", "--launch"}, {"release"}, {"rollout"}, {"agent"}, {"promote"}, {"admit"}, {"notify", "deploy"}} {
 		if e := run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); e == nil {
 			t.Fatal(args)
 		}

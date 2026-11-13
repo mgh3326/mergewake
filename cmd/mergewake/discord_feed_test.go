@@ -51,78 +51,11 @@ func discordHost(t *testing.T, hook, extra string) string {
 		t.Fatal(e)
 	}
 	cfg := filepath.Join(dir, "config.yaml")
-	body := fmt.Sprintf("version: 1\nhost: host-a\nstate_dir: %s\ndiscord:\n  enabled: true\n  webhooks_file: %s\n  kinds: {deploy: HOOK, pr: HOOK}\n%s", filepath.Join(dir, "state"), env, extra)
+	body := fmt.Sprintf("version: 1\nhost: host-a\nstate_dir: %s\ndiscord:\n  enabled: true\n  webhooks_file: %s\n  kinds: {pr: HOOK}\n%s", filepath.Join(dir, "state"), env, extra)
 	if e := os.WriteFile(cfg, []byte(body), 0o600); e != nil {
 		t.Fatal(e)
 	}
 	return cfg
-}
-
-func TestNotifyDeployCommand(t *testing.T) {
-	log := &hookLog{}
-	srv := httptest.NewServer(log)
-	defer srv.Close()
-	t.Setenv("GITHUB_TOKEN", "") // needs no GitHub credential
-	cfg := discordHost(t, srv.URL+"/deploy", "  opt_out: [example/skipped]\n")
-	deploy := func(args ...string) (string, error) {
-		var out, stderr bytes.Buffer
-		e := run(context.Background(), append([]string{"notify", "deploy", "--config", cfg}, args...), &out, &stderr)
-		return out.String(), e
-	}
-	got, e := deploy("--repo", "example/project", "--sha", testSHA, "--status", "ok", "--text", "pull deploy finished")
-	if e != nil || !strings.Contains(got, `"posted":true`) {
-		t.Fatalf("%s %v", got, e)
-	}
-	_, bodies := log.snapshot()
-	if len(bodies) != 1 || !strings.Contains(bodies[0], "pull deploy finished") || !strings.Contains(bodies[0], "example/project@aaaaaaa") {
-		t.Fatalf("%v", bodies)
-	}
-	// A deployer's retry posts once.
-	if got, e = deploy("--repo", "example/project", "--sha", testSHA, "--status", "ok"); e != nil || !strings.Contains(got, `"posted":false`) {
-		t.Fatalf("%s %v", got, e)
-	}
-	// A failure on the same commit is a different event.
-	if got, e = deploy("--repo", "example/project", "--sha", testSHA, "--status", "failed"); e != nil || !strings.Contains(got, `"posted":true`) {
-		t.Fatalf("%s %v", got, e)
-	}
-	// An opted-out repo succeeds quietly, so a deployer needs no special case.
-	if got, e = deploy("--repo", "example/skipped", "--sha", testSHA, "--status", "ok"); e != nil || !strings.Contains(got, `"posted":false`) {
-		t.Fatalf("%s %v", got, e)
-	}
-	if paths, _ := log.snapshot(); len(paths) != 2 {
-		t.Fatalf("%v", paths)
-	}
-}
-
-func TestNotifyDeployValidation(t *testing.T) {
-	srv := httptest.NewServer(http.NotFoundHandler())
-	defer srv.Close()
-	cfg := discordHost(t, srv.URL+"/s3cr3t", "")
-	off := filepath.Join(t.TempDir(), "off.yaml")
-	if e := os.WriteFile(off, []byte("version: 1\nhost: host-a\n"), 0o600); e != nil {
-		t.Fatal(e)
-	}
-	good := []string{"--repo", "example/project", "--sha", testSHA, "--status", "ok"}
-	for name, tt := range map[string]struct {
-		args []string
-		want string
-	}{
-		"no subcommand": {[]string{"notify"}, "usage: mergewake notify deploy"},
-		"other subject": {[]string{"notify", "pr"}, "usage: mergewake notify deploy"},
-		"bad repo":      {[]string{"notify", "deploy", "--config", cfg, "--repo", "../x", "--sha", testSHA, "--status", "ok"}, "--repo"},
-		"bad sha":       {[]string{"notify", "deploy", "--config", cfg, "--repo", "example/project", "--sha", "main", "--status", "ok"}, "--sha"},
-		"bad status":    {[]string{"notify", "deploy", "--config", cfg, "--repo", "example/project", "--sha", testSHA, "--status", "maybe"}, "--status"},
-		"feed off":      {append([]string{"notify", "deploy", "--config", off}, good...), "discord.enabled"},
-		"refused":       {append([]string{"notify", "deploy", "--config", cfg}, good...), "refused"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			var out, stderr bytes.Buffer
-			e := run(context.Background(), tt.args, &out, &stderr)
-			if e == nil || !strings.Contains(e.Error(), tt.want) || strings.Contains(e.Error(), "s3cr3t") {
-				t.Fatalf("%v", e)
-			}
-		})
-	}
 }
 
 // The daemon loop, end to end against a fake GitHub and a fake webhook: the pr

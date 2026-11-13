@@ -12,7 +12,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/discord"
-	"github.com/mgh3326/mergewake/internal/fleetevent"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 )
@@ -239,55 +238,6 @@ func (s *Service) feedWatch(r config.Repo, result watchResult, o Options) {
 		Repo: r.Name, PR: result.PR, Head: result.Head, Kind: "revert." + result.Action,
 		Message: watchMessage(r, result, s.now()),
 	}))
-}
-
-// feedDeploy posts a release or rollout this daemon performed. Whether it
-// worked is part of the key: a failed deploy that later succeeds on the same
-// commit posts both, and a failure repeated every pass posts once.
-func (s *Service) feedDeploy(repo, sha, source, status string, ok bool, detail error, o Options) {
-	if !s.feedOn(repo, "deploy", o) {
-		return
-	}
-	text := ""
-	if detail != nil {
-		text = detail.Error()
-	}
-	s.feedError(repo, s.Feed.Emit(deployEvent(s.Config.Host, repo, sha, source, status, ok, text, s.now())))
-}
-
-// NotifyDeploy posts a deploy reported by another deployer. It runs in a
-// one-shot process, so it posts before returning, and it reports whether it
-// did; false with no error means opted out, no deploy channel, or already
-// posted for this repo, commit and result.
-func (f *Feed) NotifyDeploy(ctx context.Context, host, repo, sha string, ok bool, text string, at time.Time) (bool, error) {
-	status := "failed"
-	if ok {
-		status = "ok"
-	}
-	return f.postNow(ctx, deployEvent(host, repo, sha, "notify", status, ok, text, at))
-}
-
-func deployEvent(host, repo, sha, source, status string, ok bool, text string, at time.Time) feedEvent {
-	result, title, color := "failed", "❌ Deploy failed", colorRed
-	if ok {
-		result, title, color = "ok", "🚀 Deploy ok", colorGreen
-	}
-	return feedEvent{
-		Repo: repo, Head: sha, Kind: "deploy." + source + "." + result,
-		Message: discord.New(discord.Embed{
-			Title:       fmt.Sprintf("%s: %s@%s", title, repo, short7(sha)),
-			URL:         commitURL(repo, sha),
-			Description: fleetevent.Bound(fleetevent.Redact(text), 1024),
-			Color:       color,
-			Fields: []discord.Field{
-				{Name: "Source", Value: source, Inline: true},
-				{Name: "Host", Value: host, Inline: true},
-				{Name: "Status", Value: status, Inline: true},
-			},
-			Footer:    &discord.Footer{Text: repo},
-			Timestamp: stamp(at),
-		}),
-	}
 }
 
 func prMessage(r config.Repo, pr github.Pull, kind string, at time.Time) discord.Message {
