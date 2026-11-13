@@ -489,9 +489,13 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	token := "gh" + "p_" + strings.Repeat("a", 36)
 	deletedFileValue := "FOO_TOKEN=" + strings.Repeat("b", 16)
+	pemBegin := strings.Join([]string{"-----", "BEGIN PRIVATE KEY-----"}, "")
+	pemBody := strings.Repeat("Ab3/", 16)
+	pemEnd := strings.Join([]string{"-----", "END PRIVATE KEY-----"}, "")
+	pemDiff := "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +0,0 @@\n-" + pemBegin + "\n-" + pemBody + "\n-" + pemEnd + "\n"
 	tests := []struct {
 		name, diff, want, notWant, path, pattern, summary string
-		rows                                              int
+		rows, count                                       int
 	}{
 		{
 			name:    "removed token line",
@@ -501,6 +505,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			path:    "auth.go",
 			pattern: "github_token",
 			rows:    1,
+			count:   1,
 		},
 		{
 			name:    "deleted file",
@@ -511,6 +516,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			path:    "old.env",
 			pattern: "token_assignment",
 			rows:    1,
+			count:   1,
 		},
 		{
 			name:    "mixed hunk redacts removed side",
@@ -520,6 +526,17 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			path:    "auth.go",
 			pattern: "github_token",
 			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "removed PEM block redacts body",
+			diff:    pemDiff,
+			want:    "-[redacted private_key]",
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   3,
 		},
 		{
 			name: "added token stays verbatim",
@@ -563,10 +580,10 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			}
 			if tt.rows > 0 {
 				body, _ := json.Marshal(rows[0])
-				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) {
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) {
 					t.Fatalf("audit contains matched text: %s", body)
 				}
-				if rows[0]["count"] != float64(1) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
+				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
 					t.Fatalf("audit row lacks redaction summary: %v", rows[0])
 				}
 			}

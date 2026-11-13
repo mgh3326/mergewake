@@ -52,12 +52,42 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 			end++
 		}
 		out.WriteString(line)
+		inPrivateKey := false
 		for _, hunkLine := range lines[i+1 : end] {
 			if len(hunkLine) == 0 || hunkLine[0] != '-' {
 				out.WriteString(hunkLine)
 				continue
 			}
-			redacted, n, names := archive.RedactSecretLike(hunkLine[1:])
+			content := hunkLine[1:]
+			redacted, n, names := archive.RedactSecretLike(content)
+			startsPrivateKey := false
+			for _, name := range names {
+				if name == "private_key" {
+					startsPrivateKey = true
+					break
+				}
+			}
+			if inPrivateKey || startsPrivateKey {
+				out.WriteString("-[redacted private_key]")
+				if strings.HasSuffix(hunkLine, "\r\n") {
+					out.WriteString("\r\n")
+				} else if strings.HasSuffix(hunkLine, "\n") {
+					out.WriteByte('\n')
+				}
+				count += max(n, 1)
+				if path != "" {
+					paths[path] = true
+				}
+				for _, name := range names {
+					patterns[name] = true
+				}
+				if strings.Contains(content, strings.Join([]string{"-----", "END"}, "")) {
+					inPrivateKey = false
+				} else if startsPrivateKey {
+					inPrivateKey = true
+				}
+				continue
+			}
 			if n == 0 {
 				out.WriteString(hunkLine)
 				continue
