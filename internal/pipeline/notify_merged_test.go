@@ -275,6 +275,14 @@ func TestLandMergedFailureRetriesFromPendingOnSweep(t *testing.T) {
 	if rows := prNotifyRows(t, s, r); len(rows) != 1 || rows[0]["head"] != shaA {
 		t.Fatalf("pr-notify rows=%v", rows)
 	}
+	mergedAt := time.Now().UTC().Format(time.RFC3339)
+	g.pull.Merged, g.pull.State, g.pull.MergedAt = true, "closed", &mergedAt
+	if err := s.ObserveMergedCandidate(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("post-Land closed evaluation duplicated MERGED: %+v", n.events)
+	}
 }
 
 func TestLandMergedLaneReadFailureStaysPending(t *testing.T) {
