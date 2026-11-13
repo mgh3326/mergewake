@@ -6,6 +6,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -239,7 +241,21 @@ func TestWebhookLogRedaction(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
 	defer srv.Close()
 	body := []byte(`{"repository":{"full_name":"o/r"},"marker":"MARKER-BODY"}`)
-	resp := post(t, srv.Client(), srv.URL+"/github", "pull_request", "delivery-id-1", body, []byte("MARKER-SECRET"))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/github", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "delivery-id-1")
+	req.Header.Set("X-GitHub-Hook-ID", "hook-17")
+	req.Header.Set("X-GitHub-Hook-Installation-Target-Type", "installation")
+	req.Header.Set("X-Other-Marker", "MARKER-HEADER")
+	req.Header.Set("Content-Type", "application/json; marker=MARKER-CONTENT-TYPE")
+	req.Header.Set("X-Hub-Signature-256", sign(body, []byte("MARKER-SECRET")))
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status=%d", resp.StatusCode)
@@ -248,11 +264,151 @@ func TestWebhookLogRedaction(t *testing.T) {
 	if !strings.Contains(out, "pull_request") || !strings.Contains(out, "delivery-id-1") {
 		t.Fatalf("log missing event or delivery id: %s", out)
 	}
-	for _, marker := range []string{"MARKER-BODY", "MARKER-SECRET", "sha256="} {
+	if !strings.Contains(out, "hook-17") || !strings.Contains(out, "installation") {
+		t.Fatalf("log missing hook fields: %s", out)
+	}
+	for _, marker := range []string{"MARKER-BODY", "MARKER-SECRET", "sha256=", "MARKER-HEADER", "MARKER-CONTENT-TYPE"} {
 		if strings.Contains(out, marker) {
 			t.Fatalf("log leaks %s: %s", marker, out)
 		}
 	}
+}
+
+func TestWebhookRepeatedDeliveryContract(t *testing.T) {
+	t.Run("same id is logged and does work once", func(t *testing.T) {
+		var buf syncBuffer
+		var mu sync.Mutex
+		var invalidations int
+		var triggers []string
+		var evaluations []PRKey
+		q := &Queue{Run: func(_ context.Context, work Work) {
+			mu.Lock()
+			evaluations = append(evaluations, work.Key)
+			mu.Unlock()
+		}}
+		startQueue(t, q)
+		d := Daemon{Log: slog.New(slog.NewJSONHandler(&buf, nil)), Webhook: &Webhook{
+			Path: "/github", Secret: testSecret, Repos: map[string]bool{"o/r": true}, Queue: q,
+			Invalidate: func(string) { invalidations++ },
+			Trigger:    func(role string) bool { triggers = append(triggers, role); return true },
+		}}
+		srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
+		defer srv.Close()
+		body := []byte(`{"repository":{"full_name":"o/r"},"pull_request":{"number":7,"head":{"sha":"head"}}}`)
+		for _, hook := range []string{"101", "202"} {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/github", bytes.NewReader(body))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("X-GitHub-Delivery", "delivery-same")
+			req.Header.Set("X-GitHub-Hook-ID", hook)
+			req.Header.Set("X-GitHub-Hook-Installation-Target-Type", "repository")
+			req.Header.Set("X-Hub-Signature-256", sign(body, testSecret))
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status=%d", resp.StatusCode)
+			}
+		}
+		q.Wait()
+		if invalidations != 1 || len(triggers) != 2 || !slices.Equal(triggers, []string{"pr", "watch"}) {
+			t.Fatalf("invalidations=%d triggers=%v", invalidations, triggers)
+		}
+		if !slices.Equal(evaluations, []PRKey{{Repo: "o/r", PR: 7}}) {
+			t.Fatalf("queued evaluations=%v", evaluations)
+		}
+		lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("logs=%d: %s", len(lines), buf.String())
+		}
+		var first, second map[string]any
+		if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+			t.Fatal(err)
+		}
+		if first["hook_id"] != "101" || first["hook_target"] != "repository" || first["repeat"] != nil {
+			t.Fatalf("first log: %v", first)
+		}
+		if second["hook_id"] != "202" || second["hook_target"] != "repository" || second["repeat"] != true || second["triggered"] == nil {
+			t.Fatalf("repeat log: %v", second)
+		}
+		if got := second["triggered"].([]any); len(got) != 0 {
+			t.Fatalf("repeat triggered=%v", got)
+		}
+	})
+
+	t.Run("different ids and empty ids both do work", func(t *testing.T) {
+		var invalidations, triggers int
+		d, srv := contractWebhook(t, &invalidations, &triggers)
+		_ = d
+		for _, tc := range []struct {
+			id string
+			pr int
+		}{{"one", 1}, {"two", 2}, {"", 3}, {"", 4}} {
+			body := []byte(fmt.Sprintf(`{"repository":{"full_name":"o/r"},"pull_request":{"number":%d}}`, tc.pr))
+			resp := post(t, srv.Client(), srv.URL+"/github", "pull_request", tc.id, body, testSecret)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status=%d", resp.StatusCode)
+			}
+		}
+		if invalidations != 4 || triggers != 8 {
+			t.Fatalf("invalidations=%d triggers=%d", invalidations, triggers)
+		}
+	})
+
+	t.Run("bad signature does not remember id", func(t *testing.T) {
+		var invalidations, triggers int
+		_, srv := contractWebhook(t, &invalidations, &triggers)
+		body := []byte(`{"repository":{"full_name":"o/r"},"pull_request":{"number":1}}`)
+		resp := post(t, srv.Client(), srv.URL+"/github", "pull_request", "bad-then-good", body, []byte("wrong"))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bad status=%d", resp.StatusCode)
+		}
+		resp = post(t, srv.Client(), srv.URL+"/github", "pull_request", "bad-then-good", body, testSecret)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted || invalidations != 1 || triggers != 2 {
+			t.Fatalf("status=%d invalidations=%d triggers=%d", resp.StatusCode, invalidations, triggers)
+		}
+	})
+
+	t.Run("window evicts the oldest id", func(t *testing.T) {
+		var invalidations, triggers int
+		_, srv := contractWebhook(t, &invalidations, &triggers)
+		send := func(id string, n int) int {
+			body := []byte(fmt.Sprintf(`{"repository":{"full_name":"o/r"},"pull_request":{"number":%d}}`, n))
+			resp := post(t, srv.Client(), srv.URL+"/github", "pull_request", id, body, testSecret)
+			resp.Body.Close()
+			return resp.StatusCode
+		}
+		if send("oldest", 1) != http.StatusAccepted {
+			t.Fatal("first status")
+		}
+		for i := 0; i < maxRememberedWebhookDeliveries; i++ {
+			if send(fmt.Sprintf("other-%d", i), i+2) != http.StatusAccepted {
+				t.Fatalf("id %d status", i)
+			}
+		}
+		before := invalidations
+		if send("oldest", 2000) != http.StatusAccepted || invalidations != before+1 {
+			t.Fatalf("evicted id was not processed: %d -> %d", before, invalidations)
+		}
+	})
+}
+
+func contractWebhook(t *testing.T, invalidations, triggers *int) (*Daemon, *httptest.Server) {
+	t.Helper()
+	d := &Daemon{Log: slog.New(slog.NewJSONHandler(io.Discard, nil)), Webhook: &Webhook{
+		Path: "/github", Secret: testSecret, Repos: map[string]bool{"o/r": true},
+		Invalidate: func(string) { *invalidations++ }, Trigger: func(string) bool { *triggers++; return true },
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(d.handleDelivery))
+	t.Cleanup(srv.Close)
+	return d, srv
 }
 
 // The form content type carries the JSON in the payload field; the signature
