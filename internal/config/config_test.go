@@ -31,6 +31,44 @@ func TestStrictConfig(t *testing.T) {
 	}
 }
 
+func TestNotifierPanewireLaneValidation(t *testing.T) {
+	tests := []struct {
+		name, notifier, wantError string
+		wantFallback              string
+	}{
+		{name: "invalid lane", notifier: "type: stdout\nlane: desk/a\n", wantError: "notifier.lane"},
+		{name: "invalid fallback", notifier: "type: stdout\nlane: desk-a\nfallback_lane: desk/b\n", wantError: "notifier.fallback_lane"},
+		{name: "invalid lane for noop", notifier: "type: noop\nlane: desk/a\n", wantError: "notifier.lane"},
+		{name: "short valid lanes", notifier: "type: panewire\nlane: desk:1\nfallback_lane: a.b-c\n", wantFallback: "a.b-c"},
+		{name: "underscore lane", notifier: "type: stdout\nlane: desk_a\n", wantFallback: "desk_a"},
+		{name: "128 character lane", notifier: "type: stdout\nlane: " + strings.Repeat("a", 128) + "\n", wantFallback: strings.Repeat("a", 128)},
+		{name: "129 character lane", notifier: "type: stdout\nlane: " + strings.Repeat("a", 129) + "\n", wantError: "notifier.lane"},
+		{name: "stdout without lanes", notifier: "type: stdout\n", wantFallback: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			contents := "version: 1\nhost: host-a\nnotifier:\n  " + strings.ReplaceAll(tt.notifier, "\n", "\n  ")
+			if err := os.WriteFile(p, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := Load(p)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("Load error = %v, want error naming %s", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Notifier.FallbackLane != tt.wantFallback {
+				t.Fatalf("fallback_lane = %q, want %q", c.Notifier.FallbackLane, tt.wantFallback)
+			}
+		})
+	}
+}
+
 func TestValidGradeScale(t *testing.T) {
 	for _, grade := range []string{"C", "B", "A", "A+", "S", "S+", "SS"} {
 		if !ValidGrade(grade) {

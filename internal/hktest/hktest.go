@@ -151,6 +151,7 @@ func New(t testing.TB) *Server {
 		documents: map[string]Document{}, fails: map[string]failure{}, afterRead: map[int64]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/tasks/{id}", s.task)
+	mux.HandleFunc("GET /v1/documents/{key}", s.documentGet)
 	mux.HandleFunc("POST /v1/tasks/{id}/comments", s.comment)
 	mux.HandleFunc("POST /v1/tasks/{id}/reopen", s.reopen)
 	mux.HandleFunc("POST /v1/tasks/{id}/decision-request", s.decisionRequest)
@@ -185,6 +186,13 @@ func (s *Server) SetTask(id int64, raw string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tasks[id] = raw
+}
+
+// SetDocument stores a document by key for GET /v1/documents/{key}.
+func (s *Server) SetDocument(key, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.documents[key] = Document{Body: body}
 }
 
 // SetTaskAfterRead makes task id become raw once its next GET has been
@@ -473,6 +481,21 @@ func (s *Server) documentPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"document": map[string]any{"id": 1, "key": key, "kind": in.Kind, "sha256": hex.EncodeToString(sum[:]), "created_by": Author}, "changed": true})
+}
+
+func (s *Server) documentGet(w http.ResponseWriter, r *http.Request) {
+	if s.failed(w, r) {
+		return
+	}
+	key := r.PathValue("key")
+	s.mu.Lock()
+	doc, ok := s.documents[key]
+	s.mu.Unlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"key": key, "body": doc.Body})
 }
 
 // storedRequest is the part of refs.decision_request hk's duplicate rule

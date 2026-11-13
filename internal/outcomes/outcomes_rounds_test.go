@@ -13,7 +13,7 @@ import (
 func publishedNotes(t *testing.T, v Outcome) (rounds string, notes map[string]json.RawMessage) {
 	t.Helper()
 	r := &cliRunner{}
-	if _, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v); err != nil {
+	if _, err := (CLI{Runner: r, Command: "panewire"}).Publish(context.Background(), v); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(strings.Join(r.args, " "), "--rounds ") {
