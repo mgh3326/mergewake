@@ -960,8 +960,8 @@ through the configured reps CLI, not other manual bench records.
 | --- | --- | --- |
 | `type` | `noop` (also empty) | `noop`, `stdout`, or `panewire`. |
 | `command` | `panewire` for that adapter | Executable path. Ignored for noop/stdout. |
-| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. |
-| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. |
+| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. Must match panewire's lane rule: 1–128 characters, starting with an ASCII letter or digit and continuing with ASCII letters, digits, `.`, `_`, `:`, or `-`. |
+| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. Must match the same panewire lane rule as `lane`. |
 
 The panewire adapter executes literal arguments equivalent to:
 
