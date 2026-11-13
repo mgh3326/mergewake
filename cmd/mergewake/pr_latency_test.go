@@ -172,8 +172,8 @@ func checkPhasesAddUp(t *testing.T, line map[string]any) {
 	}
 }
 
-// (b) An evaluation that held the review and the verdict back while GitHub's
-// file list caught up logs why.
+// (b) An evaluation that held the review back while GitHub's file list caught
+// up logs why.
 func TestPREvaluatedLogsTheSettlingReason(t *testing.T) {
 	te := timedEngineFixture(t, 2)
 	te.e.q.EnqueueNamed(daemon.SourceWebhook, te.f.repo.Name, 1, "")
@@ -183,8 +183,8 @@ func TestPREvaluatedLogsTheSettlingReason(t *testing.T) {
 		t.Fatalf("%d pr evaluated lines, want 1", len(evaluated))
 	}
 	settling, _ := evaluated[0]["settling"].(string)
-	if !strings.Contains(settling, "review_files_settling") || !strings.Contains(settling, "+files_settling") {
-		t.Fatalf("settling %q, want the review's and the gate's reason", settling)
+	if !strings.Contains(settling, "review_files_settling") {
+		t.Fatalf("settling %q, want the review's reason", settling)
 	}
 	// (e) No reviewer was spawned, so there is no latency line.
 	if n, _ := te.runner.spawns(); n != 0 || len(te.lines("review-start latency")) != 0 {

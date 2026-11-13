@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -270,13 +271,15 @@ func TestRetryReviewWaitRetriesFailedAudit(t *testing.T) {
 }
 
 // A poll the GitHub client skips while the hold reads the head's review
-// status is a wait, as on the main path: no error and no attempt.
+// status is no review: the pass returns the skip, with no attempt, no
+// escalation and no failure row, and the failure count stays as it was.
 func TestRetryReviewSkippedPollInHoldIsWait(t *testing.T) {
 	s, g, n, r, _ := failedRetryHead(t, 2, 3)
 	makeConflicting(g)
 	g.historyErr = github.ErrPollSkipped
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
-		t.Fatalf("skipped poll in the hold: %v", err)
+	err := s.RetryReview(context.Background(), r, g.pull, Options{})
+	if !errors.Is(err, github.ErrPollSkipped) {
+		t.Fatalf("skipped poll in the hold: err=%v, want the skip", err)
 	}
 	if g.pullCalls != 1 {
 		t.Fatalf("pull calls=%d, want the fresh read only: a review ran", g.pullCalls)
@@ -287,5 +290,34 @@ func TestRetryReviewSkippedPollInHoldIsWait(t *testing.T) {
 	}
 	if n.count != 0 || len(auditRows(t, s, r, "review-failed")) != 0 {
 		t.Fatalf("failure or escalation on a skipped poll: %v", n.events)
+	}
+}
+
+// A head with no counted failure whose review-history read is skipped: the
+// pass returns the skip, no review ran, and the retry state file is unchanged.
+func TestRetryReviewSkippedPollOnMainPathIsNoReview(t *testing.T) {
+	s, g, _, n, r := reviewSetup(t)
+	file := filepath.Join(s.state(r.Name), "review-retry-7.json")
+	if err := fsutil.WriteJSON(file, reviewRetryState{Head: shaA}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.historyErr = github.ErrPollSkipped
+	err = s.RetryReview(context.Background(), r, g.pull, Options{})
+	if !errors.Is(err, github.ErrPollSkipped) {
+		t.Fatalf("skipped poll on the main path: err=%v, want the skip", err)
+	}
+	after, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("state changed by a skipped poll:\n%s\n%s", before, after)
+	}
+	if n.count != 0 || len(auditRows(t, s, r, "review-failed")) != 0 {
+		t.Fatalf("failure on a skipped poll: %v", n.events)
 	}
 }
