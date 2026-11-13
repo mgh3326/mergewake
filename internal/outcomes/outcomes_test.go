@@ -281,7 +281,7 @@ func TestReconciliationMetadataDoesNotReviseOrPublish(t *testing.T) {
 		t.Errorf("schedule update changed outcome revision or was not persisted: rev=%d updated=%s due=%v", first.Revision, first.UpdatedAt, first.ReconcileDueAt)
 	}
 	r := &recordRunner{}
-	cli := CLI{Runner: r, Command: "pacelever"}
+	cli := CLI{Runner: r, Command: "panewire"}
 	if err := ledger.Flush(context.Background(), cli, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestPublishWithoutEffortSendsNoExperiment(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &recordRunner{}
-	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "panewire"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.adds) != 1 {
@@ -386,7 +386,7 @@ func TestPublishWithEffortKeepsExperiment(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &recordRunner{}
-	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "panewire"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.adds) != 1 {
@@ -407,7 +407,7 @@ func TestPublishRefusesMissingModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &recordRunner{}
-	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "panewire"}, ""); err != nil {
 		t.Fatal(err) // Flush skips an unattributed row without error
 	}
 	if len(r.adds) != 0 {
@@ -417,7 +417,7 @@ func TestPublishRefusesMissingModel(t *testing.T) {
 	inExperiment(&v)
 	v.Model = ""
 	v.ID = "m"
-	if _, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v); err == nil || !strings.Contains(err.Error(), "outcome attribution incomplete") {
+	if _, err := (CLI{Runner: r, Command: "panewire"}).Publish(context.Background(), v); err == nil || !strings.Contains(err.Error(), "outcome attribution incomplete") {
 		t.Fatalf("publish err=%v", err)
 	}
 	s, _ := ledger.Read()

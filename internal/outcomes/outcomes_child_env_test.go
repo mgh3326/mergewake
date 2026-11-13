@@ -12,7 +12,7 @@ import (
 )
 
 // hkServiceNames are the daemon's own hk service variables, which an outcomes
-// child must never inherit: pacelever skips its own config.env when it sees
+// child must never inherit: panewire skips its own config.env when it sees
 // HANDOFFKEEP_URL or HANDOFFKEEP_TOKEN, and its rep then stays local.
 var hkServiceNames = []string{
 	"HANDOFFKEEP_URL",
@@ -24,7 +24,7 @@ var hkServiceNames = []string{
 
 // keptNames are variables an outcomes child keeps, including near misses of
 // the removed names.
-var keptNames = []string{"HANDOFFKEEP_CONFIG", "PACELEVER_CONFIG", "PACELEVER_CACHE", "GH_TOKEN", "XDG_CONFIG_HOME", "HANDOFFKEEP_URL_EXTRA"}
+var keptNames = []string{"HANDOFFKEEP_CONFIG", "PANEWIRE_CONFIG", "PANEWIRE_CACHE", "GH_TOKEN", "XDG_CONFIG_HOME", "HANDOFFKEEP_URL_EXTRA"}
 
 // envCall is one outcomes CLI invocation as an env-capable runner saw it.
 type envCall struct {
@@ -79,7 +79,7 @@ func TestOutcomesChildEnvDropsHKServiceNames(t *testing.T) {
 		t.Setenv(name, canary(name))
 	}
 	r := &envRecorder{}
-	cli := CLI{Runner: r, Command: "pacelever"}
+	cli := CLI{Runner: r, Command: "panewire"}
 	if _, err := cli.Read(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestOutcomesChildEnvMatchesWholeNames(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &envRecorder{}
-			cli := CLI{Runner: r, Command: "pacelever", Environ: func() []string { return slices.Clone(tc.environ) }}
+			cli := CLI{Runner: r, Command: "panewire", Environ: func() []string { return slices.Clone(tc.environ) }}
 			if _, err := cli.Read(context.Background()); err != nil {
 				t.Fatal(err)
 			}

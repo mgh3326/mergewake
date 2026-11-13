@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// paceleverRow renders a rep the way `pacelever reps list` prints it: the rep
+// outcomeRow renders a rep the way `panewire reps list` prints it: the rep
 // ref first, the notes re-marshalled compactly last.
-func paceleverRow(t *testing.T, ref string, v Outcome, notes string) string {
+func outcomeRow(t *testing.T, ref string, v Outcome, notes string) string {
 	t.Helper()
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(notes), &obj); err != nil {
@@ -27,13 +27,13 @@ func paceleverRow(t *testing.T, ref string, v Outcome, notes string) string {
 func notesFor(t *testing.T, v Outcome) string {
 	t.Helper()
 	r := &cliRunner{}
-	if _, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v); err != nil {
+	if _, err := (CLI{Runner: r, Command: "panewire"}).Publish(context.Background(), v); err != nil {
 		t.Fatal(err)
 	}
 	return r.args[len(r.args)-1]
 }
 
-// benchRunner stands in for a pacelever whose adds all get the given ref
+// benchRunner stands in for a panewire whose adds all get the given ref
 // prefix (origin: when its bench client has no token); every add becomes a
 // row of the later `reps list` output.
 type benchRunner struct {
@@ -61,7 +61,7 @@ func (r *benchRunner) Run(_ context.Context, _ string, args []string, _, _ strin
 	if err := json.Unmarshal([]byte(notes), &envelope); err != nil {
 		r.t.Fatal(err)
 	}
-	r.rows = append(r.rows, paceleverRow(r.t, ref, envelope.Outcome, notes))
+	r.rows = append(r.rows, outcomeRow(r.t, ref, envelope.Outcome, notes))
 	return []byte("recorded rep id=" + ref + "\n"), nil
 }
 
@@ -75,7 +75,7 @@ func TestFlushAddsOnceWhenRepStaysLocal(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := &benchRunner{t: t, prefix: prefix}
-			cli := CLI{Runner: r, Command: "pacelever"}
+			cli := CLI{Runner: r, Command: "panewire"}
 			for pass := range 3 {
 				err := ledger.Flush(context.Background(), cli, "")
 				if err == nil {
@@ -132,18 +132,18 @@ func TestPublishMatchesEarlierRowOfAnyPrefix(t *testing.T) {
 		ref     string
 		wantErr string
 	}{
-		{name: "srv receipt", listed: paceleverRow(t, "srv:42", v, notes), ref: "confirmed:stable"},
-		{name: "origin row", listed: paceleverRow(t, "origin:123", v, notes), retry: true, wantErr: "rep delivered locally only (origin:123); retry failed: pending origin not found; retained in outbox"},
-		{name: "local row", listed: paceleverRow(t, "local:9", v, notes), wantErr: "rep delivered locally only (local:9), not shared; retained in outbox"},
-		{name: "origin then srv", listed: paceleverRow(t, "origin:123", v, notes) + paceleverRow(t, "srv:42", v, notes), ref: "confirmed:stable"},
-		{name: "another outcome's origin row", listed: paceleverRow(t, "origin:123", other, otherNotes), add: true, ref: "srv:42"},
+		{name: "srv receipt", listed: outcomeRow(t, "srv:42", v, notes), ref: "confirmed:stable"},
+		{name: "origin row", listed: outcomeRow(t, "origin:123", v, notes), retry: true, wantErr: "rep delivered locally only (origin:123); retry failed: pending origin not found; retained in outbox"},
+		{name: "local row", listed: outcomeRow(t, "local:9", v, notes), wantErr: "rep delivered locally only (local:9), not shared; retained in outbox"},
+		{name: "origin then srv", listed: outcomeRow(t, "origin:123", v, notes) + outcomeRow(t, "srv:42", v, notes), ref: "confirmed:stable"},
+		{name: "another outcome's origin row", listed: outcomeRow(t, "origin:123", other, otherNotes), add: true, ref: "srv:42"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &cliRunner{listed: tc.listed}
 			if strings.Contains(tc.wantErr, "retry failed") {
 				r.retryErr = errors.New("pending origin not found")
 			}
-			ref, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v)
+			ref, err := (CLI{Runner: r, Command: "panewire"}).Publish(context.Background(), v)
 			if added := slices.ContainsFunc(r.argsSeen, func(args []string) bool { return args[1] == "add" }); added != tc.add {
 				t.Fatalf("reps add ran=%v, want %v", added, tc.add)
 			}
@@ -201,7 +201,7 @@ func (r *pendingRetryRunner) Run(_ context.Context, _ string, args []string, _, 
 
 func originRowFor(t *testing.T, v Outcome) string {
 	t.Helper()
-	return paceleverRow(t, "origin:123", v, notesFor(t, v))
+	return outcomeRow(t, "origin:123", v, notesFor(t, v))
 }
 
 func TestFlushRetriesOriginRowAndRecordsReceipt(t *testing.T) {
@@ -215,7 +215,7 @@ func TestFlushRetriesOriginRowAndRecordsReceipt(t *testing.T) {
 	}
 	v := state.Latest[Key("example/project", 1)]
 	r := &pendingRetryRunner{rows: originRowFor(t, v), replies: []retryReply{{body: []byte(`{"id":77,"origin_id":123}`)}}}
-	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "pacelever"}, ""); err != nil {
+	if err := ledger.Flush(context.Background(), CLI{Runner: r, Command: "panewire"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	state, err = ledger.Read()
@@ -249,7 +249,7 @@ func TestFlushRetriesOriginAgainAfterFailure(t *testing.T) {
 		{err: errors.New("pending origin not found")},
 		{body: []byte(`{"id":77,"origin_id":123}`)},
 	}}
-	cli := CLI{Runner: r, Command: "pacelever"}
+	cli := CLI{Runner: r, Command: "panewire"}
 	err = ledger.Flush(context.Background(), cli, "")
 	if err == nil || !strings.Contains(err.Error(), "origin:123") || !strings.Contains(err.Error(), "pending origin not found") {
 		t.Fatalf("first flush error=%v, want origin row and retry detail", err)
@@ -278,7 +278,7 @@ func TestPublishDoesNotAcceptRetryWithoutServerID(t *testing.T) {
 	complete(&v)
 	v.Task, v.ID = Key("example/project", 1), "stable"
 	r := &pendingRetryRunner{rows: originRowFor(t, v), replies: []retryReply{{body: []byte(`{"origin_id":123}`)}}}
-	ref, err := (CLI{Runner: r, Command: "pacelever"}).Publish(context.Background(), v)
+	ref, err := (CLI{Runner: r, Command: "panewire"}).Publish(context.Background(), v)
 	if err == nil || ref != "" || !strings.Contains(err.Error(), "origin:123") || !strings.Contains(err.Error(), "id") {
 		t.Fatalf("ref=%q err=%v, want retry error naming origin and missing id", ref, err)
 	}
@@ -294,10 +294,10 @@ func TestReadCountsOnlySharedRows(t *testing.T) {
 		complete(v)
 		v.Task, v.ID = Key("example/project", i+1), fmt.Sprintf("id-%d", i)
 	}
-	listed := paceleverRow(t, "srv:1", shared, notesFor(t, shared)) +
-		paceleverRow(t, "origin:2", origin, notesFor(t, origin)) +
-		paceleverRow(t, "local:3", local, notesFor(t, local))
-	got, err := (CLI{Runner: &cliRunner{listed: listed}, Command: "pacelever"}).Read(context.Background())
+	listed := outcomeRow(t, "srv:1", shared, notesFor(t, shared)) +
+		outcomeRow(t, "origin:2", origin, notesFor(t, origin)) +
+		outcomeRow(t, "local:3", local, notesFor(t, local))
+	got, err := (CLI{Runner: &cliRunner{listed: listed}, Command: "panewire"}).Read(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
