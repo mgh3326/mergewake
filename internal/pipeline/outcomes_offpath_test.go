@@ -104,7 +104,7 @@ func TestReconcileOutcomesDoesNotPublish(t *testing.T) {
 	t.Cleanup(reps.unblock)
 	s.Runner = reps
 	if err := returnsWithin(t, 3*time.Second, "ReconcileOutcomes", func() error {
-		return s.ReconcileOutcomes(context.Background(), r, map[int]bool{}, Options{Shadow: true})
+		return s.ReconcileOutcomes(context.Background(), r, noneOpen, Options{Shadow: true})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -220,5 +220,24 @@ func waitFor(t *testing.T, what string, ok func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// noneOpen lists no PR as open.
+func noneOpen(int) bool { return false }
+
+// A row is checked against the live open set as it is reached: a PR the set
+// lists as open at that moment is not read as a closed one.
+func TestReconcileOutcomesAsksOpenPerRow(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	finalRow(t, s, repo, 7)
+	s.GH = pullFailGH{g}
+	var asked []int
+	err := s.ReconcileOutcomes(context.Background(), repo, func(pr int) bool { asked = append(asked, pr); return true }, Options{Shadow: true})
+	if err != nil {
+		t.Fatalf("an open PR was read as closed: %v", err)
+	}
+	if len(asked) != 1 || asked[0] != 7 {
+		t.Fatalf("open asked for %v", asked)
 	}
 }

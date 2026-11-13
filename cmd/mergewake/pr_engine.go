@@ -457,28 +457,33 @@ type openSet struct {
 	swept  bool
 	open   map[int]bool
 	recent map[int]bool
+	// gone is the PRs an evaluation saw closed since beginList: a list read
+	// before they closed must not bring them back.
+	gone map[int]bool
 }
 
 func (e *prEngine) openOf(repo string) *openSet {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.open[repo] == nil {
-		e.open[repo] = &openSet{open: map[int]bool{}, recent: map[int]bool{}}
+		e.open[repo] = &openSet{open: map[int]bool{}, recent: map[int]bool{}, gone: map[int]bool{}}
 	}
 	return e.open[repo]
 }
 
-// beginList starts a sweep's list read: PRs learned from now on survive replace.
+// beginList starts a sweep's list read: PRs learned from now on survive replace,
+// and PRs seen closed from now on stay out of it.
 func (o *openSet) beginList() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.recent = map[int]bool{}
+	o.recent, o.gone = map[int]bool{}, map[int]bool{}
 }
 
 func (o *openSet) learn(n int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.open[n], o.recent[n] = true, true
+	delete(o.gone, n)
 }
 
 func (o *openSet) forget(n int) {
@@ -486,15 +491,19 @@ func (o *openSet) forget(n int) {
 	defer o.mu.Unlock()
 	delete(o.open, n)
 	delete(o.recent, n)
+	o.gone[n] = true
 }
 
-// replace sets the open PRs to a listed set plus those learned since beginList.
+// replace sets the open PRs to a listed set, less those seen closed since
+// beginList, plus those learned since.
 func (o *openSet) replace(heads map[int]string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	next := map[int]bool{}
 	for n := range heads {
-		next[n] = true
+		if !o.gone[n] {
+			next[n] = true
+		}
 	}
 	for n := range o.recent {
 		next[n] = true
@@ -502,21 +511,24 @@ func (o *openSet) replace(heads map[int]string) {
 	o.open, o.swept = next, true
 }
 
-// openPRs is the open set the closed-row reconcile needs, a copy of the
-// engine's, so the reconcile makes no GitHub request for it and reads no ledger
-// for it. known is false until repo's first sweep.
-func (e *prEngine) openPRs(repo string) (open map[int]bool, known bool) {
+// openPRs is the open set the closed-row reconcile needs. isOpen reads the
+// engine's set when it is called, once per row, so a PR an evaluation learns
+// after the reconcile began is still open to it: a row is written only after
+// its PR is learned. The reconcile makes no GitHub request or ledger read for
+// it. known is false until repo's first sweep.
+func (e *prEngine) openPRs(repo string) (isOpen func(pr int) bool, known bool) {
 	o := e.openOf(repo)
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	if !o.swept {
+	swept := o.swept
+	o.mu.Unlock()
+	if !swept {
 		return nil, false
 	}
-	open = make(map[int]bool, len(o.open))
-	for n := range o.open {
-		open[n] = true
-	}
-	return open, true
+	return func(pr int) bool {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		return o.open[pr]
+	}, true
 }
 
 // sweepBounded keeps one repository's in-flight sweep registered until the

@@ -71,7 +71,7 @@ func TestSweepDoesNotReconcileClosedRows(t *testing.T) {
 }
 
 // noneOpen is an open set that is known and lists no PR.
-func noneOpen(string) (map[int]bool, bool) { return map[int]bool{}, true }
+func noneOpen(string) (func(int) bool, bool) { return func(int) bool { return false }, true }
 
 // Before the first sweep the open set is unknown, and the reconcile reads no
 // row: it could not tell a closed PR from an open one.
@@ -79,7 +79,7 @@ func TestReconcileLoopWaitsForTheFirstSweep(t *testing.T) {
 	f := newParallelFixture(t, 1, 0)
 	reads := countPullReads(t, f)
 	closedRow(t, f, 900)
-	unknown := func(string) (map[int]bool, bool) { return nil, false }
+	unknown := func(string) (func(int) bool, bool) { return nil, false }
 	if _, err := reconcileClosed(context.Background(), f.s, unknown, f.repo, pipeline.Options{Shadow: true}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -116,22 +116,49 @@ func TestReconcileLoopSkipsOpenPRs(t *testing.T) {
 }
 
 // A PR the engine learned while a sweep's list was being read stays open when
-// that list replaces the set, and an evaluation that sees a PR closed drops it.
-func TestOpenSetKeepsPRLearnedDuringTheListRead(t *testing.T) {
+// that list replaces the set; a PR an evaluation saw closed during the read is
+// not brought back by it.
+func TestOpenSetKeepsPRLearnedAndDropsPRClosedDuringTheListRead(t *testing.T) {
 	e, f := engineFixture(t, 1)
 	set := e.openOf(f.repo.Name)
 	set.beginList()
 	set.learn(77)
-	set.replace(map[int]string{1: "a"})
-	open, known := e.openPRs(f.repo.Name)
-	if !known || !open[1] || !open[77] || len(open) != 2 {
-		t.Fatalf("open=%v known=%v, want PRs 1 and 77", open, known)
+	set.forget(2)
+	set.replace(map[int]string{1: "a", 2: "b"})
+	isOpen, known := e.openPRs(f.repo.Name)
+	if !known || !isOpen(1) || !isOpen(77) || isOpen(2) {
+		t.Fatalf("open: 1=%v 77=%v 2=%v known=%v, want 1 and 77 open, 2 closed", isOpen != nil && isOpen(1), isOpen != nil && isOpen(77), isOpen != nil && isOpen(2), known)
 	}
 	set.forget(77)
 	set.beginList()
 	set.replace(map[int]string{1: "a"})
-	if open, _ = e.openPRs(f.repo.Name); open[77] || !open[1] {
-		t.Fatalf("open=%v after PR 77 was forgotten", open)
+	if isOpen(77) || !isOpen(1) {
+		t.Fatal("PR 77 stayed open after it was forgotten")
+	}
+}
+
+// The open set is read per row, as the reconcile reaches it: a PR the engine
+// learns after the run began (its row is written after it is learned) is not
+// read as a closed one.
+func TestReconcileLoopSeesAPRLearnedAfterTheRunBegan(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	reads := countPullReads(t, f)
+	close(f.runner.release)
+	if err := e.sweep(context.Background(), f.repo); err != nil {
+		t.Fatal(err)
+	}
+	e.q.Wait()
+	closedRow(t, f, 900)
+	late := func(repo string) (func(int) bool, bool) {
+		isOpen, known := e.openPRs(repo)
+		e.openOf(repo).learn(900) // an evaluation learns PR 900 after the snapshot
+		return isOpen, known
+	}
+	if _, err := reconcileClosed(context.Background(), f.s, late, f.repo, pipeline.Options{Shadow: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := reads.count("pulls/900"); n != 0 {
+		t.Fatalf("PR 900, learned as open during the run, was read as closed %d times", n)
 	}
 }
 
@@ -149,7 +176,11 @@ func TestReconcileLoopRunsAndStopsWithContext(t *testing.T) {
 	t.Cleanup(func() { reconcileRetryWait = old })
 	var mu sync.Mutex
 	known := false
-	openPRs := func(string) (map[int]bool, bool) { mu.Lock(); defer mu.Unlock(); return map[int]bool{}, known }
+	openPRs := func(string) (func(int) bool, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		return func(int) bool { return false }, known
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

@@ -429,7 +429,7 @@ func revertSetup(t *testing.T, mergedAgo time.Duration) (*Service, *outcomeGH, *
 // is audited, not returned, so a clean pass returns nil.
 func reconcile(t *testing.T, s *Service, r config.Repo, o Options) {
 	t.Helper()
-	if e := s.ReconcileOutcomes(context.Background(), r, map[int]bool{}, o); e != nil {
+	if e := s.ReconcileOutcomes(context.Background(), r, noneOpen, o); e != nil {
 		t.Fatal(e)
 	}
 }
