@@ -15,7 +15,6 @@ of seven sources. The `source` field of the `pr evaluated` log line names them.
 | `check` | A signed `check_run` or `check_suite` delivery that completed, or a `status` delivery, naming the PR by the numbers it lists or by its head commit. A commit that no known open PR has as its head names nothing. A check that has not completed enqueues nothing: it has no result to evaluate, and its completed delivery follows. |
 | `reviewer` | A reviewer job of the PR finished (the reviewer watch). |
 | `base` | A push to the repository's base branch (`repos[].branch`). Every open PR of the repository is queued, because its merge gate reads the base. |
-| `status` | A fresh `GET /v1/pr-status?fresh=1` read found the PR changed. |
 | `timer` | A reviewer's deadline: the PR is evaluated once its reviewer is past `review.timeout`, so a reviewer that never finishes is replaced. |
 | `sweep` | The periodic pass, below. |
 

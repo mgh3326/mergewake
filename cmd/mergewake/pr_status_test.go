@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,9 +24,8 @@ func prStatusHost(t *testing.T) (cfg, stateDir string) {
 	return cfg, stateDir
 }
 
-// (e) The CLI prints the JSON the HTTP endpoint returns for the same snapshot,
-// from local state alone.
-func TestPRStatusCLIPrintsTheEndpointJSON(t *testing.T) {
+// The CLI prints the snapshot as JSON from local state alone, with no fresh read.
+func TestPRStatusCLIPrintsSnapshotJSON(t *testing.T) {
 	cfg, stateDir := prStatusHost(t)
 	snap := prstatus.Snapshot{Repo: "o/r", PR: 7, Head: "aaaaaaa", State: "blocked", Reasons: []string{"review_missing"},
 		Checks: []prstatus.Check{{Name: "test", State: "green"}}, ObservedAt: time.Date(2026, 11, 6, 1, 2, 3, 0, time.UTC),
@@ -37,21 +33,12 @@ func TestPRStatusCLIPrintsTheEndpointJSON(t *testing.T) {
 	if e := prstatus.Write(stateDir, snap); e != nil {
 		t.Fatal(e)
 	}
-	srv := httptest.NewServer(prstatus.Handler{StateDir: stateDir})
-	defer srv.Close()
-	resp, e := http.Get(srv.URL + "?repo=o/r&pr=7")
-	if e != nil {
-		t.Fatal(e)
-	}
-	want, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
 	var out, stderr bytes.Buffer
 	if e := run(context.Background(), []string{"pr-status", "--config", cfg, "--repo", "o/r", "--pr", "7", "--json"}, &out, &stderr); e != nil {
 		t.Fatal(e)
 	}
-	if out.String() != string(want) || !strings.Contains(out.String(), `"fresh_at":null`) {
-		t.Fatalf("CLI:\n%s\nHTTP:\n%s", out.String(), want)
+	if !strings.Contains(out.String(), `"fresh_at":null`) || !strings.Contains(out.String(), `"head":"aaaaaaa"`) {
+		t.Fatalf("CLI:\n%s", out.String())
 	}
 
 	out.Reset()

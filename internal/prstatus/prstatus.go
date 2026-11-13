@@ -13,7 +13,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,9 +25,6 @@ import (
 // SourceLastPass marks gate fields as read from the daemon's last pass.
 const SourceLastPass = "last_pass"
 
-// MaxResponse bounds one API response, in bytes.
-const MaxResponse = 64 << 10
-
 // Gate states. A closed or merged PR keeps its last gate fields under its
 // final state.
 const (
@@ -39,7 +35,7 @@ const (
 	Closed  = "closed"
 )
 
-// Caps keep one snapshot far under MaxResponse whatever GitHub returns.
+// Caps keep one snapshot small whatever GitHub returns.
 const (
 	maxReasons  = 50
 	maxChecks   = 100
@@ -194,36 +190,6 @@ func Read(stateDir, repo string, n int) (Snapshot, error) {
 	return s, nil
 }
 
-// ListOpen returns the snapshots of repo's open PRs, newest PR first.
-func ListOpen(stateDir, repo string) ([]Snapshot, error) {
-	entries, e := os.ReadDir(dir(stateDir, repo))
-	if errors.Is(e, fs.ErrNotExist) {
-		return []Snapshot{}, nil
-	}
-	if e != nil {
-		return nil, e
-	}
-	out := []Snapshot{}
-	for _, entry := range entries {
-		n, err := strconv.Atoi(strings.TrimSuffix(entry.Name(), ".json"))
-		if err != nil || n <= 0 || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		s, err := Read(stateDir, repo, n)
-		if errors.Is(err, ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if s.Open() {
-			out = append(out, s)
-		}
-	}
-	slices.SortFunc(out, func(a, b Snapshot) int { return cmp.Compare(b.PR, a.PR) })
-	return out, nil
-}
-
 // Response is one PR's answer: the snapshot, with a FreshError when a
 // requested fresh read failed. Snapshot.Source stays last_pass: the gate
 // fields always are.
@@ -239,42 +205,41 @@ type Fresher func(ctx context.Context, repo string, n int) (github.PRFresh, erro
 // fresh read and writes it through: the snapshot's head, fresh block and
 // fresh_at take the new values, and the gate fields stay. When the head, the
 // checks or the unresolved threads differ from what the snapshot held, the PR
-// is marked for re-evaluation and changed is true; the caller wakes the pr
-// role and drops stale evidence. The snapshot is read first, so a PR with none
-// costs no GitHub call. A failed fresh read is reported in the response, not
-// as an error, so the snapshot still gets through.
-func Respond(ctx context.Context, stateDir, repo string, n int, fresh Fresher, now time.Time) (r Response, changed bool, err error) {
+// is marked for re-evaluation (see MarkDirty). The snapshot is read first, so a
+// PR with none costs no GitHub call. A failed fresh read is reported in the
+// response, not as an error, so the snapshot still gets through.
+func Respond(ctx context.Context, stateDir, repo string, n int, fresh Fresher, now time.Time) (Response, error) {
 	s, e := Read(stateDir, repo, n)
 	if e != nil {
-		return Response{}, false, e
+		return Response{}, e
 	}
 	if fresh == nil {
-		return Response{Snapshot: s}, false, nil
+		return Response{Snapshot: s}, nil
 	}
 	f, e := fresh(ctx, repo, n)
 	if e != nil {
-		return Response{Snapshot: s, FreshError: "GitHub read failed"}, false, nil
+		return Response{Snapshot: s, FreshError: "GitHub read failed"}, nil
 	}
 	if f.ObservedAt.IsZero() {
 		f.ObservedAt = now
 	}
-	changed = s.Open() && differs(s, f)
+	changed := s.Open() && differs(s, f)
 	next := s
 	next.GateHead = cmp.Or(s.GateHead, s.Head)
 	next.Head, next.Fresh, next.FreshAt = cmp.Or(f.Head, s.Head), &f, &f.ObservedAt
 	current, wrote, e := update(stateDir, s, next)
 	if e != nil {
-		return Response{}, false, e
+		return Response{}, e
 	}
 	if !wrote {
-		return Response{Snapshot: current}, false, nil
+		return Response{Snapshot: current}, nil
 	}
 	if changed {
 		if e = MarkDirty(stateDir, repo, n, now); e != nil {
-			return Response{}, false, e
+			return Response{}, e
 		}
 	}
-	return Response{Snapshot: next}, changed, nil
+	return Response{Snapshot: next}, nil
 }
 
 // update stores next over the snapshot it was built from, read as old, unless

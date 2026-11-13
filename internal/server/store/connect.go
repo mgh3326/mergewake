@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/mgh3326/mergewake/internal/server/state"
 )
 
 const queryTimeout = 10 * time.Second
@@ -27,17 +26,11 @@ const maxCAFileSize = 64 * 1024
 var (
 	ErrUnavailable = errors.New("server database unavailable")
 	ErrSchema      = errors.New("server database schema mismatch or incomplete migration")
-	ErrFenced      = errors.New("coordinator or attempt fenced")
-	ErrConflict    = errors.New("PR version or delivery conflict")
-	ErrNoJob       = errors.New("no eligible job or capacity")
 	ErrConfig      = errors.New("invalid server database configuration")
 )
 
 type Store struct {
 	db *sql.DB
-	// Jitter returns a fraction in [0, 1) of the up-to-20% retry spread added
-	// to a failed attempt's delay; nil means math/rand.
-	Jitter func() float64
 }
 
 // Connect reads credentials only from host environment or a private file. It
@@ -222,39 +215,4 @@ func readDSN(env func(string) string, read func(string) ([]byte, error), stat fu
 		return "", ErrConfig
 	}
 	return dsn, nil
-}
-
-func transaction[T any](ctx context.Context, s *Store, fn func(*sql.Tx) (T, error)) (T, error) {
-	var zero T
-	for attempt := 0; attempt < 3; attempt++ {
-		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-		if err != nil {
-			return zero, ErrUnavailable
-		}
-		value, err := fn(tx)
-		if err == nil {
-			// Commit failure is ambiguous: never retry this transaction here.
-			if tx.Commit() != nil {
-				return zero, ErrUnavailable
-			}
-			return value, nil
-		}
-		_ = tx.Rollback()
-		var me *mysql.MySQLError
-		if errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205) {
-			timer := time.NewTimer(time.Duration(attempt+1) * 10 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return zero, ErrUnavailable
-			case <-timer.C:
-			}
-			continue
-		}
-		if errors.Is(err, ErrFenced) || errors.Is(err, ErrConflict) || errors.Is(err, ErrNoJob) || errors.Is(err, ErrSchema) || errors.Is(err, state.ErrTransition) || errors.Is(err, state.ErrStale) {
-			return zero, err
-		}
-		return zero, ErrUnavailable
-	}
-	return zero, ErrUnavailable
 }

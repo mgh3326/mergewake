@@ -20,7 +20,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/policy"
-	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -204,8 +203,6 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		state := webhookstate.Open(s.Config.StateDir)
 		state.Log = log
 		gh.Webhook = state
-		status := prstatus.Handler{StateDir: s.Config.StateDir, Fresh: gh.PRFresh, Invalidate: gh.InvalidateEvidence,
-			Wake: func() { d.Trigger("pr") }}
 		d.Webhook = &daemon.Webhook{Listen: wc.Listen, Path: wc.Path, Secret: []byte(secret), Repos: known, Invalidate: gh.InvalidateEvidence, Dirty: dirty, State: state, Applied: gh.WebhookDelivery}
 		if engine != nil {
 			branches := map[string]string{}
@@ -213,9 +210,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				branches[r.Name] = r.Branch
 			}
 			d.Webhook.Queue, d.Webhook.Branches = engine.q, branches
-			status.Enqueue = func(repo string, n int) { engine.q.EnqueueNamed(daemon.SourceStatus, repo, n, "") }
 		}
-		d.Webhook.Status = status
 		gap, err := config.Duration(wc.MinGap)
 		if err != nil {
 			return err

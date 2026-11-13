@@ -1670,20 +1670,6 @@ remaining branch in those cases. After an API timeout or a reporting failure,
 inspect GitHub/task records and local audit rather than blindly rerunning a
 mutation. The initial release has no automatic report outbox/reconciliation.
 
-## Superfan session contract
-
-`superfan` reads embedded specs and requires no host config. Omitting `--name`
-prints all four as JSON lines. Each spec includes `name`, `component`, `prompt`,
-`allowed_read_only_sources`, and `allowed_actions`. Source names describe inputs
-the operator supplies; they are not shell commands executed by mergewake.
-
-`--launch --runner /path/to/session-runner` executes that trusted runner with no
-arguments and sends one spec JSON object on stdin. The runner owns the low-cost
-model choice, host placement, session lifetime, source collection, and enforcement
-of allowed actions. It should return after launching a resident session. With
-`--dry-run`, mergewake prints the spec and does not execute the runner. Existing
-fleet spawners can be wrapped around this protocol without importing their code.
-
 ## Daemon
 
 ```yaml

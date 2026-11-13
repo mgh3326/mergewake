@@ -23,8 +23,6 @@ const (
 	SourceReviewer Source = "reviewer"
 	// SourceBase is a push to the repository's base branch.
 	SourceBase Source = "base"
-	// SourceStatus is a fresh status read that found the PR changed.
-	SourceStatus Source = "status"
 	// SourceTimer is a reviewer's deadline: the PR is evaluated once the
 	// reviewer is past its timeout, so a reviewer that never finishes is replaced.
 	SourceTimer Source = "timer"
