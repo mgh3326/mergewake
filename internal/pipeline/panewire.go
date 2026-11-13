@@ -231,7 +231,7 @@ func panewireRenamedArgsUsageError(err error) bool {
 	return renamedRoleUsage.MatchString(stderr)
 }
 
-var renamedRoleUsage = regexp.MustCompile(`(?i)(?:--role(?:=|\s+)(?:value\s+)?(?:must\s+be\s+)?["']?(?:worker|tester|counsel|implementer|consult)\b|(?:invalid|unsupported)\s+role[: ]+\s*["']?(?:worker|tester|counsel|implementer|consult)\b|["'](?:worker|tester|counsel|implementer|consult)["'][^\n]{0,60}\bfor\b[^\n]{0,20}-?-role\b)`)
+var renamedRoleUsage = regexp.MustCompile(`(?i)(?:--role(?:=|\s+)(?:value\s+)?(?:must\s+be\s+)?["']?(?:worker|tester|counsel)\b|(?:invalid|unsupported)\s+role[: ]+\s*["']?(?:worker|tester|counsel)\b|["'](?:worker|tester|counsel)["'][^\n]{0,60}\bfor\b[^\n]{0,20}-?-role\b)`)
 
 func stderrHasFlag(stderr, flag string) bool {
 	short := "-" + strings.TrimPrefix(flag, "--")

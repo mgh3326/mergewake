@@ -141,10 +141,9 @@ func TestPanewireSpawnCompatibilityPreservesRetryFailureAndInitialRefusal(t *tes
 
 func TestPanewireRenamedArgsUsageErrorRequiresRoleContext(t *testing.T) {
 	for _, stderr := range []string{
-		"--role value must be implementer or reviewer",
+		"--role worker",
+		"--role value must be worker or reviewer",
 		"invalid role: worker",
-		"panewire: --role=consult is not accepted",
-		`invalid argument "implementer" for "--role" flag`,
 		`invalid value "worker" for flag -role`,
 		`invalid role "worker"`,
 	} {
@@ -154,6 +153,16 @@ func TestPanewireRenamedArgsUsageErrorRequiresRoleContext(t *testing.T) {
 	}
 	if panewireRenamedArgsUsageError(&integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "unknown --consult-mode flag"}) {
 		t.Fatal("unrelated role-like flag was classified as renamed-role usage")
+	}
+	for _, stderr := range []string{
+		"--role value must be implementer or reviewer",
+		`invalid argument "implementer" for "--role" flag`,
+		"invalid role: consult",
+		"panewire: --role=consult is not accepted",
+	} {
+		if panewireRenamedArgsUsageError(&integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: stderr}) {
+			t.Errorf("current role name was classified as retired: %q", stderr)
+		}
 	}
 	if !stderrHasFlag("unknown flag --author-family=anthropic", "--author-family") {
 		t.Fatal("flag with an attached value was not recognized")
