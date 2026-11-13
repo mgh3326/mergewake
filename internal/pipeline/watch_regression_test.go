@@ -121,7 +121,7 @@ func TestWatchReportedBounded(t *testing.T) {
 	if err := os.WriteFile(file, []byte(prior.String()), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.reportWatch(context.Background(), r, watchResult{Head: "head-130", Action: "hold"}, "head-130:hold", Options{}); err != nil {
+	if err := s.reportWatch(context.Background(), r, watchResult{Head: "head-130", Action: "report-culprit"}, "head-130:hold", Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -133,7 +133,7 @@ func TestWatchReportedBounded(t *testing.T) {
 	if len(keys) != 128 || keys[0] != "head-3:hold" || keys[127] != "head-130:hold" {
 		t.Fatalf("%v", keys)
 	}
-	if err := s.reportWatch(context.Background(), r, watchResult{Head: "head-130", Action: "hold"}, "head-130:hold", Options{}); err != nil {
+	if err := s.reportWatch(context.Background(), r, watchResult{Head: "head-130", Action: "report-culprit"}, "head-130:hold", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if sink.records != 1 || n.count != 1 {

@@ -1975,8 +1975,8 @@ daemon:
 
 Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. BLOCKED
 declares `blocked`; READY and MERGED are recorded, not sent, so they declare
-no event. Watch holds declare
-`watch-hold`; culprit recovery declares `culprit-hold`. Deployment decisions
+no event. Watch holds declare `watch-hold` once per red main episode and hold
+reason; culprit recovery declares `culprit-hold`. Deployment decisions
 continue through the handoffkeep approval adapter. Panewire's reviewed desk
 policy keeps routine events in its inbox and decision events as interrupts.
 
