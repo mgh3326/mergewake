@@ -452,7 +452,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 		}()
 	}
-	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, s.now().Unix()+int64(plan.replacements))
+	stamp := s.now().Unix() + int64(plan.replacements)
+	label := fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp)
+	if label == plan.supersedes {
+		// The dead reviewer was labelled in this same second: its replacement takes the next one.
+		label = fmt.Sprintf("mwr-%d-%s-p%d-%d", pr.Number, short7(pr.Head.SHA), plan.pass, stamp+1)
+	}
 	checkout := filepath.Join(cfg.Checkouts, label)
 	if resumed {
 		label, checkout = rj.Label, rj.Checkout
@@ -571,8 +576,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					collected, remoteRecord, spawn = b, &fresh, false
 				} else if err := ctx.Err(); err != nil {
 					return out, fmt.Errorf("panewire reviewer %s: %w", label, err)
-					// Give transient read errors one additional review budget to recover.
 				} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+					// Give transient read errors one additional review budget to recover.
 					return out, errPassPending
 				} else {
 					cause := "pane finished without a result"
@@ -699,9 +704,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, auditErr
 				}
 			}
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
+			}
+			if plan.supersedes != "" {
+				if e = s.audit(x.repo.Name, "reviewer-spawn-replaced", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "old_label": plan.supersedes, "label": label}, false); e != nil {
+					return out, e
+				}
 			}
 			reviewerRecorded = true
 			args = rj.Args
@@ -802,6 +812,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				}
 				keepCheckout = false
 				return out, errSecretLikeBrief
+			}
+			// A replayed request the hub never started, which panewire ended with a
+			// terminal exit, is dead: its record goes and a fresh reviewer replaces it.
+			if resumed && errors.Is(recErr, integrations.ErrJobNotFound) && deadSpawn(code) && ctx.Err() == nil {
+				return x.replaceDeadSpawn(ctx, plan, rj, code, integrations.Detail(e), leaseSHA)
 			}
 			// A fresh spawn that ended before any pane exists left nothing to
 			// wait for: the pass lease is expired, so the next run starts the
@@ -1092,6 +1107,49 @@ func spawnNeverPlaced(code int) (string, bool) {
 		return "spawn-quota-unknown", true
 	}
 	return "", false
+}
+
+// deadSpawn reports a terminal-not-landed exit of a replayed spawn: spawnNeverPlaced
+// without the answers that may still land. The held reservation (74) is answered
+// by the job that holds it, which the reviewer-held path keeps. The quota waits
+// (86, 87, 89) keep the request queued until quota returns. The rest end the
+// request before any pane exists, and panewire left no job to wait for. The
+// quota-gate timeout (124) is among them.
+func deadSpawn(code int) bool {
+	reason, never := spawnNeverPlaced(code)
+	return never && code != panewireHeld && reason != "spawn-quota-exhausted" && reason != "spawn-quota-unknown"
+}
+
+// replaceDeadSpawn answers a replayed request that deadSpawn ended, for which hk
+// has no job record: the hub never started it and will not run it. The record
+// goes, and the pass spawns a fresh reviewer for the same head and pass under a
+// new label, in this evaluation when time is left and otherwise on the next one.
+// The replay is no review failure of its own, so only the fresh spawn's outcome
+// reaches review-retry. The pass lease is handed to the replacement, as a lost
+// reviewer's is.
+func (x *panewireExecutor) replaceDeadSpawn(ctx context.Context, plan *passPlan, rj reviewerJob, code int, detail, leaseSHA string) (passOutcome, error) {
+	s, pr := x.s, x.pr
+	out := passOutcome{}
+	reason := fleetevent.Redact(detail)
+	if e := s.audit(x.repo.Name, "reviewer-spawn-dead", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": rj.Label, "exit": code, "reason": reason}, false); e != nil {
+		return out, e
+	}
+	if e := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); e != nil {
+		return out, e
+	}
+	// No pane was placed, so the dead checkout runs nothing and goes.
+	if rj.Checkout != "" {
+		c, cancel := reportContext(ctx)
+		_, _ = s.gitIn(c, config.Expand(x.repo.Root), "worktree", "remove", "--force", rj.Checkout)
+		cancel()
+	}
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < spawnLeft {
+		// Too little time for the replacement to wait for its pane: it spawns on the next run.
+		x.releaseLease(ctx, plan, leaseSHA, "reviewer-spawn-dead", reason)
+		return out, fmt.Errorf("%w: reviewer job %s did not land (panewire exit %d); its replacement spawns on the next run", errPassPending, rj.Label, code)
+	}
+	plan.supersedes = rj.Label
+	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
 }
 
 // releaseLease expires the lease this run took, only while the branch still

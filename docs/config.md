@@ -488,7 +488,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the reviewer pane is closed (only when its name, cwd and composer still match) and its remote detached worktree is removed through the hub's guarded removal; a refusal is recorded as `pending-cleanup`. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. A pane whose wait timed out is never closed here. Every later reap pass revisits a checkout still recorded as kept or `pending-cleanup` while no pane uses it: it is removed once its reviewer job is `completed`, `escalated` or `lost`, or once its label's spawn time is more than 24 hours back, and kept while the job is still open. A checkout older than 24 hours whose job record is missing is removed locally only; a remote checkout with no job record is not revisited. The record is `reap.jsonl`, so it survives a restart. Once per UTC day and host, a `reviewer-checkouts-daily` audit row in `decisions.jsonl` counts the checkouts removed and kept on the day before, with the kept reasons; it is written only when the reap acts (not in shadow or dry-run). |
 | `panewire.lane` | `panewire.owner` | Retired: findings are no longer read from a lane. The key is still accepted, so existing configs keep loading, and its value is still kept out of traces. mergewake lists and acknowledges no findings inbox, so findings events a pre-`--result` pane announced there stay as they are. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
-| `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. |
+| `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. A replay that panewire ends before any pane exists, with no hk job record for the label, is dead: mergewake writes a `reviewer-spawn-dead` audit row, drops the record and spawns a fresh reviewer under a new label, written as a `reviewer-spawn-replaced` row, in the same evaluation when time is left and otherwise on the next one. The held reservation and the quota waits (exits 74, 86, 87, 89) are not dead; their requests may still land. |
 
 #### Large PRs
 
@@ -1765,7 +1765,9 @@ status on the head, which is different from a queued or running check. It
 usually means the PR branch's workflow predates the job, and updating the branch
 fixes it. The gate waits quietly (pending) until the head commit's committer date
 is 20 minutes old, or until every other required check has completed (green, red
-or skipped) with at least one of them present; then it blocks with the reason. A
+or skipped) with at least one of them present, when it is the only required check
+absent; then it blocks with the reason. With two or more absent required checks,
+none is named before the 20 minutes. A
 PR with a `conflict` never reports its checks absent, because GitHub runs no
 workflow for it. The committer date is the clock because it needs no stored
 state, so a commit made long before it was pushed reaches the grace sooner than

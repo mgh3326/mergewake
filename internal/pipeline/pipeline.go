@@ -58,11 +58,6 @@ type Service struct {
 	Feed *Feed
 	// Now is the clock for stamps and age decisions; nil means time.Now.
 	Now func() time.Time
-	// inboxFallbacks counts findings returned through the legacy lane/file
-	// path while the reviewer job record carried no result (MW-3); the count
-	// rides on each review-inbox-fallback audit record for one release.
-	// Guarded by fallbackMu.
-	inboxFallbacks int
 	// patches caches each PR head's patch id (see patchIDOf), guarded by
 	// patchMu.
 	patches map[string]string

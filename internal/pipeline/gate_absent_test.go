@@ -181,3 +181,104 @@ func TestGateAbsentLeavesSkippedAndCancelledAlone(t *testing.T) {
 		t.Fatalf("old cancellation: %+v", v)
 	}
 }
+
+// absentGate3 gates a PR whose required checks are vet, "PR gate" and lint,
+// with the given states on the head and the head committed headAge ago.
+func absentGate3(t *testing.T, states map[string]github.CI, headAge time.Duration) (gateVerdict, *Service, *fakeGH) {
+	t.Helper()
+	s, g, _, _ := notifySetup(t)
+	s.Now = func() time.Time { return absentNow }
+	g.required = []string{"vet", "PR gate", "lint"}
+	g.checkNames = map[string]map[string]github.CI{shaA: states}
+	g.committedAt = map[string]time.Time{shaA: absentNow.Add(-headAge)}
+	return gateAt(t, s, g, shaB), s, g
+}
+
+// Two absent required checks: the cheap rule may not name either one before
+// the grace, since the second has not completed. Past the grace both are named.
+// (a) A absent, B absent, C green, head 1 minute old → pending, nothing named.
+func TestGateTwoAbsentChecksWaitInsideGrace(t *testing.T) {
+	states := map[string]github.CI{"vet": github.Absent, "PR gate": github.Absent, "lint": github.Green}
+	v, _, _ := absentGate3(t, states, time.Minute)
+	if v.State != "pending" || len(v.Reasons) != 0 {
+		t.Fatalf("verdict=%+v", v)
+	}
+}
+
+// (b) The same with the head 25 minutes old: both absent checks are named.
+func TestGateTwoAbsentChecksNamedPastGrace(t *testing.T) {
+	states := map[string]github.CI{"vet": github.Absent, "PR gate": github.Absent, "lint": github.Green}
+	v, _, _ := absentGate3(t, states, 25*time.Minute)
+	if v.State != "blocked" || !slices.Equal(sortedReasons(v), []string{"check_absent:PR gate", "check_absent:vet"}) {
+		t.Fatalf("verdict=%+v", v)
+	}
+}
+
+// (c) A absent, B green, C red, head 1 minute old: A is named now, C fails.
+func TestGateOneAbsentNamedWhenOthersCompleted(t *testing.T) {
+	states := map[string]github.CI{"vet": github.Absent, "PR gate": github.Green, "lint": github.Red}
+	v, _, _ := absentGate3(t, states, time.Minute)
+	if v.State != "blocked" || !slices.Equal(sortedReasons(v), []string{"check_absent:vet", "check_failed:lint"}) {
+		t.Fatalf("verdict=%+v", v)
+	}
+}
+
+// (d) A absent, B pending, head 1 minute old: not named.
+func TestGateAbsentNotNamedWhileSiblingPending(t *testing.T) {
+	states := map[string]github.CI{"vet": github.Absent, "PR gate": github.Pending, "lint": github.Green}
+	v, _, _ := absentGate3(t, states, time.Minute)
+	if v.State != "pending" || hasPrefixReason(v, "check_absent:") {
+		t.Fatalf("verdict=%+v", v)
+	}
+}
+
+// (e) A absent, B cancelled, head 1 minute old: not named.
+func TestGateAbsentNotNamedWhileSiblingCancelled(t *testing.T) {
+	states := map[string]github.CI{"vet": github.Absent, "PR gate": github.Cancelled, "lint": github.Green}
+	v, _, _ := absentGate3(t, states, time.Minute)
+	if v.State != "pending" || hasPrefixReason(v, "check_absent:") {
+		t.Fatalf("verdict=%+v", v)
+	}
+}
+
+// The rule itself, table-driven: absentDue names an absent check at once only
+// when it is the sole absent check and every other one has completed.
+func TestAbsentDueRule(t *testing.T) {
+	required := []string{"vet", "PR gate", "lint"}
+	cases := []struct {
+		name   string
+		states map[string]github.CI
+		age    time.Duration
+		want   bool
+	}{
+		{"two absent, one green", map[string]github.CI{"vet": github.Absent, "PR gate": github.Absent, "lint": github.Green}, time.Minute, false},
+		{"two absent past grace", map[string]github.CI{"vet": github.Absent, "PR gate": github.Absent, "lint": github.Green}, absentGrace, true},
+		{"one absent, others completed", map[string]github.CI{"vet": github.Absent, "PR gate": github.Green, "lint": github.Skipped}, time.Minute, true},
+		{"one absent, red sibling", map[string]github.CI{"vet": github.Absent, "PR gate": github.Red, "lint": github.Green}, time.Minute, true},
+		{"one absent, pending sibling", map[string]github.CI{"vet": github.Absent, "PR gate": github.Pending, "lint": github.Green}, time.Minute, false},
+		{"one absent, cancelled sibling", map[string]github.CI{"vet": github.Absent, "PR gate": github.Cancelled, "lint": github.Green}, time.Minute, false},
+		{"one absent, others absent past grace", map[string]github.CI{"vet": github.Absent, "PR gate": github.Absent, "lint": github.Absent}, absentGrace, true},
+	}
+	for _, c := range cases {
+		if got := absentDue(c.states, required, c.age); got != c.want {
+			t.Errorf("%s: absentDue=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// sortedReasons returns the verdict's reasons in order, for order-free comparison.
+func sortedReasons(v gateVerdict) []string {
+	out := slices.Clone(v.Reasons)
+	slices.Sort(out)
+	return out
+}
+
+// hasPrefixReason reports whether any reason of the verdict starts with prefix.
+func hasPrefixReason(v gateVerdict, prefix string) bool {
+	for _, r := range v.Reasons {
+		if strings.HasPrefix(r, prefix) {
+			return true
+		}
+	}
+	return false
+}
