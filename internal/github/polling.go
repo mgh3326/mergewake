@@ -338,7 +338,7 @@ func (c *Client) cacheResponse(key, tag string, body []byte, mutation bool, mark
 		if prefix == "" {
 			p.mutations[""]++
 		} else {
-			p.mutations[parts[1]+"/"+parts[2]]++
+			p.mutations[normalizeMemoRepo(parts[1]+"/"+parts[2])]++
 		}
 		var pullNumber string
 		if len(parts) >= 5 && (parts[3] == "issues" && parts[4] != "comments" || parts[3] == "pulls") && len(parts) >= 6 && (parts[5] == "comments" || parts[5] == "reviews") {
