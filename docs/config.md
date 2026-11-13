@@ -1673,7 +1673,7 @@ time-based hold can lag: a cancelled check's settling wait, a stall notice and a
 review retry backoff are re-read at most 60 minutes late for a skipped PR.
 
 Only a settled PR is remembered: a draft, or a PR whose head has its review done
-marker, evaluated without an error. A PR still being reviewed, or one whose last
+marker, evaluated without an error. A PR still being reviewed, one whose review poll the GitHub client skipped, or one whose last
 evaluation failed, is evaluated every pass. Memory is in the daemon process: a restart
 evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
 
@@ -2021,6 +2021,8 @@ reason writes a `review-retry-waiting` row, and the count, backoff and last
 error stay as they were until the head can merge cleanly again. These
 counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
+
+A review poll the GitHub client skips inside its poll interval is a wait, not a failure: it counts as no review, does not back off or count toward escalation, and the head is not settled.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` was removed; a config that sets it fails at load. Shadow and

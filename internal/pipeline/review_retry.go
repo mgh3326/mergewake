@@ -127,6 +127,8 @@ func retryDelay(n int, initial, maximum time.Duration) time.Duration {
 
 // RetryReview checks review evidence even if a completion marker exists. A
 // marker without receipts is not evidence that a review ran.
+// A skipped poll returns an error wrapping github.ErrPollSkipped, which the
+// caller counts as no review.
 func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
 	if !o.Acting() {
 		return s.Review(ctx, r, pr.Number, "", o)
@@ -225,8 +227,10 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			err = errors.New("review produced no completed pass")
 		}
 	}
+	// A skipped poll is a wait, not a review: the error wraps
+	// github.ErrPollSkipped and the caller counts the head as unreviewed.
 	if errors.Is(err, github.ErrPollSkipped) {
-		return nil
+		return err
 	}
 	var class reviewFailureClass
 	class.add(err)
@@ -325,6 +329,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 // stay as they were. A head whose passes are already complete is done
 // instead, and a pending reviewer is reported. proceed is false whenever the
 // caller must not attempt.
+// A skipped status poll is returned as its error, which wraps github.ErrPollSkipped.
 func (s *Service) reviewRetryHold(ctx context.Context, r config.Repo, file string, state *reviewRetryState, pr github.Pull) (bool, error) {
 	if state.Failures < 1 {
 		return true, nil
@@ -340,10 +345,6 @@ func (s *Service) reviewRetryHold(ctx context.Context, r config.Repo, file strin
 		return true, nil
 	}
 	complete, pending, err := s.retryReviewStatus(ctx, r, pr)
-	if errors.Is(err, github.ErrPollSkipped) {
-		// The status probe is inside its poll interval: the head waits this round.
-		return false, nil
-	}
 	if err != nil {
 		return false, err
 	}
