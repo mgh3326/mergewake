@@ -40,17 +40,12 @@ type Review struct {
 	FleetAuthors []string            `yaml:"fleet_authors"`
 	Pairings     map[string][]string `yaml:"pairings"`
 	Profiles     map[string]Reviewer `yaml:"profiles"`
-	// Scopefuel and Quota are accepted for compatibility and unused.
-	Scopefuel    string `yaml:"scopefuel"`
-	Quota        string `yaml:"quota"`
-	DefaultGrade string `yaml:"default_grade"`
+	DefaultGrade string              `yaml:"default_grade"`
 	// DefaultFamily is the reviewer family used when the PR carries no
 	// author-family trailer and the head commit identities yield no known
 	// model alias. Reviewed heads record that the family was inferred.
 	DefaultFamily string `yaml:"default_family"`
 	Timeout       string `yaml:"timeout"`
-	// Select is accepted for compatibility and is unused.
-	Select string `yaml:"select"`
 	// Executor runs each pass through panewire.
 	Executor string         `yaml:"executor"`
 	Panewire PanewireReview `yaml:"panewire"`
@@ -210,12 +205,6 @@ type PRNotify struct {
 	// ConflictOwnerAfter delays the owner's conflict notice while the author
 	// route is active and the PR keeps the same conflicting head. Empty means 30m.
 	ConflictOwnerAfter string `yaml:"conflict_owner_after"`
-	// RenotifyAfter is how long after the last READY event a PR that is still
-	// open and READY on the same head is notified again. Empty means 30m;
-	// "off" keeps one READY per head.
-	RenotifyAfter string `yaml:"renotify_after"`
-	// RenotifyMax bounds those repeats per head. 0 means 3.
-	RenotifyMax int `yaml:"renotify_max"`
 }
 
 const DefaultConflictOwnerAfter = 30 * time.Minute
@@ -232,32 +221,6 @@ func (n PRNotify) ConflictOwnerWindow() time.Duration {
 }
 
 func (n PRNotify) On() bool { return n.Enabled == nil || *n.Enabled }
-
-// DefaultRenotifyAfter and DefaultRenotifyMax apply when the keys are unset.
-const (
-	DefaultRenotifyAfter = 30 * time.Minute
-	DefaultRenotifyMax   = 3
-)
-
-// Renotify is the READY repeat interval and the repeat bound; a zero interval
-// means no repeats.
-func (n PRNotify) Renotify() (time.Duration, int) {
-	max := n.RenotifyMax
-	if max == 0 {
-		max = DefaultRenotifyMax
-	}
-	switch n.RenotifyAfter {
-	case "":
-		return DefaultRenotifyAfter, max
-	case "off":
-		return 0, 0
-	}
-	d, e := Duration(n.RenotifyAfter)
-	if e != nil {
-		return 0, 0
-	}
-	return d, max
-}
 
 // PRFindings configures delivering review findings to the PR author's lane.
 // Absent means enabled; `findings: {enabled: false}` stops the deliveries.
@@ -302,12 +265,9 @@ func (f PRFindings) AckWindow() time.Duration {
 // PRLoop extends the shared loop keys with the notify gate; other roles reject
 // the key as an unknown field.
 type PRLoop struct {
-	Loop     `yaml:",inline"`
-	Notify   PRNotify   `yaml:"notify"`
-	Findings PRFindings `yaml:"findings"`
-	// StallAfter is how long a ready PR head may wait with no review started
-	// before the stall alarm fires. Empty means 30m; "off" disables the alarm.
-	StallAfter  string      `yaml:"stall_after"`
+	Loop        `yaml:",inline"`
+	Notify      PRNotify    `yaml:"notify"`
+	Findings    PRFindings  `yaml:"findings"`
 	ReviewRetry ReviewRetry `yaml:"review_retry"`
 	// SkipBots leaves PRs opened by bot accounts (GitHub user type "Bot", e.g.
 	// Renovate) out of review, notify, landing and the stall alarm: they carry
@@ -344,21 +304,6 @@ func (r ReviewRetry) Settings() (time.Duration, time.Duration, int) {
 		failures = 3
 	}
 	return initial, maximum, failures
-}
-
-// DefaultStallAfter is the review-stall threshold when stall_after is unset.
-const DefaultStallAfter = 30 * time.Minute
-
-// StallWindow is the review-stall threshold; zero means the alarm is off.
-func (l PRLoop) StallWindow() time.Duration {
-	if l.StallAfter == "" {
-		return DefaultStallAfter
-	}
-	d, e := Duration(l.StallAfter)
-	if e != nil {
-		return 0
-	}
-	return d
 }
 
 type Daemon struct {
@@ -705,11 +650,6 @@ func validateDaemon(c *Config) error {
 			return err
 		}
 	}
-	if v := c.Daemon.PR.StallAfter; v != "" && v != "off" {
-		if _, e = Duration(v); e != nil {
-			return fmt.Errorf("daemon.pr.stall_after: %w", e)
-		}
-	}
 	retry := c.Daemon.PR.ReviewRetry
 	for _, f := range []struct{ name, value string }{{"initial", retry.Initial}, {"maximum", retry.Maximum}} {
 		name, value := f.name, f.value
@@ -725,14 +665,6 @@ func validateDaemon(c *Config) error {
 	}
 	if retry.Failures < 0 {
 		return errors.New("daemon.pr.review_retry.failures must not be negative")
-	}
-	if v := c.Daemon.PR.Notify.RenotifyAfter; v != "" && v != "off" {
-		if _, e = Duration(v); e != nil {
-			return fmt.Errorf("daemon.pr.notify.renotify_after: %w", e)
-		}
-	}
-	if c.Daemon.PR.Notify.RenotifyMax < 0 {
-		return errors.New("daemon.pr.notify.renotify_max must not be negative")
 	}
 	if v := c.Daemon.PR.Notify.ConflictOwnerAfter; v != "" {
 		if _, e = Duration(v); e != nil {
@@ -878,7 +810,6 @@ func validateReview(c *Config) error {
 	if !ValidGrade(c.Review.DefaultGrade) {
 		return errors.New("invalid review.default_grade")
 	}
-	// review.quota and review.scopefuel are accepted and unused; nothing reads them.
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return e
 	}
@@ -1102,9 +1033,6 @@ func validateProfiles(c *Config) error {
 			return errors.New("review profiles require a name, family, and supported reviewer command")
 		}
 		c.Review.Profiles[name] = p
-	}
-	if c.Review.Select != "" && c.Review.Select != "pace" && c.Review.Select != "rank" {
-		return errors.New("review.select must be pace or rank")
 	}
 	pairings := map[string][]string{}
 	for _, family := range slices.Sorted(maps.Keys(c.Review.Pairings)) {

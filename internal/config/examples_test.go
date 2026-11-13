@@ -36,10 +36,8 @@ func TestExampleHostConfigsPublishThroughPanewire(t *testing.T) {
 		if c.Outcomes.Command != "panewire" {
 			t.Errorf("%s: outcomes.command %q, want panewire", f, c.Outcomes.Command)
 		}
-		for _, v := range []string{c.Outcomes.Command, c.Review.Quota} {
-			if strings.Contains(v, "scopefuel") || strings.Contains(v, "pacelever") {
-				t.Errorf("%s: retired tool %q", f, v)
-			}
+		if strings.Contains(c.Outcomes.Command, "scopefuel") || strings.Contains(c.Outcomes.Command, "pacelever") {
+			t.Errorf("%s: retired tool %q", f, c.Outcomes.Command)
 		}
 		loaded++
 	}
