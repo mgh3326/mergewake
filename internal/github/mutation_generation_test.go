@@ -109,6 +109,21 @@ func TestOverlappingGetDoesNotRestoreClearedCache(t *testing.T) {
 	}
 }
 
+func TestPollingMutationOverlapUsesCaseFoldedRepository(t *testing.T) {
+	c := New("tok")
+	repo := normalizeMemoRepo(memoRepo("/repos/Owner/Repo/events"))
+	mark := c.poll.markRead(repo)
+	key := "PUT " + c.BaseURL + "/repos/Owner/Repo/pulls/7/merge application/json " + credUser
+	c.cacheResponse(key, "", nil, true, readMark{})
+	c.poll.mu.Lock()
+	overlapped := c.poll.overlapped(mark)
+	mutationCount := c.poll.mutations["owner/repo"]
+	c.poll.mu.Unlock()
+	if !overlapped || mutationCount != 1 {
+		t.Fatalf("mixed-case write overlap = %v, mutation count = %d", overlapped, mutationCount)
+	}
+}
+
 // A GET on another repository is unaffected by the merge and still caches.
 func TestOverlappingGetOnOtherRepoStillCaches(t *testing.T) {
 	s := newOverlapServer(t)
