@@ -12,10 +12,12 @@ import (
 	"time"
 )
 
-// DecisionDocument is the metadata needed to establish a decision's provenance.
+// DecisionDocument is the metadata needed to establish a decision's provenance,
+// plus the document text the review prompt shows as a bounded excerpt.
 type DecisionDocument struct {
 	Key       string `json:"key"`
 	UpdatedAt string `json:"updated_at"`
+	Body      string `json:"body"`
 }
 
 var decisionKey = regexp.MustCompile(`^decision/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$`)

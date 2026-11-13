@@ -43,12 +43,12 @@ func TestDecisionProvenance(t *testing.T) {
 	body := "## Operator decisions\n- verified hk:doc decision/one\n- again hk:doc decision/one\n- missing hk:doc decision/missing\n- wrong hk:doc reports/other\n- plain claim\n"
 	verified := resolveDecisions(context.Background(), body, integrations.Handoffkeep{})
 	rc := buildRoundContext(body, github.ReviewFeedback{}, roundPlan{contract: "scope", contractSource: "PR"}, "", verified)
-	for _, want := range []string{"VERIFIED OPERATOR DECISIONS", "decision/one (updated_at: 2026-11-10T00:00:00Z):\n- verified", "CLAIMED DECISIONS", "- missing hk:doc decision/missing", "- wrong hk:doc reports/other", "- plain claim", "a regression this change introduces", "not a blanket waiver"} {
+	for _, want := range []string{"VERIFIED OPERATOR DECISIONS", "decision/one (updated_at: 2026-11-10T00:00:00Z):\n- verified", "document excerpt (20 of 20 bytes):\nSECRET DOCUMENT BODY", "CLAIMED DECISIONS", "- missing hk:doc decision/missing", "- wrong hk:doc reports/other", "- plain claim", "a regression this change introduces", "not a blanket waiver"} {
 		if !strings.Contains(rc.text, want) {
 			t.Errorf("missing %q in %s", want, rc.text)
 		}
 	}
-	for _, bad := range []string{"SECRET DOCUMENT BODY", "Do not report " + "anything they decide", "OPERATOR DECISIONS (from the PR description, " + "verbatim"} {
+	for _, bad := range []string{"Do not report " + "anything they decide", "OPERATOR DECISIONS (from the PR description, " + "verbatim"} {
 		if strings.Contains(rc.text, bad) {
 			t.Errorf("unexpected %q", bad)
 		}
