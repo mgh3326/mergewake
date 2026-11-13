@@ -4,9 +4,11 @@
 #   bash tests/release-wait-checks.sh
 #
 # Every case writes a policy and per-SHA check-run / commit-status fixtures,
-# then runs the script as a child. The stub also models main, compare and tags;
-# those reads are refused by default so cases (a) to (l) prove they are not
-# needed when the tag commit is already green or is itself main's head.
+# then runs the script as a child. The stub also models main, compare and tags.
+# Compare reads are refused by default, so cases (a) to (l) prove they are not
+# needed when the tag commit is already green or is itself main's head. Tags
+# reads are refused by default too; a case that may exit 0 after reading the
+# tags allows them with allow_tags=1.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -72,6 +74,10 @@ for arg in "$@"; do
 	*/tags)
 		[ "${STUB_ALLOW_TAGS:-}" = 1 ] || { echo "stub gh: unexpected tags request: $*" >&2; exit 1; }
 		[ "$paginate" = 1 ] || { echo "stub gh: tags read is not paginated" >&2; exit 1; }
+		if [ "${STUB_FAIL_TAGS:-}" = 1 ]; then
+			echo "stub gh: tags read failed" >&2
+			exit 1
+		fi
 		cat "$STUB_DIR/tags.tsv"
 		exit 0
 		;;
@@ -104,6 +110,8 @@ reset() {
 	allow_compare=
 	allow_tags=
 	fail_compare=
+	fail_tags=
+	release_tag=v1.2.3
 }
 
 policy() { printf '%s\n' "$1" > "$case_dir/.mergewake/policy.yaml"; }
@@ -125,7 +133,9 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 		STUB_COMPARE_STATUS="$compare_status" \
 		STUB_TOTAL_COMMITS="$total_commits" \
 		STUB_COMPARE_SHAS="$compare_shas" \
+		STUB_FAIL_TAGS="$fail_tags" \
 		GITHUB_REPOSITORY="example/repo" \
+		RELEASE_TAG="$release_tag" \
 		RELEASE_CHECKS_TIMEOUT_SECONDS="$1" \
 		RELEASE_CHECKS_POLL_SECONDS=0.1 \
 		bash "$script" "$sha" 2>&1)
@@ -136,6 +146,7 @@ has() { printf '%s' "$output" | grep -Fq -- "$1"; }
 
 # (a) Every named check is green.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok, deploy-ok]'
@@ -194,6 +205,7 @@ fi
 # (d) A leftover main_checks key is ignored: with no deploy_checks or
 # watch_checks, required_checks is the set, so the failing ci-ok is not read.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 main_checks: [ci-ok]'
@@ -208,6 +220,7 @@ fi
 
 # (d) without deploy_checks, watch_checks is the set.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok]'
@@ -221,6 +234,7 @@ fi
 
 # (e) A commit status and a check run are both accepted.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok, build-linux-amd64]'
@@ -235,6 +249,7 @@ fi
 
 # (f) A rerun's newer success clears the same name's older failure.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok]'
@@ -263,6 +278,7 @@ fi
 
 # (h) The newest status per context decides, so a rerun status can go green.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok]'
@@ -277,6 +293,7 @@ fi
 
 # (i) YAML anchors and a multiline flow list are decoded, not rejected.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 deploy_checks: &d [ci-ok,
@@ -293,6 +310,7 @@ fi
 
 # (j) A transient API failure is retried instead of ending the release.
 reset
+allow_tags=1
 policy 'version: 1
 required_checks: [vet]
 watch_checks: [ci-ok]'
@@ -480,6 +498,109 @@ if [ "$status" -eq 1 ] && has 'waiting for: ci-ok (pending)' && has 'run and sta
 	pass "(u) head verdict error is surfaced and remains non-passing -> exit 1"
 else
 	fail "(u) head verdict error -> exit $status: $output"
+fi
+
+# (v) The tag commit is green and a higher stable tag points at it: superseded.
+reset
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+printf 'v1.2.4\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 3 ] && has 'v1.2.4' && has "$sha"; then
+	pass "(v) higher tag on the green tag commit -> exit 3 naming it"
+else
+	fail "(v) higher tag on the green tag commit -> exit $status: $output"
+fi
+
+# (w) As (v), but the other tag is lower: a lower tag never supersedes.
+reset
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+printf 'v1.2.2\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 0 ] && ! has 'superseded'; then
+	pass "(w) lower tag on the tag commit -> exit 0"
+else
+	fail "(w) lower tag on the tag commit -> exit $status: $output"
+fi
+
+# (x) As (v), with RELEASE_TAG v1.9.0: v1.10.0 is higher by number, not string.
+reset
+release_tag=v1.9.0
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+printf 'v1.10.0\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 3 ] && has 'v1.10.0'; then
+	pass "(x) v1.10.0 supersedes v1.9.0 by number -> exit 3"
+else
+	fail "(x) numeric compare -> exit $status: $output"
+fi
+
+# (y) As (v), but the other tag is a pre-release: it never supersedes.
+reset
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+printf 'v1.2.4-rc.1\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 0 ] && ! has 'superseded'; then
+	pass "(y) pre-release tag on the tag commit -> exit 0"
+else
+	fail "(y) pre-release tag on the tag commit -> exit $status: $output"
+fi
+
+# (z) The tag commit is pending and green main contains it; a higher tag on the
+# tag commit still supersedes.
+reset
+allow_compare=1
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+printf 'v1.2.4\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 3 ] && has 'v1.2.4' && has "$sha"; then
+	pass "(z) main head green, higher tag on the tag commit -> exit 3"
+else
+	fail "(z) main head green, higher tag on the tag commit -> exit $status: $output"
+fi
+
+# (aa) RELEASE_TAG empty (unset): the script refuses to run and names it.
+reset
+release_tag=
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+run_checks 10
+if [ "$status" -eq 1 ] && has 'RELEASE_TAG'; then
+	pass "(aa) missing RELEASE_TAG -> exit 1 naming it"
+else
+	fail "(aa) missing RELEASE_TAG -> exit $status: $output"
+fi
+
+# (bb) The tag commit is green but every tags read fails: never publish, and the
+# bound names the tags read.
+reset
+allow_tags=1
+fail_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+run_checks 1
+if [ "$status" -eq 1 ] && has 'cannot read the tags' && has 'tags read failed'; then
+	pass "(bb) failing tags read -> exit 1 at the bound, naming the tags read"
+else
+	fail "(bb) failing tags read -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then
