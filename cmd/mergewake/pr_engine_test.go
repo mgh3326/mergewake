@@ -204,6 +204,9 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 
 func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	e, f := engineFixture(t, 1)
+	var releaseRunner sync.Once
+	release := func() { releaseRunner.Do(func() { close(f.runner.release) }) }
+	t.Cleanup(release)
 	f.hub.mu.Lock()
 	f.hub.first = 5
 	f.hub.n = 1
@@ -248,7 +251,7 @@ func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	f.hub.mu.Lock()
 	f.hub.heads[5] = "new"
 	f.hub.mu.Unlock()
-	close(f.runner.release)
+	release()
 	e.q.Wait()
 }
 
