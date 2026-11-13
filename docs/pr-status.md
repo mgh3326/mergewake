@@ -65,13 +65,10 @@ through to that PR's snapshot:
   (so they settle first and, among reviews of equal hk priority, start first;
   a higher hk priority still starts earlier), evaluates them even when the
   unchanged-PR skip would leave them alone, and clears the marker when it
-  decides the PR. Through the daemon listener the
-  request also drops the repo's cached GitHub evidence and wakes the `pr` role
-  (the trigger webhooks use). A later fresh read compares against the stored
-  fresh read, so the same change wakes once.
+  decides the PR.
 - A failed read still returns the snapshot, with `fresh_error`.
 
-`fresh=1` needs `pr`. It spends one GraphQL request from the daemon's budget.
+A fresh read spends one GraphQL request from the token's budget. Only the CLI makes one; the daemon does not serve a status route.
 
 ## CLI
 
@@ -80,7 +77,6 @@ mergewake pr-status --repo owner/name --pr N [--fresh] [--json] [--config PATH]
 ```
 
 Reads the same snapshot from local state: no daemon, no GitHub call, no token.
-`--json` prints exactly what the HTTP endpoint returns; without it, a short
-summary. `--fresh` makes the same one query (it needs a token) and writes the
+`--json` prints the snapshot as JSON; without it, a short summary. `--fresh` makes the same one query (it needs a token) and writes the
 same snapshot fields and marker, but there is no daemon to wake, so the marker
 alone takes effect on the next pass.

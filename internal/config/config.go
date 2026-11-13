@@ -797,8 +797,6 @@ func validateReview(c *Config) error {
 	case "":
 		c.Review.Executor = "panewire"
 	case "panewire":
-	case "headless":
-		return errors.New("review.executor: headless was retired; use panewire (the default)")
 	default:
 		return errors.New("review.executor must be panewire")
 	}
