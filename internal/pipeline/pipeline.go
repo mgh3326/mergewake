@@ -83,6 +83,10 @@ type Service struct {
 	Log *slog.Logger
 	// shadow is the diff shadow counter state, shared by the observers.
 	shadow *shadowState
+	// OutcomesChanged, when set, tells the outcome publisher that the ledger
+	// has new outcomes (see OutcomePublisher.Nudge). It must not block. Nil
+	// means nobody is told; the publisher's timer finds them.
+	OutcomesChanged func()
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
@@ -291,7 +295,10 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 			_ = s.audit(r.Name, "land-notify-error", map[string]any{"pr": n, "error": e.Error()}, false)
 		}
 	}
-	return s.FlushOutcomes(ctx, r.Name)
+	// The merge is observed; publishing its outcome is the daemon's publisher's
+	// job, so a slow publish never holds the repository's settle lock.
+	s.nudgeOutcomes()
+	return nil
 }
 
 // gateFunc decides one PR head against the base head under a policy.

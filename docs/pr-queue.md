@@ -57,14 +57,13 @@ nothing waits, so no lookup is made.
 The `pr` role still wakes every `daemon.pr.interval`, and still wakes early on a
 webhook or a finished reviewer job. Its pass no longer evaluates PRs. It lists
 the open PRs, posts the Discord feed, puts each PR on the queue as source
-`sweep`, reconciles outcomes of PRs that left the open list, and returns the
-errors of the evaluations that ended since its last run. The interval therefore
+`sweep`, and returns the errors of the evaluations that ended since its last run. The interval therefore
 bounds how long a missed delivery goes unnoticed. It does not bound how soon a
 PR is looked at.
 
 Each repository's sweep has a five-minute deadline. A timeout returns an error
-for that repository naming the step (`open_pulls`, `bot_policy`, `feed` or
-`reconcile`), while the other repositories finish their results and the pass
+for that repository naming the step (`open_pulls`, `bot_policy` or
+`feed`), while the other repositories finish their results and the pass
 records its finish. The deadline is fixed in the package; there is no config
 key. If a sweep is still running after its deadline because an operation did
 not return on cancellation, later passes skip that repository and log `pr
