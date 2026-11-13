@@ -34,7 +34,7 @@ func TestReviewUsesLinkedTaskBodyDocumentAcceptance(t *testing.T) {
 				hk.Fail("GET /v1/documents/{key}", http.StatusInternalServerError, "internal")
 			}
 			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
-			s, g, r := panewireSetup(t, runner)
+			s, _, r := panewireSetup(t, runner)
 			s.Sink = taskBodyDocSink{runner.sink}
 			if err := s.Review(context.Background(), r, 7, "openai", Options{}); err != nil {
 				t.Fatal(err)
