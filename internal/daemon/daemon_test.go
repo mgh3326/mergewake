@@ -88,14 +88,14 @@ func TestTriggerSeamAndNextRun(t *testing.T) {
 	called := make(chan struct{}, 3)
 	done := make(chan error, 1)
 	go func() {
-		done <- d.Run(ctx, []Loop{{Role: "release", Interval: time.Hour, Run: func(context.Context) error { called <- struct{}{}; return nil }}})
+		done <- d.Run(ctx, []Loop{{Role: "reap", Interval: time.Hour, Run: func(context.Context) error { called <- struct{}{}; return nil }}})
 	}()
 	select {
 	case <-called:
 	case <-time.After(3 * time.Second):
 		t.Fatal("no initial poll")
 	}
-	if !d.Trigger("release") || d.Trigger("unknown") {
+	if !d.Trigger("reap") || d.Trigger("unknown") {
 		t.Fatal("trigger routing")
 	}
 	select {
@@ -224,14 +224,14 @@ func TestFixedClockAndJitterPinStatus(t *testing.T) {
 	d := Daemon{StateDir: state, LockDir: t.TempDir(), Host: "host-a", Now: func() time.Time { return at }, Jitter: func() float64 { return 0 }}
 	done := make(chan error, 1)
 	go func() {
-		done <- d.Run(ctx, []Loop{{Role: "release", Interval: time.Hour, Run: func(context.Context) error { return nil }}})
+		done <- d.Run(ctx, []Loop{{Role: "reap", Interval: time.Hour, Run: func(context.Context) error { return nil }}})
 	}()
 	var s Status
 	for deadline := time.Now().Add(3 * time.Second); s.NextRun.IsZero(); {
 		if time.Now().After(deadline) {
 			t.Fatal("next run never recorded")
 		}
-		if b, err := os.ReadFile(filepath.Join(state, "daemon", "release.json")); err == nil {
+		if b, err := os.ReadFile(filepath.Join(state, "daemon", "reap.json")); err == nil {
 			_ = json.Unmarshal(b, &s)
 		}
 		time.Sleep(10 * time.Millisecond)

@@ -15,8 +15,8 @@
    version and writes `SHA256SUMS`. It checks that `mergewake --version`
    prints the tag. It runs the tests. Before publishing, it waits for the tag
    commit's checks named by `.mergewake/policy.yaml` at the tag
-   (`deploy_checks`, else `watch_checks`, the same set rollout
-   uses) and publishes only when every one is green; a name may be a check run
+   (`deploy_checks`, else `watch_checks`) and publishes only when
+   every one is green; a name may be a check run
    or a commit status. A failing check fails the release with its name and URL,
    and a check not reported within the bound (`RELEASE_CHECKS_TIMEOUT_SECONDS`,
    default 60 minutes) fails it with what is missing, so a later rerun can
@@ -39,27 +39,20 @@ on a host to try it there.
 
 ## How hosts get it
 
-No workflow connects to a host. On each host, the fleet updater
-(`fleet-update`) reads the latest release, or the tag pinned for that host.
-It verifies the asset against `SHA256SUMS` and swaps the binary atomically.
-It keeps the old binary as `mergewake.prev` and restarts the owning service. If
-the version or service check fails, it restores `mergewake.prev`.
+mergewake does not deploy. No workflow connects to a host, and this repository
+holds no updater: each host installs a release asset by its own process.
 
-## Pin, hold, roll back
+## Roll back one host
 
-- **Pin or hold:** set `version=vX.Y.Z` on the host's line in the fleet-update
-  manifest. Remove the pin to follow `latest` again.
-- **Roll back the fleet:** pin the previous good tag. Alternatively, mark the
-  bad release as a pre-release or delete it, so that `latest` points to the
-  previous release on the next run.
-- **Roll back one host now:** copy the previous binary to a temporary file in
-  the same directory and rename it over `mergewake`. A rename works while the
-  service still runs the old file, whereas copying onto a running executable
-  fails on Linux with `ETXTBSY`:
-  ```sh
-  cp -p ~/.local/bin/mergewake.prev ~/.local/bin/mergewake.new
-  mv -f ~/.local/bin/mergewake.new ~/.local/bin/mergewake
-  ```
-  Restart the owning service and check that it is active and that the
-  version command prints the old tag. Then pin that tag, so that the next
-  run does not reinstall the bad release.
+Copy the previous binary to a temporary file in the same directory, then rename
+it over `mergewake`. A rename works while the service still runs the old file,
+whereas copying onto a running executable fails on Linux with `ETXTBSY`:
+
+```sh
+cp -p ~/.local/bin/mergewake.prev ~/.local/bin/mergewake.new
+mv -f ~/.local/bin/mergewake.new ~/.local/bin/mergewake
+```
+
+Restart the owning service and check that it is active and that the version
+command prints the old tag. Then keep that tag pinned in the host's own updater,
+so the next run does not reinstall the bad release.

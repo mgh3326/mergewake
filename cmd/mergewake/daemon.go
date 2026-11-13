@@ -74,7 +74,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	for _, entry := range []struct {
 		role string
 		cfg  config.Loop
-	}{{"pr", s.Config.Daemon.PR.Loop}, {"watch", s.Config.Daemon.Watch}, {"release", s.Config.Daemon.Release}, {"rollout", s.Config.Daemon.Rollout},
+	}{{"pr", s.Config.Daemon.PR.Loop}, {"watch", s.Config.Daemon.Watch},
 		{"reap", config.Loop{Enabled: s.Config.Reap.Enabled, Interval: s.Config.PollInterval}}} {
 		if !entry.cfg.Enabled {
 			continue
@@ -112,13 +112,6 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
 			return forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
-				// Release and rollout work from the install inventory. A
-				// repository without one has nothing to publish or install, so
-				// the pass decides that from config and reads nothing.
-				if (role == "release" || role == "rollout") && len(r.Install) == 0 {
-					log.Debug("skip repository without install inventory", "role", role, "repo", r.Name)
-					return nil
-				}
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 				tracing.Tag(repoSpan, "repo", r.Name)
 				var err error
@@ -138,27 +131,6 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						}
 						err = s.Watch(checkCtx, r, o)
 						tracing.Finish(span)
-					case "release":
-						head, e := gh.Head(ctx, r.Name, r.Branch)
-						if e != nil {
-							err = e
-							break
-						}
-						p, e := s.Policy(ctx, r, head)
-						if e != nil {
-							err = e
-							break
-						}
-						ci, e := gh.Check(ctx, r.Name, head, p.RequiredChecks)
-						if e != nil {
-							err = e
-							break
-						}
-						if ci == github.Green {
-							err = s.Release(ctx, r, head, o)
-						}
-					case "rollout":
-						err = s.Rollout(ctx, r, o)
 					case "reap":
 						sweepCtx, span := tracing.Span(ctx, "mergewake.reap")
 						err = s.Reap(sweepCtx, r, 0, o)

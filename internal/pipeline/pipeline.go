@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -14,12 +13,9 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
-	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
-	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
 type GitHub interface {
@@ -50,8 +46,6 @@ type GitHub interface {
 	Ancestor(context.Context, string, string, string) (bool, error)
 	ReadFile(context.Context, string, string, string) ([]byte, error)
 	Revert(context.Context, string, string, string, string, int) (string, error)
-	Publish(context.Context, manifest.Manifest) error
-	Manifests(context.Context, string) ([]manifest.Manifest, error)
 }
 type Service struct {
 	Config   config.Config
@@ -84,7 +78,6 @@ type Service struct {
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
-	Digest, Adopt            string
 }
 
 // Acting reports whether a command may write remotely or mutate the host:
@@ -107,10 +100,6 @@ func (s *Service) now() time.Time {
 	}
 	return time.Now()
 }
-
-// approvedInventoryName holds the deployment identity last approved for a
-// repository, beside its rollout receipts.
-const approvedInventoryName = "approved-inventory.json"
 
 func (s *Service) state(repo string) string { return filepath.Join(s.Config.StateDir, repo) }
 func (s *Service) audit(repo, command string, value any, dry bool) error {
@@ -307,325 +296,4 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 		return errors.New("gate changed during decision")
 	}
 	return s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA)
-}
-
-func (s *Service) Release(ctx context.Context, r config.Repo, sha string, o Options) error {
-	head, e := s.GH.Head(ctx, r.Name, r.Branch)
-	if e != nil {
-		return e
-	}
-	if sha == "" {
-		sha = head
-	}
-	if !manifest.SHA.MatchString(sha) {
-		return errors.New("release requires a full commit SHA")
-	}
-	ok, e := s.GH.Ancestor(ctx, r.Name, sha, head)
-	if e != nil {
-		return e
-	}
-	if !ok {
-		return errors.New("release commit is not on the main branch")
-	}
-	p, e := s.Policy(ctx, r, sha)
-	if e != nil {
-		return e
-	}
-	evidence, e := s.GH.CheckEvidence(ctx, r.Name, sha, p.DeploySet())
-	if e != nil {
-		return e
-	}
-	for _, c := range evidence {
-		if c.State != github.Green {
-			return fmt.Errorf("release requires green %s checks at the manifest commit", checkStage(p))
-		}
-	}
-	m, e := manifest.Build(r.Name, sha, r.Install, func(name string) ([]byte, error) { return s.GH.ReadFile(ctx, r.Name, sha, name) })
-	if e != nil {
-		return e
-	}
-	// A deploy stage states what it observed: the commit and policy revision it
-	// promised on, and where each check's green came from. A repository with no
-	// deploy stage publishes the same manifest as before.
-	if p.DeployStage() {
-		revision, e := s.policyRevision(ctx, r, sha)
-		if e != nil {
-			return e
-		}
-		m.Deploy = &manifest.DeployEvidence{SHA: sha, PolicyRevision: revision, Checks: deploymentChecks(evidence)}
-		if e = m.Validate(); e != nil {
-			return e
-		}
-	}
-	if e = s.Print(m); e != nil {
-		return e
-	}
-	if !o.Acting() {
-		return nil
-	}
-	if e = s.GH.Publish(ctx, m); e != nil {
-		s.feedDeploy(r.Name, sha, "release", "failed", false, e, o)
-		return e
-	}
-	s.feedDeploy(r.Name, sha, "release", "published", true, nil, o)
-	return nil
-}
-
-// Adopt records a hand-started container as the current receipt so the first
-// managed deploy has a known previous digest.
-func (s *Service) Adopt(ctx context.Context, r config.Repo, o Options) error {
-	var spec config.Install
-	found := false
-	for _, candidate := range r.Install {
-		if candidate.Target == o.Adopt {
-			spec, found = candidate, true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("target %q is not in the host inventory", o.Adopt)
-	}
-	if spec.Kind != "container" {
-		return errors.New("--adopt requires a container install target")
-	}
-	state := rollout.StateDir(s.Config.StateDir, r.Name)
-	result, e := rollout.AdoptContainer(ctx, spec, s.Config.Host, r.Name, rollout.Options{StateDir: state, Deny: r.Deny, DryRun: !o.Acting(), Now: s.Now}, rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime})
-	if !o.Acting() {
-		return errors.Join(e, s.Print(result))
-	}
-	// --adopt --apply is the operator's attestation of the configured host
-	// recipe. Source ancestry remains unknown until the first approved rollout.
-	if e == nil && result.Status == "adopted" {
-		e = fsutil.WriteJSON(filepath.Join(state, approvedInventoryName), s.deploymentIdentity(r, manifest.Manifest{Repo: r.Name}, Options{}))
-	}
-
-	record := struct {
-		Host, Repo string
-		Result     rollout.Result
-		Error      string
-	}{Host: s.Config.Host, Repo: r.Name, Result: result}
-	if e != nil {
-		record.Error = e.Error()
-	}
-	return errors.Join(e, s.audit(r.Name, "adopt", record, false), s.Print(result))
-}
-
-func (s *Service) Rollout(ctx context.Context, r config.Repo, o Options) error {
-	state := rollout.StateDir(s.Config.StateDir, r.Name)
-	// Keep range approval and receipt installation in one per-repository operation.
-	if o.Acting() {
-		unlock, err := rollout.Lock(filepath.Join(state, "decision-lock"))
-		if err != nil {
-			return err
-		}
-		defer unlock()
-	}
-	var window *rolloutWindow
-	if o.Acting() {
-		var unlock func()
-		var err error
-		window, unlock, err = lockRolloutWindow(s.Config.StateDir, r.RolloutWindowGroup(), r.Name)
-		if err != nil {
-			return err
-		}
-		defer unlock()
-	}
-
-	containerOnly := len(r.Install) > 0
-	for _, spec := range r.Install {
-		containerOnly = containerOnly && spec.Kind == "container"
-	}
-	if o.Adopt != "" {
-		if !containerOnly {
-			return errors.New("--adopt requires a container install inventory")
-		}
-		if o.Digest != "" {
-			return errors.New("--adopt and --digest are separate operations")
-		}
-		return s.Adopt(ctx, r, o)
-	}
-	if !containerOnly && (r.Root == "" || r.Smoke.Command == "") {
-		return errors.New("rollout requires root and a smoke command")
-	}
-	var e error
-	binaryOnly := len(r.Install) > 0
-	for _, spec := range r.Install {
-		binaryOnly = binaryOnly && spec.Kind == "release"
-	}
-	candidates, e := s.rolloutCandidates(ctx, r, binaryOnly, containerOnly)
-	if e != nil {
-		return e
-	}
-	head, e := s.GH.Head(ctx, r.Name, r.Branch)
-	if e != nil {
-		return e
-	}
-	m, e := s.admitCandidate(ctx, r, head, candidates)
-	if e != nil {
-		return e
-	}
-
-	approvedIdentity := s.deploymentIdentity(r, m, o)
-	if allowed, err := s.approveDeploy(ctx, r, m, state, containerOnly, o); err != nil || !allowed {
-		return err
-	}
-
-	if approvedIdentity != s.deploymentIdentity(r, m, o) {
-		return errors.New("deployment inventory changed during approval")
-	}
-	var timeout time.Duration
-	if r.Smoke.Command != "" {
-		timeout, e = config.Duration(r.SmokeTimeout)
-		if e != nil {
-			return e
-		}
-	}
-	root := config.Expand(r.Root)
-	smoke := func(ctx context.Context) error {
-		if r.Smoke.Command == "" {
-			return nil
-		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		_, err := s.Runner.Run(ctx, r.Smoke.Command, r.Smoke.Args, "", root)
-		return err
-	}
-	installOptions := rollout.Options{Root: root, StateDir: state, Allowed: r.Install, Deny: r.Deny, DryRun: !o.Acting(), Digest: o.Digest, Now: s.Now}
-	installOptions.BeforeDeploy = func(ctx context.Context, spec config.Install, sha string) error {
-		if spec.PreDeploy == nil || spec.PreDeploy.Command == "" {
-			return nil
-		}
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-		command := rollout.ExpandCommand(*spec.PreDeploy, r.Name, sha, root, spec.Target)
-		_, e := s.Runner.Run(ctx, command.Command, command.Args, "", root)
-		return e
-	}
-	installOptions.VerifyForward = func(context.Context) error {
-		if approvedIdentity != s.deploymentIdentity(r, m, o) {
-			return errors.New("deployment environment changed during forward verification")
-		}
-		return nil
-	}
-	var result rollout.Result
-
-	var installErr error
-	if o.Acting() {
-		if e = window.begin(m.Commit); e != nil {
-			return e
-		}
-	}
-	switch {
-	case containerOnly:
-		runtimeFor := func(spec config.Install) rollout.Runtime {
-			return rollout.RuntimeCLI{Runner: s.Runner, Runtime: spec.Runtime}
-		}
-		result, installErr = rollout.ApplyContainer(ctx, m, installOptions, s.Config.Host, runtimeFor, rollout.CheckHealth)
-	case len(m.Commands) > 0:
-		result, installErr = rollout.ApplyCommands(ctx, m, installOptions, s.Config.Host, s.Runner, func(ctx context.Context, spec config.Install, sha string) error {
-			if spec.Kind == "release" {
-				source, ok := s.GH.(interface {
-					BinaryAtCommit(context.Context, string, string) ([]byte, error)
-				})
-				if !ok {
-					return errors.New("GitHub adapter lacks pinned binary releases")
-				}
-				b, err := source.BinaryAtCommit(ctx, r.Name, sha)
-				if err != nil {
-					return err
-				}
-				target, err := manifest.Resolve(root, spec.Target)
-				if err != nil {
-					return err
-				}
-				return fsutil.Atomic(target, b, 0755)
-			}
-			command := rollout.ExpandCommand(spec.Command, r.Name, sha, root, spec.Target)
-			_, err := s.Runner.Run(ctx, command.Command, command.Args, "", root)
-			return err
-		}, smoke)
-	default:
-		selected := []config.Install{}
-		for _, file := range m.Files {
-			denied, e := policy.MatchAny(r.Deny, file.Target)
-			if e != nil {
-				return e
-			}
-			if denied {
-				continue
-			}
-			for _, spec := range r.Install {
-				if spec.Target == file.Target {
-					selected = append(selected, spec)
-					break
-				}
-			}
-		}
-		if o.Acting() {
-			for _, spec := range selected {
-				if err := rollout.CheckGate(spec, s.Config.Host, r.Name, m.Commit); err != nil {
-					return err
-				}
-			}
-		}
-		result, installErr = rollout.Apply(ctx, m, installOptions, func(ctx context.Context, name string) ([]byte, error) {
-			return s.GH.ReadFile(ctx, r.Name, m.Commit, name)
-		}, smoke)
-		if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
-			for _, spec := range selected {
-				installErr = errors.Join(installErr, rollout.PublishGate(spec, s.Config.Host, r.Name, m.Commit))
-			}
-		}
-	}
-
-	if o.Acting() && installErr == nil && (result.Status == "success" || result.Status == "current") {
-		if window != nil && result.Status == "current" {
-			if containerOnly {
-				for _, spec := range r.Install {
-					if spec.Health != nil {
-						if err := rollout.CheckHealth(ctx, *spec.Health); err != nil {
-							installErr = err
-							break
-						}
-					}
-				}
-			} else {
-				installErr = smoke(ctx)
-			}
-		}
-		if installErr == nil && approvedIdentity != s.deploymentIdentity(r, m, o) {
-			installErr = errors.New("deployment inventory changed before receipt approval")
-		}
-		if installErr == nil {
-			identity := approvedIdentity
-			var prior deployIdentity
-			found, readErr := fsutil.ReadJSON(filepath.Join(state, approvedInventoryName), &prior)
-			if result.Status == "current" && (readErr != nil || !found || prior.Config != identity.Config) {
-				installErr = errors.New("current install cannot attest a changed inventory; operator bootstrap required")
-			} else {
-				installErr = fsutil.WriteJSON(filepath.Join(state, approvedInventoryName), identity)
-			}
-		}
-		if installErr == nil {
-			installErr = window.healthy()
-		}
-	}
-
-	if !o.Acting() || result.Status == "current" || result.Status == "rejected" {
-		return errors.Join(installErr, s.Print(result))
-	}
-	record := struct {
-		Host, Repo string
-		Result     rollout.Result
-		Error      string
-	}{Host: s.Config.Host, Repo: r.Name, Result: result}
-	if installErr != nil {
-		record.Error = installErr.Error()
-	}
-	s.feedDeploy(r.Name, m.Commit, "rollout", result.Status, installErr == nil && result.Status == "success", installErr, o)
-	data, _ := json.Marshal(record)
-	id := fmt.Sprintf("rollout-%s-%d", m.Commit[:8], s.now().UnixNano())
-	reportCtx, cancel := reportContext(ctx)
-	defer cancel()
-	return errors.Join(installErr, s.audit(r.Name, "rollout", record, false), s.Sink.Record(reportCtx, "mergewake/"+s.Config.Host+"/"+id, data), s.Notifier.Notify(reportCtx, integrations.Event{ID: id, Text: fmt.Sprintf("mergewake %s %s %s %s", r.Name, s.Config.Host, m.Commit, result.Status)}))
 }

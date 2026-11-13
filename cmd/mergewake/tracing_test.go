@@ -196,8 +196,6 @@ func TestTracingPassSampling(t *testing.T) {
 	}{
 		{"pr at zero", "https://key@example.invalid/1", "0", "pr", true},
 		{"reap at zero", "https://key@example.invalid/1", "0", "reap", true},
-		{"release at zero", "https://key@example.invalid/1", "0", "release", true},
-		{"rollout at zero", "https://key@example.invalid/1", "0", "rollout", true},
 		{"watch at zero", "https://key@example.invalid/1", "0", "watch", false},
 		{"watch at one", "https://key@example.invalid/1", "1", "watch", true},
 		{"no DSN", "", "1", "pr", false},

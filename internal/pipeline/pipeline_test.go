@@ -3,16 +3,12 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -22,9 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
-	"github.com/mgh3326/mergewake/internal/rollout"
 )
 
 var shaA = strings.Repeat("a", 40)
@@ -35,33 +29,33 @@ var shaD = strings.Repeat("d", 40)
 type fakeGH struct {
 	fixtureTask bool
 	GitHub
-	pullCalls                                                    int
-	commitCalls                                                  int
-	nextHead                                                     string
-	nextBase                                                     string // base ref from the second Pull on
-	pull                                                         github.Pull
-	enabled, blocking, reviewed, gate                            bool
-	requiredBots                                                 []string
-	policyExtra                                                  string
-	required                                                     []string
-	findings                                                     int
-	passes                                                       map[string][]github.PassReceipt
-	feedback                                                     github.ReviewFeedback
-	feedbackHead                                                 string
-	feedbackHeads                                                []string // per-read GraphQL heads, consumed in order before feedbackHead
-	feedbackReads                                                int
-	refs                                                         map[string]bool
-	leaseTimes                                                   map[string]time.Time
-	leaseIDs                                                     map[string]string
-	files                                                        []policy.File
-	ci                                                           github.CI
-	postedFindings                                               []github.Finding
-	mergeCount, revertCount, postCount, claimCount, publishCount int
-	revertTrailers                                               string
-	head                                                         string
-	checks                                                       map[string]github.CI
-	checkNames                                                   map[string]map[string]github.CI
-	cancelledAt                                                  map[string]time.Time
+	pullCalls                                      int
+	commitCalls                                    int
+	nextHead                                       string
+	nextBase                                       string // base ref from the second Pull on
+	pull                                           github.Pull
+	enabled, blocking, reviewed, gate              bool
+	requiredBots                                   []string
+	policyExtra                                    string
+	required                                       []string
+	findings                                       int
+	passes                                         map[string][]github.PassReceipt
+	feedback                                       github.ReviewFeedback
+	feedbackHead                                   string
+	feedbackHeads                                  []string // per-read GraphQL heads, consumed in order before feedbackHead
+	feedbackReads                                  int
+	refs                                           map[string]bool
+	leaseTimes                                     map[string]time.Time
+	leaseIDs                                       map[string]string
+	files                                          []policy.File
+	ci                                             github.CI
+	postedFindings                                 []github.Finding
+	mergeCount, revertCount, postCount, claimCount int
+	revertTrailers                                 string
+	head                                           string
+	checks                                         map[string]github.CI
+	checkNames                                     map[string]map[string]github.CI
+	cancelledAt                                    map[string]time.Time
 	// committedAt is the committer date Commit returns by SHA.
 	committedAt map[string]time.Time
 	// staleOnce is the check states the first CheckSnapshot returns, as a
@@ -76,9 +70,6 @@ type fakeGH struct {
 	commitPRs                     map[string][]github.Pull
 	latch, headChanged, stale     bool
 	policyReads                   []string
-	m                             manifest.Manifest
-	// ms, when set, is the candidate list Manifests returns instead of m.
-	ms []manifest.Manifest
 	// diffs holds the PR diff by head SHA; heads without one share the default.
 	diffs map[string]string
 	// diffErr, when set, answers every Diff call instead of a patch (for
@@ -477,13 +468,6 @@ func (g *fakeGH) Ancestor(_ context.Context, _, older, newer string) (bool, erro
 	}
 	return !g.stale, nil
 }
-func (g *fakeGH) Publish(context.Context, manifest.Manifest) error { g.publishCount++; return nil }
-func (g *fakeGH) Manifests(context.Context, string) ([]manifest.Manifest, error) {
-	if g.ms != nil {
-		return g.ms, nil
-	}
-	return []manifest.Manifest{g.m}, nil
-}
 func (g *fakeGH) CheckEvidence(ctx context.Context, _, sha string, required []string) ([]github.CheckEvidence, error) {
 	states, e := g.CheckStates(ctx, "", sha, required)
 	if e != nil {
@@ -507,11 +491,6 @@ type reviewSink struct {
 
 func (s *reviewSink) TaskJob(context.Context, string) (string, string, error) {
 	return "", "fixture (grade B, T2)", nil
-}
-
-// Existing installer tests explicitly approve the bootstrap deployment.
-func (s *fakeSink) DeployDecision(context.Context, string, string, string, time.Time) (bool, error) {
-	return true, nil
 }
 
 func (s *fakeSink) Reopen(context.Context, string, string) error { s.reopens++; return nil }
@@ -621,7 +600,7 @@ func setup(t *testing.T) (*Service, *fakeGH, *fakeSink, *fakeNotifier, config.Re
 	g.pull.Head.Repo.FullName = "example/project"
 	sink := &fakeSink{}
 	n := &fakeNotifier{}
-	r := config.Repo{Name: "example/project", Branch: "main", Policy: ".mergewake/policy.yaml", SmokeTimeout: "5s", Root: t.TempDir()}
+	r := config.Repo{Name: "example/project", Branch: "main", Policy: ".mergewake/policy.yaml", Root: t.TempDir()}
 	s := &Service{Config: config.Config{Version: 1, Host: "host-a", StateDir: filepath.Join(t.TempDir(), "state"), WatchLimit: 20, Review: config.Review{Login: "review-bot", Timeout: "5s", Pairings: map[string][]string{"openai": {"claude"}}, Profiles: map[string]config.Reviewer{"claude": {Family: "anthropic", Command: "pi", Args: []string{"--model", "example-model"}}}}}, GH: g, Runner: &fakeRunner{pane: &panewireRunner{findings: `{"findings":[{"path":"tool","line":1,"body":"A concrete bug"}]}`, family: "anthropic"}}, Sink: sink, Notifier: n, Out: io.Discard}
 	dir := t.TempDir()
 	s.Config.Review.Executor = "panewire"
@@ -1117,51 +1096,6 @@ func TestFindingExtraKeysAreIgnored(t *testing.T) {
 	})
 }
 
-func TestReleaseAndRolloutAdapters(t *testing.T) {
-	s, g, sink, n, r := setup(t)
-	r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}
-	r.Root = t.TempDir()
-	r.Smoke = config.Command{Command: "smoke"}
-	if e := s.Release(context.Background(), r, "", Options{DryRun: true}); e != nil {
-		t.Fatal(e)
-	}
-	if g.publishCount != 0 {
-		t.Fatal("dry release published")
-	}
-	if e := s.Release(context.Background(), r, "", Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if g.publishCount != 1 {
-		t.Fatal("missing publication")
-	}
-	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
-	if e != nil {
-		t.Fatal(e)
-	}
-	g.m = m
-	// Smoke uses a separate fake: review's empty-directory assertion is irrelevant here.
-	s.Runner = smokeRunner{}
-	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if sink.records != 1 || n.count != 1 {
-		t.Fatal("rollout not reported")
-	}
-	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if sink.records != 1 || n.count != 1 {
-		t.Fatal("healthy poll repeated reporting")
-	}
-	b, e := os.ReadFile(filepath.Join(s.state(r.Name), "rollout", "installed.json"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	if !json.Valid(b) {
-		t.Fatal("invalid receipt")
-	}
-}
-
 type smokeRunner struct{}
 
 func (smokeRunner) Run(context.Context, string, []string, string, string) ([]byte, error) {
@@ -1275,75 +1209,6 @@ func (d *dockerCLI) Run(_ context.Context, command string, args []string, _, _ s
 	return nil, errors.New("unexpected runtime arguments")
 }
 
-func TestContainerRolloutAdoptAndDeploy(t *testing.T) {
-	s, g, sink, _, r := setup(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
-	defer server.Close()
-	old := "sha256:" + strings.Repeat("a", 64)
-	next := "sha256:" + strings.Repeat("b", 64)
-	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api",
-		Health: &config.Health{URL: server.URL, Status: 200, Timeout: "1s", Retries: 1}, Runtime: "docker"}
-	r.Install = []config.Install{spec}
-	r.Root, r.Smoke = "", config.Command{}
-	r.SmokeTimeout = "1s"
-	d := newDockerCLI()
-	ref := spec.Image + "@" + old
-	d.containers[spec.Name] = ref
-	d.running[spec.Name] = true
-	d.add(ref)
-	s.Runner = d
-	pinned := spec
-	pinned.Digest = next
-	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
-	if e != nil {
-		t.Fatal(e)
-	}
-	g.m = m
-	if e = s.Rollout(context.Background(), r, Options{}); e == nil || !strings.Contains(e.Error(), "unmanaged") {
-		t.Fatalf("unmanaged container replaced: %v", e)
-	}
-	if e = s.Rollout(context.Background(), r, Options{Adopt: "api"}); e != nil {
-		t.Fatal(e)
-	}
-	records := sink.records
-	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if sink.records != records+1 {
-		t.Fatalf("container deploy not reported: %d", sink.records)
-	}
-	receipt, _, e := rollout.LoadContainerReceipt(filepath.Join(s.state(r.Name), "rollout"), "host-a", r.Name)
-	if e != nil || receipt.Targets["api"].Digest != next || !reflect.DeepEqual(receipt.Targets["api"].Previous, []string{old}) {
-		t.Fatalf("receipt %+v %v", receipt, e)
-	}
-	if e = s.Rollout(context.Background(), r, Options{DryRun: true}); e != nil {
-		t.Fatal(e)
-	}
-}
-
-func TestContainerRolloutDryRunWritesNoState(t *testing.T) {
-	s, g, _, _, r := setup(t)
-	digest := "sha256:" + strings.Repeat("c", 64)
-	spec := config.Install{Kind: "container", Target: "api", Image: "registry.example/api", Name: "fleet-api",
-		Health: &config.Health{URL: "http://127.0.0.1:1/healthz", Status: 200, Timeout: "1s", Retries: 1}, Runtime: "docker"}
-	r.Install = []config.Install{spec}
-	r.Root, r.Smoke, r.SmokeTimeout = "", config.Command{}, "1s"
-	s.Runner = newDockerCLI()
-	pinned := spec
-	pinned.Digest = digest
-	m, e := manifest.Build(r.Name, shaB, []config.Install{pinned}, nil)
-	if e != nil {
-		t.Fatal(e)
-	}
-	g.m = m
-	if e = s.Rollout(context.Background(), r, Options{DryRun: true, Digest: spec.Image + "@" + digest}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = os.Stat(filepath.Join(s.state(r.Name), "rollout", rollout.ContainerReceiptName)); !os.IsNotExist(e) {
-		t.Fatal("dry-run wrote a container receipt")
-	}
-}
-
 func TestChangedHeadStopsReviewAndLand(t *testing.T) {
 	for _, command := range []string{"review", "land"} {
 		t.Run(command, func(t *testing.T) {
@@ -1385,36 +1250,6 @@ func TestLaterGreenSupersedesOldCheckpoint(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"culprit":"`+shaD+`"`) {
 		t.Fatal(out.String())
-	}
-}
-
-func TestFileRolloutCanaryGate(t *testing.T) {
-	s, g, _, _, r := setup(t)
-	s.Config.Host = "host-b"
-	spec := config.Install{Source: "tool", Target: "bin/tool", Mode: "0755", Canary: "host-a", ReceiptsDir: t.TempDir()}
-	r.Install = []config.Install{spec}
-	r.Root = t.TempDir()
-	r.Smoke = config.Command{Command: "smoke"}
-	s.Runner = smokeRunner{}
-	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
-	if e != nil {
-		t.Fatal(e)
-	}
-	g.m = m
-	if e = s.Rollout(context.Background(), r, Options{}); e == nil {
-		t.Fatal("file install ignored canary")
-	}
-	if _, e = os.Stat(filepath.Join(r.Root, "bin/tool")); !os.IsNotExist(e) {
-		t.Fatal("waiting follower mutated files")
-	}
-	if e = rollout.PublishGate(spec, "host-a", r.Name, m.Commit); e != nil {
-		t.Fatal(e)
-	}
-	if e = s.Rollout(context.Background(), r, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if e = rollout.CheckGate(config.Install{Canary: "host-b", ReceiptsDir: spec.ReceiptsDir, Target: spec.Target}, "host-c", r.Name, m.Commit); e != nil {
-		t.Fatal("follower did not publish success receipt:", e)
 	}
 }
 

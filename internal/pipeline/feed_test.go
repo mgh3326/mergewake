@@ -19,7 +19,6 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
 var updateFeedGolden = flag.Bool("update-feed-golden", false, "rewrite testdata/feed")
@@ -126,7 +125,7 @@ func feedConfig(t *testing.T, h *feedHook, dir string) config.Discord {
 	t.Helper()
 	file := filepath.Join(dir, "discord.env")
 	var b strings.Builder
-	for _, kind := range []string{"PR", "CI", "DEPLOY", "REVERT"} {
+	for _, kind := range []string{"PR", "CI", "REVERT"} {
 		fmt.Fprintf(&b, "HOOK_%s=%s/%s/%s\n", kind, h.URL, strings.ToLower(kind), feedToken)
 	}
 	if e := os.WriteFile(file, []byte(b.String()), 0600); e != nil {
@@ -135,7 +134,7 @@ func feedConfig(t *testing.T, h *feedHook, dir string) config.Discord {
 	return config.Discord{
 		Enabled:      true,
 		WebhooksFile: file,
-		Kinds:        map[string]string{"pr": "HOOK_PR", "ci": "HOOK_CI", "deploy": "HOOK_DEPLOY", "revert": "HOOK_REVERT"},
+		Kinds:        map[string]string{"pr": "HOOK_PR", "ci": "HOOK_CI", "revert": "HOOK_REVERT"},
 	}
 }
 
@@ -166,6 +165,12 @@ func runFeed(t *testing.T, f *Feed) {
 		cancel()
 		<-done
 	})
+}
+
+// holdEvent is a revert-channel event for the delivery tests. They exercise the
+// outbox, retries and dedupe, not the event's content.
+func holdEvent(r config.Repo, head string, at time.Time) feedEvent {
+	return feedEvent{Repo: r.Name, Head: head, Kind: "revert.hold", Message: watchMessage(r, watchResult{Head: head, Action: "hold"}, at)}
 }
 
 func feedPull(n int, head string) github.Pull {
@@ -212,36 +217,6 @@ func checkGolden(t *testing.T, name string, body []byte) {
 	}
 }
 
-// A rollout the daemon performs posts once per commit and result, through the
-// real Rollout path; a healthy repeat poll stays quiet.
-func TestFeedRolloutPostsDeploy(t *testing.T) {
-	s, g, h, r, _ := feedSetup(t)
-	r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}
-	r.Root = t.TempDir()
-	r.Smoke = config.Command{Command: "smoke"}
-	m, e := manifest.Build(r.Name, shaB, r.Install, func(string) ([]byte, error) { return []byte("payload"), nil })
-	if e != nil {
-		t.Fatal(e)
-	}
-	g.m = m
-	s.Runner = smokeRunner{}
-	for range 2 {
-		if e = s.Rollout(context.Background(), r, Options{}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	s.Feed.drain(context.Background())
-	got := h.posts()
-	if len(got) != 1 || got[0].Channel != "deploy" {
-		t.Fatalf("%+v", got)
-	}
-	for _, want := range []string{"🚀 Deploy ok", "example/project@bbbbbbb", `"value":"rollout"`, `"value":"host-a"`, `"value":"success"`} {
-		if !strings.Contains(string(got[0].Body), want) {
-			t.Fatalf("no %s in %s", want, got[0].Body)
-		}
-	}
-}
-
 // Every embed kind, produced by its real hook and read back from the fake
 // webhook, so the golden covers both the bytes and the channel they went to.
 func TestFeedGolden(t *testing.T) {
@@ -281,20 +256,6 @@ func TestFeedGolden(t *testing.T) {
 			g.authorName = "A Committer"
 			g.messages = map[string]string{shaB: "fix: the subject line\n\nthe body stays out"}
 			_ = s.Watch(context.Background(), r, Options{Shadow: true})
-		}},
-		{"deploy-rollout-failed", "deploy", func(t *testing.T, s *Service, g *feedGH, r config.Repo) {
-			s.feedDeploy(r.Name, shaA, "rollout", "rolled-back", false, errors.New("smoke failed; api_token=not-a-real-value"), Options{})
-		}},
-		{"deploy-release", "deploy", func(t *testing.T, s *Service, g *feedGH, r config.Repo) {
-			r.Install = []config.Install{{Source: "tool", Target: "bin/tool", Mode: "0755"}}
-			if e := s.Release(context.Background(), r, "", Options{}); e != nil {
-				t.Fatal(e)
-			}
-		}},
-		{"deploy-notify", "deploy", func(t *testing.T, s *Service, g *feedGH, r config.Repo) {
-			if _, e := s.Feed.NotifyDeploy(context.Background(), "host-a", r.Name, shaC, true, "pull deploy finished", feedNow); e != nil {
-				t.Fatal(e)
-			}
 		}},
 		{"revert-hold", "revert", func(t *testing.T, s *Service, g *feedGH, r config.Repo) {
 			w := watchResult{Head: shaB, Action: "hold", Reason: "culprit is not a single identifiable merged PR", Candidates: []int{7, 8}}
@@ -410,7 +371,7 @@ func TestFeedOutboxSurvivesRestart(t *testing.T) {
 		t.Fatalf("posts=%d outbox=%d", len(h.posts()), outboxLen(t, restarted))
 	}
 
-	ev := deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)
+	ev := holdEvent(r, shaA, feedNow)
 	if e := restarted.Emit(ev); e != nil {
 		t.Fatal(e)
 	}
@@ -440,7 +401,7 @@ func TestFeedHonours429RetryAfter(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return true
 	}
-	if e := s.Feed.Emit(deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)); e != nil {
+	if e := s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	runFeed(t, s.Feed)
@@ -483,7 +444,7 @@ func TestFeedHungWebhookDoesNotStallPoll(t *testing.T) {
 	go func() {
 		defer close(done)
 		s.FeedPRs(context.Background(), r, open, Options{})
-		s.feedDeploy(r.Name, shaA, "rollout", "success", true, nil, Options{})
+		s.feedWatch(r, watchResult{Head: shaA, Action: "hold"}, Options{})
 	}()
 	select {
 	case <-done:
@@ -498,17 +459,16 @@ func TestFeedDownWebhookDropsToLogLine(t *testing.T) {
 	s, _, h, r, logs := feedSetup(t)
 	s.Feed.Config.MaxFailures = 3
 	h.respond = func(w http.ResponseWriter, req *http.Request, _ int) bool {
-		if strings.HasPrefix(req.URL.Path, "/deploy/") {
+		if strings.HasPrefix(req.URL.Path, "/revert/") {
 			w.WriteHeader(http.StatusBadGateway)
 			return true
 		}
 		return false
 	}
-	ev := deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)
-	if e := s.Feed.Emit(ev); e != nil {
+	if e := s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
-	if e := s.Feed.Emit(feedEvent{Repo: r.Name, Head: shaA, Kind: "revert.hold", Message: watchMessage(r, watchResult{Head: shaA, Action: "hold"}, feedNow)}); e != nil {
+	if e := s.Feed.Emit(feedEvent{Repo: r.Name, PR: 7, Head: shaA, Kind: "pr.opened", Message: prMessage(r, feedPull(7, shaA), "pr.opened", feedNow)}); e != nil {
 		t.Fatal(e)
 	}
 	runFeed(t, s.Feed)
@@ -517,17 +477,17 @@ func TestFeedDownWebhookDropsToLogLine(t *testing.T) {
 	for outboxLen(t, s.Feed) != 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	deploys, reverts := 0, 0
+	reverts, prs := 0, 0
 	for _, p := range h.posts() {
 		switch p.Channel {
-		case "deploy":
-			deploys++
 		case "revert":
 			reverts++
+		case "pr":
+			prs++
 		}
 	}
-	if deploys != 3 || reverts != 1 {
-		t.Fatalf("deploy=%d revert=%d", deploys, reverts)
+	if reverts != 3 || prs != 1 {
+		t.Fatalf("revert=%d pr=%d", reverts, prs)
 	}
 	line := logs.String()
 	if strings.Count(line, "discord message dropped") != 1 || !strings.Contains(line, "3 failures, last: HTTP 502") {
@@ -536,7 +496,7 @@ func TestFeedDownWebhookDropsToLogLine(t *testing.T) {
 	if strings.Contains(line, feedToken) || strings.Contains(line, h.URL) {
 		t.Fatalf("log leaks the webhook: %s", line)
 	}
-	if e := s.Feed.Emit(ev); e != nil {
+	if e := s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	if outboxLen(t, s.Feed) != 0 {
@@ -549,7 +509,7 @@ func TestFeedUnreachableWebhookLeaksNothing(t *testing.T) {
 	s, _, h, r, logs := feedSetup(t)
 	s.Feed.Config.MaxFailures = 1
 	h.Close()
-	if e := s.Feed.Emit(deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)); e != nil {
+	if e := s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	s.Feed.drain(context.Background())
@@ -565,7 +525,7 @@ func TestFeedRefusedDropsAtOnce(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 		return true
 	}
-	if e := s.Feed.Emit(deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)); e != nil {
+	if e := s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	s.Feed.drain(context.Background())
@@ -591,11 +551,6 @@ func TestFeedOptOutPostsNothing(t *testing.T) {
 	s.FeedPRs(ctx, r, []github.Pull{feedPull(7, shaA)}, Options{})
 	s.feedBranchCI(ctx, r, shaB, []string{"CI"}, Options{})
 	s.feedWatch(r, watchResult{Head: shaB, Action: "hold"}, Options{})
-	s.feedDeploy(r.Name, shaA, "rollout", "success", true, nil, Options{})
-	posted, e := s.Feed.NotifyDeploy(ctx, "host-a", r.Name, shaA, true, "", feedNow)
-	if e != nil || posted {
-		t.Fatalf("posted=%v err=%v", posted, e)
-	}
 	s.Feed.drain(ctx)
 	if len(h.posts()) != 0 || outboxLen(t, s.Feed) != 0 {
 		t.Fatalf("posts=%d outbox=%d", len(h.posts()), outboxLen(t, s.Feed))
@@ -606,7 +561,7 @@ func TestFeedOptOutPostsNothing(t *testing.T) {
 
 	// Opting out also stops what was queued before the config changed.
 	s2, _, h2, r2, _ := feedSetup(t)
-	if e := s2.Feed.Emit(deployEvent("host-a", r2.Name, shaA, "rollout", "success", true, "", feedNow)); e != nil {
+	if e := s2.Feed.Emit(holdEvent(r2, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	s2.Config.Discord.OptOut = []string{r2.Name}
@@ -621,15 +576,15 @@ func TestFeedOptOutPostsNothing(t *testing.T) {
 // on the same repo still works.
 func TestFeedUnmappedKindIsOff(t *testing.T) {
 	s, g, h, r, _ := feedSetup(t)
-	s.Config.Discord.Kinds = map[string]string{"deploy": "HOOK_DEPLOY"}
+	s.Config.Discord.Kinds = map[string]string{"revert": "HOOK_REVERT"}
 	s.Feed = NewFeed(s.Config, nil)
 	g.ci = github.Red
 	g.pulls[7] = feedPull(7, shaA)
 	s.FeedPRs(context.Background(), r, []github.Pull{feedPull(7, shaA)}, Options{})
-	s.feedDeploy(r.Name, shaA, "rollout", "success", true, nil, Options{})
+	s.feedWatch(r, watchResult{Head: shaA, Action: "hold"}, Options{})
 	s.Feed.drain(context.Background())
 	got := h.posts()
-	if len(got) != 1 || got[0].Channel != "deploy" || g.closedReads != 0 {
+	if len(got) != 1 || got[0].Channel != "revert" || g.closedReads != 0 {
 		t.Fatalf("%+v closed=%d", got, g.closedReads)
 	}
 }
@@ -715,7 +670,7 @@ func TestFeedDryRunAndShadow(t *testing.T) {
 	g.pulls[7] = feedPull(7, shaA)
 	open := []github.Pull{feedPull(7, shaA)}
 	s.FeedPRs(context.Background(), r, open, Options{DryRun: true})
-	s.feedDeploy(r.Name, shaA, "rollout", "success", true, nil, Options{DryRun: true})
+	s.feedWatch(r, watchResult{Head: shaA, Action: "hold"}, Options{DryRun: true})
 	if outboxLen(t, s.Feed) != 0 {
 		t.Fatal("dry run queued")
 	}
@@ -776,7 +731,7 @@ func TestFeedWaitsForWebhooksFile(t *testing.T) {
 	if e = os.Remove(s.Config.Discord.WebhooksFile); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.Feed.Emit(deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)); e != nil {
+	if e = s.Feed.Emit(holdEvent(r, shaA, feedNow)); e != nil {
 		t.Fatal(e)
 	}
 	if wait := s.Feed.drain(context.Background()); wait != feedFileRetry {
@@ -805,7 +760,7 @@ func TestFeedOutboxFullDrops(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	ev := deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)
+	ev := holdEvent(r, shaA, feedNow)
 	if e := s.Feed.Emit(ev); e != nil {
 		t.Fatal(e)
 	}
@@ -818,74 +773,10 @@ func TestFeedOutboxFullDrops(t *testing.T) {
 	}
 }
 
-// The one-shot path posts before returning, gives the key back when it fails,
-// and posts once when it succeeds. ok and failed are separate events.
-func TestNotifyDeployClaimsAndReleases(t *testing.T) {
-	s, _, h, r, _ := feedSetup(t)
-	s.Feed.Config.MaxFailures = 2
-	down := true
-	h.respond = func(w http.ResponseWriter, _ *http.Request, _ int) bool {
-		if down {
-			w.WriteHeader(http.StatusInternalServerError)
-			return true
-		}
-		return false
-	}
-	ctx := context.Background()
-	notify := func(ok bool) (bool, error) {
-		return s.Feed.NotifyDeploy(ctx, "host-a", r.Name, shaA, ok, "", feedNow)
-	}
-	posted, e := notify(true)
-	if e == nil || posted || strings.Contains(e.Error(), feedToken) || strings.Contains(e.Error(), h.URL) {
-		t.Fatalf("posted=%v err=%v", posted, e)
-	}
-	if len(h.posts()) != 2 {
-		t.Fatalf("%d attempts", len(h.posts()))
-	}
-	h.mu.Lock()
-	down = false
-	h.mu.Unlock()
-	for _, tt := range []struct {
-		ok, want bool
-	}{{true, true}, {true, false}, {false, true}, {false, false}} {
-		posted, e = notify(tt.ok)
-		if e != nil || posted != tt.want {
-			t.Fatalf("ok=%v: posted=%v err=%v", tt.ok, posted, e)
-		}
-	}
-	// The daemon's own queue sees the same claim.
-	if e = s.Feed.Emit(deployEvent("host-a", r.Name, shaA, "notify", "ok", true, "", feedNow)); e != nil {
-		t.Fatal(e)
-	}
-	if outboxLen(t, s.Feed) != 0 {
-		t.Fatal("claimed key queued again")
-	}
-}
-
-// A context that ends during a rate-limit wait gives up and gives the key back.
-func TestNotifyDeployBoundedByContext(t *testing.T) {
-	s, _, h, r, _ := feedSetup(t)
-	h.respond = func(w http.ResponseWriter, _ *http.Request, _ int) bool {
-		w.Header().Set("Retry-After", "3000")
-		w.WriteHeader(http.StatusTooManyRequests)
-		return true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	posted, e := s.Feed.NotifyDeploy(ctx, "host-a", r.Name, shaA, true, "", feedNow)
-	if e == nil || posted {
-		t.Fatalf("posted=%v err=%v", posted, e)
-	}
-	seen, e := s.Feed.seen(r.Name)
-	if e != nil || seen(feedKey("deploy.notify.ok", 0, shaA)) {
-		t.Fatalf("key still claimed: %v", e)
-	}
-}
-
 // Roles and the sender race on one state: a key is queued exactly once.
 func TestFeedConcurrentEmitClaimsOnce(t *testing.T) {
 	s, _, h, r, _ := feedSetup(t)
-	ev := deployEvent("host-a", r.Name, shaA, "rollout", "success", true, "", feedNow)
+	ev := holdEvent(r, shaA, feedNow)
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)

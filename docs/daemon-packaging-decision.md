@@ -1,5 +1,10 @@
 # Keep the deployment daemon as a host binary
 
+> Note (hk 3596, 2026-11-13): the release and rollout roles, `internal/rollout`
+> and the rest of the deploy path were removed. mergewake does not deploy. The
+> evidence below that names them describes that code as it was when this record
+> was written.
+
 The deployment daemon stays a host binary. Containerizing it is possible, but
 it would require broader host authority and filesystem coupling than the binary
 already needs. This decision changes no host configuration.

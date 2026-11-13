@@ -191,7 +191,7 @@ func (d *Daemon) Run(ctx context.Context, loops []Loop) error {
 		d.mu.Lock()
 		_, exists := d.wake[l.Role]
 		d.mu.Unlock()
-		if exists || (l.Role != "pr" && l.Role != "watch" && l.Role != "release" && l.Role != "rollout" && l.Role != "reap") {
+		if exists || (l.Role != "pr" && l.Role != "watch" && l.Role != "reap") {
 			return errors.New("invalid or duplicate daemon role")
 		}
 		unlock, err := lock(filepath.Join(lockDir, l.Role+".lock"))

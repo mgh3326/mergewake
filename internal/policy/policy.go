@@ -345,8 +345,8 @@ type Policy struct {
 	// defaults to required_checks.
 	WatchChecks []string `yaml:"watch_checks"`
 	// DeployChecks names the checks that judge a release commit on the deploy
-	// stage. Empty means the repository has no deploy stage: release and
-	// rollout judge a commit by its main checks.
+	// stage. Empty means the repository has no deploy stage: the main checks
+	// judge a commit.
 	DeployChecks []string    `yaml:"deploy_checks"`
 	Blocking     []Rule      `yaml:"blocking"`
 	ReviewGate   *ReviewGate `yaml:"review_gate"`

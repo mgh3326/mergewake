@@ -273,21 +273,7 @@ func TestExampleConfig(t *testing.T) {
 	}
 }
 
-func TestExampleContainerConfig(t *testing.T) {
-	c, e := Load("../../examples/container.yaml")
-	if e != nil {
-		t.Fatal(e)
-	}
-	spec := c.Repos[0].Install[0]
-	if spec.Kind != "container" || spec.Image != "registry.example/api" || spec.Name != "fleet-api" {
-		t.Fatalf("container example %+v", spec)
-	}
-	if len(spec.Ports) != 1 || spec.Ports[0] != "127.0.0.1:8080:8080" || spec.Health == nil || spec.Health.Retries != 30 {
-		t.Fatalf("container example ports/health %+v", spec)
-	}
-}
-
-func TestCommandAndDaemonValidation(t *testing.T) {
+func TestDaemonLoopValidation(t *testing.T) {
 	for _, tc := range []struct {
 		extra string
 		fail  bool
@@ -295,15 +281,33 @@ func TestCommandAndDaemonValidation(t *testing.T) {
 		{"daemon:\n  pr: {enabled: true, interval: 0s}\n", true},
 		{"daemon:\n  pr: {enabled: true, notify: {enabled: false}}\n", false},
 		{"daemon:\n  watch: {enabled: true, notify: {enabled: false}}\n", true},
-		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: ['{sha}']}\n        verify: {command: verify}\n", false},
-		{"repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: [main]}\n        verify: {command: verify}\n", true},
-		{"repos:\n  - name: example/project\n    install:\n      - kind: release\n        target: bin/mergewake\n        verify: {command: verify}\n        canary: host-a\n", true},
 	} {
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
 		_, err := Load(path)
 		if (err != nil) != tc.fail {
 			t.Fatalf("config %s err=%v", tc.extra, err)
+		}
+	}
+}
+
+// The deploy path's keys are gone. The strict loader refuses them, and the
+// error names the key, so an old config fails loudly instead of being ignored.
+func TestRemovedDeployKeysRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, key string
+	}{
+		{"daemon.rollout", "daemon:\n  rollout: {enabled: false}\n", "rollout"},
+		{"daemon.release", "daemon:\n  release: {enabled: false}\n", "release"},
+		{"repository install", "repos:\n  - name: example/project\n    install:\n      - kind: command\n        target: tools/example\n        command: {command: installer, args: ['{sha}']}\n        verify: {command: verify}\n", "install"},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600); e != nil {
+			t.Fatal(e)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), tc.key) {
+			t.Fatalf("%s: err=%v, want a refusal naming %q", tc.name, err, tc.key)
 		}
 	}
 }
@@ -320,84 +324,6 @@ func TestPRNotifyDefaults(t *testing.T) {
 	}
 }
 
-func containerYAML(replacements ...string) string {
-	text := `version: 1
-host: host-a
-repos:
-  - name: example/project
-    install:
-      - kind: container
-        target: api
-        image: registry.example/api
-        name: fleet-api
-        ports: ["8080:8080"]
-        env_file: /etc/fleet/api.env
-        health:
-          url: http://127.0.0.1:8080/healthz
-`
-	for i := 0; i+1 < len(replacements); i += 2 {
-		text = strings.Replace(text, replacements[i], replacements[i+1], 1)
-	}
-	return text
-}
-
-func TestContainerConfigValidation(t *testing.T) {
-	const health = "        health:\n          url: http://127.0.0.1:8080/healthz\n"
-	for _, tt := range []struct {
-		name string
-		text string
-		fail bool
-	}{
-		{"minimal", containerYAML(), false},
-		{"image tag", containerYAML("        image: registry.example/api\n", "        image: registry.example/api:latest\n"), true},
-		{"missing health", containerYAML(health, ""), true},
-		{"relative health", containerYAML(health, "        health: {url: /healthz}\n"), true},
-		{"credential health", containerYAML(health, "        health: {url: 'http://user:pass@127.0.0.1/healthz'}\n"), true},
-		{"bad port", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['127.0.0.1:0:8080']"), true},
-		{"hostname port", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['localhost:8080:8080']"), true},
-		{"too many ports parts", containerYAML(`        ports: ["8080:8080"]`, "        ports: ['1:2:3:4']"), true},
-		{"bad keep", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        keep: 101\n"), true},
-		{"bad runtime", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        runtime: lxc\n"), true},
-		{"bad restart", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        restart: sometimes\n"), true},
-		{"relative env", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: fleet.env\n"), true},
-		{"bad digest", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        digest: sha256:short\n"), true},
-		{"bad volume", containerYAML("        env_file: /etc/fleet/api.env\n", "        env_file: /etc/fleet/api.env\n        volumes: ['data']\n"), true},
-		{"missing name", containerYAML("        name: fleet-api\n", ""), true},
-		{"mixed inventory", containerYAML() + "      - source: tool\n        target: bin/tool\n", true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			if e := os.WriteFile(path, []byte(tt.text), 0600); e != nil {
-				t.Fatal(e)
-			}
-			c, e := Load(path)
-			if (e != nil) != tt.fail {
-				t.Fatalf("%+v %v", c, e)
-			}
-		})
-	}
-}
-
-func TestContainerConfigDefaults(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if e := os.WriteFile(path, []byte(containerYAML()), 0600); e != nil {
-		t.Fatal(e)
-	}
-	c, e := Load(path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	spec := c.Repos[0].Install[0]
-	if spec.Restart != "unless-stopped" || spec.Runtime != "docker" || spec.Keep == nil || *spec.Keep != 2 {
-		t.Fatalf("defaults %+v", spec)
-	}
-	if spec.Health.Status != 200 || spec.Health.Timeout != "5s" || spec.Health.Retries != 20 {
-		t.Fatalf("health defaults %+v", spec.Health)
-	}
-	if len(spec.Ports) != 1 || spec.Ports[0] != "127.0.0.1:8080:8080" {
-		t.Fatalf("ports %v", spec.Ports)
-	}
-}
 func TestCanonicalFamily(t *testing.T) {
 	for in, want := range map[string]string{
 		"claude": "anthropic", "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic", "haiku": "anthropic", "kiro": "anthropic",
@@ -770,7 +696,8 @@ func TestDiscordConfigRefusals(t *testing.T) {
 	for name, tt := range map[string]struct {
 		section, want string
 	}{
-		"unknown kind":     {"discord: {kinds: {chat: HOOK_PR}}\n", "pr, ci, deploy or revert"},
+		"unknown kind":     {"discord: {kinds: {chat: HOOK_PR}}\n", "pr, ci or revert"},
+		"deploy kind":      {"discord: {kinds: {deploy: HOOK_PR}}\n", "pr, ci or revert"},
 		"bad key name":     {"discord: {kinds: {pr: 'not a key'}}\n", "must name a key"},
 		"bad opt_out":      {"discord: {opt_out: [nope]}\n", "owner/name"},
 		"negative failure": {"discord: {max_failures: -1}\n", "must not be negative"},

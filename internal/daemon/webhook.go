@@ -68,9 +68,6 @@ var webhookEventRoles = map[string][]string{
 	"check_suite":                 {"watch"},
 	"check_run":                   {"watch"},
 	"status":                      {"watch"},
-	"release":                     {"release", "rollout"},
-	"workflow_run":                {"release", "rollout"},
-	"push":                        {"release", "rollout"},
 }
 
 // checkEvent reports whether event carries a check or status result, whose
