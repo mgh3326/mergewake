@@ -259,10 +259,15 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 		return []error{fmt.Errorf("PR %d: %w", n, err)}, evalResult{gone: true}
 	}
 	if pr.State != "open" || pr.Merged || (r.Branch != "" && pr.Base.Ref != r.Branch) {
+		if pr.Merged && r.Branch != "" && pr.Base.Ref == r.Branch {
+			if mergedErr := e.s.ObserveMergedCandidate(ctx, r, pr); mergedErr != nil {
+				errs = append(errs, fmt.Errorf("PR %d MERGED notice: %w", n, mergedErr))
+			}
+		}
 		e.q.Forget(r.Name, n)
 		e.openOf(r.Name).forget(n)
 		res.gone = true
-		return nil, res
+		return errs, res
 	}
 	e.q.Learn(r.Name, n, pr.Head.SHA)
 	e.openOf(r.Name).learn(n)
@@ -411,15 +416,18 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 // returns the errors the evaluations since the last sweep ended with. It does
 // not wait for them.
 func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
+	// Pending MERGED deliveries are independent of the open PR list; retry each
+	// once on every repository sweep.
+	mergedErr := e.s.RetryMergedPending(ctx, r)
 	setPRSweepStep(ctx, "open_pulls")
 	e.q.BeginList(r.Name)
 	e.openOf(r.Name).beginList()
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
-		return err
+		return errors.Join(err, mergedErr)
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return errors.Join(err, mergedErr)
 	}
 	var errs []error
 	seen := map[int]bool{}
@@ -445,7 +453,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	e.q.Enqueue(daemon.SourceSweep, keys...)
 	e.skips.forget(r.Name, seen)
 	errs = append(errs, e.takeErrors(r.Name)...)
-	return errors.Join(errs...)
+	return errors.Join(mergedErr, errors.Join(errs...))
 }
 
 // openSet is the open PRs of one repo for the closed-row reconcile. It is the

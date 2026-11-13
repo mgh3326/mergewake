@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 )
 
@@ -43,6 +46,40 @@ func TestEventQueueEngineEvaluatesAnEventPRWhileAnotherReviewIsBlocked(t *testin
 	if errs := e.takeErrors(f.repo.Name); len(errs) > 0 && !strings.Contains(errs[0].Error(), "land") {
 		t.Fatal(errs)
 	}
+}
+
+func TestEvaluationNotifiesRecentExternallyMergedPROnce(t *testing.T) {
+	f := newParallelFixture(t, 1, 0)
+	f.repo.Lane = "design"
+	f.hub.merged = true
+	collector := &mergedEventCollector{}
+	f.s.Notifier = collector
+	e := newPREngine(f.s, f.gh, pipeline.Options{}, []config.Repo{f.repo}, nil, nil, nil)
+	w := daemon.Work{Key: daemon.PRKey{Repo: f.repo.Name, PR: 1}}
+	if _, res := e.evaluate(context.Background(), f.repo, w); !res.gone {
+		t.Fatal("merged PR stayed in the open evaluation set")
+	}
+	if _, res := e.evaluate(context.Background(), f.repo, w); !res.gone {
+		t.Fatal("repeat merged PR stayed in the open evaluation set")
+	}
+	if len(collector.events) != 1 {
+		t.Fatalf("recent external merge notices=%+v trace=%v", collector.events, f.trace.snapshot())
+	}
+	wantID := "mergewake-merged-" + f.repo.Name + "-1-" + hubHead(1)
+	if collector.events[0].ID != wantID || collector.events[0].Lane != "design" || collector.events[0].Type != "merged" {
+		t.Fatalf("external MERGED event=%+v", collector.events[0])
+	}
+	rows, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, f.repo.Name, "decisions.jsonl"))
+	if err != nil || !strings.Contains(string(rows), `"command":"pr-notify"`) || !strings.Contains(string(rows), `"head":"`+hubHead(1)+`"`) {
+		t.Fatalf("external MERGED pr-notify row missing: %s err=%v", rows, err)
+	}
+}
+
+type mergedEventCollector struct{ events []integrations.Event }
+
+func (c *mergedEventCollector) Notify(_ context.Context, event integrations.Event) error {
+	c.events = append(c.events, event)
+	return nil
 }
 
 // (d) Two PRs of one repo that reach their land decision at once are settled
