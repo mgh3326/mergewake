@@ -18,6 +18,9 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 	patterns := map[string]bool{}
 	count := 0
 	path := ""
+	pemBegin := strings.Join([]string{"-----", "BEGIN"}, "")
+	pemEnd := strings.Join([]string{"-----", "END"}, "")
+	privateKeySuffix := " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
 	var out strings.Builder
 	for i := 0; i < len(lines); {
 		line := lines[i]
@@ -54,52 +57,53 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 		out.WriteString(line)
 		inPrivateKey := false
 		for _, hunkLine := range lines[i+1 : end] {
-			if len(hunkLine) == 0 || hunkLine[0] != '-' {
+			if len(hunkLine) == 0 {
+				out.WriteString(hunkLine)
+				continue
+			}
+			prefix := hunkLine[0]
+			if prefix != '-' && prefix != '+' && prefix != ' ' {
 				out.WriteString(hunkLine)
 				continue
 			}
 			content := hunkLine[1:]
-			redacted, n, names := archive.RedactSecretLike(content)
-			startsPrivateKey := false
-			for _, name := range names {
-				if name == "private_key" {
-					startsPrivateKey = true
-					break
-				}
+			startsPrivateKey := strings.Contains(content, pemBegin) && strings.Contains(content, privateKeySuffix)
+			endsPrivateKey := strings.Contains(content, pemEnd) && strings.Contains(content, privateKeySuffix)
+			if startsPrivateKey {
+				inPrivateKey = true
 			}
-			if inPrivateKey || startsPrivateKey {
-				out.WriteString("-[redacted private_key]")
+			if prefix != '-' {
+				out.WriteString(hunkLine)
+			} else if inPrivateKey {
+				out.WriteString("-[redacted]")
 				if strings.HasSuffix(hunkLine, "\r\n") {
 					out.WriteString("\r\n")
 				} else if strings.HasSuffix(hunkLine, "\n") {
 					out.WriteByte('\n')
 				}
-				count += max(n, 1)
+				count++
 				if path != "" {
 					paths[path] = true
 				}
-				for _, name := range names {
-					patterns[name] = true
+				patterns["private_key"] = true
+			} else {
+				redacted, n, names := archive.RedactSecretLike(content)
+				if n == 0 {
+					out.WriteString(hunkLine)
+				} else {
+					out.WriteByte('-')
+					out.WriteString(redacted)
+					count += n
+					if path != "" {
+						paths[path] = true
+					}
+					for _, name := range names {
+						patterns[name] = true
+					}
 				}
-				if strings.Contains(content, strings.Join([]string{"-----", "END"}, "")) {
-					inPrivateKey = false
-				} else if startsPrivateKey {
-					inPrivateKey = true
-				}
-				continue
 			}
-			if n == 0 {
-				out.WriteString(hunkLine)
-				continue
-			}
-			out.WriteByte('-')
-			out.WriteString(redacted)
-			count += n
-			if path != "" {
-				paths[path] = true
-			}
-			for _, name := range names {
-				patterns[name] = true
+			if endsPrivateKey {
+				inPrivateKey = false
 			}
 		}
 		i = end

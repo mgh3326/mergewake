@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/hktest"
@@ -486,13 +487,40 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	}
 }
 
+func assertNoSecretPatternsOnRemovedBriefLines(t *testing.T, brief string) {
+	t.Helper()
+	inDiff, inHunk := false, false
+	for _, line := range strings.Split(brief, "\n") {
+		switch {
+		case strings.HasPrefix(line, "~~~~~~~~diff"):
+			inDiff, inHunk = true, false
+			continue
+		case inDiff && strings.HasPrefix(line, "~~~~~~~~"):
+			inDiff, inHunk = false, false
+			continue
+		case !inDiff:
+			continue
+		case strings.HasPrefix(line, "@@ "):
+			inHunk = true
+			continue
+		case !inHunk:
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			if _, count, names := archive.RedactSecretLike(line[1:]); count > 0 {
+				t.Errorf("removed brief line still matches secret patterns %v: %q", names, line)
+			}
+		}
+	}
+}
+
 func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	token := "gh" + "p_" + strings.Repeat("a", 36)
 	deletedFileValue := "FOO_TOKEN=" + strings.Repeat("b", 16)
-	pemBegin := strings.Join([]string{"-----", "BEGIN PRIVATE KEY-----"}, "")
+	pemBegin := strings.Join([]string{"-----", "BEGIN"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
 	pemBody := strings.Repeat("Ab3/", 16)
-	pemEnd := strings.Join([]string{"-----", "END PRIVATE KEY-----"}, "")
-	pemDiff := "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +0,0 @@\n-" + pemBegin + "\n-" + pemBody + "\n-" + pemEnd + "\n"
+	pemEnd := strings.Join([]string{"-----", "END"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
+	base64Line := strings.Repeat("Cd4/", 64)
 	tests := []struct {
 		name, diff, want, notWant, path, pattern, summary string
 		rows, count                                       int
@@ -519,9 +547,9 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:   1,
 		},
 		{
-			name:    "mixed hunk redacts removed side",
-			diff:    "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+replacement\n",
-			want:    "-[redacted github_token]\n+replacement",
+			name:    "mixed replace redacts removed secret",
+			diff:    "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+getenv\n",
+			want:    "-[redacted github_token]\n+getenv",
 			notWant: token,
 			path:    "auth.go",
 			pattern: "github_token",
@@ -529,9 +557,19 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:   1,
 		},
 		{
-			name:    "removed PEM block redacts body",
-			diff:    pemDiff,
-			want:    "-[redacted private_key]",
+			name:    "PEM context markers redact removed body",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +1,2 @@\n " + pemBegin + "\n-" + pemBody + "\n " + pemEnd + "\n",
+			want:    " " + pemBegin + "\n-[redacted]\n " + pemEnd,
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "fully removed PEM block",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +0,0 @@\n-" + pemBegin + "\n-" + pemBody + "\n-" + pemEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n-[redacted]",
 			notWant: pemBody,
 			path:    "id_rsa",
 			pattern: "private_key",
@@ -539,25 +577,42 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:   3,
 		},
 		{
+			name:    "removed PEM begin with context end",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +1 @@\n-" + pemBegin + "\n-" + pemBody + "\n " + pemEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n " + pemEnd,
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   2,
+		},
+		{
+			name:    "long base64 outside PEM stays unchanged",
+			diff:    "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
+			want:    "-" + base64Line,
+			notWant: "[redacted]",
+		},
+		{
 			name: "added token stays verbatim",
 			diff: "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -0,0 +1 @@\n+" + token + "\n",
 			want: "+" + token,
-			rows: 0,
 		},
 		{
 			name: "ordinary delta unchanged",
 			diff: "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+new\n",
 			want: "@@ -1 +1 @@\n-old\n+new",
-			rows: 0,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := &panewireRunner{}
 			s, g, r := panewireSetup(t, runner)
-			g.pull.Base.SHA = shaB
-			x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: tt.diff, delta: true, round: 2}
+			pr := g.pull
+			pr.Base.SHA = shaB
+			g.pull.Base.SHA = shaA
+			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
 			got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+			assertNoSecretPatternsOnRemovedBriefLines(t, got)
 			if tt.name == "ordinary delta unchanged" {
 				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLines(tt.diff)
 				if redacted != tt.diff || count != 0 || paths != nil || patterns != nil || deletedPaths != nil {
@@ -580,7 +635,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			}
 			if tt.rows > 0 {
 				body, _ := json.Marshal(rows[0])
-				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) {
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), base64Line) {
 					t.Fatalf("audit contains matched text: %s", body)
 				}
 				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
