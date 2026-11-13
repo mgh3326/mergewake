@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -26,13 +27,18 @@ var (
 // records is the outcome publisher's job.
 func runReconcileLoop(ctx context.Context, s *pipeline.Service, openPRs func(repo string) (map[int]bool, bool), repos []config.Repo, interval time.Duration, o pipeline.Options, log *slog.Logger) {
 	for ctx.Err() == nil {
-		wait := interval
+		// Repositories run in parallel, so the retry flag is shared.
+		var retry atomic.Bool
 		_ = forRepos(ctx, repos, true, func(ctx context.Context, r config.Repo) error {
 			if ran, _ := reconcileClosed(ctx, s, openPRs, r, o, log); !ran {
-				wait = min(wait, reconcileRetryWait)
+				retry.Store(true)
 			}
 			return nil
 		})
+		wait := interval
+		if retry.Load() {
+			wait = min(wait, reconcileRetryWait)
+		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(wait):
