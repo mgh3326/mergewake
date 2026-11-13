@@ -496,7 +496,7 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 		return d, e
 	}
 	if len(rt.failedHosts) > 0 || rt.unknown {
-		fields := map[string]any{"pr": pr.Number, "failed_hosts": rt.failedHosts, "lane": lane, "via": via}
+		fields := map[string]any{"pr": pr.Number, "failed_hosts": rt.failedHosts, "lane": lane, "via": via, "candidates": rt.ambiguous}
 		if rt.unknown {
 			fields["liveness"] = "unknown"
 		}
