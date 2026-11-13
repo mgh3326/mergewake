@@ -1693,7 +1693,9 @@ Requests must `POST` the exact path with a body of at most 5 MiB and a valid
 signatures get 401 and trigger nothing; verified deliveries get 202 whether
 or not anything was triggered. One log line per delivery records the
 `X-GitHub-Event`, the `X-GitHub-Delivery` id, `repository.full_name` and the
-roles woken — never the body, the signature or other headers.
+roles woken — never the body, the signature or other headers. A repeated
+delivery id is logged once more as a repeat and does nothing; `hook_id` tells
+two hooks apart when they send the same delivery id.
 
 | `X-GitHub-Event` | Roles woken |
 | --- | --- |
