@@ -60,6 +60,58 @@ func TestWorkerDeferAcceptsExistingOtherTaskAndRejectsOwnTask(t *testing.T) {
 	}
 }
 
+// A defer names its task as a bare number, "hk 4346", "hk:4346" or "#4346",
+// case-insensitive; each form counts as the same task.
+func TestWorkerDeferAcceptsEveryTaskForm(t *testing.T) {
+	for _, body := range []string{
+		"Disposition: defer 42",
+		"Disposition: defer hk 42",
+		"Disposition: defer hk:42",
+		"Disposition: defer #42",
+		"Disposition: DEFER HK 42 — filed",
+		"Disposition: defer HK:42",
+	} {
+		t.Run(body, func(t *testing.T) {
+			thread := ownFinding("T1", "low", 3, github.ReviewComment{Author: "worker", AuthorType: "User", Body: body})
+			rule := &deferTaskRule{own: "7", seen: map[string]bool{}, failed: map[string]error{}, exists: func(id string) (bool, error) {
+				return id == "42", nil
+			}}
+			if !answeredWithDefer(thread, false, rule) {
+				t.Fatalf("defer reply %q was not accepted for an existing other task", body)
+			}
+		})
+	}
+}
+
+// A defer naming the PR's own task or a task that does not exist stays open,
+// whichever form it is written in.
+func TestWorkerDeferOwnOrMissingTaskFormsStayOpen(t *testing.T) {
+	for _, body := range []string{
+		"Disposition: defer hk 7",
+		"Disposition: defer hk:7",
+		"Disposition: defer #7",
+		"Disposition: defer hk 99999",
+		"Disposition: defer hk:99999",
+		"Disposition: defer #99999",
+	} {
+		t.Run(body, func(t *testing.T) {
+			thread := ownFinding("T1", "low", 3, github.ReviewComment{Author: "worker", AuthorType: "User", Body: body})
+			rule := &deferTaskRule{own: "7", seen: map[string]bool{}, failed: map[string]error{}, exists: func(id string) (bool, error) {
+				if id == "99999" {
+					return false, errors.New("handoffkeep task not_found: 99999")
+				}
+				return true, nil
+			}}
+			if answeredWithDefer(thread, false, rule) {
+				t.Fatalf("defer reply %q was accepted; want it to stay open", body)
+			}
+			if rule.err != nil {
+				t.Fatalf("defer reply %q holds the gate with a lookup error: %v", body, rule.err)
+			}
+		})
+	}
+}
+
 func TestWorkerDeferTaskReadErrorIsRetained(t *testing.T) {
 	thread := ownFinding("T1", "low", 3, github.ReviewComment{Author: "worker", AuthorType: "User", Body: "Disposition: defer 42"})
 	rule := &deferTaskRule{own: "7", seen: map[string]bool{}, failed: map[string]error{}, exists: func(string) (bool, error) {
