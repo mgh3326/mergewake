@@ -1938,6 +1938,9 @@ already sent to the finished lane is resent once to the new lane under the event
 id `<id>-reroute`, audited as `findings-route-changed`; an acknowledged one is
 never rerouted. A terminal job whose hosts could not all be read keeps its
 lane and is audited as `findings-route-partial` with `"liveness":"unknown"`.
+A takeover is not taken while any configured host cannot be read: the bound
+author lane stays selected, and `findings-route-partial` records the candidate
+panes observed on the hosts that were read.
 A task or job read error retries without rerouting.
 
 `BLOCKED` notices for `blocking_findings`, `triage_unanswered`, or `check_failed`
