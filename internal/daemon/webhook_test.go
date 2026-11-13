@@ -388,7 +388,7 @@ func TestWebhookRepeatedDeliveryContract(t *testing.T) {
 		if send("oldest", 1) != http.StatusAccepted {
 			t.Fatal("first status")
 		}
-		for i := 0; i < maxRememberedWebhookDeliveries; i++ {
+		for i := 0; i < 1024; i++ {
 			if send(fmt.Sprintf("other-%d", i), i+2) != http.StatusAccepted {
 				t.Fatalf("id %d status", i)
 			}
