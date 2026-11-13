@@ -3,9 +3,10 @@
 #
 #   bash tests/release-wait-checks.sh
 #
-# Every case writes a policy and check-run / commit-status fixtures, then runs
-# the script as a child. The stub answers the two read endpoints from files and
-# refuses a read that does not ask for every page.
+# Every case writes a policy and per-SHA check-run / commit-status fixtures,
+# then runs the script as a child. The stub also models main, compare and tags;
+# those reads are refused by default so cases (a) to (l) prove they are not
+# needed when the tag commit is already green or is itself main's head.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -20,9 +21,12 @@ stub=$tmp/stub
 mkdir -p "$stub"
 cat > "$stub/gh" <<'STUB'
 #!/bin/sh
-# Stub gh: answer the two API reads from the fixtures in $STUB_DIR. A read must
-# paginate; STUB_FAIL_RUNS_ONCE makes the first check-run read fail.
+# Stub gh: answer API reads from fixtures in $STUB_DIR. Reads must paginate.
 paginate=0
+endpoint=
+for arg in "$@"; do
+	case $arg in repos/*) endpoint=$arg ;; esac
+done
 for arg in "$@"; do
 	[ "$arg" = --paginate ] && paginate=1
 done
@@ -30,17 +34,41 @@ for arg in "$@"; do
 	case $arg in
 	*/check-runs*)
 		[ "$paginate" = 1 ] || { echo "stub gh: check-runs read is not paginated" >&2; exit 1; }
+		sha=${endpoint#*/commits/}
+		sha=${sha%%/*}
 		if [ -n "${STUB_FAIL_RUNS_ONCE:-}" ] && [ ! -f "$STUB_DIR/failed-once" ]; then
 			: > "$STUB_DIR/failed-once"
 			echo "stub gh: transient failure" >&2
 			exit 1
 		fi
-		cat "$STUB_DIR/check-runs.tsv"
+		fixture=$STUB_DIR/check-runs-$sha.tsv
+		[ -f "$fixture" ] || fixture=$STUB_DIR/check-runs.tsv
+		cat "$fixture"
 		exit 0
 		;;
 	*/commits/*/statuses*)
 		[ "$paginate" = 1 ] || { echo "stub gh: status read is not paginated" >&2; exit 1; }
-		cat "$STUB_DIR/statuses.tsv"
+		sha=${endpoint#*/commits/}
+		sha=${sha%%/*}
+		fixture=$STUB_DIR/statuses-$sha.tsv
+		[ -f "$fixture" ] || fixture=$STUB_DIR/statuses.tsv
+		cat "$fixture"
+		exit 0
+		;;
+	*/branches/main)
+		printf '%s\n' "${STUB_MAIN_SHA:?}"
+		exit 0
+		;;
+	*/compare/*...*)
+		[ "${STUB_ALLOW_COMPARE:-}" = 1 ] || { echo "stub gh: unexpected compare request: $*" >&2; exit 1; }
+		[ "$paginate" = 1 ] || { echo "stub gh: compare read is not paginated" >&2; exit 1; }
+		printf '%s\t%s\t%s\n' "$STUB_COMPARE_STATUS" "$STUB_TOTAL_COMMITS" "$STUB_COMPARE_SHAS"
+		exit 0
+		;;
+	*/tags)
+		[ "${STUB_ALLOW_TAGS:-}" = 1 ] || { echo "stub gh: unexpected tags request: $*" >&2; exit 1; }
+		[ "$paginate" = 1 ] || { echo "stub gh: tags read is not paginated" >&2; exit 1; }
+		cat "$STUB_DIR/tags.tsv"
 		exit 0
 		;;
 	esac
@@ -62,7 +90,15 @@ fail() { printf 'FAIL: %s\n' "$*"; failures=$((failures + 1)); }
 reset() {
 	: > "$case_dir/check-runs.tsv"
 	: > "$case_dir/statuses.tsv"
+	: > "$case_dir/tags.tsv"
+	rm -f "$case_dir"/check-runs-*.tsv "$case_dir"/statuses-*.tsv
 	rm -f "$case_dir/failed-once"
+	main_sha=$sha
+	compare_status=ahead
+	total_commits=1
+	compare_shas=0123456789abcdef0123456789abcdef01234567
+	allow_compare=
+	allow_tags=
 }
 
 policy() { printf '%s\n' "$1" > "$case_dir/.mergewake/policy.yaml"; }
@@ -77,6 +113,12 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 		PATH="$stub:$PATH" \
 		STUB_DIR="$case_dir" \
 		STUB_FAIL_RUNS_ONCE="${2:-}" \
+		STUB_MAIN_SHA="$main_sha" \
+		STUB_ALLOW_COMPARE="$allow_compare" \
+		STUB_ALLOW_TAGS="$allow_tags" \
+		STUB_COMPARE_STATUS="$compare_status" \
+		STUB_TOTAL_COMMITS="$total_commits" \
+		STUB_COMPARE_SHAS="$compare_shas" \
 		GITHUB_REPOSITORY="example/repo" \
 		RELEASE_CHECKS_TIMEOUT_SECONDS="$1" \
 		RELEASE_CHECKS_POLL_SECONDS=0.1 \
@@ -282,6 +324,123 @@ if [ "$status" -ne 0 ] && has 'failure' && has 'https://ci.example/status'; then
 	pass "(l) status failure still fails a pending run -> exit $status"
 else
 	fail "(l) pending run vs status failure -> exit $status: $output"
+fi
+
+# (m) The tag commit is unsettled, but green checks on a containing main head
+# cover it when no newer release tag carries a commit in the compare list.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+run_checks 10
+if [ "$status" -eq 0 ] && has "$main_sha" && has 'contains tag commit'; then
+	pass "(m) green checks on containing main head -> exit 0 naming the head"
+else
+	fail "(m) green containing head -> exit $status: $output"
+fi
+
+# (n) A newer release tag on the compare commits supersedes this release.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+printf 'v1.2.4\t%s\n' "$compare_shas" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 3 ] && has 'v1.2.4' && has "$compare_shas" && has "$sha"; then
+	pass "(n) newer release tag supersedes -> exit 3 naming both commits"
+else
+	fail "(n) newer release tag -> exit $status: $output"
+fi
+
+# (o) A non-ahead compare cannot use the head's green checks to pass.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+compare_status=diverged
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+run_checks 1
+if [ "$status" -eq 1 ] && has 'timed out'; then
+	pass "(o) diverged head is not accepted -> exit 1 at bound"
+else
+	fail "(o) diverged compare -> exit $status: $output"
+fi
+
+# (p) A tag commit failure still fails even when main is green.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed failure https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+run_checks 10
+if [ "$status" -eq 1 ] && has 'tag commit' && has 'failure'; then
+	pass "(p) tag commit failure wins over green head -> exit 1"
+else
+	fail "(p) tag commit failed, head green -> exit $status: $output"
+fi
+
+# (q) A capped compare list is unknown and cannot pass via head checks.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+total_commits=2
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+run_checks 1
+if [ "$status" -eq 1 ] && has 'timed out'; then
+	pass "(q) incomplete compare list is unknown -> exit 1 at bound"
+else
+	fail "(q) incomplete compare list -> exit $status: $output"
+fi
+
+# (r) A red head does not fail the tag release immediately; it remains pending.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed failure https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+run_checks 1
+if [ "$status" -eq 1 ] && has 'timed out'; then
+	pass "(r) red containing head remains pending -> exit 1 at bound"
+else
+	fail "(r) red head -> exit $status: $output"
+fi
+
+# (s) A pre-release tag in the compare list does not supersede.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+printf 'v1.2.4-rc.1\t%s\n' "$compare_shas" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 0 ] && has "$main_sha" && ! has 'superseded'; then
+	pass "(s) pre-release tag does not supersede -> exit 0"
+else
+	fail "(s) pre-release tag -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then
