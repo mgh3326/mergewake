@@ -409,14 +409,20 @@ const (
 	closedUnmergedWindow   = 7 * 24 * time.Hour
 )
 
+// inClosedUnmergedWindow reports whether v is a final, unmerged row whose
+// ClosedAt is still inside closedUnmergedWindow: such a row is read daily.
+func inClosedUnmergedWindow(v outcomes.Outcome, now time.Time) bool {
+	return v.Final && v.MergedAt == nil && v.ClosedAt != nil && now.Before(v.ClosedAt.Add(closedUnmergedWindow))
+}
+
 // writeReconcileFlags records the flags the reconcile computed from seen,
-// unless the ledger row's Final or MergedAt changed since seen was read — an
-// evaluation that observed the PR reopen or merge in between owns those
-// fields — in which case the row is left unfinished and undated so the next
-// reconcile reads it again.
+// unless the ledger row's Final, MergedAt or ClosedAt changed since seen was
+// read — an evaluation that observed the PR reopen, merge or reclose in
+// between owns those fields — in which case the row is left unfinished and
+// undated so the next reconcile reads it again.
 func (s *Service) writeReconcileFlags(repo string, pr int, seen outcomes.Outcome, finished bool, due *time.Time) error {
 	return s.ledger().Update(repo, pr, func(current *outcomes.Outcome) {
-		if current.Final != seen.Final || !sameTimePtr(current.MergedAt, seen.MergedAt) {
+		if current.Final != seen.Final || !sameTimePtr(current.MergedAt, seen.MergedAt) || !sameTimePtr(current.ClosedAt, seen.ClosedAt) {
 			current.ReconcileFinished = false
 			current.ReconcileDueAt = nil
 			return
@@ -456,7 +462,11 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, isOpen f
 			continue
 		}
 		pendingEvent := s.revertEventPending(r, v, o, sent)
-		if v.ReconcileFinished && !pendingEvent {
+		// A row the pre-window logic finished with no due time is still inside
+		// its ClosedAt week: read it once more so a reopen it missed is recorded.
+		// That read puts it on the daily schedule, or finishes it after the window.
+		legacyInWindow := v.ReconcileFinished && v.ReconcileDueAt == nil && inClosedUnmergedWindow(v, s.now())
+		if v.ReconcileFinished && !pendingEvent && !legacyInWindow {
 			closedRowsSkippedNotDue++
 			continue
 		}
@@ -494,7 +504,7 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, isOpen f
 		switch {
 		case !v.Final:
 		case v.MergedAt == nil && v.Reverted == nil:
-			daily = v.ClosedAt != nil && s.now().Before(v.ClosedAt.Add(closedUnmergedWindow))
+			daily = inClosedUnmergedWindow(v, s.now())
 			finished = !daily
 		case v.MergedAt == nil || v.Reverted != nil:
 			finished = true

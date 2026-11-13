@@ -477,6 +477,72 @@ func TestReconcileClosedUnmergedRowWithoutClosedAtFinishes(t *testing.T) {
 	}
 }
 
+// A row the previous logic finished with no due time, whose ClosedAt is still
+// inside the week, is read again so a reopen it missed is recorded. A row
+// closed more than a week ago stays finished and is not read.
+func TestReconcileFinishedClosedRowInWindowIsReadAgain(t *testing.T) {
+	s, g, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	reopened := g.pull
+	reopened.Number, reopened.State = 12, "open"
+	closedPull := g.pull
+	closedPull.Number, closedPull.State = 13, "closed"
+	source := &outcomeGH{fakeGH: g, first: true, pulls: map[int]github.Pull{12: reopened, 13: closedPull}}
+	s.GH = source
+	for _, row := range []struct {
+		pr       int
+		closedAt time.Time
+	}{{12, now.Add(-48 * time.Hour)}, {13, now.Add(-8 * 24 * time.Hour)}} {
+		closed := row.closedAt
+		if err := s.ledger().Update(repo.Name, row.pr, func(v *outcomes.Outcome) {
+			v.Final, v.Decision, v.ReconcileFinished, v.ClosedAt = true, "blocked", true, &closed
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile(t, s, repo, Options{Shadow: true})
+	if got := source.pullIDs; len(got) != 1 || got[0] != 12 {
+		t.Fatalf("Pull calls = %v, want [12]", got)
+	}
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := state.Latest[outcomes.Key(repo.Name, 12)]; v.Final || v.ReconcileFinished {
+		t.Fatalf("reopen not recorded: final=%t finished=%t", v.Final, v.ReconcileFinished)
+	}
+	if v := state.Latest[outcomes.Key(repo.Name, 13)]; !v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("past-window row: finished=%t due=%v", v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}
+
+// A flag write computed from a ClosedAt that a later evaluation replaced (the
+// PR reclosed) leaves the row unfinished and undated.
+func TestReconcileFlagWriteKeepsRowWhenReclosed(t *testing.T) {
+	s, _, _, _, repo := setup(t)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(-8 * 24 * time.Hour)
+	reclosed := now.Add(-time.Hour)
+	if err := s.ledger().Update(repo.Name, 14, func(v *outcomes.Outcome) {
+		v.Final, v.ClosedAt = true, &reclosed
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seen := outcomes.Outcome{Repo: repo.Name, PR: 14, Final: true, ClosedAt: &stale}
+	if err := s.writeReconcileFlags(repo.Name, 14, seen, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.ledger().Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := state.Latest[outcomes.Key(repo.Name, 14)]
+	if v.ReconcileFinished || v.ReconcileDueAt != nil {
+		t.Fatalf("reclosed row: finished=%t due=%v", v.ReconcileFinished, v.ReconcileDueAt)
+	}
+}
+
 // The flag write applies only while the row still has the Final and MergedAt
 // the reconcile computed from. An evaluation that recorded the PR open between
 // the reconcile's ledger re-read and its write leaves the row unfinished and
