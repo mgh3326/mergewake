@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"strings"
@@ -535,6 +537,10 @@ func TestSameSubstance(t *testing.T) {
 func TestPanewireBriefCarriesTheDelta(t *testing.T) {
 	x := &panewireExecutor{s: &Service{Config: config.Config{Review: config.Review{Timeout: "10m"}}}, repo: config.Repo{Name: "example/project"}, pr: github.Pull{Number: 7, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}, diff: "diff --git a/tool b/tool\n+x\n", delta: true, round: 2, context: "ACCEPTANCE CONTRACT"}
 	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	sum := sha256.Sum256([]byte(got))
+	if hex.EncodeToString(sum[:]) != "14db2fea4782845526a55611f3d9fb6fea752b93e45a8ef2c0ad0a439d36b736" {
+		t.Fatalf("ordinary delta brief differs from d830c8c baseline: sha256=%x", sum)
+	}
 	for _, want := range []string{"this is review round 2: review only the delta patch", "## Delta to review", "+x", "optional boolean `advisory`"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in:\n%s", want, got)

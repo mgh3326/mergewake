@@ -1,0 +1,99 @@
+package pipeline
+
+import (
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/mgh3326/mergewake/internal/archive"
+)
+
+// redactDeletedDiff changes only secret-pattern matches in removed lines of
+// hunks with no additions. Its input is the review delta; callers retain that
+// original for every non-brief use.
+func redactDeletedDiff(diff string) (string, int, []string, []string) {
+	lines := strings.SplitAfter(diff, "\n")
+	paths := map[string]bool{}
+	patterns := map[string]bool{}
+	count := 0
+	path := ""
+	var out strings.Builder
+	for i := 0; i < len(lines); {
+		line := lines[i]
+		plain := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(plain, "diff --git ") {
+			path = ""
+		}
+		if strings.HasPrefix(plain, "--- ") && !strings.HasPrefix(plain, "--- /dev/null") {
+			path = strings.TrimSpace(strings.TrimPrefix(plain, "--- "))
+			if before, _, ok := strings.Cut(path, "\t"); ok {
+				path = before
+			}
+			if unquoted, err := strconv.Unquote(path); err == nil {
+				path = unquoted
+			}
+			path = strings.TrimPrefix(path, "a/")
+		}
+		if !strings.HasPrefix(plain, "@@ ") {
+			out.WriteString(line)
+			i++
+			continue
+		}
+		end := i + 1
+		for end < len(lines) {
+			next := strings.TrimRight(lines[end], "\r\n")
+			if strings.HasPrefix(next, "@@ ") || strings.HasPrefix(next, "diff --git ") {
+				break
+			}
+			end++
+		}
+		hasAddition, hasDeletion := false, false
+		for _, hunkLine := range lines[i+1 : end] {
+			if len(hunkLine) == 0 {
+				continue
+			}
+			switch hunkLine[0] {
+			case '+':
+				hasAddition = true
+			case '-':
+				hasDeletion = true
+			}
+		}
+		out.WriteString(line)
+		for _, hunkLine := range lines[i+1 : end] {
+			if !hasDeletion || hasAddition || len(hunkLine) == 0 || hunkLine[0] != '-' {
+				out.WriteString(hunkLine)
+				continue
+			}
+			redacted, n, names := archive.RedactSecretLike(hunkLine[1:])
+			if n == 0 {
+				out.WriteString(hunkLine)
+				continue
+			}
+			out.WriteByte('-')
+			out.WriteString(redacted)
+			count += n
+			if path != "" {
+				paths[path] = true
+			}
+			for _, name := range names {
+				patterns[name] = true
+			}
+		}
+		i = end
+	}
+	if count == 0 {
+		return diff, 0, nil, nil
+	}
+	pathList := make([]string, 0, len(paths))
+	for p := range paths {
+		pathList = append(pathList, p)
+	}
+	sort.Strings(pathList)
+	patternList := make([]string, 0, len(patterns))
+	for name := range patterns {
+		patternList = append(patternList, name)
+	}
+	sort.Strings(patternList)
+	return out.String(), count, pathList, patternList
+}

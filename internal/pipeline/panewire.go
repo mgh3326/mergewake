@@ -1809,7 +1809,19 @@ that are ignored.
 		// reproduce (a base merge pollutes `git diff`), so the patch is inline.
 		text = strings.Replace(text, fmt.Sprintf("review the changes in `git diff %s...%s`", x.pr.Base.SHA, x.pr.Head.SHA),
 			fmt.Sprintf("this is review round %d: review only the delta patch at the end of this brief, not `git diff`", x.round), 1)
-		text += "\n## Delta to review (hunks changed since the last reviewed head)\n\n~~~~~~~~diff\n" + strings.TrimRight(x.diff, "\n") + "\n~~~~~~~~\n"
+		diff, count, paths, patterns := redactDeletedDiff(x.diff)
+		text += "\n## Delta to review (hunks changed since the last reviewed head)\n\n~~~~~~~~diff\n" + strings.TrimRight(diff, "\n") + "\n~~~~~~~~\n"
+		if count > 0 {
+			plural := "s"
+			if count == 1 {
+				plural = ""
+			}
+			text += fmt.Sprintf("\nRedacted %d secret-like string%s in pure-deletion hunks (paths: %s). Full text is in the checkout.\n", count, plural, strings.Join(paths, ", "))
+			_ = x.s.audit(x.repo.Name, "review-brief-redacted", map[string]any{
+				"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label,
+				"count": count, "paths": paths, "pattern_names": patterns,
+			}, false)
+		}
 	}
 	return text
 }

@@ -50,6 +50,36 @@ var secretPatterns = []struct {
 	{"github_fine_grained_token", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{82}\b`)},
 }
 
+// RedactSecretLike replaces every secret-pattern match in text with a named
+// marker. It returns the number of matches and the matching pattern names in
+// pattern-list order. Callers decide which parts of their data may be redacted.
+func RedactSecretLike(text string) (string, int, []string) {
+	count := 0
+	var names []string
+	seen := map[string]bool{}
+	for _, pattern := range secretPatterns {
+		matches := pattern.re.FindAllStringIndex(text, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		var out strings.Builder
+		last := 0
+		for _, match := range matches {
+			out.WriteString(text[last:match[0]])
+			out.WriteString("[redacted " + pattern.name + "]")
+			last = match[1]
+			count++
+		}
+		out.WriteString(text[last:])
+		text = out.String()
+		if !seen[pattern.name] {
+			names = append(names, pattern.name)
+			seen[pattern.name] = true
+		}
+	}
+	return text, count, names
+}
+
 // Skip is a refusal that keeps the local job dir: the reason is stable so a
 // receipt row can dedupe on it.
 type Skip struct{ Reason string }
