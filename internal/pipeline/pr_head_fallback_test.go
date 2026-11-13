@@ -363,6 +363,124 @@ func TestPRHeadFallbackAuditErrorIsBoundedAndRedacted(t *testing.T) {
 	}
 }
 
+// prHeadWithFirstFetchErr sets up a fetchPRHead call whose pull/<n>/head
+// fetch fails with firstErr while every other git command runs for real.
+func prHeadWithFirstFetchErr(t *testing.T, firstErr error, edit func(*github.Pull)) (*Service, config.Repo, prOrigin, github.Pull) {
+	t.Helper()
+	o := seedPROrigin(t, false)
+	runner := &panewireRunner{realGit: true}
+	s, g, r := panewireSetup(t, runner)
+	s.Runner = pullFetchErrRunner{Runner: runner, err: firstErr}
+	pr := g.pull
+	pr.Head.SHA = o.head
+	if edit != nil {
+		edit(&pr)
+	}
+	return s, r, o, pr
+}
+
+// A fork PR or a head ref that cannot go in a refspec gets no branch
+// fallback: the returned error still carries the first fetch's stderr as its
+// operator detail, while its text is the one it always was.
+func TestFetchPRHeadNoFallbackErrorDetail(t *testing.T) {
+	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: "fatal: couldn't find remote ref pull/7/head\n"}
+	for _, tc := range []struct {
+		name string
+		edit func(*github.Pull)
+	}{
+		{"fork", func(pr *github.Pull) { pr.Head.Repo.FullName = "fork/project" }},
+		{"unsafe ref", func(pr *github.Pull) { pr.Head.Ref = "a..b" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, o, pr := prHeadWithFirstFetchErr(t, ce, tc.edit)
+			e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+			if e == nil {
+				t.Fatal("fetchPRHead: want the pull/<n>/head failure")
+			}
+			if want := "fetch PR head: " + ce.Error(); e.Error() != want {
+				t.Fatalf("err=%q, want %q", e.Error(), want)
+			}
+			if got := errorDetailOf(e); !strings.Contains(got, "fatal: couldn't find remote ref pull/7/head") {
+				t.Fatalf("errorDetailOf=%q, want the first fetch's stderr", got)
+			}
+			if rows := auditRows(t, s, r, "pr-head-fallback"); len(rows) != 0 {
+				t.Fatalf("pr-head-fallback rows=%v", rows)
+			}
+		})
+	}
+}
+
+// The branch fallback's audit row keeps the first fetch's stderr beside the
+// bounded error text.
+func TestPRHeadFallbackRowDetail(t *testing.T) {
+	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: "fatal: couldn't find remote ref pull/7/head\n"}
+	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
+	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+		t.Fatalf("fetchPRHead: %v", e)
+	}
+	row := fallbackRow(t, s, r, "ok")
+	if got, _ := row["detail"].(string); !strings.Contains(got, "fatal: couldn't find remote ref pull/7/head") {
+		t.Fatalf("row detail=%q, want the first fetch's stderr", got)
+	}
+	if msg, _ := row["error"].(string); msg == "" || !strings.Contains(msg, "exit status 128") {
+		t.Fatalf("row error=%q, want the bounded CommandError text", msg)
+	}
+}
+
+// The row's detail is redacted, then bounded to 512 bytes: git's stderr can
+// carry a credentialed remote URL and run long. The token straddles the cut
+// so bounding before redacting would keep a fragment of it.
+func TestPRHeadFallbackRowDetailBoundedAndRedacted(t *testing.T) {
+	token := "ghp_FAKEfakeFAKEfakeFAKEfake0123456789"
+	stderr := strings.Repeat("fatal: first fetch failed\n", 20) + token + strings.Repeat("fatal: retry later\n", 25) + "end"
+	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: stderr}
+	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
+	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+		t.Fatalf("fetchPRHead: %v", e)
+	}
+	detail, _ := fallbackRow(t, s, r, "ok")["detail"].(string)
+	if len(detail) == 0 || len(detail) > 512 {
+		t.Fatalf("detail is %d bytes, want 1..512: %q", len(detail), detail)
+	}
+	if !strings.Contains(detail, "[redacted]") {
+		t.Fatalf("detail %q: want the credential redacted", detail)
+	}
+	for _, secret := range fakeSecrets {
+		if strings.Contains(detail, secret) {
+			t.Fatalf("detail leaks %q: %q", secret, detail)
+		}
+	}
+	if strings.Contains(detail, "0123456789") {
+		t.Fatalf("detail keeps a fragment of the token: %q", detail)
+	}
+}
+
+// A first failure that is not a git CommandError carries no stderr: the
+// returned error has no detail and the fallback row has no detail field.
+func TestFetchPRHeadNoDetailWithoutCommandError(t *testing.T) {
+	plain := errors.New("fatal: plain failure")
+	t.Run("fork", func(t *testing.T) {
+		s, r, o, pr := prHeadWithFirstFetchErr(t, plain, func(pr *github.Pull) { pr.Head.Repo.FullName = "fork/project" })
+		e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+		if e == nil {
+			t.Fatal("fetchPRHead: want the pull/<n>/head failure")
+		}
+		if got := errorDetailOf(e); got != "" {
+			t.Fatalf("errorDetailOf=%q, want none", got)
+		}
+	})
+	t.Run("fallback row", func(t *testing.T) {
+		s, r, o, pr := prHeadWithFirstFetchErr(t, plain, nil)
+		if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+			t.Fatalf("fetchPRHead: %v", e)
+		}
+		row := fallbackRow(t, s, r, "ok")
+		if _, ok := row["detail"]; ok {
+			t.Fatalf("row has a detail field: %v", row["detail"])
+		}
+	})
+}
+
 // GitHub's 406 sends the diff to the local checkout, which fetches the same
 // PR head: a lost pull/<n>/head falls back to the same-repo branch there too.
 func TestLocalDiffFallsBackToBranchWithoutPullRef(t *testing.T) {

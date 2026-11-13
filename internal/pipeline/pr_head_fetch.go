@@ -28,21 +28,27 @@ const fallbackBranchBytes = 200
 // fallback deletes a local pull/<n>/head left by an earlier fetch, which
 // panewire would prefer and the remote node could not fetch. Any failure of
 // the first fetch takes the fallback: its stderr is not parsed. Each attempt
-// writes one pr-head-fallback row. The returned error is the skip reason.
+// writes one pr-head-fallback row. The returned error is the skip reason; the
+// first fetch's stderr is kept as operator detail.
 func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.Pull) error {
 	_, first := s.gitIn(ctx, root, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref)
 	if first == nil {
 		return nil
 	}
 	ref := pr.Head.Ref
+	firstDetail := gitStderrDetail(first)
 	if !strings.EqualFold(pr.Head.Repo.FullName, repo) || !fallbackBranch(ref) {
-		return fmt.Errorf("fetch PR head: %w", first)
+		return withErrorDetail(fmt.Errorf("fetch PR head: %w", first), firstDetail)
 	}
 	firstText := boundedGitError(first)
 	result, e := s.fetchBranchAtHead(ctx, root, ref, pr, firstText)
 	// The pass goes on without the row: a lost audit line is no reason to
 	// leave the PR unreviewed.
-	_ = s.audit(repo, "pr-head-fallback", map[string]any{"repo": repo, "pr": pr.Number, "head": pr.Head.SHA, "ref": ref, "error": firstText, "result": result}, false)
+	row := map[string]any{"repo": repo, "pr": pr.Number, "head": pr.Head.SHA, "ref": ref, "error": firstText, "result": result}
+	if firstDetail != "" {
+		row["detail"] = firstDetail
+	}
+	_ = s.audit(repo, "pr-head-fallback", row, false)
 	return e
 }
 
