@@ -190,26 +190,29 @@ type checkJudgment struct {
 	States map[string]github.CI
 }
 
-// absentDue reports whether a required check with no run or status on the head
-// is to be named absent now rather than waited for: the head commit is
-// absentGrace old, or every other required check has completed (green, red or
-// skipped) and at least one exists, so the workflow demonstrably ran without
-// it. Cancelled and unfinished checks do not count as completed.
+// absentDue reports whether the absent required checks are to be named now
+// rather than waited for: the head commit is absentGrace old, or the only absent
+// check is the one missing one, every other required check has completed (green,
+// red or skipped), and at least one exists, so the workflow demonstrably ran
+// without it. A second absent check has not completed, so with two or more absent
+// checks none is named before the grace. Cancelled and unfinished checks do not
+// count as completed.
 func absentDue(states map[string]github.CI, required []string, headAge time.Duration) bool {
 	if headAge >= absentGrace {
 		return true
 	}
-	done := 0
+	absent, done := 0, 0
 	for _, name := range required {
 		switch states[name] {
 		case github.Green, github.Red, github.Skipped:
 			done++
 		case github.Absent:
+			absent++
 		default:
 			return false
 		}
 	}
-	return done > 0
+	return absent == 1 && done > 0
 }
 
 // judgeChecks folds the required checks' states into what the gate acts on.

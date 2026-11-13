@@ -1765,7 +1765,9 @@ status on the head, which is different from a queued or running check. It
 usually means the PR branch's workflow predates the job, and updating the branch
 fixes it. The gate waits quietly (pending) until the head commit's committer date
 is 20 minutes old, or until every other required check has completed (green, red
-or skipped) with at least one of them present; then it blocks with the reason. A
+or skipped) with at least one of them present, when it is the only required check
+absent; then it blocks with the reason. With two or more absent required checks,
+none is named before the 20 minutes. A
 PR with a `conflict` never reports its checks absent, because GitHub runs no
 workflow for it. The committer date is the clock because it needs no stored
 state, so a commit made long before it was pushed reaches the grace sooner than
