@@ -11,8 +11,8 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// hkDoc builds a DecisionDocument the way the hk response decode does, so the
-// fixtures compile against a DecisionDocument that does not yet carry Body.
+// hkDoc builds a DecisionDocument from an hk-shaped JSON response, the same
+// decode path a real document takes, so its body field is set as in production.
 func hkDoc(key, body string) integrations.DecisionDocument {
 	raw, err := json.Marshal(map[string]string{
 		"key":        key,
