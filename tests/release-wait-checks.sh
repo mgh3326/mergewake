@@ -62,6 +62,10 @@ for arg in "$@"; do
 	*/compare/*...*)
 		[ "${STUB_ALLOW_COMPARE:-}" = 1 ] || { echo "stub gh: unexpected compare request: $*" >&2; exit 1; }
 		[ "$paginate" = 1 ] || { echo "stub gh: compare read is not paginated" >&2; exit 1; }
+		if [ "${STUB_FAIL_COMPARE:-}" = 1 ]; then
+			echo "stub gh: compare transient failure" >&2
+			exit 1
+		fi
 		printf '%s\t%s\t%s\n' "$STUB_COMPARE_STATUS" "$STUB_TOTAL_COMMITS" "$STUB_COMPARE_SHAS"
 		exit 0
 		;;
@@ -99,6 +103,7 @@ reset() {
 	compare_shas=0123456789abcdef0123456789abcdef01234567
 	allow_compare=
 	allow_tags=
+	fail_compare=
 }
 
 policy() { printf '%s\n' "$1" > "$case_dir/.mergewake/policy.yaml"; }
@@ -116,6 +121,7 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 		STUB_MAIN_SHA="$main_sha" \
 		STUB_ALLOW_COMPARE="$allow_compare" \
 		STUB_ALLOW_TAGS="$allow_tags" \
+		STUB_FAIL_COMPARE="$fail_compare" \
 		STUB_COMPARE_STATUS="$compare_status" \
 		STUB_TOTAL_COMMITS="$total_commits" \
 		STUB_COMPARE_SHAS="$compare_shas" \
@@ -441,6 +447,39 @@ if [ "$status" -eq 0 ] && has "$main_sha" && ! has 'superseded'; then
 	pass "(s) pre-release tag does not supersede -> exit 0"
 else
 	fail "(s) pre-release tag -> exit $status: $output"
+fi
+
+# (t) A transient coverage read failure keeps both the pending check and its
+# actual read error visible at the bound.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+fail_compare=1
+run_checks 1
+if [ "$status" -eq 1 ] && has 'waiting for: ci-ok (pending)' && has 'compare transient failure'; then
+	pass "(t) coverage read error retains pending checks -> exit 1"
+else
+	fail "(t) coverage read error -> exit $status: $output"
+fi
+
+# (u) A head verdict-fold error remains non-passing and is surfaced at timeout.
+reset
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed cancelled https://ci.example/tag
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf '%s\t%s\t%s\t%s\t%s\n' 2 ci-ok completed success https://ci.example/head > "$case_dir/check-runs-$main_sha.tsv"
+printf '%s\t%s\t%s\t%s\n' 3 ci-ok failure https://ci.example/head-status > "$case_dir/statuses-$main_sha.tsv"
+run_checks 1
+if [ "$status" -eq 1 ] && has 'waiting for: ci-ok (pending)' && has 'run and status disagree'; then
+	pass "(u) head verdict error is surfaced and remains non-passing -> exit 1"
+else
+	fail "(u) head verdict error -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then

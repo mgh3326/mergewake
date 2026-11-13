@@ -349,7 +349,7 @@ check_main_coverage() {
 		return 2
 	fi
 	if ! (cd "$module_root" && go run "$work/verdict.go" "$policy_abs" "$work/head-runs" "$work/head-statuses" > "$work/head-verdicts" 2>> "$work/error"); then
-		return 1
+		return 3
 	fi
 	head_green=1
 	while IFS="$(printf '\t')" read -r name state url; do
@@ -368,7 +368,7 @@ last_error=
 missing=
 while :; do
 	: > "$work/error"
-	poll_error=
+	coverage_error=
 	if gh api --paginate "repos/$repo/commits/$sha/check-runs?filter=latest&per_page=100" \
 		--jq '.check_runs[] | [.id, .name, .status, (.conclusion // ""), (.details_url // "")] | @tsv' \
 		> "$work/runs" 2> "$work/error" &&
@@ -408,10 +408,12 @@ while :; do
 			:
 		else
 			coverage_result=$?
-			[ "$coverage_result" -ne 2 ] || poll_error=1
+			case $coverage_result in
+				2) coverage_error=$(tail -n 1 "$work/error" 2>/dev/null || true) ;;
+				3) coverage_error="cannot judge main-head checks: $(cat "$work/error" 2>/dev/null || true)" ;;
+			esac
+			[ -n "$coverage_error" ] || [ "$coverage_result" -eq 1 ] || coverage_error="gh api failed"
 		fi
-		[ -z "$poll_error" ] || last_error=$(tail -n 1 "$work/error" 2>/dev/null || true)
-		if [ -n "$poll_error" ] && [ -z "$last_error" ]; then last_error="gh api failed"; fi
 	else
 		# A transient API failure is retried until the bound, never read as a
 		# missing check or as permission to publish stale verdicts.
@@ -422,6 +424,9 @@ while :; do
 	if [ $((now - start)) -ge "$timeout" ]; then
 		if [ -n "$last_error" ]; then
 			fail "could not read the checks for $sha within ${timeout}s: $last_error"
+		fi
+		if [ -n "$coverage_error" ]; then
+			fail "timed out after ${timeout}s waiting for:$missing; main coverage error: $coverage_error"
 		fi
 		fail "timed out after ${timeout}s waiting for:$missing"
 	fi
