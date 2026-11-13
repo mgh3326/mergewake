@@ -1342,21 +1342,17 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if auditErr != nil || noticeErr != nil {
 		return out, errors.Join(lost, auditErr, noticeErr)
 	}
-	if job.State != "" {
-		if _, err := x.closeReviewerJob(ctx, rj, job, "abandoned", cause); err != nil {
-			return out, err
-		}
+	closed, err := x.closeReplaced(ctx, rj, job, cause)
+	if err != nil {
+		return out, err
 	}
-	if cause == lostOverdue && job.Host != "" && job.PaneID != "" {
-		pane := reviewerPane{label: rj.Label, checkout: rj.Checkout, head: pr.Head.SHA, pass: plan.pass, placement: job, confirmed: true, force: true}
-		if x.closeReviewerPane(ctx, pane) && rj.Checkout != "" {
-			// The local checkout is this pass's mirror of the pane's replica;
-			// the pass that would have removed it now runs under another label.
-			if root := config.Expand(x.repo.Root); root != "" {
-				c, cancel := reportContext(ctx)
-				_, _ = s.gitIn(c, root, "worktree", "remove", "--force", rj.Checkout)
-				cancel()
-			}
+	if closed.PaneClosed && rj.Checkout != "" {
+		// The local checkout is this pass's mirror of the pane's replica;
+		// the pass that would have removed it now runs under another label.
+		if root := config.Expand(x.repo.Root); root != "" {
+			c, cancel := reportContext(ctx)
+			_, _ = s.gitIn(c, root, "worktree", "remove", "--force", rj.Checkout)
+			cancel()
 		}
 	}
 	if err := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); err != nil {
