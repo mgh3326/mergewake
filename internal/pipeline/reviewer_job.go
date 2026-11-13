@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -22,6 +23,9 @@ import (
 // panewireHeld is panewire's active-job refusal: the hub keeps one live
 // reservation per (task, role), and another reviewer job of the task holds it.
 const panewireHeld = 74
+
+// panewireCloseRefused is panewire's exit status for a job close it refuses.
+const panewireCloseRefused = 5
 
 // panewireQuotaTimeout is panewire's quota gate deadline exit: the spawn waited
 // for quota and gave up before it placed a pane.
@@ -150,6 +154,9 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 // hub frees the reservation itself when the job ends, and a spawn it still
 // holds is refused as reviewer-held. Only a cancelled context or a failed
 // audit write is an error.
+//
+// A close refused because the job already has a terminal record counts as
+// closed: the job has ended, so nothing is owed (alreadyClosedRefusal).
 func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob, job integrations.JobRecord, outcome, reason string) (bool, error) {
 	s, cfg := x.s, x.s.Config.Review.Panewire
 	lane := reviewerLane(job, rj)
@@ -166,9 +173,19 @@ func (x *panewireExecutor) closeReviewerJob(ctx context.Context, rj reviewerJob,
 		if ctx.Err() != nil {
 			return false, e
 		}
+		if alreadyClosedRefusal(e) {
+			return true, s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "label": rj.Label, "head": rj.Head, "reason": "already closed"}, false)
+		}
 		skipped = fleetevent.Redact(integrations.Detail(e))
 	}
 	return false, s.audit(x.repo.Name, "reviewer-close-skipped", map[string]any{"pr": x.pr.Number, "label": rj.Label, "head": rj.Head, "reason": skipped}, false)
+}
+
+// alreadyClosedRefusal reports whether panewire refused a job close because the
+// job already has a terminal record: exit 5 with that text on stderr. Other
+// refusals with the same exit (owner_mismatch, job_unknown, ...) leave the job owed.
+func alreadyClosedRefusal(e error) bool {
+	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "already has a terminal record")
 }
 
 // reviewerLane is the owner lane a reviewer's hk job closes under: the hk
@@ -182,10 +199,12 @@ func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
 
 // closeMovedHeadJob closes the reviewer job of a record left by an older head
 // of the PR, so its hub reservation does not refuse every spawn for the new
-// head. A job with no hk record, or one that already ended, holds nothing and
-// is left alone. A job that cannot be closed from here is audited and treated
-// the same: the caller drops the record. A closed job is remembered for this
-// run, so a spawn refused as held can close it once more and retry.
+// head. A job with no hk record holds nothing and is left alone. A terminal job
+// with no pane holds nothing either. A terminal job with a pane holds no
+// reservation, so no job close is sent, but its pane is still closed from the
+// record's host and pane. A job that cannot be closed from here is audited and
+// treated the same: the caller drops the record. A closed job is remembered for
+// this run, so a spawn refused as held can close it once more and retry.
 func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob) error {
 	s, pr := x.s, x.pr
 	job, e := x.job(ctx, rj.Label)
@@ -194,7 +213,7 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 		return nil
 	case e != nil:
 		return fmt.Errorf("reviewer job %s of head %s: %w", rj.Label, short7(rj.Head), e)
-	case terminalJob(job.State):
+	case terminalJob(job.State) && (job.Host == "" || job.PaneID == ""):
 		return nil
 	}
 	res, e := x.closeReplaced(ctx, rj, job, "PR head moved")

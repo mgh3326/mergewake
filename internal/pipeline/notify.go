@@ -480,7 +480,7 @@ func (s *Service) queueMerged(ctx context.Context, r config.Repo, pr github.Pull
 	if e != nil {
 		return "", "", false, e
 	}
-	entry := mergedPending{PR: pr.Number, Head: pr.Head.SHA, MergedAt: s.now().UTC(), Summary: summary, Body: pr.Body, MergeCommitSHA: pr.MergeCommitSHA}
+	entry := mergedPending{PR: pr.Number, Head: pr.Head.SHA, MergedAt: mergedAtFor(pr, s.now()), Summary: summary, Body: pr.Body, MergeCommitSHA: pr.MergeCommitSHA}
 	if e = pending.put(entry); e != nil {
 		return "", "", false, e
 	}
@@ -490,6 +490,17 @@ func (s *Service) queueMerged(ctx context.Context, r config.Repo, pr github.Pull
 		}
 	}
 	return "", "", false, errors.New("MERGED pending entry disappeared after write")
+}
+
+// mergedAtFor is the PR's merge time when it names one that is not after now,
+// else now: the 24-hour retry window of a new pending entry runs from it.
+func mergedAtFor(pr github.Pull, now time.Time) time.Time {
+	if pr.MergedAt != nil {
+		if at, e := time.Parse(time.RFC3339, *pr.MergedAt); e == nil && !at.After(now) {
+			return at.UTC()
+		}
+	}
+	return now.UTC()
 }
 
 // RetryMergedPending retries every durable MERGED candidate once per repo pass.
@@ -524,7 +535,8 @@ func (s *Service) retryMerged(ctx context.Context, r config.Repo, entry mergedPe
 	if sent.has(key) {
 		return "", "", false, pending.remove(entry.key())
 	}
-	if s.now().Sub(entry.MergedAt) > 24*time.Hour {
+	// A delivered notice is never recorded as given up; it finishes as sent below.
+	if !entry.Notified && s.now().Sub(entry.MergedAt) > 24*time.Hour {
 		record := mergedRecord{PR: entry.PR, Head: entry.Head, State: "merged", Summary: entry.Summary, Sent: false, Suppressed: "gave up after 24 hours"}
 		if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
 			return "", "", false, e

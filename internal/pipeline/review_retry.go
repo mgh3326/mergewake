@@ -340,6 +340,10 @@ func (s *Service) reviewRetryHold(ctx context.Context, r config.Repo, file strin
 		return true, nil
 	}
 	complete, pending, err := s.retryReviewStatus(ctx, r, pr)
+	if errors.Is(err, github.ErrPollSkipped) {
+		// The status probe is inside its poll interval: the head waits this round.
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -353,14 +357,16 @@ func (s *Service) reviewRetryHold(ctx context.Context, r config.Repo, file strin
 	if reason == "ci_red" {
 		audited = &state.WaitCIRed
 	}
-	if !*audited {
-		*audited = true
-		_ = s.audit(r.Name, "review-retry-waiting", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "reason": reason, "failures": state.Failures}, false)
-		if err := fsutil.WriteJSON(file, *state); err != nil {
-			return false, err
-		}
+	if *audited {
+		return false, nil
 	}
-	return false, nil
+	// The flag is set, and the state written, only once the row is in the
+	// journal: a failed append leaves the next evaluation to write it again.
+	if err := s.audit(r.Name, "review-retry-waiting", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "reason": reason, "failures": state.Failures}, false); err != nil {
+		return false, nil
+	}
+	*audited = true
+	return false, fsutil.WriteJSON(file, *state)
 }
 
 // reviewRetryRed reports whether a required check under the base branch's
