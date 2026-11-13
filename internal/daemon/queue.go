@@ -108,19 +108,24 @@ type Queue struct {
 	// base branch enqueues, and how an event that names only a commit finds its PR.
 	open map[string]map[int]string
 	// listing records changes made after a sweep starts reading a repo's open
-	// PRs, so SetOpen can reconcile those changes with the eventual list.
-	listing     map[string]*openList
-	listEpoch   map[string]uint64
-	listedEpoch map[string]uint64
+	// PRs, so SetOpen or AbortList can reconcile them with the outcome.
+	listing        map[string]*openList
+	listEpoch      map[string]uint64
+	committedEpoch map[string]uint64
 	// timers are the pending EnqueueAt calls. They live only in memory: a
 	// restart repeats what they would have found through the sweep.
 	timers map[timerKey]*timer
 }
 
 type openList struct {
-	epoch     uint64
-	learned   map[int]string
-	forgotten map[int]struct{}
+	epoch   uint64
+	current map[int]openFact
+	stale   map[int]openFact
+}
+
+type openFact struct {
+	open bool
+	head string
 }
 
 type timer struct {
@@ -211,7 +216,7 @@ func (q *Queue) init() {
 		q.open = map[string]map[int]string{}
 		q.listing = map[string]*openList{}
 		q.listEpoch = map[string]uint64{}
-		q.listedEpoch = map[string]uint64{}
+		q.committedEpoch = map[string]uint64{}
 		q.timers = map[timerKey]*timer{}
 		q.changed = sync.NewCond(&q.mu)
 	}
@@ -412,14 +417,48 @@ func (q *Queue) EnqueueRepo(src Source, repo string) {
 
 // BeginList marks the start of a sweep's open PR list read for repo and returns
 // the epoch to attach to evaluation reads started after the mark.
+func (q *Queue) ReadMark(repo string) uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	return q.listEpoch[repo]
+}
+
 func (q *Queue) BeginList(repo string) uint64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
 	q.listEpoch[repo]++
 	epoch := q.listEpoch[repo]
-	q.listing[repo] = &openList{epoch: epoch, learned: map[int]string{}, forgotten: map[int]struct{}{}}
+	q.listing[repo] = &openList{epoch: epoch, current: map[int]openFact{}, stale: map[int]openFact{}}
 	return epoch
+}
+
+// AbortList ends a failed list read without letting its uncommitted mark
+// supersede reads that completed while it was open.
+func (q *Queue) AbortList(repo string, epoch uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	changes := q.listing[repo]
+	if changes == nil || changes.epoch != epoch {
+		return
+	}
+	for n, fact := range changes.stale {
+		if _, superseded := changes.current[n]; superseded {
+			continue
+		}
+		if fact.open {
+			if q.open[repo] == nil {
+				q.open[repo] = map[int]string{}
+			}
+			q.open[repo][n] = fact.head
+			continue
+		}
+		q.cancelPR(repo, n)
+		delete(q.open[repo], n)
+	}
+	delete(q.listing, repo)
 }
 
 // SetOpen replaces the known open PRs of repo with their heads, reconciling
@@ -429,18 +468,19 @@ func (q *Queue) SetOpen(repo string, heads map[int]string) {
 	defer q.mu.Unlock()
 	q.init()
 	if changes := q.listing[repo]; changes != nil {
-		merged := make(map[int]string, len(heads)+len(changes.learned))
+		merged := make(map[int]string, len(heads)+len(changes.current))
 		for n, head := range heads {
 			merged[n] = head
 		}
-		for n := range changes.forgotten {
-			delete(merged, n)
-		}
-		for n, head := range changes.learned {
-			merged[n] = head
+		for n, fact := range changes.current {
+			if fact.open {
+				merged[n] = fact.head
+			} else {
+				delete(merged, n)
+			}
 		}
 		heads = merged
-		q.listedEpoch[repo] = changes.epoch
+		q.committedEpoch[repo] = changes.epoch
 		delete(q.listing, repo)
 	}
 	for tk := range q.timers {
@@ -457,18 +497,23 @@ func (q *Queue) Learn(repo string, n int, sha string, readEpoch ...uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	epoch := q.listEpoch[repo]
 	if len(readEpoch) > 0 {
-		epoch := readEpoch[0]
-		if epoch < q.listedEpoch[repo] {
+		epoch = readEpoch[0]
+	}
+	if epoch < q.committedEpoch[repo] {
+		return
+	}
+	if changes := q.listing[repo]; changes != nil && epoch < changes.epoch {
+		if _, superseded := changes.current[n]; superseded {
 			return
 		}
-		if changes := q.listing[repo]; changes != nil && epoch < changes.epoch {
-			if q.open[repo] == nil {
-				q.open[repo] = map[int]string{}
-			}
-			q.open[repo][n] = sha
-			return
+		if q.open[repo] == nil {
+			q.open[repo] = map[int]string{}
 		}
+		q.open[repo][n] = sha
+		changes.stale[n] = openFact{open: true, head: sha}
+		return
 	}
 	q.learn(repo, n, sha)
 }
@@ -484,8 +529,7 @@ func (q *Queue) Head(repo string, n int) string {
 
 func (q *Queue) learn(repo string, n int, sha string) {
 	if changes := q.listing[repo]; changes != nil {
-		changes.learned[n] = sha
-		delete(changes.forgotten, n)
+		changes.current[n] = openFact{open: true, head: sha}
 	}
 	if q.open[repo] == nil {
 		q.open[repo] = map[int]string{}
@@ -500,12 +544,22 @@ func (q *Queue) Forget(repo string, n int, readEpoch ...uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
-	if len(readEpoch) > 0 && readEpoch[0] < q.listEpoch[repo] {
+	epoch := q.listEpoch[repo]
+	if len(readEpoch) > 0 {
+		epoch = readEpoch[0]
+	}
+	if epoch < q.committedEpoch[repo] {
+		return
+	}
+	if changes := q.listing[repo]; changes != nil && epoch < changes.epoch {
+		if _, superseded := changes.current[n]; superseded {
+			return
+		}
+		changes.stale[n] = openFact{}
 		return
 	}
 	if changes := q.listing[repo]; changes != nil {
-		changes.forgotten[n] = struct{}{}
-		delete(changes.learned, n)
+		changes.current[n] = openFact{}
 	}
 	q.cancelPR(repo, n)
 	delete(q.open[repo], n)

@@ -421,6 +421,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	mergedErr := e.s.RetryMergedPending(ctx, r)
 	setPRSweepStep(ctx, "open_pulls")
 	epoch := e.beginOpenList(r.Name)
+	defer e.q.AbortList(r.Name, epoch)
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
 		return errors.Join(err, mergedErr)
