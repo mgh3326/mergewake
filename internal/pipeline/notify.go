@@ -632,7 +632,11 @@ func (s *Service) saveReadyClocks(repo string, clocks map[string]readyClock) err
 }
 
 // startReadyClock records the first READY for key; nothing is sent.
+//
+// It rereads the file under its lock, so a clock another PR's pass of the
+// repository recorded since is kept, not overwritten.
 func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
+	defer lockPath(s.readyClocksFile(r.Name))()
 	clocks, e := s.loadReadyClocks(r.Name)
 	if e != nil {
 		return e

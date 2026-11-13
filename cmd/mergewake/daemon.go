@@ -387,7 +387,7 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 // reviewPR runs one PR's review, then settles it under settling unless the
 // caller already settled its reviewed head. A review the retry reran there is
 // settled by the next evaluation of the PR.
-func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool, settling *sync.Mutex) (errs []error, clean, reviewed, unreviewed bool) {
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool) (errs []error, clean, reviewed, unreviewed bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
 	e := s.RetryReview(reviewCtx, r, pr, o)
@@ -422,9 +422,6 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 		return errs, clean, reviewed, unreviewed
 	}
 	ph := daemon.PhasesOf(ctx)
-	ph.Enter(daemon.PhaseLockWait)
-	settling.Lock()
-	defer settling.Unlock()
 	ph.Enter(daemon.PhaseSettle)
 	settleErrs := settlePR(ctx, s, r, pr.Number, o)
 	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed, unreviewed
@@ -432,7 +429,8 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 
 // settlePR delivers findings to the author lane before the verdict, so the
 // author fixes them without the desk relaying anything, then notifies the
-// verdict and lands the PR.
+// verdict and lands the PR. It takes no repository lock: each ledger the
+// delivery and the notice write has its own, and Land takes the merge lock.
 func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
 	ctx, span := tracing.Span(ctx, "mergewake.settle")
 	defer tracing.Finish(span)

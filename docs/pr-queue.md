@@ -37,9 +37,15 @@ head, then deliver findings, notify and land. It never waits for another PR.
 - Different PRs run at once. `daemon.pr.review_parallel` bounds the evaluations
   of one repository that run at once. Unset or `0` means no bound. A priority-1
   PR may start past an explicit bound, up to two at once per repository.
-- Lands stay one at a time per repository. The settle step of each PR (findings,
-  notice, land) takes the repository's settle lock, so each land sees the base
-  the previous one left.
+- Merges stay one at a time per repository. Land takes the repository's merge
+  lock from its last recheck of the PR (the fresh PR read, the base head, the
+  policy and the gate against that base) to the end of `GH.Merge`, so each merge
+  sees the base the previous one left. Nothing else of a settle is under it:
+  the findings delivery and the verdict notice of one PR run while another PR's
+  merge is in flight, and so do the steps of Land after its merge. The files
+  they share (`findings-deliveries.json`, `pr-ready-renotify.json`) are each
+  rewritten under a lock of their own, held only to reread, change and write the
+  file.
 - An evaluation that only check deliveries queued reads the PR without forcing
   fresh evidence when the check ran on the head the queue knows for it: the
   check result is the new fact, not the PR. Any other source, and a check that
@@ -89,9 +95,9 @@ them are not counted). All values are milliseconds.
 | --- | --- |
 | `read_ms` | The first reads: the PR, the bot policy and the skip plan. |
 | `observe_ms` | Recording the PR's outcomes. |
-| `review_ms` | The review claim check, the priority lookup and the review call, spawn included. It ends when the evaluation starts to wait for the settle lock. |
-| `lock_wait_ms` | Waiting for the repository's settle lock. |
-| `settle_ms` | Holding that lock: findings, notice and land. |
+| `review_ms` | The review claim check, the priority lookup and the review call, spawn included. It ends when the evaluation starts its settle. |
+| `lock_wait_ms` | Waiting for the repository's merge lock, in Land, after the first gate. |
+| `settle_ms` | The settle without that wait: findings, notice and land, merge included. |
 
 Two more fields sit inside those phases and are not added to the sum:
 

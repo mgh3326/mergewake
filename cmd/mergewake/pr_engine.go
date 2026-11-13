@@ -27,9 +27,10 @@ import (
 // looked at.
 //
 // One evaluation is observe, then review, then settle, as the pass used to run
-// it for each PR. It never waits for another PR. Lands stay one at a time per
-// repo, under the repo's settling lock: each must see the base the previous
-// land left.
+// it for each PR. It never waits for another PR, except at the merge: Land
+// takes the repo's merge lock from its last recheck to the end of the merge,
+// so each merge sees the base the previous one left. Findings and the verdict
+// notice of two PRs of one repo go out at once.
 type prEngine struct {
 	s     *pipeline.Service
 	gh    *github.Client
@@ -53,7 +54,6 @@ type prEngine struct {
 	open     map[string]*openSet
 	sweepMu  sync.Mutex
 	sweeping map[string]*prSweepState
-	settling map[string]*sync.Mutex
 	// since is what happened per repo after the last pass line.
 	since map[string]*passCounts
 	errs  map[string][]error
@@ -101,7 +101,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
 		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
@@ -143,15 +143,6 @@ var reviewPriorityGrace = 2 * time.Second
 // prSweepTimeout bounds how long one repository can hold a PR pass. Tests
 // shorten it to exercise the timeout and still-running paths.
 var prSweepTimeout = 5 * time.Minute
-
-func (e *prEngine) repoLock(repo string) *sync.Mutex {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.settling[repo] == nil {
-		e.settling[repo] = &sync.Mutex{}
-	}
-	return e.settling[repo]
-}
 
 func (e *prEngine) counts(repo string) *passCounts {
 	if e.since[repo] == nil {
@@ -398,15 +389,11 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseReview)
-	lock := e.repoLock(r.Name)
 	// An unreadable or poll-skipped marker is not done: the PR is reviewed.
 	if done, err := e.gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); err == nil && done {
 		handled = true
-		ph.Enter(daemon.PhaseLockWait)
-		lock.Lock()
 		ph.Enter(daemon.PhaseSettle)
 		errs = settlePR(ctx, e.s, r, pr.Number, o)
-		lock.Unlock()
 		ph.Enter(daemon.PhaseReview)
 	} else {
 		// A PR that never had to wait for a slot has not been looked up yet.
@@ -426,7 +413,7 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 	c.reviewing++
 	c.peak = max(c.peak, c.reviewing)
 	e.mu.Unlock()
-	reviewErrs, ok, reviewed, unreviewed := reviewPR(ctx, e.s, r, pr, o, !handled, lock)
+	reviewErrs, ok, reviewed, unreviewed := reviewPR(ctx, e.s, r, pr, o, !handled)
 	e.mu.Lock()
 	e.counts(r.Name).reviewing--
 	e.mu.Unlock()

@@ -162,7 +162,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				// Keep what was already delivered; a retry of the failed batch
 				// reuses its event ID, which panewire dedupes.
 				if changed && o.Reporting() {
-					e = errors.Join(e, s.saveDeliveries(r.Name, ledger))
+					e = errors.Join(e, s.saveDeliveries(r.Name, n, ledger))
 				}
 				return errors.Join(followErr, e)
 			}
@@ -178,7 +178,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
-		followErr = errors.Join(followErr, s.saveDeliveries(r.Name, ledger))
+		followErr = errors.Join(followErr, s.saveDeliveries(r.Name, n, ledger))
 	}
 	return followErr
 }
@@ -707,8 +707,42 @@ func (s *Service) loadDeliveries(repo string) ([]findingsDelivery, error) {
 	return ds, nil
 }
 
-// saveDeliveries keeps the deliveries of the last 30 days, newest 1000 at most.
-func (s *Service) saveDeliveries(repo string, ds []findingsDelivery) error {
+// saveDeliveries writes PR n's deliveries from ledger into the file. A pass
+// loads the file, sends over the network and only then saves, so another PR's
+// pass of the same repository may have saved in between: the save rereads the
+// file under its lock and replaces only PR n's entries, keeping every other
+// PR's as the file now holds them. It keeps the deliveries of the last 30 days,
+// newest 1000 at most.
+func (s *Service) saveDeliveries(repo string, n int, ledger []findingsDelivery) error {
+	defer lockPath(s.deliveriesFile(repo))()
+	stored, e := s.loadDeliveries(repo)
+	if e != nil {
+		return e
+	}
+	mine := map[string]findingsDelivery{}
+	var order []string
+	for _, d := range ledger {
+		if d.PR == n {
+			if _, dup := mine[d.ID]; !dup {
+				order = append(order, d.ID)
+			}
+			mine[d.ID] = d
+		}
+	}
+	ds := make([]findingsDelivery, 0, len(stored)+len(order))
+	for _, d := range stored {
+		if m, ok := mine[d.ID]; ok && d.PR == n {
+			ds = append(ds, m)
+			delete(mine, d.ID)
+			continue
+		}
+		ds = append(ds, d)
+	}
+	for _, id := range order {
+		if d, ok := mine[id]; ok {
+			ds = append(ds, d)
+		}
+	}
 	cutoff := s.now().Add(-30 * 24 * time.Hour)
 	ds = slices.DeleteFunc(ds, func(d findingsDelivery) bool { return d.SentAt.Before(cutoff) })
 	if len(ds) > 1000 {
