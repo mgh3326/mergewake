@@ -45,6 +45,9 @@ func (r *envRecorder) reply(args []string) []byte {
 	if args[1] == "list" {
 		return []byte(r.listed)
 	}
+	if args[1] == "pending" {
+		return []byte(`{"id":77,"origin_id":123}`)
+	}
 	return []byte("recorded rep id=srv:42\n")
 }
 func (r *envRecorder) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
@@ -116,6 +119,34 @@ func TestOutcomesChildEnvDropsHKServiceNames(t *testing.T) {
 	for _, name := range append(slices.Clone(hkServiceNames), keptNames...) {
 		if os.Getenv(name) != canary(name) {
 			t.Errorf("daemon environment changed: %s", name)
+		}
+	}
+}
+
+func TestOriginRetryUsesOutcomesChildEnv(t *testing.T) {
+	var v Outcome
+	complete(&v)
+	v.Task, v.ID = Key("example/project", 1), "stable"
+	var env []string
+	for _, name := range append(slices.Clone(hkServiceNames), keptNames...) {
+		env = append(env, name+"="+canary(name))
+	}
+	r := &envRecorder{listed: originRowFor(t, v)}
+	cli := CLI{Runner: r, Command: "panewire", Environ: func() []string { return slices.Clone(env) }}
+	if ref, err := cli.Publish(context.Background(), v); err != nil || ref != "srv:77" {
+		t.Fatalf("ref=%q err=%v", ref, err)
+	}
+	if len(r.calls) != 2 || !r.calls[1].viaEnv || !slices.Equal(r.calls[1].args, []string{"reps", "pending", "retry", "origin:123"}) {
+		t.Fatalf("calls=%+v, want profile list then env retry", r.calls)
+	}
+	for _, name := range hkServiceNames {
+		if _, n := envValue(r.calls[1].env, name); n != 0 {
+			t.Errorf("retry child env carries %s", name)
+		}
+	}
+	for _, name := range keptNames {
+		if got, n := envValue(r.calls[1].env, name); got != canary(name) || n != 1 {
+			t.Errorf("retry child env lost %s (value=%q occurrences=%d)", name, got, n)
 		}
 	}
 }

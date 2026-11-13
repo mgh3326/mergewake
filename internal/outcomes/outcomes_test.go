@@ -163,16 +163,23 @@ func TestConcurrentUpdatesAndNoDuplicateObservation(t *testing.T) {
 }
 
 type cliRunner struct {
-	calls  int
-	listed string
-	args   []string
+	calls    int
+	listed   string
+	args     []string
+	argsSeen [][]string
+	retryOut []byte
+	retryErr error
 }
 
 func (r *cliRunner) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
 	r.calls++
 	r.args = args
+	r.argsSeen = append(r.argsSeen, slices.Clone(args))
 	if args[1] == "list" {
 		return []byte(r.listed), nil
+	}
+	if args[1] == "pending" {
+		return r.retryOut, r.retryErr
 	}
 	return []byte("recorded rep id=srv:42\n"), nil
 }
