@@ -271,24 +271,13 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	rec := e.seen.Evaluating(r.Name, n, pr.Head.SHA, evalStart)
 	ctx = pipeline.WithHeadLatency(ctx, &pipeline.HeadLatency{Log: e.log, Repo: r.Name, PR: n, Head: pr.Head.SHA,
 		Seen: rec.Seen, SeenBy: rec.SeenBy, FirstEval: rec.FirstEval, EvalStart: evalStart, Evals: rec.Evals})
-	// A policy that lists dependency bots keeps their PRs out of the drop and
-	// out of review: they are settled by Land's bot-patch gate alone. An
-	// unreadable policy lists none, so the bots stay dropped as before.
-	var listed []string
-	if pr.User.Type == "Bot" {
-		var err error
-		if listed, err = e.s.BotUpdateAuthors(ctx, r); err != nil {
-			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
-		}
-	}
-	if len(skipBotPulls([]github.Pull{pr}, e.s.Config.Daemon.PR.SkipBots, listed...)) == 0 {
+	if len(skipBotPulls([]github.Pull{pr}, e.s.Config.Daemon.PR.SkipBots)) == 0 {
 		res.gone = true
 		return errs, res
 	}
 	// A conflicting head gets its one ESC here, before the unchanged skip and
-	// whatever the draft, review, settle or bot landing below does: a held,
-	// quota-stopped or pending review never reaches NotifyPR, and a listed
-	// bot's PR never does. The ESC changes nothing below.
+	// whatever the draft, review or settle below does: a held, quota-stopped or
+	// pending review never reaches NotifyPR. The ESC changes nothing below.
 	if err := e.s.EscalateConflict(ctx, r, pr, e.o); err != nil {
 		errs = append(errs, fmt.Errorf("PR %d conflict ESC: %w", n, err))
 	}
@@ -298,7 +287,7 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	// A PR whose ETags, head, base and webhooks are as its last clean
 	// evaluation left them keeps that verdict: nothing below touches it.
 	var plan skipPlan
-	if e.skips != nil && !isListedBot(pr, listed) {
+	if e.skips != nil {
 		base, baseErr := e.gh.Head(readCtx, r.Name, r.Branch)
 		plan = e.skips.plan(ctx, e.gh, r.Name, n, base, baseErr)
 		// A fresh status read that found the PR changed asked for a full
@@ -329,8 +318,6 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	switch {
 	case pr.Draft:
 		settled = true
-	case isListedBot(pr, listed):
-		errs = append(errs, botLand(prCtx, e.s, r, n, opts)...)
 	default:
 		var reviewErrs []error
 		var clean, reviewed bool
@@ -442,18 +429,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	}
 	e.q.SetOpen(r.Name, heads)
 	e.openOf(r.Name).replace(heads)
-	var listed []string
-	if hasBotPull(prs) {
-		setPRSweepStep(ctx, "bot_policy")
-		var err error
-		if listed, err = e.s.BotUpdateAuthors(ctx, r); err != nil {
-			errs = append(errs, fmt.Errorf("bot_updates policy: %w", err))
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	}
-	prs = skipBotPulls(prs, e.s.Config.Daemon.PR.SkipBots, listed...)
+	prs = skipBotPulls(prs, e.s.Config.Daemon.PR.SkipBots)
 	// PRs a fresh status read marked go first.
 	prs = dirtyFirst(prs, prstatus.DirtyPRs(e.s.Config.StateDir, r.Name))
 	setPRSweepStep(ctx, "feed")

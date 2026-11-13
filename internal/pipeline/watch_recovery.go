@@ -286,7 +286,7 @@ func (s *watchStream) confirmRecovery(ctx context.Context, r config.Repo, p poli
 			return st, false, "", false, e
 		}
 		if !ready {
-			if s.now().Sub(at) >= p.AnyRefWait() {
+			if s.now().Sub(at) >= policy.DefaultAnyRefTimeout {
 				timedOut = append(timedOut, sha)
 			}
 			continue

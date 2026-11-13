@@ -81,8 +81,7 @@ func (s *watchStream) endAnyRef(repo string) error {
 // watchDeploy finds the newest terminal deploy result without assigning a
 // result to intervening commits that did not run the deploy stage.
 func (s *watchStream) watchDeploy(ctx context.Context, r config.Repo, p policy.Policy, mainHead string, o Options) error {
-	p.MainChecks = p.DeploySet()
-	p.WatchChecks = nil
+	p.WatchChecks = p.DeploySet()
 	// A dispatched candidate is judged by the checks its any-ref deploy run
 	// posts; unset, by the deploy set as before.
 	p.AnyRefChecks = p.AnyRefDeployChecks

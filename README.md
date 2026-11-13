@@ -145,20 +145,19 @@ observation, not merging, so it also runs while the daemon is in shadow mode;
 
 ```text
 [mergewake] BLOCKED example/project#7 head=a1b2c3d | check_failed:vet; check_failed:test | lane=worker-lane via task 2252
-[mergewake] BLOCKED example/project#7 head=a1b2c3d | threads_open:1; base_stale | lane=operator-desk via config
+[mergewake] BLOCKED example/project#7 head=a1b2c3d | threads_open:1; conflict | lane=operator-desk via config
 ```
 
 READY means the merge gate passed: every `required_checks` entry green on the
 head, zero unresolved review threads, the `mergewake/reviews/<pr>/<head>-done`
 marker plus the head-bound passes from the trusted `review.login` (the marker
-alone is forgeable), the base branch an ancestor of the head, and no merge
+alone is forgeable), and no merge
 conflict — the same inputs `land` merges on. BLOCKED names the reason from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` for unresolved review threads (`blocking_findings:<n>` and
 `triage_unanswered:<n>` instead when the repo policy grades findings), `finding_outside_diff:<n>` for critical or high findings a pass listed in its review body because their path is not in the diff (a person's `Disposition: dismiss: <reason>` PR comment naming the head's SHA clears it), `review_missing` when the
-marker or passes are absent, `base_stale` when the base moved ahead of the
-head and the repo sets `require_up_to_date: true`, and `conflict` when GitHub reports the PR unmergeable. Pending or missing
-check evidence emits nothing. When acting and `base_stale` is the only blocker (it needs `require_up_to_date: true`), `auto_update_branch` defaults to true and updates the PR branch once per base SHA; an ambiguous attempt may be retried after a fresh gate check. Shadow mode reports BLOCKED; set it to false in `.mergewake/policy.yaml` to notify instead. A failed update notifies with `update_failed:<status>` (or `unknown` for an ambiguous failure). Each `(PR, head, verdict)` emits once — a
+marker or passes are absent, and `conflict` when GitHub reports the PR unmergeable. A base that moved ahead of the head does not block: the PR merges on its own head and the post-merge CI checks the result. Pending or missing
+check evidence emits nothing. Shadow mode reports BLOCKED. Each `(PR, head, verdict)` emits once — a
 changed BLOCKED reason set counts as a new verdict and emits again for the
 same head — while a new head re-arms the notification and sent keys persist
 across daemon restarts under `<state_dir>/<repo>/pr-notify-sent`. BLOCKED is declared `--type blocked`, so it stays unread on the lane until

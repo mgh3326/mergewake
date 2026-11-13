@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -73,30 +72,6 @@ type ReviewGate struct {
 // deletions) is held only by block-class findings.
 type FastLane struct {
 	MaxChangedLines int `yaml:"max_changed_lines"`
-}
-
-// BotUpdates names the dependency bots whose patch updates land without a
-// review and the files such an update may change. Land is "patch", the only
-// mode.
-type BotUpdates struct {
-	Authors []string `yaml:"authors"`
-	Paths   []string `yaml:"paths"`
-	Land    string   `yaml:"land"`
-}
-
-// Lists reports whether a PR opened by login, a GitHub user of userType, is by
-// a listed bot. The login must match exactly (case aside): NormalizeAuthor
-// would let a human account named like the bot pass.
-func (b *BotUpdates) Lists(login, userType string) bool {
-	if b == nil || userType != "Bot" {
-		return false
-	}
-	for _, a := range b.Authors {
-		if strings.EqualFold(a, login) {
-			return true
-		}
-	}
-	return false
 }
 
 // GateVerdict is the graded outcome for one PR classification. Blocking
@@ -362,21 +337,13 @@ func (g ReviewGate) MissingRequiredBots(fs []ReviewFinding, reviews map[string]i
 }
 
 type Policy struct {
-	DeployApproval   []Rule `yaml:"deploy_approval"`
-	AutoUpdateBranch *bool  `yaml:"auto_update_branch"`
-	// RequireUpToDate opts the repository into holding a head whose base moved
-	// ahead (GitHub reports the PR "behind") as base_stale. Absent or false
-	// lands such a head and records Review.BaseBehind; post-merge CI checks the
-	// composed result.
-	RequireUpToDate bool     `yaml:"require_up_to_date"`
-	Version         int      `yaml:"version"`
-	Enabled         bool     `yaml:"enabled"`
-	RequiredChecks  []string `yaml:"required_checks"`
-	WatchChecks     []string `yaml:"watch_checks"`
-	// MainChecks names the checks that judge a main-branch commit. It defaults
-	// to watch_checks, its legacy name; a policy may set both only with the
-	// same list.
-	MainChecks []string `yaml:"main_checks"`
+	DeployApproval []Rule   `yaml:"deploy_approval"`
+	Version        int      `yaml:"version"`
+	Enabled        bool     `yaml:"enabled"`
+	RequiredChecks []string `yaml:"required_checks"`
+	// WatchChecks names the checks that judge a main-branch commit; it
+	// defaults to required_checks.
+	WatchChecks []string `yaml:"watch_checks"`
 	// DeployChecks names the checks that judge a release commit on the deploy
 	// stage. Empty means the repository has no deploy stage: release and
 	// rollout judge a commit by its main checks.
@@ -384,9 +351,6 @@ type Policy struct {
 	Blocking     []Rule      `yaml:"blocking"`
 	ReviewGate   *ReviewGate `yaml:"review_gate"`
 	FastLane     *FastLane   `yaml:"fast_lane"`
-	// BotUpdates opts the repository into landing a dependency bot's patch
-	// updates without review. Absent keeps every bot PR out of the land path.
-	BotUpdates *BotUpdates `yaml:"bot_updates"`
 	// AnyRefWorkflow names a workflow file in .github/workflows that runs the
 	// watch checks for any commit (workflow_dispatch with input ref). When it
 	// is set, watch dispatches it for a commit bisect needs but has no result
@@ -404,21 +368,17 @@ type Policy struct {
 	// deploy_checks; the names are not required to be in deploy_checks, because
 	// the deploy run reports under its own names.
 	AnyRefDeployChecks []string `yaml:"any_ref_deploy_checks"`
-	// AnyRefTimeout bounds the wait for one dispatched commit's result, as a
-	// Go duration. Empty means DefaultAnyRefTimeout.
-	AnyRefTimeout string `yaml:"any_ref_timeout"`
 }
 
-// DefaultAnyRefTimeout is how long watch waits for one any-ref CI result.
+// DefaultAnyRefTimeout is how long watch waits for one any-ref CI result. It
+// has no policy key.
 const DefaultAnyRefTimeout = 45 * time.Minute
 
-// WatchSet is the checks that judge the newest main head: main_checks, its
-// alias watch_checks, else required_checks.
+// WatchSet is the checks that judge the newest main head: watch_checks, else
+// required_checks.
 func (p Policy) WatchSet() []string {
-	for _, set := range [][]string{p.MainChecks, p.WatchChecks} {
-		if len(set) > 0 {
-			return set
-		}
+	if len(p.WatchChecks) > 0 {
+		return p.WatchChecks
 	}
 	return p.RequiredChecks
 }
@@ -443,19 +403,6 @@ func (p Policy) BisectChecks() []string {
 		return p.AnyRefChecks
 	}
 	return p.WatchSet()
-}
-
-// AnyRefWait returns the validated any_ref_timeout, or the default.
-func (p Policy) AnyRefWait() time.Duration {
-	if d, e := time.ParseDuration(p.AnyRefTimeout); e == nil && d > 0 {
-		return d
-	}
-	return DefaultAnyRefTimeout
-}
-
-// AutoUpdateBranchEnabled defaults branch updates on when the key is absent.
-func (p Policy) AutoUpdateBranchEnabled() bool {
-	return p.AutoUpdateBranch == nil || *p.AutoUpdateBranch
 }
 
 type Decision struct {
@@ -486,22 +433,12 @@ func (p Policy) Validate() error {
 		}
 		watchSeen[n] = true
 	}
-	for _, set := range []struct {
-		key    string
-		checks []string
-	}{{"main_checks", p.MainChecks}, {"deploy_checks", p.DeployChecks}} {
-		seen := map[string]bool{}
-		for _, n := range set.checks {
-			if strings.TrimSpace(n) == "" || seen[n] {
-				return fmt.Errorf("%s must be nonempty and unique", set.key)
-			}
-			seen[n] = true
+	deployDup := map[string]bool{}
+	for _, n := range p.DeployChecks {
+		if strings.TrimSpace(n) == "" || deployDup[n] {
+			return errors.New("deploy_checks must be nonempty and unique")
 		}
-	}
-	// watch_checks is the legacy name of main_checks. Keeping both is allowed
-	// only while they agree, so no policy reads two different main sets.
-	if len(p.MainChecks) > 0 && len(p.WatchChecks) > 0 && !slices.Equal(p.MainChecks, p.WatchChecks) {
-		return errors.New("main_checks and watch_checks are the same key; set one or give both the same list")
+		deployDup[n] = true
 	}
 	// An empty list is an error, not "unset": it would silently mean every
 	// candidate is judged by no check.
@@ -546,14 +483,6 @@ func (p Policy) Validate() error {
 	}
 	if w := p.AnyRefWorkflow; w != "" && (strings.TrimSpace(w) != w || strings.Contains(w, "/") || !(strings.HasSuffix(w, ".yml") || strings.HasSuffix(w, ".yaml"))) {
 		return fmt.Errorf("any_ref_workflow %q must be a workflow file name ending in .yml or .yaml", w)
-	}
-	if p.AnyRefTimeout != "" {
-		if d, e := time.ParseDuration(p.AnyRefTimeout); e != nil || d <= 0 {
-			return fmt.Errorf("any_ref_timeout %q must be a positive duration", p.AnyRefTimeout)
-		}
-		if p.AnyRefWorkflow == "" {
-			return errors.New("any_ref_timeout requires any_ref_workflow")
-		}
 	}
 	for _, r := range append(append([]Rule{}, p.Blocking...), p.DeployApproval...) {
 		if len(r.Paths) == 0 || strings.TrimSpace(r.Reason) == "" {
@@ -602,24 +531,6 @@ func (p Policy) Validate() error {
 		for _, a := range p.ReviewGate.IgnoreAuthors {
 			if strings.TrimSpace(a) == "" {
 				return errors.New("review_gate ignore_authors must be nonempty")
-			}
-		}
-	}
-	if b := p.BotUpdates; b != nil {
-		if b.Land != "patch" {
-			return fmt.Errorf("bot_updates land must be %q", "patch")
-		}
-		if len(b.Authors) == 0 || len(b.Paths) == 0 {
-			return errors.New("bot_updates requires authors and paths")
-		}
-		for _, a := range b.Authors {
-			if strings.TrimSpace(a) == "" || strings.TrimSpace(a) != a {
-				return errors.New("bot_updates authors must be nonempty logins")
-			}
-		}
-		for _, g := range b.Paths {
-			if _, err := Match(g, "probe"); err != nil {
-				return err
 			}
 		}
 	}

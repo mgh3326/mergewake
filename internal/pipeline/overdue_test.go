@@ -207,9 +207,6 @@ func TestMergeOverdueExclusions(t *testing.T) {
 			yes := true
 			rig.g.pull.Mergeable, rig.g.pull.MergeableState = &yes, "clean"
 		}},
-		{"base stale", true, func(rig *overdueRig) {
-			rig.g.policyExtra, rig.g.stale, rig.g.pull.MergeableState = requireUpToDate, true, "behind"
-		}, func(rig *overdueRig) { rig.g.stale, rig.g.pull.MergeableState = false, "clean" }},
 		{"T3 trailer", true, func(rig *overdueRig) { rig.g.pull.Body = "Mergewake-Tier: T3" }, func(rig *overdueRig) { rig.g.pull.Body = "Mergewake-Tier: T2" }},
 		{"T3 task title", true, func(rig *overdueRig) {
 			rig.g.pull.Body = "Mergewake-Task: 42"
@@ -362,40 +359,6 @@ func TestMergeOverdueCIRunningStartsNoReviewClock(t *testing.T) {
 	}
 }
 
-// branchUpdateTo makes the next evaluation find a stale base that mergewake
-// updates, the update producing head newHead as a merge of base into oldHead.
-func (rig *overdueRig) branchUpdateTo(newHead string) {
-	rig.t.Helper()
-	rig.g.policyExtra, rig.g.stale, rig.g.pull.MergeableState = requireUpToDate, true, "behind"
-	rig.g.updateHook = func() {
-		rig.g.stale, rig.g.pull.MergeableState = false, "clean"
-		rig.g.pull.Head.SHA = newHead
-		rig.g.parents2 = map[string][]string{newHead: {shaA, shaB}}
-		markReviewed(rig.g)
-	}
-}
-
-// (a) mergewake updates the branch at minute 30: the head it makes keeps the
-// old head's HeadSeen and READY, so ready_too_long still falls due 45 minutes
-// after the READY the author never had to repeat.
-func TestMergeOverdueCarriesClocksAcrossOwnBranchUpdate(t *testing.T) {
-	rig := newOverdueRig(t, true)
-	rig.at(0) // READY for aaaaaaa
-	rig.branchUpdateTo(shaC)
-	rig.at(30 * time.Minute)
-	rig.g.updateHook = nil
-	rig.at(31 * time.Minute)
-	rig.wantConditions()
-	rig.at(44 * time.Minute)
-	rig.wantConditions(overdueNotLanded)
-	rig.at(45 * time.Minute)
-	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
-	e := rig.n.overdueEvents()[1]
-	if !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | clocks carried from aaaaaaa after mergewake updated the branch | gate: ready") {
-		t.Fatal(e.Text)
-	}
-}
-
 // (b) An author push is a head of its own: no update made it, so its clocks
 // start at the push and its READY is the one sent for it.
 func TestMergeOverdueAuthorPushRestartsClocks(t *testing.T) {
@@ -410,48 +373,6 @@ func TestMergeOverdueAuthorPushRestartsClocks(t *testing.T) {
 	rig.at(76 * time.Minute)
 	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
 	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | gate: ready") || strings.Contains(e.Text, "carried from") {
-		t.Fatal(e.Text)
-	}
-}
-
-// (c) mergewake updates the branch, then the author pushes on top of the
-// result: the carry does not follow that push, and the clocks restart from it.
-func TestMergeOverdueAuthorPushAfterOwnUpdateRestartsClocks(t *testing.T) {
-	rig := newOverdueRig(t, true)
-	rig.at(0) // READY for aaaaaaa
-	rig.branchUpdateTo(shaC)
-	rig.at(30 * time.Minute)
-	rig.g.updateHook = nil
-	rig.at(31 * time.Minute) // ccccccc inherits aaaaaaa's clocks
-	rig.g.pull.Head.SHA = shaD
-	rig.g.parents2[shaD] = []string{shaC}
-	markReviewed(rig.g)
-	rig.at(32 * time.Minute)
-	rig.wantConditions()
-	rig.at(45 * time.Minute)
-	rig.wantConditions(overdueNotLanded)
-	if got := rig.n.conditions(); len(got) != 1 {
-		t.Fatalf("the push took a carried clock: %v", got)
-	}
-}
-
-// (d) The update record is written with the clocks: a restart between the
-// update and the head it produced still carries them.
-func TestMergeOverdueCarrySurvivesRestart(t *testing.T) {
-	rig := newOverdueRig(t, true)
-	rig.at(0)
-	rig.branchUpdateTo(shaC)
-	rig.at(30 * time.Minute)
-	rig.g.updateHook = nil
-	restarted := *rig.s
-	rig.n = &laneNotifier{refuse: map[string]bool{}}
-	restarted.Notifier = rig.n
-	rig.s = &restarted
-	rig.at(31 * time.Minute)
-	rig.wantConditions()
-	rig.at(45 * time.Minute)
-	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
-	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "head=ccccccc | ready_too_long after 45m0s | clocks carried from aaaaaaa") {
 		t.Fatal(e.Text)
 	}
 }

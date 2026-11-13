@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -119,23 +118,6 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if v.State == "pending" {
 		return s.audit(r.Name, "pr-notify", record, false)
 	}
-	if o.Acting() && v.State == "blocked" && len(v.Reasons) == 1 && v.Reasons[0] == "base_stale" && p.AutoUpdateBranchEnabled() {
-		status, attempted, err := s.updateStaleBranch(ctx, r, pr, baseSHA)
-		if err != nil {
-			return err
-		}
-		if status == "recheck" {
-			return nil
-		}
-		if status == "ok" {
-			if attempted {
-				return s.audit(r.Name, "base_updated", map[string]any{"pr": n, "from": pr.Head.SHA}, false)
-			}
-			return nil
-		}
-		v.Reasons = append(v.Reasons, "update_failed:"+status)
-		record.Reasons = v.Reasons
-	}
 	summary := pr.Title
 	// identity is the summary as it was before the conflict ESC took the
 	// conflict out of the BLOCKED text: the sent key and event id still carry
@@ -237,75 +219,6 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		record.FailedHosts = authorScanFailures(ctx)
 	}
 	return s.audit(r.Name, "pr-notify", record, false)
-}
-
-// updateStaleBranch reserves each PR/base pair before the network call. A
-// unknown outcome is retried only after fresh PR, base and gate checks.
-func (s *Service) updateStaleBranch(ctx context.Context, r config.Repo, pr github.Pull, baseSHA string) (string, bool, error) {
-	dir := filepath.Join(s.state(r.Name), "base-updates")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", false, err
-	}
-	key := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", pr.Number, baseSHA)))
-	path := filepath.Join(dir, hex.EncodeToString(key[:]))
-	unlock, err := fsutil.Lock(path+".lock", true)
-	if err != nil {
-		return "", false, err
-	}
-	defer unlock()
-	data, err := os.ReadFile(path)
-	if err == nil && string(data) != "unknown" {
-		return string(data), false, nil
-	}
-	if err == nil {
-		fresh := github.FreshEvidence(ctx)
-		current, e := s.GH.Pull(fresh, r.Name, pr.Number)
-		if e != nil {
-			return "", false, e
-		}
-		base, e := s.GH.Head(fresh, r.Name, r.Branch)
-		if e != nil {
-			return "", false, e
-		}
-		if current.State != "open" || current.Draft || current.Base.Ref != r.Branch || current.Head.SHA != pr.Head.SHA || base != baseSHA {
-			return "recheck", false, nil
-		}
-		p, e := s.Policy(fresh, r, base)
-		if e != nil {
-			return "", false, e
-		}
-		if !p.AutoUpdateBranchEnabled() {
-			return "recheck", false, nil
-		}
-		v, e := s.mergeGate(fresh, r, current, p, base)
-		if e != nil {
-			return "", false, e
-		}
-		if v.State != "blocked" || len(v.Reasons) != 1 || v.Reasons[0] != "base_stale" {
-			return "recheck", false, nil
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", false, err
-	}
-	if err = fsutil.Atomic(path, []byte("unknown"), 0600); err != nil {
-		return "", false, err
-	}
-	status := "ok"
-	if err = s.GH.UpdateBranch(ctx, r.Name, pr.Number, pr.Head.SHA); err != nil {
-		status = "unknown"
-		var api *github.APIError
-		if errors.As(err, &api) {
-			status = fmt.Sprint(api.Code)
-		}
-	} else if e := s.recordBranchUpdate(r.Name, pr.Number, pr.Head.SHA); e != nil {
-		// The update happened; a lost record only restarts the overdue clocks
-		// of the head it produces.
-		_ = s.audit(r.Name, "base-update-record-error", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "error": integrations.Detail(e)}, false)
-	}
-	if err = fsutil.Atomic(path, []byte(status), 0600); err != nil {
-		_ = s.audit(r.Name, "base-update-marker-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, false)
-	}
-	return status, true, nil
 }
 
 // errNotifyDelivery marks a lane event the notifier refused. The first
@@ -819,9 +732,6 @@ func (s *Service) isDeskLane(lane string) bool {
 // interrupts and must be acked. A BLOCKED never reaches here for mergewake's
 // own review wait: NotifyPR sends that only as the review-stalled alert.
 func verdictType(state, via string) string {
-	if state == botNoticeState {
-		return "decision"
-	}
 	if state == "blocked" && via == "unknown author; desk" {
 		return "decision"
 	}

@@ -15,7 +15,7 @@
    version and writes `SHA256SUMS`. It checks that `mergewake --version`
    prints the tag. It runs the tests. Before publishing, it waits for the tag
    commit's checks named by `.mergewake/policy.yaml` at the tag
-   (`deploy_checks`, else `main_checks`/`watch_checks`, the same set rollout
+   (`deploy_checks`, else `watch_checks`, the same set rollout
    uses) and publishes only when every one is green; a name may be a check run
    or a commit status. A failing check fails the release with its name and URL,
    and a check not reported within the bound (`RELEASE_CHECKS_TIMEOUT_SECONDS`,

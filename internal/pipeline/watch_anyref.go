@@ -121,7 +121,7 @@ func (s *watchStream) anyRef(ctx context.Context, r config.Repo, p policy.Policy
 	if st.Head != head {
 		st = anyRefIncident{Head: head, Limit: anyRefLimit(interval)}
 	}
-	step := st.decide(sha, s.now(), p.AnyRefWait())
+	step := st.decide(sha, s.now(), policy.DefaultAnyRefTimeout)
 	if !step.dispatch {
 		return step.reason, step.notify, nil
 	}

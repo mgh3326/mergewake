@@ -37,9 +37,6 @@ type fakeGH struct {
 	GitHub
 	pullCalls                                                    int
 	commitCalls                                                  int
-	updateHeads                                                  []string
-	updateErr                                                    error
-	updateHook                                                   func()
 	nextHead                                                     string
 	nextBase                                                     string // base ref from the second Pull on
 	pull                                                         github.Pull
@@ -147,13 +144,6 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 		p.Base.Ref = g.nextBase
 	}
 	return p, nil
-}
-func (g *fakeGH) UpdateBranch(_ context.Context, _ string, _ int, head string) error {
-	g.updateHeads = append(g.updateHeads, head)
-	if g.updateHook != nil {
-		g.updateHook()
-	}
-	return g.updateErr
 }
 func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {
@@ -673,7 +663,6 @@ func TestLand(t *testing.T) {
 		{name: "pending checks wait", enabled: true, reviewed: true, ci: github.Pending, action: "pending"},
 		{name: "review missing", enabled: true, ci: github.Green, action: "blocked"},
 		{name: "threads open", enabled: true, reviewed: true, findings: 2, ci: github.Green, action: "blocked"},
-		{name: "stale base", enabled: true, reviewed: true, stale: true, ci: github.Green, action: "blocked"},
 		{name: "conflict", enabled: true, reviewed: true, conflict: true, ci: github.Green, action: "blocked"},
 		{name: "blocking reviewed merges", enabled: true, blocking: true, reviewed: true, ci: github.Green, merges: 1, action: "merge"},
 		{name: "dry run", enabled: true, reviewed: true, ci: github.Green, dry: true},
@@ -683,11 +672,6 @@ func TestLand(t *testing.T) {
 			s, g, _, _, r := setup(t)
 			g.enabled = tt.enabled
 			g.blocking = tt.blocking
-			g.stale = tt.stale
-			if tt.stale {
-				g.pull.MergeableState = "behind"
-				g.policyExtra = "require_up_to_date: true\n"
-			}
 			if tt.reviewed {
 				markReviewed(g)
 			}

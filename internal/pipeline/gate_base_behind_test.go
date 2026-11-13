@@ -3,14 +3,11 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
-
-const requireUpToDate = "require_up_to_date: true\n"
 
 // mergeRecorder remembers the sha each merge call was bound to.
 type mergeRecorder struct {
@@ -69,8 +66,8 @@ func TestBaseBehindCleanPRIsReadyAndLands(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(g.updateHeads) != 0 || n.count != 0 {
-		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
+	if n.count != 0 {
+		t.Fatalf("events=%v", n.events)
 	}
 	if got := baseBehindFlag(t, out, "pr-notify", false); got != true {
 		t.Fatalf("notify base_behind = %v", got)
@@ -81,29 +78,8 @@ func TestBaseBehindCleanPRIsReadyAndLands(t *testing.T) {
 	if got := baseBehindFlag(t, out, "land", true); got != true {
 		t.Fatalf("land base_behind = %v", got)
 	}
-	if len(g.shas) != 1 || g.shas[0] != shaA || g.mergeCount != 1 || len(g.updateHeads) != 0 {
-		t.Fatalf("merge shas=%v count=%d updates=%v", g.shas, g.mergeCount, g.updateHeads)
-	}
-}
-
-// (b) GitHub reports behind and the policy requires an up-to-date branch: the
-// gate blocks on base_stale and the notifier updates the branch once.
-func TestBaseBehindRequiredBlocksAndUpdates(t *testing.T) {
-	s, g, n, _, r := baseBehindSetup(t, true, "behind", requireUpToDate)
-	if v := gateAt(t, s, g.fakeGH, shaB); v.State != "blocked" || reasons(v) != "base_stale" || v.Review.BaseBehind {
-		t.Fatalf("gate: %+v", v)
-	}
-	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if len(g.updateHeads) != 1 || g.updateHeads[0] != shaA || n.count != 0 {
-		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
-	}
-	if e := s.Land(context.Background(), r, 7, Options{}); e != nil {
-		t.Fatal(e)
-	}
-	if g.mergeCount != 0 {
-		t.Fatal("behind PR merged")
+	if len(g.shas) != 1 || g.shas[0] != shaA || g.mergeCount != 1 {
+		t.Fatalf("merge shas=%v count=%d", g.shas, g.mergeCount)
 	}
 }
 
@@ -117,8 +93,8 @@ func TestBaseBehindDefaultPolicyLandsBehindHead(t *testing.T) {
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(g.updateHeads) != 0 || n.count != 0 {
-		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
+	if n.count != 0 {
+		t.Fatalf("events=%v", n.events)
 	}
 	if got := baseBehindFlag(t, out, "pr-notify", false); got != true {
 		t.Fatalf("notify base_behind = %v", got)
@@ -129,28 +105,20 @@ func TestBaseBehindDefaultPolicyLandsBehindHead(t *testing.T) {
 	if got := baseBehindFlag(t, out, "land", true); got != true {
 		t.Fatalf("land base_behind = %v", got)
 	}
-	if g.mergeCount != 1 || len(g.updateHeads) != 0 {
-		t.Fatalf("merges=%d updates=%v", g.mergeCount, g.updateHeads)
+	if g.mergeCount != 1 {
+		t.Fatalf("merges=%d", g.mergeCount)
 	}
 }
 
-// (c) A behind head that also conflicts is blocked on conflict under either
-// policy, and the branch is never updated.
-func TestBaseBehindConflictBlocksWithoutUpdate(t *testing.T) {
-	for name, extra := range map[string]string{"default": "", "required": requireUpToDate} {
-		t.Run(name, func(t *testing.T) {
-			s, g, _, _, r := baseBehindSetup(t, true, "dirty", extra)
-			v := gateAt(t, s, g.fakeGH, shaB)
-			if v.State != "blocked" || !strings.Contains(reasons(v), "conflict") || (extra == "" && strings.Contains(reasons(v), "base_stale")) {
-				t.Fatalf("gate: %+v", v)
-			}
-			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
-				t.Fatal(e)
-			}
-			if len(g.updateHeads) != 0 {
-				t.Fatalf("updates=%v", g.updateHeads)
-			}
-		})
+// (c) A behind head that also conflicts is blocked on conflict alone.
+func TestBaseBehindConflictBlocks(t *testing.T) {
+	s, g, _, _, r := baseBehindSetup(t, true, "dirty", "")
+	v := gateAt(t, s, g.fakeGH, shaB)
+	if v.State != "blocked" || reasons(v) != "conflict" {
+		t.Fatalf("gate: %+v", v)
+	}
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
 	}
 }
 

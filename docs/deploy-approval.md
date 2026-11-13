@@ -137,8 +137,8 @@ document referenced by the question, preserving hk's notification size limit.
 
 For repositories with a deploy stage, release and rollout read the policy's
 `deploy_checks` (for example `deploy-ok`, posted after the main stage is green on
-the same commit); a repository without one uses its main set, `main_checks`
-(`watch_checks` is its legacy alias), else `required_checks`. `ci-ok` alone does
+the same commit); a repository without one uses its main set, `watch_checks`,
+else `required_checks`. `ci-ok` alone does
 not release a deploy-stage repository, and the manifest records the deploy
 observation it was published on. Approval never overrides a failing release CI
 check.

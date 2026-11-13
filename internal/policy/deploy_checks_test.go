@@ -8,16 +8,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestMainAndDeployChecksParse(t *testing.T) {
+func TestWatchAndDeployChecksParse(t *testing.T) {
 	for _, tt := range []struct {
 		name, extra  string
 		main, deploy []string
 		stage        bool
 	}{
-		{"main and deploy", "main_checks: [ci-ok, image]\ndeploy_checks: [deploy-ok]\n", []string{"ci-ok", "image"}, []string{"deploy-ok"}, true},
-		{"watch_checks alias", "watch_checks: [ci-ok]\n", []string{"ci-ok"}, []string{"ci-ok"}, false},
-		{"main overrides required", "main_checks: [ci-ok]\n", []string{"ci-ok"}, []string{"ci-ok"}, false},
-		{"both aliases agree", "main_checks: [ci-ok]\nwatch_checks: [ci-ok]\n", []string{"ci-ok"}, []string{"ci-ok"}, false},
+		{"watch and deploy", "watch_checks: [ci-ok, image]\ndeploy_checks: [deploy-ok]\n", []string{"ci-ok", "image"}, []string{"deploy-ok"}, true},
+		{"watch overrides required", "watch_checks: [ci-ok]\n", []string{"ci-ok"}, []string{"ci-ok"}, false},
 		{"no deploy stage", "", []string{"CI"}, []string{"CI"}, false},
 		{"explicit empty deploy stage", "deploy_checks: []\n", []string{"CI"}, []string{"CI"}, false},
 	} {
@@ -42,13 +40,12 @@ func TestMainAndDeployChecksParse(t *testing.T) {
 	}
 }
 
-func TestMainAndDeployChecksValidation(t *testing.T) {
+func TestWatchAndDeployChecksValidation(t *testing.T) {
 	for _, tt := range []struct {
 		name, extra, want string
 	}{
-		{"different aliases", "main_checks: [ci-ok]\nwatch_checks: [other]\n", "main_checks and watch_checks"},
-		{"blank main", "main_checks: [' ']\n", "main_checks"},
-		{"duplicate main", "main_checks: [ci-ok, ci-ok]\n", "main_checks"},
+		{"blank watch", "watch_checks: [' ']\n", "watch_checks"},
+		{"duplicate watch", "watch_checks: [ci-ok, ci-ok]\n", "watch_checks"},
 		{"blank deploy", "deploy_checks: ['']\n", "deploy_checks"},
 		{"duplicate deploy", "deploy_checks: [deploy-ok, deploy-ok]\n", "deploy_checks"},
 	} {
@@ -65,10 +62,10 @@ func TestMainAndDeployChecksValidation(t *testing.T) {
 	}
 }
 
-// any_ref_checks is a subset of the main set, which main_checks now names.
+// any_ref_checks is a subset of the main set, which watch_checks names.
 func TestAnyRefChecksFollowMainChecks(t *testing.T) {
 	var p Policy
-	text := "version: 1\nrequired_checks: [CI]\nmain_checks: [ci-ok, image]\nany_ref_checks: [ci-ok]\n"
+	text := "version: 1\nrequired_checks: [CI]\nwatch_checks: [ci-ok, image]\nany_ref_checks: [ci-ok]\n"
 	if e := yaml.Unmarshal([]byte(text), &p); e != nil {
 		t.Fatal(e)
 	}

@@ -54,31 +54,6 @@ func TestLandForgedMarkerNeedsPasses(t *testing.T) {
 	}
 }
 
-// A stale base is its own verdict even on an otherwise ready head: the worker
-// updates the branch, which produces a new head to gate.
-func TestLandStaleBaseBlocks(t *testing.T) {
-	s, g, _, _, r := setup(t)
-	g.enabled = true
-	markReviewed(g)
-	g.stale = true
-	g.pull.MergeableState = "behind"
-	g.policyExtra = "require_up_to_date: true\n"
-	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if g.mergeCount != 0 || landAction(t, s, r.Name) != "blocked" {
-		t.Fatal("stale-base head merged")
-	}
-	g.stale = false
-	g.pull.MergeableState = "clean"
-	if err := s.Land(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if g.mergeCount != 1 {
-		t.Fatal("fresh base did not land")
-	}
-}
-
 // Any unresolved review thread holds the head regardless of who opened it;
 // resolving it releases the merge.
 func TestLandOpenThreadsBlock(t *testing.T) {
