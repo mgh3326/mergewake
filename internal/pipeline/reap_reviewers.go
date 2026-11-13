@@ -409,7 +409,7 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		}
 		w.record(gate, "kept", "job:"+st)
 		return
-	case job.Role != "reviewer" && job.Role != "worker":
+	case !reviewerReapRole(job.Role):
 		w.record(gate, "kept", "role:"+job.Role)
 		return
 	}
@@ -462,6 +462,15 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		}
 	}
 	w.removeLocal(ctx, l)
+}
+
+func reviewerReapRole(role string) bool {
+	switch role {
+	case "reviewer", "worker", "implementer", "tester", "counsel", "consult":
+		return true
+	default:
+		return false
+	}
 }
 
 // closePane finds the label's pane on hs and closes it under I4 and I5. It

@@ -1290,7 +1290,7 @@ func TestReviewAuthorFamilyAlias(t *testing.T) {
 		t.Fatal(e)
 	}
 	for _, spawn := range runner.pane.spawns {
-		if arg(spawn, "--builder-family") != "anthropic" {
+		if arg(spawn, "--author-family") != "anthropic" {
 			t.Fatalf("alias not normalised: %v", spawn)
 		}
 	}

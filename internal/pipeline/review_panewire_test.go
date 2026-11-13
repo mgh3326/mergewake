@@ -409,7 +409,7 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 		t.Fatal(runner.spawns, runner.headless, g.postCount)
 	}
 	sp := runner.spawns[0]
-	for flag, want := range map[string]string{"-m": "auto", "--builder-job": "author-job", "--builder-family": "anthropic", "--task": "42", "--role": "reviewer", "--t": "T2", "--host": "auto", "-w": "reviews"} {
+	for flag, want := range map[string]string{"-m": "auto", "--builder-job": "author-job", "--author-family": "anthropic", "--task": "42", "--role": "reviewer", "--t": "T2", "--host": "auto", "-w": "reviews"} {
 		if arg(sp, flag) != want {
 			t.Fatalf("%s=%q in %v", flag, arg(sp, flag), sp)
 		}
@@ -554,7 +554,7 @@ func (r refuseHKCLI) Run(_ context.Context, command string, args []string, _, _ 
 	return nil, errors.New("no subprocess in this test")
 }
 
-// The builder's hk job record supplies --builder-family; a builder without a
+// The builder's hk job record supplies --author-family; a builder without a
 // record (pre-records spawn) falls back to the trailer/commit inference.
 func TestPanewireBuilderFamilyFromRecord(t *testing.T) {
 	for name, tc := range map[string]struct {
@@ -575,7 +575,7 @@ func TestPanewireBuilderFamilyFromRecord(t *testing.T) {
 				t.Fatal(e)
 			}
 			sp := runner.spawns[0]
-			if arg(sp, "--builder-family") != tc.want || arg(sp, "--builder-job") != "author-job" {
+			if arg(sp, "--author-family") != tc.want || arg(sp, "--builder-job") != "author-job" {
 				t.Fatal(sp)
 			}
 			brief, _ := os.ReadFile(arg(sp, "-p"))
@@ -615,8 +615,8 @@ func TestPanewireBuilderFamilyArgUsesAcceptedFamilies(t *testing.T) {
 			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 				t.Fatal(err)
 			}
-			if got := arg(runner.spawns[0], "--builder-family"); got != tc.want {
-				t.Fatalf("--builder-family=%q, want %q; argv=%v", got, tc.want, runner.spawns[0])
+			if got := arg(runner.spawns[0], "--author-family"); got != tc.want {
+				t.Fatalf("--author-family=%q, want %q; argv=%v", got, tc.want, runner.spawns[0])
 			}
 		})
 	}
@@ -629,8 +629,8 @@ func TestPanewireUnsupportedBuilderFamilyPreservesAuthorFamily(t *testing.T) {
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := arg(runner.spawns[0], "--builder-family"); got != "other" {
-		t.Fatalf("--builder-family=%q, want other", got)
+	if got := arg(runner.spawns[0], "--author-family"); got != "other" {
+		t.Fatalf("--author-family=%q, want other", got)
 	}
 	passes := g.passes[g.pull.Head.SHA]
 	if len(passes) != 1 || passes[0].Family != "openai" || passes[0].SameFamily {
@@ -939,7 +939,7 @@ func TestPanewireFamilyRefusalRetriesAsWorker(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(runner.spawns) != 2 || arg(runner.spawns[1], "--role") != "worker" || runner.headless != 0 {
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "--role") != "implementer" || arg(runner.spawns[1], "--author-family") != "anthropic" || runner.headless != 0 {
 		t.Fatal(runner.spawns, runner.headless)
 	}
 	got := g.passes[shaA][0]
@@ -956,7 +956,7 @@ func TestPanewireSkipFailsPassWithoutHeadless(t *testing.T) {
 	}{
 		"no task trailer":  {"Mergewake-Author-Family: openai\n", &panewireRunner{findings: `{"findings":[]}`}, "no Mergewake-Task trailer"},
 		"spawn refused":    {"", &panewireRunner{refuse: map[string]int{"reviewer": 70}}, "panewire spawn exit 70"},
-		"refused twice":    {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}}, "panewire spawn exit 77"},
+		"refused twice":    {"", &panewireRunner{refuse: map[string]int{"reviewer": panewireRefused, "implementer": panewireRefused}}, "panewire spawn exit 77"},
 		"no findings file": {"", &panewireRunner{}, "no findings: job record no job record"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1202,7 +1202,7 @@ func TestPanewireTaskWithoutBoundJobRunsTopLevel(t *testing.T) {
 		t.Fatalf("spawns=%d headless=%d", len(runner.spawns), runner.headless)
 	}
 	sp := runner.spawns[0]
-	if slices.Contains(sp, "--builder-job") || arg(sp, "--builder-family") != "openai" || arg(sp, "--task") != "42" || arg(sp, "--role") != "reviewer" {
+	if slices.Contains(sp, "--builder-job") || arg(sp, "--author-family") != "openai" || arg(sp, "--task") != "42" || arg(sp, "--role") != "reviewer" {
 		t.Fatal(sp)
 	}
 	if p := g.passes[shaA]; len(p) != 1 || p[0].Executor != "panewire" {
@@ -1229,7 +1229,7 @@ func TestPanewireWorkerSeatSpawnCarriesAcceptedBuilderFamily(t *testing.T) {
 		t.Fatalf("spawns=%d, want reviewer refusal and worker-seat spawn", len(runner.spawns))
 	}
 	spawn := runner.spawns[1]
-	if arg(spawn, "--role") != "worker" || arg(spawn, "--builder-family") != "anthropic" {
+	if arg(spawn, "--role") != "implementer" || arg(spawn, "--author-family") != "anthropic" {
 		t.Fatalf("worker-seat spawn missing accepted builder family: %v", spawn)
 	}
 }

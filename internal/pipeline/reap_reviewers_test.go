@@ -202,6 +202,26 @@ func TestReapReviewer_B_I2_KeepsPaneOfUnfinishedJob(t *testing.T) {
 	}
 }
 
+func TestReapReviewerAcceptsOldAndRenamedWorkerRoles(t *testing.T) {
+	for _, role := range []string{"worker", "implementer", "tester", "counsel", "consult"} {
+		t.Run(role, func(t *testing.T) {
+			f := newReviewerFix(t)
+			label := reviewerLabelFor(12, time.Hour)
+			f.addReviewer(label, "w1:p5")
+			rec := f.sink.recs[label]
+			rec.Role = role
+			f.sink.recs[label] = rec
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			rows := f.rows(t)
+			if len(rows) < 1 || rows[0].Result != "closed" || rows[0].Reason == "role:"+role {
+				t.Fatalf("role %q not accepted: %v", role, rowSummary(rows))
+			}
+		})
+	}
+}
+
 // (c) A label younger than review.timeout + 1m may still belong to a running
 // pass: no row, no hub op.
 func TestReapReviewer_C_I3_LeavesYoungLabel(t *testing.T) {

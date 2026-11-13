@@ -373,7 +373,7 @@ func TestReviewBriefDocResumedReplayKeepsRecordedArgs(t *testing.T) {
 	if arg(first, "-p") != "hk:doc/review/"+label || docPuts(hk) != 1 {
 		t.Fatalf("first spawn %v, %d doc PUTs", first, docPuts(hk))
 	}
-	if rj := readReviewerJob(t, s, r, 1); !slices.Equal(rj.Args, first) {
+	if rj := readReviewerJob(t, s, r, 1); !slices.Equal(panewireSpawnArgs(rj.Args), first) {
 		t.Fatalf("record %v != spawn %v", rj.Args, first)
 	}
 	stored := hk.Documents()["review/"+label]

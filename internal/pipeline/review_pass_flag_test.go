@@ -55,13 +55,13 @@ func TestReviewPassFlagAbsentFromWorkerSeatFallback(t *testing.T) {
 	if role, pass := roleAndPass(first); role != "reviewer" || pass != "1" {
 		t.Fatalf("first spawn role=%q pass=%q: %v", role, pass, first)
 	}
-	if role, pass := roleAndPass(fallback); role != "worker" || slices.Contains(fallback, "--review-pass") || pass != "" {
+	if role, pass := roleAndPass(fallback); role != "implementer" || slices.Contains(fallback, "--review-pass") || pass != "" {
 		t.Fatalf("fallback role=%q: %v", role, fallback)
 	}
 	// Everything but the role and the flag is the first spawn's argv.
 	rest := func(args []string) []string {
 		return slices.DeleteFunc(slices.Clone(args), func(a string) bool {
-			return a == "--role" || a == "reviewer" || a == "worker" || a == "--review-pass" || a == "1"
+			return a == "--role" || a == "reviewer" || a == "implementer" || a == "--review-pass" || a == "1"
 		})
 	}
 	if !slices.Equal(rest(first), rest(fallback)) {
@@ -76,7 +76,7 @@ func TestReviewPassFlagSurvivesResumedReplay(t *testing.T) {
 	if role, pass := roleAndPass(first); role != "reviewer" || pass != "1" {
 		t.Fatalf("first spawn: %v", first)
 	}
-	if rj := readReviewerJob(t, s, r, 1); !slices.Equal(rj.Args, first) {
+	if rj := readReviewerJob(t, s, r, 1); !slices.Equal(panewireSpawnArgs(rj.Args), first) {
 		t.Fatalf("record %v != spawn %v", rj.Args, first)
 	}
 	c.t = c.t.Add(2 * time.Second)

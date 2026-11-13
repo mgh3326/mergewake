@@ -78,7 +78,7 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 	runner.waitTimeout = o.waitTimeout
 	runner.spawnOut = o.spawnOut
 	if o.refuseAll {
-		runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
+		runner.refuse = map[string]int{"reviewer": panewireRefused, "implementer": panewireRefused}
 	}
 	runner.afterRun = func() {
 		label := arg(runner.spawns[len(runner.spawns)-1], "-l")

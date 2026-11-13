@@ -161,7 +161,7 @@ func TestRetryReviewRespawnsPanewireAfterFailedPane(t *testing.T) {
 		retrySpawns   int // spawn calls in the retry
 		newLabelRetry bool
 	}{
-		{"refused", map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}, 2, 1, true},
+		{"refused", map[string]int{"reviewer": panewireRefused, "implementer": panewireRefused}, 2, 1, true},
 		{"spawn exit 70", map[string]int{"reviewer": 70}, 1, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
