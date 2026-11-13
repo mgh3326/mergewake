@@ -179,8 +179,9 @@ var (
 	// outsideDismissForm is the dismiss disposition with its reason, bare
 	// ("Dismiss: …") or under "Disposition:" ("Disposition: dismiss …").
 	outsideDismissForm = regexp.MustCompile(`(?im)^\W*(?:disposition\s*:\s*)?dismiss\w*\s*:?\s*\S`)
-	// outsideDeferForm is the defer disposition naming its task.
-	outsideDeferForm = regexp.MustCompile(`(?im)^\W*disposition\s*:\s*defer\s+\S*\d\S*`)
+	// outsideDeferForm is the defer disposition naming its task, in the form
+	// deferTaskRef accepts (gate.go).
+	outsideDeferForm = regexp.MustCompile(`(?im)^\W*disposition\s*:\s*defer\s+` + deferTaskRef)
 )
 
 // outsideTitle is the short text BLOCKED and answers show for a finding.
