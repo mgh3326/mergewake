@@ -220,3 +220,44 @@ func TestWatchHoldEpisodeRejectsUnreadableState(t *testing.T) {
 		t.Fatal("unreadable episode state accepted")
 	}
 }
+
+func TestMainWatchHoldUsesEpisodeStateForDeduplication(t *testing.T) {
+	s, _, sink, n, r := episodeHoldSetup(t)
+	result := watchResult{Head: shaB, Action: "hold", Reason: "one reason"}
+	for i := 0; i < 2; i++ {
+		if err := s.reportWatch(context.Background(), r, result, shaB+":"+result.Reason, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n.count != 1 || sink.records != 1 {
+		t.Fatalf("notifications=%d sink records=%d", n.count, sink.records)
+	}
+	if _, err := os.Stat(filepath.Join(s.state(r.Name), "watch-reported")); !os.IsNotExist(err) {
+		t.Fatalf("main hold unexpectedly used watch-reported: %v", err)
+	}
+	episode, err := s.readWatchHoldEpisode(r.Name)
+	if err != nil || !episode.Announced["one reason"] || episode.AnnouncedPairs["one reason"] != shaB+"\x00one reason" {
+		t.Fatalf("episode state=%+v err=%v", episode, err)
+	}
+}
+
+func TestWatchHoldSuppressionStateTracksOnlyCurrentHead(t *testing.T) {
+	s, _, _, n, r := episodeHoldSetup(t)
+	for i := 0; i < 200; i++ {
+		head := fmt.Sprintf("head-%03d", i)
+		if err := s.reportWatch(context.Background(), r, watchResult{Head: head, Action: "hold", Reason: "one reason"}, head+":one reason", Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	episode, err := s.readWatchHoldEpisode(r.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || episode.SuppressedHead != "head-199" || len(episode.Suppressed) != 1 || len(episode.AnnouncedPairs) != 1 {
+		t.Fatalf("notifications=%d episode=%+v", n.count, episode)
+	}
+	data, err := os.ReadFile(filepath.Join(s.state(r.Name), "watch-hold-active.json"))
+	if err != nil || len(data) > 512 {
+		t.Fatalf("episode file size=%d err=%v", len(data), err)
+	}
+}

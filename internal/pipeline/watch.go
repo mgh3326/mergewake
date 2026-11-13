@@ -35,10 +35,14 @@ type watchResult struct {
 }
 
 type watchHoldEpisode struct {
-	ID         string          `json:"id"`
-	Announced  map[string]bool `json:"announced,omitempty"`
-	Notified   map[string]bool `json:"notified,omitempty"`
-	Suppressed map[string]bool `json:"suppressed,omitempty"`
+	ID             string            `json:"id"`
+	Announced      map[string]bool   `json:"announced,omitempty"`
+	AnnouncedPairs map[string]string `json:"announced_pairs,omitempty"`
+	SuppressedHead string            `json:"suppressed_head,omitempty"`
+	Suppressed     map[string]bool   `json:"suppressed,omitempty"`
+	// Notified reads episode files written by the first implementation and is
+	// migrated to AnnouncedPairs on the next write.
+	Notified map[string]bool `json:"notified,omitempty"`
 }
 
 // UnknownEvidenceError names the bracket commit whose CI evidence Bisect
@@ -704,8 +708,12 @@ func (s *Service) reportMainWatchHold(ctx context.Context, r config.Repo, result
 	}
 	class := watchHoldReasonClass(result.Reason)
 	pair := result.Head + "\x00" + result.Reason
+	if episode.SuppressedHead != result.Head {
+		episode.SuppressedHead = result.Head
+		episode.Suppressed = map[string]bool{}
+	}
 	if episode.Announced[class] {
-		if episode.Notified[pair] || episode.Suppressed[pair] {
+		if episode.AnnouncedPairs[class] == pair || episode.Suppressed[pair] {
 			return nil
 		}
 		if err = s.audit(r.Name, "watch-hold-suppressed", map[string]any{"head": result.Head, "reason": result.Reason, "episode": episode.ID}, false); err != nil {
@@ -734,7 +742,8 @@ func (s *Service) reportMainWatchHold(ctx context.Context, r config.Repo, result
 		return err
 	}
 	episode.Announced[class] = true
-	episode.Notified[pair] = true
+	episode.AnnouncedPairs[class] = pair
+	episode.Notified = nil
 	return s.writeWatchHoldEpisode(r.Name, episode)
 }
 
@@ -752,9 +761,18 @@ func (s *Service) readWatchHoldEpisode(repo string) (watchHoldEpisode, error) {
 	if episode.Announced == nil {
 		episode.Announced = map[string]bool{}
 	}
-	if episode.Notified == nil {
-		episode.Notified = map[string]bool{}
+	if episode.AnnouncedPairs == nil {
+		episode.AnnouncedPairs = map[string]string{}
 	}
+	for pair := range episode.Notified {
+		if i := strings.IndexByte(pair, '\x00'); i >= 0 {
+			class := watchHoldReasonClass(pair[i+1:])
+			if episode.Announced[class] && episode.AnnouncedPairs[class] == "" {
+				episode.AnnouncedPairs[class] = pair
+			}
+		}
+	}
+	episode.Notified = nil
 	if episode.Suppressed == nil {
 		episode.Suppressed = map[string]bool{}
 	}
