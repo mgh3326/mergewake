@@ -42,6 +42,29 @@ func TestEventQueueEngineEvaluatesAnEventPRWhileAnotherReviewIsBlocked(t *testin
 	}
 }
 
+func TestEvaluationNotifiesRecentExternallyMergedPROnce(t *testing.T) {
+	f := newParallelFixture(t, 1, 0)
+	f.repo.Lane = "design"
+	f.hub.merged = true
+	e := newPREngine(f.s, f.gh, pipeline.Options{}, []config.Repo{f.repo}, nil, nil, nil)
+	w := daemon.Work{Key: daemon.PRKey{Repo: f.repo.Name, PR: 1}}
+	if _, res := e.evaluate(context.Background(), f.repo, w); !res.gone {
+		t.Fatal("merged PR stayed in the open evaluation set")
+	}
+	if _, res := e.evaluate(context.Background(), f.repo, w); !res.gone {
+		t.Fatal("repeat merged PR stayed in the open evaluation set")
+	}
+	var notices int
+	for _, step := range f.trace.snapshot() {
+		if step == "notify 1" {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("recent external merge notices=%d trace=%v", notices, f.trace.snapshot())
+	}
+}
+
 // (d) Two PRs of one repo that reach their land decision at once are settled
 // one after the other: the merge request, made inside each settle, never has
 // a second one in flight beside it.
