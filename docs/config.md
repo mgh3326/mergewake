@@ -634,7 +634,7 @@ nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
 
-A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
+A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A job that already ended (`completed`, `escalated`, or `lost`) holds no hub claim, so it gets no job close and only its pane is closed. A job close that panewire refuses because the job already has a terminal record counts as closed; any other refusal stays owed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
 
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire

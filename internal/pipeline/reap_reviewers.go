@@ -173,8 +173,9 @@ type reviewerSweep struct {
 	// remote is the newest remote worktree path a receipt recorded per label
 	// and host, the fallback when the pane is gone and the job names no cwd.
 	remote map[string]map[string]string
-	// abandoned names labels an earlier pass closed abandoned; their job
-	// record no longer reads spawned or completed, and the pane still needs reaping.
+	// abandoned names labels an earlier pass closed abandoned. Their job record
+	// still reads spawned until panewire's sweep ends the job (then lost), so
+	// this receipt, not the record, stops a second abandon; the pane still needs reaping.
 	abandoned map[string]bool
 	// pulls memoises the PR reads of one pass; a failed read is not kept.
 	pulls map[int]github.Pull
