@@ -756,8 +756,9 @@ on it.
   posted. The `review` audit event counts them as `duplicates_dropped`.
 - **Closed contract.** A PR-body section headed `Acceptance` (`Acceptance
   criteria`, `Acceptance (…)`; any heading level, up to the next heading of the
-  same or higher level), else the same section in the body of the task named by
-  the `Mergewake-Task` trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
+  same or higher level), else the same section in the body document named by
+  the task's `body_doc` field for the task named by the `Mergewake-Task`
+  trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
   the closed list of what the change must do. The reviewer marks a finding
   outside it with `"advisory": true`. mergewake then caps the finding at
   `medium` (unrated becomes `low`), posts it with an `<!-- mergewake-advisory -->`
@@ -829,7 +830,7 @@ Mergewake-Tier: T1
 ```
 
 `Mergewake-Author-Model` is optional when the configured author profile has a
-concrete `--model` argument. Use `baseline` and `downshift` arm names for pacelever exploration compatibility.
+concrete `--model` argument. Use `baseline` and `downshift` arm names for exploration compatibility.
 Grade and tier come from the trailer, else from the `(grade X, Tn)` marker in the
 title of the PR's `Mergewake-Task`, else they are unknown; no config default fills
 them. A row with an unknown grade is never published; `outcomes report` counts it
@@ -905,16 +906,18 @@ Everything else is kept, including `PATH`, `HOME`, `XDG_*`,
 through its own configuration. The daemon's own environment is not
 changed; its hk HTTP clients keep these variables.
 
-Only a `srv:` row is a receipt. Before each `reps add`, mergewake lists the
-profile's reps and looks for a row whose notes carry the same outcome id:
+Only a `srv:` row is a receipt. Before publishing, mergewake lists the
+profile's reps and looks for a row whose notes carry the same outcome id. A
+`srv:` row takes precedence over pending local rows:
 
 | Earlier row | Result |
 |---|---|
 | `id=srv:N` | Confirmed and recorded as published; no add. |
-| `id=origin:N` or `id=local:N` | No add. The outcome is not published and stays in the outbox: `rep delivered locally only (origin:N), not shared; retained in outbox`. |
-| None | `reps add`. A reply other than `recorded rep id=srv:N` stays in the outbox, and the next flush finds its row. |
+| `id=origin:N` | Run `reps pending retry origin:N` within the same 45-second bound. A reply with a positive server `id` records `srv:<id>`; on failure, the outcome stays in the outbox and the next flush retries. |
+| `id=local:N` | No retry or add. The outcome is not published and stays in the outbox: `rep delivered locally only (local:N), not shared; retained in outbox`. |
+| None | `reps add`. A reply other than `recorded rep id=srv:N` stays in the outbox; the next flush finds its row and retries it if it has an `origin:N` id. |
 
-A local-only row stops duplicate adds but is never counted as shared:
+A `local:N` row stops duplicate adds but is never counted as shared:
 `outcomes report --source hk` reads `srv:` rows only.
 
 Publishing runs in one background publisher in the daemon, while the `pr` role
@@ -2006,7 +2009,11 @@ threshold. Failed attempts back off exponentially and persist per PR head in
 `<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
 `3` failures. A new head resets the counter. At the threshold, one
 `automation-failed` event interrupts `notifier.lane`; later attempts keep the
-bounded backoff. These counters are per host. GitHub review leases still
+bounded backoff. While a failed head conflicts or its required checks are
+red, retries and the failure escalation wait: the first wait per head and
+reason writes a `review-retry-waiting` row, and the count, backoff and last
+error stay as they were until the head can merge cleanly again. These
+counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.

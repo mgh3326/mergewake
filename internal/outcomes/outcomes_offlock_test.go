@@ -190,7 +190,7 @@ func TestFlushAfterCrashBetweenPublishAndAppendPublishesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &benchRunner{t: t, prefix: "srv"}
-	cli := CLI{Runner: r, Command: "pacelever"}
+	cli := CLI{Runner: r, Command: "panewire"}
 	err := ledger.Flush(context.Background(), crashAfterPublish{cli}, "")
 	if err == nil || !strings.Contains(err.Error(), "crash between") {
 		t.Fatalf("simulated crash: %v", err)

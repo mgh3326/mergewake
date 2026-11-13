@@ -34,6 +34,11 @@ type reviewRetryState struct {
 	// LastError is the redacted, clipped text of the last counted failure, for
 	// the escalation notice.
 	LastError string `json:"last_error,omitempty"`
+	// WaitConflict and WaitCIRed record the wait reasons this head already
+	// audited, so the review-retry-waiting row is written once per reason,
+	// not once per poll.
+	WaitConflict bool `json:"wait_conflict,omitempty"`
+	WaitCIRed    bool `json:"wait_ci_red,omitempty"`
 }
 
 // reviewErrorLimit bounds the error text a failure row and notice carry.
@@ -137,6 +142,21 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	state.Backoffs = max(state.Backoffs, state.Failures)
 	initial, maximum, threshold := s.Config.Daemon.PR.ReviewRetry.Settings()
 	if state.Failures >= threshold && !state.Escalated {
+		// The escalation waits with the retries while the failed head
+		// conflicts or its required checks are red.
+		fresh, err := s.GH.Pull(github.FreshEvidence(ctx), r.Name, pr.Number)
+		if err != nil {
+			return err
+		}
+		if fresh.State == "open" && !fresh.Merged && !fresh.Draft && fresh.Head.SHA == pr.Head.SHA {
+			proceed, err := s.reviewRetryHold(ctx, r, file, &state, fresh)
+			if err != nil {
+				return err
+			}
+			if !proceed {
+				return nil
+			}
+		}
 		sent, err := s.escalateReviewFailure(ctx, r, pr, state.Failures, state.LastError)
 		if err != nil {
 			return err
@@ -163,6 +183,13 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		return err
 	}
 	if fresh.State != "open" || fresh.Merged || fresh.Draft || fresh.Head.SHA != pr.Head.SHA {
+		return nil
+	}
+	proceed, err := s.reviewRetryHold(ctx, r, file, &state, fresh)
+	if err != nil {
+		return err
+	}
+	if !proceed {
 		return nil
 	}
 	ctx, attempt := withAttempt(ctx)
@@ -288,6 +315,68 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		}
 	}
 	return err
+}
+
+// reviewRetryHold decides whether a head with counted failures waits before
+// its next attempt or escalation. pr is the fresh pull of the open head. A
+// conflicting head, or one whose required checks under the trusted base
+// policy are red, waits: the first wait per head and reason writes a
+// review-retry-waiting row, and the failure count, backoff and last error
+// stay as they were. A head whose passes are already complete is done
+// instead, and a pending reviewer is reported. proceed is false whenever the
+// caller must not attempt.
+func (s *Service) reviewRetryHold(ctx context.Context, r config.Repo, file string, state *reviewRetryState, pr github.Pull) (bool, error) {
+	if state.Failures < 1 {
+		return true, nil
+	}
+	var reason string
+	switch {
+	case conflicting(pr):
+		reason = "conflict"
+	case s.reviewRetryRed(ctx, r, pr):
+		reason = "ci_red"
+	}
+	if reason == "" {
+		return true, nil
+	}
+	complete, pending, err := s.retryReviewStatus(ctx, r, pr)
+	if err != nil {
+		return false, err
+	}
+	if complete {
+		return false, fsutil.WriteJSON(file, reviewRetryState{Head: pr.Head.SHA})
+	}
+	if pending {
+		return false, ErrReviewPending
+	}
+	audited := &state.WaitConflict
+	if reason == "ci_red" {
+		audited = &state.WaitCIRed
+	}
+	if !*audited {
+		*audited = true
+		_ = s.audit(r.Name, "review-retry-waiting", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "reason": reason, "failures": state.Failures}, false)
+		if err := fsutil.WriteJSON(file, *state); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// reviewRetryRed reports whether a required check under the base branch's
+// trusted policy is red on the head. Pending and unreadable states are not
+// red: the wait fails open, so a retry runs exactly as it would without it.
+func (s *Service) reviewRetryRed(ctx context.Context, r config.Repo, pr github.Pull) bool {
+	head, err := s.GH.Head(ctx, r.Name, r.Branch)
+	if err != nil {
+		return false
+	}
+	p, err := s.Policy(ctx, r, head)
+	if err != nil {
+		return false
+	}
+	ci, err := s.GH.Check(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	return err == nil && ci == github.Red
 }
 
 func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr github.Pull, failures int, lastError string) (bool, error) {

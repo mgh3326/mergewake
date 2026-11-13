@@ -258,9 +258,9 @@ type Handoffkeep struct {
 
 var TaskID = regexp.MustCompile(`^[1-9][0-9]*$`)
 
-// Reopen reads the task, records note as a comment, then reopens a merged or
-// dropped task with note as the reason. An already reopened task only gets
-// the comment; any other state is refused after the comment.
+// Reopen reads the task and records note as a comment before reopening a
+// settled or icebox task. Unstarted and legacy reopened tasks only get the
+// comment; other states are refused after the comment.
 func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if strings.TrimSpace(note) == "" {
 		return errors.New("reopen requires a reason")
@@ -276,15 +276,15 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if _, e = c.CommentTask(ctx, id, note); e != nil {
 		return e
 	}
-	if current.State == "reopened" {
+	if current.State == "reopened" || current.State == "unstarted" {
 		return nil
 	}
 
-	if current.State != "merged" && current.State != "dropped" {
-		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged or dropped", task, current.State)
+	if !reopenableState(current.State) {
+		return fmt.Errorf("recovery comment recorded; task %s is %q, explicit reopen requires merged, deployed, completed, dropped, duplicate or icebox", task, current.State)
 	}
 	if _, e = c.ReopenTask(ctx, id, note); e != nil {
-		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to reopened; server may lack explicit reopen support: %w", task, current.State, e)
+		return fmt.Errorf("recovery comment recorded, but task %s could not reopen from %q to unstarted; server may lack explicit reopen support: %w", task, current.State, e)
 	}
 	return nil
 }
@@ -294,16 +294,6 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 func (h Handoffkeep) Lane(ctx context.Context, task string) (string, error) {
 	x, e := h.task(ctx, task)
 	return x.Lane, e
-}
-
-// TaskBody reads the task's free text. hk's task answer has never carried a
-// body or description field (a task's body is the document its body_doc
-// names), so the `tasks show` read this replaces always found "" — and so
-// does this one. The read is kept so an unknown task or an unreachable hk
-// is still an error.
-func (h Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
-	_, e := h.task(ctx, task)
-	return "", e
 }
 
 // TaskJob reads the panewire job bound to a task (`refs.job_id`) and the task
