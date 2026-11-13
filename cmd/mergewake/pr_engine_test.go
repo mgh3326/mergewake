@@ -205,20 +205,20 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	e, f := engineFixture(t, 1)
 	var releaseRunner sync.Once
-	release := func() { releaseRunner.Do(func() { close(f.runner.release) }) }
-	t.Cleanup(release)
+	unblockRunner := func() { releaseRunner.Do(func() { close(f.runner.release) }) }
+	t.Cleanup(unblockRunner)
 	f.hub.mu.Lock()
 	f.hub.first = 5
 	f.hub.n = 1
 	f.hub.heads = map[int]string{5: "old"}
 	f.hub.mu.Unlock()
-	entered, release := make(chan struct{}), make(chan struct{})
+	entered, releasePull := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/5") {
 			once.Do(func() {
 				close(entered)
-				<-release
+				<-releasePull
 			})
 		}
 		f.hub.ServeHTTP(w, r)
@@ -243,7 +243,7 @@ func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	f.hub.mu.Lock()
 	f.hub.heads[5] = "old"
 	f.hub.mu.Unlock()
-	close(release)
+	close(releasePull)
 	f.runner.waitFor(t, "the in-flight evaluation to reach review", func(in, started, _ int) bool { return in == 1 && started == 1 })
 	if got := e.q.Head(f.repo.Name, 5); got != "new" {
 		t.Fatalf("pre-list evaluation overwrote listed head with %q", got)
@@ -251,7 +251,7 @@ func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	f.hub.mu.Lock()
 	f.hub.heads[5] = "new"
 	f.hub.mu.Unlock()
-	release()
+	unblockRunner()
 	e.q.Wait()
 }
 
