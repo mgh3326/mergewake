@@ -380,7 +380,10 @@ these steps in order:
    `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
    under the archive's `.locks` directory, outside task/job names; a lock older
    than 24 hours is reclaimable, and a live lock is reported as
-   `archive-lock-busy`. If hosts present the same task/job key, a stale or
+   `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
+   age; a claim that finds one held past 24 hours fails with an error naming the
+   guard path, and the lock is left alone. Remove that guard by hand once no
+   archive run is live. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
@@ -633,8 +636,6 @@ replaced once like any completed reviewer without a result, with no second
 nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
-
-A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
 
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire
@@ -962,8 +963,8 @@ through the configured reps CLI, not other manual bench records.
 | --- | --- | --- |
 | `type` | `noop` (also empty) | `noop`, `stdout`, or `panewire`. |
 | `command` | `panewire` for that adapter | Executable path. Ignored for noop/stdout. |
-| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. Must match panewire's lane rule: 1–128 characters, starting with an ASCII letter or digit and continuing with ASCII letters, digits, `.`, `_`, `:`, or `-`. |
-| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. Must match the same panewire lane rule as `lane`. |
+| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. |
+| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. |
 
 The panewire adapter executes literal arguments equivalent to:
 
