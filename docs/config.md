@@ -380,10 +380,7 @@ these steps in order:
    `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
    under the archive's `.locks` directory, outside task/job names; a lock older
    than 24 hours is reclaimable, and a live lock is reported as
-   `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
-   age; a claim that finds one held past 24 hours fails with an error naming the
-   guard path, and the lock is left alone. Remove that guard by hand once no
-   archive run is live. If hosts present the same task/job key, a stale or
+   `archive-lock-busy`. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
