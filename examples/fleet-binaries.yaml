@@ -21,12 +21,7 @@ review:
   login: review-bot
   timeout: 10m
   default_grade: B
-  # pace (default): free models, then pools projected well under 100% at their
-  # reset (otherwise wasted), then the rest under 100%; tight or unmeasured
-  # pools are skipped. rank: keep the quota tool's recommendation order.
-  select: pace
-  # Optional fixed order for other-family reviewers; it takes precedence over
-  # pace order but never admits a skipped pool.
+  # Optional fixed order for other-family reviewers.
   # pairings:
   #   openai: [claude, deepseek]
   profiles:

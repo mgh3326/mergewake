@@ -553,8 +553,7 @@ func TestOutcomesCommandDefault(t *testing.T) {
 	}{
 		{"no review or outcomes keys", "", "panewire"},
 		{"review.panewire.command", "review:\n  panewire: {command: /opt/pw}\n", "/opt/pw"},
-		{"retired review.quota and review.scopefuel", "review:\n  quota: /x/pacelever\n  scopefuel: /y\n", "panewire"},
-		{"explicit outcomes.command beats retired quota", "outcomes:\n  command: /x/explicit\nreview:\n  quota: /x/pacelever\n", "/x/explicit"},
+		{"explicit outcomes.command", "outcomes:\n  command: /x/explicit\n", "/x/explicit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -633,46 +632,17 @@ func TestWebhookConfig(t *testing.T) {
 	}
 }
 
-func TestStallAfterAndBudgetConfig(t *testing.T) {
-	for _, tc := range []struct {
-		extra string
-		fail  bool
-		stall time.Duration
-	}{
-		{"", false, DefaultStallAfter},
-		{"daemon:\n  pr: {enabled: true, stall_after: 45m}\n", false, 45 * time.Minute},
-		{"daemon:\n  pr: {enabled: true, stall_after: off}\n", false, 0},
-		{"daemon:\n  pr: {enabled: true, stall_after: soon}\n", true, 0},
-		{"daemon:\n  pr: {enabled: true, stall_after: 0s}\n", true, 0},
-		{"daemon:\n  watch: {enabled: true, stall_after: 5m}\n", true, 0},
-	} {
-		path := filepath.Join(t.TempDir(), "config.yaml")
-		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
-		c, err := Load(path)
-		if (err != nil) != tc.fail {
-			t.Fatalf("config %q err=%v", tc.extra, err)
-		}
-		if err == nil && c.Daemon.PR.StallWindow() != tc.stall {
-			t.Fatalf("config %q: stall window %v, want %v", tc.extra, c.Daemon.PR.StallWindow(), tc.stall)
-		}
-	}
-}
-
-func TestRenotifyAndFindingsConfig(t *testing.T) {
+func TestFindingsAckConfig(t *testing.T) {
 	for _, tc := range []struct {
 		extra       string
 		fail        bool
-		every       time.Duration
-		max         int
 		ack         time.Duration
 		findingsOff bool
 	}{
-		{"", false, DefaultRenotifyAfter, DefaultRenotifyMax, DefaultFindingsAckAfter, false},
-		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: 1h, renotify_max: 5}, findings: {ack_after: 5m}}\n", false, time.Hour, 5, 5 * time.Minute, false},
-		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: off}, findings: {enabled: false}}\n", false, 0, 0, DefaultFindingsAckAfter, true},
-		{"daemon:\n  pr: {enabled: true, notify: {renotify_after: soon}}\n", true, 0, 0, 0, false},
-		{"daemon:\n  pr: {enabled: true, notify: {renotify_max: -1}}\n", true, 0, 0, 0, false},
-		{"daemon:\n  pr: {enabled: true, findings: {ack_after: never}}\n", true, 0, 0, 0, false},
+		{"", false, DefaultFindingsAckAfter, false},
+		{"daemon:\n  pr: {enabled: true, findings: {ack_after: 5m}}\n", false, 5 * time.Minute, false},
+		{"daemon:\n  pr: {enabled: true, findings: {enabled: false}}\n", false, DefaultFindingsAckAfter, true},
+		{"daemon:\n  pr: {enabled: true, findings: {ack_after: never}}\n", true, 0, false},
 	} {
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		os.WriteFile(path, []byte("version: 1\nhost: host-a\n"+tc.extra), 0600)
@@ -683,9 +653,8 @@ func TestRenotifyAndFindingsConfig(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		every, max := c.Daemon.PR.Notify.Renotify()
-		if every != tc.every || max != tc.max || c.Daemon.PR.Findings.AckWindow() != tc.ack || c.Daemon.PR.Findings.On() == tc.findingsOff {
-			t.Fatalf("config %q: renotify %v/%d ack %v on=%v", tc.extra, every, max, c.Daemon.PR.Findings.AckWindow(), c.Daemon.PR.Findings.On())
+		if c.Daemon.PR.Findings.AckWindow() != tc.ack || c.Daemon.PR.Findings.On() == tc.findingsOff {
+			t.Fatalf("config %q: ack %v on=%v", tc.extra, c.Daemon.PR.Findings.AckWindow(), c.Daemon.PR.Findings.On())
 		}
 	}
 }

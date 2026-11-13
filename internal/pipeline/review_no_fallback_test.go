@@ -209,10 +209,9 @@ func TestRetryReviewRespawnsPanewireAfterFailedPane(t *testing.T) {
 func TestPanewireNeedsNoProfilesOrQuota(t *testing.T) {
 	for name, profiles := range map[string]map[string]config.Reviewer{"missing": nil, "empty": {}} {
 		t.Run(name, func(t *testing.T) {
-			runner := &panewireRunner{family: "openai", quotaErr: errors.New("scopefuel: not found")}
+			runner := &panewireRunner{family: "openai", quotaErr: errors.New("quota tool: not found")}
 			s, g, r := panewireSetup(t, runner)
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-			s.Config.Review.Quota = "scopefuel"
 			s.Config.Review.Profiles = profiles
 			s.Config.Review.Pairings = nil
 			out := &bytes.Buffer{}

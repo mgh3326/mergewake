@@ -212,7 +212,6 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 func TestRecordOnlyReadyNeverReminds(t *testing.T) {
 	for _, setup := range []func(*testing.T) (*Service, *fakeGH, *fakeNotifier, config.Repo){workerNotifySetup, notifySetup} {
 		s, _, n, r := setup(t)
-		s.Config.Daemon.PR.Notify.RenotifyAfter, s.Config.Daemon.PR.Notify.RenotifyMax = "10m", 3
 		now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 		s.Now = func() time.Time { return now }
 		for _, d := range []time.Duration{0, 11 * time.Minute, 30 * time.Minute, time.Hour} {
