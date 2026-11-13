@@ -75,11 +75,13 @@ func (w *writeEpochs) bump(repo string) {
 
 func normalizeMemoRepo(repo string) string { return strings.ToLower(repo) }
 
-// memoRepo names the repository a write route touches, or "" when unknown.
+// memoRepo names the repository a route touches, or "" when unknown. Preserve
+// its spelling for consumers such as webhook state, which keys repositories
+// exactly; memo and epoch keys normalize separately.
 func memoRepo(route string) string {
 	parts := strings.Split(strings.TrimPrefix(route, "/"), "/")
 	if len(parts) >= 3 && parts[0] == "repos" {
-		return normalizeMemoRepo(parts[1] + "/" + parts[2])
+		return parts[1] + "/" + parts[2]
 	}
 	return ""
 }

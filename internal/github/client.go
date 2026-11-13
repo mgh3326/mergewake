@@ -160,7 +160,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	}
 	// A mutation that clears this repository while the request is in flight
 	// makes its response older than the cache: it is never stored.
-	mark := c.poll.markRead(memoRepo(strings.Split(route, "?")[0]))
+	mark := c.poll.markRead(normalizeMemoRepo(memoRepo(strings.Split(route, "?")[0])))
 	release, cached, e := c.beginRequest(ctx, key, fresh, cred.id)
 	if e != nil {
 		return nil, e
