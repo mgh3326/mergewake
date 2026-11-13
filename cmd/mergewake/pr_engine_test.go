@@ -207,7 +207,7 @@ func TestSweepListWinsOverEvaluationReadStartedBeforeIt(t *testing.T) {
 	f.hub.mu.Lock()
 	f.hub.first = 5
 	f.hub.n = 1
-	f.hub.heads = map[string]string{5: "old"}
+	f.hub.heads = map[int]string{5: "old"}
 	f.hub.mu.Unlock()
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
