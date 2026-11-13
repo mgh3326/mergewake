@@ -77,12 +77,16 @@ func TestReplacedPaneClosedOnMovedHead(t *testing.T) {
 	s, _, r, labels := movedHeadSetup(t, runner, old)
 	hub := replacedHub(t, s, labels[0], "p1", "idle")
 	hub.dropClosed = true
+	hub.closeOutcomes = []string{"pane-changed"}
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	closes := hub.ops("pane.close")
-	if len(closes) != 1 || closes[0]["pane_id"] != "p1" || closes[0]["name"] != labels[0] {
-		t.Fatalf("pane closes=%v, want one close of %s's pane p1", closes, labels[0])
+	if len(closes) == 0 || closes[0]["pane_id"] != "p1" || closes[0]["name"] != labels[0] {
+		t.Fatalf("pane closes=%v, want a close of %s's pane p1", closes, labels[0])
+	}
+	if n := len(hub.agents["panes"].([]any)); n != 0 {
+		t.Fatalf("moved head's pane still listed (%d panes), closes=%v", n, closes)
 	}
 	if len(runner.closes) != 2 {
 		t.Fatalf("job closes=%v, want both moved-head jobs closed", runner.closes)
