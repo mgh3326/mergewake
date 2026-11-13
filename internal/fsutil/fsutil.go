@@ -111,3 +111,11 @@ func Lock(name string, wait bool) (unlock func(), err error) {
 		_ = f.Close()
 	}, nil
 }
+
+// TryLockFile takes an exclusive advisory lock on f without blocking. The lock
+// belongs to f's open file description: it lasts until f is closed, and a second
+// open of the same file conflicts with it, even within this process. It fails
+// with EWOULDBLOCK while another holder has the lock.
+func TryLockFile(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+}
