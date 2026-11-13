@@ -403,6 +403,7 @@ func (s *Service) recordRevert(repo string, pr int, url string) error {
 
 // Revisit PRs no longer in the open list: this observes external desk merges,
 // closures and recovery merges, even while the daemon itself is shadow-only.
+// It publishes nothing: it tells the outcome publisher what it recorded.
 func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map[int]bool, o Options) error {
 	if o.DryRun {
 		return nil
@@ -471,7 +472,9 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 		}
 	}
 	slog.Info("closed PR outcome reconciliation", "repo", r.Name, "closed_rows_read", closedRowsRead, "closed_rows_skipped_not_due", closedRowsSkippedNotDue)
-	errs = append(errs, s.FlushOutcomes(ctx, r.Name))
+	if closedRowsRead > 0 {
+		s.nudgeOutcomes()
+	}
 	return errors.Join(errs...)
 }
 
@@ -486,8 +489,16 @@ func outcomePublishDetail(msg string) string {
 	return clip(strings.ToValidUTF8(msg, "\uFFFD"), outcomePublishErrorMax)
 }
 
-// FlushOutcomes is the automatic flush at the end of a repo pass and after a
-// land. A publication failure does not fail the pass: it is audited as
+// nudgeOutcomes tells the outcome publisher, when there is one, that the ledger
+// has new outcomes.
+func (s *Service) nudgeOutcomes() {
+	if s.OutcomesChanged != nil {
+		s.OutcomesChanged()
+	}
+}
+
+// FlushOutcomes is the automatic flush of one repo's outcomes, run by the
+// outcome publisher (never by Land or the reconcile). A publication failure does not fail the pass: it is audited as
 // outcome-publish-error and logged, and the outcomes stay in the outbox for
 // the next flush. A ledger or IO failure, or an audit row that cannot be
 // written, is still returned. The operator's `mergewake outcomes sync` calls

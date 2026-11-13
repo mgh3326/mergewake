@@ -453,20 +453,47 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	return strings.TrimPrefix(reply, "recorded rep id="), nil
 }
 
-// Flush never deletes observations. A failed publish is retried with the exact
-// same event payload. A newer terminal snapshot supersedes older local revisions.
-// repo limits a flush to one repository's outcomes; an empty repo flushes all,
-// so a per-repo loop never publishes (or reports) another repo's records.
-// Failed publishes return a *PublishError once every outcome was tried.
-func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
-	return l.locked(func(f *os.File, s State) error {
-		keys := make([]string, 0, len(s.Latest))
-		for key := range s.Latest {
-			keys = append(keys, key)
+// publishTimeout bounds one outcome's publication.
+const publishTimeout = 45 * time.Second
+
+// lockPublish takes the publish lock: an exclusive flock on a file of its own,
+// held by one flush from reading the outbox to its last receipt. Flushes in
+// this process, in another daemon and in `mergewake outcomes sync` queue on it,
+// so an outcome is never published by two flushes at once. It is not the ledger
+// lock: Update and Read never wait for it. A wait ends with ctx.
+func (l Ledger) lockPublish(ctx context.Context) (func(), error) {
+	if err := os.MkdirAll(l.Dir, 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(l.Dir, "outcomes.publish.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 		}
-		sort.Strings(keys)
-		var errs []error
-		for _, key := range keys {
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// outbox lists, in key order, the outcomes a flush of repo has to publish: the
+// latest revision of each final, attributed row with no receipt. The ledger
+// lock is held only for this read.
+func (l Ledger) outbox(repo string) ([]Outcome, error) {
+	var pending []Outcome
+	err := l.locked(func(_ *os.File, s State) error {
+		for _, key := range slices.Sorted(maps.Keys(s.Latest)) {
 			v := s.Latest[key]
 			if repo != "" && v.Repo != repo {
 				continue
@@ -474,22 +501,69 @@ func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
 			if !v.Final || !v.Attributed() || s.Published[v.ID] != "" {
 				continue
 			}
-			publishCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-			rep, err := reps.Publish(publishCtx, v)
-			cancel()
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s profile=%s effort=%s: %s", key, v.Profile, v.Effort, integrations.Detail(err)))
-				continue
-			}
-			if err = appendEvent(f, Event{Version: 1, ID: v.ID, At: l.now().UTC(), Kind: "published", Rep: rep}); err != nil {
-				return err
-			}
+			pending = append(pending, v)
 		}
-		if len(errs) == 0 {
+		return nil
+	})
+	return pending, err
+}
+
+// receipt appends the published event of outcome id unless one is there. The
+// ledger lock is held only for this append, never during a publish.
+func (l Ledger) receipt(id, rep string) error {
+	return l.locked(func(f *os.File, s State) error {
+		if s.Published[id] != "" {
 			return nil
 		}
-		return &PublishError{Count: len(errs), Err: errors.Join(errs...)}
+		return appendEvent(f, Event{Version: 1, ID: id, At: l.now().UTC(), Kind: "published", Rep: rep})
 	})
+}
+
+// Flush never deletes observations. A failed publish is retried with the exact
+// same event payload. A newer terminal snapshot supersedes older local revisions.
+// repo limits a flush to one repository's outcomes; an empty repo flushes all,
+// so a per-repo loop never publishes (or reports) another repo's records.
+// Failed publishes return a *PublishError once every outcome was tried.
+//
+// The ledger lock is held to read the outbox and to append each receipt, never
+// during a publish. One flush at a time holds the publish lock, and it reads the
+// outbox after taking it; with CLI.Publish checking the outcome's event ID in
+// the shared store first, an outcome is published once, whether two flushes
+// start together or a process dies between the publish and its receipt.
+// When ctx ends the flush stops and returns its error.
+func (l Ledger) Flush(ctx context.Context, reps Reps, repo string) error {
+	unlock, err := l.lockPublish(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	pending, err := l.outbox(repo)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, v := range pending {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		publishCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+		rep, err := reps.Publish(publishCtx, v)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			errs = append(errs, fmt.Errorf("%s profile=%s effort=%s: %s", v.Task, v.Profile, v.Effort, integrations.Detail(err)))
+			continue
+		}
+		if err = l.receipt(v.ID, rep); err != nil {
+			return err
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return &PublishError{Count: len(errs), Err: errors.Join(errs...)}
 }
 
 // PublishError is a Flush whose ledger reads and writes succeeded but whose

@@ -962,13 +962,26 @@ profile's reps and looks for a row whose notes carry the same outcome id:
 A local-only row stops duplicate adds but is never counted as shared:
 `outcomes report --source hk` reads `srv:` rows only.
 
-The automatic flush at the end of each repo pass and after each land does not
-fail the pass when publication fails. It writes one `outcome-publish-error`
+Publishing runs in one background publisher in the daemon, while the `pr` role
+is on. It runs at start, on a nudge after each land and each closed-row
+reconcile that read a row, and on a timer of `poll_interval`; a run is bounded to
+five minutes and each publish to 45 seconds, and the publisher stops with the
+daemon. Land, the PR sweep and the reconcile never publish, so none of them
+waits for a publish and the repo's settle lock is never held across one. A one-shot
+`mergewake land` leaves its outcome in the outbox for the daemon or
+`mergewake outcomes sync`.
+The ledger lock is held only to read the outbox and to append each receipt, so
+other ledger writers are never blocked by a publish. A flush, whether the
+publisher's or `mergewake outcomes sync`, takes a publish lock
+(`<state_dir>/outcomes.publish.lock`) first and reads the outbox after it, so two
+flushes never publish at once; the stable event ID check above covers a crash
+between a publish and its receipt. The publisher's flush does not
+fail when publication fails. It writes one `outcome-publish-error`
 audit row to the repo's `decisions.jsonl` (`repo`, `count` of failed outcomes,
 and `error` cut to 512 bytes of valid UTF-8), logs a warning, and keeps the
 outcomes in the outbox for the next flush. A ledger read or write failure,
-or an `outcome-publish-error` row that cannot be written, still fails the
-pass. `mergewake outcomes sync` stays strict: it exits
+or an `outcome-publish-error` row that cannot be written, is logged by the
+publisher and retried on its next run. `mergewake outcomes sync` stays strict: it exits
 non-zero when any outcome fails to publish.
 
 ```sh
@@ -1683,6 +1696,14 @@ daemon:
   release: {enabled: true, interval: 2m}
   rollout: {enabled: true, interval: 2m}
 ```
+
+The `pr` role's closed-row outcome reconcile runs in a loop of its own beside
+it, not in its sweep: every `daemon.pr.interval`, while `pr` is enabled, with no
+config key of its own, and one repository per goroutine. It reads the open PRs
+from the `pr` queue, so it makes no GitHub request for them and waits (retrying
+every five seconds) for each repository's first sweep. Each due closed row is
+read at most hourly. A run is bounded to ten minutes and logs one
+`outcome reconcile run` line per repository. The loop stops with the daemon.
 
 All roles default disabled; omitted intervals inherit poll_interval. `daemon`
 runs only configured roles, one goroutine each. Shadow is the default for all

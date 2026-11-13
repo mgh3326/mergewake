@@ -244,6 +244,55 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 	if url := os.Getenv("MERGEWAKE_HEALTHCHECK_URL"); url != "" {
 		d.Healthy = healthcheck(url)
 	}
+	// One publisher sends the outcomes to the shared store, off the paths that
+	// review and merge PRs. It runs while the pr role does, as the flushes it
+	// replaces did, and it stops with the daemon: a publish in flight ends with
+	// its context.
+	if s.Config.Daemon.PR.Loop.Enabled {
+		// The timer is poll_interval; a config that set none (one not read
+		// through config.Load) gets its default, a minute.
+		interval := time.Minute
+		if s.Config.PollInterval != "" {
+			var err error
+			if interval, err = config.Duration(s.Config.PollInterval); err != nil {
+				return err
+			}
+		}
+		var names []string
+		for _, r := range repos {
+			names = append(names, r.Name)
+		}
+		publisher := s.NewOutcomePublisher(names, interval)
+		s.OutcomesChanged = publisher.Nudge
+		publishCtx, stopPublisher := context.WithCancel(ctx)
+		published := make(chan struct{})
+		go func() {
+			defer close(published)
+			publisher.Run(publishCtx)
+		}()
+		defer func() {
+			stopPublisher()
+			<-published
+		}()
+	}
+	// Closed-row outcome reconcile left the pr sweep: it has a loop of its own
+	// beside the pr role's, at its interval, and stops with the daemon.
+	if engine != nil {
+		interval, err := config.Duration(s.Config.Daemon.PR.Loop.Interval)
+		if err != nil {
+			return err
+		}
+		reconcileCtx, stopReconcile := context.WithCancel(ctx)
+		reconciled := make(chan struct{})
+		go func() {
+			defer close(reconciled)
+			runReconcileLoop(reconcileCtx, s, engine.openPRs, repos, interval, o, log)
+		}()
+		defer func() {
+			stopReconcile()
+			<-reconciled
+		}()
+	}
 	// The queue runs until the daemon stops, and the daemon waits for the
 	// evaluations in flight, as a pass used to wait for its reviews.
 	if engine != nil {

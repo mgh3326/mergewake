@@ -122,21 +122,23 @@ func (pullFailGH) Pull(context.Context, string, int) (github.Pull, error) {
 	return github.Pull{}, errors.New("pull read failed")
 }
 
-// A reconciliation error other than publication still fails the pass; the
-// publication failure beside it is audited, not returned.
+// A reconciliation error is returned as it is; the reconcile publishes
+// nothing, so a publication failure is neither returned with it nor audited by
+// it (the outcome publisher audits those, see FlushOutcomes).
 func TestReconcileOutcomesKeepsReadErrors(t *testing.T) {
 	s, g, _, _, repo := setup(t)
 	finalRow(t, s, repo, 7)
 	s.GH = pullFailGH{g}
-	s.Runner = &refusedReps{}
+	r := &refusedReps{}
+	s.Runner = r
 	err := s.ReconcileOutcomes(context.Background(), repo, map[int]bool{}, Options{Shadow: true})
 	if err == nil || !strings.Contains(err.Error(), "pull read failed") {
 		t.Fatalf("PR read failure lost: %v", err)
 	}
-	if strings.Contains(err.Error(), refusedText) {
-		t.Fatal("publication failure returned with the pass error")
+	if strings.Contains(err.Error(), refusedText) || r.adds != 0 {
+		t.Fatalf("the reconcile published: adds=%d err=%v", r.adds, err)
 	}
-	if rows := auditRows(t, s, repo, "outcome-publish-error"); len(rows) != 1 {
-		t.Fatalf("%d outcome-publish-error audits", len(rows))
+	if rows := auditRows(t, s, repo, "outcome-publish-error"); len(rows) != 0 {
+		t.Fatalf("%d outcome-publish-error audits from the reconcile", len(rows))
 	}
 }

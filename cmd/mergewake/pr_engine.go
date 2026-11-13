@@ -14,6 +14,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
@@ -47,7 +48,9 @@ type prEngine struct {
 	// pr role then starts reviewers without waiting for them.
 	revisit pipeline.Revisit
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// swept is the repos whose sweep has listed their open PRs at least once.
+	swept    map[string]bool
 	sweepMu  sync.Mutex
 	sweeping map[string]*prSweepState
 	settling map[string]*sync.Mutex
@@ -98,7 +101,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		sweeping: map[string]*prSweepState{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		sweeping: map[string]*prSweepState{}, swept: map[string]bool{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
 		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
@@ -448,6 +451,9 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 		heads[pr.Number] = pr.Head.SHA
 	}
 	e.q.SetOpen(r.Name, heads)
+	e.mu.Lock()
+	e.swept[r.Name] = true
+	e.mu.Unlock()
 	var listed []string
 	if hasBotPull(prs) {
 		setPRSweepStep(ctx, "bot_policy")
@@ -473,13 +479,32 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	}
 	e.q.Enqueue(daemon.SourceSweep, keys...)
 	e.skips.forget(r.Name, seen)
-	setPRSweepStep(ctx, "reconcile")
-	errs = append(errs, e.s.ReconcileOutcomes(ctx, r, seen, e.o))
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	errs = append(errs, e.takeErrors(r.Name)...)
 	return errors.Join(errs...)
+}
+
+// openPRs is the open set the closed-row reconcile needs: the PRs of repo with
+// an outcome row that the queue knows are open (the sweep sets them and each
+// evaluation keeps them current), so the reconcile makes no GitHub request for
+// it. known is false until repo's first sweep.
+func (e *prEngine) openPRs(repo string) (open map[int]bool, known bool) {
+	e.mu.Lock()
+	swept := e.swept[repo]
+	e.mu.Unlock()
+	if !swept {
+		return nil, false
+	}
+	state, err := outcomes.Ledger{Dir: e.s.Config.StateDir}.Read()
+	if err != nil {
+		return nil, false
+	}
+	open = map[int]bool{}
+	for _, v := range state.Latest {
+		if v.Repo == repo && e.q.Head(repo, v.PR) != "" {
+			open[v.PR] = true
+		}
+	}
+	return open, true
 }
 
 // sweepBounded keeps one repository's in-flight sweep registered until the
