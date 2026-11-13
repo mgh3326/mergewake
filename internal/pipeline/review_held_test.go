@@ -379,7 +379,7 @@ func TestRetryHeldMixedWithRealFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	held := runner.refuse
-	runner.refuse = map[string]int{"reviewer": panewireRefused, "worker": panewireRefused}
+	runner.refuse = map[string]int{"reviewer": panewireRefused, "implementer": panewireRefused}
 	if err := retryOnce(t, s, g, r); err == nil {
 		t.Fatal("a refused spawn is a real failure")
 	}

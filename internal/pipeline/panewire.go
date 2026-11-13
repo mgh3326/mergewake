@@ -93,7 +93,7 @@ func reviewerRoleArgs(pass int) (args []string, ok bool) {
 
 // workerSeatArgs turns a recorded reviewer spawn into the worker-seat
 // fallback: panewire refuses --review-pass outside the reviewer role, so the
-// role and the flag are both removed before --role worker is appended.
+// role and the flag are both removed before --role implementer is appended.
 func workerSeatArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -103,7 +103,7 @@ func workerSeatArgs(args []string) []string {
 		}
 		out = append(out, args[i])
 	}
-	return append(out, "--role", "worker")
+	return append(out, "--role", "implementer")
 }
 
 // panewireSpawnArgs bounds the builder family on every spawn, including
@@ -111,14 +111,138 @@ func workerSeatArgs(args []string) []string {
 func panewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
 	if i := slices.Index(out, "--builder-family"); i >= 0 {
+		out[i] = "--author-family"
 		if i+1 < len(out) {
 			out[i+1] = panewireBuilderFamily(out[i+1])
 		} else {
 			out = append(out, "other")
 		}
-		return out
+	} else if i := slices.Index(out, "--author-family"); i >= 0 {
+		if i+1 < len(out) {
+			out[i+1] = panewireBuilderFamily(out[i+1])
+		} else {
+			out = append(out, "other")
+		}
+	} else {
+		out = append(out, "--author-family", "other")
 	}
-	return append(out, "--builder-family", "other")
+	for i := 0; i < len(out); i++ {
+		if out[i] == "--role" && i+1 < len(out) {
+			switch out[i+1] {
+			case "worker", "tester":
+				out[i+1] = "implementer"
+			case "counsel":
+				out[i+1] = "consult"
+			}
+		}
+		if out[i] == "--routing-role" {
+			end := min(i+2, len(out))
+			out = slices.Delete(out, i, end)
+			i--
+		}
+	}
+	return out
+}
+
+const panewireSpawnCompatibilityTTL = 10 * time.Minute
+
+type panewireSpawnCompatibility struct {
+	mu       sync.Mutex
+	legacyTo time.Time
+	now      func() time.Time
+}
+
+func (c *panewireSpawnCompatibility) launch(ctx context.Context, runner integrations.Runner, command string, args []string) ([]byte, error) {
+	modernArgs := panewireSpawnArgs(args)
+	if c == nil {
+		return runner.Run(ctx, command, modernArgs, "", "")
+	}
+	c.mu.Lock()
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	legacy := now().Before(c.legacyTo)
+	c.mu.Unlock()
+	if legacy {
+		b, err := runner.Run(ctx, command, oldPanewireSpawnArgs(modernArgs), "", "")
+		if err == nil || !panewireRenamedArgsUsageError(err) {
+			return b, err
+		}
+		b, err = runner.Run(ctx, command, modernArgs, "", "")
+		if err == nil {
+			c.mu.Lock()
+			c.legacyTo = time.Time{}
+			c.mu.Unlock()
+		}
+		return b, err
+	}
+	b, err := runner.Run(ctx, command, modernArgs, "", "")
+	if err == nil || !panewireRenamedArgsUsageError(err) {
+		return b, err
+	}
+	modernErr := err
+	b, err = runner.Run(ctx, command, oldPanewireSpawnArgs(modernArgs), "", "")
+	if err == nil {
+		c.mu.Lock()
+		c.legacyTo = now().Add(panewireSpawnCompatibilityTTL)
+		c.mu.Unlock()
+		return b, nil
+	}
+	return b, fmt.Errorf("legacy-spelling retry failed after modern-spelling refusal (%s): %w", integrations.Detail(modernErr), err)
+}
+
+var panewireSpawnCompat panewireSpawnCompatibility
+
+func oldPanewireSpawnArgs(args []string) []string {
+	out := slices.Clone(args)
+	for i := 0; i < len(out); i++ {
+		switch out[i] {
+		case "--author-family":
+			out[i] = "--builder-family"
+		case "--role":
+			if i+1 < len(out) {
+				switch out[i+1] {
+				case "implementer":
+					out[i+1] = "worker"
+				case "consult":
+					out[i+1] = "counsel"
+				}
+			}
+		}
+	}
+	return out
+}
+
+func panewireRenamedArgsUsageError(err error) bool {
+	if exitStatus(err) != 2 {
+		return false
+	}
+	var commandErr *integrations.CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	stderr := commandErr.Stderr
+	for _, renamed := range []string{"--author-family", "--builder-family", "--routing-role"} {
+		if stderrHasFlag(stderr, renamed) {
+			return true
+		}
+	}
+	return renamedRoleUsage.MatchString(stderr)
+}
+
+var renamedRoleUsage = regexp.MustCompile(`(?i)(?:--role(?:=|\s+)(?:value\s+)?(?:must\s+be\s+)?["']?(?:worker|tester|counsel)\b|(?:invalid|unsupported)\s+role[: ]+\s*["']?(?:worker|tester|counsel)\b|["'](?:worker|tester|counsel)["'][^\n]{0,60}\bfor\b[^\n]{0,20}-?-role\b)`)
+
+func stderrHasFlag(stderr, flag string) bool {
+	short := "-" + strings.TrimPrefix(flag, "--")
+	for _, word := range strings.Fields(stderr) {
+		word = strings.Trim(word, `"'=:,.;()[]{}<>`)
+		name, _, _ := strings.Cut(word, "=")
+		if name == flag || name == short {
+			return true
+		}
+	}
+	return false
 }
 
 // panewireExecutor spawns the pass as a visible reviewer pane through panewire.
@@ -739,13 +863,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		var spawnTook time.Duration
 		defer func() { phases.Spawned(spawnTook) }()
 		launch := func(c context.Context, a []string) ([]byte, error) {
-			a = panewireSpawnArgs(a)
 			if async {
 				a = placeOnly(a)
 			}
 			began := phases.Now()
 			defer func() { spawnTook += phases.Now().Sub(began) }()
-			return s.Runner.Run(c, cfg.Command, a, "", "")
+			return panewireSpawnCompat.launch(c, s.Runner, cfg.Command, a)
 		}
 		// The spawn is accepted once panewire placed the reviewer: its call
 		// returned, or its wait ended on a pane that runs on. A resumed job was

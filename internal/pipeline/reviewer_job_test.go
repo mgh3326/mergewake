@@ -39,7 +39,7 @@ func interruptedReviewer(t *testing.T) (*Service, *fakeGH, config.Repo, *panewir
 		t.Fatalf("first run spawns=%d headless=%d posts=%d", len(runner.spawns), runner.headless, g.postCount)
 	}
 	rj := readReviewerJob(t, s, r, 1)
-	if rj.Label != arg(runner.spawns[0], "-l") || !slices.Equal(rj.Args, runner.spawns[0]) || rj.Head != shaA || rj.Checkout != arg(runner.spawns[0], "-c") {
+	if rj.Label != arg(runner.spawns[0], "-l") || !slices.Equal(panewireSpawnArgs(rj.Args), runner.spawns[0]) || rj.Head != shaA || rj.Checkout != arg(runner.spawns[0], "-c") {
 		t.Fatalf("record %+v for spawn %v", rj, runner.spawns[0])
 	}
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
@@ -107,6 +107,9 @@ func TestReviewerJobResumeReplaysSpawn(t *testing.T) {
 		t.Fatalf("spawns=%d headless=%d posts=%d", len(runner.spawns), runner.headless, g.postCount)
 	}
 	first, replay := runner.spawns[0], runner.spawns[1]
+	if arg(replay, "--author-family") != "anthropic" || slices.Contains(replay, "--builder-family") {
+		t.Fatalf("replayed spawn did not use the current family flag: %v", replay)
+	}
 	if !slices.Equal(withoutWait(first), withoutWait(replay)) || arg(replay, "-l") != arg(first, "-l") {
 		t.Fatalf("replay changed the spawn:\n%v\n%v", first, replay)
 	}
@@ -146,11 +149,11 @@ func TestReviewerJobResumeBoundsBuilderFamily(t *testing.T) {
 				t.Fatalf("spawns=%d, want resumed launch", len(runner.spawns))
 			}
 			first, replay := runner.spawns[0], runner.spawns[1]
-			if got := arg(replay, "--builder-family"); got != tc.want {
-				t.Fatalf("replayed --builder-family=%q, want %q; args=%v", got, tc.want, replay)
+			if got := arg(replay, "--author-family"); got != tc.want {
+				t.Fatalf("replayed --author-family=%q, want %q; args=%v", got, tc.want, replay)
 			}
 			want := slices.Clone(first)
-			want[slices.Index(want, "--builder-family")+1] = tc.want
+			want[slices.Index(want, "--author-family")+1] = tc.want
 			if !slices.Equal(withoutWait(want), withoutWait(replay)) || arg(first, "-l") != arg(replay, "-l") {
 				t.Fatalf("replay changed saved arguments beyond family and wait timeout:\nwant %v\ngot  %v", want, replay)
 			}
