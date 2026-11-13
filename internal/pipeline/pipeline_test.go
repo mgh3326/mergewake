@@ -33,6 +33,8 @@ type fakeGH struct {
 	commitCalls                                    int
 	nextHead                                       string
 	nextBase                                       string // base ref from the second Pull on
+	nextBodyPull                                   int
+	nextBody                                       string
 	pull                                           github.Pull
 	enabled, blocking, reviewed, gate              bool
 	requiredBots                                   []string
@@ -133,6 +135,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 	}
 	if g.pullCalls > 1 && g.nextBase != "" {
 		p.Base.Ref = g.nextBase
+	}
+	if g.pullCalls == g.nextBodyPull {
+		p.Body = g.nextBody
 	}
 	return p, nil
 }

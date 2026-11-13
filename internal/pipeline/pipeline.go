@@ -228,9 +228,9 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	// The merge already landed and is observed: the lane event is best-effort,
 	// its failure audited rather than returned.
 	if s.Config.Daemon.PR.Notify.On() {
-		landed := pr
-		landed.MergeCommitSHA = merged.MergeCommitSHA
-		if _, _, _, e = s.laneEvent(ctx, r, landed, "merged", pr.Title); e != nil {
+		landed := merged
+		landed.Head.SHA = pr.Head.SHA
+		if e = s.RetryMergedCandidate(ctx, r, landed, pr.Title); e != nil {
 			_ = s.audit(r.Name, "land-notify-error", map[string]any{"pr": n, "error": e.Error()}, false)
 		}
 	}

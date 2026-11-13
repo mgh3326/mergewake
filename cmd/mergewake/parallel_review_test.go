@@ -54,6 +54,7 @@ type reviewHub struct {
 	// an accepted merge, so later list calls do not offer it again.
 	closeOnMerge bool
 	closed       map[int]bool
+	merged       bool // mergedPRs are returned closed with a recent merged_at
 	// conflicting makes every PR report mergeable false and state dirty;
 	// draft makes every PR a draft.
 	conflicting, draft bool
@@ -91,6 +92,9 @@ func (h *reviewHub) pull(n int) string {
 	mergeable, state := true, "clean"
 	if h.conflicting {
 		mergeable, state = false, "dirty"
+	}
+	if h.merged {
+		return fmt.Sprintf(`{"number":%d,"state":"closed","merged":true,"merged_at":%q,"draft":false,"title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":1,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"}}`, n, time.Now().UTC().Format(time.RFC3339), n, task, h.head(n), n, h.repoName(), hubBase)
 	}
 	return fmt.Sprintf(`{"number":%d,"state":"open","draft":%t,"title":"change %d","body":"Mergewake-Author-Family: openai\nMergewake-Task: %d\n","changed_files":%d,"head":{"sha":%q,"ref":"b%d","repo":{"full_name":%q}},"base":{"ref":"main","sha":%q},"user":{"login":"author","type":"User"},"mergeable":%t,"mergeable_state":%q}`, n, h.draft, n, task, max(h.changedFiles, 1), h.head(n), n, h.repoName(), hubBase, mergeable, state)
 }

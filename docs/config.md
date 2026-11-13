@@ -1518,6 +1518,7 @@ For `example/project`, state resides beneath
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
+| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
@@ -1720,18 +1721,21 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
 `triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path or line is not in the diff; each is tracked across heads by the `od-…` ref the BLOCKED notice names — it stays open until a person answers it by PR comment naming the ref, its `path:line`, or its title, with `Fixed in <sha>` naming a commit in the PR's history, `Dismiss: <reason>`, or `Disposition: defer <task>` (the task as `4253`, `hk 4253`, `hk:4253` or `#4253`); or until a later completed review pass does not report it again — and only when that pass's prompt listed the finding, which the pass receipt records — which re-reviews it away. A finding answered or re-reviewed never comes back. Reviews posted before the body listed findings keep the old rule: the opaque count holds only the current head's patch-matching passes and a person's `Dismiss:` comment naming the head's SHA prefix clears it), `review_missing`, `conflict`. Queued or running
 check evidence emits nothing, and neither does a required check that has not reported yet
-inside the grace described under `check_absent` below. A READY verdict under acting mode with
-`enabled` repository policy merges the gated head and records `MERGED`; no lane
-event is sent for either. Each `(PR, head,
+inside the grace described under `check_absent` below. Under acting mode,
+`enabled` repository policy merges the gated head. MERGED is sent once per
+(PR, head) to the PR's design lane; failed sends and audit rows remain pending
+and retry on every repository sweep. Each `(PR, head,
 verdict)` is handled once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
 head re-arms notification, and a restart does not resend. BLOCKED is
 declared with `panewire emit --type blocked`, so it stays unread on the
 receiving lane until it runs `panewire inbox ack` (panewire
 `docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
-event untyped). READY and MERGED are recorded, never sent: nobody acts on either,
-because mergewake merges on its own gate. Each writes its `pr-notify-sent` key and
-one `pr-notify` decision row with `"suppressed":"record only"`, the head's
+event untyped). READY is recorded, never sent, because mergewake merges on its own
+gate. MERGED writes one `pr-notify` row and its sent key after the row is durable;
+no design lane is recorded as `"no design lane"`. Recent PRs merged outside
+mergewake also receive one notice. Pending notices older than 24 hours are
+recorded as gave up. The head's
 summary, and the author worker lane (job bound to the task, else the author
 pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
@@ -1797,8 +1801,9 @@ that the threads above hold from earlier passes. The list can be shorter than th
 count, because a reviewer still requesting changes counts toward the count but
 is not a thread.
 
-`READY` and `MERGED` are recorded, not sent, so the design session hears only the
-BLOCKED reasons that need its decision.
+`READY` is recorded, not sent. `MERGED` is sent once per (PR, head) to the PR's
+design lane and retried until sent, so the design session hears merge notices
+and the BLOCKED reasons that need its decision.
 
 A head that keeps `review_missing` for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
@@ -1982,8 +1987,8 @@ daemon:
 ```
 
 Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. BLOCKED
-declares `blocked`; READY and MERGED are recorded, not sent, so they declare
-no event. Watch holds declare `watch-hold` once per red main episode and hold
+declares `blocked`; READY is recorded, not sent, while MERGED is sent once per
+(PR, head) to the design lane and retried until sent. Watch holds declare `watch-hold` once per red main episode and hold
 reason; culprit recovery declares `culprit-hold`. Deployment decisions
 continue through the handoffkeep approval adapter. Panewire's reviewed desk
 policy keeps routine events in its inbox and decision events as interrupts.
