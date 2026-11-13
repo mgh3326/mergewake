@@ -99,13 +99,17 @@ func validateTLSMode(tlsValue, caFile, serverName string) error {
 }
 
 func privateCATLSConfig(path, serverName string) (*tls.Config, error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, ErrConfig
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, ErrConfig
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || (info.Mode().Perm() != 0600 && info.Mode().Perm() != 0644) || info.Size() > maxCAFileSize {
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || (opened.Mode().Perm() != 0600 && opened.Mode().Perm() != 0644) || opened.Size() > maxCAFileSize || !os.SameFile(info, opened) {
 		return nil, ErrConfig
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxCAFileSize+1))
