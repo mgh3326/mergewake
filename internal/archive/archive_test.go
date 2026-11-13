@@ -1687,6 +1687,135 @@ func TestArchiveStaleLockReclaimDeadOwnerOneOfN(t *testing.T) {
 	}
 }
 
+// TestArchiveStaleLockReclaimStalledHolderKeepsOneWinner covers a reclaimer that
+// stalls inside its critical section past the guard TTL. Its guard is not broken
+// by age, so a claimer that finds it aged must fail and leave the lock alone. The
+// stalled reclaimer then resumes and is the only winner.
+func TestArchiveStaleLockReclaimStalledHolderKeepsOneWinner(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "stalled-holder")
+	lock := staleLockDir(t, e, dest, "dead 1")
+	dir := t.TempDir()
+	paused, resume := filepath.Join(dir, "paused"), filepath.Join(dir, "resume")
+	stalled := &pauseBeforeReclaimRemove{Runner: &fakeRunner{}, paused: paused, resume: resume}
+	type result struct {
+		release func()
+		err     error
+	}
+	stalledDone := make(chan result, 1)
+	go func() {
+		a := &Archiver{Runner: stalled, DriveDir: e.drive}
+		release, err := a.claim(context.Background(), dest)
+		stalledDone <- result{release, err}
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(resume, nil, 0o644) })
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, err := os.Stat(paused); err == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("stalled reclaimer did not reach removal")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	// The stalled reclaimer holds the guard. Age it past the TTL, as a holder
+	// that has stopped making progress looks.
+	guard := lock + ".guard"
+	aged := time.Now().Add(-2 * time.Duration(archiveLockTTL) * time.Second)
+	if err := os.Chtimes(guard, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	next := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+	nextRelease, nextErr := next.claim(context.Background(), dest)
+	if nextErr == nil {
+		nextRelease()
+		t.Fatalf("claim under an aged guard acquired the lock\n%s", lockState(e, dest))
+	}
+	if !strings.Contains(nextErr.Error(), guard) {
+		t.Fatalf("claim error %q does not name guard %s", nextErr, guard)
+	}
+	if _, err := os.Stat(guard); err != nil {
+		t.Fatalf("aged guard was removed: %v", err)
+	}
+	if err := os.WriteFile(resume, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := <-stalledDone
+	if first.err != nil {
+		t.Fatalf("stalled reclaimer: %v\n%s", first.err, lockState(e, dest))
+	}
+	if first.release != nil {
+		first.release()
+	}
+}
+
+// TestArchiveGuardTrapRemovesOnlyItsOwnGuard runs the guard script as a holder.
+// The guard is removed on exit only while it still carries the holder's token.
+func TestArchiveGuardTrapRemovesOnlyItsOwnGuard(t *testing.T) {
+	run := func(t *testing.T, body string) (guard string) {
+		t.Helper()
+		lock := filepath.Join(t.TempDir(), "lock")
+		script := "guard_ttl=\"$3\"; guard_owner=\"$2\"\n" + lockGuard + body
+		out, err := exec.Command("sh", "-c", script, "sh", lock, "owner-a", "86400").CombinedOutput()
+		if err != nil {
+			t.Fatalf("holder script: %v: %s", err, out)
+		}
+		return lock + ".guard"
+	}
+	t.Run("own guard removed on exit", func(t *testing.T) {
+		guard := run(t, "")
+		if _, err := os.Stat(guard); !os.IsNotExist(err) {
+			t.Fatalf("own guard still present after exit: %v", err)
+		}
+	})
+	t.Run("successor guard kept on exit", func(t *testing.T) {
+		guard := run(t, "printf 'successor\\n' > \"$guard/owner\"\n")
+		owner, err := os.ReadFile(guard + "/owner")
+		if err != nil || string(owner) != "successor\n" {
+			t.Fatalf("successor guard: owner=%q err=%v", owner, err)
+		}
+	})
+}
+
+// TestArchiveGuardHeldPastTTLIsReportedNotBroken covers a guard left by a holder
+// that is gone or stuck. The claim fails naming the guard, the lock is untouched,
+// and the guard stays for an operator to remove.
+func TestArchiveGuardHeldPastTTLIsReportedNotBroken(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "held-guard")
+	lock := staleLockDir(t, e, dest, "dead 1")
+	guard := lock + ".guard"
+	if err := os.Mkdir(guard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-2 * time.Duration(archiveLockTTL) * time.Second)
+	if err := os.Chtimes(guard, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+	release, err := a.claim(context.Background(), dest)
+	if err == nil || !strings.Contains(err.Error(), guard) || !strings.Contains(err.Error(), "remove it by hand") {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("claim err=%v, want an error naming guard %s", err, guard)
+	}
+	var skip *Skip
+	if errors.As(err, &skip) {
+		t.Fatalf("held guard reported as a busy skip: %v", err)
+	}
+	if _, err := os.Stat(guard); err != nil {
+		t.Fatalf("held guard was removed: %v", err)
+	}
+	owner, err := os.ReadFile(lock + "/owner")
+	if err != nil || string(owner) != "dead 1\n" {
+		t.Fatalf("lock changed under a held guard: owner=%q err=%v", owner, err)
+	}
+}
+
 func TestArchiveLockReclaimFreshLockStaysBusy(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
@@ -1727,6 +1856,31 @@ func TestArchiveLockReclaimOwnerlessYoungLockStaysBusy(t *testing.T) {
 	if _, err := os.Stat(lock); err != nil {
 		t.Fatalf("young ownerless lock was removed: %v", err)
 	}
+}
+
+func TestArchiveLockReclaimOwnerlessExpiredLockIsReclaimed(t *testing.T) {
+	e := setup(t)
+	a := archiver(e, "")
+	dest := filepath.Join(e.drive, "tasks", "2402", "ownerless-expired")
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-2 * time.Duration(archiveLockTTL) * time.Second)
+	if err := os.Chtimes(lock, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	release, err := a.claim(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("expired ownerless lock: claim err=%v, want acquired", err)
+	}
+	if _, err := os.Stat(lock + "/owner"); err != nil {
+		t.Fatalf("reclaimed lock has no owner: %v", err)
+	}
+	if parked, _ := filepath.Glob(lock + ".reclaim.*"); len(parked) != 0 {
+		t.Fatalf("parked copy left behind: %v", parked)
+	}
+	release()
 }
 
 func TestArchiveLockReclaimReleaseByNonOwnerKeepsLock(t *testing.T) {
@@ -2021,10 +2175,10 @@ type pauseBeforeReclaimRemove struct {
 }
 
 func (r *pauseBeforeReclaimRemove) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
-	if name == "sh" && len(args) > 1 && strings.Contains(args[1], `if rm -rf "$1" && take`) {
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], `if mv "$1" "$parked"`) {
 		args = append([]string(nil), args...)
 		pause := fmt.Sprintf(`: > %q; while [ ! -e %q ]; do sleep 0.01; done; `, r.paused, r.resume)
-		args[1] = strings.Replace(args[1], `if rm -rf "$1" && take`, pause+`if rm -rf "$1" && take`, 1)
+		args[1] = strings.Replace(args[1], `if mv "$1" "$parked"`, pause+`if mv "$1" "$parked"`, 1)
 	}
 	return r.Runner.Run(ctx, name, args, input, dir)
 }

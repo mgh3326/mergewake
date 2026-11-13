@@ -69,6 +69,11 @@ type appAuth struct {
 	announced map[string]bool
 	// fallbackUntil is the latest end of any repository's fallback window.
 	fallbackUntil atomic.Int64
+
+	// pause waits between delivery-log pages; nil means a real timer. maxPages
+	// bounds the walk; zero means appDeliveriesMaxPages. Tests set both.
+	pause    func(context.Context, time.Duration) error
+	maxPages int
 }
 
 // EnableApp makes the client read through installation tokens of the App with
@@ -210,13 +215,21 @@ func (a *appAuth) deny(c *Client, repo string, now time.Time, ttl time.Duration,
 // calls never carry the user token and sit outside the request gate: they are
 // few, and the App has its own rate limit.
 func (a *appAuth) call(ctx context.Context, c *Client, method, route string, out any) (int, error) {
+	code, _, e := a.send(ctx, c, method, c.BaseURL+route, route, out)
+	return code, e
+}
+
+// send is call for a full URL, and also returns the response headers (the
+// delivery log pages by Link header). route names the request in counts and
+// errors, so a cursor in target never reaches them.
+func (a *appAuth) send(ctx context.Context, c *Client, method, target, route string, out any) (int, http.Header, error) {
 	jwt, e := signAppJWT(a.id, a.key, c.now())
 	if e != nil {
-		return 0, e
+		return 0, nil, e
 	}
-	req, e := http.NewRequestWithContext(ctx, method, c.BaseURL+route, nil)
+	req, e := http.NewRequestWithContext(ctx, method, target, nil)
 	if e != nil {
-		return 0, e
+		return 0, nil, e
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
@@ -225,18 +238,18 @@ func (a *appAuth) call(ctx context.Context, c *Client, method, route string, out
 	resp, e := c.HTTP.Do(req)
 	if e != nil {
 		recordRequest(ctx, method, route, 0, credApp)
-		return 0, fmt.Errorf("GitHub App %s request failed", method)
+		return 0, nil, fmt.Errorf("GitHub App %s request failed", method)
 	}
 	defer resp.Body.Close()
 	recordRequest(ctx, method, route, resp.StatusCode, credApp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, &APIError{resp.StatusCode, method, route}
+		return resp.StatusCode, resp.Header, &APIError{resp.StatusCode, method, route}
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if e != nil {
-		return resp.StatusCode, e
+		return resp.StatusCode, resp.Header, e
 	}
-	return resp.StatusCode, json.Unmarshal(b, out)
+	return resp.StatusCode, resp.Header, json.Unmarshal(b, out)
 }
 
 func (a *appAuth) lookup(ctx context.Context, c *Client, repo string) (int64, int, error) {
