@@ -31,52 +31,56 @@ fields under `state` `merged` or `closed`.
 
 The next gate decision replaces the snapshot, `fresh` and `fresh_at` included.
 
-## HTTP
-
-The status route is served on the webhook listener (`daemon.webhook.listen`,
-loopback), so it needs `daemon.webhook.enabled`. It takes no signature and adds
-no listener, address or auth. The webhook path itself behaves as before.
-
-```
-GET /v1/pr-status?repo=owner/name&pr=N
-GET /v1/pr-status?repo=owner/name
-GET /v1/pr-status?repo=owner/name&pr=N&fresh=1
-```
-
-- With `pr`: the snapshot as JSON. `404` when there is none, `400` for a
-  malformed `repo`, `pr` or `fresh`, `405` for methods other than GET and HEAD.
-- Without `pr`: `{"repo": ..., "prs": [...]}`, the open PRs' snapshots, newest
-  PR first. Merged and closed PRs are left out.
-- Responses stay under 64 KiB (the list drops the oldest PRs and sets
-  `truncated`) and carry no tokens or secrets.
-- Reading never calls GitHub.
-
-### `fresh=1`
-
-One GraphQL query reads the head, the status check rollup, the unresolved
-review thread count (first 100) and the mergeable state. The result is written
-through to that PR's snapshot:
-
-- `head`, `fresh` and `fresh_at` take the new values; `state`, `reasons`,
-  `checks`, `findings` and `observed_at` stay. The gate is never recomputed.
-- If the head, the checks (as success, failure or pending) or the unresolved
-  thread count differ from the snapshot, the PR is marked for re-evaluation. A
-  marker file `<n>.dirty` is written; the next `pr` pass lists marked PRs first
-  (so they settle first and, among reviews of equal hk priority, start first;
-  a higher hk priority still starts earlier), evaluates them even when the
-  unchanged-PR skip would leave them alone, and clears the marker when it
-  decides the PR.
-- A failed read still returns the snapshot, with `fresh_error`.
-
-A fresh read spends one GraphQL request from the token's budget. Only the CLI makes one; the daemon does not serve a status route.
-
 ## CLI
 
 ```
 mergewake pr-status --repo owner/name --pr N [--fresh] [--json] [--config PATH]
 ```
 
-Reads the same snapshot from local state: no daemon, no GitHub call, no token.
-`--json` prints the snapshot as JSON; without it, a short summary. `--fresh` makes the same one query (it needs a token) and writes the
-same snapshot fields and marker, but there is no daemon to wake, so the marker
-alone takes effect on the next pass.
+Reads the PR's snapshot from local state: no daemon, no GitHub call, no token.
+`--json` prints the snapshot as JSON, with `fresh_error` when a fresh read failed;
+without it, a short summary. A PR with no snapshot is an error, and `--fresh`
+checks that before it reads GitHub.
+
+### `--fresh`
+
+`--fresh` makes one GraphQL request and needs a token. The request bypasses the
+caches and reads:
+
+- the PR's head;
+- the status check rollup of that head (`SUCCESS`, `FAILURE`, `PENDING`, `ERROR`, or none);
+- the unresolved review threads, the first 100 (`unresolved_threads_capped` is set when there are more);
+- GitHub's `mergeable` and `merge_state`.
+
+It writes the result through to that PR's snapshot:
+
+- `head`, `fresh` and `fresh_at` take the new values. `state`, `reasons`,
+  `checks`, `threads`, `findings` and `observed_at` stay: the read never
+  recomputes the gate, and it never feeds the merge gate.
+- If the head, the checks class (success, failure or pending; no checks is its
+  own class) or the unresolved thread count differs, and the PR is still open,
+  the command writes the marker `<n>.dirty` in the PR's `pr-status` directory.
+  The file holds a timestamp. The baseline is the previous fresh read when there
+  is one, else the gate's snapshot. The thread count is compared only when
+  neither read hit the 100-thread cap.
+- If a gate decision replaced the snapshot while the read was in flight, the
+  read is dropped and nothing is written or marked.
+
+The next `pr` pass of that repo handles a marked PR first:
+
+- Marked PRs are queued ahead of the others. The queue starts the lowest hk
+  priority rank first and keeps arrival order within a rank, so a marked PR
+  starts first among PRs of equal rank, and a higher rank still starts earlier.
+- The PR is evaluated even when the unchanged-PR skip would leave it alone.
+- The marker is removed when the pass that decides the PR started after the
+  marker was written. A marker written during that pass stays for the next one.
+
+There is no daemon to wake, so a marker written by the command takes effect on
+the next `pr` pass.
+
+If the GitHub read fails, the snapshot is still printed, with `fresh_error` set
+to `GitHub read failed` (the summary shows `fresh: GitHub read failed`). Nothing
+is written and no marker is set.
+
+Each `--fresh` spends one GraphQL request from the token's budget. A plain read
+spends none.
