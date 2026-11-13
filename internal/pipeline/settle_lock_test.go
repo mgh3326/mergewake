@@ -315,27 +315,25 @@ func TestDeliverySaveKeepsAnotherPRsEntryAddedSinceTheLoad(t *testing.T) {
 	}
 }
 
-// (c) READY verdicts of different PRs of one repository, recorded at once, all
-// keep their clock in pr-ready-renotify.json.
+// (c) READY clocks that different PRs of one repository record at once all stay
+// in pr-ready-renotify.json. startReadyClock is the one step of NotifyPR that
+// rewrites the file; the passes call it together, as they do when several PRs
+// of a repository are settled at the same time.
 func TestConcurrentReadyClocksKeepEveryPRsClock(t *testing.T) {
-	const prs = 24
-	s, _, numbers, r := settleSetup(t, prs)
-	sink := &jobSink{
-		lanes: map[string]string{"2481": "design-lane"},
-		jobs:  map[string]string{"2481": "w-7"},
-		recs:  map[string]integrations.JobRecord{"w-7": {Role: "worker", Label: "worker-lane"}},
-	}
-	s.Sink = sink
+	const rounds, prs = 4, 32
+	s, _, _, r := settleSetup(t, 1)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
-	errs := make(chan error, prs)
-	for _, num := range numbers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			errs <- s.NotifyPR(asPR(fmt.Sprint(num)), r, num, Options{})
-		}()
+	errs := make(chan error, rounds*prs)
+	for round := range rounds {
+		for pr := range prs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				errs <- s.startReadyClock(r, verdictKey("ready", round*prs+pr, shaA), "worker-lane")
+			}()
+		}
 	}
 	close(start)
 	wg.Wait()
@@ -349,7 +347,7 @@ func TestConcurrentReadyClocksKeepEveryPRsClock(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if len(clocks) != prs {
-		t.Fatalf("%d READY clocks in the file, want %d: %v", len(clocks), prs, clocks)
+	if len(clocks) != rounds*prs {
+		t.Fatalf("%d READY clocks in the file, want %d", len(clocks), rounds*prs)
 	}
 }
