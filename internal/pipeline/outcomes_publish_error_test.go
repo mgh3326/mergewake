@@ -64,7 +64,7 @@ func TestFlushOutcomesAuditsPublishFailure(t *testing.T) {
 	if r.adds != 2 {
 		t.Fatalf("reps add ran %d times, want one per flush", r.adds)
 	}
-	if err := s.ledger().Flush(context.Background(), outcomes.CLI{Runner: r, Command: "pacelever"}, repo.Name); err == nil {
+	if err := s.ledger().Flush(context.Background(), outcomes.CLI{Runner: r, Command: "panewire"}, repo.Name); err == nil {
 		t.Fatal("strict Ledger.Flush hid the publication failure")
 	}
 	state, err := s.ledger().Read()
