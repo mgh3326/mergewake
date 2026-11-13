@@ -25,7 +25,7 @@ var (
 // and returns when ctx ends. It runs beside the pr role, never inside its sweep
 // or an evaluation, so a slow run delays neither. Publishing the outcomes it
 // records is the outcome publisher's job.
-func runReconcileLoop(ctx context.Context, s *pipeline.Service, openPRs func(repo string) (map[int]bool, bool), repos []config.Repo, interval time.Duration, o pipeline.Options, log *slog.Logger) {
+func runReconcileLoop(ctx context.Context, s *pipeline.Service, openPRs func(repo string) (func(pr int) bool, bool), repos []config.Repo, interval time.Duration, o pipeline.Options, log *slog.Logger) {
 	for ctx.Err() == nil {
 		// Repositories run in parallel, so the retry flag is shared.
 		var retry atomic.Bool
@@ -49,20 +49,20 @@ func runReconcileLoop(ctx context.Context, s *pipeline.Service, openPRs func(rep
 // reconcileClosed is one bounded run of the reconcile for r. ran is false when
 // the run had to wait: before r's first sweep no row can be told from an open
 // PR. A run logs one line, with its error.
-func reconcileClosed(ctx context.Context, s *pipeline.Service, openPRs func(repo string) (map[int]bool, bool), r config.Repo, o pipeline.Options, log *slog.Logger) (ran bool, err error) {
+func reconcileClosed(ctx context.Context, s *pipeline.Service, openPRs func(repo string) (func(pr int) bool, bool), r config.Repo, o pipeline.Options, log *slog.Logger) (ran bool, err error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 	started := time.Now()
-	open, known := openPRs(r.Name)
+	isOpen, known := openPRs(r.Name)
 	if !known {
 		log.Info("outcome reconcile run", "repo", r.Name, "skipped", "no open set yet")
 		return false, nil
 	}
-	err = s.ReconcileOutcomes(ctx, r, open, o)
-	attrs := []any{"repo", r.Name, "elapsed_ms", time.Since(started).Milliseconds(), "open_prs", len(open), "timed_out", errors.Is(ctx.Err(), context.DeadlineExceeded)}
+	err = s.ReconcileOutcomes(ctx, r, isOpen, o)
+	attrs := []any{"repo", r.Name, "elapsed_ms", time.Since(started).Milliseconds(), "timed_out", errors.Is(ctx.Err(), context.DeadlineExceeded)}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
 	}

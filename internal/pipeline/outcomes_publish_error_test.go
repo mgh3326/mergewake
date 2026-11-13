@@ -131,7 +131,7 @@ func TestReconcileOutcomesKeepsReadErrors(t *testing.T) {
 	s.GH = pullFailGH{g}
 	r := &refusedReps{}
 	s.Runner = r
-	err := s.ReconcileOutcomes(context.Background(), repo, map[int]bool{}, Options{Shadow: true})
+	err := s.ReconcileOutcomes(context.Background(), repo, noneOpen, Options{Shadow: true})
 	if err == nil || !strings.Contains(err.Error(), "pull read failed") {
 		t.Fatalf("PR read failure lost: %v", err)
 	}
