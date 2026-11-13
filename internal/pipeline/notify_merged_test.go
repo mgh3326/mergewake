@@ -182,6 +182,9 @@ func TestMergedAuditFailureRetriesRowWithoutSending(t *testing.T) {
 	if n.count != 1 {
 		t.Fatalf("retry resent notice: %d", n.count)
 	}
+	if rows := prNotifyRows(t, s, r); len(rows) != 1 || rows[0]["sent"] != true {
+		t.Fatalf("retry did not write exactly one successful row: %v", rows)
+	}
 	if !sentKeyHas(t, s, r, verdictKey("merged", 7, shaA)) {
 		t.Fatal("key not saved")
 	}
