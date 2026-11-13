@@ -109,13 +109,14 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 	e, f := engineFixture(t, 1)
 	entered, releaseList := make(chan struct{}), make(chan struct{})
 	prEntered, releasePR := make(chan struct{}), make(chan struct{})
+	var prOnce sync.Once
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "open" {
 			close(entered)
 			<-releaseList
 		}
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/5") {
-			close(prEntered)
+			prOnce.Do(func() { close(prEntered) })
 			<-releasePR
 		}
 		f.hub.ServeHTTP(w, r)
