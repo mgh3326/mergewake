@@ -25,11 +25,6 @@ func appendLine(name string, line []byte) error {
 	return fsutil.AppendLine(name, line)
 }
 
-// fallbackMu guards Service.inboxFallbacks. Nothing counts legacy findings
-// uses any more (the lane/file path is gone); both go with the next change
-// to pipeline.go.
-var fallbackMu sync.Mutex
-
 // pathLocks holds one mutex per state file or checkout that is read, changed
 // and written back, so two goroutines never lose each other's update.
 var pathLocks sync.Map // string → *sync.Mutex

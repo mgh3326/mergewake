@@ -576,8 +576,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					collected, remoteRecord, spawn = b, &fresh, false
 				} else if err := ctx.Err(); err != nil {
 					return out, fmt.Errorf("panewire reviewer %s: %w", label, err)
-					// Give transient read errors one additional review budget to recover.
 				} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+					// Give transient read errors one additional review budget to recover.
 					return out, errPassPending
 				} else {
 					cause := "pane finished without a result"
