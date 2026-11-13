@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -148,6 +149,43 @@ func TestPrivateCAFileConstraints(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := privateCATLSConfig(dir, "MySQL_Endpoint_Server"); !errors.Is(err, ErrConfig) {
 		t.Fatalf("directory accepted: %v", err)
+	}
+}
+
+func TestPrivateCARejectsFIFOWithoutBlocking(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "ca.fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := privateCATLSConfig(fifo, "MySQL_Endpoint_Server")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrConfig) {
+			t.Fatalf("FIFO CA path returned %v, want ErrConfig", err)
+		}
+	case <-time.After(2 * time.Second):
+		// Release the blocked open so this test cannot hang the package.
+		go func() {
+			if f, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+				f.Close()
+			}
+		}()
+		t.Fatal("privateCATLSConfig blocked opening a FIFO CA path")
+	}
+}
+
+func TestPrivateCASymlinkToRegularCAAccepted(t *testing.T) {
+	target := writeTestCAPEM(t)
+	link := filepath.Join(t.TempDir(), "ca-link.pem")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := privateCATLSConfig(link, "MySQL_Endpoint_Server"); err != nil {
+		t.Fatalf("symlink to valid CA rejected: %v", err)
 	}
 }
 

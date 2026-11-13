@@ -833,8 +833,14 @@ func validateAdapters(c *Config) error {
 	if c.Notifier.Type == "panewire" && c.Notifier.Lane == "" {
 		return errors.New("panewire notifier requires lane")
 	}
+	if c.Notifier.Lane != "" && !PanewireLane(c.Notifier.Lane) {
+		return errors.New("notifier.lane must match panewire's lane rule")
+	}
 	if c.Notifier.FallbackLane == "" {
 		c.Notifier.FallbackLane = c.Notifier.Lane
+	}
+	if c.Notifier.FallbackLane != "" && !PanewireLane(c.Notifier.FallbackLane) {
+		return errors.New("notifier.fallback_lane must match panewire's lane rule")
 	}
 	if c.Sink.ReopenState == "" {
 		c.Sink.ReopenState = "reopened"
@@ -843,6 +849,13 @@ func validateAdapters(c *Config) error {
 		return errors.New("sink.reopen_state must be reopened")
 	}
 	return nil
+}
+
+var panewireLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// PanewireLane reports whether lane is accepted by panewire's --lane rule.
+func PanewireLane(lane string) bool {
+	return panewireLanePattern.MatchString(lane)
 }
 
 // validateProfiles checks reviewer profiles, pairings and the default family, canonicalizing family names.

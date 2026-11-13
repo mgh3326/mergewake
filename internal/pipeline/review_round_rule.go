@@ -392,10 +392,6 @@ func emitSafe(s string) string {
 	}, s)
 }
 
-// panewireLaneName is panewire's --lane rule (hub_jobs.go:15 at 1b4d7b7). It
-// has no underscore, unlike laneName.
-var panewireLaneName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-
 func round5DecisionText(r config.Repo, pr github.Pull, rounds int, open []github.ReviewThread) string {
 	head := "<!-- mergewake-round-hold --> " + fmt.Sprintf("[mergewake] ESC %s#%d | round %d ended without a pass (%d open finding(s))", r.Name, pr.Number, rounds, len(open))
 	choices := " | choices: 1) cut the scope (the part that keeps drawing findings goes to a follow-up task, the rest merges) or 2) one SS consult on the design | reply with PR comment: Mergewake-Round-Hold: release"
@@ -530,7 +526,7 @@ func (s *Service) sendRoundHoldDecision(ctx context.Context, r config.Repo, pr g
 	}
 
 	lane := s.designLane(ctx, r, pr)
-	if !panewireLaneName.MatchString(lane) {
+	if !config.PanewireLane(lane) {
 		// panewire refuses a lane outside its rule; the desk takes the event.
 		lane = s.deskLane()
 	}

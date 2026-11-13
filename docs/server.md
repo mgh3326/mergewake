@@ -435,7 +435,7 @@ is an explicit upstream API dependency, not an endpoint claimed to exist.
 Handoffkeep's existing job-by-ID projection is usable after resolution. Keep
 timeouts, credential handling and response redaction behind the adapter.
 
-Findings and author-actionable BLOCKED go to the author lane (READY and MERGED are recorded, not sent);
+Findings and author-actionable BLOCKED go to the author lane. READY is recorded, not sent; MERGED is sent once per (PR, head) to the PR's design lane and retried until sent;
 follow-up workers attach to that job rather than the coordinator. Durable inbox
 ACK and verified dispositions stop reminders as appropriate. Operator
 interruptions have a closed reason vocabulary:

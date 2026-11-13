@@ -411,8 +411,10 @@ func (s *Service) rerunOutcome(ctx context.Context, reader statusReader, r confi
 }
 
 // fixPR finds the open PR that names this red as its fix through a
-// `Fixes-Red-Main: <sha>` line in its body or head commit message.
-func (s *Service) fixPR(ctx context.Context, r config.Repo, st recoveryIncident) (*github.Pull, error) {
+// `Fixes-Red-Main: <sha>` line in its body or head commit message. The match
+// covers the incident's culprit, its recorded head, and the current red head
+// recovery is handling: a held incident keeps its recorded head.
+func (s *Service) fixPR(ctx context.Context, r config.Repo, st recoveryIncident, head string) (*github.Pull, error) {
 	lister, ok := s.GH.(openLister)
 	if !ok {
 		return nil, nil
@@ -426,14 +428,14 @@ func (s *Service) fixPR(ctx context.Context, r config.Repo, st recoveryIncident)
 		if pr.Number == st.RevertPR {
 			continue
 		}
-		if namesFix(pr.Body, st) {
+		if namesFix(pr.Body, st, head) {
 			return pr, nil
 		}
 		c, e := s.GH.Commit(ctx, r.Name, pr.Head.SHA)
 		if e != nil {
 			continue
 		}
-		if namesFix(c.Commit.Message, st) {
+		if namesFix(c.Commit.Message, st, head) {
 			return pr, nil
 		}
 	}
@@ -441,14 +443,14 @@ func (s *Service) fixPR(ctx context.Context, r config.Repo, st recoveryIncident)
 }
 
 // namesFix reports whether text names the red through a Fixes-Red-Main line.
-func namesFix(text string, st recoveryIncident) bool {
+func namesFix(text string, st recoveryIncident, head string) bool {
 	for _, line := range strings.Split(text, "\n") {
 		v, ok := strings.CutPrefix(strings.TrimSpace(line), "Fixes-Red-Main:")
 		if !ok {
 			continue
 		}
 		v = strings.TrimSpace(v)
-		for _, sha := range []string{st.Culprit, st.Head} {
+		for _, sha := range []string{st.Culprit, st.Head, head} {
 			if sha != "" && (v == sha || len(v) >= 7 && strings.HasPrefix(sha, v)) {
 				return true
 			}
@@ -735,7 +737,7 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 	}
 	// A fix PR is named and put first in the review queue from the poll that
 	// sees it, inside the initial window too: the window is when it is needed.
-	fix, e := s.fixPR(ctx, r, st)
+	fix, e := s.fixPR(ctx, r, st, head)
 	if e != nil {
 		return e
 	}

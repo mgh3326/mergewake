@@ -42,6 +42,10 @@ type fakeReapHub struct {
 	tops        map[string]string // cwd → worktree toplevel, when the cwd is a subdirectory
 	dropClosed  bool
 	dropRemoved bool
+	// closeOutcomes answers the next pane.close calls in turn, before close;
+	// closeFails makes the next pane.close calls answer a node error.
+	closeOutcomes []string
+	closeFails    int
 	// commons maps a cwd to the common git dir worktree.inspect reports for it
 	// (/repo/.git when absent); lists holds each common's worktree.list rows,
 	// served listPage rows at a time (all at once when zero) behind an offset
@@ -159,8 +163,19 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		case "pane.capture":
 			result = h.capture
 		case "pane.close":
-			result = h.close
-			if h.dropClosed && h.close["outcome"] == "closed" {
+			if h.closeFails > 0 {
+				h.closeFails--
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "node_busy"})
+				return
+			}
+			out := h.close
+			if len(h.closeOutcomes) > 0 {
+				out = map[string]any{"outcome": h.closeOutcomes[0]}
+				h.closeOutcomes = h.closeOutcomes[1:]
+			}
+			result = out
+			if h.dropClosed && out["outcome"] == "closed" {
 				id := body["args"].(map[string]any)["pane_id"]
 				for _, list := range []string{"agents", "panes"} {
 					var keep []any

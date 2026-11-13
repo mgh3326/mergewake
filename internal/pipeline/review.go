@@ -151,6 +151,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if pr.State != "open" || pr.Draft {
 		return errors.New("review requires an open, ready PR")
 	}
+	// Closes a replaced reviewer still owes from an earlier pass: a close that
+	// did not land is retried here, whether or not reap is enabled. Only a
+	// cancelled run stops the review.
+	if e = (&panewireExecutor{s: s, repo: r, pr: pr}).retryReplacedCloses(ctx); e != nil && ctx.Err() != nil {
+		return e
+	}
 	if s.isRoundHoldActive(ctx, r, pr) {
 		return ErrReviewHeld
 	}

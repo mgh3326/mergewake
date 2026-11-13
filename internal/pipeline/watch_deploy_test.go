@@ -221,6 +221,92 @@ func TestWatchDeployRevertUsesPRChecks(t *testing.T) {
 	}
 }
 
+func deployFixPRRow(t *testing.T, s *Service, r config.Repo) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(s.state(r.Name), "decisions.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.Contains(line, `"command":"recovery-fix-pr"`) {
+			t.Logf("urgent row: %s", line)
+			return line
+		}
+	}
+	t.Fatal("no recovery-fix-pr audit row")
+	return ""
+}
+
+// While a deploy incident is held for a changed check set, its recorded head
+// stays put but a fix PR may name the current red head.
+func TestWatchDeployCheckSetChangeFixPRMatchesCurrentHead(t *testing.T) {
+	setup := func(t *testing.T) (*Service, *deployTestGH, config.Repo) {
+		t.Helper()
+		s, g, _, r, now := deploySetup(t)
+		st := confirmedDeploy(now.Add(-fixWindow))
+		st.Checks = "old-deploy-check"
+		st.RevertPR = 9
+		st.RevertURL = "https://github.com/example/project/pull/9"
+		seedDeployIncident(t, s, r, st)
+		g.latch = true
+		g.head = advancedHead
+		g.parents[advancedHead] = shaC
+		g.checkNames[advancedHead] = map[string]github.CI{"CI": github.Green, "deploy-ok": github.Red}
+		return s, g, r
+	}
+	assertFix := func(t *testing.T, s *Service, g *deployTestGH, r config.Repo, got watchResult) {
+		t.Helper()
+		if got.Action != "recovery-fix-pr" || !strings.Contains(got.Reason, "#11") || g.merges != 0 {
+			t.Fatalf("%+v merges=%d", got, g.merges)
+		}
+		st, found := readDeployIncident(t, s, r)
+		if !found || st.Head != shaC || st.FixPR != 11 || st.Checks != "old-deploy-check" {
+			t.Fatalf("incident=%+v found=%v", st, found)
+		}
+		if !s.urgentFix(r.Name, 11) {
+			t.Fatal("fix PR was not marked urgent")
+		}
+		if priority := s.ReviewPriority(context.Background(), r, g.openPulls[0]); priority.Value != 1 || priority.Source != "recovery-fix" {
+			t.Fatalf("fix PR priority %+v", priority)
+		}
+		row := deployFixPRRow(t, s, r)
+		for _, want := range []string{`"pr":11`, `"priority":1`, `"priority_source":"recovery-fix"`} {
+			if !strings.Contains(row, want) {
+				t.Fatalf("urgent row %q lacks %s", row, want)
+			}
+		}
+	}
+
+	t.Run("body", func(t *testing.T) {
+		s, g, r := setup(t)
+		g.openPulls = []github.Pull{fixPull(advancedHead)}
+		assertFix(t, s, g, r, recoveryWatch(t, s, r))
+	})
+	t.Run("commit message", func(t *testing.T) {
+		s, g, r := setup(t)
+		pr := fixPull(advancedHead)
+		pr.Body = "ordinary change\n"
+		if g.messages == nil {
+			g.messages = map[string]string{}
+		}
+		g.messages[pr.Head.SHA] = "Fixes-Red-Main: " + advancedHead + "\n"
+		g.openPulls = []github.Pull{pr}
+		assertFix(t, s, g, r, recoveryWatch(t, s, r))
+	})
+	t.Run("unrelated sha", func(t *testing.T) {
+		s, g, r := setup(t)
+		g.openPulls = []github.Pull{fixPull(strings.Repeat("9", 40))}
+		got := recoveryWatch(t, s, r)
+		if got.Action != "recovery-hold" || !strings.Contains(got.Reason, "check set changed") {
+			t.Fatalf("%+v", got)
+		}
+		st, found := readDeployIncident(t, s, r)
+		if !found || st.Head != shaC || st.FixPR != 0 || s.urgentFix(r.Name, 11) {
+			t.Fatalf("incident=%+v found=%v urgent=%v", st, found, s.urgentFix(r.Name, 11))
+		}
+	})
+}
+
 func TestWatchDeployWorkflowWithoutSuite(t *testing.T) {
 	s, g, _, r, _ := deploySetup(t)
 	g.suite = false
