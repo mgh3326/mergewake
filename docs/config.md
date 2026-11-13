@@ -1526,7 +1526,7 @@ For `example/project`, state resides beneath
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
-| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours. |
+| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
@@ -1742,8 +1742,9 @@ receiving lane until it runs `panewire inbox ack` (panewire
 event untyped). READY is recorded, never sent, because mergewake merges on its own
 gate. MERGED writes one `pr-notify` row and its sent key after the row is durable;
 no design lane is recorded as `"no design lane"`. Recent PRs merged outside
-mergewake also receive one notice. Pending notices older than 24 hours are
-recorded as gave up. The head's
+mergewake also receive one notice. Pending notices more than 24 hours after the PR's merge (else
+after mergewake first saw it) are recorded as gave up, unless already delivered: a delivered notice
+is recorded as sent. The head's
 summary, and the author worker lane (job bound to the task, else the author
 pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
