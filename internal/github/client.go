@@ -305,7 +305,7 @@ type Pull struct {
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
-	return memoized(ctx, c, memoKey{repo, "pull", strconv.Itoa(n)}, func() (Pull, error) {
+	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
 		if p, ok := c.storedPull(ctx, repo, n); ok {
 			return p, nil
 		}
@@ -347,7 +347,7 @@ func (c *Client) UpdateBranch(ctx context.Context, repo string, n int, head stri
 	return c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/update-branch", base(repo), n), map[string]string{"expected_head_sha": head}, nil)
 }
 func (c *Client) Head(ctx context.Context, repo, branch string) (string, error) {
-	return memoized(ctx, c, memoKey{repo, "head", branch}, func() (string, error) {
+	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "head", id: branch}, func() (string, error) {
 		var r struct {
 			Object Ref `json:"object"`
 		}
@@ -966,7 +966,7 @@ func (c *Client) ReviewHistory(ctx context.Context, repo string, n int, login st
 // githubHistory reads the history from GitHub; in phase 1 it also compares it
 // with hk's record of the PR.
 func (c *Client) githubHistory(ctx context.Context, repo string, n int, login string) ([]ReviewedPass, error) {
-	out, e := memoized(ctx, c, memoKey{repo, "reviews", strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
+	out, e := memoized(ctx, c, memoKey{client: c, repo: repo, kind: "reviews", id: strconv.Itoa(n) + " " + login}, func() ([]ReviewedPass, error) {
 		history, e := c.reviewHistory(ctx, repo, n, login)
 		if e == nil && !c.hkPrimary && c.hk != nil {
 			gh := make([]HKReview, len(history))

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -55,6 +58,40 @@ func TestNewObjectsOnlyWithDSN(t *testing.T) {
 		if o.Close() != nil {
 			t.Fatal("close")
 		}
+	}
+}
+
+func TestObjectsUsesInjectedEnvironment(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- struct{}{}
+			conn.Close()
+		}
+	}()
+	t.Setenv("MERGEWAKE_MYSQL_DSN", fmt.Sprintf("user:pass@tcp(%s)/db?tls=true", listener.Addr()))
+	getenv := func(k string) string {
+		if k == "MERGEWAKE_MYSQL_DSN" {
+			return "not-a-dsn"
+		}
+		return ""
+	}
+	o := NewObjects(getenv)
+	defer o.Close()
+	_, _, err = o.GetObject(context.Background(), "o/r", "commit", head(1), "")
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("GetObject error = %v, want ErrConfig", err)
+	}
+	select {
+	case <-accepted:
+		t.Fatal("object cache dialled the process environment DSN")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 

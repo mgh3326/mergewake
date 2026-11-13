@@ -7,18 +7,22 @@ import (
 )
 
 // A pass memoizes the mutable reads that repeat inside it (Head, Pull,
-// ReviewHistory): the first result stands for the rest of the pass. A read that
-// asks for fresh evidence skips the memo and refreshes it. Every write the
+// ReviewHistory): the newest successful result stands for the rest of the pass.
+// A read that asks for fresh evidence skips the memo and refreshes it. Every write the
 // client makes, from any pass, bumps its repository's write epoch; an entry
 // holds only while the epoch it was read under is current, so no pass reads
 // state older than a write this process made, and a read in flight during a
 // write is not kept.
 
-type memoKey struct{ repo, kind, id string }
+type memoKey struct {
+	client         *Client
+	repo, kind, id string
+}
 
 type memoEntry struct {
 	value any
 	epoch uint64
+	start uint64
 }
 
 // passMemo is one pass's memo and cache breaker. A pass that repeats (watch,
@@ -26,6 +30,7 @@ type memoEntry struct {
 type passMemo struct {
 	mu        sync.Mutex
 	entries   map[memoKey]memoEntry
+	starts    map[memoKey]uint64
 	cacheDown bool
 }
 
@@ -52,12 +57,14 @@ type writeEpochs struct {
 }
 
 func (w *writeEpochs) of(repo string) uint64 {
+	repo = normalizeMemoRepo(repo)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.epoch[repo] + w.epoch[""]
 }
 
 func (w *writeEpochs) bump(repo string) {
+	repo = normalizeMemoRepo(repo)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.epoch == nil {
@@ -66,11 +73,13 @@ func (w *writeEpochs) bump(repo string) {
 	w.epoch[repo]++
 }
 
+func normalizeMemoRepo(repo string) string { return strings.ToLower(repo) }
+
 // memoRepo names the repository a write route touches, or "" when unknown.
 func memoRepo(route string) string {
 	parts := strings.Split(strings.TrimPrefix(route, "/"), "/")
 	if len(parts) >= 3 && parts[0] == "repos" {
-		return parts[1] + "/" + parts[2]
+		return normalizeMemoRepo(parts[1] + "/" + parts[2])
 	}
 	return ""
 }
@@ -101,14 +110,16 @@ func (m *passMemo) tripCache() bool {
 	return !was
 }
 
-// memoized returns the pass's first successful result for k while no write to
+// memoized returns the pass's newest successful result for k while no write to
 // the repository has happened since. Errors are never kept. A fresh read always
-// calls read and stores its result.
+// calls read; an older in-flight read cannot replace its result.
 func memoized[T any](ctx context.Context, c *Client, k memoKey, read func() (T, error)) (T, error) {
 	m := memoOf(ctx)
 	if m == nil {
 		return read()
 	}
+	k.client = c
+	k.repo = normalizeMemoRepo(k.repo)
 	if !isFresh(ctx) {
 		m.mu.Lock()
 		entry, ok := m.entries[k]
@@ -118,6 +129,13 @@ func memoized[T any](ctx context.Context, c *Client, k memoKey, read func() (T, 
 			return entry.value.(T), nil
 		}
 	}
+	m.mu.Lock()
+	if m.starts == nil {
+		m.starts = map[memoKey]uint64{}
+	}
+	m.starts[k]++
+	start := m.starts[k]
+	m.mu.Unlock()
 	epoch := c.writes.of(k.repo)
 	v, e := read()
 	if e != nil {
@@ -129,7 +147,10 @@ func memoized[T any](ctx context.Context, c *Client, k memoKey, read func() (T, 
 		if m.entries == nil {
 			m.entries = map[memoKey]memoEntry{}
 		}
-		m.entries[k] = memoEntry{v, epoch}
+		entry, exists := m.entries[k]
+		if !exists || entry.start <= start {
+			m.entries[k] = memoEntry{value: v, epoch: epoch, start: start}
+		}
 		m.mu.Unlock()
 	}
 	return v, nil
