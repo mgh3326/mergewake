@@ -412,6 +412,7 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 // not wait for them.
 func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	setPRSweepStep(ctx, "open_pulls")
+	e.q.BeginList(r.Name)
 	e.openOf(r.Name).beginList()
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {

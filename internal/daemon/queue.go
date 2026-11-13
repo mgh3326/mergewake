@@ -107,9 +107,17 @@ type Queue struct {
 	// open is each repo's known open PRs and their heads: what a push to the
 	// base branch enqueues, and how an event that names only a commit finds its PR.
 	open map[string]map[int]string
+	// listing records changes made after a sweep starts reading a repo's open
+	// PRs, so SetOpen can reconcile those changes with the eventual list.
+	listing map[string]*openList
 	// timers are the pending EnqueueAt calls. They live only in memory: a
 	// restart repeats what they would have found through the sweep.
 	timers map[timerKey]*timer
+}
+
+type openList struct {
+	learned   map[int]string
+	forgotten map[int]struct{}
 }
 
 type timer struct {
@@ -198,6 +206,7 @@ func (q *Queue) init() {
 		q.entries = map[PRKey]*entry{}
 		q.repos = map[string]*repoState{}
 		q.open = map[string]map[int]string{}
+		q.listing = map[string]*openList{}
 		q.timers = map[timerKey]*timer{}
 		q.changed = sync.NewCond(&q.mu)
 	}
@@ -396,11 +405,34 @@ func (q *Queue) EnqueueRepo(src Source, repo string) {
 	q.pump()
 }
 
-// SetOpen replaces the known open PRs of repo with their heads.
+// BeginList marks the start of a sweep's open PR list read for repo.
+func (q *Queue) BeginList(repo string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.init()
+	q.listing[repo] = &openList{learned: map[int]string{}, forgotten: map[int]struct{}{}}
+}
+
+// SetOpen replaces the known open PRs of repo with their heads, reconciling
+// any learns or forgets made since BeginList.
 func (q *Queue) SetOpen(repo string, heads map[int]string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	if changes := q.listing[repo]; changes != nil {
+		merged := make(map[int]string, len(heads)+len(changes.learned))
+		for n, head := range heads {
+			merged[n] = head
+		}
+		for n := range changes.forgotten {
+			delete(merged, n)
+		}
+		for n, head := range changes.learned {
+			merged[n] = head
+		}
+		heads = merged
+		delete(q.listing, repo)
+	}
 	for tk := range q.timers {
 		if _, ok := heads[tk.key.PR]; tk.key.Repo == repo && !ok {
 			q.cancel(tk)
@@ -427,6 +459,9 @@ func (q *Queue) Head(repo string, n int) string {
 }
 
 func (q *Queue) learn(repo string, n int, sha string) {
+	if changes := q.listing[repo]; changes != nil {
+		changes.learned[n] = sha
+	}
 	if q.open[repo] == nil {
 		q.open[repo] = map[int]string{}
 	}
@@ -439,6 +474,9 @@ func (q *Queue) Forget(repo string, n int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.init()
+	if changes := q.listing[repo]; changes != nil {
+		changes.forgotten[n] = struct{}{}
+	}
 	q.cancelPR(repo, n)
 	delete(q.open[repo], n)
 }
