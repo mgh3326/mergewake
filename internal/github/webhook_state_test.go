@@ -147,6 +147,26 @@ func TestShadowPullComparesWithoutChangingTheResult(t *testing.T) {
 	}
 }
 
+func TestWriteDistrustsWebhookStateUsingOriginalRepoSpelling(t *testing.T) {
+	now := time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC)
+	store := webhookstate.Open(t.TempDir())
+	store.Now = func() time.Time { return now }
+	store.SeedPR("Owner/Repo", webhookstate.PR{Number: 7, State: "open", HeadSHA: "h1"})
+	if _, ok := store.UsablePR("Owner/Repo", 7); !ok {
+		t.Fatal("fixture PR is not usable before the write")
+	}
+	c := api(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	c.Webhook = store
+	if _, err := c.request(context.Background(), "PUT", "/repos/Owner/Repo/pulls/7/merge", "application/json", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.UsablePR("Owner/Repo", 7); ok {
+		t.Fatal("write left the exact-spelling webhook entry trusted")
+	}
+}
+
 func TestShadowPullIgnoresAStoredPRNewerThanTheAPI(t *testing.T) {
 	f := &stateFake{}
 	f.set("h1", "2026-11-06T00:01:00Z")

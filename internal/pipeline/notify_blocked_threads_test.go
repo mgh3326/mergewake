@@ -71,7 +71,7 @@ func TestBlockedNoticeListsHoldingThreads(t *testing.T) {
 			t.Fatalf("event missing %q:\n%s", want, ev)
 		}
 	}
-	if strings.Contains(ev, "raised no new findings") {
+	if strings.Contains(ev, "posted no holding finding") {
 		t.Fatalf("clean-pass claim while a thread is posted on the head:\n%s", ev)
 	}
 	if strings.Count(ev, "reply not accepted") != 1 {
@@ -88,7 +88,7 @@ func TestBlockedNoticeCleanLatestPassSaysSo(t *testing.T) {
 	if !strings.Contains(ev, "blocking_findings:1") {
 		t.Fatalf("%s", ev)
 	}
-	if !strings.Contains(ev, "latest review pass on "+shaA[:7]+" raised no new findings") {
+	if !strings.Contains(ev, "latest review pass on "+shaA[:7]+" posted no holding finding") {
 		t.Fatalf("clean latest pass not stated:\n%s", ev)
 	}
 }
@@ -151,10 +151,67 @@ func TestHoldingNoticeFitsRoom(t *testing.T) {
 			t.Fatalf("room %d: notice is %d bytes:\n%s", room, len(got), got)
 		}
 	}
-	if got := holdingNotice(v, shaA, 2000); !strings.Contains(got, "a block-class thread clears") || !strings.Contains(got, "raised no new findings") {
+	if got := holdingNotice(v, shaA, 2000); !strings.Contains(got, "a block-class thread clears") || !strings.Contains(got, "posted no holding finding") {
 		t.Fatalf("fixed text missing at room 2000:\n%s", got)
 	}
 	if got := holdingNotice(v, shaA, 100); got != "" {
 		t.Fatalf("notice at room 100 should be empty:\n%s", got)
+	}
+}
+
+// (f) The clearing sentence names resolving the thread as well as the two
+// reply forms: a thread fixed on the head clears by being resolved.
+func TestBlockedNoticeClearsWhenResolved(t *testing.T) {
+	ev := notifyBlocked(t, mwHigh("t1", shaA, "https://example.test/pull/7#r1"))
+	if !strings.Contains(ev, "clears when it is resolved, or with a reply of") {
+		t.Fatalf("clearing sentence missing resolve:\n%s", ev)
+	}
+}
+
+// (g) A clean latest pass is scoped to holding findings: it says the pass
+// posted no holding finding and that the listed threads hold from earlier
+// passes, so it cannot contradict an open triage finding on the head.
+func TestBlockedNoticeCleanPassPostedNoHolding(t *testing.T) {
+	ev := notifyBlocked(t, mwHigh("t1", shaC, "https://example.test/pull/7#r1"))
+	if !strings.Contains(ev, "posted no holding finding") {
+		t.Fatalf("clean-pass scope missing:\n%s", ev)
+	}
+	if strings.Contains(ev, "raised no new findings") {
+		t.Fatalf("old clean-pass wording still present:\n%s", ev)
+	}
+	if !strings.Contains(ev, "threads above hold from earlier passes") {
+		t.Fatalf("earlier-passes clause missing:\n%s", ev)
+	}
+}
+
+// (h) The list budget is computed from the full tail: with ten long holding
+// threads the notice never exceeds the room verdictEvent leaves under
+// panewire's 2048-byte limit, at any room.
+func TestBlockedNoticeLongListStaysInRoom(t *testing.T) {
+	var holds []holdingThread
+	for i := 1; i <= 10; i++ {
+		holds = append(holds, holdingThread{
+			Ref:       fmt.Sprintf("https://example.test/pull/7#discussion_r%02d", i),
+			Author:    "coderabbitai[bot]",
+			Severity:  "major",
+			Location:  "internal/pipeline/a_rather/long/file/name_for_the_finding.go:123",
+			ReplyBy:   "dev",
+			ReplyBody: strings.Repeat("still broken ", 8),
+		})
+	}
+	v := gateVerdict{Holds: holds, PassClean: true}
+	for room := 200; room <= findingsLaneText; room++ {
+		if got := holdingNotice(v, shaA, room); len(got) > room {
+			t.Fatalf("room %d: notice is %d bytes:\n%s", room, len(got), got)
+		}
+	}
+	// The realistic room verdictEvent computes keeps the whole event under
+	// panewire's 2048-byte limit.
+	head := fmt.Sprintf("[mergewake] BLOCKED example/project#7 head=%s | blocking_findings:10", shaA[:7])
+	tail := " | lane=author via findings"
+	room := findingsLaneText - len(head) - len(tail) - len(" | ")
+	full := head + " | " + holdingNotice(v, shaA, room) + tail
+	if len(full) > 2048 {
+		t.Fatalf("event text is %d bytes, over 2048:\n%s", len(full), full)
 	}
 }
