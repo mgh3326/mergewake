@@ -92,7 +92,7 @@ func TestPanewireDuplicateEventCountsAsDelivered(t *testing.T) {
 }
 
 func TestDetailAddsStderrTail(t *testing.T) {
-	err := &CommandError{Command: "pacelever", Err: errors.New("exit status 2"), Stderr: "error: experiment_arm must be baseline or downshift\n"}
+	err := &CommandError{Command: "panewire", Err: errors.New("exit status 2"), Stderr: "error: experiment_arm must be baseline or downshift\n"}
 	got := Detail(err)
 	if !strings.Contains(got, "exit status 2") || !strings.Contains(got, "experiment_arm") {
 		t.Fatalf("detail=%q", got)

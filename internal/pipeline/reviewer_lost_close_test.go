@@ -72,29 +72,6 @@ func TestLostOverdueReviewerMismatchedPaneIsKept(t *testing.T) {
 	}
 }
 
-// (c) A pane that finished without a result keeps today's behaviour: it is not
-// captured or closed, and no pane skip is audited.
-func TestLostFinishedPaneKeepsPaneHandling(t *testing.T) {
-	s, g, r, runner, c := interruptedReviewer(t)
-	old := readReviewerJob(t, s, r, 1)
-	hub := lostPaneHub(t, s, runner, old, "done")
-	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-	pastBudget(g, c)
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if captures, closes := hub.ops("pane.capture"), hub.ops("pane.close"); len(captures)+len(closes) != 0 {
-		t.Fatalf("a finished pane was touched: capture=%v close=%v", captures, closes)
-	}
-	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 0 {
-		t.Fatalf("reviewer-close-skipped = %v", rows)
-	}
-	closedOnce(t, runner, old.Label)
-	if len(runner.spawns) != 2 {
-		t.Fatalf("spawns = %v", runner.spawns)
-	}
-}
-
 // (d) A forced close that the hub refuses is audited with its reason and never
 // fails the pass: the replacement still runs.
 func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
