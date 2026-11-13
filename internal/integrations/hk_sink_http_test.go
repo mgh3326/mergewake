@@ -217,6 +217,25 @@ func TestTaskBodyReadsLinkedDocument(t *testing.T) {
 	}
 }
 
+func TestTaskBodySectionSuffixReadsNamedDocument(t *testing.T) {
+	hk := hktest.New(t)
+	hk.SetTask(42, `{"id":42,"title":"task","state":"unstarted","body_doc":"design/x#3-task"}`)
+	hk.SetDocument("design/x", "# Task\n\n## Acceptance\n\n- sectioned contract\n")
+	body, err := (Handoffkeep{}).TaskBody(context.Background(), "42")
+	if err != nil || body != "# Task\n\n## Acceptance\n\n- sectioned contract\n" {
+		t.Fatalf("TaskBody = %q, %v", body, err)
+	}
+	var docReads []string
+	for _, r := range hk.Requests() {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/v1/documents/") {
+			docReads = append(docReads, r.Path)
+		}
+	}
+	if len(docReads) != 1 || docReads[0] != "/v1/documents/design%2Fx" {
+		t.Fatalf("document requests = %q, want [/v1/documents/design%%2Fx]", docReads)
+	}
+}
+
 func TestTaskBodyDocumentNotFoundAndReadError(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		hk := hktest.New(t)
