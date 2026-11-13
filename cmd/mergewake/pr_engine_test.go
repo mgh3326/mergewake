@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -106,19 +107,18 @@ func TestEventQueueSweepQueuesInsteadOfEvaluatingInline(t *testing.T) {
 }
 
 func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
-	e, f := engineFixture(t, 1)
-	f.hub.heads = map[int]string{5: "eee"}
+	f := newParallelFixture(t, 1, 0)
+	e := newPREngine(f.s, f.gh, pipeline.Options{}, []config.Repo{f.repo}, nil, nil, func(string, int) {})
+	works := make(chan daemon.Work, 10)
+	e.q.Run = func(_ context.Context, w daemon.Work) { works <- w }
+	ctx, cancel := context.WithCancel(context.Background())
+	e.q.Start(ctx)
+	t.Cleanup(func() { cancel(); e.q.Wait() })
 	entered, releaseList := make(chan struct{}), make(chan struct{})
-	prEntered, releasePR := make(chan struct{}), make(chan struct{})
-	var prOnce sync.Once
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "open" {
 			close(entered)
 			<-releaseList
-		}
-		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls/5") {
-			prOnce.Do(func() { close(prEntered) })
-			<-releasePR
 		}
 		f.hub.ServeHTTP(w, r)
 	}))
@@ -134,26 +134,34 @@ func TestSweepKeepsWebhookLearnedHeadWhileListingOpenPulls(t *testing.T) {
 	// This is the queue call made by the webhook handler for a delivery naming
 	// PR 5 and its head while the list response is in flight.
 	e.q.EnqueueNamed(daemon.SourceWebhook, f.repo.Name, 5, "eee")
-	select {
-	case <-prEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("PR 5 evaluation did not reach its fake GitHub read")
-	}
 	close(releaseList)
 	if err := <-returned; err != nil {
 		t.Fatal(err)
 	}
-	f.runner.waitFor(t, "listed PR evaluation", func(in, started, _ int) bool { return in == 1 && started == 1 })
 	if got := e.q.Head(f.repo.Name, 5); got != "eee" {
 		t.Fatalf("sweep lost learned head: got %q, want eee", got)
 	}
-	e.q.EnqueueNamed(daemon.SourceCheck, f.repo.Name, 0, "eee")
-	close(releasePR)
-	close(f.runner.release)
-	f.runner.waitFor(t, "commit-only check evaluation of PR 5", func(in, started, _ int) bool { return in == 3 && started == 3 })
 	e.q.Wait()
-	if got := strings.Join(f.trace.snapshot(), "\n"); !strings.Contains(got, "review 5") {
-		t.Fatalf("trace does not include PR 5 from the commit-only check: %s", got)
+	initial := []daemon.Work{<-works, <-works}
+	for _, want := range []int{1, 5} {
+		found := false
+		for _, w := range initial {
+			found = found || w.Key.PR == want
+		}
+		if !found {
+			t.Fatalf("initial sweep/webhook work %v missing PR %d", initial, want)
+		}
+	}
+	e.q.EnqueueNamed(daemon.SourceCheck, f.repo.Name, 0, "eee")
+	e.q.Wait()
+	var check daemon.Work
+	select {
+	case check = <-works:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit-only check did not queue PR 5")
+	}
+	if check.Key.PR != 5 || !slices.Equal(check.Sources, []daemon.Source{daemon.SourceCheck}) {
+		t.Fatalf("commit-only check work %+v, want only PR 5 from a check", check)
 	}
 }
 
