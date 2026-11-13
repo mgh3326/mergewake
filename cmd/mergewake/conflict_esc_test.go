@@ -4,19 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/daemon"
-	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/pipeline"
 )
 
 // escRecorder is the fixture notifier with the conflict ESCs kept apart so a
@@ -214,68 +209,6 @@ func TestConflictEscEngineNewHeadReviewedAfterEsc(t *testing.T) {
 				wantEngineEscs(t, n, 1, "desk")
 			}
 		})
-	}
-}
-
-// (P3, mergewake#247 r1) A listed dependency bot's PR that conflicts gets its
-// ESC like any other PR, routed by its body lane: every destination refusing
-// leaves it pending, and a later pass delivers exactly one. It keeps its
-// reviewer exemption: no review is claimed or started.
-func TestConflictEscEngineListedBot(t *testing.T) {
-	h := &botHub{
-		policy:      "version: 1\nenabled: true\nrequired_checks: [CI]\nbot_updates:\n  authors: [\"renovate[bot]\"]\n  paths: [\"**/package-lock.json\"]\n  land: patch\n",
-		conflicting: true,
-		trailer:     "\nMergewake-Notify-Lane: bot-lane\n",
-	}
-	srv := httptest.NewServer(h)
-	defer srv.Close()
-	repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml"}
-	cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10, Review: config.Review{Login: "reviewer"}}
-	cfg.Daemon.PR.SkipBots = true
-	cfg.Notifier.Lane = "desk"
-	gh := github.New("")
-	gh.BaseURL = srv.URL
-	gh.Stderr = io.Discard
-	n := &escRecorder{trace: &eventLog{}, refuse: true}
-	out := &syncBuffer{}
-	now := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: n, Out: out, Now: func() time.Time { return now }}
-	pass := func(what string) {
-		t.Helper()
-		if err := pollPRs(context.Background(), s, gh, repo, pipeline.Options{}); err != nil && !strings.Contains(err.Error(), "conflict ESC") {
-			t.Fatalf("%s: %v", what, err)
-		}
-	}
-
-	pass("refused pass")
-	if tries, escs := n.counts(); tries == 0 || len(escs) != 0 {
-		t.Fatalf("listed bot PR: %d ESC deliveries attempted, %d accepted; want attempts and none accepted", tries, len(escs))
-	}
-	if got := out.take(); !strings.Contains(got, `"command":"conflict-esc-failed"`) {
-		t.Fatalf("the refused ESC was not audited: %s", got)
-	}
-
-	n.mu.Lock()
-	n.refuse = false
-	n.mu.Unlock()
-	now = now.Add(2 * time.Minute)
-	pass("recovery pass")
-	now = now.Add(time.Hour)
-	pass("later pass")
-	_, escs := n.counts()
-	if len(escs) != 2 {
-		t.Fatalf("%d ESCs accepted for the listed bot PR, want author and delayed owner notices: %+v", len(escs), escs)
-	}
-	if e := escs[0]; e.Lane != "bot-lane" || e.Type != "decision" || !strings.Contains(e.Text, "o/one#1 ") || !strings.Contains(e.Text, "conflict") {
-		t.Fatalf("author ESC %+v", e)
-	}
-	if e := escs[1]; e.Lane != "desk" || e.Type != "decision" || !strings.Contains(e.Text, "remains conflicted") {
-		t.Fatalf("delayed owner ESC %+v", e)
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.reviews) != 0 {
-		t.Fatalf("a review was claimed or started for the listed bot PR: %v", h.reviews)
 	}
 }
 

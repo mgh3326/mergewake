@@ -118,16 +118,6 @@ PR head SHA, and the worktree's origin remote names the configured
 repository. Titles and names are never used for matching; a reused branch
 whose tip moved on does not match.
 
-One exception covers mergewake's own branch update. When it merges the base
-into a stale PR branch, the PR head becomes a merge commit the worker never
-checked out. Such a worktree still matches when the PR head has exactly two
-parents, the first is the worktree's checkout, and the second is the base SHA
-of an `ok` base-update receipt for that PR in the repo's state dir
-(`<state_dir>/<repo>/base-updates/`, written by the branch update, only read
-here). With no receipt, a receipt that is not `ok`, a different first parent
-(the worktree holds commits the PR head lacks) or a single parent, nothing
-matches. The exception applies to every use of the match: closing the pane,
-the worktree recorded on a job-bound row, and worktree and branch removal.
 The head commit is read once per PR per daemon process, shared with the task
 lookup below; a worktree that matches the head exactly costs no extra call.
 
@@ -1137,7 +1127,7 @@ takes effect without a restart.
 | `pr` | PR opened; a draft counts once it is ready for review | `pr` role | PR |
 | `pr` | PR merged or closed | `pr` role | PR, head |
 | `ci` | Required check failed on an open PR's head | `pr` role | PR, head |
-| `ci` | Required, `main_checks` or its alias `watch_checks` check failed on the default branch | `watch` role | head |
+| `ci` | Required or `watch_checks` check failed on the default branch | `watch` role | head |
 | `revert` | Revert PR opened, culprit reported, or watch hold | `watch` role | head, action |
 
 Each event posts one message, and restarts stay quiet. Some consequences:
@@ -1182,16 +1172,28 @@ a successful post and recording it can post that message once more.
 | --- | --- | --- |
 | `version` | Required: `1` | Policy schema version. |
 | `enabled` | `false` | Explicit opt-in for acting `land` (auto-merge on a READY verdict) and `watch`. A caller can force shadow with `--shadow`; there is no CLI bypass of `false`. |
-| `auto_update_branch` | `true` | While acting, update a reviewed PR branch when `base_stale` is its only blocker; set `false` to notify instead. `base_stale` applies only with `require_up_to_date: true`; without it no PR is updated for a moved base. Each PR/base SHA is attempted once, except an ambiguous outcome may be retried after a fresh gate check. |
-| `require_up_to_date` | `false` | Hold a head whose base moved ahead as `base_stale` when GitHub reports the PR `behind` (branch protection requires an up-to-date branch), in both the review gate and the bot-patch gate; with `auto_update_branch` on, the branch is then updated. Absent or `false`: a conflict-free PR with a moved base is not held and its branch is not updated; the land and notify records carry `base_behind: true`, and the main-branch CI checks the composed result after the merge. A conflict blocks as `conflict` either way. Must be a boolean. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
-| `main_checks` | `watch_checks`, else `required_checks` | Exact, unique check names that judge a main-branch commit (watch and bisect). `watch_checks` is its legacy name: a policy may set one or both, but both must list the same checks. |
+| `watch_checks` | `required_checks` | Exact, unique check names that judge a main-branch commit (watch and bisect). |
 | `deploy_checks` | Empty | Exact, unique check names of the deploy stage, for example `[deploy-ok]`. When set, the watch deploy stream judges by them; empty means the repository has no deploy stage and the main checks judge the commit. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
 
-| `bot_updates` | Absent | Opt-in landing of a dependency bot's patch updates without review; see [Dependency-bot patch updates](#dependency-bot-patch-updates). |
+Policy files decode strictly: a key not listed here, or in the sections below,
+is an error that names it. These keys were removed, and a policy that still sets
+one is refused:
+
+- `require_up_to_date` and `auto_update_branch`. A PR whose base moved on merges
+  on its own head; the land and notify records carry `base_behind: true`, and
+  the post-merge CI checks the composed result. mergewake no longer holds a head
+  as `base_stale` and no longer updates a PR branch. Records and state files
+  from earlier releases stay in place and are not read.
+- `main_checks`. `watch_checks` is the one name for the checks that judge a
+  main-branch commit.
+- `bot_updates`. Every bot PR stays dropped by `daemon.pr.skip_bots`, or goes
+  through review like any other PR.
+- `any_ref_timeout`. The any-ref wait is fixed at 45 minutes.
+
 
 Each blocking rule has:
 
@@ -1259,40 +1261,6 @@ true) clears an outdated finding by anyone but `review.login`: a block finding
 head. The other `review_gate` keys stay parseable but do not affect the land
 gate.
 
-### Dependency-bot patch updates
-
-A bot's PR has no `Mergewake-Task` trailer, so no reviewer can be spawned for
-it. `daemon.pr.skip_bots` drops such PRs; `bot_updates` lets a repository say
-which bots' patch updates land on their own and which files they may change:
-
-```yaml
-bot_updates:
-  authors: ["renovate[bot]"]
-  paths: ["**/package-lock.json", "**/pnpm-lock.yaml", "uv.lock", "**/package.json"]
-  land: patch   # the only value
-```
-
-A PR by a listed bot (the exact login, and a GitHub `Bot` account) skips
-`skip_bots` and review. It is landed by `land`, bound to its head SHA, with
-`reason: bot-patch` in the land record, only when all of these hold:
-
-- every changed file matches `paths`, and the PR classifies `routine`;
-- every update row in the body is a patch bump. The body must hold a table with
-  a `Change` column (the Renovate layout, `` `8.3.4` -> `8.3.6` ``). An `Update`
-  column names the type; without one the versions decide: same major and
-  minor, higher patch. A body with no such table, or a version that is not
-  plain `x.y.z`, is "update type unknown";
-- the required checks are green as the review gate judges them;
-- GitHub reports the PR mergeable, up to date where the base requires it, with
-  no unresolved thread.
-
-Any other PR of a listed bot is told to the desk once per head as a
-`BOT_UPDATE` lane event naming the reasons, and nothing else is done with it.
-A pending check or an unknown mergeable state waits without a notice. Shadow
-mode and `--dry-run` never merge; the land record says what would happen, and
-only dry-run stays silent. Other bots stay dropped by `skip_bots`, and the
-review gate of every other PR is unchanged.
-
 ### Patch-id review verdicts
 
 A review verdict covers a patch, not a SHA. mergewake computes the patch id of
@@ -1323,7 +1291,7 @@ and file order never changes the id. Binary diffs hash their blob ids.
 - A changed patch id schedules a review as before. A diff that cannot be read
   gives no patch id, and an unknown id equals nothing: that head is reviewed on
   its own. Passes recorded before patch ids existed inherit nothing.
-- `base_stale` never asks for a review. A stale head keeps the review it has;
+- A moved base never asks for a review. A stale head keeps the review it has;
   once the base is merged in, the new head gets a fresh CI run and, with an
   unchanged patch, no new review, so landing waits on CI alone.
 - Finding dispositions live on the PR's review threads, not on a head, so they
@@ -1697,8 +1665,7 @@ review retry backoff are re-read at most 60 minutes late for a skipped PR.
 
 Only a settled PR is remembered: a draft, or a PR whose head has its review done
 marker, evaluated without an error. A PR still being reviewed, or one whose last
-evaluation failed, is evaluated every pass. Dependency-bot PRs listed in the
-policy are always evaluated. Memory is in the daemon process: a restart
+evaluation failed, is evaluated every pass. Memory is in the daemon process: a restart
 evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
 
 Each repository's pass logs `pr pass` with `prs_skipped`, `prs_evaluated`,
@@ -1749,7 +1716,7 @@ head, and a mergeable PR; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `check_absent:<name>` per required check with no run or status on the head at all (see below),
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
-`triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path or line is not in the diff; each is tracked across heads by the `od-…` ref the BLOCKED notice names — it stays open until a person answers it by PR comment naming the ref, its `path:line`, or its title, with `Fixed in <sha>` naming a commit in the PR's history, `Dismiss: <reason>`, or `Disposition: defer <task>`; or until a later completed review pass does not report it again — and only when that pass's prompt listed the finding, which the pass receipt records — which re-reviews it away. A finding answered or re-reviewed never comes back. Reviews posted before the body listed findings keep the old rule: the opaque count holds only the current head's patch-matching passes and a person's `Dismiss:` comment naming the head's SHA prefix clears it), `review_missing`, `base_stale` (only with `require_up_to_date: true`, when GitHub reports the PR behind), `conflict`. Queued or running
+`triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path or line is not in the diff; each is tracked across heads by the `od-…` ref the BLOCKED notice names — it stays open until a person answers it by PR comment naming the ref, its `path:line`, or its title, with `Fixed in <sha>` naming a commit in the PR's history, `Dismiss: <reason>`, or `Disposition: defer <task>`; or until a later completed review pass does not report it again — and only when that pass's prompt listed the finding, which the pass receipt records — which re-reviews it away. A finding answered or re-reviewed never comes back. Reviews posted before the body listed findings keep the old rule: the opaque count holds only the current head's patch-matching passes and a person's `Dismiss:` comment naming the head's SHA prefix clears it), `review_missing`, `conflict`. Queued or running
 check evidence emits nothing, and neither does a required check that has not reported yet
 inside the grace described under `check_absent` below. A READY verdict under acting mode with
 `enabled` repository policy merges the gated head and records `MERGED`; no lane
@@ -1791,7 +1758,7 @@ gate can emit falls in one of three classes:
 | `conflict` | author | Not sent as BLOCKED: the conflict ESC below tells it, once per head. |
 | `review_missing (<block detail>)`, for example `missing-task-trailer` | author | Same route: the review waits on something only the author can add. |
 | `review_missing` with no block detail | mergewake-internal wait | Nothing is sent. Only the stall alert below. |
-| `threads_open:<n>`, `base_stale`, `update_failed:<status>` | needs a human decision | Unchanged: the task lane, trailer or notifier lane, in the `notifyLane` order, type `blocked`. |
+| `threads_open:<n>` | needs a human decision | Unchanged: the task lane, trailer or notifier lane, in the `notifyLane` order, type `blocked`. |
 
 `check_absent:<name>` means the required check has no check run and no commit
 status on the head, which is different from a queued or running check. It
@@ -1916,7 +1883,7 @@ between the update and the head it produced keeps the carry.
 A head is not overdue, and is looked at again on every pass, while the gate holds
 it for any reason but mergewake's own `review_missing` queue state: an open
 critical/high finding (`blocking_findings`, `finding_outside_diff`), a failed or
-expired-cancelled check, `check_absent`, `conflict`, `base_stale`, and the other
+expired-cancelled check, `check_absent`, `conflict`, and the other
 author or settling waits. A pending verdict that waits only on GitHub's
 mergeability computation is held for that evaluation; one that waits on CI is
 not, so a head READY 45 minutes ago whose checks are rerunning still owes
@@ -2033,7 +2000,7 @@ The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` was removed; a config that sets it fails at load. Shadow and
 dry-run modes do not retry reviews or write retry state.
 `daemon.pr.skip_bots: true` excludes bot-authored PRs from review, notification,
-and landing, except a bot the repository's policy lists under `bot_updates`.
+and landing.
 They still count as open for outcome reconciliation.
 
 `daemon.pr.review_parallel` caps how many PRs of one repository the `pr` role
@@ -2148,9 +2115,8 @@ The workflow named by `any_ref_workflow` is the repository's own file: it needs 
 status on that sha. mergewake's own `.mergewake/policy.yaml` sets
 `any_ref_workflow: ci-any-ref.yml`.
 
-`policy.main_checks` names the checks that judge a main-branch commit when their
-names differ from the PR merge checks. `policy.watch_checks` is its legacy name:
-set one, or both with the same list. When neither is set the main set is
+`policy.watch_checks` names the checks that judge a main-branch commit when their
+names differ from the PR merge checks. When it is not set the main set is
 `required_checks`. Watch judges the newest head and bisect candidates by this
 set, never by deploy checks, so a missing `deploy-ok` is not a red main head. For
 example a project with `Compile and RunPureChecks (PR)` can watch
@@ -2178,8 +2144,7 @@ dispatches the same commit twice for the same red head.
 Each red head is one incident; a new red head starts a new one, and a green head
 ends it. Per incident, watch dispatches at most `ceil(log2(n)) + 2` times, where
 `n` is the number of commits after the green boundary. It waits at most
-`policy.any_ref_timeout` (a Go duration; default `45m`) for each commit after its
-dispatch. Past either bound, or when GitHub refuses the dispatch (HTTP 403, 404
+45 minutes for each commit after its dispatch (there is no policy key for it). Past either bound, or when GitHub refuses the dispatch (HTTP 403, 404
 or 422), watch holds with a reason that names the cause and notifies once per
 incident. A refusal is not retried until the next incident. Shadow and
 `--dry-run` passes dispatch nothing and name the commit they would dispatch in
@@ -2204,7 +2169,7 @@ deploy-ok]` with `any_ref_deploy_checks: [ci-ok-deploy]`). It applies to the
 deploy stream only: a commit bisect needs is judged by its own deploy run
 (`deploy_checks`) when that is green or red, and otherwise by these checks, so a
 dispatched candidate whose run posted `ci-ok-deploy` is green or red instead of
-holding until `any_ref_timeout`. The deploy head is still judged by
+holding until the 45-minute wait ends. The deploy head is still judged by
 `deploy_checks` alone, the head-versus-candidate guard above does not apply to
 it, and the confirmation re-runs read these checks. The revert PR, the recovery
 latch and `last-deploy-revert` work as before. The key needs

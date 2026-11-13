@@ -145,10 +145,6 @@ func TestNotifyBlockedReasons(t *testing.T) {
 		{"threads open", func(g *fakeGH) {
 			g.findings = 2
 		}, "threads_open:2", "BLOCKED"},
-		{"stale base", func(g *fakeGH) {
-			g.stale = true
-			g.pull.MergeableState = "behind"
-		}, "base_stale", "BLOCKED"},
 		{"conflict", func(g *fakeGH) {
 			no := false
 			g.pull.Mergeable = &no
@@ -158,7 +154,6 @@ func TestNotifyBlockedReasons(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, g, n, r := notifySetup(t)
 			tt.prepare(g)
-			g.policyExtra = "require_up_to_date: true\nauto_update_branch: false\n"
 			if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 				t.Fatal(e)
 			}
@@ -410,156 +405,5 @@ func TestNotifyLaneRepoLane(t *testing.T) {
 				t.Fatalf("%+v", n.events)
 			}
 		})
-	}
-}
-
-func TestNotifyAutoUpdateBranch(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		extra     string
-		findings  int
-		updateErr error
-		wantCalls int
-		reason    string
-	}{
-		{"stale only", "", 0, nil, 1, ""},
-		{"other blocker", "", 1, nil, 0, "threads_open:1; base_stale"},
-		{"update fails", "", 0, &github.APIError{Code: 422}, 1, "base_stale; update_failed:422"},
-		{"disabled", "auto_update_branch: false\n", 0, nil, 0, "base_stale"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, g, n, r := notifySetup(t)
-			g.stale, g.policyExtra, g.findings, g.updateErr = true, "require_up_to_date: true\n"+tc.extra, tc.findings, tc.updateErr
-			g.pull.MergeableState = "behind"
-			for i := 0; i < 2; i++ {
-				if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if len(g.updateHeads) != tc.wantCalls {
-				t.Fatalf("update calls: %v", g.updateHeads)
-			}
-			if tc.wantCalls > 0 && g.updateHeads[0] != shaA {
-				t.Fatalf("expected head: %v", g.updateHeads)
-			}
-			if tc.reason == "" {
-				if n.count != 0 {
-					t.Fatalf("unexpected event: %v", n.events)
-				}
-			} else if n.count != 1 || !strings.Contains(lastEvent(t, n), tc.reason) {
-				t.Fatalf("events: %v", n.events)
-			}
-		})
-	}
-}
-
-func TestAutoUpdatePersistenceAndGuards(t *testing.T) {
-	s, g, n, r := notifySetup(t)
-	g.stale = true
-	g.pull.MergeableState = "behind"
-	g.policyExtra = "require_up_to_date: true\n"
-	if err := s.NotifyPR(context.Background(), r, 7, Options{DryRun: true}); err != nil {
-		t.Fatal(err)
-	}
-	g.pull.Draft = true
-	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 0 {
-		t.Fatal("dry-run or draft updated branch")
-	}
-	g.pull.Draft = false
-	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	restarted := *s
-	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 1 {
-		t.Fatalf("restart retried: %v", g.updateHeads)
-	}
-	g.head = shaC
-	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	g.head = shaD
-	if err := restarted.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 3 || g.updateHeads[1] != shaA || g.updateHeads[2] != shaA || n.count != 0 {
-		t.Fatalf("two base moves: calls=%v events=%v", g.updateHeads, n.events)
-	}
-}
-
-func TestNotifyShadowStaleBaseBlocksWithoutUpdate(t *testing.T) {
-	s, g, n, r := notifySetup(t)
-	g.stale = true
-	g.pull.MergeableState = "behind"
-	g.policyExtra = "require_up_to_date: true\n"
-	if err := s.NotifyPR(context.Background(), r, 7, Options{Shadow: true}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 0 || n.count != 1 || !strings.Contains(lastEvent(t, n), "BLOCKED example/project#7 head=aaaaaaa | base_stale") {
-		t.Fatalf("updates=%v events=%v", g.updateHeads, n.events)
-	}
-	if _, err := os.Stat(filepath.Join(s.state(r.Name), "base-updates")); !os.IsNotExist(err) {
-		t.Fatalf("shadow reserved update: %v", err)
-	}
-}
-
-func TestAutoUpdateMarkerWriteFailureRecovers(t *testing.T) {
-	s, g, n, r := notifySetup(t)
-	g.stale = true
-	g.pull.MergeableState = "behind"
-	g.policyExtra = "require_up_to_date: true\n"
-	var marker string
-	g.updateHook = func() {
-		entries, err := os.ReadDir(filepath.Join(s.state(r.Name), "base-updates"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, e := range entries {
-			if !strings.HasSuffix(e.Name(), ".lock") {
-				marker = filepath.Join(s.state(r.Name), "base-updates", e.Name())
-			}
-		}
-		if err := os.Rename(marker, marker+".saved"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(marker, 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 1 || n.count != 0 {
-		t.Fatalf("calls=%v events=%v", g.updateHeads, n.events)
-	}
-	if err := os.Remove(marker); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(marker+".saved", marker); err != nil {
-		t.Fatal(err)
-	}
-	g.updateHook = nil
-	g.nextHead = shaC
-	status, _, err := s.updateStaleBranch(context.Background(), r, g.pull, shaB)
-	if err != nil || status != "recheck" || len(g.updateHeads) != 1 {
-		t.Fatalf("changed head: status=%s err=%v calls=%v", status, err, g.updateHeads)
-	}
-	g.nextHead = ""
-	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 2 || n.count != 0 {
-		t.Fatalf("calls=%v events=%v", g.updateHeads, n.events)
-	}
-	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(g.updateHeads) != 2 {
-		t.Fatalf("completed update retried: %v", g.updateHeads)
 	}
 }

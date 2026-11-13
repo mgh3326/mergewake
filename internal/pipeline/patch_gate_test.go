@@ -212,8 +212,8 @@ func TestGateChangedPatchNeedsReview(t *testing.T) {
 	}
 }
 
-// base_stale never asks for a review: the stale head keeps its review, and once
-// the base is merged in the new head with the same patch waits on CI alone.
+// A moved base never asks for a review: the stale head keeps its review, and
+// once the base is merged in the new head with the same patch waits on CI alone.
 func TestBaseStateNeverReReviews(t *testing.T) {
 	s, g, _, _, _ := reviewedAtA(t, toolDiff("aaaaaaa..bbbbbbb", 41, "new"))
 	g.enabled = true
@@ -224,8 +224,7 @@ func TestBaseStateNeverReReviews(t *testing.T) {
 	g.pull.Head.SHA = shaA
 	g.stale = true
 	g.pull.MergeableState = "behind"
-	g.policyExtra = "require_up_to_date: true\n"
-	if v := gateAt(t, s, g, shaB); reasons(v) != "base_stale" {
+	if v := gateAt(t, s, g, shaB); reasons(v) != "" || !v.Review.BaseBehind {
 		t.Fatalf("stale head: %+v", v)
 	}
 	// Head B has the base merged in; its CI has not finished.

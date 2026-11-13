@@ -19,7 +19,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/github/webhookstate"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
-	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/tracing"
 )
 
@@ -425,48 +424,16 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	return errs
 }
 
-// skipBotPulls drops PRs opened by bot accounts when skip is set, except those
-// by a bot in listed; they stay in the open set for outcome reconciliation.
-func skipBotPulls(prs []github.Pull, skip bool, listed ...string) []github.Pull {
+// skipBotPulls drops PRs opened by bot accounts when skip is set.
+func skipBotPulls(prs []github.Pull, skip bool) []github.Pull {
 	if !skip {
 		return prs
 	}
 	out := make([]github.Pull, 0, len(prs))
 	for _, pr := range prs {
-		if pr.User.Type != "Bot" || isListedBot(pr, listed) {
+		if pr.User.Type != "Bot" {
 			out = append(out, pr)
 		}
 	}
 	return out
-}
-
-func hasBotPull(prs []github.Pull) bool {
-	for _, pr := range prs {
-		if pr.User.Type == "Bot" {
-			return true
-		}
-	}
-	return false
-}
-
-// isListedBot reports whether pr is by a bot the policy lists. It is the same
-// test Land's gate selection applies.
-func isListedBot(pr github.Pull, listed []string) bool {
-	return (&policy.BotUpdates{Authors: listed}).Lists(pr.User.Login, pr.User.Type)
-}
-
-// botLand settles a listed bot's PR: Land decides it with the bot-patch gate,
-// merging it or telling the desk why not. It delivers no findings, sends no
-// verdict notice and starts no review.
-func botLand(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
-	daemon.PhasesOf(ctx).Enter(daemon.PhaseSettle)
-	ctx, span := tracing.Span(ctx, "mergewake.settle")
-	defer tracing.Finish(span)
-	landCtx, land := tracing.Span(ctx, "mergewake.land")
-	e := s.Land(landCtx, r, n, o)
-	tracing.Finish(land)
-	if e != nil {
-		return []error{fmt.Errorf("PR %d land: %w", n, e)}
-	}
-	return nil
 }

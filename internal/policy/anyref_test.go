@@ -13,16 +13,11 @@ func TestAnyRefPolicyKeys(t *testing.T) {
 	for _, tt := range []struct {
 		name, extra string
 		fail        bool
-		wait        time.Duration
 	}{
-		{"unset", "", false, DefaultAnyRefTimeout},
-		{"workflow", "any_ref_workflow: ci-any-ref.yml\n", false, DefaultAnyRefTimeout},
-		{"workflow and timeout", "any_ref_workflow: ci-any-ref.yaml\nany_ref_timeout: 20m\n", false, 20 * time.Minute},
-		{"path", "any_ref_workflow: .github/workflows/ci-any-ref.yml\n", true, 0},
-		{"not yaml", "any_ref_workflow: ci-any-ref\n", true, 0},
-		{"bad timeout", "any_ref_workflow: ci-any-ref.yml\nany_ref_timeout: soon\n", true, 0},
-		{"zero timeout", "any_ref_workflow: ci-any-ref.yml\nany_ref_timeout: 0s\n", true, 0},
-		{"timeout without workflow", "any_ref_timeout: 20m\n", true, 0},
+		{"unset", "", false},
+		{"workflow", "any_ref_workflow: ci-any-ref.yml\n", false},
+		{"path", "any_ref_workflow: .github/workflows/ci-any-ref.yml\n", true},
+		{"not yaml", "any_ref_workflow: ci-any-ref\n", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var p Policy
@@ -32,9 +27,6 @@ func TestAnyRefPolicyKeys(t *testing.T) {
 			e := p.Validate()
 			if (e != nil) != tt.fail {
 				t.Fatalf("validate: %v", e)
-			}
-			if !tt.fail && p.AnyRefWait() != tt.wait {
-				t.Fatalf("wait %s", p.AnyRefWait())
 			}
 		})
 	}
@@ -77,5 +69,12 @@ func TestAnyRefChecksValidation(t *testing.T) {
 				t.Fatalf("bisect checks %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// The any-ref wait has no policy key: every policy waits this long.
+func TestAnyRefWaitIsTheDefault(t *testing.T) {
+	if DefaultAnyRefTimeout != 45*time.Minute {
+		t.Fatalf("wait %s", DefaultAnyRefTimeout)
 	}
 }

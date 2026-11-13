@@ -59,7 +59,7 @@ func TestWatchMainGreenWithMissingDeployOK(t *testing.T) {
 	s, g, _, _, r := setup(t)
 	g.enabled = true
 	g.required = []string{"ci-ok"}
-	g.policyExtra = "main_checks: [ci-ok]\ndeploy_checks: [deploy-ok]\n"
+	g.policyExtra = "watch_checks: [ci-ok]\ndeploy_checks: [deploy-ok]\n"
 	g.head = shaB
 	adapter := &deployChecksGH{fakeGH: g, names: map[string]map[string]github.CI{
 		shaB: {"ci-ok": github.Green},

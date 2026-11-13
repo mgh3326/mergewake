@@ -23,7 +23,6 @@ type GitHub interface {
 	Files(context.Context, string, int) ([]policy.File, error)
 	Diff(context.Context, string, int) (string, error)
 	Merge(context.Context, string, int, string) error
-	UpdateBranch(context.Context, string, int, string) error
 	Head(context.Context, string, string) (string, error)
 	CreateRef(context.Context, string, string, string) error
 	RecoveryActive(context.Context, string) (bool, error)
@@ -192,8 +191,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
-	gate, reason := s.gateFor(pr, p)
-	v, e := gate(ctx, r, pr, p, head)
+	v, e := s.mergeGate(ctx, r, pr, p, head)
 	if e != nil {
 		return e
 	}
@@ -211,24 +209,17 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		// Review is the patch id, the review rounds and how the findings
 		// stand, so `land --dry-run` shows why a head is or is not ready.
 		Review reviewRecord `json:"review"`
-		// Reason names the gate when it is not the review gate.
-		Reason string `json:"reason,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, v.State, v.SameFamily, v.Review, reason, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, v.State, v.SameFamily, v.Review, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, v.SameFamily, o.DryRun); e != nil {
 		return e
 	}
-	if reason == botPatchReason && v.State == "blocked" && o.Reporting() {
-		if e = s.noticeBotUpdate(ctx, r, pr, v); e != nil {
-			return e
-		}
-	}
 	if v.State != "ready" || d.Shadow || o.DryRun {
 		return nil
 	}
-	if e = s.mergePinned(ctx, r, pr, reason); e != nil {
+	if e = s.mergePinned(ctx, r, pr); e != nil {
 		return e
 	}
 	s.postTaskEvent(ctx, r, pr, integrations.SourceMerge, nil, s.now())
@@ -271,7 +262,7 @@ func (s *Service) mergeLock(repo string) func() {
 // that the "PR changed during decision" check is as fresh as the base: a PR
 // read before a long wait for the lock would be checked against a stale head.
 // GH.Merge is the step being serialised.
-func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull, reason string) error {
+func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull) error {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseLockWait)
 	unlock := s.mergeLock(r.Name)
@@ -297,11 +288,7 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 	if !p.Enabled {
 		return errors.New("landing policy changed during decision")
 	}
-	gate, again := s.gateFor(freshPR, p)
-	if again != reason {
-		return errors.New("landing policy changed during decision")
-	}
-	v, e := gate(ctx, r, freshPR, p, fresh)
+	v, e := s.mergeGate(ctx, r, freshPR, p, fresh)
 	if e != nil {
 		return e
 	}
@@ -309,17 +296,4 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 		return errors.New("gate changed during decision")
 	}
 	return s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA)
-}
-
-// gateFunc decides one PR head against the base head under a policy.
-type gateFunc func(context.Context, config.Repo, github.Pull, policy.Policy, string) (gateVerdict, error)
-
-// gateFor picks the merge gate: the bot-patch gate, named by its reason, for a
-// PR by a bot the policy lists under bot_updates, and the review gate for every
-// other PR. The listing is the only thing that skips the review requirement.
-func (s *Service) gateFor(pr github.Pull, p policy.Policy) (gateFunc, string) {
-	if p.BotUpdates.Lists(pr.User.Login, pr.User.Type) {
-		return s.botGate, botPatchReason
-	}
-	return s.mergeGate, ""
 }
