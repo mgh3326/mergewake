@@ -156,10 +156,15 @@ func TestHKSinkUnconfiguredRunsNoSubprocess(t *testing.T) {
 func TestHKSinkCLIHTTPParity(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"merged with job", hkTask(42, "merged", "mergewake-design", "Fix the watch (grade B, T2)", 2, `{"pr":"https://github.com/example/project/pull/7","job_id":"wk-3549-a"}`)},
+		{"deployed", hkTask(42, "deployed", "lane-a", "Deployed", 2, `{}`)},
+		{"completed", hkTask(42, "completed", "lane-a", "Completed", 2, `{}`)},
 		{"decision request", hkTask(42, "developing", "deploy-lane", "Deploy approval (grade A, T3)", 1,
 			`{"job_id":"wk-7","decision_request":{"id":"dr-42-1","revision":1,"status":"open","question":"Approve?","requested_by":"svc-mergewake","requested_at":"2026-11-08T00:00:00Z","human_only":true}}`)},
 		{"no job no lane", hkTask(42, "developing", "", "Untitled", 0, `{}`)},
 		{"dropped", hkTask(42, "dropped", "lane-b", "Dropped (grade C)", 4, `{"closure":{"type":"dropped","evidence":"superseded"}}`)},
+		{"duplicate", hkTask(42, "duplicate", "lane-b", "Duplicate", 4, `{}`)},
+		{"icebox", hkTask(42, "icebox", "lane-b", "Icebox", 4, `{}`)},
+		{"unstarted", hkTask(42, "unstarted", "lane-b", "Unstarted", 4, `{}`)},
 		{"legacy reopened", hkTask(42, "reopened", "lane-c", "Legacy", 3, `{"job_id":"wk-é-1"}`)},
 		{"minimal", `{"id":42,"title":"t","state":"merged","refs":{}}`},
 	} {
