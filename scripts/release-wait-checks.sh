@@ -4,8 +4,7 @@
 #
 # The names are read from POLICY_FILE at the tag by decoding the YAML with the
 # repository's own gopkg.in/yaml.v3, then selected in mergewake's DeploySet
-# order: deploy_checks, else main_checks, else watch_checks, else
-# required_checks. A name may be reported as a check run or as a commit status;
+# order: deploy_checks, else watch_checks, else required_checks. A name may be reported as a check run or as a commit status;
 # both sources are folded the way internal/github's gate folds them: the latest
 # result per name wins, so a rerun clears an older failure and an in-flight run
 # keeps the name pending.
@@ -16,7 +15,7 @@
 # authenticates gh. RELEASE_CHECKS_TIMEOUT_SECONDS bounds the wait (default
 # 3600) and RELEASE_CHECKS_POLL_SECONDS sets the poll interval (default 30).
 # The script must run from the repository checkout: it compiles a small helper
-# with `go run` so the policy is read with the same YAML library as rollout.
+# with `go run` so the policy is read with the repository's YAML library.
 set -eu
 
 usage() {
@@ -70,7 +69,6 @@ import (
 
 type policy struct {
 	Deploy   []string `yaml:"deploy_checks"`
-	Main     []string `yaml:"main_checks"`
 	Watch    []string `yaml:"watch_checks"`
 	Required []string `yaml:"required_checks"`
 }
@@ -249,16 +247,13 @@ func main() {
 	}
 	names := p.Deploy
 	if len(names) == 0 {
-		names = p.Main
-	}
-	if len(names) == 0 {
 		names = p.Watch
 	}
 	if len(names) == 0 {
 		names = p.Required
 	}
 	if len(names) == 0 {
-		fatal("%s: no deploy_checks, main_checks, watch_checks or required_checks", os.Args[1])
+		fatal("%s: no deploy_checks, watch_checks or required_checks", os.Args[1])
 	}
 	seen := map[string]bool{}
 	for _, name := range names {

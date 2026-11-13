@@ -143,20 +143,22 @@ else
 	fail "(d) deploy_checks selection -> exit $status: $output"
 fi
 
-# (d) without deploy_checks, main_checks is the set.
+# (d) A leftover main_checks key is ignored: with no deploy_checks or
+# watch_checks, required_checks is the set, so the failing ci-ok is not read.
 reset
 policy 'version: 1
 required_checks: [vet]
 main_checks: [ci-ok]'
-run 1 deploy-ok completed success https://ci.example/deploy-ok
-run_checks 1
-if [ "$status" -ne 0 ] && has 'ci-ok' && ! has 'deploy-ok'; then
-	pass "(d) main_checks selects ci-ok, not the green deploy-ok"
+run 1 ci-ok completed failure https://ci.example/ci-ok
+run 2 vet completed success https://ci.example/vet
+run_checks 10
+if [ "$status" -eq 0 ] && has 'vet' && ! has 'ci-ok'; then
+	pass "(d) main_checks is ignored, required_checks selects vet, not the failing ci-ok"
 else
-	fail "(d) main_checks selection -> exit $status: $output"
+	fail "(d) main_checks fall-through -> exit $status: $output"
 fi
 
-# (d) without main_checks, watch_checks is the set.
+# (d) without deploy_checks, watch_checks is the set.
 reset
 policy 'version: 1
 required_checks: [vet]
@@ -173,7 +175,7 @@ fi
 reset
 policy 'version: 1
 required_checks: [vet]
-main_checks: [ci-ok, build-linux-amd64]'
+watch_checks: [ci-ok, build-linux-amd64]'
 status_line 1 ci-ok success https://ci.example/status/ci-ok
 run 1 build-linux-amd64 completed success https://ci.example/run/build-linux-amd64
 run_checks 10
@@ -215,7 +217,7 @@ fi
 reset
 policy 'version: 1
 required_checks: [vet]
-main_checks: [ci-ok]'
+watch_checks: [ci-ok]'
 status_line 1 ci-ok failure https://ci.example/old
 status_line 2 ci-ok success https://ci.example/new
 run_checks 10
@@ -229,9 +231,9 @@ fi
 reset
 policy 'version: 1
 required_checks: [vet]
-main_checks: &main [ci-ok,
+deploy_checks: &d [ci-ok,
   deploy-ok]
-watch_checks: *main'
+watch_checks: *d'
 run 1 ci-ok completed success https://ci.example/ci-ok
 run 2 deploy-ok completed success https://ci.example/deploy-ok
 run_checks 10
