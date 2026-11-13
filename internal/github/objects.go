@@ -38,7 +38,7 @@ type ObjectCache interface {
 // hex object id, never a branch name, and path printable ASCII within the
 // column.
 func cacheable(sha, path string) bool {
-	if !shaSegment.MatchString(sha) || len(path) > 255 {
+	if (len(sha) != 40 && len(sha) != 64) || !shaSegment.MatchString(sha) || len(path) > 255 {
 		return false
 	}
 	for _, r := range path {

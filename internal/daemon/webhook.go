@@ -24,6 +24,8 @@ import (
 // MaxWebhookBody caps a delivery at 5 MiB.
 const MaxWebhookBody = 5 << 20
 
+const maxRememberedWebhookDeliveries = 1024
+
 // Webhook receives signed GitHub deliveries, invalidates cached evidence, and
 // wakes roles early. Polling bounds missed deliveries and landing reads fresh
 // evidence. Listen, Path and Secret arrive pre-validated from configuration.
@@ -54,6 +56,35 @@ type Webhook struct {
 	Applied func(repo, event, delivery string, body []byte)
 
 	parseWarned sync.Map
+	deliveryMu  sync.Mutex
+	deliveryIDs [maxRememberedWebhookDeliveries]string
+	deliveryAt  int
+	deliverySet map[string]int
+}
+
+// rememberDelivery atomically records a verified delivery id and reports
+// whether it was already in the bounded in-memory window.
+func (wh *Webhook) rememberDelivery(id string) bool {
+	if id == "" {
+		return false
+	}
+	wh.deliveryMu.Lock()
+	defer wh.deliveryMu.Unlock()
+	_, repeat := wh.deliverySet[id]
+	if wh.deliverySet == nil {
+		wh.deliverySet = make(map[string]int, maxRememberedWebhookDeliveries)
+	}
+	old := wh.deliveryIDs[wh.deliveryAt]
+	if old != "" {
+		wh.deliverySet[old]--
+		if wh.deliverySet[old] == 0 {
+			delete(wh.deliverySet, old)
+		}
+	}
+	wh.deliveryIDs[wh.deliveryAt] = id
+	wh.deliverySet[id]++
+	wh.deliveryAt = (wh.deliveryAt + 1) % len(wh.deliveryIDs)
+	return repeat
 }
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping
@@ -135,6 +166,22 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad signature", http.StatusUnauthorized)
 		return
 	}
+	repeat := wh.rememberDelivery(r.Header.Get("X-GitHub-Delivery"))
+	if repeat {
+		payload := body
+		if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "application/x-www-form-urlencoded" {
+			if form, err := url.ParseQuery(string(body)); err == nil {
+				payload = []byte(form.Get("payload"))
+			}
+		}
+		var delivery deliveryPayload
+		_ = json.Unmarshal(payload, &delivery)
+		args := webhookLogArgs(r, delivery.Repository.FullName, []string{})
+		args = append(args, "repeat", true)
+		d.Log.Info("webhook delivery", args...)
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
 	var delivery deliveryPayload
 	// GitHub sends JSON either raw or, for the form content type, in the
 	// payload field; both are read after the signature over the raw body.
@@ -198,12 +245,24 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// The body, the signature and every other header stay out of the log.
-	d.Log.Info("webhook delivery",
+	d.Log.Info("webhook delivery", webhookLogArgs(r, delivery.Repository.FullName, triggered)...)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func webhookLogArgs(r *http.Request, repo string, triggered []string) []any {
+	args := []any{
 		"event", r.Header.Get("X-GitHub-Event"),
 		"delivery", r.Header.Get("X-GitHub-Delivery"),
-		"repo", delivery.Repository.FullName,
-		"triggered", triggered)
-	w.WriteHeader(http.StatusAccepted)
+		"repo", repo,
+		"triggered", triggered,
+	}
+	if hookID := r.Header.Get("X-GitHub-Hook-ID"); hookID != "" {
+		args = append(args, "hook_id", hookID)
+	}
+	if target := r.Header.Get("X-GitHub-Hook-Installation-Target-Type"); target != "" {
+		args = append(args, "hook_target", target)
+	}
+	return args
 }
 
 // deliveryPayload is the part of a delivery that names a repository, a PR or a
