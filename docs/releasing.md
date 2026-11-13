@@ -19,7 +19,10 @@
    only when every one is green; a name may be a check run or a commit status.
    A failing check at the tag fails the release with its name and URL. While
    tag checks are pending, a newer release tag on main that contains the tag
-   commit supersedes this run, so it stops without publishing. If main has no
+   commit supersedes this run, so it stops without publishing. Also, once the
+   tag commit's checks are green, or main's head is green and contains it, a
+   higher stable release tag on the tag commit itself supersedes this run: versions
+   compare by number, and a lower or equal tag or a `-suffix` tag never does. If main has no
    newer release tag and its head contains the tag commit, green policy checks
    on that head let this run publish. Pending checks that reach the bound
    (`RELEASE_CHECKS_TIMEOUT_SECONDS`, default 60 minutes) fail with what is

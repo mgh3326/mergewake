@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fail publication unless every check named by the repository policy at SHA is
 # green, or main contains SHA and has green policy checks. Exit 3 means a newer
-# release tag on main already contains SHA and supersedes this release.
+# release tag on main already contains SHA, or a higher stable release tag points
+# at SHA; either supersedes this release.
 #
 # The names are read from POLICY_FILE at the tag by decoding the YAML with the
 # repository's own gopkg.in/yaml.v3, then selected in mergewake's DeploySet
@@ -11,11 +12,13 @@
 # keeps the name pending.
 #
 # usage: scripts/release-wait-checks.sh SHA [POLICY_FILE] (exit 0 green, 1
-# failed or timed out, 2 usage, 3 superseded by a newer release tag)
+# failed or timed out, 2 usage, 3 superseded by a release tag)
 #
 # GITHUB_REPOSITORY must name the repository (owner/name) and GH_TOKEN
 # authenticates gh. RELEASE_CHECKS_TIMEOUT_SECONDS bounds the wait (default
 # 3600) and RELEASE_CHECKS_POLL_SECONDS sets the poll interval (default 30).
+# RELEASE_TAG names the tag being released: vMAJOR.MINOR.PATCH with an optional
+# -suffix. A -suffix tag is a pre-release and skips the same-commit check.
 # The script must run from the repository checkout: it compiles a small helper
 # with `go run` so the policy is read with the repository's YAML library.
 set -eu
@@ -38,8 +41,12 @@ policy=${2:-.mergewake/policy.yaml}
 repo=${GITHUB_REPOSITORY:-}
 timeout=${RELEASE_CHECKS_TIMEOUT_SECONDS:-3600}
 poll=${RELEASE_CHECKS_POLL_SECONDS:-30}
+release_tag=${RELEASE_TAG:-}
 
 [ -n "$repo" ] || fail "GITHUB_REPOSITORY is not set"
+[ -n "$release_tag" ] || fail "RELEASE_TAG is not set"
+printf '%s\n' "$release_tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' ||
+	fail "RELEASE_TAG must be vMAJOR.MINOR.PATCH with an optional -suffix: $release_tag"
 [ -f "$policy" ] || fail "policy file not found: $policy"
 case $timeout in
 	'' | *[!0-9]*) fail "RELEASE_CHECKS_TIMEOUT_SECONDS must be a whole number of seconds" ;;
@@ -293,6 +300,50 @@ func main() {
 }
 GOVERDICT
 
+# read_tags fills $work/tags with "name<TAB>sha" for every tag. On failure the
+# last line of $work/error names the tags read, so the caller reports it.
+read_tags() {
+	if gh api --paginate "repos/$repo/tags" \
+		--jq '.[] | [.name, .commit.sha] | @tsv' \
+		> "$work/tags" 2> "$work/error"; then
+		return 0
+	fi
+	err=$(tail -n 1 "$work/error" 2>/dev/null || true)
+	printf 'cannot read the tags: %s\n' "${err:-gh api failed}" > "$work/error"
+	return 1
+}
+
+# version_gt TAG BASE: exit 0 when stable vMAJOR.MINOR.PATCH TAG is higher than
+# BASE, compared by number, so v1.10.0 is higher than v1.9.0.
+version_gt() {
+	IFS=. read -r a1 a2 a3 <<EOF
+${1#v}
+EOF
+	IFS=. read -r b1 b2 b3 <<EOF
+${2#v}
+EOF
+	[ "$a1" -gt "$b1" ] && return 0
+	[ "$a1" -eq "$b1" ] || return 1
+	[ "$a2" -gt "$b2" ] && return 0
+	[ "$a2" -eq "$b2" ] || return 1
+	[ "$a3" -gt "$b3" ]
+}
+
+# check_same_commit exits 3 when a stable tag higher than RELEASE_TAG points at
+# the tag commit. A -suffix RELEASE_TAG is a pre-release and skips this check.
+# It reads $work/tags, which read_tags filled.
+check_same_commit() {
+	case $release_tag in *-*) return 0 ;; esac
+	while IFS="$(printf '\t')" read -r tag tag_sha; do
+		[ "$tag_sha" = "$sha" ] || continue
+		printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || continue
+		version_gt "$tag" "$release_tag" || continue
+		printf 'release-wait-checks: superseded by %s at %s; tag commit is %s\n' \
+			"$tag" "$tag_sha" "$sha"
+		exit 3
+	done < "$work/tags"
+}
+
 check_main_coverage() {
 	if ! gh api "repos/$repo/branches/main" --jq '.commit.sha' > "$work/head" 2> "$work/error"; then
 		return 2
@@ -319,9 +370,7 @@ check_main_coverage() {
 	esac
 	[ "${compare_status:-}" = ahead ] || return 1
 
-	if ! gh api --paginate "repos/$repo/tags" \
-		--jq '.[] | [.name, .commit.sha] | @tsv' \
-		> "$work/tags" 2> "$work/error"; then
+	if ! read_tags; then
 		return 2
 	fi
 	while IFS="$(printf '\t')" read -r tag tag_sha; do
@@ -356,6 +405,7 @@ check_main_coverage() {
 		[ "$state" = success ] || head_green=0
 	done < "$work/head-verdicts"
 	if [ "$head_green" -eq 1 ]; then
+		check_same_commit
 		printf 'release-wait-checks: main head %s contains tag commit %s; all %s policy checks are green\n' \
 			"$head" "$sha" "$(wc -l < "$work/head-verdicts" | tr -d ' ')"
 		exit 0
@@ -397,14 +447,19 @@ while :; do
 		done < "$work/verdicts"
 		[ -z "$failed" ] || fail "the tag commit's checks are not green for $sha"
 		if [ -z "$missing" ]; then
-			printf 'release-wait-checks: all %s policy checks are green for %s\n' \
-				"$(wc -l < "$work/verdicts" | tr -d ' ')" "$sha"
-			exit 0
-		fi
-
+			# All tag checks are green: publish unless a higher release tag
+			# already points at this commit. A failed tags read is retried,
+			# never read as a pass.
+			if read_tags; then
+				check_same_commit
+				printf 'release-wait-checks: all %s policy checks are green for %s\n' \
+					"$(wc -l < "$work/verdicts" | tr -d ' ')" "$sha"
+				exit 0
+			fi
+			last_error=$(tail -n 1 "$work/error" 2>/dev/null || true)
 		# Only pending tag checks enter the main coverage path. A failed API
 		# read leaves the result unknown for this poll and is retried next time.
-		if check_main_coverage; then
+		elif check_main_coverage; then
 			:
 		else
 			coverage_result=$?

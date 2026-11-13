@@ -5,8 +5,8 @@ name: Release
 # with GITHUB_TOKEN, but only after the tag commit's checks named by
 # .mergewake/policy.yaml (deploy_checks, else watch_checks, else
 # required_checks) are green at the tag, or at a newer main head that contains
-# it. A newer release tag on main supersedes this run, which then publishes
-# nothing. A test tag v0.0.0*
+# it. A newer release tag on main, or a higher release tag on the tag commit
+# itself, supersedes this run, which then publishes nothing. A test tag v0.0.0*
 # (e.g. v0.0.0-test.1) runs the same build and checks on the tag but is never
 # published.
 # Manual runs build the same assets for a
@@ -114,6 +114,7 @@ jobs:
         name: Wait for release checks or supersession
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if sh scripts/release-wait-checks.sh "$GITHUB_SHA"; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
