@@ -403,8 +403,10 @@ func (s *Service) recordRevert(repo string, pr int, url string) error {
 
 // Revisit PRs no longer in the open list: this observes external desk merges,
 // closures and recovery merges, even while the daemon itself is shadow-only.
+// isOpen is asked for each row as it is reached, not once up front, so a PR
+// that opened after the ledger was read is not taken for a closed one.
 // It publishes nothing: it tells the outcome publisher what it recorded.
-func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map[int]bool, o Options) error {
+func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, isOpen func(pr int) bool, o Options) error {
 	if o.DryRun {
 		return nil
 	}
@@ -418,7 +420,7 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, open map
 	sent, _ := s.taskEventKeys(r.Name)
 	for _, key := range slices.Sorted(maps.Keys(state.Latest)) {
 		v := state.Latest[key]
-		if v.Repo != r.Name || open[v.PR] {
+		if v.Repo != r.Name || isOpen(v.PR) {
 			continue
 		}
 		pendingEvent := s.revertEventPending(r, v, o, sent)

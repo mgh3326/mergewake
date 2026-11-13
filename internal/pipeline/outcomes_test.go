@@ -159,7 +159,7 @@ func TestReconcileBackfillsProfileWithoutEffort(t *testing.T) {
 	if err := s.ledger().Update(repo.Name, g.pull.Number, func(v *outcomes.Outcome) { v.Final = true; v.Decision = "landed" }); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReconcileOutcomes(context.Background(), repo, map[int]bool{}, Options{Shadow: true}); err != nil {
+	if err := s.ReconcileOutcomes(context.Background(), repo, noneOpen, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
 	state, err := s.ledger().Read()
