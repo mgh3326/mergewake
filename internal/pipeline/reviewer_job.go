@@ -232,6 +232,49 @@ func (s *Service) dropReviewerJob(repo string, pr, pass int) error {
 	return nil
 }
 
+// deadReviewerLabel is the marker replaceDeadSpawn leaves when it cannot
+// replace a dead spawn in the same run: the next run's fresh spawn for the
+// same head and pass must not reuse the label, whose stamp the clock can
+// still reproduce. It lives outside reviewer-jobs/, so the record globs never
+// match or read it, and it is removed once the replacement's record is
+// written, or when the head moves. Replacements is the dead record's
+// lost-result budget, carried so the replacement neither spends nor resets it.
+type deadReviewerLabel struct {
+	Head         string `json:"head"`
+	Label        string `json:"label"`
+	Replacements int    `json:"replacements"`
+}
+
+func (s *Service) deadLabelPath(repo string, pr, pass int) string {
+	return filepath.Join(s.state(repo), "reviewer-dead", fmt.Sprintf("%d-p%d.json", pr, pass))
+}
+
+func (s *Service) saveDeadLabel(repo string, pr, pass int, d deadReviewerLabel) error {
+	return fsutil.WriteJSON(s.deadLabelPath(repo, pr, pass), d)
+}
+
+func (s *Service) dropDeadLabel(repo string, pr, pass int) error {
+	if e := os.Remove(s.deadLabelPath(repo, pr, pass)); e != nil && !errors.Is(e, fs.ErrNotExist) {
+		return e
+	}
+	return nil
+}
+
+// deadLabel reads the marker kept for this pass of the current head. A marker
+// of another head is stale — the head moved — and is removed; the pass then
+// spawns as if none was kept.
+func (x *panewireExecutor) deadLabel(pass int) (deadReviewerLabel, bool, error) {
+	var d deadReviewerLabel
+	ok, e := fsutil.ReadJSON(x.s.deadLabelPath(x.repo.Name, x.pr.Number, pass), &d)
+	if e != nil || !ok {
+		return d, false, e
+	}
+	if d.Head != x.pr.Head.SHA {
+		return d, false, x.s.dropDeadLabel(x.repo.Name, x.pr.Number, pass)
+	}
+	return d, true, nil
+}
+
 // withWaitTimeout returns the recorded spawn arguments with --wait-timeout
 // bounded by wait; every other argument is unchanged, so the hub treats the
 // replay as the same spawn request and re-attaches a wait to its operation.

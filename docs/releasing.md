@@ -15,12 +15,16 @@
    version and writes `SHA256SUMS`. It checks that `mergewake --version`
    prints the tag. It runs the tests. Before publishing, it waits for the tag
    commit's checks named by `.mergewake/policy.yaml` at the tag
-   (`deploy_checks`, else `watch_checks`) and publishes only when
-   every one is green; a name may be a check run
-   or a commit status. A failing check fails the release with its name and URL,
-   and a check not reported within the bound (`RELEASE_CHECKS_TIMEOUT_SECONDS`,
-   default 60 minutes) fails it with what is missing, so a later rerun can
-   publish. Then it publishes the GitHub Release with `GITHUB_TOKEN`.
+   (`deploy_checks`, else `watch_checks`, else `required_checks`) and publishes
+   only when every one is green; a name may be a check run or a commit status.
+   A failing check at the tag fails the release with its name and URL. While
+   tag checks are pending, a newer release tag on main that contains the tag
+   commit supersedes this run, so it stops without publishing. If main has no
+   newer release tag and its head contains the tag commit, green policy checks
+   on that head let this run publish. Pending checks that reach the bound
+   (`RELEASE_CHECKS_TIMEOUT_SECONDS`, default 60 minutes) fail with what is
+   missing, so a later rerun can publish. Then it publishes the GitHub Release
+   with `GITHUB_TOKEN`.
 
 Pushing a test tag `v0.0.0-<anything>` (for example `v0.0.0-test.1`) runs
 the same build and checks on a real tag, publishes nothing and does not wait.

@@ -252,6 +252,9 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 // notice, when set, renders the BLOCKED notice into the text with the room the
 // rest of the text leaves under findingsLaneText.
 func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author bool, notice func(room int) string) (string, string, bool, error) {
+	if state == "merged" {
+		return s.queueMerged(ctx, r, pr, summary)
+	}
 	var lane, via string
 	var e error
 	switch {
@@ -303,9 +306,6 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	}
 	if state == "ready" {
 		return s.recordOnlyEvent(ctx, r, pr, state, summary, key, baseBehind, sent)
-	}
-	if state == "merged" {
-		return s.mergedEvent(ctx, r, pr, summary, key, sent)
 	}
 	if sent.has("decided " + key) {
 		return "", "", false, nil
@@ -439,13 +439,9 @@ type mergedRecord struct {
 	Suppressed string `json:"suppressed,omitempty"`
 }
 
-// mergedEvent sends one MERGED per (PR, head) to the PR's design lane: a valid
-// Mergewake-Notify-Lane trailer, else the repo lane. With neither, nothing is
-// sent and the row says "no design lane"; the desk fallback never gets it. The
-// sent key is added only after a successful send, so a failed send is returned
-// (as errNotifyDelivery) and the next pass retries; the merge itself is never
-// blocked by it.
-func (s *Service) mergedEvent(ctx context.Context, r config.Repo, pr github.Pull, summary, key string, sent *sentKeys) (string, string, bool, error) {
+// mergedEvent sends one MERGED per (PR, head) to its design lane and keeps the
+// pending record until both delivery (or suppression) and audit are durable.
+func (s *Service) mergedEvent(ctx context.Context, r config.Repo, pr github.Pull, summary string, sent *sentKeys, alreadySent bool) (string, string, bool, error) {
 	lane, via, e := s.mergedLane(ctx, r, pr)
 	if e != nil {
 		return "", "", false, e
@@ -453,32 +449,148 @@ func (s *Service) mergedEvent(ctx context.Context, r config.Repo, pr github.Pull
 	record := mergedRecord{PR: pr.Number, Head: pr.Head.SHA, State: "merged", Summary: summary}
 	if lane == "" {
 		record.Suppressed = "no design lane"
+	} else if !alreadySent {
+		merge := ""
+		if pr.MergeCommitSHA != "" {
+			merge = " merge=" + short7(pr.MergeCommitSHA)
+		}
+		text := fmt.Sprintf("[mergewake] MERGED %s#%d head=%s%s | %s | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), merge, summary, lane, via)
+		reportCtx, cancel := reportContext(ctx)
+		defer cancel()
+		if e = s.Notifier.Notify(reportCtx, integrations.Event{ID: fmt.Sprintf("mergewake-merged-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Text: clip(text, findingsLaneText), Lane: lane, Type: verdictType("merged", via)}); e != nil {
+			return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
+		}
+	}
+	if lane != "" {
+		record.Lane, record.Via, record.Sent = lane, via, true
+	}
+	return lane, via, lane != "", nil
+}
+
+func (s *Service) queueMerged(ctx context.Context, r config.Repo, pr github.Pull, summary string) (string, string, bool, error) {
+	key := verdictKey("merged", pr.Number, pr.Head.SHA)
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
+	if e != nil {
+		return "", "", false, e
+	}
+	if sent.has(key) {
+		return "", "", false, nil
+	}
+	pending, e := loadMergedPending(s.state(r.Name))
+	if e != nil {
+		return "", "", false, e
+	}
+	entry := mergedPending{PR: pr.Number, Head: pr.Head.SHA, MergedAt: s.now().UTC(), Summary: summary, Body: pr.Body, MergeCommitSHA: pr.MergeCommitSHA}
+	if e = pending.put(entry); e != nil {
+		return "", "", false, e
+	}
+	for _, stored := range pending.entries() {
+		if stored.key() == key {
+			return s.retryMerged(ctx, r, stored, stored.Notified)
+		}
+	}
+	return "", "", false, errors.New("MERGED pending entry disappeared after write")
+}
+
+// RetryMergedPending retries every durable MERGED candidate once per repo pass.
+func (s *Service) RetryMergedPending(ctx context.Context, r config.Repo) error {
+	if !s.Config.Daemon.PR.Notify.On() {
+		return nil
+	}
+	pending, e := loadMergedPending(s.state(r.Name))
+	if e != nil {
+		return e
+	}
+	entries := pending.entries()
+	var errs []error
+	for _, entry := range entries {
+		if _, _, _, e = s.retryMerged(ctx, r, entry, entry.Notified); e != nil {
+			errs = append(errs, fmt.Errorf("PR %d head %s: %w", entry.PR, entry.Head, e))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Service) retryMerged(ctx context.Context, r config.Repo, entry mergedPending, alreadySent bool) (string, string, bool, error) {
+	pending, e := loadMergedPending(s.state(r.Name))
+	if e != nil {
+		return "", "", false, e
+	}
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
+	if e != nil {
+		return "", "", false, e
+	}
+	key := verdictKey("merged", entry.PR, entry.Head)
+	if sent.has(key) {
+		return "", "", false, pending.remove(entry.key())
+	}
+	if s.now().Sub(entry.MergedAt) > 24*time.Hour {
+		record := mergedRecord{PR: entry.PR, Head: entry.Head, State: "merged", Summary: entry.Summary, Sent: false, Suppressed: "gave up after 24 hours"}
+		if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
+			return "", "", false, e
+		}
 		if e = sent.add(key); e != nil {
 			return "", "", false, e
 		}
-		return "", "", false, s.audit(r.Name, "pr-notify", record, false)
+		return "", "", false, pending.remove(entry.key())
 	}
-	merge := ""
-	if pr.MergeCommitSHA != "" {
-		merge = " merge=" + short7(pr.MergeCommitSHA)
+	pr := github.Pull{Number: entry.PR, Head: github.Ref{SHA: entry.Head}, Title: entry.Summary, Base: github.Ref{Ref: r.Branch}}
+	// Land/evaluation call sites may supply refreshed PR details through the pending record.
+	pr.Body, pr.MergeCommitSHA = entry.Body, entry.MergeCommitSHA
+	lane, via, delivered := entry.Lane, entry.Via, entry.Notified
+	if !entry.Resolved {
+		lane, via, delivered, e = s.mergedEvent(ctx, r, pr, entry.Summary, sent, alreadySent || entry.Notified)
+		if e != nil {
+			_ = pending.put(entry)
+			return "", "", false, e
+		}
+		entry.Resolved, entry.Lane, entry.Via = true, lane, via
+		if lane == "" {
+			entry.Suppressed = "no design lane"
+		}
 	}
-	text := fmt.Sprintf("[mergewake] MERGED %s#%d head=%s%s | %s | lane=%s via %s",
-		r.Name, pr.Number, short7(pr.Head.SHA), merge, summary, lane, via)
-	reportCtx, cancel := reportContext(ctx)
-	defer cancel()
-	if e = s.Notifier.Notify(reportCtx, integrations.Event{
-		ID:   fmt.Sprintf("mergewake-merged-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA),
-		Text: clip(text, findingsLaneText),
-		Lane: lane,
-		Type: verdictType("merged", via),
-	}); e != nil {
-		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(e))
+	if delivered {
+		entry.Notified = true
+	}
+	if e = pending.put(entry); e != nil {
+		return lane, via, delivered, e
+	}
+	record := mergedRecord{PR: entry.PR, Head: entry.Head, State: "merged", Summary: entry.Summary, Lane: lane, Via: via, Sent: delivered, Suppressed: entry.Suppressed}
+	if record.Suppressed == "" && lane == "" {
+		record.Suppressed = "no design lane"
+	}
+	if e = s.audit(r.Name, "pr-notify", record, false); e != nil {
+		return lane, via, delivered, e
 	}
 	if e = sent.add(key); e != nil {
-		return "", "", false, e
+		return lane, via, delivered, e
 	}
-	record.Lane, record.Via, record.Sent = lane, via, true
-	return lane, via, true, s.audit(r.Name, "pr-notify", record, false)
+	return lane, via, delivered, pending.remove(entry.key())
+}
+
+// ObserveMergedCandidate queues a recently merged PR read by the evaluator.
+func (s *Service) ObserveMergedCandidate(ctx context.Context, r config.Repo, pr github.Pull) error {
+	if !s.Config.Daemon.PR.Notify.On() || !pr.Merged || pr.Base.Ref != r.Branch || pr.MergedAt == nil {
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339, *pr.MergedAt)
+	if err != nil || s.now().Sub(at) > 24*time.Hour || at.After(s.now()) {
+		return nil
+	}
+	if pr.Head.SHA == "" {
+		return errors.New("merged PR has no head SHA")
+	}
+	_, _, _, err = s.queueMerged(ctx, r, pr, pr.Title)
+	return err
+}
+
+// RetryMergedCandidate adds the known gated head and attempts its MERGED.
+func (s *Service) RetryMergedCandidate(ctx context.Context, r config.Repo, pr github.Pull, summary string) error {
+	if !s.Config.Daemon.PR.Notify.On() {
+		return nil
+	}
+	_, _, _, err := s.queueMerged(ctx, r, pr, summary)
+	return err
 }
 
 // mergedLane is the design lane a MERGED goes to: a valid Mergewake-Notify-Lane
@@ -645,18 +757,18 @@ const (
 )
 
 // holdingNotice renders the threads holding head for the BLOCKED notice in at
-// most room bytes: the threads that fit, the reply forms that clear a
-// block-class thread, and whether the head's latest review pass is clean. It
-// returns "" when room cannot hold the fixed text, so the event is sent without
-// the list rather than refused by panewire. It only adds text: reasons, the
+// most room bytes: the threads that fit, how a block-class thread clears, and
+// whether the head's latest review pass is clean. It returns "" when room
+// cannot hold the fixed text, so the event is sent without the list rather
+// than refused by panewire. It only adds text: reasons, the
 // identity and the sent key stay as they were.
 func holdingNotice(v gateVerdict, head string, room int) string {
 	if len(v.Holds) == 0 {
 		return ""
 	}
-	tail := " | a block-class thread clears only with a reply of Fixed in <sha> or Dismiss: <evidence>"
+	tail := " | a block-class thread clears when it is resolved, or with a reply of Fixed in <sha> or Dismiss: <evidence>"
 	if v.PassClean {
-		tail += fmt.Sprintf(" | latest review pass on %s raised no new findings; the threads above hold from earlier passes", head[:7])
+		tail += fmt.Sprintf(" | latest review pass on %s posted no holding finding; the threads above hold from earlier passes", head[:7])
 	}
 	budget := room - len(tail) - holdReserve
 	if budget < 0 {
