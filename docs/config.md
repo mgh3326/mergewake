@@ -1693,7 +1693,9 @@ Requests must `POST` the exact path with a body of at most 5 MiB and a valid
 signatures get 401 and trigger nothing; verified deliveries get 202 whether
 or not anything was triggered. One log line per delivery records the
 `X-GitHub-Event`, the `X-GitHub-Delivery` id, `repository.full_name` and the
-roles woken — never the body, the signature or other headers.
+roles woken — never the body, the signature or other headers. A repeated
+delivery id is logged once more as a repeat and does nothing; `hook_id` tells
+two hooks apart when they send the same delivery id.
 
 | `X-GitHub-Event` | Roles woken |
 | --- | --- |
@@ -1787,10 +1789,11 @@ holding the head: up to ten, then `and N more`, within a byte budget that keeps
 the event under panewire's 2048-byte limit. Each entry names the thread (its URL,
 else its id), the finding's author, its severity (`unrated` when none is
 readable), and `path:line`. A thread with a reply names the latest one and says
-`reply not accepted`, since only a reply of `Fixed in <sha>` or `Dismiss: <evidence>`
-clears a block-class thread. When the head's review pass is complete and no
-holding finding was posted on the head, the text says the latest review pass
-raised no new findings. The list can be shorter than the `blocking_findings:<n>`
+`reply not accepted`, since a block-class thread clears when it is resolved,
+or with a reply of `Fixed in <sha>` or `Dismiss: <evidence>`. When the head's
+review pass is complete and no holding finding was posted on the head, the
+text says the latest review pass on the head posted no holding finding and
+that the threads above hold from earlier passes. The list can be shorter than the `blocking_findings:<n>`
 count, because a reviewer still requesting changes counts toward the count but
 is not a thread.
 
@@ -1938,6 +1941,9 @@ already sent to the finished lane is resent once to the new lane under the event
 id `<id>-reroute`, audited as `findings-route-changed`; an acknowledged one is
 never rerouted. A terminal job whose hosts could not all be read keeps its
 lane and is audited as `findings-route-partial` with `"liveness":"unknown"`.
+A takeover is not taken while any configured host cannot be read: the bound
+author lane stays selected, and `findings-route-partial` records the candidate
+panes observed on the hosts that were read.
 A task or job read error retries without rerouting.
 
 `BLOCKED` notices for `blocking_findings`, `triage_unanswered`, or `check_failed`

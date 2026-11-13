@@ -645,18 +645,18 @@ const (
 )
 
 // holdingNotice renders the threads holding head for the BLOCKED notice in at
-// most room bytes: the threads that fit, the reply forms that clear a
-// block-class thread, and whether the head's latest review pass is clean. It
-// returns "" when room cannot hold the fixed text, so the event is sent without
-// the list rather than refused by panewire. It only adds text: reasons, the
+// most room bytes: the threads that fit, how a block-class thread clears, and
+// whether the head's latest review pass is clean. It returns "" when room
+// cannot hold the fixed text, so the event is sent without the list rather
+// than refused by panewire. It only adds text: reasons, the
 // identity and the sent key stay as they were.
 func holdingNotice(v gateVerdict, head string, room int) string {
 	if len(v.Holds) == 0 {
 		return ""
 	}
-	tail := " | a block-class thread clears only with a reply of Fixed in <sha> or Dismiss: <evidence>"
+	tail := " | a block-class thread clears when it is resolved, or with a reply of Fixed in <sha> or Dismiss: <evidence>"
 	if v.PassClean {
-		tail += fmt.Sprintf(" | latest review pass on %s raised no new findings; the threads above hold from earlier passes", head[:7])
+		tail += fmt.Sprintf(" | latest review pass on %s posted no holding finding; the threads above hold from earlier passes", head[:7])
 	}
 	budget := room - len(tail) - holdReserve
 	if budget < 0 {
