@@ -50,8 +50,9 @@ func objectError(err error) error {
 // use and again after a failed attempt, so a database that is down when the
 // process starts costs a pass nothing once it returns.
 type Objects struct {
-	mu sync.Mutex
-	s  *Store
+	mu     sync.Mutex
+	s      *Store
+	getenv func(string) string
 }
 
 // NewObjects returns nil unless a database DSN is configured (either variable).
@@ -60,14 +61,14 @@ func NewObjects(getenv func(string) string) *Objects {
 	if getenv("MERGEWAKE_MYSQL_DSN") == "" && getenv("MERGEWAKE_MYSQL_DSN_FILE") == "" {
 		return nil
 	}
-	return &Objects{}
+	return &Objects{getenv: getenv}
 }
 
 func (o *Objects) open(ctx context.Context) (*Store, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.s == nil {
-		s, err := Open(ctx)
+		s, err := open(ctx, o.getenv)
 		if err != nil {
 			return nil, err
 		}
