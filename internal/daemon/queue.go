@@ -461,6 +461,7 @@ func (q *Queue) Head(repo string, n int) string {
 func (q *Queue) learn(repo string, n int, sha string) {
 	if changes := q.listing[repo]; changes != nil {
 		changes.learned[n] = sha
+		delete(changes.forgotten, n)
 	}
 	if q.open[repo] == nil {
 		q.open[repo] = map[int]string{}
@@ -476,6 +477,7 @@ func (q *Queue) Forget(repo string, n int) {
 	q.init()
 	if changes := q.listing[repo]; changes != nil {
 		changes.forgotten[n] = struct{}{}
+		delete(changes.learned, n)
 	}
 	q.cancelPR(repo, n)
 	delete(q.open[repo], n)
