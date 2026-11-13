@@ -281,6 +281,30 @@ func TestSetOpenMergesChangesSinceBeginList(t *testing.T) {
 			t.Fatalf("head %q, want new", got)
 		}
 	})
+	t.Run("forget after learn stays absent", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Learn("o/r", 2, "learned")
+		q.Forget("o/r", 2)
+		q.SetOpen("o/r", map[int]string{2: "listed"})
+		if got := q.Head("o/r", 2); got != "" {
+			t.Fatalf("head after forget %q, want absent", got)
+		}
+		q.EnqueueNamed(SourceCheck, "o/r", 0, "learned")
+		if got := q.Take("o/r").Depth; got != 0 {
+			t.Fatalf("forgotten PR was queued by its learned head: depth %d", got)
+		}
+	})
+	t.Run("learn after forget restores head", func(t *testing.T) {
+		q := &Queue{}
+		q.BeginList("o/r")
+		q.Forget("o/r", 3)
+		q.Learn("o/r", 3, "new")
+		q.SetOpen("o/r", map[int]string{3: "old"})
+		if got := q.Head("o/r", 3); got != "new" {
+			t.Fatalf("head %q, want new", got)
+		}
+	})
 	t.Run("no mark replaces", func(t *testing.T) {
 		q := &Queue{}
 		q.SetOpen("o/r", map[int]string{1: "a", 2: "b"})
