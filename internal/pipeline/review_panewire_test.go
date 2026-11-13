@@ -595,10 +595,17 @@ func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 	if !bytes.Contains(brief, []byte("[redacted github_token]")) || bytes.Contains(brief, []byte(token)) || !bytes.Contains(brief, []byte("Redacted 1 secret-like string")) || !bytes.Contains(brief, []byte("Full text is in the checkout.")) {
 		t.Fatalf("spawned brief does not carry the redacted delta and summary:\n%s", brief)
 	}
+	for _, line := range strings.Split(string(brief), "\n") {
+		if strings.Contains(line, "[redacted github_token]") || strings.Contains(line, "Redacted 1 secret-like string") {
+			t.Logf("brief excerpt: %s", line)
+		}
+	}
 	rows := auditRows(t, s, r, "review-brief-redacted")
 	if len(rows) != 1 || rows[0]["pr"] != float64(7) || rows[0]["head"] != shaA || rows[0]["pass"] != float64(1) || rows[0]["label"] != arg(runner.spawns[0], "-l") || rows[0]["count"] != float64(1) || !slices.Contains(rows[0]["paths"].([]any), "auth.go") || !slices.Contains(rows[0]["pattern_names"].([]any), "github_token") {
 		t.Fatalf("redaction audit: %v", rows)
 	}
+	auditJSON, _ := json.Marshal(rows[0])
+	t.Logf("redaction audit row: %s", auditJSON)
 	receipts := g.passes[shaA]
 	wantPatch := reviewPatchID(full)
 	redactedFull := patchOne + redactDeletedDiffMust(delta)
