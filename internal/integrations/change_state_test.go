@@ -343,3 +343,22 @@ func TestHKChangeOutboxReplaysFindingsInOrder(t *testing.T) {
 		t.Fatalf("times=%v", times)
 	}
 }
+
+// A rejected change batch or section logs hk's reason with no run of 32 or
+// more hex digits.
+func TestHKChangeRejectRedactsHexRuns(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"invalid_context","reason":"bad credential `+hex64+`"}`)
+	}))
+	t.Cleanup(server.Close)
+	var logs bytes.Buffer
+	w := NewChangeWriter(slog.New(slog.NewTextHandler(&logs, nil)))
+	w.endpoint = func() (*hkJobs, error) { return &hkJobs{base: server.URL, token: "test"}, nil }
+	at := time.Now().UTC()
+	w.Queue("o/r", 7, "state", ChangeSection{At: at, Value: map[string]any{"observed_at": at}})
+	drainChange(t, w)
+	if !strings.Contains(logs.String(), "reason=") || !strings.Contains(logs.String(), "[redacted]") || hexRunLong.MatchString(logs.String()) {
+		t.Fatalf("logs=%s", logs.String())
+	}
+}
