@@ -48,7 +48,8 @@ type prEngine struct {
 	// pr role then starts reviewers without waiting for them.
 	revisit pipeline.Revisit
 
-	mu sync.Mutex
+	mu        sync.Mutex
+	listEpoch map[string]uint64
 	// open is each repo's open PRs as this engine knows them, for the
 	// closed-row reconcile (see openSet).
 	open     map[string]*openSet
@@ -101,7 +102,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		listEpoch: map[string]uint64{}, sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
 		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
@@ -245,6 +246,7 @@ func (e *prEngine) freshRead(w daemon.Work) bool {
 // settle it as one PR of the old pass was.
 func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (errs []error, res evalResult) {
 	n := w.Key.PR
+	readEpoch := e.currentListEpoch(r.Name)
 	evalStart := w.Phases.Now()
 	readCtx := ctx
 	if e.freshRead(w) {
@@ -264,13 +266,11 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 				errs = append(errs, fmt.Errorf("PR %d MERGED notice: %w", n, mergedErr))
 			}
 		}
-		e.q.Forget(r.Name, n)
-		e.openOf(r.Name).forget(n)
+		e.forgetOpenRead(r.Name, n, readEpoch)
 		res.gone = true
 		return errs, res
 	}
-	e.q.Learn(r.Name, n, pr.Head.SHA)
-	e.openOf(r.Name).learn(n)
+	e.learnOpenRead(r.Name, n, pr.Head.SHA, readEpoch)
 	// The head is met here at the latest; a delivery that named it set an
 	// earlier time.
 	rec := e.seen.Evaluating(r.Name, n, pr.Head.SHA, evalStart)
@@ -420,7 +420,8 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	// once on every repository sweep.
 	mergedErr := e.s.RetryMergedPending(ctx, r)
 	setPRSweepStep(ctx, "open_pulls")
-	e.openOf(r.Name).beginList()
+	epoch := e.beginOpenList(r.Name)
+	defer e.q.AbortList(r.Name, epoch)
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
 		return errors.Join(err, mergedErr)
@@ -435,8 +436,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 		seen[pr.Number] = true
 		heads[pr.Number] = pr.Head.SHA
 	}
-	e.q.SetOpen(r.Name, heads)
-	e.openOf(r.Name).replace(heads)
+	e.replaceOpenList(r.Name, epoch, heads)
 	prs = skipBotPulls(prs, e.s.Config.Daemon.PR.SkipBots)
 	// PRs a fresh status read marked go first.
 	prs = dirtyFirst(prs, prstatus.DirtyPRs(e.s.Config.StateDir, r.Name))
@@ -477,6 +477,53 @@ func (e *prEngine) openOf(repo string) *openSet {
 		e.open[repo] = &openSet{open: map[int]bool{}, recent: map[int]bool{}, gone: map[int]bool{}}
 	}
 	return e.open[repo]
+}
+
+func (e *prEngine) beginOpenList(repo string) uint64 {
+	o := e.openOf(repo)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	epoch := e.q.BeginList(repo)
+	e.listEpoch[repo] = epoch
+	o.beginList()
+	return epoch
+}
+
+func (e *prEngine) currentListEpoch(repo string) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.listEpoch[repo]
+}
+
+func (e *prEngine) learnOpenRead(repo string, n int, sha string, epoch uint64) {
+	o := e.openOf(repo)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.Learn(repo, n, sha, epoch)
+	if e.listEpoch[repo] == epoch {
+		o.learn(n)
+	}
+}
+
+func (e *prEngine) forgetOpenRead(repo string, n int, epoch uint64) {
+	o := e.openOf(repo)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.Forget(repo, n, epoch)
+	if e.listEpoch[repo] == epoch {
+		o.forget(n)
+	}
+}
+
+func (e *prEngine) replaceOpenList(repo string, epoch uint64, heads map[int]string) {
+	o := e.openOf(repo)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.listEpoch[repo] != epoch {
+		return
+	}
+	e.q.SetOpen(repo, heads)
+	o.replace(heads)
 }
 
 // beginList starts a sweep's list read: PRs learned from now on survive replace,

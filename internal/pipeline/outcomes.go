@@ -401,6 +401,44 @@ func (s *Service) recordRevert(repo string, pr int, url string) error {
 	})
 }
 
+// closedUnmergedInterval is how often a PR closed without merging is re-read
+// while its ClosedAt is known; closedUnmergedWindow bounds that re-reading to
+// a week after closing, the same span as the revert verdict.
+const (
+	closedUnmergedInterval = 24 * time.Hour
+	closedUnmergedWindow   = 7 * 24 * time.Hour
+)
+
+// inClosedUnmergedWindow reports whether v is a final, unmerged row whose
+// ClosedAt is still inside closedUnmergedWindow: such a row is read daily.
+func inClosedUnmergedWindow(v outcomes.Outcome, now time.Time) bool {
+	return v.Final && v.MergedAt == nil && v.ClosedAt != nil && now.Before(v.ClosedAt.Add(closedUnmergedWindow))
+}
+
+// writeReconcileFlags records the flags the reconcile computed from seen,
+// unless the ledger row's Final, MergedAt or ClosedAt changed since seen was
+// read — an evaluation that observed the PR reopen, merge or reclose in
+// between owns those fields — in which case the row is left unfinished and
+// undated so the next reconcile reads it again.
+func (s *Service) writeReconcileFlags(repo string, pr int, seen outcomes.Outcome, finished bool, due *time.Time) error {
+	return s.ledger().Update(repo, pr, func(current *outcomes.Outcome) {
+		if current.Final != seen.Final || !sameTimePtr(current.MergedAt, seen.MergedAt) || !sameTimePtr(current.ClosedAt, seen.ClosedAt) {
+			current.ReconcileFinished = false
+			current.ReconcileDueAt = nil
+			return
+		}
+		current.ReconcileFinished = finished
+		current.ReconcileDueAt = due
+	})
+}
+
+func sameTimePtr(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}
+
 // Revisit PRs no longer in the open list: this observes external desk merges,
 // closures and recovery merges, even while the daemon itself is shadow-only.
 // isOpen is asked for each row as it is reached, not once up front, so a PR
@@ -424,8 +462,22 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, isOpen f
 			continue
 		}
 		pendingEvent := s.revertEventPending(r, v, o, sent)
-		if v.ReconcileFinished && !pendingEvent {
+		// A row the pre-window logic finished with no due time is still inside
+		// its ClosedAt week: read it once more so a reopen it missed is recorded.
+		// That read puts it on the daily schedule, or finishes it after the window.
+		legacyInWindow := v.ReconcileFinished && v.ReconcileDueAt == nil && inClosedUnmergedWindow(v, s.now())
+		if v.ReconcileFinished && !pendingEvent && !legacyInWindow {
 			closedRowsSkippedNotDue++
+			continue
+		}
+		// A closed-unmerged row with a known ClosedAt can still hide a reopen
+		// that was closed or merged before any evaluation saw it open, so it is
+		// re-read daily until a week after closing — the revert window — then
+		// finished without another read.
+		if v.Final && v.MergedAt == nil && v.ClosedAt != nil && !s.now().Before(v.ClosedAt.Add(closedUnmergedWindow)) {
+			if err := s.writeReconcileFlags(r.Name, v.PR, v, true, nil); err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
 		if v.ReconcileDueAt != nil && s.now().Before(*v.ReconcileDueAt) {
@@ -448,28 +500,29 @@ func (s *Service) ReconcileOutcomes(ctx context.Context, r config.Repo, isOpen f
 			continue
 		}
 		v = latest.Latest[key]
-		if !v.Final {
-			v.ReconcileFinished = false
-			due := s.now().Add(time.Hour)
-			v.ReconcileDueAt = &due
-		} else if v.MergedAt == nil || v.Reverted != nil {
-			v.ReconcileFinished = true
-		} else {
-			v.ReconcileFinished = false
+		finished, daily := false, false
+		switch {
+		case !v.Final:
+		case v.MergedAt == nil && v.Reverted == nil:
+			daily = inClosedUnmergedWindow(v, s.now())
+			finished = !daily
+		case v.MergedAt == nil || v.Reverted != nil:
+			finished = true
 		}
 		// Re-read sent keys because ObservePR can settle a revert event during
 		// this visit. A pending event remains eligible at the same hourly cadence.
 		sent, _ = s.taskEventKeys(r.Name)
-		if v.ReconcileFinished && !s.revertEventPending(r, v, o, sent) {
-			v.ReconcileDueAt = nil
-		} else {
-			due := s.now().Add(time.Hour)
-			v.ReconcileDueAt = &due
+		var due *time.Time
+		switch {
+		case finished && !s.revertEventPending(r, v, o, sent):
+		case daily:
+			d := s.now().Add(closedUnmergedInterval)
+			due = &d
+		default:
+			d := s.now().Add(time.Hour)
+			due = &d
 		}
-		if err := s.ledger().Update(r.Name, v.PR, func(current *outcomes.Outcome) {
-			current.ReconcileFinished = v.ReconcileFinished
-			current.ReconcileDueAt = v.ReconcileDueAt
-		}); err != nil {
+		if err := s.writeReconcileFlags(r.Name, v.PR, v, finished, due); err != nil {
 			errs = append(errs, err)
 		}
 	}
