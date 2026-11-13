@@ -360,8 +360,8 @@ func stablePatchID(patch string) string {
 
 // patchDigest is the part of a receipt's patch after the colon (the digest of
 // the changed text), or "" when the receipt has none or hk would refuse it.
-// reviewPatchID cuts that digest to 12 hex digits and hk takes 16 or more, so
-// today's receipts send none: hk refuses the record that carries a short one.
+// reviewPatchID cuts that digest to 12 hex digits, which hk takes, so a review
+// record carries it as patch_digest.
 func patchDigest(patch string) string {
 	_, digest, ok := strings.Cut(patch, ":")
 	if !ok {

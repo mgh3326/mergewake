@@ -21,7 +21,7 @@ var (
 	hkPatchIDRE       = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 	hkReviewTokenRE   = regexp.MustCompile(`^[a-z0-9_.-]{1,64}$`)
 	hkReviewProfileRE = regexp.MustCompile(`^[a-z0-9_.@-]{1,64}$`)
-	hkPatchDigestRE   = regexp.MustCompile(`^[0-9a-f]{16,128}$`)
+	hkPatchDigestRE   = regexp.MustCompile(`^[0-9a-f]{12,128}$`)
 )
 
 const (
@@ -135,7 +135,7 @@ func hkCheckReview(rv hkReview) error {
 		return fmt.Errorf("reviewer must be non-empty printable text of at most %d bytes", hkMaxReviewText)
 	}
 	if rv.PatchDigest != nil && !hkPatchDigestRE.MatchString(*rv.PatchDigest) {
-		return errors.New("patch_digest must be 16 to 128 lower-case hex digits")
+		return errors.New("patch_digest must be 12 to 128 lower-case hex digits")
 	}
 	if rv.OutsideDiffBlocking != nil && (*rv.OutsideDiffBlocking < 0 || *rv.OutsideDiffBlocking > hkMaxReviewCount) {
 		return fmt.Errorf("outside_diff_blocking must be 0 to %d", int(hkMaxReviewCount))
