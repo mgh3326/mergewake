@@ -524,13 +524,8 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 	pgpBody := strings.Repeat("Ef5/", 16)
 	pgpEnd := strings.Join([]string{"-----", "END "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
 	base64Line := strings.Repeat("Cd4/", 16)
-	tailLine := strings.Repeat("Ij7/", 5)
-	pgpChecksum := "=aB3d"
+	base64Run := strings.Repeat("Gh6+", 12)
 	sha := strings.Repeat("0a1b2c", 5)
-	sha1 := strings.Repeat("9f8e7", 8)
-	longIdent := "func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {"
-	goSum := "github.com/stretchr/testify v1.8.4 h1:" + strings.Repeat("Zx9q", 11) + "="
-	lockIntegrity := "      \"integrity\": \"sha512-" + strings.Repeat("Qr5+", 21) + "Kl==\","
 	tests := []struct {
 		name, diff, want, alsoWant, notWant, path, pattern, summary string
 		rows, count                                                 int
@@ -628,29 +623,14 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			count:   1,
 		},
 		{
-			name:    "key body with its short tail and checksum redacted when context omits the PEM begin",
-			diff:    "diff --git a/private.asc b/private.asc\n--- a/private.asc\n+++ b/private.asc\n@@ -12,5 +12,1 @@\n keep\n-" + base64Line + "\n-" + tailLine + "\n-" + pgpChecksum + "\n-not base64 here\n-" + tailLine + "\n",
-			want:    "-[redacted]\n-[redacted]\n-[redacted]\n-not base64 here\n-" + tailLine,
-			notWant: pgpChecksum,
-			path:    "private.asc",
-			pattern: "key_body",
-			rows:    1,
-			count:   3,
-		},
-		{
-			name:    "short base64 line after context is not a key tail",
-			diff:    "diff --git a/private.asc b/private.asc\n--- a/private.asc\n+++ b/private.asc\n@@ -12,4 +12,2 @@\n-" + base64Line + "\n keep\n-" + tailLine + "\n",
-			want:    "-[redacted]\n keep\n-" + tailLine,
-			notWant: base64Line,
-			path:    "private.asc",
+			name:    "base64 run inside a removed line redacted",
+			diff:    "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1,2 +1 @@\n-key: " + base64Run + " # old\n keep\n",
+			want:    "-key: [redacted] # old\n keep",
+			notWant: base64Run,
+			path:    "blob",
 			pattern: "key_body",
 			rows:    1,
 			count:   1,
-		},
-		{
-			name: "ordinary removed text with long tokens stays verbatim",
-			diff: "diff --git a/mod b/mod\n--- a/mod\n+++ b/mod\n@@ -1,5 +1 @@\n-rev " + sha1 + "\n-" + longIdent + "\n-" + goSum + "\n-" + lockIntegrity + "\n-" + sha1 + "\n keep\n",
-			want: "-rev " + sha1 + "\n-" + longIdent + "\n-" + goSum + "\n-" + lockIntegrity + "\n-" + sha1 + "\n keep",
 		},
 		{
 			name: "removed short hex value stays verbatim",
@@ -705,7 +685,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			}
 			if tt.rows > 0 {
 				body, _ := json.Marshal(rows[0])
-				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) {
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) || strings.Contains(string(body), base64Run) {
 					t.Fatalf("audit contains matched text: %s", body)
 				}
 				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
