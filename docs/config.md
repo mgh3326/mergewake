@@ -741,9 +741,14 @@ on it.
   anchored on that changed line (`fleet-review` §Rounds); a finding on any other
   line fails the same new-side-line check as before. The panewire brief carries the delta patch inline instead of `git diff`.
   Secret-like strings in removed lines are redacted, including in mixed hunks.
-  A removed line outside a known private-key block is also redacted where it
-  holds a run of 40 or more base64 characters (`[A-Za-z0-9+/=]`), because a
-  hunk's context may omit the block's BEGIN marker; added and context lines are
+  A removed line outside a known private-key block is also redacted when it
+  looks like one line of a base64 key body, because a hunk's context may omit
+  the block's BEGIN marker: the whole trimmed line is base64, 56 to 80
+  characters long, with an upper-case letter, a lower-case letter, and a digit,
+  `+` or `/`. The contiguous removed lines after such a line that are wholly
+  base64 of any length (the short last line, a PGP `=XXXX` checksum) are
+  redacted with it, up to the first line that is not. Hashes, identifiers and
+  other text inside a line are not touched; added and context lines are
   verbatim.
   When the previous patch cannot be read, the round reviews the whole diff and
   the audit event says why (`round_note`). When nothing changed at all, the round
