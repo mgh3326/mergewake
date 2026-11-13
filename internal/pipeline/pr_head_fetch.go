@@ -28,8 +28,9 @@ const fallbackBranchBytes = 200
 // fallback deletes a local pull/<n>/head left by an earlier fetch, which
 // panewire would prefer and the remote node could not fetch. Any failure of
 // the first fetch takes the fallback: its stderr is not parsed. Each attempt
-// writes one pr-head-fallback row. The returned error is the skip reason; the
-// first fetch's stderr is kept as operator detail.
+// writes one pr-head-fallback row. The returned error is the skip reason; its
+// operator detail is the first fetch's stderr, then, when a failed fallback's
+// git command wrote stderr, that command's, joined by "; ".
 func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.Pull) error {
 	_, first := s.gitIn(ctx, root, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref)
 	if first == nil {
@@ -49,6 +50,15 @@ func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.
 		row["detail"] = firstDetail
 	}
 	_ = s.audit(repo, "pr-head-fallback", row, false)
+	if e != nil && firstDetail != "" {
+		// The fallback's own git stderr, when it has any, comes after the first
+		// fetch's.
+		detail := firstDetail
+		if own := errorDetailOf(e); own != "" {
+			detail += "; " + own
+		}
+		e = withErrorDetail(e, detail)
+	}
 	return e
 }
 
