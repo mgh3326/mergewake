@@ -3,8 +3,8 @@ name: Release
 # A v* tag builds the four CGO-disabled release binaries (linux/darwin x
 # amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
 # with GITHUB_TOKEN, but only after the tag commit's checks named by
-# .mergewake/policy.yaml (deploy_checks, else main_checks/watch_checks) are
-# green: release judges the same evidence as rollout. A test tag v0.0.0*
+# .mergewake/policy.yaml (deploy_checks, else watch_checks, else
+# required_checks) are green. A test tag v0.0.0*
 # (e.g. v0.0.0-test.1) runs the same build and checks on the tag but is never
 # published.
 # Manual runs build the same assets for a
@@ -90,8 +90,8 @@ jobs:
       - run: go test -race ./...
 
   checks:
-    # Release publishes the same evidence rollout requires: the checks named by
-    # the policy at the tag must be green before any asset goes out. Dry runs
+    # Release publishes only when the checks named by the policy at the tag are
+    # green: deploy_checks, else watch_checks, else required_checks. Dry runs
     # and test tags never reach this job.
     needs: [build, test]
     if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
