@@ -54,6 +54,11 @@ type Webhook struct {
 	// the response or the wake.
 	State   *webhookstate.Store
 	Applied func(repo, event, delivery string, body []byte)
+	// Receipts, when set, records each verified delivery (see receipts.go).
+	Receipts *Receipts
+	// Check, when set, compares the App's delivery log with Receipts hourly
+	// (see delivery_check.go). Nil means no check runs.
+	Check *DeliveryCheck
 
 	parseWarned sync.Map
 	deliveryMu  sync.Mutex
@@ -124,6 +129,13 @@ func (d *Daemon) serveWebhook(ctx context.Context, wg *sync.WaitGroup) error {
 			d.flushState(ctx)
 		}()
 	}
+	if wh.Check != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runDeliveryCheck(ctx)
+		}()
+	}
 	srv := &http.Server{Handler: http.HandlerFunc(d.handleDelivery), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	wg.Add(1)
 	go func() {
@@ -167,6 +179,7 @@ func (d *Daemon) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repeat := wh.rememberDelivery(r.Header.Get("X-GitHub-Delivery"))
+	wh.recordReceipt(r, body, repeat)
 	if repeat {
 		payload := body
 		if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "application/x-www-form-urlencoded" {

@@ -224,3 +224,150 @@ func TestReplacedJobWithoutPaneClosesNoPane(t *testing.T) {
 		t.Fatalf("pane closed without a record pane id: %v", hub.ops("pane.close"))
 	}
 }
+
+// closeRefusal is what panewire's job close prints with exit 5 when it refuses
+// the close: the refusal is on stderr, the output of a failed close is empty.
+func closeRefusal(stderr string) error {
+	return &integrations.CommandError{Command: "panewire", Err: panewireExit(5), Stderr: stderr + "\n"}
+}
+
+// replacedMarker reads the owed-close marker of a replaced reviewer of PR 7,
+// and reports whether one remains.
+func replacedMarker(t *testing.T, s *Service, r config.Repo, label string) (replacedClose, bool) {
+	t.Helper()
+	raw, err := os.ReadFile(s.replacedClosePath(r.Name, 7, label))
+	if os.IsNotExist(err) {
+		return replacedClose{}, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m replacedClose
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m, true
+}
+
+// jobClosesOf counts the job closes the runner made for one label.
+func jobClosesOf(runner *panewireRunner, label string) int {
+	n := 0
+	for _, cl := range runner.closes {
+		if cl[2] == label {
+			n++
+		}
+	}
+	return n
+}
+
+// (a) A job close that panewire refuses because the job already has a terminal
+// record has ended the job: it is not owed again, and the marker goes once the
+// pane is gone.
+func TestAlreadyClosedJobRefusalIsClosed(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, r, 1)
+	hub := budgetPane(t, s, runner, old, "done")
+	hub.close = map[string]any{"outcome": "closed"}
+	hub.dropClosed = true
+	runner.closeErrs = []error{
+		fmt.Errorf("hk unavailable"),
+		closeRefusal("close refused: job " + old.Label + " already has a terminal record (00002-job.revoked.json) after its latest claim"),
+	}
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	pastBudget(g, c)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if m, owed := replacedMarker(t, s, r, old.Label); !owed || !m.JobOpen {
+		t.Fatalf("failed job close is not owed: marker=%+v owed=%v", m, owed)
+	}
+	laterSweep(t, s, r, c)
+	if m, owed := replacedMarker(t, s, r, old.Label); owed {
+		t.Fatalf("refused close still owed: marker=%+v", m)
+	}
+	before := jobClosesOf(runner, old.Label)
+	laterSweep(t, s, r, c)
+	if got := jobClosesOf(runner, old.Label); got != before {
+		t.Fatalf("job of %s closed again after the refusal: %d -> %d", old.Label, before, got)
+	}
+}
+
+// (b) Refusals that are not "already has a terminal record" leave the job
+// owed: the sweep retries the close.
+func TestOtherCloseRefusalsStayOwed(t *testing.T) {
+	for _, code := range []string{"owner_mismatch", "job_unknown", "lane_not_routed_to_caller", "scope_forbidden"} {
+		t.Run(code, func(t *testing.T) {
+			s, g, r, runner, c := interruptedReviewer(t)
+			old := readReviewerJob(t, s, r, 1)
+			hub := budgetPane(t, s, runner, old, "done")
+			hub.close = map[string]any{"outcome": "closed"}
+			hub.dropClosed = true
+			refused := "close refused: job " + old.Label + " " + code
+			runner.closeErrs = []error{closeRefusal(refused), closeRefusal(refused)}
+			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+			pastBudget(g, c)
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			laterSweep(t, s, r, c)
+			m, owed := replacedMarker(t, s, r, old.Label)
+			if !owed || !m.JobOpen {
+				t.Fatalf("refusal %s marked the job closed: marker=%+v owed=%v", code, m, owed)
+			}
+			if n := jobClosesOf(runner, old.Label); n != 2 {
+				t.Fatalf("job closes of %s = %d, want both refused closes made, closes=%v", old.Label, n, runner.closes)
+			}
+		})
+	}
+}
+
+// (c) A terminal job of an older head holds no reservation: no job close is
+// sent, and its pane is still force-closed from the record's host and pane.
+func TestTerminalOldHeadClosesPaneOnly(t *testing.T) {
+	for _, state := range []string{"completed", "lost"} {
+		t.Run(state, func(t *testing.T) {
+			runner := &panewireRunner{family: "openai"}
+			old := integrations.JobRecord{State: state, OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
+			s, _, r, labels := movedHeadSetup(t, runner, old)
+			hub := replacedHub(t, s, labels[0], "p1", "idle")
+			hub.dropClosed = true
+			hub.closeOutcomes = []string{"pane-changed"}
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.closes) != 0 {
+				t.Fatalf("job closes=%v, want none for a %s job", runner.closes, state)
+			}
+			if n := len(hub.agents["panes"].([]any)); n != 0 {
+				t.Fatalf("%s job's old pane still listed (%d), closes=%v", state, n, hub.ops("pane.close"))
+			}
+		})
+	}
+}
+
+// (c) A failed pane close of a terminal old-head job is owed in the marker as
+// the pane alone; the next sweep closes it.
+func TestTerminalOldHeadPaneCloseOwedInMarker(t *testing.T) {
+	runner := &panewireRunner{family: "openai"}
+	old := integrations.JobRecord{State: "completed", OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
+	s, _, r, labels := movedHeadSetup(t, runner, old)
+	hub := replacedHub(t, s, labels[0], "p1", "idle")
+	hub.dropClosed = true
+	hub.closeFails = 1
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	m, owed := replacedMarker(t, s, r, labels[0])
+	if !owed || m.JobOpen || !m.PaneOpen {
+		t.Fatalf("want only the pane owed: marker=%+v owed=%v", m, owed)
+	}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(hub.agents["panes"].([]any)); n != 0 {
+		t.Fatalf("later sweep left the old head's pane, closes=%v", hub.ops("pane.close"))
+	}
+	if _, owed := replacedMarker(t, s, r, labels[0]); owed {
+		t.Fatalf("marker still owed after its pane closed")
+	}
+}

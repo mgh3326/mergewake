@@ -236,6 +236,99 @@ func TestMergedPendingPersistsAndExpiresOnce(t *testing.T) {
 	}
 }
 
+// The 24-hour retry window runs from the PR's merge time, not from when
+// mergewake first saw it: a PR merged 23 hours ago gives up two hours later.
+func TestMergedRetryWindowCountsFromMergeTime(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	now := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	r.Lane = "repo-design"
+	n.err = errors.New("lane offline")
+	mergedAt := now.Add(-23 * time.Hour).Format(time.RFC3339)
+	g.pull.Merged, g.pull.State, g.pull.MergedAt = true, "closed", &mergedAt
+	if err := s.RetryMergedCandidate(context.Background(), r, g.pull, g.pull.Title); err == nil {
+		t.Fatal("expected notifier failure")
+	}
+	now = now.Add(2 * time.Hour)
+	if err := s.RetryMergedPending(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	rows := prNotifyRows(t, s, r)
+	if len(rows) != 1 || rows[0]["sent"] != false || rows[0]["suppressed"] != "gave up after 24 hours" {
+		t.Fatalf("rows=%v", rows)
+	}
+}
+
+// A delivered MERGED whose audit write failed is finished as sent once it is
+// past 24 hours: one sent row, no give-up reason, no second send.
+func TestMergedDeliveredEntryPastWindowFinishesAsSent(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	now := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	r.Lane = "repo-design"
+	mergedAt := now.Add(-time.Hour).Format(time.RFC3339)
+	g.pull.Merged, g.pull.State, g.pull.MergedAt = true, "closed", &mergedAt
+	s.Out = &failOnceOutput{Writer: io.Discard, fail: true}
+	if err := s.RetryMergedCandidate(context.Background(), r, g.pull, g.pull.Title); err == nil {
+		t.Fatal("audit failure was hidden")
+	}
+	if n.count != 1 {
+		t.Fatalf("first sends=%d", n.count)
+	}
+	now = now.Add(25 * time.Hour)
+	s.Out = io.Discard
+	if err := s.RetryMergedPending(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("retry resent notice: %d", n.count)
+	}
+	rows := prNotifyRows(t, s, r)
+	if len(rows) != 1 || rows[0]["sent"] != true || rows[0]["lane"] != "repo-design" || rows[0]["via"] != "repo lane" || rows[0]["suppressed"] != nil {
+		t.Fatalf("rows=%v", rows)
+	}
+	if !sentKeyHas(t, s, r, verdictKey("merged", 7, shaA)) {
+		t.Fatal("sent key not recorded")
+	}
+	pending, e := loadMergedPending(s.state(r.Name))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if left := pending.entries(); len(left) != 0 {
+		t.Fatalf("pending entries=%+v", left)
+	}
+}
+
+// A new pending entry is stamped with the PR's merge time when it names one
+// that is not after now; otherwise with now.
+func TestMergedPendingStampsNowWithoutUsableMergeTime(t *testing.T) {
+	now := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	later := now.Add(time.Hour).Format(time.RFC3339)
+	for _, tc := range []struct {
+		name     string
+		mergedAt *string
+	}{{"no merged_at", nil}, {"merged_at after now", &later}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, n, r := notifySetup(t)
+			s.Now = func() time.Time { return now }
+			r.Lane = "repo-design"
+			n.err = errors.New("lane offline")
+			g.pull.Merged, g.pull.State, g.pull.MergedAt = true, "closed", tc.mergedAt
+			if err := s.RetryMergedCandidate(context.Background(), r, g.pull, g.pull.Title); err == nil {
+				t.Fatal("expected notifier failure")
+			}
+			pending, e := loadMergedPending(s.state(r.Name))
+			if e != nil {
+				t.Fatal(e)
+			}
+			entries := pending.entries()
+			if len(entries) != 1 || !entries[0].MergedAt.Equal(now) {
+				t.Fatalf("entries=%+v", entries)
+			}
+		})
+	}
+}
+
 func TestMergedNotificationUsesRefreshedBodyAndGatedHead(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	r.Lane = "repo-design"

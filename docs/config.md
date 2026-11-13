@@ -380,7 +380,10 @@ these steps in order:
    `drive-dir-exists`. Publication is serialized with an owner/timestamp lock
    under the archive's `.locks` directory, outside task/job names; a lock older
    than 24 hours is reclaimable, and a live lock is reported as
-   `archive-lock-busy`. If hosts present the same task/job key, a stale or
+   `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
+   age; a claim that finds one held past 24 hours fails with an error naming the
+   guard path, and the lock is left alone. Remove that guard by hand once no
+   archive run is live. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
@@ -634,7 +637,7 @@ nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
 
-A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
+A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A job that already ended (`completed`, `escalated`, or `lost`) holds no hub claim, so it gets no job close and only its pane is closed. A job close that panewire refuses because the job already has a terminal record counts as closed; any other refusal stays owed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
 
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire
@@ -1528,7 +1531,7 @@ For `example/project`, state resides beneath
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
-| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours. |
+| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
@@ -1744,8 +1747,9 @@ receiving lane until it runs `panewire inbox ack` (panewire
 event untyped). READY is recorded, never sent, because mergewake merges on its own
 gate. MERGED writes one `pr-notify` row and its sent key after the row is durable;
 no design lane is recorded as `"no design lane"`. Recent PRs merged outside
-mergewake also receive one notice. Pending notices older than 24 hours are
-recorded as gave up. The head's
+mergewake also receive one notice. Pending notices more than 24 hours after the PR's merge (else
+after mergewake first saw it) are recorded as gave up, unless already delivered: a delivered notice
+is recorded as sent. The head's
 summary, and the author worker lane (job bound to the task, else the author
 pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
