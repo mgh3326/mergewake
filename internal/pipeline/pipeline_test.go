@@ -77,6 +77,8 @@ type fakeGH struct {
 	// diffErr, when set, answers every Diff call instead of a patch (for
 	// example the HTTP 406 GitHub returns for a very large PR).
 	diffErr error
+	// historyErr, when set, answers every ReviewHistory call.
+	historyErr error
 	// commitErr answers Commit for the named SHAs; notAncestor lists the
 	// (older, newer) pairs Ancestor denies. Unlisted pairs follow stale.
 	commitErr   map[string]error
@@ -266,6 +268,9 @@ func (g *fakeGH) ReviewPasses(_ context.Context, _ string, _ int, sha, _ string)
 	return g.passes[sha], nil
 }
 func (g *fakeGH) ReviewHistory(_ context.Context, _ string, _ int, _ string) ([]github.ReviewedPass, error) {
+	if g.historyErr != nil {
+		return nil, g.historyErr
+	}
 	var out []github.ReviewedPass
 	for _, sha := range slices.Sorted(maps.Keys(g.passes)) {
 		for _, p := range g.passes[sha] {

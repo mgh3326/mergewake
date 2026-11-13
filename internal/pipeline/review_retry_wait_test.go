@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -177,5 +179,113 @@ func TestRetryReviewPendingChecksRetry(t *testing.T) {
 	}
 	if n.count != 1 {
 		t.Fatalf("escalations=%d: %v", n.count, n.events)
+	}
+}
+
+// assertEscalationHeld checks a head at the escalation threshold that waits:
+// one attempt-free pull, no escalation notice, one wait row, Escalated false.
+func assertEscalationHeld(t *testing.T, s *Service, r config.Repo, g *fakeGH, n *fakeNotifier, reason string) {
+	t.Helper()
+	if g.pullCalls != 1 {
+		t.Fatalf("pull calls=%d, want the fresh read only: a review ran", g.pullCalls)
+	}
+	st := retryStateOf(t, s, r)
+	if st.Failures != 3 || st.Escalated {
+		t.Fatalf("state=%+v, want the kept count and no escalation", st)
+	}
+	if n.count != 0 {
+		t.Fatalf("escalation notices=%d: %v", n.count, n.events)
+	}
+	rows := waitingRows(t, s, r)
+	if len(rows) != 1 || rows[0]["reason"] != reason || rows[0]["head"] != shaA || rows[0]["failures"] != float64(3) {
+		t.Fatalf("waiting rows=%v, want one %s row for the head", rows, reason)
+	}
+}
+
+// At the threshold the escalation waits too: a conflicting head sends no
+// escalation notice and keeps Escalated false while the conflict holds.
+func TestRetryReviewEscalationWaitsWhileHeadConflicts(t *testing.T) {
+	s, g, n, r, _ := failedRetryHead(t, 3, 3)
+	makeConflicting(g)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	assertEscalationHeld(t, s, r, g, n, "conflict")
+}
+
+// The escalation wait also holds while a required check under the trusted
+// base policy is red.
+func TestRetryReviewEscalationWaitsWhileChecksRed(t *testing.T) {
+	s, g, n, r, _ := failedRetryHead(t, 3, 3)
+	redChecks(g, github.Red)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	assertEscalationHeld(t, s, r, g, n, "ci_red")
+}
+
+// A wait whose audit row fails is not claimed: the flag and the state file
+// stay as they were, and the next evaluation writes the row and sets the flag.
+func TestRetryReviewWaitRetriesFailedAudit(t *testing.T) {
+	s, g, _, r, _ := failedRetryHead(t, 2, 3)
+	makeConflicting(g)
+	ctx := context.Background()
+	stateFile := filepath.Join(s.state(r.Name), "review-retry-7.json")
+	before, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory under the journal's name makes its append fail.
+	journal := filepath.Join(s.state(r.Name), "decisions.jsonl")
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryReview(ctx, r, g.pull, Options{}); err != nil {
+		t.Fatalf("poll with a failed audit: %v", err)
+	}
+	after, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("state file changed on a failed audit:\n%s\n%s", before, after)
+	}
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if rows := waitingRows(t, s, r); len(rows) != 0 {
+		t.Fatalf("waiting rows=%v after a failed audit, want none", rows)
+	}
+	if err := s.RetryReview(ctx, r, g.pull, Options{}); err != nil {
+		t.Fatalf("poll after the journal recovers: %v", err)
+	}
+	st := retryStateOf(t, s, r)
+	if !st.WaitConflict || st.Failures != 2 || st.Escalated {
+		t.Fatalf("state=%+v, want the conflict wait set and the kept count", st)
+	}
+	rows := waitingRows(t, s, r)
+	if len(rows) != 1 || rows[0]["reason"] != "conflict" || rows[0]["failures"] != float64(2) {
+		t.Fatalf("waiting rows=%v, want one conflict row", rows)
+	}
+}
+
+// A poll the GitHub client skips while the hold reads the head's review
+// status is a wait, as on the main path: no error and no attempt.
+func TestRetryReviewSkippedPollInHoldIsWait(t *testing.T) {
+	s, g, n, r, _ := failedRetryHead(t, 2, 3)
+	makeConflicting(g)
+	g.historyErr = github.ErrPollSkipped
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatalf("skipped poll in the hold: %v", err)
+	}
+	if g.pullCalls != 1 {
+		t.Fatalf("pull calls=%d, want the fresh read only: a review ran", g.pullCalls)
+	}
+	st := retryStateOf(t, s, r)
+	if st.Failures != 2 || st.Escalated {
+		t.Fatalf("state=%+v, want the kept count and no escalation", st)
+	}
+	if n.count != 0 || len(auditRows(t, s, r, "review-failed")) != 0 {
+		t.Fatalf("failure or escalation on a skipped poll: %v", n.events)
 	}
 }
