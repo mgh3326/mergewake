@@ -2009,7 +2009,11 @@ threshold. Failed attempts back off exponentially and persist per PR head in
 `<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
 `3` failures. A new head resets the counter. At the threshold, one
 `automation-failed` event interrupts `notifier.lane`; later attempts keep the
-bounded backoff. These counters are per host. GitHub review leases still
+bounded backoff. While a failed head conflicts or its required checks are
+red, retries and the failure escalation wait: the first wait per head and
+reason writes a `review-retry-waiting` row, and the count, backoff and last
+error stay as they were until the head can merge cleanly again. These
+counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
