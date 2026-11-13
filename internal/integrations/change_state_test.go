@@ -199,6 +199,7 @@ func TestHKChangeOutboxReplaysAfterFailure(t *testing.T) {
 	if err != nil || len(files) != 1 || !strings.Contains(logs.String(), "hk change request failed") {
 		t.Fatalf("files=%v err=%v logs=%s", files, err, logs.String())
 	}
+	abandonClaims(w)
 	mu.Lock()
 	fail = false
 	mu.Unlock()
@@ -207,6 +208,7 @@ func TestHKChangeOutboxReplaysAfterFailure(t *testing.T) {
 	t.Setenv("HANDOFFKEEP_TOKEN_SVC_MERGEWAKE", "test")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", "")
 	t.Setenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", "")
+	abandonClaims(w)
 	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)), dir)
 	drainChange(t, restarted)
 	files, err = os.ReadDir(w.outbox)
@@ -258,6 +260,7 @@ func TestHKChangeOutboxSurvivesBoundedShutdown(t *testing.T) {
 	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	restarted.outbox = dir
 	restarted.endpoint = func() (*hkJobs, error) { return &hkJobs{base: fast.URL, token: "test"}, nil }
+	abandonClaims(w)
 	restarted.reload()
 	drainChange(t, restarted)
 	mu.Lock()
@@ -290,6 +293,7 @@ func TestHKChangeOutboxRetainsEndpointFailure(t *testing.T) {
 	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	restarted.outbox = dir
 	restarted.endpoint = func() (*hkJobs, error) { return &hkJobs{base: srv.URL, token: "test"}, nil }
+	abandonClaims(w)
 	restarted.reload()
 	drainChange(t, restarted)
 	files, err = os.ReadDir(dir)
@@ -335,6 +339,7 @@ func TestHKChangeOutboxReplaysFindingsInOrder(t *testing.T) {
 	restarted := NewChangeWriter(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	restarted.outbox = dir
 	restarted.endpoint = w.endpoint
+	abandonClaims(w)
 	restarted.reload()
 	drainChange(t, restarted)
 	mu.Lock()
