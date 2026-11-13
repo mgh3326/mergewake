@@ -165,6 +165,14 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 		bound.failedHosts = append([]string(nil), scan.failedHosts...)
 		bound.via += " (partial pane scan)"
 	}
+	// A partial scan cannot establish that one observed pane is the unique
+	// takeover candidate. Keep the bound author lane and report every observed
+	// candidate in the partial-route audit.
+	if len(bound.failedHosts) > 0 && len(others) > 0 && !finished {
+		bound.candidates = others
+		bound.unknown = unknown
+		return bound, nil
+	}
 	route, takenOver := bound, false
 	switch len(others) {
 	case 0:

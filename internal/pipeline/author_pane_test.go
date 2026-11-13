@@ -245,7 +245,7 @@ func setPartialAuthorScan(s *Service, run *scriptRunner) {
 	run.errs = map[string]error{key("ssh", "-o", "BatchMode=yes", "-T", "-n", "unavailable", reap.Join([]string{"herdr", "agent", "list"})): errors.New("pane list failed")}
 }
 
-func TestPartialAuthorScanStillUsesUniqueTakeover(t *testing.T) {
+func TestPartialAuthorScanKeepsBoundLaneAndAuditsCandidate(t *testing.T) {
 	s, _, run := takeoverSetup(t, paneB)
 	setPartialAuthorScan(s, run)
 	var out bytes.Buffer
@@ -255,12 +255,59 @@ func TestPartialAuthorScanStillUsesUniqueTakeover(t *testing.T) {
 		t.Fatal(e)
 	}
 	n := s.Notifier.(*ackNotifier)
-	if n.count != 1 || n.events[0].Lane != "w-9-lane" {
-		t.Fatalf("unique healthy-host takeover not selected: %+v calls=%v", n.events, run.calls)
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("partial scan did not keep bound lane: %+v calls=%v", n.events, run.calls)
 	}
 	rows := auditRecords(t, out.Bytes(), "findings-route-partial")
-	if len(rows) != 1 || rows[0]["lane"] != "w-9-lane" {
+	if len(rows) != 1 || rows[0]["lane"] != "w-7" || !strings.Contains(fmt.Sprint(rows[0]["candidates"]), "w-9") {
 		t.Fatalf("partial takeover audit rows %+v", rows)
+	}
+}
+
+func TestPartialAuthorScanReadyRecordKeepsBoundLane(t *testing.T) {
+	s, _, _, r := workerNotifySetup(t)
+	sink := s.Sink.(*jobSink)
+	sink.recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
+	run := authorHost(paneB)
+	s.Runner = run
+	setPartialAuthorScan(s, run)
+	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	rows := prNotifyRows(t, s, r)
+	if len(rows) != 1 || rows[0]["lane"] != "worker-lane" || !strings.Contains(fmt.Sprint(rows[0]["via"]), "partial pane scan") {
+		t.Fatalf("partial READY route: %+v", rows)
+	}
+}
+
+func TestPartialAuthorScanStoredDeliveryDoesNotResendToCandidate(t *testing.T) {
+	s, _, _ := takeoverSetup(t, aPane{"w1:p9", "w-5", "/wt/z", "other-branch", projectOrigin})
+	var out bytes.Buffer
+	s.Out = &out
+	n := s.Notifier.(*ackNotifier)
+	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	deliver(t, s, testRepoFor(s))
+	if n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("initial delivery: %+v", n.events)
+	}
+	s.Runner = authorHost(paneB)
+	setPartialAuthorScan(s, s.Runner.(*scriptRunner))
+	base := s.now()
+	s.Now = func() time.Time { return base.Add(s.Config.Daemon.PR.Findings.AckWindow() + time.Minute) }
+	deliver(t, s, testRepoFor(s))
+	if n.count != 2 || n.events[1].Lane != "w-7" || !strings.HasSuffix(n.events[1].ID, "-resend") {
+		t.Fatalf("partial re-send moved to candidate: %+v", n.events)
+	}
+}
+
+func TestFullAuthorScanStillTakesOverUniquePane(t *testing.T) {
+	s, _, _ := takeoverSetup(t, paneB)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-9-lane" || rt.via != "takeover pane w-9" {
+		t.Fatalf("route %q via %q", rt.lane, rt.via)
 	}
 }
 
