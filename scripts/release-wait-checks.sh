@@ -1,6 +1,7 @@
 #!/bin/sh
 # Fail publication unless every check named by the repository policy at SHA is
-# green.
+# green, or main contains SHA and has green policy checks. Exit 3 means a newer
+# release tag on main already contains SHA and supersedes this release.
 #
 # The names are read from POLICY_FILE at the tag by decoding the YAML with the
 # repository's own gopkg.in/yaml.v3, then selected in mergewake's DeploySet
@@ -9,7 +10,8 @@
 # result per name wins, so a rerun clears an older failure and an in-flight run
 # keeps the name pending.
 #
-# usage: scripts/release-wait-checks.sh SHA [POLICY_FILE]
+# usage: scripts/release-wait-checks.sh SHA [POLICY_FILE] (exit 0 green, 1
+# failed or timed out, 2 usage, 3 superseded by a newer release tag)
 #
 # GITHUB_REPOSITORY must name the repository (owner/name) and GH_TOKEN
 # authenticates gh. RELEASE_CHECKS_TIMEOUT_SECONDS bounds the wait (default
@@ -291,11 +293,82 @@ func main() {
 }
 GOVERDICT
 
+check_main_coverage() {
+	if ! gh api "repos/$repo/branches/main" --jq '.commit.sha' > "$work/head" 2> "$work/error"; then
+		return 2
+	fi
+	head=$(cat "$work/head")
+	[ "$head" != "$sha" ] || return 1
+
+	if ! gh api --paginate --slurp "repos/$repo/compare/$sha...$head" \
+		--jq '[.[0].status, (.[0].total_commits | tostring), ([.[].commits[]?.sha] | join(","))] | @tsv' \
+		> "$work/compare" 2> "$work/error"; then
+		return 2
+	fi
+	compare_status=
+	total_commits=
+	compare_shas=
+	IFS="$(printf '\t')" read -r compare_status total_commits compare_shas < "$work/compare" || true
+	compare_count=0
+	if [ -n "${compare_shas:-}" ]; then
+		compare_count=$(printf '%s\n' "$compare_shas" | awk -F, '{print NF}')
+	fi
+	case ${total_commits:-} in
+		'' | *[!0-9]*) return 1 ;;
+		*) [ "$compare_count" -ge "$total_commits" ] || return 1 ;;
+	esac
+	[ "${compare_status:-}" = ahead ] || return 1
+
+	if ! gh api --paginate "repos/$repo/tags" \
+		--jq '.[] | [.name, .commit.sha] | @tsv' \
+		> "$work/tags" 2> "$work/error"; then
+		return 2
+	fi
+	while IFS="$(printf '\t')" read -r tag tag_sha; do
+		case $tag in
+			v0.0.0 | *-*) continue ;;
+			*) ;;
+		esac
+		printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || continue
+		[ "$tag_sha" != "$sha" ] || continue
+		case ,${compare_shas:-}, in
+			*,"$tag_sha",*)
+				printf 'release-wait-checks: superseded by %s at %s; tag commit is %s\n' \
+					"$tag" "$tag_sha" "$sha"
+				exit 3
+				;;
+		esac
+	done < "$work/tags"
+
+	if ! gh api --paginate "repos/$repo/commits/$head/check-runs?filter=latest&per_page=100" \
+		--jq '.check_runs[] | [.id, .name, .status, (.conclusion // ""), (.details_url // "")] | @tsv' \
+		> "$work/head-runs" 2> "$work/error" ||
+		! gh api --paginate "repos/$repo/commits/$head/statuses?per_page=100" \
+			--jq '.[] | [.id, .context, .state, (.target_url // "")] | @tsv' \
+			> "$work/head-statuses" 2>> "$work/error"; then
+		return 2
+	fi
+	if ! (cd "$module_root" && go run "$work/verdict.go" "$policy_abs" "$work/head-runs" "$work/head-statuses" > "$work/head-verdicts" 2>> "$work/error"); then
+		return 3
+	fi
+	head_green=1
+	while IFS="$(printf '\t')" read -r name state url; do
+		[ "$state" = success ] || head_green=0
+	done < "$work/head-verdicts"
+	if [ "$head_green" -eq 1 ]; then
+		printf 'release-wait-checks: main head %s contains tag commit %s; all %s policy checks are green\n' \
+			"$head" "$sha" "$(wc -l < "$work/head-verdicts" | tr -d ' ')"
+		exit 0
+	fi
+	return 1
+}
+
 start=$(date +%s)
 last_error=
 missing=
 while :; do
 	: > "$work/error"
+	coverage_error=
 	if gh api --paginate "repos/$repo/commits/$sha/check-runs?filter=latest&per_page=100" \
 		--jq '.check_runs[] | [.id, .name, .status, (.conclusion // ""), (.details_url // "")] | @tsv' \
 		> "$work/runs" 2> "$work/error" &&
@@ -328,6 +401,19 @@ while :; do
 				"$(wc -l < "$work/verdicts" | tr -d ' ')" "$sha"
 			exit 0
 		fi
+
+		# Only pending tag checks enter the main coverage path. A failed API
+		# read leaves the result unknown for this poll and is retried next time.
+		if check_main_coverage; then
+			:
+		else
+			coverage_result=$?
+			case $coverage_result in
+				2) coverage_error=$(tail -n 1 "$work/error" 2>/dev/null || true) ;;
+				3) coverage_error="cannot judge main-head checks: $(cat "$work/error" 2>/dev/null || true)" ;;
+			esac
+			[ -n "$coverage_error" ] || [ "$coverage_result" -eq 1 ] || coverage_error="gh api failed"
+		fi
 	else
 		# A transient API failure is retried until the bound, never read as a
 		# missing check or as permission to publish stale verdicts.
@@ -338,6 +424,9 @@ while :; do
 	if [ $((now - start)) -ge "$timeout" ]; then
 		if [ -n "$last_error" ]; then
 			fail "could not read the checks for $sha within ${timeout}s: $last_error"
+		fi
+		if [ -n "$coverage_error" ]; then
+			fail "timed out after ${timeout}s waiting for:$missing; main coverage error: $coverage_error"
 		fi
 		fail "timed out after ${timeout}s waiting for:$missing"
 	fi

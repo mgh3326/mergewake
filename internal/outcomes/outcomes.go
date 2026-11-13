@@ -401,6 +401,22 @@ func (c CLI) Publish(ctx context.Context, v Outcome) (string, error) {
 	if ref, shared := earlierRep(b, v.ID); shared {
 		return "confirmed:" + v.ID, nil
 	} else if ref != "" {
+		if strings.HasPrefix(ref, "origin:") {
+			b, err := c.run(ctx, []string{"reps", "pending", "retry", ref})
+			if err != nil {
+				return "", fmt.Errorf("rep delivered locally only (%s); retry failed: %s; retained in outbox", ref, integrations.Detail(err))
+			}
+			var receipt struct {
+				ID int `json:"id"`
+			}
+			if err := json.Unmarshal(b, &receipt); err != nil {
+				return "", fmt.Errorf("rep delivered locally only (%s); retry failed: invalid JSON response: %s; retained in outbox", ref, err)
+			}
+			if receipt.ID <= 0 {
+				return "", fmt.Errorf("rep delivered locally only (%s); retry failed: response has no positive server id; retained in outbox", ref)
+			}
+			return fmt.Sprintf("srv:%d", receipt.ID), nil
+		}
 		return "", fmt.Errorf("rep delivered locally only (%s), not shared; retained in outbox", ref)
 	}
 	if v.Profile == "" || v.Model == "" || v.Grade == "" || v.Tier == "" {

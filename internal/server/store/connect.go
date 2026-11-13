@@ -36,11 +36,15 @@ type Store struct {
 // Connect reads credentials only from host environment or a private file. It
 // connects but does not migrate; Open also checks the complete schema.
 func Connect(ctx context.Context) (*Store, error) {
-	dsn, err := readDSN(os.Getenv, os.ReadFile, os.Stat)
+	return connect(ctx, os.Getenv)
+}
+
+func connect(ctx context.Context, getenv func(string) string) (*Store, error) {
+	dsn, err := readDSN(getenv, os.ReadFile, os.Stat)
 	if err != nil {
 		return nil, err
 	}
-	caFile, serverName := os.Getenv("MERGEWAKE_MYSQL_CA_FILE"), os.Getenv("MERGEWAKE_MYSQL_SERVER_NAME")
+	caFile, serverName := getenv("MERGEWAKE_MYSQL_CA_FILE"), getenv("MERGEWAKE_MYSQL_SERVER_NAME")
 	if caFile != "" {
 		if serverName == "" {
 			return nil, ErrConfig
@@ -95,13 +99,17 @@ func validateTLSMode(tlsValue, caFile, serverName string) error {
 }
 
 func privateCATLSConfig(path, serverName string) (*tls.Config, error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, ErrConfig
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, ErrConfig
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || (info.Mode().Perm() != 0600 && info.Mode().Perm() != 0644) || info.Size() > maxCAFileSize {
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || (opened.Mode().Perm() != 0600 && opened.Mode().Perm() != 0644) || opened.Size() > maxCAFileSize || !os.SameFile(info, opened) {
 		return nil, ErrConfig
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxCAFileSize+1))
@@ -183,7 +191,11 @@ func pinnedCertificateVerifier(roots *x509.CertPool, serverName string) func(tls
 }
 
 func Open(ctx context.Context) (*Store, error) {
-	s, err := Connect(ctx)
+	return open(ctx, os.Getenv)
+}
+
+func open(ctx context.Context, getenv func(string) string) (*Store, error) {
+	s, err := connect(ctx, getenv)
 	if err != nil {
 		return nil, err
 	}

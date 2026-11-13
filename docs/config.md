@@ -634,6 +634,8 @@ nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
 
+A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
+
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire
 selects the reviewer. `review.profiles` is still read for the author's model
@@ -756,8 +758,9 @@ on it.
   posted. The `review` audit event counts them as `duplicates_dropped`.
 - **Closed contract.** A PR-body section headed `Acceptance` (`Acceptance
   criteria`, `Acceptance (…)`; any heading level, up to the next heading of the
-  same or higher level), else the same section in the body of the task named by
-  the `Mergewake-Task` trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
+  same or higher level), else the same section in the body document named by
+  the task's `body_doc` field for the task named by the `Mergewake-Task`
+  trailer when the sink can read task text, is capped at 4 KB and passed to the reviewer as
   the closed list of what the change must do. The reviewer marks a finding
   outside it with `"advisory": true`. mergewake then caps the finding at
   `medium` (unrated becomes `low`), posts it with an `<!-- mergewake-advisory -->`
@@ -829,7 +832,7 @@ Mergewake-Tier: T1
 ```
 
 `Mergewake-Author-Model` is optional when the configured author profile has a
-concrete `--model` argument. Use `baseline` and `downshift` arm names for pacelever exploration compatibility.
+concrete `--model` argument. Use `baseline` and `downshift` arm names for exploration compatibility.
 Grade and tier come from the trailer, else from the `(grade X, Tn)` marker in the
 title of the PR's `Mergewake-Task`, else they are unknown; no config default fills
 them. A row with an unknown grade is never published; `outcomes report` counts it
@@ -905,16 +908,18 @@ Everything else is kept, including `PATH`, `HOME`, `XDG_*`,
 through its own configuration. The daemon's own environment is not
 changed; its hk HTTP clients keep these variables.
 
-Only a `srv:` row is a receipt. Before each `reps add`, mergewake lists the
-profile's reps and looks for a row whose notes carry the same outcome id:
+Only a `srv:` row is a receipt. Before publishing, mergewake lists the
+profile's reps and looks for a row whose notes carry the same outcome id. A
+`srv:` row takes precedence over pending local rows:
 
 | Earlier row | Result |
 |---|---|
 | `id=srv:N` | Confirmed and recorded as published; no add. |
-| `id=origin:N` or `id=local:N` | No add. The outcome is not published and stays in the outbox: `rep delivered locally only (origin:N), not shared; retained in outbox`. |
-| None | `reps add`. A reply other than `recorded rep id=srv:N` stays in the outbox, and the next flush finds its row. |
+| `id=origin:N` | Run `reps pending retry origin:N` within the same 45-second bound. A reply with a positive server `id` records `srv:<id>`; on failure, the outcome stays in the outbox and the next flush retries. |
+| `id=local:N` | No retry or add. The outcome is not published and stays in the outbox: `rep delivered locally only (local:N), not shared; retained in outbox`. |
+| None | `reps add`. A reply other than `recorded rep id=srv:N` stays in the outbox; the next flush finds its row and retries it if it has an `origin:N` id. |
 
-A local-only row stops duplicate adds but is never counted as shared:
+A `local:N` row stops duplicate adds but is never counted as shared:
 `outcomes report --source hk` reads `srv:` rows only.
 
 Publishing runs in one background publisher in the daemon, while the `pr` role
@@ -957,8 +962,8 @@ through the configured reps CLI, not other manual bench records.
 | --- | --- | --- |
 | `type` | `noop` (also empty) | `noop`, `stdout`, or `panewire`. |
 | `command` | `panewire` for that adapter | Executable path. Ignored for noop/stdout. |
-| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. |
-| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. |
+| `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. Must match panewire's lane rule: 1–128 characters, starting with an ASCII letter or digit and continuing with ASCII letters, digits, `.`, `_`, `:`, or `-`. |
+| `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. Must match the same panewire lane rule as `lane`. |
 
 The panewire adapter executes literal arguments equivalent to:
 
@@ -1518,6 +1523,7 @@ For `example/project`, state resides beneath
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
+| `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
@@ -1693,7 +1699,9 @@ Requests must `POST` the exact path with a body of at most 5 MiB and a valid
 signatures get 401 and trigger nothing; verified deliveries get 202 whether
 or not anything was triggered. One log line per delivery records the
 `X-GitHub-Event`, the `X-GitHub-Delivery` id, `repository.full_name` and the
-roles woken — never the body, the signature or other headers.
+roles woken — never the body, the signature or other headers. A repeated
+delivery id is logged once more as a repeat and does nothing; `hook_id` tells
+two hooks apart when they send the same delivery id.
 
 | `X-GitHub-Event` | Roles woken |
 | --- | --- |
@@ -1718,18 +1726,21 @@ closed vocabulary: `check_failed:<name>` per failing required check,
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
 `triage_unanswered:<n>`), `finding_outside_diff:<n>` (critical or high findings a pass listed in its review body because their path or line is not in the diff; each is tracked across heads by the `od-…` ref the BLOCKED notice names — it stays open until a person answers it by PR comment naming the ref, its `path:line`, or its title, with `Fixed in <sha>` naming a commit in the PR's history, `Dismiss: <reason>`, or `Disposition: defer <task>` (the task as `4253`, `hk 4253`, `hk:4253` or `#4253`); or until a later completed review pass does not report it again — and only when that pass's prompt listed the finding, which the pass receipt records — which re-reviews it away. A finding answered or re-reviewed never comes back. Reviews posted before the body listed findings keep the old rule: the opaque count holds only the current head's patch-matching passes and a person's `Dismiss:` comment naming the head's SHA prefix clears it), `review_missing`, `conflict`. Queued or running
 check evidence emits nothing, and neither does a required check that has not reported yet
-inside the grace described under `check_absent` below. A READY verdict under acting mode with
-`enabled` repository policy merges the gated head and records `MERGED`; no lane
-event is sent for either. Each `(PR, head,
+inside the grace described under `check_absent` below. Under acting mode,
+`enabled` repository policy merges the gated head. MERGED is sent once per
+(PR, head) to the PR's design lane; failed sends and audit rows remain pending
+and retry on every repository sweep. Each `(PR, head,
 verdict)` is handled once per the `pr-notify-sent` state file; a changed
 BLOCKED reason set is a new verdict that emits again for the same head, a new
 head re-arms notification, and a restart does not resend. BLOCKED is
 declared with `panewire emit --type blocked`, so it stays unread on the
 receiving lane until it runs `panewire inbox ack` (panewire
 `docs/quiet-delivery.md` §Must-ack types; a panewire too old for a type gets the
-event untyped). READY and MERGED are recorded, never sent: nobody acts on either,
-because mergewake merges on its own gate. Each writes its `pr-notify-sent` key and
-one `pr-notify` decision row with `"suppressed":"record only"`, the head's
+event untyped). READY is recorded, never sent, because mergewake merges on its own
+gate. MERGED writes one `pr-notify` row and its sent key after the row is durable;
+no design lane is recorded as `"no design lane"`. Recent PRs merged outside
+mergewake also receive one notice. Pending notices older than 24 hours are
+recorded as gave up. The head's
 summary, and the author worker lane (job bound to the task, else the author
 pane) it would have gone to in `lane` and `via`, if any. A READY also starts its
 clock in `<state_dir>/<repo>/pr-ready-renotify.json`, which `merge_overdue`
@@ -1787,15 +1798,17 @@ holding the head: up to ten, then `and N more`, within a byte budget that keeps
 the event under panewire's 2048-byte limit. Each entry names the thread (its URL,
 else its id), the finding's author, its severity (`unrated` when none is
 readable), and `path:line`. A thread with a reply names the latest one and says
-`reply not accepted`, since only a reply of `Fixed in <sha>` or `Dismiss: <evidence>`
-clears a block-class thread. When the head's review pass is complete and no
-holding finding was posted on the head, the text says the latest review pass
-raised no new findings. The list can be shorter than the `blocking_findings:<n>`
+`reply not accepted`, since a block-class thread clears when it is resolved,
+or with a reply of `Fixed in <sha>` or `Dismiss: <evidence>`. When the head's
+review pass is complete and no holding finding was posted on the head, the
+text says the latest review pass on the head posted no holding finding and
+that the threads above hold from earlier passes. The list can be shorter than the `blocking_findings:<n>`
 count, because a reviewer still requesting changes counts toward the count but
 is not a thread.
 
-`READY` and `MERGED` are recorded, not sent, so the design session hears only the
-BLOCKED reasons that need its decision.
+`READY` is recorded, not sent. `MERGED` is sent once per (PR, head) to the PR's
+design lane and retried until sent, so the design session hears merge notices
+and the BLOCKED reasons that need its decision.
 
 A head that keeps `review_missing` for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
@@ -1938,6 +1951,9 @@ already sent to the finished lane is resent once to the new lane under the event
 id `<id>-reroute`, audited as `findings-route-changed`; an acknowledged one is
 never rerouted. A terminal job whose hosts could not all be read keeps its
 lane and is audited as `findings-route-partial` with `"liveness":"unknown"`.
+A takeover is not taken while any configured host cannot be read: the bound
+author lane stays selected, and `findings-route-partial` records the candidate
+panes observed on the hosts that were read.
 A task or job read error retries without rerouting.
 
 `BLOCKED` notices for `blocking_findings`, `triage_unanswered`, or `check_failed`
@@ -1976,8 +1992,8 @@ daemon:
 ```
 
 Deliveries persist in `<state_dir>/<repo>/findings-deliveries.json`. BLOCKED
-declares `blocked`; READY and MERGED are recorded, not sent, so they declare
-no event. Watch holds declare `watch-hold` once per red main episode and hold
+declares `blocked`; READY is recorded, not sent, while MERGED is sent once per
+(PR, head) to the design lane and retried until sent. Watch holds declare `watch-hold` once per red main episode and hold
 reason; culprit recovery declares `culprit-hold`. Deployment decisions
 continue through the handoffkeep approval adapter. Panewire's reviewed desk
 policy keeps routine events in its inbox and decision events as interrupts.
@@ -1995,7 +2011,11 @@ threshold. Failed attempts back off exponentially and persist per PR head in
 `<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
 `3` failures. A new head resets the counter. At the threshold, one
 `automation-failed` event interrupts `notifier.lane`; later attempts keep the
-bounded backoff. These counters are per host. GitHub review leases still
+bounded backoff. While a failed head conflicts or its required checks are
+red, retries and the failure escalation wait: the first wait per head and
+reason writes a `review-retry-waiting` row, and the count, backoff and last
+error stay as they were until the head can merge cleanly again. These
+counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.

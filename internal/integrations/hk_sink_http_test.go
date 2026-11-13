@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,7 +93,8 @@ func TestHKSinkCallsGoOverHTTPWithSvcToken(t *testing.T) {
 		}
 	}
 	want := map[string]int{
-		"GET /v1/tasks/42":                                 5, // Lane, TaskBody, TaskJob, TaskPriority, Reopen's read
+		"GET /v1/tasks/42": 5, // Lane, TaskBody, TaskJob, TaskPriority, Reopen's read
+		"GET /v1/documents/design%2F2026-11-08%2Fbody":     1, // TaskBody's linked document
 		"POST /v1/tasks/42/comments":                       1,
 		"POST /v1/tasks/42/reopen":                         1,
 		"PUT /v1/attachments":                              1,
@@ -155,10 +157,15 @@ func TestHKSinkUnconfiguredRunsNoSubprocess(t *testing.T) {
 func TestHKSinkCLIHTTPParity(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"merged with job", hkTask(42, "merged", "mergewake-design", "Fix the watch (grade B, T2)", 2, `{"pr":"https://github.com/example/project/pull/7","job_id":"wk-3549-a"}`)},
+		{"deployed", hkTask(42, "deployed", "lane-a", "Deployed", 2, `{}`)},
+		{"completed", hkTask(42, "completed", "lane-a", "Completed", 2, `{}`)},
 		{"decision request", hkTask(42, "developing", "deploy-lane", "Deploy approval (grade A, T3)", 1,
 			`{"job_id":"wk-7","decision_request":{"id":"dr-42-1","revision":1,"status":"open","question":"Approve?","requested_by":"svc-mergewake","requested_at":"2026-11-08T00:00:00Z","human_only":true}}`)},
 		{"no job no lane", hkTask(42, "developing", "", "Untitled", 0, `{}`)},
 		{"dropped", hkTask(42, "dropped", "lane-b", "Dropped (grade C)", 4, `{"closure":{"type":"dropped","evidence":"superseded"}}`)},
+		{"duplicate", hkTask(42, "duplicate", "lane-b", "Duplicate", 4, `{}`)},
+		{"icebox", hkTask(42, "icebox", "lane-b", "Icebox", 4, `{}`)},
+		{"unstarted", hkTask(42, "unstarted", "lane-b", "Unstarted", 4, `{}`)},
 		{"legacy reopened", hkTask(42, "reopened", "lane-c", "Legacy", 3, `{"job_id":"wk-é-1"}`)},
 		{"minimal", `{"id":42,"title":"t","state":"merged","refs":{}}`},
 	} {
@@ -185,16 +192,108 @@ func TestHKSinkCLIHTTPParity(t *testing.T) {
 			if want, we := cliTaskBody(out); e != nil || we != nil || body != want {
 				t.Errorf("body: http %q %v, cli %q %v", body, e, want, we)
 			}
-			// Reopen acts on the state the CLI parser read: merged or dropped
-			// reopens, reopened only comments, anything else is refused.
+			// Reopen follows hk's current reopenable states; legacy reopened
+			// remains comment-only and other active states are refused.
 			e = h.Reopen(ctx, "42", "parity")
 			state := cliState(out)
-			wantReopen := state == "merged" || state == "dropped"
+			wantReopen := slices.Contains([]string{"merged", "deployed", "completed", "dropped", "duplicate", "icebox"}, state)
 			if got := len(hk.Reopens()) == 1; got != wantReopen {
 				t.Errorf("state %q: reopened=%t", state, got)
 			}
-			if wantErr := !wantReopen && state != "reopened"; (e != nil) != wantErr {
+			if wantErr := !wantReopen && state != "reopened" && state != "unstarted"; (e != nil) != wantErr {
 				t.Errorf("state %q: reopen err = %v", state, e)
+			}
+		})
+	}
+}
+
+func TestTaskBodyReadsLinkedDocument(t *testing.T) {
+	hk := hktest.New(t)
+	hk.SetTask(42, `{"id":42,"title":"task","state":"unstarted","body_doc":"design/task-body"}`)
+	hk.SetDocument("design/task-body", "# Task\n\n## Acceptance\n\n- linked contract\n")
+	body, err := (Handoffkeep{}).TaskBody(context.Background(), "42")
+	if err != nil || body != "# Task\n\n## Acceptance\n\n- linked contract\n" {
+		t.Fatalf("TaskBody = %q, %v", body, err)
+	}
+}
+
+func TestTaskBodySectionSuffixReadsNamedDocument(t *testing.T) {
+	hk := hktest.New(t)
+	hk.SetTask(42, `{"id":42,"title":"task","state":"unstarted","body_doc":"design/x#3-task"}`)
+	hk.SetDocument("design/x", "# Task\n\n## Acceptance\n\n- sectioned contract\n")
+	body, err := (Handoffkeep{}).TaskBody(context.Background(), "42")
+	if err != nil || body != "# Task\n\n## Acceptance\n\n- sectioned contract\n" {
+		t.Fatalf("TaskBody = %q, %v", body, err)
+	}
+	var docReads []string
+	for _, r := range hk.Requests() {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/v1/documents/") {
+			docReads = append(docReads, r.Path)
+		}
+	}
+	if len(docReads) != 1 || docReads[0] != "/v1/documents/design%2Fx" {
+		t.Fatalf("document requests = %q, want [/v1/documents/design%%2Fx]", docReads)
+	}
+}
+
+func TestTaskBodyDocumentNotFoundAndReadError(t *testing.T) {
+	t.Run("not found", func(t *testing.T) {
+		hk := hktest.New(t)
+		hk.SetTask(42, `{"id":42,"title":"task","state":"unstarted","body_doc":"design/missing"}`)
+		body, err := (Handoffkeep{}).TaskBody(context.Background(), "42")
+		if err != nil || body != "" {
+			t.Fatalf("TaskBody = %q, %v", body, err)
+		}
+	})
+	t.Run("server error", func(t *testing.T) {
+		hk := hktest.New(t)
+		hk.SetTask(42, `{"id":42,"title":"task","state":"unstarted","body_doc":"design/error"}`)
+		hk.Fail("GET /v1/documents/{key}", http.StatusInternalServerError, "internal")
+		if body, err := (Handoffkeep{}).TaskBody(context.Background(), "42"); err == nil || body != "" {
+			t.Fatalf("TaskBody = %q, %v; want error", body, err)
+		}
+	})
+}
+
+func TestTaskBodyAndReopenUnknownTask(t *testing.T) {
+	hktest.New(t)
+	h := Handoffkeep{}
+	if _, err := h.TaskBody(context.Background(), "404"); err == nil || !strings.Contains(err.Error(), "not_found") {
+		t.Fatalf("TaskBody error = %v, want not_found", err)
+	}
+	if err := h.Reopen(context.Background(), "404", "reason"); err == nil || !strings.Contains(err.Error(), "not_found") {
+		t.Fatalf("Reopen error = %v, want not_found", err)
+	}
+}
+
+func TestReopenCurrentHKStates(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  string
+	}{
+		{"merged", "reopen"}, {"deployed", "reopen"}, {"completed", "reopen"},
+		{"dropped", "reopen"}, {"duplicate", "reopen"}, {"icebox", "reopen"},
+		{"unstarted", "comment"}, {"reopened", "comment"}, {"developing", "refuse"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			hk := hktest.New(t)
+			hk.SetTask(42, `{"id":42,"title":"task","state":"`+tc.state+`"}`)
+			err := (Handoffkeep{}).Reopen(context.Background(), "42", "reason")
+			if len(hk.Comments()) != 1 {
+				t.Fatalf("comments = %d, want 1", len(hk.Comments()))
+			}
+			wantReopens := 0
+			if tc.want == "reopen" {
+				wantReopens = 1
+			}
+			if got := len(hk.Reopens()); got != wantReopens {
+				t.Fatalf("reopens = %d, want %q", got, tc.want)
+			}
+			if (tc.want == "refuse") != (err != nil) {
+				t.Fatalf("Reopen error = %v, want %s", err, tc.want)
+			}
+			if tc.want == "refuse" && !strings.Contains(err.Error(), "merged, deployed, completed, dropped, duplicate or icebox") {
+				t.Fatalf("refusal message = %v", err)
 			}
 		})
 	}
@@ -328,7 +427,7 @@ func TestHKSinkReopenOutcomes(t *testing.T) {
 		hk := hktest.New(t)
 		hk.SetTask(42, hkTask(42, "developing", "l", "t", 0, `{}`))
 		e := (Handoffkeep{Runner: noCLI(t)}).Reopen(ctx, "42", "note")
-		if e == nil || !strings.Contains(e.Error(), "explicit reopen requires merged or dropped") || len(hk.Comments()) != 1 || len(hk.Reopens()) != 0 {
+		if e == nil || !strings.Contains(e.Error(), "explicit reopen requires merged, deployed, completed, dropped, duplicate or icebox") || len(hk.Comments()) != 1 || len(hk.Reopens()) != 0 {
 			t.Fatalf("err=%v comments=%d reopens=%d", e, len(hk.Comments()), len(hk.Reopens()))
 		}
 	})

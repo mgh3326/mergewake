@@ -3,14 +3,12 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Every host config under examples loads and publishes outcomes through
-// panewire; none names the retired scopefuel or pacelever tool.
+// Every host config under examples loads and publishes outcomes through panewire.
 func TestExampleHostConfigsPublishThroughPanewire(t *testing.T) {
 	files, err := filepath.Glob("../../examples/*.yaml")
 	if err != nil {
@@ -35,9 +33,6 @@ func TestExampleHostConfigsPublishThroughPanewire(t *testing.T) {
 		}
 		if c.Outcomes.Command != "panewire" {
 			t.Errorf("%s: outcomes.command %q, want panewire", f, c.Outcomes.Command)
-		}
-		if strings.Contains(c.Outcomes.Command, "scopefuel") || strings.Contains(c.Outcomes.Command, "pacelever") {
-			t.Errorf("%s: retired tool %q", f, c.Outcomes.Command)
 		}
 		loaded++
 	}
