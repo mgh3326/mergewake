@@ -1345,16 +1345,19 @@ func TestArchiveStaleLockReclaimHasSingleWinner(t *testing.T) {
 	}
 	start := make(chan struct{})
 	type claimResult struct {
+		who     string
 		release func()
 		err     error
 	}
 	results := make(chan claimResult, 2)
+	trace := &claimTrace{}
 	for i := 0; i < 2; i++ {
+		who := fmt.Sprintf("claimer-%d", i)
 		go func() {
-			a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+			a := &Archiver{Runner: &tracingRunner{Runner: &fakeRunner{}, who: who, trace: trace}, DriveDir: e.drive}
 			<-start
 			release, err := a.claim(context.Background(), dest)
-			results <- claimResult{release, err}
+			results <- claimResult{who, release, err}
 		}()
 	}
 	close(start)
@@ -1363,18 +1366,22 @@ func TestArchiveStaleLockReclaimHasSingleWinner(t *testing.T) {
 	// count as a second winner while the first is not holding anything.
 	wins := 0
 	var held []func()
+	var winners []string
 	for i := 0; i < 2; i++ {
 		result := <-results
 		if result.err == nil {
 			wins++
 			held = append(held, result.release)
+			winners = append(winners, result.who)
 		}
 	}
+	// Capture the lock while the winners still hold it, then release them.
+	state := lockState(e, dest)
 	for _, release := range held {
 		release()
 	}
 	if wins != 1 {
-		t.Fatalf("stale lock claim winners=%d, want exactly one", wins)
+		t.Fatalf("stale lock claim winners=%d, want exactly one\nwinners=%v\n%s\ntrace:\n%s", wins, winners, state, trace)
 	}
 }
 
@@ -1414,7 +1421,7 @@ func staleLockDir(t *testing.T, e env, dest, owner string) string {
 // claimConcurrently runs n claims of dest at once and returns their results
 // in order. Every claim has returned before this returns, so a caller that
 // releases winners afterwards measures holders at one time, not in sequence.
-func claimConcurrently(e env, dest string, n int) (releases []func(), busy int, err error) {
+func claimConcurrently(e env, dest string, n int, trace *claimTrace) (releases []func(), busy int, err error) {
 	type result struct {
 		release func()
 		err     error
@@ -1426,7 +1433,8 @@ func claimConcurrently(e env, dest string, n int) (releases []func(), busy int, 
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			a := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+			who := fmt.Sprintf("claimer-%d", i)
+			a := &Archiver{Runner: &tracingRunner{Runner: &fakeRunner{}, who: who, trace: trace}, DriveDir: e.drive}
 			<-start
 			release, err := a.claim(context.Background(), dest)
 			results[i] = result{release, err}
@@ -1434,18 +1442,94 @@ func claimConcurrently(e env, dest string, n int) (releases []func(), busy int, 
 	}
 	close(start)
 	wg.Wait()
-	for _, r := range results {
+	for i, r := range results {
 		var skip *Skip
 		switch {
 		case r.err == nil:
 			releases = append(releases, r.release)
+			trace.add("claimer-%d result: acquired", i)
 		case errors.As(r.err, &skip) && skip.Reason == "archive-lock-busy":
 			busy++
+			trace.add("claimer-%d result: busy", i)
 		default:
+			trace.add("claimer-%d result: error %v", i, r.err)
 			return releases, busy, r.err
 		}
 	}
 	return releases, busy, nil
+}
+
+// claimTrace records what each claimer's shell scripts returned, in the order
+// the scripts finished. Every lock change runs under the lock's guard, so this
+// order is the order of the critical sections a failing run went through.
+type claimTrace struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (c *claimTrace) add(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, fmt.Sprintf(format, args...))
+}
+
+func (c *claimTrace) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.events, "\n")
+}
+
+// tracingRunner runs the real command and records each script's output.
+type tracingRunner struct {
+	reap.Runner
+	who   string
+	trace *claimTrace
+}
+
+func (r *tracingRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	out, err := r.Runner.Run(ctx, name, args, input, dir)
+	if name == "sh" && len(args) > 1 {
+		r.trace.add("%s %s -> out=%q err=%v", r.who, scriptKind(args[1]), out, err)
+	}
+	return out, err
+}
+
+func scriptKind(script string) string {
+	switch {
+	case strings.Contains(script, "take() {"):
+		return "reclaim"
+	case strings.HasPrefix(script, "mkdir -p"):
+		return "claim"
+	default:
+		return "release"
+	}
+}
+
+// lockState describes the lock dir, its guard and its owner file (owner and
+// born) for a destination, for a failure message. It prints the test's clock
+// too, so born can be compared with now.
+func lockState(e env, dest string) string {
+	sum := sha256.Sum256([]byte(dest))
+	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sum))
+	var b strings.Builder
+	fmt.Fprintf(&b, "lock %s\nnow=%d\n", lock, time.Now().Unix())
+	if fi, err := os.Stat(lock); err != nil {
+		fmt.Fprintf(&b, "lock dir: %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "lock dir: exists, mtime=%d\n", fi.ModTime().Unix())
+		entries, _ := os.ReadDir(lock)
+		for _, en := range entries {
+			fmt.Fprintf(&b, "lock entry: %s\n", en.Name())
+		}
+		owner, err := os.ReadFile(filepath.Join(lock, "owner"))
+		fmt.Fprintf(&b, "owner file: %q err=%v\n", owner, err)
+	}
+	if fi, err := os.Stat(lock + ".guard"); err != nil {
+		fmt.Fprintf(&b, "guard: %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "guard: exists, mtime=%d\n", fi.ModTime().Unix())
+	}
+	return b.String()
 }
 
 // moveShim pauses a claim just after its first `mv` of an armed lock path, so
@@ -1589,15 +1673,17 @@ func TestArchiveStaleLockReclaimDeadOwnerOneOfN(t *testing.T) {
 	e := setup(t)
 	dest := filepath.Join(e.drive, "tasks", "2402", "dead-owner")
 	staleLockDir(t, e, dest, "dead 1")
-	releases, busy, err := claimConcurrently(e, dest, 8)
+	trace := &claimTrace{}
+	releases, busy, err := claimConcurrently(e, dest, 8, trace)
+	state := lockState(e, dest)
 	if err != nil {
-		t.Fatalf("claim failed: %v", err)
+		t.Fatalf("claim failed: %v\n%s\ntrace:\n%s", err, state, trace)
 	}
 	for _, release := range releases {
 		release()
 	}
 	if len(releases) != 1 || busy != 7 {
-		t.Fatalf("winners=%d busy=%d, want 1 and 7", len(releases), busy)
+		t.Fatalf("winners=%d busy=%d, want 1 and 7\n%s\ntrace:\n%s", len(releases), busy, state, trace)
 	}
 }
 
@@ -1611,7 +1697,7 @@ func TestArchiveLockReclaimFreshLockStaysBusy(t *testing.T) {
 	}
 	lock := filepath.Join(e.drive, ".locks", fmt.Sprintf("%x", sha256.Sum256([]byte(dest))))
 	before, _ := os.ReadFile(filepath.Join(lock, "owner"))
-	releases, busy, err := claimConcurrently(e, dest, 6)
+	releases, busy, err := claimConcurrently(e, dest, 6, &claimTrace{})
 	if err != nil || len(releases) != 0 || busy != 6 {
 		t.Fatalf("fresh lock: releases=%d busy=%d err=%v, want 0 and 6", len(releases), busy, err)
 	}

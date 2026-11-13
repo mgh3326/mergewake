@@ -114,6 +114,9 @@ type passPlan struct {
 	replacements int
 	// label is the reviewer label of the pass, once one is placed or resumed.
 	label string
+	// supersedes is the label of a dead reviewer this run replaces (replaceDeadSpawn);
+	// the new label must differ from it.
+	supersedes string
 }
 
 // passFailure is a pass that did not post, with the pass number and the
