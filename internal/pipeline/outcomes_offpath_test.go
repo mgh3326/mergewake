@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -169,29 +170,46 @@ func TestOutcomePublisherStopsWithContextDuringPublish(t *testing.T) {
 	}
 }
 
-// One publish run is bounded: a command that never answers is cut off by the
-// run's own deadline, and the outcome stays in the outbox.
-func TestOutcomePublisherRunIsBounded(t *testing.T) {
+// A run attempts every pending outcome of every repository: slow or failing
+// early ones never use up a budget that later ones needed.
+func TestOutcomePublisherRunReachesEveryOutcome(t *testing.T) {
 	s, _, _, _, r := setup(t)
-	finalRow(t, s, r, 1)
-	reps := newHangingReps()
-	t.Cleanup(reps.unblock)
-	s.Runner = reps
+	for pr := 1; pr <= 8; pr++ {
+		finalRow(t, s, r, pr)
+	}
+	runner := &failFirstReps{fail: 7}
+	s.Runner = runner
 	p := s.NewOutcomePublisher([]string{r.Name}, time.Hour)
-	p.Timeout = 200 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); p.Run(ctx) }()
 	t.Cleanup(func() { cancel(); <-done })
-	p.Nudge()
-	<-reps.entered
-	// The run ended by its deadline, so the next nudge starts another run.
-	time.Sleep(500 * time.Millisecond)
-	p.Nudge()
-	waitFor(t, "second run", func() bool { return reps.callCount() >= 2 })
-	if state, _ := s.ledger().Read(); len(state.Published) != 0 {
-		t.Fatalf("a cut-off publish was acknowledged: %v", state.Published)
+	waitFor(t, "the eighth outcome", func() bool { state, _ := s.ledger().Read(); return len(state.Published) == 1 })
+	if n := runner.addCount(); n != 8 {
+		t.Fatalf("%d publishes in the first run, want all 8", n)
 	}
+}
+
+// failFirstReps refuses the first `fail` adds and accepts the rest.
+type failFirstReps struct {
+	mu   sync.Mutex
+	fail int
+	adds int
+}
+
+func (f *failFirstReps) addCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.adds }
+
+func (f *failFirstReps) Run(_ context.Context, _ string, args []string, _, _ string) ([]byte, error) {
+	if len(args) > 1 && args[1] == "add" {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.adds++
+		if f.adds <= f.fail {
+			return nil, errors.New("offline")
+		}
+		return []byte("recorded rep id=srv:1\n"), nil
+	}
+	return nil, nil
 }
 
 func waitFor(t *testing.T, what string, ok func() bool) {

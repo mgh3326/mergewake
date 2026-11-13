@@ -962,9 +962,9 @@ A local-only row stops duplicate adds but is never counted as shared:
 
 Publishing runs in one background publisher in the daemon, while the `pr` role
 is on. It runs at start, on a nudge after each land and each closed-row
-reconcile that read a row, and on a timer of `poll_interval`; a run is bounded to
-five minutes and each publish to 45 seconds, and the publisher stops with the
-daemon. Land, the PR sweep and the reconcile never publish, so none of them
+reconcile that read a row, and on a timer of `poll_interval`; each publish is bounded to 45 seconds and a run
+attempts every pending outcome of every repo (it has no shared deadline that
+slow outcomes could use up), and the publisher stops with the daemon. Land, the PR sweep and the reconcile never publish, so none of them
 waits for a publish and the repo's settle lock is never held across one. A one-shot
 `mergewake land` leaves its outcome in the outbox for the daemon or
 `mergewake outcomes sync`.
@@ -1698,7 +1698,7 @@ daemon:
 The `pr` role's closed-row outcome reconcile runs in a loop of its own beside
 it, not in its sweep: every `daemon.pr.interval`, while `pr` is enabled, with no
 config key of its own, and one repository per goroutine. It reads the open PRs
-from the `pr` queue, so it makes no GitHub request for them and waits (retrying
+from the `pr` engine's own copy of its queue's open set, so it makes no GitHub request or ledger read for them and waits (retrying
 every five seconds) for each repository's first sweep. Each due closed row is
 read at most hourly. A run is bounded to ten minutes and logs one
 `outcome reconcile run` line per repository. The loop stops with the daemon.

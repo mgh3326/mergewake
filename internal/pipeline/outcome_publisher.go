@@ -6,11 +6,6 @@ import (
 	"time"
 )
 
-// outcomePublishRunTimeout bounds one publisher run, which publishes every
-// repository's outbox. Each publish is also bounded on its own (see
-// outcomes.Ledger.Flush).
-const outcomePublishRunTimeout = 5 * time.Minute
-
 // OutcomePublisher publishes the outcomes in the ledger's outbox from one
 // background loop, so no pass that reviews or merges a PR waits for a publish.
 // It runs when nudged (Land and the closed-row reconcile nudge it) and on a
@@ -18,14 +13,14 @@ const outcomePublishRunTimeout = 5 * time.Minute
 type OutcomePublisher struct {
 	s     *Service
 	repos []string
-	// Interval is the timer; Timeout bounds one run.
-	Interval, Timeout time.Duration
-	nudge             chan struct{}
+	// Interval is the timer.
+	Interval time.Duration
+	nudge    chan struct{}
 }
 
 // NewOutcomePublisher is a publisher of the outcomes of repos, in order.
 func (s *Service) NewOutcomePublisher(repos []string, interval time.Duration) *OutcomePublisher {
-	return &OutcomePublisher{s: s, repos: repos, Interval: interval, Timeout: outcomePublishRunTimeout, nudge: make(chan struct{}, 1)}
+	return &OutcomePublisher{s: s, repos: repos, Interval: interval, nudge: make(chan struct{}, 1)}
 }
 
 // Nudge asks for a run. It never blocks, and a burst of nudges is one run.
@@ -59,13 +54,14 @@ func (p *OutcomePublisher) Run(ctx context.Context) {
 	}
 }
 
-// once is one bounded run over every repository. A publication failure is
-// audited by FlushOutcomes and stays in the outbox; any other error is logged.
+// once is one run over every repository. Each publish is bounded on its own
+// (see outcomes.Ledger.Flush) and ends with ctx. The run has no deadline of its
+// own: a shared one would let slow early outcomes starve the later ones, run
+// after run. A publication failure is audited by FlushOutcomes and stays in the
+// outbox; any other error is logged.
 func (p *OutcomePublisher) once(ctx context.Context) {
-	runCtx, cancel := context.WithTimeout(ctx, p.Timeout)
-	defer cancel()
 	for _, repo := range p.repos {
-		if err := p.s.FlushOutcomes(runCtx, repo); err != nil {
+		if err := p.s.FlushOutcomes(ctx, repo); err != nil {
 			if ctx.Err() != nil {
 				return
 			}

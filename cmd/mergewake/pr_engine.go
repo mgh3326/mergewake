@@ -14,7 +14,6 @@ import (
 	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/outcomes"
 	"github.com/mgh3326/mergewake/internal/pipeline"
 	"github.com/mgh3326/mergewake/internal/prstatus"
 	"github.com/mgh3326/mergewake/internal/tracing"
@@ -49,8 +48,9 @@ type prEngine struct {
 	revisit pipeline.Revisit
 
 	mu sync.Mutex
-	// swept is the repos whose sweep has listed their open PRs at least once.
-	swept    map[string]bool
+	// open is each repo's open PRs as this engine knows them, for the
+	// closed-row reconcile (see openSet).
+	open     map[string]*openSet
 	sweepMu  sync.Mutex
 	sweeping map[string]*prSweepState
 	settling map[string]*sync.Mutex
@@ -101,7 +101,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		sweeping: map[string]*prSweepState{}, swept: map[string]bool{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, settling: map[string]*sync.Mutex{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
 		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
@@ -269,10 +269,12 @@ func (e *prEngine) evaluate(ctx context.Context, r config.Repo, w daemon.Work) (
 	}
 	if pr.State != "open" || pr.Merged || (r.Branch != "" && pr.Base.Ref != r.Branch) {
 		e.q.Forget(r.Name, n)
+		e.openOf(r.Name).forget(n)
 		res.gone = true
 		return nil, res
 	}
 	e.q.Learn(r.Name, n, pr.Head.SHA)
+	e.openOf(r.Name).learn(n)
 	// The head is met here at the latest; a delivery that named it set an
 	// earlier time.
 	rec := e.seen.Evaluating(r.Name, n, pr.Head.SHA, evalStart)
@@ -436,6 +438,7 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 // not wait for them.
 func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	setPRSweepStep(ctx, "open_pulls")
+	e.openOf(r.Name).beginList()
 	prs, err := e.gh.OpenPulls(ctx, r.Name, r.Branch)
 	if err != nil {
 		return err
@@ -451,9 +454,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 		heads[pr.Number] = pr.Head.SHA
 	}
 	e.q.SetOpen(r.Name, heads)
-	e.mu.Lock()
-	e.swept[r.Name] = true
-	e.mu.Unlock()
+	e.openOf(r.Name).replace(heads)
 	var listed []string
 	if hasBotPull(prs) {
 		setPRSweepStep(ctx, "bot_policy")
@@ -483,26 +484,74 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	return errors.Join(errs...)
 }
 
-// openPRs is the open set the closed-row reconcile needs: the PRs of repo with
-// an outcome row that the queue knows are open (the sweep sets them and each
-// evaluation keeps them current), so the reconcile makes no GitHub request for
-// it. known is false until repo's first sweep.
-func (e *prEngine) openPRs(repo string) (open map[int]bool, known bool) {
+// openSet is the open PRs of one repo for the closed-row reconcile. It is the
+// queue's set, kept here because the queue offers no snapshot: the sweep replaces
+// it, and each evaluation adds or drops its PR. A PR learned while a sweep's list
+// was being read stays in the set the list replaces, so a PR that opened after
+// the list was read is never taken for a closed one.
+type openSet struct {
+	mu     sync.Mutex
+	swept  bool
+	open   map[int]bool
+	recent map[int]bool
+}
+
+func (e *prEngine) openOf(repo string) *openSet {
 	e.mu.Lock()
-	swept := e.swept[repo]
-	e.mu.Unlock()
-	if !swept {
+	defer e.mu.Unlock()
+	if e.open[repo] == nil {
+		e.open[repo] = &openSet{open: map[int]bool{}, recent: map[int]bool{}}
+	}
+	return e.open[repo]
+}
+
+// beginList starts a sweep's list read: PRs learned from now on survive replace.
+func (o *openSet) beginList() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.recent = map[int]bool{}
+}
+
+func (o *openSet) learn(n int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.open[n], o.recent[n] = true, true
+}
+
+func (o *openSet) forget(n int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.open, n)
+	delete(o.recent, n)
+}
+
+// replace sets the open PRs to a listed set plus those learned since beginList.
+func (o *openSet) replace(heads map[int]string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	next := map[int]bool{}
+	for n := range heads {
+		next[n] = true
+	}
+	for n := range o.recent {
+		next[n] = true
+	}
+	o.open, o.swept = next, true
+}
+
+// openPRs is the open set the closed-row reconcile needs, a copy of the
+// engine's, so the reconcile makes no GitHub request for it and reads no ledger
+// for it. known is false until repo's first sweep.
+func (e *prEngine) openPRs(repo string) (open map[int]bool, known bool) {
+	o := e.openOf(repo)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.swept {
 		return nil, false
 	}
-	state, err := outcomes.Ledger{Dir: e.s.Config.StateDir}.Read()
-	if err != nil {
-		return nil, false
-	}
-	open = map[int]bool{}
-	for _, v := range state.Latest {
-		if v.Repo == repo && e.q.Head(repo, v.PR) != "" {
-			open[v.PR] = true
-		}
+	open = make(map[int]bool, len(o.open))
+	for n := range o.open {
+		open[n] = true
 	}
 	return open, true
 }

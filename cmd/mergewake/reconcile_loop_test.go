@@ -115,6 +115,26 @@ func TestReconcileLoopSkipsOpenPRs(t *testing.T) {
 	}
 }
 
+// A PR the engine learned while a sweep's list was being read stays open when
+// that list replaces the set, and an evaluation that sees a PR closed drops it.
+func TestOpenSetKeepsPRLearnedDuringTheListRead(t *testing.T) {
+	e, f := engineFixture(t, 1)
+	set := e.openOf(f.repo.Name)
+	set.beginList()
+	set.learn(77)
+	set.replace(map[int]string{1: "a"})
+	open, known := e.openPRs(f.repo.Name)
+	if !known || !open[1] || !open[77] || len(open) != 2 {
+		t.Fatalf("open=%v known=%v, want PRs 1 and 77", open, known)
+	}
+	set.forget(77)
+	set.beginList()
+	set.replace(map[int]string{1: "a"})
+	if open, _ = e.openPRs(f.repo.Name); open[77] || !open[1] {
+		t.Fatalf("open=%v after PR 77 was forgotten", open)
+	}
+}
+
 // The loop runs every interval, retries soon when it had no open set, and
 // returns when its context ends.
 func TestReconcileLoopRunsAndStopsWithContext(t *testing.T) {
