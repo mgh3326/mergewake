@@ -59,7 +59,7 @@ type Webhook struct {
 	deliveryMu  sync.Mutex
 	deliveryIDs [maxRememberedWebhookDeliveries]string
 	deliveryAt  int
-	deliverySet map[string]struct{}
+	deliverySet map[string]int
 }
 
 // rememberDelivery atomically records a verified delivery id and reports
@@ -70,20 +70,21 @@ func (wh *Webhook) rememberDelivery(id string) bool {
 	}
 	wh.deliveryMu.Lock()
 	defer wh.deliveryMu.Unlock()
-	if _, ok := wh.deliverySet[id]; ok {
-		return true
-	}
+	_, repeat := wh.deliverySet[id]
 	if wh.deliverySet == nil {
-		wh.deliverySet = make(map[string]struct{}, maxRememberedWebhookDeliveries)
+		wh.deliverySet = make(map[string]int, maxRememberedWebhookDeliveries)
 	}
 	old := wh.deliveryIDs[wh.deliveryAt]
 	if old != "" {
-		delete(wh.deliverySet, old)
+		wh.deliverySet[old]--
+		if wh.deliverySet[old] == 0 {
+			delete(wh.deliverySet, old)
+		}
 	}
 	wh.deliveryIDs[wh.deliveryAt] = id
-	wh.deliverySet[id] = struct{}{}
+	wh.deliverySet[id]++
 	wh.deliveryAt = (wh.deliveryAt + 1) % len(wh.deliveryIDs)
-	return false
+	return repeat
 }
 
 // webhookEventRoles maps X-GitHub-Event to the roles an event wakes. ping

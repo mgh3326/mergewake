@@ -322,6 +322,7 @@ func TestWebhookRepeatedDeliveryContract(t *testing.T) {
 		if len(lines) != 2 {
 			t.Fatalf("logs=%d: %s", len(lines), buf.String())
 		}
+		t.Logf("two delivery log lines:\n%s", strings.Join(lines, "\n"))
 		var first, second map[string]any
 		if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
 			t.Fatal(err)
