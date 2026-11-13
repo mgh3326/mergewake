@@ -170,9 +170,10 @@ func TestWebhookEventRoles(t *testing.T) {
 		{"check_suite", []string{"watch"}},
 		{"check_run", []string{"watch"}},
 		{"status", []string{"watch"}},
-		{"release", []string{"release", "rollout"}},
-		{"workflow_run", []string{"release", "rollout"}},
-		{"push", []string{"release", "rollout"}},
+		// The release and rollout roles are gone, so their events wake nothing.
+		{"release", nil},
+		{"workflow_run", nil},
+		{"push", nil},
 		{"ping", nil},
 		{"repository", nil},
 	} {
@@ -268,13 +269,13 @@ func TestWebhookFormEncodedPayload(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Hub-Signature-256", sign(body, testSecret))
-	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-GitHub-Event", "status")
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted || !slices.Equal(triggered, []string{"release", "rollout"}) {
+	if resp.StatusCode != http.StatusAccepted || !slices.Equal(triggered, []string{"watch"}) {
 		t.Fatalf("form delivery: status=%d triggered=%v", resp.StatusCode, triggered)
 	}
 }

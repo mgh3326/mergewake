@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -26,9 +27,16 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/changestate"
 	"github.com/mgh3326/mergewake/internal/github/webhookstate"
-	"github.com/mgh3326/mergewake/internal/manifest"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
+
+// maxFileSize bounds one repository file the client reads whole.
+const maxFileSize = 32 << 20
+
+// safePath reports whether p is a clean relative repository path.
+func safePath(p string) bool {
+	return p != "" && p != "." && !path.IsAbs(p) && path.Clean(p) == p && p != ".." && !strings.HasPrefix(p, "../") && !strings.ContainsAny(p, "\\\x00\r\n")
+}
 
 type Client struct {
 	Changes                   changestate.Writer
@@ -212,8 +220,8 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		}
 		c.cacheResponse(key, "", nil, true, mark)
 	}
-	b, e := io.ReadAll(io.LimitReader(resp.Body, manifest.MaxFileSize*2+1))
-	if len(b) > manifest.MaxFileSize*2 {
+	b, e := io.ReadAll(io.LimitReader(resp.Body, maxFileSize*2+1))
+	if len(b) > maxFileSize*2 {
 		return nil, errors.New("GitHub response too large")
 	}
 	if e == nil && !mutation {
@@ -1308,7 +1316,7 @@ type blobResponse struct {
 }
 
 func (c *Client) Entry(ctx context.Context, repo, tree, name string) (TreeEntry, error) {
-	if !manifest.SafePath(name) {
+	if !safePath(name) {
 		return TreeEntry{}, errors.New("unsafe source path")
 	}
 	parts := strings.Split(name, "/")
@@ -1374,7 +1382,7 @@ func (c *Client) readFile(ctx context.Context, repo, sha, name string) ([]byte, 
 	if e != nil {
 		return nil, e
 	}
-	if b.Encoding != "base64" || b.Size > manifest.MaxFileSize {
+	if b.Encoding != "base64" || b.Size > maxFileSize {
 		return nil, errors.New("unsupported or oversized Git blob")
 	}
 	data, e := base64.StdEncoding.DecodeString(strings.ReplaceAll(b.Content, "\n", ""))

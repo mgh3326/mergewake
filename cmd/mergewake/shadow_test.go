@@ -10,7 +10,6 @@ func TestShadowModePerCommand(t *testing.T) {
 	}{
 		{"review", false, false, false, true},
 		{"review", true, false, false, false},
-		{"rollout", true, false, false, false},
 		{"reap", true, true, false, true},
 		// land and watch opt in through repository policy: --apply is ignored.
 		{"land", false, false, false, false},

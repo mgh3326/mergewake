@@ -4,7 +4,7 @@ Each host has one operator-owned YAML file, normally
 `~/.config/mergewake/config.yaml`. Each repository has a policy at
 `.mergewake/policy.yaml`. Unknown keys, duplicate YAML keys, and multiple YAML
 documents are errors. There is no environment interpolation except expansion of
-a leading `~/` in local config, state, install-root and container `env_file`
+a leading `~/` in local config and state
 paths. Credentials belong in the environment, the external CLI's own credential
 store, or a mode-0600 file the config names (`reap.hub.token_file`,
 `discord.webhooks_file`).
@@ -12,7 +12,6 @@ store, or a mode-0600 file the config names (`reap.hub.token_file`,
 Use [examples/host.yaml](../examples/host.yaml) and
 [examples/policy.yaml](../examples/policy.yaml) as starting points. Their repo,
 host, model IDs, commands, and task ID are placeholders. None is a discovery rule.
-Different hosts may use the same inventory and different deny lists.
 
 ## Host file
 
@@ -23,9 +22,9 @@ Different hosts may use the same inventory and different deny lists.
 | `state_dir` | `~/.local/state/mergewake` | Private local audit, checkpoints, receipts, locks, and journals. Keep it outside Git and install roots. |
 | `token_env` | `GITHUB_TOKEN` | Name of the environment variable containing the GitHub credential. Its value is never a config key. |
 | `github_app` | Absent | Serve GitHub reads with a GitHub App installation token; see [GitHub App reads](#github-app-reads). Absent means the `token_env` credential serves every request. |
-| `poll_interval` | `60s` | Positive Go duration between completed `watch` or `agent` iterations. |
+| `poll_interval` | `60s` | Positive Go duration between completed `watch` iterations. |
 | `watch_limit` | `100` | Maximum commit interval inspected during recovery, from 2 through 1000. |
-| `repos` | Empty list | Repositories this host may operate on. Names must be unique; `agent` requires at least one. |
+| `repos` | Empty list | Repositories this host may operate on. Names must be unique. |
 | `hosts` | Empty list | Session hosts scanned by `reap`; see below. |
 | `reap` | Disabled | Merged-PR session/worktree reaping; see below. |
 | `daemon` | All roles disabled | Role config and explicit acting opt-in; see below. |
@@ -38,44 +37,12 @@ Different hosts may use the same inventory and different deny lists.
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `name` | Required | GitHub `owner/name`; commands cannot select an unconfigured repo. |
-| `branch` | `main` | Base branch for landing, CI watching, release ancestry, and recovery PRs. |
+| `branch` | `main` | Base branch for landing, CI watching, and recovery PRs. |
 | `policy` | `.mergewake/policy.yaml` | Clean relative policy path inside the repository. Loaded through GitHub at a trusted base commit. |
-| `root` | Required for file and command/release rollout | Explicit local installation directory; leading `~/` expands. Use a dedicated root per inventory. Filesystem root is refused. Container inventories do not use it. |
-| `deny` | Empty list | Per-host relative target globs. These override all manifest/install permissions. Example: `bin/relay-hub`, `bin/operator-daemon`, `protected/**`. |
-| `install` | Required for release and rollout | Authorized source/target inventory; see below. This is intent/configuration, not generated hashes. |
-| `smoke` | Required for file and command/release rollout | Operator-owned smoke command; see below. Never supplied by a manifest or PR. Container targets use `install[].health` instead. |
-| `smoke_timeout` | `30s` | Positive Go duration for the smoke command. |
+| `root` | Empty | Local checkout of the repository. Review builds its local diff and detached PR-head worktrees from it, so a repository that is reviewed needs one. Leading `~/` expands. |
 | `task` | Empty | Optional fallback numeric handoffkeep task ID when the originating PR has no `Mergewake-Task` trailer. |
 | `lane` | Empty | The repo's design-session (owner) lane: receives this repo's PR events when neither the task trailer nor a `Mergewake-Notify-Lane` trailer names one, and the human-judgment notices and holds (review failures, lost review results, review blocks, aged check failures, and out-of-scope or unacknowledged findings handed to the owner). Empty falls back to the desk (`notifier.fallback_lane`, else `notifier.lane`). |
 | `hk_task_events` | `true` | With the `handoffkeep` sink, post a task event to hk's `POST /v1/task-events` for each PR with a `Mergewake-Task` trailer: `mergewake.pr` when an open, ready PR is first observed, `mergewake.review` when a review run claims a pass, `mergewake.merge` after mergewake's own merge, and `mergewake.revert` when a watch revert PR is merged (a revert merged more than seven days before mergewake first sees it is not posted). Dry runs and shadow mode post nothing. A failed post never fails the action; each post is an `hk-task-event` row in `decisions.jsonl`. Set `false` for a repo whose hk predates the endpoint (handoffkeep#136). |
-
-Each `install[]` entry has:
-
-| Key | Required / default | Meaning |
-| --- | --- | --- |
-| `kind` | `file` | `file`, `command`, `release`, or `container`. A repo inventory cannot mix these families. |
-| `source` | Required for file | Regular Git file at the release commit, relative to repo root. Symlinks, trees, submodules and files over 32 MiB are refused. |
-| `target` | Required | Clean relative path beneath `root`, or the logical label for command/release/container targets. Absolute paths, traversal, duplicate targets, and file/directory overlaps are refused. |
-| `mode` | Quoted `"0644"` | Octal string: only `"0644"` and `"0755"`. Must agree with the manifest. |
-
-The published inventory can contain denied targets; hosts skip them. Other
-manifest targets must match a host inventory entry's source, target, and mode.
-A host refuses a manifest with no permitted targets. Removing a source or entry
-does **not** remove an existing installed file.
-
-`smoke.command` is the executable and `smoke.args` is a YAML array of literal
-arguments, defaulting to empty. It runs with `root` as its working directory.
-For example:
-
-```yaml
-smoke:
-  command: ./bin/tool
-  args: [--version]
-```
-
-Commands are invoked directly, with no shell expansion. Use a separately
-reviewed script for more complex checks. Smoke should be read-only: rollback
-restores installed files, not external actions taken by a smoke command.
 
 ### `hosts[]`
 
@@ -227,7 +194,7 @@ on the first of its merged PRs. Job-bound rows carry `task` and `job`; they
 carry `cwd` and `worktree` only when the lead sits in that PR's own
 worktree, which worktree cleanup then picks up as before.
 
-Rollout (the desk): deploy, run `mergewake reap --repo <repo> --dry-run`
+Enabling reap (the desk): run `mergewake reap --repo <repo> --dry-run`
 once per configured repo and compare the planned `would-close` and
 `job_has_open_pr` rows with the panes you expect, then set `reap.act: true`.
 Rollback: `reap.act: false`.
@@ -1063,8 +1030,7 @@ attachments as written by `svc-mergewake`. They read the process environment onl
 | `HANDOFFKEEP_CF_ACCESS_CLIENT_ID`, `HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET` | Optional Cloudflare Access pair. Set both or neither. |
 
 mergewake does not read the hk CLI's `~/.config/handoffkeep/config.env` or
-its machine token `HANDOFFKEEP_TOKEN`. For how the deploy approval matches
-its answer, see [deploy-approval.md](deploy-approval.md#lookup-by-request-id).
+its machine token `HANDOFFKEEP_TOKEN`.
 `sink.command` is still accepted, and mergewake runs no hk command with it: a
 large review brief's prompt still tells the reviewer to run
 `<sink.command> attach get` on its own host.
@@ -1081,7 +1047,7 @@ there). A unit drop-in adds `EnvironmentFile=%h/.config/mergewake/hk-svc.env`
 environment only and knows no file path. A command run from a shell, such as
 `mergewake review` or `mergewake watch`, needs the variables in that shell's
 environment. A mergewake run by macOS launchd (for example a `mergewake
-rollout` LaunchAgent) gets no hk HTTP unless its launcher sets the two keys.
+daemon` LaunchAgent) gets no hk HTTP unless its launcher sets the two keys.
 
 If `HANDOFFKEEP_URL` or `HANDOFFKEEP_TOKEN_SVC_MERGEWAKE` is unset, every hk
 HTTP call behaves as on a host with no hk endpoint. Job records cannot be
@@ -1091,7 +1057,7 @@ empty. Each sink call (task read, comment, reopen, report document,
 attachment) fails with `handoffkeep endpoint unconfigured`; there is no
 fallback to the hk CLI or its `config.env`. Callers report that failure as
 they reported a failed CLI call before: the watch notification carries a
-failed reopen, a rollout or watch report records the failed write, and a job
+failed reopen, a watch report records the failed write, and a job
 archive is an `error` row retried an hour later. With `sink.type: handoffkeep`, the daemon logs one error line at
 start, `startup check failed`, that names the unset keys and no value. The
 daemon keeps running.
@@ -1113,8 +1079,8 @@ daemon keeps running.
 ### `discord`
 
 Posts the events of every watched repo to Discord from the daemon, so no repo
-needs its own workflow or webhook secret. Only `mergewake daemon` and
-`mergewake notify deploy` post; other commands do not.
+needs its own workflow or webhook secret. Only `mergewake daemon` posts; other
+commands do not.
 
 ```yaml
 discord:
@@ -1123,7 +1089,6 @@ discord:
   kinds:
     pr: DISCORD_WEBHOOK_PR_LOG
     ci: DISCORD_WEBHOOK_GITHUB_ACTION
-    deploy: DISCORD_WEBHOOK_DEPLOY_LOG
     revert: DISCORD_WEBHOOK_DEPLOY_LOG
   opt_out: [example/keeps-its-own-workflows]
 ```
@@ -1132,7 +1097,7 @@ discord:
 | --- | --- | --- |
 | `enabled` | `false` | Turns the feed on. |
 | `webhooks_file` | Required when enabled | Absolute or `~/` path to a mode-0600 env file of `KEY=URL` lines. |
-| `kinds` | Required when enabled | Maps an event kind to a key in that file. A kind left out posts nothing. Keys are `pr`, `ci`, `deploy` and `revert`. |
+| `kinds` | Required when enabled | Maps an event kind to a key in that file. A kind left out posts nothing. Keys are `pr`, `ci` and `revert`. |
 | `opt_out` | empty | `owner/name` repos that post nothing, through any path. |
 | `max_failures` | `5` | Failed posts a message gets before it drops to a log line. |
 
@@ -1173,9 +1138,6 @@ takes effect without a restart.
 | `pr` | PR merged or closed | `pr` role | PR, head |
 | `ci` | Required check failed on an open PR's head | `pr` role | PR, head |
 | `ci` | Required, `main_checks` or its alias `watch_checks` check failed on the default branch | `watch` role | head |
-| `deploy` | Release published, or publishing failed | `release` role | commit, result |
-| `deploy` | Rollout finished or failed | `rollout` role | commit, result |
-| `deploy` | Another deployer's report | `mergewake notify deploy` | commit, result |
 | `revert` | Revert PR opened, culprit reported, or watch hold | `watch` role | head, action |
 
 Each event posts one message, and restarts stay quiet. Some consequences:
@@ -1183,19 +1145,16 @@ Each event posts one message, and restarts stay quiet. Some consequences:
 - A force push is not a new PR, so it does not post again. A new red head does.
 - `ci` posts the checks that have failed when the head is first seen red. A
   sibling check that fails later on the same head does not post again.
-- A failed deploy that later succeeds on the same commit posts both. A failure
-  repeated every pass posts once.
 - A PR older than the repo's baseline does not post, so turning the feed on does
   not replay history. A merged or closed PR also has to be under 72 hours old. A
   `ci` failure has no such limit: heads already red when the feed turns on post
-  once. So does the head the `release` role publishes next.
+  once.
 - PRs left out by `daemon.pr.skip_bots` stay out of the feed.
 - A reopened PR does not post.
 
 A kind only posts while its role runs: enable `daemon.watch` for default-branch
 `ci` and for `revert`. Shadow mode still posts PR and `ci` events, because
-reporting is not acting. It posts no `deploy` or `revert`, because shadow mode
-deploys nothing and opens no revert. `--dry-run` posts nothing and writes no feed
+reporting is not acting. It posts no `revert`, because shadow mode opens no revert. `--dry-run` posts nothing and writes no feed
 state.
 
 #### Delivery
@@ -1217,34 +1176,6 @@ the key and the reason, and does not post again. Messages for other webhooks kee
 flowing. Past 1000 queued messages, a new one drops the same way. A crash between
 a successful post and recording it can post that message once more.
 
-#### `mergewake notify deploy`
-
-Deployers the daemon does not run report through this command. It needs no GitHub
-token, and the repo does not have to be in `repos`.
-
-```sh
-mergewake notify deploy --repo owner/name --sha "$SHA" --status ok|failed \
-  [--text "pull deploy finished"] [--config PATH]
-```
-
-| Flag | Meaning |
-| --- | --- |
-| `--repo` | `owner/name` that was deployed. |
-| `--sha` | Deployed commit, 7 to 64 lowercase hex characters. |
-| `--status` | `ok` or `failed`. |
-| `--text` | Optional message text. Credential-shaped substrings are redacted. |
-
-It posts before it returns and prints one JSON line. `"posted": false` with exit
-status 0 means the repo is opted out, `deploy` has no channel, or this repo,
-commit and status was already posted from this host, so a retrying deployer posts
-once. It exits non-zero if `discord.enabled` is off or the post fails, and a later
-call can then retry. One call takes at most 2 minutes, so a deployer should not
-fail a deploy on it:
-
-```sh
-mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
-```
-
 ## Per-repo policy
 
 | Key | Required / default | Meaning |
@@ -1255,7 +1186,7 @@ mergewake notify deploy --repo owner/name --sha "$SHA" --status ok || true
 | `require_up_to_date` | `false` | Hold a head whose base moved ahead as `base_stale` when GitHub reports the PR `behind` (branch protection requires an up-to-date branch), in both the review gate and the bot-patch gate; with `auto_update_branch` on, the branch is then updated. Absent or `false`: a conflict-free PR with a moved base is not held and its branch is not updated; the land and notify records carry `base_behind: true`, and the main-branch CI checks the composed result after the merge. A conflict blocks as `conflict` either way. Must be a boolean. |
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `main_checks` | `watch_checks`, else `required_checks` | Exact, unique check names that judge a main-branch commit (watch and bisect). `watch_checks` is its legacy name: a policy may set one or both, but both must list the same checks. |
-| `deploy_checks` | Empty | Exact, unique check names of the deploy stage, for example `[deploy-ok]`. When set, `release` requires them green and `rollout` admits only commits that pass them; empty means the repository has no deploy stage and the main checks judge release and rollout. |
+| `deploy_checks` | Empty | Exact, unique check names of the deploy stage, for example `[deploy-ok]`. When set, the watch deploy stream judges by them; empty means the repository has no deploy stage and the main checks judge the commit. |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
@@ -1611,7 +1542,7 @@ For `example/project`, state resides beneath
 
 | Path | Meaning |
 | --- | --- |
-| `decisions.jsonl` | Append-only observations/intent and completed recovery/rollout records. A planned action is not proof it completed. |
+| `decisions.jsonl` | Append-only observations/intent and completed recovery records. A planned action is not proof it completed. |
 | `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `panewire done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
@@ -1626,24 +1557,6 @@ For `example/project`, state resides beneath
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
 | `discord-baseline` | When the feed first ran for this repo. Older PRs do not post. |
 | `../discord/outbox/` | `<state_dir>/discord/outbox/`, host-wide: messages waiting to post, one JSON file each. They hold no webhook URL. |
-| `rollout/lock/` | Local install exclusion; never stolen automatically. |
-| `rollout/transaction/journal.json` | Previous file existence/modes and previous receipt for crash recovery. |
-| `rollout/transaction/*.bak` | Private previous bytes. Retained if rollback cannot finish. |
-| `rollout/installed.json` | Last successful manifest and install result. Used with actual hashes, never trusted alone. |
-| `rollout/rejected.json` | Release that failed after mutation. Prevents repeated retries of that commit. |
-| `rollout/container-installed.json` | Current and previous digests per container target, with the last managed release commit. |
-| `rollout/container-journal.json` | In-flight container swap; replay restores the previous container before another attempt. |
-| `rollout/container-rollback-*.json` | Rollback audit for an interrupted or failed container deploy. |
-| `rollout/container-rejected.json` | Container digest that failed after mutation. Prevents repeated retries of that digest. |
-| `rollout-deny` | Operator-maintained rollout culprits, one full commit SHA per line. Those commits and everything after them stay uninstalled until main is green again. |
-
-After an interrupted install, confirm no process still owns `rollout/lock`, inspect
-the journal, and remove only that stale lock. The next acting rollout restores the
-journal before proceeding. If rollback fails, preserve its journal/backups and
-repair the cause before another attempt. After investigating a smoke failure,
-removing `rejected.json` authorizes a retry; stopping the polling agent while doing
-this avoids an immediate unintended retry. No dry run clears locks or recovers a
-journal.
 
 For a failed independent review, inspect
 `mergewake/reviews/<PR>/<full-head-SHA>` (plus `-p2` for a second pass) and
@@ -1677,8 +1590,6 @@ daemon:
   act: false
   pr: {enabled: true, interval: 60s, notify: {enabled: true}, findings: {enabled: true, ack_after: 15m}}
   watch: {enabled: true, interval: 60s}
-  release: {enabled: true, interval: 2m}
-  rollout: {enabled: true, interval: 2m}
 ```
 
 The `pr` role's closed-row outcome reconcile runs in a loop of its own beside
@@ -1692,8 +1603,7 @@ read at most hourly. A run is bounded to ten minutes and logs one
 All roles default disabled; omitted intervals inherit poll_interval. `daemon`
 runs only configured roles, one goroutine each. Shadow is the default for all
 roles; acting needs both `daemon.act: true` and `mergewake daemon --apply`.
-Land/watch additionally require enabled repository policy. Standalone review,
-release, rollout and agent need `--apply` to mutate. `--shadow` forces the daemon
+Land/watch additionally require enabled repository policy. Standalone review needs `--apply` to mutate. `--shadow` forces the daemon
 back to observation, and `--dry-run` suppresses pipeline state too. The daemon
 still maintains its supervision locks and status in shadow/dry-run modes.
 
@@ -1821,7 +1731,6 @@ roles woken — never the body, the signature or other headers.
 | `X-GitHub-Event` | Roles woken |
 | --- | --- |
 | `pull_request`, `pull_request_review`, `pull_request_review_thread`, `pull_request_review_comment`, `check_suite`, `check_run`, `status` | `pr`, `watch` |
-| `release`, `workflow_run`, `push` | `release`, `rollout` |
 | `ping`, any other event | none |
 
 Only enabled roles wake, and only for repositories in `repos`.
@@ -2159,8 +2068,7 @@ Each role writes `<state_dir>/daemon/<role>.json`: last_run, last_finish,
 last_error, next_run, running and failures. Values are the last saved observation;
 a hard crash can leave a stale running/next_run value. Role locks use the OS user
 cache under `mergewake/daemon-locks/`, independent of state_dir. Use one service
-account per host. Locks release automatically at exit. Install-transaction locks
-still require inspection after crashes.
+account per host. Locks release automatically at exit.
 
 Delays have positive jitter up to 20%, exponential failure backoff up to 30m (or
 the base interval if longer), and rate-limit pacing. Conditional GET caches are
@@ -2240,211 +2148,6 @@ The workflow named by `any_ref_workflow` is the repository's own file: it needs 
 status on that sha. mergewake's own `.mergewake/policy.yaml` sets
 `any_ref_workflow: ci-any-ref.yml`.
 
-## Container installs
-
-`kind: container` covers the small subset of Kubernetes this fleet needs: one
-immutable image per logical target, host-published ports, an operator-owned env
-file, optional volumes, a restart policy, and an HTTP health check. The runtime is
-the host's `docker` by default, or `podman` with the same CLI subset; mergewake
-never calls a registry API or a cluster.
-
-| Key | Required / default | Meaning |
-| --- | --- | --- |
-| `target` | Required | Logical label used in the manifest, deny list and gate receipts. |
-| `image` | Required | Registry/repository without a tag or digest. |
-| `name` | Required | Runtime container name; the previous container is kept as `<name>.mergewake-prev`. |
-| `ports` | Empty | `host_ip:host_port:container_port`, or `host_port:container_port`. The host address defaults to `127.0.0.1`; a supplied address must be an IP literal. |
-| `env_file` | Empty | Absolute operator-owned path passed as `--env-file`. Its values are never read or printed. |
-| `volumes` | Empty | `source:destination[:ro\|rw]` entries passed as `--volume`. |
-| `restart` | `unless-stopped` | `no`, `always`, `unless-stopped`, or `on-failure[:N]`. |
-| `health` | Required | `url`, expected `status` (default 200), per-request `timeout` (default `5s`), and `retries` (default 20, one second apart). |
-| `keep` | `2` | Previous digests kept as history and spared by garbage collection. `0..100`. |
-| `runtime` | `docker` | `docker` or `podman`. |
-| `user` | Empty | Optional `--user` value. |
-| `digest` | Empty | `sha256:<64 hex>` pinned into the release manifest. Without it, `rollout --digest` must supply the deploy digest. |
-
-### Digest source
-
-A container deploy always names an immutable `repo@sha256:...`. mergewake takes
-the digest from the release manifest (`install[].digest`, published by `release`)
-or from `rollout --digest repo@sha256:...`. The explicit flag must name the same
-repository as `image`, and is accepted only when the inventory has exactly one
-container target. A tag, a missing digest, or a digest for another repository is
-refused before any pull. The manifest commit remains the release identity used for
-ancestry, CI and receipts.
-
-Image names are compared literally with the runtime's repository digests, so use
-the fully qualified form (`registry.example/api`, or `docker.io/library/nginx`
-rather than `nginx`); the daemon normalizes Docker Hub short names.
-
-The rollout still fetches the newest published manifest, so `--digest` supplies
-the payload while the manifest supplies the release identity (commit, ancestry and
-CI). Publish one with `mergewake release`; the host inventory may omit `digest`
-when the desk intends to pass it explicitly.
-
-### Deploy sequence and swap strategy
-
-The old and new container bind the same host ports, so they cannot overlap.
-mergewake therefore performs a short, explicit stop-and-swap rather than starting
-a temporary second container behind a proxy:
-
-1. Verify the release commit, CI, deny list, gates and receipt ancestry.
-2. Inspect the running container and refuse on drift: a missing or stopped
-   container, a digest mismatch, an unmanaged container, or a changed image
-   repository.
-3. Pull every new digest before touching a running container.
-4. Write `container-journal.json`, then stop and rename the old container to
-   `<name>.mergewake-prev`. Its writable layer is preserved for rollback.
-5. Start `<name>` from the new digest and poll `health` until it passes or its
-   retries are exhausted.
-6. Persist the receipt (the new digest becomes current; the old digest is
-   prepended to `previous`, capped at `keep`), remove the preserved container,
-   remove the journal, then garbage-collect images.
-
-On any failure between steps 4 and 6, the new container is removed, the preserved
-container is renamed back and started, its health is checked again, and a
-`container-rollback-*.json` audit plus `container-rejected.json` is written. The
-previous receipt is restored, so `status` matches the running container again. A
-digest that rolled back is refused until an operator inspects it and removes
-`container-rejected.json`. A crash is recovered from the journal on the next
-acting rollout; a journal whose receipt already records the new digest is treated
-as a completed deploy, so only the preserved container and journal are cleaned up.
-
-### Image garbage collection
-
-After a successful deploy mergewake lists images of that repository and removes
-every digest that is neither the current digest nor one of the newest `keep`
-previous digests, except that it never removes an image referenced by any
-container, stopped ones included. Removed digests are reported under
-`removed_images`; a failed removal becomes a warning and never rolls back a
-healthy deploy. Images pulled by a failed attempt are collected by a later
-successful deploy.
-
-### Adopt and status
-
-```sh
-mergewake rollout --config /path/to/host.yaml --repo example/project --adopt api
-```
-
-`--adopt <target>` records an already-running, hand-started container as the
-current receipt, including its resolved repository digest, so the first managed
-deploy has a known previous digest. The container must be running; a start from a
-tag is resolved through the image's `RepoDigests`, and adopt refuses when no
-repository digest can be resolved. A rollout refuses to replace a container that
-has no receipt and tells the operator to adopt it first. With `--dry-run` (or
-without `--apply`) adopt plans and prints the result without writing state.
-
-`mergewake status` prints one JSON line per container target with `running`,
-`digest`, `health`, `previous`, `images_kept`, and `status`. Drift or an unhealthy
-target is reported and returns a failing exit status.
-
-Container inventories use no `root`, `smoke`, `source`, or `mode`. They cannot be
-mixed with file or command/release entries in one repo inventory. `serial` and
-`canary` ordering, `receipts_dir` gate receipts, the deny list, `--dry-run`, and
-the installed receipt all apply unchanged. See
-[examples/container.yaml](../examples/container.yaml) for a template.
-
-## Command installs and receipt ordering
-
-Every install kind accepts `serial`, `canary` and `receipts_dir` for receipt
-ordering. Command/release entries additionally accept the recipe fields below:
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `command.command`, `command.args` | Required for command | Trusted installer executable and literal arguments. Args must contain `{sha}`. |
-| `verify.command`, `verify.args` | Required | Read-only verification command, run after install and rollback. |
-| `verify_output` | `{sha}` | Exact trimmed stdout expected from verify; must include `{sha}`. Use a wrapper to validate a version plus revision. |
-| `initial_sha` | Empty | Full previous installed SHA, required until a receipt exists. Verified before mutation. Retain it when editing config so the recipe fingerprint stays stable. |
-| `timeout` | `5m` | Timeout for each install + verify; rollback gets a fresh bounded context. |
-| `serial` | Empty | Ordered list of host labels. A host waits for all preceding hosts' successful receipts for the same commit. |
-| `canary` | Empty | Host label whose successful smoke receipt every other host must see first. |
-| `receipts_dir` | Required with serial/canary | Trusted shared or desk-replicated receipt directory. No network transport is supplied. |
-
-Placeholders `{sha}`, `{repo}`, `{root}` and `{target}` expand in argument values
-only; commands never pass through a shell. Target is a clean relative logical
-install label and remains subject to the per-host deny list. For `release`, it is
-the binary path beneath root. Commands and their other paths are operator-owned;
-manifest targets cannot constrain the side effects of an arbitrary script.
-
-Use separate inventories for files and command installs. The following are
-independent templates, with public-safe placeholders:
-
-```yaml
-# (a) An existing clone; a reviewed wrapper checks out the exact SHA, then runs
-# that repository's own ./install.sh. No git pull or branch name is substituted.
-install:
-  - kind: command
-    target: tools/example
-    command:
-      command: /path/to/install-checkout
-      args: [/path/to/configured-clone, '{sha}']
-    verify:
-      command: /path/to/check-installed-sha
-    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    canary: host-a
-    serial: [host-a, host-b]
-    receipts_dir: /path/to/shared-receipts
-```
-
-A reviewed `install-checkout` wrapper can use the following sequence. It must
-refuse a dirty clone and ensure the configured repository identity is correct;
-the clone must already contain the requested commit:
-
-```sh
-#!/bin/sh
-set -eu
-cd "$1"
-[ -z "$(git status --porcelain)" ]
-git checkout --detach "$2"
-[ "$(git rev-parse HEAD)" = "$2" ]
-./install.sh
-```
-
-```yaml
-# (b) uv installs directly from the pinned commit. The verify wrapper must
-# independently inspect the installed package's recorded source revision.
-install:
-  - kind: command
-    target: tools/example
-    command:
-      command: uv
-      args: [tool, install, --force, 'git+https://github.com/<owner>/<repo>@{sha}']
-    verify: {command: /path/to/check-installed-source-sha}
-    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-```
-
-```yaml
-# (c) mergewake release binaries, identical assets to install.sh. Pure release
-# inventories poll published v* releases without needing a manifest release.
-root: /path/to/dedicated-root
-install:
-  - kind: release
-    target: bin/mergewake
-    verify: {command: ./bin/mergewake, args: [commit]}
-    initial_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-smoke: {command: ./bin/mergewake, args: [--help]}
-```
-
-The initial SHA must correspond to the installed binary, and a published binary
-release must exist for it so rollback can reinstall it. Bootstrap with install.sh
-as a separate desk action. Binary installs resolve tags to full SHAs, check CI
-and ancestry, verify size and SHA256SUMS, and atomically replace the binary.
-
-Command state uses `command-installed.json` (per-target sha/previous_sha and recipe
-fingerprint), `command-journal.json`, `command-rejected.json`, and timestamped
-`command-rollback-*.json` under the repo's rollout state directory. Recovery
-refuses changed recipes or denied targets. Shared gate receipts live at
-`<receipts_dir>/<sha>/<host>/<target>.json` and are written only after all verify
-and smoke checks pass. Protect that directory: an operator-supplied receipt is a
-trust assertion. Missing, failed, wrong-host, wrong-repo or wrong-SHA receipts
-never authorize a follower. No empty prior SHA is treated as a rollback plan.
-
-`status` checks file digests or runs command verify as appropriate; denied targets
-are reported without execution. There are no implicit service restarts, database
-migration reversals or notifications outbox. Smoke and verification should be
-read-only, and install scripts must be safe to repeat at the same commit.
-
-
 `policy.main_checks` names the checks that judge a main-branch commit when their
 names differ from the PR merge checks. `policy.watch_checks` is its legacy name:
 set one, or both with the same list. When neither is set the main set is
@@ -2456,24 +2159,9 @@ measurement always uses required_checks.
 
 `policy.deploy_checks` names the checks of the deploy stage (for example
 `deploy-ok`, posted after the main stage is green on the same commit). When it is
-set, `release` publishes a manifest only for a commit whose deploy checks are
-green; `ci-ok` alone never releases. The published manifest records the
-observation in its `deploy` field: the commit, the git blob revision of the
-policy it was read against, and each check's name, state and run/status URL. An
-empty or absent `deploy_checks` means the repository has no deploy stage, and
-release and rollout judge a commit by the main checks as before.
-
-`rollout` installs the newest published release manifest that is an ancestor of
-the configured branch head, green on the checks named by its own policy (deploy
-checks, or the main checks when there is no deploy stage), and outside a
-recorded red range. A newer candidate that is not an ancestor, not green, or
-denied is skipped; when none is admissible the error names every skipped
-candidate. `state/<repo>/rollout-deny` lists culprits, one full commit SHA per
-line, with blank lines and `#` comments ignored. A listed commit is never
-installed, and every commit after a listed culprit is denied until the branch
-head is green again — the "no intermediate commit between a culprit and a red
-head" rule. Delete a line once a green head has superseded it; a line that is not
-a full SHA is an error, so an unreadable entry can never admit its culprit.
+set, watch judges the deploy stream by these checks, so `ci-ok` alone never clears
+the deploy stage. An empty or absent `deploy_checks` means the repository has no
+deploy stage, and the main checks judge a commit.
 
 `policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
 that runs the checks bisect judges a commit by for any commit: it has a

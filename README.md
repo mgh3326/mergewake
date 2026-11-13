@@ -3,7 +3,7 @@
 **The after-merge pipeline for your agent fleet.**
 
 mergewake is one Go binary for policy-based landing, one independent review per
-PR head, main CI recovery, release manifests, verified file and command rollouts, a polling daemon, and
+PR head, main CI recovery, a polling daemon, and
 experimental resident monitors. It stays on Git and GitHub. Hosts and model
 pairings are configuration, so the same tool runs across macOS, Linux, and
 Linux arm64 hosts.
@@ -24,8 +24,8 @@ go build -o mergewake ./cmd/mergewake
 ```
 
 Create an operator-owned host config from [examples/host.yaml](examples/host.yaml).
-Replace `example/project`, the install inventory, smoke command, reviewer login,
-and placeholder model IDs with your values. Put a policy based on
+Replace `example/project`, reviewer login, and placeholder model IDs with your
+values. Put a policy based on
 [examples/policy.yaml](examples/policy.yaml) in the target repository. Required
 check names must match the repository's actual GitHub checks. Supply a GitHub
 credential through the environment variable named by `token_env`; never put its
@@ -39,10 +39,9 @@ value in either YAML file.
 ./mergewake watch --config /path/to/host.yaml --repo example/project --once --shadow
 ```
 
-Review, release, rollout and agent commands stay in shadow mode unless passed
-`--apply`. `land` and `watch` also require repository policy opt-in; `--shadow`
-forces observation. `--dry-run` makes no remote writes, runs no reviewer or smoke
-command, and writes no pipeline state. Daemon status and role locks are local
+Review commands stay in shadow mode unless passed `--apply`. `land` and `watch` also require repository policy opt-in; `--shadow`
+forces observation. `--dry-run` makes no remote writes, runs no reviewer command,
+and writes no pipeline state. Daemon status and role locks are local
 supervision state; the daemon keeps them even while observing.
 
 Install a published binary without Go (the command below is for an operator):
@@ -60,12 +59,8 @@ sh /tmp/mergewake-install.sh --tag v0.2.0
 | `land --repo … --pr …` | Run the merge gate for one PR — `--dry-run` prints the verdict — and squash-merge the exact gated head through GitHub. |
 | `review --repo … --pr …` | Claim one PR head, select a different model family from the pool with the most quota left to burn before its reset, review only the diff, post inline review comments. |
 | `watch --repo …` | Poll main CI, find a green-to-red boundary among squash commits using existing checks, open a revert PR, reopen the task when its API permits, and notify. `--once` inspects once. |
-| `release --repo …` | Verify green main ancestry and publish an immutable manifest as a GitHub Release asset. `--commit` accepts a full SHA. |
-| `rollout --repo …` | Pull the newest mergewake manifest, verify bytes, install permitted files or container digests, smoke/health-test, roll back on failure, and report. |
-| `daemon` | Run enabled PR, CI watch, green-main release and host rollout loops concurrently. Shadow by default; acting needs `daemon.act: true` and `--apply`. |
+| `daemon` | Run enabled PR, CI watch and reap loops concurrently. Shadow by default; acting needs `daemon.act: true` and `--apply`. |
 | `status --daemon` | Show each role’s last run, last error, failure count and next run. |
-| `agent` | Poll all configured repositories for verified rollouts. `--once` runs a single poll; `--repo` selects one. |
-| `status` | Read local receipts and check installed digests and modes. Returns failure on drift; supports `--repo`. |
 
 All acting commands support `--dry-run`. There is no merge lock, mandatory
 rebase, multi-round tester loop, or committed manifest/hash-pin file. A fixed
@@ -77,21 +72,14 @@ main is still red or pending, or the latch has no revert PR the watcher opened,
 an operator must inspect recovery and remove the tag and branch. The tag
 survives automatic deletion of merged PR branches.
 
-Release inventories describe regular files at a verified Git commit, their
-SHA256, mode, and relative install targets. Hosts separately authorize the file
-inventory, install root, deny patterns, and smoke command. Successful agent polls
-verify current bytes and avoid repeated writes and reports. Smoke failures restore
-previous bytes and permissions and suppress retries of that release until an
-operator clears its rejection receipt.
-
 ## Integrations and limits
 
 Adapters use only APIs or CLI argument vectors:
 
 - GitHub REST plus a read-only GraphQL query for review-thread resolution.
 - `panewire emit` for notifications, with stdout and no-op alternatives.
-- hk task read, comment, reopen and document write for task recovery and
-  rollout records, through hk's public Go client; a no-op sink is available.
+- hk task read, comment, reopen and document write for task recovery, through
+  hk's public Go client; a no-op sink is available.
 - hk `POST /v1/task-events` for PR, review, merge and revert events on tasks
   named by a `Mergewake-Task` trailer (`hk_task_events`, on by default).
   This call and mergewake's other hk HTTP calls (the sink's task, comment,
@@ -119,19 +107,6 @@ jitter, bounded backoff, role locks and local status support supervision; exampl
 are in [deploy/](deploy/). An optional in-process receiver (`daemon.webhook`)
 serves HMAC-signed GitHub deliveries on loopback and wakes matching roles
 early; polling remains complete.
-
-Command installs use host-owned recipes with `{sha}` arguments, exact-output
-verification, smoke checks, prior-SHA journals and rollback receipts. `release`
-installs download the same checksummed binaries as `install.sh`. Serial/canary
-ordering uses success receipts supplied through an operator-owned shared or
-replicated directory. See [docs/config.md](docs/config.md) for templates and
-remaining operating limits, and [DESIGN.md](DESIGN.md) for failure boundaries.
-
-Container installs deploy `repo@sha256:...` digests through `docker` or `podman`,
-stop-and-swap the previous container, poll an HTTP health check, restore the
-preserved container on failure, and garbage-collect old images. `rollout --adopt`
-records a hand-started container; `status` reports its digest and health. See
-[examples/container.yaml](examples/container.yaml).
 
 ## PR lane notifications
 
@@ -208,9 +183,8 @@ lanes override the configured one. Disable the feature with
 
 With a `discord` section in the host config, the daemon posts every watched
 repo's events to Discord, so no repo needs its own workflow or webhook secret:
-PRs opened, merged and closed, required checks that failed, releases and
-rollouts, and watch reverts and holds. Other deployers report through
-`mergewake notify deploy --repo R --sha S --status ok|failed --text T`.
+PRs opened, merged and closed, required checks that failed, and watch reverts
+and holds.
 
 Webhook URLs stay in a mode-0600 file; a URL inline in the config is refused. A
 slow or down webhook never holds up a poll. See
@@ -233,7 +207,7 @@ job record does not name, panes without a job dir and panes with unsent
 composer text are never closed. A PR without the trailer keeps the worktree
 match. Every decision lands in `<state_dir>/<repo>/reap.jsonl`.
 
-Rollout is the desk's: deploy, run `mergewake reap --repo <repo> --dry-run`
+Enabling reap is the desk's call: run `mergewake reap --repo <repo> --dry-run`
 once per repo and compare the plan with the panes you expect to close, then
 set `reap.act: true`. Rollback is `reap.act: false`. See
 [docs/config.md](docs/config.md#reap).

@@ -1,5 +1,11 @@
 # Design
 
+> Removed in hk 3596 (2026-11-13): the release, rollout, agent and promote
+> commands, the `manifest` and `rollout` packages, and the Discord deploy post
+> no longer exist. mergewake does not deploy. The sections on manifests, command
+> and container installs, failure boundaries for installs, and the deploy part of
+> the package table describe that removed code; they are kept as history.
+
 mergewake moves routine coordination into a small deterministic pipeline. A
 repository owns the policy describing harm that can happen before a revert; a
 host owns what it may install and which local model CLIs it may invoke. Neither
@@ -30,8 +36,7 @@ flowchart TD
 ```
 
 `daemon` runs one goroutine per enabled role: PR polling feeds review and land,
-main CI feeds watch, green-main detection feeds release, and host polling feeds
-rollout. Each role polls every configured repo and reports errors independently.
+main CI feeds watch, and reap sweeps merged work. Each role polls every configured repo and reports errors independently.
 Polling alone completes delivery; no public ingress is required. The daemon
 package exposes `Trigger(role)` for optional trusted webhook adapters. Timers
 remain active if no adapter is present.
@@ -54,8 +59,8 @@ are killed together; rollback uses a fresh bounded context before shutdown
 returns. File and command journals preserve recovery after a hard kill.
 
 Shadow is the daemon default. Acting requires host `daemon.act` and `--apply`;
-landing and recovery also obey repository policy. Standalone review, release and
-rollout likewise require `--apply`.
+landing and recovery also obey repository policy. Standalone review likewise
+requires `--apply`.
 
 ## Package boundaries
 
@@ -65,9 +70,7 @@ rollout likewise require `--apply`.
 | `policy` | Slash-aware path globs, previous names on renames, change-kind matching. |
 | `github` | Bounded HTTP requests and pagination, CI evidence, PR operations, inverse trees, release assets. |
 | `daemon` | Independent role scheduling, advisory locks, status, backoff and optional triggers. |
-| `pipeline` | Landing, one-pass review, CI diagnosis, release and rollout orchestration, the Discord feed's events, outbox and sender. |
-| `manifest` | Deterministic inventories, SHA256 and size validation, safe relative paths. |
-| `rollout` | Local exclusion, snapshots, durable journals, atomic per-file replacement, container digest swaps, rollback. |
+| `pipeline` | Landing, one-pass review, CI diagnosis, the Discord feed's events, outbox and sender. |
 | `integrations` | CLI runner, notifier and task-sink interfaces and adapters. |
 | `discord` | Webhook message types and limits, one post attempt, rate-limit parsing; never exposes a webhook URL. |
 | `reap` | herdr pane and git worktree inspection, ssh execution, remote-URL parsing, protect globs. |

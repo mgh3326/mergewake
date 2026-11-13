@@ -70,7 +70,7 @@ func Pass(ctx context.Context, role string) (context.Context, *sentry.Span) {
 	}
 	options := []sentry.SpanOption{sentry.WithOpName("mergewake.pass")}
 	switch role {
-	case "pr", "reap", "release", "rollout":
+	case "pr", "reap":
 		options = append(options, sentry.WithSpanSampled(sentry.SampledTrue))
 	}
 	span := sentry.StartTransaction(ctx, role+" pass", options...)

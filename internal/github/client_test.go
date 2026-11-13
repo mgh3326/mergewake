@@ -11,9 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mgh3326/mergewake/internal/config"
-	"github.com/mgh3326/mergewake/internal/manifest"
 )
 
 var testSHA = strings.Repeat("a", 40)
@@ -163,69 +160,6 @@ func TestReviewedRequiresTrustedLoginAndExactHead(t *testing.T) {
 		}
 	}
 }
-func TestPublishDraftAndIdempotency(t *testing.T) {
-	m, e := manifest.Build("example/project", testSHA, []config.Install{{Source: "tool", Target: "bin/tool"}}, func(string) ([]byte, error) { return []byte("payload"), nil })
-	if e != nil {
-		t.Fatal(e)
-	}
-	tagged, published := false, false
-	uploads, mutations := 0, 0
-	var asset []byte
-	c := api(t, func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if r.Method != "GET" {
-			mutations++
-		}
-		switch {
-		case strings.Contains(p, "/git/ref/tags/"):
-			if !tagged {
-				http.NotFound(w, r)
-			} else {
-				reply(w, map[string]any{"object": Ref{SHA: testSHA}})
-			}
-		case strings.HasSuffix(p, "/git/refs"):
-			tagged = true
-			reply(w, Ref{SHA: testSHA})
-		case strings.Contains(p, "/releases/tags/"):
-			if !published {
-				http.NotFound(w, r)
-			} else {
-				reply(w, Release{ID: 1, Tag: Tag(testSHA), Assets: []Asset{{ID: 2, Name: AssetName, Size: int64(len(asset))}}})
-			}
-		case strings.HasSuffix(p, "/releases") && r.Method == "POST":
-			reply(w, Release{ID: 1, Tag: Tag(testSHA), Draft: true})
-		case strings.HasSuffix(p, "/releases/1/assets"):
-			uploads++
-			var v manifest.Manifest
-			if e := json.NewDecoder(r.Body).Decode(&v); e != nil {
-				t.Fatal(e)
-			}
-			asset, _ = json.MarshalIndent(v, "", "  ")
-			reply(w, Asset{ID: 2})
-		case strings.HasSuffix(p, "/releases/1") && r.Method == "PATCH":
-			if uploads != 1 {
-				t.Error("published without asset")
-			}
-			published = true
-			reply(w, Release{ID: 1})
-		case strings.HasSuffix(p, "/releases/assets/2"):
-			_, _ = w.Write(asset)
-		default:
-			t.Error("unexpected route", r.Method, p)
-			http.NotFound(w, r)
-		}
-	})
-	if e = c.Publish(context.Background(), m); e != nil {
-		t.Fatal(e)
-	}
-	first := mutations
-	if e = c.Publish(context.Background(), m); e != nil {
-		t.Fatal(e)
-	}
-	if uploads != 1 || mutations != first {
-		t.Fatal("idempotent publish mutated release")
-	}
-}
 func TestReadFileRejectsSymlink(t *testing.T) {
 	for _, mode := range []string{"100644", "120000"} {
 		t.Run(mode, func(t *testing.T) {
@@ -266,24 +200,6 @@ func TestReadFileMissingNamesPath(t *testing.T) {
 	_, e := c.ReadFile(context.Background(), "example/project", testSHA, ".mergewake/policy.yaml")
 	if e == nil || !strings.Contains(e.Error(), "not found") || !strings.Contains(e.Error(), ".mergewake/policy.yaml") || !strings.Contains(e.Error(), "example/project") {
 		t.Fatalf("unhelpful missing-source error: %v", e)
-	}
-}
-func TestLatestRejectsWrongTagCommit(t *testing.T) {
-	m, _ := manifest.Build("example/project", testSHA, []config.Install{{Source: "tool", Target: "tool"}}, func(string) ([]byte, error) { return []byte("x"), nil })
-	c := api(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/releases"):
-			reply(w, []Release{{ID: 1, Tag: Tag(testSHA), Assets: []Asset{{ID: 2, Name: AssetName, Size: 1000}}}})
-		case strings.Contains(r.URL.Path, "/assets/"):
-			reply(w, m)
-		case strings.Contains(r.URL.Path, "/commits/"):
-			reply(w, Ref{SHA: strings.Repeat("b", 40)})
-		default:
-			http.NotFound(w, r)
-		}
-	})
-	if _, e := c.Manifests(context.Background(), "example/project"); e == nil {
-		t.Fatal("tag mismatch accepted")
 	}
 }
 func TestRevertOverlapAndCASLatch(t *testing.T) {
