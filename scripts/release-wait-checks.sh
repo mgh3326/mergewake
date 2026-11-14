@@ -13,6 +13,8 @@
 #
 # usage: scripts/release-wait-checks.sh SHA [POLICY_FILE] (exit 0 green, 1
 # failed or timed out, 2 usage, 3 superseded by a release tag)
+#        scripts/release-wait-checks.sh --recheck-supersession SHA (exit 0
+#        not superseded, 1 the tags read failed, 2 usage, 3 superseded)
 #
 # GITHUB_REPOSITORY must name the repository (owner/name) and GH_TOKEN
 # authenticates gh. RELEASE_CHECKS_TIMEOUT_SECONDS bounds the wait (default
@@ -33,7 +35,14 @@ fail() {
 	exit 1
 }
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+mode="wait"
+if [ "${1:-}" = --recheck-supersession ]; then
+	mode=recheck
+	shift
+fi
+if [ "$mode" = recheck ]; then
+	[ "$#" -eq 1 ] || usage
+elif [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 	usage
 fi
 sha=$1
@@ -47,16 +56,23 @@ release_tag=${RELEASE_TAG:-}
 [ -n "$release_tag" ] || fail "RELEASE_TAG is not set"
 printf '%s\n' "$release_tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' ||
 	fail "RELEASE_TAG must be vMAJOR.MINOR.PATCH with an optional -suffix: $release_tag"
-[ -f "$policy" ] || fail "policy file not found: $policy"
+if [ "$mode" = wait ]; then
+	[ -f "$policy" ] || fail "policy file not found: $policy"
+fi
 case $timeout in
 	'' | *[!0-9]*) fail "RELEASE_CHECKS_TIMEOUT_SECONDS must be a whole number of seconds" ;;
 esac
 [ "$timeout" -gt 0 ] || fail "RELEASE_CHECKS_TIMEOUT_SECONDS must be positive"
-command -v go >/dev/null 2>&1 || fail "go is required to decode $policy"
+if [ "$mode" = wait ]; then
+	command -v go >/dev/null 2>&1 || fail "go is required to decode $policy"
+fi
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 module_root=$(dirname "$script_dir")
-policy_abs=$(cd "$(dirname "$policy")" && pwd)/$(basename "$policy")
+policy_abs=
+if [ "$mode" = wait ]; then
+	policy_abs=$(cd "$(dirname "$policy")" && pwd)/$(basename "$policy")
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -313,6 +329,39 @@ read_tags() {
 	return 1
 }
 
+# strip_zeros N: print decimal N without leading zeros; an all-zero N prints 0.
+strip_zeros() {
+	s=$1
+	while [ "${#s}" -gt 1 ] && [ "${s#0}" != "$s" ]; do
+		s=${s#0}
+	done
+	printf '%s\n' "$s"
+}
+
+# num_eq A B and num_gt A B compare decimal strings of any length, so a tag
+# component past the shell's integer range still orders. Non-digit input is
+# never equal or greater, the same refusal the integer tests gave.
+num_eq() {
+	case $1 in '' | *[!0-9]*) return 1 ;; esac
+	case $2 in '' | *[!0-9]*) return 1 ;; esac
+	[ "$(strip_zeros "$1")" = "$(strip_zeros "$2")" ]
+}
+
+num_gt() {
+	case $1 in '' | *[!0-9]*) return 1 ;; esac
+	case $2 in '' | *[!0-9]*) return 1 ;; esac
+	a=$(strip_zeros "$1")
+	b=$(strip_zeros "$2")
+	if [ "${#a}" -gt "${#b}" ]; then
+		return 0
+	fi
+	if [ "${#a}" -lt "${#b}" ]; then
+		return 1
+	fi
+	# shellcheck disable=SC3012 # dash, bash and ash all order equal-length strings with \>
+	[ "$a" \> "$b" ]
+}
+
 # version_gt TAG BASE: exit 0 when stable vMAJOR.MINOR.PATCH TAG is higher than
 # BASE, compared by number, so v1.10.0 is higher than v1.9.0.
 version_gt() {
@@ -322,11 +371,11 @@ EOF
 	IFS=. read -r b1 b2 b3 <<EOF
 ${2#v}
 EOF
-	[ "$a1" -gt "$b1" ] && return 0
-	[ "$a1" -eq "$b1" ] || return 1
-	[ "$a2" -gt "$b2" ] && return 0
-	[ "$a2" -eq "$b2" ] || return 1
-	[ "$a3" -gt "$b3" ]
+	num_gt "$a1" "$b1" && return 0
+	num_eq "$a1" "$b1" || return 1
+	num_gt "$a2" "$b2" && return 0
+	num_eq "$a2" "$b2" || return 1
+	num_gt "$a3" "$b3"
 }
 
 # check_same_commit exits 3 when a stable tag higher than RELEASE_TAG points at
@@ -343,6 +392,17 @@ check_same_commit() {
 		exit 3
 	done < "$work/tags"
 }
+
+# --recheck-supersession reads the tags once and runs check_same_commit, for
+# the publish step to repeat the supersession check right before creating the
+# release. A failed tags read fails; it is never read as "not superseded".
+if [ "$mode" = recheck ]; then
+	if ! read_tags; then
+		fail "$(cat "$work/error")"
+	fi
+	check_same_commit
+	exit 0
+fi
 
 check_main_coverage() {
 	if ! gh api "repos/$repo/branches/main" --jq '.commit.sha' > "$work/head" 2> "$work/error"; then

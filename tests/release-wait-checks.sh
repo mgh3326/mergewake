@@ -142,7 +142,34 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 	status=$?
 }
 
+run_recheck() {
+	output=$(cd "$case_dir" &&
+		PATH="$stub:$PATH" \
+		STUB_DIR="$case_dir" \
+		STUB_ALLOW_TAGS="$allow_tags" \
+		STUB_FAIL_TAGS="$fail_tags" \
+		GITHUB_REPOSITORY="example/repo" \
+		RELEASE_TAG="$release_tag" \
+		bash "$script" --recheck-supersession "$sha" 2>&1)
+	status=$?
+}
+
 has() { printf '%s' "$output" | grep -Fq -- "$1"; }
+
+# version_gt is exercised directly: the decimal-string rules (components past
+# the shell's integer range, leading zeros) are unit-tested by extracting the
+# function and its helpers, since check_same_commit's tag filter keeps such
+# components away from the end-to-end path.
+unit=$tmp/version-unit.sh
+{
+	sed -n '/^strip_zeros()/,/^}/p' "$script"
+	sed -n '/^num_eq()/,/^}/p' "$script"
+	sed -n '/^num_gt()/,/^}/p' "$script"
+	sed -n '/^version_gt()/,/^}/p' "$script"
+} > "$unit"
+unit_gt() { # TAG BASE: exit 0 when TAG is the greater version
+	sh -c '. "$1"; version_gt "$2" "$3"' _ "$unit" "$1" "$2"
+}
 
 # (a) Every named check is green.
 reset
@@ -601,6 +628,68 @@ if [ "$status" -eq 1 ] && has 'cannot read the tags' && has 'tags read failed'; 
 	pass "(bb) failing tags read -> exit 1 at the bound, naming the tags read"
 else
 	fail "(bb) failing tags read -> exit $status: $output"
+fi
+
+# (cc) version_gt compares components as decimal strings: a component past the
+# shell's integer range still orders, and leading zeros compare equal.
+if unit_gt 'v1.2.99999999999999999999' 'v1.2.3' &&
+	! unit_gt 'v1.2.3' 'v1.2.99999999999999999999' &&
+	! unit_gt 'v1.2.010' 'v1.2.10' &&
+	! unit_gt 'v1.2.10' 'v1.2.010' &&
+	unit_gt 'v1.2.010' 'v1.2.9' &&
+	unit_gt 'v1.10.0' 'v1.9.0' &&
+	! unit_gt 'v1.2.3' 'v1.2.3'; then
+	pass "(cc) version_gt decimal-string compare"
+else
+	fail "(cc) version_gt decimal-string compare"
+fi
+
+# (dd) A higher tag whose component exceeds the shell's integer range still
+# supersedes the release end to end.
+reset
+allow_tags=1
+policy 'version: 1
+watch_checks: [ci-ok]'
+run 1 ci-ok completed success https://ci.example/tag
+printf 'v1.2.99999999999999999999\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_checks 10
+if [ "$status" -eq 3 ] && has 'v1.2.99999999999999999999'; then
+	pass "(dd) huge version component supersedes -> exit 3"
+else
+	fail "(dd) huge version component -> exit $status: $output"
+fi
+
+# (ee) --recheck-supersession exits 3 when a higher tag points at the commit.
+reset
+allow_tags=1
+printf 'v1.2.4\t%s\n' "$sha" > "$case_dir/tags.tsv"
+run_recheck
+if [ "$status" -eq 3 ] && has 'superseded by v1.2.4'; then
+	pass "(ee) recheck mode superseded -> exit 3"
+else
+	fail "(ee) recheck superseded -> exit $status: $output"
+fi
+
+# (ff) --recheck-supersession exits 0 when no higher tag points at the commit.
+reset
+allow_tags=1
+printf 'v1.2.3\t%s\nv1.2.2\t%s\n' "$sha" "$sha" > "$case_dir/tags.tsv"
+run_recheck
+if [ "$status" -eq 0 ] && ! has 'superseded'; then
+	pass "(ff) recheck mode not superseded -> exit 0"
+else
+	fail "(ff) recheck not superseded -> exit $status: $output"
+fi
+
+# (gg) A failed tags read in --recheck-supersession is a failure, never a pass.
+reset
+allow_tags=1
+fail_tags=1
+run_recheck
+if [ "$status" -eq 1 ] && has 'cannot read the tags' && has 'tags read failed'; then
+	pass "(gg) recheck tags read failure -> exit 1"
+else
+	fail "(gg) recheck tags read failure -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then

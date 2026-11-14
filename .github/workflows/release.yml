@@ -166,4 +166,16 @@ jobs:
             sh scripts/repair-release-assets.sh "$GITHUB_REF_NAME" dist/release
             exit 0
           fi
+          # A higher release tag may have appeared during the wait or the
+          # build: recheck supersession immediately before publishing. Exit 3
+          # means superseded, so this run publishes nothing.
+          if sh scripts/release-wait-checks.sh --recheck-supersession "$GITHUB_SHA"; then
+            :
+          else
+            status=$?
+            if [ "$status" -eq 3 ]; then
+              exit 0
+            fi
+            exit "$status"
+          fi
           gh release create "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "$@"
