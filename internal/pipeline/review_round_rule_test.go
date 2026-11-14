@@ -1007,6 +1007,78 @@ func TestRoundRule_LadderTerminalOutcomes(t *testing.T) {
 	}
 }
 
+// A pending (rc 124) call keeps retrying and an ended ladder keeps retrying
+// its owed decision after the ladder round has passed: reviewRounds is
+// monotonic, so rounds == ladderRound never holds again once a new round is
+// recorded.
+func TestRoundRule_LadderObligationSurvivesLaterRounds(t *testing.T) {
+	ladderEndedEvents := func(n *ackNotifier) int {
+		count := 0
+		for _, e := range n.events {
+			if e.Type == "decision" && strings.HasPrefix(e.ID, "mergewake-ladder-ended-") {
+				count++
+			}
+		}
+		return count
+	}
+
+	t.Run("pending_retries_after_ladder_round", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		run.escalateRC = 124
+		run.escalateOutput = "pending\n"
+
+		deliver(t, s, r)
+		if calls, _, _ := escalateSnapshot(run); calls != 1 {
+			t.Fatalf("first evaluation calls = %d, want 1", calls)
+		}
+
+		// Another review round is recorded while the call is pending, then
+		// the pending operation ends without a successor.
+		g.fakeGH.passes["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] = []github.PassReceipt{{Pass: 1, Patch: "patch-6", Round: 6}}
+		run.escalateRC = 1
+		run.escalateOutput = "rebind_unconfirmed\n"
+
+		deliver(t, s, r)
+		if calls, _, _ := escalateSnapshot(run); calls != 2 {
+			t.Fatalf("pending retry after the ladder round calls = %d, want 2", calls)
+		}
+		if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+			t.Fatalf("ended outcome after the ladder round must mark escalated")
+		}
+		if got := ladderEndedEvents(n); got != 1 {
+			t.Fatalf("want 1 ladder-ended decision event, got %d: %+v", got, n.events)
+		}
+	})
+
+	t.Run("owed_decision_retries_after_ladder_round", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 6)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		// An earlier evaluation ended the ladder but its decision notify
+		// failed, so the event is still owed.
+		_ = s.saveRoundRuleState(r.Name, 7, roundRuleState{
+			LadderEscalated:        true,
+			LadderEndedNoSuccessor: true,
+		})
+
+		deliver(t, s, r)
+
+		if got := ladderEndedEvents(n); got != 1 {
+			t.Fatalf("want 1 ladder-ended decision event, got %d: %+v", got, n.events)
+		}
+		if calls, _, _ := escalateSnapshot(run); calls != 0 {
+			t.Fatalf("owed decision must not call panewire again, calls = %d", calls)
+		}
+		if st := s.loadRoundRuleState(r.Name, 7); !st.LadderEndedEventSent {
+			t.Fatalf("owed decision was sent but LadderEndedEventSent is false")
+		}
+	})
+}
+
 // (d) two evaluations of the same PR at once make at most one
 // escalate-author call.
 func TestRoundRule_LadderConcurrentEvaluationsSingleCall(t *testing.T) {

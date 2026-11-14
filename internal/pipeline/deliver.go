@@ -174,7 +174,12 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			changed = true
 		}
 	}
-	if done && rounds == ladderRound && openBlocking {
+	// A pending (rc 124) call retries until its bound and an ended ladder
+	// with an unsent decision retries the notify, even after the ladder
+	// round has passed.
+	ladderOwed := st.LadderEndedNoSuccessor && !st.LadderEndedEventSent
+	ladderRetry := !st.escalated() && !st.LadderPendingSince.IsZero()
+	if (done && rounds == ladderRound && openBlocking) || ladderOwed || ladderRetry {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
