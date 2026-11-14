@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"regexp"
+	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -80,16 +81,25 @@ func dedupeTasks(tasks []string) []string {
 }
 
 var (
-	closesHKTasks = regexp.MustCompile(`(?i)\bcloses\s+hk\s+[0-9]+(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)hk\s+[0-9]+)*`)
-	hkTaskID      = regexp.MustCompile(`(?i)\bhk\s+([0-9]+)`)
+	closesHKTasks = regexp.MustCompile(`(?i)^(?:[-*+]\s+|[0-9]+[.)]\s+)?(?:closes|fixes|resolves)\s+hk\s+[0-9]+(?:\s*(?:,\s*(?:and\s+)?|and\s+)hk\s+[0-9]+)*\s*$`)
+	hkTaskID      = regexp.MustCompile(`(?i)hk\s+([0-9]+)(?:$|[^[:alnum:]])`)
 )
 
 // closesTasks reads the hk task IDs of every `Closes hk N` list in body:
 // `Closes hk 1`, `Closes hk 1, hk 2` and `Closes hk 1 and hk 2`.
 func closesTasks(body string) []string {
 	var out []string
-	for _, list := range closesHKTasks.FindAllString(body, -1) {
-		for _, match := range hkTaskID.FindAllStringSubmatch(list, -1) {
+	inFence := false
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || strings.HasPrefix(trimmed, ">") || !closesHKTasks.MatchString(trimmed) {
+			continue
+		}
+		for _, match := range hkTaskID.FindAllStringSubmatch(trimmed, -1) {
 			if integrations.TaskID.MatchString(match[1]) {
 				out = append(out, match[1])
 			}

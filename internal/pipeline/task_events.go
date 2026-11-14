@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -30,6 +31,30 @@ type taskEventRecord struct {
 	SourceRef string                        `json:"source_ref"`
 	Result    *integrations.TaskEventResult `json:"result,omitempty"`
 	Error     string                        `json:"error,omitempty"`
+}
+
+type cappedTaskRecord struct {
+	Source    string `json:"source"`
+	Task      string `json:"task"`
+	SourceRef string `json:"source_ref"`
+	Error     string `json:"error"`
+}
+
+var taskEventBudget = 30 * time.Second
+
+func isTasksFieldRefusal(err error) bool {
+	var hkErr *integrations.HKError
+	return errors.As(err, &hkErr) && hkErr.Status == 400 && hkErr.Code == "invalid_event"
+}
+
+func auditTaskEvent(s *Service, r config.Repo, row taskEventRecord, task string, result integrations.TaskEventResult, err error) {
+	row.Task = task
+	if err != nil {
+		row.Error = err.Error()
+	} else {
+		row.Result = &result
+	}
+	_ = s.audit(r.Name, "hk-task-event", row, false)
 }
 
 // fieldsRefusedRecord is the audit row of an hk that answered 400 to the
@@ -106,7 +131,7 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	if !ok || !r.TaskEventsOn() {
 		return postGated
 	}
-	ctx, cancel := reportContext(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), taskEventBudget)
 	defer cancel()
 	row := taskEventRecord{Source: source, SourceRef: prURL(r.Name, pr.Number)}
 	if revert != nil {
@@ -121,49 +146,68 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	if len(tasks) == 0 {
 		return postNoTask
 	}
-	mergeSHA := ""
-	mergeSHARead := false
-	attempted := false
+	ids := make([]int64, 0, min(len(tasks), integrations.MaxEventTasks))
+	validTasks := make([]string, 0, min(len(tasks), integrations.MaxEventTasks))
 	for _, task := range tasks {
-		eventRow := row
-		eventRow.Task = task
-		id, err := strconv.ParseInt(task, 10, 64)
-		if err != nil {
-			eventRow.Error = "task ID out of range; not posted"
-			_ = s.audit(r.Name, "hk-task-event", eventRow, false)
+		id, parseErr := strconv.ParseInt(task, 10, 64)
+		if parseErr != nil {
+			bad := row
+			bad.Task = task
+			bad.Error = "task ID out of range; not posted"
+			_ = s.audit(r.Name, "hk-task-event", bad, false)
 			continue
 		}
-		attempted = true
-		if source == integrations.SourceMerge && !mergeSHARead {
-			mergeSHA = s.mergeCommit(ctx, r, pr)
-			mergeSHARead = true
+		if len(ids) == integrations.MaxEventTasks {
+			_ = s.audit(r.Name, "hk-task-event", cappedTaskRecord{Source: source, Task: task, SourceRef: row.SourceRef, Error: "tasks-capped"}, false)
+			continue
 		}
-		ev := integrations.TaskEvent{Source: source, SourceRef: row.SourceRef, TaskID: id, PR: prURL(r.Name, pr.Number), At: &at}
-		if revert != nil {
-			ev.RevertPR, ev.RevertedPR = row.SourceRef, ev.PR
+		ids, validTasks = append(ids, id), append(validTasks, task)
+	}
+	if len(ids) == 0 {
+		return postInvalid
+	}
+	mergeSHA := ""
+	if source == integrations.SourceMerge {
+		mergeSHA = s.mergeCommit(ctx, r, pr)
+	}
+	ev := integrations.TaskEvent{Source: source, SourceRef: row.SourceRef, TaskID: ids[0], Tasks: ids[1:], PR: prURL(r.Name, pr.Number), At: &at}
+	if revert != nil {
+		ev.RevertPR, ev.RevertedPR = row.SourceRef, ev.PR
+	}
+	ev.HeadSHA, ev.BaseSHA, ev.MergeSHA = integrations.SHA(pr.Head.SHA), integrations.SHA(pr.Base.SHA), mergeSHA
+	if source == integrations.SourceReview {
+		ev.Reviews = s.hkReviews(r.Name, taskEventRecord{Source: source, Task: validTasks[0], SourceRef: row.SourceRef}, reviews)
+	}
+	res, postErr := hk.PostTaskEvent(ctx, ev)
+	if len(ids) > 1 && isTasksFieldRefusal(postErr) {
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				break
+			}
+			one := ev
+			one.TaskID, one.Tasks = id, nil
+			result, e := hk.PostTaskEvent(ctx, one)
+			i := slices.Index(ids, id)
+			auditTaskEvent(s, r, row, validTasks[i], result, e)
 		}
-		ev.HeadSHA, ev.BaseSHA = integrations.SHA(pr.Head.SHA), integrations.SHA(pr.Base.SHA)
-		ev.MergeSHA = mergeSHA
-		if source == integrations.SourceReview {
-			ev.Reviews = s.hkReviews(r.Name, eventRow, reviews)
+		return postSent
+	}
+	for i, task := range validTasks {
+		taskResult := res
+		if postErr == nil && len(res.Tasks) > 0 {
+			for _, perTask := range res.Tasks {
+				if perTask.TaskID == ids[i] {
+					taskResult.Applied, taskResult.Redelivered, taskResult.State, taskResult.Reason = perTask.Applied, perTask.Redelivered, perTask.State, perTask.Reason
+					break
+				}
+			}
 		}
-		postCtx, postCancel := reportContext(ctx)
-		res, postErr := hk.PostTaskEvent(postCtx, ev)
-		postCancel()
-		if postErr != nil {
-			eventRow.Error = postErr.Error()
-		} else {
-			eventRow.Result = &res
-		}
-		_ = s.audit(r.Name, "hk-task-event", eventRow, false)
-		if postErr == nil && res.FieldsRefused != "" {
+		auditTaskEvent(s, r, row, task, taskResult, postErr)
+		if postErr == nil && res.FieldsRefused != "" && i == 0 {
 			_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
 		}
 	}
-	if attempted {
-		return postSent
-	}
-	return postInvalid
+	return postSent
 }
 
 // hkReviews fits each record to hk's rules (ReviewRecord.ForHK) and audits
