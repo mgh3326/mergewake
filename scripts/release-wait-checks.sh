@@ -406,15 +406,17 @@ check_main_tag_coverage() {
 		return 1
 	fi
 
-	if ! gh api --paginate --slurp "repos/$repo/compare/$sha...$head" \
-		--jq '[.[0].status, (.[0].total_commits | tostring), ([.[].commits[]?.sha] | join(","))] | @tsv' \
-		> "$work/compare" 2> "$work/error"; then
+	if ! gh api --paginate "repos/$repo/compare/$sha...$head" \
+		> "$work/compare-json" 2> "$work/error"; then
 		return 2
 	fi
-	compare_status=
-	total_commits=
-	compare_shas=
-	IFS="$(printf '\t')" read -r compare_status total_commits compare_shas < "$work/compare" || true
+	if ! jq -sr '.[0].status, (.[0].total_commits | tostring), ([.[].commits[]?.sha] | join(","))' \
+		"$work/compare-json" > "$work/compare" 2> "$work/error"; then
+		return 2
+	fi
+	compare_status=$(sed -n '1p' "$work/compare")
+	total_commits=$(sed -n '2p' "$work/compare")
+	compare_shas=$(sed -n '3p' "$work/compare")
 	compare_count=0
 	if [ -n "${compare_shas:-}" ]; then
 		compare_count=$(printf '%s\n' "$compare_shas" | awk -F, '{print NF}')
@@ -423,7 +425,14 @@ check_main_tag_coverage() {
 		'' | *[!0-9]*) return 1 ;;
 		*) [ "$compare_count" -ge "$total_commits" ] || return 1 ;;
 	esac
-	[ "${compare_status:-}" = ahead ] || return 1
+	case ${compare_status:-} in
+		ahead) ;;
+		diverged | behind)
+			[ "$mode" = recheck ] && return 0
+			return 1
+			;;
+		*) return 1 ;;
+	esac
 
 	if [ "$mode" = wait ] && ! read_tags; then
 		return 2

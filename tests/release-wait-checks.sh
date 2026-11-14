@@ -25,12 +25,16 @@ cat > "$stub/gh" <<'STUB'
 #!/bin/sh
 # Stub gh: answer API reads from fixtures in $STUB_DIR. Reads must paginate.
 paginate=0
+has_slurp=0
+has_jq=0
 endpoint=
 for arg in "$@"; do
 	case $arg in repos/*) endpoint=$arg ;; esac
 done
 for arg in "$@"; do
 	[ "$arg" = --paginate ] && paginate=1
+	[ "$arg" = --slurp ] && has_slurp=1
+	[ "$arg" = --jq ] && has_jq=1
 done
 for arg in "$@"; do
 	case $arg in
@@ -68,9 +72,25 @@ for arg in "$@"; do
 	*/compare/*...*)
 		[ "${STUB_ALLOW_COMPARE:-}" = 1 ] || { echo "stub gh: unexpected compare request: $*" >&2; exit 1; }
 		[ "$paginate" = 1 ] || { echo "stub gh: compare read is not paginated" >&2; exit 1; }
+		if [ "$has_slurp" = 1 ] && [ "$has_jq" = 1 ]; then
+			echo "gh: cannot use --slurp with --jq" >&2
+			exit 1
+		fi
 		if [ "${STUB_FAIL_COMPARE:-}" = 1 ]; then
 			echo "stub gh: compare transient failure" >&2
 			exit 1
+		fi
+		if [ "${STUB_COMPARE_JSON:-}" = 1 ]; then
+			commits_json=
+			old_ifs=$IFS
+			IFS=,
+			for commit_sha in $STUB_COMPARE_SHAS; do
+				commits_json=${commits_json}${commits_json:+,}{\"sha\":\"$commit_sha\"}
+			done
+			IFS=$old_ifs
+			printf '{"status":"%s","total_commits":%s,"commits":[%s]}\n' \
+				"$STUB_COMPARE_STATUS" "$STUB_TOTAL_COMMITS" "$commits_json"
+			exit 0
 		fi
 		printf '%s\t%s\t%s\n' "$STUB_COMPARE_STATUS" "$STUB_TOTAL_COMMITS" "$STUB_COMPARE_SHAS"
 		exit 0
@@ -139,6 +159,7 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 		STUB_COMPARE_STATUS="$compare_status" \
 		STUB_TOTAL_COMMITS="$total_commits" \
 		STUB_COMPARE_SHAS="$compare_shas" \
+		STUB_COMPARE_JSON=1 \
 		STUB_FAIL_TAGS="$fail_tags" \
 		GITHUB_REPOSITORY="example/repo" \
 		RELEASE_TAG="$release_tag" \
@@ -160,6 +181,7 @@ run_recheck() {
 		STUB_COMPARE_STATUS="$compare_status" \
 		STUB_TOTAL_COMMITS="$total_commits" \
 		STUB_COMPARE_SHAS="$compare_shas" \
+		STUB_COMPARE_JSON=1 \
 		STUB_FAIL_TAGS="$fail_tags" \
 		GITHUB_REPOSITORY="example/repo" \
 		RELEASE_TAG="$release_tag" \
@@ -745,18 +767,34 @@ else
 	fail "(jj) recheck main-head read failure -> exit $status: $output"
 fi
 
-# (kk) A compare that cannot bound the range (not ahead) in
-# --recheck-supersession fails rather than reading as not superseded.
+# (kk) A complete diverged comparison means main does not contain the release
+# SHA, so it cannot supersede it.
+	for status_case in diverged behind; do
+	reset
+	main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	allow_compare=1
+	allow_tags=1
+	compare_status=$status_case
+	run_recheck
+	if [ "$status" -eq 0 ] && ! has 'superseded'; then
+		pass "(kk) recheck $status_case compare -> exit 0"
+	else
+		fail "(kk) recheck $status_case compare -> exit $status: $output"
+	fi
+done
+
+# An incomplete diverged range cannot establish that main does not contain sha.
 reset
 main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 allow_compare=1
 allow_tags=1
 compare_status=diverged
+total_commits=2
 run_recheck
 if [ "$status" -eq 1 ] && ! has 'superseded'; then
-	pass "(kk) recheck inconclusive compare -> exit 1"
+	pass "(kk) recheck truncated diverged compare -> exit 1"
 else
-	fail "(kk) recheck inconclusive compare -> exit $status: $output"
+	fail "(kk) recheck truncated diverged compare -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then
