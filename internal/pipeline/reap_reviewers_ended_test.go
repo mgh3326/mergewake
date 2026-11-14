@@ -97,3 +97,32 @@ func TestReapReviewerUnreadableJobRecordKeepsPane(t *testing.T) {
 		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }
+
+// (a) A lost job whose role is not reviewer keeps its finished pane: the early
+// release is reviewer-only, so the hold stays as job:lost and nothing closes.
+func TestReapLostNonReviewerJobKeepsFinishedPane(t *testing.T) {
+	for _, role := range []string{"worker", "implementer", "tester", "counsel", "consult"} {
+		t.Run(role, func(t *testing.T) {
+			f := newEndedFix(t, "lost")
+			f.hub.composer = map[string]any{"outcome": "read", "composer": "empty"}
+			f.setJob(func(j *integrations.JobRecord) { j.Role = role })
+			f.passAfter(t, 0)
+			f.passAfter(t, 3*time.Hour)
+			rows := f.rows(t)
+			if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "job:lost" {
+				t.Fatalf("closes=%d: %v", f.closes(), rowSummary(rows))
+			}
+		})
+	}
+}
+
+// (b) A lost reviewer job whose pane has an empty composer closes at once.
+func TestReapLostReviewerJobClosesEmptyPane(t *testing.T) {
+	f := newEndedFix(t, "lost")
+	f.hub.composer = map[string]any{"outcome": "read", "composer": "empty"}
+	f.passAfter(t, 0)
+	rows := f.rows(t)
+	if f.closes() != 1 || len(rows) == 0 || rows[0].Result != "closed" {
+		t.Fatalf("closes=%d: %v", f.closes(), rowSummary(rows))
+	}
+}

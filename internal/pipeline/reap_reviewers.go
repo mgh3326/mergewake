@@ -32,21 +32,22 @@ import (
 // local checkout is removed only when it is clean, detached at the reviewed
 // head and no local pane runs in it.
 //
-// A reviewer-only exception keeps finished panes from piling up. An omp pane
-// has a composer herdr cannot read, so a reviewer pane whose job record says
-// the job ended (completed or lost) closes without the read. One whose job
-// record does not say that waits: it closes once it has stayed idle with an
-// unreadable composer for reviewerUnreadableIdle. And a reviewer job that never
-// left spawned, whose pane is idle and whose PR is closed or past the reviewed
-// head, is closed abandoned first (abandonSpawned). A worker pane keeps the
-// composer read: a person may type in it.
+// A reviewer-only exception keeps finished panes from piling up; it applies to
+// reviewer jobs only. An omp pane has a composer herdr cannot read, so a
+// reviewer pane whose job record says the job ended (completed or lost) closes
+// without the read. One whose job record does not say that waits: it closes
+// once it has stayed idle with an unreadable composer for
+// reviewerUnreadableIdle. And a reviewer job that never left spawned, whose
+// pane is idle and whose PR is closed or past the reviewed head, is closed
+// abandoned first (abandonSpawned). A worker pane keeps the composer read: a
+// person may type in it.
 
 // reviewerLabelPattern is the label a review pass gives its pane, job and
 // checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go). The hub's
 // replacement for a quota-stopped reviewer adds -q<n> (n >= 1) to the old job id.
 // reviewerUnreadableIdle is how long a reviewer pane must have sat idle with a
-// composer the hub could not read before the sweep closes it unread; a job
-// record that says the job ended skips the clock. The clock is the pane
+// composer the hub could not read before the sweep closes it unread; a reviewer
+// job record that says the job ended skips the clock. The clock is the pane
 // stream's kept composer-unknown row: the receipts dedupe repeats, so that
 // row's time is when the sweep first saw this state, and a pane that worked in
 // between wrote a different row and started the clock again.
@@ -405,7 +406,8 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	held := !reaped && !w.abandoned[l.name]
 	// A lost reviewer job cannot be holding anyone's work either: its finished
 	// pane is reaped now, under the same composer read a completed job's gets.
-	if held && job.State == "lost" && c.pane != nil && paneFinished(c.pane.Status) {
+	// Only reviewer jobs get this; a lost worker or implementer keeps its hold.
+	if held && job.Role == "reviewer" && job.State == "lost" && c.pane != nil && paneFinished(c.pane.Status) {
 		held = false
 	}
 	if held && unused && (job.State == "escalated" || job.State == "lost" || aged) {
@@ -576,7 +578,7 @@ func (w *reviewerSweep) unreadableKeep(rec reapReceipt, pane reap.Pane, job inte
 		}
 		return "status:" + st, ""
 	}
-	if terminalJob(job.State) {
+	if job.Role == "reviewer" && terminalJob(job.State) {
 		return "", composerUnknownJobEnded
 	}
 	prior, ok := w.streams[rec.Label]["pane"]
