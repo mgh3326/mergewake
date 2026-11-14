@@ -1449,7 +1449,7 @@ func (x *panewireExecutor) nudgeIdleReviewer(ctx context.Context, plan *passPlan
 	}
 	findings := filepath.Join(cfg.Jobs, rj.Label, "findings.json")
 	report := filepath.Join(cfg.Jobs, rj.Label, "report.md")
-	text := fmt.Sprintf("mergewake: your review of %s#%d pass %d has no result yet. Write the two files now from the work you have already done: findings.json at %s and report.md at %s. Then run `panewire done %s --result %s --report %s`. Do not start new reading.", x.repo.Name, pr.Number, plan.pass, findings, report, rj.Label, findings, report)
+	text := fmt.Sprintf("mergewake: your review of %s#%d pass %d has no result yet. Write the two files now from the work you have already done: findings.json at %s and report.md at %s. Then run `panewire done %s --result %s --report %s` in the foreground and wait for it to finish. `OK job=` means success; on a non-zero exit, fix what the error names in findings.json or report.md and run the same command again. Do not start new reading.", x.repo.Name, pr.Number, plan.pass, findings, report, rj.Label, findings, report)
 	c, cancel := reportContext(ctx)
 	defer cancel()
 	if e := s.Notifier.Notify(c, integrations.Event{ID: rj.Label + "-nudge", Lane: rj.Label, Text: text}); e != nil {
@@ -1895,7 +1895,11 @@ func (x *panewireExecutor) brief(plan *passPlan, label, jobDir, authorFamily str
 	// `panewire done --result` stores the findings on the job's hk record in
 	// the same PUT as `completed`, so mergewake reads them back through the
 	// record on any host — no attachment, lane event or inbox read.
-	ret := "Then run `panewire done " + label + " --result \"$J/findings.json\" --report \"$J/report.md\"`."
+	ret := "Then run `panewire done " + label + " --result \"$J/findings.json\" --report \"$J/report.md\"` in the\n" +
+		"foreground and wait for it to finish. Success is a line that starts with\n" +
+		"`OK job=`; if it exits non-zero, read the error, fix what it names in\n" +
+		"findings.json or report.md, and run the same command again. Stop only after an\n" +
+		"`OK job=` line."
 	text := fmt.Sprintf(`# Review — %[1]s#%[2]d pass %[3]d (%[4]s lens)
 
 You are the independent reviewer for pull request %[1]s#%[2]d. mergewake posts
