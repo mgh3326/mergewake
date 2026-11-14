@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/hktest"
@@ -484,6 +485,246 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 			}
 		}
 	}
+}
+
+func assertNoSecretPatternsOnRemovedBriefLines(t *testing.T, brief string) {
+	t.Helper()
+	inDiff, inHunk := false, false
+	for _, line := range strings.Split(brief, "\n") {
+		switch {
+		case strings.HasPrefix(line, "~~~~~~~~diff"):
+			inDiff, inHunk = true, false
+			continue
+		case inDiff && strings.HasPrefix(line, "~~~~~~~~"):
+			inDiff, inHunk = false, false
+			continue
+		case !inDiff:
+			continue
+		case strings.HasPrefix(line, "@@ "):
+			inHunk = true
+			continue
+		case !inHunk:
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			if _, count, names := archive.RedactSecretLike(line[1:]); count > 0 {
+				t.Errorf("removed brief line still matches secret patterns %v: %q", names, line)
+			}
+		}
+	}
+}
+
+func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
+	token := "gh" + "p_" + strings.Repeat("a", 36)
+	deletedFileValue := "FOO_TOKEN=" + strings.Repeat("b", 16)
+	pemBegin := strings.Join([]string{"-----", "BEGIN"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
+	pemBody := strings.Repeat("Ab3/", 16)
+	pemEnd := strings.Join([]string{"-----", "END"}, "") + " PRIVATE KEY" + strings.Join([]string{"-----"}, "")
+	pgpBegin := strings.Join([]string{"-----", "BEGIN "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
+	pgpBody := strings.Repeat("Ef5/", 16)
+	pgpEnd := strings.Join([]string{"-----", "END "}, "") + "PGP PRIVATE KEY BLOCK" + strings.Join([]string{"-----"}, "")
+	base64Line := strings.Repeat("Cd4/", 64)
+	tests := []struct {
+		name, diff, want, alsoWant, notWant, path, pattern, summary string
+		rows, count                                                 int
+	}{
+		{
+			name:    "removed token line",
+			diff:    "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1,2 +1 @@\n-const old = \"" + token + "\"\n keep\n",
+			want:    "-const old = \"[redacted github_token]\"\n keep",
+			notWant: token,
+			path:    "auth.go",
+			pattern: "github_token",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "deleted file",
+			diff:    "diff --git a/old.env b/old.env\ndeleted file mode 100644\n--- a/old.env\n+++ /dev/null\n@@ -1 +0,0 @@\n-" + deletedFileValue + "\n",
+			want:    "-[redacted token_assignment]",
+			notWant: deletedFileValue,
+			summary: "Deleted-file text is in base revision " + shaB,
+			path:    "old.env",
+			pattern: "token_assignment",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "mixed replace redacts removed secret",
+			diff:    "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+getenv\n",
+			want:    "-[redacted github_token]\n+getenv",
+			notWant: token,
+			path:    "auth.go",
+			pattern: "github_token",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "PEM context markers redact removed body",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +1,2 @@\n " + pemBegin + "\n-" + pemBody + "\n " + pemEnd + "\n",
+			want:    " " + pemBegin + "\n-[redacted]\n " + pemEnd,
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   1,
+		},
+		{
+			name:    "fully removed PEM block",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +0,0 @@\n-" + pemBegin + "\n-" + pemBody + "\n-" + pemEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n-[redacted]",
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   3,
+		},
+		{
+			name:    "fully removed PGP private key block",
+			diff:    "diff --git a/private.asc b/private.asc\n--- a/private.asc\n+++ b/private.asc\n@@ -1,3 +0,0 @@\n-" + pgpBegin + "\n-" + pgpBody + "\n-" + pgpEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n-[redacted]",
+			notWant: pgpBody,
+			path:    "private.asc",
+			pattern: "private_key",
+			rows:    1,
+			count:   3,
+		},
+		{
+			name:    "removed PEM begin with context end",
+			diff:    "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1,3 +1 @@\n-" + pemBegin + "\n-" + pemBody + "\n " + pemEnd + "\n",
+			want:    "-[redacted]\n-[redacted]\n " + pemEnd,
+			notWant: pemBody,
+			path:    "id_rsa",
+			pattern: "private_key",
+			rows:    1,
+			count:   2,
+		},
+		{
+			name:     "PEM state spans hunks and resets between files",
+			diff:     "diff --git a/id_rsa b/id_rsa\n--- a/id_rsa\n+++ b/id_rsa\n@@ -1 +0,0 @@\n-" + pemBegin + "\n@@ -10 +9,0 @@\n-" + pemBody + "\ndiff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
+			want:     "-[redacted]",
+			alsoWant: "-" + base64Line,
+			notWant:  pemBody,
+			path:     "id_rsa",
+			pattern:  "private_key",
+			rows:     1,
+			count:    2,
+		},
+		{
+			name:    "long base64 outside PEM stays unchanged",
+			diff:    "diff --git a/blob b/blob\n--- a/blob\n+++ b/blob\n@@ -1 +0,0 @@\n-" + base64Line + "\n",
+			want:    "-" + base64Line,
+			notWant: "[redacted]",
+		},
+		{
+			name: "added token stays verbatim",
+			diff: "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -0,0 +1 @@\n+" + token + "\n",
+			want: "+" + token,
+		},
+		{
+			name: "ordinary delta unchanged",
+			diff: "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+new\n",
+			want: "@@ -1 +1 @@\n-old\n+new",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &panewireRunner{}
+			s, g, r := panewireSetup(t, runner)
+			pr := g.pull
+			pr.Base.SHA = shaB
+			g.pull.Base.SHA = shaA
+			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
+			got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+			assertNoSecretPatternsOnRemovedBriefLines(t, got)
+			if tt.name == "ordinary delta unchanged" {
+				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLines(tt.diff)
+				if redacted != tt.diff || count != 0 || paths != nil || patterns != nil || deletedPaths != nil {
+					t.Fatalf("ordinary diff changed: %q %d %v %v %v", redacted, count, paths, patterns, deletedPaths)
+				}
+			}
+			if !strings.Contains(got, tt.want) || tt.alsoWant != "" && !strings.Contains(got, tt.alsoWant) || tt.notWant != "" && strings.Contains(got, tt.notWant) || tt.summary != "" && !strings.Contains(got, tt.summary) || tt.summary != "" && strings.Contains(got, "Full text is in the checkout") {
+				t.Fatalf("brief did not satisfy want %q / also-want %q / not-want %q / summary %q:\n%s", tt.want, tt.alsoWant, tt.notWant, tt.summary, got)
+			}
+			if tt.summary != "" {
+				for _, line := range strings.Split(got, "\n") {
+					if strings.Contains(line, "Deleted-file text is in base revision") {
+						t.Logf("deleted-file summary: %s", line)
+					}
+				}
+			}
+			rows := auditRows(t, s, r, "review-brief-redacted")
+			if len(rows) != tt.rows {
+				t.Fatalf("redaction audit rows=%v, want %d", rows, tt.rows)
+			}
+			if tt.rows > 0 {
+				body, _ := json.Marshal(rows[0])
+				if strings.Contains(string(body), token) || strings.Contains(string(body), deletedFileValue) || strings.Contains(string(body), pemBody) || strings.Contains(string(body), pgpBody) || strings.Contains(string(body), base64Line) {
+					t.Fatalf("audit contains matched text: %s", body)
+				}
+				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any(tt.pattern)) {
+					t.Fatalf("audit row lacks redaction summary: %v", rows[0])
+				}
+			}
+		})
+	}
+}
+
+func TestPanewireRoundOneBriefKeepsRemovedSecretVerbatim(t *testing.T) {
+	token := "gh" + "p_" + strings.Repeat("d", 36)
+	diff := "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +0,0 @@\n-" + token + "\n"
+	runner := &panewireRunner{}
+	s, g, r := panewireSetup(t, runner)
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, delta: false, round: 1}
+	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	if strings.Contains(got, token) || strings.Contains(got, "Delta to review") || strings.Contains(got, "Redacted ") || len(auditRows(t, s, r, "review-brief-redacted")) != 0 {
+		t.Fatalf("round-one brief changed: %s", got)
+	}
+}
+
+func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
+	token := "gh" + "p_" + strings.Repeat("c", 36)
+	delta := "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1 +1 @@\n-" + token + "\n+replacement\n"
+	full := patchOne + delta
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	g.refs = map[string]bool{doneRef(7, shaB): true}
+	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: full}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d, want a successful reviewer spawn", len(runner.spawns))
+	}
+	brief, err := os.ReadFile(arg(runner.spawns[0], "-p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(brief, []byte("[redacted github_token]")) || bytes.Contains(brief, []byte(token)) || !bytes.Contains(brief, []byte("Redacted 1 secret-like string")) || bytes.Contains(brief, []byte("Full text is in the checkout.")) {
+		t.Fatalf("spawned brief does not carry the redacted delta and summary:\n%s", brief)
+	}
+	for _, line := range strings.Split(string(brief), "\n") {
+		if strings.Contains(line, "[redacted github_token]") || strings.Contains(line, "Redacted 1 secret-like string") {
+			t.Logf("brief excerpt: %s", line)
+		}
+	}
+	rows := auditRows(t, s, r, "review-brief-redacted")
+	if len(rows) != 1 || rows[0]["pr"] != float64(7) || rows[0]["head"] != shaA || rows[0]["pass"] != float64(1) || rows[0]["label"] != arg(runner.spawns[0], "-l") || rows[0]["count"] != float64(1) || !slices.Contains(rows[0]["paths"].([]any), "auth.go") || !slices.Contains(rows[0]["pattern_names"].([]any), "github_token") {
+		t.Fatalf("redaction audit: %v", rows)
+	}
+	auditJSON, _ := json.Marshal(rows[0])
+	t.Logf("redaction audit row: %s", auditJSON)
+	receipts := g.passes[shaA]
+	wantPatch := reviewPatchID(full)
+	redactedFull := patchOne + redactRemovedDiffLinesMust(delta)
+	if len(receipts) != 1 || receipts[0].Patch != wantPatch || receipts[0].Patch == reviewPatchID(redactedFull) {
+		t.Fatalf("receipt=%+v; want raw reviewed diff patch %q", receipts, wantPatch)
+	}
+}
+
+func redactRemovedDiffLinesMust(diff string) string {
+	redacted, _, _, _, _ := redactRemovedDiffLines(diff)
+	return redacted
 }
 
 func TestPanewireLargeBriefUploadFailureIsExplicit(t *testing.T) {
