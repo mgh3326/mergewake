@@ -30,6 +30,12 @@ func pastCache(ctx context.Context) context.Context {
 	return context.WithValue(freshRequest(ctx), uncachedRequestKey{}, true)
 }
 
+// Uncached is for a read whose caller already knows the answer should differ
+// from what the caches hold, such as a PR's merge commit once the list reports
+// it merged. It reads past the memo, the stored webhook copy and the ETag
+// replay. Use it only where that read is needed.
+func Uncached(ctx context.Context) context.Context { return pastCache(ctx) }
+
 // FreshEvidence forces decision-critical reads through to GitHub.
 func FreshEvidence(ctx context.Context) context.Context {
 	return context.WithValue(ctx, freshEvidenceKey{}, true)

@@ -742,7 +742,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if p.MergeCommitSHA == "" {
 			// The pulls list endpoint omits merge_commit_sha; resolve it for
 			// the few PRs that actually name work.
-			fp, e := s.GH.Pull(ctx, r.Name, p.Number)
+			fp, e := s.GH.Pull(github.Uncached(ctx), r.Name, p.Number)
 			if e != nil {
 				errs = append(errs, fmt.Errorf("PR %d merge commit: %w", p.Number, e))
 				continue

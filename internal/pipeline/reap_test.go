@@ -749,6 +749,10 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil {
 		t.Fatal(err)
 	}
+	// Precondition: a plain read replays the merged body without the sha.
+	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil || conditional.Load() == 0 {
+		t.Fatalf("no ETag replay to exercise: conditional=%d err=%v", conditional.Load(), err)
+	}
 
 	r := &scriptRunner{outs: worktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
@@ -758,8 +762,95 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	if !r.called("worktree\x00remove") {
 		t.Fatal("stale cached PR body starved the merge commit")
 	}
-	if conditional.Load() == 0 || unconditional.Load() < 2 {
-		t.Fatalf("did not exercise stale ETag replay and fresh detail read: conditional=%d unconditional=%d", conditional.Load(), unconditional.Load())
+	if unconditional.Load() < 2 {
+		t.Fatalf("reap did not read the PR unconditionally: %d", unconditional.Load())
+	}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "merge-commit-unknown" {
+			t.Fatalf("merge commit stayed unknown: %v", row)
+		}
+	}
+}
+
+// The PR was open when its single-PR body was cached, so the replayed body
+// has neither merged nor merged_at and the client takes no fresh read. The
+// list already says the PR is merged, so reap must read past every cache:
+// only an unconditional request carries the merge commit.
+func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
+	mergedAt := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	mergeSHA := strings.Repeat("b", 40)
+	var primed atomic.Bool
+	var conditional, unconditional atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case path == "/repos/example/project/pulls":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"user": map[string]any{"login": "a"},
+			}})
+		case strings.HasSuffix(path, "/pulls/12/reviews"):
+			fmt.Fprint(w, `[]`)
+		case strings.HasSuffix(path, "/check-runs"):
+			fmt.Fprint(w, `{"check_runs":[]}`)
+		case strings.HasSuffix(path, "/statuses"):
+			fmt.Fprint(w, `[]`)
+		case path == "/repos/example/project/commits/"+headSHA:
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": headSHA, "commit": map[string]any{"message": "t"}})
+		case path == "/repos/example/project/pulls/12":
+			if r.Header.Get("If-None-Match") == `"open"` {
+				conditional.Add(1)
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			unconditional.Add(1)
+			body := map[string]any{
+				"number": 12, "state": "open", "merged": false, "updated_at": updatedAt,
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"user": map[string]any{"login": "a"},
+			}
+			etag := `"open"`
+			if primed.Load() {
+				body = map[string]any{
+					"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
+					"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+					"user": map[string]any{"login": "a"}, "merge_commit_sha": mergeSHA,
+				}
+				etag = `"merged"`
+			}
+			w.Header().Set("ETag", etag)
+			_ = json.NewEncoder(w).Encode(body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	gh := github.New("")
+	gh.BaseURL = server.URL
+	gh.UploadURL = server.URL
+	gh.HTTP = server.Client()
+	// Cache the open body with its validator, then let GitHub merge the PR.
+	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil {
+		t.Fatal(err)
+	}
+	// Precondition: a plain read now replays the open body with its ETag.
+	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil || conditional.Load() == 0 {
+		t.Fatalf("no ETag replay to exercise: conditional=%d err=%v", conditional.Load(), err)
+	}
+	primed.Store(true)
+
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, pullCacheGH{gh}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("open-PR replay starved the merge commit on the first pass")
+	}
+	if unconditional.Load() < 2 {
+		t.Fatalf("reap did not read the PR unconditionally: %d", unconditional.Load())
 	}
 	for _, row := range reapLogRows(t, s, "example/project") {
 		if row["reason"] == "merge-commit-unknown" {
