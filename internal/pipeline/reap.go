@@ -278,6 +278,14 @@ func reapRowKey(v reapReceipt) string {
 
 func reapRowSig(v reapReceipt) string { return v.Result + "|" + v.Reason }
 
+// terminalWorktreeSig reports whether a worktree's latest row is a terminal
+// outcome: removed, or proven gone (every writer records a gone worktree as
+// skipped with reason worktree-gone). Such a worktree is never offered or
+// inspected again.
+func terminalWorktreeSig(sig string) bool {
+	return sig == "removed|" || sig == "skipped|worktree-gone"
+}
+
 func newReapHistory(receipts []reapReceipt) *reapHistory {
 	h := &reapHistory{
 		lastRow:       map[string]string{},
@@ -347,7 +355,7 @@ func (h *reapHistory) prDone(pr int) bool {
 	for hp := range paths {
 		host, path, _ := strings.Cut(hp, "\x00")
 		sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: pr, Host: host, Worktree: path})]
-		if sig != "removed|" && sig != "worktree-gone|" {
+		if !terminalWorktreeSig(sig) {
 			return false
 		}
 	}
@@ -738,7 +746,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			// it as a candidate would only log the same skip every pass. Live
 			// pane matches are never suppressed.
 			sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: rec.Host, Worktree: path})]
-			if sig == "removed|" || sig == "worktree-gone|" {
+			if terminalWorktreeSig(sig) {
 				continue
 			}
 			add(byName[rec.Host], path, "receipt")
@@ -754,7 +762,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			for _, jc := range found {
 				// A removed or proven-gone worktree is terminal here too.
 				sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: jc.host, Worktree: jc.path})]
-				if sig == "removed|" || sig == "worktree-gone|" {
+				if terminalWorktreeSig(sig) {
 					continue
 				}
 				add(byName[jc.host], jc.path, "job-record")
