@@ -1996,6 +1996,10 @@ that are ignored.
 	return text
 }
 
+type mergeBaser interface {
+	MergeBase(ctx context.Context, repo, baseRef, head string) (string, error)
+}
+
 // deltaRedaction is the review delta as the brief shows it, with what was
 // masked and the files whose old side could not be used.
 type deltaRedaction struct {
@@ -2011,8 +2015,19 @@ func (x *panewireExecutor) redactedDelta(ctx context.Context) deltaRedaction {
 	x.redactOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(ctx, oldSideTimeout)
 		defer cancel()
+		// The delta's old side is the merge base of the base branch and the
+		// head, which is not pr.Base.SHA once the base has moved on.
+		rev := ""
 		old := newOldSideLoader(func(path string) ([]byte, error) {
-			return x.s.GH.ReadFile(ctx, x.repo.Name, x.pr.Base.SHA, path)
+			if rev == "" {
+				rev = x.pr.Base.SHA
+				if mb, ok := x.s.GH.(mergeBaser); ok {
+					if sha, err := mb.MergeBase(ctx, x.repo.Name, x.pr.Base.Ref, x.pr.Head.SHA); err == nil && sha != "" {
+						rev = sha
+					}
+				}
+			}
+			return x.s.GH.ReadFile(ctx, x.repo.Name, rev, path)
 		})
 		r := &x.redacted
 		r.diff, r.count, r.paths, r.patterns, r.deletedPaths = redactRemovedDiffLinesOldSide(x.diff, old)

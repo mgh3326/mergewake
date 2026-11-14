@@ -195,10 +195,14 @@ func markPEMBlock(lines []string, secret []bool, i int) int {
 func markWrappedBase64(lines []string, secret []bool, i int) int {
 	t := strings.TrimSpace(lines[i])
 	secret[i] = true
-	if strings.Trim(t[base64PEMEnd(t):], "\"',; \t") != "" {
+	start, end := base64PEMRun(t)
+	if strings.Trim(t[end:], "\"',; \t") != "" {
 		return i + 1
 	}
-	prev := len(t)
+	// Every chunk of a wrapped value is as wide as the first one, except the
+	// last, which is shorter. The width is the first line's base64 run only: a
+	// key such as `tls.key: ` before it is not part of the value.
+	width := end - start
 	j := i + 1
 	for ; j < len(lines); j++ {
 		c := strings.TrimSpace(lines[j])
@@ -206,11 +210,10 @@ func markWrappedBase64(lines []string, secret []bool, i int) int {
 			break
 		}
 		secret[j] = true
-		if len(c) < prev {
+		if len(c) < width {
 			j++
 			break
 		}
-		prev = len(c)
 	}
 	return j
 }
@@ -221,6 +224,12 @@ func markWrappedBase64(lines []string, secret []bool, i int) int {
 // are decoded, so no other base64 (a go.sum hash, a lockfile integrity value,
 // a certificate) matches: only text that opens with the BEGIN marker does.
 func base64PEMEnd(line string) int {
+	_, end := base64PEMRun(line)
+	return end
+}
+
+// base64PEMRun is base64PEMEnd with the run's start offset too.
+func base64PEMRun(line string) (start, end int) {
 	for _, loc := range base64Run.FindAllStringIndex(line, -1) {
 		run := line[loc[0]:loc[1]]
 		run = strings.TrimRight(run, "=")
@@ -234,8 +243,8 @@ func base64PEMEnd(line string) int {
 		}
 		dec = bytes.TrimLeft(dec, " \t\r\n")
 		if bytes.HasPrefix(dec, []byte(pemKeyBegin)) && bytes.Contains(dec, []byte("PRIVATE KEY")) {
-			return loc[1]
+			return loc[0], loc[1]
 		}
 	}
-	return 0
+	return 0, 0
 }

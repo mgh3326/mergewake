@@ -17,6 +17,15 @@ type oldSideGH struct {
 	files map[string]string
 	fail  map[string]bool
 	reads []string // "sha:path"
+	// mergeBase, when set, is the revision files is served at; atBase is what
+	// the (moved) base branch tip holds instead.
+	mergeBase string
+	mbErr     error
+	atBase    map[string]string
+}
+
+func (g *oldSideGH) MergeBase(_ context.Context, _, _, _ string) (string, error) {
+	return g.mergeBase, g.mbErr
 }
 
 func (g *oldSideGH) ReadFile(_ context.Context, _, sha, name string) ([]byte, error) {
@@ -24,7 +33,11 @@ func (g *oldSideGH) ReadFile(_ context.Context, _, sha, name string) ([]byte, er
 	if g.fail[name] {
 		return nil, errors.New("boom")
 	}
-	body, ok := g.files[name]
+	files := g.files
+	if g.mergeBase != "" && sha != g.mergeBase {
+		files = g.atBase
+	}
+	body, ok := files[name]
 	if !ok {
 		return nil, errors.New("not found")
 	}
@@ -71,7 +84,19 @@ func oldSideCorpus() []oldSideCase {
 	k8sCert := b64(joinLines(certBegin, cert1, certEnd))
 	// A key wrapped over several lines by a yaml folded scalar.
 	wrapped := b64(joinLines(rsaBegin, k1, k2, k3, rsaEnd))
-	w1, w2, w3 := wrapped[:64], wrapped[64:128], wrapped[128:]
+	var chunks []string
+	for rest := wrapped; rest != ""; {
+		n := min(64, len(rest))
+		chunks, rest = append(chunks, rest[:n]), rest[n:]
+	}
+	w2, w3, w4 := chunks[1], chunks[2], chunks[3]
+	wrappedLines := func(prefix string) []string {
+		var l []string
+		for _, c := range chunks[1:] {
+			l = append(l, "    "+c)
+		}
+		return append([]string{prefix + chunks[0]}, l...)
+	}
 
 	sha1 := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"
 	goSum1 := "golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ="
@@ -112,9 +137,18 @@ func oldSideCorpus() []oldSideCase {
 		{
 			name:     "k8s base64 PEM wrapped over lines, first line outside the hunk",
 			path:     "wrapped.yaml",
-			old:      joinLines("data:", "  tls.key: >-", "    "+w1, "    "+w2, "    "+w3, "type: Opaque"),
-			diff:     fileDiff("wrapped.yaml", 4, 3, 1, "-    "+w2, "-    "+w3, " type: Opaque"),
+			old:      joinLines(append(append([]string{"data:", "  tls.key: >-"}, wrappedLines("    ")...), "type: Opaque")...),
+			diff:     fileDiff("wrapped.yaml", 4, 2, 0, "-    "+w2, "-    "+w3),
 			masked:   []string{w2, w3},
+			count:    2,
+			wantRows: 1,
+		},
+		{
+			name:     "k8s base64 PEM wrapped after a yaml key, only later chunks in the hunk",
+			path:     "wrapped2.yaml",
+			old:      joinLines(append(append([]string{"data:"}, wrappedLines("  tls.key: ")...), "type: Opaque")...),
+			diff:     fileDiff("wrapped2.yaml", 4, 2, 0, "-    "+w3, "-    "+w4),
+			masked:   []string{w3, w4},
 			count:    2,
 			wantRows: 1,
 		},
@@ -346,4 +380,50 @@ func TestBase64PEMEnd(t *testing.T) {
 			t.Errorf("base64PEMEnd(%.40q)=%v, want %v", line, got, want)
 		}
 	}
+}
+
+// The delta's old side is the merge base. When the base branch has moved, its
+// tip holds another revision of the file, and reading that would leave the key
+// body in the brief.
+func TestPanewireOldSideReadsTheMergeBase(t *testing.T) {
+	begin := "-----" + "BEGIN " + "PRIVATE KEY" + "-----"
+	end := "-----" + "END " + "PRIVATE KEY" + "-----"
+	k1, k2, removed, tail := strings.Repeat("Qm9k", 16), strings.Repeat("Zx7/", 16), strings.Repeat("Pw3+", 16), "Zx9+/Q=="
+	atMergeBase := joinLines(begin, k1, k2, removed, tail, end)
+	atMovedTip := joinLines("added on main", "added on main too", begin, k1, k2, removed, tail, end)
+	diff := fileDiff("id_key", 3, 4, 2, " "+k2, "-"+removed, "-"+tail, " "+end)
+	const mb = "cccccccccccccccccccccccccccccccccccccccc"
+
+	t.Run("merge base", func(t *testing.T) {
+		runner := &panewireRunner{}
+		s, g, r := panewireSetup(t, runner)
+		gh := &oldSideGH{fakeGH: g, mergeBase: mb, files: map[string]string{"id_key": atMergeBase}, atBase: map[string]string{"id_key": atMovedTip}}
+		s.GH = gh
+		pr := g.pull
+		pr.Base.SHA = shaB
+		x := &panewireExecutor{s: s, repo: r, pr: pr, diff: diff, delta: true, round: 2}
+		got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+		if strings.Contains(got, removed) || strings.Contains(got, tail) || strings.Count(got, "-[redacted]") != 2 {
+			t.Fatalf("key body reached the brief:\n%s", got)
+		}
+		if want := []string{mb + ":id_key"}; !slices.Equal(gh.reads, want) {
+			t.Fatalf("reads=%v, want %v", gh.reads, want)
+		}
+		if rows := auditRows(t, s, r, "review-brief-oldside-fallback"); len(rows) != 0 {
+			t.Fatalf("fallback rows: %v", rows)
+		}
+	})
+	t.Run("merge base unknown falls back to the PR base sha", func(t *testing.T) {
+		runner := &panewireRunner{}
+		s, g, r := panewireSetup(t, runner)
+		gh := &oldSideGH{fakeGH: g, mbErr: errors.New("compare failed"), files: map[string]string{"id_key": atMergeBase}}
+		s.GH = gh
+		pr := g.pull
+		pr.Base.SHA = shaB
+		x := &panewireExecutor{s: s, repo: r, pr: pr, diff: diff, delta: true, round: 2}
+		got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+		if strings.Contains(got, removed) || !slices.Equal(gh.reads, []string{shaB + ":id_key"}) {
+			t.Fatalf("reads=%v brief:\n%s", gh.reads, got)
+		}
+	})
 }
