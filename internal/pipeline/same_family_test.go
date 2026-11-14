@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/outcomes"
 )
 
 // outcomeSameFamily reads the PR-level same_family the outcome ledger holds.
@@ -191,4 +192,49 @@ func TestSameFamilyUnknownFamilyReceipt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A ledger rebuild from GitHub replaces the row's same_family with the judged
+// head's value. The row still holds an earlier head's true when the rebuild
+// runs, and head 2's two other-family passes must read false anyway: the rebuild
+// may not OR the stale value in.
+func TestSameFamilyLedgerRebuildReplacesStaleValue(t *testing.T) {
+	s, g, _, _, r := reviewSetup(t)
+	g.enabled = true
+	g.blocking = true
+	ctx := context.Background()
+	if e := s.ledger().Update(r.Name, 7, func(v *outcomes.Outcome) { v.SameFamily = true }); e != nil {
+		t.Fatal(e)
+	}
+	g.pull.Head.SHA = shaC
+	g.passes = map[string][]github.PassReceipt{
+		shaC: {
+			{Pass: 1, Lens: "correctness", Family: "openai", SameFamily: false, AuthorFamily: "anthropic"},
+			{Pass: 2, Lens: "state-risk", Family: "openai", SameFamily: false, AuthorFamily: "anthropic"},
+		},
+	}
+	g.refs = map[string]bool{doneRef(7, shaC): true}
+	// The rebuild runs only when GitHub reports reviews the row has not seen.
+	s.GH = &reviewedHeadsGH{fakeGH: g, heads: []string{shaC}}
+	if e := s.ObservePR(ctx, r, g.pull, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if outcomeSameFamily(t, s, r.Name) {
+		t.Fatal("ledger rebuild kept an earlier head's same_family true for the judged head")
+	}
+}
+
+// reviewedHeadsGH reports the given heads as reviewed, so an observation
+// rebuilds the outcome row from GitHub.
+type reviewedHeadsGH struct {
+	*fakeGH
+	heads []string
+}
+
+func (g *reviewedHeadsGH) ReviewOutcomes(context.Context, string, int, string) (map[string]map[string]int, error) {
+	out := map[string]map[string]int{}
+	for _, h := range g.heads {
+		out[h] = map[string]int{}
+	}
+	return out, nil
 }
