@@ -393,33 +393,30 @@ check_same_commit() {
 	done < "$work/tags"
 }
 
-# --recheck-supersession reads the tags once and runs check_same_commit, for
-# the publish step to repeat the supersession check right before creating the
-# release. A failed tags read fails; it is never read as "not superseded".
-if [ "$mode" = recheck ]; then
-	if ! read_tags; then
-		fail "$(cat "$work/error")"
-	fi
-	check_same_commit
-	exit 0
-fi
-
-check_main_coverage() {
+# check_main_tag_coverage scans main's compare range for a higher stable tag.
+# It reads tags itself in wait mode; recheck supplies the snapshot it already
+# read for check_same_commit.
+check_main_tag_coverage() {
 	if ! gh api "repos/$repo/branches/main" --jq '.commit.sha' > "$work/head" 2> "$work/error"; then
 		return 2
 	fi
 	head=$(cat "$work/head")
-	[ "$head" != "$sha" ] || return 1
+	if [ "$head" = "$sha" ]; then
+		[ "$mode" = recheck ] && return 0
+		return 1
+	fi
 
-	if ! gh api --paginate --slurp "repos/$repo/compare/$sha...$head" \
-		--jq '[.[0].status, (.[0].total_commits | tostring), ([.[].commits[]?.sha] | join(","))] | @tsv' \
-		> "$work/compare" 2> "$work/error"; then
+	if ! gh api --paginate "repos/$repo/compare/$sha...$head" \
+		> "$work/compare-json" 2> "$work/error"; then
 		return 2
 	fi
-	compare_status=
-	total_commits=
-	compare_shas=
-	IFS="$(printf '\t')" read -r compare_status total_commits compare_shas < "$work/compare" || true
+	if ! jq -sr '.[0].status, (.[0].total_commits | tostring), ([.[].commits[]?.sha] | join(","))' \
+		"$work/compare-json" > "$work/compare" 2> "$work/error"; then
+		return 2
+	fi
+	compare_status=$(sed -n '1p' "$work/compare")
+	total_commits=$(sed -n '2p' "$work/compare")
+	compare_shas=$(sed -n '3p' "$work/compare")
 	compare_count=0
 	if [ -n "${compare_shas:-}" ]; then
 		compare_count=$(printf '%s\n' "$compare_shas" | awk -F, '{print NF}')
@@ -428,9 +425,16 @@ check_main_coverage() {
 		'' | *[!0-9]*) return 1 ;;
 		*) [ "$compare_count" -ge "$total_commits" ] || return 1 ;;
 	esac
-	[ "${compare_status:-}" = ahead ] || return 1
+	case ${compare_status:-} in
+		ahead) ;;
+		diverged | behind)
+			[ "$mode" = recheck ] && return 0
+			return 1
+			;;
+		*) return 1 ;;
+	esac
 
-	if ! read_tags; then
+	if [ "$mode" = wait ] && ! read_tags; then
 		return 2
 	fi
 	while IFS="$(printf '\t')" read -r tag tag_sha; do
@@ -449,6 +453,32 @@ check_main_coverage() {
 		esac
 	done < "$work/tags"
 
+	return 0
+}
+
+# --recheck-supersession repeats both supersession checks immediately before
+# creating the release. Failed reads are errors, never a pass.
+if [ "$mode" = recheck ]; then
+	if ! read_tags; then
+		fail "$(cat "$work/error")"
+	fi
+	check_same_commit
+	coverage_result=0
+	if check_main_tag_coverage; then
+		:
+	else
+		coverage_result=$?
+	fi
+	case $coverage_result in
+		0) ;;
+		2) fail "$(cat "$work/error")" ;;
+		*) fail "cannot determine whether main supersedes $sha" ;;
+	esac
+	exit 0
+fi
+
+check_main_coverage() {
+	check_main_tag_coverage || return $?
 	if ! gh api --paginate "repos/$repo/commits/$head/check-runs?filter=latest&per_page=100" \
 		--jq '.check_runs[] | [.id, .name, .status, (.conclusion // ""), (.details_url // "")] | @tsv' \
 		> "$work/head-runs" 2> "$work/error" ||
