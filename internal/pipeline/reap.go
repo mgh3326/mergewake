@@ -621,7 +621,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// reviewer spawn must not close the author's job pane, remove its worktree,
 	// delete its branch or archive its job.
 	if reviewersOnly(ctx) && prNum > 0 {
-		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)...)
+		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)...)
 	}
 
 	for _, p := range pulls {
@@ -632,7 +632,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if prNum > 0 {
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
-				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
+				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue
@@ -951,7 +951,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			note(brec)
 		}
 	}
-	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, hosts, acting, reviewerNote)...)
+	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
 	if s.Config.Reap.Archive.Enabled {
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, acting, note)...)
 	}

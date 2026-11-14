@@ -27,7 +27,10 @@ type reviewerSummaryState struct {
 // is read, advanced and saved under the repo's state lock, so concurrent passes
 // write each day once. The state is saved right after each row, so a crash
 // between the two repeats at most that one row. Counts come from the reviewer
-// rows in receipts (see reviewerDayCounts).
+// rows in receipts (see reviewerDayCounts). now is when receipts were read, not
+// when the summary runs: a day is summarized only once it ended before that
+// read, so a row stamped on that day but appended after the read is counted by
+// a later pass instead of being missed.
 func (s *Service) reviewerDailySummary(repo string, receipts []reapReceipt, hosts []*reapHost, now time.Time) error {
 	path := filepath.Join(s.state(repo), "reviewer-summary.json")
 	defer lockPath(path)()
