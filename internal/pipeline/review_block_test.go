@@ -122,6 +122,36 @@ func TestFleetPRWithoutTrailerBlocksVisibly(t *testing.T) {
 	}
 }
 
+// Several Mergewake-Task lines are not missing: the first one binds the
+// review's task lookup.
+func TestSeveralTaskTrailersUseFirstForReviewBlock(t *testing.T) {
+	f := blockSetup(t)
+	f.g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\n" + fleetBody
+	sink := f.s.Sink.(*taskJobSink)
+	b, blocked := f.s.reviewBlockFor(context.Background(), f.r, f.g.pull)
+	if blocked || b.reason != "" {
+		t.Fatalf("block = %+v, %v", b, blocked)
+	}
+	if len(sink.tasks) != 1 || sink.tasks[0] != "11" {
+		t.Fatalf("task lookups %v, want [11]", sink.tasks)
+	}
+}
+
+// A Closes hk reference delivers a task to the merge event, but it is not the
+// Mergewake-Task trailer the review gate requires.
+func TestClosesReferenceDoesNotSatisfyTaskTrailer(t *testing.T) {
+	f := blockSetup(t)
+	f.g.pull.Body = "Closes hk 11\n" + fleetBody
+	sink := f.s.Sink.(*taskJobSink)
+	b, blocked := f.s.reviewBlockFor(context.Background(), f.r, f.g.pull)
+	if !blocked || b.reason != blockMissingTrailer {
+		t.Fatalf("block = %+v, %v", b, blocked)
+	}
+	if len(sink.tasks) != 0 {
+		t.Fatalf("task lookups %v, want none", sink.tasks)
+	}
+}
+
 func TestFleetTaskWithoutMarkerBlocksVisibly(t *testing.T) {
 	f := blockSetup(t)
 	f.g.pull.Body = "Mergewake-Task: 42\n" + fleetBody

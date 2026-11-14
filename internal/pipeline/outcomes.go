@@ -20,13 +20,22 @@ import (
 func (s *Service) ledger() outcomes.Ledger {
 	return outcomes.Ledger{Dir: s.Config.StateDir, Now: s.Now}
 }
-func trailer(body, key string) string {
+func trailerValues(body, key string) []string {
 	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `: ([^\r\n]+?)[\t ]*$`)
 	matches := re.FindAllStringSubmatch(body, -1)
-	if len(matches) != 1 {
+	values := make([]string, 0, len(matches))
+	for _, match := range matches {
+		values = append(values, match[1])
+	}
+	return values
+}
+
+func trailer(body, key string) string {
+	values := trailerValues(body, key)
+	if len(values) != 1 {
 		return ""
 	}
-	return matches[0][1]
+	return values[0]
 }
 
 var profileName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)

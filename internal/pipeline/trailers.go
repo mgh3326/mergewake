@@ -2,9 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"regexp"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // prTrailer reads one Mergewake-* trailer of a PR: the PR body first, then the
@@ -28,4 +30,70 @@ func (s *Service) prTrailer(ctx context.Context, r config.Repo, pr github.Pull, 
 		return v, nil
 	}
 	return "", nil
+}
+
+// prTaskTrailers reads every Mergewake-Task line a PR carries: all valid lines
+// of the PR body, or all valid lines of the head commit when the body has
+// none. The order is the order the lines appear.
+func (s *Service) prTaskTrailers(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
+	if tasks := taskIDs(trailerValues(pr.Body, "Mergewake-Task")); len(tasks) > 0 {
+		return tasks, nil
+	}
+	c, err := s.headCommit(ctx, r, pr)
+	if err != nil {
+		return nil, err
+	}
+	return taskIDs(trailerValues(c.Commit.Message, "Mergewake-Task")), nil
+}
+
+// prTasks is the delivered-task list: the task trailers above plus every
+// Closes hk reference in the PR body, deduplicated in first-seen order.
+func (s *Service) prTasks(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
+	tasks, err := s.prTaskTrailers(ctx, r, pr)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeTasks(append(tasks, closesTasks(pr.Body)...)), nil
+}
+
+func taskIDs(values []string) []string {
+	var out []string
+	for _, value := range values {
+		if integrations.TaskID.MatchString(value) {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func dedupeTasks(tasks []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, task := range tasks {
+		if task == "" || seen[task] {
+			continue
+		}
+		seen[task] = true
+		out = append(out, task)
+	}
+	return out
+}
+
+var (
+	closesHKTasks = regexp.MustCompile(`(?i)\bcloses\s+hk\s+[0-9]+(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)hk\s+[0-9]+)*`)
+	hkTaskID      = regexp.MustCompile(`(?i)\bhk\s+([0-9]+)`)
+)
+
+// closesTasks reads the hk task IDs of every `Closes hk N` list in body:
+// `Closes hk 1`, `Closes hk 1, hk 2` and `Closes hk 1 and hk 2`.
+func closesTasks(body string) []string {
+	var out []string
+	for _, list := range closesHKTasks.FindAllString(body, -1) {
+		for _, match := range hkTaskID.FindAllStringSubmatch(list, -1) {
+			if integrations.TaskID.MatchString(match[1]) {
+				out = append(out, match[1])
+			}
+		}
+	}
+	return out
 }

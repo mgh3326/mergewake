@@ -300,6 +300,7 @@ type taskJobSink struct {
 	missing   *integrations.JobRecord
 	jobErr    error
 	gets      []string
+	tasks     []string
 	uploadErr error
 	// svc is the service whose fake panes publish results (publishedRecord).
 	svc *Service
@@ -325,7 +326,10 @@ func (s *taskJobSink) PutAttachment(_ context.Context, path string) (string, err
 
 func (s *taskJobSink) AttachmentCommand() string { return "handoffkeep" }
 
-func (s *taskJobSink) TaskJob(context.Context, string) (string, string, error) {
+func (s *taskJobSink) TaskJob(_ context.Context, task string) (string, string, error) {
+	fakeGHMu.Lock()
+	s.tasks = append(s.tasks, task)
+	fakeGHMu.Unlock()
 	return s.job, s.title, nil
 }
 

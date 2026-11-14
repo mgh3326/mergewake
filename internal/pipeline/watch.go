@@ -835,7 +835,13 @@ func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github
 		{"Mergewake-Tier", validTier},
 		{"Mergewake-Notify-Lane", nil},
 	} {
-		value, err := s.prTrailer(ctx, r, pr, t.key, t.valid)
+		var value string
+		var err error
+		if t.key == "Mergewake-Task" {
+			value, err = s.prTask(ctx, r, pr)
+		} else {
+			value, err = s.prTrailer(ctx, r, pr, t.key, t.valid)
+		}
 		if err != nil {
 			return "", err
 		}

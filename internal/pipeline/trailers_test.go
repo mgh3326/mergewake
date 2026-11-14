@@ -117,6 +117,17 @@ func TestTrailersOutcomeRowNeitherUnchanged(t *testing.T) {
 	}
 }
 
+// One-task readers keep the first Mergewake-Task line; later lines and Closes
+// references do not change it.
+func TestPRTaskUsesFirstOfSeveralTrailers(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\nCloses hk 13\n"
+	task, err := s.prTask(context.Background(), r, g.pull)
+	if err != nil || task != "11" {
+		t.Fatalf("task %q, %v; want 11", task, err)
+	}
+}
+
 // A task trailer only in the head commit does not block the first pass of a
 // new head: the review runs and no BLOCKED comment is posted.
 func TestTrailersTaskInHeadCommitDoesNotBlockFirstPass(t *testing.T) {
