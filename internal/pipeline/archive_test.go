@@ -734,8 +734,8 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "hk comment") {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(f.out.String(), `"action":"reap"`) || !strings.Contains(f.out.String(), `"errors":1}`) {
-		t.Fatalf("summary does not count the archive error once:\n%s", f.out.String())
+	if n := summaryCount(t, f.out, "errors"); n != 1 {
+		t.Fatalf("summary counts %d errors, want 1:\n%s", n, f.out.String())
 	}
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 		t.Fatal("job dir lost")
@@ -757,8 +757,8 @@ func TestReapSummaryCountsEveryErrorRow(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "close-pane pane w1:p1: close failed") {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(out.String(), `"errors":1}`) {
-		t.Fatalf("summary does not count the error row once:\n%s", out.String())
+	if n := summaryCount(t, &out, "errors"); n != 1 {
+		t.Fatalf("summary counts %d errors, want 1:\n%s", n, out.String())
 	}
 }
 
