@@ -269,3 +269,45 @@ func TestReviewerCheckoutDayCountsKeepLastKeptOverLaterOutcome(t *testing.T) {
 		t.Fatalf("removed=%d kept=%d reasons=%v; want removed 1, kept 2 (job:running 2)", removed, kept, reasons)
 	}
 }
+
+// A pass that reads its receipts at 23:59:50 and runs the summary after
+// midnight must not summarize the day that ended after its snapshot: a reviewer
+// row stamped 23:59:55 lands after the snapshot, and the next pass counts it.
+func TestReviewerCheckoutDailySummaryCountsRowsAfterSnapshot(t *testing.T) {
+	f := newReviewerFix(t)
+	f.run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
+	f.run.outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
+	snapshot := time.Date(2026, 11, 3, 23, 59, 50, 0, time.UTC)
+	afterMidnight := time.Date(2026, 11, 4, 0, 0, 5, 0, time.UTC)
+	label := reviewerLabelFor(40, 30*time.Hour)
+	late := reapReceipt{Time: time.Date(2026, 11, 3, 23, 59, 55, 0, time.UTC), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 40, Worktree: "/repo/" + label, Host: "node", Result: "kept", Reason: "job:running"}
+	// The first clock read is the pass's receipts snapshot; the row lands
+	// right after it, before the pass's summary reads the clock again.
+	calls := 0
+	f.s.Now = func() time.Time {
+		calls++
+		switch calls {
+		case 1:
+			return snapshot
+		case 2:
+			seedReapRows(t, f.s, testRepo.Name, late)
+		}
+		return afterMidnight
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Now = func() time.Time { return afterMidnight.Add(5 * time.Second) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var node map[string]any
+	for _, row := range dailySummaries(t, f) {
+		if row["host"] == "node" && row["day"] == "2026-11-03" {
+			node = row
+		}
+	}
+	if node == nil || node["kept"] != float64(1) {
+		t.Fatalf("node summary for 2026-11-03 must count the row stamped 23:59:55: %v", node)
+	}
+}
