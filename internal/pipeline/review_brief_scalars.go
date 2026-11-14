@@ -127,17 +127,30 @@ func quotedEnd(s *yaml.Node, lines []string, quote rune) int {
 	}
 	row := []rune(lines[l-1])
 	// Column is the scalar's first character, which is its anchor or tag when it
-	// has one: skip those properties to reach the opening quote.
+	// has one. The properties, white space, comments and line breaks may all
+	// stand between it and the opening quote: skip them to reach the quote.
 	i := s.Column - 1
-	for i >= 0 && i < len(row) && (row[i] == '&' || row[i] == '!') {
-		for i < len(row) && row[i] != ' ' && row[i] != '\t' {
+	for {
+		for i >= 0 && i < len(row) && (row[i] == ' ' || row[i] == '\t') {
 			i++
 		}
-		for i < len(row) && (row[i] == ' ' || row[i] == '\t') {
-			i++
+		switch {
+		case i >= 0 && i < len(row) && (row[i] == '&' || row[i] == '!'):
+			for i < len(row) && row[i] != ' ' && row[i] != '\t' {
+				i++
+			}
+			continue
+		case i >= len(row) || row[i] == '#':
+			if l >= len(lines) {
+				return l
+			}
+			l++
+			row, i = []rune(lines[l-1]), 0
+			continue
 		}
+		break
 	}
-	if i < 0 || i >= len(row) || row[i] != quote {
+	if i < 0 || row[i] != quote {
 		return l
 	}
 	i++ // first rune after the opening quote
