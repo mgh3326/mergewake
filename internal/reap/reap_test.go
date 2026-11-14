@@ -3,6 +3,7 @@ package reap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -88,7 +89,7 @@ func TestInspectLinkedCanonicalAndPlain(t *testing.T) {
 		key("git", []string{"-C", "/sub", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}):     "/repo/.git/modules/sub\n/repo/.git/modules/sub\n/repo/sub\n",
 	}
 	errs := map[string]error{
-		key("git", []string{"-C", "/plain", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}): errors.New("not a git repository"),
+		key("git", []string{"-C", "/plain", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}): exitStatus(128),
 	}
 	e, _ := testExec(outs, errs)
 	w, err := e.Inspect(context.Background(), "/repo.wt")
@@ -113,6 +114,52 @@ func TestInspectLinkedCanonicalAndPlain(t *testing.T) {
 	}, nil)
 	if w, err = rel.Inspect(context.Background(), "/w/x/a/b"); err != nil || w == nil || w.Common != "/w/x/repo/.git" {
 		t.Fatalf("relative common dir: %+v %v", w, err)
+	}
+}
+
+// exitStatus is the error the runner returns for a command that exited with
+// the given status, as integrations.Exec does (ExitCode on the cause).
+type exitStatus int
+
+func (s exitStatus) Error() string { return fmt.Sprintf("exit status %d", int(s)) }
+func (s exitStatus) ExitCode() int { return int(s) }
+
+// Only git's own refusal proves a path is not a worktree; every other failure
+// must come back as an error, so a transient read is never recorded as gone.
+func TestInspectFailureIsNotProvenAbsent(t *testing.T) {
+	const revParse = "rev-parse"
+	args := func(cwd string) []string {
+		return []string{"-C", cwd, revParse, "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}
+	}
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool // true: (nil, nil) — proven not a worktree
+	}{
+		{"ssh transport failure", exitStatus(255), false},
+		{"runner could not start", errors.New("exec: \"git\": not found"), false},
+		{"killed by a signal", exitStatus(-1), false},
+		{"git refused the path", exitStatus(128), true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e, _ := testExec(nil, map[string]error{key("git", args("/w/x")): tt.err})
+			w, err := e.Inspect(context.Background(), "/w/x")
+			if tt.want && (w != nil || err != nil) {
+				t.Fatalf("want (nil, nil), got %+v %v", w, err)
+			}
+			if !tt.want && (w != nil || err == nil) {
+				t.Fatalf("want an error, got %+v %v", w, err)
+			}
+		})
+	}
+}
+
+func TestInspectCancelledIsNotProvenAbsent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e, _ := testExec(nil, map[string]error{key("git", []string{"-C", "/w/x", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"}): exitStatus(128)})
+	if w, err := e.Inspect(ctx, "/w/x"); w != nil || err == nil {
+		t.Fatalf("cancelled inspect read as absent: %+v %v", w, err)
 	}
 }
 

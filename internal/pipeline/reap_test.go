@@ -47,8 +47,21 @@ func (s *scriptRunner) Run(_ context.Context, name string, args []string, _ stri
 			return []byte(o), nil
 		}
 	}
+	// An unscripted worktree probe is a path git refuses (not a repository, or
+	// a missing directory): exit 128, as git itself reports it. Only git's own
+	// refusal proves a path is not a worktree.
+	if name == "git" && strings.Contains(k, "\x00rev-parse\x00--absolute-git-dir\x00--git-common-dir\x00--show-toplevel") {
+		return nil, gitRefusal{}
+	}
 	return nil, fmt.Errorf("unexpected command: %s", strings.ReplaceAll(k, "\x00", " "))
 }
+
+// gitRefusal is the error for a command git exited 128 on, as the runner
+// returns it.
+type gitRefusal struct{}
+
+func (gitRefusal) Error() string { return "exit status 128" }
+func (gitRefusal) ExitCode() int { return 128 }
 
 func (s *scriptRunner) called(sub string) bool {
 	for _, c := range s.calls {

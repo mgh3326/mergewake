@@ -472,12 +472,18 @@ func (e Exec) Pushed(ctx context.Context, main, branch, base string) bool {
 }
 
 // Inspect resolves a pane cwd to a linked git worktree. It returns (nil, nil)
-// when the path is not a worktree — an ordinary directory, a bare repo, a
-// submodule, or a clone's canonical checkout.
+// only when the path is proven not to be one: git ran and refused it (exit
+// 128, "not a git repository" or a missing directory), or it resolved to an
+// ordinary directory, a bare repo, a submodule, or a clone's canonical
+// checkout. Any other failure — the command could not run, ssh exit 255, a
+// timeout, a cancelled context — is an error: an unknown state is never gone.
 func (e Exec) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 	b, err := e.Run(ctx, "git", "-C", cwd, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel")
 	if err != nil {
-		return nil, nil
+		if ctx.Err() == nil && gitRefused(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("inspect %s: %w", cwd, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	if len(lines) != 3 {
@@ -504,6 +510,16 @@ func (e Exec) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 		w.Repo = RepoFromRemote(string(b))
 	}
 	return w, nil
+}
+
+// gitRefused reports whether err is git itself exiting 128, its status for a
+// fatal error such as "not a git repository" or a -C directory that does not
+// exist. ssh passes a remote command's status through and reserves 255 for its
+// own failures; a process killed by a signal has no status (-1). The status is
+// used rather than git's stderr text, which is translated on localized hosts.
+func gitRefused(err error) bool {
+	var ex interface{ ExitCode() int }
+	return errors.As(err, &ex) && ex.ExitCode() == 128
 }
 
 // Entry is one `git worktree list --porcelain` record.
