@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -71,7 +72,7 @@ are ignored.
 `
 
 func TestPanewireBriefForbidsRunningTests(t *testing.T) {
-	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := briefExecutor("25m").brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	for _, want := range []string{
 		"Do not modify the worktree.",
 		"Read the diff and the files it",
@@ -86,7 +87,7 @@ func TestPanewireBriefForbidsRunningTests(t *testing.T) {
 }
 
 func TestPanewireBriefExplainsOutsideDiffFindings(t *testing.T) {
-	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := briefExecutor("25m").brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	for _, want := range []string{
 		"repository-relative path where the defect occurs, even if the PR does not change it",
 		"report its real path",
@@ -112,7 +113,7 @@ func TestPanewireBriefDeadlineInMinutes(t *testing.T) {
 		{"25m", "You have 25 minutes from the start of this review; findings returned after\nthat are ignored."},
 		{"40m", "You have 40 minutes from the start of this review; findings returned after\nthat are ignored."},
 	} {
-		got := briefExecutor(tt.timeout).brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+		got := briefExecutor(tt.timeout).brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 		if !strings.Contains(got, tt.want) {
 			t.Fatalf("%s: missing %q in:\n%s", tt.timeout, tt.want, got)
 		}
@@ -125,7 +126,7 @@ func TestPanewireBriefDeadlineInMinutes(t *testing.T) {
 func TestPanewireBriefDeltaKeepsBothChanges(t *testing.T) {
 	x := briefExecutor("40m")
 	x.delta, x.round, x.diff = true, 2, "diff --git a/tool b/tool\n+x\n"
-	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	for _, want := range []string{
 		"this is review round 2: review only the delta patch",
 		"## Delta to review",
@@ -141,7 +142,7 @@ func TestPanewireBriefDeltaKeepsBothChanges(t *testing.T) {
 }
 
 func TestPanewireBriefDoneWaitsForOKLine(t *testing.T) {
-	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := briefExecutor("25m").brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	for _, want := range []string{
 		"`panewire done label --result \"$J/findings.json\" --report \"$J/report.md\"`",
 		"foreground and wait for it to finish",
@@ -171,7 +172,7 @@ run them. Reading commands (git diff/log/show, grep, reading files) are fine.
 		"findings.json or report.md, and run the same command again. Stop only after an\n" +
 		"`OK job=` line."
 
-	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := briefExecutor("25m").brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	gotRest := strings.Replace(strings.Replace(strings.Replace(got, newRule, "", 1), newDeadline, "", 1), newDone, "", 1)
 	oldRest := strings.Replace(strings.Replace(strings.Replace(oldBrief, oldRule, "", 1), oldDeadline, "", 1), oldDone, "", 1)
 	if gotRest != oldRest {

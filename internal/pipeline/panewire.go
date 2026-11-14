@@ -275,6 +275,8 @@ type panewireExecutor struct {
 	mu           sync.Mutex    // guards movedHead: the passes of a head run concurrently
 	jobMu        sync.Mutex    // one pass at a time closes the records of older heads
 	opts         Options
+	redactOnce   sync.Once // the passes of a head share one redacted delta and one old-side read
+	redacted     deltaRedaction
 	sweepMu      sync.Mutex // guards swept and sweepErr: one reviewer sweep per run
 	swept        bool
 	sweepErr     error
@@ -651,7 +653,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// Only a fresh pass publishes its brief: a resumed one replays the
 	// recorded spawn arguments, -p included, and never PUTs it again.
 	if !resumed {
-		text := x.brief(plan, label, jobDir, builderFamily)
+		text := x.brief(ctx, plan, label, jobDir, builderFamily)
 		if doc, ok := x.briefDoc(ctx, plan, label, task, text); ok {
 			briefPath = doc
 		} else {
@@ -1884,7 +1886,7 @@ func (x *panewireExecutor) briefMinutes() int {
 	return int(d.Round(time.Minute) / time.Minute)
 }
 
-func (x *panewireExecutor) brief(plan *passPlan, label, jobDir, authorFamily string) string {
+func (x *panewireExecutor) brief(ctx context.Context, plan *passPlan, label, jobDir, authorFamily string) string {
 	focus := "concrete bugs"
 	if f, ok := lensFocus[plan.lens]; ok {
 		focus += "; this pass focuses on " + f
@@ -1964,7 +1966,8 @@ that are ignored.
 		// reproduce (a base merge pollutes `git diff`), so the patch is inline.
 		text = strings.Replace(text, fmt.Sprintf("review the changes in `git diff %s...%s`", x.pr.Base.SHA, x.pr.Head.SHA),
 			fmt.Sprintf("this is review round %d: review only the delta patch at the end of this brief, not `git diff`", x.round), 1)
-		diff, count, paths, patterns, deletedPaths := redactRemovedDiffLines(x.diff)
+		red := x.redactedDelta(ctx)
+		diff, count, paths, patterns, deletedPaths := red.diff, red.count, red.paths, red.patterns, red.deletedPaths
 		text += "\n## Delta to review (hunks changed since the last reviewed head)\n\n~~~~~~~~diff\n" + strings.TrimRight(diff, "\n") + "\n~~~~~~~~\n"
 		if count > 0 {
 			plural := "s"
@@ -1981,8 +1984,41 @@ that are ignored.
 				"count": count, "paths": paths, "pattern_names": patterns,
 			}, false)
 		}
+		if len(red.oldSideSkipped) > 0 {
+			// The old-side check added no coverage for these files: their
+			// removed lines kept the in-hunk rules only.
+			_ = x.s.audit(x.repo.Name, "review-brief-oldside-fallback", map[string]any{
+				"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label,
+				"files": red.oldSideSkipped,
+			}, false)
+		}
 	}
 	return text
+}
+
+// deltaRedaction is the review delta as the brief shows it, with what was
+// masked and the files whose old side could not be used.
+type deltaRedaction struct {
+	diff                          string
+	count                         int
+	paths, patterns, deletedPaths []string
+	oldSideSkipped                []oldSideFallback
+}
+
+// redactedDelta masks the delta's removed lines once per run, reading the
+// base-revision text of each file that has removed lines.
+func (x *panewireExecutor) redactedDelta(ctx context.Context) deltaRedaction {
+	x.redactOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(ctx, oldSideTimeout)
+		defer cancel()
+		old := newOldSideLoader(func(path string) ([]byte, error) {
+			return x.s.GH.ReadFile(ctx, x.repo.Name, x.pr.Base.SHA, path)
+		})
+		r := &x.redacted
+		r.diff, r.count, r.paths, r.patterns, r.deletedPaths = redactRemovedDiffLinesOldSide(x.diff, old)
+		r.oldSideSkipped = old.skipped()
+	})
+	return x.redacted
 }
 
 // shellQuote single-quotes s for a POSIX shell.

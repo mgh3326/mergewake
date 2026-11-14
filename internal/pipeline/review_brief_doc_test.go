@@ -63,7 +63,7 @@ func runBriefPass(t *testing.T, s *Service, g *fakeGH, r config.Repo, timeout ti
 func wantBrief(t *testing.T, s *Service, x *panewireExecutor, plan *passPlan) string {
 	t.Helper()
 	family := x.builderFamily(context.Background(), "author-job")
-	return x.brief(plan, plan.label, filepath.Join(s.Config.Review.Panewire.Jobs, plan.label), family)
+	return x.brief(context.Background(), plan, plan.label, filepath.Join(s.Config.Review.Panewire.Jobs, plan.label), family)
 }
 
 const briefFindings = `{"findings":[{"path":"tool","line":1,"body":"A concrete bug","severity":"high"}]}`

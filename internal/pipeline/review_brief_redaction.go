@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +13,14 @@ import (
 // Its input is the review delta; callers retain that original for every
 // non-brief use.
 func redactRemovedDiffLines(diff string) (string, int, []string, []string, []string) {
+	return redactRemovedDiffLinesOldSide(diff, nil)
+}
+
+// redactRemovedDiffLinesOldSide is redactRemovedDiffLines plus the old-side
+// check: a removed line is also masked when its old-side line number falls in a
+// private-key block of the file at old, or when it is itself a base64 private
+// key. A nil old, or a file old cannot supply, keeps the in-hunk rules only.
+func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int, []string, []string, []string) {
 	lines := strings.SplitAfter(diff, "\n")
 	paths := map[string]bool{}
 	deletedPaths := map[string]bool{}
@@ -57,6 +66,16 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 			end++
 		}
 		out.WriteString(line)
+		oldLine, hunkOld := hunkOldStart(plain), (*oldSide)(nil)
+		if oldLine > 0 && hunkHasRemoved(lines[i+1:end]) {
+			if o := old.lookup(path); o != nil {
+				if o.aligned(oldLine, lines[i+1:end]) {
+					hunkOld = o
+				} else {
+					old.misaligned(path)
+				}
+			}
+		}
 		for _, hunkLine := range lines[i+1 : end] {
 			if len(hunkLine) == 0 {
 				out.WriteString(hunkLine)
@@ -68,6 +87,11 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 				continue
 			}
 			content := hunkLine[1:]
+			oldSecret := false
+			if prefix != '+' {
+				oldSecret = prefix == '-' && (hunkOld.secretAt(oldLine) || base64PEMEnd(strings.TrimSpace(content)) > 0)
+				oldLine++
+			}
 			startsPrivateKey := strings.Contains(content, pemBegin) && strings.Contains(content, privateKeyType)
 			endsPrivateKey := strings.Contains(content, pemEnd) && strings.Contains(content, privateKeyType)
 			if startsPrivateKey {
@@ -75,7 +99,7 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 			}
 			if prefix != '-' {
 				out.WriteString(hunkLine)
-			} else if inPrivateKey {
+			} else if inPrivateKey || oldSecret {
 				out.WriteString("-[redacted]")
 				if strings.HasSuffix(hunkLine, "\r\n") {
 					out.WriteString("\r\n")
@@ -130,4 +154,28 @@ func redactRemovedDiffLines(diff string) (string, int, []string, []string, []str
 	}
 	sort.Strings(deletedPathList)
 	return out.String(), count, pathList, patternList, deletedPathList
+}
+
+var hunkOldStartRE = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? `)
+
+// hunkOldStart is the old-side line a hunk header starts at, or 0.
+func hunkOldStart(header string) int {
+	m := hunkOldStartRE.FindStringSubmatch(header)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func hunkHasRemoved(hunk []string) bool {
+	for _, l := range hunk {
+		if strings.HasPrefix(l, "-") {
+			return true
+		}
+	}
+	return false
 }

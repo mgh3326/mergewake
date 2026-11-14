@@ -639,7 +639,7 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			pr.Base.SHA = shaB
 			g.pull.Base.SHA = shaA
 			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
-			got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+			got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 			assertNoSecretPatternsOnRemovedBriefLines(t, got)
 			if tt.name == "ordinary delta unchanged" {
 				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLines(tt.diff)
@@ -680,7 +680,7 @@ func TestPanewireRoundOneBriefKeepsRemovedSecretVerbatim(t *testing.T) {
 	runner := &panewireRunner{}
 	s, g, r := panewireSetup(t, runner)
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: diff, delta: false, round: 1}
-	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	if strings.Contains(got, token) || strings.Contains(got, "Delta to review") || strings.Contains(got, "Redacted ") || len(auditRows(t, s, r, "review-brief-redacted")) != 0 {
 		t.Fatalf("round-one brief changed: %s", got)
 	}
