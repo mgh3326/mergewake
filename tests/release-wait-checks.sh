@@ -58,6 +58,10 @@ for arg in "$@"; do
 		exit 0
 		;;
 	*/branches/main)
+		if [ "${STUB_FAIL_MAIN:-}" = 1 ]; then
+			echo "stub gh: main read failed" >&2
+			exit 1
+		fi
 		printf '%s\n' "${STUB_MAIN_SHA:?}"
 		exit 0
 		;;
@@ -110,6 +114,7 @@ reset() {
 	allow_compare=
 	allow_tags=
 	fail_compare=
+	fail_main=
 	fail_tags=
 	release_tag=v1.2.3
 }
@@ -130,6 +135,7 @@ run_checks() { # timeout_seconds [stub_fail_runs_once]
 		STUB_ALLOW_COMPARE="$allow_compare" \
 		STUB_ALLOW_TAGS="$allow_tags" \
 		STUB_FAIL_COMPARE="$fail_compare" \
+		STUB_FAIL_MAIN="$fail_main" \
 		STUB_COMPARE_STATUS="$compare_status" \
 		STUB_TOTAL_COMMITS="$total_commits" \
 		STUB_COMPARE_SHAS="$compare_shas" \
@@ -146,7 +152,14 @@ run_recheck() {
 	output=$(cd "$case_dir" &&
 		PATH="$stub:$PATH" \
 		STUB_DIR="$case_dir" \
+		STUB_MAIN_SHA="$main_sha" \
+		STUB_ALLOW_COMPARE="$allow_compare" \
 		STUB_ALLOW_TAGS="$allow_tags" \
+		STUB_FAIL_COMPARE="$fail_compare" \
+		STUB_FAIL_MAIN="$fail_main" \
+		STUB_COMPARE_STATUS="$compare_status" \
+		STUB_TOTAL_COMMITS="$total_commits" \
+		STUB_COMPARE_SHAS="$compare_shas" \
 		STUB_FAIL_TAGS="$fail_tags" \
 		GITHUB_REPOSITORY="example/repo" \
 		RELEASE_TAG="$release_tag" \
@@ -690,6 +703,60 @@ if [ "$status" -eq 1 ] && has 'cannot read the tags' && has 'tags read failed'; 
 	pass "(gg) recheck tags read failure -> exit 1"
 else
 	fail "(gg) recheck tags read failure -> exit $status: $output"
+fi
+
+# (hh) --recheck-supersession exits 3 when a higher stable tag points at a
+# commit inside sha...main-head, not at the tag commit itself.
+reset
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+printf 'v1.2.4\t%s\n' "$compare_shas" > "$case_dir/tags.tsv"
+run_recheck
+if [ "$status" -eq 3 ] && has 'superseded by v1.2.4' && has "$compare_shas" && has "$sha"; then
+	pass "(hh) recheck compare-range superseded -> exit 3"
+else
+	fail "(hh) recheck compare-range superseded -> exit $status: $output"
+fi
+
+# (ii) A failed compare read in --recheck-supersession is a failure: never 0,
+# never 3.
+reset
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+fail_compare=1
+run_recheck
+if [ "$status" -ne 0 ] && [ "$status" -ne 3 ] && has 'compare transient failure'; then
+	pass "(ii) recheck compare read failure -> exit $status"
+else
+	fail "(ii) recheck compare read failure -> exit $status: $output"
+fi
+
+# (jj) A failed main-head read in --recheck-supersession is a failure too.
+reset
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_tags=1
+fail_main=1
+run_recheck
+if [ "$status" -ne 0 ] && [ "$status" -ne 3 ] && has 'main read failed'; then
+	pass "(jj) recheck main-head read failure -> exit $status"
+else
+	fail "(jj) recheck main-head read failure -> exit $status: $output"
+fi
+
+# (kk) A compare that cannot bound the range (not ahead) in
+# --recheck-supersession fails rather than reading as not superseded.
+reset
+main_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allow_compare=1
+allow_tags=1
+compare_status=diverged
+run_recheck
+if [ "$status" -eq 1 ] && ! has 'superseded'; then
+	pass "(kk) recheck inconclusive compare -> exit 1"
+else
+	fail "(kk) recheck inconclusive compare -> exit $status: $output"
 fi
 
 if [ "$failures" -ne 0 ]; then
