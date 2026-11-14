@@ -258,9 +258,14 @@ func mustFix(s string) bool {
 	return s == "critical" || s == "high" || s == "blocking" || s == "major"
 }
 
-// prTask reads the Mergewake-Task trailer: PR body first, then the head commit.
+// prTask reads the first Mergewake-Task trailer: PR body first, then the head
+// commit. Later task lines and Closes hk references do not change it.
 func (s *Service) prTask(ctx context.Context, r config.Repo, pr github.Pull) (string, error) {
-	return s.prTrailer(ctx, r, pr, "Mergewake-Task", integrations.TaskID.MatchString)
+	tasks, err := s.prTaskTrailers(ctx, r, pr)
+	if err != nil || len(tasks) == 0 {
+		return "", err
+	}
+	return tasks[0], nil
 }
 
 // terminalJob reports the hk job states after which the author attempt no

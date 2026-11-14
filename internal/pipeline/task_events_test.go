@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,8 @@ type fakeHK struct {
 	message string
 	// why holds the violation behind each rules refusal.
 	why []string
+	// failTasks is the number of leading requests for a task that answer 500.
+	failTasks map[int64]int
 }
 
 func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +76,10 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.why = append(h.why, why)
 			status, code = http.StatusBadRequest, "invalid_context"
 		}
+	}
+	if n := h.failTasks[ev.TaskID]; n > 0 {
+		h.failTasks[ev.TaskID] = n - 1
+		status, code = http.StatusInternalServerError, "unavailable"
 	}
 	message := h.message
 	h.mu.Unlock()
@@ -181,9 +188,22 @@ func taskEventAudit(t *testing.T, s *Service, repo string) []taskEventRecord {
 
 func wantEvent(t *testing.T, got integrations.TaskEvent, source, ref, pr, reverted, revert string) {
 	t.Helper()
-	if got.Source != source || got.SourceRef != ref || got.TaskID != 2909 || got.PR != pr || got.RevertedPR != reverted || got.RevertPR != revert || got.At == nil {
-		t.Fatalf("event %+v, want source=%s ref=%s pr=%s reverted=%s revert=%s task=2909", got, source, ref, pr, reverted, revert)
+	wantTaskEvent(t, got, 2909, source, ref, pr, reverted, revert)
+}
+
+func wantTaskEvent(t *testing.T, got integrations.TaskEvent, task int64, source, ref, pr, reverted, revert string) {
+	t.Helper()
+	if got.Source != source || got.SourceRef != ref || got.TaskID != task || got.PR != pr || got.RevertedPR != reverted || got.RevertPR != revert || got.At == nil {
+		t.Fatalf("event %+v, want task=%d source=%s ref=%s pr=%s reverted=%s revert=%s", got, task, source, ref, pr, reverted, revert)
 	}
+}
+
+func receivedTaskIDs(got []integrations.TaskEvent) []int64 {
+	ids := make([]int64, len(got))
+	for i, ev := range got {
+		ids[i] = ev.TaskID
+	}
+	return ids
 }
 
 // Land posts mergewake.merge once, after GitHub accepted the merge.
@@ -207,6 +227,99 @@ func TestTaskEventMerge(t *testing.T) {
 	if len(rows) != 1 || rows[0].Source != integrations.SourceMerge || rows[0].Task != "2909" || rows[0].Result == nil || !rows[0].Result.Applied {
 		t.Fatalf("audit %+v", rows)
 	}
+}
+
+// A bundle PR's merge event goes to every Mergewake-Task line, in order.
+func TestTaskEventMergeAllTaskTrailers(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\n"
+	g.enabled = true
+	markReviewed(g)
+	s.GH = mergeGH{g}
+	if e := s.Land(context.Background(), r, 7, Options{Observed: true}); e != nil {
+		t.Fatal(e)
+	}
+	got := hk.received()
+	if g.mergeCount != 1 || len(got) != 2 {
+		t.Fatalf("merges=%d events=%+v", g.mergeCount, got)
+	}
+	wantTaskEvent(t, got[0], 11, integrations.SourceMerge, testPRURL, testPRURL, "", "")
+	wantTaskEvent(t, got[1], 12, integrations.SourceMerge, testPRURL, testPRURL, "", "")
+	rows := taskEventAudit(t, s, r.Name)
+	if len(rows) != 2 || rows[0].Task != "11" || rows[1].Task != "12" || rows[0].Result == nil || !rows[0].Result.Applied || rows[1].Result == nil || !rows[1].Result.Applied {
+		t.Fatalf("audit %+v", rows)
+	}
+}
+
+// The delivered-task list is every task trailer plus every Closes hk
+// reference in the PR body, deduplicated and in order. With no body trailer,
+// the head commit supplies the trailers as before.
+func TestTaskEventMergeDeliveredTasks(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		messages map[string]string
+		want     []int64
+	}{
+		{name: "closes list", body: "Mergewake-Task: 11\nCloses hk 11, hk 13\n", want: []int64{11, 13}},
+		{name: "closes and", body: "Mergewake-Task: 11\nCloses hk 11 and hk 14\n", want: []int64{11, 14}},
+		{name: "closes only", body: "Closes hk 15, hk 16\n", want: []int64{15, 16}},
+		{name: "commit trailers and closes", body: "Closes hk 23\n", messages: map[string]string{shaA: "subject\n\nMergewake-Task: 21\nMergewake-Task: 22\n"}, want: []int64{21, 22, 23}},
+		{name: "body trailers beat commit", body: "Mergewake-Task: 11\n", messages: map[string]string{shaA: "subject\n\nMergewake-Task: 99\nMergewake-Task: 100\n"}, want: []int64{11}},
+		{name: "duplicates", body: "Mergewake-Task: 11\nMergewake-Task: 11\nCloses hk 11, hk 12\nCloses hk 12\n", want: []int64{11, 12}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, hk, r := hkSetup(t)
+			g.pull.Body = tc.body
+			g.messages = tc.messages
+			if got := s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceMerge, nil, time.Now()); got != postSent {
+				t.Fatalf("outcome %v", got)
+			}
+			got := hk.received()
+			if !slices.Equal(receivedTaskIDs(got), tc.want) {
+				t.Fatalf("task IDs %v, want %v (events %+v)", receivedTaskIDs(got), tc.want, got)
+			}
+			for _, ev := range got {
+				wantTaskEvent(t, ev, ev.TaskID, integrations.SourceMerge, testPRURL, testPRURL, "", "")
+			}
+		})
+	}
+}
+
+// One task's failed post is audited and does not stop the others; hk's client
+// retries only that task's event.
+func TestTaskEventMergeFailureDoesNotStopOtherTasks(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	g.pull.Body = "Mergewake-Task: 13\nMergewake-Task: 11\n"
+	hk.failTasks = map[int64]int{13: 3}
+	if got := s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceMerge, nil, time.Now()); got != postSent {
+		t.Fatalf("outcome %v", got)
+	}
+	got := hk.received()
+	if want := []int64{13, 13, 13, 11}; !slices.Equal(receivedTaskIDs(got), want) {
+		t.Fatalf("task IDs %v, want %v", receivedTaskIDs(got), want)
+	}
+	rows := taskEventAudit(t, s, r.Name)
+	if len(rows) != 2 || rows[0].Task != "13" || rows[0].Result != nil || !strings.Contains(rows[0].Error, "HTTP 500") || rows[1].Task != "11" || rows[1].Result == nil || !rows[1].Result.Applied {
+		t.Fatalf("audit %+v", rows)
+	}
+}
+
+// The revert event fans out to the same delivered-task list.
+func TestTaskEventRevertAllTasks(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\n"
+	recovery := github.Pull{Number: 9, State: "closed"}
+	revertURL := "https://github.com/example/project/pull/9"
+	if got := s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceRevert, &recovery, time.Now()); got != postSent {
+		t.Fatalf("outcome %v", got)
+	}
+	got := hk.received()
+	if len(got) != 2 {
+		t.Fatalf("events %+v", got)
+	}
+	wantTaskEvent(t, got[0], 11, integrations.SourceRevert, revertURL, testPRURL, testPRURL, revertURL)
+	wantTaskEvent(t, got[1], 12, integrations.SourceRevert, revertURL, testPRURL, testPRURL, revertURL)
 }
 
 // A PR that never merges, here one the gate blocks, posts no merge event.
