@@ -462,7 +462,7 @@ func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	g.blocking = true
 	g.refs = map[string]bool{doneRef(7, shaB): true}
 	large := "diff --git a/tool b/tool\n--- a/tool\n+++ b/tool\n@@ -1 +1 @@\n-old\n+" + strings.Repeat("large delta 한글 ", 6000) + "\n"
-	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}
+	s.GH = servedReadGH{roundGH: &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: large}, files: servedOldSide(large)}
 	if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
 		t.Fatal(e)
 	}
@@ -638,11 +638,13 @@ func TestPanewireBriefRedactsRemovedLines(t *testing.T) {
 			pr := g.pull
 			pr.Base.SHA = shaB
 			g.pull.Base.SHA = shaA
+			// The removed lines are covered: the base text the delta's hunks match.
+			s.GH = &oldSideGH{fakeGH: g, files: servedOldSide(tt.diff)}
 			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
 			got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 			assertNoSecretPatternsOnRemovedBriefLines(t, got)
 			if tt.name == "ordinary delta unchanged" {
-				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLines(tt.diff)
+				redacted, count, paths, patterns, deletedPaths := redactRemovedDiffLinesOldSide(tt.diff, oldSideLoaderFor(tt.diff))
 				if redacted != tt.diff || count != 0 || paths != nil || patterns != nil || deletedPaths != nil {
 					t.Fatalf("ordinary diff changed: %q %d %v %v %v", redacted, count, paths, patterns, deletedPaths)
 				}
@@ -693,7 +695,7 @@ func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	g.refs = map[string]bool{doneRef(7, shaB): true}
-	s.GH = &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: full}
+	s.GH = servedReadGH{roundGH: &roundGH{fakeGH: g, heads: []github.ReviewedHead{{SHA: shaB, Round: 1}}, old: patchOne, full: full}, files: servedOldSide(delta)}
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +729,7 @@ func TestPanewireRoundTwoRedactsBriefButKeepsRawPatchReceipt(t *testing.T) {
 }
 
 func redactRemovedDiffLinesMust(diff string) string {
-	redacted, _, _, _, _ := redactRemovedDiffLines(diff)
+	redacted, _, _, _, _ := redactRemovedDiffLinesOldSide(diff, oldSideLoaderFor(diff))
 	return redacted
 }
 

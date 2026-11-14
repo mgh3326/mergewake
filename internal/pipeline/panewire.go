@@ -1985,8 +1985,9 @@ that are ignored.
 			}, false)
 		}
 		if len(red.oldSideSkipped) > 0 {
-			// The old-side check added no coverage for these files: their
-			// removed lines kept the in-hunk rules only.
+			// Removed lines of these files were withheld: their hunks were not
+			// covered by a scanned old side. Context and added lines are shown.
+			text += withheldNotice(red.oldSideSkipped)
 			_ = x.s.audit(x.repo.Name, "review-brief-oldside-fallback", map[string]any{
 				"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label,
 				"files": red.oldSideSkipped,
@@ -2019,6 +2020,11 @@ func (x *panewireExecutor) redactedDelta(ctx context.Context) deltaRedaction {
 		// head, which is not pr.Base.SHA once the base has moved on.
 		rev := ""
 		old := newOldSideLoader(func(path string) ([]byte, error) {
+			// A Service without a GitHub client cannot read the base revision: the
+			// read fails, and the file's removed lines are withheld, not sent.
+			if x.s.GH == nil {
+				return nil, errOldSideNoClient
+			}
 			if rev == "" {
 				rev = x.pr.Base.SHA
 				if mb, ok := x.s.GH.(mergeBaser); ok {

@@ -9,23 +9,24 @@ import (
 	"github.com/mgh3326/mergewake/internal/archive"
 )
 
-// redactRemovedDiffLines changes only secret-pattern matches in removed lines.
-// Its input is the review delta; callers retain that original for every
-// non-brief use.
-func redactRemovedDiffLines(diff string) (string, int, []string, []string, []string) {
-	return redactRemovedDiffLinesOldSide(diff, nil)
-}
-
-// redactRemovedDiffLinesOldSide is redactRemovedDiffLines plus the old-side
-// check: a removed line is also masked when its old-side line number falls in a
-// private-key block of the file at old, or when it is itself a base64 private
-// key. A nil old, or a file old cannot supply, keeps the in-hunk rules only.
+// redactRemovedDiffLinesOldSide masks the secret-like text of a delta's removed
+// lines, and withholds the removed lines whose hunk the old side does not cover:
+// a removed line is shown only when the scanned old side of its file matches its
+// hunk. Its old-side line number may fall in a private-key block of the file at
+// old, or it may itself be a base64 private key. A nil old has no old side at
+// all, so every removed line is withheld. It returns the masked diff, the number
+// of masked strings, and the paths, pattern names and deleted paths behind them.
+// Withheld lines are not counted there; they are recorded in old.
 func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int, []string, []string, []string) {
+	if old == nil {
+		old = &oldSideLoader{}
+	}
 	lines := strings.SplitAfter(diff, "\n")
 	paths := map[string]bool{}
 	deletedPaths := map[string]bool{}
 	patterns := map[string]bool{}
 	count := 0
+	withheld := 0
 	path := ""
 	pemBegin := strings.Join([]string{"-----", "BEGIN "}, "")
 	pemEnd := strings.Join([]string{"-----", "END "}, "")
@@ -66,23 +67,38 @@ func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int
 			end++
 		}
 		out.WriteString(line)
-		oldLine, hunkOld := hunkOldStart(plain), (*oldSide)(nil)
-		if oldLine > 0 && hunkHasRemoved(lines[i+1:end]) {
-			if o := old.lookup(path); o != nil {
-				if o.aligned(oldLine, lines[i+1:end]) {
-					hunkOld = o
-				} else {
-					old.misaligned(path)
-				}
+		hunk := lines[i+1 : end]
+		oldLine := hunkOldStart(plain)
+		var hunkOld *oldSide
+		reason := ""
+		if hunkHasRemoved(hunk) {
+			o := old.lookup(path)
+			switch {
+			case o == nil:
+				reason = old.unscannedReason(path)
+			case oldLine < 1 || !o.aligned(oldLine, hunk):
+				reason = oldSideMisaligned
+			default:
+				hunkOld = o
 			}
 		}
-		for _, hunkLine := range lines[i+1 : end] {
-			if len(hunkLine) == 0 {
-				out.WriteString(hunkLine)
-				continue
+		withholding := hunkOld == nil
+		// pending counts the withheld removed lines of the run being read; the
+		// run is written as one marker line, when the next line is not removed.
+		pending, hunkWithheld := 0, 0
+		flush := func() {
+			if pending > 0 {
+				out.WriteString(withheldMarker(pending, reason))
+				pending = 0
 			}
-			prefix := hunkLine[0]
+		}
+		for _, hunkLine := range hunk {
+			prefix := byte(0)
+			if len(hunkLine) > 0 {
+				prefix = hunkLine[0]
+			}
 			if prefix != '-' && prefix != '+' && prefix != ' ' {
+				flush()
 				out.WriteString(hunkLine)
 				continue
 			}
@@ -97,9 +113,15 @@ func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int
 			if startsPrivateKey {
 				inPrivateKey = true
 			}
-			if prefix != '-' {
+			switch {
+			case prefix == '-' && withholding:
+				pending++
+				hunkWithheld++
+			case prefix != '-':
+				flush()
 				out.WriteString(hunkLine)
-			} else if inPrivateKey || oldSecret {
+			case inPrivateKey || oldSecret:
+				flush()
 				out.WriteString("-[redacted]")
 				if strings.HasSuffix(hunkLine, "\r\n") {
 					out.WriteString("\r\n")
@@ -111,7 +133,8 @@ func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int
 					paths[path] = true
 				}
 				patterns["private_key"] = true
-			} else {
+			default:
+				flush()
 				redacted, n, names := archive.RedactSecretLike(content)
 				if n == 0 {
 					out.WriteString(hunkLine)
@@ -131,10 +154,18 @@ func redactRemovedDiffLinesOldSide(diff string, old *oldSideLoader) (string, int
 				inPrivateKey = false
 			}
 		}
+		flush()
+		if hunkHasRemoved(hunk) {
+			old.note(path, !withholding, reason, hunkWithheld)
+		}
+		withheld += hunkWithheld
 		i = end
 	}
 	if count == 0 {
-		return diff, 0, nil, nil, nil
+		if withheld == 0 {
+			return diff, 0, nil, nil, nil
+		}
+		return out.String(), 0, nil, nil, nil
 	}
 	pathList := make([]string, 0, len(paths))
 	for p := range paths {
