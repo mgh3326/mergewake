@@ -294,8 +294,8 @@ func TestPanewireOldSideReadsOnlyFilesWithRemovedLines(t *testing.T) {
 	}
 }
 
-// When the old side cannot be used the brief keeps today's rules, and the
-// audit log says which files fell back and why.
+// When the old side cannot be used the file's removed lines are withheld, and
+// the audit log says which files were withheld, why, and how much.
 func TestPanewireOldSideFallbackIsRecorded(t *testing.T) {
 	end := "-----" + "END " + "PRIVATE KEY" + "-----"
 	body := strings.Repeat("Qm9k", 16)
@@ -320,17 +320,10 @@ func TestPanewireOldSideFallbackIsRecorded(t *testing.T) {
 			diff := fileDiff("k", 2, 3, 1, " "+body, "-"+body+"x", " "+end)
 			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: diff, delta: true, round: 2}
 			got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
-			if !strings.Contains(got, "-"+body+"x") || strings.Contains(got, "[redacted") {
-				t.Fatalf("fallback changed the brief:\n%s", got)
+			if strings.Contains(got, "-"+body+"x") || strings.Contains(got, "[redacted") || !strings.Contains(got, fmt.Sprintf("-[1 removed lines withheld: old side not scanned (%s)]", tt.reason)) {
+				t.Fatalf("fallback did not withhold the removed line:\n%s", got)
 			}
-			rows := auditRows(t, s, r, "review-brief-oldside-fallback")
-			if len(rows) != 1 {
-				t.Fatalf("fallback rows=%v", rows)
-			}
-			files, _ := rows[0]["files"].([]any)
-			if len(files) != 1 || files[0].(map[string]any)["path"] != "k" || files[0].(map[string]any)["reason"] != tt.reason {
-				t.Fatalf("fallback row: %v, want reason %s", rows[0], tt.reason)
-			}
+			wantWithheldAudit(t, auditRows(t, s, r, "review-brief-oldside-fallback"), "k", tt.reason, "none", 1)
 		})
 	}
 }
@@ -350,9 +343,10 @@ func TestOldSideLoaderStopsAtTheBudget(t *testing.T) {
 			t.Fatalf("lookup %d available=%v, want %v", i, ok, i < read)
 		}
 	}
-	sk := l.skipped()
-	if len(sk) != 2 || sk[0].Reason != oldSideOverBudget {
-		t.Fatalf("skipped=%v", sk)
+	for i := read; i < n; i++ {
+		if got := l.unscannedReason(fmt.Sprintf("f%d", i)); got != oldSideOverBudget {
+			t.Fatalf("f%d reason=%s, want %s", i, got, oldSideOverBudget)
+		}
 	}
 }
 
