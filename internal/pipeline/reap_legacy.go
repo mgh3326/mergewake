@@ -622,7 +622,7 @@ func (w *legacySweep) merged(ctx context.Context, hs *reapHost, l *reap.ListedWo
 		return
 	}
 	if p.MergeCommitSHA == "" {
-		fp, e := w.s.GH.Pull(ctx, w.r.Name, p.Number)
+		fp, e := w.s.GH.Pull(github.Uncached(ctx), w.r.Name, p.Number)
 		if e != nil {
 			*errs = append(*errs, fmt.Errorf("PR %d merge commit: %w", p.Number, e))
 			keep("merge-commit-unknown")
