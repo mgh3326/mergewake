@@ -156,8 +156,11 @@ func (hs *reapHost) refreshPanes(ctx context.Context) error {
 	for _, p := range all {
 		if p.Cwd != "" {
 			if _, ok := hs.trees[p.Cwd]; !ok {
-				w, _ := hs.ops.Inspect(ctx, p.Cwd)
-				hs.trees[p.Cwd] = w
+				// A failed inspect is not cached: a nil here would read as a
+				// proven-gone worktree to the job-record source.
+				if w, e := hs.ops.Inspect(ctx, p.Cwd); e == nil {
+					hs.trees[p.Cwd] = w
+				}
 			}
 		}
 	}
@@ -400,7 +403,11 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 						hs.failed = true
 						return hs, append(errs, fmt.Errorf("%s: %w", h.Name, e))
 					}
-					hs.trees[p.Cwd] = w
+					// Only a proven answer is cached; a failed inspect is
+					// retried by the next reader instead of read as gone.
+					if e == nil {
+						hs.trees[p.Cwd] = w
+					}
 				}
 			}
 		}
