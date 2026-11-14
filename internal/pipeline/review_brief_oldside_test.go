@@ -508,13 +508,18 @@ func oldSideScalarCorpus() []oldSideCase {
 	jsonKey := key[:20] + `\n` + key[20:]
 	uni := `\u004c` + key[1:]
 	pgpBlock := chunks(pgp, 64, 64)
+	bundle := b64(joinLines(certBegin, k1, k1, certEnd, begin, k1, k2, k3, tail, end))
 	escaped := strings.ReplaceAll(joinLines(begin, k1, k2, end), "\n", `\n`)
 	return []oldSideCase{
 		leak("block scalar wrapped after 20 characters", "a.yaml", blockFile, 4, block[2], block[3]),
 		leak("double-quoted scalar with escaped line breaks", "b.yaml", quotedFile, 4, quoted[2], quoted[3]),
+		leak("anchored double-quoted scalar", "b2.yaml", cat([]string{"data:", "  key: &k \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 4, quoted[2], quoted[3]),
+		leak("tagged double-quoted scalar", "b3.yaml", cat([]string{"data:", "  key: !!str \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 4, quoted[2], quoted[3]),
+		leakTo("PEM marker after a plain key", "b4.yaml", []string{"key: " + begin, "  " + k1, "  " + k2, "  " + k3, "  " + end, "other: 1"}, 3, 5, k2, k3),
 		leakTo("JSON string with an escaped newline in the header", "c.json", []string{"{", `  "key": "` + jsonKey + `",`, `  "n": 1`, "}"}, 2, 2, key[20:]),
 		leakTo("JSON string with a unicode escape in the header", "d.json", []string{"{", `  "key": "` + uni + `",`, `  "n": 1`, "}"}, 2, 2, key[1:]),
 		leak("PGP armor whose comment holds an END marker", "e.yaml", cat([]string{"data:", "  key: |"}, indent("    ", pgpBlock)), 6, pgpBlock[3], pgpBlock[4]),
+		leak("base64 bundle with a certificate before the key", "b5.yaml", cat([]string{"data:", "  pem: |"}, indent("    ", chunks(bundle, 64, 64))), 5, chunks(bundle, 64, 64)[3], chunks(bundle, 64, 64)[4]),
 		leak("PEM body line with an inner space", "f.key", []string{begin, k1, k2[:32] + " " + k2[32:], k3, end}, 3, k3),
 		leak("double-quoted PEM with newline escapes", "g.yaml", []string{`key: "` + escaped[:len(begin)+2+64] + `\`, `  ` + escaped[len(begin)+2+64:] + `"`}, 2, escaped[len(begin)+2+64:len(begin)+2+64+8]),
 		leak("base64 key with a comment after its first chunk (not YAML)", "h.yaml", cat([]string{"key: " + block[0] + block[1] + " # note"}, indent("    ", block[2:])), 2, block[2], block[3]),

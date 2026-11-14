@@ -22,26 +22,29 @@ func startsPrivateKey(text string) bool {
 	return privateKeyBegin.MatchString(strings.TrimLeft(text, " \t\r\n"))
 }
 
-// scalarHoldsPrivateKey reports whether a parsed scalar value is a private key:
-// PEM text, or base64 that decodes to it. The value is the scalar after the YAML
-// or JSON rules of quoting, folding and escaping, so the way the file wraps it
-// does not matter. Only its first bytes are decoded: truncated keys are keys
-// too, and no other base64 (a hash, a certificate) opens with the marker.
-func scalarHoldsPrivateKey(value string) bool {
-	if startsPrivateKey(value) {
-		return true
-	}
+// privateKeyLine finds a private-key marker that opens a line of a value.
+var privateKeyLine = regexp.MustCompile(`(?m)^[ \t]*-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`)
+
+// scalarBase64HoldsPrivateKey reports whether a scalar value is base64 that
+// decodes to text holding a private key, wherever in that text (a bundle may
+// carry a certificate first). The value is the scalar after the YAML or JSON
+// rules of quoting, folding and escaping, so the way the file wraps it does not
+// matter. A certificate, a public key or a hash decodes to no such marker.
+func scalarBase64HoldsPrivateKey(value string) bool {
 	run := strings.Join(strings.Fields(value), "")
 	n := 0
-	for n < len(run) && n < 256 && (run[n] >= 'A' && run[n] <= 'Z' || run[n] >= 'a' && run[n] <= 'z' || run[n] >= '0' && run[n] <= '9' || run[n] == '+' || run[n] == '/') {
+	for n < len(run) && n < scalarDecodeCap && (run[n] >= 'A' && run[n] <= 'Z' || run[n] >= 'a' && run[n] <= 'z' || run[n] >= '0' && run[n] <= '9' || run[n] == '+' || run[n] == '/') {
 		n++
 	}
 	if n < 24 {
 		return false
 	}
 	dec, err := base64.StdEncoding.DecodeString(run[:n/4*4])
-	return err == nil && startsPrivateKey(string(dec))
+	return err == nil && privateKeyLine.Match(dec)
 }
+
+// scalarDecodeCap bounds the base64 characters decoded for one scalar.
+const scalarDecodeCap = 256 << 10
 
 // markScalarPrivateKeys marks the source lines of every YAML or JSON scalar in
 // body that holds a private key. The scalar's own lines are found from the
@@ -72,13 +75,7 @@ func markScalarPrivateKeys(body []byte, lines []string, secret []bool) (parsed b
 		walk(&doc)
 	}
 	for _, s := range scalars {
-		if !scalarHoldsPrivateKey(s.Value) {
-			continue
-		}
-		plain := s.Style&(yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle|yaml.LiteralStyle|yaml.FoldedStyle) == 0
-		if plain && startsPrivateKey(s.Value) {
-			// A PEM file that happens to parse as one plain scalar runs on into
-			// whatever follows its END marker; markPEMBlock ends it there.
+		if !scalarHoldsKey(s, lines) {
 			continue
 		}
 		first, last := scalarLines(s, lines, nodeLines)
@@ -129,11 +126,21 @@ func quotedEnd(s *yaml.Node, lines []string, quote rune) int {
 		return s.Line
 	}
 	row := []rune(lines[l-1])
-	col := s.Column // 1-based; the opening quote
-	if col < 1 || col > len(row) {
+	// Column is the scalar's first character, which is its anchor or tag when it
+	// has one: skip those properties to reach the opening quote.
+	i := s.Column - 1
+	for i >= 0 && i < len(row) && (row[i] == '&' || row[i] == '!') {
+		for i < len(row) && row[i] != ' ' && row[i] != '\t' {
+			i++
+		}
+		for i < len(row) && (row[i] == ' ' || row[i] == '\t') {
+			i++
+		}
+	}
+	if i < 0 || i >= len(row) || row[i] != quote {
 		return l
 	}
-	i := col // first rune after the opening quote
+	i++ // first rune after the opening quote
 	for {
 		for ; i < len(row); i++ {
 			switch {
@@ -151,4 +158,23 @@ func quotedEnd(s *yaml.Node, lines []string, quote rune) int {
 		l++
 		row, i = []rune(lines[l-1]), 0
 	}
+}
+
+// scalarHoldsKey reports whether the source lines of scalar s are to be marked.
+// Block scalars and plain scalars that carry PEM text are left to the line
+// scan (markPEMBlock), which ends a block at its own END marker and keeps the
+// text around it visible; the scalar rule takes what that scan cannot see.
+func scalarHoldsKey(s *yaml.Node, lines []string) bool {
+	if scalarBase64HoldsPrivateKey(s.Value) {
+		return true
+	}
+	switch {
+	case s.Style&(yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle) != 0:
+		return privateKeyLine.MatchString(s.Value)
+	case s.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0:
+		return false
+	}
+	// A plain scalar that opens with the marker, after `key: `, not at a line
+	// start: markPEMBlock cannot see that marker.
+	return startsPrivateKey(s.Value) && !privateKeyBegin.MatchString(strings.TrimSpace(lines[min(max(s.Line, 1), len(lines))-1]))
 }
