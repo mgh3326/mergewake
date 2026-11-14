@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -668,10 +671,100 @@ func TestReapResolvesMergeCommit(t *testing.T) {
 	}
 	var saw bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		saw = saw || row["reason"] == "merge-commit-unknown"
+		if row["reason"] == "merge-commit-unknown" {
+			saw = true
+			if row["host"] == "" {
+				t.Fatalf("merge-commit-unknown row has no host: %v", row)
+			}
+		}
 	}
 	if !saw {
 		t.Fatal("unresolvable merge commit not recorded")
+	}
+}
+
+// pullCacheGH is the real GitHub client with only the revert watch faked: the
+// merge-commit path under test is the client's own list-then-single read.
+type pullCacheGH struct{ *github.Client }
+
+func (pullCacheGH) WatchRevert(context.Context, string, int, string) (*github.Pull, error) {
+	return nil, nil
+}
+
+// A merged PR body cached without merge_commit_sha must not starve reap: the
+// single-PR read revalidates to a 304 replay, while an unconditional read has
+// the sha. PullValidators primes that cache without the state writer's repair.
+func TestReapMergeCommitPastStalePullCache(t *testing.T) {
+	mergedAt := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	mergeSHA := strings.Repeat("b", 40)
+	var unconditional atomic.Int32
+	var conditional atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case path == "/repos/example/project/pulls":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"user": map[string]any{"login": "a"},
+			}})
+		case strings.HasSuffix(path, "/pulls/12/reviews"):
+			fmt.Fprint(w, `[]`)
+		case strings.HasSuffix(path, "/check-runs"):
+			fmt.Fprint(w, `{"check_runs":[]}`)
+		case strings.HasSuffix(path, "/statuses"):
+			fmt.Fprint(w, `[]`)
+		case path == "/repos/example/project/commits/"+headSHA:
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": headSHA, "commit": map[string]any{"message": "t"}})
+		case path == "/repos/example/project/pulls/12":
+			if inm := r.Header.Get("If-None-Match"); inm == `"e1"` || inm == `"e2"` {
+				conditional.Add(1)
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			body := map[string]any{
+				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"user": map[string]any{"login": "a"},
+			}
+			etag := `"e1"`
+			if unconditional.Add(1) > 1 {
+				body["merge_commit_sha"] = mergeSHA
+				etag = `"e2"`
+			}
+			w.Header().Set("ETag", etag)
+			_ = json.NewEncoder(w).Encode(body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	gh := github.New("")
+	gh.BaseURL = server.URL
+	gh.UploadURL = server.URL
+	gh.HTTP = server.Client()
+	// Prime the PR cache with the merged body GitHub served before the sha was
+	// populated; PullValidators reads the PR without the changestate repair.
+	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, pullCacheGH{gh}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("stale cached PR body starved the merge commit")
+	}
+	if conditional.Load() == 0 || unconditional.Load() < 2 {
+		t.Fatalf("did not exercise stale ETag replay and fresh detail read: conditional=%d unconditional=%d", conditional.Load(), unconditional.Load())
+	}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "merge-commit-unknown" {
+			t.Fatalf("merge commit stayed unknown: %v", row)
+		}
 	}
 }
 
