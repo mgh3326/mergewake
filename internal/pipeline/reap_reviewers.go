@@ -32,21 +32,24 @@ import (
 // local checkout is removed only when it is clean, detached at the reviewed
 // head and no local pane runs in it.
 //
-// Two reviewer-only exceptions keep finished panes from piling up. An omp pane
-// has a composer herdr cannot read, so a reviewer pane that stayed idle with an
-// unreadable composer for reviewerUnreadableIdle closes without the read. And a
-// reviewer job that never left spawned, whose pane is idle and whose PR is
-// closed or past the reviewed head, is closed abandoned first (abandonSpawned).
-// A worker pane keeps the composer read: a person may type in it.
+// A reviewer-only exception keeps finished panes from piling up. An omp pane
+// has a composer herdr cannot read, so a reviewer pane whose job record says
+// the job ended (completed or lost) closes without the read. One whose job
+// record does not say that waits: it closes once it has stayed idle with an
+// unreadable composer for reviewerUnreadableIdle. And a reviewer job that never
+// left spawned, whose pane is idle and whose PR is closed or past the reviewed
+// head, is closed abandoned first (abandonSpawned). A worker pane keeps the
+// composer read: a person may type in it.
 
 // reviewerLabelPattern is the label a review pass gives its pane, job and
 // checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go). The hub's
 // replacement for a quota-stopped reviewer adds -q<n> (n >= 1) to the old job id.
 // reviewerUnreadableIdle is how long a reviewer pane must have sat idle with a
-// composer the hub could not read before the sweep closes it unread. The clock
-// is the pane stream's kept composer-unknown row: the receipts dedupe repeats,
-// so that row's time is when the sweep first saw this state, and a pane that
-// worked in between wrote a different row and started the clock again.
+// composer the hub could not read before the sweep closes it unread; a job
+// record that says the job ended skips the clock. The clock is the pane
+// stream's kept composer-unknown row: the receipts dedupe repeats, so that
+// row's time is when the sweep first saw this state, and a pane that worked in
+// between wrote a different row and started the clock again.
 const reviewerUnreadableIdle = 2 * time.Hour
 
 var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
@@ -390,14 +393,21 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		return
 	}
 	// A reviewer job stuck in spawned is closed abandoned when its review can
-	// no longer matter; the pane then goes through the normal reap below.
+	// no longer matter; the pane then goes through the normal reap below. The
+	// record still reads spawned, so the composer clock below keeps its wait.
+	reaped := job.State == "completed"
 	if job.State == "spawned" && job.Role == "reviewer" && c.pane != nil && !w.abandoned[l.name] {
 		if !w.abandonSpawned(ctx, c, gate, job) {
 			return
 		}
-		job.State = "completed"
+		reaped = true
 	}
-	held := job.State != "completed" && !w.abandoned[l.name]
+	held := !reaped && !w.abandoned[l.name]
+	// A lost reviewer job cannot be holding anyone's work either: its finished
+	// pane is reaped now, under the same composer read a completed job's gets.
+	if held && job.State == "lost" && c.pane != nil && paneFinished(c.pane.Status) {
+		held = false
+	}
 	if held && unused && (job.State == "escalated" || job.State == "lost" || aged) {
 		held = false
 	}
@@ -509,23 +519,27 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 	}
 	// I5: an unsent draft, or a composer that cannot be read, keeps the pane. A
 	// reviewer pane whose composer the hub reports unreadable (not a failed
-	// read) closes once it has been idle long enough.
+	// read) closes once its job record says the job ended, or once it has been
+	// idle long enough; the row then carries the reason of that close.
+	closeReason := ""
 	switch composer, e := hs.ops.Composer(ctx, pane); {
 	case e != nil:
 		w.record(rec, "kept", reap.ComposerUnknown)
 		return nil, false
 	case composer == reap.ComposerUnknown && job.Role == "reviewer":
-		if reason := w.unreadableKeep(rec, pane); reason != "" {
-			w.record(rec, "kept", reason)
+		keep, reason := w.unreadableKeep(rec, pane, job)
+		if keep != "" {
+			w.record(rec, "kept", keep)
 			return nil, false
 		}
+		closeReason = reason
 	case composer != reap.ComposerEmpty:
 		w.record(rec, "kept", composer)
 		return nil, false
 	}
 	if !w.acting {
 		hs.closed[pane.ID] = true
-		w.record(rec, "would-close", "")
+		w.record(rec, "would-close", closeReason)
 		return &pane, true
 	}
 	outcome, e := hs.ops.CloseExact(ctx, pane)
@@ -535,7 +549,7 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 		return nil, false
 	case outcome == reap.CloseClosed:
 		hs.closed[pane.ID] = true
-		w.record(rec, "closed", "")
+		w.record(rec, "closed", closeReason)
 		return &pane, true
 	case outcome == reap.CapturePaneGone:
 		// Not marked closed: the in-use check must still see any pane that
@@ -548,22 +562,38 @@ func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reap
 }
 
 // unreadableKeep is why a reviewer pane with an unreadable composer stays, or
-// "" once it may close: idle or done, and in the same unreadable state since a
-// kept composer-unknown row at least reviewerUnreadableIdle old. The first
-// sighting writes that row and keeps the pane.
-func (w *reviewerSweep) unreadableKeep(rec reapReceipt, pane reap.Pane) string {
-	if pane.Status != "idle" && pane.Status != "done" {
+// "" once it may close, with the reason its close row carries. A job record
+// that says the job ended (terminalJob) ends the wait at once: a pane whose job
+// has ended can no longer hold anyone's work. Otherwise the pane must be idle
+// or done, and in the same unreadable state since a kept composer-unknown row
+// at least reviewerUnreadableIdle old. The first sighting writes that row and
+// keeps the pane.
+func (w *reviewerSweep) unreadableKeep(rec reapReceipt, pane reap.Pane, job integrations.JobRecord) (keep, closeReason string) {
+	if !paneFinished(pane.Status) {
 		st := pane.Status
 		if st == "" {
 			st = "unknown"
 		}
-		return "status:" + st
+		return "status:" + st, ""
+	}
+	if terminalJob(job.State) {
+		return "", composerUnknownJobEnded
 	}
 	prior, ok := w.streams[rec.Label]["pane"]
 	if !ok || prior.Result != "kept" || prior.Reason != reap.ComposerUnknown || w.now.Sub(prior.Time) < reviewerUnreadableIdle {
-		return reap.ComposerUnknown
+		return reap.ComposerUnknown, ""
 	}
-	return ""
+	return "", ""
+}
+
+// composerUnknownJobEnded is the close reason of a reviewer pane whose composer
+// the hub could not read and whose job record says the job ended.
+const composerUnknownJobEnded = "composer-unknown-job-ended"
+
+// paneFinished reports whether a pane is idle or done: it is not running work
+// and is not waiting at a prompt, so a person is not typing in it.
+func paneFinished(status string) bool {
+	return status == "idle" || status == "done"
 }
 
 // abandonSpawned closes a reviewer job that is still spawned when its pane is
@@ -577,7 +607,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		w.record(gate, "kept", "job:spawned")
 		return false
 	}
-	if c.pane.Status != "idle" && c.pane.Status != "done" {
+	if !paneFinished(c.pane.Status) {
 		return keep()
 	}
 	l := c.label

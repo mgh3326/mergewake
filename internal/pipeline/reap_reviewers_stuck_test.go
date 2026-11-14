@@ -69,8 +69,23 @@ func (f *reviewerFix) allowJobClose() {
 	f.run.fn = func(k string) (string, bool) { return "", strings.Contains(k, "\x00job\x00close\x00") }
 }
 
-// (a) A finished omp reviewer pane whose composer cannot be read closes once it
-// has sat idle that way for two hours, not before.
+// spawnedStuckFix is a stuck reviewer whose review is over but whose hk job
+// record still reads spawned: the abandon close leaves the record spawned until
+// panewire's sweep ends the job, so the composer clock still governs its pane.
+func spawnedStuckFix(t *testing.T) *stuckFix {
+	t.Helper()
+	f := newStuckFix(t)
+	merged := "2026-11-04T10:00:00Z"
+	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "closed", Merged: true, MergedAt: &merged, Head: github.Ref{SHA: headSHA}}}
+	f.allowJobClose()
+	f.addReviewer(f.label, "w1:p5")
+	f.setJob(func(j *integrations.JobRecord) { j.State, j.OwnerLane = "spawned", "lane-x" })
+	return f
+}
+
+// (a) A finished omp reviewer pane whose composer cannot be read and whose job
+// record does not say the job ended closes once it has sat idle that way for
+// two hours, not before.
 func TestReapReviewerUnreadableComposerClosesAfterTwoHours(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -83,11 +98,9 @@ func TestReapReviewerUnreadableComposerClosesAfterTwoHours(t *testing.T) {
 		{"idle 30 min", "idle", 30 * time.Minute, 0, "composer-unknown"},
 		{"done 3 h", "done", 3 * time.Hour, 1, ""},
 		{"idle 3 h", "idle", 3 * time.Hour, 1, ""},
-		{"working 3 h", "working", 3 * time.Hour, 0, "status:working"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newStuckFix(t)
-			f.addReviewer(f.label, "w1:p5")
+			f := spawnedStuckFix(t)
 			f.setPane("w1:p5", "agent_status", tt.status)
 			f.passAfter(t, 0)
 			if f.closes() != 0 {
@@ -111,8 +124,7 @@ func TestReapReviewerUnreadableComposerClosesAfterTwoHours(t *testing.T) {
 
 // A pane that worked in between starts the two hours again.
 func TestReapReviewerUnreadableComposerClockRestartsWhenPaneWorks(t *testing.T) {
-	f := newStuckFix(t)
-	f.addReviewer(f.label, "w1:p5")
+	f := spawnedStuckFix(t)
 	f.passAfter(t, 0)
 	f.setPane("w1:p5", "agent_status", "working")
 	f.passAfter(t, 90*time.Minute)

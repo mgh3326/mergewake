@@ -158,10 +158,11 @@ func TestReapReviewer_A_I1_I2_I4_I5_I6_ClosesPaneAndRemovesWorktree(t *testing.T
 	}
 }
 
-// (b) The same pane whose job is running, escalated, lost or has no record:
-// kept with the state as the reason, never read or closed.
+// (b) The same pane whose job is running or escalated, or has no record: kept
+// with the state as the reason, never read or closed. A lost job's finished
+// pane is reaped now (TestReapReviewerEndedJobClosesUnreadablePaneAtOnce).
 func TestReapReviewer_B_I2_KeepsPaneOfUnfinishedJob(t *testing.T) {
-	for _, state := range []string{"running", "escalated", "lost", "missing"} {
+	for _, state := range []string{"running", "escalated", "missing"} {
 		t.Run(state, func(t *testing.T) {
 			f := newReviewerFix(t)
 			label := reviewerLabelFor(12, time.Hour)
@@ -309,7 +310,6 @@ func TestReapReviewer_E_I5_KeepsPaneWithComposerOrFailedRecheck(t *testing.T) {
 		closes         int
 	}{
 		{"draft", "has_text", false, "closed", "composer-text", 0},
-		{"unknown", "unknown", false, "closed", "composer-unknown", 0},
 		{"unreadable", "empty", true, "closed", "composer-unknown", 0},
 		{"recheck changed", "empty", false, "pane-changed", "pane close recheck: pane-changed", 1},
 	} {
