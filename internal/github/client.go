@@ -307,17 +307,64 @@ type Pull struct {
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
 		if p, ok := c.storedPull(ctx, repo, n); ok {
-			return p, nil
+			return c.repairMergeCommit(ctx, repo, n, p), nil
 		}
 		var p Pull
 		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
-		if e == nil {
-			c.shadowPull(repo, n, p)
-			c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
-			c.writePull(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "")
+		if e != nil {
+			return p, e
 		}
-		return p, e
+		var fresh Pull
+		freshTried := false
+		if p.MergeCommitSHA == "" && (p.Merged || p.MergedAt != nil) {
+			freshTried = true
+			var ok bool
+			fresh, ok = c.freshPull(ctx, repo, n)
+			if ok {
+				p = adoptMergeFields(p, fresh)
+			}
+		}
+		c.shadowPull(repo, n, p)
+		c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
+		c.writePullFresh(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "", fresh, freshTried)
+		return p, nil
 	})
+}
+
+// freshPull reads a PR past the ETag and poll caches. ok is false when the
+// read itself failed; fresh is then zero.
+func (c *Client) freshPull(ctx context.Context, repo string, n int) (fresh Pull, ok bool) {
+	if e := c.json(pastCache(ctx), "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &fresh); e != nil {
+		return Pull{}, false
+	}
+	return fresh, true
+}
+
+func adoptMergeFields(p, fresh Pull) Pull {
+	if fresh.MergeCommitSHA != "" {
+		p.MergeCommitSHA = fresh.MergeCommitSHA
+	}
+	if p.MergedAt == nil {
+		p.MergedAt = fresh.MergedAt
+	}
+	if !p.Merged {
+		p.Merged = fresh.Merged
+	}
+	return p
+}
+
+// repairMergeCommit heals a merged PR served without merge_commit_sha (a list
+// body, a stale ETag replay or stored webhook state) with one read past the
+// cache. A PR that still lacks the sha is returned unchanged.
+func (c *Client) repairMergeCommit(ctx context.Context, repo string, n int, p Pull) Pull {
+	if p.MergeCommitSHA != "" || !(p.Merged || p.MergedAt != nil) {
+		return p
+	}
+	fresh, ok := c.freshPull(ctx, repo, n)
+	if !ok {
+		return p
+	}
+	return adoptMergeFields(p, fresh)
 }
 func (c *Client) Files(ctx context.Context, repo string, n int) ([]policy.File, error) {
 	return list[policy.File](ctx, c, fmt.Sprintf("%s/pulls/%d/files", base(repo), n))
