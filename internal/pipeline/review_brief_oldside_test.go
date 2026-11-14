@@ -153,6 +153,15 @@ func oldSideCorpus() []oldSideCase {
 			wantRows: 1,
 		},
 		{
+			name:     "k8s base64 PEM wrapped deeper than its first line, chunks of uneven width",
+			path:     "uneven.yaml",
+			old:      joinLines("data:", "  tls.key: "+wrapped[:64], "        "+wrapped[64:112], "        "+wrapped[112:200], "        "+wrapped[200:260], "        "+wrapped[260:], "type: Opaque"),
+			diff:     fileDiff("uneven.yaml", 4, 3, 0, "-        "+wrapped[112:200], "-        "+wrapped[200:260], "-        "+wrapped[260:]),
+			masked:   []string{wrapped[112:200], wrapped[200:260], wrapped[260:]},
+			count:    3,
+			wantRows: 1,
+		},
+		{
 			name:     "key block ends before a SHA-1 in the same hunk",
 			path:     "mixed.txt",
 			old:      joinLines(rsaBegin, k1, k2, rsaEnd, "commit "+sha1, "name"),

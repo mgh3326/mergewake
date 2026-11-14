@@ -190,8 +190,10 @@ func markPEMBlock(lines []string, secret []bool, i int) int {
 	return j
 }
 
-// markWrappedBase64 marks line i, which holds a base64 private key, and the
-// base64-only lines that carry on its wrapped value.
+// markWrappedBase64 marks line i, which holds the start of a base64 private
+// key, and the base64-only lines that carry on its wrapped value. The value ends
+// where its decoded text reaches the END marker, however wide each chunk is; a
+// value the file leaves unterminated ends at the first line that is not base64.
 func markWrappedBase64(lines []string, secret []bool, i int) int {
 	t := strings.TrimSpace(lines[i])
 	secret[i] = true
@@ -199,10 +201,10 @@ func markWrappedBase64(lines []string, secret []bool, i int) int {
 	if strings.Trim(t[end:], "\"',; \t") != "" {
 		return i + 1
 	}
-	// Every chunk of a wrapped value is as wide as the first one, except the
-	// last, which is shorter. The width is the first line's base64 run only: a
-	// key such as `tls.key: ` before it is not part of the value.
-	width := end - start
+	value := t[start:end]
+	if decodesToPEMEnd(value) {
+		return i + 1
+	}
 	j := i + 1
 	for ; j < len(lines); j++ {
 		c := strings.TrimSpace(lines[j])
@@ -210,12 +212,21 @@ func markWrappedBase64(lines []string, secret []bool, i int) int {
 			break
 		}
 		secret[j] = true
-		if len(c) < width {
+		value += c
+		if decodesToPEMEnd(value) {
 			j++
 			break
 		}
 	}
 	return j
+}
+
+// decodesToPEMEnd reports whether the base64 text, cut to whole quanta, decodes
+// to something that holds a PEM END marker.
+func decodesToPEMEnd(value string) bool {
+	value = strings.TrimRight(value, "=")
+	dec, err := base64.StdEncoding.DecodeString(value[:len(value)/4*4])
+	return err == nil && bytes.Contains(dec, []byte(pemKeyEnd))
 }
 
 // base64PEMEnd returns the end offset of the first base64 run in line that
