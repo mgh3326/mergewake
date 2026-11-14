@@ -536,7 +536,7 @@ func TestSameSubstance(t *testing.T) {
 
 func TestPanewireBriefCarriesTheDelta(t *testing.T) {
 	x := &panewireExecutor{s: &Service{Config: config.Config{Review: config.Review{Timeout: "10m"}}}, repo: config.Repo{Name: "example/project"}, pr: github.Pull{Number: 7, Head: github.Ref{SHA: shaA}, Base: github.Ref{Ref: "main", SHA: shaB}}, diff: "diff --git a/tool b/tool\n+x\n", delta: true, round: 2, context: "ACCEPTANCE CONTRACT"}
-	got := x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
 	sum := sha256.Sum256([]byte(got))
 	if hex.EncodeToString(sum[:]) != "457821ac6c49a6617faaf416a993ab9e136116612d5ab24fd43c98ce01e41a51" {
 		t.Fatalf("ordinary delta brief differs from d830c8c baseline: sha256=%x", sum)
@@ -547,7 +547,7 @@ func TestPanewireBriefCarriesTheDelta(t *testing.T) {
 		}
 	}
 	x.delta, x.context = false, ""
-	if got = x.brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai"); strings.Contains(got, "Delta to review") || !strings.Contains(got, "git diff "+shaB+"..."+shaA) || !strings.Contains(got, "No other keys.") {
+	if got = x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai"); strings.Contains(got, "Delta to review") || !strings.Contains(got, "git diff "+shaB+"..."+shaA) || !strings.Contains(got, "No other keys.") {
 		t.Fatal(got)
 	}
 }

@@ -1373,6 +1373,19 @@ func (c *Client) Commit(ctx context.Context, repo, sha string) (Commit, error) {
 func (c *Client) PRsForCommit(ctx context.Context, repo, sha string) ([]Pull, error) {
 	return list[Pull](ctx, c, base(repo)+"/commits/"+sha+"/pulls")
 }
+
+// MergeBase is the merge base of the base ref's tip and head: the revision the
+// old side of the PR diff comes from.
+func (c *Client) MergeBase(ctx context.Context, repo, baseRef, head string) (string, error) {
+	var r struct {
+		MergeBaseCommit Ref `json:"merge_base_commit"`
+	}
+	if e := c.json(ctx, "GET", base(repo)+"/compare/"+url.PathEscape(baseRef)+"..."+url.PathEscape(head), nil, &r); e != nil {
+		return "", e
+	}
+	return r.MergeBaseCommit.SHA, nil
+}
+
 func (c *Client) Ancestor(ctx context.Context, repo, older, newer string) (bool, error) {
 	var r struct {
 		Status          string `json:"status"`
