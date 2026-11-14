@@ -86,7 +86,7 @@ func TestReviewerNudgedOnceWhenPaneFinishedWithoutResult(t *testing.T) {
 	if len(events) != 1 || events[0].Lane != old.Label || events[0].ID != old.Label+"-nudge" {
 		t.Fatalf("nudge events=%+v", events)
 	}
-	for _, want := range []string{filepath.Join(jobDirOf(s, old.Label), "findings.json"), filepath.Join(jobDirOf(s, old.Label), "report.md"), "panewire done " + old.Label} {
+	for _, want := range []string{filepath.Join(jobDirOf(s, old.Label), "findings.json"), filepath.Join(jobDirOf(s, old.Label), "report.md"), "panewire done " + old.Label, "foreground", "`OK job=`", "run the same command again"} {
 		if !strings.Contains(events[0].Text, want) {
 			t.Fatalf("nudge text %q lacks %q", events[0].Text, want)
 		}

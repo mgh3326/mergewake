@@ -140,6 +140,21 @@ func TestPanewireBriefDeltaKeepsBothChanges(t *testing.T) {
 	}
 }
 
+func TestPanewireBriefDoneWaitsForOKLine(t *testing.T) {
+	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	for _, want := range []string{
+		"`panewire done label --result \"$J/findings.json\" --report \"$J/report.md\"`",
+		"foreground and wait for it to finish",
+		"starts with\n`OK job=`",
+		"exits non-zero, read the error, fix what it names in\nfindings.json or report.md, and run the same command again",
+		"Stop only after an\n`OK job=` line",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
 func TestPanewireBriefRestUnchanged(t *testing.T) {
 	const oldRule = "Do not modify the worktree. "
 	const newRule = `Do not modify the worktree. Read the diff and the files it
@@ -149,10 +164,16 @@ run them. Reading commands (git diff/log/show, grep, reading files) are fine.
 `
 	const oldDeadline = "The review deadline is mergewake's review.timeout; findings returned after it\nare ignored."
 	const newDeadline = "You have 25 minutes from the start of this review; findings returned after\nthat are ignored."
+	const oldDone = "Then run `panewire done label --result \"$J/findings.json\" --report \"$J/report.md\"`."
+	const newDone = "Then run `panewire done label --result \"$J/findings.json\" --report \"$J/report.md\"` in the\n" +
+		"foreground and wait for it to finish. Success is a line that starts with\n" +
+		"`OK job=`; if it exits non-zero, read the error, fix what it names in\n" +
+		"findings.json or report.md, and run the same command again. Stop only after an\n" +
+		"`OK job=` line."
 
 	got := briefExecutor("25m").brief(&passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
-	gotRest := strings.Replace(strings.Replace(got, newRule, "", 1), newDeadline, "", 1)
-	oldRest := strings.Replace(strings.Replace(oldBrief, oldRule, "", 1), oldDeadline, "", 1)
+	gotRest := strings.Replace(strings.Replace(strings.Replace(got, newRule, "", 1), newDeadline, "", 1), newDone, "", 1)
+	oldRest := strings.Replace(strings.Replace(strings.Replace(oldBrief, oldRule, "", 1), oldDeadline, "", 1), oldDone, "", 1)
 	if gotRest != oldRest {
 		t.Fatalf("brief changed outside the two sentences:\n--- got\n%s\n--- want\n%s", gotRest, oldRest)
 	}
