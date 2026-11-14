@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -189,8 +190,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			diff = src.text
 			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
-		if from, _, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
+		if from, inherited, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
 			if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
+				return e
+			}
+			// The counted passes are the inherited head's: same_family is
+			// computed over them alone.
+			if e = s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, inherited, o.DryRun); e != nil {
 				return e
 			}
 			if o.Acting() {
@@ -266,6 +272,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	for _, receipt := range receipts {
 		posted[receipt.Pass] = receipt
 	}
+	// runReceipts is every receipt the head carries once this run ends: the
+	// passes already posted plus the ones this run produces. The outcome's
+	// same_family is computed over it when the run completes.
+	runReceipts := maps.Clone(posted)
 	missing, pending := []int{}, []int{}
 	for i := 1; i <= needed; i++ {
 		if _, ok := posted[i]; ok {
@@ -298,6 +308,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		action := "review-pending"
 		if len(pending) == 0 {
 			action = "already-reviewed"
+			if e = s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(posted)), o.DryRun); e != nil {
+				return e
+			}
 			if o.Acting() {
 				if e = s.markDone(ctx, r.Name, n, pr.Head.SHA); e != nil {
 					return e
@@ -407,8 +420,8 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	}()
 	// Every missing pass of the head runs at once: no pass reads another's
 	// result, and each owns its claim ref, reviewer job record and outcome.
-	// mu guards what the passes of this run share: reviewStarted, reviews and
-	// known.
+	// mu guards what the passes of this run share: reviewStarted, reviews,
+	// known and runReceipts.
 	var mu sync.Mutex
 	runOne := func(plan *passPlan) error {
 		passStarted := s.now()
@@ -509,8 +522,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		known = append(known, knownFromFindings(findings)...)
 		mu.Unlock()
 		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil)
-		plan.sameFamily = out.family == "" || out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AnsweredContext: prContext.answered, OutsideShown: strings.Join(prContext.outside, " "), Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
+		// same_family is a fact only when both families are known: an
+		// unnamed reviewer family is unknown, never the author's.
+		plan.sameFamily = out.family != "" && family != "" && out.family == family
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AuthorFamily: family, AnsweredContext: prContext.answered, OutsideShown: strings.Join(prContext.outside, " "), Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n")}
+		mu.Lock()
+		runReceipts[plan.pass] = receipt
+		mu.Unlock()
 		if e = s.auditRoundFindingFacts(r.Name, n, pr.Head.SHA, plan.pass, rp.round, findingFacts); e != nil {
 			return e
 		}
@@ -532,6 +550,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		for _, p := range current {
 			if p.Pass == plan.pass {
 				alreadyPosted = true
+				// Another run posted this pass while this one worked: its
+				// receipt counts for the head's same_family like any other.
+				mu.Lock()
+				runReceipts[p.Pass] = p
+				mu.Unlock()
 				break
 			}
 		}
@@ -649,6 +672,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plans[held].pass})
 	}
 	if len(posted)+len(plans) >= needed {
+		if e := s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(runReceipts)), o.DryRun); e != nil {
+			return e
+		}
 		return s.markDone(ctx, r.Name, n, pr.Head.SHA)
 	}
 	return nil

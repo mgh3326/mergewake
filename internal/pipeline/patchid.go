@@ -241,3 +241,22 @@ func inheritedPasses(history []github.ReviewedPass, patch, head string, needed i
 	}
 	return "", nil, false
 }
+
+// sameFamilyOf reports whether the counted passes of one reviewed head all
+// came from the author's family: every receipt that names a reviewer family
+// must carry same_family, and at least one must name a family. A pass whose
+// reviewer family is unknown cannot be shown to share the author's, so it
+// does not count, and a head with no known-family pass is not same-family.
+func sameFamilyOf(receipts []github.PassReceipt) bool {
+	known := false
+	for _, r := range receipts {
+		if r.Family == "" {
+			continue
+		}
+		if !r.SameFamily {
+			return false
+		}
+		known = true
+	}
+	return known
+}

@@ -232,15 +232,20 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 						order = append(order, h.SHA)
 					}
 				}
-				sameFamily := false
+				byHead := map[string][]github.PassReceipt{}
+				heads := slices.Sorted(maps.Keys(reviews))
+				if !slices.Contains(heads, p.Head.SHA) {
+					heads = append(heads, p.Head.SHA)
+					slices.Sort(heads)
+				}
 				reviewers := map[string]map[string]string{}
-				for _, head := range slices.Sorted(maps.Keys(reviews)) {
+				for _, head := range heads {
 					passes, e := s.GH.ReviewPasses(ctx, r.Name, p.Number, head, s.Config.Review.Login)
 					if e != nil {
 						return e
 					}
+					byHead[head] = passes
 					for _, receipt := range passes {
-						sameFamily = sameFamily || receipt.SameFamily
 						if receipt.Reviewer != "" {
 							if reviewers[head] == nil {
 								reviewers[head] = map[string]string{}
@@ -248,6 +253,10 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 							reviewers[head][strconv.Itoa(receipt.Pass)] = receipt.Reviewer
 						}
 					}
+				}
+				counted, e := s.countedHeadPasses(ctx, r, p, order, byHead)
+				if e != nil {
+					return e
 				}
 				if e = s.ledger().Update(r.Name, p.Number, func(v *outcomes.Outcome) {
 					if v.Reviews == nil {
@@ -263,7 +272,11 @@ func (s *Service) ObservePR(ctx context.Context, r config.Repo, p github.Pull, o
 							v.Findings[severity] += n
 						}
 					}
-					v.SameFamily = v.SameFamily || sameFamily
+					// same_family describes the passes that count for the head
+					// being judged — its own receipts, or the inherited head's —
+					// so an earlier head's same-family review cannot hold the
+					// flag true here.
+					v.SameFamily = sameFamilyOf(counted)
 					for head, passes := range reviewers {
 						for pass, reviewer := range passes {
 							v.SetReviewer(head, pass, reviewer)
@@ -370,12 +383,94 @@ func (s *Service) recordReview(repo string, pr int, head string, findings []gith
 				v.Findings[k] += n
 			}
 		}
-		v.SameFamily = v.SameFamily || receipt.SameFamily
 		if receipt.Reviewer != "" {
 			v.SetReviewer(head, strconv.Itoa(receipt.Pass), receipt.Reviewer)
 		}
 	})
 }
+
+// recordHeadSameFamily records whether the passes that count for head are all
+// the author's family. It replaces the row's value: same_family describes the
+// head being judged, so an earlier head's same-family review cannot hold it
+// true for a later head, and a later other-family review can take it back.
+func (s *Service) recordHeadSameFamily(repo string, pr int, head string, receipts []github.PassReceipt, dry bool) error {
+	if dry {
+		return nil
+	}
+	return s.ledger().Update(repo, pr, func(v *outcomes.Outcome) {
+		if v.Head != "" && v.Head != head {
+			return
+		}
+		v.SameFamily = sameFamilyOf(receipts)
+	})
+}
+
+// countedHeadPasses returns the receipts the merge verdict judges for the
+// PR's current head when the outcome ledger is rebuilt from GitHub: the
+// head's own when its review stands (done marker and a complete pass set),
+// else the inherited head's — the same set same_family is computed over. The
+// pass count a complete review needs comes from the PR's class; order is the
+// review history's head order so an earlier same-patch head wins the way the
+// verdict's history does.
+func (s *Service) countedHeadPasses(ctx context.Context, r config.Repo, p github.Pull, order []string, byHead map[string][]github.PassReceipt) ([]github.PassReceipt, error) {
+	own := byHead[p.Head.SHA]
+	files, e := s.GH.Files(ctx, r.Name, p.Number)
+	if e != nil {
+		return nil, e
+	}
+	base, e := s.GH.Head(ctx, r.Name, r.Branch)
+	if e != nil {
+		return nil, e
+	}
+	pol, e := s.Policy(ctx, r, base)
+	if e != nil {
+		return nil, e
+	}
+	needed := 1
+	if pol.ClassifyGuarded(files, r.Policy).Class == "blocking" {
+		needed = 2
+	}
+	done, e := s.GH.ReviewClaimed(ctx, r.Name, p.Number, p.Head.SHA+"-done")
+	if e != nil && !errors.Is(e, github.ErrPollSkipped) {
+		return nil, e
+	}
+	_, complete := distinctPasses(own, needed)
+	ownReviewed := e == nil && done && complete
+	if ownReviewed {
+		return own, nil
+	}
+	patch := ""
+	for _, receipt := range own {
+		if receipt.Patch != "" {
+			patch = receipt.Patch
+			break
+		}
+	}
+	if patch == "" {
+		patch = s.patchIDOf(ctx, r.Name, p.Number, p.Head.SHA)
+	}
+	var history []github.ReviewedPass
+	seen := map[string]bool{}
+	for _, head := range order {
+		seen[head] = true
+		for _, receipt := range byHead[head] {
+			history = append(history, github.ReviewedPass{Head: head, PassReceipt: receipt})
+		}
+	}
+	for _, head := range slices.Sorted(maps.Keys(byHead)) {
+		if seen[head] {
+			continue
+		}
+		for _, receipt := range byHead[head] {
+			history = append(history, github.ReviewedPass{Head: head, PassReceipt: receipt})
+		}
+	}
+	if _, inherited, ok := inheritedPasses(history, patch, p.Head.SHA, needed); ok {
+		return inherited, nil
+	}
+	return own, nil
+}
+
 func (s *Service) recordDecision(repo string, pr int, action string, shadow, sameFamily, dry bool) error {
 	if dry {
 		return nil
@@ -383,7 +478,9 @@ func (s *Service) recordDecision(repo string, pr int, action string, shadow, sam
 	return s.ledger().Update(repo, pr, func(v *outcomes.Outcome) {
 		v.Action = action
 		v.Shadow = shadow
-		v.SameFamily = v.SameFamily || sameFamily
+		// The verdict's same_family already covers only the passes that
+		// count for the head it judged, so it replaces the row's value.
+		v.SameFamily = sameFamily
 		if !v.Final {
 			if action == "merge" {
 				v.Decision = "eligible"

@@ -453,9 +453,6 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	v.Status.Passes = receipts
 	posted, complete := distinctPasses(receipts, needed)
 	v.HeadPasses, v.PassesNeeded = posted, needed
-	for _, receipt := range receipts {
-		v.SameFamily = v.SameFamily || receipt.SameFamily
-	}
 	v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
 	v.Review.Rounds, v.Review.Reviewed = reviewRounds(history)
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
@@ -473,6 +470,11 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	v.Status.Done = done
 	reviewed := done && complete
+	// counted is the pass set same_family is computed over: the head's own
+	// receipts, or the inherited head's alone when the verdict inherits —
+	// the head's own partial receipts never join them, and nothing ORs the
+	// flag across heads.
+	counted := receipts
 	if !reviewed {
 		// A verdict covers a patch: an earlier head with the same patch id, such
 		// as this head before the base was merged into it, already carries the
@@ -480,11 +482,10 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		if from, inherited, ok := inheritedPasses(history, v.Review.PatchID, pr.Head.SHA, needed); ok {
 			reviewed = true
 			v.Review.Inherited = from
-			for _, receipt := range inherited {
-				v.SameFamily = v.SameFamily || receipt.SameFamily
-			}
+			counted = inherited
 		}
 	}
+	v.SameFamily = sameFamilyOf(counted)
 	v.PassClean = reviewed && !holdsPostedOn(v.Holds, pr.Head.SHA)
 	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
 	records, legacyOutside, e := s.outsideGate(ctx, r, pr, history, v.Review.PatchID, v.Review.Inherited, reviewed, fixes)

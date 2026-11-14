@@ -200,14 +200,15 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 		FinishedAt:     &finished,
 	}
 	// Facts mergewake holds for every posted pass are sent as explicit values,
-	// false and 0 included. same_family is a fact only when the pass has a
-	// family: without one the review code defaults it to true.
+	// false and 0 included. same_family is a fact only when both families are
+	// known: without the author's family on the receipt the comparison never
+	// happened, and without the reviewer's there is nothing to compare.
 	delta, quiet, outside := receipt.Delta != "", receipt.Quiet, github.OutsideBlockingCount(findings)
 	rec.Delta, rec.Quiet, rec.OutsideDiffBlocking = &delta, &quiet, &outside
 	if reviewer := strings.TrimSpace(receipt.Reviewer); reviewer != "" {
 		rec.Reviewer = &reviewer
 	}
-	if rec.Family != "" {
+	if rec.Family != "" && receipt.AuthorFamily != "" {
 		rec.SameFamily = &receipt.SameFamily
 	}
 	if digest := patchDigest(receipt.Patch); digest != "" {

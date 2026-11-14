@@ -447,7 +447,7 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	}
 	got := g.passes[shaA][0]
 	diff, _ := g.Diff(context.Background(), "", 0)
-	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", Executor: "panewire", Round: 1, Patch: reviewPatchID(diff)}) {
+	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", SameFamily: false, AuthorFamily: "anthropic", Executor: "panewire", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
 	}
 }

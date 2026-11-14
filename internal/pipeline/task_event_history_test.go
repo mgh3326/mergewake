@@ -57,7 +57,7 @@ const (
 // explicit false as a fact, and mergewake knows this pass was not quiet.
 func TestPassRecordReviewHistory(t *testing.T) {
 	pr := github.Pull{Head: github.Ref{SHA: shaA}, Base: github.Ref{SHA: shaB}}
-	receipt := github.PassReceipt{Pass: 1, Round: 1, Lens: "default", Reviewer: "sonnet@high", Family: "anthropic", SameFamily: true, Patch: historyPatchID + ":" + historyDigest}
+	receipt := github.PassReceipt{Pass: 1, Round: 1, Lens: "default", Reviewer: "sonnet@high", Family: "anthropic", SameFamily: true, AuthorFamily: "anthropic", Patch: historyPatchID + ":" + historyDigest}
 	at := time.Now()
 	rec := passRecord(pr, receipt, nil, "", at, at)
 	if rec.Reviewer == nil || *rec.Reviewer != "sonnet@high" {

@@ -1841,7 +1841,8 @@ func (x *panewireExecutor) task(ctx context.Context) (string, error) {
 // the record is the only truthful source there. The local job-dir spawn
 // receipt answers for a pane on this host whose record carries no family,
 // then a configured profile whose gate profile is the seat. An unknown
-// family returns "" and the pass counts as same-family.
+// family returns "" and the pass records same_family false: an unnamed
+// family is never the author's.
 func (x *panewireExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat string) string {
 	if rec.Family != "" {
 		return rec.Family
