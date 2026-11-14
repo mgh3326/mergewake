@@ -671,7 +671,12 @@ func TestReapResolvesMergeCommit(t *testing.T) {
 	}
 	var saw bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		saw = saw || row["reason"] == "merge-commit-unknown"
+		if row["reason"] == "merge-commit-unknown" {
+			saw = true
+			if row["host"] == "" {
+				t.Fatalf("merge-commit-unknown row has no host: %v", row)
+			}
+		}
 	}
 	if !saw {
 		t.Fatal("unresolvable merge commit not recorded")
@@ -694,6 +699,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	mergeSHA := strings.Repeat("b", 40)
 	var unconditional atomic.Int32
+	var conditional atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
@@ -713,6 +719,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"sha": headSHA, "commit": map[string]any{"message": "t"}})
 		case path == "/repos/example/project/pulls/12":
 			if inm := r.Header.Get("If-None-Match"); inm == `"e1"` || inm == `"e2"` {
+				conditional.Add(1)
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
@@ -750,6 +757,9 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	}
 	if !r.called("worktree\x00remove") {
 		t.Fatal("stale cached PR body starved the merge commit")
+	}
+	if conditional.Load() == 0 || unconditional.Load() < 2 {
+		t.Fatalf("did not exercise stale ETag replay and fresh detail read: conditional=%d unconditional=%d", conditional.Load(), unconditional.Load())
 	}
 	for _, row := range reapLogRows(t, s, "example/project") {
 		if row["reason"] == "merge-commit-unknown" {
