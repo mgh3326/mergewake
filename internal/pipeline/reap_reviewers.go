@@ -195,7 +195,7 @@ type reviewerCandidate struct {
 
 // reapReviewers runs the sweep on every scanned host. prNum > 0 limits it to
 // that PR's labels. note writes one reviewer-reap row and its audit record.
-func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
+func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
 	timeout := s.Config.Review.Timeout
 	if timeout == "" {
 		timeout = "10m" // config's default when the key is unset
@@ -315,7 +315,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		w.visit(ctx, c)
 	}
 	if acting {
-		if e := s.reviewerDailySummary(r.Name, receipts, hosts, s.now()); e != nil {
+		if e := s.reviewerDailySummary(r.Name, receipts, hosts, snapshot); e != nil {
 			w.errs = append(w.errs, e)
 		}
 	}
