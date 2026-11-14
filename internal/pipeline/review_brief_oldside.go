@@ -111,6 +111,11 @@ func scanOldSide(body []byte) *oldSide {
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
 	}
+	for i, l := range lines {
+		// A CRLF file's lines carry no carriage return: every scan below reads
+		// text, and none of them should have to know the line ending.
+		lines[i] = strings.TrimSuffix(l, "\r")
+	}
 	secret := make([]bool, len(lines))
 	parsed := markScalarPrivateKeys(body, lines, secret)
 	for i, m := range markPrivateKeyLines(lines, parsed) {

@@ -515,6 +515,11 @@ func oldSideScalarCorpus() []oldSideCase {
 		leak("double-quoted scalar with escaped line breaks", "b.yaml", quotedFile, 4, quoted[2], quoted[3]),
 		leak("anchored double-quoted scalar", "b2.yaml", cat([]string{"data:", "  key: &k \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 4, quoted[2], quoted[3]),
 		leak("double-quoted scalar on the line after its anchor", "b6.yaml", cat([]string{"data:", "  key: &k # the key", "    \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 5, quoted[2], quoted[3]),
+		func() oldSideCase {
+			c := leak("CRLF file, double-quoted scalar on the line after its anchor", "b7.yaml", cat([]string{"data:", "  key: &k ", "    \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 5, quoted[2], quoted[3])
+			c.old = strings.ReplaceAll(c.old, "\n", "\r\n")
+			return c
+		}(),
 		leak("tagged double-quoted scalar", "b3.yaml", cat([]string{"data:", "  key: !!str \"" + quoted[0]}, indent("    ", quoted[1:])[:len(quoted)-2], []string{"    " + quoted[len(quoted)-1] + `"`}), 4, quoted[2], quoted[3]),
 		leakTo("PEM marker after a plain key", "b4.yaml", []string{"key: " + begin, "  " + k1, "  " + k2, "  " + k3, "  " + end, "other: 1"}, 3, 5, k2, k3),
 		leakTo("JSON string with an escaped newline in the header", "c.json", []string{"{", `  "key": "` + jsonKey + `",`, `  "n": 1`, "}"}, 2, 2, key[20:]),
