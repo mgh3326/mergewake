@@ -382,8 +382,9 @@ these steps in order:
    than 24 hours is reclaimable, and a live lock is reported as
    `archive-lock-busy`. A guard (`<lock>.guard`) held by a claim is never broken by
    age; a claim that finds one held past 24 hours fails with an error naming the
-   guard path, and the lock is left alone. Remove that guard by hand once no
-   archive run is live. If hosts present the same task/job key, a stale or
+   guard path, and the lock is left alone. Remove that guard by hand, with
+   `rm -r`, once no archive run is live: it is a directory holding an `owner`
+   file. If hosts present the same task/job key, a stale or
    different-host plan remains `drive-dir-exists` and cannot overwrite the
    completed copy. A job with its own top-level `manifest.json` is
    skipped as `manifest-collision`.
@@ -1684,7 +1685,7 @@ time-based hold can lag: a cancelled check's settling wait, a stall notice and a
 review retry backoff are re-read at most 60 minutes late for a skipped PR.
 
 Only a settled PR is remembered: a draft, or a PR whose head has its review done
-marker, evaluated without an error. A PR still being reviewed, or one whose last
+marker, evaluated without an error. A PR still being reviewed, one whose review poll the GitHub client skipped, or one whose last
 evaluation failed, is evaluated every pass. Memory is in the daemon process: a restart
 evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
 
@@ -2032,6 +2033,8 @@ reason writes a `review-retry-waiting` row, and the count, backoff and last
 error stay as they were until the head can merge cleanly again. These
 counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
+
+A review poll the GitHub client skips inside its poll interval is a wait, not a failure: it counts as no review, does not back off or count toward escalation, and the head is not settled.
 
 The daemon uses retry failures instead of the elapsed-time-only STALLED alarm.
 `stall_after` was removed; a config that sets it fails at load. Shadow and
