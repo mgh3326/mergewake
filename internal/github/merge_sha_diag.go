@@ -66,6 +66,43 @@ func (b *decodedBody) snapshot() (source string, status int, credential string, 
 	return b.source, b.status, b.credential, b.body
 }
 
+// decodedFirst is the first body a pull read decoded, taken before any fresh
+// re-read replaces the record. Its pull is that body's decode, before any
+// adoption of re-read fields.
+type decodedFirst struct {
+	pull               Pull
+	source, credential string
+	status             int
+	raw                []byte
+}
+
+// first takes the provenance of the body the record holds now, for a pull
+// decoded from it.
+func (b *decodedBody) first(p Pull) decodedFirst {
+	source, status, credential, raw := b.snapshot()
+	return decodedFirst{pull: p, source: source, status: status, credential: credential, raw: raw}
+}
+
+// Outcomes of the fresh re-read a merged pull without merge_commit_sha gets.
+const (
+	refetchNotTried     = "not_tried"
+	refetchFilled       = "filled"
+	refetchStillMissing = "still_missing"
+)
+
+// refetchOutcome says what the re-read did: none was tried, it supplied the
+// sha, or the pull still lacks it.
+func refetchOutcome(tried bool, p Pull) string {
+	switch {
+	case !tried:
+		return refetchNotTried
+	case p.MergeCommitSHA != "":
+		return refetchFilled
+	default:
+		return refetchStillMissing
+	}
+}
+
 // httpBodySource names a body a live response carried: "http 200".
 func httpBodySource(status int) string {
 	return "http " + strconv.Itoa(status)
@@ -107,6 +144,7 @@ type mergeSHAMissing struct {
 	KeyPresent bool     `json:"key_present"`
 	ValueNull  bool     `json:"value_null"`
 	Keys       []string `json:"keys"`
+	Refetch    string   `json:"refetch"`
 }
 
 // mergeSHALog reports, once per repository and number, a merged decode without
@@ -117,17 +155,18 @@ type mergeSHALog struct {
 	seen map[string]bool
 }
 
-// noteMergeSHA logs a pull decoded as merged without merge_commit_sha, from the
-// body a read handed back. raw is the object to read keys from: the body itself
-// for a single read, one element of a list body for MergedPulls. A decode that
-// served no body (a pass-memo hit) is not logged: the read that produced the
-// memoized value was logged, or was fine, when it happened.
-func (c *Client) noteMergeSHA(repo string, n int, route string, p Pull, body *decodedBody, raw []byte) {
-	if p.MergeCommitSHA != "" || !(p.Merged || p.MergedAt != nil) {
+// noteMergeSHA logs a pull whose first decoded body was merged without
+// merge_commit_sha, from that body (taken before any fresh re-read), and what
+// the re-read did about it. It logs even when the re-read then supplies the
+// sha. raw is the object to read keys from: the body itself for a single read,
+// one element of a list body for MergedPulls. A decode that served no body (a
+// pass-memo hit) is not logged: the read that produced the memoized value was
+// logged, or was fine, when it happened.
+func (c *Client) noteMergeSHA(repo string, n int, route string, first decodedFirst, refetch string) {
+	if first.pull.MergeCommitSHA != "" || !(first.pull.Merged || first.pull.MergedAt != nil) {
 		return
 	}
-	source, status, credential, _ := body.snapshot()
-	if source == "" {
+	if first.source == "" {
 		return
 	}
 	key := normalizeMemoRepo(repo) + "\x00" + strconv.Itoa(n)
@@ -142,14 +181,15 @@ func (c *Client) noteMergeSHA(repo string, n int, route string, p Pull, body *de
 	}
 	s.seen[key] = true
 	s.mu.Unlock()
-	f := factsOf(raw)
+	f := factsOf(first.raw)
 	out := c.Stderr
 	if out == nil {
 		out = os.Stderr
 	}
 	_ = json.NewEncoder(out).Encode(mergeSHAMissing{
 		Level: "INFO", Msg: "merge_sha_missing", Repo: repo, PR: n, Route: route,
-		Credential: credential, Source: source, Status: status,
+		Credential: first.credential, Source: first.source, Status: first.status,
 		KeyPresent: f.KeyPresent, ValueNull: f.ValueNull, Keys: f.Keys,
+		Refetch: refetch,
 	})
 }
