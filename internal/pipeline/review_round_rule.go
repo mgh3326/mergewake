@@ -24,6 +24,10 @@ import (
 // the log and the audit.
 const roundHoldNotifyDetailLimit = 512
 
+// ladderPendingBound bounds how long a pending (rc 124) escalate-author may
+// be retried before the outcome is treated as ended without a successor.
+const ladderPendingBound = 2 * time.Hour
+
 // roundHoldNotifyDetail is a failed notify's error with panewire's stderr,
 // redacted, as one line of at most roundHoldNotifyDetailLimit bytes. The
 // stderr is the reason panewire refused the event; CommandError keeps it out
@@ -70,6 +74,13 @@ type roundRuleState struct {
 	Round3Escalated bool      `json:"round3_escalated,omitempty"` // legacy alias
 	LadderOutput    string    `json:"ladder_output,omitempty"`
 	LadderAt        time.Time `json:"ladder_at,omitzero"`
+	// LadderPendingSince is the first pending (rc 124) outcome; retries stop
+	// at ladderPendingBound and the step is treated as ended.
+	LadderPendingSince time.Time `json:"ladder_pending_since,omitzero"`
+	// LadderEndedNoSuccessor records an ended or unconfirmed outcome;
+	// LadderEndedEventSent marks its one owner-lane decision event delivered.
+	LadderEndedNoSuccessor bool `json:"ladder_ended_no_successor,omitempty"`
+	LadderEndedEventSent   bool `json:"ladder_ended_event_sent,omitempty"`
 
 	// Hold
 	HoldHeld               bool      `json:"hold_held,omitempty"`
@@ -107,6 +118,7 @@ func (st *roundRuleState) setEscalated(v bool, now time.Time, output string) {
 	st.Round3Escalated = v
 	st.LadderAt = now
 	st.LadderOutput = output
+	st.LadderPendingSince = time.Time{}
 }
 
 func (st *roundRuleState) held() bool {
@@ -237,13 +249,35 @@ func (s *Service) escalateAuthorRound3(ctx context.Context, r config.Repo, pr gi
 	s.escalateAuthorLadder(ctx, r, pr, fb, o, 3, st)
 }
 
-// escalateAuthorLadder executes `panewire escalate-author` once per (task, PR, round ladder).
+// escalateAuthorLadder executes `panewire escalate-author` once per (task, PR, round ladder)
+// and acts on its exit code (panewire docs/escalate-author.md): 0 escalated,
+// 2 intact, 124 pending — retried by a later evaluation, the call is
+// idempotent — and 1 ended or unconfirmed. Any other code or a run error keeps
+// the old behaviour: marked escalated and audited as an error. The whole step
+// runs under the round-rule state lock, so two evaluations of the same PR
+// cannot call panewire twice.
 func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, ladderRound int, st *roundRuleState) {
-	if o.DryRun || st.escalated() {
+	if o.DryRun {
 		return
 	}
-	st.setEscalated(true, s.now().UTC(), "")
-	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	file := s.roundRuleFile(r.Name, pr.Number)
+	defer lockPath(file)()
+	unlock, err := fsutil.Lock(file+".lock", true)
+	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("round-rule state lock failed", "pr", pr.Number, "error", err)
+		}
+		return
+	}
+	defer unlock()
+
+	// The caller's copy may be stale: another evaluation of this PR can
+	// settle between the caller's load and this lock.
+	*st = s.loadRoundRuleState(r.Name, pr.Number)
+	if st.escalated() {
+		s.sendLadderEndedDecision(ctx, r, pr, o, st)
+		return
+	}
 
 	task, _ := s.prTask(ctx, r, pr)
 	job, _, _, _ := s.boundJob(ctx, task)
@@ -283,18 +317,19 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 
 	out, err := s.Runner.Run(cmdCtx, "panewire", args, "", "")
 	outputStr := strings.TrimSpace(string(out))
-	st.setEscalated(true, s.now().UTC(), outputStr)
-	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	now := s.now().UTC()
 
 	if err == nil {
-		_ = s.audit(r.Name, "escalate-author", map[string]any{
+		st.setEscalated(true, now, outputStr)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		_ = s.audit(r.Name, "ladder-escalated", map[string]any{
 			"pr":     pr.Number,
 			"round":  ladderRound,
 			"rc":     0,
 			"output": outputStr,
 		}, o.DryRun)
 		if s.Log != nil {
-			s.Log.Info("escalate-author succeeded", "pr", pr.Number, "output", outputStr)
+			s.Log.Info("escalate-author escalated", "pr", pr.Number, "output", outputStr)
 		}
 		return
 	}
@@ -316,29 +351,109 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 		fmt.Sscanf(err.Error(), "exit status %d", &exitCode)
 	}
 
-	if exitCode == 2 {
-		_ = s.audit(r.Name, "escalate-author", map[string]any{
+	switch exitCode {
+	case 2:
+		st.setEscalated(true, now, outputStr)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		_ = s.audit(r.Name, "ladder-intact", map[string]any{
 			"pr":     pr.Number,
 			"round":  ladderRound,
 			"rc":     2,
 			"output": outputStr,
 		}, o.DryRun)
 		if s.Log != nil {
-			s.Log.Info("escalate-author refused", "pr", pr.Number, "output", outputStr)
+			s.Log.Info("escalate-author intact", "pr", pr.Number, "output", outputStr)
 		}
-		return
+	case 124:
+		if st.LadderPendingSince.IsZero() {
+			st.LadderPendingSince = now
+		}
+		if now.Sub(st.LadderPendingSince) < ladderPendingBound {
+			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+			_ = s.audit(r.Name, "ladder-pending", map[string]any{
+				"pr":     pr.Number,
+				"round":  ladderRound,
+				"rc":     exitCode,
+				"output": outputStr,
+			}, o.DryRun)
+			if s.Log != nil {
+				s.Log.Info("escalate-author pending", "pr", pr.Number, "output", outputStr)
+			}
+			return
+		}
+		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode)
+	case 1:
+		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode)
+	default:
+		st.setEscalated(true, now, outputStr)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		_ = s.audit(r.Name, "escalate-author-error", map[string]any{
+			"pr":     pr.Number,
+			"round":  ladderRound,
+			"rc":     exitCode,
+			"error":  err.Error(),
+			"output": outputStr,
+		}, o.DryRun)
+		if s.Log != nil {
+			s.Log.Warn("escalate-author error", "pr", pr.Number, "error", err, "output", outputStr)
+		}
 	}
+}
 
-	_ = s.audit(r.Name, "escalate-author-error", map[string]any{
+// ladderEnded records the ended-without-successor outcome: the step is done
+// (marked escalated so it is not retried), audited, and the owner lane gets
+// one decision event. The caller holds the round-rule state lock.
+func (s *Service) ladderEnded(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, now time.Time, output string, ladderRound, exitCode int) {
+	st.setEscalated(true, now, output)
+	st.LadderEndedNoSuccessor = true
+	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	_ = s.audit(r.Name, "ladder-ended-no-successor", map[string]any{
 		"pr":     pr.Number,
 		"round":  ladderRound,
 		"rc":     exitCode,
-		"error":  err.Error(),
-		"output": outputStr,
+		"output": output,
 	}, o.DryRun)
 	if s.Log != nil {
-		s.Log.Warn("escalate-author error", "pr", pr.Number, "error", err, "output", outputStr)
+		s.Log.Warn("escalate-author ended without successor", "pr", pr.Number, "rc", exitCode, "output", output)
 	}
+	s.sendLadderEndedDecision(ctx, r, pr, o, st)
+}
+
+// sendLadderEndedDecision emits the one decision event owed when the ladder
+// ended with no confirmed successor, to the same lane the round-hold decision
+// uses. The caller holds the round-rule state lock, so the sent flag and the
+// event cannot race a second evaluation; a failed notify stays unsent and a
+// later pass retries it.
+func (s *Service) sendLadderEndedDecision(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) {
+	if !st.LadderEndedNoSuccessor || st.LadderEndedEventSent || !o.Reporting() {
+		return
+	}
+	lane := s.designLane(ctx, r, pr)
+	if !config.PanewireLane(lane) {
+		lane = s.deskLane()
+	}
+	eventID := fmt.Sprintf("mergewake-ladder-ended-%s-%d", r.Name, pr.Number)
+	text := emitSafe(fmt.Sprintf("author ended without successor; PR %s#%d needs a new author", r.Name, pr.Number))
+
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	if err := s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   eventID,
+		Lane: lane,
+		Type: "decision",
+		Text: text,
+	}); err != nil {
+		detail := roundHoldNotifyDetail(err)
+		if s.Log != nil {
+			s.Log.Warn("ladder-ended decision notify failed", "pr", pr.Number, "error", detail)
+		}
+		if aerr := s.audit(r.Name, "ladder-ended-notify-failed", map[string]any{"pr": pr.Number, "error": detail}, o.DryRun); aerr != nil && s.Log != nil {
+			s.Log.Warn("ladder-ended notify audit failed", "pr", pr.Number, "error", aerr)
+		}
+		return
+	}
+	st.LadderEndedEventSent = true
+	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 }
 
 // checkRoundHoldRelease finds the first comment that releases the round hold:

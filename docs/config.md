@@ -791,8 +791,14 @@ on it.
   - **Round ladder (`review.round_rule.ladder`, default 5):** mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
     `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round <n> --findings-file <path>`,
     where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
-    rc 0 logs `job=<id> rung=<profile@effort>`; rc 2 logs `no_rung` or `quota_refused`; any other rc, timeout
-    or missing command is logged and review continues.
+    rc 0 marks the step escalated (`ladder-escalated`); rc 2 marks it escalated too, the author
+    untouched (`ladder-intact`); rc 124 is pending — audited `ladder-pending`, not marked, and
+    retried by a later evaluation with the same arguments until a 2-hour bound, after which it is
+    treated as rc 1; rc 1 (or pending past the bound) marks it escalated (`ladder-ended-no-successor`)
+    and sends the owner lane one `decision` event that the author ended without a successor; any
+    other rc, timeout or missing command is logged (`escalate-author-error`), marked escalated, and
+    review continues. The whole step runs under the round-rule state lock, so concurrent evaluations
+    of one PR cannot call it twice.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
     and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
     round count, open findings, and the two choices: cut the scope or request one SS consult on the design.

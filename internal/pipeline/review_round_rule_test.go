@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -47,10 +50,10 @@ func (r *roundRuleRunner) Run(ctx context.Context, command string, args []string
 		if err != nil {
 			return nil, err
 		}
-		if rc == 2 {
+		if rc != 0 {
 			return []byte(out), &integrations.CommandError{
 				Command: "panewire",
-				Err:     errors.New("exit status 2"),
+				Err:     fmt.Errorf("exit status %d", rc),
 				Stderr:  out,
 			}
 		}
@@ -803,4 +806,309 @@ func TestRoundRule_ConfigOverrideMovesAllThree(t *testing.T) {
 			t.Fatalf("round 6 decision event not sent")
 		}
 	})
+}
+
+// auditLines returns the raw decisions.jsonl rows of repo.
+func auditLines(t *testing.T, s *Service, repo string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if err != nil {
+		t.Fatalf("read decisions.jsonl: %v", err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func auditHas(t *testing.T, s *Service, repo, command string) bool {
+	t.Helper()
+	for _, line := range auditLines(t, s, repo) {
+		var row struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err == nil && row.Command == command {
+			return true
+		}
+	}
+	return false
+}
+
+// escalateArgsEqual compares two escalate-author argument vectors ignoring the
+// --findings-file value, whose temp path differs per call.
+func escalateArgsEqual(a, b []string) bool {
+	strip := func(args []string) []string {
+		out := make([]string, 0, len(args))
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--findings-file" {
+				i++
+				continue
+			}
+			out = append(out, args[i])
+		}
+		return out
+	}
+	return slices.Equal(strip(a), strip(b))
+}
+
+func escalateSnapshot(run *roundRuleRunner) (calls int, args []string, findings string) {
+	run.callsMu.Lock()
+	defer run.callsMu.Unlock()
+	return run.escalateCalls, append([]string(nil), run.lastArgs...), run.findingsJSON
+}
+
+// (a) rc 124 is pending: the ladder stays un-escalated and the next
+// evaluation calls again with the same arguments.
+func TestRoundRule_LadderPendingRetries(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 5)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+	run.escalateRC = 124
+	run.escalateOutput = "pending\n"
+
+	deliver(t, s, r)
+
+	if st := s.loadRoundRuleState(r.Name, 7); st.escalated() {
+		t.Fatalf("rc 124 marked the ladder escalated")
+	}
+	calls, args1, findings1 := escalateSnapshot(run)
+	if calls != 1 {
+		t.Fatalf("want 1 escalate-author call, got %d", calls)
+	}
+	if !auditHas(t, s, r.Name, "ladder-pending") {
+		t.Fatalf("rc 124 missing ladder-pending audit: %v", auditLines(t, s, r.Name))
+	}
+
+	deliver(t, s, r)
+
+	calls, args2, findings2 := escalateSnapshot(run)
+	if calls != 2 {
+		t.Fatalf("pending rc 124 must be retried on the next evaluation, calls = %d", calls)
+	}
+	if !escalateArgsEqual(args1, args2) {
+		t.Fatalf("retry args differ: %v vs %v", args1, args2)
+	}
+	if findings1 != findings2 {
+		t.Fatalf("retry findings file content differs:\n%s\nvs\n%s", findings1, findings2)
+	}
+}
+
+// (b) rc 1, and rc 124 past the retry bound, end the ladder with no confirmed
+// successor: one decision event to the owner lane, none on later passes.
+func TestRoundRule_LadderEndedDecisionOnce(t *testing.T) {
+	decisionEvents := func(n *ackNotifier) []integrations.Event {
+		var out []integrations.Event
+		for _, e := range n.events {
+			if e.Type == "decision" && strings.HasPrefix(e.ID, "mergewake-ladder-ended-") {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	checkEnded := func(t *testing.T, s *Service, n *ackNotifier, run *roundRuleRunner, r config.Repo, wantCalls int) {
+		t.Helper()
+		if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+			t.Fatalf("ended outcome must mark the ladder escalated")
+		}
+		if !auditHas(t, s, r.Name, "ladder-ended-no-successor") {
+			t.Fatalf("ended outcome missing ladder-ended-no-successor audit: %v", auditLines(t, s, r.Name))
+		}
+		evs := decisionEvents(n)
+		if len(evs) != 1 {
+			t.Fatalf("want exactly 1 decision event, got %d: %+v", len(evs), n.events)
+		}
+		if evs[0].Lane != "design-lane" {
+			t.Fatalf("decision event lane = %q, want design-lane", evs[0].Lane)
+		}
+		for _, want := range []string{"author ended without successor", "example/project#7"} {
+			if !strings.Contains(evs[0].Text, want) {
+				t.Fatalf("decision text missing %q: %s", want, evs[0].Text)
+			}
+		}
+		calls, _, _ := escalateSnapshot(run)
+		if calls != wantCalls {
+			t.Fatalf("escalate-author calls = %d, want %d", calls, wantCalls)
+		}
+	}
+
+	t.Run("rc_1", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		run.escalateRC = 1
+		run.escalateOutput = "rebind_unconfirmed\n"
+
+		deliver(t, s, r)
+		deliver(t, s, r)
+		checkEnded(t, s, n, run, r, 1)
+	})
+
+	t.Run("pending_past_bound", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		run.escalateRC = 124
+		run.escalateOutput = "pending\n"
+
+		deliver(t, s, r)
+		if st := s.loadRoundRuleState(r.Name, 7); st.escalated() {
+			t.Fatalf("first rc 124 must not mark the ladder escalated")
+		}
+
+		// Move the clock past the pending retry bound; the next rc 124 is
+		// treated as ended.
+		s.Now = func() time.Time { return time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC) }
+		deliver(t, s, r)
+		deliver(t, s, r)
+		checkEnded(t, s, n, run, r, 2)
+	})
+}
+
+// (c) rc 0 and rc 2 mark the ladder escalated with their audit and are not
+// retried.
+func TestRoundRule_LadderTerminalOutcomes(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		rc        int
+		output    string
+		wantAudit string
+	}{
+		{"rc_0", 0, "", "ladder-escalated"},
+		{"rc_2", 2, "quota_refused\n", "ladder-intact"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, run, r := roundRuleSetup(t, 5)
+			g.feedback.Threads = []github.ReviewThread{
+				ownFinding("T1", "high", 10),
+			}
+			run.escalateRC = tt.rc
+			run.escalateOutput = tt.output
+
+			deliver(t, s, r)
+			deliver(t, s, r)
+
+			if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+				t.Fatalf("%s must mark the ladder escalated", tt.name)
+			}
+			if !auditHas(t, s, r.Name, tt.wantAudit) {
+				t.Fatalf("%s missing %s audit: %v", tt.name, tt.wantAudit, auditLines(t, s, r.Name))
+			}
+			calls, _, _ := escalateSnapshot(run)
+			if calls != 1 {
+				t.Fatalf("%s must not be retried, calls = %d", tt.name, calls)
+			}
+		})
+	}
+}
+
+// A pending (rc 124) call keeps retrying and an ended ladder keeps retrying
+// its owed decision after the ladder round has passed: reviewRounds is
+// monotonic, so rounds == ladderRound never holds again once a new round is
+// recorded.
+func TestRoundRule_LadderObligationSurvivesLaterRounds(t *testing.T) {
+	ladderEndedEvents := func(n *ackNotifier) int {
+		count := 0
+		for _, e := range n.events {
+			if e.Type == "decision" && strings.HasPrefix(e.ID, "mergewake-ladder-ended-") {
+				count++
+			}
+		}
+		return count
+	}
+
+	t.Run("pending_retries_after_ladder_round", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		run.escalateRC = 124
+		run.escalateOutput = "pending\n"
+
+		deliver(t, s, r)
+		if calls, _, _ := escalateSnapshot(run); calls != 1 {
+			t.Fatalf("first evaluation calls = %d, want 1", calls)
+		}
+
+		// Another review round is recorded while the call is pending, then
+		// the pending operation ends without a successor.
+		g.fakeGH.passes["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] = []github.PassReceipt{{Pass: 1, Patch: "patch-6", Round: 6}}
+		run.escalateRC = 1
+		run.escalateOutput = "rebind_unconfirmed\n"
+
+		deliver(t, s, r)
+		if calls, _, _ := escalateSnapshot(run); calls != 2 {
+			t.Fatalf("pending retry after the ladder round calls = %d, want 2", calls)
+		}
+		if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+			t.Fatalf("ended outcome after the ladder round must mark escalated")
+		}
+		if got := ladderEndedEvents(n); got != 1 {
+			t.Fatalf("want 1 ladder-ended decision event, got %d: %+v", got, n.events)
+		}
+	})
+
+	t.Run("owed_decision_retries_after_ladder_round", func(t *testing.T) {
+		s, g, n, _, run, r := roundRuleSetup(t, 6)
+		g.feedback.Threads = []github.ReviewThread{
+			ownFinding("T1", "high", 10),
+		}
+		// An earlier evaluation ended the ladder but its decision notify
+		// failed, so the event is still owed.
+		_ = s.saveRoundRuleState(r.Name, 7, roundRuleState{
+			LadderEscalated:        true,
+			LadderEndedNoSuccessor: true,
+		})
+
+		deliver(t, s, r)
+
+		if got := ladderEndedEvents(n); got != 1 {
+			t.Fatalf("want 1 ladder-ended decision event, got %d: %+v", got, n.events)
+		}
+		if calls, _, _ := escalateSnapshot(run); calls != 0 {
+			t.Fatalf("owed decision must not call panewire again, calls = %d", calls)
+		}
+		if st := s.loadRoundRuleState(r.Name, 7); !st.LadderEndedEventSent {
+			t.Fatalf("owed decision was sent but LadderEndedEventSent is false")
+		}
+	})
+}
+
+// (d) two evaluations of the same PR at once make at most one
+// escalate-author call.
+func TestRoundRule_LadderConcurrentEvaluationsSingleCall(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 5)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "high", 10),
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			st := s.loadRoundRuleState(r.Name, 7)
+			s.escalateAuthorLadder(context.Background(), r, g.pull, g.feedback, Options{}, 5, &st)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	calls, _, _ := escalateSnapshot(run)
+	if calls > 1 {
+		t.Fatalf("two concurrent evaluations made %d escalate-author calls, want at most 1", calls)
+	}
+	if calls != 1 {
+		t.Fatalf("want 1 escalate-author call, got %d", calls)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+		t.Fatalf("the evaluation that ran did not record the outcome")
+	}
 }
