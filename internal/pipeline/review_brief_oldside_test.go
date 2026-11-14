@@ -218,50 +218,61 @@ func oldSideCorpus() []oldSideCase {
 
 func TestPanewireBriefRedactsPrivateKeysByOldSide(t *testing.T) {
 	for _, tt := range oldSideCorpus() {
-		t.Run(tt.name, func(t *testing.T) {
-			runner := &panewireRunner{}
-			s, g, r := panewireSetup(t, runner)
-			gh := &oldSideGH{fakeGH: g, files: map[string]string{tt.path: tt.old}}
-			s.GH = gh
-			pr := g.pull
-			pr.Base.SHA = shaB
-			x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
-			got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
-			for _, m := range tt.masked {
-				if strings.Contains(got, m) {
-					t.Errorf("brief still shows %q", m)
-				}
+		t.Run(tt.name, func(t *testing.T) { checkOldSideCase(t, tt) })
+	}
+}
+
+// Wrapped and escaped base64 keys: the extent of the value comes from the YAML
+// or JSON scalar, not from how its lines look.
+func TestPanewireBriefRedactsScalarPrivateKeysByOldSide(t *testing.T) {
+	for _, tt := range oldSideScalarCorpus() {
+		t.Run(tt.name, func(t *testing.T) { checkOldSideCase(t, tt) })
+	}
+}
+
+func checkOldSideCase(t *testing.T, tt oldSideCase) {
+	t.Helper()
+	runner := &panewireRunner{}
+	s, g, r := panewireSetup(t, runner)
+	gh := &oldSideGH{fakeGH: g, files: map[string]string{tt.path: tt.old}}
+	s.GH = gh
+	pr := g.pull
+	pr.Base.SHA = shaB
+	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: tt.diff, delta: true, round: 2}
+	got := x.brief(context.Background(), &passPlan{pass: 1, lens: "default"}, "label", "/tmp/job", "openai")
+	for _, m := range tt.masked {
+		if strings.Contains(got, m) {
+			t.Errorf("brief still shows %q", m)
+		}
+	}
+	for _, v := range tt.visible {
+		if !strings.Contains(got, v) {
+			t.Errorf("brief lost %q", v)
+		}
+	}
+	if n := strings.Count(got, "-[redacted]"); n != tt.count {
+		t.Errorf("masked %d lines, want %d:\n%s", n, tt.count, got)
+	}
+	rows := auditRows(t, s, r, "review-brief-redacted")
+	if len(rows) != tt.wantRows {
+		t.Fatalf("redaction rows=%v, want %d", rows, tt.wantRows)
+	}
+	if tt.wantRows == 1 {
+		body, _ := json.Marshal(rows[0])
+		for _, m := range tt.masked {
+			if strings.Contains(string(body), m) {
+				t.Fatalf("audit row holds key text: %s", body)
 			}
-			for _, v := range tt.visible {
-				if !strings.Contains(got, v) {
-					t.Errorf("brief lost %q", v)
-				}
-			}
-			if n := strings.Count(got, "-[redacted]"); n != tt.count {
-				t.Errorf("masked %d lines, want %d:\n%s", n, tt.count, got)
-			}
-			rows := auditRows(t, s, r, "review-brief-redacted")
-			if len(rows) != tt.wantRows {
-				t.Fatalf("redaction rows=%v, want %d", rows, tt.wantRows)
-			}
-			if tt.wantRows == 1 {
-				body, _ := json.Marshal(rows[0])
-				for _, m := range tt.masked {
-					if strings.Contains(string(body), m) {
-						t.Fatalf("audit row holds key text: %s", body)
-					}
-				}
-				if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any("private_key")) {
-					t.Fatalf("audit row: %v", rows[0])
-				}
-			}
-			if want := []string{shaB + ":" + tt.path}; !slices.Equal(gh.reads, want) {
-				t.Fatalf("old-side reads=%v, want %v (the base revision, once)", gh.reads, want)
-			}
-			if rows := auditRows(t, s, r, "review-brief-oldside-fallback"); len(rows) != 0 {
-				t.Fatalf("unexpected fallback rows: %v", rows)
-			}
-		})
+		}
+		if rows[0]["count"] != float64(tt.count) || !slices.Contains(rows[0]["paths"].([]any), any(tt.path)) || !slices.Contains(rows[0]["pattern_names"].([]any), any("private_key")) {
+			t.Fatalf("audit row: %v", rows[0])
+		}
+	}
+	if want := []string{shaB + ":" + tt.path}; !slices.Equal(gh.reads, want) {
+		t.Fatalf("old-side reads=%v, want %v (the base revision, once)", gh.reads, want)
+	}
+	if rows := auditRows(t, s, r, "review-brief-oldside-fallback"); len(rows) != 0 {
+		t.Fatalf("unexpected fallback rows: %v", rows)
 	}
 }
 
@@ -368,7 +379,7 @@ func TestMarkPrivateKeyLines(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := markPrivateKeyLines(tt.lines); !slices.Equal(got, tt.want) {
+			if got := markPrivateKeyLines(tt.lines, false); !slices.Equal(got, tt.want) {
 				t.Fatalf("marked %v, want %v", got, tt.want)
 			}
 		})
@@ -435,4 +446,91 @@ func TestPanewireOldSideReadsTheMergeBase(t *testing.T) {
 			t.Fatalf("reads=%v brief:\n%s", gh.reads, got)
 		}
 	})
+}
+
+func oldSideScalarCorpus() []oldSideCase {
+	begin := "-----" + "BEGIN " + "PRIVATE KEY" + "-----"
+	end := "-----" + "END " + "PRIVATE KEY" + "-----"
+	pgpBegin := "-----" + "BEGIN " + "PGP PRIVATE KEY BLOCK" + "-----"
+	pgpEnd := "-----" + "END " + "PGP PRIVATE KEY BLOCK" + "-----"
+	certBegin := "-----" + "BEGIN " + "CERTIFICATE" + "-----"
+	certEnd := "-----" + "END " + "CERTIFICATE" + "-----"
+	line := func(seed string) string { return strings.Repeat(seed, 16) }
+	k1, k2, k3, tail := line("Qm9k"), line("Zx7/"), line("Pw3+"), "Zx9+/Q=="
+	key := b64(joinLines(begin, k1, k2, k3, tail, end))
+	pgp := b64(joinLines(pgpBegin, "Comment: -----"+"END DECOY-----", "", k1, k2, k3, pgpEnd))
+	cert := b64(joinLines(certBegin, "Comment: PRIVATE KEY", "", k1, certEnd))
+	sha1 := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"
+	chunks := func(v string, first, width int) []string {
+		out := []string{v[:first]}
+		for rest := v[first:]; rest != ""; {
+			n := min(width, len(rest))
+			out, rest = append(out, rest[:n]), rest[n:]
+		}
+		return out
+	}
+	indent := func(prefix string, ls []string) []string {
+		out := make([]string, len(ls))
+		for i, l := range ls {
+			out[i] = prefix + l
+		}
+		return out
+	}
+	cat := func(parts ...[]string) []string {
+		var out []string
+		for _, p := range parts {
+			out = append(out, p...)
+		}
+		return out
+	}
+	// leak builds a case that removes lines from..end of a file whose key value
+	// starts after head; the removed lines carry key text only.
+	var leakTo func(name, path string, file []string, from, to int, masked ...string) oldSideCase
+	leak := func(name, path string, file []string, from int, masked ...string) oldSideCase {
+		return leakTo(name, path, file, from, len(file), masked...)
+	}
+	leakTo = func(name, path string, file []string, from, to int, masked ...string) oldSideCase {
+		var hunk []string
+		for _, l := range file[from-1 : to] {
+			hunk = append(hunk, "-"+l)
+		}
+		return oldSideCase{name: name, path: path, old: joinLines(file...), diff: fileDiff(path, from, len(hunk), 0, hunk...), masked: masked, count: len(hunk), wantRows: 1}
+	}
+
+	block := chunks(key, 20, 64)
+	blockFile := cat([]string{"data:", "  key: |"}, indent("    ", block))
+	quoted := chunks(key, 64, 64)
+	for i := 0; i < len(quoted)-1; i++ {
+		quoted[i] += "\\"
+	}
+	quotedFile := cat([]string{"data:"}, []string{"  key: \"" + quoted[0]}, indent("    ", quoted[1:]))
+	quotedFile[len(quotedFile)-1] += "\""
+	jsonKey := key[:20] + `\n` + key[20:]
+	uni := `\u004c` + key[1:]
+	pgpBlock := chunks(pgp, 64, 64)
+	escaped := strings.ReplaceAll(joinLines(begin, k1, k2, end), "\n", `\n`)
+	return []oldSideCase{
+		leak("block scalar wrapped after 20 characters", "a.yaml", blockFile, 4, block[2], block[3]),
+		leak("double-quoted scalar with escaped line breaks", "b.yaml", quotedFile, 4, quoted[2], quoted[3]),
+		leakTo("JSON string with an escaped newline in the header", "c.json", []string{"{", `  "key": "` + jsonKey + `",`, `  "n": 1`, "}"}, 2, 2, key[20:]),
+		leakTo("JSON string with a unicode escape in the header", "d.json", []string{"{", `  "key": "` + uni + `",`, `  "n": 1`, "}"}, 2, 2, key[1:]),
+		leak("PGP armor whose comment holds an END marker", "e.yaml", cat([]string{"data:", "  key: |"}, indent("    ", pgpBlock)), 6, pgpBlock[3], pgpBlock[4]),
+		leak("PEM body line with an inner space", "f.key", []string{begin, k1, k2[:32] + " " + k2[32:], k3, end}, 3, k3),
+		leak("double-quoted PEM with newline escapes", "g.yaml", []string{`key: "` + escaped[:len(begin)+2+64] + `\`, `  ` + escaped[len(begin)+2+64:] + `"`}, 2, escaped[len(begin)+2+64:len(begin)+2+64+8]),
+		leak("base64 key with a comment after its first chunk (not YAML)", "h.yaml", cat([]string{"key: " + block[0] + block[1] + " # note"}, indent("    ", block[2:])), 2, block[2], block[3]),
+		{
+			name:    "bare hash after a closed key string stays visible",
+			path:    "i.yaml",
+			old:     joinLines(`[ "`+key[:80]+`",`, "  "+sha1, "]"),
+			diff:    fileDiff("i.yaml", 2, 2, 1, "-  "+sha1, " ]"),
+			visible: []string{"-  " + sha1},
+		},
+		{
+			name:    "certificate with a private-key comment stays visible",
+			path:    "j.yaml",
+			old:     joinLines("data:", "  crt: |", "    "+cert[:64], "    "+cert[64:]),
+			diff:    fileDiff("j.yaml", 4, 1, 0, "-    "+cert[64:]),
+			visible: []string{"-    " + cert[64:]},
+		},
+	}
 }

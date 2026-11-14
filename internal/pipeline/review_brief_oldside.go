@@ -1,7 +1,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"encoding/base64"
 	"regexp"
 	"sort"
@@ -112,7 +111,12 @@ func scanOldSide(body []byte) *oldSide {
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
 	}
-	return &oldSide{lines: lines, secret: markPrivateKeyLines(lines)}
+	secret := make([]bool, len(lines))
+	parsed := markScalarPrivateKeys(body, lines, secret)
+	for i, m := range markPrivateKeyLines(lines, parsed) {
+		secret[i] = secret[i] || m
+	}
+	return &oldSide{lines: lines, secret: secret}
 }
 
 // aligned reports whether the old and context lines of a hunk that starts at
@@ -151,14 +155,16 @@ var (
 // name ends in PRIVATE KEY, so RSA, EC, OPENSSH and ENCRYPTED too, and the PGP
 // private-key armor) and of base64-encoded PEM private keys, as found in
 // Kubernetes secrets. Certificates and public keys are not marked.
-func markPrivateKeyLines(lines []string) []bool {
+func markPrivateKeyLines(lines []string, parsed bool) []bool {
 	secret := make([]bool, len(lines))
 	for i := 0; i < len(lines); {
 		t := strings.TrimSpace(lines[i])
 		switch {
-		case strings.HasPrefix(t, pemKeyBegin) && strings.Contains(t, "PRIVATE KEY"):
+		case privateKeyBegin.MatchString(t):
 			i = markPEMBlock(lines, secret, i)
-		case base64PEMEnd(t) > 0:
+		case !parsed && base64PEMEnd(t) > 0:
+			// A file that parses as YAML or JSON has its base64 keys marked by
+			// scalar; one that does not is read by line.
 			i = markWrappedBase64(lines, secret, i)
 		default:
 			i++
@@ -167,19 +173,29 @@ func markPrivateKeyLines(lines []string) []bool {
 	return secret
 }
 
+// pemBlockSpan bounds how far a BEGIN marker looks for its END.
+const pemBlockSpan = 4096
+
 // markPEMBlock marks the block that begins at line i and returns the index of
-// the first line after it. The block ends at its END line, or, when the file
-// ends it unterminated, at the first line that cannot be key text.
+// the first line after it. A block with its END marker is marked whole, whatever
+// its lines look like (PEM readers accept spaces inside a body); one the file
+// leaves unterminated ends at the first line that cannot be key text.
 func markPEMBlock(lines []string, secret []bool, i int) int {
+	label := privateKeyBegin.FindStringSubmatch(strings.TrimSpace(lines[i]))[1]
+	endMarker := pemKeyEnd + label + "-----"
+	for j := i + 1; j < len(lines) && j <= i+pemBlockSpan; j++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[j]), endMarker) {
+			for k := i; k <= j; k++ {
+				secret[k] = true
+			}
+			return j + 1
+		}
+	}
 	secret[i] = true
 	j := i + 1
 	for ; j < len(lines); j++ {
 		t := strings.TrimSpace(lines[j])
-		if strings.HasPrefix(t, pemKeyEnd) {
-			secret[j] = true
-			return j + 1
-		}
-		if t != "" && !base64Only.MatchString(t) && !pemHeaderLine.MatchString(t) {
+		if t != "" && !base64Only.MatchString(strings.NewReplacer(" ", "", "\t", "").Replace(t)) && !pemHeaderLine.MatchString(t) {
 			break
 		}
 		secret[j] = true
@@ -190,21 +206,11 @@ func markPEMBlock(lines []string, secret []bool, i int) int {
 	return j
 }
 
-// markWrappedBase64 marks line i, which holds the start of a base64 private
-// key, and the base64-only lines that carry on its wrapped value. The value ends
-// where its decoded text reaches the END marker, however wide each chunk is; a
-// value the file leaves unterminated ends at the first line that is not base64.
+// markWrappedBase64 marks line i, which holds the start of a base64 private key
+// that no YAML or JSON parse accounted for (a file that does not parse), and the
+// base64-only lines that follow it.
 func markWrappedBase64(lines []string, secret []bool, i int) int {
-	t := strings.TrimSpace(lines[i])
 	secret[i] = true
-	start, end := base64PEMRun(t)
-	if strings.Trim(t[end:], "\"',; \t") != "" {
-		return i + 1
-	}
-	value := t[start:end]
-	if decodesToPEMEnd(value) {
-		return i + 1
-	}
 	j := i + 1
 	for ; j < len(lines); j++ {
 		c := strings.TrimSpace(lines[j])
@@ -212,21 +218,8 @@ func markWrappedBase64(lines []string, secret []bool, i int) int {
 			break
 		}
 		secret[j] = true
-		value += c
-		if decodesToPEMEnd(value) {
-			j++
-			break
-		}
 	}
 	return j
-}
-
-// decodesToPEMEnd reports whether the base64 text, cut to whole quanta, decodes
-// to something that holds a PEM END marker.
-func decodesToPEMEnd(value string) bool {
-	value = strings.TrimRight(value, "=")
-	dec, err := base64.StdEncoding.DecodeString(value[:len(value)/4*4])
-	return err == nil && bytes.Contains(dec, []byte(pemKeyEnd))
 }
 
 // base64PEMEnd returns the end offset of the first base64 run in line that
@@ -252,8 +245,7 @@ func base64PEMRun(line string) (start, end int) {
 		if err != nil {
 			continue
 		}
-		dec = bytes.TrimLeft(dec, " \t\r\n")
-		if bytes.HasPrefix(dec, []byte(pemKeyBegin)) && bytes.Contains(dec, []byte("PRIVATE KEY")) {
+		if startsPrivateKey(string(dec)) {
 			return loc[0], loc[1]
 		}
 	}
