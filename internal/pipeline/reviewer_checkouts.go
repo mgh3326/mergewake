@@ -60,8 +60,8 @@ func (s *Service) reviewerDailySummary(repo string, receipts []reapReceipt, host
 			day = last.AddDate(0, 0, 1)
 		}
 		for ; !day.After(ends[name]); day = day.AddDate(0, 0, 1) {
-			removed, kept, reasons := reviewerDayCounts(receipts, hosts, name, day)
-			value := map[string]any{"host": name, "day": day.Format(reviewerSummaryDay), "removed": removed, "kept": kept, "kept_reasons": reasons}
+			removed, kept, errored, skipped, reasons := reviewerDayCounts(receipts, hosts, name, day)
+			value := map[string]any{"host": name, "day": day.Format(reviewerSummaryDay), "removed": removed, "kept": kept, "kept_reasons": reasons, "errored": errored, "skipped": skipped}
 			if err := s.audit(repo, "reviewer-checkouts-daily", value, false); err != nil {
 				return err
 			}
@@ -123,12 +123,17 @@ func reviewerSummaryHost(recorded string, hosts []*reapHost) string {
 // removed row that day counts as removed. Otherwise a label with a kept or
 // pending-cleanup row that day counts as kept, under the reason of its last such
 // row. A later row with another result (a shadow pass's would-remove, an error)
-// does not hide a checkout that is still kept.
-func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, day time.Time) (removed, kept int, reasons map[string]int) {
+// does not hide a checkout that is still kept. A label whose only rows that day
+// are error or skipped counts as errored (any error row) or skipped; a would-remove
+// or other settled row keeps it out of both.
+func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, day time.Time) (removed, kept, errored, skipped int, reasons map[string]int) {
 	type labelState struct {
 		removed bool
 		kept    bool
 		reason  string
+		errored bool
+		skipped bool
+		settled bool // a row with a result other than error or skipped
 	}
 	byLabel := map[string]*labelState{}
 	want := day.Format(reviewerSummaryDay)
@@ -143,12 +148,19 @@ func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, d
 			byLabel[label] = st
 		}
 		switch v.Result {
+		case "error":
+			st.errored = true
+			continue
+		case "skipped":
+			st.skipped = true
+			continue
 		case "removed":
 			st.removed = true
 		case "kept", "pending-cleanup":
 			st.kept = true
 			st.reason = v.Reason
 		}
+		st.settled = true
 	}
 	reasons = map[string]int{}
 	for _, st := range byLabel {
@@ -158,7 +170,12 @@ func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, d
 		case st.kept:
 			kept++
 			reasons[st.reason]++
+		case st.settled:
+		case st.errored:
+			errored++
+		case st.skipped:
+			skipped++
 		}
 	}
-	return removed, kept, reasons
+	return removed, kept, errored, skipped, reasons
 }

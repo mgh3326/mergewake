@@ -264,7 +264,7 @@ func TestReviewerCheckoutDayCountsKeepLastKeptOverLaterOutcome(t *testing.T) {
 		row(33, 8, "kept", "composer-text"),
 		row(33, 12, "removed", ""),
 	}
-	removed, kept, reasons := reviewerDayCounts(receipts, nil, "local", day)
+	removed, kept, _, _, reasons := reviewerDayCounts(receipts, nil, "local", day)
 	if removed != 1 || kept != 2 || reasons["job:running"] != 2 {
 		t.Fatalf("removed=%d kept=%d reasons=%v; want removed 1, kept 2 (job:running 2)", removed, kept, reasons)
 	}
@@ -309,5 +309,76 @@ func TestReviewerCheckoutDailySummaryCountsRowsAfterSnapshot(t *testing.T) {
 	}
 	if node == nil || node["kept"] != float64(1) {
 		t.Fatalf("node summary for 2026-11-03 must count the row stamped 23:59:55: %v", node)
+	}
+}
+
+// reviewerSummaryOf runs one summary over receipts and returns host's row for day.
+func reviewerSummaryOf(t *testing.T, f *reviewerFix, receipts []reapReceipt, host, day string) map[string]any {
+	t.Helper()
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	if err := f.s.reviewerDailySummary(testRepo.Name, receipts, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range dailySummaries(t, f) {
+		if row["host"] == host && row["day"] == day {
+			return row
+		}
+	}
+	t.Fatalf("no summary for host %s on %s", host, day)
+	return nil
+}
+
+// A checkout whose only rows that day are error rows is counted as errored.
+func TestReviewerCheckoutDayCountsErroredOnly(t *testing.T) {
+	f := newReviewerFix(t)
+	day := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	label := reviewerLabelFor(50, 30*time.Hour)
+	receipts := []reapReceipt{{Time: day.Add(10 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 50, Worktree: "/repo/" + label, Host: "local", Result: "error", Reason: "checkout remove: boom"}}
+	row := reviewerSummaryOf(t, f, receipts, "local", "2026-11-03")
+	if row["errored"] != float64(1) || row["skipped"] != float64(0) || row["removed"] != float64(0) || row["kept"] != float64(0) {
+		t.Fatalf("errored-only checkout summary: %v", row)
+	}
+}
+
+// A checkout whose only rows that day are skipped rows is counted as skipped.
+func TestReviewerCheckoutDayCountsSkippedOnly(t *testing.T) {
+	f := newReviewerFix(t)
+	day := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	label := reviewerLabelFor(51, 30*time.Hour)
+	receipts := []reapReceipt{{Time: day.Add(10 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 51, Worktree: "/repo/" + label, Host: "local", Result: "skipped", Reason: "pane-live"}}
+	row := reviewerSummaryOf(t, f, receipts, "local", "2026-11-03")
+	if row["skipped"] != float64(1) || row["errored"] != float64(0) || row["removed"] != float64(0) || row["kept"] != float64(0) {
+		t.Fatalf("skipped-only checkout summary: %v", row)
+	}
+}
+
+// A kept checkout with a later error row stays counted as kept, not errored.
+func TestReviewerCheckoutDayCountsKeptBeatsLaterError(t *testing.T) {
+	f := newReviewerFix(t)
+	day := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	label := reviewerLabelFor(52, 30*time.Hour)
+	receipts := []reapReceipt{
+		{Time: day.Add(9 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 52, Worktree: "/repo/" + label, Host: "local", Result: "kept", Reason: "job:running"},
+		{Time: day.Add(11 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 52, Worktree: "/repo/" + label, Host: "local", Result: "error", Reason: "checkout remove: boom"},
+	}
+	row := reviewerSummaryOf(t, f, receipts, "local", "2026-11-03")
+	if row["kept"] != float64(1) || row["errored"] != float64(0) {
+		t.Fatalf("kept-then-error checkout summary: %v", row)
+	}
+}
+
+// A checkout with an error row and a would-remove row is neither errored nor
+// skipped: the would-remove row settles it, as before.
+func TestReviewerCheckoutDayCountsErrorWithWouldRemoveNotCounted(t *testing.T) {
+	f := newReviewerFix(t)
+	day := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	label := reviewerLabelFor(53, 30*time.Hour)
+	receipts := []reapReceipt{
+		{Time: day.Add(9 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 53, Worktree: "/repo/" + label, Host: "local", Result: "error", Reason: "checkout remove: boom"},
+		{Time: day.Add(11 * time.Hour), Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 53, Worktree: "/repo/" + label, Host: "local", Result: "would-remove"},
+	}
+	row := reviewerSummaryOf(t, f, receipts, "local", "2026-11-03")
+	if row["errored"] != float64(0) || row["skipped"] != float64(0) || row["removed"] != float64(0) || row["kept"] != float64(0) {
+		t.Fatalf("error plus would-remove checkout summary: %v", row)
 	}
 }
