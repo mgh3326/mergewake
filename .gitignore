@@ -3,3 +3,5 @@
 *.test
 coverage.out
 .mergewake-state/
+# Worker note files (a brief tells workers to keep notes outside the worktree)
+report.draft.md
