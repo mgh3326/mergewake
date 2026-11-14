@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -62,5 +63,48 @@ func TestReapSkipsGoneWorktreeTerminalPR(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(r.calls, "\n"), "/gone.wt") {
 		t.Fatalf("gone worktree inspected: %q", r.calls)
+	}
+}
+
+// settledLowPR is a merged PR of the same task numbered below jobRecordPR, so
+// reap resolves the shared job for it first. It is on another branch.
+var settledLowPR = github.Pull{
+	Number: 11, State: "closed", Merged: true,
+	Body:     "Earlier PR of the same task.\n\nMergewake-Task: 4669\n",
+	Head:     github.Ref{Ref: "wk/y", SHA: "feedfeed"},
+	Base:     github.Ref{Ref: "main"},
+	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "def456",
+}
+
+// settledLowGH lists settledLowPR beside the job's own PR.
+type settledLowGH struct{ siblingGH }
+
+func (g *settledLowGH) MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error) {
+	return []github.Pull{jobRecordPR, settledLowPR}, nil
+}
+
+// A terminal row is per PR. PR 11 already settled /repo.wt (and still has a
+// live receipt, so it is evaluated), but PR 12, whose branch the worktree is
+// on, has no such row: PR 11's settled result must not be reused for PR 12,
+// which still inspects the worktree and is offered it.
+func TestReapSettledJobWorktreeIsPerPR(t *testing.T) {
+	s, _, run, _ := jobCandFixture(t, integrations.JobRecord{State: "completed", Host: "local", Cwd: "/repo.wt"})
+	gh := &settledLowGH{siblingGH{reverts: map[int]int{}}}
+	s.GH = gh
+	seedReapRows(t, s, "example/project",
+		reapReceipt{Action: "remove-worktree", Repo: "example/project", PR: 11, Host: "local", Worktree: "/repo.wt", Cwd: "/repo.wt", Result: "skipped", Reason: "worktree-gone"},
+		reapReceipt{Action: "remove-worktree", Repo: "example/project", PR: 11, Host: "local", Worktree: "/live.wt", Cwd: "/live.wt", Result: "skipped", Reason: "pane-in-use"},
+	)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !run.called("/live.wt") {
+		t.Fatalf("PR 11 was not evaluated, so the test proves nothing: %q", run.calls)
+	}
+	if !run.called("/repo.wt") {
+		t.Fatalf("PR 12 reused PR 11's settled result: %q", run.calls)
+	}
+	if gh.reverts[12] != 1 {
+		t.Fatalf("owner PR 12 revert checks = %d, want 1", gh.reverts[12])
 	}
 }

@@ -105,7 +105,7 @@ type jobResolved struct {
 // record or worktree read error is returned and is never counted as a missing
 // job, and it yields no candidate. p is a PR reap already listed; the record
 // and worktree reads are local, so this costs no GitHub call.
-func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBinding, bindErr error, records *passJobRecords, byName map[string]*reapHost, reach *reapJobReach) ([]jobCand, error) {
+func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBinding, bindErr error, records *passJobRecords, byName map[string]*reapHost, reach *reapJobReach, settled func(host, path string) bool) ([]jobCand, error) {
 	reach.PRs++
 	switch {
 	case bindErr != nil:
@@ -119,7 +119,7 @@ func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBi
 		reach.miss("no-bound-job")
 		return nil, nil
 	}
-	res := s.resolveJobWorktree(ctx, b.Job, records, byName)
+	res := s.resolveJobWorktree(ctx, b.Job, records, byName, settled)
 	if res.err != nil {
 		reach.miss(res.miss)
 		return nil, fmt.Errorf("PR %d %w", p.Number, res.err)
@@ -137,20 +137,23 @@ func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBi
 }
 
 // resolveJobWorktree resolves job's worktree once per pass; later PRs of the
-// same job reuse the result.
-func (s *Service) resolveJobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost) jobResolved {
+// same job reuse the result. A settled miss is not cached: settled reads the
+// current PR's own rows, so another PR of the job must still resolve it.
+func (s *Service) resolveJobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost, settled func(host, path string) bool) jobResolved {
 	if res, ok := records.cands[job]; ok {
 		return res
 	}
-	res := s.jobWorktree(ctx, job, records, byName)
-	records.cands[job] = res
+	res := s.jobWorktree(ctx, job, records, byName, settled)
+	if res.miss != "job-worktree-settled" {
+		records.cands[job] = res
+	}
 	return res
 }
 
 // jobWorktree reads job's record and the worktree it names: the host and cwd
 // panewire wrote at spawn, and the branch that worktree is on. A worktree the
 // host no longer has is a miss, not a candidate.
-func (s *Service) jobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost) jobResolved {
+func (s *Service) jobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost, settled func(host, path string) bool) jobResolved {
 	rec, e := records.job(ctx, job)
 	switch {
 	case errors.Is(e, integrations.ErrJobNotFound):
@@ -170,6 +173,11 @@ func (s *Service) jobWorktree(ctx context.Context, job string, records *passJobR
 	}
 	if host == "" {
 		return jobResolved{miss: "job-host-unconfigured"}
+	}
+	// A worktree an earlier pass already removed or proved gone is terminal:
+	// it is not inspected again (the receipt source skips it the same way).
+	if settled != nil && settled(host, rec.Cwd) {
+		return jobResolved{miss: "job-worktree-settled"}
 	}
 	hs := byName[host]
 	if hs == nil || hs.failed {
