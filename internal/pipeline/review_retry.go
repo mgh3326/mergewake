@@ -39,6 +39,9 @@ type reviewRetryState struct {
 	// not once per poll.
 	WaitConflict bool `json:"wait_conflict,omitempty"`
 	WaitCIRed    bool `json:"wait_ci_red,omitempty"`
+	// DeferredNext is the Next value whose review-retry-deferred row is already
+	// in the journal, so a deferral is audited once per next, not once per poll.
+	DeferredNext time.Time `json:"deferred_next,omitempty"`
 }
 
 // reviewErrorLimit bounds the error text a failure row and notice carry.
@@ -172,6 +175,18 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		}
 	}
 	if s.now().Before(state.Next) {
+		// The deferral leaves one row per next value, so a PR in its backoff
+		// is visible in the journal. The flag is set only once the row is in:
+		// a failed append leaves the next evaluation to write it again.
+		if !state.DeferredNext.Equal(state.Next) {
+			row := map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "next": state.Next.UTC().Format(time.RFC3339), "failures": state.Failures, "last_error": state.LastError}
+			if s.audit(r.Name, "review-retry-deferred", row, false) == nil {
+				state.DeferredNext = state.Next
+				if err := fsutil.WriteJSON(file, state); err != nil {
+					return err
+				}
+			}
+		}
 		switch {
 		case state.Held:
 			return ErrReviewHeld
