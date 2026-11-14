@@ -174,7 +174,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			changed = true
 		}
 	}
-	if done && rounds == ladderRound && openBlocking && !st.escalated() {
+	if done && rounds == ladderRound && openBlocking {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
