@@ -181,3 +181,56 @@ func TestReapJobRecordReadErrorIsNotAMiss(t *testing.T) {
 		t.Fatalf("removed on a failed read: %q", run.calls)
 	}
 }
+
+// siblingPR is a second merged PR of the same task, on its own branch: the job's
+// worktree is on wk/x, so this PR must not be offered it.
+var siblingPR = github.Pull{
+	Number: 13, State: "closed", Merged: true,
+	Body:     "Sibling of the same task.\n\nMergewake-Task: 4669\n",
+	Head:     github.Ref{Ref: "wk/y", SHA: "feedfeed"},
+	Base:     github.Ref{Ref: "main"},
+	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "def456",
+}
+
+// siblingGH lists jobRecordPR and its sibling, and counts the revert checks each
+// PR costs.
+type siblingGH struct {
+	jobCandGH
+	reverts map[int]int
+}
+
+func (g *siblingGH) MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error) {
+	return []github.Pull{jobRecordPR, siblingPR}, nil
+}
+
+func (g *siblingGH) WatchRevert(_ context.Context, _ string, n int, _ string) (*github.Pull, error) {
+	g.reverts[n]++
+	return nil, nil
+}
+
+// Acceptance 4: a job's worktree is offered only to the merged PR whose head
+// branch it is on; a sibling PR of the same task makes no revert check for it and
+// leaves no row.
+func TestReapOffersJobWorktreeOnlyToItsBranchPR(t *testing.T) {
+	s, _, _, out := jobCandFixture(t, integrations.JobRecord{State: "completed", Host: "local", Cwd: "/repo.wt"})
+	gh := &siblingGH{reverts: map[int]int{}}
+	s.GH = gh
+	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if gh.reverts[13] != 0 {
+		t.Fatalf("sibling PR 13 ran the revert check %d times", gh.reverts[13])
+	}
+	if gh.reverts[12] != 1 {
+		t.Fatalf("owner PR 12 revert checks = %d, want 1", gh.reverts[12])
+	}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["pr"] == float64(13) && row["worktree"] == "/repo.wt" {
+			t.Fatalf("sibling PR 13 got the job worktree: %v", row)
+		}
+	}
+	worktrees, misses := jobReach(t, reapSummary(t, out))
+	if worktrees != 1 || len(misses) != 0 {
+		t.Fatalf("reach = %d %v", worktrees, misses)
+	}
+}

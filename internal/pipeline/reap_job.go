@@ -38,13 +38,14 @@ type reapBinding struct{ Task, Job string }
 // read error is kept for the pass, so neither reader retries it, but it is
 // never remembered across passes and never reads as a missing record.
 type passJobRecords struct {
-	jobs reapJobs
-	recs map[string]integrations.JobRecord
-	errs map[string]error
+	jobs  reapJobs
+	recs  map[string]integrations.JobRecord
+	errs  map[string]error
+	cands map[string]jobResolved
 }
 
 func newPassJobRecords(jobs reapJobs) *passJobRecords {
-	return &passJobRecords{jobs: jobs, recs: map[string]integrations.JobRecord{}, errs: map[string]error{}}
+	return &passJobRecords{jobs: jobs, recs: map[string]integrations.JobRecord{}, errs: map[string]error{}, cands: map[string]jobResolved{}}
 }
 
 // job reads one record, from the pass's cache when either reader already did.
@@ -80,17 +81,31 @@ func newReapJobReach() reapJobReach { return reapJobReach{Misses: map[string]int
 
 func (r *reapJobReach) miss(reason string) { r.Misses[reason]++ }
 
-// reapJobCandidates returns the worktrees PR p's task names through hk: the
+// jobResolved is one job's worktree as a pass resolved it: the configured host
+// and cwd its record names, and the branch that worktree is on. miss names why
+// there is no worktree; err is a read error, which is never a miss. It is
+// resolved once per job per pass, and each merged PR of the task then takes or
+// refuses it by branch.
+type jobResolved struct {
+	cand   jobCand
+	branch string
+	miss   string
+	err    error
+}
+
+// reapJobCandidates returns the worktree PR p's task names through hk: the
 // task's bound job (already resolved by reapBind) and the record of that job,
 // whose host and cwd panewire wrote at spawn. It is reap's third discovery
 // source beside a live pane and an earlier receipt: neither sees a worktree
 // whose pane closed before reap looked at it, or whose close row recorded no
 // cwd. The record's host is mapped to a configured host by name or machine id,
-// the rule the pane path and the legacy sweep already use. Misses are counted
-// in reach; a record read error is returned and is never counted as a missing
-// job, and it yields no candidate. p is a PR reap already listed and both reads
-// are the ones the pane path already made, so this costs no GitHub call.
-func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBinding, bindErr error, records *passJobRecords, reach *reapJobReach) ([]jobCand, error) {
+// the rule the pane path and the legacy sweep already use. The worktree is
+// offered only to a PR whose head branch it is on, so a sibling PR of the same
+// task costs no GitHub call and leaves no row. Misses are counted in reach; a
+// record or worktree read error is returned and is never counted as a missing
+// job, and it yields no candidate. p is a PR reap already listed; the record
+// and worktree reads are local, so this costs no GitHub call.
+func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBinding, bindErr error, records *passJobRecords, byName map[string]*reapHost, reach *reapJobReach) ([]jobCand, error) {
 	reach.PRs++
 	switch {
 	case bindErr != nil:
@@ -104,19 +119,48 @@ func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBi
 		reach.miss("no-bound-job")
 		return nil, nil
 	}
-	rec, e := records.job(ctx, b.Job)
+	res := s.resolveJobWorktree(ctx, b.Job, records, byName)
+	if res.err != nil {
+		reach.miss(res.miss)
+		return nil, fmt.Errorf("PR %d %w", p.Number, res.err)
+	}
+	if res.miss != "" {
+		reach.miss(res.miss)
+		return nil, nil
+	}
+	if res.branch != p.Head.Ref {
+		// The worktree is on another PR's branch: not this PR's, and not a miss.
+		return nil, nil
+	}
+	reach.Worktrees++
+	return []jobCand{res.cand}, nil
+}
+
+// resolveJobWorktree resolves job's worktree once per pass; later PRs of the
+// same job reuse the result.
+func (s *Service) resolveJobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost) jobResolved {
+	if res, ok := records.cands[job]; ok {
+		return res
+	}
+	res := s.jobWorktree(ctx, job, records, byName)
+	records.cands[job] = res
+	return res
+}
+
+// jobWorktree reads job's record and the worktree it names: the host and cwd
+// panewire wrote at spawn, and the branch that worktree is on. A worktree the
+// host no longer has is a miss, not a candidate.
+func (s *Service) jobWorktree(ctx context.Context, job string, records *passJobRecords, byName map[string]*reapHost) jobResolved {
+	rec, e := records.job(ctx, job)
 	switch {
 	case errors.Is(e, integrations.ErrJobNotFound):
 		// A job may still write its record; that is a miss, not a failure.
-		reach.miss("no-job-record")
-		return nil, nil
+		return jobResolved{miss: "no-job-record"}
 	case e != nil:
-		reach.miss("job-read-error")
-		return nil, fmt.Errorf("PR %d job record %s: %s", p.Number, b.Job, integrations.Detail(e))
+		return jobResolved{miss: "job-read-error", err: fmt.Errorf("job record %s: %s", job, integrations.Detail(e))}
 	}
 	if rec.Cwd == "" {
-		reach.miss("job-without-cwd")
-		return nil, nil
+		return jobResolved{miss: "job-without-cwd"}
 	}
 	var host string
 	for _, h := range s.Config.Hosts {
@@ -125,11 +169,23 @@ func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBi
 		}
 	}
 	if host == "" {
-		reach.miss("job-host-unconfigured")
-		return nil, nil
+		return jobResolved{miss: "job-host-unconfigured"}
 	}
-	reach.Worktrees++
-	return []jobCand{{host: host, path: rec.Cwd}}, nil
+	hs := byName[host]
+	if hs == nil || hs.failed {
+		return jobResolved{miss: "job-host-unreadable"}
+	}
+	w, ok := hs.trees[rec.Cwd]
+	if !ok {
+		var e error
+		if w, e = hs.ops.Inspect(ctx, rec.Cwd); e != nil {
+			return jobResolved{miss: "job-worktree-error", err: fmt.Errorf("job %s worktree %s: %s", job, rec.Cwd, integrations.Detail(e))}
+		}
+	}
+	if w == nil {
+		return jobResolved{miss: "job-worktree-gone"}
+	}
+	return jobResolved{cand: jobCand{host: host, path: rec.Cwd}, branch: w.Branch}
 }
 
 var reapBindMu sync.Mutex

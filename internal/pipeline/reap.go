@@ -747,7 +747,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// host and cwd panewire wrote at spawn, which outlives a pane that
 		// closed before reap saw it and a close row that recorded no cwd.
 		if records != nil {
-			found, e := s.reapJobCandidates(ctx, p, bound, bindErr, records, &reach)
+			found, e := s.reapJobCandidates(ctx, p, bound, bindErr, records, byName, &reach)
 			if e != nil {
 				errs = append(errs, e)
 			}
