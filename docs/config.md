@@ -191,8 +191,21 @@ Rollback: `reap.act: false`.
 
 After `worktree_after` with no revert, a merged PR's worktree is removed —
 but only for PRs that name a candidate worktree on some configured host (a
-matching pane cwd or a prior `reap.jsonl` row); a merged PR with nothing to
-reap produces no rows and no follow-up GitHub calls. The pull list endpoint
+matching pane cwd, a prior `reap.jsonl` row, or the job record of the task the
+PR carries); a merged PR with nothing to reap produces no rows and no
+follow-up GitHub calls. The third source reads the record of the task's bound
+job — the binding the job path above already made, so no extra task read and no
+GitHub call — and takes its `host` and `cwd`, mapped to a configured host by
+name or machine id. It reaches a worktree whose pane closed before reap looked
+at it, or whose close row recorded no cwd; the `remove-worktree` row's `source`
+says which of the three named it. Only the task's bound job is read: a
+hand-over's earlier attempts are not, so their worktrees still need a pane or a
+receipt. A record that cannot be read yields no candidate and is reported, and
+never counts as a missing job; the pass summary's `job_records` counts what the
+source reached (`prs`, `worktrees`) and what it could not (`no-task-trailer`,
+`no-bound-job`, `no-job-record`, `job-without-cwd`, `job-host-unconfigured`,
+`binding-error`, `job-read-error`), for merged PRs past `worktree_after`.
+The pull list endpoint
 omits `merge_commit_sha`, so when candidates do exist it is resolved through
 the single-PR endpoint before the revert check. The
 revert knowledge comes from the watch role's recovery-PR convention: a
@@ -211,8 +224,9 @@ into the base branch (remote-tracking `origin/<branch>` first, then local) or
 be fully pushed upstream. Anything dirty, unknown or ambiguous is skipped with
 the reason recorded; removal is `git worktree remove` without `--force` and the
 local branch is deleted with `git branch -d`, never `-D`. The remote branch
-stays. Worktrees are found from the panes and from prior `reap.jsonl` rows, so
-a worktree whose pane already closed still gets cleaned.
+stays. Worktrees are found from the panes, from prior `reap.jsonl` rows and from
+the job record of the PR's task, so a worktree whose pane already closed still
+gets cleaned.
 
 #### Panewire transport
 

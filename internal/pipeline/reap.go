@@ -37,12 +37,13 @@ type reapReceipt struct {
 	Saved    string    `json:"saved,omitempty"` // report/log path captured before a pane close
 	Result   string    `json:"result"`          // closed, removed, deleted, abandoned, would-*, skipped, error
 	Reason   string    `json:"reason,omitempty"`
-	Files    []string  `json:"files,omitempty"` // ignored paths named by a refusing removal skip
-	Job      string    `json:"job,omitempty"`   // job dir name of a closed pane or archived job
-	Task     string    `json:"task,omitempty"`  // Mergewake-Task of a job-bound row
-	Open     []string  `json:"open,omitempty"`  // open PRs (owner/name#N) keeping a job's pane
-	Label    string    `json:"label,omitempty"` // reviewer label of a reviewer-reap row
-	Head     string    `json:"head,omitempty"`  // checked-out commit of a legacy-sweep row
+	Files    []string  `json:"files,omitempty"`  // ignored paths named by a refusing removal skip
+	Job      string    `json:"job,omitempty"`    // job dir name of a closed pane or archived job
+	Task     string    `json:"task,omitempty"`   // Mergewake-Task of a job-bound row
+	Open     []string  `json:"open,omitempty"`   // open PRs (owner/name#N) keeping a job's pane
+	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap row
+	Head     string    `json:"head,omitempty"`   // checked-out commit of a legacy-sweep row
+	Source   string    `json:"source,omitempty"` // what named a merged-PR worktree: pane, receipt or job-record
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }
@@ -507,6 +508,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
 	}
+	// One hk job record read per job per pass, and the job-record source's
+	// counters: the pane path and the worktree candidate source below share
+	// both.
+	var records *passJobRecords
+	if jobs, ok := s.Sink.(reapJobs); ok {
+		records = newPassJobRecords(jobs)
+	}
+	reach := newReapJobReach()
 	// Errors are counted once, from errs: note itself appends every "error"
 	// row, so no row-level failure can be missing from the summary.
 	scanned, closed, planned, removed, deleted, skipped, archived, jobsDone := 0, 0, 0, 0, 0, 0, 0, 0
@@ -644,7 +653,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if !jobSeen[bound.Job] {
 				jobSeen[bound.Job] = true
 				match := func(w *reap.Worktree) bool { return matches(w, p) }
-				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, h.jobClosed, h.jobEverClosed, note)
+				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, records, h.jobClosed, h.jobEverClosed, note)
 			}
 		}
 		for _, hs := range hosts {
@@ -694,25 +703,26 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 
 		type cand struct {
-			hs   *reapHost
-			path string
+			hs     *reapHost
+			path   string
+			source string
 		}
 		var cands []cand
 		seen := map[string]bool{}
-		add := func(hs *reapHost, path string) {
+		add := func(hs *reapHost, path, source string) {
 			if hs == nil || hs.failed || path == "" {
 				return
 			}
 			k := hs.host.Name + "\x00" + path
 			if !seen[k] {
 				seen[k] = true
-				cands = append(cands, cand{hs, path})
+				cands = append(cands, cand{hs: hs, path: path, source: source})
 			}
 		}
 		for _, hs := range hosts {
 			for _, pane := range hs.panes {
 				if w := hs.trees[pane.Cwd]; matches(w, p) {
-					add(hs, w.Path)
+					add(hs, w.Path, "pane")
 				}
 			}
 		}
@@ -731,7 +741,24 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if sig == "removed|" || sig == "worktree-gone|" {
 				continue
 			}
-			add(byName[rec.Host], path)
+			add(byName[rec.Host], path, "receipt")
+		}
+		// The job record is the third source: the task's bound job names the
+		// host and cwd panewire wrote at spawn, which outlives a pane that
+		// closed before reap saw it and a close row that recorded no cwd.
+		if records != nil {
+			found, e := s.reapJobCandidates(ctx, p, bound, bindErr, records, &reach)
+			if e != nil {
+				errs = append(errs, e)
+			}
+			for _, jc := range found {
+				// A removed or proven-gone worktree is terminal here too.
+				sig := h.lastRow[reapRowKey(reapReceipt{Action: "remove-worktree", PR: p.Number, Host: jc.host, Worktree: jc.path})]
+				if sig == "removed|" || sig == "worktree-gone|" {
+					continue
+				}
+				add(byName[jc.host], jc.path, "job-record")
+			}
 		}
 		// A PR with no discovered worktree on any host leaves no rows and
 		// costs no GitHub calls beyond the listing: the merge-commit and
@@ -790,7 +817,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 
 		for _, c := range cands {
-			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref}
+			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref, Source: c.source}
 			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
 			case e != nil:
@@ -941,6 +968,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		JobsDone int    `json:"jobs_done"`
 		Skipped  int    `json:"skipped"`
 		ErrCount int    `json:"errors"`
-	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, jobsDone, skipped, len(errs)}
+		// JobRecords is what the third discovery source reached: the job
+		// records of the tasks of the merged PRs past worktree_after.
+		JobRecords reapJobReach `json:"job_records"`
+	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, jobsDone, skipped, len(errs), reach}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }
