@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +43,8 @@ type fakeHK struct {
 	// refuseHistory answers 400 invalid_event to an event whose reviews[] carry
 	// a review-history field, as an hk that predates those fields does.
 	refuseHistory bool
+	refuseTasks   bool
+	hangSingles   bool
 	// message is added to every 400 as hk's "message" field.
 	message string
 	// why holds the violation behind each rules refusal.
@@ -71,6 +74,9 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.refuseReviews && len(ev.Reviews) > 0 {
 		status, code = http.StatusBadRequest, "invalid_event"
 	}
+	if h.refuseTasks && len(ev.Tasks) > 0 {
+		status, code = http.StatusBadRequest, "invalid_event"
+	}
 	if h.rules {
 		if why := hkRulesCheck(raw); why != "" {
 			h.why = append(h.why, why)
@@ -89,6 +95,10 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+	if h.hangSingles && len(ev.Tasks) == 0 && ev.TaskID != 0 {
+		<-r.Context().Done()
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if status != 0 && status != http.StatusOK {
@@ -199,9 +209,10 @@ func wantTaskEvent(t *testing.T, got integrations.TaskEvent, task int64, source,
 }
 
 func receivedTaskIDs(got []integrations.TaskEvent) []int64 {
-	ids := make([]int64, len(got))
-	for i, ev := range got {
-		ids[i] = ev.TaskID
+	var ids []int64
+	for _, ev := range got {
+		ids = append(ids, ev.TaskID)
+		ids = append(ids, ev.Tasks...)
 	}
 	return ids
 }
@@ -232,7 +243,7 @@ func TestTaskEventMerge(t *testing.T) {
 // A bundle PR's merge event goes to every Mergewake-Task line, in order.
 func TestTaskEventMergeAllTaskTrailers(t *testing.T) {
 	s, g, hk, r := hkSetup(t)
-	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\n"
+	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\nMergewake-Task: 13\n"
 	g.enabled = true
 	markReviewed(g)
 	s.GH = mergeGH{g}
@@ -240,14 +251,69 @@ func TestTaskEventMergeAllTaskTrailers(t *testing.T) {
 		t.Fatal(e)
 	}
 	got := hk.received()
-	if g.mergeCount != 1 || len(got) != 2 {
+	if g.mergeCount != 1 || len(got) != 1 {
 		t.Fatalf("merges=%d events=%+v", g.mergeCount, got)
 	}
 	wantTaskEvent(t, got[0], 11, integrations.SourceMerge, testPRURL, testPRURL, "", "")
-	wantTaskEvent(t, got[1], 12, integrations.SourceMerge, testPRURL, testPRURL, "", "")
+	if !slices.Equal(got[0].Tasks, []int64{12, 13}) {
+		t.Fatalf("tasks=%v", got[0].Tasks)
+	}
 	rows := taskEventAudit(t, s, r.Name)
-	if len(rows) != 2 || rows[0].Task != "11" || rows[1].Task != "12" || rows[0].Result == nil || !rows[0].Result.Applied || rows[1].Result == nil || !rows[1].Result.Applied {
+	if len(rows) != 3 || rows[0].Result == nil || !rows[0].Result.Applied || rows[1].Result == nil || !rows[1].Result.Applied || rows[2].Result == nil || !rows[2].Result.Applied {
 		t.Fatalf("audit %+v", rows)
+	}
+}
+
+func TestTaskEventMergeTasksCapped(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	var body strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&body, "Mergewake-Task: %d\n", i)
+	}
+	g.pull.Body = body.String()
+	s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceMerge, nil, time.Now())
+	got := hk.received()
+	if len(got) != 1 || got[0].TaskID != 1 || len(got[0].Tasks) != 31 {
+		t.Fatalf("events=%+v", got)
+	}
+	rows := eventAuditRows(t, s, r.Name, "hk-task-event")
+	var capped []map[string]any
+	for _, row := range rows {
+		if row["error"] == "tasks-capped" {
+			capped = append(capped, row)
+		}
+	}
+	if len(capped) != 8 {
+		t.Fatalf("capped audit rows=%d all=%d", len(capped), len(rows))
+	}
+	for _, row := range capped {
+		if row["error"] != "tasks-capped" {
+			t.Fatalf("capped row=%+v", row)
+		}
+	}
+}
+
+func TestTaskEventTasksRefusedFallsBackUnderSharedDeadline(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	oldBudget := taskEventBudget
+	taskEventBudget = 100 * time.Millisecond
+	t.Cleanup(func() { taskEventBudget = oldBudget })
+	g.pull.Body = "Mergewake-Task: 11\nMergewake-Task: 12\nMergewake-Task: 13\n"
+	hk.refuseTasks, hk.hangSingles = true, true
+	start := time.Now()
+	s.postTaskEvent(context.Background(), r, g.pull, integrations.SourceMerge, nil, time.Now())
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("fallback exceeded single deadline: %v", elapsed)
+	}
+	if got := len(hk.received()); got < 2 || got > 3 {
+		t.Fatalf("requests=%d, want one refusal and bounded retrying fallback", got)
+	}
+}
+
+func TestClosesTasksStrictLines(t *testing.T) {
+	body := "no longer closes hk 12\n```text\nCloses hk 13\n```\n> Closes hk 14\nCloses hk 15abc\n- Closes hk 16, hk 17\nRESOLVES HK 18\n"
+	if got := closesTasks(body); !slices.Equal(got, []string{"16", "17", "18"}) {
+		t.Fatalf("got %v", got)
 	}
 }
 
@@ -296,11 +362,11 @@ func TestTaskEventMergeFailureDoesNotStopOtherTasks(t *testing.T) {
 		t.Fatalf("outcome %v", got)
 	}
 	got := hk.received()
-	if want := []int64{13, 13, 13, 11}; !slices.Equal(receivedTaskIDs(got), want) {
-		t.Fatalf("task IDs %v, want %v", receivedTaskIDs(got), want)
+	if len(got) != 3 || !slices.Equal(got[0].Tasks, []int64{11}) {
+		t.Fatalf("batch attempts %+v", got)
 	}
 	rows := taskEventAudit(t, s, r.Name)
-	if len(rows) != 2 || rows[0].Task != "13" || rows[0].Result != nil || !strings.Contains(rows[0].Error, "HTTP 500") || rows[1].Task != "11" || rows[1].Result == nil || !rows[1].Result.Applied {
+	if len(rows) != 2 || rows[0].Task != "13" || rows[0].Result != nil || rows[1].Task != "11" || rows[1].Result != nil {
 		t.Fatalf("audit %+v", rows)
 	}
 }
@@ -315,11 +381,13 @@ func TestTaskEventRevertAllTasks(t *testing.T) {
 		t.Fatalf("outcome %v", got)
 	}
 	got := hk.received()
-	if len(got) != 2 {
+	if len(got) != 1 {
 		t.Fatalf("events %+v", got)
 	}
 	wantTaskEvent(t, got[0], 11, integrations.SourceRevert, revertURL, testPRURL, testPRURL, revertURL)
-	wantTaskEvent(t, got[1], 12, integrations.SourceRevert, revertURL, testPRURL, testPRURL, revertURL)
+	if !slices.Equal(got[0].Tasks, []int64{12}) {
+		t.Fatalf("tasks=%v", got[0].Tasks)
+	}
 }
 
 // A PR that never merges, here one the gate blocks, posts no merge event.
