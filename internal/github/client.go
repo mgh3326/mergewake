@@ -79,6 +79,7 @@ type Client struct {
 	poll              pollingState
 	evidence          evidenceCache
 	writes            writeEpochs
+	mergeSHASeen      mergeSHALog
 }
 
 func (c *Client) now() time.Time {
@@ -204,7 +205,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 			return nil, errUncached304
 		}
 		probeOf(ctx).note(cmp.Or(resp.Header.Get("ETag"), cached.ETag))
-		return append([]byte(nil), cached.Body...), nil
+		body := append([]byte(nil), cached.Body...)
+		noteDecodedBody(ctx, body, resp.StatusCode, sourceNotModified, cred.kind)
+		return body, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if method == "GET" && resp.StatusCode == http.StatusNotFound && c.Polling {
@@ -229,6 +232,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if method == "GET" {
 			probeOf(ctx).note(resp.Header.Get("ETag"))
 		}
+	}
+	if e == nil && method == "GET" {
+		noteDecodedBody(ctx, b, resp.StatusCode, httpBodySource(resp.StatusCode), cred.kind)
 	}
 	return b, e
 }
@@ -305,7 +311,8 @@ type Pull struct {
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
-	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
+	ctx, body := withDecodedBody(ctx)
+	p, e := memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
 		if p, ok := c.storedPull(ctx, repo, n); ok {
 			return c.repairMergeCommit(ctx, repo, n, p), nil
 		}
@@ -329,6 +336,12 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 		c.writePullFresh(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "", fresh, freshTried)
 		return p, nil
 	})
+	if e != nil {
+		return p, e
+	}
+	_, _, _, raw := body.snapshot()
+	c.noteMergeSHA(repo, n, "single", p, body, raw)
+	return p, nil
 }
 
 // freshPull reads a PR past the ETag and poll caches. ok is false when the
@@ -1306,11 +1319,23 @@ type Commit struct {
 // them must follow up with Pull.
 func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since time.Time) ([]Pull, error) {
 	var out []Pull
+	ctx, body := withDecodedBody(ctx)
 	for page := 1; page <= 10; page++ {
-		var batch []Pull
+		var raw []json.RawMessage
 		route := fmt.Sprintf("%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d", base(repo), page)
-		if e := c.json(ctx, "GET", route, nil, &batch); e != nil {
+		if e := c.json(ctx, "GET", route, nil, &raw); e != nil {
 			return nil, e
+		}
+		batch := make([]Pull, 0, len(raw))
+		for _, item := range raw {
+			var p Pull
+			if e := json.Unmarshal(item, &p); e != nil {
+				return nil, e
+			}
+			// Each element is its own object: the keys of one, not of the page
+			// array, are what the missing-sha diagnostic records.
+			c.noteMergeSHA(repo, p.Number, "list", p, body, item)
+			batch = append(batch, p)
 		}
 		stop := false
 		for _, p := range batch {
