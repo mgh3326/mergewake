@@ -34,6 +34,7 @@ type TaskEvent struct {
 	Source     string     `json:"source"`
 	SourceRef  string     `json:"source_ref"`
 	TaskID     int64      `json:"task_id"`
+	Tasks      []int64    `json:"tasks,omitempty"`
 	PR         string     `json:"pr,omitempty"`
 	RevertedPR string     `json:"reverted_pr,omitempty"`
 	RevertPR   string     `json:"revert_pr,omitempty"`
@@ -50,6 +51,9 @@ type TaskEvent struct {
 
 // MaxReviewRecords is how many reviews[] items hk takes in one event.
 const MaxReviewRecords = 16
+
+// MaxEventTasks is how many task IDs hk accepts in one task event.
+const MaxEventTasks = 32
 
 // ReviewRecord is one review pass posted for a head, in hk's `reviews[]`
 // shape. Every field but ReviewedHead is left out when mergewake does not know
@@ -240,10 +244,11 @@ func (ev TaskEvent) plain() TaskEvent {
 // TaskEventResult is what hk did with an event: applied moved the task,
 // redelivered means hk had already recorded it.
 type TaskEventResult struct {
-	Applied     bool   `json:"applied"`
-	Redelivered bool   `json:"redelivered"`
-	State       string `json:"state,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	Applied     bool                  `json:"applied"`
+	Redelivered bool                  `json:"redelivered"`
+	State       string                `json:"state,omitempty"`
+	Reason      string                `json:"reason,omitempty"`
+	Tasks       []TaskEventTaskResult `json:"tasks,omitempty"`
 	// FieldsRefused is set by PostTaskEvent, never by hk: hk answered 400 to the
 	// extended payload (this is its error code, or "invalid" when it sent none)
 	// and the event was accepted only when resent with fewer optional fields.
@@ -254,6 +259,15 @@ type TaskEventResult struct {
 	// drops every optional field.
 	FieldsRefusedMessage string `json:"-"`
 	FieldsResend         string `json:"-"`
+}
+
+// TaskEventTaskResult is hk's result for one task in a batched event.
+type TaskEventTaskResult struct {
+	TaskID      int64  `json:"task_id"`
+	Applied     bool   `json:"applied"`
+	Redelivered bool   `json:"redelivered"`
+	State       string `json:"state,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 // The resend forms of a refused extended event, most complete first.
