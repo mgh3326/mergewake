@@ -75,17 +75,28 @@ const (
 )
 
 // postTaskEvent tells hk that a mergewake action on pr has happened: it runs
-// after the action and never fails it. It posts only when the repo keeps
-// hk_task_events on, the sink can post task events, and pr carries a
-// Mergewake-Task trailer. revert is the merged revert PR of pr for
-// mergewake.revert and nil otherwise. Every post, failed or not, is one
-// hk-task-event audit row.
+// after the action and never fails it. Merge and revert post once per task the
+// PR delivers; the other sources post to the first Mergewake-Task line. revert
+// is the merged revert PR of pr for mergewake.revert and nil otherwise. Every
+// post, failed or not, is one hk-task-event audit row.
 func (s *Service) postTaskEvent(ctx context.Context, r config.Repo, pr github.Pull, source string, revert *github.Pull, at time.Time) postOutcome {
 	if source == integrations.SourceMerge {
 		// Whatever the task event does, the merge itself has landed.
 		mergeLanded(ctx, r.Name, pr.Number)
 	}
 	return s.postTaskEventWith(ctx, r, pr, source, revert, at, nil)
+}
+
+// eventTasks is the task list one event source posts to.
+func (s *Service) eventTasks(ctx context.Context, r config.Repo, pr github.Pull, source string) ([]string, error) {
+	if source == integrations.SourceMerge || source == integrations.SourceRevert {
+		return s.prTasks(ctx, r, pr)
+	}
+	task, err := s.prTask(ctx, r, pr)
+	if err != nil || task == "" {
+		return nil, err
+	}
+	return []string{task}, nil
 }
 
 // postTaskEventWith is postTaskEvent for a mergewake.review event that also
@@ -101,44 +112,58 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 	if revert != nil {
 		row.SourceRef = prURL(r.Name, revert.Number)
 	}
-	task, e := s.prTask(ctx, r, pr)
-	if e != nil {
-		row.Error = "task trailer unreadable: " + e.Error()
+	tasks, err := s.eventTasks(ctx, r, pr, source)
+	if err != nil {
+		row.Error = "task trailer unreadable: " + err.Error()
 		_ = s.audit(r.Name, "hk-task-event", row, false)
 		return postUnreadable
 	}
-	if task == "" {
+	if len(tasks) == 0 {
 		return postNoTask
 	}
-	row.Task = task
-	id, e := strconv.ParseInt(task, 10, 64)
-	if e != nil {
-		row.Error = "task ID out of range; not posted"
-		_ = s.audit(r.Name, "hk-task-event", row, false)
-		return postInvalid
+	mergeSHA := ""
+	mergeSHARead := false
+	attempted := false
+	for _, task := range tasks {
+		eventRow := row
+		eventRow.Task = task
+		id, err := strconv.ParseInt(task, 10, 64)
+		if err != nil {
+			eventRow.Error = "task ID out of range; not posted"
+			_ = s.audit(r.Name, "hk-task-event", eventRow, false)
+			continue
+		}
+		attempted = true
+		if source == integrations.SourceMerge && !mergeSHARead {
+			mergeSHA = s.mergeCommit(ctx, r, pr)
+			mergeSHARead = true
+		}
+		ev := integrations.TaskEvent{Source: source, SourceRef: row.SourceRef, TaskID: id, PR: prURL(r.Name, pr.Number), At: &at}
+		if revert != nil {
+			ev.RevertPR, ev.RevertedPR = row.SourceRef, ev.PR
+		}
+		ev.HeadSHA, ev.BaseSHA = integrations.SHA(pr.Head.SHA), integrations.SHA(pr.Base.SHA)
+		ev.MergeSHA = mergeSHA
+		if source == integrations.SourceReview {
+			ev.Reviews = s.hkReviews(r.Name, eventRow, reviews)
+		}
+		postCtx, postCancel := reportContext(ctx)
+		res, postErr := hk.PostTaskEvent(postCtx, ev)
+		postCancel()
+		if postErr != nil {
+			eventRow.Error = postErr.Error()
+		} else {
+			eventRow.Result = &res
+		}
+		_ = s.audit(r.Name, "hk-task-event", eventRow, false)
+		if postErr == nil && res.FieldsRefused != "" {
+			_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
+		}
 	}
-	ev := integrations.TaskEvent{Source: source, SourceRef: row.SourceRef, TaskID: id, PR: prURL(r.Name, pr.Number), At: &at}
-	if revert != nil {
-		ev.RevertPR, ev.RevertedPR = row.SourceRef, ev.PR
+	if attempted {
+		return postSent
 	}
-	ev.HeadSHA, ev.BaseSHA = integrations.SHA(pr.Head.SHA), integrations.SHA(pr.Base.SHA)
-	if source == integrations.SourceMerge {
-		ev.MergeSHA = s.mergeCommit(ctx, r, pr)
-	}
-	if source == integrations.SourceReview {
-		ev.Reviews = s.hkReviews(r.Name, row, reviews)
-	}
-	res, e := hk.PostTaskEvent(ctx, ev)
-	if e != nil {
-		row.Error = e.Error()
-	} else {
-		row.Result = &res
-	}
-	_ = s.audit(r.Name, "hk-task-event", row, false)
-	if e == nil && res.FieldsRefused != "" {
-		_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
-	}
-	return postSent
+	return postInvalid
 }
 
 // hkReviews fits each record to hk's rules (ReviewRecord.ForHK) and audits
