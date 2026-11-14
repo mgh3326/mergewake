@@ -312,6 +312,10 @@ type Pull struct {
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	ctx, body := withDecodedBody(ctx)
+	// first and refetch are set only by a read that decoded a live body; a
+	// memo hit or stored state leaves them empty and logs nothing.
+	var first decodedFirst
+	var refetch string
 	p, e := memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
 		if p, ok := c.storedPull(ctx, repo, n); ok {
 			return c.repairMergeCommit(ctx, repo, n, p), nil
@@ -321,6 +325,8 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 		if e != nil {
 			return p, e
 		}
+		// Take the first body before a fresh re-read replaces the record.
+		first = body.first(p)
 		var fresh Pull
 		freshTried := false
 		if p.MergeCommitSHA == "" && (p.Merged || p.MergedAt != nil) {
@@ -331,6 +337,7 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 				p = adoptMergeFields(p, fresh)
 			}
 		}
+		refetch = refetchOutcome(freshTried, p)
 		c.shadowPull(repo, n, p)
 		c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
 		c.writePullFresh(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "", fresh, freshTried)
@@ -339,8 +346,7 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	if e != nil {
 		return p, e
 	}
-	_, _, _, raw := body.snapshot()
-	c.noteMergeSHA(repo, n, "single", p, body, raw)
+	c.noteMergeSHA(repo, n, "single", first, refetch)
 	return p, nil
 }
 
@@ -1334,7 +1340,9 @@ func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since tim
 			}
 			// Each element is its own object: the keys of one, not of the page
 			// array, are what the missing-sha diagnostic records.
-			c.noteMergeSHA(repo, p.Number, "list", p, body, item)
+			first := body.first(p)
+			first.raw = item
+			c.noteMergeSHA(repo, p.Number, "list", first, refetchNotTried)
 			batch = append(batch, p)
 		}
 		stop := false

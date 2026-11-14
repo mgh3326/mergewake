@@ -139,7 +139,7 @@ func TestMergeSHAMissingLogsListItems(t *testing.T) {
 	if l["route"] != "list" || l["pr"] != float64(11) || l["source"] != "http 200" || l["status"] != float64(http.StatusOK) {
 		t.Fatalf("line %v", l)
 	}
-	if l["key_present"] != true || l["value_null"] != true {
+	if l["key_present"] != true || l["value_null"] != true || l["refetch"] != "not_tried" {
 		t.Fatalf("key facts %v", l)
 	}
 	requireLogKeys(t, l["keys"], "base", "merge_commit_sha", "merged", "merged_at", "number", "state", "updated_at")
@@ -183,5 +183,69 @@ func TestMergeSHAFacts(t *testing.T) {
 	}
 	if f := factsOf([]byte(`[]`)); f.KeyPresent || f.ValueNull || len(f.Keys) != 0 {
 		t.Fatalf("array facts %+v", f)
+	}
+}
+
+// A merged pull whose cached body, replayed on a 304, lacks merge_commit_sha
+// logs that first body (the 304 replay) with refetch filled when the fresh
+// re-read supplies the sha.
+func TestMergeSHAMissingLogsFirstBodyBeforeRefetch(t *testing.T) {
+	const cached = `{"number":12,"state":"closed","merged":true,"merged_at":"2026-11-06T09:40:49Z"}`
+	const fresh = `{"number":12,"state":"closed","merged":true,"merged_at":"2026-11-06T09:40:49Z","merge_commit_sha":"cccccccccccccccccccccccccccccccccccccccc"}`
+	var reads int
+	c, logs := mergeSHALogs(t, func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		switch {
+		case reads == 1:
+			w.Header().Set("ETag", `"e1"`)
+			fmt.Fprint(w, cached)
+		case reads == 2:
+			if r.Header.Get("If-None-Match") != `"e1"` {
+				t.Errorf("conditional read sent %q", r.Header.Get("If-None-Match"))
+			}
+			w.WriteHeader(http.StatusNotModified)
+		default:
+			fmt.Fprint(w, fresh)
+		}
+	})
+	var seed map[string]any
+	if e := c.json(context.Background(), "GET", "/repos/o/r/pulls/12", nil, &seed); e != nil {
+		t.Fatal(e)
+	}
+	p, e := c.Pull(context.Background(), "o/r", 12)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if p.MergeCommitSHA == "" {
+		t.Fatalf("fresh re-read did not supply the sha: %+v", p)
+	}
+	lines := logLines(t, logs)
+	if len(lines) != 1 {
+		t.Fatalf("lines=%v", lines)
+	}
+	l := lines[0]
+	if l["source"] != sourceNotModified || l["status"] != float64(http.StatusNotModified) || l["credential"] != "user" {
+		t.Fatalf("line %v", l)
+	}
+	if l["key_present"] != false || l["refetch"] != "filled" {
+		t.Fatalf("line %v", l)
+	}
+	requireLogKeys(t, l["keys"], "merged", "merged_at", "number", "state")
+}
+
+// A merged pull whose first body and fresh re-read both lack merge_commit_sha
+// logs refetch still_missing.
+func TestMergeSHAMissingLogsRefetchStillMissing(t *testing.T) {
+	const body = `{"number":13,"state":"closed","merged":true,"merged_at":"2026-11-06T09:40:49Z"}`
+	c, logs := mergeSHALogs(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) })
+	if _, e := c.Pull(context.Background(), "o/r", 13); e != nil {
+		t.Fatal(e)
+	}
+	lines := logLines(t, logs)
+	if len(lines) != 1 {
+		t.Fatalf("lines=%v", lines)
+	}
+	if l := lines[0]; l["source"] != "http 200" || l["refetch"] != "still_missing" {
+		t.Fatalf("line %v", l)
 	}
 }
