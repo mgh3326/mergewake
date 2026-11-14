@@ -762,6 +762,10 @@ type PassReceipt struct {
 	Reviewer   string `json:"reviewer,omitempty"`
 	Family     string `json:"family,omitempty"`
 	SameFamily bool   `json:"same_family"`
+	// AuthorFamily is the author family the reviewer family was compared
+	// against; empty when the author family was not known. SameFamily is
+	// true only when both families are known and equal.
+	AuthorFamily string `json:"author_family,omitempty"`
 	// AnsweredContext counts the already-answered findings the prompt carried,
 	// so the effect of that context can be measured later.
 	AnsweredContext int `json:"answered_context"`
