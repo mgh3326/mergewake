@@ -165,19 +165,24 @@ func TestSameFamilyVerdictUsesInheritedSetOnly(t *testing.T) {
 // (d) A receipt that names no reviewer family is unknown, not same-family,
 // even one written before the flag meant anything: the gate cannot call it
 // the author's family. A receipt whose family is known and marked same still
-// counts.
+// counts, and an unknown-family receipt beside a known same-family one does
+// not make the head not same-family: only a known other family does.
 func TestSameFamilyUnknownFamilyReceipt(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		receipt github.PassReceipt
-		sameFam bool
+		name     string
+		receipts []github.PassReceipt
+		sameFam  bool
 	}{
-		{"unknown reviewer family stored as same", github.PassReceipt{Pass: 1, Lens: "default", Family: "", SameFamily: true}, false},
-		{"known same family", github.PassReceipt{Pass: 1, Lens: "default", Family: "anthropic", SameFamily: true}, true},
+		{"unknown reviewer family stored as same", []github.PassReceipt{{Pass: 1, Lens: "default", Family: "", SameFamily: true}}, false},
+		{"known same family", []github.PassReceipt{{Pass: 1, Lens: "default", Family: "anthropic", SameFamily: true}}, true},
+		{"known same and unknown family", []github.PassReceipt{
+			{Pass: 1, Lens: "default", Family: "anthropic", SameFamily: true},
+			{Pass: 2, Lens: "correctness", Family: "", SameFamily: false},
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
-			g.passes = map[string][]github.PassReceipt{shaA: {tc.receipt}}
+			g.passes = map[string][]github.PassReceipt{shaA: tc.receipts}
 			g.refs = map[string]bool{doneRef(7, shaA): true}
 			p, e := s.Policy(context.Background(), r, shaB)
 			if e != nil {
@@ -237,4 +242,124 @@ func (g *reviewedHeadsGH) ReviewOutcomes(context.Context, string, int, string) (
 		out[h] = map[string]int{}
 	}
 	return out, nil
+}
+
+// The decision row may still hold head 1's same-family true when Land records
+// its verdict for head 2, whose own passes came from another family: nothing
+// has run recordHeadSameFamily for head 2 yet. recordDecision replaces the
+// value with the judged head's, so the stale true may not be OR-ed in.
+func TestSameFamilyLandReplacesEarlierHeadValue(t *testing.T) {
+	s, g, _, _, r := reviewSetup(t)
+	g.blocking = true
+	ctx := context.Background()
+	// Head 1's same-family review left the row true.
+	if e := s.ledger().Update(r.Name, 7, func(v *outcomes.Outcome) {
+		v.Head = shaA
+		v.SameFamily = true
+	}); e != nil {
+		t.Fatal(e)
+	}
+	// Head 2's own passes are another family's and form a complete set.
+	g.pull.Head.SHA = shaC
+	g.passes = map[string][]github.PassReceipt{
+		shaC: {
+			{Pass: 1, Lens: "correctness", Family: "openai", SameFamily: false, AuthorFamily: "anthropic"},
+			{Pass: 2, Lens: "state-risk", Family: "openai", SameFamily: false, AuthorFamily: "anthropic"},
+		},
+	}
+	g.refs = map[string]bool{doneRef(7, shaC): true}
+	if e := s.Land(ctx, r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if outcomeSameFamily(t, s, r.Name) {
+		t.Fatal("land kept head 1's same_family true for head 2, whose own passes came from another family")
+	}
+}
+
+// orderedReviewHistoryGH answers ReviewHistory in the review order given,
+// instead of the fake's head order by SHA, so a test can tell a verdict that
+// follows the review history from one that follows sorted heads.
+type orderedReviewHistoryGH struct {
+	*fakeGH
+	order []string
+}
+
+func (g *orderedReviewHistoryGH) ReviewHistory(context.Context, string, int, string) ([]github.ReviewedPass, error) {
+	var out []github.ReviewedPass
+	for _, head := range g.order {
+		for _, p := range g.passes[head] {
+			out = append(out, github.ReviewedPass{Head: head, PassReceipt: p})
+		}
+	}
+	return out, nil
+}
+
+// The inherited pass set follows the review history's head order in both
+// places that compute it: the merge gate's verdict and the ledger rebuild's
+// countedHeadPasses. Two earlier heads carry the same patch, one same-family
+// and one another family's, so a path that picked the other head would record
+// the opposite same_family.
+func TestSameFamilyInheritedHeadOrderMatchesRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order []string
+		want  string
+	}{
+		{"review history puts the other-family head first", []string{shaB, shaA}, shaB},
+		{"review history puts the same-family head first", []string{shaA, shaB}, shaA},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, _, _, r := setup(t)
+			g.blocking = true
+			ctx := context.Background()
+			diff, e := g.Diff(ctx, "", 0)
+			if e != nil {
+				t.Fatal(e)
+			}
+			patch := reviewPatchID(diff)
+			g.passes = map[string][]github.PassReceipt{
+				shaA: {
+					{Pass: 1, Lens: "correctness", Family: "anthropic", SameFamily: true, AuthorFamily: "anthropic", Patch: patch},
+					{Pass: 2, Lens: "state-risk", Family: "anthropic", SameFamily: true, AuthorFamily: "anthropic", Patch: patch},
+				},
+				shaB: {
+					{Pass: 1, Lens: "correctness", Family: "openai", SameFamily: false, AuthorFamily: "anthropic", Patch: patch},
+					{Pass: 2, Lens: "state-risk", Family: "openai", SameFamily: false, AuthorFamily: "anthropic", Patch: patch},
+				},
+				// The judged head's own pass is not a complete set, so both
+				// places inherit one of the two earlier heads.
+				shaC: {{Pass: 1, Lens: "correctness", Family: "anthropic", SameFamily: true, AuthorFamily: "anthropic", Patch: patch}},
+			}
+			g.pull.Head.SHA = shaC
+			s.GH = &orderedReviewHistoryGH{fakeGH: g, order: tc.order}
+			p, e := s.Policy(ctx, r, shaB)
+			if e != nil {
+				t.Fatal(e)
+			}
+			v, e := s.mergeGate(ctx, r, g.pull, p, shaB)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if v.Review.Inherited != tc.want {
+				t.Fatalf("gate inherited %q, want %s", v.Review.Inherited, tc.want)
+			}
+			byHead := map[string][]github.PassReceipt{}
+			for head, passes := range g.passes {
+				byHead[head] = passes
+			}
+			counted, e := s.countedHeadPasses(ctx, r, g.pull, tc.order, byHead)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if !slices.Equal(sortedPasses(counted), sortedPasses(g.passes[tc.want])) {
+				t.Fatalf("countedHeadPasses inherited %+v, gate inherited %s's %+v", counted, tc.want, g.passes[tc.want])
+			}
+			if got, want := sameFamilyOf(counted), v.SameFamily; got != want {
+				t.Fatalf("rebuild same_family=%v, gate same_family=%v", got, want)
+			}
+			if want := tc.want == shaA; v.SameFamily != want {
+				t.Fatalf("gate same_family=%v, want %v", v.SameFamily, want)
+			}
+		})
+	}
 }
