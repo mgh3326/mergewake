@@ -33,6 +33,13 @@ func changeSource(ctx context.Context) string {
 	return "poll"
 }
 func (c *Client) writePull(ctx context.Context, repo string, p Pull, at time.Time, source, delivery string) {
+	c.writePullFresh(ctx, repo, p, at, source, delivery, Pull{}, false)
+}
+
+// writePullFresh is writePull with a fresh PR read the caller already made
+// past the cache. freshTried reports that the read happened even when it
+// failed, so the state writer does not fetch the same PR twice.
+func (c *Client) writePullFresh(ctx context.Context, repo string, p Pull, at time.Time, source, delivery string, fresh Pull, freshTried bool) {
 	if c.Changes == nil {
 		return
 	}
@@ -46,8 +53,11 @@ func (c *Client) writePull(ctx context.Context, repo string, p Pull, at time.Tim
 		// once past the cache; if GitHub still lacks it, no write is made and a
 		// later one fills it.
 		if p.MergeCommitSHA == "" || p.MergedAt == nil {
-			var fresh Pull
-			if e := c.json(pastCache(ctx), "GET", fmt.Sprintf("%s/pulls/%d", base(repo), p.Number), nil, &fresh); e == nil && fresh.MergeCommitSHA != "" && fresh.MergedAt != nil {
+			if !freshTried {
+				freshTried = true
+				fresh, _ = c.freshPull(ctx, repo, p.Number)
+			}
+			if fresh.MergeCommitSHA != "" && fresh.MergedAt != nil {
 				p.MergeCommitSHA, p.MergedAt = fresh.MergeCommitSHA, fresh.MergedAt
 			}
 		}

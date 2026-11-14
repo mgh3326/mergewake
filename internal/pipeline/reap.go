@@ -750,7 +750,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			p.MergeCommitSHA = fp.MergeCommitSHA
 		}
 		if p.MergeCommitSHA == "" {
-			note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "merge-commit-unknown"})
+			seenHost := map[string]bool{}
+			for _, c := range cands {
+				if seenHost[c.hs.host.Name] {
+					continue
+				}
+				seenHost[c.hs.host.Name] = true
+				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Result: "skipped", Reason: "merge-commit-unknown"})
+			}
 			continue
 		}
 		watcher, ok := s.GH.(interface {
