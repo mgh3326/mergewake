@@ -98,11 +98,13 @@ func (s *Service) specOrigin(ctx context.Context, root string) string {
 }
 
 // specOriginCarried reports whether origin is a remote a hub node clones: an
-// https, ssh or git URL with a host and no userinfo, or an scp-style
-// host:owner/repo. A local path names no clone of the repository the diff came
-// from. An origin that carries a credential is refused too: the spec puts the
-// origin in the spawn argv and in the reviewer-job record, which survives the
-// attempt, so such a checkout keeps the local path instead.
+// https, ssh or git URL with a host, or an scp-style host:owner/repo. A local
+// path names no clone of the repository the diff came from. An origin that can
+// carry a credential is refused too, since the spec puts it in the spawn argv
+// and in the reviewer-job record, which survives the attempt: any https
+// userinfo can be a token-as-username, while an ssh or git login name is not a
+// credential and only a password is (the same line panewire's own
+// credentialedURL draws). Such a checkout keeps the local path instead.
 func specOriginCarried(origin string) bool {
 	if origin == "" || strings.HasPrefix(origin, "-") {
 		return false
@@ -114,12 +116,20 @@ func specOriginCarried(origin string) bool {
 	}
 	if strings.Contains(origin, "://") {
 		u, e := url.Parse(origin)
-		if e != nil || u.Host == "" || u.User != nil {
+		if e != nil || u.Host == "" {
 			return false
 		}
 		switch u.Scheme {
-		case "https", "ssh", "git":
-			return true
+		case "https":
+			// Either half of an https userinfo can be the credential.
+			return u.User == nil
+		case "ssh", "git":
+			// ssh://git@host/owner/repo names a login, not a secret.
+			if u.User == nil {
+				return true
+			}
+			_, password := u.User.Password()
+			return !password
 		}
 		return false
 	}

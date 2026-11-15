@@ -258,3 +258,28 @@ func TestReviewerSpawnKeepsACredentialedOriginOutOfTheArgv(t *testing.T) {
 		}
 	}
 }
+
+// Only an origin that can carry a credential keeps the local path: any https
+// userinfo can be a token, while an ssh or git login name is not a credential.
+// The same line panewire's own rule draws.
+func TestSpecOriginCarriedRefusesOnlyCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		origin string
+		want   bool
+	}{
+		{"https://github.com/example/project.git", true},
+		{"https://user@github.com/example/project.git", false},
+		{"https://user:token@github.com/example/project.git", false},
+		{"ssh://git@github.com/example/project.git", true},
+		{"ssh://deploy:secret@github.com/example/project.git", false},
+		{"git@github.com:example/project.git", true},
+		{"deploy:secret@github.com:example/project.git", false},
+		{"/tmp/origin.git", false},
+		{"file:///tmp/origin.git", false},
+		{"", false},
+	} {
+		if got := specOriginCarried(tc.origin); got != tc.want {
+			t.Errorf("%q: got %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+}
