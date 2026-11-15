@@ -16,7 +16,7 @@ import (
 // the pass must still confirm before its checkout is released.
 type reviewerPane struct {
 	label     string
-	checkout  string                 // local PR-head checkout the spawn named
+	checkout  string                 // local PR-head checkout the spawn named; empty for a spec-placed reviewer
 	head      string                 // PR head the pass reviewed
 	pass      int                    // review pass number
 	placement integrations.JobRecord // host and pane id from this spawn's OK line
@@ -228,7 +228,7 @@ func (c *reviewerCleanup) cleanRemote(ctx context.Context, host reap.HubHost) {
 	}
 	c.paneGone = true
 	cwd := c.p.placement.Cwd
-	if filepath.Base(filepath.Clean(cwd)) != c.p.label {
+	if !reviewerCheckoutDir(filepath.Base(filepath.Clean(cwd)), c.p.label) {
 		c.record("skipped", "pane gone; remote cwd unavailable or mismatched")
 		return
 	}

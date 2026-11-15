@@ -301,7 +301,7 @@ func TestFetchPRHeadNoFallbackForForkPR(t *testing.T) {
 	pr := g.pull
 	pr.Head.SHA = o.head
 	pr.Head.Repo.FullName = "fork/project"
-	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	_, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
 	if e == nil || !strings.Contains(e.Error(), "fetch PR head") {
 		t.Fatalf("err=%v, want the pull/<n>/head failure", e)
 	}
@@ -346,7 +346,7 @@ func TestPRHeadFallbackAuditErrorIsBoundedAndRedacted(t *testing.T) {
 	s.Runner = pullFetchErrRunner{Runner: runner, err: errors.New(long)}
 	pr := g.pull
 	pr.Head.SHA = o.head
-	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+	if _, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
 		t.Fatalf("fetchPRHead: %v", e)
 	}
 	msg, _ := fallbackRow(t, s, r, "ok")["error"].(string)
@@ -393,7 +393,7 @@ func TestFetchPRHeadNoFallbackErrorDetail(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, r, o, pr := prHeadWithFirstFetchErr(t, ce, tc.edit)
-			e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+			_, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
 			if e == nil {
 				t.Fatal("fetchPRHead: want the pull/<n>/head failure")
 			}
@@ -415,7 +415,7 @@ func TestFetchPRHeadNoFallbackErrorDetail(t *testing.T) {
 func TestPRHeadFallbackRowDetail(t *testing.T) {
 	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: "fatal: couldn't find remote ref pull/7/head\n"}
 	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
-	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+	if _, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
 		t.Fatalf("fetchPRHead: %v", e)
 	}
 	row := fallbackRow(t, s, r, "ok")
@@ -435,7 +435,7 @@ func TestPRHeadFallbackRowDetailBoundedAndRedacted(t *testing.T) {
 	stderr := strings.Repeat("fatal: first fetch failed\n", 20) + token + strings.Repeat("fatal: retry later\n", 25) + "end"
 	ce := &integrations.CommandError{Command: "git", Err: errors.New("exit status 128"), Stderr: stderr}
 	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
-	if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+	if _, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
 		t.Fatalf("fetchPRHead: %v", e)
 	}
 	detail, _ := fallbackRow(t, s, r, "ok")["detail"].(string)
@@ -461,7 +461,7 @@ func TestFetchPRHeadNoDetailWithoutCommandError(t *testing.T) {
 	plain := errors.New("fatal: plain failure")
 	t.Run("fork", func(t *testing.T) {
 		s, r, o, pr := prHeadWithFirstFetchErr(t, plain, func(pr *github.Pull) { pr.Head.Repo.FullName = "fork/project" })
-		e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+		_, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
 		if e == nil {
 			t.Fatal("fetchPRHead: want the pull/<n>/head failure")
 		}
@@ -471,7 +471,7 @@ func TestFetchPRHeadNoDetailWithoutCommandError(t *testing.T) {
 	})
 	t.Run("fallback row", func(t *testing.T) {
 		s, r, o, pr := prHeadWithFirstFetchErr(t, plain, nil)
-		if e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
+		if _, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr); e != nil {
 			t.Fatalf("fetchPRHead: %v", e)
 		}
 		row := fallbackRow(t, s, r, "ok")
@@ -511,7 +511,7 @@ func TestFetchPRHeadFallbackFailureDetailKeepsFirstStderr(t *testing.T) {
 	// panewireRunner's git failures carry no stderr; the branch fetch needs the
 	// real runner's CommandError.
 	s.Runner = pullFetchErrRunner{Runner: integrations.Exec{}, err: ce}
-	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	_, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
 	if e == nil {
 		t.Fatal("fetchPRHead: want the branch fallback failure")
 	}
@@ -533,7 +533,7 @@ func TestFetchPRHeadHeadMovedDetailIsFirstStderr(t *testing.T) {
 	s, r, o, pr := prHeadWithFirstFetchErr(t, ce, nil)
 	tip := o.commit(t, "later")
 	gitAt(t, o.work, "push", o.origin, "feat/thing")
-	e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
+	_, e := s.fetchPRHead(context.Background(), o.root, r.Name, pr)
 	if e == nil {
 		t.Fatal("fetchPRHead: want the head-moved failure")
 	}

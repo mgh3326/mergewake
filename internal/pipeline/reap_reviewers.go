@@ -84,6 +84,17 @@ func reviewerStream(v reapReceipt) string {
 	return v.Host + "\x00" + v.Worktree
 }
 
+// reviewerCheckoutSuffix ends the directory a hub node prepares for a
+// spec-placed reviewer (panewire names it <job>-checkout). A local reviewer
+// checkout is named for the label alone.
+const reviewerCheckoutSuffix = "-checkout"
+
+// reviewerCheckoutDir reports whether a checkout directory's base name is
+// label's own: <label> locally, <label>-checkout on the node.
+func reviewerCheckoutDir(base, label string) bool {
+	return base == label || base == label+reviewerCheckoutSuffix
+}
+
 // reviewerCheckoutTTL: a checkout no pane uses is revisited until its label is
 // this old, then released even if its job never reached a terminal state.
 const reviewerCheckoutTTL = 24 * time.Hour
@@ -139,13 +150,14 @@ func reviewerWaiting(v reapReceipt, now time.Time) bool {
 
 // reviewerLabelOf names the label a reviewer receipt is about: reviewer-reap
 // rows carry it, reviewer-cleanup rows name the checkout or remote worktree
-// whose directory base is the label.
+// whose directory base is the label — with the node's -checkout suffix for a
+// spec-placed reviewer.
 func reviewerLabelOf(v reapReceipt) string {
 	switch v.Action {
 	case "reviewer-reap":
 		return v.Label
 	case "reviewer-cleanup":
-		return filepath.Base(filepath.Clean(v.Worktree))
+		return strings.TrimSuffix(filepath.Base(filepath.Clean(v.Worktree)), reviewerCheckoutSuffix)
 	}
 	return ""
 }
@@ -339,9 +351,10 @@ func reviewerStuckAfter(c config.Config) (time.Duration, error) {
 }
 
 // remember records a remote path a receipt named for a label on a host; only
-// an absolute path whose base is the label counts.
+// an absolute path whose base is the label — or the node's <label>-checkout —
+// counts.
 func (w *reviewerSweep) remember(label, host, path string) {
-	if label == "" || host == "" || !filepath.IsAbs(path) || filepath.Base(filepath.Clean(path)) != label {
+	if label == "" || host == "" || !filepath.IsAbs(path) || !reviewerCheckoutDir(filepath.Base(filepath.Clean(path)), label) {
 		return
 	}
 	if w.remote[label] == nil {
@@ -775,7 +788,7 @@ const (
 func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l reviewerLabel, cwd string) remoteStep {
 	rec := w.row(l)
 	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
-	if cwd == "" || filepath.Base(filepath.Clean(cwd)) != l.name {
+	if cwd == "" || !reviewerCheckoutDir(filepath.Base(filepath.Clean(cwd)), l.name) {
 		// The path is not going to become known, so the outcome is final
 		// once the sweep acts; the host's own sweep owns the worktree. A
 		// shadow run stays pending.

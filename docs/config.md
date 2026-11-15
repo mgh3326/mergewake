@@ -465,7 +465,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. mergewake never reads those findings from there: they come back on the job record, or from the host through `panewire node job-result` (step 5). |
-| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the pass leaves the reviewer pane for panewire's node to close and removes its remote detached worktree through the hub's guarded removal once the pane is gone; a refusal is recorded as `pending-cleanup`. A pane still present is recorded as `pending-cleanup` and the checkout is kept. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. Every later reap pass revisits a checkout still recorded as kept or `pending-cleanup` while no pane uses it: it is removed once its reviewer job is `completed`, `escalated` or `lost`, or once its label's spawn time is more than 24 hours back, and kept while the job is still open. A reviewer job still `claimed` or `spawned` with no result past `panewire.stuck_after` is treated as ended once its pane is proven gone: mergewake closes the job `abandoned` (the close that lets panewire's sweep end the record) and removes its worktrees in the same pass; while its pane is still present the pane is left for panewire's node and the label is marked `stuck-reviewer` once, with the age. A checkout older than 24 hours whose job record is missing is removed locally only; a remote checkout with no job record is not revisited. The record is `reap.jsonl`, so it survives a restart. A directory under this checkouts path that no reviewer-job record of any repo names (its `checkout` field, or its label's path here) and that no pane or process uses is an orphan: a whole-repo reap pass removes it from the owning repo's pass with `git worktree remove` (never forced) once it is older than `panewire.stuck_after` and is a detached worktree of that repo that is clean and holds no ignored file outside `reap.regenerable`; it writes one `reviewer-cleanup` row with reason `orphan-checkout` and a `reviewer-reap` audit record in `decisions.jsonl`. A directory that is not a git worktree is kept and reported once as `not-a-git-worktree`, by the alphabetically first configured repo's log only; an unreadable job record stops the orphan sweep for that pass. Process working directories come from `/proc`, or from `lsof -a -d cwd` plus `ps -A` filtered to the effective uid where `/proc` is absent; there `lsof` supplies the readable working directories and `ps` supplies the same-user pid list, so a pid with no cwd record is unknown rather than invisible. A same-user process that denies its working directory (on `/proc`, a non-dumpable one such as an `sshd` session or systemd's `sd-pam`; on the lsof path, a pid whose cwd lsof did not report) is treated as holding no checkout when its open files could be read and none lies under this path, or when its executable, or a kernel-reported name, never enters a work directory (the lsof path's `ps` name is the process's own argv0 and is not trusted for this); any other such process, and a host with no scan at all, makes the sweep remove nothing and fail no pass, and writes one `skipped` row with reason `process-scan-unavailable` naming the pid and the process name, once per UTC day and host, a new day reporting it again even when the process is unchanged, so a sweep that can never run stays visible. Shadow mode only plans (`would-remove`). Once per UTC day and host, a `reviewer-checkouts-daily` audit row in `decisions.jsonl` counts the checkouts removed and kept on the day before, with the kept reasons; it is written only when the reap acts (not in shadow or dry-run). |
+| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. A reviewer placed from a checkout spec (the hub advertises `checkout_spec_v1`) has no directory here and its job record names no `checkout`: the node prepares its worktree, reap removes it there under the node's `<label>-checkout` name, and nothing here is created or removed. After each terminal pass outcome, the pass leaves the reviewer pane for panewire's node to close and removes its remote detached worktree through the hub's guarded removal once the pane is gone; a refusal is recorded as `pending-cleanup`. A pane still present is recorded as `pending-cleanup` and the checkout is kept. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. Every later reap pass revisits a checkout still recorded as kept or `pending-cleanup` while no pane uses it: it is removed once its reviewer job is `completed`, `escalated` or `lost`, or once its label's spawn time is more than 24 hours back, and kept while the job is still open. A reviewer job still `claimed` or `spawned` with no result past `panewire.stuck_after` is treated as ended once its pane is proven gone: mergewake closes the job `abandoned` (the close that lets panewire's sweep end the record) and removes its worktrees in the same pass; while its pane is still present the pane is left for panewire's node and the label is marked `stuck-reviewer` once, with the age. A checkout older than 24 hours whose job record is missing is removed locally only; a remote checkout with no job record is not revisited. The record is `reap.jsonl`, so it survives a restart. A directory under this checkouts path that no reviewer-job record of any repo names (its `checkout` field, or its label's path here) and that no pane or process uses is an orphan: a whole-repo reap pass removes it from the owning repo's pass with `git worktree remove` (never forced) once it is older than `panewire.stuck_after` and is a detached worktree of that repo that is clean and holds no ignored file outside `reap.regenerable`; it writes one `reviewer-cleanup` row with reason `orphan-checkout` and a `reviewer-reap` audit record in `decisions.jsonl`. A directory that is not a git worktree is kept and reported once as `not-a-git-worktree`, by the alphabetically first configured repo's log only; an unreadable job record stops the orphan sweep for that pass. Process working directories come from `/proc`, or from `lsof -a -d cwd` plus `ps -A` filtered to the effective uid where `/proc` is absent; there `lsof` supplies the readable working directories and `ps` supplies the same-user pid list, so a pid with no cwd record is unknown rather than invisible. A same-user process that denies its working directory (on `/proc`, a non-dumpable one such as an `sshd` session or systemd's `sd-pam`; on the lsof path, a pid whose cwd lsof did not report) is treated as holding no checkout when its open files could be read and none lies under this path, or when its executable, or a kernel-reported name, never enters a work directory (the lsof path's `ps` name is the process's own argv0 and is not trusted for this); any other such process, and a host with no scan at all, makes the sweep remove nothing and fail no pass, and writes one `skipped` row with reason `process-scan-unavailable` naming the pid and the process name, once per UTC day and host, a new day reporting it again even when the process is unchanged, so a sweep that can never run stays visible. Shadow mode only plans (`would-remove`). Once per UTC day and host, a `reviewer-checkouts-daily` audit row in `decisions.jsonl` counts the checkouts removed and kept on the day before, with the kept reasons; it is written only when the reap acts (not in shadow or dry-run). |
 | `panewire.lane` | `panewire.owner` | Retired: findings are no longer read from a lane. The key is still accepted, so existing configs keep loading, and its value is still kept out of traces. mergewake lists and acknowledges no findings inbox, so findings events a pre-`--result` pane announced there stay as they are. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 | `panewire.stuck_after` | `6h` | How old a reviewer job — or the worker seat a refused reviewer role retries as — still `claimed` or `spawned` with no result may get before the reviewer sweep treats it as ended for cleanup: once the job's pane is proven gone mergewake closes the job `abandoned` and removes its worktrees in the same pass; while the pane is still present the pane is left for panewire's node and the label is marked `stuck-reviewer` once, with the age. A job record that names no pane is proven gone only when its label is absent from a fresh scan of every host it could be on; a host whose scan failed, could not read its full pane list or could not be refreshed keeps the job. Other roles keep their hold. |
@@ -501,14 +501,23 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    still carries the author's family (trailer/commit inference) so the
    reviewer excludes it.
 2. A fork PR (head repository other than the repo) is not offered: panewire can
-   replicate only a spec origin carries. The pass claim is taken, then
-   `git -C <root> fetch --no-tags origin +pull/<n>/head:refs/remotes/origin/pull/<n>/head <base>`
-   (panewire builds the detached spec for another host from that ref, not from
-   `FETCH_HEAD`) and a worktree
+   replicate only a spec origin carries. The pass claim is taken, then the PR
+   head is fetched so that a real ref carries it:
+   `git -C <root> fetch --no-tags origin +pull/<n>/head:refs/remotes/origin/pull/<n>/head <base>`,
+   and, on the fallback below, the branch. When the hub advertises the
+   `checkout_spec_v1` spawn feature, the spawn names that ref instead of a
+   local checkout, and no worktree is added under `panewire.checkouts` and no
+   directory is created there: panewire's node prepares the detached worktree
+   at the exact head from
+   `--checkout-origin <the checkout's origin remote> --checkout-commit <sha>
+   --checkout-ref pull/<n>/head` (or `refs/heads/<ref>` for a taken branch
+   fallback), and refuses a commit the fetched ref does not contain. Otherwise
+   — an older hub, an unverifiable feature answer, a CLI that does not know
+   the flags, or a checkout whose `origin` is not a remote — a worktree
    detached at the exact head SHA is added under `panewire.checkouts`
-   (`git worktree add --detach <checkout> <sha>`). mergewake creates no local
-   branch, and the author's branch being checked out in another worktree is no
-   obstacle. The worktree is removed after the wait.
+   (`git worktree add --detach <checkout> <sha>`), as before. mergewake creates
+   no local branch, and the author's branch being checked out in another
+   worktree is no obstacle. A local worktree is removed after the wait.
    GitHub can lose `refs/pull/<n>/head` for an open PR while its branch is
    intact. When that fetch fails (for any reason), a same-repo PR whose head
    ref is a plain branch name (no leading `-`, `..`, `:`, whitespace, `*`, `^`,
@@ -532,15 +541,30 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
 3. mergewake writes a brief naming the PR, head SHA, base, lens, the
    author family, the output contract and the same PR context (answered
    findings and operator decisions), then runs
-   `panewire spawn -c <checkout> -m auto -p <brief> -l
+   `panewire spawn (-c <checkout> | --checkout-origin <origin>
+   --checkout-commit <sha> --checkout-ref <ref>) -m auto -p <brief> -l
    mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> [--builder-job <author job>] --builder-family <family from the author's job record, else inferred> --role
    reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
    --wait-timeout <rest of review.timeout>`. panewire picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
    clones the repo under `$HOME/work` and adds a worktree detached at the same
-   head, fetched as `pull/<n>/head`. Exit 77 (no admitted seat outside that family) retries
+   head, fetched as the ref the spawn named. Exit 77 (no admitted seat outside that family) retries
    once with `--role worker`, which may pick the author's family; the receipt
    records that as `fallback`.
+   The hub's `checkout_spec_v1` support is read by panewire itself: it asks the
+   hub for the feature before it submits, and stops with exit 2 (`hub does not
+   support --checkout-origin`) or 70 (`unable to verify hub support`) before a
+   request exists, which an older CLI answers with its unknown-flag refusal.
+   Such a refusal makes the pass add the local checkout, rewrite the recorded
+   argv in the `-c` form, write a `reviewer-checkout-spec-refused` row to
+   `decisions.jsonl` and spawn again. A refusal that says the hub or the CLI
+   cannot carry the spec is remembered for 10 minutes, so an old hub costs one
+   refused attempt per window rather than one worktree per attempt, and an
+   upgraded hub is picked up without a restart. The reviewer-job record keeps
+   the argv actually spawned, and carries no `checkout` field for a
+   spec-placed reviewer: its worktree lives on the node, named
+   `<label>-checkout` there, and reap removes it there through the hub's
+   guarded removal once its pane is gone.
 4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
    mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass fails. Otherwise

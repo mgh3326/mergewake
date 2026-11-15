@@ -82,7 +82,7 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 	if fetch.Base.Ref == "" {
 		fetch.Base.Ref = pr.Base.SHA
 	}
-	if e := s.fetchPRHead(ctx, root, r.Name, fetch); e != nil {
+	if _, e := s.fetchPRHead(ctx, root, r.Name, fetch); e != nil {
 		return diffResult{}, fmt.Errorf("fetch PR refs: %w", e)
 	}
 	have := func(sha string) bool {
