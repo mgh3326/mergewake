@@ -889,32 +889,34 @@ func (w *legacySweep) taskFor(host reap.Host, c *legacyCand, wt *reap.Worktree, 
 
 // jobRecordNames reports whether the job record's cwd or recorded worktree is
 // this worktree on this host: the record must name the host the job ran on —
-// absolute paths and branch-head pairs collide across hosts — its cwd must be
-// the path or inside it, or the recorded worktree must be the same head on
-// the same branch of the same repo. An origin that does not parse to
-// owner/name never matches.
+// absolute paths and branch-head pairs collide across hosts. A record that
+// carries a recorded worktree must agree with it on branch and repo before
+// its cwd may name the path: worktree paths get reused, and a record from a
+// checkout that has since moved to another branch or repo is not this
+// worktree's. The recorded head is spawn-time and legitimately advances as
+// the job commits, so it confirms a match but never vetoes one.
 func jobRecordNames(rec *integrations.JobRecord, wt *reap.Worktree, host reap.Host) bool {
 	if rec.Host == "" || (rec.Host != host.Name && rec.Host != host.MachineID()) {
 		return false
 	}
-	if rec.Cwd != "" {
-		cwd, path := filepath.Clean(rec.Cwd), filepath.Clean(wt.Path)
-		if cwd == path || strings.HasPrefix(cwd, path+string(filepath.Separator)) {
-			return true
+	cwdMatch := func() bool {
+		if rec.Cwd == "" {
+			return false
 		}
+		cwd, path := filepath.Clean(rec.Cwd), filepath.Clean(wt.Path)
+		return cwd == path || strings.HasPrefix(cwd, path+string(filepath.Separator))
 	}
-	jw := rec.Worktree
-	if jw == nil || jw.Head == "" || jw.Head != wt.Head {
-		return false
+	if jw := rec.Worktree; jw != nil {
+		if jw.Branch == nil || *jw.Branch == "" || *jw.Branch != wt.Branch {
+			return false
+		}
+		origin := reap.RepoFromRemote(jw.Origin)
+		if origin == "" || !strings.EqualFold(origin, wt.Repo) {
+			return false
+		}
+		return cwdMatch() || (jw.Head != "" && jw.Head == wt.Head)
 	}
-	if jw.Branch == nil || *jw.Branch == "" || *jw.Branch != wt.Branch {
-		return false
-	}
-	origin := reap.RepoFromRemote(jw.Origin)
-	if origin == "" || !strings.EqualFold(origin, wt.Repo) {
-		return false
-	}
-	return true
+	return cwdMatch()
 }
 
 func sortedJobIDs(recs map[string]*integrations.JobRecord) []string {

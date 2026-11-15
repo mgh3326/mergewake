@@ -763,11 +763,13 @@ func TestLegacySweepKeepsWhenNewestPRBindingFails(t *testing.T) {
 }
 
 // jobRecordNames matches a record to a worktree only on the host the job ran
-// on, and a recorded worktree origin that does not parse to owner/name never
-// matches — head and branch alone are not enough across repos.
+// on; a recorded worktree that disagrees on branch or repo vetoes the cwd
+// match (paths get reused), and an origin that does not parse to owner/name
+// never matches — head and branch alone are not enough across repos.
 func TestJobRecordNamesHostAndOrigin(t *testing.T) {
 	host := reap.Host{Name: "node", Machine: "node-a"}
 	branch := "wk/b"
+	oldBranch := "wk/old"
 	wt := &reap.Worktree{Path: "/b.wt", Branch: "wk/b", Head: headSHA, Repo: "example/project"}
 	for _, tc := range []struct {
 		name string
@@ -785,6 +787,9 @@ func TestJobRecordNamesHostAndOrigin(t *testing.T) {
 		{"worktree other repo", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/other.git", Branch: &branch, Head: headSHA}}, false},
 		{"worktree detached record", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Head: headSHA}}, false},
 		{"worktree foreign host", &integrations.JobRecord{Host: "node-b", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Branch: &branch, Head: headSHA}}, false},
+		{"reused path other branch", &integrations.JobRecord{Host: "node-a", Cwd: "/b.wt", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Branch: &oldBranch, Head: "cccc3333"}}, false},
+		{"reused path other repo", &integrations.JobRecord{Host: "node-a", Cwd: "/b.wt", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/other.git", Branch: &branch, Head: headSHA}}, false},
+		{"advanced head same branch", &integrations.JobRecord{Host: "node-a", Cwd: "/b.wt", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Branch: &branch, Head: "spawn1111"}}, true},
 	} {
 		if got := jobRecordNames(tc.rec, wt, host); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
