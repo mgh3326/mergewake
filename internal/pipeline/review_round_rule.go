@@ -95,6 +95,12 @@ type roundRuleState struct {
 	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
 	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
 	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
+	// CommentAt is the first pass a settled row's task comment could not be
+	// recorded; the next head waits only consultCommentBound past it.
+	// CommentDropped records that the bound was reached, so the drop is
+	// audited once.
+	HubConsultCommentAt      time.Time `json:"hub_consult_comment_at,omitzero"`
+	HubConsultCommentDropped bool      `json:"hub_consult_comment_dropped,omitempty"`
 
 	// Ladder
 	LadderEscalated bool      `json:"ladder_escalated,omitempty"`

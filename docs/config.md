@@ -795,7 +795,11 @@ on it.
     `answered` delivers the findings with the `answer_doc` key (passed through unread) and no ask-a-consult
     directive; `refused`, `failed`, `cancelled`, an rc 1/2 request failure or an expired wait delivers them as today
     plus one line saying the consult could not be had and why. A settled consult records one hk task comment (id,
-    state, seat, answer_doc) that retries on its own until hk accepts it; request, state change, supersession,
+    state, seat, answer_doc) that retries on its own until hk accepts it. The reset of a superseded row waits for
+    its own comment only while recording it can still succeed: a sink without `Comment` (`sink.type` ""/`noop`)
+    or a PR with no task never waits, and a failing write holds the next head for at most 10 minutes from the
+    first failure — then the reset proceeds and the drop is audited as `consult-comment-dropped` once, so the
+    round's findings are never held past that bound. Request, state change, supersession,
     outcome and delivery are audited as `consult-request` / `consult-state` / `consult-superseded` /
     `consult-outcome` / `consult-delivered`.
   - **Round ladder (`review.round_rule.ladder`, default 5):** mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:

@@ -73,6 +73,12 @@ func (s *Service) consultCmd() string {
 	return "panewire"
 }
 
+// consultCommentBound bounds how long a settled consult's unrecorded task
+// comment may hold the next head's delivery. The hk write is retried on
+// every pass; a comment that still cannot be recorded past the bound is
+// dropped — the reset proceeds and the drop is audited once.
+const consultCommentBound = 10 * time.Minute
+
 // consultWaitExpired reports whether a consult attempt started at has been
 // outstanding past review.round_rule.hub_consult_wait.
 func (s *Service) consultWaitExpired(at, now time.Time) bool {
@@ -141,13 +147,34 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 	if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
 		// The reset below drops the old row's id: finish its task comment
 		// first, or a superseded comment a transient hk failure left
-		// unrecorded could never be retried. While it stays unrecorded
-		// the new head waits; the next pass retries.
+		// unrecorded could never be retried.
+		//
+		// The wait is bounded (consultCommentBound): only a failed comment
+		// write can still succeed on a later pass, so a sink without Comment
+		// or a PR with no task never holds, and a write that keeps failing
+		// holds until the bound — then the reset proceeds and the drop is
+		// audited, so the round's findings are never held past it.
 		if st.HubConsultID != "" && st.HubConsultDone && !st.HubConsultCommented {
-			s.hubConsultComment(ctx, r, pr, o, st)
-			if !st.HubConsultCommented {
-				_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-				return "", true
+			retry := s.hubConsultComment(ctx, r, pr, o, st)
+			if retry {
+				now := s.now().UTC()
+				if st.HubConsultCommentAt.IsZero() {
+					st.HubConsultCommentAt = now
+				}
+				held := now.Sub(st.HubConsultCommentAt)
+				if held < consultCommentBound {
+					_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+					return "", true
+				}
+				if !st.HubConsultCommentDropped {
+					st.HubConsultCommentDropped = true
+					_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+					_ = s.audit(r.Name, "consult-comment-dropped", map[string]any{
+						"pr": pr.Number, "id": st.HubConsultID, "head": st.HubConsultHead,
+						"state": st.HubConsultState, "held": held.Round(time.Second).String(),
+						"reason": "task comment not recorded within " + consultCommentBound.String(),
+					}, o.DryRun)
+				}
 			}
 		}
 		// Persist the attempt before the slow hk and hub work: the wait bound
@@ -166,6 +193,8 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		st.HubConsultReason = ""
 		st.HubConsultDone = false
 		st.HubConsultCommented = false
+		st.HubConsultCommentAt = time.Time{}
+		st.HubConsultCommentDropped = false
 		if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil {
 			_ = s.audit(r.Name, "consult-state-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(e)}, o.DryRun)
 			return "", true
@@ -449,19 +478,23 @@ func (s *Service) hubConsultCommentRetry(ctx context.Context, r config.Repo, pr 
 // hubConsultComment records the finished consult on the hk task once: id,
 // state, seat and answer_doc. A comment failure stays uncommented so a
 // later pass retries it. The caller holds the state lock.
-func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) {
+//
+// retry is true only when a later pass can still record it: a failed write.
+// A sink without Comment (integrations.Noop) and a PR with no task can
+// never record it, so the caller must not wait on them.
+func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) (retry bool) {
 	if st.HubConsultCommented || st.HubConsultID == "" {
-		return
+		return false
 	}
 	c, ok := s.Sink.(interface {
 		Comment(context.Context, string, string) error
 	})
 	if !ok {
-		return
+		return false
 	}
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil || task == "" {
-		return
+		return false
 	}
 	body := fmt.Sprintf("hub consult %s: state=%s seat=%s job=%s answer_doc=%s reason=%s",
 		st.HubConsultID, st.HubConsultState, st.HubConsultSeat, st.HubConsultJob, st.HubConsultAnswerDoc, emitSafe(st.HubConsultReason))
@@ -469,10 +502,11 @@ func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr githu
 	defer cancel()
 	if err := c.Comment(reportCtx, task, body); err != nil {
 		_ = s.audit(r.Name, "consult-comment-failed", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "error": integrations.Detail(err)}, o.DryRun)
-		return
+		return true
 	}
 	st.HubConsultCommented = true
 	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	return false
 }
 
 // recoverConsultID reads the id of a consult request this PR and head already
