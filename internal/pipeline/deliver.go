@@ -127,7 +127,17 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	st := s.loadRoundRuleState(r.Name, n)
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
-	if done && rounds == consultRound && openBlocking && !st.directiveSent() && len(inScope) == 0 {
+	// The hub consult (review.round_rule.hub_consult) replaces the author
+	// directive: while it is queued or running inside the wait this round's
+	// findings stay undelivered; its outcome becomes the delivery's
+	// directive line.
+	consultOn := s.Config.Review.RoundRule.HubConsult
+	consultDirective := ""
+	consultPending := false
+	if consultOn && done && rounds == consultRound && openBlocking && !st.directiveSent() {
+		consultDirective, consultPending = s.hubConsultOutcome(ctx, r, pr, fb, o, &st)
+	}
+	if done && rounds == consultRound && openBlocking && !st.directiveSent() && len(inScope) == 0 && !consultPending {
 		for _, t := range openThreads {
 			first := t.Comments[0]
 			inScope = append(inScope, pendingFinding{
@@ -153,9 +163,18 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			if len(batch.findings) == 0 {
 				continue
 			}
+			// A consult still queued or running holds this round's findings;
+			// they go out with its outcome on a later pass.
+			if consultPending && batch.scope == "author" {
+				continue
+			}
 			directive := ""
 			if batch.scope == "author" && done && rounds == consultRound && openBlocking && !st.directiveSent() {
-				directive = RoundDirective
+				if consultOn {
+					directive = consultDirective
+				} else {
+					directive = RoundDirective
+				}
 			}
 			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive)
 			if e != nil {
@@ -169,6 +188,9 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			if directive != "" && o.Reporting() {
 				st.setDirectiveSent(true, s.now().UTC())
 				_ = s.saveRoundRuleState(r.Name, n, st)
+				if consultOn {
+					_ = s.audit(r.Name, "consult-delivered", map[string]any{"pr": n, "id": st.HubConsultID, "state": st.HubConsultState, "answer_doc": st.HubConsultAnswerDoc}, o.DryRun)
+				}
 			}
 			ledger = append(ledger, d)
 			changed = true

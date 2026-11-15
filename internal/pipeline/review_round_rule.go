@@ -69,6 +69,22 @@ type roundRuleState struct {
 	Round3DirectiveSent  bool      `json:"round3_directive_sent,omitempty"` // legacy alias
 	ConsultAt            time.Time `json:"consult_at,omitzero"`
 
+	// Hub consult (review.round_rule.hub_consult, hk 4551): one hub consult
+	// per PR and head. The stored row fields let a later pass or a restart
+	// poll instead of requesting again; Done marks the outcome applied to a
+	// delivery, after which nothing hub-side is touched.
+	HubConsultID        string    `json:"hub_consult_id,omitempty"`
+	HubConsultState     string    `json:"hub_consult_state,omitempty"`
+	HubConsultQuestion  string    `json:"hub_consult_question,omitempty"`
+	HubConsultAnswerDoc string    `json:"hub_consult_answer_doc,omitempty"`
+	HubConsultVerdict   string    `json:"hub_consult_verdict,omitempty"`
+	HubConsultSeat      string    `json:"hub_consult_seat,omitempty"`
+	HubConsultJob       string    `json:"hub_consult_job,omitempty"`
+	HubConsultReason    string    `json:"hub_consult_reason,omitempty"`
+	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
+	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
+	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
+
 	// Ladder
 	LadderEscalated bool      `json:"ladder_escalated,omitempty"`
 	Round3Escalated bool      `json:"round3_escalated,omitempty"` // legacy alias

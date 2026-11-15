@@ -242,6 +242,30 @@ func (h *Hub) do(ctx context.Context, method, path string, body any, out any) er
 	return nil
 }
 
+// ConsultRow is the hub's consult row (panewire docs/consult-on-request.md).
+type ConsultRow struct {
+	ID        string `json:"id"`
+	State     string `json:"state"`
+	AnswerDoc string `json:"answer_doc"`
+	Reason    string `json:"reason"`
+	Verdict   string `json:"verdict"`
+	Job       string `json:"job"`
+	Seat      struct {
+		Profile string `json:"profile"`
+		Family  string `json:"family"`
+		Grade   string `json:"grade"`
+	} `json:"seat"`
+}
+
+// Consult returns one consult row, GET /v1/consults/{id}. It never changes
+// the row: re-POSTing a refused or failed consult would retry it (contract
+// §Idempotency), so a caller that only wants the state reads it here.
+func (h *Hub) Consult(ctx context.Context, id string) (ConsultRow, error) {
+	var row ConsultRow
+	e := h.do(ctx, http.MethodGet, "/v1/consults/"+url.PathEscape(id), nil, &row)
+	return row, e
+}
+
 // Agents returns one machine's row of GET /v1/nodes/agents, fetched once per
 // Hub. A machine the hub does not know is an error, never an empty host.
 func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error) {
