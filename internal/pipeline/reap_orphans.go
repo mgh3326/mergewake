@@ -278,6 +278,13 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 			note(orphanRow(r, hs, path, orphanPlanned, orphanReason))
 			continue
 		}
+		// The scan above is a cheap pre-filter: a process can start in the
+		// checkout during this pass's slow per-candidate checks. Scan again right
+		// before the removal, and keep the checkout if that scan fails.
+		fresh, e := processCwds(ctx, s.Runner)
+		if e != nil || anyWithin(fresh, path) {
+			continue
+		}
 		if e := hs.exec.RemoveWorktree(ctx, filepath.Dir(tree.Common), path); e != nil {
 			errs = append(errs, fmt.Errorf("orphan checkout %s: worktree remove: %w", path, e))
 			continue

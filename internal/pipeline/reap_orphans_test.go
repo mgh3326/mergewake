@@ -309,3 +309,26 @@ func TestOrphanCheckoutShadowRowNotReviewerCandidate(t *testing.T) {
 		t.Fatalf("a process-held orphan was removed on a later pass: calls %q", f.run.calls)
 	}
 }
+
+// A process that starts in the checkout after the sweep's first scan, while the
+// candidate is being checked, keeps it: the scan is repeated before removal.
+func TestOrphanCheckoutProcessStartingMidSweepKept(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	saved := processCwds
+	t.Cleanup(func() { processCwds = saved })
+	calls := 0
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
+		calls++
+		if calls == 1 {
+			return nil, nil
+		}
+		return []string{path}, nil
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removedCalled(f, path) {
+		t.Fatalf("removed under a process that started mid-sweep: calls %q", f.run.calls)
+	}
+}
