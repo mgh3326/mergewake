@@ -1951,10 +1951,16 @@ does not reset them: `head_seen` (the first pass that saw the head, after the PR
 left draft), `checks_done` (every required check completed: green, red or
 skipped), `review_done` (the head's done marker and all needed passes, or an
 earlier head's review of the same patch) and `ready` (the READY verdict
-mergewake recorded for the head). Draft time does not count: while the PR is a
-draft no condition fires, and the pass that first sees it out of draft moves the
-head's clocks forward by the hold's span; a clock or a READY recorded inside the
-hold starts again at that pass. A new head starts its own clocks, with one
+mergewake recorded for the head). Each is the raw time its event was recorded,
+and no pass moves it. Draft time does not count: while the PR is a draft no
+condition fires, and every draft the head went through is kept as a hold span
+(`from`, `to`), the hold in progress included. An age is computed when it is
+read: the time since the clock's time, less every hold span it overlaps, so a
+clock that starts inside a hold counts from the hold's end. Nothing depends on
+the order the clocks were filled in or on which pass could reach a read: a hold
+that closed before a clock was filled still comes off it. A file an earlier
+release wrote has no spans, and its clocks already carry the holds they went
+through, so it keeps its ages. A new head starts its own clocks, with one
 exception: a head mergewake made itself by updating a stale branch inherits the
 old head's `head_seen` and `ready`, because only the author's push resets that
 clock. mergewake records the update in the same file when the call succeeds and

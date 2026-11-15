@@ -634,9 +634,9 @@ func TestMergeOverdueHoldEndsOnFailedOpenPass(t *testing.T) {
 
 // A pass that sees the PR open ends an open draft hold before the reads that
 // can fail: draft at t1, open at t2 with GH.Head failing, draft at t3, open at
-// t4. The hold is off the clocks at t2 (the same span shift tickOverdueClocks
-// applies), so the second hold starts from that pass's sighting, not from the
-// first hold's anchor.
+// t4. The hold is closed into Holds at t2, so the second hold starts from that
+// pass's sighting, not from the first hold's anchor, and the clocks themselves
+// are never moved: every open minute before t4 is covered by a span.
 func TestMergeOverdueFailedOpenPassEndsDraftHold(t *testing.T) {
 	rig := newOverdueRig(t, true)
 	read := func() overdueClock {
@@ -666,8 +666,11 @@ func TestMergeOverdueFailedOpenPassEndsDraftHold(t *testing.T) {
 	if !c.DraftSince.IsZero() {
 		t.Fatalf("the hold is still open after the open sighting: draft_since=%v", c.DraftSince.Sub(overdueStart))
 	}
-	if !c.HeadSeen.Equal(overdueStart.Add(30 * time.Minute)) {
-		t.Fatalf("the hold's span is still on the clocks: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	if len(c.Holds) != 1 || !c.Holds[0].From.Equal(overdueStart) || !c.Holds[0].To.Equal(overdueStart.Add(30*time.Minute)) {
+		t.Fatalf("the hold was not closed into the sighting's span: %+v", c.Holds)
+	}
+	if !c.HeadSeen.Equal(overdueStart) {
+		t.Fatalf("the hold moved a raw clock: head_seen=%v", c.HeadSeen.Sub(overdueStart))
 	}
 	rig.s.GH = rig.g
 	rig.g.pull.Draft = true
@@ -677,15 +680,30 @@ func TestMergeOverdueFailedOpenPassEndsDraftHold(t *testing.T) {
 	}
 	rig.g.pull.Draft = false
 	rig.at(2 * time.Hour)
-	if c := read(); !c.DraftSince.IsZero() || !c.HeadSeen.Equal(overdueStart.Add(2*time.Hour)) {
-		t.Fatalf("leaving the second hold did not land the clocks at t4: %+v", c)
+	rig.wantConditions()
+	c = read()
+	if !c.DraftSince.IsZero() || len(c.Holds) != 2 || !c.LastOpen.Equal(overdueStart.Add(2*time.Hour)) {
+		t.Fatalf("leaving the second hold did not close it into its span: %+v", c)
+	}
+	// The spans cover every open minute before t4, so the ages are zero there
+	// and the threshold counts from t4: the reports the old shift produced,
+	// without the shift.
+	now := overdueStart.Add(2 * time.Hour)
+	if conditions, _ := overdueDue(c, true, now); len(conditions) != 0 {
+		t.Fatalf("conditions at t4 = %v, want none", conditions)
+	}
+	rig.at(2*time.Hour + 10*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 10m0s |") {
+		t.Fatal(e.Text)
 	}
 }
 
-// A pass that cannot read the READY record still writes its open sighting and
-// ends the open hold, then returns the read error: a later draft anchors at
-// this pass, and a READY filled later is not moved by the ended hold again.
-func TestMergeOverdueOpenPassSurvivesFailedReadyRead(t *testing.T) {
+// The open sighting does no fallible read of its own: a corrupt READY file (the
+// read that used to run before the write) cannot keep it from recording the
+// sighting or closing the hold into a span, and it never fills the READY clock
+// itself. A later tick fills that clock with its raw record time.
+func TestMergeOverdueOpenSightingDoesNotReadReady(t *testing.T) {
 	rig := newOverdueRig(t, true)
 	file := rig.s.overdueClocksFile(rig.r.Name)
 	readyFile := rig.s.readyClocksFile(rig.r.Name)
@@ -701,18 +719,6 @@ func TestMergeOverdueOpenPassSurvivesFailedReadyRead(t *testing.T) {
 	rig.at(0) // READY and the last open pass at overdueStart
 	rig.g.pull.Draft = true
 	rig.at(6 * time.Minute) // the hold is anchored at t0
-	// The READY clock is recorded after the clocks tick (recordOnlyEvent), so
-	// the entry may still carry no READY when the hold ends.
-	st, e := readOverdueState(file)
-	if e != nil {
-		t.Fatal(e)
-	}
-	c := st.Clocks[key]
-	c.Ready = time.Time{}
-	st.Clocks[key] = c
-	if e := writeOverdueState(file, st); e != nil {
-		t.Fatal(e)
-	}
 	good, e := os.ReadFile(readyFile)
 	if e != nil {
 		t.Fatal(e)
@@ -722,31 +728,128 @@ func TestMergeOverdueOpenPassSurvivesFailedReadyRead(t *testing.T) {
 	}
 	rig.g.pull.Draft = false
 	rig.now = overdueStart.Add(30 * time.Minute)
-	if e := rig.s.noteOpenPass(rig.r, rig.g.pull); e == nil {
-		t.Fatal("the READY read failure was not returned")
+	if e := rig.s.noteOpenPass(rig.r, rig.g.pull); e != nil {
+		t.Fatalf("the open sighting read the READY file: %v", e)
 	}
-	c = read()
+	c := read()
 	if !c.LastOpen.Equal(rig.now) {
-		t.Fatalf("the failed pass did not record its open sighting: last_open=%v", c.LastOpen.Sub(overdueStart))
+		t.Fatalf("the pass did not record its open sighting: last_open=%v", c.LastOpen.Sub(overdueStart))
 	}
 	if !c.DraftSince.IsZero() {
-		t.Fatalf("the hold is still open after the failed pass: draft_since=%v", c.DraftSince.Sub(overdueStart))
+		t.Fatalf("the hold is still open after the pass: draft_since=%v", c.DraftSince.Sub(overdueStart))
 	}
-	if !c.HeadSeen.Equal(rig.now) {
-		t.Fatalf("the hold's span is still on the clocks: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	if len(c.Holds) != 1 || !c.Holds[0].From.Equal(overdueStart) || !c.Holds[0].To.Equal(rig.now) {
+		t.Fatalf("the hold was not closed into its span: %+v", c.Holds)
 	}
-	// The next pass fills the READY. The hold it already ended must not move
-	// it again: one shift is owed, not two.
+	if !c.HeadSeen.Equal(overdueStart) {
+		t.Fatalf("the hold moved a raw clock: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	}
+	if !c.Ready.IsZero() {
+		t.Fatalf("the open sighting filled the READY clock: %v", c.Ready.Sub(overdueStart))
+	}
+	// The next pass fills the READY with the time it was recorded, not with the
+	// hold's end: the age is computed against the span when it is read.
 	if e := os.WriteFile(readyFile, good, 0o644); e != nil {
 		t.Fatal(e)
 	}
 	rig.at(31 * time.Minute)
-	c = read()
-	if !c.Ready.Equal(overdueStart) {
-		t.Fatalf("the later READY fill was shifted by the ended hold: ready=%v", c.Ready.Sub(overdueStart))
+	if c = read(); !c.Ready.Equal(overdueStart) {
+		t.Fatalf("the later READY fill was shifted by the hold: ready=%v", c.Ready.Sub(overdueStart))
 	}
-	if !c.HeadSeen.Equal(overdueStart.Add(30 * time.Minute)) {
-		t.Fatalf("the ended hold was shifted a second time: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+}
+
+// r4579172925: the READY is recorded at t0, a draft holds from t1 to t2 and a
+// later pass fills the READY clock. The age is (now-t0) less the hold, whether
+// the READY read failed on the pass that closed the hold (case a) or succeeded
+// there (case b): the two orders are the same facts, and they report the same
+// ages. Nothing was shifted, so a late fill cannot miss a hold that closed.
+func TestMergeOverdueReadyFillOrderDoesNotMatter(t *testing.T) {
+	// run drives the same scenario, failing the READY read on the closing pass
+	// when failAtClose is set, and returns the stored clock at t3 plus the
+	// conditions 45 minutes of open time after t0.
+	run := func(failAtClose bool) (overdueClock, []string) {
+		t.Helper()
+		rig := newOverdueRig(t, true)
+		file := rig.s.overdueClocksFile(rig.r.Name)
+		readyFile := rig.s.readyClocksFile(rig.r.Name)
+		key := overdueKey(rig.g.pull)
+		read := func() overdueClock {
+			t.Helper()
+			st, e := readOverdueState(file)
+			if e != nil {
+				t.Fatal(e)
+			}
+			return st.Clocks[key]
+		}
+		// The READY verdict is recorded after the clocks tick, so the first pass
+		// leaves the READY clock at zero.
+		rig.at(0)
+		if c := read(); !c.Ready.IsZero() {
+			t.Fatalf("the tick saw a READY the same pass had not recorded yet: %v", c.Ready.Sub(overdueStart))
+		}
+		// t1: an open pass whose READY read fails, so the sighting moves and the
+		// clock stays zero (the read that would fill it did not answer).
+		good, e := os.ReadFile(readyFile)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e := os.WriteFile(readyFile, []byte("{"), 0o644); e != nil {
+			t.Fatal(e)
+		}
+		rig.now = overdueStart.Add(10 * time.Minute)
+		rig.eval()
+		if c := read(); !c.LastOpen.Equal(rig.now) || !c.Ready.IsZero() {
+			t.Fatalf("the failed pass did not leave last_open at t1 and ready at zero: %+v", c)
+		}
+		// t1..t2: a draft hold, anchored at that sighting.
+		rig.g.pull.Draft = true
+		rig.at(20 * time.Minute)
+		if c := read(); !c.DraftSince.Equal(overdueStart.Add(10 * time.Minute)) {
+			t.Fatalf("the hold is not anchored at the sighting: draft_since=%v", c.DraftSince.Sub(overdueStart))
+		}
+		// t2: the PR is open again and the hold closes. The READY read succeeds
+		// here in case b.
+		if !failAtClose {
+			if e := os.WriteFile(readyFile, good, 0o644); e != nil {
+				t.Fatal(e)
+			}
+		}
+		rig.g.pull.Draft = false
+		rig.at(80 * time.Minute)
+		if e := os.WriteFile(readyFile, good, 0o644); e != nil {
+			t.Fatal(e)
+		}
+		if failAtClose {
+			if c := read(); !c.Ready.IsZero() {
+				t.Fatalf("the failed read filled the READY clock: %v", c.Ready.Sub(overdueStart))
+			}
+		}
+		// t3: a later pass fills the READY, raw.
+		rig.at(81 * time.Minute)
+		c := read()
+		if !c.Ready.Equal(overdueStart) {
+			t.Fatalf("the READY fill was shifted by the hold: ready=%v", c.Ready.Sub(overdueStart))
+		}
+		if len(c.Holds) != 1 || !c.Holds[0].From.Equal(overdueStart.Add(10*time.Minute)) || !c.Holds[0].To.Equal(overdueStart.Add(80*time.Minute)) {
+			t.Fatalf("the hold was not kept as one span: %+v", c.Holds)
+		}
+		// 45 minutes of open time from t0 is due at t0+45m plus the 70m hold,
+		// however long ago t0 is by then.
+		rig.at(115 * time.Minute)
+		return c, rig.n.conditions()
+	}
+	clockA, conditionsA := run(true)
+	clockB, conditionsB := run(false)
+	want := strings.Join([]string{overdueNotLanded, overdueReadyTooLong}, ",")
+	for i, conditions := range [][]string{conditionsA, conditionsB} {
+		if got := strings.Join(conditions, ","); got != want {
+			t.Fatalf("order %d: conditions = [%s], want [%s]", i, got, want)
+		}
+	}
+	for i, c := range []overdueClock{clockA, clockB} {
+		if age := openAge(c, c.Ready, overdueStart.Add(115*time.Minute)); age != 45*time.Minute {
+			t.Fatalf("order %d: ready age = %v, want 45m", i, age)
+		}
 	}
 }
 
@@ -790,4 +893,115 @@ func TestMergeOverdueHeadFirstSeenInDraft(t *testing.T) {
 	rig.wantConditions(overdueNotLanded)
 	rig.at(8*time.Hour + 45*time.Minute)
 	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+}
+
+// The age of a clock is the time since it started, less every draft hold it
+// overlaps, computed at read time: the stored times are raw and no pass moves
+// them.
+func TestOverdueOpenAge(t *testing.T) {
+	t0 := overdueStart
+	t1 := t0.Add(10 * time.Minute)
+	t2 := t0.Add(time.Hour)
+	t3 := t0.Add(3 * time.Hour)
+	for _, tc := range []struct {
+		name  string
+		clock overdueClock
+		start time.Time
+		now   time.Time
+		want  time.Duration
+	}{
+		{name: "no hold", clock: overdueClock{}, start: t0, now: t3, want: 3 * time.Hour},
+		{name: "a closed hold is taken off", clock: overdueClock{Holds: []holdSpan{{From: t1, To: t2}}}, start: t0, now: t3, want: 3*time.Hour - 50*time.Minute},
+		{name: "a hold after now is not", clock: overdueClock{Holds: []holdSpan{{From: t3, To: t3.Add(time.Hour)}}}, start: t0, now: t3, want: 3 * time.Hour},
+		{name: "a clock inside a closed hold counts from its end", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t2}}}, start: t1, now: t3, want: 2 * time.Hour},
+		{name: "a hold before the clock takes nothing", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t2}}}, start: t2.Add(time.Minute), now: t3, want: time.Hour + 59*time.Minute},
+		{name: "the hold in progress counts to now", clock: overdueClock{DraftSince: t1}, start: t0, now: t3, want: 10 * time.Minute},
+		{name: "a clock inside the hold in progress counts nothing", clock: overdueClock{DraftSince: t0}, start: t1, now: t3, want: 0},
+		{name: "every hold is taken off", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}, {From: t2, To: t2.Add(10 * time.Minute)}}}, start: t0, now: t3, want: 3*time.Hour - 20*time.Minute},
+		{name: "closed and in progress", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}}, DraftSince: t2}, start: t0, now: t3, want: 50 * time.Minute},
+		{name: "no start", clock: overdueClock{DraftSince: t1}, start: time.Time{}, now: t3, want: 0},
+		{name: "a start after now", clock: overdueClock{}, start: t3.Add(time.Hour), now: t3, want: 0},
+	} {
+		if got := openAge(tc.clock, tc.start, tc.now); got != tc.want {
+			t.Errorf("%s: age = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The ages are a function of the raw event times, the hold spans and now, not
+// of the order the facts were recorded in: every permutation of (fill Ready,
+// fill ReviewDone, open hold, close hold, a pass whose READY read failed and
+// recorded nothing) gives the same conditions at the same age. This is the
+// class the four patches before this one kept moving: a hold consumed at one
+// instant left every later-filled clock uncovered.
+func TestOverdueDueOrderIndependent(t *testing.T) {
+	t0 := overdueStart
+	t1 := t0.Add(10 * time.Minute)
+	t2 := t0.Add(time.Hour)
+	now := t0.Add(3 * time.Hour)
+	facts := []func(c *overdueClock){
+		func(c *overdueClock) { c.Ready = t0 },
+		func(c *overdueClock) { c.ReviewDone = t0 },
+		func(c *overdueClock) { c.Holds = append(c.Holds, holdSpan{From: t1, To: t2}) },
+		func(*overdueClock) {}, // the failed pass: nothing was observed, nothing recorded
+	}
+	wantAge := 3*time.Hour - 50*time.Minute
+	order := make([]int, len(facts))
+	var walk func(int, []bool)
+	permutations := 0
+	walk = func(i int, used []bool) {
+		if i == len(order) {
+			permutations++
+			var c overdueClock
+			for _, fact := range order {
+				facts[fact](&c)
+			}
+			conditions, ages := overdueDue(c, true, now)
+			if strings.Join(conditions, ",") != strings.Join([]string{overdueNotLanded, overdueReadyTooLong}, ",") {
+				t.Fatalf("%v: conditions = %v", order, conditions)
+			}
+			for _, name := range []string{overdueNotLanded, overdueReadyTooLong} {
+				if ages[name] != wantAge {
+					t.Fatalf("%v: %s age = %v, want %v", order, name, ages[name], wantAge)
+				}
+			}
+			return
+		}
+		for j := range facts {
+			if used[j] {
+				continue
+			}
+			used[j], order[i] = true, j
+			walk(i+1, used)
+			used[j] = false
+		}
+	}
+	walk(0, make([]bool, len(facts)))
+	if permutations != 24 {
+		t.Fatalf("permutations walked = %d, want 24", permutations)
+	}
+}
+
+// Holds are bounded: past 32 spans the two oldest are merged, not dropped, so
+// the oldest hold still starts where it did.
+func TestOverdueCloseHoldCapsSpans(t *testing.T) {
+	var c overdueClock
+	count := overdueHoldSpans + 8
+	for i := range count {
+		from := overdueStart.Add(time.Duration(i) * 2 * time.Hour)
+		c.DraftSince = from
+		if !closeHold(&c, from.Add(time.Hour)) {
+			t.Fatalf("hold %d was not closed", i)
+		}
+	}
+	if len(c.Holds) != overdueHoldSpans {
+		t.Fatalf("holds = %d, want %d", len(c.Holds), overdueHoldSpans)
+	}
+	if !c.Holds[0].From.Equal(overdueStart) {
+		t.Fatalf("the oldest hold was dropped rather than merged: %+v", c.Holds[0])
+	}
+	last := overdueStart.Add(time.Duration(count-1) * 2 * time.Hour)
+	if want := last.Add(time.Hour); !c.Holds[len(c.Holds)-1].To.Equal(want) {
+		t.Fatalf("the newest hold = %+v, want To %v", c.Holds[len(c.Holds)-1], want)
+	}
 }
