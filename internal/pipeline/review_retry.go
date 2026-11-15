@@ -86,8 +86,8 @@ type countedFailure struct {
 }
 
 // waitText is the reason a review wait's audit row recorded ("held
-// (reviewer-held)", "quota-stopped (pool seat)"), carried in the wait's sentinel
-// error so the caller names it too.
+// (reviewer-held)", "held (round-hold)", "quota-stopped (pool seat)"), carried
+// in the wait's sentinel error so the caller names it too.
 type waitText string
 
 func (w waitText) Error() string { return string(w) }
@@ -102,11 +102,16 @@ func reviewWaitErr(sentinel error, text string) error {
 }
 
 // waitText names this pass's wait with the reason its audit row recorded: the
-// reviewer that held the reservation, or the pool a reviewer stopped on.
+// reviewer that held the reservation, the round hold, or the pool a reviewer
+// stopped on. It follows the flag that won, so a held evaluation joined with a
+// quota stop is named held: state.Held is set before state.QuotaStopped, which
+// only a hold-free evaluation sets.
 func (c *reviewFailureClass) waitText() string {
 	switch {
 	case len(c.held) > 0:
 		return "held (reviewer-held)"
+	case c.roundHold:
+		return "held (round-hold)"
 	case len(c.quotas) > 0 && c.quotas[0].pool != "":
 		return "quota-stopped (pool " + c.quotas[0].pool + ")"
 	}
