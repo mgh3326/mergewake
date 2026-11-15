@@ -101,7 +101,7 @@ func scanProcessesLsof(ctx context.Context, run integrations.Runner) (procEviden
 		return procEvidence{}, fmt.Errorf("%w: lsof: %v", errProcessScanUnavailable, e)
 	}
 	uid := strconv.Itoa(os.Getuid())
-	p, e := run.Run(ctx, "ps", []string{"-A", "-o", "pid=,uid=,ucomm=,state=,command="}, "", "")
+	p, e := run.Run(ctx, "ps", []string{"-A", "-o", "pid=,uid=,state=,command="}, "", "")
 	if e != nil {
 		return procEvidence{}, fmt.Errorf("%w: ps: %v", errProcessScanUnavailable, e)
 	}
@@ -213,14 +213,16 @@ type lsofCwdScan struct {
 	pids map[int]bool
 }
 
-// psProcess is one same-user process from `ps -o pid=,uid=,ucomm=,state=`.
+// psProcess is one same-user process from `ps -o pid=,uid=,state=,command=`.
 type psProcess struct {
 	pid  int
 	comm string
 }
 
 // parseLsofCwdPids reads the process and cwd name fields of `lsof -F pn`
-// output. Other fields, including the file-descriptor field, are ignored.
+// output. Other fields, including the file-descriptor field, are ignored. Only
+// an absolute path counts as a readable cwd: Darwin lsof can emit an error
+// string such as `cwd|rtd info error: ...` for a cwd it could not resolve.
 func parseLsofCwdPids(out []byte) lsofCwdScan {
 	scan := lsofCwdScan{pids: map[int]bool{}}
 	pid := 0
@@ -229,21 +231,24 @@ func parseLsofCwdPids(out []byte) lsofCwdScan {
 		case strings.HasPrefix(line, "p"):
 			pid, _ = strconv.Atoi(line[1:])
 		case strings.HasPrefix(line, "n") && pid > 0 && len(line) > 1:
-			scan.cwds = append(scan.cwds, line[1:])
-			scan.pids[pid] = true
+			if cwd := line[1:]; strings.HasPrefix(cwd, "/") {
+				scan.cwds = append(scan.cwds, cwd)
+				scan.pids[pid] = true
+			}
 		}
 	}
 	return scan
 }
 
-// parsePsProcesses reads `ps -A -o pid=,uid=,ucomm=,state=,command=` output
-// and keeps the processes whose effective uid is uid. A zombie has no cwd and
-// cannot hold a checkout, so state Z is skipped. ps lists its own scanner
-// process, which started after lsof ran; excluding that exact command keeps it
-// from reading as a missing cwd. Any other malformed line makes the listing
-// unreliable, so the scan fails closed.
+// parsePsProcesses reads `ps -A -o pid=,uid=,state=,command=` output and keeps
+// the processes whose effective uid is uid. The command column supplies comm
+// as the argv0 basename; ucomm is not used because ps does not escape spaces
+// in it. A zombie has no cwd and cannot hold a checkout, so state Z is skipped.
+// ps lists its own scanner process, which started after lsof ran; excluding
+// that exact command keeps it from reading as a missing cwd. Any other
+// malformed line makes the listing unreliable, so the scan fails closed.
 func parsePsProcesses(out []byte, uid string) ([]psProcess, error) {
-	const selfArgs = "-A -o pid=,uid=,ucomm=,state=,command="
+	const selfArgs = "-A -o pid=,uid=,state=,command="
 	var procs []psProcess
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
@@ -260,16 +265,20 @@ func parsePsProcesses(out []byte, uid string) ([]psProcess, error) {
 		if fields[1] != uid {
 			continue
 		}
-		if len(fields) < 4 {
+		if len(fields) < 3 {
 			return nil, fmt.Errorf("malformed process line %q", line)
 		}
-		if strings.HasPrefix(fields[3], "Z") {
+		if strings.HasPrefix(fields[2], "Z") {
 			continue
 		}
-		if len(fields) > 7 && filepath.Base(fields[4]) == "ps" && strings.Join(fields[5:], " ") == selfArgs {
+		if len(fields) > 6 && filepath.Base(fields[3]) == "ps" && strings.Join(fields[4:], " ") == selfArgs {
 			continue
 		}
-		procs = append(procs, psProcess{pid: pid, comm: fields[2]})
+		var comm string
+		if len(fields) > 3 {
+			comm = filepath.Base(fields[3])
+		}
+		procs = append(procs, psProcess{pid: pid, comm: comm})
 	}
 	if len(procs) == 0 {
 		return nil, errors.New("no same-user processes")

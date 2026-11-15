@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -357,6 +358,8 @@ func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 // fails closed with the day's one row. A process lsof did report, and one whose
 // name never enters a work directory, do not block the sweep.
 func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
+	uid := strconv.Itoa(os.Getuid())
+	cwdError := "ncwd|rtd info error: Operation not permitted\n"
 	for _, test := range []struct {
 		name    string
 		lsof    string
@@ -366,20 +369,20 @@ func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
 	}{
 		{
 			name:   "same-user pid without cwd fails closed",
-			lsof:   "p101\nfcwd\nn/\n",
-			ps:     " 101 501 worker S worker --serve\n 102 501 sudo S sudo --serve\n",
+			lsof:   "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
+			ps:     " 101 " + uid + " S worker --serve\n 102 " + uid + " S sudo --serve\n",
 			reason: "pid 102 (sudo)",
 		},
 		{
 			name:    "sshd without cwd passes",
-			lsof:    "p101\nfcwd\nn/\n",
-			ps:      " 101 501 worker S worker --serve\n 102 501 sshd S sshd\n",
+			lsof:    "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
+			ps:      " 101 " + uid + " S worker --serve\n 102 " + uid + " S sshd\n",
 			removed: true,
 		},
 		{
 			name:    "all cwds present proceeds",
 			lsof:    "p101\nfcwd\nn/\n",
-			ps:      " 101 501 worker S worker --serve\n",
+			ps:      " 101 " + uid + " S worker --serve\n",
 			removed: true,
 		},
 	} {
@@ -478,32 +481,34 @@ func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
 // lsof -F pn output carries one cwd per pid's n record; other fields are
 // ignored, and the pid set records which processes had a readable cwd.
 func TestParseLsofCwdPids(t *testing.T) {
-	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\np303\nfcwd\n")
+	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\n" +
+		"p303\nfcwd\nncwd|rtd info error: Operation not permitted\np404\nfcwd\nnrelative/path\n")
 	got := parseLsofCwdPids(out)
 	if len(got.cwds) != 2 || got.cwds[0] != "/Users/x/checkouts/mwr-1" || got.cwds[1] != "/" {
 		t.Fatalf("cwds = %q", got.cwds)
 	}
-	if !got.pids[101] || !got.pids[202] || got.pids[303] {
+	if !got.pids[101] || !got.pids[202] || got.pids[303] || got.pids[404] {
 		t.Fatalf("pids = %v", got.pids)
 	}
 }
 
 // ps lists all users; the scan keeps only the effective uid, skips zombies,
-// and excludes its own scanner command. A malformed same-user line makes the
-// listing unreliable.
+// keeps a live process whose command contains spaces, and excludes its own
+// scanner command. A malformed same-user line makes the listing unreliable.
 func TestParsePsProcesses(t *testing.T) {
-	out := []byte(" 101 501 worker S worker --serve\n" +
-		" 102 501 ps R ps -A -o pid=,uid=,ucomm=,state=,command=\n" +
-		" 103 0 login Ss login\n" +
-		" 104 501 old Z old <defunct>\n")
+	out := []byte(" 101 501 S worker --serve\n" +
+		" 102 501 R ps -A -o pid=,uid=,state=,command=\n" +
+		" 103 0 Ss login\n" +
+		" 104 501 Z old <defunct>\n" +
+		" 105 501 S Build Zeta --serve\n")
 	procs, err := parsePsProcesses(out, "501")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(procs) != 1 || procs[0].pid != 101 || procs[0].comm != "worker" {
+	if len(procs) != 2 || procs[0].pid != 101 || procs[0].comm != "worker" || procs[1].pid != 105 || procs[1].comm != "Build" {
 		t.Fatalf("procs = %+v", procs)
 	}
-	if _, err := parsePsProcesses([]byte("PID UID UCOMM STATE COMMAND\n"), "501"); err == nil {
+	if _, err := parsePsProcesses([]byte("PID UID STATE COMMAND\n"), "501"); err == nil {
 		t.Fatal("malformed ps output parsed")
 	}
 }
