@@ -50,12 +50,19 @@ type overdueClock struct {
 	// Ready is when mergewake recorded the READY verdict for the head; no READY,
 	// no ready_too_long.
 	Ready time.Time `json:"ready,omitzero"`
-	// DraftSince is when this head was first seen as a draft in the hold that
-	// is going on. While it is set the clocks do not count: the per-pass PR
-	// path returns before the gate for a draft, so noteDraftHold records it,
-	// and the pass that sees the PR leave draft subtracts the span.
+	// DraftSince is when the draft hold that is going on started. While it is
+	// set the clocks do not count: the per-pass PR path returns before the
+	// gate for a draft, so noteDraftHold records it, and the pass that sees
+	// the PR leave draft subtracts the span. The hold starts at LastOpen, not
+	// at the pass that first saw it (see below).
 	DraftSince time.Time `json:"draft_since,omitzero"`
-	Touched    time.Time `json:"touched,omitzero"`
+	// LastOpen is the last pass that saw the PR not a draft. The time between
+	// it and the pass that first sees a draft may already have been a draft,
+	// so a hold that starts now is anchored here. Zero on a file an earlier
+	// release wrote, and for a head first seen as a draft: the hold then
+	// starts at the pass that saw it, as it did before.
+	LastOpen time.Time `json:"last_open,omitzero"`
+	Touched  time.Time `json:"touched,omitzero"`
 }
 
 // overdueState is pr-overdue-clocks.json: the clocks by (PR, head). A file an
@@ -143,7 +150,9 @@ func reviewCompleted(v gateVerdict) bool {
 // READY verdict mergewake recorded for the head (notify.go recordOnlyEvent). A
 // draft hold does not count: while the PR is a draft no clock starts its
 // countdown, and the pass that sees it leave draft moves the clocks this head
-// had already started forward by the hold's span. Entries untouched for a week
+// had already started forward by the hold's span. The span is measured from the
+// last pass that saw the PR open (LastOpen), so the draft time before the pass
+// that first saw the draft is not counted as open. Entries untouched for a week
 // are dropped.
 func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
 	file := s.overdueClocksFile(r.Name)
@@ -173,27 +182,32 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 			c.Ready, changed = ready, true
 		}
 	}
-	if pr.Draft && c.DraftSince.IsZero() {
-		c.DraftSince, changed = now, true
-	}
-	if !pr.Draft && !c.DraftSince.IsZero() {
-		// The clock of this head stop while it was a draft. Move each one it
-		// had already started forward by the hold's span, and rest a clock that
-		// started inside the hold (or a READY recorded in it) at now: that is
-		// the pass that saw the PR ready.
-		shift := now.Sub(c.DraftSince)
-		for _, at := range []*time.Time{&c.HeadSeen, &c.ChecksDone, &c.ReviewDone, &c.Ready} {
-			if at.IsZero() {
-				continue
-			}
-			if moved := at.Add(shift); moved.Before(now) {
-				*at = moved
-			} else {
-				*at = now
-			}
+	if pr.Draft {
+		if c.DraftSince.IsZero() {
+			// The hold may have started any time after the last pass that saw
+			// the PR open: count it from there, not from this pass.
+			c.DraftSince, changed = draftAnchor(c.LastOpen, now), true
 		}
-		c.DraftSince = time.Time{}
-		changed = true
+	} else {
+		c.LastOpen, changed = now, true
+		if !c.DraftSince.IsZero() {
+			// The clocks of this head stop while it was a draft. Move each one
+			// it had already started forward by the hold's span, and rest a
+			// clock that started inside the hold (or a READY recorded in it) at
+			// now: that is the pass that saw the PR ready.
+			shift := now.Sub(c.DraftSince)
+			for _, at := range []*time.Time{&c.HeadSeen, &c.ChecksDone, &c.ReviewDone, &c.Ready} {
+				if at.IsZero() {
+					continue
+				}
+				if moved := at.Add(shift); moved.Before(now) {
+					*at = moved
+				} else {
+					*at = now
+				}
+			}
+			c.DraftSince = time.Time{}
+		}
 	}
 	if now.Sub(c.Touched) >= time.Hour {
 		c.Touched, changed = now, true
@@ -208,6 +222,17 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 		}
 	}
 	return c, writeOverdueState(file, st)
+}
+
+// draftAnchor is where a draft hold that starts now is anchored: the last pass
+// that saw the PR open, so draft time before the pass that first saw it is not
+// counted as open. No last open (a file an earlier release wrote, or a head
+// first seen as a draft): today's anchor, this pass.
+func draftAnchor(lastOpen, now time.Time) time.Time {
+	if lastOpen.IsZero() {
+		return now
+	}
+	return lastOpen
 }
 
 // noteDraftHold records that the open PR is a draft now. The per-pass PR path
@@ -229,7 +254,7 @@ func (s *Service) noteDraftHold(r config.Repo, pr github.Pull) error {
 		return nil
 	}
 	if c.DraftSince.IsZero() {
-		c.DraftSince = now
+		c.DraftSince = draftAnchor(c.LastOpen, now)
 	}
 	c.Touched = now
 	st.Clocks[key] = c

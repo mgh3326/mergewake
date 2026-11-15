@@ -510,6 +510,63 @@ func TestMergeOverdueDraftHoldDoesNotCount(t *testing.T) {
 	}
 }
 
+// A draft hold is anchored at the last pass that saw the PR open, not at the
+// first pass that saw it a draft: the draft time between those two passes is
+// not counted as open time. READY at t0, a draft from t0+1m first seen at
+// t0+6m, and the PR ready again at t0+8h: the head owes the full threshold
+// from t0+8h.
+func TestMergeOverdueDraftHoldAnchorsAtLastOpenPass(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // reviewed and READY at overdueStart; the last pass that sees it open
+	rig.g.pull.Draft = true
+	rig.at(6 * time.Minute) // the draft from t0+1m is first seen here
+	rig.at(8 * time.Hour)
+	rig.wantConditions() // a draft is held: no condition fires
+	rig.g.pull.Draft = false
+	rig.at(8 * time.Hour) // ready again: the whole hold is off the clocks
+	rig.wantConditions()
+	rig.at(8*time.Hour + 44*time.Minute) // not_landed counts from the hold's end; ready_too_long does not owe yet
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 44m0s |") {
+		t.Fatal(e.Text)
+	}
+	rig.at(8*time.Hour + 45*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
+// A hold a clocks file from an earlier release recorded has no last_open: it
+// keeps that anchor, counting the hold from the pass that first saw the draft.
+func TestMergeOverdueLegacyDraftHoldKeepsItsAnchor(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	file := rig.s.overdueClocksFile(rig.r.Name)
+	legacy := map[string]overdueClock{"7 " + shaA: {
+		HeadSeen:   overdueStart,
+		ChecksDone: overdueStart,
+		ReviewDone: overdueStart,
+		Ready:      overdueStart,
+		DraftSince: overdueStart.Add(6 * time.Minute),
+		Touched:    overdueStart.Add(6 * time.Minute),
+	}}
+	if e := fsutil.WriteJSON(file, legacy); e != nil {
+		t.Fatal(e)
+	}
+	rig.g.pull.Draft = true
+	rig.at(8 * time.Hour) // still a draft: the entry is kept as it is
+	rig.g.pull.Draft = false
+	rig.at(8 * time.Hour) // the hold counts from t0+6m, as before
+	rig.wantConditions()
+	rig.at(8*time.Hour + 38*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(8*time.Hour + 39*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
 // The same 8 hours without a draft are unchanged: the clocks count the wall
 // time from the READY and the review completion.
 func TestMergeOverdueNoDraftCountsAsBefore(t *testing.T) {
