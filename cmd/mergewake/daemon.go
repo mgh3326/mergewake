@@ -112,7 +112,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			// The pr role runs every repository at once: a pass is as long as
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
-			return forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
+			err := forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 				tracing.Tag(repoSpan, "repo", r.Name)
 				var err error
@@ -140,6 +140,18 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				}()
 				return err
 			})
+			if role == "reap" && ctx.Err() == nil {
+				// The legacy sweep has an interval of its own
+				// (reap.legacy_every), so this pass only asks whether it is
+				// due. Its failure is audited by ReapLegacy and logged here,
+				// never failing the role or the next regular reap.
+				legacyCtx, span := tracing.Span(ctx, "mergewake.reap-legacy")
+				if e := s.ReapLegacyScheduled(legacyCtx, repos, o); e != nil {
+					log.Error("legacy sweep", "error", e)
+				}
+				tracing.Finish(span)
+			}
+			return err
 		}})
 	}
 	if len(s.Config.Repos) == 0 {

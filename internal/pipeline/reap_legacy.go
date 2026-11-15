@@ -19,9 +19,11 @@ import (
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// The legacy sweep is a one-shot, conservative pass over worktrees the daemon's
-// reap never sees again: reap.scan_after bounds which merged PRs it looks at,
-// so a worktree whose merge is older than that stays forever.
+// The legacy sweep is a conservative pass over worktrees the daemon's reap
+// never sees again: reap.scan_after bounds which merged PRs it looks at, so a
+// worktree whose merge is older than that stays forever. The daemon runs it on
+// reap.legacy_every per repo (ReapLegacyScheduled); `mergewake reap --legacy`
+// runs one pass by hand.
 //
 // Candidates come from two sources, merged by worktree path. The node's
 // worktree.list names every worktree of a common git dir: the common dirs are
@@ -127,11 +129,12 @@ func legacyVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
 	}
 }
 
-// ReapLegacy runs the one-time sweep for repo r over one configured host
-// (host non-empty) or all of them, one host at a time. Without --apply, or
+// ReapLegacy runs one sweep for repo r over one configured host (host
+// non-empty) or all of them, one host at a time. Without --apply, or
 // without reap.act, it plans: rows say would-remove and nothing is removed.
 // Plans and results both land in <state>/<repo>/reap.jsonl as legacy-sweep
-// rows. The daemon's Reap ignores those rows.
+// rows. The daemon's Reap ignores those rows; the schedule that calls this
+// from the daemon lives in ReapLegacyScheduled.
 func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o Options) (retErr error) {
 	defer func() {
 		if retErr != nil {

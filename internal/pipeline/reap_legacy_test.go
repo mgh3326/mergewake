@@ -21,6 +21,11 @@ type legacyGH struct {
 	reapGH
 	closed []github.Pull
 	open   []github.Pull
+	// closedCalls counts the AllClosedPulls reads: a schedule test tells a
+	// sweep that ran from one the interval skipped by it.
+	closedCalls int
+	// closedErr fails AllClosedPulls for the named repo.
+	closedErr map[string]error
 	// openByCall, when set, answers the nth OpenPulls call (the last entry for
 	// later calls); onOpen runs at the start of each call.
 	openByCall [][]github.Pull
@@ -28,7 +33,11 @@ type legacyGH struct {
 	onOpen     func(call int)
 }
 
-func (g *legacyGH) AllClosedPulls(context.Context, string) ([]github.Pull, error) {
+func (g *legacyGH) AllClosedPulls(_ context.Context, repo string) ([]github.Pull, error) {
+	g.closedCalls++
+	if e := g.closedErr[repo]; e != nil {
+		return nil, e
+	}
 	return g.closed, nil
 }
 

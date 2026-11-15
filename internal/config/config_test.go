@@ -147,6 +147,12 @@ func TestReapConfig(t *testing.T) {
 		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
 		{"bad scan", "reap:\n  scan_after: 0s\n", true},
+		{"legacy every default", "reap:\n  enabled: true\n", false},
+		{"legacy every", "reap:\n  legacy_every: 48h\n", false},
+		{"legacy every off", "reap:\n  legacy_every: off\n", false},
+		{"legacy every zero", "reap:\n  legacy_every: '0'\n", false},
+		{"legacy every bad", "reap:\n  legacy_every: soon\n", true},
+		{"legacy every negative", "reap:\n  legacy_every: -24h\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
 		{"retired protect ignored", "reap:\n  protect: ['..']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
@@ -225,6 +231,12 @@ func TestReapConfig(t *testing.T) {
 				if c.Reap.ScanAfter != "720h" {
 					t.Fatal(c.Reap.ScanAfter)
 				}
+				if c.Reap.LegacyEvery == "" {
+					t.Fatal("missing default legacy_every")
+				}
+				if tt.name == "defaults" && c.Reap.LegacyEvery != LegacyEveryDefault {
+					t.Fatalf("legacy_every = %q, want %q", c.Reap.LegacyEvery, LegacyEveryDefault)
+				}
 				if len(c.Reap.Regenerable) == 0 {
 					t.Fatal("missing default regenerable list")
 				}
@@ -247,6 +259,34 @@ func TestReapConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The scheduled sweep's interval accepts a duration plus the two ways to turn
+// it off; zero seconds and negative spans stay errors, as for every other reap
+// duration.
+func TestLegacyInterval(t *testing.T) {
+	for _, tt := range []struct {
+		in    string
+		want  time.Duration
+		fails bool
+	}{
+		{"", 24 * time.Hour, false},
+		{"48h", 48 * time.Hour, false},
+		{"off", 0, false},
+		{"OFF", 0, false},
+		{"0", 0, false},
+		{"0s", 0, true},
+		{"-24h", 0, true},
+		{"soon", 0, true},
+	} {
+		got, e := (Reap{LegacyEvery: tt.in}).LegacyInterval()
+		if (e != nil) != tt.fails {
+			t.Fatalf("%q: %v, want failure=%t", tt.in, e, tt.fails)
+		}
+		if e == nil && got != tt.want {
+			t.Fatalf("%q: %s, want %s", tt.in, got, tt.want)
+		}
 	}
 }
 

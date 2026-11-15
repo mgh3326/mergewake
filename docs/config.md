@@ -63,6 +63,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
+| `legacy_every` | `24h` | How often the daemon's reap role runs the legacy sweep for a repo; `0` or `off` disables it. The last attempt per repo is kept in the state dir, so a restart inside the interval waits. |
 | `protect` | - | Retired: accepted but ignored. Mergewake never closes panes. Remove it from host configs when convenient. |
 | `transport` | `panewire` when `hub.url` is set, else `ssh` | How remote hosts are reached: `panewire` sends every remote operation through the hub's node commands; `ssh` runs `herdr`/`git` over `ssh(1)`. Local hosts always run locally. |
 | `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
@@ -72,9 +73,11 @@ Session hosts where agent panes may run, used only by `reap`.
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
 
 **Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
-is a one-shot pass, not part of the daemon loop, over worktrees whose PR merged
-at least 14 days ago, however long ago (the daemon only sees merges inside
-`scan_after`; this ignores that window). Candidates come from two sources merged
+runs one pass by hand; the daemon's reap role also runs the sweep for every
+configured repo, over all hosts at once, on `reap.legacy_every`. Both cover
+worktrees whose PR merged at least 14 days ago, however long ago (the daemon
+only sees merges inside `scan_after`; this ignores that window). Candidates
+come from two sources merged
 by worktree path. On each host the sweep takes the common git dirs of the
 worktrees reap already inspects (pane cwds and job cwds) whose origin is the
 configured repo, and pages the node's `worktree.list` for each; every listed
@@ -114,6 +117,19 @@ and each host ends with a summary of counts by result and reason, plus `listed`,
 trailer, no bound job or no job record cannot be reached this way and are only
 counted. Only panewire-hub hosts can be swept. The daemon's reap ignores
 `legacy-sweep` rows.
+
+The daemon runs the sweep from its reap role, at most once per repo per
+`reap.legacy_every` (default `24h`; `0` or `off` turns it off). The last
+attempt per repo is written to `<state_dir>/<repo>/legacy-sweep.json` before the
+sweep starts, so a restart inside the interval does not sweep again and a
+failing sweep waits for the next interval instead of running on every reap
+pass. It acts under the same gates as the pass it rides on: `reap.act` decides
+whether a removal is real, and daemon shadow mode plans only, writing
+`would-remove` rows. Each repo's sweep covers all its hosts at once, keeping one
+set of per-sweep caches. A failure is audited as `reap-legacy-error` and logged
+with the daemon's other errors; the remaining repos and the regular reap pass
+still run. `mergewake reap --legacy` runs one pass by hand and does not move the
+daemon's schedule.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role clean up merged-PR worktrees once they age out. Reap never closes
