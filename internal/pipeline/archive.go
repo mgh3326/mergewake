@@ -12,6 +12,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -24,43 +25,27 @@ func (s *Service) archiver() *archive.Archiver {
 // hk or Drive outage costs one attempt per job per hour, not one per poll.
 const archiveRetry = time.Hour
 
+// jobRef names one archived job dir: its host and its directory name.
+type jobRef struct{ host, job string }
+
 // archiveTerminal reports whether a job's newest archive row ends its work.
-// A live or unscannable pane is the only refusal worth retrying; every other
-// skip (task-unknown, drive-dir-exists, job-changed, ...) waits for a person.
+// Only a live or unscannable pane, an active or unfinished job, a fresh
+// sighting (awaiting-min-age) or a job-gone race is worth retrying; every
+// other skip waits for a person.
 func archiveTerminal(v reapReceipt) bool {
 	switch v.Result {
 	case "archived":
 		return true
 	case "skipped":
-		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed"
+		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed" && v.Reason != "awaiting-min-age" && v.Reason != "job-active" && v.Reason != "not-finished" && v.Reason != "job-gone"
 	}
 	return false
-}
-
-// jobFromSaved recovers a job name from a close row written before rows named
-// their job: the saved report or screen sits directly in <jobs>/<job>. The
-// saved path may spell the jobs dir as configured (~/jobs) or expanded
-// (/home/ops/jobs), so a ~/ jobs dir matches on its expanded suffix.
-func jobFromSaved(hs *reapHost, saved string) string {
-	if hs == nil || hs.host.Jobs == "" || saved == "" {
-		return ""
-	}
-	dir := filepath.Dir(saved)
-	parent, jobs := filepath.Dir(dir), filepath.Clean(hs.host.Jobs)
-	match := parent == jobs
-	if rest, ok := strings.CutPrefix(jobs, "~/"); ok && !match {
-		match = filepath.IsAbs(parent) && strings.HasSuffix(parent, string(filepath.Separator)+rest)
-	}
-	if !match || !reap.ValidJobName(filepath.Base(dir)) {
-		return ""
-	}
-	return filepath.Base(dir)
 }
 
 func liveName(hs *reapHost, job string) bool {
 	for _, list := range [][]reap.Pane{hs.panes, hs.all} {
 		for _, p := range list {
-			if p.Name == job && !hs.closed[p.ID] {
+			if p.Name == job {
 				return true
 			}
 		}
@@ -112,87 +97,140 @@ func retentionReason(retained []archive.Retention) string {
 	return strings.Join(parts, "; ")
 }
 
-// reapArchive archives the job dirs of panes reap closed once the close is
-// older than reap.archive.min_age. It works from close-pane receipts, so it
-// needs no GitHub call; only a pane reap really closed releases its job dir
-// in acting mode, while shadow plans also cover would-close rows.
-func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts map[string]*reapHost, acting bool, note func(reapReceipt)) []error {
+// reapArchive archives the job dirs of ended jobs whose pane is gone once the
+// gone state is older than reap.archive.min_age. It enumerates each reachable
+// host's job dirs, so it needs no GitHub call and no pane close: a job is
+// eligible only when no pane uses it anymore, its hk job record — when one
+// can be read — is terminal, and its own events say it finished. The first
+// pass that sees all three writes a sighting row (skipped awaiting-min-age),
+// and a later pass archives once that row is older than min_age. Acting needs
+// reap.act and --apply like every reap mutation; otherwise the plan — what
+// moves to Drive, what goes to hk, what is excluded and what would be
+// deleted — is printed as an archive-plan line with a would-archive row. A
+// job whose name is a live pane again is skipped as pane-live. Each outcome is
+// an archive-job row in reap.jsonl; archived and every refusal other than a
+// live pane, a missing pane scan, an active or unfinished job, a job-gone
+// race, or a fresh sighting are final, and a failed attempt is retried at
+// most once an hour. Old close-pane rows still load but no longer feed this
+// stage. The --pr run scopes to one PR's cleanup and skips this host-wide
+// stage.
+func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts map[string]*reapHost, records *passJobRecords, acting bool, note func(reapReceipt)) []error {
+	if prNum > 0 {
+		return nil
+	}
 	minAge, e := config.Age(s.Config.Reap.Archive.MinAge)
 	if e != nil {
 		return []error{e}
 	}
 	now := s.now()
-	type jobRef struct{ host, job string }
-	closes := map[jobRef]reapReceipt{}
+	// last remembers the newest archive-job row per job, so a completed
+	// archive is never repeated and a fresh sighting ages from its own row.
 	last := map[jobRef]reapReceipt{}
-	var order []jobRef
 	for _, rec := range receipts {
-		switch rec.Action {
-		case "close-pane":
-			if rec.Result != "closed" && rec.Result != "would-close" || prNum > 0 && rec.PR != prNum {
-				continue
-			}
-			job := rec.Job
-			if job == "" {
-				job = jobFromSaved(hosts[rec.Host], rec.Saved)
-			}
-			if job == "" {
-				continue
-			}
-			k := jobRef{rec.Host, job}
-			prev, seen := closes[k]
-			if !seen {
-				order = append(order, k)
-			}
-			// The newest real close wins: a reused job name closed again
-			// restarts min_age. A shadow plan never replaces a real close.
-			if !seen || rec.Result == "closed" || prev.Result == "would-close" {
-				rec.Job = job
-				closes[k] = rec
-			}
-		case "archive-job":
-			last[jobRef{rec.Host, rec.Job}] = rec
+		if rec.Action != "archive-job" {
+			continue
+		}
+		k := jobRef{rec.Host, rec.Job}
+		if prev, ok := last[k]; !ok || rec.Time.After(prev.Time) {
+			last[k] = rec
 		}
 	}
-	for _, k := range order {
-		c, hs := closes[k], hosts[k.host]
-		prev, tried := last[k]
-		// An archive row older than the newest close belongs to an earlier
-		// job under the same name and decides nothing about this one.
-		tried = tried && !prev.Time.Before(c.Time)
-		switch {
-		case hs == nil || hs.failed:
-			continue
-		case acting && c.Result != "closed":
-			continue
-		case tried && archiveTerminal(prev):
-			continue
-		case tried && prev.Result == "would-archive" && !acting && prNum == 0:
-			// One shadow plan per job is enough for the daemon; an explicit
-			// --pr run still prints it again.
-			continue
-		case tried && (prev.Result == "error" || prev.Result == "archived-retained") && now.Sub(prev.Time) < archiveRetry:
-			continue
-		case now.Sub(c.Time) < minAge:
-			continue
-		}
-		rec := reapReceipt{Action: "archive-job", Repo: r.Name, PR: c.PR, Host: k.host, Job: k.job}
-		switch {
-		case archive.ExcludedName(s.Config.Reap.Archive.Exclude, k.job):
-			rec.Result, rec.Reason = "skipped", "excluded-name"
-		case hs.viaHub:
-			rec.Result, rec.Reason = "skipped", "archive-over-hub"
-		case hs.usageUnknown:
-			rec.Result, rec.Reason = "skipped", "pane-scan-failed"
-		case liveName(hs, k.job):
-			// A reused job name is running again: its dir is not finished.
-			rec.Result, rec.Reason = "skipped", "pane-live"
-		default:
-			s.archiveJob(ctx, hs.host, k.job, acting, &rec)
-		}
-		note(rec)
+	var errs []error
+	names := make([]string, 0, len(hosts))
+	for name := range hosts {
+		names = append(names, name)
 	}
-	return nil
+	sort.Strings(names)
+	for _, name := range names {
+		hs := hosts[name]
+		if hs == nil || hs.failed {
+			continue
+		}
+		h := hs.host
+		// Archive moves files over ssh, so a host reap reaches through the
+		// hub is not archived; without a jobs dir there is nothing to
+		// enumerate; and without a readable pane list no pane can be proven
+		// gone.
+		if s.viaHub(h) || h.Jobs == "" || hs.usageUnknown {
+			continue
+		}
+		a := s.archiver()
+		root, e := a.Jobs(ctx, h)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
+			continue
+		}
+		summaries, e := a.HostJobs(ctx, h, root)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
+			continue
+		}
+		jobs := make([]string, 0, len(summaries))
+		for job := range summaries {
+			jobs = append(jobs, job)
+		}
+		sort.Strings(jobs)
+		for _, job := range jobs {
+			if e := ctx.Err(); e != nil {
+				return append(errs, e)
+			}
+			k := jobRef{h.Name, job}
+			prior, tried := last[k]
+			if tried && archiveTerminal(prior) && summaries[job].Newest > prior.Time.Unix() {
+				// A new job under a reused name restarts every clock: its
+				// files are newer than the earlier job's final row.
+				tried = false
+			}
+			if tried && archiveTerminal(prior) {
+				continue
+			}
+			if tried && (prior.Result == "error" || prior.Result == "archived-retained") && now.Sub(prior.Time) < archiveRetry {
+				continue
+			}
+			rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
+			summary := summaries[job]
+			skipReason, _ := archive.HostSkipReason(summary)
+			switch {
+			case !reap.ValidJobName(job):
+				rec.Result, rec.Reason = "skipped", "job-name-invalid"
+			case archive.ExcludedName(s.Config.Reap.Archive.Exclude, job):
+				rec.Result, rec.Reason = "skipped", "excluded-name"
+			case skipReason == "job-dir-symlink" || skipReason == "job-gone":
+				rec.Result, rec.Reason = "skipped", skipReason
+			case liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)):
+				// A reused job name is running again: its dir is not finished.
+				rec.Result, rec.Reason = "skipped", "pane-live"
+			default:
+				hkSkip := ""
+				if records != nil {
+					jr, e := records.job(ctx, job)
+					switch {
+					case e == nil && !terminalJob(jr.State):
+						hkSkip = "job-active"
+					case e != nil && !errors.Is(e, integrations.ErrJobNotFound):
+						rec.Result, rec.Reason = "error", "job record: "+integrations.Detail(e)
+					}
+				}
+				switch {
+				case rec.Result != "":
+				case hkSkip != "":
+					rec.Result, rec.Reason = "skipped", hkSkip
+				case skipReason == "not-finished":
+					rec.Result, rec.Reason = "skipped", "not-finished"
+				case !tried || prior.Result != "skipped" || prior.Reason != "awaiting-min-age":
+					// First sighting of the gone state: record it; a later
+					// pass archives once it is older than min_age.
+					rec.Result, rec.Reason = "skipped", "awaiting-min-age"
+				case now.Sub(prior.Time) < minAge:
+					continue
+				default:
+					s.archiveJob(ctx, h, job, acting, &rec)
+				}
+			}
+			note(rec)
+		}
+	}
+	return errs
 }
 
 // archiveRow is one durable row of <state_dir>/archive-jobs.jsonl.
@@ -234,7 +272,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			errs = append(errs, fmt.Errorf("%s: archive does not run over reap.transport panewire", h.Name))
 			continue
 		}
-		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, closed: map[string]bool{}}
+		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}}
 		var e error
 		if hs.panes, e = hs.exec.Panes(ctx); e == nil {
 			hs.all, e = hs.exec.AllPanes(ctx)

@@ -90,11 +90,15 @@ func TestReapReviewerFinal_C_UnknownRemotePathIsTerminalAndNotRevisited(t *testi
 // twice more, and the last refusal is terminal. Only the hub ever removes.
 func TestReapReviewerFinal_D_RefusedRemovalRetriesDailyThenSettles(t *testing.T) {
 	f := newFinalFix(t)
-	f.hub.dropClosed = true
 	f.hub.removeOutcome = "dirty"
 	label := reviewerLabelFor(12, time.Hour)
-	f.addReviewer(label, "w1:p5")
 	cwd := "/repo/" + label
+	f.addReviewer(label, "w1:p5")
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// The pane is gone, so the sweep reaches the hub's guarded removal.
+	f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
 	sweep := func(after time.Duration) {
 		t.Helper()
 		f.clock = f.clock.Add(after)
@@ -104,7 +108,6 @@ func TestReapReviewerFinal_D_RefusedRemovalRetriesDailyThenSettles(t *testing.T)
 	}
 	removes := func() int { return len(f.hub.ops("worktree.remove")) }
 	last := func() reapReceipt { rows := f.rows(t); return rows[len(rows)-1] }
-
 	sweep(0)
 	if removes() != 1 || last().Result != "pending-cleanup" || last().Reason != refusedDirty {
 		t.Fatalf("first refusal: removes %d rows %v", removes(), rowSummary(f.rows(t)))
@@ -147,7 +150,6 @@ func TestReapReviewerFinal_E_SamePendingOutcomeIsOneRow(t *testing.T) {
 	f := newFinalFix(t)
 	label := reviewerLabelFor(12, time.Hour)
 	f.addReviewer(label, "w1:p5")
-	f.hub.composer = map[string]any{"outcome": "read", "composer": "has_text"}
 	for range 3 {
 		f.clock = f.clock.Add(25 * time.Minute)
 		if err := f.reap(t, 0, Options{}); err != nil {
@@ -155,7 +157,7 @@ func TestReapReviewerFinal_E_SamePendingOutcomeIsOneRow(t *testing.T) {
 		}
 	}
 	rows := f.rows(t)
-	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "composer-text" || len(f.audits(t)) != 1 || f.printed() != 1 {
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" || len(f.audits(t)) != 1 || f.printed() != 1 {
 		t.Fatalf("rows %v audits %d printed %d", rowSummary(rows), len(f.audits(t)), f.printed())
 	}
 }

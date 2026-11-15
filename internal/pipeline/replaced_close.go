@@ -43,12 +43,12 @@ func (s *Service) replacedClosePath(repo string, pr int, label string) string {
 	return filepath.Join(s.state(repo), "replaced-closes", fmt.Sprintf("%d-%s.json", pr, label))
 }
 
-// closeReplaced closes a replaced reviewer's job as abandoned and force-closes
-// its pane in the same step, whatever the cause that replaced it. A close that
-// does not land stays owed in a marker for the next review run of the PR. A
-// terminal job (completed, escalated, lost) holds no hub claim, so only its
-// pane is owed. hk has no abandoned state: after the close the record reads
-// spawned until panewire's sweep ends the job, then lost.
+// closeReplaced closes a replaced reviewer's job as abandoned in the same step,
+// whatever the cause that replaced it. The pane is never closed here: it stays
+// owed in a marker until panewire's node closes it. A terminal job (completed,
+// escalated, lost) holds no hub claim, so nothing is owed for it. hk has no
+// abandoned state: after the close the record reads spawned until panewire's
+// sweep ends the job, then lost.
 func (x *panewireExecutor) closeReplaced(ctx context.Context, rj reviewerJob, job integrations.JobRecord, reason string) (replacedResult, error) {
 	m := replacedClose{
 		PR: x.pr.Number, Pass: rj.Pass, Label: rj.Label, Head: rj.Head, Reason: reason,

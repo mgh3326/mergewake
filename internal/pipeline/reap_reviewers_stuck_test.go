@@ -83,60 +83,18 @@ func spawnedStuckFix(t *testing.T) *stuckFix {
 	return f
 }
 
-// (a) A finished omp reviewer pane whose composer cannot be read and whose job
-// record does not say the job ended closes once it has sat idle that way for
-// two hours, not before.
-func TestReapReviewerUnreadableComposerClosesAfterTwoHours(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		status string
-		wait   time.Duration
-		closes int
-		reason string
-	}{
-		{"done 30 min", "done", 30 * time.Minute, 0, "composer-unknown"},
-		{"idle 30 min", "idle", 30 * time.Minute, 0, "composer-unknown"},
-		{"done 3 h", "done", 3 * time.Hour, 1, ""},
-		{"idle 3 h", "idle", 3 * time.Hour, 1, ""},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			f := spawnedStuckFix(t)
-			f.setPane("w1:p5", "agent_status", tt.status)
-			f.passAfter(t, 0)
-			if f.closes() != 0 {
-				t.Fatal("closed on first sight")
-			}
-			f.passAfter(t, tt.wait)
-			if f.closes() != tt.closes {
-				t.Fatalf("closes=%d, want %d: %v", f.closes(), tt.closes, rowSummary(f.rows(t)))
-			}
-			rows := f.rows(t)
-			last := rows[len(rows)-1]
-			switch {
-			case tt.closes == 1 && (last.Result != "removed" && last.Result != "closed"):
-				t.Fatalf("rows: %v", rowSummary(rows))
-			case tt.closes == 0 && (last.Result != "kept" || last.Reason != tt.reason):
-				t.Fatalf("rows: %v", rowSummary(rows))
-			}
-		})
-	}
-}
-
-// A pane that worked in between starts the two hours again.
-func TestReapReviewerUnreadableComposerClockRestartsWhenPaneWorks(t *testing.T) {
-	f := spawnedStuckFix(t)
+// (a) A finished omp reviewer pane whose composer cannot be read is never read
+// at all: the sweep keeps it for panewire's node to close, however long it
+// sits idle.
+func TestReapReviewerUnreadableComposerKeepsPaneForNode(t *testing.T) {
+	f := newStuckFix(t)
+	f.addReviewer(f.label, "w1:p5")
+	f.setPane("w1:p5", "agent_status", "done")
 	f.passAfter(t, 0)
-	f.setPane("w1:p5", "agent_status", "working")
-	f.passAfter(t, 90*time.Minute)
-	f.setPane("w1:p5", "agent_status", "idle")
-	f.passAfter(t, 100*time.Minute)
-	f.passAfter(t, 3*time.Hour) // 80 min after the idle sighting
-	if f.closes() != 0 {
-		t.Fatalf("closed before two idle hours: %v", rowSummary(f.rows(t)))
-	}
-	f.passAfter(t, 100*time.Minute+2*time.Hour)
-	if f.closes() != 1 {
-		t.Fatalf("closes=%d: %v", f.closes(), rowSummary(f.rows(t)))
+	f.passAfter(t, 3*time.Hour)
+	rows := f.rows(t)
+	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
+		t.Fatalf("closes=%d rows: %v", f.closes(), rowSummary(rows))
 	}
 }
 
@@ -150,13 +108,12 @@ func TestReapReviewerUnreadableComposerKeepsWorkerPane(t *testing.T) {
 	f.passAfter(t, 3*time.Hour)
 	f.passAfter(t, 30*time.Hour)
 	rows := f.rows(t)
-	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "composer-unknown" {
+	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 		t.Fatalf("closes=%d rows: %v", f.closes(), rowSummary(rows))
 	}
 }
 
-// (c) A focused reviewer pane stays, and a failed composer read never counts
-// as an unreadable one.
+// (c) A focused reviewer pane stays: its worktree waits for panewire's node.
 func TestReapReviewerUnreadableComposerKeepsFocusedPane(t *testing.T) {
 	f := newStuckFix(t)
 	f.addReviewer(f.label, "w1:p5")
@@ -165,7 +122,7 @@ func TestReapReviewerUnreadableComposerKeepsFocusedPane(t *testing.T) {
 	f.passAfter(t, 0)
 	f.passAfter(t, 3*time.Hour)
 	rows := f.rows(t)
-	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "operator-owned" {
+	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 		t.Fatalf("closes=%d rows: %v", f.closes(), rowSummary(rows))
 	}
 }
@@ -218,7 +175,7 @@ func TestReapReviewerAbandonsSpawnedJob(t *testing.T) {
 			if len(closes) != 1 || strings.Join(closes[0], " ") != strings.Join(want, " ") {
 				t.Fatalf("job closes=%v, want %v", closes, want)
 			}
-			if len(rows) < 2 || rows[0].Result != "abandoned" || rows[0].Reason != tt.abandon || rows[1].Result != "closed" || len(f.hub.ops("pane.close")) != 1 {
+			if len(rows) < 2 || rows[0].Result != "abandoned" || rows[0].Reason != tt.abandon || rows[1].Result != "kept" || rows[1].Reason != "pane-in-use" || len(f.hub.ops("pane.close")) != 0 {
 				t.Fatalf("rows: %v", rowSummary(rows))
 			}
 		})
@@ -262,8 +219,8 @@ func TestReapReviewerAbandonNeedsFinishedPaneAndActing(t *testing.T) {
 	}
 }
 
-// An abandoned job whose pane stays (its composer is unreadable) is not
-// closed a second time, and the pane is reaped on a later pass.
+// An abandoned job whose pane stays is not closed a second time: the job close
+// ran once, the pane waits for panewire's node, and no pane close ever runs.
 func TestReapReviewerAbandonedJobPaneIsReapedLater(t *testing.T) {
 	f := newStuckFix(t)
 	merged := "2026-11-04T10:00:00Z"
@@ -277,10 +234,15 @@ func TestReapReviewerAbandonedJobPaneIsReapedLater(t *testing.T) {
 	if n := len(f.jobCloses()); n != 1 || f.closes() != 0 {
 		t.Fatalf("job closes=%d pane closes=%d: %v", n, f.closes(), rowSummary(f.rows(t)))
 	}
-	// hk now reports the closed job in a state the sweep does not treat as completed.
+	// hk now reports the closed job lost: still no pane close, still one job
+	// close, and the pane-in-use row is not rewritten.
 	f.setJob(func(j *integrations.JobRecord) { j.State = "lost" })
 	f.passAfter(t, 3*time.Hour)
-	if n := len(f.jobCloses()); n != 1 || f.closes() != 1 {
+	if n := len(f.jobCloses()); n != 1 || f.closes() != 0 {
 		t.Fatalf("job closes=%d pane closes=%d: %v", n, f.closes(), rowSummary(f.rows(t)))
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[0].Result != "abandoned" || rows[1].Result != "kept" || rows[1].Reason != "pane-in-use" {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }

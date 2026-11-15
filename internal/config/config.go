@@ -284,7 +284,6 @@ type Reap struct {
 	Act           bool     `yaml:"act"`
 	WorktreeAfter string   `yaml:"worktree_after"`
 	ScanAfter     string   `yaml:"scan_after"`
-	Protect       []string `yaml:"protect"`
 	Regenerable   []string `yaml:"regenerable"`
 	// Transport reaches remote hosts: panewire (the hub's node commands) or
 	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
@@ -329,11 +328,6 @@ var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
 // ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
 // output limit, since each text file is read back through it.
 const ArchiveTextCap = 3 << 20
-
-// DefaultReapProtect names resident and desk panes that reap never closes. A
-// configured reap.protect list replaces this list; unnamed panes and panes
-// outside a linked worktree are always protected regardless of the list.
-var DefaultReapProtect = []string{"*-integrator", "director-*", "fleet-tooling-*", "consult-*", "cmd"}
 
 // DefaultReapRegenerable names gitignored paths whose loss is acceptable
 // because they rebuild on demand: language caches, build output, vendored
@@ -633,14 +627,6 @@ func validateReap(c *Config) error {
 	}
 	if _, e = Duration(c.Reap.ScanAfter); e != nil {
 		return e
-	}
-	if len(c.Reap.Protect) == 0 {
-		c.Reap.Protect = DefaultReapProtect
-	}
-	for _, g := range c.Reap.Protect {
-		if _, e = policy.Match(g, "probe"); e != nil {
-			return e
-		}
 	}
 	if len(c.Reap.Regenerable) == 0 {
 		c.Reap.Regenerable = DefaultReapRegenerable

@@ -642,8 +642,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			return skipWith(gitStderrDetail(e), "checkout PR head %s: %v", short7(pr.Head.SHA), e)
 		}
 	}
-	// A local pane runs in this checkout: closeReviewerPane keeps it until the
-	// pane is closed or gone. A resumed job's pane may still run in it.
+	// A local pane runs in this checkout: the cleanup keeps the checkout until
+	// the pane is gone. A resumed job's pane may still run in it.
 	keepCheckout := resumed
 	defer func() {
 		if !keepCheckout {
@@ -1026,16 +1026,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	// The spawn returned, so its wait finished, or a resumed job had already
 	// finished. Every outcome from here is terminal for this pass, and the
-	// pane is closed after it is recorded. A timed-out wait returned above and
-	// never reaches this defer, because the pane may still be working. A
-	// resumed job read without a spawn has no confirmed placement, so its pane
-	// and checkout stay with a pending-cleanup receipt.
+	// checkout is released once the pane is gone. A timed-out wait returned
+	// above and never reaches this defer, because the pane may still be
+	// working. A resumed job read without a spawn has no confirmed placement,
+	// so its pane and checkout stay with a pending-cleanup receipt.
 	keepCheckout = false
 	placement, confirmed := spawnPlacement(string(stdout))
 	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
-	closePane := true
+	cleanupPane := true
 	defer func() {
-		if closePane {
+		if cleanupPane {
 			x.closeReviewerPane(ctx, pane)
 		}
 	}()
@@ -1070,7 +1070,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	case res.result != nil:
 		b = res.result
 	case quota && replacement != "":
-		keepJob, keepCheckout, closePane = true, true, false
+		keepJob, keepCheckout, cleanupPane = true, true, false
 		next, err := x.job(ctx, replacement)
 		if err != nil {
 			if revisit != nil {

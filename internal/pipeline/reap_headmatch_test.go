@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
-	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // The worktree heads these tests put on the merged PR's branch. headSHA, the
@@ -128,38 +126,82 @@ func requireNothing(t *testing.T, s *Service, run *scriptRunner) {
 }
 
 // (a) On the PR head the worktree is the PR's own, and no compare is asked.
+// While its pane lists, removal waits as pane-in-use; once panewire's node
+// closes the pane, the shadow plan names the removal.
 func TestReapAncestorExactHeadNeedsNoCompare(t *testing.T) {
-	s, gh, _ := ancestryService(t, headSHA, nil)
+	s, gh, run := ancestryService(t, headSHA, nil)
+	agents, panes := run.outs[key("herdr", "agent", "list")], run.outs[key("herdr", "pane", "list")]
+	emptyPanes := `{"result":{"panes":[]}}`
+	run.queue = map[string][]string{
+		key("herdr", "agent", "list"): {agents, agents},
+		key("herdr", "pane", "list"):  {panes, emptyPanes, emptyPanes},
+	}
 	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
 	if len(gh.calls) != 0 {
 		t.Fatalf("compares %v", gh.calls)
 	}
-	requireRows(t, s, "close-pane/would-close", "remove-worktree/would-remove", "delete-branch/would-delete")
+	requireRows(t, s, "remove-worktree/skipped")
+	if row := leadRow(t, s, "close-pane"); row != nil {
+		t.Fatalf("close-pane row written: %v", row)
+	}
+	if run.called("pane\x00close") {
+		t.Fatalf("pane closed: %q", run.calls)
+	}
+	// The pane is gone from the pane list: the shadow plan names the removal
+	// with no compare.
+	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 0 {
+		t.Fatalf("compares %v", gh.calls)
+	}
+	requireRows(t, s, "remove-worktree/would-remove", "delete-branch/would-delete")
 }
 
 // (b) Two commits behind the merged head: an ancestor, so every commit in the
-// worktree is in the merged PR. It is the PR's own and is closed and removed
-// like an exact match, after one compare.
+// worktree is in the merged PR. It is the PR's own and is removed like an
+// exact match, after one compare per pass. Nothing closes the pane.
 func TestReapAncestorBehindHeadQualifies(t *testing.T) {
 	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
 	for name, o := range map[string]Options{"shadow": {Shadow: true}, "apply": {}} {
 		t.Run(name, func(t *testing.T) {
 			s, gh, run := ancestryService(t, behindHead, table)
+			agents, panes := run.outs[key("herdr", "agent", "list")], run.outs[key("herdr", "pane", "list")]
+			emptyPanes := `{"result":{"panes":[]}}`
+			run.queue = map[string][]string{
+				key("herdr", "agent", "list"): {agents, agents},
+				key("herdr", "pane", "list"):  {panes, emptyPanes, emptyPanes},
+			}
 			if err := s.Reap(context.Background(), testRepo, 0, o); err != nil {
 				t.Fatal(err)
 			}
 			if len(gh.calls) != 1 || gh.calls[0] != [2]string{behindHead, headSHA} {
 				t.Fatalf("compares %v", gh.calls)
 			}
-			if name == "shadow" {
-				requireRows(t, s, "close-pane/would-close", "remove-worktree/would-remove", "delete-branch/would-delete")
-				return
+			requireRows(t, s, "remove-worktree/skipped")
+			// The pane is gone from the pane list: the worktree goes, after
+			// one compare per pass.
+			if err := s.Reap(context.Background(), testRepo, 0, o); err != nil {
+				t.Fatal(err)
 			}
-			requireRows(t, s, "close-pane/closed", "remove-worktree/removed", "delete-branch/deleted")
-			if !run.called("worktree\x00remove\x00/repo.wt") {
-				t.Fatalf("calls %q", run.calls)
+			if len(gh.calls) != 2 || gh.calls[1] != [2]string{behindHead, headSHA} {
+				t.Fatalf("compares %v", gh.calls)
+			}
+			if name == "shadow" {
+				requireRows(t, s, "remove-worktree/would-remove", "delete-branch/would-delete")
+			} else {
+				requireRows(t, s, "remove-worktree/removed", "delete-branch/deleted")
+				if !run.called("worktree\x00remove\x00/repo.wt") {
+					t.Fatalf("calls %q", run.calls)
+				}
+			}
+			if row := leadRow(t, s, "close-pane"); row != nil {
+				t.Fatalf("close-pane row written: %v", row)
+			}
+			if run.called("pane\x00close") {
+				t.Fatalf("pane closed: %q", run.calls)
 			}
 		})
 	}
@@ -193,8 +235,8 @@ func TestReapAncestorDivergedHeadDoesNotQualify(t *testing.T) {
 	requireNothing(t, s, run)
 }
 
-// (e) Qualifying by ancestry does not lift the dirty guard: the pane closes, the
-// worktree is refused as dirty and is never removed.
+// (e) Qualifying by ancestry does not lift the dirty guard: the worktree is
+// refused as dirty and is never removed. Nothing closes the pane either.
 func TestReapAncestorDirtyWorktreeKeptByGuard(t *testing.T) {
 	table := map[[2]string]compareReply{{behindHead, headSHA}: {status: "ahead", base: behindHead}}
 	s, gh, run := ancestryService(t, behindHead, table)
@@ -205,7 +247,7 @@ func TestReapAncestorDirtyWorktreeKeptByGuard(t *testing.T) {
 	if len(gh.calls) != 1 {
 		t.Fatalf("compares %v", gh.calls)
 	}
-	requireRows(t, s, "close-pane/closed", "remove-worktree/skipped")
+	requireRows(t, s, "remove-worktree/skipped")
 	reason := ""
 	for _, row := range reapLogRows(t, s, testRepo.Name) {
 		if row["action"] == "remove-worktree" {
@@ -217,6 +259,9 @@ func TestReapAncestorDirtyWorktreeKeptByGuard(t *testing.T) {
 	}
 	if run.called("worktree\x00remove") || run.called("branch\x00-d") {
 		t.Fatalf("dirty worktree removed: %q", run.calls)
+	}
+	if row := leadRow(t, s, "close-pane"); row != nil {
+		t.Fatalf("close-pane row written: %v", row)
 	}
 }
 
@@ -250,26 +295,9 @@ func TestReapAncestryReadOncePerPass(t *testing.T) {
 	}
 }
 
-// The job path records the worktree of a lead sitting on an ancestor of the
-// merged head, which later cleanup reads.
-func TestReapJobBoundCloseRowNamesAncestorWorktree(t *testing.T) {
-	s, _, _, run := leadFixture(t, leadPane(""))
-	table := map[[2]string]compareReply{{behindHead, leadPR.Head.SHA}: {status: "ahead", base: behindHead}}
-	s.GH = &compareGH{GitHub: s.GH, client: compareClient(t, table)}
-	run.outs[key("git", "-C", "/other.wt", "branch", "--show-current")] = "wk/lead\n"
-	run.outs[key("git", "-C", "/other.wt", "rev-parse", "HEAD")] = behindHead + "\n"
-	run.outs[key("git", "-C", "/other.wt", "remote", "get-url", "origin")] = "git@github.com:example/project.git\n"
-	if err := s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
-		t.Fatal(err)
-	}
-	row := leadRow(t, s, "close-pane")
-	if row == nil || row["result"] != "would-close" || row["worktree"] != "/other.wt" || row["branch"] != "wk/lead" {
-		t.Fatalf("close row: %v", reapLogRows(t, s, "example/project"))
-	}
-}
-
 // The hub's worktree.remove is told the checkout it will remove, which is the
-// ancestor head, not the PR head it no longer equals.
+// ancestor head, not the PR head it no longer equals. The pane still listed
+// waits first; once panewire's node closes it, the removal runs.
 func TestReapPanewireRemovesAncestorWorktree(t *testing.T) {
 	hub := newFakeReapHub()
 	hub.wtHead = behindHead
@@ -279,159 +307,25 @@ func TestReapPanewireRemovesAncestorWorktree(t *testing.T) {
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
+	if len(hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("removed with the pane still listed: %v", hub.ops("worktree.remove"))
+	}
+	hub.agents["agents"], hub.agents["panes"] = []any{}, []any{}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
 	removes := hub.ops("worktree.remove")
 	if len(removes) != 1 || removes[0]["expect_head"] != behindHead {
 		t.Fatalf("remove args: %#v rows: %v", removes, reapLogRows(t, s, testRepo.Name))
 	}
 }
 
-// (f) A bound job with no pane wearing its label on its host leaves one row
-// naming why; the same outcome on the next pass writes nothing.
-func TestReapRecordsBoundJobWithoutPane(t *testing.T) {
-	s, _, _, run := leadFixture(t, leadPane(""))
-	run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
-	run.outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
-	for pass := 1; pass <= 2; pass++ {
-		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-			t.Fatal(err)
-		}
-		var rows []map[string]any
-		for _, row := range reapLogRows(t, s, "example/project") {
-			if row["reason"] == "job-pane-missing" {
-				rows = append(rows, row)
-			}
-		}
-		if len(rows) != 1 {
-			t.Fatalf("pass %d: %d job-pane-missing rows: %v", pass, len(rows), reapLogRows(t, s, "example/project"))
-		}
-		row := rows[0]
-		if row["action"] != "close-pane" || row["result"] != "skipped" || row["task"] != "2497" || row["job"] != "lead-a" || row["host"] != "local" || row["pr"] != float64(12) {
-			t.Fatalf("row %v", row)
-		}
-	}
-	if run.called("pane\x00close") || run.called("panewire") {
-		t.Fatalf("acted: %q", run.calls)
-	}
-}
-
-// A host whose panes could not be read says nothing about the label.
-func TestReapBoundJobOnUnreadableHostWritesNoMissingRow(t *testing.T) {
+// A host whose panes could not be read fails the pass with no rows about it.
+func TestReapBoundJobOnUnreadableHostReportsError(t *testing.T) {
 	s, _, _, run := leadFixture(t, leadPane(""))
 	delete(run.outs, key("herdr", "agent", "list"))
 	err := s.Reap(context.Background(), testRepo, 0, Options{})
 	if err == nil {
 		t.Fatal("unreadable host not reported")
 	}
-	if _, e := os.Stat(s.reapLog("example/project")); e == nil {
-		for _, row := range reapLogRows(t, s, "example/project") {
-			if row["reason"] == "job-pane-missing" {
-				t.Fatalf("row %v", row)
-			}
-		}
-	}
-}
-
-// (g) A close whose done failed still gets its done once the pane is gone, and
-// a pane gone because reap closed it is never reported missing, before or
-// after the done.
-func TestReapClosedJobIsNotMissing(t *testing.T) {
-	s, _, _, run := leadFixture(t, leadPane(""))
-	doneKey := key("panewire", "done", "lead-a", "--report", "/jobs/lead-a/pane-screen.txt")
-	run.errs = map[string]error{doneKey: errors.New("hk unreachable")}
-	agents := run.outs[key("herdr", "agent", "list")]
-	run.queue = map[string][]string{key("herdr", "agent", "list"): {agents, agents, `{"result":{"agents":[]}}`}}
-	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err == nil || !strings.Contains(err.Error(), "hk unreachable") {
-		t.Fatalf("err=%v", err)
-	}
-	delete(run.errs, doneKey)
-	run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
-	for pass := 0; pass < 2; pass++ {
-		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if row := leadRow(t, s, "job-done"); row["result"] != "done" {
-		t.Fatalf("job-done row %v", row)
-	}
-	if n := callCount(run, doneKey); n != 2 {
-		t.Fatalf("done called %d times", n)
-	}
-	for _, row := range reapLogRows(t, s, "example/project") {
-		if row["reason"] == "job-pane-missing" {
-			t.Fatalf("closed job reported missing: %v", row)
-		}
-	}
-}
-
-// The job path's pane guards keep their reasons: the status, jobs-dir, job
-// name and pane id checks that the other job tests do not name.
-func TestReapJobPathKeepsPaneGuards(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		pane   string
-		setup  func(*Service, *jobSink)
-		reason string
-	}{
-		{"working", strings.Replace(leadPane(""), `"idle"`, `"working"`, 1), nil, "status:working"},
-		{"no pane id", strings.Replace(leadPane(""), `"pane_id":"w2:p1"`, `"pane_id":""`, 1), nil, "pane-id-missing"},
-		{"jobs dir unset", leadPane(""), func(s *Service, _ *jobSink) { s.Config.Hosts[0].Jobs = "" }, "jobs-dir-unset"},
-		{"job name invalid", leadPane(""), func(_ *Service, sink *jobSink) {
-			sink.jobs["2497"] = "lead a"
-			sink.recs["lead a"] = sink.recs["lead-a"]
-		}, "job-name-invalid"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _, sink, run := leadFixture(t, tc.pane)
-			if tc.setup != nil {
-				tc.setup(s, sink)
-			}
-			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if run.called("pane\x00close") || run.called("panewire") {
-				t.Fatalf("closed: %q", run.calls)
-			}
-			if row := leadRow(t, s, "close-pane"); row == nil || row["result"] != "skipped" || row["reason"] != tc.reason {
-				t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
-			}
-		})
-	}
-}
-
-// A second host that also answers to the job's recorded host and cannot be
-// read: the pane found on the readable host is still closed there, and when
-// no pane is found nothing is reported missing, because the unread host may
-// hold it.
-func TestReapJobPaneWithUnreadableSiblingHost(t *testing.T) {
-	sibling := func(s *Service) {
-		s.Config.Hosts = append(s.Config.Hosts, reapHostSibling())
-	}
-	t.Run("pane found keeps its host", func(t *testing.T) {
-		s, _, _, run := leadFixture(t, leadPane(""))
-		sibling(s)
-		_ = s.Reap(context.Background(), testRepo, 0, Options{Shadow: true})
-		row := leadRow(t, s, "close-pane")
-		if row == nil || row["result"] != "would-close" || row["host"] != "local" {
-			t.Fatalf("row %v", row)
-		}
-		_ = run
-	})
-	t.Run("no pane and sibling unread", func(t *testing.T) {
-		s, _, _, run := leadFixture(t, leadPane(""))
-		sibling(s)
-		run.outs[key("herdr", "agent", "list")] = `{"result":{"agents":[]}}`
-		run.outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
-		_ = s.Reap(context.Background(), testRepo, 0, Options{})
-		if _, err := os.Stat(s.reapLog("example/project")); err == nil {
-			for _, row := range reapLogRows(t, s, "example/project") {
-				if row["reason"] == "job-pane-missing" {
-					t.Fatalf("row %v", row)
-				}
-			}
-		}
-	})
-}
-
-func reapHostSibling() reap.Host {
-	return reap.Host{Name: "remote", SSH: "ops@unreachable.example", Machine: "local"}
 }

@@ -52,8 +52,8 @@ Session hosts where agent panes may run, used only by `reap`.
 | --- | --- | --- |
 | `name` | Required | Unique label for receipts; same alphabet as `host`. |
 | `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
-| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (panewire's `HUB_MACHINE_ID`), so name a local host after its machine id; otherwise its leads are skipped as `job-host-unconfigured`. |
-| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Needed before any pane on a local or ssh host can be closed: a pane is skipped with `jobs-dir-unset` without it. Leading `~/` expands for local hosts only; ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
+| `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead's worktree is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (panewire's `HUB_MACHINE_ID`), so name a local host after its machine id. |
+| `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Reap's archive stage enumerates and archives these dirs; leading `~/` expands for local hosts only, ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
 
 ### `reap`
 
@@ -63,7 +63,6 @@ Session hosts where agent panes may run, used only by `reap`.
 | `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
 | `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
 | `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
-| `protect` | `*-integrator`, `director-*`, `fleet-tooling-*`, `consult-*`, `cmd` | Pane-name globs that are never closed. A non-empty configured list replaces the defaults. Unnamed panes and panes outside a linked worktree are always protected. |
 | `transport` | `panewire` when `hub.url` is set, else `ssh` | How remote hosts are reached: `panewire` sends every remote operation through the hub's node commands; `ssh` runs `herdr`/`git` over `ssh(1)`. Local hosts always run locally. |
 | `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
 | `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 env file of a scoped hub service credential: `HUB_MACHINE_ID=svc-mergewake` and its `HUB_TOKEN` (see "Hub credential" below). A file whose `HUB_MACHINE_ID` is `operator`, or that has none, is refused when the config loads and again when each pass reads it; a file other users can read is refused. |
@@ -108,9 +107,17 @@ counted. Only panewire-hub hosts can be swept. The daemon's reap ignores
 `legacy-sweep` rows.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
-daemon role close merged-PR sessions, then clean their worktrees once they
-age out. For each merged PR on a configured repo's base branch, every host is
-scanned with `herdr agent list` — remote hosts through the panewire hub (one
+daemon role clean up merged-PR worktrees once they age out. Reap never closes
+a pane: panewire's node closes an ended job's pane on pane-id + harness-session
+proof (reviewer and consult jobs at completion or loss, implementer jobs when
+the task is merged, deployed, dropped or handed over, `keep=true` panes 24 h
+after completion), so a worktree still in use simply waits as `pane-in-use`
+until that close lands. On deploy, panes of ended jobs close within an hour
+via panewire; rpi is offline and still runs an older panewire without the
+node close, so its panes wait for hk 4716.
+
+For each merged PR on a configured repo's base branch, every host is scanned
+with `herdr agent list` — remote hosts through the panewire hub (one
 `GET /v1/nodes/agents` per pass, see "Panewire transport" below) or, under
 the ssh transport, over `ssh <ssh> herdr agent list`. A pane matches only when its `cwd` is a linked git worktree, its
 current branch equals the PR head branch, its checked-out commit equals the
@@ -121,72 +128,22 @@ whose tip moved on does not match.
 The head commit is read once per PR per daemon process, shared with the task
 lookup below; a worktree that matches the head exactly costs no extra call.
 
-Before a matching pane is closed it must be reported as `idle` or `done` —
-an allowlist; `working`, `blocked`, `waiting`, empty and unknown states all
-keep the pane — and `<jobs>/<name>` must already exist, which is what proves
-the fleet spawned the pane: a named operator pane merely cd'd into a merged
-worktree is skipped as `not-a-job`. The pane's output must then be captured:
-an existing `<jobs>/<name>/report.md` wins only when it is newer than the
-merge — a stale file could belong to a reused job name — otherwise the pane's
-last screen is saved to `<jobs>/<name>/pane-screen.txt` first. The saved path
-is recorded in the receipt. Immediately before `herdr pane close <pane_id>` the agent list
-is re-read and the pane must still be present with the same id, status, cwd
-and name; a pane that changed or went back to work is skipped as
-`pane-changed` or `pane-gone`. Closing happens only in acting mode.
-Two more guards apply to every close: a pane herdr reports `focused` is the
-operator's (`operator-owned`), and a pane whose input line holds text nobody
-sent is kept. The composer is read with `herdr pane read <id> --source
-visible` — claude's input line between its last two dividers, codex's `›`
-line — and anything else reads as `composer-unknown`, which also keeps the
-pane; a dim placeholder reads as text and keeps it too.
-
 #### Job-bound leads
 
 A merged PR whose body or head commit carries `Mergewake-Task: <id>` is
-reaped through its job instead of its worktree: the same binding the findings
+reaped through its job as well as its worktree: the same binding the findings
 router uses — hk task → bound job (`refs.job_id`) → the job record panewire
-wrote at spawn (`host`, `label`, `pane_id`). The pane is the one named after
-the label on the configured host whose `name` or `machine` equals the
-record's `host`. herdr pane ids are host-local, so no other host is searched:
-a record whose host is missing or not configured is `job-host-unconfigured`,
-and more than one match is `job-pane-ambiguous`. Its cwd does not matter, so a lead that launched in
-one repo's worktree and owns PRs across repos is still found. The binding is
-read once per merged PR per daemon process (a task with no job yet is asked
-again each pass). A PR without the trailer, or whose task has no bound job,
-keeps the worktree match above — the latter still behind the open-PR rule
-below; an hk read error closes nothing that pass.
-
-The lead closes only when the whole job is finished, checked in this order:
-
-1. idle or done, not protected, `<jobs>/<job>` resolvable (`jobs-dir-unset`,
-   `job-name-invalid`), a record that names its pane (`pane-id-unrecorded`),
-   not focused and that very pane (`operator-owned`);
-2. no open PR — against any base, in any configured repo, trailer in the body
-   or head commit — carries the task; otherwise `job_has_open_pr`, with the
-   open PRs (`owner/name#N`) in the row's `open`. A repo mergewake does not
-   configure is not seen;
-3. an empty composer (`composer-text`, `composer-unknown`);
-4. the job dir exists (`not-a-job`) and the output is saved first, by the
-   same capture rule as above, into the job's directory `<jobs>/<job id>`;
-5. the same re-read before `herdr pane close`.
-
-After the close, mergewake marks the job done the way the lead would:
-`panewire done <job> --report <saved>` on the job's host, a `job-done` row with
-`done` (`would-done` in shadow). A job hk already holds terminal is skipped as
-`already-<state>`. If the done fails, the next pass retries it once the pane
-is gone, until a `done` row or a terminal hk state ends it. When the job's host
-was read and no pane wears the job's label, and no earlier pass closed that
-job's pane, reap writes one `close-pane` row with `skipped` and the reason
-`job-pane-missing` (with `task`, `job` and `host`), so a task bound to a lost
-job leaves a trace; the same outcome on a later pass writes no new row. A host
-whose panes could not be read writes none. Each job is decided once per pass,
-on the first of its merged PRs. Job-bound rows carry `task` and `job`; they
-carry `cwd` and `worktree` only when the lead sits in that PR's own
-worktree, which worktree cleanup then picks up as before.
+wrote at spawn (`host`, `cwd`). The binding is read once per merged PR per
+daemon process (a task with no job yet is asked again each pass) and names a
+third worktree source beside live panes and prior `reap.jsonl` rows: the
+record's host (mapped to a configured host by `name` or `machine`) and cwd,
+which outlive any pane. A PR without the trailer, or whose task has no bound
+job, keeps the worktree match; an hk read error only loses that source
+that pass.
 
 Enabling reap (the desk): run `mergewake reap --repo <repo> --dry-run`
-once per configured repo and compare the planned `would-close` and
-`job_has_open_pr` rows with the panes you expect, then set `reap.act: true`.
+once per configured repo and compare the planned `would-remove` rows with the
+worktrees you expect, then set `reap.act: true`.
 Rollback: `reap.act: false`.
 
 After `worktree_after` with no revert, a merged PR's worktree is removed —
@@ -196,8 +153,8 @@ PR carries); a merged PR with nothing to reap produces no rows and no
 follow-up GitHub calls. The third source reads the record of the task's bound
 job — the binding the job path above already made, so no extra task read and no
 GitHub call — and takes its `host` and `cwd`, mapped to a configured host by
-name or machine id. It reaches a worktree whose pane closed before reap looked
-at it, or whose close row recorded no cwd; the `remove-worktree` row's `source`
+name or machine id. It reaches a worktree whose pane panewire's node closed
+before reap looked at it; the `remove-worktree` row's `source`
 says which of the three named it. Only the task's bound job is read: a
 hand-over's earlier attempts are not, so their worktrees still need a pane or a
 receipt. A record that cannot be read yields no candidate and is reported, and
@@ -225,8 +182,8 @@ be fully pushed upstream. Anything dirty, unknown or ambiguous is skipped with
 the reason recorded; removal is `git worktree remove` without `--force` and the
 local branch is deleted with `git branch -d`, never `-D`. The remote branch
 stays. Worktrees are found from the panes, from prior `reap.jsonl` rows and from
-the job record of the PR's task, so a worktree whose pane already closed still
-gets cleaned.
+the job record of the PR's task, so a worktree whose pane panewire already
+closed still gets cleaned.
 
 #### Panewire transport
 
@@ -241,27 +198,18 @@ on a host that also has `ssh`. Each remote host maps to panewire machine
   as a host with no panes;
 - worktree matching uses `worktree.inspect`, which returns the same branch,
   head and origin the ssh path reads with git;
-- capture uses `pane.capture` with the merge time and, only in acting mode,
-  `write: true`: the node applies the same job-directory, fresh-`report.md`
-  and `pane-screen.txt` rules against its own jobs inbox, and the receipt's
-  `saved` is the node's path;
-- the close uses `pane.close` with the discovered id, name, status and cwd;
-  the node re-reads herdr and closes only an exact match, answering
-  `pane-changed` or `pane-gone` otherwise, which become the same receipt
-  reasons as the ssh path;
-- composer checks use identity-checked `pane.read`; only recognized `empty`
-  permits closing, and hub errors or unknown composers keep the pane;
-- after closing a job pane, `job.done` runs the guarded host-local completion
-  command using the report saved by capture.
+- pane presence uses identity-checked `pane.read` and the agent list, read-only:
+  reap never captures a screen, never checks a composer and never closes a
+  pane — panewire's node closes an ended job's pane itself;
+- the hub host's aged-out worktree is removed through node command
+  `worktree.remove`, with the inspected PR head, base branch and configured
+  `reap.regenerable` list. Its refusal outcomes become the same receipt reasons
+  as the ssh path (`dirty`, `pane-in-use`, `unmerged-or-unpushed`, etc.);
+  ignored paths retain the `ignored-files:<count-hash>` reason and `files` list.
+  An unrecognized node outcome is skipped as `cleanup-unknown:<outcome>`.
+  Shadow mode records `would-remove` without calling the removal command.
 
-The hub host's aged-out worktree is removed through node command
-`worktree.remove`, with the inspected PR head, base branch and configured
-`reap.regenerable` list. Its refusal outcomes become the same receipt reasons
-as the ssh path (`dirty`, `pane-in-use`, `unmerged-or-unpushed`, etc.);
-ignored paths retain the `ignored-files:<count-hash>` reason and `files` list.
-An unrecognized node outcome is skipped as `cleanup-unknown:<outcome>`.
-Shadow mode records `would-remove` without calling the removal command. The
-hub path never falls back to ssh. Hosts with
+The hub path never falls back to ssh. Hosts with
 empty `ssh` and no `machine` keep running every step locally.
 
 ##### Hub credential
@@ -273,7 +221,7 @@ never with the operator token (panewire `docs/hub-scopes.md`). It sends
 machine (operator decision D1):
 
 ```sh
-HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*,node.command:pane.capture@*,node.command:pane.read@*,node.command:job.done@*,node.command:pane.close@*
+HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.command:worktree.inspect@*,node.command:worktree.remove@*
 ```
 
 | Scope | Reap uses it for |
@@ -282,10 +230,12 @@ HUB_SCOPES_svc-mergewake=nodes.agents.read,node.command:agents.list@*,node.comma
 | `node.command:agents.list@*` | not sent by reap today (discovery uses the fleet-wide list); granted with D1 for a per-machine re-read |
 | `node.command:worktree.inspect@*` | worktree matching and the aged-out worktree check |
 | `node.command:worktree.remove@*` | guarded cleanup of merged PR worktrees |
-| `node.command:pane.read@*` | identity-checked visible composer classification before a close |
-| `node.command:job.done@*` | host-local guarded `panewire done` after closing a job pane |
-| `node.command:pane.capture@*` | saving the report or screen before a close |
-| `node.command:pane.close@*` | the exact-match close |
+
+Reap sends no other node command: it never captures a screen, never classifies
+a composer and never closes a pane. Panewire's node closes an ended job's pane
+itself, so no close scopes are needed. A credential minted before this change
+keeps working; the operator can drop the `pane.*` and `job.done` scopes at the
+next mint.
 
 The operator mints the credential on the hub with
 `deploy/hub-token-mint.sh` (panewire) and copies the client env file, mode
@@ -305,8 +255,7 @@ hosts:
 
 A hub answer of `401` (unknown credential) or `403` (`scope_forbidden`: the
 scopes do not cover the request) is a scope/auth error for that host. On
-discovery or `worktree.inspect` it fails the host for the pass; on a capture
-or close it is an `error` receipt for that pane. Either way the error reads
+discovery or `worktree.inspect` it fails the host for the pass. The error reads
 `hub scope/auth error ... for client svc-mergewake on <route>`, and a refused
 host is never read as a host with no panes.
 
@@ -330,7 +279,7 @@ A single PR's fetch failure never aborts the pass.
 | `archive_host` | Empty / `local` | Where `drive_dir` lives: empty or `local` is this machine, anything else a single `ssh(1)` destination reachable from this machine (options, whitespace and leading `-` are refused). |
 | `text_max_bytes` | `1048576` | Maximum size of `*.md` and `*.json` files inspected locally for hk guard patterns; at most 3 MiB. It does not control Drive copying. |
 | `drive_max_file_bytes` | `0` | Maximum size of one regular file copied to Drive. `0` disables the cap; a file larger than a positive cap is listed as oversized and is deleted with the job dir after a successful archive. Oversized files are not uploaded to hk. |
-| `min_age` | `24h` | How long after reap closed a job's pane its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
+| `min_age` | `24h` | How long after reap first sights an ended job whose pane is gone its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 | `max_jobs_per_run` | `0` | Maximum jobs selected for archive or resume by one `archive-jobs` run; `0` means no limit. Dry-run and shadow use the same cap and selection as apply. Oldest jobs are taken first and the summary reports eligible jobs left. |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
 
@@ -461,18 +410,27 @@ job host needs `find`, `chmod`, `stat`, `tar`, `xargs` and
 this machine `bash`. A job dir whose listing exceeds the 4 MiB command
 output limit fails and is kept.
 
-In the reap role the stage runs after the PR loop, from `reap.jsonl`: each
-job whose pane reap `closed` (the row's `job`, or the directory of its saved
-report for older rows) is archived once that close is older than `min_age`.
-It needs no GitHub call. Acting needs `reap.act` and `--apply` like every
-reap mutation; otherwise the plan — what moves to Drive, what goes to hk,
-what is excluded and what would be deleted — is printed as an
-`archive-plan` line with a `would-archive` row (shadow `would-close` rows are
-planned too, once per job in the daemon). A job whose name is again a live
-pane is skipped as `pane-live`. Each outcome is an `archive-job` row in
-`reap.jsonl` with the Drive directory, hk ids and excluded names; `archived`
-and every refusal other than `pane-live`/`pane-scan-failed` are final, and a
-failed attempt is retried at most once an hour.
+In the reap role the stage runs after the PR loop, over each reachable host's
+job dirs — it needs no GitHub call and no pane close. A job is eligible only
+when no pane uses it anymore (neither by name nor by cwd), its hk job record
+— when one can be read — is terminal (`completed`, `escalated` or `lost`),
+and its own events say it finished. The first pass that sees all three writes
+a sighting row (`skipped` `awaiting-min-age`); a later pass archives once that
+row is older than `min_age`, so the age counts from when reap first saw the
+gone state, not from any file time. Acting needs `reap.act` and `--apply`
+like every reap mutation; otherwise the plan — what moves to Drive, what goes
+to hk, what is excluded and what would be deleted — is printed as an
+`archive-plan` line with a `would-archive` row. A job whose name is a live
+pane again is skipped as `pane-live`, and an hk record that is still live as
+`job-active`; a job mid-run is `not-finished`. Each outcome is an
+`archive-job` row in `reap.jsonl` with the Drive directory, hk ids and
+excluded names; a new job dir under a reused name restarts every clock, since
+its files are newer than the earlier job's final row. `archived` and every
+refusal other than a live pane, a missing pane scan, an active or unfinished
+job, a `job-gone` race, or a fresh sighting are final, and a failed attempt is
+retried at most once an hour. A full (non-`--pr`) pass runs the stage; a
+`--pr` run scopes to one PR's cleanup and skips it. Old `close-pane` rows
+still load but no longer feed the stage.
 
 `mergewake archive-jobs [--older-than 14d] [--host NAME] [--dry-run|--apply]`
 runs the same plan and apply over a host's existing backlog: every job dir in
@@ -503,7 +461,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. mergewake never reads those findings from there: they come back on the job record, or from the host through `panewire node job-result` (step 5). |
-| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the reviewer pane is closed (only when its name, cwd and composer still match) and its remote detached worktree is removed through the hub's guarded removal; a refusal is recorded as `pending-cleanup`. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. A pane whose wait timed out is never closed here. Every later reap pass revisits a checkout still recorded as kept or `pending-cleanup` while no pane uses it: it is removed once its reviewer job is `completed`, `escalated` or `lost`, or once its label's spawn time is more than 24 hours back, and kept while the job is still open. A checkout older than 24 hours whose job record is missing is removed locally only; a remote checkout with no job record is not revisited. The record is `reap.jsonl`, so it survives a restart. Once per UTC day and host, a `reviewer-checkouts-daily` audit row in `decisions.jsonl` counts the checkouts removed and kept on the day before, with the kept reasons; it is written only when the reap acts (not in shadow or dry-run). |
+| `panewire.checkouts` | `<state_dir>/review-checkouts` | Parent of the detached PR-head worktrees created from the repo's `root`; panewire names the remote worktree after the checkout. After each terminal pass outcome, the pass leaves the reviewer pane for panewire's node to close and removes its remote detached worktree through the hub's guarded removal once the pane is gone; a refusal is recorded as `pending-cleanup`. A pane still present is recorded as `pending-cleanup` and the checkout is kept. Each cleanup writes a `reviewer-cleanup` row to `reap.jsonl` and to `decisions.jsonl`. Every later reap pass revisits a checkout still recorded as kept or `pending-cleanup` while no pane uses it: it is removed once its reviewer job is `completed`, `escalated` or `lost`, or once its label's spawn time is more than 24 hours back, and kept while the job is still open. A checkout older than 24 hours whose job record is missing is removed locally only; a remote checkout with no job record is not revisited. The record is `reap.jsonl`, so it survives a restart. Once per UTC day and host, a `reviewer-checkouts-daily` audit row in `decisions.jsonl` counts the checkouts removed and kept on the day before, with the kept reasons; it is written only when the reap acts (not in shadow or dry-run). |
 | `panewire.lane` | `panewire.owner` | Retired: findings are no longer read from a lane. The key is still accepted, so existing configs keep loading, and its value is still kept out of traces. mergewake lists and acknowledges no findings inbox, so findings events a pre-`--result` pane announced there stay as they are. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 | `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. A replay that panewire ends before any pane exists, with no hk job record for the label, is dead: mergewake writes a `reviewer-spawn-dead` audit row, drops the record and spawns a fresh reviewer under a new label, written as a `reviewer-spawn-replaced` row, in the same evaluation when time is left and otherwise on the next one. The held reservation and the quota waits (exits 74, 86, 87, 89) are not dead; their requests may still land. |
@@ -655,7 +613,7 @@ nudge. The receipt's
 `executor` is always `panewire`, and its `fallback` carries only the
 worker-seat note from step 3.
 
-A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned` and its pane force-closed in the same step, after the pane's last screen is captured, even when the pane's recheck would keep it. Only the pane id on that reviewer's own job record is closed. A job that already ended (`completed`, `escalated`, or `lost`) holds no hub claim, so it gets no job close and only its pane is closed. A job close that panewire refuses because the job already has a terminal record counts as closed; any other refusal stays owed. A failed close stays owed and is retried on each later review run of the PR until the job and pane are closed or gone.
+A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned`. Its pane is never closed here: panewire's node closes it, and the owed pane is settled once the pane is gone. A job that already ended (`completed`, `escalated`, or `lost`) holds no hub claim, so it gets no job close. A job close that panewire refuses because the job already has a terminal record counts as closed; any other refusal stays owed. A failed close stays owed and is retried on each later review run of the PR until the job is closed or gone.
 
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire
@@ -1545,7 +1503,7 @@ For `example/project`, state resides beneath
 | Path | Meaning |
 | --- | --- |
 | `decisions.jsonl` | Append-only observations/intent and completed recovery records. A planned action is not proof it completed. |
-| `reap.jsonl` | Append-only reap receipts: pane closes, worktree removals, branch deletions, skips and `would-*` plans, each with repo, PR, host and the saved report/screen path and job name; job-bound rows add `task` (and `open` for `job_has_open_pr`), and `job-done` rows record `panewire done`; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. |
+| `reap.jsonl` | Append-only reap receipts: worktree removals, branch deletions, reviewer-reap and reviewer-cleanup rows, skips and `would-*` plans, each with repo, PR, host and worktree; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. Old `close-pane` and `job-done` rows from before panewire's node took over pane closes still load but no new ones are written. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `recovery.json` | The red-main incident: when main first turned red, the culprit and green baseline, the 2/2 any-ref evidence, the fix window and the revert PR. Persisted, so a restart keeps the same window; deleted once main is green. |
@@ -2253,16 +2211,16 @@ A check run and a commit status with the same name combine as follows: a pending
 cancelled or skipped value yields to a green or red one. Two decisive values
 that disagree are an error.
 
-The hub reap transport reads composers with `pane.read`: only `empty` permits
-closing. `has_text` maps to `composer-text`; unknown, missing, changed/gone panes
-and hub errors keep the pane. Codex placeholder text remains nonempty unless the
-node can prove it is an accepted placeholder. After closure, `job.done` runs on
-the job host with the saved report path; only `done` and `already-done` succeed.
-The node-side `pane.close` rechecks the visible composer before and after its
-settle interval; text, an unreadable composer or an unknown composer keeps the
-pane even if its name, status and cwd did not change after capture.
-Grant both scopes before enabling this caller; older hubs fail safely and keep
-panes. The operator credential cannot substitute for these service-only ops.
+Panewire's node closes an ended job's pane itself and reads its composer with
+`pane.read` to do it: only `empty` permits closing. `has_text` maps to
+`composer-text`; unknown, missing, changed/gone panes and hub errors keep the
+pane. Codex placeholder text remains nonempty unless the node can prove it is
+an accepted placeholder. The node-side `pane.close` rechecks the visible
+composer before and after its settle interval; text, an unreadable composer or
+an unknown composer keeps the pane even if its name, status and cwd did not
+change. Mergewake never calls these: it only waits for the pane to be gone
+(`pane-in-use`) before cleaning the worktree, and for the gone state to age
+past `min_age` before archiving the job dir.
 
 
 Launcher cutover: set `review.executor: panewire`. Remove the former
