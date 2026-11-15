@@ -30,9 +30,9 @@ func hkClient() (client.Client, error) {
 	return client.Client{URL: c.base, Token: c.token, CFAccessClientID: c.cfID, CFAccessClientSecret: c.cfSecret, HTTP: c.client(hkClientTimeout)}, nil
 }
 
-// errTaskNotFound is hk's not_found answer for a task: the CLI's `tasks show`
+// ErrTaskNotFound is hk's not_found answer for a task: the CLI's `tasks show`
 // failed on it, and the sink keeps that an error.
-var errTaskNotFound = errors.New("handoffkeep task not_found")
+var ErrTaskNotFound = errors.New("handoffkeep task not_found")
 
 // taskClient validates a task ID and returns it with the hk client.
 func taskClient(task string) (client.Client, int64, error) {
@@ -44,14 +44,14 @@ func taskClient(task string) (client.Client, int64, error) {
 	return c, id, e
 }
 
-// getTask reads one task; an unknown task is errTaskNotFound.
+// getTask reads one task; an unknown task is ErrTaskNotFound.
 func getTask(ctx context.Context, c client.Client, id int64) (client.Task, error) {
 	x, found, e := c.GetTask(ctx, id)
 	if e != nil {
 		return client.Task{}, e
 	}
 	if !found {
-		return client.Task{}, fmt.Errorf("%w: %d", errTaskNotFound, id)
+		return client.Task{}, fmt.Errorf("%w: %d", ErrTaskNotFound, id)
 	}
 	return x, nil
 }

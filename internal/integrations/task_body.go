@@ -45,7 +45,7 @@ func (Handoffkeep) TaskBody(ctx context.Context, task string) (string, error) {
 				Error string `json:"error"`
 			}
 			if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&answer) == nil && answer.Error == "not_found" {
-				return "", fmt.Errorf("%w: %d", errTaskNotFound, id)
+				return "", fmt.Errorf("%w: %d", ErrTaskNotFound, id)
 			}
 		}
 		return "", errors.New("handoffkeep task unavailable")
