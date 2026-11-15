@@ -412,6 +412,10 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		}
 		reaped = true
 	}
+	// stuckEnded marks a stuck job whose pane is proven gone: it is treated
+	// as ended below, and its record is closed abandoned once every keep-gate
+	// has passed, just before the worktrees go.
+	stuckEnded := false
 	if stuck && !reaped {
 		switch {
 		case !unused:
@@ -425,15 +429,11 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 			// lists: same mark, same wait.
 			w.noteStuck(gate, l, job)
 			return
-		case !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l):
-			return
 		default:
-			// The job can never report: treat it as ended for the cleanup
-			// below, the same as a finished record.
-			reaped = true
+			stuckEnded = true
 		}
 	}
-	held := !reaped && !w.abandoned[l.name]
+	held := !reaped && !stuckEnded && !w.abandoned[l.name]
 	// A lost reviewer job cannot be holding anyone's work either: its pane is
 	// left for panewire's node to close. Only reviewer jobs get this; a lost
 	// worker or implementer keeps its hold.
@@ -493,6 +493,9 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		// A pane still around names the worktree it uses; the pane-in-use
 		// guards below keep it until panewire's node closes the pane.
 		cwd = c.pane.Cwd
+	}
+	if stuckEnded && !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l) {
+		return
 	}
 	if hs != nil {
 		// L1: an unknown remote path is recorded as pending-cleanup and does not
