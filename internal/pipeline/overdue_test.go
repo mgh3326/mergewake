@@ -597,6 +597,41 @@ func TestMergeOverdueOpenPassRecordedBeforeFailedPass(t *testing.T) {
 	}
 }
 
+// A hold ends at the pass that sees the PR open, even when that pass fails
+// later: the open time those passes saw is not counted as hold.
+func TestMergeOverdueHoldEndsOnFailedOpenPass(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(6 * time.Minute) // the hold is anchored at t0
+	rig.g.pull.Draft = false
+	rig.s.GH = &headFailGH{fakeGH: rig.g}
+	for _, at := range []time.Duration{30 * time.Minute, 40 * time.Minute} {
+		rig.now = overdueStart.Add(at)
+		if e := rig.s.NotifyPR(context.Background(), rig.r, 7, Options{}); e == nil {
+			t.Fatal("the pass did not fail")
+		}
+	}
+	rig.s.GH = rig.g
+	rig.g.pull.Draft = true
+	rig.at(50 * time.Minute) // the second hold is anchored at the 40m pass
+	rig.at(2 * time.Hour)
+	rig.wantConditions()
+	rig.g.pull.Draft = false
+	rig.at(2 * time.Hour) // the 10m the failed passes saw open
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 10m0s |") {
+		t.Fatal(e.Text)
+	}
+	rig.at(2*time.Hour + 34*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(2*time.Hour + 35*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
 // headFailGH fails Head, the read NotifyPR makes after it sees the PR open.
 type headFailGH struct {
 	*fakeGH
