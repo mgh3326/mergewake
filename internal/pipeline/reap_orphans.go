@@ -93,15 +93,15 @@ func scanProcesses(ctx context.Context, run integrations.Runner) (procEvidence, 
 }
 
 // scanProcessesLsof reads the working directories lsof can name, then lists
-// this user's processes with ps so a pid with no cwd record fails closed.
+// this user's effective-uid processes with ps so a pid with no cwd record
+// fails closed.
 func scanProcessesLsof(ctx context.Context, run integrations.Runner) (procEvidence, error) {
 	b, e := run.Run(ctx, "lsof", []string{"-a", "-d", "cwd", "-F", "pn"}, "", "")
 	if e != nil {
 		return procEvidence{}, fmt.Errorf("%w: lsof: %v", errProcessScanUnavailable, e)
 	}
 	uid := strconv.Itoa(os.Getuid())
-	psArgs := []string{"-U", uid, "-o", "pid=,ucomm=,command="}
-	p, e := run.Run(ctx, "ps", psArgs, "", "")
+	p, e := run.Run(ctx, "ps", []string{"-A", "-o", "pid=,uid=,ucomm=,state=,command="}, "", "")
 	if e != nil {
 		return procEvidence{}, fmt.Errorf("%w: ps: %v", errProcessScanUnavailable, e)
 	}
@@ -213,7 +213,7 @@ type lsofCwdScan struct {
 	pids map[int]bool
 }
 
-// psProcess is one same-user process from `ps -o pid=,ucomm=,command=`.
+// psProcess is one same-user process from `ps -o pid=,uid=,ucomm=,state=`.
 type psProcess struct {
 	pid  int
 	comm string
@@ -236,12 +236,14 @@ func parseLsofCwdPids(out []byte) lsofCwdScan {
 	return scan
 }
 
-// parsePsProcesses reads `ps -U <uid> -o pid=,ucomm=,command=` output. ps
-// lists its own scanner process, which started after lsof ran; excluding that
-// exact command keeps it from reading as a missing cwd. Any other malformed
-// line makes the listing unreliable, so the scan fails closed.
+// parsePsProcesses reads `ps -A -o pid=,uid=,ucomm=,state=,command=` output
+// and keeps the processes whose effective uid is uid. A zombie has no cwd and
+// cannot hold a checkout, so state Z is skipped. ps lists its own scanner
+// process, which started after lsof ran; excluding that exact command keeps it
+// from reading as a missing cwd. Any other malformed line makes the listing
+// unreliable, so the scan fails closed.
 func parsePsProcesses(out []byte, uid string) ([]psProcess, error) {
-	selfArgs := "-U " + uid + " -o pid=,ucomm=,command="
+	const selfArgs = "-A -o pid=,uid=,ucomm=,state=,command="
 	var procs []psProcess
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
@@ -252,14 +254,22 @@ func parsePsProcesses(out []byte, uid string) ([]psProcess, error) {
 		if e != nil {
 			return nil, fmt.Errorf("malformed pid %q", fields[0])
 		}
-		if len(fields) > 6 && filepath.Base(fields[2]) == "ps" && strings.Join(fields[3:], " ") == selfArgs {
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("malformed process line %q", line)
+		}
+		if fields[1] != uid {
 			continue
 		}
-		var comm string
-		if len(fields) > 1 {
-			comm = fields[1]
+		if len(fields) < 4 {
+			return nil, fmt.Errorf("malformed process line %q", line)
 		}
-		procs = append(procs, psProcess{pid: pid, comm: comm})
+		if strings.HasPrefix(fields[3], "Z") {
+			continue
+		}
+		if len(fields) > 7 && filepath.Base(fields[4]) == "ps" && strings.Join(fields[5:], " ") == selfArgs {
+			continue
+		}
+		procs = append(procs, psProcess{pid: pid, comm: fields[2]})
 	}
 	if len(procs) == 0 {
 		return nil, errors.New("no same-user processes")

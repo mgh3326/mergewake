@@ -367,19 +367,19 @@ func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
 		{
 			name:   "same-user pid without cwd fails closed",
 			lsof:   "p101\nfcwd\nn/\n",
-			ps:     " 101 worker\n 102 sudo\n",
+			ps:     " 101 501 worker S worker --serve\n 102 501 sudo S sudo --serve\n",
 			reason: "pid 102 (sudo)",
 		},
 		{
 			name:    "sshd without cwd passes",
 			lsof:    "p101\nfcwd\nn/\n",
-			ps:      " 101 worker\n 102 sshd\n",
+			ps:      " 101 501 worker S worker --serve\n 102 501 sshd S sshd\n",
 			removed: true,
 		},
 		{
 			name:    "all cwds present proceeds",
 			lsof:    "p101\nfcwd\nn/\n",
-			ps:      " 101 worker\n",
+			ps:      " 101 501 worker S worker --serve\n",
 			removed: true,
 		},
 	} {
@@ -488,11 +488,14 @@ func TestParseLsofCwdPids(t *testing.T) {
 	}
 }
 
-// ps lists its own scanner process; the scan excludes that exact command so it
-// does not read as a same-user process with no cwd. A malformed line makes the
+// ps lists all users; the scan keeps only the effective uid, skips zombies,
+// and excludes its own scanner command. A malformed same-user line makes the
 // listing unreliable.
 func TestParsePsProcesses(t *testing.T) {
-	out := []byte(" 101 worker worker --serve\n 102 ps ps -U 501 -o pid=,ucomm=,command=\n")
+	out := []byte(" 101 501 worker S worker --serve\n" +
+		" 102 501 ps R ps -A -o pid=,uid=,ucomm=,state=,command=\n" +
+		" 103 0 login Ss login\n" +
+		" 104 501 old Z old <defunct>\n")
 	procs, err := parsePsProcesses(out, "501")
 	if err != nil {
 		t.Fatal(err)
@@ -500,7 +503,7 @@ func TestParsePsProcesses(t *testing.T) {
 	if len(procs) != 1 || procs[0].pid != 101 || procs[0].comm != "worker" {
 		t.Fatalf("procs = %+v", procs)
 	}
-	if _, err := parsePsProcesses([]byte("PID UCOMM COMMAND\n"), "501"); err == nil {
+	if _, err := parsePsProcesses([]byte("PID UID UCOMM STATE COMMAND\n"), "501"); err == nil {
 		t.Fatal("malformed ps output parsed")
 	}
 }
