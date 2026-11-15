@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +24,11 @@ import (
 // findings. One consult runs per PR and head; the row lives in the
 // round-rule state file so a later pass or a restart polls it instead of
 // asking again. The switch is review.round_rule.hub_consult, default off.
+//
+// The obligation is owed per head, not per round: once requested, it is
+// advanced and settled on every pass until it is terminal, whatever the
+// current round or done marker says. A consult of an earlier head is
+// superseded, never delivered as the new head's directive.
 
 // consultTerminal lists the consult row states after which nothing is
 // polled or re-requested: re-POSTing a refused or failed row retries it
@@ -48,7 +56,7 @@ func (st *roundRuleState) hubConsultDirective() string {
 	if reason == "" {
 		reason = st.HubConsultState
 	}
-	return "the hub consult could not be had: " + clip(reason, 200) + " | directive stands: " + RoundDirective
+	return "the hub consult could not be had: " + clip(emitSafe(reason), 200) + " | directive stands: " + RoundDirective
 }
 
 // consultCmd is the panewire binary hub calls go through.
@@ -59,16 +67,31 @@ func (s *Service) consultCmd() string {
 	return "panewire"
 }
 
-// hubConsultOutcome runs one pass of the consult step for a PR at its
-// consult round and answers the directive the round's findings delivery
-// carries. pending is true while the consult is queued or running inside
-// the wait — that round's findings stay undelivered; the stored row lets
-// the next pass (or the next pass after a restart) resume the poll.
-// Everything runs under the round-rule state lock, so concurrent
-// evaluations of one PR cannot request or settle twice.
-func (s *Service) hubConsultOutcome(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState) (directive string, pending bool) {
+// consultWaitExpired reports whether a consult attempt started at has been
+// outstanding past review.round_rule.hub_consult_wait.
+func (s *Service) consultWaitExpired(at, now time.Time) bool {
+	if at.IsZero() {
+		return false
+	}
+	return now.Sub(at) >= s.Config.Review.RoundRuleHubConsultWait()
+}
+
+// hubConsultStep runs the consult step when the hub consult switch is on and
+// answers the directive the author's delivery carries. hold is true while
+// the consult owed for the current head is queued or running inside the wait
+// — that delivery waits; the stored row lets the next pass (or the next pass
+// after a restart) resume it.
+//
+// Everything runs under the round-rule state lock, so concurrent evaluations
+// of one PR cannot request or settle twice.
+func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, done bool, rounds int, openBlocking bool) (directive string, hold bool) {
 	if o.DryRun {
-		return "", true
+		if done && rounds == s.Config.Review.RoundRuleConsult() && openBlocking && !st.directiveSent() {
+			// A dry run decides only: it neither requests nor delivers the
+			// held round's findings.
+			return "", true
+		}
+		return "", false
 	}
 	file := s.roundRuleFile(r.Name, pr.Number)
 	defer lockPath(file)()
@@ -84,11 +107,83 @@ func (s *Service) hubConsultOutcome(ctx context.Context, r config.Repo, pr githu
 	// The caller's copy may be stale: another evaluation of this PR can
 	// settle between the caller's load and this lock.
 	*st = s.loadRoundRuleState(r.Name, pr.Number)
+
+	// A file written before the head key existed adopts the current head for
+	// an outstanding row, so an upgrade resumes it instead of orphaning it.
+	if !st.HubConsultOwed && st.HubConsultID != "" && !st.HubConsultDone && !st.directiveSent() {
+		st.HubConsultOwed = true
+		if st.HubConsultHead == "" {
+			st.HubConsultHead = pr.Head.SHA
+		}
+	}
+
+	// A consult of another head is superseded: the answer was made from
+	// another checkout and finding set, so it is never applied to this head.
+	if st.HubConsultOwed && st.HubConsultHead != "" && st.HubConsultHead != pr.Head.SHA {
+		s.hubConsultSupersede(ctx, r, pr, o, st)
+	}
+
+	// An owed consult is advanced on every pass, whatever the current round
+	// or done marker says: a push or a new review round must not orphan the
+	// row, its wait bound or its outcome.
+	if st.HubConsultOwed {
+		return s.hubConsultAdvance(ctx, r, pr, fb, o, st, s.now().UTC())
+	}
+
+	if done && rounds == s.Config.Review.RoundRuleConsult() && openBlocking && !st.directiveSent() {
+		// Persist the attempt before the slow hk and hub work: the wait bound
+		// is measured from here, so an hk outage retries only inside the wait.
+		st.HubConsultOwed = true
+		st.HubConsultHead = pr.Head.SHA
+		st.HubConsultAt = s.now().UTC()
+		st.HubConsultPosted = false
+		st.HubConsultID = ""
+		st.HubConsultState = ""
+		st.HubConsultQuestion = ""
+		st.HubConsultAnswerDoc = ""
+		st.HubConsultVerdict = ""
+		st.HubConsultSeat = ""
+		st.HubConsultJob = ""
+		st.HubConsultReason = ""
+		st.HubConsultDone = false
+		st.HubConsultCommented = false
+		if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil {
+			_ = s.audit(r.Name, "consult-state-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(e)}, o.DryRun)
+			return "", true
+		}
+		return s.hubConsultAdvance(ctx, r, pr, fb, o, st, s.now().UTC())
+	}
+	return "", false
+}
+
+// hubConsultAdvance moves an owed consult one step: request it when no row
+// exists yet, poll it otherwise. A row whose id was lost to a failed state
+// write is reconciled from the audit journal, never re-requested.
+func (s *Service) hubConsultAdvance(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, now time.Time) (string, bool) {
 	if st.HubConsultDone {
 		return st.hubConsultDirective(), false
 	}
-	now := s.now().UTC()
-	if st.HubConsultID == "" && st.HubConsultState == "" {
+	if st.HubConsultID == "" {
+		if st.HubConsultPosted {
+			if id := s.recoverConsultID(r.Name, pr.Number, st.HubConsultHead); id != "" {
+				st.HubConsultID = id
+				if st.HubConsultState == "" {
+					st.HubConsultState = "queued"
+				}
+				_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+				_ = s.audit(r.Name, "consult-recovered", map[string]any{"pr": pr.Number, "id": id, "head": st.HubConsultHead}, o.DryRun)
+				return s.hubConsultPoll(ctx, r, pr, o, st, now)
+			}
+		}
+		if s.consultWaitExpired(st.HubConsultAt, now) {
+			st.HubConsultDone = true
+			if st.HubConsultReason == "" {
+				st.HubConsultReason = "no consult row within " + s.Config.Review.RoundRuleHubConsultWait().String()
+			}
+			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+			_ = s.audit(r.Name, "consult-outcome", map[string]any{"pr": pr.Number, "state": "wait-expired", "reason": st.HubConsultReason}, o.DryRun)
+			return st.hubConsultDirective(), false
+		}
 		return s.hubConsultRequest(ctx, r, pr, fb, o, st, now)
 	}
 	return s.hubConsultPoll(ctx, r, pr, o, st, now)
@@ -96,10 +191,11 @@ func (s *Service) hubConsultOutcome(ctx context.Context, r config.Repo, pr githu
 
 // hubConsultRequest writes the question document to hk and POSTs one
 // `panewire consult request` through the hub credential. The caller holds
-// the round-rule state lock. Any failure the contract counts as no
-// consult (no task trailer, rc 1, rc 2, a run error or an unreadable
-// answer) settles as fallback; a failed document write or task read is
-// transient and the pass stays pending.
+// the round-rule state lock and has persisted the attempt time. Any failure
+// the contract counts as no consult (no task trailer, rc 1, rc 2, a run
+// error or an unreadable answer) settles as fallback; a failed document
+// write or task read is transient and the pass stays held — the attempt
+// time already persisted bounds those retries.
 func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, now time.Time) (string, bool) {
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
@@ -108,6 +204,7 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	}
 	if task == "" {
 		st.HubConsultDone = true
+		st.HubConsultOwed = false
 		st.HubConsultReason = "PR carries no Mergewake-Task trailer"
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-skipped", map[string]any{"pr": pr.Number, "reason": st.HubConsultReason}, o.DryRun)
@@ -139,6 +236,15 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 		"--requester", fmt.Sprintf("mergewake/%s#%d", r.Name, pr.Number),
 		"--json")
 
+	// Record that the POST may reach the hub before it runs: if the id is
+	// lost afterwards, the pass reconciles it from the journal instead of
+	// re-requesting.
+	st.HubConsultPosted = true
+	if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil {
+		_ = s.audit(r.Name, "consult-state-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(e)}, o.DryRun)
+		return "", true
+	}
+
 	cmdCtx, cmdCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cmdCancel()
 	out, err := s.Runner.Run(cmdCtx, s.consultCmd(), integrations.HubArgv(s.Config.Reap.Hub, args...), "", "")
@@ -150,7 +256,10 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 			detail = strings.TrimSpace(ce.Stderr)
 		}
 		st.HubConsultDone = true
-		st.HubConsultReason = fmt.Sprintf("consult request failed (rc %d): %s", rc, clip(detail, 200))
+		st.HubConsultOwed = false
+		// One printable line: the reason ends up in a panewire lane event,
+		// which refuses control bytes (emitSafe, as the round hold does).
+		st.HubConsultReason = fmt.Sprintf("consult request failed (rc %d): %s", rc, clip(emitSafe(detail), 200))
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-request-failed", map[string]any{"pr": pr.Number, "rc": rc, "error": integrations.Detail(err), "output": detail}, o.DryRun)
 		return st.hubConsultDirective(), false
@@ -158,11 +267,12 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 
 	var row reap.ConsultRow
 	if e := json.Unmarshal(out, &row); e != nil || row.ID == "" {
-		reason := fmt.Sprintf("unreadable consult row: %s", clip(string(out), 200))
+		reason := fmt.Sprintf("unreadable consult row: %s", emitSafe(clip(string(out), 200)))
 		if e != nil {
-			reason = "unreadable consult row: " + e.Error()
+			reason = "unreadable consult row: " + emitSafe(e.Error())
 		}
 		st.HubConsultDone = true
+		st.HubConsultOwed = false
 		st.HubConsultReason = reason
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-request-failed", map[string]any{"pr": pr.Number, "rc": 0, "error": reason}, o.DryRun)
@@ -170,12 +280,21 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	}
 
 	st.HubConsultID = row.ID
-	st.HubConsultAt = now
 	s.hubConsultApply(st, row)
-	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-	_ = s.audit(r.Name, "consult-request", map[string]any{
-		"pr": pr.Number, "id": row.ID, "state": row.State, "question": st.HubConsultQuestion,
-	}, o.DryRun)
+	// Journal the row with its head before the state file: the request is
+	// durable (and possibly paid), so a lost state write is reconciled from
+	// this record, never by re-POSTing a row that may have gone terminal.
+	if e := s.audit(r.Name, "consult-request", map[string]any{
+		"pr": pr.Number, "head": pr.Head.SHA, "id": row.ID, "state": row.State, "question": st.HubConsultQuestion,
+	}, o.DryRun); e != nil && s.Log != nil {
+		s.Log.Warn("consult request audit failed", "pr", pr.Number, "error", e)
+	}
+	if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil {
+		if e2 := s.saveRoundRuleState(r.Name, pr.Number, *st); e2 != nil {
+			_ = s.audit(r.Name, "consult-state-error", map[string]any{"pr": pr.Number, "id": row.ID, "error": integrations.Detail(e2)}, o.DryRun)
+			return "", true
+		}
+	}
 	if s.Log != nil {
 		s.Log.Info("hub consult requested", "pr", pr.Number, "id", row.ID, "state", row.State)
 	}
@@ -186,7 +305,7 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 // and settles it when terminal. The CLI's only consult verb is request and
 // re-POSTing a terminal row retries it, so a non-terminal row is read over
 // HTTP, never re-requested. The wait bound is measured from the first
-// request; past it the findings go out without the consult.
+// attempt; past it the findings go out without the consult.
 func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, now time.Time) (string, bool) {
 	if consultTerminal(st.HubConsultState) {
 		return s.hubConsultSettle(ctx, r, pr, o, st)
@@ -194,12 +313,16 @@ func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.P
 	wait := s.Config.Review.RoundRuleHubConsultWait()
 	if now.Sub(st.HubConsultAt) >= wait {
 		st.HubConsultDone = true
+		st.HubConsultOwed = false
 		st.HubConsultReason = fmt.Sprintf("no terminal state within %s (last state %s)", wait, st.HubConsultState)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-outcome", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "state": "wait-expired", "reason": st.HubConsultReason}, o.DryRun)
 		return st.hubConsultDirective(), false
 	}
-	hub, err := s.reapHub()
+	// The poll reads reap.hub directly, whatever reap.transport is: the
+	// request goes through the panewire CLI with the same credential, so a
+	// host whose reap transport is ssh must still be able to read the row.
+	hub, err := s.hubClient(s.Config.Reap.Hub)
 	if err != nil || hub == nil {
 		if err != nil {
 			_ = s.audit(r.Name, "consult-poll-error", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "error": integrations.Detail(err)}, o.DryRun)
@@ -228,7 +351,7 @@ func (s *Service) hubConsultApply(st *roundRuleState, row reap.ConsultRow) {
 	st.HubConsultVerdict = row.Verdict
 	st.HubConsultJob = row.Job
 	if row.Reason != "" {
-		st.HubConsultReason = row.Reason
+		st.HubConsultReason = emitSafe(row.Reason)
 	}
 	if row.Seat.Profile != "" || row.Seat.Family != "" || row.Seat.Grade != "" {
 		st.HubConsultSeat = strings.TrimSpace(strings.Join([]string{row.Seat.Profile, row.Seat.Family, row.Seat.Grade}, "/"))
@@ -236,8 +359,10 @@ func (s *Service) hubConsultApply(st *roundRuleState, row reap.ConsultRow) {
 }
 
 // hubConsultSettle ends the step once the stored row is terminal: the
-// outcome is marked applied, audited once and recorded on the hk task once.
-// A non-terminal row stays pending; the caller holds the state lock.
+// outcome is marked settled, audited once and recorded on the hk task. The
+// task comment stays retryable on its own until it succeeds (see
+// hubConsultCommentRetry). A non-terminal row stays pending; the caller
+// holds the state lock.
 func (s *Service) hubConsultSettle(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) (string, bool) {
 	if !consultTerminal(st.HubConsultState) {
 		return "", true
@@ -253,6 +378,45 @@ func (s *Service) hubConsultSettle(ctx context.Context, r config.Repo, pr github
 	}, o.DryRun)
 	s.hubConsultComment(ctx, r, pr, o, st)
 	return st.hubConsultDirective(), false
+}
+
+// hubConsultSupersede closes a consult owed for a head the PR no longer has.
+// The hub row is left as it is (phase 1 has no cancel route); the state
+// records the supersession so the stale answer is never delivered, and the
+// current head starts its own consult if its round reaches the consult round.
+func (s *Service) hubConsultSupersede(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) {
+	prev := st.HubConsultHead
+	st.HubConsultDone = true
+	st.HubConsultOwed = false
+	st.HubConsultState = "superseded"
+	st.HubConsultReason = fmt.Sprintf("superseded by head %s (requested for %s)", short7(pr.Head.SHA), short7(prev))
+	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	_ = s.audit(r.Name, "consult-superseded", map[string]any{
+		"pr": pr.Number, "id": st.HubConsultID, "head": prev, "new_head": pr.Head.SHA,
+	}, o.DryRun)
+	s.hubConsultComment(ctx, r, pr, o, st)
+}
+
+// hubConsultCommentRetry finishes a settled consult's task comment that a
+// transient hk failure left unrecorded. It runs on every pass, independently
+// of the findings delivery and of directiveSent, so the promised task record
+// is never lost.
+func (s *Service) hubConsultCommentRetry(ctx context.Context, r config.Repo, pr github.Pull, o Options) {
+	if o.DryRun {
+		return
+	}
+	file := s.roundRuleFile(r.Name, pr.Number)
+	defer lockPath(file)()
+	unlock, err := fsutil.Lock(file+".lock", true)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	st := s.loadRoundRuleState(r.Name, pr.Number)
+	if !st.HubConsultDone || st.HubConsultCommented || st.HubConsultID == "" {
+		return
+	}
+	s.hubConsultComment(ctx, r, pr, o, &st)
 }
 
 // hubConsultComment records the finished consult on the hk task once: id,
@@ -273,7 +437,7 @@ func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr githu
 		return
 	}
 	body := fmt.Sprintf("hub consult %s: state=%s seat=%s job=%s answer_doc=%s reason=%s",
-		st.HubConsultID, st.HubConsultState, st.HubConsultSeat, st.HubConsultJob, st.HubConsultAnswerDoc, st.HubConsultReason)
+		st.HubConsultID, st.HubConsultState, st.HubConsultSeat, st.HubConsultJob, st.HubConsultAnswerDoc, emitSafe(st.HubConsultReason))
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if err := c.Comment(reportCtx, task, body); err != nil {
@@ -282,6 +446,59 @@ func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr githu
 	}
 	st.HubConsultCommented = true
 	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+}
+
+// recoverConsultID reads the id of a consult request this PR and head already
+// made from the repo's read-only audit journal. A failed state write (or a
+// crash between the POST and the state file) is reconciled from it instead of
+// a re-POST, which would retry a row that may have gone terminal.
+func (s *Service) recoverConsultID(repo string, pr int, head string) string {
+	const maxScan = 8 << 20
+	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	off := info.Size() - maxScan
+	if off < 0 {
+		off = 0
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return ""
+	}
+	buf, err := io.ReadAll(f)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(buf), "\n")
+	if off > 0 && len(lines) > 0 {
+		lines = lines[1:] // the first line was cut mid-record
+	}
+	var rec struct {
+		Command string `json:"command"`
+		Value   struct {
+			PR   int    `json:"pr"`
+			Head string `json:"head"`
+			ID   string `json:"id"`
+		} `json:"value"`
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.Contains(line, `"consult-request"`) {
+			continue
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec.Command == "consult-request" && rec.Value.PR == pr && rec.Value.Head == head && rec.Value.ID != "" {
+			return rec.Value.ID
+		}
+	}
+	return ""
 }
 
 // commandExitCode extracts the exit status of a failed Runner call the way

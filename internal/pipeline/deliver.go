@@ -130,12 +130,13 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// The hub consult (review.round_rule.hub_consult) replaces the author
 	// directive: while it is queued or running inside the wait this round's
 	// findings stay undelivered; its outcome becomes the delivery's
-	// directive line.
+	// directive line. The step runs on every pass, so an outstanding consult
+	// is advanced whatever the current round or done marker says.
 	consultOn := s.Config.Review.RoundRule.HubConsult
 	consultDirective := ""
 	consultPending := false
-	if consultOn && done && rounds == consultRound && openBlocking && !st.directiveSent() {
-		consultDirective, consultPending = s.hubConsultOutcome(ctx, r, pr, fb, o, &st)
+	if consultOn {
+		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, openBlocking)
 	}
 	if done && rounds == consultRound && openBlocking && !st.directiveSent() && len(inScope) == 0 && !consultPending {
 		for _, t := range openThreads {
@@ -169,10 +170,12 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 				continue
 			}
 			directive := ""
-			if batch.scope == "author" && done && rounds == consultRound && openBlocking && !st.directiveSent() {
+			if batch.scope == "author" && !st.directiveSent() {
 				if consultOn {
+					// A settled consult answers for this head: its answer, or
+					// the could-not-be-had line, replaces today's directive.
 					directive = consultDirective
-				} else {
+				} else if done && rounds == consultRound && openBlocking {
 					directive = RoundDirective
 				}
 			}
@@ -187,6 +190,11 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			}
 			if directive != "" && o.Reporting() {
 				st.setDirectiveSent(true, s.now().UTC())
+				if consultOn {
+					// The outcome went out with the findings: nothing more is
+					// owed for this head.
+					st.HubConsultOwed = false
+				}
 				_ = s.saveRoundRuleState(r.Name, n, st)
 				if consultOn {
 					_ = s.audit(r.Name, "consult-delivered", map[string]any{"pr": n, "id": st.HubConsultID, "state": st.HubConsultState, "answer_doc": st.HubConsultAnswerDoc}, o.DryRun)
@@ -195,6 +203,11 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 			ledger = append(ledger, d)
 			changed = true
 		}
+	}
+	// A settled consult's task record retries on its own, even after the
+	// findings went out: a transient hk failure must not lose it.
+	if consultOn {
+		s.hubConsultCommentRetry(ctx, r, pr, o)
 	}
 	// A pending (rc 124) call retries until its bound and an ended ladder
 	// with an unsent decision retries the notify, even after the ladder

@@ -71,8 +71,19 @@ type roundRuleState struct {
 
 	// Hub consult (review.round_rule.hub_consult, hk 4551): one hub consult
 	// per PR and head. The stored row fields let a later pass or a restart
-	// poll instead of requesting again; Done marks the outcome applied to a
-	// delivery, after which nothing hub-side is touched.
+	// poll instead of requesting again.
+	//
+	// Owed marks an outstanding consult and is independent of the current
+	// round: it is set when the consult is requested and cleared once its
+	// outcome went out with a delivery (or its head was superseded). Head is
+	// the commit the row was requested for — the hub keys consults by
+	// (task, repo#pr, head), so a row of another head is never applied here.
+	// Posted records that the request may have reached the hub, so an id lost
+	// to a failed state write is reconciled from the audit journal instead of
+	// a re-POST. Done marks the outcome settled and audited.
+	HubConsultOwed      bool      `json:"hub_consult_owed,omitempty"`
+	HubConsultHead      string    `json:"hub_consult_head,omitempty"`
+	HubConsultPosted    bool      `json:"hub_consult_posted,omitempty"`
 	HubConsultID        string    `json:"hub_consult_id,omitempty"`
 	HubConsultState     string    `json:"hub_consult_state,omitempty"`
 	HubConsultQuestion  string    `json:"hub_consult_question,omitempty"`

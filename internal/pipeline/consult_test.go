@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -98,19 +99,27 @@ func (h *consultHub) getCount() int {
 }
 
 // consultSink is a jobSink that captures Record'ed documents and task
-// comments.
+// comments; recordErr and commentErr script an hk failure.
 type consultSink struct {
 	*jobSink
-	docs     map[string]string
-	comments []string
+	docs       map[string]string
+	comments   []string
+	recordErr  error
+	commentErr error
 }
 
 func (s *consultSink) Record(_ context.Context, key string, data []byte) error {
+	if s.recordErr != nil {
+		return s.recordErr
+	}
 	s.docs[key] = string(data)
 	return nil
 }
 
 func (s *consultSink) Comment(_ context.Context, task, body string) error {
+	if s.commentErr != nil {
+		return s.commentErr
+	}
 	s.comments = append(s.comments, task+": "+body)
 	return nil
 }
@@ -475,5 +484,252 @@ func TestHubConsult_NoTaskFallsBack(t *testing.T) {
 	}
 	if !strings.Contains(n.events[0].Text, "consult could not be had") {
 		t.Fatalf("missing could-not-be-had line: %s", n.events[0].Text)
+	}
+}
+
+// A consult is keyed by head: a new head that inherits the reviewed patch
+// and stays in the consult round never reuses the old head's row. The old
+// row is superseded and recorded, and the new head gets its own consult.
+func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
+	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.queue = []consultResp{
+		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
+		{rc: 0, out: `{"id":"c-2","state":"queued"}`},
+	}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	hub.rows["c-2"] = reap.ConsultRow{ID: "c-2", State: "queued"}
+
+	deliver(t, s, r)
+	if run.requestCount() != 1 || n.count != 0 {
+		t.Fatalf("first pass: requests=%d events=%d", run.requestCount(), n.count)
+	}
+
+	// The author pushes; the same reviewed patch keeps the round at the
+	// consult round, so a new consult is owed for the new head.
+	g.pull.Head.SHA = shaC
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-3", Round: 3}}
+	g.refs[doneRef(7, shaC)] = true
+
+	deliver(t, s, r)
+
+	if run.requestCount() != 2 {
+		t.Fatalf("want a consult for the new head, requests=%v", run.requests)
+	}
+	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
+		t.Fatalf("new request --head=%q, want %q", got, shaC)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	if st.HubConsultID != "c-2" || st.HubConsultHead != shaC {
+		t.Fatalf("state not re-keyed to the new head: %+v", st)
+	}
+	if n.count != 0 {
+		t.Fatalf("findings delivered while the new consult is queued: %+v", n.events)
+	}
+	if hub.getCount() != 0 {
+		t.Fatalf("old head's row polled %d times", hub.getCount())
+	}
+	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 || rows[0]["head"] != shaA {
+		t.Fatalf("supersession not audited: %v", rows)
+	}
+	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "superseded") {
+		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
+	}
+}
+
+// When the pushed head's round is past the consult round, the owed consult
+// is superseded and the new round's findings go out at once: they are never
+// held behind another head's row or answered with its answer.
+func TestHubConsult_NewRoundReleasesHeldFindings(t *testing.T) {
+	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+
+	deliver(t, s, r)
+	if n.count != 0 {
+		t.Fatal("delivered while the consult was queued")
+	}
+
+	// The author pushes a new patch: round 4, past the consult round.
+	g.pull.Head.SHA = shaC
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-4", Round: 4}}
+	g.refs[doneRef(7, shaC)] = true
+
+	deliver(t, s, r)
+
+	if n.count != 1 {
+		t.Fatalf("new round's findings still held: %+v", n.events)
+	}
+	if strings.Contains(n.events[0].Text, "hub consult") {
+		t.Fatalf("stale consult text attached to the new head: %s", n.events[0].Text)
+	}
+	if run.requestCount() != 1 {
+		t.Fatalf("round 4 requested a consult: %v", run.requests)
+	}
+	if hub.getCount() != 0 {
+		t.Fatalf("old head's row polled %d times", hub.getCount())
+	}
+	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 {
+		t.Fatalf("supersession not audited: %v", rows)
+	}
+	if len(sink.comments) != 1 {
+		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
+	}
+	// Nothing more is polled or delivered on later passes.
+	deliver(t, s, r)
+	if n.count != 1 || run.requestCount() != 1 || hub.getCount() != 0 {
+		t.Fatalf("superseded consult acted again: events=%d requests=%d gets=%d", n.count, run.requestCount(), hub.getCount())
+	}
+}
+
+// A task comment hk refused once is retried on later passes, even after the
+// findings were delivered.
+func TestHubConsult_CommentRetriedAfterDelivery(t *testing.T) {
+	s, g, n, sink, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.def = consultResp{rc: 0, out: `{"id":"c-7","state":"answered","answer_doc":"reports/c-7/sha256/aa.md"}`}
+	sink.commentErr = errors.New("hk unavailable")
+
+	deliver(t, s, r)
+	if n.count != 1 {
+		t.Fatalf("findings held by a failed task comment: %+v", n.events)
+	}
+	if len(sink.comments) != 0 {
+		t.Fatalf("comment recorded despite the failure: %v", sink.comments)
+	}
+
+	sink.commentErr = nil
+	deliver(t, s, r)
+	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "c-7") {
+		t.Fatalf("comment not retried after delivery: %v", sink.comments)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HubConsultCommented {
+		t.Fatalf("comment not marked done: %+v", st)
+	}
+
+	// A further pass does not comment twice.
+	deliver(t, s, r)
+	if len(sink.comments) != 1 {
+		t.Fatalf("comment repeated: %v", sink.comments)
+	}
+}
+
+// A failed task read or question write retries only inside the wait: past it
+// the findings go out with the fallback, so an hk outage cannot hold them.
+func TestHubConsult_WaitBoundsPrerequestFailure(t *testing.T) {
+	s, g, n, sink, run, _, r, now := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	sink.recordErr = errors.New("hk unavailable")
+
+	deliver(t, s, r)
+	if n.count != 0 || run.requestCount() != 0 {
+		t.Fatalf("failed pre-work delivered or requested: events=%d requests=%d", n.count, run.requestCount())
+	}
+
+	*now = now.Add(time.Hour)
+	deliver(t, s, r)
+	if n.count != 0 {
+		t.Fatalf("findings delivered before the wait expired: %+v", n.events)
+	}
+
+	*now = now.Add(2 * time.Hour)
+	deliver(t, s, r)
+	assertFallbackDelivered(t, n, "no consult row within")
+	if run.requestCount() != 0 {
+		t.Fatalf("a consult was requested after the pre-work failed: %v", run.requests)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HubConsultDone {
+		t.Fatalf("pre-request failure not settled: %+v", st)
+	}
+}
+
+// The request row is journaled with its head before the state file: an id
+// lost to a failed state write is reconciled from the journal, never
+// re-requested.
+func TestHubConsult_ReconcilesLostID(t *testing.T) {
+	s, g, n, _, run, hub, r, now := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-5"] = reap.ConsultRow{ID: "c-5", State: "queued"}
+
+	// The request landed and was audited, then the state write was lost.
+	st := s.loadRoundRuleState(r.Name, 7)
+	st.HubConsultOwed = true
+	st.HubConsultHead = shaA
+	st.HubConsultPosted = true
+	st.HubConsultAt = *now
+	if e := s.saveRoundRuleState(r.Name, 7, st); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.audit(r.Name, "consult-request", map[string]any{"pr": 7, "head": shaA, "id": "c-5", "state": "queued"}, false); e != nil {
+		t.Fatal(e)
+	}
+
+	deliver(t, s, r)
+
+	if run.requestCount() != 0 {
+		t.Fatalf("lost id re-requested: %v", run.requests)
+	}
+	if hub.getCount() == 0 {
+		t.Fatal("reconciled row not polled")
+	}
+	if got := s.loadRoundRuleState(r.Name, 7); got.HubConsultID != "c-5" {
+		t.Fatalf("id not recovered: %+v", got)
+	}
+	if rows := auditRows(t, s, r, "consult-recovered"); len(rows) != 1 {
+		t.Fatalf("recovery not audited: %v", rows)
+	}
+	if n.count != 0 {
+		t.Fatalf("delivered while the recovered consult is queued: %+v", n.events)
+	}
+}
+
+// The poll reads reap.hub over HTTP whatever reap.transport is: the request
+// goes through the panewire CLI with the same credential, so an ssh reap
+// transport must not blind the poll.
+func TestHubConsult_PollsOnSSHTransport(t *testing.T) {
+	s, g, n, _, run, hub, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	s.Config.Reap.Transport = config.ReapTransportSSH
+
+	deliver(t, s, r)
+	if n.count != 0 || run.requestCount() != 1 {
+		t.Fatalf("request pass: events=%d requests=%d", n.count, run.requestCount())
+	}
+	deliver(t, s, r)
+	if n.count != 0 || hub.getCount() == 0 {
+		t.Fatalf("ssh transport did not poll the row: events=%d gets=%d", n.count, hub.getCount())
+	}
+
+	hub.mu.Lock()
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "answered", AnswerDoc: "reports/c-1/sha256/aa.md"}
+	hub.mu.Unlock()
+
+	deliver(t, s, r)
+	if n.count != 1 || !strings.Contains(n.events[0].Text, "reports/c-1/sha256/aa.md") {
+		t.Fatalf("answer not delivered over ssh reap transport: %+v", n.events)
+	}
+	if run.requestCount() != 1 {
+		t.Fatalf("poll re-requested: %v", run.requests)
+	}
+}
+
+// A multiline CLI error reaches the lane event as one printable line: emit
+// refuses control bytes, so the fallback would otherwise never deliver.
+func TestHubConsult_ErrorDetailIsOneLine(t *testing.T) {
+	s, g, n, _, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.def = consultResp{rc: 1, out: "hub unavailable\nerror: dial tcp 10.0.0.1: connect: refused\n"}
+
+	deliver(t, s, r)
+	if n.count != 1 {
+		t.Fatalf("want 1 findings event, got %d", n.count)
+	}
+	text := n.events[0].Text
+	if strings.ContainsAny(text, "\n\r\t") {
+		t.Fatalf("control byte in the delivery: %q", text)
+	}
+	if !strings.Contains(text, "hub unavailable error: dial tcp") {
+		t.Fatalf("error detail not flattened: %s", text)
 	}
 }
