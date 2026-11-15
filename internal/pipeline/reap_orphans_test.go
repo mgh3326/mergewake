@@ -46,6 +46,34 @@ func scanProc(t *testing.T, ev procEvidence, err error) {
 	t.Cleanup(func() { processScan = saved })
 }
 
+// lsofScanRunner answers the two commands the lsof process scan makes.
+type lsofScanRunner struct {
+	lsof  []byte
+	ps    []byte
+	calls []string
+}
+
+func (r *lsofScanRunner) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
+	r.calls = append(r.calls, command+" "+strings.Join(args, " "))
+	switch command {
+	case "lsof":
+		return r.lsof, nil
+	case "ps":
+		return r.ps, nil
+	}
+	return nil, errors.New("unexpected command " + command)
+}
+
+// scanLsofProc runs the real lsof scan against the fake command runner.
+func scanLsofProc(t *testing.T, run *lsofScanRunner) {
+	t.Helper()
+	saved := processScan
+	processScan = func(ctx context.Context, _ integrations.Runner) (procEvidence, error) {
+		return scanProcessesLsof(ctx, run)
+	}
+	t.Cleanup(func() { processScan = saved })
+}
+
 // orphanRows are the reviewer-cleanup rows of the orphan sweep: they name a
 // checkout with no PR, which the reviewer rows do not.
 func orphanRows(t *testing.T, f *reviewerFix) []reapReceipt {
@@ -325,6 +353,60 @@ func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 	}
 }
 
+// On the lsof path a same-user pid with no reported cwd is unknown: the sweep
+// fails closed with the day's one row. A process lsof did report, and one whose
+// name never enters a work directory, do not block the sweep.
+func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		lsof    string
+		ps      string
+		removed bool
+		reason  string
+	}{
+		{
+			name:   "same-user pid without cwd fails closed",
+			lsof:   "p101\nfcwd\nn/\n",
+			ps:     " 101 worker\n 102 sudo\n",
+			reason: "pid 102 (sudo)",
+		},
+		{
+			name:    "sshd without cwd passes",
+			lsof:    "p101\nfcwd\nn/\n",
+			ps:      " 101 worker\n 102 sshd\n",
+			removed: true,
+		},
+		{
+			name:    "all cwds present proceeds",
+			lsof:    "p101\nfcwd\nn/\n",
+			ps:      " 101 worker\n",
+			removed: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newOrphanFix(t)
+			_, path := orphanCheckout(t, f, 7*time.Hour)
+			scanLsofProc(t, &lsofScanRunner{lsof: []byte(test.lsof), ps: []byte(test.ps)})
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := removedCalled(f, path); got != test.removed {
+				t.Fatalf("removed=%v calls %q", got, f.run.calls)
+			}
+			rows := orphanRows(t, f)
+			if test.removed {
+				if len(rows) != 1 || rows[0].Result != "removed" {
+					t.Fatalf("rows: %+v", rows)
+				}
+				return
+			}
+			if len(rows) != 1 || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, orphanScanUnavailable) || !strings.Contains(rows[0].Reason, test.reason) {
+				t.Fatalf("rows: %+v", rows)
+			}
+		})
+	}
+}
+
 // A non-dumpable same-user process whose open files point at nothing under the
 // checkouts directory cannot hold one: the sweep proceeds (hk 4792).
 func TestOrphanCheckoutUnreadableCwdOpenFilesElsewhereProceeds(t *testing.T) {
@@ -393,12 +475,33 @@ func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
 	}
 }
 
-// lsof -F n output carries one cwd per n record; other fields are ignored.
-func TestParseLsofCwds(t *testing.T) {
-	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\n")
-	got := parseLsofCwds(out)
-	if len(got) != 2 || got[0] != "/Users/x/checkouts/mwr-1" || got[1] != "/" {
-		t.Fatalf("cwds = %q", got)
+// lsof -F pn output carries one cwd per pid's n record; other fields are
+// ignored, and the pid set records which processes had a readable cwd.
+func TestParseLsofCwdPids(t *testing.T) {
+	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\np303\nfcwd\n")
+	got := parseLsofCwdPids(out)
+	if len(got.cwds) != 2 || got.cwds[0] != "/Users/x/checkouts/mwr-1" || got.cwds[1] != "/" {
+		t.Fatalf("cwds = %q", got.cwds)
+	}
+	if !got.pids[101] || !got.pids[202] || got.pids[303] {
+		t.Fatalf("pids = %v", got.pids)
+	}
+}
+
+// ps lists its own scanner process; the scan excludes that exact command so it
+// does not read as a same-user process with no cwd. A malformed line makes the
+// listing unreliable.
+func TestParsePsProcesses(t *testing.T) {
+	out := []byte(" 101 worker worker --serve\n 102 ps ps -U 501 -o pid=,ucomm=,command=\n")
+	procs, err := parsePsProcesses(out, "501")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(procs) != 1 || procs[0].pid != 101 || procs[0].comm != "worker" {
+		t.Fatalf("procs = %+v", procs)
+	}
+	if _, err := parsePsProcesses([]byte("PID UCOMM COMMAND\n"), "501"); err == nil {
+		t.Fatal("malformed ps output parsed")
 	}
 }
 

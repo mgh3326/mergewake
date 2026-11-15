@@ -35,9 +35,10 @@ type procEvidence struct {
 	unknown []procUnknown
 }
 
-// procUnknown is a same-user process that denies its working directory. fds are
-// the paths it has open, when those could be read; exe and comm are what the
-// process let the scan read of its executable and its name.
+// procUnknown is a same-user process that denies its working directory, or
+// whose working directory the scan could not read. fds are the paths it has
+// open, when those could be read; exe and comm are what the process let the
+// scan read of its executable and its name.
 type procUnknown struct {
 	pid      int
 	comm     string
@@ -78,21 +79,44 @@ func procNoWorkDir(name string) bool {
 }
 
 // scanProcesses reads every process's working directory: from /proc where it
-// exists (Linux), otherwise from `lsof -a -d cwd -F n` (macOS). A process that
-// exited, or belongs to another user and cannot be read under /proc, holds no
-// checkout of this user's. A same-user process that denies its working
-// directory is recorded with what it still allows; lsof lists only what it can
-// read, so that scan reports none. Any scan failure is
-// errProcessScanUnavailable.
+// exists (Linux), otherwise from lsof and ps (macOS). A process that exited,
+// or belongs to another user and cannot be read under /proc, holds no checkout
+// of this user's. A same-user process that denies its working directory is
+// recorded with what it still allows; lsof lists only what it can read, so the
+// ps pid list makes a missing cwd unknown instead of invisible. Any scan
+// failure is errProcessScanUnavailable.
 func scanProcesses(ctx context.Context, run integrations.Runner) (procEvidence, error) {
 	if _, e := os.Stat("/proc/self/cwd"); e == nil {
 		return procScanEvidence()
 	}
-	b, e := run.Run(ctx, "lsof", []string{"-a", "-d", "cwd", "-F", "n"}, "", "")
+	return scanProcessesLsof(ctx, run)
+}
+
+// scanProcessesLsof reads the working directories lsof can name, then lists
+// this user's processes with ps so a pid with no cwd record fails closed.
+func scanProcessesLsof(ctx context.Context, run integrations.Runner) (procEvidence, error) {
+	b, e := run.Run(ctx, "lsof", []string{"-a", "-d", "cwd", "-F", "pn"}, "", "")
 	if e != nil {
 		return procEvidence{}, fmt.Errorf("%w: lsof: %v", errProcessScanUnavailable, e)
 	}
-	return procEvidence{cwds: parseLsofCwds(b)}, nil
+	uid := strconv.Itoa(os.Getuid())
+	psArgs := []string{"-U", uid, "-o", "pid=,ucomm=,command="}
+	p, e := run.Run(ctx, "ps", psArgs, "", "")
+	if e != nil {
+		return procEvidence{}, fmt.Errorf("%w: ps: %v", errProcessScanUnavailable, e)
+	}
+	procs, e := parsePsProcesses(p, uid)
+	if e != nil {
+		return procEvidence{}, fmt.Errorf("%w: ps: %v", errProcessScanUnavailable, e)
+	}
+	scan := parseLsofCwdPids(b)
+	ev := procEvidence{cwds: scan.cwds}
+	for _, proc := range procs {
+		if !scan.pids[proc.pid] {
+			ev.unknown = append(ev.unknown, procUnknown{pid: proc.pid, comm: proc.comm})
+		}
+	}
+	return ev, nil
 }
 
 // procScanEvidence reads the working directories under /proc.
@@ -182,16 +206,65 @@ func sameUserProcess(dir string) bool {
 	return !ok || int(st.Uid) == os.Getuid()
 }
 
-// parseLsofCwds reads the name fields (n) of `lsof -F n` output: one path per
-// cwd record.
-func parseLsofCwds(out []byte) []string {
-	var cwds []string
+// lsofCwdScan is the readable cwd set from `lsof -F pn`: the paths, and the
+// pids whose cwd lsof named.
+type lsofCwdScan struct {
+	cwds []string
+	pids map[int]bool
+}
+
+// psProcess is one same-user process from `ps -o pid=,ucomm=,command=`.
+type psProcess struct {
+	pid  int
+	comm string
+}
+
+// parseLsofCwdPids reads the process and cwd name fields of `lsof -F pn`
+// output. Other fields, including the file-descriptor field, are ignored.
+func parseLsofCwdPids(out []byte) lsofCwdScan {
+	scan := lsofCwdScan{pids: map[int]bool{}}
+	pid := 0
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "n") && len(line) > 1 {
-			cwds = append(cwds, line[1:])
+		switch {
+		case strings.HasPrefix(line, "p"):
+			pid, _ = strconv.Atoi(line[1:])
+		case strings.HasPrefix(line, "n") && pid > 0 && len(line) > 1:
+			scan.cwds = append(scan.cwds, line[1:])
+			scan.pids[pid] = true
 		}
 	}
-	return cwds
+	return scan
+}
+
+// parsePsProcesses reads `ps -U <uid> -o pid=,ucomm=,command=` output. ps
+// lists its own scanner process, which started after lsof ran; excluding that
+// exact command keeps it from reading as a missing cwd. Any other malformed
+// line makes the listing unreliable, so the scan fails closed.
+func parsePsProcesses(out []byte, uid string) ([]psProcess, error) {
+	selfArgs := "-U " + uid + " -o pid=,ucomm=,command="
+	var procs []psProcess
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		pid, e := strconv.Atoi(fields[0])
+		if e != nil {
+			return nil, fmt.Errorf("malformed pid %q", fields[0])
+		}
+		if len(fields) > 6 && filepath.Base(fields[2]) == "ps" && strings.Join(fields[3:], " ") == selfArgs {
+			continue
+		}
+		var comm string
+		if len(fields) > 1 {
+			comm = fields[1]
+		}
+		procs = append(procs, psProcess{pid: pid, comm: comm})
+	}
+	if len(procs) == 0 {
+		return nil, errors.New("no same-user processes")
+	}
+	return procs, nil
 }
 
 // anyWithin reports whether any path is dir or lies under it.
