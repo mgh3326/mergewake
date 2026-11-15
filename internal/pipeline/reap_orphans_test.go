@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,34 @@ func scanProc(t *testing.T, ev procEvidence, err error) {
 	t.Helper()
 	saved := processScan
 	processScan = func(context.Context, integrations.Runner) (procEvidence, error) { return ev, err }
+	t.Cleanup(func() { processScan = saved })
+}
+
+// lsofScanRunner answers the two commands the lsof process scan makes.
+type lsofScanRunner struct {
+	lsof  []byte
+	ps    []byte
+	calls []string
+}
+
+func (r *lsofScanRunner) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
+	r.calls = append(r.calls, command+" "+strings.Join(args, " "))
+	switch command {
+	case "lsof":
+		return r.lsof, nil
+	case "ps":
+		return r.ps, nil
+	}
+	return nil, errors.New("unexpected command " + command)
+}
+
+// scanLsofProc runs the real lsof scan against the fake command runner.
+func scanLsofProc(t *testing.T, run *lsofScanRunner) {
+	t.Helper()
+	saved := processScan
+	processScan = func(ctx context.Context, _ integrations.Runner) (procEvidence, error) {
+		return scanProcessesLsof(ctx, run)
+	}
 	t.Cleanup(func() { processScan = saved })
 }
 
@@ -325,6 +354,65 @@ func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 	}
 }
 
+// On the lsof path a same-user pid with no reported cwd is unknown: the sweep
+// fails closed with the day's one row, even when its argv0 names an
+// allow-listed program — that name is process-chosen and is not evidence. A
+// process lsof did report does not block the sweep.
+func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
+	uid := strconv.Itoa(os.Getuid())
+	cwdError := "ncwd|rtd info error: Operation not permitted\n"
+	for _, test := range []struct {
+		name    string
+		lsof    string
+		ps      string
+		removed bool
+		reason  string
+	}{
+		{
+			name:   "same-user pid without cwd fails closed",
+			lsof:   "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
+			ps:     " 101 " + uid + " S worker --serve\n 102 " + uid + " S sudo --serve\n",
+			reason: "pid 102 (sudo)",
+		},
+		{
+			// argv0 is process-chosen, so it cannot satisfy the no-work-dir
+			// allow-list: the pid stays unresolved and the sweep fails closed.
+			name:   "sshd argv0 without cwd fails closed",
+			lsof:   "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
+			ps:     " 101 " + uid + " S worker --serve\n 102 " + uid + " S sshd\n",
+			reason: "pid 102 (sshd)",
+		},
+		{
+			name:    "all cwds present proceeds",
+			lsof:    "p101\nfcwd\nn/\n",
+			ps:      " 101 " + uid + " S worker --serve\n",
+			removed: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newOrphanFix(t)
+			_, path := orphanCheckout(t, f, 7*time.Hour)
+			scanLsofProc(t, &lsofScanRunner{lsof: []byte(test.lsof), ps: []byte(test.ps)})
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := removedCalled(f, path); got != test.removed {
+				t.Fatalf("removed=%v calls %q", got, f.run.calls)
+			}
+			rows := orphanRows(t, f)
+			if test.removed {
+				if len(rows) != 1 || rows[0].Result != "removed" {
+					t.Fatalf("rows: %+v", rows)
+				}
+				return
+			}
+			if len(rows) != 1 || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, orphanScanUnavailable) || !strings.Contains(rows[0].Reason, test.reason) {
+				t.Fatalf("rows: %+v", rows)
+			}
+		})
+	}
+}
+
 // A non-dumpable same-user process whose open files point at nothing under the
 // checkouts directory cannot hold one: the sweep proceeds (hk 4792).
 func TestOrphanCheckoutUnreadableCwdOpenFilesElsewhereProceeds(t *testing.T) {
@@ -368,9 +456,11 @@ func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
 		proc    procUnknown
 		removed bool
 	}{
-		{"parenthesised helper", procUnknown{pid: 4711, comm: "(sd-pam)"}, true},
+		{"parenthesised helper", procUnknown{pid: 4711, comm: "(sd-pam)", commTrusted: true}, true},
 		{"readable executable", procUnknown{pid: 4712, comm: "sshd", exe: "/usr/sbin/sshd"}, true},
-		{"unknown name", procUnknown{pid: 4713, comm: "sudo"}, false},
+		{"trusted allow-list name", procUnknown{pid: 4714, comm: "sshd", commTrusted: true}, true},
+		{"argv0 name is not evidence", procUnknown{pid: 4715, comm: "sshd"}, false},
+		{"unknown name", procUnknown{pid: 4713, comm: "sudo", commTrusted: true}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newOrphanFix(t)
@@ -393,12 +483,38 @@ func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
 	}
 }
 
-// lsof -F n output carries one cwd per n record; other fields are ignored.
-func TestParseLsofCwds(t *testing.T) {
-	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\n")
-	got := parseLsofCwds(out)
-	if len(got) != 2 || got[0] != "/Users/x/checkouts/mwr-1" || got[1] != "/" {
-		t.Fatalf("cwds = %q", got)
+// lsof -F pn output carries one cwd per pid's n record; other fields are
+// ignored, and the pid set records which processes had a readable cwd.
+func TestParseLsofCwdPids(t *testing.T) {
+	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\n" +
+		"p303\nfcwd\nncwd|rtd info error: Operation not permitted\np404\nfcwd\nnrelative/path\n")
+	got := parseLsofCwdPids(out)
+	if len(got.cwds) != 2 || got.cwds[0] != "/Users/x/checkouts/mwr-1" || got.cwds[1] != "/" {
+		t.Fatalf("cwds = %q", got.cwds)
+	}
+	if !got.pids[101] || !got.pids[202] || got.pids[303] || got.pids[404] {
+		t.Fatalf("pids = %v", got.pids)
+	}
+}
+
+// ps lists all users; the scan keeps only the effective uid, skips zombies,
+// keeps a live process whose command contains spaces, and excludes its own
+// scanner command. A malformed same-user line makes the listing unreliable.
+func TestParsePsProcesses(t *testing.T) {
+	out := []byte(" 101 501 S worker --serve\n" +
+		" 102 501 R ps -A -o pid=,uid=,state=,command=\n" +
+		" 103 0 Ss login\n" +
+		" 104 501 Z old <defunct>\n" +
+		" 105 501 S Build Zeta --serve\n")
+	procs, err := parsePsProcesses(out, "501")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(procs) != 2 || procs[0].pid != 101 || procs[0].comm != "worker" || procs[1].pid != 105 || procs[1].comm != "Build" {
+		t.Fatalf("procs = %+v", procs)
+	}
+	if _, err := parsePsProcesses([]byte("PID UID STATE COMMAND\n"), "501"); err == nil {
+		t.Fatal("malformed ps output parsed")
 	}
 }
 
