@@ -511,24 +511,139 @@ func TestTaskAndSecretBlocksStayWithOwnerLane(t *testing.T) {
 	}
 }
 
+// scanRouter routes ssh to remote (the unreachable host's fake), the pane
+// lister's scripted commands to lister, and everything else to pane.
+type scanRouter struct {
+	lister *scriptRunner
+	remote *scriptRunner
+	pane   *panewireRunner
+}
+
+func (r scanRouter) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "ssh" {
+		return r.remote.Run(ctx, name, args, input, dir)
+	}
+	if _, ok := r.lister.outs[key(name, args...)]; ok || name == "herdr" {
+		return r.lister.Run(ctx, name, args, input, dir)
+	}
+	return r.pane.Run(ctx, name, args, input, dir)
+}
+
+// withSplitAuthorScan puts the w-9 author pane on a healthy host beside an
+// unreachable one, the shape of a fleet where one host is down.
+func (f blockFixture) withSplitAuthorScan(t *testing.T) *scriptRunner {
+	t.Helper()
+	lister := authorHost(aPane{"pane-author", "w-9", "/wt/a", "feat/thing", projectOrigin})
+	remote := &scriptRunner{errs: map[string]error{
+		key("ssh", "-o", "BatchMode=yes", "-T", "-n", "unavailable", reap.Join([]string{"herdr", "agent", "list"})): errors.New("pane list failed"),
+	}}
+	f.s.Runner = scanRouter{lister: lister, remote: remote, pane: f.runner}
+	f.s.Config.Hosts = []reap.Host{{Name: "healthy"}, {Name: "unavailable", SSH: "unavailable"}}
+	f.runner.sink.jobs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "author-route"}
+	return lister
+}
+
+// (g) One host's pane list fails while the author's pane answers on another:
+// the block still reaches the author lane, the via naming the partial scan.
+func TestAuthorBlockPartialScanRoutesToAuthorPane(t *testing.T) {
+	f := blockSetup(t)
+	f.withSplitAuthorScan(t)
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "author-route" || !strings.Contains(ev.Text, "(partial pane scan)") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+	if f.gh.posts != 1 {
+		t.Fatalf("comments posted %d times, want 1", f.gh.posts)
+	}
+}
+
+// (h) The same partial scan with no author pane on the hosts that answered:
+// the owner lane gets the block, the via saying the scan was partial.
+func TestAuthorBlockPartialScanWithoutAuthorGoesToOwnerLane(t *testing.T) {
+	f := blockSetup(t)
+	lister := f.withSplitAuthorScan(t)
+	lister.outs = authorHost().outs
+	f.r.Lane = "owner-route"
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "owner-route" || !strings.HasSuffix(ev.Text, "| lane=owner-route via owner lane (partial pane scan)") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+}
+
+// (i) Every host unreachable is still no reason to fail the review: the owner
+// lane gets the block.
+func TestAuthorBlockScanFailureGoesToOwnerLane(t *testing.T) {
+	f := blockSetup(t)
+	f.r.Lane = "owner-route"
+	remote := &scriptRunner{}
+	f.s.Runner = scanRouter{lister: &scriptRunner{}, remote: remote, pane: f.runner}
+	f.s.Config.Hosts = []reap.Host{{Name: "down-a", SSH: "down-a"}, {Name: "down-b", SSH: "down-b"}}
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "owner-route" || !strings.HasSuffix(ev.Text, "| lane=owner-route via owner lane (pane scan failed)") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+}
+
+// (j) A route read error that is not a pane scan failure — here the author
+// pane's job record — still sends nothing and retries.
+func TestAuthorBlockJobReadErrorStillRetries(t *testing.T) {
+	f := blockSetup(t)
+	f.withSplitAuthorScan(t)
+	f.runner.sink.jobErr = errors.New("hk down")
+	if e := f.review(t); e == nil || errors.Is(e, ErrReviewBlocked) {
+		t.Fatalf("a failed job read must stay a retryable error: %v", e)
+	}
+	if f.n.count != 0 {
+		t.Fatalf("events after a read error: %+v", f.n.events)
+	}
+	f.runner.sink.jobErr = nil
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 || f.n.events[0].Lane != "author-route" {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	if f.gh.posts != 1 {
+		t.Fatalf("comments posted %d times, want 1", f.gh.posts)
+	}
+}
+
 // (e) A pane read error sends nothing and records no sent key, and the next
 // pass with a working lister sends once. The comment is still posted once.
 func TestAuthorRouteReadErrorSendsNothingThenRetries(t *testing.T) {
 	f := blockSetup(t)
 	lister := f.withAuthorPane(t)
 	lister.errs = map[string]error{key("herdr", "agent", "list"): errors.New("herdr down")}
-	if e := f.review(t); e == nil || errors.Is(e, ErrReviewBlocked) {
-		t.Fatalf("a failed pane read must stay a retryable error: %v", e)
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatalf("a failed pane read falls back to the owner lane, not a retry: %v", e)
 	}
-	if f.n.count != 0 {
-		t.Fatalf("events after a read error: %+v", f.n.events)
+	if f.n.count != 1 || f.n.events[0].Lane != "desk-lane" {
+		t.Fatalf("events after a scan failure: %+v", f.n.events)
 	}
 	lister.errs = nil
 	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
 		t.Fatal(e)
 	}
-	if f.n.count != 1 || f.n.events[0].Lane != "author-route" {
-		t.Fatalf("events: %+v", f.n.events)
+	if f.n.count != 1 {
+		t.Fatalf("the block was already sent once: %+v", f.n.events)
 	}
 	if f.gh.posts != 1 {
 		t.Fatalf("comments posted %d times, want 1", f.gh.posts)
