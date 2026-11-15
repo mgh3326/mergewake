@@ -150,10 +150,11 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		// unrecorded could never be retried.
 		//
 		// The wait is bounded (consultCommentBound): only a failed comment
-		// write can still succeed on a later pass, so a sink without Comment
-		// or a PR with no task never holds, and a write that keeps failing
-		// holds until the bound — then the reset proceeds and the drop is
-		// audited, so the round's findings are never held past it.
+		// write or task read can still succeed on a later pass, so a sink
+		// without Comment or a PR with no task never holds, and a failure
+		// that keeps recurring holds until the bound — then the reset proceeds
+		// and the drop is audited, so the round's findings are never held past
+		// it.
 		if st.HubConsultID != "" && st.HubConsultDone && !st.HubConsultCommented {
 			retry := s.hubConsultComment(ctx, r, pr, o, st)
 			if retry {
@@ -479,9 +480,9 @@ func (s *Service) hubConsultCommentRetry(ctx context.Context, r config.Repo, pr 
 // state, seat and answer_doc. A comment failure stays uncommented so a
 // later pass retries it. The caller holds the state lock.
 //
-// retry is true only when a later pass can still record it: a failed write.
-// A sink without Comment (integrations.Noop) and a PR with no task can
-// never record it, so the caller must not wait on them.
+// retry is true only when a later pass can still record it: a failed write or
+// a failed task read. A sink without Comment (integrations.Noop) and a PR with
+// no task can never record it, so the caller must not wait on them.
 func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState) (retry bool) {
 	if st.HubConsultCommented || st.HubConsultID == "" {
 		return false
@@ -493,7 +494,13 @@ func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr githu
 		return false
 	}
 	task, err := s.prTask(ctx, r, pr)
-	if err != nil || task == "" {
+	if err != nil {
+		// The task read failed, so a later pass may still find the task and
+		// record the comment: an error is never read as "this PR has no task".
+		_ = s.audit(r.Name, "consult-comment-failed", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "error": integrations.Detail(err)}, o.DryRun)
+		return true
+	}
+	if task == "" {
 		return false
 	}
 	body := fmt.Sprintf("hub consult %s: state=%s seat=%s job=%s answer_doc=%s reason=%s",
