@@ -48,6 +48,39 @@ func authorScanFailures(ctx context.Context) []string {
 	return nil
 }
 
+// hostScanError is one configured host's pane-list failure inside an
+// authorScan.
+type hostScanError struct{ host string }
+
+func (e hostScanError) Error() string {
+	return fmt.Sprintf("author pane scan: host %s: pane list failed", e.host)
+}
+
+// hostScanOnly reports whether err consists solely of hostScanError leaves:
+// hosts that could not be read while others answered, or every host. Any
+// other read error — an hk task or job read, the panewire hub — is not, and
+// keeps the caller's retry path.
+func hostScanOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(hostScanError); ok {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if !hostScanOnly(e) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return hostScanOnly(u.Unwrap())
+	}
+	return false
+}
+
 func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 	scan, ok := ctx.Value(authorScanKey{}).(*authorScan)
 	if !ok {
@@ -63,7 +96,7 @@ func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 		for _, h := range s.Config.Hosts {
 			hs, _ := s.reapScanHost(ctx, hub, h)
 			if hs.failed {
-				errs = append(errs, fmt.Errorf("author pane scan: host %s: pane list failed", h.Name))
+				errs = append(errs, hostScanError{h.Name})
 				scan.failedHosts = append(scan.failedHosts, h.Name)
 			} else {
 				scan.readHosts++
@@ -89,6 +122,13 @@ func (s *Service) authorPane(ctx context.Context, r config.Repo, pr github.Pull)
 	if err != nil {
 		return "", "", false, err
 	}
+	return s.authorPaneOn(ctx, jobs, hosts, r, pr)
+}
+
+// authorPaneOn is authorPane over an already-read host scan. A failed host
+// has no panes, so the hosts that answered still give the route; the caller
+// decides whether a scan error beside them is fatal.
+func (s *Service) authorPaneOn(ctx context.Context, jobs reapJobs, hosts []*reapHost, r config.Repo, pr github.Pull) (lane, via string, ok bool, err error) {
 	var pane, job string
 	n := 0
 	for _, hs := range hosts {
