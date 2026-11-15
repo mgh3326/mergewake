@@ -762,15 +762,23 @@ on it.
   counting count one round per reviewed head.
 - **Review-round rule (consult, ladder, hold).** A round ends without a pass when its review
   leaves at least one critical or high finding still open (not fixed or dismissed
-  with evidence) after the verdict. The round thresholds come from configuration
+  with evidence) after the verdict; the hub consult below uses its own, lower bar (any open
+  finding above low). The round thresholds come from configuration
   (`review.round_rule`, defaults 3 / 5 / 7):
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
     `stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause.`
     No panewire call or lane event is emitted.
   - **Hub consult (`review.round_rule.hub_consult`, default false):** When on, the consult round asks the hub for the
-    consult instead of telling the author to (operator decision 250; panewire docs/consult-on-request.md). mergewake
-    writes a question document to hk (the PR, the reviewed head, every open finding with id, severity, path:line and
-    text, and the task's contract pointer), then runs once per PR and head, on the daemon host bounded at 60 s:
+    consult instead of telling the author to (operator decision 250; panewire docs/consult-on-request.md). With the
+    switch on, the request is gated on findings above low rather than on the round rule's blocking bar: the round must
+    be complete (the head's `-done` marker) and at least one finding must still be open above low — `medium`, `high`
+    or `critical`, with the legacy aliases `blocking` (high) and `major` (CodeRabbit's rank above minor). Open
+    severities come from the PR's review threads, as the gate reads them: the first comment's label, unresolved and not
+    disposed (a medium finding by any human answer, a critical or high one only by a verified fix or a reasoned
+    dismissal). An all-low round requests nothing (decision 250); with the switch off, the directive path below keeps
+    its blocking condition. mergewake writes a question document to hk (the PR, the reviewed head, every open
+    finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR and head,
+    on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
     (`reap.hub`). A PR without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state

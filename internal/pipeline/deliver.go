@@ -123,7 +123,8 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
 	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
 	rounds, _ := reviewRounds(history)
-	openBlocking, openThreads := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
+	openBlocking := len(openBlockingThreads) > 0
 	st := s.loadRoundRuleState(r.Name, n)
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
@@ -132,14 +133,21 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// findings stay undelivered; its outcome becomes the delivery's
 	// directive line. The step runs on every pass, so an outstanding consult
 	// is advanced whatever the current round or done marker says.
+	// It is owed on a round that ended with any open finding above low
+	// (operator decision 250: no consult for an all-low round), while the
+	// OFF path keeps the round rule's blocking bar.
 	consultOn := s.Config.Review.RoundRule.HubConsult
+	consultOwed, consultThreads := openBlocking, openBlockingThreads
+	if consultOn {
+		consultOwed, consultThreads = len(openAboveLowThreads) > 0, openAboveLowThreads
+	}
 	consultDirective := ""
 	consultPending := false
 	if consultOn {
-		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, openBlocking)
+		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, consultOwed)
 	}
-	if done && rounds == consultRound && openBlocking && !st.directiveSent() && len(inScope) == 0 && !consultPending {
-		for _, t := range openThreads {
+	if done && rounds == consultRound && consultOwed && !st.directiveSent() && len(inScope) == 0 && !consultPending {
+		for _, t := range consultThreads {
 			first := t.Comments[0]
 			inScope = append(inScope, pendingFinding{
 				thread:   t.ID,

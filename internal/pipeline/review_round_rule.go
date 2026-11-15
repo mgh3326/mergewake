@@ -211,24 +211,50 @@ func (s *Service) saveRoundRuleState(repo string, pr int, st roundRuleState) err
 // roundEndsWithoutPass reports whether the PR has at least one critical or high
 // finding still open after the verdict.
 func (s *Service) roundEndsWithoutPass(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (bool, []github.ReviewThread) {
+	blocking, _ := s.openFindings(ctx, r, pr, fb)
+	return len(blocking) > 0, blocking
+}
+
+// aboveLow reports whether a finding's severity ranks above low for the hub
+// consult: medium and up, with the legacy aliases this tool ranks there —
+// blocking (high) and major (CodeRabbit's rank above minor). An unrated or
+// unknown severity does not count: the tool cannot tell it above low, and a
+// blocking path already holds it for triage.
+func aboveLow(severity string) bool {
+	switch severity {
+	case "critical", "high", "blocking", "medium", "major":
+		return true
+	}
+	return false
+}
+
+// openFindings lists the threads still open after the verdict — unresolved and
+// not disposed by the gate's rule — at the two severity thresholds the round
+// rule reads: blocking (critical/high, the must-fix set) and aboveLow (medium
+// and up, the hub consult's trigger, operator decision 250: one consult per PR
+// and round, none for an all-low round). A thread can be in both.
+func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread) {
 	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
-	var open []github.ReviewThread
 	for _, t := range fb.Threads {
 		if t.IsResolved || len(t.Comments) == 0 {
 			continue
 		}
 		first := t.Comments[0]
 		sev := github.ThreadSeverity(first.Author, first.Body)
-		if !mustFix(sev) {
+		must := mustFix(sev)
+		if !must && !aboveLow(sev) {
 			continue
 		}
 		if disposed(t, own, verify, s.Config.Review.FleetAuthors) {
 			continue
 		}
-		open = append(open, t)
+		if must {
+			blocking = append(blocking, t)
+		}
+		above = append(above, t)
 	}
-	return len(open) > 0, open
+	return blocking, above
 }
 
 type escalateFinding struct {
