@@ -132,16 +132,9 @@ const (
 // where a spawn places one when the field is empty. A record that cannot be
 // read may name any directory, so the caller stops the sweep on its error.
 func (s *Service) recordedCheckouts(dir string) (map[string]bool, error) {
-	var paths []string
-	for _, pattern := range []string{
-		filepath.Join(s.Config.StateDir, "*", "reviewer-jobs", "*.json"),
-		filepath.Join(s.Config.StateDir, "*", "*", "reviewer-jobs", "*.json"),
-	} {
-		m, e := filepath.Glob(pattern)
-		if e != nil {
-			return nil, e
-		}
-		paths = append(paths, m...)
+	paths, e := recordFiles(s.Config.StateDir)
+	if e != nil {
+		return nil, e
 	}
 	named := map[string]bool{}
 	for _, path := range paths {
@@ -157,6 +150,57 @@ func (s *Service) recordedCheckouts(dir string) (map[string]bool, error) {
 		}
 	}
 	return named, nil
+}
+
+// recordFiles lists the reviewer-job record files under stateDir, at
+// <name>/reviewer-jobs and <owner>/<repo>/reviewer-jobs. filepath.Glob cannot
+// tell an unreadable directory from an empty one, so each is read here: only a
+// missing directory is empty, and any other read failure is returned.
+func recordFiles(stateDir string) ([]string, error) {
+	var out []string
+	add := func(dir string) error {
+		ents, e := os.ReadDir(dir)
+		if errors.Is(e, fs.ErrNotExist) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		for _, ent := range ents {
+			if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".json") {
+				out = append(out, filepath.Join(dir, ent.Name()))
+			}
+		}
+		return nil
+	}
+	top, e := os.ReadDir(stateDir)
+	if errors.Is(e, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if e != nil {
+		return nil, e
+	}
+	for _, t := range top {
+		if !t.IsDir() {
+			continue
+		}
+		base := filepath.Join(stateDir, t.Name())
+		if e := add(filepath.Join(base, "reviewer-jobs")); e != nil {
+			return nil, e
+		}
+		sub, e := os.ReadDir(base)
+		if e != nil {
+			return nil, e
+		}
+		for _, u := range sub {
+			if u.IsDir() {
+				if e := add(filepath.Join(base, u.Name(), "reviewer-jobs")); e != nil {
+					return nil, e
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // orphanLocalHost is the configured local host, or this machine's own panes
@@ -246,6 +290,17 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 		// Another repo's worktree, a branch checkout, or a directory nested in a
 		// worktree is not this pass's to remove.
 		if filepath.Clean(tree.Path) != path || !strings.EqualFold(tree.Repo, r.Name) || tree.Branch != "" {
+			continue
+		}
+		// Inspect reads the branch without failing on error, so a failed read
+		// leaves Branch empty. Detached needs positive evidence: HEAD resolves to
+		// itself, not to a branch ref.
+		head, e := hs.exec.Run(ctx, "git", "-C", path, "rev-parse", "--symbolic-full-name", "HEAD")
+		if e != nil {
+			errs = append(errs, fmt.Errorf("orphan checkout %s: head: %w", path, e))
+			continue
+		}
+		if strings.TrimSpace(string(head)) != "HEAD" {
 			continue
 		}
 		clean, e := hs.exec.Clean(ctx, path)

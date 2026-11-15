@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ func orphanCheckout(t *testing.T, f *reviewerFix, age time.Duration) (label, pat
 	t.Helper()
 	label = reviewerLabelFor(12, age)
 	path = localCheckout(t, f, label, false)
+	f.run.outs[key("git", "-C", path, "rev-parse", "--symbolic-full-name", "HEAD")] = "HEAD\n"
 	mtime := reviewerNow.Add(-age)
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatal(err)
@@ -330,5 +332,42 @@ func TestOrphanCheckoutProcessStartingMidSweepKept(t *testing.T) {
 	}
 	if removedCalled(f, path) {
 		t.Fatalf("removed under a process that started mid-sweep: calls %q", f.run.calls)
+	}
+}
+
+// A failed HEAD read is not evidence of a detached checkout: the directory is
+// kept, and nothing is removed.
+func TestOrphanCheckoutHeadUnreadableKept(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	if f.run.errs == nil {
+		f.run.errs = map[string]error{}
+	}
+	f.run.errs[key("git", "-C", path, "rev-parse", "--symbolic-full-name", "HEAD")] = errors.New("transient")
+	if err := f.reap(t, 0, Options{}); err == nil {
+		t.Fatal("expected the head read error to surface")
+	}
+	if removedCalled(f, path) {
+		t.Fatalf("removed without a head read: calls %q", f.run.calls)
+	}
+}
+
+// A directory under a state subdirectory that cannot be read stops the sweep:
+// its records may name any checkout.
+func TestRecordFilesUnreadableDirIsError(t *testing.T) {
+	state := t.TempDir()
+	bad := filepath.Join(state, "owner", "repo", "reviewer-jobs")
+	if err := os.MkdirAll(bad, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bad, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o700) })
+	if _, err := recordFiles(state); err == nil {
+		t.Fatal("unreadable reviewer-jobs dir read as empty")
+	}
+	if _, err := recordFiles(filepath.Join(t.TempDir(), "missing")); err != nil {
+		t.Fatalf("a missing state dir is empty, not an error: %v", err)
 	}
 }
