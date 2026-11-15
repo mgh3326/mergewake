@@ -100,6 +100,15 @@ func writeOverdueState(file string, st overdueState) error {
 	return fsutil.WriteJSON(file, st)
 }
 
+// pruneClocks drops the entries untouched for a week.
+func pruneClocks(clocks map[string]overdueClock, now time.Time) {
+	for k, o := range clocks {
+		if o.Touched.Before(now.Add(-7 * 24 * time.Hour)) {
+			delete(clocks, k)
+		}
+	}
+}
+
 // overdueKey is the clocks key of one (PR, head).
 func overdueKey(pr github.Pull) string {
 	return fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
@@ -151,9 +160,9 @@ func reviewCompleted(v gateVerdict) bool {
 // draft hold does not count: while the PR is a draft no clock starts its
 // countdown, and the pass that sees it leave draft moves the clocks this head
 // had already started forward by the hold's span. The span is measured from the
-// last pass that saw the PR open (LastOpen), so the draft time before the pass
-// that first saw the draft is not counted as open. Entries untouched for a week
-// are dropped.
+// last pass that saw the PR open (LastOpen, noteOpenPass), so the draft time
+// before the pass that first saw the draft is not counted as open. Entries
+// untouched for a week are dropped.
 func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
 	file := s.overdueClocksFile(r.Name)
 	defer lockPath(file)()
@@ -189,7 +198,6 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 			c.DraftSince, changed = draftAnchor(c.LastOpen, now), true
 		}
 	} else {
-		c.LastOpen, changed = now, true
 		if !c.DraftSince.IsZero() {
 			// The clocks of this head stop while it was a draft. Move each one
 			// it had already started forward by the hold's span, and rest a
@@ -207,6 +215,7 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 				}
 			}
 			c.DraftSince = time.Time{}
+			changed = true
 		}
 	}
 	if now.Sub(c.Touched) >= time.Hour {
@@ -216,11 +225,7 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 		return c, nil
 	}
 	st.Clocks[key] = c
-	for k, o := range st.Clocks {
-		if o.Touched.Before(now.Add(-7 * 24 * time.Hour)) {
-			delete(st.Clocks, k)
-		}
-	}
+	pruneClocks(st.Clocks, now)
 	return c, writeOverdueState(file, st)
 }
 
@@ -233,6 +238,27 @@ func draftAnchor(lastOpen, now time.Time) time.Time {
 		return now
 	}
 	return lastOpen
+}
+
+// noteOpenPass records that this pass saw the open PR not a draft. notify.go
+// calls it as soon as it has read the PR, before the reads that can fail: a
+// pass that errors before the gate saw the PR open all the same, so a hold that
+// starts after it is anchored here, not at an older pass. Every reporting pass
+// of an open, non-draft PR writes it.
+func (s *Service) noteOpenPass(r config.Repo, pr github.Pull) error {
+	file := s.overdueClocksFile(r.Name)
+	defer lockPath(file)()
+	st, e := readOverdueState(file)
+	if e != nil {
+		return e
+	}
+	now := s.now().UTC()
+	key := overdueKey(pr)
+	c := st.Clocks[key]
+	c.LastOpen, c.Touched = now, now
+	st.Clocks[key] = c
+	pruneClocks(st.Clocks, now)
+	return writeOverdueState(file, st)
 }
 
 // noteDraftHold records that the open PR is a draft now. The per-pass PR path
@@ -258,11 +284,7 @@ func (s *Service) noteDraftHold(r config.Repo, pr github.Pull) error {
 	}
 	c.Touched = now
 	st.Clocks[key] = c
-	for k, o := range st.Clocks {
-		if o.Touched.Before(now.Add(-7 * 24 * time.Hour)) {
-			delete(st.Clocks, k)
-		}
-	}
+	pruneClocks(st.Clocks, now)
 	return writeOverdueState(file, st)
 }
 

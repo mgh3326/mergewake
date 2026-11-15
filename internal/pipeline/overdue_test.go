@@ -567,6 +567,45 @@ func TestMergeOverdueLegacyDraftHoldKeepsItsAnchor(t *testing.T) {
 	}
 }
 
+// A pass records an open PR before the reads that can fail: a pass that errors
+// before the gate still anchors a draft hold that starts after it.
+func TestMergeOverdueOpenPassRecordedBeforeFailedPass(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.s.GH = &headFailGH{fakeGH: rig.g}
+	rig.now = overdueStart.Add(30 * time.Minute)
+	if e := rig.s.NotifyPR(context.Background(), rig.r, 7, Options{}); e == nil {
+		t.Fatal("the pass did not fail")
+	}
+	rig.s.GH = rig.g
+	rig.g.pull.Draft = true
+	rig.at(time.Hour) // the hold is anchored at the failed pass, not at t0
+	rig.at(8 * time.Hour)
+	rig.wantConditions() // a draft is held: no condition fires
+	rig.g.pull.Draft = false
+	rig.at(8 * time.Hour)
+	rig.wantConditions(overdueNotLanded) // the 30m it was seen open still counts
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 30m0s |") {
+		t.Fatal(e.Text)
+	}
+	rig.at(8*time.Hour + 14*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(8*time.Hour + 15*time.Minute) // ready_too_long from the 30m anchor
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
+// headFailGH fails Head, the read NotifyPR makes after it sees the PR open.
+type headFailGH struct {
+	*fakeGH
+}
+
+func (g *headFailGH) Head(context.Context, string, string) (string, error) {
+	return "", errors.New("head unavailable")
+}
+
 // The same 8 hours without a draft are unchanged: the clocks count the wall
 // time from the READY and the review completion.
 func TestMergeOverdueNoDraftCountsAsBefore(t *testing.T) {
