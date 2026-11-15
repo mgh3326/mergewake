@@ -452,7 +452,10 @@ const archiveLockTTL = int64(24 * 60 * 60)
 // a gone stdout (the ssh client closed) fails and the script runs on to its
 // EXIT trap; HUP, INT and TERM exit through that trap too. Only SIGKILL, a
 // host crash, or a signal between the mkdir and the EXIT trap line can still
-// leave a guard.
+// leave a guard. The EXIT trap reads the owner file with `read`, not a command
+// substitution: on bash 3.2 (macOS /bin/sh and /bin/bash) a write that failed
+// with EPIPE leaves its bytes pending, and a later $( ) captures them, which
+// would make the token comparison fail and strand the guard.
 const lockGuard = `guard="$1.guard"
 trap '' PIPE
 trap 'exit 1' HUP INT TERM
@@ -468,7 +471,7 @@ until mkdir "$guard" 2>/dev/null; do
 done
 guard_token="$guard_owner.$$.$now"
 if ! printf '%s\n' "$guard_token" > "$guard/owner"; then rm -rf "$guard"; echo busy; exit 0; fi
-trap 'if [ "$(cat "$guard/owner" 2>/dev/null)" = "$guard_token" ]; then rm -rf "$guard"; fi' EXIT
+trap 'guard_seen=; IFS= read -r guard_seen 2>/dev/null < "$guard/owner"; [ "$guard_seen" = "$guard_token" ] && rm -rf "$guard"' EXIT
 `
 
 // claimScript is one claim attempt. It never moves or removes an existing lock:
