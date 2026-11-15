@@ -123,13 +123,17 @@ The daemon runs the sweep from its reap role, at most once per repo per
 attempt per repo is written to `<state_dir>/<repo>/legacy-sweep.json` before the
 sweep starts, so a restart inside the interval does not sweep again and a
 failing sweep waits for the next interval instead of running on every reap
-pass. It acts under the same gates as the pass it rides on: `reap.act` decides
-whether a removal is real, and daemon shadow mode plans only, writing
-`would-remove` rows. Each repo's sweep covers all its hosts at once, keeping one
-set of per-sweep caches. A failure is audited as `reap-legacy-error` and logged
-with the daemon's other errors; the remaining repos and the regular reap pass
-still run. `mergewake reap --legacy` runs one pass by hand and does not move the
-daemon's schedule.
+pass. A corrupt `legacy-sweep.json` is treated like a missing record — the
+sweep runs and the stamp write repairs the file — while a read failure that is
+not a decode error (permissions, say) stays not-due, since the write would fail
+the same way; both are audited as `reap-legacy-error`. It acts under the same
+gates as the pass it rides on: `reap.act` decides whether a removal is real,
+and daemon shadow mode plans only, writing `would-remove` rows. Each repo's
+sweep covers all its hosts at once, keeping one set of per-sweep caches. A
+failure is audited as `reap-legacy-error` and logged with the daemon's other
+errors; the remaining repos and the regular reap pass still run.
+`mergewake reap --legacy` runs one pass by hand and does not move the daemon's
+schedule.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role clean up merged-PR worktrees once they age out. Reap never closes

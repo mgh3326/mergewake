@@ -45,7 +45,7 @@ func (s *Service) ReapLegacyScheduled(ctx context.Context, repos []config.Repo, 
 		if e := ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
-		due, e := s.legacyDue(r.Name, every)
+		due, e := s.legacyDue(r.Name, every, o.DryRun)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.Name, e))
 			continue
@@ -66,11 +66,21 @@ func (s *Service) ReapLegacyScheduled(ctx context.Context, repos []config.Repo, 
 // interval exists to bound. A stamp in the future means the clock moved back;
 // that makes the sweep due once rather than holding it off until the clock
 // catches up.
-func (s *Service) legacyDue(repo string, every time.Duration) (bool, error) {
+//
+// A corrupt record is treated like a missing one — the sweep is due and the
+// stamp write repairs the file — while any other read failure stays not-due,
+// since the stamp write would fail the same way. Both are audited as
+// reap-legacy-error so the cause shows in decisions.jsonl.
+func (s *Service) legacyDue(repo string, every time.Duration, dry bool) (bool, error) {
 	file := s.legacyScheduleFile(repo)
 	var last legacySchedule
-	if _, e := fsutil.ReadJSON(file, &last); e != nil {
-		return false, e
+	found, e := fsutil.ReadJSON(file, &last)
+	if e != nil {
+		ae := s.audit(repo, "reap-legacy-error", map[string]any{"error": e.Error(), "file": filepath.Base(file)}, dry)
+		if !found {
+			return false, errors.Join(e, ae)
+		}
+		last = legacySchedule{}
 	}
 	now := s.now().UTC()
 	if since := now.Sub(last.LastRun); !last.LastRun.IsZero() && since >= 0 && since < every {
