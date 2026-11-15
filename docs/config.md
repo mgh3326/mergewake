@@ -1576,7 +1576,7 @@ For `example/project`, state resides beneath
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
-| `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
+| `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on its review — in the merge gate on `review_missing`, or on the review path while the review is held, quota-stopped, pending or its poll was skipped; the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
@@ -1862,14 +1862,22 @@ is not a thread.
 design lane and retried until sent, so the design session hears merge notices
 and the BLOCKED reasons that need its decision.
 
-A head that keeps `review_missing` for more than 60 minutes gets one
+A head that keeps waiting for its review for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
 head, the wait so far, the passes posted against those needed, and the reviewer
-job recorded for the head, if any. The wait starts when this host first sees the
-head with that reason after its required checks settle, and it is kept in
-`pr-review-wait.json`. The alert is sent once per `(PR, head)`, deduped across
-restarts by a `stalled <PR> <head>` key in `pr-notify-sent`. It is sent only while
-`review_missing` is the whole reason set. A head that is later reviewed and blocks
+job recorded for the head, if any. When the review itself did not run, it also
+names that wait, with the reason its audit row recorded where the pass knew one:
+`held (reviewer-held)`, `quota-stopped (pool <pool>)`, `pending`, or `skipped`
+for a poll the GitHub client dropped. The wait starts when this host first sees
+the head waiting for its review — in the merge gate on `review_missing`, or on
+the review path when the review is held, quota-stopped, pending or skipped — and
+it is kept in `pr-review-wait.json`. The alert is sent once per `(PR, head)`,
+deduped across restarts by a `stalled <PR> <head>` key in `pr-notify-sent`, by
+whichever path first sees the wait past the threshold, and a delivery the
+notifier refuses is retried on the next pass. The review path sends the alert
+and nothing else: findings delivery and Land wait for a review that posted
+something. On the gate path it is sent only while `review_missing` is the whole
+reason set. A head that is later reviewed and blocks
 again follows the rules above. This is the only stall alert: the older
 elapsed-time `STALLED review` alarm, which the daemon stopped calling when
 reviews moved to retry accounting, is removed with its `review-wait.json` and
