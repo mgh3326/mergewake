@@ -41,8 +41,23 @@ const (
 	overdueReadyTooLong     = "ready_too_long"
 )
 
+// overdueHoldSpans bounds the holds an entry keeps. Past it the two oldest are
+// merged into one, which over-counts the open time between them as held; the
+// entry is pruned a week after its last touch either way.
+const overdueHoldSpans = 32
+
+// holdSpan is one closed draft hold: the PR was a draft from From to To. It is
+// data, not a correction: no clock is moved for it, and an age takes off the
+// part of the span it overlaps (openAge).
+type holdSpan struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+}
+
 // overdueClock holds the clocks of one (PR, head). A zero time means the event
-// has not been seen yet. Touched only bounds how long an idle entry is kept.
+// has not been seen yet. Each is the raw time its event was recorded and no
+// hold ever moves it: the draft holds are kept beside them, and an age is
+// computed when it is read. Touched only bounds how long an idle entry is kept.
 type overdueClock struct {
 	HeadSeen   time.Time `json:"head_seen,omitzero"`
 	ChecksDone time.Time `json:"checks_done,omitzero"`
@@ -53,9 +68,13 @@ type overdueClock struct {
 	// DraftSince is when the draft hold that is going on started. While it is
 	// set the clocks do not count: the per-pass PR path returns before the
 	// gate for a draft, so noteDraftHold records it, and the pass that sees
-	// the PR leave draft subtracts the span. The hold starts at LastOpen, not
-	// at the pass that first saw it (see below).
+	// the PR leave draft closes it into Holds (closeHold). The hold starts at
+	// LastOpen, not at the pass that first saw it (see below).
 	DraftSince time.Time `json:"draft_since,omitzero"`
+	// Holds are the draft holds this head has been through, oldest first. A
+	// file an earlier release wrote has none: its holds were taken off the
+	// clocks it stored, which is the same age as holding them would give.
+	Holds []holdSpan `json:"holds,omitempty"`
 	// LastOpen is the last pass that saw the PR not a draft. The time between
 	// it and the pass that first sees a draft may already have been a draft,
 	// so a hold that starts now is anchored here. Zero on a file an earlier
@@ -158,9 +177,9 @@ func reviewCompleted(v gateVerdict) bool {
 // entry. The READY time comes from the
 // READY verdict mergewake recorded for the head (notify.go recordOnlyEvent). A
 // draft hold does not count: while the PR is a draft no clock starts its
-// countdown, and the pass that sees it leave draft moves the clocks this head
-// had already started forward by the hold's span. The span is measured from the
-// last pass that saw the PR open (LastOpen, noteOpenPass), so the draft time
+// countdown, and the pass that sees it leave draft closes the hold into Holds,
+// where the ages are computed against it (openAge). The span is measured from
+// the last pass that saw the PR open (LastOpen, noteOpenPass), so the draft time
 // before the pass that first saw the draft is not counted as open. Entries
 // untouched for a week are dropped.
 func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict) (overdueClock, error) {
@@ -198,7 +217,7 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 			c.DraftSince, changed = draftAnchor(c.LastOpen, now), true
 		}
 	} else {
-		changed = holdEnd(&c, now) || changed
+		changed = closeHold(&c, now) || changed
 	}
 	if now.Sub(c.Touched) >= time.Hour {
 		c.Touched, changed = now, true
@@ -211,29 +230,23 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 	return c, writeOverdueState(file, st)
 }
 
-// holdEnd closes the draft hold the entry still carries at now: the clocks of
-// this head stopped while it was a draft, so move each one it had already
-// started forward by the hold's span, and rest a clock that started inside the
-// hold (or a READY recorded in it) at now — the pass that saw the PR ready. It
-// reports whether the entry changed. Both places that see the PR open call it,
-// tickOverdueClocks and noteOpenPass, so a pass that errors later still ends the
-// hold.
-func holdEnd(c *overdueClock, now time.Time) bool {
+// closeHold ends the draft hold the entry still carries at now: the span is
+// recorded in Holds and DraftSince cleared, and nothing else moves. Both places
+// that see the PR open call it, tickOverdueClocks and noteOpenPass, so a pass
+// that errors later still ends the hold. It reports whether the entry changed.
+func closeHold(c *overdueClock, now time.Time) bool {
 	if c.DraftSince.IsZero() {
 		return false
 	}
-	shift := now.Sub(c.DraftSince)
-	for _, at := range []*time.Time{&c.HeadSeen, &c.ChecksDone, &c.ReviewDone, &c.Ready} {
-		if at.IsZero() {
-			continue
-		}
-		if moved := at.Add(shift); moved.Before(now) {
-			*at = moved
-		} else {
-			*at = now
-		}
-	}
+	c.Holds = append(c.Holds, holdSpan{From: c.DraftSince, To: now})
 	c.DraftSince = time.Time{}
+	// Keep the list bounded: merge the two oldest spans. That counts the open
+	// time between them as held, the conservative direction, and the entry is
+	// pruned a week after its last touch anyway.
+	for len(c.Holds) > overdueHoldSpans {
+		c.Holds[1] = holdSpan{From: c.Holds[0].From, To: c.Holds[1].To}
+		c.Holds = c.Holds[1:]
+	}
 	return true
 }
 
@@ -252,11 +265,9 @@ func draftAnchor(lastOpen, now time.Time) time.Time {
 // calls it as soon as it has read the PR, before the reads that can fail: a
 // pass that errors before the gate saw the PR open all the same, so a hold that
 // starts after it is anchored here, not at an older pass, and a hold it ends is
-// off the clocks then. Every reporting pass of an open, non-draft PR writes it.
-// That holds for its own READY read too: the sighting and the hold's end are
-// written before the read error is returned, and a READY such a pass could not
-// fill is filled by a later one as the record stands, not shifted by the hold
-// again.
+// closed into Holds then. It does no fallible read of its own, so nothing can
+// keep it from writing the sighting: the READY time is filled by
+// tickOverdueClocks, raw, whenever a pass gets to read it.
 func (s *Service) noteOpenPass(r config.Repo, pr github.Pull) error {
 	file := s.overdueClocksFile(r.Name)
 	defer lockPath(file)()
@@ -267,28 +278,16 @@ func (s *Service) noteOpenPass(r config.Repo, pr github.Pull) error {
 	now := s.now().UTC()
 	key := overdueKey(pr)
 	c := st.Clocks[key]
-	var readyErr error
-	if c.Ready.IsZero() {
-		// The READY verdict is recorded after the clocks tick, so fill it here
-		// before the hold's span is taken off: a READY sent before the hold
-		// counts from where the hold ends, not from its unwritten record.
-		ready, ok, e := s.readySent(r.Name, pr)
-		if e != nil {
-			readyErr = e
-		} else if ok {
-			c.Ready = ready
-		}
-	}
 	c.LastOpen, c.Touched = now, now
-	holdEnd(&c, now)
+	closeHold(&c, now)
 	st.Clocks[key] = c
 	pruneClocks(st.Clocks, now)
-	return errors.Join(readyErr, writeOverdueState(file, st))
+	return writeOverdueState(file, st)
 }
 
 // noteDraftHold records that the open PR is a draft now. The per-pass PR path
 // returns before the gate for a draft, so this is the only place the hold is
-// seen; tickOverdueClocks subtracts its span when the PR leaves draft. The
+// seen; the pass that sees the PR leave draft closes its span into Holds. The
 // entry is written when the hold starts and then hourly, so an idle draft does
 // not rewrite the file on every pass.
 func (s *Service) noteDraftHold(r config.Repo, pr github.Pull) error {
@@ -346,14 +345,52 @@ func overdueHeld(v gateVerdict) bool {
 	return v.State == "pending" && checksCompleted(v)
 }
 
+// openAge is how long the clock that started at start has counted at now: the
+// time since start, less every draft hold it overlaps, the hold in progress
+// included up to now. A clock that starts inside a hold counts from the hold's
+// end; a hold that ends before the clock starts takes nothing off. Nothing here
+// depends on the order the clocks were filled in or on which pass read what:
+// the same raw times and hold spans always give the same age.
+func openAge(c overdueClock, start, now time.Time) time.Duration {
+	if start.IsZero() || !now.After(start) {
+		return 0
+	}
+	held := time.Duration(0)
+	take := func(from, to time.Time) {
+		if from.Before(start) {
+			from = start
+		}
+		if to.After(now) {
+			to = now
+		}
+		if to.After(from) {
+			held += to.Sub(from)
+		}
+	}
+	for _, h := range c.Holds {
+		take(h.From, h.To)
+	}
+	if !c.DraftSince.IsZero() {
+		take(c.DraftSince, now)
+	}
+	if age := now.Sub(start) - held; age > 0 {
+		return age
+	}
+	return 0
+}
+
 // overdueDue lists the conditions whose time has passed, with the age each is
-// reported at.
+// reported at. The age is open time (openAge), never the wall time since the
+// clock started: a draft hold is not the author's wait.
 func overdueDue(c overdueClock, started bool, now time.Time) (conditions []string, ages map[string]time.Duration) {
 	ages = map[string]time.Duration{}
 	add := func(name string, since time.Time, after time.Duration) {
-		if !since.IsZero() && now.Sub(since) >= after {
+		if since.IsZero() {
+			return
+		}
+		if age := openAge(c, since, now); age >= after {
 			conditions = append(conditions, name)
-			ages[name] = now.Sub(since)
+			ages[name] = age
 		}
 	}
 	if !started {
