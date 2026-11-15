@@ -1864,11 +1864,15 @@ and the BLOCKED reasons that need its decision.
 
 A head that keeps waiting for its review for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
-head, the wait so far, the passes posted against those needed, and the reviewer
-job recorded for the head, if any. When the review itself did not run, it also
-names that wait, with the reason its audit row recorded where the pass knew one:
-`held (reviewer-held)`, `quota-stopped (pool <pool>)`, `pending`, or `skipped`
-for a poll the GitHub client dropped. The wait starts when this host first sees
+head and the wait so far, then how far the head's review got. On the gate path
+(the `review_missing` wait) that is the passes posted against those needed and
+the reviewer job recorded for the head, if any; on the review path, where the
+review itself did not run, only the reviewer job recorded for the head is
+known, so that path names the reviewer job and not a pass count. When the
+review itself did not run, the alert also names that wait, with the reason its
+audit row recorded where the pass knew one: `held (reviewer-held)`, `held
+(round-hold)`, `quota-stopped (pool <pool>)`, `pending`, or `skipped` for a poll
+the GitHub client dropped. The wait starts when this host first sees
 the head waiting for its review — in the merge gate on `review_missing`, or on
 the review path when the review is held, quota-stopped, pending or skipped — and
 it is kept in `pr-review-wait.json`. The alert is sent once per `(PR, head)`,
