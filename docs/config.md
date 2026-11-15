@@ -1052,6 +1052,7 @@ Healthy repeated agent polls do not emit a fresh installation notification.
 | `type` | `noop` (also empty) | `noop` or `handoffkeep`. |
 | `command` | `handoffkeep` for that adapter | The hk CLI: still run for deploy approvals (`deploy_task`), and named to reviewers as the command that reads a large review brief. The task, attachment and document calls below do not run it. |
 | `reopen_state` | `reopened` | Only `reopened` is accepted; terminal tasks use the explicit reason-required operation. |
+| `reconcile_every` | `1h` | Positive duration, or `off`. How often the daemon checks hk's unreconciled PR rows against GitHub and writes the merged and closed ones back; see [unreconciled-row sync](#unreconciled-row-sync). |
 
 The handoffkeep adapter reads the task (`GET /v1/tasks/ID`), posts the reason
 as a comment (`POST /v1/tasks/ID/comments`), then reopens a merged or dropped
@@ -1063,6 +1064,33 @@ remain enforced. No fallback generic transition is attempted. Structured
 reports are `note` documents (`PUT /v1/documents/KEY`). These calls go over
 HTTP with the [hk HTTP credential](#hk-http-credential).
 
+#### unreconciled-row sync
+
+hk keeps one change row per PR, and the daemon writes it as its passes see
+PRs. A PR merged outside mergewake's pass is never written as merged, so its
+row stays open and the hk tasks waiting on it stay stuck between merged and
+deployed. With the `handoffkeep` sink the daemon closes that gap: every
+`sink.reconcile_every` (default `1h`, `off` disables it) it reads hk's
+`GET /v1/changes/unreconciled` rows — rows hk holds open, and rows hk holds
+merged with no merge commit, oldest first — and for each row of a configured
+repository it reads the PR through the client (`Pull`, whose merged commit
+comes from GraphQL) and writes the state through the change-state writer. A
+merged row is written with `merge_sha` and `merged_at`, a closed-unmerged row
+as `closed`, and a PR that is still open gets no write. Rows of repositories
+this host does not configure are counted and skipped, never read.
+
+The endpoint pages by `limit` only and takes no `after_id`. A run therefore
+reads hk's maximum page (1000 rows) and checks at most 500 rows, starting
+after the last row the previous run checked and wrapping at the end, so rows
+that stay open at the head of the list cannot starve the rest. A list longer
+than one page takes several runs to cover, and a still-open row is checked
+again only when the rotation reaches it or the page no longer fills. GitHub
+reads go through the client's memo and ETag cache, and the GraphQL resolver
+runs only for a merged PR. Each run logs one `hk change sync run` line with
+`rows`, `merged`, `closed`, `open`, `other_repo` and `errors`; a failed read
+(an hk without the endpoint answers 404) is in that line, and the next run
+retries.
+
 #### hk HTTP credential
 
 mergewake's own HTTP calls to hk authenticate as the hk client
@@ -1070,6 +1098,7 @@ mergewake's own HTTP calls to hk authenticate as the hk client
 
 - job records (`GET /v1/jobs/<id>`);
 - change priority and review records (`GET /v1/changes?pr=`);
+- unreconciled change rows (`GET /v1/changes/unreconciled`);
 - change state (`POST /v1/changes/batch`, `PUT /v1/changes/<section>`);
 - task events (`POST /v1/task-events`);
 - through the hk public client (`github.com/mgh3326/handoffkeep/client`), the
@@ -1640,6 +1669,12 @@ from the `pr` engine's own copy of its queue's open set, so it makes no GitHub r
 every five seconds) for each repository's first sweep. Each due closed row is
 read at most hourly. A run is bounded to ten minutes and logs one
 `outcome reconcile run` line per repository. The loop stops with the daemon.
+
+The hk unreconciled-row sync also runs in a loop of its own, with the
+`handoffkeep` sink and a change-state writer, every `sink.reconcile_every`
+(default `1h`, `off` disables it). It runs one bounded sync per interval and
+logs one `hk change sync run` line; see
+[unreconciled-row sync](#unreconciled-row-sync). It stops with the daemon.
 
 All roles default disabled; omitted intervals inherit poll_interval. `daemon`
 runs only configured roles, one goroutine each. Shadow is the default for all

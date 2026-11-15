@@ -32,6 +32,13 @@ func changeSource(ctx context.Context) string {
 	}
 	return "poll"
 }
+
+// RecordPull writes a pull's state through the change-state writer, for a
+// caller that read it with ReadPull: the unreconciled-row sync records only a
+// row whose pull is merged or closed.
+func (c *Client) RecordPull(ctx context.Context, repo string, p Pull, at time.Time) {
+	c.writePull(ctx, repo, p, at, changeSource(ctx), "")
+}
 func (c *Client) writePull(ctx context.Context, repo string, p Pull, at time.Time, source, delivery string) {
 	if c.Changes == nil {
 		return
