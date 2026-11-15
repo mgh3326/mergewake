@@ -768,7 +768,7 @@ func (w *legacySweep) unmerged(ctx context.Context, hs *reapHost, c *legacyCand,
 			return
 		}
 	}
-	id := w.taskFor(c, wt, p)
+	id := w.taskFor(hs.host, c, wt, p)
 	if id == "" {
 		keep("no-task")
 		return
@@ -836,13 +836,13 @@ func (w *legacySweep) unmerged(ctx context.Context, hs *reapHost, c *legacyCand,
 	w.removeGuarded(ctx, hs, wt, rec, errs)
 }
 
-// taskFor names the hk task a worktree belongs to. Every positive
+// taskFor names the hk task a worktree belongs to on host. Every positive
 // identification counts — the closed PR's Mergewake-Task trailer, a bound
 // job's trailer task, and each job record whose worktree or cwd is this path
-// (its own task_id or the task that bound it this pass). It returns "" unless
-// all of them name exactly one task: no identification, or identifications
-// that disagree, keep the worktree.
-func (w *legacySweep) taskFor(c *legacyCand, wt *reap.Worktree, p *github.Pull) string {
+// on this host (its own task_id or the task that bound it this pass). It
+// returns "" unless all of them name exactly one task: no identification, or
+// identifications that disagree, keep the worktree.
+func (w *legacySweep) taskFor(host reap.Host, c *legacyCand, wt *reap.Worktree, p *github.Pull) string {
 	var ids []string
 	seen := map[string]bool{}
 	addID := func(id string) {
@@ -853,7 +853,7 @@ func (w *legacySweep) taskFor(c *legacyCand, wt *reap.Worktree, p *github.Pull) 
 	}
 	addJob := func(job string) {
 		rec := w.jobRecs[job]
-		if rec == nil || !jobRecordNames(rec, wt) {
+		if rec == nil || !jobRecordNames(rec, wt, host) {
 			return
 		}
 		if rec.TaskID != nil && *rec.TaskID > 0 {
@@ -884,9 +884,15 @@ func (w *legacySweep) taskFor(c *legacyCand, wt *reap.Worktree, p *github.Pull) 
 }
 
 // jobRecordNames reports whether the job record's cwd or recorded worktree is
-// this worktree: a cwd at or inside it, or the same head on the same branch of
-// the same repo.
-func jobRecordNames(rec *integrations.JobRecord, wt *reap.Worktree) bool {
+// this worktree on this host: the record must name the host the job ran on —
+// absolute paths and branch-head pairs collide across hosts — its cwd must be
+// the path or inside it, or the recorded worktree must be the same head on
+// the same branch of the same repo. An origin that does not parse to
+// owner/name never matches.
+func jobRecordNames(rec *integrations.JobRecord, wt *reap.Worktree, host reap.Host) bool {
+	if rec.Host == "" || (rec.Host != host.Name && rec.Host != host.MachineID()) {
+		return false
+	}
 	if rec.Cwd != "" {
 		cwd, path := filepath.Clean(rec.Cwd), filepath.Clean(wt.Path)
 		if cwd == path || strings.HasPrefix(cwd, path+string(filepath.Separator)) {
@@ -900,7 +906,8 @@ func jobRecordNames(rec *integrations.JobRecord, wt *reap.Worktree) bool {
 	if jw.Branch == nil || *jw.Branch == "" || *jw.Branch != wt.Branch {
 		return false
 	}
-	if origin := reap.RepoFromRemote(jw.Origin); origin != "" && !strings.EqualFold(origin, wt.Repo) {
+	origin := reap.RepoFromRemote(jw.Origin)
+	if origin == "" || !strings.EqualFold(origin, wt.Repo) {
 		return false
 	}
 	return true

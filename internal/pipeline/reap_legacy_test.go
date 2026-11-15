@@ -12,6 +12,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // legacyGH lists every closed and open PR for the legacy sweep, as the real
@@ -720,5 +721,55 @@ func TestLegacySweepKeepsAmbiguousTaskMapping(t *testing.T) {
 	wantRow(t, legacyOnly(t, s), "kept", "no-task")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("removed an ambiguous worktree %d times", n)
+	}
+}
+
+// A job record on another host names the same absolute path but not this
+// worktree: the foreign record cannot identify the task, so the row stays
+// no-task even though its task is dropped.
+func TestLegacySweepForeignHostJobRecordKeepsNoTask(t *testing.T) {
+	pr := listPR(41, "wk/other", 20)
+	pr.Body = "Work.\n\nMergewake-Task: 9999\n"
+	s, hub := listFixture(t, []map[string]any{listedRow("/b.wt", "wk/b")}, pr)
+	sink := s.Sink.(*jobSink)
+	sink.jobs["9999"] = "job-b"
+	sink.recs["job-b"] = integrations.JobRecord{State: "completed", Host: "node-b", Cwd: "/b.wt", Label: "job-b"}
+	sink.tasks = map[string]client.Task{"9999": {State: "dropped", UpdatedAt: time.Now().Add(-20 * 24 * time.Hour)}}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, rowFor(t, s, "/b.wt"), "kept", "no-task")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed on a foreign host's record %d times", n)
+	}
+}
+
+// jobRecordNames matches a record to a worktree only on the host the job ran
+// on, and a recorded worktree origin that does not parse to owner/name never
+// matches — head and branch alone are not enough across repos.
+func TestJobRecordNamesHostAndOrigin(t *testing.T) {
+	host := reap.Host{Name: "node", Machine: "node-a"}
+	branch := "wk/b"
+	wt := &reap.Worktree{Path: "/b.wt", Branch: "wk/b", Head: headSHA, Repo: "example/project"}
+	for _, tc := range []struct {
+		name string
+		rec  *integrations.JobRecord
+		want bool
+	}{
+		{"cwd on machine id", &integrations.JobRecord{Host: "node-a", Cwd: "/b.wt"}, true},
+		{"cwd on host name", &integrations.JobRecord{Host: "node", Cwd: "/b.wt"}, true},
+		{"cwd in a subdirectory", &integrations.JobRecord{Host: "node-a", Cwd: "/b.wt/sub"}, true},
+		{"cwd foreign host", &integrations.JobRecord{Host: "node-b", Cwd: "/b.wt"}, false},
+		{"cwd no host", &integrations.JobRecord{Cwd: "/b.wt"}, false},
+		{"worktree same repo", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Branch: &branch, Head: headSHA}}, true},
+		{"worktree https origin", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "https://github.com/example/project", Branch: &branch, Head: headSHA}}, true},
+		{"worktree local origin", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "/src/project", Branch: &branch, Head: headSHA}}, false},
+		{"worktree other repo", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/other.git", Branch: &branch, Head: headSHA}}, false},
+		{"worktree detached record", &integrations.JobRecord{Host: "node-a", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Head: headSHA}}, false},
+		{"worktree foreign host", &integrations.JobRecord{Host: "node-b", Worktree: &integrations.JobWorktree{Origin: "git@github.com:example/project.git", Branch: &branch, Head: headSHA}}, false},
+	} {
+		if got := jobRecordNames(tc.rec, wt, host); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
