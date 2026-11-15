@@ -926,7 +926,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
 	if s.Config.Reap.Archive.Enabled {
-		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note)...)
+		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
 	}
 	result := struct {
 		Action   string `json:"action"`

@@ -421,17 +421,20 @@ row is older than `min_age`, so the age counts from when reap first saw the
 gone state, not from any file time. Acting needs `reap.act` and `--apply`
 like every reap mutation; otherwise the plan — what moves to Drive, what goes
 to hk, what is excluded and what would be deleted — is printed as an
-`archive-plan` line with a `would-archive` row. A job whose name is a live
-pane again is skipped as `pane-live`, and an hk record that is still live as
-`job-active`; a job mid-run is `not-finished`. Each outcome is an
-`archive-job` row in `reap.jsonl` with the Drive directory, hk ids and
+`archive-plan` line with a `would-archive` row (one shadow plan per job; an
+acting pass still archives once its own sighting ages out). A job whose name
+is a live pane again is skipped as `pane-live`, and an hk record that is
+still live as `job-active`; a job mid-run is `not-finished`. Each outcome is
+an `archive-job` row in `reap.jsonl` with the Drive directory, hk ids and
 excluded names; a new job dir under a reused name restarts every clock, since
-its files are newer than the earlier job's final row. `archived` and every
-refusal other than a live pane, a missing pane scan, an active or unfinished
-job, a `job-gone` race, or a fresh sighting are final, and a failed attempt is
-retried at most once an hour. A full (non-`--pr`) pass runs the stage; a
-`--pr` run scopes to one PR's cleanup and skips it. Old `close-pane` rows
-still load but no longer feed the stage.
+its files are newer than the earlier job's final row — the restart writes a
+fresh sighting row even when the earlier row is itself a sighting.
+`archived` and every refusal other than a live pane, a missing pane scan, an
+active or unfinished job, an unknown job, a `job-gone` race, or a fresh
+sighting are final, and a failed attempt is retried at most once an hour, by
+re-attempting the archive directly rather than starting a fresh sighting. A
+full (non-`--pr`) pass runs the stage; a `--pr` run scopes to one PR's cleanup
+and skips it. Old `close-pane` rows still load but no longer feed the stage.
 
 `mergewake archive-jobs [--older-than 14d] [--host NAME] [--dry-run|--apply]`
 runs the same plan and apply over a host's existing backlog: every job dir in

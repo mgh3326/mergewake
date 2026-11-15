@@ -580,6 +580,13 @@ func TestReapArchiveShadowOnlyPlans(t *testing.T) {
 	if len(rows) != 2 || rows[1].Result != "would-archive" {
 		t.Fatalf("rows = %+v", rows)
 	}
+	// A second shadow pass plans nothing new: one shadow plan per job.
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows(t)) != 2 || f.hkCalls() != 0 {
+		t.Fatalf("shadow replanned: %+v", f.rows(t))
+	}
 	var plan map[string]any
 	for _, line := range strings.Split(f.out.String(), "\n") {
 		if strings.Contains(line, `"archive-plan"`) {
@@ -826,7 +833,36 @@ func TestReapArchiveReusedNameArchivesAgain(t *testing.T) {
 	}
 }
 
-// One failed archive is one error in the reap summary, kept for retry.
+// A new incarnation after a non-terminal sighting gets its own sighting: the
+// old awaiting row does not release the new dir on its own clock.
+func TestReapArchiveReusedNameRestartsStaleSighting(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
+	f.seedArchive(t, "wk-7", "skipped", "awaiting-min-age", time.Now().Add(-48*time.Hour))
+	// The job runs again under the same name after that sighting: its files
+	// are newer than the old row.
+	dir := jobDir(t, f.jobs, "wk-7", time.Hour)
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[1].Result != "skipped" || rows[1].Reason != "awaiting-min-age" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("reused job archived on the old sighting")
+	}
+	// Once the new sighting ages out, the new incarnation archives.
+	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("reused job not archived after its own min_age")
+	}
+}
+
 func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.hk.Fail("POST /v1/tasks/{id}/comments", 500, "internal")
@@ -852,6 +888,15 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	}
 	if len(f.rows(t)) != 2 {
 		t.Fatalf("throttled retry wrote a row: %+v", f.rows(t))
+	}
+	// Past the hour the retry attempts the archive again at once, instead of
+	// starting a fresh min_age sighting.
+	f.s.Now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err == nil {
+		t.Fatal("unthrottled retry did not fail")
+	}
+	if rows := f.rows(t); len(rows) != 3 || rows[2].Result != "error" {
+		t.Fatalf("retry did not re-attempt the archive: %+v", rows)
 	}
 }
 

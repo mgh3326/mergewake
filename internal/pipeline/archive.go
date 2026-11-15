@@ -114,7 +114,7 @@ func retentionReason(retained []archive.Retention) string {
 // most once an hour. Old close-pane rows still load but no longer feed this
 // stage. The --pr run scopes to one PR's cleanup and skips this host-wide
 // stage.
-func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts map[string]*reapHost, records *passJobRecords, acting bool, note func(reapReceipt)) []error {
+func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, hosts map[string]*reapHost, records *passJobRecords, acting bool, note func(reapReceipt), resight func(reapReceipt)) []error {
 	if prNum > 0 {
 		return nil
 	}
@@ -176,15 +176,22 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			}
 			k := jobRef{h.Name, job}
 			prior, tried := last[k]
-			if tried && archiveTerminal(prior) && summaries[job].Newest > prior.Time.Unix() {
+			reset := false
+			if tried && summaries[job].Newest > prior.Time.Unix() {
 				// A new job under a reused name restarts every clock: its
-				// files are newer than the earlier job's final row.
-				tried = false
+				// files are newer than the earlier job's row, terminal or
+				// not, so no sighting or archive of the old job decides it.
+				tried, reset = false, true
 			}
 			if tried && archiveTerminal(prior) {
 				continue
 			}
 			if tried && (prior.Result == "error" || prior.Result == "archived-retained") && now.Sub(prior.Time) < archiveRetry {
+				continue
+			}
+			if tried && prior.Result == "would-archive" && !acting {
+				// One shadow plan per job is enough; an acting pass still
+				// archives once its own sighting ages out.
 				continue
 			}
 			rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
@@ -226,14 +233,26 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				case skipReason == "not-finished":
 					rec.Result, rec.Reason = "skipped", "not-finished"
 				case !tried || prior.Result != "skipped" || prior.Reason != "awaiting-min-age":
-					// First sighting of the gone state: record it; a later
-					// pass archives once it is older than min_age.
-					rec.Result, rec.Reason = "skipped", "awaiting-min-age"
+					if tried && (prior.Result == "error" || prior.Result == "archived-retained") {
+						// The retry waited out its hour: attempt the archive
+						// again now instead of starting a fresh sighting.
+						s.archiveJob(ctx, h, job, acting, &rec)
+					} else {
+						// First sighting of the gone state: record it; a later
+						// pass archives once it is older than min_age.
+						rec.Result, rec.Reason = "skipped", "awaiting-min-age"
+					}
 				case now.Sub(prior.Time) < minAge:
 					continue
 				default:
 					s.archiveJob(ctx, h, job, acting, &rec)
 				}
+			}
+			if reset && rec.Result == "skipped" && rec.Reason == "awaiting-min-age" {
+				// The reset starts a new clock with a fresh row even though
+				// an identical sighting is already logged: the dedupe in
+				// note keys on outcome alone and would keep the stale time.
+				resight(rec)
 			}
 			note(rec)
 		}
