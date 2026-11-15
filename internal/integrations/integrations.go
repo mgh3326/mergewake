@@ -306,6 +306,12 @@ func (h Handoffkeep) TaskJob(ctx context.Context, task string) (string, string, 
 	return x.Refs.JobID, x.Title, nil
 }
 
+// Task reads one task's whole public record: state, refs and timestamps, for
+// callers that need more than TaskJob's projection.
+func (h Handoffkeep) Task(ctx context.Context, task string) (client.Task, error) {
+	return h.task(ctx, task)
+}
+
 // TaskPriority reads the task's priority: 1 is urgent and 4 low; 0 means the
 // task has none.
 func (h Handoffkeep) TaskPriority(ctx context.Context, task string) (int, error) {

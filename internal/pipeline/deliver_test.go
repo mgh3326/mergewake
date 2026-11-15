@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/handoffkeep/client"
+
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -18,14 +20,25 @@ import (
 // jobSink is an hk sink that knows task lanes and the job bound to a task.
 type jobSink struct {
 	fakeSink
-	lanes map[string]string
-	jobs  map[string]string
-	recs  map[string]integrations.JobRecord
+	lanes  map[string]string
+	jobs   map[string]string
+	recs   map[string]integrations.JobRecord
+	tasks  map[string]client.Task
+	taskEr map[string]error
 }
 
 func (s *jobSink) Lane(_ context.Context, task string) (string, error) { return s.lanes[task], nil }
 func (s *jobSink) TaskJob(_ context.Context, task string) (string, string, error) {
 	return s.jobs[task], "", nil
+}
+func (s *jobSink) Task(_ context.Context, task string) (client.Task, error) {
+	if e, ok := s.taskEr[task]; ok {
+		return client.Task{}, e
+	}
+	if t, ok := s.tasks[task]; ok {
+		return t, nil
+	}
+	return client.Task{}, integrations.ErrTaskNotFound
 }
 func (s *jobSink) Job(_ context.Context, id string) (integrations.JobRecord, error) {
 	rec, ok := s.recs[id]

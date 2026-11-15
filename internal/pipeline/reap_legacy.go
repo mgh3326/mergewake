@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mgh3326/handoffkeep/client"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -53,6 +56,12 @@ type legacyClosedLister interface {
 
 type legacyRevertWatcher interface {
 	WatchRevert(context.Context, string, int, string) (*github.Pull, error)
+}
+
+// legacyTaskReader is the hk task read the sweep needs for a candidate whose
+// PR did not merge: its state and close time decide dropped-task removal.
+type legacyTaskReader interface {
+	Task(context.Context, string) (client.Task, error)
 }
 
 // legacyCand is one worktree path on one host: one that some PR's bound job
@@ -200,11 +209,16 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	reach := legacyReach{ClosedPRs: len(closed), Unreachable: map[string]int{}, BoundJobsBy: map[string]int{}, boundJobSeen: map[string]bool{}}
 	byHost := map[string]map[string]*legacyCand{} // host name → cwd → candidate
 	records := map[string]*integrations.JobRecord{}
+	bindings := map[int]reapBinding{}
+	jobTasks := map[string]string{}
 	for _, p := range closed {
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
 		b, e := s.reapBind(ctx, r, p)
+		if e == nil {
+			bindings[p.Number] = b
+		}
 		switch {
 		case e != nil:
 			reach.miss("binding-error")
@@ -234,6 +248,7 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 			reach.miss("no-job-record")
 			continue
 		}
+		jobTasks[b.Job] = b.Task
 		if rec.Cwd == "" {
 			reach.miss("job-without-cwd")
 			continue
@@ -271,7 +286,9 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	if e != nil {
 		return errors.Join(append(errs, e)...)
 	}
-	sweep := &legacySweep{s: s, r: r, o: o, acting: acting, lastRow: lastRow, newest: newest, open: openBranches(open, r.Name), openLister: openLister, watcher: watcher, ancestry: map[string]bool{}}
+	taskReader, _ := s.Sink.(legacyTaskReader)
+	sweep := &legacySweep{s: s, r: r, o: o, acting: acting, lastRow: lastRow, newest: newest, open: openBranches(open, r.Name), openLister: openLister, watcher: watcher, ancestry: map[string]bool{},
+		bindings: bindings, jobRecs: records, jobTasks: jobTasks, tasks: taskReader, taskReads: map[string]legacyTaskRead{}}
 	for _, h := range wanted {
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
@@ -338,6 +355,20 @@ type legacySweep struct {
 		OpenPulls(context.Context, string, string) ([]github.Pull, error)
 	}
 	ancestry map[string]bool
+	// bindings, jobRecs and jobTasks carry what the closed-PR binding pass
+	// learned, so an unmerged branch can still find its hk task: the PR's
+	// trailer first, then a job record that names the worktree.
+	bindings  map[int]reapBinding
+	jobRecs   map[string]*integrations.JobRecord
+	jobTasks  map[string]string
+	tasks     legacyTaskReader
+	taskReads map[string]legacyTaskRead
+}
+
+// legacyTaskRead caches one hk task read for the sweep.
+type legacyTaskRead struct {
+	task client.Task
+	err  error
 }
 
 // legacyFound is what one host's enumeration reached.
@@ -542,28 +573,31 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	// The PR of this branch is the newest closed one on it, bound to a job or
 	// not; a fork's branch of the same name is not this repository's.
 	p := w.newest[wt.Branch]
-	if p == nil {
-		keep("no-pr")
-		return ""
-	}
-	rec.PR = p.Number
-	var mergedAt *time.Time
-	if p.MergedAt != nil {
-		mergedAt = parsedTime(*p.MergedAt)
+	if p != nil {
+		rec.PR = p.Number
 	}
 	switch {
 	case w.open[wt.Branch]:
 		keep("open-pr")
-	case !(p.Merged || p.MergedAt != nil):
-		keep("closed-unmerged")
-	case p.Base.Ref != w.r.Branch:
-		keep("base-mismatch")
-	case mergedAt == nil || p.Head.SHA == "":
-		keep("unclassified")
-	case w.s.now().Sub(*mergedAt) < legacyMinAge:
-		keep("too-young")
+	case p == nil:
+		w.unmerged(ctx, hs, c, wt, nil, rec, errs)
 	default:
-		w.merged(ctx, hs, c.listed, wt, *p, *mergedAt, rec, errs)
+		var mergedAt *time.Time
+		if p.MergedAt != nil {
+			mergedAt = parsedTime(*p.MergedAt)
+		}
+		switch {
+		case !(p.Merged || p.MergedAt != nil):
+			w.unmerged(ctx, hs, c, wt, p, rec, errs)
+		case p.Base.Ref != w.r.Branch:
+			keep("base-mismatch")
+		case mergedAt == nil || p.Head.SHA == "":
+			keep("unclassified")
+		case w.s.now().Sub(*mergedAt) < legacyMinAge:
+			keep("too-young")
+		default:
+			w.merged(ctx, hs, c.listed, wt, *p, *mergedAt, rec, errs)
+		}
 	}
 	return ""
 }
@@ -649,7 +683,14 @@ func (w *legacySweep) merged(ctx context.Context, hs *reapHost, l *reap.ListedWo
 			return
 		}
 	}
-	// The one removal path is the node's guarded worktree.remove.
+	w.removeGuarded(ctx, hs, wt, rec, errs)
+}
+
+// removeGuarded is the one removal path both the merged and the dropped-task
+// sweeps share: the node's guarded worktree.remove, behind a pane re-scan, an
+// open-PR re-read and a worktree re-inspection.
+func (w *legacySweep) removeGuarded(ctx context.Context, hs *reapHost, wt *reap.Worktree, rec *reapReceipt, errs *[]error) {
+	keep := func(reason string) { rec.Result, rec.Reason = "kept", reason }
 	remover, ok := hs.ops.(interface {
 		WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
 	})
@@ -706,4 +747,219 @@ func (w *legacySweep) merged(ctx context.Context, hs *reapHost, l *reap.ListedWo
 	}
 	rec.Files = result.Files
 	rec.Result, rec.Reason = legacyVerdict(result)
+}
+
+// unmerged runs the dropped-task path for a worktree whose branch has no PR
+// or whose newest closed PR did not merge. p is nil when the branch has no
+// closed PR at all. Removal goes through the same guarded path as a merged
+// PR's, and only when hk positively names the worktree's task as dropped or
+// duplicate and closed at least legacyMinAge ago.
+func (w *legacySweep) unmerged(ctx context.Context, hs *reapHost, c *legacyCand, wt *reap.Worktree, p *github.Pull, rec *reapReceipt, errs *[]error) {
+	keep := func(reason string) { rec.Result, rec.Reason = "kept", reason }
+	// The node's listed status is a cheap pre-check before any hk read; the
+	// guarded removal still decides at the moment of removal.
+	if l := c.listed; l != nil {
+		switch {
+		case l.Status.Error != "":
+			keep("status-error")
+			return
+		case l.Status.Dirty || l.Status.Untracked > 0:
+			keep("local-only")
+			return
+		}
+	}
+	id := w.taskFor(c, wt, p)
+	if id == "" {
+		keep("no-task")
+		return
+	}
+	t, e := w.task(ctx, id)
+	switch {
+	case e == nil:
+	case errors.Is(e, integrations.ErrTaskNotFound):
+		keep("no-task")
+		return
+	default:
+		*errs = append(*errs, fmt.Errorf("task %s: %s", id, integrations.Detail(e)))
+		keep("task-read-error")
+		return
+	}
+	rec.Task = id
+	if t.State != "dropped" && t.State != "duplicate" {
+		state := t.State
+		if state == "" {
+			state = "unknown"
+		}
+		keep("task-" + state)
+		return
+	}
+	// hk exposes no dedicated close time on the public task; the last update
+	// is the close for a task that ended dropped or duplicate.
+	if t.UpdatedAt.IsZero() {
+		keep("task-close-unknown")
+		return
+	}
+	if w.s.now().Sub(t.UpdatedAt) < legacyMinAge {
+		keep("task-too-young")
+		return
+	}
+	// Every commit must already be on the remote: the closed PR's head, the
+	// base, or the remote branch of the same name.
+	refs := []string{}
+	if p != nil && p.Head.SHA != "" {
+		refs = append(refs, p.Head.SHA)
+	}
+	for _, ref := range []string{w.r.Branch, wt.Branch} {
+		seen := false
+		for _, have := range refs {
+			seen = seen || have == ref
+		}
+		if !seen {
+			refs = append(refs, ref)
+		}
+	}
+	if ok, failed := w.headOnRefs(ctx, wt.Head, refs, errs); failed {
+		keep("head-check-failed")
+		return
+	} else if !ok {
+		keep("local-only")
+		return
+	}
+	switch {
+	case hs.usageUnknown:
+		keep("pane-scan-failed")
+		return
+	case hs.paneInUse(wt.Path):
+		keep("pane-in-use")
+		return
+	}
+	w.removeGuarded(ctx, hs, wt, rec, errs)
+}
+
+// taskFor names the hk task a worktree belongs to. Every positive
+// identification counts — the closed PR's Mergewake-Task trailer, a bound
+// job's trailer task, and each job record whose worktree or cwd is this path
+// (its own task_id or the task that bound it this pass). It returns "" unless
+// all of them name exactly one task: no identification, or identifications
+// that disagree, keep the worktree.
+func (w *legacySweep) taskFor(c *legacyCand, wt *reap.Worktree, p *github.Pull) string {
+	var ids []string
+	seen := map[string]bool{}
+	addID := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	addJob := func(job string) {
+		rec := w.jobRecs[job]
+		if rec == nil || !jobRecordNames(rec, wt) {
+			return
+		}
+		if rec.TaskID != nil && *rec.TaskID > 0 {
+			addID(strconv.FormatInt(*rec.TaskID, 10))
+		}
+		addID(w.jobTasks[job])
+	}
+	var boundJob string
+	if p != nil {
+		if b, ok := w.bindings[p.Number]; ok {
+			addID(b.Task)
+			boundJob = b.Job
+			addJob(b.Job)
+		}
+	}
+	if c.job != "" {
+		addJob(c.job)
+	}
+	for _, job := range sortedJobIDs(w.jobRecs) {
+		if job != c.job && job != boundJob {
+			addJob(job)
+		}
+	}
+	if len(ids) == 1 {
+		return ids[0]
+	}
+	return ""
+}
+
+// jobRecordNames reports whether the job record's cwd or recorded worktree is
+// this worktree: a cwd at or inside it, or the same head on the same branch of
+// the same repo.
+func jobRecordNames(rec *integrations.JobRecord, wt *reap.Worktree) bool {
+	if rec.Cwd != "" {
+		cwd, path := filepath.Clean(rec.Cwd), filepath.Clean(wt.Path)
+		if cwd == path || strings.HasPrefix(cwd, path+string(filepath.Separator)) {
+			return true
+		}
+	}
+	jw := rec.Worktree
+	if jw == nil || jw.Head == "" || jw.Head != wt.Head {
+		return false
+	}
+	if jw.Branch == nil || *jw.Branch == "" || *jw.Branch != wt.Branch {
+		return false
+	}
+	if origin := reap.RepoFromRemote(jw.Origin); origin != "" && !strings.EqualFold(origin, wt.Repo) {
+		return false
+	}
+	return true
+}
+
+func sortedJobIDs(recs map[string]*integrations.JobRecord) []string {
+	ids := make([]string, 0, len(recs))
+	for id := range recs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// headOnRefs reports whether head is one of refs or an ancestor of one,
+// through GitHub's compare. A read error is appended to errs and reported as
+// failed; a ref GitHub does not know counts as not an ancestor.
+func (w *legacySweep) headOnRefs(ctx context.Context, head string, refs []string, errs *[]error) (ok, failed bool) {
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		if head == ref {
+			return true, false
+		}
+		k := head + "\x00" + ref
+		a, seen := w.ancestry[k]
+		if !seen {
+			var e error
+			a, e = w.s.GH.Ancestor(ctx, w.r.Name, head, ref)
+			switch {
+			case github.NotFound(e):
+				a = false
+			case e != nil:
+				*errs = append(*errs, fmt.Errorf("head ancestry %s...%s: %w", head, ref, e))
+				return false, true
+			}
+			w.ancestry[k] = a
+		}
+		if a {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// task reads one hk task, cached for the sweep so a worktree's task is read
+// at most once per pass.
+func (w *legacySweep) task(ctx context.Context, id string) (client.Task, error) {
+	if r, ok := w.taskReads[id]; ok {
+		return r.task, r.err
+	}
+	var t client.Task
+	var err error
+	if w.tasks == nil {
+		err = errors.New("hk task reader unavailable")
+	} else {
+		t, err = w.tasks.Task(ctx, id)
+	}
+	w.taskReads[id] = legacyTaskRead{task: t, err: err}
+	return t, err
 }

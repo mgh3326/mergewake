@@ -87,9 +87,17 @@ before any GitHub call. The sweep asks the node about each worktree
 through the node's guarded `worktree.remove` (`detached:false`), and only when
 the PR is merged into the base at least 14 days ago, the head is the merged
 head or inside the merged work, no pane or process is in it, and the node
-finds it clean. The node decides cleanliness at removal; a plan never probes
+finds it clean. A worktree whose branch has no PR, or whose newest closed PR
+did not merge, is removed the same way only when hk positively names its task
+`dropped` or `duplicate`, last updated at least 14 days ago (hk exposes no
+separate close time). The task comes from the PR's `Mergewake-Task` trailer
+and from the job records whose cwd or recorded worktree is the path; every
+identification must agree on one task, a task read that fails or a task in any
+other state keeps the worktree (`no-task`, `task-read-error`, `task-<state>`,
+`task-too-young`), and the same ancestry, pane and node-guard checks apply.
+The node decides cleanliness at removal; a plan never probes
 it, so a plan row says `would-remove` with reason `node guard decides
-cleanliness`. Closed-unmerged PRs, worktrees of other repos, branches with an open
+cleanliness`. Worktrees of other repos, branches with an open
 PR, detached worktrees and anything unclassifiable are kept with
 the reason; `mwr-*` reviewer checkouts, attached or detached, are left to the
 reviewer sweep and get no row. A final node refusal (`ignored-files`, `dirty`, `worktree-changed` and similar)

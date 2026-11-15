@@ -2,10 +2,13 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/handoffkeep/client"
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -185,21 +188,22 @@ func TestLegacySweepDirtyWorktreeIsTheNodesRefusal(t *testing.T) {
 	}
 }
 
-// (d) A PR closed without merge keeps its worktree even though the branch may
-// still be on origin.
+// (d) A PR closed without merge keeps its worktree while its task cannot be
+// shown dropped or duplicate: with no task record the row is no-task.
 func TestLegacySweepKeepsClosedUnmergedPR(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	gh.closed = []github.Pull{legacyPR(40, 20, false)}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
-	wantRow(t, legacyOnly(t, s), "kept", "closed-unmerged")
+	wantRow(t, legacyOnly(t, s), "kept", "no-task")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("removed a closed-unmerged worktree %d times", n)
 	}
 }
 
-// (e) A worktree on a branch no PR of its task used has no PR.
+// (e) A worktree on a branch no PR of its task used has no PR; its task comes
+// from the job record, and an unreadable one keeps it.
 func TestLegacySweepKeepsWorktreeWithNoPR(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	p := legacyPR(40, 20, true)
@@ -208,7 +212,7 @@ func TestLegacySweepKeepsWorktreeWithNoPR(t *testing.T) {
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
-	wantRow(t, legacyOnly(t, s), "kept", "no-pr")
+	wantRow(t, legacyOnly(t, s), "kept", "no-task")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("removed a worktree with no PR %d times", n)
 	}
@@ -472,7 +476,8 @@ func TestLegacySweepReceiptIsWrittenBeforePrinting(t *testing.T) {
 }
 
 // The newest closed PR of the branch decides, even when it is bound to no job:
-// a later closed-unmerged PR keeps the worktree of an older merged one.
+// a later closed-unmerged PR keeps the worktree of an older merged one, and
+// with no dropped task behind it the row is no-task.
 func TestLegacySweepNewestClosedPRDecidesEvenWithoutJob(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	later := legacyPR(41, 20, false)
@@ -483,7 +488,7 @@ func TestLegacySweepNewestClosedPRDecidesEvenWithoutJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := legacyOnly(t, s)
-	wantRow(t, row, "kept", "closed-unmerged")
+	wantRow(t, row, "kept", "no-task")
 	if row["pr"] != float64(41) {
 		t.Fatalf("row: %v", row)
 	}
@@ -529,5 +534,191 @@ func TestLegacySweepReinspectsBeforeRemoval(t *testing.T) {
 	wantRow(t, legacyOnly(t, s), "kept", "worktree-changed")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("removed a switched checkout %d times", n)
+	}
+}
+
+// droppedFixture is legacyFixture with PR 40 closed unmerged and task 3074 in
+// the given state, last updated updatedAgo ago (hk's close time for a task
+// that ended dropped or duplicate).
+func droppedFixture(t *testing.T, state string, updatedAgo time.Duration, closure string) (*Service, *fakeReapHub, *legacyGH) {
+	t.Helper()
+	s, hub, gh := legacyFixture(t)
+	gh.closed = []github.Pull{legacyPR(40, 20, false)}
+	task := client.Task{State: state, UpdatedAt: time.Now().Add(-updatedAgo)}
+	if closure != "" {
+		task.Refs.Closure = &client.TaskClosure{Type: closure, Evidence: "test"}
+	}
+	s.Sink.(*jobSink).tasks = map[string]client.Task{"3074": task}
+	return s, hub, gh
+}
+
+// A worktree whose newest PR closed unmerged is removed once hk shows its task
+// dropped or duplicate and closed long enough ago: the plan says would-remove
+// and the apply goes through the guarded worktree.remove only.
+func TestLegacySweepRemovesDroppedTaskWorktree(t *testing.T) {
+	for _, tc := range []struct{ name, state, closure string }{
+		{"dropped", "dropped", "obsolete"},
+		{"dropped superseded", "dropped", "superseded"},
+		{"duplicate", "duplicate", "superseded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, hub, _ := droppedFixture(t, tc.state, 20*24*time.Hour, tc.closure)
+			if err := s.ReapLegacy(context.Background(), testRepo, "", plan()); err != nil {
+				t.Fatal(err)
+			}
+			row := legacyOnly(t, s)
+			wantRow(t, row, "would-remove", legacyGuardNote)
+			if row["task"] != "3074" || row["pr"] != float64(40) {
+				t.Fatalf("row: %v", row)
+			}
+			if n := len(hub.ops("worktree.remove")); n != 0 {
+				t.Fatalf("plan sent worktree.remove %d times", n)
+			}
+			if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+				t.Fatal(err)
+			}
+			removes := hub.ops("worktree.remove")
+			if len(removes) != 1 || removes[0]["cwd"] != legacyCwd || removes[0]["expect_head"] != headSHA || removes[0]["base"] != "main" || removes[0]["detached"] != false {
+				t.Fatalf("remove args: %#v", removes)
+			}
+			rows := legacyRows(t, s)
+			wantRow(t, rows[len(rows)-1], "removed", "")
+		})
+	}
+}
+
+// A branch with no PR at all resolves its task through the job record whose
+// cwd is the worktree, and a dropped task removes it the same way.
+func TestLegacySweepRemovesNoPRDroppedTaskWorktree(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	p := legacyPR(40, 20, true)
+	p.Head.Ref = "wk/other"
+	gh.closed = []github.Pull{p}
+	s.Sink.(*jobSink).tasks = map[string]client.Task{"3074": {State: "dropped", UpdatedAt: time.Now().Add(-20 * 24 * time.Hour)}}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	row := legacyOnly(t, s)
+	if row["result"] != "removed" || row["pr"] != float64(0) {
+		t.Fatalf("row: %v", row)
+	}
+	removes := hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != legacyCwd {
+		t.Fatalf("remove args: %#v", removes)
+	}
+}
+
+// A task that is not dropped or duplicate keeps its worktree, named by state.
+func TestLegacySweepKeepsNonDroppedTask(t *testing.T) {
+	for _, state := range []string{"reviewing", "developing", "merged", "backlog"} {
+		t.Run(state, func(t *testing.T) {
+			s, hub, _ := droppedFixture(t, state, 20*24*time.Hour, "")
+			if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+				t.Fatal(err)
+			}
+			wantRow(t, legacyOnly(t, s), "kept", "task-"+state)
+			if n := len(hub.ops("worktree.remove")); n != 0 {
+				t.Fatalf("removed a %s task's worktree %d times", state, n)
+			}
+		})
+	}
+}
+
+// A dropped task closed inside legacyMinAge keeps its worktree.
+func TestLegacySweepKeepsYoungTaskClose(t *testing.T) {
+	s, hub, _ := droppedFixture(t, "dropped", 10*24*time.Hour, "obsolete")
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "task-too-young")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed a recently closed task's worktree %d times", n)
+	}
+}
+
+// The same guards as the merged path apply: a dirty listed status or a head
+// not on the remote keeps the worktree as local-only.
+func TestLegacySweepDroppedKeepsLocalOnly(t *testing.T) {
+	t.Run("dirty", func(t *testing.T) {
+		s, hub, _ := droppedFixture(t, "dropped", 20*24*time.Hour, "obsolete")
+		// A pane in another repo worktree seeds the common so worktree.list
+		// answers the dirty row for the candidate.
+		hub.agents["agents"] = []any{map[string]any{"pane_id": "w1:p9", "agent_status": "idle", "cwd": "/repo.wt"}}
+		hub.agents["panes"] = []any{map[string]any{"pane_id": "w1:p9", "agent_status": "idle", "cwd": "/repo.wt"}}
+		hub.lists = map[string][]map[string]any{listCommon: {
+			withStatus(listedRow(legacyCwd, "wk/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
+		}}
+		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+			t.Fatal(err)
+		}
+		wantRow(t, legacyOnly(t, s), "kept", "local-only")
+		if n := len(hub.ops("worktree.remove")); n != 0 {
+			t.Fatalf("removed a dirty worktree %d times", n)
+		}
+	})
+	t.Run("unpushed", func(t *testing.T) {
+		s, hub, gh := droppedFixture(t, "dropped", 20*24*time.Hour, "obsolete")
+		hub.wtHead = "ffff9999"
+		s.GH = &movedHeadGH{legacyGH: gh}
+		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+			t.Fatal(err)
+		}
+		wantRow(t, legacyOnly(t, s), "kept", "local-only")
+		if n := len(hub.ops("worktree.remove")); n != 0 {
+			t.Fatalf("removed an unpushed worktree %d times", n)
+		}
+	})
+}
+
+// A pane in the worktree keeps it even when the task is dropped.
+func TestLegacySweepDroppedKeepsPaneInUse(t *testing.T) {
+	s, hub, _ := droppedFixture(t, "dropped", 20*24*time.Hour, "obsolete")
+	hub.agents["panes"] = []any{map[string]any{"pane_id": "w3:p1", "agent_status": "idle", "cwd": legacyCwd}}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "pane-in-use")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed a pane's worktree %d times", n)
+	}
+}
+
+// A task read that fails is kept, not guessed at; the failure is reported
+// like any other per-candidate error.
+func TestLegacySweepKeepsTaskReadError(t *testing.T) {
+	s, hub, _ := droppedFixture(t, "dropped", 20*24*time.Hour, "obsolete")
+	s.Sink.(*jobSink).taskEr = map[string]error{"3074": errors.New("hk down")}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err == nil || !strings.Contains(err.Error(), "task 3074") {
+		t.Fatalf("want the task read error reported, got %v", err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "task-read-error")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed on a failed task read %d times", n)
+	}
+}
+
+// Two job records naming the same worktree for different tasks is ambiguous:
+// the worktree is kept rather than guessed at. Both tasks are bound through
+// merged PRs on other branches, so the worktree's own branch has no PR.
+func TestLegacySweepKeepsAmbiguousTaskMapping(t *testing.T) {
+	s, hub, gh := legacyFixture(t)
+	p1 := legacyPR(40, 20, true)
+	p1.Head.Ref = "wk/a1"
+	p2 := legacyPR(41, 20, true)
+	p2.Head.Ref = "wk/a2"
+	p2.Body = "Work.\n\nMergewake-Task: 9999\n"
+	gh.closed = []github.Pull{p1, p2}
+	s.Sink.(*jobSink).jobs["9999"] = "job-b"
+	s.Sink.(*jobSink).recs["job-b"] = integrations.JobRecord{State: "completed", Host: "node-a", Cwd: legacyCwd, Label: "job-b"}
+	s.Sink.(*jobSink).tasks = map[string]client.Task{
+		"3074": {State: "dropped", UpdatedAt: time.Now().Add(-20 * 24 * time.Hour)},
+		"9999": {State: "dropped", UpdatedAt: time.Now().Add(-20 * 24 * time.Hour)},
+	}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "no-task")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed an ambiguous worktree %d times", n)
 	}
 }

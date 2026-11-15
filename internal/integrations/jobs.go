@@ -37,10 +37,22 @@ type JobRecord struct {
 	Host   string `json:"host"`
 	PaneID string `json:"pane_id"`
 	Cwd    string `json:"cwd"`
+	// TaskID is the hk task the job works for, and Worktree the checkout
+	// panewire recorded at spawn (origin, branch and head).
+	TaskID   *int64       `json:"task_id"`
+	Worktree *JobWorktree `json:"worktree"`
 	// EndReason is why a job ended without a result. A job panewire stopped on
 	// an exhausted quota pool is state lost with "quota_stop pool=<pool>
 	// reset_at=<RFC3339 UTC>"; reset_at is absent when unknown.
 	EndReason string `json:"end_reason"`
+}
+
+// JobWorktree is the checkout a job record names: the remote origin, the
+// checked-out branch (nil on a detached worktree) and the head commit.
+type JobWorktree struct {
+	Origin string  `json:"origin"`
+	Branch *string `json:"branch"`
+	Head   string  `json:"head"`
 }
 
 // ErrJobNotFound is a 404 from the jobs endpoint: the record does not exist

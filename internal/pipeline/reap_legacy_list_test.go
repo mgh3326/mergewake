@@ -99,7 +99,7 @@ func TestLegacyListEnumeratesEveryPage(t *testing.T) {
 	if a["pr"] != float64(40) || a["branch"] != "wk/a" {
 		t.Fatalf("receipt shape: %v", a)
 	}
-	wantRow(t, rowFor(t, s, "/b.wt"), "kept", "no-pr")
+	wantRow(t, rowFor(t, s, "/b.wt"), "kept", "no-task")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("plan sent worktree.remove %d times", n)
 	}
@@ -108,7 +108,7 @@ func TestLegacyListEnumeratesEveryPage(t *testing.T) {
 		sum["listed"] != float64(3) || sum["candidates"] != float64(2) || sum["would_remove"] != float64(1) {
 		t.Fatalf("summary: %v", sum)
 	}
-	if kept, _ := sum["kept_by_reason"].(map[string]any); kept["no-pr"] != float64(1) || len(kept) != 1 {
+	if kept, _ := sum["kept_by_reason"].(map[string]any); kept["no-task"] != float64(1) || len(kept) != 1 {
 		t.Fatalf("kept_by_reason: %v", sum["kept_by_reason"])
 	}
 }
@@ -138,7 +138,7 @@ func TestLegacyListKeepsBranchWithNoPR(t *testing.T) {
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
-	wantRow(t, rowFor(t, s, "/n.wt"), "kept", "no-pr")
+	wantRow(t, rowFor(t, s, "/n.wt"), "kept", "no-task")
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("removed a worktree with no PR %d times", n)
 	}
