@@ -355,8 +355,9 @@ func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 }
 
 // On the lsof path a same-user pid with no reported cwd is unknown: the sweep
-// fails closed with the day's one row. A process lsof did report, and one whose
-// name never enters a work directory, do not block the sweep.
+// fails closed with the day's one row, even when its argv0 names an
+// allow-listed program — that name is process-chosen and is not evidence. A
+// process lsof did report does not block the sweep.
 func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
 	uid := strconv.Itoa(os.Getuid())
 	cwdError := "ncwd|rtd info error: Operation not permitted\n"
@@ -374,10 +375,12 @@ func TestOrphanCheckoutLsofUnreadableCwd(t *testing.T) {
 			reason: "pid 102 (sudo)",
 		},
 		{
-			name:    "sshd without cwd passes",
-			lsof:    "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
-			ps:      " 101 " + uid + " S worker --serve\n 102 " + uid + " S sshd\n",
-			removed: true,
+			// argv0 is process-chosen, so it cannot satisfy the no-work-dir
+			// allow-list: the pid stays unresolved and the sweep fails closed.
+			name:   "sshd argv0 without cwd fails closed",
+			lsof:   "p101\nfcwd\nn/\np102\nfcwd\n" + cwdError,
+			ps:     " 101 " + uid + " S worker --serve\n 102 " + uid + " S sshd\n",
+			reason: "pid 102 (sshd)",
 		},
 		{
 			name:    "all cwds present proceeds",
@@ -453,9 +456,11 @@ func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
 		proc    procUnknown
 		removed bool
 	}{
-		{"parenthesised helper", procUnknown{pid: 4711, comm: "(sd-pam)"}, true},
+		{"parenthesised helper", procUnknown{pid: 4711, comm: "(sd-pam)", commTrusted: true}, true},
 		{"readable executable", procUnknown{pid: 4712, comm: "sshd", exe: "/usr/sbin/sshd"}, true},
-		{"unknown name", procUnknown{pid: 4713, comm: "sudo"}, false},
+		{"trusted allow-list name", procUnknown{pid: 4714, comm: "sshd", commTrusted: true}, true},
+		{"argv0 name is not evidence", procUnknown{pid: 4715, comm: "sshd"}, false},
+		{"unknown name", procUnknown{pid: 4713, comm: "sudo", commTrusted: true}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newOrphanFix(t)

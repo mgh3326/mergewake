@@ -38,13 +38,18 @@ type procEvidence struct {
 // procUnknown is a same-user process that denies its working directory, or
 // whose working directory the scan could not read. fds are the paths it has
 // open, when those could be read; exe and comm are what the process let the
-// scan read of its executable and its name.
+// scan read of its executable and its name. commTrusted marks a comm read
+// from the kernel's process name under /proc, the name evidence the
+// allow-list has always used; the lsof path's comm is the ps argv0 basename,
+// which the process sets, so it is audit detail only and never satisfies the
+// allow-list.
 type procUnknown struct {
-	pid      int
-	comm     string
-	exe      string
-	fds      []string
-	fdsKnown bool
+	pid         int
+	comm        string
+	exe         string
+	fds         []string
+	fdsKnown    bool
+	commTrusted bool
 }
 
 // heldPaths resolves one scan into the paths a process may hold — every readable
@@ -57,7 +62,7 @@ func (ev procEvidence) heldPaths() (held []string, unresolved []procUnknown) {
 			held = append(held, p.fds...)
 			continue
 		}
-		if procNoWorkDir(filepath.Base(p.exe)) || (p.exe == "" && procNoWorkDir(p.comm)) {
+		if procNoWorkDir(filepath.Base(p.exe)) || (p.exe == "" && p.commTrusted && procNoWorkDir(p.comm)) {
 			continue
 		}
 		unresolved = append(unresolved, p)
@@ -152,7 +157,7 @@ func procScanEvidence() (procEvidence, error) {
 // unknownProcess reads what a same-user process that denies its working
 // directory still lets this user read.
 func unknownProcess(dir string, pid int) procUnknown {
-	p := procUnknown{pid: pid, comm: procCommName(dir)}
+	p := procUnknown{pid: pid, comm: procCommName(dir), commTrusted: true}
 	if exe, e := os.Readlink(filepath.Join(dir, "exe")); e == nil {
 		p.exe = exe
 	}
