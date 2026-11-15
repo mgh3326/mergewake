@@ -180,12 +180,13 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	if e != nil {
 		return e
 	}
-	// lastRow is the newest result per worktree, so a rerun skips what is
-	// already removed or refused and writes only rows whose outcome changed.
-	lastRow := map[string]string{}
+	// lastRow is the newest row per worktree, so a rerun skips what is
+	// already removed or refused — but a terminal row suppresses only the
+	// checkout it names: a replacement at the same path is evaluated again.
+	lastRow := map[string]legacyLast{}
 	for _, rec := range receipts {
 		if legacyRow(rec) {
-			lastRow[legacyKey(rec.Host, rec.Worktree)] = rec.Result + "|" + rec.Reason
+			lastRow[legacyKey(rec.Host, rec.Worktree)] = legacyLast{sig: rec.Result + "|" + rec.Reason, result: rec.Result, branch: rec.Branch, head: rec.Head}
 		}
 	}
 
@@ -343,13 +344,23 @@ func openBranches(open []github.Pull, repo string) map[string]bool {
 
 func legacyKey(host, path string) string { return host + "\x00" + path }
 
+// legacyLast is the newest legacy-sweep row of one worktree path: the
+// result|reason signature note compares repeats against, and the checkout
+// identity (branch and head) a terminal row is bound to.
+type legacyLast struct {
+	sig    string
+	result string
+	branch string
+	head   string
+}
+
 // legacySweep carries one repo's pass state across its hosts.
 type legacySweep struct {
 	s       *Service
 	r       config.Repo
 	o       Options
 	acting  bool
-	lastRow map[string]string
+	lastRow map[string]legacyLast
 	newest  map[string]*github.Pull // head branch → its newest closed PR
 	open    map[string]bool         // head branches that had an open PR when the sweep began
 	watcher legacyRevertWatcher
@@ -464,12 +475,17 @@ func (w *legacySweep) enumerate(ctx context.Context, hs *reapHost, bound map[str
 // should fail the run; every evaluation, even a kept one, leaves a row.
 func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand, tally legacyTally) []error {
 	// A removed worktree is finished and a refused one is never retried on its
-	// own: neither is inspected again. This is the cheap check by the job's cwd;
-	// evaluate repeats it by the inspected worktree root, which is what rows
-	// are keyed by when the cwd sits inside the worktree.
-	if prior := w.prior(c.host, c.cwd); prior != "" {
-		tally.add("already-"+prior, "")
-		return nil
+	// own: neither is inspected again — but only for the checkout the terminal
+	// row names. The listed row carries branch and head, so a replacement at
+	// the same path falls through to evaluate, which inspects and repeats the
+	// check by the worktree root, which is what rows are keyed by when the cwd
+	// sits inside the worktree. Without a listed row the identity is unknown
+	// and evaluate decides after inspecting.
+	if c.listed != nil {
+		if prior := w.prior(c.host, c.cwd, c.listed.Branch, c.listed.Head); prior != "" {
+			tally.add("already-"+prior, "")
+			return nil
+		}
 	}
 	// The main checkout and reviewer checkouts are never this sweep's.
 	switch {
@@ -498,13 +514,20 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 	return errs
 }
 
-// prior is "removed" or "refused" when the worktree's newest row is final.
-func (w *legacySweep) prior(host, path string) string {
-	switch r, _, _ := strings.Cut(w.lastRow[legacyKey(host, path)], "|"); r {
-	case "removed", "refused":
-		return r
+// prior is "removed" or "refused" when the worktree's newest row is final for
+// this checkout: a terminal row suppresses only the branch and head it
+// recorded, so a different checkout at the same path is evaluated again. A
+// row without a head (written before heads were recorded) counts as matching,
+// so old rows do not all re-evaluate once.
+func (w *legacySweep) prior(host, path, branch, head string) string {
+	l, ok := w.lastRow[legacyKey(host, path)]
+	if !ok || (l.result != "removed" && l.result != "refused") {
+		return ""
 	}
-	return ""
+	if l.branch != branch || (l.head != "" && l.head != head) {
+		return ""
+	}
+	return l.result
 }
 
 // note prints a row and appends it to reap.jsonl unless it repeats the
@@ -513,8 +536,8 @@ func (w *legacySweep) prior(host, path string) string {
 func (w *legacySweep) note(v reapReceipt) error {
 	v.Time = w.s.now().UTC()
 	key, sig := legacyKey(v.Host, v.Worktree), v.Result+"|"+v.Reason
-	repeat := w.lastRow[key] == sig
-	w.lastRow[key] = sig
+	repeat := w.lastRow[key].sig == sig
+	w.lastRow[key] = legacyLast{sig: sig, result: v.Result, branch: v.Branch, head: v.Head}
 	// The receipt is the durable record, so it is written before the row is
 	// printed: a failing stdout must not lose a removal.
 	var werr error
@@ -556,7 +579,7 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	rec.Worktree, rec.Branch, rec.Head = wt.Path, wt.Branch, wt.Head
 	// Rows are keyed by the worktree root the node reported, which differs from
 	// the job's cwd when the job worked in a subdirectory.
-	if prior := w.prior(c.host, wt.Path); prior != "" {
+	if prior := w.prior(c.host, wt.Path, wt.Branch, wt.Head); prior != "" {
 		return "already-" + prior
 	}
 	switch {

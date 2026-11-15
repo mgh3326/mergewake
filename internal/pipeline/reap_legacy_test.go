@@ -313,6 +313,70 @@ func TestLegacySweepRerunIsIdempotent(t *testing.T) {
 	}
 }
 
+// A terminal receipt binds the checkout it names: the same branch and head
+// stays suppressed, while a replacement checkout at the same path — another
+// branch, or the same branch at another head — is evaluated again.
+func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "removed", "")
+	// The same checkout stays suppressed on the next sweep.
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := legacyRows(t, s); len(rows) != 1 {
+		t.Fatalf("same checkout re-evaluated: %v", rows)
+	}
+	// A replacement on another branch at the same path is evaluated: its row
+	// says kept/no-task, not already-removed.
+	hub.branches = map[string]string{legacyCwd: "wk/y"}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	rows := legacyRows(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("replacement checkout not evaluated: %v", rows)
+	}
+	wantRow(t, rows[1], "kept", "no-task")
+	if rows[1]["branch"] != "wk/y" {
+		t.Fatalf("row: %v", rows[1])
+	}
+
+	// Same branch at another head is a different checkout too: evaluated and
+	// removed again through the guard. The repeat removal writes no second
+	// receipt — the outcome did not change — so the remove count is the proof.
+	s2, hub2, _ := legacyFixture(t)
+	if err := s2.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	hub2.wtHead = "ffff9999"
+	if err := s2.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	removes := hub2.ops("worktree.remove")
+	if len(removes) != 2 || removes[1]["expect_head"] != "ffff9999" {
+		t.Fatalf("moved head not re-evaluated: %#v", removes)
+	}
+}
+
+// A terminal receipt written before heads were recorded has no head: it still
+// suppresses the same branch, so old rows do not all re-evaluate once.
+func TestLegacySweepTerminalReceiptWithoutHeadStillMatches(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt","branch":"wk/x","result":"removed"}`+"\n")
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := legacyRows(t, s); len(rows) != 1 {
+		t.Fatalf("headless receipt re-evaluated: %v", rows)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("worktree.remove calls: %d", n)
+	}
+}
+
 // Worktrees of another repository and detached ones are listed, never removed;
 // reviewer checkouts belong to the reviewer sweep and get no row.
 func TestLegacySweepKeepsForeignDetachedAndSkipsReviewerCheckouts(t *testing.T) {
