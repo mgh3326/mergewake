@@ -800,7 +800,7 @@ on it.
   finding above low). The round thresholds come from configuration
   (`review.round_rule`, defaults 3 / 5 / 7):
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
-    `stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause.`
+    `stop patching; ask your design lane for a consult one grade above your seat in another family: ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself`
     No panewire call or lane event is emitted.
   - **Hub consult (`review.round_rule.hub_consult`, default false):** When on, the consult round asks the hub for the
     consult instead of telling the author to (operator decision 250; panewire docs/consult-on-request.md). With the

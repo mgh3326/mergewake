@@ -132,7 +132,7 @@ func TestRoundRule_a_Round3DirectiveAndEscalateAuthor(t *testing.T) {
 			t.Fatalf("want 1 findings delivery event, got %d: %+v", n.count, n.events)
 		}
 		ev := n.events[0]
-		const wantDirective = "stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause"
+		wantDirective := Round3Directive
 		if !strings.Contains(ev.Text, wantDirective) {
 			t.Fatalf("findings message missing directive: %s", ev.Text)
 		}
@@ -457,7 +457,7 @@ func TestRoundRule_g_PassRound3Or5GetsNeither(t *testing.T) {
 			t.Fatalf("passing round 3 called escalate-author %d times, want 0", calls)
 		}
 		for _, e := range n.events {
-			if strings.Contains(e.Text, "stop patching; ask a consult") {
+			if strings.Contains(e.Text, "stop patching; ask your design lane") {
 				t.Fatalf("passing round 3 carried directive: %s", e.Text)
 			}
 		}
@@ -732,7 +732,7 @@ func TestRoundRule_ConfigOverrideMovesAllThree(t *testing.T) {
 		if n.count != 1 {
 			t.Fatalf("want 1 findings delivery event at round 2, got %d", n.count)
 		}
-		if !strings.Contains(n.events[0].Text, "stop patching; ask a consult") {
+		if !strings.Contains(n.events[0].Text, "stop patching; ask your design lane") {
 			t.Fatalf("round 2 findings missing consult directive: %s", n.events[0].Text)
 		}
 		run.callsMu.Lock()

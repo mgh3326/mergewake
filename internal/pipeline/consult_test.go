@@ -296,7 +296,7 @@ func TestHubConsult_AnsweredAtRequest(t *testing.T) {
 	if !strings.Contains(text, "split") {
 		t.Fatalf("delivery missing verdict: %s", text)
 	}
-	if strings.Contains(text, "ask a consult") {
+	if strings.Contains(text, Round3Directive) {
 		t.Fatalf("answered delivery still tells the author to consult: %s", text)
 	}
 	if !strings.Contains(text, "T1") && !strings.Contains(text, "tool:10") {
@@ -403,6 +403,9 @@ func assertFallbackDelivered(t *testing.T, n *ackNotifier, reason string) {
 	if !strings.Contains(text, Round3Directive) {
 		t.Fatalf("fallback dropped today's directive: %s", text)
 	}
+	if !strings.Contains(text, "ESC --type decision") || !strings.Contains(text, "do not call any model API") {
+		t.Fatalf("fallback directive missing the ESC route or the model-API ban: %s", text)
+	}
 	if !strings.Contains(text, "tool:10") {
 		t.Fatalf("fallback lost the finding: %s", text)
 	}
@@ -492,7 +495,7 @@ func TestHubConsult_MediumOnlyRequestsAndDelivers(t *testing.T) {
 	if !strings.Contains(text, "T1") && !strings.Contains(text, "tool:10") {
 		t.Fatalf("delivery missing the open medium finding: %s", text)
 	}
-	if strings.Contains(text, "ask a consult") {
+	if strings.Contains(text, Round3Directive) {
 		t.Fatalf("answered delivery still tells the author to consult: %s", text)
 	}
 }
