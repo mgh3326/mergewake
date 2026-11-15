@@ -124,6 +124,11 @@ type PanewireReview struct {
 	// StaleAfter is how long a pass's recorded reviewer job may stay live
 	// before the desk is told; empty means twice review.timeout.
 	StaleAfter string `yaml:"stale_after"`
+	// StuckAfter is how old a reviewer job still claimed or spawned with no
+	// result may get before the reviewer sweep treats it as ended for
+	// cleanup once its pane is gone, and marks it stuck-reviewer while the
+	// pane stays; empty means 6h.
+	StuckAfter string `yaml:"stuck_after"`
 }
 type Outcomes struct {
 	Command string `yaml:"command"`
@@ -747,6 +752,11 @@ func validateReview(c *Config) error {
 	if v := c.Review.Panewire.StaleAfter; v != "" {
 		if _, e = Duration(v); e != nil {
 			return fmt.Errorf("review.panewire.stale_after: %w", e)
+		}
+	}
+	if v := c.Review.Panewire.StuckAfter; v != "" {
+		if _, e = Duration(v); e != nil {
+			return fmt.Errorf("review.panewire.stuck_after: %w", e)
 		}
 	}
 	switch c.Review.Executor {
