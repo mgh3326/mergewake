@@ -1,8 +1,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,15 +53,39 @@ func assertLeaseReleased(t *testing.T, s *Service, g *fakeGH, r config.Repo, run
 	}
 }
 
-// (a) A spawn refused because another reviewer job holds the reservation
-// (exit 74) releases the lease; the next run starts the pass.
-func TestLeaseReleaseOnReviewerHeld(t *testing.T) {
+// (a) The hub's active-job refusal (74) is an ordinary pre-start refusal now
+// that a reviewer spawn takes no hub reservation: no reviewer-held row, no
+// sweep, the lease goes back and the pass fails like any other refusal.
+func TestLeaseReleaseOnActiveJobRefusal(t *testing.T) {
 	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}}
 	s, g, r := panewireSetup(t, runner)
 	if err := s.Review(context.Background(), r, 7, "", Options{}); !errors.Is(err, ErrReviewUnavailable) {
 		t.Fatalf("err=%v", err)
 	}
-	assertLeaseReleased(t, s, g, r, runner, "reviewer-held")
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d", len(runner.spawns))
+	}
+	if rows := auditRows(t, s, r, "reviewer-held"); len(rows) != 0 {
+		t.Fatalf("held audit=%v", rows)
+	}
+	if rows := auditRows(t, s, r, "reviewer-held-sweep-failed"); len(rows) != 0 {
+		t.Fatalf("sweep audit=%v", rows)
+	}
+	assertLeaseReleased(t, s, g, r, runner, "spawn-refused")
+}
+
+// A pass refused with 74 is a real review failure, not a wait: RetryReview
+// counts it and backs off.
+func TestActiveJobRefusalCountsAsReviewFailure(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}}
+	s, g, r := panewireSetup(t, runner)
+	err := s.RetryReview(context.Background(), r, g.pull, Options{})
+	if err == nil || errors.Is(err, ErrReviewHeld) || !errors.Is(err, ErrReviewUnavailable) {
+		t.Fatalf("retry err=%v, want a review-unavailable failure", err)
+	}
+	if st := retryStateOf(t, s, r); st.Failures != 1 || st.Backoffs != 1 || st.Held || st.WaitText != "" {
+		t.Fatalf("retry state=%+v, want one counted failure and no wait", st)
+	}
 }
 
 // (b) A quota gate timeout (exit 124) before any pane exists releases the lease.
@@ -131,5 +157,34 @@ func TestLeaseReleaseKeepsLeaseOnSuccess(t *testing.T) {
 	}
 	if rows := auditRows(t, s, r, "review-lease-released"); len(rows) != 0 {
 		t.Fatalf("release audit=%v", rows)
+	}
+}
+
+// raceClaim is the GitHub client when another host claims a pass between the
+// pass list and this host's claim: the preflight reads no lease, the claim
+// loses.
+type raceClaim struct{ *fakeGH }
+
+func (c *raceClaim) ClaimReviewWithSHA(context.Context, string, string, string, time.Duration) (string, bool, error) {
+	return "", false, nil
+}
+
+// A pass the preflight found unclaimed, but which another host claimed before
+// this host's claim, is not reviewed: the claim check in runPass keeps one
+// reviewer per pass when two evaluations race past the pass list.
+func TestLostClaimRacePlacesNoReviewer(t *testing.T) {
+	runner := &panewireRunner{family: "openai", findings: `{"findings":[]}`}
+	s, g, r := panewireSetup(t, runner)
+	s.GH = &raceClaim{fakeGH: g}
+	var output bytes.Buffer
+	s.Out = &output
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("review: %v", err)
+	}
+	if !strings.Contains(output.String(), `"action":"review-pending"`) {
+		t.Fatalf("output=%s, want the pass pending", output.String())
+	}
+	if len(runner.spawns) != 0 || g.postCount != 0 {
+		t.Fatalf("spawns=%d posts=%d, want no reviewer", len(runner.spawns), g.postCount)
 	}
 }

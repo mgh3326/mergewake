@@ -84,6 +84,31 @@ func TestReviewerDeadReplayIsDroppedAndRespawned(t *testing.T) {
 	reviewerJobGone(t, s, r, 1)
 }
 
+// The hub's active-job refusal (74) ends a replay the hub never started just
+// like any other pre-start refusal: a reviewer spawn takes no hub reservation,
+// so the record goes and a fresh reviewer replaces it.
+func TestReviewerActiveJobRefusalReplayIsDead(t *testing.T) {
+	s, g, r, runner, _, refuse := deadReplayRig(t, panewireHeld)
+	old := readReviewerJob(t, s, r, 1).Label
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("review: %v", err)
+	}
+	if refuse.refused != 1 || len(runner.spawns) != 2 || g.postCount != 1 {
+		t.Fatalf("replays=%d spawns=%d posts=%d, want the replay and one fresh spawn", refuse.refused, len(runner.spawns), g.postCount)
+	}
+	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
+		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
+	}
+	dead := auditRows(t, s, r, "reviewer-spawn-dead")
+	if len(dead) != 1 || dead[0]["label"] != old || dead[0]["exit"] != float64(panewireHeld) {
+		t.Fatalf("reviewer-spawn-dead rows %v", dead)
+	}
+	if rows := auditRows(t, s, r, "reviewer-held"); len(rows) != 0 {
+		t.Fatalf("held audit=%v", rows)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
 // A deferred chain in one clock second must advance beyond every dead label,
 // including the replacement that became the newest dead marker.
 func TestReviewerDeferredReplacementLabelsAdvanceMonotonically(t *testing.T) {
@@ -326,13 +351,12 @@ func TestReviewerDeadReplayDeferredKeepsReplacements(t *testing.T) {
 
 // (c) A replay that answers an exit which may still land keeps its record and
 // spawns nothing new, as today. The list holds the answers that mean a pane may
-// exist, the held reservation, and the quota waits that keep the request queued.
+// exist and the quota waits that keep the request queued.
 func TestReviewerReplayThatMayLandKeepsRecord(t *testing.T) {
 	for name, exit := range map[string]int{
 		"wait timeout":       panewireWaitTimeout,
 		"brief unconfirmed":  76,
 		"lane unregistered":  82,
-		"held reservation":   panewireHeld,
 		"quota wait":         86,
 		"quota escalate":     87,
 		"quota unknown":      89,

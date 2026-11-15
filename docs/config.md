@@ -469,7 +469,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `panewire.lane` | `panewire.owner` | Retired: findings are no longer read from a lane. The key is still accepted, so existing configs keep loading, and its value is still kept out of traces. mergewake lists and acknowledges no findings inbox, so findings events a pre-`--result` pane announced there stay as they are. |
 | `panewire.exclude_hosts` | Empty | Hosts the pane must not run on, passed as `--exclude-host a,b` (needs a panewire whose `spawn` has `--exclude-host`). Must not contain `panewire.host`. |
 | `panewire.stuck_after` | `6h` | How old a reviewer job — or the worker seat a refused reviewer role retries as — still `claimed` or `spawned` with no result may get before the reviewer sweep treats it as ended for cleanup: once the job's pane is proven gone mergewake closes the job `abandoned` and removes its worktrees in the same pass; while the pane is still present the pane is left for panewire's node and the label is marked `stuck-reviewer` once, with the age. A job record that names no pane is proven gone only when its label is absent from a fresh scan of every host it could be on; a host whose scan failed, could not read its full pane list or could not be refreshed keeps the job. Other roles keep their hold. |
-| `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. A replay that panewire ends before any pane exists, with no hk job record for the label, is dead: mergewake writes a `reviewer-spawn-dead` audit row, drops the record and spawns a fresh reviewer under a new label, written as a `reviewer-spawn-replaced` row, in the same evaluation when time is left and otherwise on the next one. The held reservation and the quota waits (exits 74, 86, 87, 89) are not dead; their requests may still land. |
+| `panewire.stale_after` | Twice `timeout` | How long a pass's recorded reviewer job may stay live before mergewake writes a `reviewer-stale` audit row and tells the desk once per PR, head and pass. A pass with a recorded job never spawns another reviewer: the next run reads the job's result when it completed, or replays the recorded spawn to re-attach the wait. A replay that panewire ends before any pane exists, with no hk job record for the label, is dead: mergewake writes a `reviewer-spawn-dead` audit row, drops the record and spawns a fresh reviewer under a new label, written as a `reviewer-spawn-replaced` row, in the same evaluation when time is left and otherwise on the next one. The quota waits (exits 86, 87, 89) are not dead; their requests may still land. |
 
 #### Large PRs
 
@@ -1845,8 +1845,8 @@ the reviewer job recorded for the head, if any; on the review path, where the
 review itself did not run, only the reviewer job recorded for the head is
 known, so that path names the reviewer job and not a pass count. When the
 review itself did not run, the alert also names that wait, with the reason its
-audit row recorded where the pass knew one: `held (reviewer-held)`, `held
-(round-hold)`, `quota-stopped (pool <pool>)`, `pending`, or `skipped` for a poll
+audit row recorded where the pass knew one: `held (round-hold)`,
+`quota-stopped (pool <pool>)`, `pending`, or `skipped` for a poll
 the GitHub client dropped. The wait starts when this host first sees
 the head waiting for its review — in the merge gate on `review_missing`, or on
 the review path when the review is held, quota-stopped, pending or skipped — and

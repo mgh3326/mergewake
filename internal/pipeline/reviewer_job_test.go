@@ -240,35 +240,24 @@ func TestReviewerJobStaleNotifiesOnce(t *testing.T) {
 	}
 }
 
-// (e) A fresh spawn refused because another reviewer job of the task holds
-// the reservation is a held pass: a reviewer-held audit row, a pass failure
-// and no headless reviewer.
-func TestReviewerHeldIsNotASkip(t *testing.T) {
-	runner := &panewireRunner{family: "openai", refuse: map[string]int{"reviewer": panewireHeld}}
+// (e) A fresh spawn refused with the hub's active-job refusal (74) is an
+// ordinary pre-start refusal: the pass fails, its record goes and no
+// reviewer-held row is written, because a reviewer spawn takes no hub
+// reservation and the exit answers something else.
+func TestActiveJobRefusalFailsThePass(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}}
 	s, g, r := panewireSetup(t, runner)
 	err := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), "holds the reviewer reservation") {
+	if !errors.Is(err, ErrReviewUnavailable) || !strings.Contains(err.Error(), "panewire spawn exit 74") {
 		t.Fatalf("err=%v", err)
 	}
 	if len(runner.spawns) != 1 || runner.headless != 0 || g.postCount != 0 || len(g.passes[shaA]) != 0 {
 		t.Fatalf("spawns=%d headless=%d posts=%d", len(runner.spawns), runner.headless, g.postCount)
 	}
-	held := auditRows(t, s, r, "reviewer-held")
-	if len(held) != 1 || held[0]["label"] != arg(runner.spawns[0], "-l") || held[0]["task"] != "42" || held[0]["pass"] != float64(1) {
-		t.Fatalf("held audit=%v", held)
+	if rows := auditRows(t, s, r, "reviewer-held"); len(rows) != 0 {
+		t.Fatalf("held audit=%v", rows)
 	}
 	reviewerJobGone(t, s, r, 1)
-	// RetryReview counts no failure and no backoff: the next evaluation retries.
-	c := &clock{t: time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)}
-	s.Now = c.now
-	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewHeld) {
-		t.Fatalf("retry err=%v, want ErrReviewHeld", err)
-	}
-	var state reviewRetryState
-	if _, err := fsutil.ReadJSON(filepath.Join(s.state(r.Name), "review-retry-7.json"), &state); err != nil || state.Failures != 0 || state.Backoffs != 0 || !state.Held || runner.headless != 0 {
-		t.Fatalf("retry state %+v err=%v headless=%d", state, err, runner.headless)
-	}
 }
 
 // (f) Records left by an older head are ignored and dropped; the new head
@@ -706,39 +695,6 @@ func TestReviewerHeadMovedCloseFailureIsSkipped(t *testing.T) {
 	}
 }
 
-// (d) A fresh spawn refused as held, after this run closed the older head's
-// job, closes it once more and spawns again once.
-func TestReviewerHeadMovedHeldSpawnRetriesOnce(t *testing.T) {
-	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}}
-	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	// Both records are closed up front; the refusal closes each again.
-	movedHeadClosed(t, runner, labels[0], labels[1], labels[0], labels[1])
-	if len(runner.spawns) != 2 || g.postCount != 1 {
-		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
-	}
-	if !slices.Equal(runner.spawns[0], runner.spawns[1]) {
-		t.Fatalf("retry changed the spawn:\n%v\n%v", runner.spawns[0], runner.spawns[1])
-	}
-	if len(auditRows(t, s, r, "reviewer-held")) != 0 {
-		t.Fatal("a held spawn that succeeded on retry is not a held pass")
-	}
-	reviewerJobGone(t, s, r, 1)
-}
-
-// A second refusal is a held pass: the spawn is retried once, not forever.
-func TestReviewerHeadMovedHeldTwiceFailsPass(t *testing.T) {
-	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld, panewireHeld}}
-	s, g, r, _ := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
-	err := s.Review(context.Background(), r, 7, "", Options{})
-	if !errors.Is(err, ErrReviewUnavailable) || len(runner.spawns) != 2 || g.postCount != 0 {
-		t.Fatalf("err=%v spawns=%d posts=%d", err, len(runner.spawns), g.postCount)
-	}
-	reviewerJobGone(t, s, r, 1)
-}
-
 // (e) A record for the current head is untouched: its job is replayed, not
 // closed.
 func TestReviewerCurrentHeadRecordNotClosed(t *testing.T) {
@@ -774,22 +730,4 @@ func TestReviewerHeadMovedDryRunLeavesJobAndRecord(t *testing.T) {
 			t.Fatalf("record %+v", rj)
 		}
 	}
-}
-
-// A repeat close that fails is audited like the first: the spawn is retried
-// once and the records are dropped.
-func TestReviewerHeadMovedRepeatCloseFailureIsSkipped(t *testing.T) {
-	runner := &panewireRunner{family: "openai", exits: []int{panewireHeld}, closeErrs: []error{nil, nil, panewireExit(1)}}
-	s, g, r, labels := movedHeadSetup(t, runner, integrations.JobRecord{State: "claimed", OwnerLane: "owner"})
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.spawns) != 2 || g.postCount != 1 {
-		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
-	}
-	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 1 || rows[0]["label"] != labels[0] {
-		t.Fatalf("skipped audit=%v", rows)
-	}
-	reviewerJobGone(t, s, r, 1)
-	reviewerJobGone(t, s, r, 2)
 }

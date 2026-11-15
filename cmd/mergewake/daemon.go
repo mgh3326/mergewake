@@ -377,7 +377,7 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	if e != nil {
 		switch {
 		case unreviewed:
-			// No failure and nothing to settle: the reviewer-held,
+			// No failure and nothing to settle: the round-hold,
 			// review-quota-stopped or review-pending audit row already records it.
 		case errors.Is(e, pipeline.ErrReviewUnavailable):
 			clean = false

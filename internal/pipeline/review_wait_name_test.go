@@ -9,8 +9,8 @@ import (
 )
 
 // (a) The wait text follows the flag that won: a round hold joined with a
-// quota stop is named held, a reviewer hold joined with one is named after the
-// reviewer, and only a quota stop on its own is named after its pool.
+// quota stop is named held, and only a quota stop on its own is named after its
+// pool.
 func TestReviewWaitTextFollowsTheFlagThatWon(t *testing.T) {
 	quota := &reviewQuotaStopped{label: "reviewer", pool: "seat"}
 	for _, tt := range []struct {
@@ -20,7 +20,6 @@ func TestReviewWaitTextFollowsTheFlagThatWon(t *testing.T) {
 	}{
 		{"round hold with a quota stop", errors.Join(ErrReviewHeld, quota), "held (round-hold)"},
 		{"round hold alone", ErrReviewHeld, "held (round-hold)"},
-		{"reviewer hold with a quota stop", errors.Join(&reviewerHeld{err: errors.New("job_already_claimed")}, quota), "held (reviewer-held)"},
 		{"quota stop alone", quota, "quota-stopped (pool seat)"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

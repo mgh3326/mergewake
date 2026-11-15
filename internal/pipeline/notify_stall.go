@@ -107,7 +107,7 @@ func (s *Service) NotifyReviewStall(ctx context.Context, r config.Repo, pr githu
 }
 
 // reviewWaitName names the wait a RetryReview error reports, with the reason
-// its audit row recorded when the error carries one: "held (reviewer-held)",
+// its audit row recorded when the error carries one: "held (round-hold)",
 // "quota-stopped (pool <pool>)", "pending" or "skipped". Empty when err keeps
 // no head out of review.
 func reviewWaitName(err error) string {

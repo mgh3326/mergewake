@@ -20,8 +20,10 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// panewireHeld is panewire's active-job refusal: the hub keeps one live
-// reservation per (task, role), and another reviewer job of the task holds it.
+// panewireHeld is panewire's active-job refusal: another job of the task holds
+// a reservation the hub no longer takes for a reviewer. Since panewire's
+// reviewer path stopped reserving (v0.0.424), a reviewer spawn does not answer
+// it; an old hub that still does is treated as an ordinary pre-start refusal.
 const panewireHeld = 74
 
 // panewireCloseRefused is panewire's exit status for a job close it refuses.
@@ -137,13 +139,6 @@ func (x *panewireExecutor) reviewerJob(ctx context.Context, pass int) (reviewerJ
 	return rj, ok, nil
 }
 
-// movedHeadJobs is a snapshot of the older-head records this run closed.
-func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return slices.Clone(x.movedHead)
-}
-
 // closeReviewerJob closes a reviewer job with the given outcome so its hub
 // reservation is released, as best effort: the daemon's node credential often cannot close a
 // job whose pane ran on another host (no local events, no claim for the lane); the close
@@ -151,9 +146,8 @@ func (x *panewireExecutor) movedHeadJobs() []reviewerJob {
 // is the hk record's, else the --owner of the recorded spawn arguments, else
 // the configured one. A close that cannot run or fails is audited as
 // reviewer-close-skipped and reported as not closed, never as an error: the
-// hub frees the reservation itself when the job ends, and a spawn it still
-// holds is refused as reviewer-held. Only a cancelled context or a failed
-// audit write is an error.
+// hub frees the reservation itself when the job ends. Only a cancelled context
+// or a failed audit write is an error.
 //
 // A close refused because the job already has a terminal record counts as
 // closed: the job has ended, so nothing is owed (alreadyClosedRefusal).
@@ -198,13 +192,11 @@ func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
 }
 
 // closeMovedHeadJob closes the reviewer job of a record left by an older head
-// of the PR, so its hub reservation does not refuse every spawn for the new
-// head. A job with no hk record holds nothing and is left alone. A terminal job
+// of the PR. A job with no hk record holds nothing and is left alone. A terminal job
 // with no pane holds nothing either. A terminal job with a pane holds no
 // reservation, so no job close is sent, but its pane is still closed from the
 // record's host and pane. A job that cannot be closed from here is audited and
-// treated the same: the caller drops the record. A closed job is remembered for
-// this run, so a spawn refused as held can close it once more and retry.
+// treated the same: the caller drops the record.
 func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob) error {
 	s, pr := x.s, x.pr
 	job, e := x.job(ctx, rj.Label)
@@ -220,11 +212,6 @@ func (x *panewireExecutor) closeMovedHeadJob(ctx context.Context, rj reviewerJob
 	if e != nil || !res.JobClosed {
 		return e
 	}
-	x.mu.Lock()
-	if !slices.ContainsFunc(x.movedHead, func(m reviewerJob) bool { return m.Label == rj.Label }) {
-		x.movedHead = append(x.movedHead, rj)
-	}
-	x.mu.Unlock()
 	return s.audit(x.repo.Name, "reviewer-head-moved", map[string]any{"pr": pr.Number, "old_head": rj.Head, "new_head": pr.Head.SHA, "label": rj.Label}, false)
 }
 
