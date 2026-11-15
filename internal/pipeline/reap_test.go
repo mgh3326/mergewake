@@ -443,8 +443,8 @@ func (g *spyGH) WatchRevert(context.Context, string, int, string) (*github.Pull,
 	return nil, nil
 }
 
-// listNoSHAGH mimics the real list endpoint: the pull carries no
-// merge_commit_sha, so it must be resolved via the single-PR endpoint.
+// listNoSHAGH mimics the real list endpoint: the list body carries no
+// merge_commit_sha, so it must be resolved through Pull.
 type listNoSHAGH struct{ reapGH }
 
 func (listNoSHAGH) MergedPulls(_ context.Context, repo, branch string, _ time.Time) ([]github.Pull, error) {
@@ -457,7 +457,7 @@ func (listNoSHAGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error
 	return mergedPull, nil
 }
 
-// stillNoSHAGH resolves nothing: the single-PR endpoint also lacks the SHA.
+// stillNoSHAGH resolves nothing: Pull cannot produce the SHA either.
 type stillNoSHAGH struct{ listNoSHAGH }
 
 func (stillNoSHAGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
@@ -631,7 +631,7 @@ func TestReapResolvesMergeCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !r.called("worktree\x00remove") {
-		t.Fatal("merge_commit_sha was not resolved via the single-PR endpoint")
+		t.Fatal("merge_commit_sha was not resolved through Pull")
 	}
 
 	r = &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
@@ -665,17 +665,21 @@ func (pullCacheGH) WatchRevert(context.Context, string, int, string) (*github.Pu
 }
 
 // A merged PR body cached without merge_commit_sha must not starve reap: the
-// single-PR read revalidates to a 304 replay, while an unconditional read has
-// the sha. PullValidators primes that cache without the state writer's repair.
+// merge commit comes from GraphQL, whatever body the REST caches replay.
+// PullValidators primes the pull cache without the state writer's resolver.
 func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	mergedAt := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	mergeSHA := strings.Repeat("b", 40)
 	var unconditional atomic.Int32
 	var conditional atomic.Int32
+	var graphql atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
+		case path == "/graphql":
+			graphql.Add(1)
+			fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"mergedAt":%q,"mergeCommit":{"oid":%q}}}}}`, mergedAt, mergeSHA)
 		case path == "/repos/example/project/pulls":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
@@ -691,23 +695,18 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 		case path == "/repos/example/project/commits/"+headSHA:
 			_ = json.NewEncoder(w).Encode(map[string]any{"sha": headSHA, "commit": map[string]any{"message": "t"}})
 		case path == "/repos/example/project/pulls/12":
-			if inm := r.Header.Get("If-None-Match"); inm == `"e1"` || inm == `"e2"` {
+			if inm := r.Header.Get("If-None-Match"); inm == `"e1"` {
 				conditional.Add(1)
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
-			body := map[string]any{
+			unconditional.Add(1)
+			w.Header().Set("ETag", `"e1"`)
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
 				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 				"user": map[string]any{"login": "a"},
-			}
-			etag := `"e1"`
-			if unconditional.Add(1) > 1 {
-				body["merge_commit_sha"] = mergeSHA
-				etag = `"e2"`
-			}
-			w.Header().Set("ETag", etag)
-			_ = json.NewEncoder(w).Encode(body)
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -717,8 +716,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	gh.BaseURL = server.URL
 	gh.UploadURL = server.URL
 	gh.HTTP = server.Client()
-	// Prime the PR cache with the merged body GitHub served before the sha was
-	// populated; PullValidators reads the PR without the changestate repair.
+	// Prime the pull cache with the merged body that carries no sha.
 	if _, err := gh.PullValidators(context.Background(), "example/project", 12); err != nil {
 		t.Fatal(err)
 	}
@@ -738,6 +736,9 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	if unconditional.Load() < 2 {
 		t.Fatalf("reap did not read the PR unconditionally: %d", unconditional.Load())
 	}
+	if graphql.Load() != 1 {
+		t.Fatalf("merge commit queries=%d, want one", graphql.Load())
+	}
 	for _, row := range reapLogRows(t, s, "example/project") {
 		if row["reason"] == "merge-commit-unknown" {
 			t.Fatalf("merge commit stayed unknown: %v", row)
@@ -745,19 +746,22 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 	}
 }
 
-// The PR was open when its single-PR body was cached, so the replayed body
-// has neither merged nor merged_at and the client takes no fresh read. The
-// list already says the PR is merged, so reap must read past every cache:
-// only an unconditional request carries the merge commit.
+// The PR was open when its single-PR body was cached, so a replayed body has
+// neither merged nor merged_at and the client would not consult GraphQL. The
+// list already says the PR is merged, so reap reads past every cache; the
+// merge commit then comes from GraphQL.
 func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 	mergedAt := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	mergeSHA := strings.Repeat("b", 40)
 	var primed atomic.Bool
-	var conditional, unconditional atomic.Int32
+	var conditional, unconditional, graphql atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
+		case path == "/graphql":
+			graphql.Add(1)
+			fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"mergedAt":%q,"mergeCommit":{"oid":%q}}}}}`, mergedAt, mergeSHA)
 		case path == "/repos/example/project/pulls":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
@@ -789,7 +793,7 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 				body = map[string]any{
 					"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
 					"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
-					"user": map[string]any{"login": "a"}, "merge_commit_sha": mergeSHA,
+					"user": map[string]any{"login": "a"},
 				}
 				etag = `"merged"`
 			}
@@ -824,6 +828,9 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 	}
 	if unconditional.Load() < 2 {
 		t.Fatalf("reap did not read the PR unconditionally: %d", unconditional.Load())
+	}
+	if graphql.Load() != 1 {
+		t.Fatalf("merge commit queries=%d, want one", graphql.Load())
 	}
 	for _, row := range reapLogRows(t, s, "example/project") {
 		if row["reason"] == "merge-commit-unknown" {

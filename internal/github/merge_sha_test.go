@@ -3,7 +3,9 @@ package github_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,8 @@ import (
 )
 
 const mergeSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+const mergedAt = "2026-11-06T09:40:49Z"
 
 type stateWrites struct {
 	mu     sync.Mutex
@@ -41,38 +45,67 @@ func mergedBody(sha string) string {
 	if sha != "" {
 		field = fmt.Sprintf(`"merge_commit_sha":%q,`, sha)
 	}
-	return fmt.Sprintf(`{"number":7,"state":"closed","merged":true,"merged_at":"2026-11-06T09:40:49Z",%s"title":"t","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"},"user":{"login":"a"}}`, field, testSHA)
+	return fmt.Sprintf(`{"number":7,"state":"closed","merged":true,"merged_at":%q,%s"title":"t","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"},"user":{"login":"a"}}`, mergedAt, field, testSHA)
+}
+
+// graphQLMergeCommit is GitHub's answer to the merge commit query.
+func graphQLMergeCommit(sha, at string) string {
+	mergedAt := "null"
+	if at != "" {
+		mergedAt = fmt.Sprintf("%q", at)
+	}
+	commit := "null"
+	if sha != "" {
+		commit = fmt.Sprintf(`{"oid":%q}`, sha)
+	}
+	return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"mergedAt":%s,"mergeCommit":%s}}}}`, mergedAt, commit)
+}
+
+// mergeAPI answers the single-PR REST read and the merge commit query, and
+// counts both.
+type mergeAPI struct {
+	pull    string
+	graph   string
+	pulls   atomic.Int32
+	graphql atomic.Int32
+}
+
+func (m *mergeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == "POST" && r.URL.Path == "/graphql":
+		m.graphql.Add(1)
+		fmt.Fprint(w, m.graph)
+	default:
+		m.pulls.Add(1)
+		fmt.Fprint(w, m.pull)
+	}
 }
 
 func requireMergedWrite(t *testing.T, v map[string]any) {
 	t.Helper()
-	if v["state"] != "merged" || v["merge_sha"] != mergeSHA || v["merged_at"] != "2026-11-06T09:40:49Z" {
+	if v["state"] != "merged" || v["merge_sha"] != mergeSHA || v["merged_at"] != mergedAt {
 		t.Fatalf("merged state write %v", v)
 	}
 }
 
-// (a) A merged PR body without merge_commit_sha is read once more, past the
-// cache, and the state write carries merge_sha and merged_at.
-func TestMergedPullWithoutSHAIsReadFreshBeforeWriting(t *testing.T) {
-	var gets atomic.Int32
-	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		if gets.Add(1) == 1 {
-			fmt.Fprint(w, mergedBody(""))
-			return
-		}
-		if r.Header.Get("If-None-Match") != "" {
-			t.Errorf("fresh read sent If-None-Match %q", r.Header.Get("If-None-Match"))
-		}
-		fmt.Fprint(w, mergedBody(mergeSHA))
-	})
+// (a) A merged PR body without merge_commit_sha resolves the field through
+// GraphQL, and the state write carries it.
+func TestMergedPullResolvesMergeCommitFromGraphQL(t *testing.T) {
+	m := &mergeAPI{pull: mergedBody(""), graph: graphQLMergeCommit(mergeSHA, mergedAt)}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = io.Discard
 	rec := &stateWrites{}
 	c.Changes = rec
-	if _, e := c.Pull(context.Background(), "o/r", 7); e != nil {
+	p, e := c.Pull(context.Background(), "o/r", 7)
+	if e != nil {
 		t.Fatal(e)
 	}
+	if p.MergeCommitSHA != mergeSHA || m.graphql.Load() != 1 {
+		t.Fatalf("sha %q with %d GraphQL calls", p.MergeCommitSHA, m.graphql.Load())
+	}
 	writes := rec.all()
-	if gets.Load() != 2 || len(writes) != 1 {
-		t.Fatalf("gets=%d writes=%v", gets.Load(), writes)
+	if len(writes) != 1 {
+		t.Fatalf("writes=%v", writes)
 	}
 	requireMergedWrite(t, writes[0])
 	if got := c.ChangeCounts().Skipped; got != 0 {
@@ -80,65 +113,80 @@ func TestMergedPullWithoutSHAIsReadFreshBeforeWriting(t *testing.T) {
 	}
 }
 
-// (b) GitHub still lacks merge_commit_sha on the fresh read: no state write, and
-// the skip is counted.
-func TestMergedPullStillWithoutSHAWritesNothing(t *testing.T) {
-	var gets atomic.Int32
-	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		gets.Add(1)
-		fmt.Fprint(w, mergedBody(""))
-	})
+// (b) When the body also lacks merged_at, the same query supplies it.
+func TestMergedPullWithoutMergedAtResolvesBoth(t *testing.T) {
+	const body = `{"number":7,"state":"closed","merged":true,"title":"t","head":{"sha":"h"},"base":{"sha":"b1","ref":"main"},"user":{"login":"a"}}`
+	m := &mergeAPI{pull: body, graph: graphQLMergeCommit(mergeSHA, mergedAt)}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = io.Discard
+	rec := &stateWrites{}
+	c.Changes = rec
+	p, e := c.Pull(context.Background(), "o/r", 7)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if p.MergeCommitSHA != mergeSHA || p.MergedAt == nil || *p.MergedAt != mergedAt {
+		t.Fatalf("pull %+v", p)
+	}
+	if writes := rec.all(); len(writes) != 1 {
+		t.Fatalf("writes=%v", writes)
+	} else {
+		requireMergedWrite(t, writes[0])
+	}
+}
+
+// (c) A GraphQL error is the old "unknown": no sha, no state write, and the
+// skip is counted.
+func TestMergedPullGraphQLErrorWritesNothing(t *testing.T) {
+	m := &mergeAPI{pull: mergedBody(""), graph: `{"errors":[{"message":"unavailable"}]}`}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = io.Discard
 	rec := &stateWrites{}
 	c.Changes = rec
 	p, e := c.Pull(context.Background(), "o/r", 7)
 	if e != nil || !p.Merged || p.MergeCommitSHA != "" {
 		t.Fatalf("pull %+v err %v", p, e)
 	}
-	if gets.Load() != 2 || len(rec.all()) != 0 {
-		t.Fatalf("gets=%d writes=%v", gets.Load(), rec.all())
+	if len(rec.all()) != 0 {
+		t.Fatalf("writes=%v", rec.all())
 	}
 	if got := c.ChangeCounts().Skipped; got != 1 {
 		t.Fatalf("skipped=%d", got)
 	}
 }
 
-// (c) A merged pull_request delivery writes merge_sha and merged_at from its own
-// payload, with no further GitHub read.
-func TestWebhookMergedPayloadWritesMergeFields(t *testing.T) {
-	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("unexpected GitHub read %s", r.URL.Path)
-	})
-	rec := &stateWrites{}
-	c.Changes = rec
-	c.Webhook = webhookstate.Open(t.TempDir())
-	body := fmt.Sprintf(`{"action":"closed","pull_request":{"number":7,"state":"closed","merged":true,"merged_at":"2026-11-06T09:40:49Z","merge_commit_sha":%q,"updated_at":"2026-11-06T09:40:50Z","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"}}}`, mergeSHA, testSHA)
-	c.WebhookDelivery("o/r", "pull_request", "d-merged", []byte(body))
-	writes := rec.all()
-	if len(writes) != 1 {
-		t.Fatalf("writes=%v", writes)
+// (d) A merged pull's merge commit never changes: the second read of the same
+// PR makes no second GraphQL call.
+func TestSecondPullMakesNoSecondGraphQLCall(t *testing.T) {
+	m := &mergeAPI{pull: mergedBody(""), graph: graphQLMergeCommit(mergeSHA, mergedAt)}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = io.Discard
+	for range 2 {
+		if _, e := c.Pull(context.Background(), "o/r", 7); e != nil {
+			t.Fatal(e)
+		}
 	}
-	requireMergedWrite(t, writes[0])
-	if writes[0]["source"] != "webhook" || writes[0]["delivery_id"] != "d-merged" {
-		t.Fatalf("write %v", writes[0])
+	if m.graphql.Load() != 1 || m.pulls.Load() != 2 {
+		t.Fatalf("graphql=%d pulls=%d", m.graphql.Load(), m.pulls.Load())
 	}
 }
 
-// (d) A closed, unmerged PR is written as state=closed with no merge fields and
-// without a second read.
-func TestClosedUnmergedPullWritesNoMergeFields(t *testing.T) {
-	var gets atomic.Int32
-	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		gets.Add(1)
-		fmt.Fprintf(w, `{"number":7,"state":"closed","merged":false,"merged_at":null,"merge_commit_sha":null,"title":"t","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"},"user":{"login":"a"}}`, testSHA)
-	})
+// (e) An unmerged PR makes no GraphQL call.
+func TestUnmergedPullMakesNoGraphQLCall(t *testing.T) {
+	m := &mergeAPI{pull: fmt.Sprintf(`{"number":7,"state":"closed","merged":false,"merged_at":null,"title":"t","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"},"user":{"login":"a"}}`, testSHA)}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = io.Discard
 	rec := &stateWrites{}
 	c.Changes = rec
 	if _, e := c.Pull(context.Background(), "o/r", 7); e != nil {
 		t.Fatal(e)
 	}
+	if m.graphql.Load() != 0 {
+		t.Fatalf("graphql=%d", m.graphql.Load())
+	}
 	writes := rec.all()
-	if gets.Load() != 1 || len(writes) != 1 || writes[0]["state"] != "closed" {
-		t.Fatalf("gets=%d writes=%v", gets.Load(), writes)
+	if len(writes) != 1 || writes[0]["state"] != "closed" {
+		t.Fatalf("writes=%v", writes)
 	}
 	for _, k := range []string{"merge_sha", "merged_at"} {
 		if _, ok := writes[0][k]; ok {
@@ -150,30 +198,47 @@ func TestClosedUnmergedPullWritesNoMergeFields(t *testing.T) {
 	}
 }
 
-// (e) The hk 3296 record of a merged PR (state merged, merged_at set, merge_sha
-// null, source poll, observed an hour later) came from a conditional poll read
-// that GitHub answered 304 and the client answered with the cached body that had
-// no merge_commit_sha; writePull stamped that body with a new observed_at, and hk
-// keeps the newest observation per section. Reproduce: the body cached for the
-// ETag lacks the sha, every conditional read replays it, and only an
-// unconditional read gets the sha. Every state write must still carry it.
-func TestStaleCachedBodyReplayNeverErasesMergeSHA(t *testing.T) {
-	var unconditional, conditional atomic.Int32
+// (f) A merged pull_request delivery writes merge_sha and merged_at from its own
+// payload, with no further GitHub read.
+func TestWebhookMergedPayloadWritesMergeFields(t *testing.T) {
 	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected GitHub read %s", r.URL.Path)
+	})
+	rec := &stateWrites{}
+	c.Changes = rec
+	c.Webhook = webhookstate.Open(t.TempDir())
+	body := fmt.Sprintf(`{"action":"closed","pull_request":{"number":7,"state":"closed","merged":true,"merged_at":%q,"merge_commit_sha":%q,"updated_at":"2026-11-06T09:40:50Z","head":{"sha":%q,"ref":"topic"},"base":{"sha":"b1","ref":"main"}}}`, mergedAt, mergeSHA, testSHA)
+	c.WebhookDelivery("o/r", "pull_request", "d-merged", []byte(body))
+	writes := rec.all()
+	if len(writes) != 1 {
+		t.Fatalf("writes=%v", writes)
+	}
+	requireMergedWrite(t, writes[0])
+	if writes[0]["source"] != "webhook" || writes[0]["delivery_id"] != "d-merged" {
+		t.Fatalf("write %v", writes[0])
+	}
+}
+
+// (g) A stale cached body replayed on a 304 has no merge_commit_sha; every
+// state write still carries one, and the query is made once.
+func TestStaleCachedBodyReplayNeverErasesMergeSHA(t *testing.T) {
+	var conditional atomic.Int32
+	m := &mergeAPI{graph: graphQLMergeCommit(mergeSHA, mergedAt)}
+	c := changeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/graphql" {
+			m.ServeHTTP(w, r)
+			return
+		}
 		if r.Header.Get("If-None-Match") == `"e1"` {
 			conditional.Add(1)
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		if unconditional.Add(1) == 1 {
-			w.Header().Set("ETag", `"e1"`)
-			fmt.Fprint(w, mergedBody(""))
-			return
-		}
-		w.Header().Set("ETag", `"e2"`)
-		fmt.Fprint(w, mergedBody(mergeSHA))
+		w.Header().Set("ETag", `"e1"`)
+		fmt.Fprint(w, mergedBody(""))
 	})
 	c.Polling = true
+	c.Stderr = io.Discard
 	rec := &stateWrites{}
 	c.Changes = rec
 	for range 3 {
@@ -181,11 +246,33 @@ func TestStaleCachedBodyReplayNeverErasesMergeSHA(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
+	if conditional.Load() == 0 {
+		t.Fatal("no ETag replay exercised")
+	}
 	writes := rec.all()
 	if len(writes) != 3 {
 		t.Fatalf("writes=%v", writes)
 	}
 	for _, v := range writes {
 		requireMergedWrite(t, v)
+	}
+	if m.graphql.Load() != 1 {
+		t.Fatalf("graphql=%d", m.graphql.Load())
+	}
+}
+
+// (h) The resolution failure is reported once per pull, not once per read.
+func TestMergeCommitFailureLoggedOnce(t *testing.T) {
+	var logs strings.Builder
+	m := &mergeAPI{pull: mergedBody(""), graph: `{"errors":[{"message":"unavailable"}]}`}
+	c := changeAPI(t, m.ServeHTTP)
+	c.Stderr = &logs
+	for range 2 {
+		if _, e := c.Pull(context.Background(), "o/r", 7); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if n := strings.Count(logs.String(), "merge commit of o/r#7 unresolved"); n != 1 {
+		t.Fatalf("logged %d times: %q", n, logs.String())
 	}
 }

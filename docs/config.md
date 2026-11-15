@@ -163,9 +163,9 @@ never counts as a missing job; the pass summary's `job_records` counts what the
 source reached (`prs`, `worktrees`) and what it could not (`no-task-trailer`,
 `no-bound-job`, `no-job-record`, `job-without-cwd`, `job-host-unconfigured`,
 `binding-error`, `job-read-error`), for merged PRs past `worktree_after`.
-The pull list endpoint
-omits `merge_commit_sha`, so when candidates do exist it is resolved through
-the single-PR endpoint before the revert check. The
+The API version the client sends carries no `merge_commit_sha` on REST pull
+objects, so when candidates do exist it is resolved from GraphQL for that PR
+before the revert check. The
 revert knowledge comes from the watch role's recovery-PR convention: a
 recovery merged within seven days of the PR's merge, or one still open, skips
 cleanup. Removal also requires the worktree to still exist in `git worktree

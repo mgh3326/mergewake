@@ -79,7 +79,7 @@ type Client struct {
 	poll              pollingState
 	evidence          evidenceCache
 	writes            writeEpochs
-	mergeSHASeen      mergeSHALog
+	mergeCommits      mergeCommits
 }
 
 func (c *Client) now() time.Time {
@@ -205,9 +205,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 			return nil, errUncached304
 		}
 		probeOf(ctx).note(cmp.Or(resp.Header.Get("ETag"), cached.ETag))
-		body := append([]byte(nil), cached.Body...)
-		noteDecodedBody(ctx, body, resp.StatusCode, sourceNotModified, cred.kind)
-		return body, nil
+		return append([]byte(nil), cached.Body...), nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if method == "GET" && resp.StatusCode == http.StatusNotFound && c.Polling {
@@ -232,9 +230,6 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if method == "GET" {
 			probeOf(ctx).note(resp.Header.Get("ETag"))
 		}
-	}
-	if e == nil && method == "GET" {
-		noteDecodedBody(ctx, b, resp.StatusCode, httpBodySource(resp.StatusCode), cred.kind)
 	}
 	return b, e
 }
@@ -311,79 +306,22 @@ type Pull struct {
 }
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
-	ctx, body := withDecodedBody(ctx)
-	// first and refetch are set only by a read that decoded a live body; a
-	// memo hit or stored state leaves them empty and logs nothing.
-	var first decodedFirst
-	var refetch string
-	p, e := memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
+	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
 		if p, ok := c.storedPull(ctx, repo, n); ok {
-			return c.repairMergeCommit(ctx, repo, n, p), nil
+			return c.mergeCommitOf(ctx, repo, p), nil
 		}
 		var p Pull
-		e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p)
-		if e != nil {
+		if e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p); e != nil {
 			return p, e
 		}
-		// Take the first body before a fresh re-read replaces the record.
-		first = body.first(p)
-		var fresh Pull
-		freshTried := false
-		if p.MergeCommitSHA == "" && (p.Merged || p.MergedAt != nil) {
-			freshTried = true
-			var ok bool
-			fresh, ok = c.freshPull(ctx, repo, n)
-			if ok {
-				p = adoptMergeFields(p, fresh)
-			}
-		}
-		refetch = refetchOutcome(freshTried, p)
+		// REST carries no merge_commit_sha under this client's API version, so
+		// a merged pull's merge commit comes from GraphQL.
+		p = c.mergeCommitOf(ctx, repo, p)
 		c.shadowPull(repo, n, p)
 		c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
-		c.writePullFresh(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "", fresh, freshTried)
+		c.writePull(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "")
 		return p, nil
 	})
-	if e != nil {
-		return p, e
-	}
-	c.noteMergeSHA(repo, n, "single", first, refetch)
-	return p, nil
-}
-
-// freshPull reads a PR past the ETag and poll caches. ok is false when the
-// read itself failed; fresh is then zero.
-func (c *Client) freshPull(ctx context.Context, repo string, n int) (fresh Pull, ok bool) {
-	if e := c.json(pastCache(ctx), "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &fresh); e != nil {
-		return Pull{}, false
-	}
-	return fresh, true
-}
-
-func adoptMergeFields(p, fresh Pull) Pull {
-	if fresh.MergeCommitSHA != "" {
-		p.MergeCommitSHA = fresh.MergeCommitSHA
-	}
-	if p.MergedAt == nil {
-		p.MergedAt = fresh.MergedAt
-	}
-	if !p.Merged {
-		p.Merged = fresh.Merged
-	}
-	return p
-}
-
-// repairMergeCommit heals a merged PR served without merge_commit_sha (a list
-// body, a stale ETag replay or stored webhook state) with one read past the
-// cache. A PR that still lacks the sha is returned unchanged.
-func (c *Client) repairMergeCommit(ctx context.Context, repo string, n int, p Pull) Pull {
-	if p.MergeCommitSHA != "" || !(p.Merged || p.MergedAt != nil) {
-		return p
-	}
-	fresh, ok := c.freshPull(ctx, repo, n)
-	if !ok {
-		return p
-	}
-	return adoptMergeFields(p, fresh)
 }
 func (c *Client) Files(ctx context.Context, repo string, n int) ([]policy.File, error) {
 	return list[policy.File](ctx, c, fmt.Sprintf("%s/pulls/%d/files", base(repo), n))
@@ -433,15 +371,12 @@ func (c *Client) DispatchWorkflow(ctx context.Context, repo, workflow, ref strin
 
 // DispatchWorkflowRun dispatches like DispatchWorkflow and returns the id of
 // the run GitHub started, so a later read can tell that run's results from any
-// other run's. The id is zero when GitHub does not report one (a server that
-// predates return_run_details, which answers 204 or refuses the field).
+// other run's. Under this client's API version the dispatch always answers 200
+// with the run details; return_run_details is gone. The id is zero only when
+// the answer carries no run.
 func (c *Client) DispatchWorkflowRun(ctx context.Context, repo, workflow, ref string, inputs map[string]string) (int64, error) {
 	route := base(repo) + "/actions/workflows/" + url.PathEscape(workflow) + "/dispatches"
-	b, e := c.request(ctx, "POST", route, "application/vnd.github+json", mustJSON(map[string]any{"ref": ref, "inputs": inputs, "return_run_details": true}))
-	var a *APIError
-	if errors.As(e, &a) && (a.Code == 400 || a.Code == 422) {
-		return 0, c.DispatchWorkflow(ctx, repo, workflow, ref, inputs)
-	}
+	b, e := c.request(ctx, "POST", route, "application/vnd.github+json", mustJSON(map[string]any{"ref": ref, "inputs": inputs}))
 	if e != nil {
 		return 0, e
 	}
@@ -1321,29 +1256,16 @@ type Commit struct {
 // repo with hundreds of old merged PRs does not relist them every pass.
 // Pages stop once an item's updated_at predates since; merged_at never
 // postdates updated_at, so the page cut cannot drop a PR the window keeps.
-// List responses omit detail fields like merge_commit_sha — callers needing
-// them must follow up with Pull.
+// REST pull objects carry no merge_commit_sha under this client's API version;
+// a caller that needs one reads the pull through Pull, which resolves it from
+// GraphQL for that pull alone.
 func (c *Client) MergedPulls(ctx context.Context, repo, branch string, since time.Time) ([]Pull, error) {
 	var out []Pull
-	ctx, body := withDecodedBody(ctx)
 	for page := 1; page <= 10; page++ {
-		var raw []json.RawMessage
+		var batch []Pull
 		route := fmt.Sprintf("%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d", base(repo), page)
-		if e := c.json(ctx, "GET", route, nil, &raw); e != nil {
+		if e := c.json(ctx, "GET", route, nil, &batch); e != nil {
 			return nil, e
-		}
-		batch := make([]Pull, 0, len(raw))
-		for _, item := range raw {
-			var p Pull
-			if e := json.Unmarshal(item, &p); e != nil {
-				return nil, e
-			}
-			// Each element is its own object: the keys of one, not of the page
-			// array, are what the missing-sha diagnostic records.
-			first := body.first(p)
-			first.raw = item
-			c.noteMergeSHA(repo, p.Number, "list", first, refetchNotTried)
-			batch = append(batch, p)
 		}
 		stop := false
 		for _, p := range batch {
@@ -1371,7 +1293,16 @@ func (c *Client) Commit(ctx context.Context, repo, sha string) (Commit, error) {
 	return immutable[Commit](ctx, c, repo, kindCommit, sha, base(repo)+"/commits/"+url.PathEscape(sha))
 }
 func (c *Client) PRsForCommit(ctx context.Context, repo, sha string) ([]Pull, error) {
-	return list[Pull](ctx, c, base(repo)+"/commits/"+sha+"/pulls")
+	pulls, e := list[Pull](ctx, c, base(repo)+"/commits/"+sha+"/pulls")
+	if e != nil {
+		return nil, e
+	}
+	// The watch role brackets a red main by a merged PR's landing SHA, and this
+	// list body carries no merge_commit_sha under this client's API version.
+	for i := range pulls {
+		pulls[i] = c.mergeCommitOf(ctx, repo, pulls[i])
+	}
+	return pulls, nil
 }
 
 // MergeBase is the merge base of the base ref's tip and head: the revision the
