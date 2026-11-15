@@ -148,6 +148,7 @@ func TestReapConfig(t *testing.T) {
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
 		{"bad scan", "reap:\n  scan_after: 0s\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
+		{"retired protect ignored", "reap:\n  protect: ['..']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
 		{"ssh host", "hosts:\n  - {name: node, ssh: ops@node.example}\n", false},

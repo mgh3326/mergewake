@@ -301,11 +301,15 @@ type Webhook struct {
 	MinGap string `yaml:"min_gap"`
 }
 type Reap struct {
-	Enabled       bool     `yaml:"enabled"`
-	Act           bool     `yaml:"act"`
-	WorktreeAfter string   `yaml:"worktree_after"`
-	ScanAfter     string   `yaml:"scan_after"`
-	Regenerable   []string `yaml:"regenerable"`
+	Enabled       bool   `yaml:"enabled"`
+	Act           bool   `yaml:"act"`
+	WorktreeAfter string `yaml:"worktree_after"`
+	ScanAfter     string `yaml:"scan_after"`
+	// Protect is retired: mergewake never closes panes, so the globs are
+	// accepted but ignored. Kept so host configs written before the
+	// retirement still load; new configs should omit it.
+	Protect     []string `yaml:"protect"`
+	Regenerable []string `yaml:"regenerable"`
 	// Transport reaches remote hosts: panewire (the hub's node commands) or
 	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
 	Transport string  `yaml:"transport"`
