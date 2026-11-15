@@ -900,6 +900,107 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	}
 }
 
+// A retained archive is re-attempted after the hour, and each attempt is
+// recorded: the retry row is appended even though the outcome repeats.
+func TestReapArchiveRetainedRetryAppendsRow(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "wt", ".git"), "gitdir: missing\n")
+	old := time.Now().Add(-48 * time.Hour)
+	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, _ error) error { return os.Chtimes(p, old, old) })
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(t); len(rows) != 1 || rows[0].Reason != "awaiting-min-age" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	// Once the sighting ages out the archive runs and is retained.
+	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "archived-retained" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	// Past the retry hour the attempt is recorded again, not deduped away.
+	f.s.Now = func() time.Time { return time.Now().Add(50 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(t); len(rows) != 3 || rows[2].Result != "archived-retained" {
+		t.Fatalf("retry did not re-attempt the archive: %+v", rows)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("retained source removed")
+	}
+}
+
+// An hk read failure is reported but never counts as an archive attempt: once
+// the hour passes the job is sighted fresh instead of archived sight-unseen.
+func TestReapArchiveHkErrorLeadsToSighting(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.s.Sink = failingJobSink{&jobSink{}}
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err == nil {
+		t.Fatal("unreadable hk record wrote no error")
+	}
+	if rows := f.rows(t); len(rows) != 1 || rows[0].Result != "error" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	// Once hk answers again, the stale lookup error must not trigger a
+	// direct archive: the job is sighted fresh instead.
+	f.s.Now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	f.s.Sink = &jobSink{recs: map[string]integrations.JobRecord{"wk-7": {State: "completed"}}}
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "skipped" || rows[1].Reason != "awaiting-min-age" {
+		t.Fatalf("recovered hk did not sight fresh: %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir archived without a sighting")
+	}
+	// Once the fresh sighting ages out, the ended job archives.
+	f.s.Now = func() time.Time { return time.Now().Add(50 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("ended job not archived after hk recovered")
+	}
+}
+
+// An uncertain host listing is refreshed before any decision: without a
+// trustworthy mtime the job is not archived, and the refresh problem is
+// recorded instead of a sighting.
+func TestReapArchiveUncertainListingRefreshesBeforeDeciding(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-000 directories")
+	}
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	if err := os.Chmod(filepath.Join(dir, "events"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dir, "events"), 0o755) })
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
+	err := f.s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "Permission denied") {
+		t.Fatalf("unreadable listing wrote no error: %v", err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "error" {
+		t.Fatalf("uncertain listing not refreshed into an error: %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir touched")
+	}
+}
+
 // Under reap.transport panewire a remote host is reached through the hub, so
 // archive, which moves files over ssh, must leave it alone even when it also
 // has an ssh destination.

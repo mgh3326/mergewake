@@ -29,15 +29,15 @@ const archiveRetry = time.Hour
 type jobRef struct{ host, job string }
 
 // archiveTerminal reports whether a job's newest archive row ends its work.
-// Only a live or unscannable pane, an active or unfinished job, a fresh
-// sighting (awaiting-min-age) or a job-gone race is worth retrying; every
-// other skip waits for a person.
+// Only a live or unscannable pane, an active, unfinished or unknown job, a
+// fresh sighting (awaiting-min-age) or a job-gone race is worth retrying;
+// every other skip waits for a person.
 func archiveTerminal(v reapReceipt) bool {
 	switch v.Result {
 	case "archived":
 		return true
 	case "skipped":
-		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed" && v.Reason != "awaiting-min-age" && v.Reason != "job-active" && v.Reason != "not-finished" && v.Reason != "job-gone"
+		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed" && v.Reason != "awaiting-min-age" && v.Reason != "job-active" && v.Reason != "not-finished" && v.Reason != "job-gone" && v.Reason != "job-unknown"
 	}
 	return false
 }
@@ -177,7 +177,29 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			k := jobRef{h.Name, job}
 			prior, tried := last[k]
 			reset := false
-			if tried && summaries[job].Newest > prior.Time.Unix() {
+			summary := summaries[job]
+			newest := summary.Newest
+			skipReason, _ := archive.HostSkipReason(summary)
+			if summary.NeedsRefresh && skipReason == "" {
+				// An uncertain listing carries no usable mtime, so the
+				// reuse check below would run blind: refresh the job first,
+				// the way archive-jobs does before planning.
+				if files, reason, rnewest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
+					rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
+					rec.Result, rec.Reason = archive.Reason(e)
+					note(rec)
+					continue
+				} else if reason != "" {
+					rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
+					rec.Result, rec.Reason = "skipped", reason
+					note(rec)
+					continue
+				} else {
+					newest = rnewest
+					_ = files
+				}
+			}
+			if tried && newest > prior.Time.Unix() {
 				// A new job under a reused name restarts every clock: its
 				// files are newer than the earlier job's row, terminal or
 				// not, so no sighting or archive of the old job decides it.
@@ -195,8 +217,6 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				continue
 			}
 			rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
-			summary := summaries[job]
-			skipReason, _ := archive.HostSkipReason(summary)
 			switch {
 			case !reap.ValidJobName(job):
 				rec.Result, rec.Reason = "skipped", "job-name-invalid"
@@ -233,7 +253,10 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				case skipReason == "not-finished":
 					rec.Result, rec.Reason = "skipped", "not-finished"
 				case !tried || prior.Result != "skipped" || prior.Reason != "awaiting-min-age":
-					if tried && (prior.Result == "error" || prior.Result == "archived-retained") {
+					// A job-record lookup error never attempted an archive, so
+					// it falls through to a fresh sighting; only a failure of
+					// the archive itself retries directly.
+					if tried && (prior.Result == "archived-retained" || prior.Result == "error" && !strings.HasPrefix(prior.Reason, "job record: ")) {
 						// The retry waited out its hour: attempt the archive
 						// again now instead of starting a fresh sighting.
 						s.archiveJob(ctx, h, job, acting, &rec)
@@ -248,10 +271,11 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 					s.archiveJob(ctx, h, job, acting, &rec)
 				}
 			}
-			if reset && rec.Result == "skipped" && rec.Reason == "awaiting-min-age" {
+			if reset && (rec.Result == "skipped" && rec.Reason == "awaiting-min-age" || !acting && rec.Result == "would-archive") {
 				// The reset starts a new clock with a fresh row even though
-				// an identical sighting is already logged: the dedupe in
-				// note keys on outcome alone and would keep the stale time.
+				// an identical outcome is already logged: the dedupe in note
+				// keys on outcome alone and would keep the stale time, and a
+				// shadow plan would otherwise print on every poll.
 				resight(rec)
 			}
 			note(rec)
