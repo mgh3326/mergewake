@@ -918,6 +918,12 @@ func TestOverdueOpenAge(t *testing.T) {
 		{name: "the hold in progress counts to now", clock: overdueClock{DraftSince: t1}, start: t0, now: t3, want: 10 * time.Minute},
 		{name: "a clock inside the hold in progress counts nothing", clock: overdueClock{DraftSince: t0}, start: t1, now: t3, want: 0},
 		{name: "every hold is taken off", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}, {From: t2, To: t2.Add(10 * time.Minute)}}}, start: t0, now: t3, want: 3*time.Hour - 20*time.Minute},
+		{name: "overlapping holds are taken off once", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}, {From: t0, To: t2}}}, start: t0, now: t3, want: 2 * time.Hour},
+		{name: "a hold inside another is taken off once", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t3}, {From: t1, To: t2}}}, start: t0, now: t3, want: 0},
+		{name: "touching holds are taken off once", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}, {From: t1, To: t2}}}, start: t0, now: t3, want: 2 * time.Hour},
+		{name: "holds in any order are taken off", clock: overdueClock{Holds: []holdSpan{{From: t2, To: t2.Add(10 * time.Minute)}, {From: t0, To: t1}}}, start: t0, now: t3, want: 3*time.Hour - 20*time.Minute},
+		{name: "the hold in progress overlaps a closed one", clock: overdueClock{Holds: []holdSpan{{From: t1, To: t2}}, DraftSince: t1}, start: t0, now: t3, want: 10 * time.Minute},
+		{name: "a clock inside overlapping holds counts from their union's end", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t2}, {From: t1, To: t3}}}, start: t1, now: t3, want: 0},
 		{name: "closed and in progress", clock: overdueClock{Holds: []holdSpan{{From: t0, To: t1}}, DraftSince: t2}, start: t0, now: t3, want: 50 * time.Minute},
 		{name: "no start", clock: overdueClock{DraftSince: t1}, start: time.Time{}, now: t3, want: 0},
 		{name: "a start after now", clock: overdueClock{}, start: t3.Add(time.Hour), now: t3, want: 0},
@@ -1003,5 +1009,57 @@ func TestOverdueCloseHoldCapsSpans(t *testing.T) {
 	last := overdueStart.Add(time.Duration(count-1) * 2 * time.Hour)
 	if want := last.Add(time.Hour); !c.Holds[len(c.Holds)-1].To.Equal(want) {
 		t.Fatalf("the newest hold = %+v, want To %v", c.Holds[len(c.Holds)-1], want)
+	}
+}
+
+// A pass can close a draft hold without recording its open sighting: a dry-run
+// pass reports nothing, and an open sighting whose write fails leaves LastOpen
+// where it was. The close itself must move LastOpen all the same: a draft that
+// starts after it anchors there, not before the hold that just ended, so the
+// spans never overlap and the age is the true open time.
+func TestMergeOverdueCloseWithoutSightingThenDraft(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	file := rig.s.overdueClocksFile(rig.r.Name)
+	key := overdueKey(rig.g.pull)
+	read := func() overdueClock {
+		t.Helper()
+		st, e := readOverdueState(file)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return st.Clocks[key]
+	}
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(6 * time.Minute) // the hold is anchored at t0
+	// t1: the PR is open again and the hold is closed by tickOverdueClocks
+	// alone, the way a pass whose open sighting did not land closes it.
+	rig.g.pull.Draft = false
+	rig.now = overdueStart.Add(30 * time.Minute)
+	if _, e := rig.s.tickOverdueClocks(context.Background(), rig.r, rig.g.pull, gateVerdict{}); e != nil {
+		t.Fatal(e)
+	}
+	if c := read(); !c.DraftSince.IsZero() || len(c.Holds) != 1 || !c.Holds[0].To.Equal(overdueStart.Add(30*time.Minute)) {
+		t.Fatalf("the pass did not close the hold into its span: %+v", c)
+	}
+	if c := read(); !c.LastOpen.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the close left the last open before the hold it ended: last_open=%v", c.LastOpen.Sub(overdueStart))
+	}
+	// t2: the PR is a draft again. The hold starts where the closed one ended,
+	// so every minute of it is held once and nothing before it is.
+	rig.g.pull.Draft = true
+	rig.at(40 * time.Minute)
+	if c := read(); !c.DraftSince.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the second hold is anchored before the closed one ended: draft_since=%v", c.DraftSince.Sub(overdueStart))
+	}
+	// t3: open again. Every minute before t3 is held, so the open age is zero
+	// there and the thresholds count from t3.
+	rig.g.pull.Draft = false
+	rig.at(2 * time.Hour)
+	rig.wantConditions()
+	rig.at(2*time.Hour + 10*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 10m0s |") {
+		t.Fatal(e.Text)
 	}
 }
