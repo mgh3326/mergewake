@@ -49,9 +49,12 @@ func consultTerminal(state string) bool {
 // answered, else today's directive plus why no consult could be had.
 func (st *roundRuleState) hubConsultDirective() string {
 	if st.HubConsultState == "answered" {
-		d := "the hub consult answered: " + st.HubConsultAnswerDoc + " — read it before patching"
+		// Answer fields come from the hub row: control bytes would fail
+		// every lane-event delivery, so they are flattened here as well as
+		// on apply (an older state file may hold raw values).
+		d := "the hub consult answered: " + emitSafe(st.HubConsultAnswerDoc) + " — read it before patching"
 		if st.HubConsultVerdict != "" {
-			d += " (verdict: " + st.HubConsultVerdict + ")"
+			d += " (verdict: " + emitSafe(st.HubConsultVerdict) + ")"
 		}
 		return d
 	}
@@ -136,6 +139,17 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 	}
 
 	if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
+		// The reset below drops the old row's id: finish its task comment
+		// first, or a superseded comment a transient hk failure left
+		// unrecorded could never be retried. While it stays unrecorded
+		// the new head waits; the next pass retries.
+		if st.HubConsultID != "" && st.HubConsultDone && !st.HubConsultCommented {
+			s.hubConsultComment(ctx, r, pr, o, st)
+			if !st.HubConsultCommented {
+				_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+				return "", true
+			}
+		}
 		// Persist the attempt before the slow hk and hub work: the wait bound
 		// is measured from here, so an hk outage retries only inside the wait.
 		st.HubConsultOwed = true
@@ -196,11 +210,14 @@ func (s *Service) hubConsultAdvance(ctx context.Context, r config.Repo, pr githu
 
 // hubConsultRequest writes the question document to hk and POSTs one
 // `panewire consult request` through the hub credential. The caller holds
-// the round-rule state lock and has persisted the attempt time. Any failure
-// the contract counts as no consult (no task trailer, rc 1, rc 2, a run
-// error or an unreadable answer) settles as fallback; a failed document
-// write or task read is transient and the pass stays held — the attempt
-// time already persisted bounds those retries.
+// the round-rule state lock and has persisted the attempt time. A failure
+// the contract counts as no consult (no task trailer, rc >= 0, or an
+// unreadable answer) settles as fallback but stays owed until the outcome is
+// delivered, so a failed delivery never re-POSTs; a failed document write or
+// task read is transient and the pass stays held — the attempt time already
+// persisted bounds those retries. A run without an exit status (timeout,
+// cancel, killed child) may have reached the hub and created a paid row, so
+// it holds for reconcile instead of settling.
 func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, now time.Time) (string, bool) {
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
@@ -209,7 +226,6 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	}
 	if task == "" {
 		st.HubConsultDone = true
-		st.HubConsultOwed = false
 		st.HubConsultReason = "PR carries no Mergewake-Task trailer"
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-skipped", map[string]any{"pr": pr.Number, "reason": st.HubConsultReason}, o.DryRun)
@@ -255,13 +271,19 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	out, err := s.Runner.Run(cmdCtx, s.consultCmd(), integrations.HubArgv(s.Config.Reap.Hub, args...), "", "")
 	if err != nil {
 		rc := commandExitCode(err)
+		if rc < 0 {
+			// No exit status (timeout, cancel, killed child): the POST may
+			// already have created a paid row, so hold and reconcile on
+			// the next pass instead of abandoning it as failed.
+			_ = s.audit(r.Name, "consult-request-error", map[string]any{"pr": pr.Number, "rc": rc, "error": integrations.Detail(err)}, o.DryRun)
+			return "", true
+		}
 		detail := strings.TrimSpace(string(out))
 		var ce *integrations.CommandError
 		if errors.As(err, &ce) && strings.TrimSpace(ce.Stderr) != "" {
 			detail = strings.TrimSpace(ce.Stderr)
 		}
 		st.HubConsultDone = true
-		st.HubConsultOwed = false
 		// One printable line: the reason ends up in a panewire lane event,
 		// which refuses control bytes (emitSafe, as the round hold does).
 		st.HubConsultReason = fmt.Sprintf("consult request failed (rc %d): %s", rc, clip(emitSafe(detail), 200))
@@ -277,7 +299,6 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 			reason = "unreadable consult row: " + emitSafe(e.Error())
 		}
 		st.HubConsultDone = true
-		st.HubConsultOwed = false
 		st.HubConsultReason = reason
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-request-failed", map[string]any{"pr": pr.Number, "rc": 0, "error": reason}, o.DryRun)
@@ -318,7 +339,6 @@ func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.P
 	wait := s.Config.Review.RoundRuleHubConsultWait()
 	if now.Sub(st.HubConsultAt) >= wait {
 		st.HubConsultDone = true
-		st.HubConsultOwed = false
 		st.HubConsultReason = fmt.Sprintf("no terminal state within %s (last state %s)", wait, st.HubConsultState)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "consult-outcome", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "state": "wait-expired", "reason": st.HubConsultReason}, o.DryRun)
@@ -352,8 +372,10 @@ func (s *Service) hubConsultApply(st *roundRuleState, row reap.ConsultRow) {
 	if row.State != "" {
 		st.HubConsultState = row.State
 	}
-	st.HubConsultAnswerDoc = row.AnswerDoc
-	st.HubConsultVerdict = row.Verdict
+	// The answer pointer and verdict travel to a lane event through the
+	// directive, which refuses control bytes: flatten them on the way in.
+	st.HubConsultAnswerDoc = emitSafe(row.AnswerDoc)
+	st.HubConsultVerdict = emitSafe(row.Verdict)
 	st.HubConsultJob = row.Job
 	if row.Reason != "" {
 		st.HubConsultReason = emitSafe(row.Reason)
