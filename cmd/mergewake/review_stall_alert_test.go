@@ -99,12 +99,12 @@ func (s *stallFixture) waited(t *testing.T, since time.Time) {
 	}
 }
 
-// The stall alert fires while a review is held, naming the hold: the path a
-// held review takes returns before settle, so the notify-side stall check
-// never ran for it.
-func TestHeldReviewStallAlertsOnce(t *testing.T) {
+// The stall alert fires while the round hold keeps the review back, naming the
+// hold: the path a held review takes returns before settle, so the notify-side
+// stall check never ran for it.
+func TestRoundHoldStallAlertsOnce(t *testing.T) {
 	s := newStallFixture(t)
-	s.f.s.Runner = &heldRunner{}
+	holdRound(t, s)
 
 	// Under reviewStallAfter the wait is young: no alert.
 	s.pass(t)
@@ -118,7 +118,7 @@ func TestHeldReviewStallAlertsOnce(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("alerts=%q, want one held stall alert", got)
 	}
-	if !strings.Contains(got[0], "review stalled") || !strings.Contains(got[0], "held (reviewer-held)") {
+	if !strings.Contains(got[0], "review stalled") || !strings.Contains(got[0], "held (round-hold)") {
 		t.Fatalf("alert does not name the held wait: %q", got[0])
 	}
 	if !strings.Contains(got[0], "o/one#1") {
@@ -142,6 +142,21 @@ func TestHeldReviewStallAlertsOnce(t *testing.T) {
 		if strings.Contains(text, "FINDINGS") {
 			t.Fatalf("a held review delivered findings: %q", text)
 		}
+	}
+}
+
+// holdRound makes the PR's round hold active where the review pass reads it,
+// with its comment baseline set at none.
+func holdRound(t *testing.T, s *stallFixture) {
+	t.Helper()
+	path := filepath.Join(s.f.s.Config.StateDir, s.f.repo.Name, "round-rules", "1.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	at := s.clock.at.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	b := []byte(fmt.Sprintf(`{"hold_held":true,"hold_baseline_captured":true,"hold_comment_count":0,"hold_at":%q}`, at))
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

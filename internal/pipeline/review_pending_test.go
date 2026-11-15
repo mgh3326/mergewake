@@ -19,7 +19,7 @@ func TestErrPassPendingCountsNoReviewFailure(t *testing.T) {
 	} {
 		var class reviewFailureClass
 		class.add(err)
-		if class.real || class.collection || len(class.quotas) > 0 || len(class.held) > 0 {
+		if class.real || class.collection || len(class.quotas) > 0 {
 			t.Fatalf("%v was classified as a failure: %+v", err, class)
 		}
 	}

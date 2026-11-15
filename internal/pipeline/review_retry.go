@@ -24,15 +24,16 @@ type reviewRetryState struct {
 	// failure plus the collection failures, which never count toward
 	// escalation. A file without it reads as Failures.
 	Backoffs int `json:"backoffs,omitempty"`
-	// Held is set while the last evaluation ended held: nothing failed, but no
-	// review completed, so the daemon must not settle the PR as unchanged.
+	// Held is set while the last evaluation ended on a round hold: nothing
+	// failed, but no review completed, so the daemon must not settle the PR as
+	// unchanged.
 	Held bool `json:"held,omitempty"`
 	// QuotaStopped is set while the last evaluation ended on a quota stop with
 	// nothing else wrong: nothing failed, but no review completed, so the
 	// daemon must not settle the PR as unchanged.
 	QuotaStopped bool `json:"quota_stopped,omitempty"`
 	// WaitText names the wait Held or QuotaStopped records, with the reason its
-	// audit row carried ("held (reviewer-held)", "quota-stopped (pool seat)"),
+	// audit row carried ("held (round-hold)", "quota-stopped (pool seat)"),
 	// so a pass deferred inside the wait and the review-stall alert name it.
 	WaitText string `json:"wait_text,omitempty"`
 	// LastError is the redacted, clipped text of the last counted failure, for
@@ -61,15 +62,13 @@ func reviewErrorText(err error) string {
 }
 
 // reviewFailureClass sorts what Review returned by how RetryReview accounts
-// for it: a quota stop waits for its reset and is no failure, a held reviewer
-// waits for the time panewire named, if any, and is no failure, a round hold
+// for it: a quota stop waits for its reset and is no failure, a round hold
 // waits for its release and is no failure, a pending pass whose reviewer runs
 // on or whose claim another host holds is no failure, a collection failure
 // backs off without counting toward escalation, and anything else is a real
 // review failure.
 type reviewFailureClass struct {
 	quotas     []*reviewQuotaStopped
-	held       []*reviewerHeld
 	roundHold  bool
 	collection bool
 	pending    bool
@@ -86,8 +85,8 @@ type countedFailure struct {
 }
 
 // waitText is the reason a review wait's audit row recorded ("held
-// (reviewer-held)", "held (round-hold)", "quota-stopped (pool seat)"), carried
-// in the wait's sentinel error so the caller names it too.
+// (round-hold)", "quota-stopped (pool seat)"), carried in the wait's sentinel
+// error so the caller names it too.
 type waitText string
 
 func (w waitText) Error() string { return string(w) }
@@ -102,14 +101,9 @@ func reviewWaitErr(sentinel error, text string) error {
 }
 
 // waitText names this pass's wait with the reason its audit row recorded: the
-// reviewer that held the reservation, the round hold, or the pool a reviewer
-// stopped on. It follows the flag that won, so a held evaluation joined with a
-// quota stop is named held: state.Held is set before state.QuotaStopped, which
-// only a hold-free evaluation sets.
+// round hold, or the pool a reviewer stopped on.
 func (c *reviewFailureClass) waitText() string {
 	switch {
-	case len(c.held) > 0:
-		return "held (reviewer-held)"
 	case c.roundHold:
 		return "held (round-hold)"
 	case len(c.quotas) > 0 && c.quotas[0].pool != "":
@@ -126,14 +120,11 @@ func (c *reviewFailureClass) add(err error) {
 		return
 	}
 	var quota *reviewQuotaStopped
-	var held *reviewerHeld
 	var collect *collectionFailure
 	var lost *reviewResultLost
 	switch {
 	case errors.As(err, &quota):
 		c.quotas = append(c.quotas, quota)
-	case errors.As(err, &held):
-		c.held = append(c.held, held)
 	case errors.Is(err, ErrReviewHeld):
 		c.roundHold = true
 	case errors.Is(err, errPassPending), errors.Is(err, ErrReviewPending):
@@ -326,19 +317,11 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			state.Next = at
 		}
 	}
-	for _, h := range class.held {
-		// The hold frees by itself. Wait for the time panewire named, however
-		// often it repeats; a refusal that named none retries at the next
-		// evaluation. No failure, backoff or escalation comes from a hold.
-		if at := s.now().Add(h.retryAfter); h.retryAfter > 0 && at.After(state.Next) {
-			state.Next = at
-		}
-	}
-	// Only a held or quota-stopped evaluation with nothing else wrong is marked
-	// so: a real failure supersedes it, and the daemon must not settle this
-	// evaluation. A hold is the stronger marker, so a run with both waits for
-	// the hold.
-	state.Held = (len(class.held) > 0 || class.roundHold) && !class.real && !class.collection
+	// Only a round hold or a quota stop with nothing else wrong is marked so: a
+	// real failure supersedes it, and the daemon must not settle this
+	// evaluation. A round hold is the stronger marker, so a run with both waits
+	// for the hold.
+	state.Held = class.roundHold && !class.real && !class.collection
 	state.QuotaStopped = len(class.quotas) > 0 && !class.real && !class.collection && !state.Held
 	state.WaitText = ""
 	if state.Held || state.QuotaStopped {

@@ -28,9 +28,9 @@ import (
 
 var ErrReviewUnavailable = errors.New("review unavailable")
 
-// ErrReviewHeld reports an evaluation that ended held: another reviewer job
-// holds the reservation. Nothing failed, but no review completed, so the PR
-// must be evaluated again once the hold clears, not settled as unchanged.
+// ErrReviewHeld reports an evaluation that ended held: the round hold keeps
+// its review back. Nothing failed, but no review completed, so the PR must be
+// evaluated again once the hold clears, not settled as unchanged.
 var ErrReviewHeld = errors.New("review held")
 
 // ErrReviewQuotaStopped reports an evaluation whose only outcome was a quota

@@ -64,30 +64,6 @@ func escSkips() (*prSkips, *syncBuffer) {
 	return &prSkips{Dirty: &daemon.Dirty{}, Log: slog.New(slog.NewJSONHandler(logs, nil))}, logs
 }
 
-// (B2, held) A conflicting PR whose reviewer the hub holds never reaches
-// settlePR, so NotifyPR never sees it. It still gets its ESC, once, and the
-// reviewer placement is what it would be without the conflict.
-func TestConflictEscEngineHeldReview(t *testing.T) {
-	f := newParallelFixture(t, 1, 1)
-	f.hub.conflicting = true
-	runner := &heldRunner{}
-	f.s.Runner = runner
-	n := &escRecorder{trace: f.trace}
-	f.s.Notifier = n
-	skips, logs := escSkips()
-
-	runSkippedPass(t, f, skips, logs)
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
-	}
-	wantEngineEscs(t, n, 1, "desk")
-	if strings.Contains(f.out.String(), `"command":"pr-notify`) {
-		t.Fatalf("a held review reached settlePR: %s", f.out)
-	}
-	runSkippedPass(t, f, skips, logs)
-	wantEngineEscs(t, n, 1, "desk")
-}
-
 // (B2, pending and quota) A conflicting PR whose reviewer is still running,
 // then stopped on an exhausted pool, gets one ESC and no other reviewer.
 func TestConflictEscEnginePendingAndQuotaReview(t *testing.T) {
