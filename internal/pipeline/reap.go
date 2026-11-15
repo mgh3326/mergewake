@@ -555,8 +555,11 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed or retained archive always appends: its time spaces the
 		// next retry. So does a completed one, which carries its own Drive
-		// and hk record.
-		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
+		// and hk record. The day's process-scan-unavailable row always
+		// appends too: its reason can stay identical for days while the
+		// sweep stays blocked, and the day gate already limits it to one a
+		// day (hk 4792).
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
 		h.lastRow[reapRowKey(v)] = reapRowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)
@@ -565,9 +568,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// reviewerNote is note plus one reviewer-reap audit record per new row: a
 	// repeat of the stream's last result and reason writes neither, and is not
 	// printed either except by a dry run, whose output is the report. A repeated
-	// error still counts, so the pass reports it.
+	// error still counts, so the pass reports it. The day's
+	// process-scan-unavailable row is never a repeat: see note.
 	reviewerNote := func(v reapReceipt) {
-		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v)
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v)
 		if repeat && !o.DryRun && v.Result != "error" {
 			return
 		}

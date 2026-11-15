@@ -289,9 +289,9 @@ func TestOrphanCheckoutNoProcessScanFailsClosed(t *testing.T) {
 }
 
 // A same-user process the scan cannot rule out fails the sweep closed: nothing
-// is removed, and one skipped row names the process — once per UTC day even when
-// the pid changes, so a pass every minute does not bury the log, and a new day
-// reports the condition again.
+// is removed, and one skipped row names the process — once per UTC day, so a
+// pass every minute does not bury the log. A new day reports the condition
+// again, even when the blocking process is the same one.
 func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 7*time.Hour)
@@ -314,12 +314,14 @@ func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
 	if len(rows) != 1 || rows[0].Result != "skipped" || !strings.Contains(rows[0].Reason, "pid 4711") || !strings.Contains(rows[0].Reason, "sudo") {
 		t.Fatalf("rows: %+v", rows)
 	}
+	// The same process on the next day is a new day's row, not a repeat.
 	f.s.Now = func() time.Time { return reviewerNow.Add(24 * time.Hour) }
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(orphanRows(t, f)); got != 2 {
-		t.Fatalf("rows after a day = %d, want the day's second row", got)
+	rows = orphanRows(t, f)
+	if len(rows) != 2 || !strings.Contains(rows[1].Reason, "pid 4722") {
+		t.Fatalf("rows after a day = %+v, want the day's second row for the same process", rows)
 	}
 }
 

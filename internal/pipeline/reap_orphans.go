@@ -501,6 +501,14 @@ func orphanScanDetail(e error, unresolved []procUnknown) string {
 	return detail
 }
 
+// dailyScanRow reports whether v is the day's process-scan-unavailable row. It
+// is never compared against the stream's previous row: the day gate above
+// already makes it one a day, and its reason can stay identical for days while
+// the same process keeps blocking the sweep.
+func dailyScanRow(v reapReceipt) bool {
+	return v.Action == orphanAction && strings.HasPrefix(v.Reason, orphanScanUnavailable)
+}
+
 // orphanScanRowDue reports whether this pass writes the day's
 // process-scan-unavailable row: only the pass that writes rows about the
 // checkouts directory itself, and only once per UTC day, so a host that can
