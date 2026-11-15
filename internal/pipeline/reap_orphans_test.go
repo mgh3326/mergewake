@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -144,7 +146,9 @@ func TestOrphanCheckoutProcessCwdKept(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 7*time.Hour)
 	saved := processCwds
-	processCwds = func() ([]string, error) { return []string{path + "/internal", "/"}, nil }
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
+		return []string{path + "/internal", "/"}, nil
+	}
 	t.Cleanup(func() { processCwds = saved })
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -250,5 +254,32 @@ func TestOrphanCheckoutSkippedForPRScopedPass(t *testing.T) {
 	}
 	if removedCalled(f, path) {
 		t.Fatalf("PR-scoped pass swept the directory: calls %q", f.run.calls)
+	}
+}
+
+// A host with no process scan (neither /proc nor lsof) removes nothing and
+// fails no pass: the sweep cannot prove that no process holds a checkout.
+func TestOrphanCheckoutNoProcessScanFailsClosed(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	saved := processCwds
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
+		return nil, errProcessScanUnavailable
+	}
+	t.Cleanup(func() { processCwds = saved })
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatalf("pass failed on a host without a process scan: %v", err)
+	}
+	if removedCalled(f, path) || len(orphanRows(t, f)) != 0 {
+		t.Fatalf("removed without a process scan: calls %q", f.run.calls)
+	}
+}
+
+// lsof -F n output carries one cwd per n record; other fields are ignored.
+func TestParseLsofCwds(t *testing.T) {
+	out := []byte("p101\nfcwd\nn/Users/x/checkouts/mwr-1\np202\nfcwd\nn/\n")
+	got := parseLsofCwds(out)
+	if len(got) != 2 || got[0] != "/Users/x/checkouts/mwr-1" || got[1] != "/" {
+		t.Fatalf("cwds = %q", got)
 	}
 }
