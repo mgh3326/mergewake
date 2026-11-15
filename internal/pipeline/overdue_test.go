@@ -682,6 +682,74 @@ func TestMergeOverdueFailedOpenPassEndsDraftHold(t *testing.T) {
 	}
 }
 
+// A pass that cannot read the READY record still writes its open sighting and
+// ends the open hold, then returns the read error: a later draft anchors at
+// this pass, and a READY filled later is not moved by the ended hold again.
+func TestMergeOverdueOpenPassSurvivesFailedReadyRead(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	file := rig.s.overdueClocksFile(rig.r.Name)
+	readyFile := rig.s.readyClocksFile(rig.r.Name)
+	key := overdueKey(rig.g.pull)
+	read := func() overdueClock {
+		t.Helper()
+		st, e := readOverdueState(file)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return st.Clocks[key]
+	}
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(6 * time.Minute) // the hold is anchored at t0
+	// The READY clock is recorded after the clocks tick (recordOnlyEvent), so
+	// the entry may still carry no READY when the hold ends.
+	st, e := readOverdueState(file)
+	if e != nil {
+		t.Fatal(e)
+	}
+	c := st.Clocks[key]
+	c.Ready = time.Time{}
+	st.Clocks[key] = c
+	if e := writeOverdueState(file, st); e != nil {
+		t.Fatal(e)
+	}
+	good, e := os.ReadFile(readyFile)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(readyFile, []byte("{"), 0o644); e != nil {
+		t.Fatal(e)
+	}
+	rig.g.pull.Draft = false
+	rig.now = overdueStart.Add(30 * time.Minute)
+	if e := rig.s.noteOpenPass(rig.r, rig.g.pull); e == nil {
+		t.Fatal("the READY read failure was not returned")
+	}
+	c = read()
+	if !c.LastOpen.Equal(rig.now) {
+		t.Fatalf("the failed pass did not record its open sighting: last_open=%v", c.LastOpen.Sub(overdueStart))
+	}
+	if !c.DraftSince.IsZero() {
+		t.Fatalf("the hold is still open after the failed pass: draft_since=%v", c.DraftSince.Sub(overdueStart))
+	}
+	if !c.HeadSeen.Equal(rig.now) {
+		t.Fatalf("the hold's span is still on the clocks: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	}
+	// The next pass fills the READY. The hold it already ended must not move
+	// it again: one shift is owed, not two.
+	if e := os.WriteFile(readyFile, good, 0o644); e != nil {
+		t.Fatal(e)
+	}
+	rig.at(31 * time.Minute)
+	c = read()
+	if !c.Ready.Equal(overdueStart) {
+		t.Fatalf("the later READY fill was shifted by the ended hold: ready=%v", c.Ready.Sub(overdueStart))
+	}
+	if !c.HeadSeen.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the ended hold was shifted a second time: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	}
+}
+
 // headFailGH fails Head, the read NotifyPR makes after it sees the PR open.
 type headFailGH struct {
 	*fakeGH
