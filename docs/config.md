@@ -560,11 +560,20 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    `decisions.jsonl` and spawn again. A refusal that says the hub or the CLI
    cannot carry the spec is remembered for 10 minutes, so an old hub costs one
    refused attempt per window rather than one worktree per attempt, and an
-   upgraded hub is picked up without a restart. The reviewer-job record keeps
+   upgraded hub is picked up without a restart. A local checkout that cannot be
+   made after the refusal placed nothing: the pass releases its lease at once,
+   drops the reviewer-job record and records a `panewire reviewer local
+   checkout failed` skip, and no receipt names a directory that was never
+   created. The reviewer-job record keeps
    the argv actually spawned, and carries no `checkout` field for a
    spec-placed reviewer: its worktree lives on the node, named
    `<label>-checkout` there, and reap removes it there through the hub's
-   guarded removal once its pane is gone.
+   guarded removal once its pane is gone. A spec-placed spawn that ends without
+   a pane result writes a `pending-cleanup` receipt naming that
+   `<label>-checkout` worktree by label, since the pass holds no node path; the
+   reviewer sweep resolves its host and path from the job record once the job
+   has ended, and leaves the worktree to the node's own sweep when the record
+   names no path.
 4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
    mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass fails. Otherwise

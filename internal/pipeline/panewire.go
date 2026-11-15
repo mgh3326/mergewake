@@ -830,7 +830,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			prepErr := x.localReviewerCheckout(pc, checkout)
 			cancel()
 			if prepErr != nil {
-				return b, fmt.Errorf("checkout spec refused (%s); local checkout: %w", reason, prepErr)
+				// The directory was never made: no receipt and no record may
+				// name it, and the spawn placed nothing.
+				checkout = ""
+				return b, &checkoutSpecFallbackFailed{spec: reason, err: prepErr}
 			}
 			rj.Args = legacy
 			rj.Checkout = checkout
@@ -864,6 +867,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		if e != nil {
 			code := exitStatus(e)
+			// A refused spec whose fallback checkout could not be made placed
+			// nothing, whatever exit code git returned for the checkout.
+			unplaced := checkoutFallbackFailed(e)
 			var commandErr *integrations.CommandError
 			stderr := ""
 			if errors.As(e, &commandErr) {
@@ -890,27 +896,35 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// follow a placed pane, such as a timed-out wait, keeps the lease.
 			if reason, never := spawnNeverPlaced(code); never && !resumed && ctx.Err() == nil {
 				x.releaseLease(ctx, plan, leaseSHA, reason, "")
+			} else if unplaced && !resumed && ctx.Err() == nil {
+				x.releaseLease(ctx, plan, leaseSHA, "spawn-local-checkout-failed", "")
 			}
-			// A refused fresh spawn created no job: its record goes.
-			if !resumed && spawnRefused(code) {
+			// A refused fresh spawn created no job, and neither did a refused
+			// spec whose fallback checkout failed: their record goes.
+			if !resumed && (spawnRefused(code) || unplaced) {
 				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
 					return out, errors.Join(e, dropErr)
 				}
 			}
 			// Every exit but the pre-start refusal may leave a pane running in
 			// this checkout: a timed-out --wait is one such exit. Keep the checkout
-			// and name it in a receipt for a later cleanup. A refused spawn started
-			// no pane, so its checkout is still removed below.
-			if !spawnRefused(code) || resumed {
+			// and name it in a receipt for a later cleanup, naming the node's
+			// worktree when the spawn held no local checkout. A refused spawn
+			// started no pane, and a refused spec whose fallback checkout failed
+			// created nothing, so nothing is kept for either.
+			if (!spawnRefused(code) || resumed) && !unplaced {
 				keepCheckout = true
-				if checkout != "" {
-					x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
-				}
+				x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
 			}
 			if ctx.Err() != nil {
 				res, skipErr := skip("panewire reviewer deadline")
 				res.skips[len(res.skips)-1].withCause(e)
 				return res, errors.Join(fmt.Errorf("panewire reviewer %s: %w", label, errors.Join(e, ctx.Err())), skipErr)
+			}
+			if unplaced {
+				res, skipErr := skip("panewire reviewer local checkout failed: %v", integrations.Detail(e))
+				res.skips[len(res.skips)-1].withCause(e)
+				return res, skipErr
 			}
 			// Only a wait that ended on its own deadline leaves the job
 			// pending: it may still run, so the record stays and the next run

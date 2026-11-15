@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -168,6 +169,29 @@ func hubLacksCheckoutSpec(err error) bool {
 	return strings.Contains(detail, "does not support --checkout-origin") ||
 		strings.Contains(detail, "unable to verify hub support for --checkout-origin") ||
 		strings.Contains(detail, "flag provided but not defined: -checkout-origin")
+}
+
+// checkoutSpecFallbackFailed is a refused checkout spec whose fallback local
+// checkout could not be made. Nothing was placed: panewire refused the spec
+// before submitting anything, so there is no request, job or pane behind the
+// failure. The wrapped error stays reachable for its stderr and exit code.
+type checkoutSpecFallbackFailed struct {
+	spec string
+	err  error
+}
+
+func (e *checkoutSpecFallbackFailed) Error() string {
+	return fmt.Sprintf("checkout spec refused (%s); local checkout: %v", e.spec, e.err)
+}
+
+func (e *checkoutSpecFallbackFailed) Unwrap() error { return e.err }
+
+// checkoutFallbackFailed reports whether err is a refused checkout spec whose
+// fallback local checkout could not be made: the spawn placed nothing, so it
+// counts as never placed whatever exit code git returned.
+func checkoutFallbackFailed(err error) bool {
+	var target *checkoutSpecFallbackFailed
+	return errors.As(err, &target)
 }
 
 // localArgs rewrites a spawn argv that names a checkout spec into the -c form

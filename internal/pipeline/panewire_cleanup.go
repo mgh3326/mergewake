@@ -282,9 +282,16 @@ func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost,
 
 // keepUnfinishedCheckout handles a spawn that ended without a pane result. It
 // closes nothing: the checkout stays with a pending-cleanup receipt that names
-// it, so the checkout is not removed under a pane that may still run.
+// it, so the checkout is not removed under a pane that may still run. A
+// spec-placed spawn holds no local checkout, so its receipt names the node's
+// <label>-checkout worktree instead: the reviewer sweep resolves its host and
+// path from the job record once the job has ended.
 func (x *panewireExecutor) keepUnfinishedCheckout(p reviewerPane, reason string) {
-	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: p.checkout}}
+	worktree := p.checkout
+	if worktree == "" {
+		worktree = p.label + reviewerCheckoutSuffix
+	}
+	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: worktree}}
 	c.record("pending-cleanup", reason)
 }
 
