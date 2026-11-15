@@ -146,7 +146,33 @@ type Sink struct {
 	Type        string `yaml:"type"`
 	Command     string `yaml:"command"`
 	ReopenState string `yaml:"reopen_state"`
+	// ReconcileEvery is how often the daemon checks hk's unreconciled PR rows
+	// against GitHub and writes the merged and closed ones back; empty means
+	// DefaultReconcileEvery, and "off" disables the check.
+	ReconcileEvery string `yaml:"reconcile_every"`
 }
+
+// DefaultReconcileEvery is the unreconciled-row sync's interval when
+// sink.reconcile_every is unset.
+const DefaultReconcileEvery = time.Hour
+
+// ReconcileInterval returns the unreconciled-row sync's interval, and false
+// when sink.reconcile_every is "off". Load validates the value, so an invalid
+// one cannot reach it.
+func (s Sink) ReconcileInterval() (time.Duration, bool) {
+	switch s.ReconcileEvery {
+	case "off":
+		return 0, false
+	case "":
+		return DefaultReconcileEvery, true
+	}
+	d, e := Duration(s.ReconcileEvery)
+	if e != nil {
+		return 0, false
+	}
+	return d, true
+}
+
 type Repo struct {
 	Name   string `yaml:"name"`
 	Root   string `yaml:"root"`
@@ -868,6 +894,11 @@ func validateAdapters(c *Config) error {
 	}
 	if c.Sink.ReopenState != "reopened" {
 		return errors.New("sink.reopen_state must be reopened")
+	}
+	if c.Sink.ReconcileEvery != "" && c.Sink.ReconcileEvery != "off" {
+		if _, e := Duration(c.Sink.ReconcileEvery); e != nil {
+			return errors.New("sink.reconcile_every must be a positive duration or off")
+		}
 	}
 	return nil
 }

@@ -307,21 +307,41 @@ type Pull struct {
 
 func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull", id: strconv.Itoa(n)}, func() (Pull, error) {
-		if p, ok := c.storedPull(ctx, repo, n); ok {
-			return c.mergeCommitOf(ctx, repo, p), nil
-		}
-		var p Pull
-		if e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p); e != nil {
+		p, e := c.readPull(ctx, repo, n)
+		if e != nil {
 			return p, e
 		}
-		// REST carries no merge_commit_sha under this client's API version, so
-		// a merged pull's merge commit comes from GraphQL.
-		p = c.mergeCommitOf(ctx, repo, p)
-		c.shadowPull(repo, n, p)
-		c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
 		c.writePull(ctx, repo, p, time.Now().UTC(), changeSource(ctx), "")
 		return p, nil
 	})
+}
+
+// ReadPull reads a pull without recording the observation, for a caller that
+// writes the change state itself: Pull records every pull it reads, and a row
+// that is still open needs no write. It shares Pull's caches but keeps its own
+// memo key, so neither read can stand in for the other's write.
+func (c *Client) ReadPull(ctx context.Context, repo string, n int) (Pull, error) {
+	return memoized(ctx, c, memoKey{client: c, repo: repo, kind: "pull-read", id: strconv.Itoa(n)}, func() (Pull, error) {
+		return c.readPull(ctx, repo, n)
+	})
+}
+
+// readPull is Pull's read: the stored delivery while it can answer, else the
+// API's pull with a merged one's merge commit resolved.
+func (c *Client) readPull(ctx context.Context, repo string, n int) (Pull, error) {
+	if p, ok := c.storedPull(ctx, repo, n); ok {
+		return c.mergeCommitOf(ctx, repo, p), nil
+	}
+	var p Pull
+	if e := c.json(ctx, "GET", fmt.Sprintf("%s/pulls/%d", base(repo), n), nil, &p); e != nil {
+		return p, e
+	}
+	// REST carries no merge_commit_sha under this client's API version, so
+	// a merged pull's merge commit comes from GraphQL.
+	p = c.mergeCommitOf(ctx, repo, p)
+	c.shadowPull(repo, n, p)
+	c.changeHeads.Store(repo+"\x00"+strconv.Itoa(n), p.Head.SHA)
+	return p, nil
 }
 func (c *Client) Files(ctx context.Context, repo string, n int) ([]policy.File, error) {
 	return list[policy.File](ctx, c, fmt.Sprintf("%s/pulls/%d/files", base(repo), n))

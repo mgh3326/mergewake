@@ -264,6 +264,23 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			<-reconciled
 		}()
 	}
+	// hk's unreconciled PR rows get a loop of their own: a PR merged outside
+	// mergewake's pass is never written as merged by the sweep, and its row
+	// keeps the hk tasks waiting on it from settling. It runs with the
+	// handoffkeep sink and a real change-state writer, at its own interval.
+	if every, on := changeSyncEnabled(s.Config, gh.Changes != nil); on {
+		changes := newChangeSync(gh, repos, log)
+		syncCtx, stopSync := context.WithCancel(ctx)
+		synced := make(chan struct{})
+		go func() {
+			defer close(synced)
+			runChangeSyncLoop(syncCtx, changes, every)
+		}()
+		defer func() {
+			stopSync()
+			<-synced
+		}()
+	}
 	// The queue runs until the daemon stops, and the daemon waits for the
 	// evaluations in flight, as a pass used to wait for its reviews.
 	if engine != nil {
