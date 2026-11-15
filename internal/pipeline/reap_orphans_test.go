@@ -355,6 +355,9 @@ func TestOrphanCheckoutHeadUnreadableKept(t *testing.T) {
 // A directory under a state subdirectory that cannot be read stops the sweep:
 // its records may name any checkout.
 func TestRecordFilesUnreadableDirIsError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-000 directories")
+	}
 	state := t.TempDir()
 	bad := filepath.Join(state, "owner", "repo", "reviewer-jobs")
 	if err := os.MkdirAll(bad, 0o700); err != nil {
