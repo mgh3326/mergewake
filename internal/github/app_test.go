@@ -60,6 +60,10 @@ type fakeGitHub struct {
 	expiresIn time.Duration
 	clock     func() time.Time
 	remaining func(auth string) (int, time.Time, bool)
+	// installationPermissions is what the installation lookup reports and
+	// tokenPermissions what the minted token reports; either may be nil.
+	installationPermissions map[string]string
+	tokenPermissions        map[string]string
 }
 
 func (f *fakeGitHub) token() string { return "inst-token-" + strconv.Itoa(int(f.mints.Load())) }
@@ -77,12 +81,12 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		reply(w, map[string]any{"id": appTestInstall})
+		reply(w, map[string]any{"id": appTestInstall, "permissions": f.installationPermissions})
 		return
 	case strings.HasPrefix(r.URL.Path, "/app/installations/") && r.Method == "POST":
 		f.mints.Add(1)
 		w.WriteHeader(http.StatusCreated)
-		reply(w, map[string]any{"token": f.token(), "expires_at": f.clock().Add(f.expiresIn).UTC().Format(time.RFC3339)})
+		reply(w, map[string]any{"token": f.token(), "expires_at": f.clock().Add(f.expiresIn).UTC().Format(time.RFC3339), "permissions": f.tokenPermissions})
 		return
 	}
 	if code := f.denyRead[memoRepo(r.URL.Path)]; code != 0 && strings.HasPrefix(auth, "Bearer inst-token-") {
@@ -196,6 +200,35 @@ func TestAppReadsUseInstallationTokenAndWritesUseUserToken(t *testing.T) {
 	}
 	if h.fake.lookups.Load() != 1 || h.fake.mints.Load() != 1 {
 		t.Errorf("lookups=%d mints=%d, want one each for one repository", h.fake.lookups.Load(), h.fake.mints.Load())
+	}
+}
+
+// The installation's permission names and levels are logged once, from either
+// answer that carries them, and the token is never part of the line.
+func TestAppInstallationPermissionsLogged(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		install, token map[string]string
+	}{
+		{"installation lookup", map[string]string{"pull_requests": "write", "contents": "read"}, nil},
+		{"token mint", nil, map[string]string{"pull_requests": "write", "contents": "read"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newAppHarness(t, true)
+			h.fake.installationPermissions, h.fake.tokenPermissions = tt.install, tt.token
+			for range 2 {
+				if _, ok := h.AppToken(context.Background(), "o/r"); !ok {
+					t.Fatal("App could not serve the repository")
+				}
+			}
+			logs := h.stderr.String()
+			if n := strings.Count(logs, "app installation permissions: contents=read, pull_requests=write"); n != 1 {
+				t.Fatalf("logged %d times: %q", n, logs)
+			}
+			if strings.Contains(logs, h.fake.token()) {
+				t.Fatalf("log line carries the token: %q", logs)
+			}
+		})
 	}
 }
 

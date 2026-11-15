@@ -732,8 +732,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			continue
 		}
 		if p.MergeCommitSHA == "" {
-			// The pulls list endpoint omits merge_commit_sha; resolve it for
-			// the few PRs that actually name work.
+			// The list body carries no merge_commit_sha under this client's API
+			// version; Pull resolves it from GraphQL for the few PRs that name
+			// work. It reads past the caches because a body cached while the PR
+			// was open would not say it merged.
 			fp, e := s.GH.Pull(github.Uncached(ctx), r.Name, p.Number)
 			if e != nil {
 				errs = append(errs, fmt.Errorf("PR %d merge commit: %w", p.Number, e))

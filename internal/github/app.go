@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,8 @@ type appAuth struct {
 	tokens    map[int64]installToken
 	fallback  map[string]time.Time
 	announced map[string]bool
+	// permissions records the installations whose permission set was logged.
+	permissions map[int64]bool
 	// fallbackUntil is the latest end of any repository's fallback window.
 	fallbackUntil atomic.Int64
 
@@ -79,7 +82,7 @@ type appAuth struct {
 // EnableApp makes the client read through installation tokens of the App with
 // this id, signed by key. Without it every request uses Token.
 func (c *Client) EnableApp(appID int64, key *rsa.PrivateKey) {
-	c.app = &appAuth{id: appID, key: key, installs: map[string]int64{}, tokens: map[int64]installToken{}, fallback: map[string]time.Time{}, announced: map[string]bool{}}
+	c.app = &appAuth{id: appID, key: key, installs: map[string]int64{}, tokens: map[int64]installToken{}, fallback: map[string]time.Time{}, announced: map[string]bool{}, permissions: map[int64]bool{}}
 }
 
 var graphqlMutation = regexp.MustCompile(`\b(mutation|subscription)\b`)
@@ -135,9 +138,10 @@ func (a *appAuth) credential(ctx context.Context, c *Client, repo string) (crede
 	}
 	id, ok := a.installs[repo]
 	if !ok {
+		var perms map[string]string
 		var code int
 		var e error
-		id, code, e = a.lookup(ctx, c, repo)
+		id, perms, code, e = a.lookup(ctx, c, repo)
 		if e != nil {
 			ttl, reason := appTransientTTL, "installation lookup failed"
 			if code == http.StatusNotFound {
@@ -147,16 +151,19 @@ func (a *appAuth) credential(ctx context.Context, c *Client, repo string) (crede
 			return credential{}, false
 		}
 		a.installs[repo] = id
+		a.announcePermissions(c, id, perms)
 	}
 	t := a.tokens[id]
 	if t.token == "" || !now.Before(t.expires.Add(-appTokenRefreshMargin)) {
+		var perms map[string]string
 		var e error
-		t, e = a.mint(ctx, c, id)
+		t, perms, e = a.mint(ctx, c, id)
 		if e != nil {
 			a.deny(c, repo, now, appTransientTTL, "installation token request failed")
 			return credential{}, false
 		}
 		a.tokens[id] = t
+		a.announcePermissions(c, id, perms)
 	}
 	return credential{id: credApp + ":" + strconv.FormatInt(id, 10), kind: credApp, token: t.token, repo: repo, installation: id}, true
 }
@@ -252,29 +259,60 @@ func (a *appAuth) send(ctx context.Context, c *Client, method, target, route str
 	return resp.StatusCode, resp.Header, json.Unmarshal(b, out)
 }
 
-func (a *appAuth) lookup(ctx context.Context, c *Client, repo string) (int64, int, error) {
+func (a *appAuth) lookup(ctx context.Context, c *Client, repo string) (int64, map[string]string, int, error) {
 	var out struct {
-		ID int64 `json:"id"`
+		ID          int64             `json:"id"`
+		Permissions map[string]string `json:"permissions"`
 	}
 	code, e := a.call(ctx, c, http.MethodGet, base(repo)+"/installation", &out)
 	if e == nil && out.ID <= 0 {
 		e = errors.New("GitHub App installation has no id")
 	}
-	return out.ID, code, e
+	return out.ID, out.Permissions, code, e
 }
 
-func (a *appAuth) mint(ctx context.Context, c *Client, installation int64) (installToken, error) {
+func (a *appAuth) mint(ctx context.Context, c *Client, installation int64) (installToken, map[string]string, error) {
 	var out struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Token       string            `json:"token"`
+		ExpiresAt   time.Time         `json:"expires_at"`
+		Permissions map[string]string `json:"permissions"`
 	}
 	if _, e := a.call(ctx, c, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", installation), &out); e != nil {
-		return installToken{}, e
+		return installToken{}, nil, e
 	}
 	if out.Token == "" || out.ExpiresAt.IsZero() {
-		return installToken{}, errors.New("GitHub App token response is incomplete")
+		return installToken{}, nil, errors.New("GitHub App token response is incomplete")
 	}
-	return installToken{out.Token, out.ExpiresAt}, nil
+	return installToken{out.Token, out.ExpiresAt}, out.Permissions, nil
+}
+
+// announcePermissions logs the permission names and levels GitHub reported
+// for an installation, once per installation per process. The token is never
+// part of the line. The caller holds a.mu.
+func (a *appAuth) announcePermissions(c *Client, installation int64, perms map[string]string) {
+	if len(perms) == 0 || a.permissions[installation] {
+		return
+	}
+	a.permissions[installation] = true
+	out := c.Stderr
+	if out == nil {
+		out = os.Stderr
+	}
+	fmt.Fprintf(out, "mergewake: app installation permissions: %s\n", permissionList(perms))
+}
+
+// permissionList renders a permissions object as "name=level" in name order.
+func permissionList(perms map[string]string) string {
+	names := make([]string, 0, len(perms))
+	for name := range perms {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, len(names))
+	for i, name := range names {
+		parts[i] = name + "=" + perms[name]
+	}
+	return strings.Join(parts, ", ")
 }
 
 // signAppJWT builds the RS256 token GitHub expects from an App: issued a
