@@ -744,6 +744,24 @@ func TestLegacySweepForeignHostJobRecordKeepsNoTask(t *testing.T) {
 	}
 }
 
+// The newest closed PR's binding failed this pass, so its task is unknown:
+// the older job record bound to the same worktree cannot stand in, and the
+// row stays no-task even though that task is dropped.
+func TestLegacySweepKeepsWhenNewestPRBindingFails(t *testing.T) {
+	s, hub, gh := droppedFixture(t, "dropped", 20*24*time.Hour, "obsolete")
+	newer := legacyPR(41, 20, false)
+	newer.Body = "No trailer."
+	gh.closed = append(gh.closed, newer)
+	gh.commitErr = map[string]error{headSHA: errors.New("commit read failed")}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err == nil || !strings.Contains(err.Error(), "PR 41 job binding") {
+		t.Fatalf("want the binding error reported, got %v", err)
+	}
+	wantRow(t, legacyOnly(t, s), "kept", "no-task")
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removed on an unknown newest-PR task %d times", n)
+	}
+}
+
 // jobRecordNames matches a record to a worktree only on the host the job ran
 // on, and a recorded worktree origin that does not parse to owner/name never
 // matches — head and branch alone are not enough across repos.

@@ -863,11 +863,15 @@ func (w *legacySweep) taskFor(host reap.Host, c *legacyCand, wt *reap.Worktree, 
 	}
 	var boundJob string
 	if p != nil {
-		if b, ok := w.bindings[p.Number]; ok {
-			addID(b.Task)
-			boundJob = b.Job
-			addJob(b.Job)
+		b, ok := w.bindings[p.Number]
+		if !ok {
+			// The newest closed PR's binding failed this pass, so its task is
+			// unknown: no job record may stand in for it.
+			return ""
 		}
+		addID(b.Task)
+		boundJob = b.Job
+		addJob(b.Job)
 	}
 	if c.job != "" {
 		addJob(c.job)
