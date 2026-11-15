@@ -357,7 +357,9 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 
 // reviewPR runs one PR's review, then settles it under settling unless the
 // caller already settled its reviewed head. A review the retry reran there is
-// settled by the next evaluation of the PR.
+// settled by the next evaluation of the PR. A review that ran nothing — held,
+// quota-stopped, pending or a skipped poll — sends only the review-stall
+// check: findings delivery and Land stay off that path.
 func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool) (errs []error, clean, reviewed, unreviewed bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
@@ -387,9 +389,17 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 			errs = append(errs, fmt.Errorf("PR %d review: %w", pr.Number, e))
 		}
 	}
-	// A held, quota-stopped or pending review posts nothing, so it must not
-	// settle either: running DeliverFindings, NotifyPR or Land for it would
-	// report and act on a review that did not happen.
+	// A held, quota-stopped or pending review posts nothing, and a skipped poll
+	// read nothing, so none may settle either: running DeliverFindings,
+	// NotifyPR or Land for them would report and act on a review that did not
+	// happen. They can still stall: a head that has waited out
+	// reviewStallAfter is told to its owner lane once, naming this wait, and
+	// only the stall check runs here.
+	if unreviewed {
+		if stallErr := s.NotifyReviewStall(ctx, r, pr, o, e); stallErr != nil {
+			errs = append(errs, fmt.Errorf("PR %d review stall: %w", pr.Number, stallErr))
+		}
+	}
 	if !settle || unreviewed {
 		return errs, clean, reviewed, unreviewed
 	}
