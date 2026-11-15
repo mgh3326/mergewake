@@ -1001,6 +1001,44 @@ func TestReapArchiveUncertainListingRefreshesBeforeDeciding(t *testing.T) {
 	}
 }
 
+// A failed listing refresh never counts as an archive attempt: once the
+// listing reads cleanly the job gets its first sighting, not a direct
+// archive, even past the retry hour.
+func TestReapArchiveRefreshErrorSightsBeforeArchiving(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-000 directories")
+	}
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	if err := os.Chmod(filepath.Join(dir, "events"), 0); err != nil {
+		t.Fatal(err)
+	}
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err == nil {
+		t.Fatal("unreadable listing wrote no error")
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "error" || !strings.HasPrefix(rows[0].Reason, "refresh: ") {
+		t.Fatalf("refresh failure not marked: %+v", rows)
+	}
+	// The listing reads cleanly now, past the retry hour: the job still
+	// gets its first sighting instead of a direct archive.
+	if err := os.Chmod(filepath.Join(dir, "events"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows = f.rows(t)
+	if len(rows) != 2 || rows[1].Result != "skipped" || rows[1].Reason != "awaiting-min-age" {
+		t.Fatalf("refresh error archived without a sighting: %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir archived without a sighting")
+	}
+}
+
 // Under reap.transport panewire a remote host is reached through the hub, so
 // archive, which moves files over ssh, must leave it alone even when it also
 // has an ssh destination.

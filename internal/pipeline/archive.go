@@ -187,6 +187,12 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				if files, reason, rnewest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
 					rec := reapReceipt{Action: "archive-job", Repo: r.Name, Host: h.Name, Job: job}
 					rec.Result, rec.Reason = archive.Reason(e)
+					if rec.Result == "error" {
+						// A failed refresh never attempted an archive: mark it so
+						// the direct-retry below does not mistake it for one and
+						// skip the min_age sighting.
+						rec.Reason = "refresh: " + rec.Reason
+					}
 					note(rec)
 					continue
 				} else if reason != "" {
@@ -253,10 +259,10 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				case skipReason == "not-finished":
 					rec.Result, rec.Reason = "skipped", "not-finished"
 				case !tried || prior.Result != "skipped" || prior.Reason != "awaiting-min-age":
-					// A job-record lookup error never attempted an archive, so
-					// it falls through to a fresh sighting; only a failure of
-					// the archive itself retries directly.
-					if tried && (prior.Result == "archived-retained" || prior.Result == "error" && !strings.HasPrefix(prior.Reason, "job record: ")) {
+					// A job-record lookup or listing-refresh error never attempted
+					// an archive, so both fall through to a fresh sighting; only
+					// a failure of the archive itself retries directly.
+					if tried && (prior.Result == "archived-retained" || prior.Result == "error" && !strings.HasPrefix(prior.Reason, "job record: ") && !strings.HasPrefix(prior.Reason, "refresh: ")) {
 						// The retry waited out its hour: attempt the archive
 						// again now instead of starting a fresh sighting.
 						s.archiveJob(ctx, h, job, acting, &rec)
