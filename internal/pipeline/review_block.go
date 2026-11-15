@@ -204,17 +204,51 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 // blockLane is the lane a review block goes to. A missing trailer and an
 // unknown family are fixed by the PR's author, so the author's lane is found
 // first (findingsRoute); with none found, and for the other reasons, which a
-// human judges, it is the repo's owner lane. A route read error is returned,
-// so nothing is sent and the next pass retries.
+// human judges, it is the repo's owner lane. A route read error that is not
+// a per-host pane scan failure is returned, so nothing is sent and the next
+// pass retries; a scan failure routes on the hosts that answered and falls
+// back to the owner lane when none names the author, since an unreachable
+// host must not fail the review.
 func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, b reviewBlock) (lane, via string, err error) {
 	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
+		ctx = WithAuthorScan(ctx)
 		route, e := s.findingsRoute(ctx, r, pr)
-		if e != nil {
-			return "", "", fmt.Errorf("review block route: %w", e)
-		}
-		if route.via != "unknown author; desk" {
+		switch {
+		case e == nil && route.via != "unknown author; desk":
 			return route.lane, route.via, nil
+		case e != nil && hostScanOnly(e):
+			return s.blockLanePartial(ctx, r, pr)
+		case e != nil:
+			return "", "", fmt.Errorf("review block route: %w", e)
 		}
 	}
 	return s.ownerLane(r), "owner lane", nil
+}
+
+// blockLanePartial routes a review block when the author scan lost one or
+// more hosts: the author pane is looked up on the hosts that answered, the
+// via naming the partial scan as findings delivery does; with no author pane
+// the block goes to the owner lane.
+func (s *Service) blockLanePartial(ctx context.Context, r config.Repo, pr github.Pull) (lane, via string, err error) {
+	hosts, _ := s.authorHosts(ctx)
+	jobs, has := s.Sink.(reapJobs)
+	if has && len(s.Config.Hosts) > 0 && pr.Head.Ref != "" && sameRepoHead(pr, r.Name) {
+		l, v, ok, e := s.authorPaneOn(ctx, jobs, hosts, r, pr)
+		if e != nil {
+			return "", "", fmt.Errorf("review block route: %w", e)
+		}
+		if ok {
+			return l, v + " (partial pane scan)", nil
+		}
+	}
+	read := 0
+	for _, hs := range hosts {
+		if !hs.failed {
+			read++
+		}
+	}
+	if read == 0 {
+		return s.ownerLane(r), "owner lane (pane scan failed)", nil
+	}
+	return s.ownerLane(r), "owner lane (partial pane scan)", nil
 }
