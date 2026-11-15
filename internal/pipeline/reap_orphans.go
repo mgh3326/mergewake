@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -22,50 +23,152 @@ import (
 // it cannot prove that no process holds a checkout.
 var errProcessScanUnavailable = errors.New("no process working-directory scan on this host")
 
-// processCwds lists the working directories of this machine's processes; a
-// variable so a test can stand in for the platform scan.
-var processCwds = listProcessCwds
+// processScan reads this machine's processes; a variable so a test can stand in
+// for the platform scan.
+var processScan = scanProcesses
 
-// listProcessCwds reads every process's working directory: from /proc where it
+// procEvidence is what one scan read of this machine's processes: the working
+// directories it could read, and every same-user process whose working
+// directory it could not.
+type procEvidence struct {
+	cwds    []string
+	unknown []procUnknown
+}
+
+// procUnknown is a same-user process that denies its working directory. fds are
+// the paths it has open, when those could be read; exe and comm are what the
+// process let the scan read of its executable and its name.
+type procUnknown struct {
+	pid      int
+	comm     string
+	exe      string
+	fds      []string
+	fdsKnown bool
+}
+
+// heldPaths resolves one scan into the paths a process may hold — every readable
+// working directory, plus the open files of a process that denies its cwd — and
+// the processes it cannot rule out, whose checkout is unknown.
+func (ev procEvidence) heldPaths() (held []string, unresolved []procUnknown) {
+	held = append(held, ev.cwds...)
+	for _, p := range ev.unknown {
+		if p.fdsKnown {
+			held = append(held, p.fds...)
+			continue
+		}
+		if procNoWorkDir(filepath.Base(p.exe)) || (p.exe == "" && procNoWorkDir(p.comm)) {
+			continue
+		}
+		unresolved = append(unresolved, p)
+	}
+	return held, unresolved
+}
+
+// procNoWorkDir names the programs that never enter a work directory, so a
+// same-user process whose working directory and open files both deny this user
+// cannot hold a checkout: an sshd session, and systemd's PAM helper. It decides
+// only when nothing stronger does: a process whose open files could be read is
+// judged by those alone.
+func procNoWorkDir(name string) bool {
+	switch name {
+	case "sshd", "sshd-session", "sd-pam", "(sd-pam)":
+		return true
+	}
+	return false
+}
+
+// scanProcesses reads every process's working directory: from /proc where it
 // exists (Linux), otherwise from `lsof -a -d cwd -F n` (macOS). A process that
 // exited, or belongs to another user and cannot be read under /proc, holds no
-// checkout of this user's. Any scan failure is errProcessScanUnavailable.
-func listProcessCwds(ctx context.Context, run integrations.Runner) ([]string, error) {
+// checkout of this user's. A same-user process that denies its working
+// directory is recorded with what it still allows; lsof lists only what it can
+// read, so that scan reports none. Any scan failure is
+// errProcessScanUnavailable.
+func scanProcesses(ctx context.Context, run integrations.Runner) (procEvidence, error) {
 	if _, e := os.Stat("/proc/self/cwd"); e == nil {
-		return procCwds()
+		return procScanEvidence()
 	}
 	b, e := run.Run(ctx, "lsof", []string{"-a", "-d", "cwd", "-F", "n"}, "", "")
 	if e != nil {
-		return nil, fmt.Errorf("%w: lsof: %v", errProcessScanUnavailable, e)
+		return procEvidence{}, fmt.Errorf("%w: lsof: %v", errProcessScanUnavailable, e)
 	}
-	return parseLsofCwds(b), nil
+	return procEvidence{cwds: parseLsofCwds(b)}, nil
 }
 
-// procCwds reads the working directories under /proc.
-func procCwds() ([]string, error) {
+// procScanEvidence reads the working directories under /proc.
+func procScanEvidence() (procEvidence, error) {
 	entries, e := os.ReadDir("/proc")
 	if e != nil {
-		return nil, fmt.Errorf("%w: %v", errProcessScanUnavailable, e)
+		return procEvidence{}, fmt.Errorf("%w: %v", errProcessScanUnavailable, e)
 	}
-	var out []string
+	var ev procEvidence
 	for _, ent := range entries {
-		if _, e := strconv.Atoi(ent.Name()); e != nil {
+		pid, e := strconv.Atoi(ent.Name())
+		if e != nil {
 			continue
 		}
-		cwd, e := os.Readlink(filepath.Join("/proc", ent.Name(), "cwd"))
+		dir := filepath.Join("/proc", ent.Name())
+		cwd, e := os.Readlink(filepath.Join(dir, "cwd"))
 		switch {
 		case e == nil:
-			out = append(out, cwd)
+			ev.cwds = append(ev.cwds, cwd)
 		case errors.Is(e, fs.ErrNotExist):
-		case errors.Is(e, fs.ErrPermission) && !sameUserProcess(filepath.Join("/proc", ent.Name())):
+		case !sameUserProcess(dir):
 			// Another user's process: it cannot be running in this user's checkout.
 		default:
-			// A same-user process whose cwd is unreadable (a non-dumpable process
-			// can deny its own cwd) may be in a checkout: unknown, so fail closed.
-			return nil, fmt.Errorf("%w: %v", errProcessScanUnavailable, e)
+			// A same-user process that denies its cwd may be in a checkout. A
+			// non-dumpable process denies cwd, exe, fd and environ together, yet
+			// keeps comm, stat and cmdline readable: read what it still allows.
+			ev.unknown = append(ev.unknown, unknownProcess(dir, pid))
 		}
 	}
-	return out, nil
+	return ev, nil
+}
+
+// unknownProcess reads what a same-user process that denies its working
+// directory still lets this user read.
+func unknownProcess(dir string, pid int) procUnknown {
+	p := procUnknown{pid: pid, comm: procCommName(dir)}
+	if exe, e := os.Readlink(filepath.Join(dir, "exe")); e == nil {
+		p.exe = exe
+	}
+	ents, e := os.ReadDir(filepath.Join(dir, "fd"))
+	if e != nil {
+		return p
+	}
+	p.fdsKnown = true
+	for _, ent := range ents {
+		target, e := os.Readlink(filepath.Join(dir, "fd", ent.Name()))
+		switch {
+		case e == nil:
+			p.fds = append(p.fds, target)
+		case errors.Is(e, fs.ErrNotExist):
+			// Closed while scanning.
+		default:
+			// One hidden target proves nothing about the descriptors beside it.
+			p.fds, p.fdsKnown = nil, false
+			return p
+		}
+	}
+	return p
+}
+
+// procCommName reads a process's name from /proc/<pid>/comm, or from the
+// parenthesised name in /proc/<pid>/stat when that file does not read. It is
+// empty when neither does.
+func procCommName(dir string) string {
+	if b, e := os.ReadFile(filepath.Join(dir, "comm")); e == nil {
+		return strings.TrimSpace(string(b))
+	}
+	b, e := os.ReadFile(filepath.Join(dir, "stat"))
+	if e != nil {
+		return ""
+	}
+	op, cl := strings.IndexByte(string(b), '('), strings.LastIndexByte(string(b), ')')
+	if op < 0 || cl <= op {
+		return ""
+	}
+	return string(b[op+1 : cl])
 }
 
 // sameUserProcess reports whether the /proc entry at dir belongs to this user.
@@ -123,8 +226,12 @@ const (
 	orphanRemoved     = "removed"
 	orphanPlanned     = "would-remove"
 	orphanKept        = "kept"
+	orphanSkipped     = "skipped"
 	orphanReason      = "orphan-checkout"
 	orphanNotWorktree = "not-a-git-worktree"
+	// orphanScanUnavailable is the reason token of a row saying the pass could
+	// not finish its process scan, so nothing was removed.
+	orphanScanUnavailable = "process-scan-unavailable"
 )
 
 // recordedCheckouts names every checkout a reviewer-job record of any repo
@@ -223,7 +330,7 @@ func (s *Service) orphanLocalHost(ctx context.Context, hosts []*reapHost) *reapH
 // reviewer-job record names. It runs on each whole-repo reap pass; a directory
 // is removed by the pass of the repo that owns its worktree. Rows go through
 // note, which writes the reap log and the reviewer audit record.
-func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
+func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, receipts []reapReceipt, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
 	dir := config.Expand(s.Config.Review.Panewire.Checkouts)
 	if dir == "" {
 		return nil
@@ -247,14 +354,24 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 	if hs.failed || hs.usageUnknown {
 		return []error{errors.New("orphan checkouts: local pane scan failed; no checkout removed")}
 	}
-	cwds, e := processCwds(ctx, s.Runner)
-	if errors.Is(e, errProcessScanUnavailable) {
-		// Fail closed without a pass error: this host cannot prove a process
-		// holds no checkout, so nothing is removed or receipted.
-		return nil
-	}
-	if e != nil {
+	held, unresolved, e := s.orphanHeldPaths(ctx)
+	if e != nil && !errors.Is(e, errProcessScanUnavailable) {
 		return []error{fmt.Errorf("orphan checkouts: %w", e)}
+	}
+	// Fail closed without a pass error: this host cannot prove that no process
+	// holds a checkout, so nothing is removed. The day's row keeps the blocked
+	// sweep visible, so a host that can never finish the scan is not silently
+	// idle (hk 4792). One row a day, not one a pass: the condition persists.
+	noted := false
+	noteScan := func(e error, unresolved []procUnknown) {
+		if !noted && s.orphanScanRowDue(r, receipts) {
+			note(orphanRow(r, hs, "", orphanSkipped, orphanScanUnavailable+": "+orphanScanDetail(e, unresolved)))
+		}
+		noted = true
+	}
+	if e != nil || len(unresolved) > 0 {
+		noteScan(e, unresolved)
+		return nil
 	}
 	now := s.now()
 	var errs []error
@@ -282,7 +399,7 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 		if tree == nil {
 			// One repo's pass reports a non-worktree: the directory belongs to no
 			// repo, so every repo's log would otherwise carry the same row.
-			if s.reportsOrphanNonWorktrees(r) {
+			if s.reportsOrphanDirRows(r) {
 				note(orphanRow(r, hs, path, orphanKept, orphanNotWorktree))
 			}
 			continue
@@ -326,7 +443,7 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 		if hs.paneInUse(path) {
 			continue
 		}
-		if anyWithin(cwds, path) {
+		if anyWithin(held, path) {
 			continue
 		}
 		if !acting {
@@ -335,9 +452,13 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 		}
 		// The scan above is a cheap pre-filter: a process can start in the
 		// checkout during this pass's slow per-candidate checks. Scan again right
-		// before the removal, and keep the checkout if that scan fails.
-		fresh, e := processCwds(ctx, s.Runner)
-		if e != nil || anyWithin(fresh, path) {
+		// before the removal, and keep the checkout if that scan proves nothing.
+		fresh, freshUnresolved, e := s.orphanHeldPaths(ctx)
+		if e != nil || len(freshUnresolved) > 0 {
+			noteScan(e, freshUnresolved)
+			continue
+		}
+		if anyWithin(fresh, path) {
 			continue
 		}
 		if e := hs.exec.RemoveWorktree(ctx, filepath.Dir(tree.Common), path); e != nil {
@@ -349,9 +470,58 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, hosts 
 	return errs
 }
 
-// reportsOrphanNonWorktrees reports whether r's pass writes the non-worktree
-// rows: the alphabetically first configured repo, so one log holds each.
-func (s *Service) reportsOrphanNonWorktrees(r config.Repo) bool {
+// orphanHeldPaths runs the process scan and resolves it: the paths a process
+// may hold, and the same-user processes it cannot rule out.
+func (s *Service) orphanHeldPaths(ctx context.Context) (held []string, unresolved []procUnknown, err error) {
+	ev, e := processScan(ctx, s.Runner)
+	if e != nil {
+		return nil, nil, e
+	}
+	held, unresolved = ev.heldPaths()
+	return held, unresolved, nil
+}
+
+// orphanScanDetail names the process that blocked the sweep, or the scan
+// failure itself, so the row carries the pid and the process name.
+func orphanScanDetail(e error, unresolved []procUnknown) string {
+	if len(unresolved) == 0 {
+		if e != nil {
+			return e.Error()
+		}
+		return "unknown process"
+	}
+	p := unresolved[0]
+	detail := fmt.Sprintf("pid %d", p.pid)
+	if p.comm != "" {
+		detail += " (" + p.comm + ")"
+	}
+	if n := len(unresolved) - 1; n > 0 {
+		detail += fmt.Sprintf(" and %d more", n)
+	}
+	return detail
+}
+
+// orphanScanRowDue reports whether this pass writes the day's
+// process-scan-unavailable row: only the pass that writes rows about the
+// checkouts directory itself, and only once per UTC day, so a host that can
+// never finish the scan says so once a day instead of on every pass.
+func (s *Service) orphanScanRowDue(r config.Repo, receipts []reapReceipt) bool {
+	if !s.reportsOrphanDirRows(r) {
+		return false
+	}
+	today := s.now().UTC().Format(time.DateOnly)
+	for _, v := range receipts {
+		if v.Action == orphanAction && strings.HasPrefix(v.Reason, orphanScanUnavailable) && v.Time.UTC().Format(time.DateOnly) == today {
+			return false
+		}
+	}
+	return true
+}
+
+// reportsOrphanDirRows reports whether r's pass writes the rows about the
+// checkouts directory itself — a non-worktree, or a process scan that cannot
+// finish: the alphabetically first configured repo, so one log holds each.
+func (s *Service) reportsOrphanDirRows(r config.Repo) bool {
 	first := r.Name
 	for _, c := range s.Config.Repos {
 		if c.Name < first {

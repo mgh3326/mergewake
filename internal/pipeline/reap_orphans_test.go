@@ -29,13 +29,21 @@ func orphanCheckout(t *testing.T, f *reviewerFix, age time.Duration) (label, pat
 }
 
 // newOrphanFix stubs the process scan empty, so the test host's own processes
-// do not decide the outcome; the process-cwd tests set their own.
+// do not decide the outcome; the process-scan tests set their own.
 func newOrphanFix(t *testing.T) *reviewerFix {
 	t.Helper()
-	saved := processCwds
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return nil, nil }
-	t.Cleanup(func() { processCwds = saved })
+	saved := processScan
+	processScan = func(context.Context, integrations.Runner) (procEvidence, error) { return procEvidence{}, nil }
+	t.Cleanup(func() { processScan = saved })
 	return newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+}
+
+// scanProc stands in for the host's process scan for one test.
+func scanProc(t *testing.T, ev procEvidence, err error) {
+	t.Helper()
+	saved := processScan
+	processScan = func(context.Context, integrations.Runner) (procEvidence, error) { return ev, err }
+	t.Cleanup(func() { processScan = saved })
 }
 
 // orphanRows are the reviewer-cleanup rows of the orphan sweep: they name a
@@ -152,11 +160,7 @@ func TestOrphanCheckoutPaneInUseKept(t *testing.T) {
 func TestOrphanCheckoutProcessCwdKept(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 7*time.Hour)
-	saved := processCwds
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
-		return []string{path + "/internal", "/"}, nil
-	}
-	t.Cleanup(func() { processCwds = saved })
+	scanProc(t, procEvidence{cwds: []string{path + "/internal", "/"}}, nil)
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -265,20 +269,125 @@ func TestOrphanCheckoutSkippedForPRScopedPass(t *testing.T) {
 }
 
 // A host with no process scan (neither /proc nor lsof) removes nothing and
-// fails no pass: the sweep cannot prove that no process holds a checkout.
+// fails no pass: the sweep cannot prove that no process holds a checkout. It
+// writes one skipped row naming the failure, so a sweep that can never run is
+// visible (hk 4792).
 func TestOrphanCheckoutNoProcessScanFailsClosed(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 7*time.Hour)
-	saved := processCwds
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
-		return nil, errProcessScanUnavailable
-	}
-	t.Cleanup(func() { processCwds = saved })
+	scanProc(t, procEvidence{}, errProcessScanUnavailable)
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatalf("pass failed on a host without a process scan: %v", err)
 	}
-	if removedCalled(f, path) || len(orphanRows(t, f)) != 0 {
+	if removedCalled(f, path) {
 		t.Fatalf("removed without a process scan: calls %q", f.run.calls)
+	}
+	rows := orphanRows(t, f)
+	if len(rows) != 1 || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, orphanScanUnavailable) {
+		t.Fatalf("rows: %+v", rows)
+	}
+}
+
+// A same-user process the scan cannot rule out fails the sweep closed: nothing
+// is removed, and one skipped row names the process — once per UTC day even when
+// the pid changes, so a pass every minute does not bury the log, and a new day
+// reports the condition again.
+func TestOrphanCheckoutUnresolvedProcessReportsOncePerDay(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	pid := 4711
+	saved := processScan
+	processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
+		return procEvidence{unknown: []procUnknown{{pid: pid, comm: "sudo"}}}, nil
+	}
+	t.Cleanup(func() { processScan = saved })
+	for _, p := range []int{4711, 4722} {
+		pid = p
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if removedCalled(f, path) {
+		t.Fatalf("removed under a process the scan cannot rule out: calls %q", f.run.calls)
+	}
+	rows := orphanRows(t, f)
+	if len(rows) != 1 || rows[0].Result != "skipped" || !strings.Contains(rows[0].Reason, "pid 4711") || !strings.Contains(rows[0].Reason, "sudo") {
+		t.Fatalf("rows: %+v", rows)
+	}
+	f.s.Now = func() time.Time { return reviewerNow.Add(24 * time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(orphanRows(t, f)); got != 2 {
+		t.Fatalf("rows after a day = %d, want the day's second row", got)
+	}
+}
+
+// A non-dumpable same-user process whose open files point at nothing under the
+// checkouts directory cannot hold one: the sweep proceeds (hk 4792).
+func TestOrphanCheckoutUnreadableCwdOpenFilesElsewhereProceeds(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	scanProc(t, procEvidence{unknown: []procUnknown{
+		{pid: 4711, comm: "sudo", fdsKnown: true, fds: []string{"/tmp/notes", "socket:[7]"}},
+	}}, nil)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !removedCalled(f, path) {
+		t.Fatalf("checkout no process holds was kept: calls %q", f.run.calls)
+	}
+	if rows := orphanRows(t, f); len(rows) != 1 || rows[0].Result != "removed" {
+		t.Fatalf("rows: %+v", rows)
+	}
+}
+
+// An open file under the checkout is proof that its process holds it: kept.
+func TestOrphanCheckoutUnreadableCwdOpenFileInCheckoutKept(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 7*time.Hour)
+	scanProc(t, procEvidence{unknown: []procUnknown{
+		{pid: 4711, comm: "sudo", fdsKnown: true, fds: []string{"/tmp/notes", path + "/.git/index"}},
+	}}, nil)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removedCalled(f, path) || len(orphanRows(t, f)) != 0 {
+		t.Fatalf("checkout held by an open file removed: calls %q", f.run.calls)
+	}
+}
+
+// A process whose working directory and open files both deny this user is judged
+// by its executable or name only when that never enters a work directory; any
+// other name fails the sweep closed.
+func TestOrphanCheckoutUnreadableCwdNameAllowList(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		proc    procUnknown
+		removed bool
+	}{
+		{"parenthesised helper", procUnknown{pid: 4711, comm: "(sd-pam)"}, true},
+		{"readable executable", procUnknown{pid: 4712, comm: "sshd", exe: "/usr/sbin/sshd"}, true},
+		{"unknown name", procUnknown{pid: 4713, comm: "sudo"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newOrphanFix(t)
+			_, path := orphanCheckout(t, f, 7*time.Hour)
+			scanProc(t, procEvidence{unknown: []procUnknown{test.proc}}, nil)
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := removedCalled(f, path); got != test.removed {
+				t.Fatalf("removed=%v calls %q", got, f.run.calls)
+			}
+			rows := orphanRows(t, f)
+			switch {
+			case test.removed && (len(rows) != 1 || rows[0].Result != "removed"):
+				t.Fatalf("rows: %+v", rows)
+			case !test.removed && (len(rows) != 1 || rows[0].Result != "skipped"):
+				t.Fatalf("rows: %+v", rows)
+			}
+		})
 	}
 }
 
@@ -297,13 +406,11 @@ func TestParseLsofCwds(t *testing.T) {
 func TestOrphanCheckoutShadowRowNotReviewerCandidate(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 25*time.Hour)
-	saved := processCwds
-	t.Cleanup(func() { processCwds = saved })
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return nil, nil }
+	scanProc(t, procEvidence{}, nil)
 	if err := f.reap(t, 0, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
 	}
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return []string{path + "/work"}, nil }
+	scanProc(t, procEvidence{cwds: []string{path + "/work"}}, nil)
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -317,16 +424,16 @@ func TestOrphanCheckoutShadowRowNotReviewerCandidate(t *testing.T) {
 func TestOrphanCheckoutProcessStartingMidSweepKept(t *testing.T) {
 	f := newOrphanFix(t)
 	_, path := orphanCheckout(t, f, 7*time.Hour)
-	saved := processCwds
-	t.Cleanup(func() { processCwds = saved })
 	calls := 0
-	processCwds = func(context.Context, integrations.Runner) ([]string, error) {
+	saved := processScan
+	processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
 		calls++
 		if calls == 1 {
-			return nil, nil
+			return procEvidence{}, nil
 		}
-		return []string{path}, nil
+		return procEvidence{cwds: []string{path}}, nil
 	}
+	t.Cleanup(func() { processScan = saved })
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
