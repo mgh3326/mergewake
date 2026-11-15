@@ -763,6 +763,28 @@ on it.
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
     `stop patching; ask a consult one grade above your seat in another family, give it every finding so far, ask for the root cause.`
     No panewire call or lane event is emitted.
+  - **Hub consult (`review.round_rule.hub_consult`, default false):** When on, the consult round asks the hub for the
+    consult instead of telling the author to (operator decision 250; panewire docs/consult-on-request.md). mergewake
+    writes a question document to hk (the PR, the reviewed head, every open finding with id, severity, path:line and
+    text, and the task's contract pointer), then runs once per PR and head, on the daemon host bounded at 60 s:
+    `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
+    --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
+    (`reap.hub`). A PR without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
+    file, keyed by the head it was requested for. Later passes read a non-terminal row with
+    `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
+    terminal row would retry it), until `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout)
+    passes; the wait also bounds a failed task read or question write, and it is measured from the first attempt.
+    The obligation is owed until its outcome is delivered, whatever the current review round says: a push that
+    changes the head supersedes the old row (recorded, never delivered as the new head's answer) and the new head
+    starts its own consult when its round reaches the consult round. While the consult is queued or running that
+    round's findings wait — a restart resumes the poll from the state file. The row is journaled in the audit log
+    before the state file, so an id lost to a failed state write is reconciled from it instead of re-requested.
+    `answered` delivers the findings with the `answer_doc` key (passed through unread) and no ask-a-consult
+    directive; `refused`, `failed`, `cancelled`, an rc 1/2 request failure or an expired wait delivers them as today
+    plus one line saying the consult could not be had and why. A settled consult records one hk task comment (id,
+    state, seat, answer_doc) that retries on its own until hk accepts it; request, state change, supersession,
+    outcome and delivery are audited as `consult-request` / `consult-state` / `consult-superseded` /
+    `consult-outcome` / `consult-delivered`.
   - **Round ladder (`review.round_rule.ladder`, default 5):** mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
     `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round <n> --findings-file <path>`,
     where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
@@ -1512,7 +1534,7 @@ For `example/project`, state resides beneath
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
-| `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on mergewake's own review (`review_missing`); the clock of the 60-minute review-stalled alert, kept a week. |
+| `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on its review — in the merge gate on `review_missing`, or on the review path while the review is held, quota-stopped, pending or its poll was skipped; the clock of the 60-minute review-stalled alert, kept a week. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
@@ -1798,14 +1820,22 @@ is not a thread.
 design lane and retried until sent, so the design session hears merge notices
 and the BLOCKED reasons that need its decision.
 
-A head that keeps `review_missing` for more than 60 minutes gets one
+A head that keeps waiting for its review for more than 60 minutes gets one
 `review stalled` alert (type `blocked`) on the `notifyLane` lane. It names the PR,
 head, the wait so far, the passes posted against those needed, and the reviewer
-job recorded for the head, if any. The wait starts when this host first sees the
-head with that reason after its required checks settle, and it is kept in
-`pr-review-wait.json`. The alert is sent once per `(PR, head)`, deduped across
-restarts by a `stalled <PR> <head>` key in `pr-notify-sent`. It is sent only while
-`review_missing` is the whole reason set. A head that is later reviewed and blocks
+job recorded for the head, if any. When the review itself did not run, it also
+names that wait, with the reason its audit row recorded where the pass knew one:
+`held (reviewer-held)`, `quota-stopped (pool <pool>)`, `pending`, or `skipped`
+for a poll the GitHub client dropped. The wait starts when this host first sees
+the head waiting for its review — in the merge gate on `review_missing`, or on
+the review path when the review is held, quota-stopped, pending or skipped — and
+it is kept in `pr-review-wait.json`. The alert is sent once per `(PR, head)`,
+deduped across restarts by a `stalled <PR> <head>` key in `pr-notify-sent`, by
+whichever path first sees the wait past the threshold, and a delivery the
+notifier refuses is retried on the next pass. The review path sends the alert
+and nothing else: findings delivery and Land wait for a review that posted
+something. On the gate path it is sent only while `review_missing` is the whole
+reason set. A head that is later reviewed and blocks
 again follows the rules above. This is the only stall alert: the older
 elapsed-time `STALLED review` alarm, which the daemon stopped calling when
 reviews moved to retry accounting, is removed with its `review-wait.json` and

@@ -138,7 +138,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			if len(reasons) == 0 && !conflicted {
 				// Only mergewake's own queue holds the head: nothing for any
 				// session to do until the wait outlasts reviewStallAfter.
-				lane, via, sent, e := s.reviewStalled(ctx, r, pr, v, since)
+				lane, via, sent, e := s.reviewStalled(ctx, r, pr, s.reviewState(r, pr, v), "", since)
 				if e != nil {
 					if !errors.Is(e, errNotifyDelivery) {
 						return e

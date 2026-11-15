@@ -31,6 +31,10 @@ type reviewRetryState struct {
 	// nothing else wrong: nothing failed, but no review completed, so the
 	// daemon must not settle the PR as unchanged.
 	QuotaStopped bool `json:"quota_stopped,omitempty"`
+	// WaitText names the wait Held or QuotaStopped records, with the reason its
+	// audit row carried ("held (reviewer-held)", "quota-stopped (pool seat)"),
+	// so a pass deferred inside the wait and the review-stall alert name it.
+	WaitText string `json:"wait_text,omitempty"`
 	// LastError is the redacted, clipped text of the last counted failure, for
 	// the escalation notice.
 	LastError string `json:"last_error,omitempty"`
@@ -79,6 +83,34 @@ type countedFailure struct {
 	pass  int
 	label string
 	err   error
+}
+
+// waitText is the reason a review wait's audit row recorded ("held
+// (reviewer-held)", "quota-stopped (pool seat)"), carried in the wait's sentinel
+// error so the caller names it too.
+type waitText string
+
+func (w waitText) Error() string { return string(w) }
+
+// reviewWaitErr is the sentinel of a review wait with the wait's reason text
+// when the pass recorded one.
+func reviewWaitErr(sentinel error, text string) error {
+	if text == "" {
+		return sentinel
+	}
+	return errors.Join(sentinel, waitText(text))
+}
+
+// waitText names this pass's wait with the reason its audit row recorded: the
+// reviewer that held the reservation, or the pool a reviewer stopped on.
+func (c *reviewFailureClass) waitText() string {
+	switch {
+	case len(c.held) > 0:
+		return "held (reviewer-held)"
+	case len(c.quotas) > 0 && c.quotas[0].pool != "":
+		return "quota-stopped (pool " + c.quotas[0].pool + ")"
+	}
+	return ""
 }
 
 func (c *reviewFailureClass) add(err error) {
@@ -189,9 +221,9 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		}
 		switch {
 		case state.Held:
-			return ErrReviewHeld
+			return reviewWaitErr(ErrReviewHeld, state.WaitText)
 		case state.QuotaStopped:
-			return ErrReviewQuotaStopped
+			return reviewWaitErr(ErrReviewQuotaStopped, state.WaitText)
 		}
 		return nil
 	}
@@ -303,6 +335,10 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	// the hold.
 	state.Held = (len(class.held) > 0 || class.roundHold) && !class.real && !class.collection
 	state.QuotaStopped = len(class.quotas) > 0 && !class.real && !class.collection && !state.Held
+	state.WaitText = ""
+	if state.Held || state.QuotaStopped {
+		state.WaitText = class.waitText()
+	}
 	if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 		return errors.Join(err, saveErr)
 	}
@@ -310,10 +346,10 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 		// Only quota stops, holds and pending passes: the audit row says it,
 		// and nothing failed.
 		if state.Held {
-			return ErrReviewHeld
+			return reviewWaitErr(ErrReviewHeld, state.WaitText)
 		}
 		if state.QuotaStopped {
-			return ErrReviewQuotaStopped
+			return reviewWaitErr(ErrReviewQuotaStopped, state.WaitText)
 		}
 		if class.pending {
 			return ErrReviewPending

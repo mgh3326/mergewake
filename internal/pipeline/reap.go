@@ -171,7 +171,17 @@ func (s *Service) reapHub() (*reap.Hub, error) {
 	if s.Config.Reap.Transport != config.ReapTransportPanewire {
 		return nil, nil
 	}
-	cfg := s.Config.Reap.Hub
+	return s.hubClient(s.Config.Reap.Hub)
+}
+
+// hubClient builds a panewire hub client from cfg, or nil when cfg names no
+// hub. It is independent of reap.transport: a caller whose calls go through
+// the panewire CLI (with the same reap.hub credential) reads the hub over
+// HTTP on a host whose reap transport is ssh.
+func (s *Service) hubClient(cfg config.ReapHub) (*reap.Hub, error) {
+	if cfg.URL == "" {
+		return nil, nil
+	}
 	origin, err := reap.HubOrigin(cfg.URL)
 	if err != nil {
 		return nil, err

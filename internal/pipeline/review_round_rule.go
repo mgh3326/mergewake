@@ -69,6 +69,33 @@ type roundRuleState struct {
 	Round3DirectiveSent  bool      `json:"round3_directive_sent,omitempty"` // legacy alias
 	ConsultAt            time.Time `json:"consult_at,omitzero"`
 
+	// Hub consult (review.round_rule.hub_consult, hk 4551): one hub consult
+	// per PR and head. The stored row fields let a later pass or a restart
+	// poll instead of requesting again.
+	//
+	// Owed marks an outstanding consult and is independent of the current
+	// round: it is set when the consult is requested and cleared once its
+	// outcome went out with a delivery (or its head was superseded). Head is
+	// the commit the row was requested for — the hub keys consults by
+	// (task, repo#pr, head), so a row of another head is never applied here.
+	// Posted records that the request may have reached the hub, so an id lost
+	// to a failed state write is reconciled from the audit journal instead of
+	// a re-POST. Done marks the outcome settled and audited.
+	HubConsultOwed      bool      `json:"hub_consult_owed,omitempty"`
+	HubConsultHead      string    `json:"hub_consult_head,omitempty"`
+	HubConsultPosted    bool      `json:"hub_consult_posted,omitempty"`
+	HubConsultID        string    `json:"hub_consult_id,omitempty"`
+	HubConsultState     string    `json:"hub_consult_state,omitempty"`
+	HubConsultQuestion  string    `json:"hub_consult_question,omitempty"`
+	HubConsultAnswerDoc string    `json:"hub_consult_answer_doc,omitempty"`
+	HubConsultVerdict   string    `json:"hub_consult_verdict,omitempty"`
+	HubConsultSeat      string    `json:"hub_consult_seat,omitempty"`
+	HubConsultJob       string    `json:"hub_consult_job,omitempty"`
+	HubConsultReason    string    `json:"hub_consult_reason,omitempty"`
+	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
+	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
+	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
+
 	// Ladder
 	LadderEscalated bool      `json:"ladder_escalated,omitempty"`
 	Round3Escalated bool      `json:"round3_escalated,omitempty"` // legacy alias

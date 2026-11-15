@@ -59,6 +59,27 @@ type RoundRuleConfig struct {
 	Consult int `yaml:"consult"`
 	Ladder  int `yaml:"ladder"`
 	Hold    int `yaml:"hold"`
+	// HubConsult, when true, asks the hub for the consult-round consult and
+	// delivers its answer with the findings instead of telling the author to
+	// start one (operator decision 250, hk 4551). Off keeps the directive.
+	HubConsult bool `yaml:"hub_consult"`
+	// HubConsultWait bounds how long a queued or running consult is awaited
+	// before the findings go out without it; empty means 2h, the hub's own
+	// consult timeout.
+	HubConsultWait string `yaml:"hub_consult_wait"`
+}
+
+// RoundRuleHubConsultWait returns the hub-consult wait bound (default 2h, the
+// hub's consult timeout); an invalid value falls back to the default.
+func (r Review) RoundRuleHubConsultWait() time.Duration {
+	if r.RoundRule.HubConsultWait == "" {
+		return 2 * time.Hour
+	}
+	d, e := Duration(r.RoundRule.HubConsultWait)
+	if e != nil {
+		return 2 * time.Hour
+	}
+	return d
 }
 
 // RoundRuleConsult returns the consult round threshold (default 3).
