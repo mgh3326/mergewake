@@ -21,9 +21,12 @@ import (
 // The hub consult of operator decision 250 (hk 4551, panewire hk 4552,
 // docs/consult-on-request.md): at the consult round mergewake, not the
 // author, asks the hub for a consult and delivers its answer with the
-// findings. One consult runs per PR and head; the row lives in the
-// round-rule state file so a later pass or a restart polls it instead of
-// asking again. The switch is review.round_rule.hub_consult, default off.
+// findings. It is owed when the round ended without a pass and at least one
+// finding is still open above low — medium, high or critical — so an all-low
+// round asks nothing (decision 250). One consult runs per PR and head; the
+// row lives in the round-rule state file so a later pass or a restart polls
+// it instead of asking again. The switch is review.round_rule.hub_consult,
+// default off.
 //
 // The obligation is owed per head, not per round: once requested, it is
 // advanced and settled on every pass until it is terminal, whatever the
@@ -77,16 +80,18 @@ func (s *Service) consultWaitExpired(at, now time.Time) bool {
 }
 
 // hubConsultStep runs the consult step when the hub consult switch is on and
-// answers the directive the author's delivery carries. hold is true while
-// the consult owed for the current head is queued or running inside the wait
-// — that delivery waits; the stored row lets the next pass (or the next pass
-// after a restart) resume it.
+// answers the directive the author's delivery carries. openAboveLow is the
+// consult trigger: the round ended and at least one finding is still open
+// above low (medium and up; an all-low round owes no consult, operator
+// decision 250). hold is true while the consult owed for the current head is
+// queued or running inside the wait — that delivery waits; the stored row
+// lets the next pass (or the next pass after a restart) resume it.
 //
 // Everything runs under the round-rule state lock, so concurrent evaluations
 // of one PR cannot request or settle twice.
-func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, done bool, rounds int, openBlocking bool) (directive string, hold bool) {
+func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, done bool, rounds int, openAboveLow bool) (directive string, hold bool) {
 	if o.DryRun {
-		if done && rounds == s.Config.Review.RoundRuleConsult() && openBlocking && !st.directiveSent() {
+		if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
 			// A dry run decides only: it neither requests nor delivers the
 			// held round's findings.
 			return "", true
@@ -130,7 +135,7 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		return s.hubConsultAdvance(ctx, r, pr, fb, o, st, s.now().UTC())
 	}
 
-	if done && rounds == s.Config.Review.RoundRuleConsult() && openBlocking && !st.directiveSent() {
+	if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
 		// Persist the attempt before the slow hk and hub work: the wait bound
 		// is measured from here, so an hk outage retries only inside the wait.
 		st.HubConsultOwed = true

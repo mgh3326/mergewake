@@ -466,6 +466,89 @@ func TestHubConsult_AllLowRequestsNothing(t *testing.T) {
 	}
 }
 
+// A round that ends with an open medium finding and nothing above it is not
+// all-low: it owes the consult (operator decision 250), and the answer goes
+// out with the finding.
+func TestHubConsult_MediumOnlyRequestsAndDelivers(t *testing.T) {
+	s, g, n, _, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{
+		ownFinding("T1", "medium", 10),
+		ownFinding("T2", "low", 20),
+	}
+	run.def = consultResp{rc: 0, out: `{"id":"c-4","state":"answered","answer_doc":"reports/c-4/sha256/bb.md"}`}
+
+	deliver(t, s, r)
+
+	if run.requestCount() != 1 {
+		t.Fatalf("want 1 consult request for a medium-only round, got %d: %v", run.requestCount(), run.requests)
+	}
+	if n.count != 1 {
+		t.Fatalf("want 1 findings delivery with the answer, got %d: %+v", n.count, n.events)
+	}
+	text := n.events[0].Text
+	if !strings.Contains(text, "reports/c-4/sha256/bb.md") {
+		t.Fatalf("delivery missing the answer_doc: %s", text)
+	}
+	if !strings.Contains(text, "T1") && !strings.Contains(text, "tool:10") {
+		t.Fatalf("delivery missing the open medium finding: %s", text)
+	}
+	if strings.Contains(text, "ask a consult") {
+		t.Fatalf("answered delivery still tells the author to consult: %s", text)
+	}
+}
+
+// A medium finding delivered in an earlier round still owes the consult at
+// the consult round, and the answer goes out with it: the round is not
+// waiting on an undelivered finding.
+func TestHubConsult_MediumAlreadyDeliveredStillDeliversAnswer(t *testing.T) {
+	s, g, n, _, run, _, r, now := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "medium", 10)}
+	ledger := []findingsDelivery{{ID: "d-1", PR: 7, Head: shaA, Scope: "author", Threads: []string{"T1"}, Lane: "w-7", SentAt: *now}}
+	if e := s.saveDeliveries(r.Name, 7, ledger); e != nil {
+		t.Fatal(e)
+	}
+	run.def = consultResp{rc: 0, out: `{"id":"c-5","state":"answered","answer_doc":"reports/c-5/sha256/cc.md"}`}
+
+	deliver(t, s, r)
+
+	if run.requestCount() != 1 {
+		t.Fatalf("want 1 consult request, got %d: %v", run.requestCount(), run.requests)
+	}
+	if n.count != 1 {
+		t.Fatalf("answer delivered without the finding it answers, got %d events", n.count)
+	}
+	text := n.events[0].Text
+	if !strings.Contains(text, "reports/c-5/sha256/cc.md") {
+		t.Fatalf("delivery missing the answer_doc: %s", text)
+	}
+	if !strings.Contains(text, "T1") && !strings.Contains(text, "tool:10") {
+		t.Fatalf("delivery lost the open medium finding: %s", text)
+	}
+}
+
+// OFF: a round-3 PR whose only open finding is medium keeps today's
+// directive path — the finding goes out, no directive, no consult.
+func TestHubConsult_OffMediumKeepsNoDirective(t *testing.T) {
+	s, g, n, js, _, r := roundRuleSetup(t, 3)
+	run := &consultRunner{inner: s.Runner}
+	s.Runner = run
+	sink := &consultSink{jobSink: js, docs: map[string]string{}}
+	s.Sink = sink
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "medium", 10)}
+
+	deliver(t, s, r)
+
+	if n.count != 1 {
+		t.Fatalf("want 1 findings event, got %d", n.count)
+	}
+	if strings.Contains(n.events[0].Text, Round3Directive) {
+		t.Fatalf("OFF medium-only round got the round-3 directive: %s", n.events[0].Text)
+	}
+	if run.requestCount() != 0 || len(sink.docs) != 0 {
+		t.Fatalf("OFF requested a consult: requests=%d docs=%v", run.requestCount(), sink.docs)
+	}
+}
+
 // A PR without a Mergewake-Task trailer skips the consult and the
 // findings go out as today.
 func TestHubConsult_NoTaskFallsBack(t *testing.T) {
