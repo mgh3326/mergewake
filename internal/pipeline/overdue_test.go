@@ -597,6 +597,91 @@ func TestMergeOverdueOpenPassRecordedBeforeFailedPass(t *testing.T) {
 	}
 }
 
+// A hold ends at the pass that sees the PR open, even when that pass fails
+// later: the open time those passes saw is not counted as hold.
+func TestMergeOverdueHoldEndsOnFailedOpenPass(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(6 * time.Minute) // the hold is anchored at t0
+	rig.g.pull.Draft = false
+	rig.s.GH = &headFailGH{fakeGH: rig.g}
+	for _, at := range []time.Duration{30 * time.Minute, 40 * time.Minute} {
+		rig.now = overdueStart.Add(at)
+		if e := rig.s.NotifyPR(context.Background(), rig.r, 7, Options{}); e == nil {
+			t.Fatal("the pass did not fail")
+		}
+	}
+	rig.s.GH = rig.g
+	rig.g.pull.Draft = true
+	rig.at(50 * time.Minute) // the second hold is anchored at the 40m pass
+	rig.at(2 * time.Hour)
+	rig.wantConditions()
+	rig.g.pull.Draft = false
+	rig.at(2 * time.Hour) // the 10m the failed passes saw open
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 10m0s |") {
+		t.Fatal(e.Text)
+	}
+	rig.at(2*time.Hour + 34*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(2*time.Hour + 35*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
+// A pass that sees the PR open ends an open draft hold before the reads that
+// can fail: draft at t1, open at t2 with GH.Head failing, draft at t3, open at
+// t4. The hold is off the clocks at t2 (the same span shift tickOverdueClocks
+// applies), so the second hold starts from that pass's sighting, not from the
+// first hold's anchor.
+func TestMergeOverdueFailedOpenPassEndsDraftHold(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	read := func() overdueClock {
+		t.Helper()
+		st, e := readOverdueState(rig.s.overdueClocksFile(rig.r.Name))
+		if e != nil {
+			t.Fatal(e)
+		}
+		return st.Clocks[overdueKey(rig.g.pull)]
+	}
+	rig.at(0) // READY and the last open pass at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(10 * time.Minute) // the hold is anchored at t0
+	if c := read(); c.DraftSince.IsZero() {
+		t.Fatalf("the draft pass recorded no hold: %+v", c)
+	}
+	rig.s.GH = &headFailGH{fakeGH: rig.g}
+	rig.g.pull.Draft = false
+	rig.now = overdueStart.Add(30 * time.Minute)
+	if e := rig.s.NotifyPR(context.Background(), rig.r, 7, Options{}); e == nil {
+		t.Fatal("the pass did not fail")
+	}
+	c := read()
+	if !c.LastOpen.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the failed pass did not record its open sighting: last_open=%v", c.LastOpen.Sub(overdueStart))
+	}
+	if !c.DraftSince.IsZero() {
+		t.Fatalf("the hold is still open after the open sighting: draft_since=%v", c.DraftSince.Sub(overdueStart))
+	}
+	if !c.HeadSeen.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the hold's span is still on the clocks: head_seen=%v", c.HeadSeen.Sub(overdueStart))
+	}
+	rig.s.GH = rig.g
+	rig.g.pull.Draft = true
+	rig.at(50 * time.Minute)
+	if c := read(); !c.DraftSince.Equal(overdueStart.Add(30 * time.Minute)) {
+		t.Fatalf("the second hold is not anchored at the open sighting: draft_since=%v", c.DraftSince.Sub(overdueStart))
+	}
+	rig.g.pull.Draft = false
+	rig.at(2 * time.Hour)
+	if c := read(); !c.DraftSince.IsZero() || !c.HeadSeen.Equal(overdueStart.Add(2*time.Hour)) {
+		t.Fatalf("leaving the second hold did not land the clocks at t4: %+v", c)
+	}
+}
+
 // headFailGH fails Head, the read NotifyPR makes after it sees the PR open.
 type headFailGH struct {
 	*fakeGH

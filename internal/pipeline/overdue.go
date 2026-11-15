@@ -198,25 +198,7 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 			c.DraftSince, changed = draftAnchor(c.LastOpen, now), true
 		}
 	} else {
-		if !c.DraftSince.IsZero() {
-			// The clocks of this head stop while it was a draft. Move each one
-			// it had already started forward by the hold's span, and rest a
-			// clock that started inside the hold (or a READY recorded in it) at
-			// now: that is the pass that saw the PR ready.
-			shift := now.Sub(c.DraftSince)
-			for _, at := range []*time.Time{&c.HeadSeen, &c.ChecksDone, &c.ReviewDone, &c.Ready} {
-				if at.IsZero() {
-					continue
-				}
-				if moved := at.Add(shift); moved.Before(now) {
-					*at = moved
-				} else {
-					*at = now
-				}
-			}
-			c.DraftSince = time.Time{}
-			changed = true
-		}
+		changed = holdEnd(&c, now) || changed
 	}
 	if now.Sub(c.Touched) >= time.Hour {
 		c.Touched, changed = now, true
@@ -227,6 +209,32 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 	st.Clocks[key] = c
 	pruneClocks(st.Clocks, now)
 	return c, writeOverdueState(file, st)
+}
+
+// holdEnd closes the draft hold the entry still carries at now: the clocks of
+// this head stopped while it was a draft, so move each one it had already
+// started forward by the hold's span, and rest a clock that started inside the
+// hold (or a READY recorded in it) at now — the pass that saw the PR ready. It
+// reports whether the entry changed. Both places that see the PR open call it,
+// tickOverdueClocks and noteOpenPass, so a pass that errors later still ends the
+// hold.
+func holdEnd(c *overdueClock, now time.Time) bool {
+	if c.DraftSince.IsZero() {
+		return false
+	}
+	shift := now.Sub(c.DraftSince)
+	for _, at := range []*time.Time{&c.HeadSeen, &c.ChecksDone, &c.ReviewDone, &c.Ready} {
+		if at.IsZero() {
+			continue
+		}
+		if moved := at.Add(shift); moved.Before(now) {
+			*at = moved
+		} else {
+			*at = now
+		}
+	}
+	c.DraftSince = time.Time{}
+	return true
 }
 
 // draftAnchor is where a draft hold that starts now is anchored: the last pass
@@ -243,8 +251,8 @@ func draftAnchor(lastOpen, now time.Time) time.Time {
 // noteOpenPass records that this pass saw the open PR not a draft. notify.go
 // calls it as soon as it has read the PR, before the reads that can fail: a
 // pass that errors before the gate saw the PR open all the same, so a hold that
-// starts after it is anchored here, not at an older pass. Every reporting pass
-// of an open, non-draft PR writes it.
+// starts after it is anchored here, not at an older pass, and a hold it ends is
+// off the clocks then. Every reporting pass of an open, non-draft PR writes it.
 func (s *Service) noteOpenPass(r config.Repo, pr github.Pull) error {
 	file := s.overdueClocksFile(r.Name)
 	defer lockPath(file)()
@@ -255,7 +263,20 @@ func (s *Service) noteOpenPass(r config.Repo, pr github.Pull) error {
 	now := s.now().UTC()
 	key := overdueKey(pr)
 	c := st.Clocks[key]
+	if c.Ready.IsZero() {
+		// The READY verdict is recorded after the clocks tick, so fill it here
+		// before the hold's span is taken off: a READY sent before the hold
+		// counts from where the hold ends, not from its unwritten record.
+		ready, ok, e := s.readySent(r.Name, pr)
+		if e != nil {
+			return e
+		}
+		if ok {
+			c.Ready = ready
+		}
+	}
 	c.LastOpen, c.Touched = now, now
+	holdEnd(&c, now)
 	st.Clocks[key] = c
 	pruneClocks(st.Clocks, now)
 	return writeOverdueState(file, st)
