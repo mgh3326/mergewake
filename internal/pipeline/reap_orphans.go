@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -55,12 +56,27 @@ func procCwds() ([]string, error) {
 		switch {
 		case e == nil:
 			out = append(out, cwd)
-		case errors.Is(e, fs.ErrNotExist), errors.Is(e, fs.ErrPermission):
+		case errors.Is(e, fs.ErrNotExist):
+		case errors.Is(e, fs.ErrPermission) && !sameUserProcess(filepath.Join("/proc", ent.Name())):
+			// Another user's process: it cannot be running in this user's checkout.
 		default:
+			// A same-user process whose cwd is unreadable (a non-dumpable process
+			// can deny its own cwd) may be in a checkout: unknown, so fail closed.
 			return nil, fmt.Errorf("%w: %v", errProcessScanUnavailable, e)
 		}
 	}
 	return out, nil
+}
+
+// sameUserProcess reports whether the /proc entry at dir belongs to this user.
+// It is true when the owner cannot be read, so an unknown process fails closed.
+func sameUserProcess(dir string) bool {
+	fi, e := os.Stat(dir)
+	if e != nil {
+		return true
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return !ok || int(st.Uid) == os.Getuid()
 }
 
 // parseLsofCwds reads the name fields (n) of `lsof -F n` output: one path per

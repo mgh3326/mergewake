@@ -229,6 +229,11 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 				w.remember(rec.Label, rec.Host, rec.Cwd)
 			}
 		case "reviewer-cleanup":
+			// An orphan-sweep row (no PR) names a checkout no job record owns: the
+			// orphan sweep's guards decide it, so it is no reviewer candidate here.
+			if rec.PR == 0 {
+				continue
+			}
 			lastCleanup[reviewerLabelOf(rec)] = rec
 			// Cwd holds the remote pane's cwd or the remote worktree; the
 			// local checkout is only ever in Worktree.

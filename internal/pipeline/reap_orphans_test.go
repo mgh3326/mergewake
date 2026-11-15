@@ -26,8 +26,13 @@ func orphanCheckout(t *testing.T, f *reviewerFix, age time.Duration) (label, pat
 	return label, path
 }
 
+// newOrphanFix stubs the process scan empty, so the test host's own processes
+// do not decide the outcome; the process-cwd tests set their own.
 func newOrphanFix(t *testing.T) *reviewerFix {
 	t.Helper()
+	saved := processCwds
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return nil, nil }
+	t.Cleanup(func() { processCwds = saved })
 	return newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
 }
 
@@ -281,5 +286,26 @@ func TestParseLsofCwds(t *testing.T) {
 	got := parseLsofCwds(out)
 	if len(got) != 2 || got[0] != "/Users/x/checkouts/mwr-1" || got[1] != "/" {
 		t.Fatalf("cwds = %q", got)
+	}
+}
+
+// A shadow pass leaves a would-remove orphan row. On a later acting pass the
+// reviewer sweep must not turn that row into a candidate: a label past a day
+// with no job would otherwise reach removeLocal, which has no process guard.
+func TestOrphanCheckoutShadowRowNotReviewerCandidate(t *testing.T) {
+	f := newOrphanFix(t)
+	_, path := orphanCheckout(t, f, 25*time.Hour)
+	saved := processCwds
+	t.Cleanup(func() { processCwds = saved })
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return nil, nil }
+	if err := f.reap(t, 0, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	processCwds = func(context.Context, integrations.Runner) ([]string, error) { return []string{path + "/work"}, nil }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removedCalled(f, path) {
+		t.Fatalf("a process-held orphan was removed on a later pass: calls %q", f.run.calls)
 	}
 }
