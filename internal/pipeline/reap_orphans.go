@@ -333,8 +333,11 @@ const (
 
 // recordedCheckouts names every checkout a reviewer-job record of any repo
 // holds: its checkout field, and the path its label gives under dir, which is
-// where a spawn places one when the field is empty. A record that cannot be
-// read may name any directory, so the caller stops the sweep on its error.
+// where a spawn places a local checkout whether or not the record names it. A
+// spec-placed reviewer's record names no checkout (its worktree lives on the
+// node), and its label still names that path, so a directory left there is not
+// swept as an orphan. A record that cannot be read may name any directory, so
+// the caller stops the sweep on its error.
 func (s *Service) recordedCheckouts(dir string) (map[string]bool, error) {
 	paths, e := recordFiles(s.Config.StateDir)
 	if e != nil {

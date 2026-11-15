@@ -67,13 +67,22 @@ type panewireRunner struct {
 	closeErrs    []error // the result of each `panewire job close` in turn (nil succeeds)
 	spawns       [][]string
 	git          [][]string
-	headless     int
-	remote       *taskJobSink
-	inbox        []string // lane.event items, as panewire inbox list prints them
-	inboxErr     error
-	acks         [][]string
-	late         int // inbox looks that still show nothing
-	looks        int
+	// gitOuts and gitErrs answer a git call by its key (see key) before
+	// anything else; the origin a reviewer collects for a checkout spec comes
+	// from the first.
+	gitOuts map[string]string
+	gitErrs map[string]error
+	// specRefused makes a spawn that names a checkout spec answer as panewire
+	// does when the hub does not advertise checkout_spec_v1: exit 2, before any
+	// request is submitted.
+	specRefused bool
+	headless    int
+	remote      *taskJobSink
+	inbox       []string // lane.event items, as panewire inbox list prints them
+	inboxErr    error
+	acks        [][]string
+	late        int // inbox looks that still show nothing
+	looks       int
 	// nodeResult answers `panewire node job-result` ({"found":false} when
 	// empty); nodeReads are the --job labels it was asked for.
 	nodeResult string
@@ -136,6 +145,12 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 	switch command {
 	case "git":
 		r.git = append(r.git, args)
+		if e, ok := r.gitErrs[key("git", args...)]; ok {
+			return nil, e
+		}
+		if out, ok := r.gitOuts[key("git", args...)]; ok {
+			return []byte(out), nil
+		}
 		if r.realGit {
 			b, e := exec.CommandContext(ctx, "git", args...).CombinedOutput()
 			if e != nil {
@@ -161,6 +176,10 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "panewire":
 		r.spawns = append(r.spawns, args)
+		if r.specRefused && slices.Contains(args, "--checkout-origin") {
+			// panewire's pre-submit feature check: no request, job or pane.
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-origin; upgrade the hub before submitting"}
+		}
 		brief, job, e := r.spawnBrief(args)
 		if e != nil {
 			return nil, e
@@ -430,6 +449,7 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	// branch is created and the worktree is removed afterwards.
 	want := []string{
 		"fetch --no-tags origin +pull/7/head:refs/remotes/origin/pull/7/head main",
+		"remote get-url origin",
 		"worktree add --detach " + checkout + " " + shaA,
 		"worktree remove --force " + checkout,
 	}
@@ -965,7 +985,7 @@ func TestPanewireFailedCheckoutFailsPass(t *testing.T) {
 	s, g, r := panewireSetup(t, runner)
 	e := s.Review(context.Background(), r, 7, "openai", Options{})
 	got := gitCalls(runner, r.Root)
-	if len(got) != 3 || !strings.HasPrefix(got[1], "worktree add --detach ") || !strings.HasPrefix(got[2], "worktree remove --force ") {
+	if len(got) != 4 || !strings.HasPrefix(got[2], "worktree add --detach ") || !strings.HasPrefix(got[3], "worktree remove --force ") {
 		t.Fatalf("%q", got)
 	}
 	if len(runner.spawns) != 0 {
@@ -1070,7 +1090,7 @@ func TestPanewireCheckoutDetached(t *testing.T) {
 		want   []string
 		reason string
 	}{
-		"same repo": {want: []string{"worktree add --detach <checkout> " + shaA, "worktree remove --force <checkout>"}},
+		"same repo": {want: []string{"remote get-url origin", "worktree add --detach <checkout> " + shaA, "worktree remove --force <checkout>"}},
 		"fork":      {fork: "someone/project", want: []string{}, reason: "head branch is not in example/project (fork PR)"},
 	} {
 		t.Run(name, func(t *testing.T) {

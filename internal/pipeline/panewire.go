@@ -523,36 +523,50 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return strings.TrimSpace(string(b)), e
 	}
 	cleanup := func() {
+		if checkout == "" {
+			// A spec-placed reviewer holds no local checkout to release.
+			return
+		}
 		// The pane is finished or abandoned; the deadline may already be spent.
 		c, cancel := reportContext(ctx)
 		defer cancel()
 		_, _ = git(c, "worktree", "remove", "--force", checkout)
 	}
+	// spec is the checkout a spawn names instead of -c <checkout>; nil keeps
+	// today's local checkout.
+	var spec *reviewerCheckoutSpec
 	if !resumed {
 		if e = os.MkdirAll(jobDir, 0700); e != nil {
 			return skip("job dir: %v", e)
 		}
-		if e = os.MkdirAll(cfg.Checkouts, 0700); e != nil {
-			return skip("checkout dir: %v", e)
-		}
-		// The checkout spec is detached: fetch "pull/<n>/head" and stand at the
-		// exact reviewed head. C creates no local branch, and the author's branch
-		// checked out in another worktree is no obstacle. The head lands in a
-		// real ref: panewire builds the detached spec for another host from a
-		// local refs/remotes/origin/pull/<n>/head that points at the checkout's
-		// HEAD, or else from a refs/remotes/origin/<branch> that contains it, and
-		// FETCH_HEAD is neither. The leading "+" lets a force-pushed PR move the
-		// ref. fetchPRHead falls back to the branch when GitHub has no
-		// pull/<n>/head, and only while the branch is at the exact head.
-		if e = s.fetchPRHead(ctx, root, x.repo.Name, pr); e != nil {
+		// The head lands in a real ref either way: panewire's node fetches the
+		// ref a checkout spec names and stands at the exact commit. The leading
+		// "+" lets a force-pushed PR move it. fetchPRHead falls back to the
+		// branch when GitHub has no pull/<n>/head, and only while the branch is
+		// at the exact head; the ref it settled on travels with the spec.
+		var ref string
+		if ref, e = s.fetchPRHead(ctx, root, x.repo.Name, pr); e != nil {
 			return skipWith(errorDetailOf(e), "%v", e)
 		}
-		// panewire resolves the detached spec (origin, sha, fetch "pull/<n>/head"
-		// or the branch) from this worktree and prepares the same detached
-		// worktree remotely.
-		if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
-			cleanup()
-			return skipWith(gitStderrDetail(e), "checkout PR head %s: %v", short7(pr.Head.SHA), e)
+		if !reviewerSpecs.legacy() {
+			if origin := s.specOrigin(ctx, root); origin != "" {
+				spec = &reviewerCheckoutSpec{origin: origin, commit: pr.Head.SHA, ref: ref}
+				checkout = ""
+			}
+		}
+		if spec == nil {
+			if e = os.MkdirAll(cfg.Checkouts, 0700); e != nil {
+				return skip("checkout dir: %v", e)
+			}
+			// The checkout is detached: C creates no local branch, and the
+			// author's branch checked out in another worktree is no obstacle.
+			// panewire resolves the same detached spec (origin, sha, fetch
+			// "pull/<n>/head" or the branch) from this worktree and prepares the
+			// same detached worktree remotely.
+			if _, e = git(ctx, "worktree", "add", "--detach", checkout, pr.Head.SHA); e != nil {
+				cleanup()
+				return skipWith(gitStderrDetail(e), "checkout PR head %s: %v", short7(pr.Head.SHA), e)
+			}
 		}
 	}
 	// A local pane runs in this checkout: the cleanup keeps the checkout until
@@ -732,7 +746,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if resumed {
 			args = withWaitTimeout(rj.Args, wait)
 		} else {
-			args = []string{"spawn", "-c", checkout, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task}
+			args = []string{"spawn"}
+			if spec != nil {
+				args = append(args, spec.args()...)
+			} else {
+				args = append(args, "-c", checkout)
+			}
+			args = append(args, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task)
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}
@@ -785,6 +805,41 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			defer func() { spawnTook += phases.Now().Sub(began) }()
 			return panewireSpawnCompat.launch(c, s.Runner, cfg.Command, a)
 		}
+		// place answers panewire's refusal of a checkout spec. The hub feature
+		// check runs before the request is submitted, so nothing was placed and
+		// no job exists: the pass makes the local checkout it always made,
+		// re-records the argv in the -c form and asks again. A refusal that names
+		// the hub's or the CLI's missing flag is remembered for reviewerSpecTTL;
+		// any other spec refusal is not, so a corrected spec is tried again.
+		place := func(c context.Context, a []string) ([]byte, error) {
+			b, refusal := launch(c, a)
+			if refusal == nil || !checkoutSpecRefused(refusal) {
+				return b, refusal
+			}
+			reason := fleetevent.Redact(integrations.Detail(refusal))
+			if hubLacksCheckoutSpec(refusal) {
+				reviewerSpecs.refused()
+			}
+			_ = s.audit(x.repo.Name, "reviewer-checkout-spec-refused", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": reason}, false)
+			legacy, ok := localArgs(a, filepath.Join(cfg.Checkouts, label))
+			if !ok {
+				return b, refusal
+			}
+			pc, cancel := reportContext(c)
+			checkout = filepath.Join(cfg.Checkouts, label)
+			prepErr := x.localReviewerCheckout(pc, checkout)
+			cancel()
+			if prepErr != nil {
+				return b, fmt.Errorf("checkout spec refused (%s); local checkout: %w", reason, prepErr)
+			}
+			rj.Args = legacy
+			rj.Checkout = checkout
+			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+				return b, saveErr
+			}
+			note = "the hub carries no checkout spec; the reviewer was placed from a local checkout"
+			return launch(c, legacy)
+		}
 		// The spawn is accepted once panewire placed the reviewer: its call
 		// returned, or its wait ended on a pane that runs on. A resumed job was
 		// placed by an earlier evaluation.
@@ -795,7 +850,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 		}
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
-		stdout, e = launch(runCtx, args)
+		stdout, e = place(runCtx, args)
 		tracing.Finish(runSpan)
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
@@ -848,7 +903,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// no pane, so its checkout is still removed below.
 			if !spawnRefused(code) || resumed {
 				keepCheckout = true
-				x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+				if checkout != "" {
+					x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
+				}
 			}
 			if ctx.Err() != nil {
 				res, skipErr := skip("panewire reviewer deadline")
@@ -1062,6 +1119,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 // "Exit codes"). A spawn that ends with one placed nothing and left no job to
 // wait for.
 const (
+	panewireUsage            = 2  // usage refusal, the checkout-spec feature check among them
 	panewireConfigRefused    = 70 // configuration, unreadable catalog or policy
 	panewireDuplicateState   = 75 // unreadable duplicate state or a changed artifact
 	panewirePreflight        = 78 // a checked remote host failed a check

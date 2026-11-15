@@ -18,34 +18,37 @@ const prHeadErrorBytes = 512
 const fallbackBranchBytes = 200
 
 // fetchPRHead brings pr's head into the checkout at root. It fetches
-// pull/<n>/head into the remote-tracking ref panewire builds a remote
-// reviewer's detached spec from. GitHub can lose that ref for an open PR while
-// its branch is intact; then, for a same-repo PR only, it fetches the branch
-// into refs/remotes/origin/<branch>, which panewire also accepts, and goes on
+// pull/<n>/head into the remote-tracking ref a reviewer spawn's checkout spec
+// names. GitHub can lose that ref for an open PR while its branch is intact;
+// then, for a same-repo PR only, it fetches the branch into
+// refs/remotes/origin/<branch>, which a checkout spec also names, and goes on
 // only when that branch's tip is the exact head: the remote node fetches the
 // branch and requires FETCH_HEAD to equal the head, so a branch that moved
 // cannot carry the review, and the next pass reviews the new head. A taken
 // fallback deletes a local pull/<n>/head left by an earlier fetch, which
 // panewire would prefer and the remote node could not fetch. Any failure of
 // the first fetch takes the fallback: its stderr is not parsed. Each attempt
-// writes one pr-head-fallback row. The returned error is the skip reason; its
-// operator detail is the first fetch's stderr, then, when a failed fallback's
-// git command wrote stderr, that command's, joined by "; ".
-func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.Pull) error {
+// writes one pr-head-fallback row. The returned ref is what a checkout spec
+// names for this head: "pull/<n>/head", or "refs/heads/<branch>" for a taken
+// fallback. The returned error is the skip reason; its operator detail is the
+// first fetch's stderr, then, when a failed fallback's git command wrote
+// stderr, that command's, joined by "; ".
+func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.Pull) (ref string, err error) {
+	pull := fmt.Sprintf("pull/%d/head", pr.Number)
 	_, first := s.gitIn(ctx, root, "fetch", "--no-tags", "origin", prHeadRefspec(pr.Number), pr.Base.Ref)
 	if first == nil {
-		return nil
+		return pull, nil
 	}
-	ref := pr.Head.Ref
+	branch := pr.Head.Ref
 	firstDetail := gitStderrDetail(first)
-	if !strings.EqualFold(pr.Head.Repo.FullName, repo) || !fallbackBranch(ref) {
-		return withErrorDetail(fmt.Errorf("fetch PR head: %w", first), firstDetail)
+	if !strings.EqualFold(pr.Head.Repo.FullName, repo) || !fallbackBranch(branch) {
+		return "", withErrorDetail(fmt.Errorf("fetch PR head: %w", first), firstDetail)
 	}
 	firstText := boundedGitError(first)
-	result, e := s.fetchBranchAtHead(ctx, root, ref, pr, firstText)
+	result, e := s.fetchBranchAtHead(ctx, root, branch, pr, firstText)
 	// The pass goes on without the row: a lost audit line is no reason to
 	// leave the PR unreviewed.
-	row := map[string]any{"repo": repo, "pr": pr.Number, "head": pr.Head.SHA, "ref": ref, "error": firstText, "result": result}
+	row := map[string]any{"repo": repo, "pr": pr.Number, "head": pr.Head.SHA, "ref": branch, "error": firstText, "result": result}
 	if firstDetail != "" {
 		row["detail"] = firstDetail
 	}
@@ -59,7 +62,10 @@ func (s *Service) fetchPRHead(ctx context.Context, root, repo string, pr github.
 		}
 		e = withErrorDetail(e, detail)
 	}
-	return e
+	if e != nil {
+		return "", e
+	}
+	return "refs/heads/" + branch, nil
 }
 
 // fetchBranchAtHead is the fallback itself. result is "ok", "fetch-failed",

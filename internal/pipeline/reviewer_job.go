@@ -44,12 +44,16 @@ const panewireWaitTimeout = 85
 // included; Recorded is when the job was first spawned and bounds how long a
 // live job is waited for.
 type reviewerJob struct {
-	PR           int       `json:"pr"`
-	Head         string    `json:"head"`
-	LeaseSHA     string    `json:"lease_sha,omitempty"`
-	Pass         int       `json:"pass"`
-	Label        string    `json:"label"`
-	Checkout     string    `json:"checkout"`
+	PR       int    `json:"pr"`
+	Head     string `json:"head"`
+	LeaseSHA string `json:"lease_sha,omitempty"`
+	Pass     int    `json:"pass"`
+	Label    string `json:"label"`
+	// Checkout is the local PR-head checkout this spawn named. Empty means the
+	// spawn named a checkout spec instead (hk 4807): the node prepared the
+	// worktree, so there is nothing under review.panewire.checkouts to remove
+	// and no fields of this record name one.
+	Checkout     string    `json:"checkout,omitempty"`
 	Args         []string  `json:"args"`
 	Recorded     time.Time `json:"recorded"`
 	Replacements int       `json:"replacements,omitempty"`
