@@ -424,7 +424,7 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 			// owner sees it.
 			w.noteStuck(gate, l, job)
 			return
-		case !w.stuckPaneGone(job):
+		case !w.abandoned[l.name] && !w.stuckPaneGone(ctx, job):
 			// No pane carries the label, but the job's own pane still
 			// lists: same mark, same wait.
 			w.noteStuck(gate, l, job)
@@ -598,13 +598,31 @@ func (w *reviewerSweep) noteStuck(gate reapReceipt, l reviewerLabel, job integra
 	w.record(gate, "stuck-reviewer", fmt.Sprintf("job %s with no result for %s; pane left for panewire's node", job.State, w.now.Sub(l.started).Round(time.Minute)))
 }
 
+// paneListed reports whether id is in the host's agent or full pane list.
+func paneListed(hs *reapHost, id string) bool {
+	for _, list := range [][]reap.Pane{hs.panes, hs.all} {
+		for _, p := range list {
+			if p.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // stuckPaneGone reports whether the job's recorded pane is absent from the
 // pane lists of the host the job names — every scanned host when it names
-// none. A host that failed its scan, or a named host that is not configured,
-// cannot prove the pane is gone.
-func (w *reviewerSweep) stuckPaneGone(job integrations.JobRecord) bool {
+// none. The discovery lists can be stale — a stuck job's pane may have spawned
+// since the scan — so an absence is proven on a refreshed list, and a host
+// that failed its scan or a named host that is not configured cannot prove it.
+func (w *reviewerSweep) stuckPaneGone(ctx context.Context, job integrations.JobRecord) bool {
 	if job.PaneID == "" {
 		return true
+	}
+	if job.Host == "" && w.local == nil {
+		// The job names no host: this machine's panes count too, so the local
+		// fallback host must exist before an absence can be proven.
+		w.localHost(ctx)
 	}
 	hosts := w.hosts
 	if w.local != nil {
@@ -626,19 +644,17 @@ func (w *reviewerSweep) stuckPaneGone(job integrations.JobRecord) bool {
 		}
 		targets = append(targets, hs)
 	}
-	if job.Host != "" && len(targets) == 0 {
+	if len(targets) == 0 {
 		return false
 	}
 	for _, hs := range targets {
-		if hs.failed || hs.usageUnknown {
+		if hs.failed || hs.usageUnknown || paneListed(hs, job.PaneID) {
 			return false
 		}
-		for _, list := range [][]reap.Pane{hs.panes, hs.all} {
-			for _, p := range list {
-				if p.ID == job.PaneID {
-					return false
-				}
-			}
+	}
+	for _, hs := range targets {
+		if e := hs.refreshPanes(ctx); e != nil || paneListed(hs, job.PaneID) {
+			return false
 		}
 	}
 	return true
