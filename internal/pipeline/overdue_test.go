@@ -481,3 +481,64 @@ func TestMergeOverdueLegacyClocksFileLoads(t *testing.T) {
 		t.Fatalf("file not rewritten in the current shape: %s", b)
 	}
 }
+
+// (j) A draft is a deliberate hold, not the author's wait: while the PR is a
+// draft no condition fires and its clocks do not count. The pass that sees it
+// leave draft restarts the head's clocks there, so a READY 8 hours before the
+// hold owes its threshold from the draft's end.
+func TestMergeOverdueDraftHoldDoesNotCount(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0) // reviewed and READY at overdueStart
+	rig.g.pull.Draft = true
+	rig.at(0) // the next pass sees the draft at the same instant (fake clock)
+	rig.at(8 * time.Hour)
+	rig.wantConditions() // a draft is held: no condition fires
+	rig.g.pull.Draft = false
+	rig.at(8 * time.Hour) // leaving draft starts the clocks again here
+	rig.wantConditions()
+	rig.at(8*time.Hour + 9*time.Minute)
+	rig.wantConditions()
+	rig.at(8*time.Hour + 10*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	if e := rig.n.overdueEvents()[0]; !strings.Contains(e.Text, "| not_landed after 10m0s |") {
+		t.Fatal(e.Text)
+	}
+	rig.at(8*time.Hour + 45*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	if e := rig.n.overdueEvents()[1]; !strings.Contains(e.Text, "| ready_too_long after 45m0s |") {
+		t.Fatal(e.Text)
+	}
+}
+
+// The same 8 hours without a draft are unchanged: the clocks count the wall
+// time from the READY and the review completion.
+func TestMergeOverdueNoDraftCountsAsBefore(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.at(0)
+	rig.at(8 * time.Hour)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+	for _, e := range rig.n.overdueEvents() {
+		if !strings.Contains(e.Text, "after 8h0m0s |") {
+			t.Fatal(e.Text)
+		}
+	}
+}
+
+// A head first seen while the PR is a draft starts its clocks at the pass that
+// sees the PR ready: the report's "a head first seen after it became ready".
+func TestMergeOverdueHeadFirstSeenInDraft(t *testing.T) {
+	rig := newOverdueRig(t, true)
+	rig.g.pull.Draft = true
+	rig.at(0) // seen only as a draft
+	rig.at(8 * time.Hour)
+	rig.wantConditions()
+	rig.g.pull.Draft = false
+	rig.at(8 * time.Hour) // the ready pass starts the clocks
+	rig.wantConditions()
+	rig.at(8*time.Hour + 9*time.Minute)
+	rig.wantConditions()
+	rig.at(8*time.Hour + 10*time.Minute)
+	rig.wantConditions(overdueNotLanded)
+	rig.at(8*time.Hour + 45*time.Minute)
+	rig.wantConditions(overdueNotLanded, overdueReadyTooLong)
+}
