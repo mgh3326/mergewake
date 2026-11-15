@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,5 +230,31 @@ func TestReapReviewerRemovesSpecPlacedNodeCheckout(t *testing.T) {
 	rows := f.rows(t)
 	if len(rows) != 2 || rows[1].Result != "removed" || rows[1].Worktree != cwd || rows[1].Label != label {
 		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+// A checkout whose origin carries a credential keeps the local path: such an
+// origin would otherwise sit in the spawn argv (visible in ps) and in the
+// reviewer-job record, which outlives the attempt.
+func TestReviewerSpawnKeepsACredentialedOriginOutOfTheArgv(t *testing.T) {
+	freshReviewerSpecs(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, _, r := panewireSetup(t, runner)
+	reviewOrigin(runner, r.Root, "https://user:secret-token@github.com/example/project.git")
+	var record []byte
+	runner.afterRun = func() {
+		record, _ = os.ReadFile(s.reviewerJobPath(r.Name, 7, 1))
+	}
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	sp := runner.spawns[0]
+	if slices.Contains(sp, "--checkout-origin") || arg(sp, "-c") == "" {
+		t.Fatalf("spec named for a credentialed origin: %v", sp)
+	}
+	for _, seen := range []string{strings.Join(sp, " "), string(record)} {
+		if strings.Contains(seen, "secret-token") {
+			t.Fatalf("credential reached the spawn or the record: %s", seen)
+		}
 	}
 }

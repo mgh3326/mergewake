@@ -98,15 +98,23 @@ func (s *Service) specOrigin(ctx context.Context, root string) string {
 }
 
 // specOriginCarried reports whether origin is a remote a hub node clones: an
-// https, ssh or git URL with a host, or an scp-style host:owner/repo. A local
-// path names no clone of the repository the diff came from.
+// https, ssh or git URL with a host and no userinfo, or an scp-style
+// host:owner/repo. A local path names no clone of the repository the diff came
+// from. An origin that carries a credential is refused too: the spec puts the
+// origin in the spawn argv and in the reviewer-job record, which survives the
+// attempt, so such a checkout keeps the local path instead.
 func specOriginCarried(origin string) bool {
 	if origin == "" || strings.HasPrefix(origin, "-") {
 		return false
 	}
+	for _, r := range origin {
+		if r <= ' ' || r == 0x7f {
+			return false
+		}
+	}
 	if strings.Contains(origin, "://") {
 		u, e := url.Parse(origin)
-		if e != nil || u.Host == "" {
+		if e != nil || u.Host == "" || u.User != nil {
 			return false
 		}
 		switch u.Scheme {
@@ -115,8 +123,14 @@ func specOriginCarried(origin string) bool {
 		}
 		return false
 	}
-	_, path, ok := strings.Cut(origin, ":")
-	return ok && path != "" && !strings.HasPrefix(path, "/")
+	left, path, ok := strings.Cut(origin, ":")
+	if !ok || path == "" || strings.HasPrefix(path, "/") {
+		return false
+	}
+	// scp-style user@host is a login name and carries no secret; a password
+	// (user:pw@host:owner/repo) puts the "@" into the path past the first
+	// colon, and is refused rather than copied.
+	return !strings.Contains(left, ":") && !strings.Contains(path, "@")
 }
 
 // checkoutSpecRefused reports whether panewire refused this spawn before it
