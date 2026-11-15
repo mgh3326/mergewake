@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -231,15 +232,19 @@ func (s *Service) tickOverdueClocks(ctx context.Context, r config.Repo, pr githu
 }
 
 // closeHold ends the draft hold the entry still carries at now: the span is
-// recorded in Holds and DraftSince cleared, and nothing else moves. Both places
-// that see the PR open call it, tickOverdueClocks and noteOpenPass, so a pass
-// that errors later still ends the hold. It reports whether the entry changed.
+// recorded in Holds, DraftSince cleared and LastOpen set to now, since the pass
+// that closes a hold has seen the PR open. Both places that see the PR open
+// call it, tickOverdueClocks and noteOpenPass, so a pass that errors later
+// still ends the hold, and a hold that starts after this one is anchored here
+// rather than at a sighting from before it (draftAnchor). It reports whether
+// the entry changed.
 func closeHold(c *overdueClock, now time.Time) bool {
 	if c.DraftSince.IsZero() {
 		return false
 	}
 	c.Holds = append(c.Holds, holdSpan{From: c.DraftSince, To: now})
 	c.DraftSince = time.Time{}
+	c.LastOpen = now
 	// Keep the list bounded: merge the two oldest spans. That counts the open
 	// time between them as held, the conservative direction, and the entry is
 	// pruned a week after its last touch anyway.
@@ -346,32 +351,51 @@ func overdueHeld(v gateVerdict) bool {
 }
 
 // openAge is how long the clock that started at start has counted at now: the
-// time since start, less every draft hold it overlaps, the hold in progress
-// included up to now. A clock that starts inside a hold counts from the hold's
-// end; a hold that ends before the clock starts takes nothing off. Nothing here
-// depends on the order the clocks were filled in or on which pass read what:
-// the same raw times and hold spans always give the same age.
+// time since start, less the union of the draft holds it overlaps, the hold in
+// progress included up to now. The spans are merged before they are taken off,
+// so overlapping or touching spans, whatever wrote them, take their shared time
+// off once. A clock that starts inside a hold counts from the hold's end; a hold
+// that ends before the clock starts takes nothing off. Nothing here depends on
+// the order the clocks were filled in, on which pass read what, or on the order
+// the spans are stored in: the same raw times and hold spans always give the
+// same age.
 func openAge(c overdueClock, start, now time.Time) time.Duration {
 	if start.IsZero() || !now.After(start) {
 		return 0
 	}
+	spans := make([]holdSpan, 0, len(c.Holds)+1)
+	spans = append(spans, c.Holds...)
+	if !c.DraftSince.IsZero() {
+		spans = append(spans, holdSpan{From: c.DraftSince, To: now})
+	}
+	slices.SortFunc(spans, func(a, b holdSpan) int { return a.From.Compare(b.From) })
 	held := time.Duration(0)
-	take := func(from, to time.Time) {
+	var runFrom, runTo time.Time
+	running := false
+	for _, h := range spans {
+		from, to := h.From, h.To
 		if from.Before(start) {
 			from = start
 		}
 		if to.After(now) {
 			to = now
 		}
-		if to.After(from) {
-			held += to.Sub(from)
+		if !to.After(from) {
+			continue
+		}
+		if !running || from.After(runTo) {
+			if running {
+				held += runTo.Sub(runFrom)
+			}
+			runFrom, runTo, running = from, to, true
+			continue
+		}
+		if to.After(runTo) {
+			runTo = to
 		}
 	}
-	for _, h := range c.Holds {
-		take(h.From, h.To)
-	}
-	if !c.DraftSince.IsZero() {
-		take(c.DraftSince, now)
+	if running {
+		held += runTo.Sub(runFrom)
 	}
 	if age := now.Sub(start) - held; age > 0 {
 		return age
