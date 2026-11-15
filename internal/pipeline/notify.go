@@ -68,6 +68,15 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		}
 		return s.noteDraftHold(r, pr)
 	}
+	if o.Reporting() {
+		// The pass saw the PR open. Record it before the reads below, which can
+		// fail: a draft a later pass sees must not hold time this pass saw open
+		// (overdue.go noteOpenPass). The clocks are a side record, so an error
+		// is audited and the verdict still goes out.
+		if e := s.noteOpenPass(r, pr); e != nil {
+			_ = s.audit(r.Name, "merge-overdue-error", map[string]any{"pr": n, "head": pr.Head.SHA, "error": integrations.Detail(e)}, false)
+		}
+	}
 	baseSHA, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {
 		return e
