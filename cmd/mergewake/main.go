@@ -123,7 +123,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			family = fs.String("author-family", "", "PR author model family (or PR body trailer)")
 		} else if command == "reap" {
 			shadow = fs.Bool("shadow", false, "force observation mode")
-			legacy = fs.Bool("legacy", false, "one-time sweep of worktrees whose PR merged at least 14 days ago, past the daemon's scan window (every configured repo unless --repo; plans unless --apply)")
+			legacy = fs.Bool("legacy", false, "sweep worktrees whose PR merged at least 14 days ago, past the daemon's scan window, now (every configured repo unless --repo; plans unless --apply)")
 			legacyHost = fs.String("host", "", "with --legacy: sweep one configured host only")
 		} else {
 			shadow = fs.Bool("shadow", false, "force decision-only mode")
@@ -265,8 +265,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	return nil
 }
 
-// runReapLegacy runs the one-time legacy sweep over --repo or, without it,
-// every configured repo. It is not part of the daemon loop.
+// runReapLegacy runs the legacy sweep by hand over --repo or, without it,
+// every configured repo. The daemon runs the same sweep on reap.legacy_every.
 func runReapLegacy(ctx context.Context, s *pipeline.Service, c config.Config, repo, host string, o pipeline.Options) error {
 	var errs []error
 	for _, r := range c.Repos {

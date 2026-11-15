@@ -305,11 +305,19 @@ type Webhook struct {
 	// back and spend the GitHub rate limit.
 	MinGap string `yaml:"min_gap"`
 }
+
+// LegacyEveryDefault is how often the daemon runs a repo's legacy sweep when
+// reap.legacy_every is unset.
+const LegacyEveryDefault = "24h"
+
 type Reap struct {
 	Enabled       bool   `yaml:"enabled"`
 	Act           bool   `yaml:"act"`
 	WorktreeAfter string `yaml:"worktree_after"`
 	ScanAfter     string `yaml:"scan_after"`
+	// LegacyEvery is how often the daemon runs the legacy sweep for a repo;
+	// "0" or "off" disables it. Empty means LegacyEveryDefault.
+	LegacyEvery string `yaml:"legacy_every"`
 	// Protect is retired: mergewake never closes panes, so the globs are
 	// accepted but ignored. Kept so host configs written before the
 	// retirement still load; new configs should omit it.
@@ -320,6 +328,19 @@ type Reap struct {
 	Transport string  `yaml:"transport"`
 	Hub       ReapHub `yaml:"hub"`
 	Archive   Archive `yaml:"archive"`
+}
+
+// LegacyInterval parses reap.legacy_every: the time between the starts of a
+// repo's legacy sweeps. Zero means the daemon does not run them, which "0" and
+// "off" spell; empty resolves to LegacyEveryDefault.
+func (r Reap) LegacyInterval() (time.Duration, error) {
+	switch {
+	case r.LegacyEvery == "":
+		return Duration(LegacyEveryDefault)
+	case r.LegacyEvery == "0", strings.EqualFold(r.LegacyEvery, "off"):
+		return 0, nil
+	}
+	return Duration(r.LegacyEvery)
 }
 
 // ReapHub locates the panewire hub and the credential files reap sends it.
@@ -656,6 +677,12 @@ func validateReap(c *Config) error {
 		c.Reap.ScanAfter = "720h"
 	}
 	if _, e = Duration(c.Reap.ScanAfter); e != nil {
+		return e
+	}
+	if c.Reap.LegacyEvery == "" {
+		c.Reap.LegacyEvery = LegacyEveryDefault
+	}
+	if _, e = c.Reap.LegacyInterval(); e != nil {
 		return e
 	}
 	if len(c.Reap.Regenerable) == 0 {
