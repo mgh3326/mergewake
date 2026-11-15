@@ -56,8 +56,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	// The ESC never holds up the verdict: its error is returned with the rest.
 	escErr := s.EscalateConflict(ctx, r, pr, o)
 	defer func() { retErr = errors.Join(retErr, escErr) }()
-	if pr.State != "open" || pr.Draft || pr.Base.Ref != r.Branch {
+	if pr.State != "open" || pr.Base.Ref != r.Branch {
 		return nil
+	}
+	if pr.Draft {
+		// A draft is the author's deliberate hold, not a wait to report: no
+		// gate and no clock here. The hold is recorded so leaving draft does
+		// not count it against the head (overdue.go noteDraftHold).
+		if !o.Reporting() {
+			return nil
+		}
+		return s.noteDraftHold(r, pr)
 	}
 	baseSHA, e := s.GH.Head(ctx, r.Name, r.Branch)
 	if e != nil {

@@ -1951,7 +1951,10 @@ does not reset them: `head_seen` (the first pass that saw the head, after the PR
 left draft), `checks_done` (every required check completed: green, red or
 skipped), `review_done` (the head's done marker and all needed passes, or an
 earlier head's review of the same patch) and `ready` (the READY verdict
-mergewake recorded for the head). A new head starts its own clocks, with one
+mergewake recorded for the head). Draft time does not count: while the PR is a
+draft no condition fires, and the pass that first sees it out of draft moves the
+head's clocks forward by the hold's span; a clock or a READY recorded inside the
+hold starts again at that pass. A new head starts its own clocks, with one
 exception: a head mergewake made itself by updating a stale branch inherits the
 old head's `head_seen` and `ready`, because only the author's push resets that
 clock. mergewake records the update in the same file when the call succeeds and
