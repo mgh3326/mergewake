@@ -582,6 +582,80 @@ func TestAuthorBlockPartialScanWithoutAuthorGoesToOwnerLane(t *testing.T) {
 	}
 }
 
+// (k) A partial scan that finds no author pane still honours the lane the PR
+// names: the Notify-Lane trailer is consulted before the owner lane, the
+// order findingsRoute uses.
+func TestAuthorBlockPartialScanWithoutAuthorUsesNotifyLane(t *testing.T) {
+	f := blockSetup(t)
+	lister := f.withSplitAuthorScan(t)
+	lister.outs = authorHost().outs
+	f.r.Lane = "owner-route"
+	f.g.pull.Body = "Mergewake-Notify-Lane: trailer-route\n" + fleetBody
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "trailer-route" || !strings.HasSuffix(ev.Text, "| lane=trailer-route via notify-lane trailer") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+}
+
+// (l) Same partial scan and no author pane, but the task names the lane: the
+// block goes there rather than to the owner lane.
+func TestAuthorBlockPartialScanWithoutAuthorUsesTaskLane(t *testing.T) {
+	f := familyBlockSetup(t)
+	lister := f.withSplitAuthorScan(t)
+	lister.outs = authorHost().outs
+	f.r.Lane = "owner-route"
+	f.runner.sink.lanes = map[string]string{"42": "task-route"}
+	if e := f.review(t); !errors.Is(e, ErrReviewBlocked) {
+		t.Fatal(e)
+	}
+	if got := f.blocked(t, 7); got != blockUnknownFamily {
+		t.Fatalf("outcome row: %q", got)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("events: %+v", f.n.events)
+	}
+	ev := f.n.events[0]
+	if ev.Lane != "task-route" || !strings.HasSuffix(ev.Text, "| lane=task-route via task 42") {
+		t.Fatalf("event lane %q text %q", ev.Lane, ev.Text)
+	}
+}
+
+// (m) A task read the router cannot complete keeps the owner-lane fallback:
+// routing reports no error, so the block still goes out and the review is not
+// failed on the read.
+func TestAuthorBlockPartialScanTaskReadErrorKeepsOwnerLane(t *testing.T) {
+	for name, arrange := range map[string]func(*testing.T, blockFixture){
+		"task trailer unreadable": func(_ *testing.T, f blockFixture) {
+			f.g.commitErr = map[string]error{shaA: errors.New("GitHub GET /commits: HTTP 502")}
+		},
+		"task lane unreadable": func(_ *testing.T, f blockFixture) {
+			f.g.pull.Body = "Mergewake-Task: 42\n" + fleetBody
+			f.runner.sink.err = errors.New("hk unavailable")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := blockSetup(t)
+			lister := f.withSplitAuthorScan(t)
+			lister.outs = authorHost().outs
+			f.r.Lane = "owner-route"
+			arrange(t, f)
+			lane, via, e := f.s.blockLanePartial(WithAuthorScan(context.Background()), f.r, f.g.pull)
+			if e != nil {
+				t.Fatalf("a task read must keep the owner-lane fallback, not fail the review: %v", e)
+			}
+			if lane != "owner-route" || via != "owner lane (partial pane scan)" {
+				t.Fatalf("lane %q via %q", lane, via)
+			}
+		})
+	}
+}
+
 // (i) Every host unreachable is still no reason to fail the review: the owner
 // lane gets the block.
 func TestAuthorBlockScanFailureGoesToOwnerLane(t *testing.T) {

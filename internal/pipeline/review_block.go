@@ -203,12 +203,13 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 
 // blockLane is the lane a review block goes to. A missing trailer and an
 // unknown family are fixed by the PR's author, so the author's lane is found
-// first (findingsRoute); with none found, and for the other reasons, which a
-// human judges, it is the repo's owner lane. A route read error that is not
-// a per-host pane scan failure is returned, so nothing is sent and the next
-// pass retries; a scan failure routes on the hosts that answered and falls
-// back to the owner lane when none names the author, since an unreachable
-// host must not fail the review.
+// first (findingsRoute); with none found the lane the PR names is used (see
+// blockLanePartial), and for the other reasons, which a human judges, it is
+// the repo's owner lane. A route read error that is not a per-host pane scan
+// failure is returned, so nothing is sent and the next pass retries; a scan
+// failure routes on the hosts that answered and falls back to the owner lane
+// when none names the author, since an unreachable host must not fail the
+// review.
 func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, b reviewBlock) (lane, via string, err error) {
 	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
 		ctx = WithAuthorScan(ctx)
@@ -228,7 +229,10 @@ func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, 
 // blockLanePartial routes a review block when the author scan lost one or
 // more hosts: the author pane is looked up on the hosts that answered, the
 // via naming the partial scan as findings delivery does; with no author pane
-// the block goes to the owner lane.
+// the lane the PR itself names (see explicitLane) is used, and only with none
+// does the block go to the owner lane. A task read keeps that owner-lane
+// fallback rather than failing the review: a block that cannot be routed on
+// the PR's own lane is still worth delivering.
 func (s *Service) blockLanePartial(ctx context.Context, r config.Repo, pr github.Pull) (lane, via string, err error) {
 	hosts, _ := s.authorHosts(ctx)
 	jobs, has := s.Sink.(reapJobs)
@@ -239,6 +243,11 @@ func (s *Service) blockLanePartial(ctx context.Context, r config.Repo, pr github
 		}
 		if ok {
 			return l, v + " (partial pane scan)", nil
+		}
+	}
+	if task, e := s.prTask(ctx, r, pr); e == nil {
+		if l, v, e := s.explicitLane(ctx, r, pr, task, s.deskLane()); e == nil && l != "" {
+			return l, v, nil
 		}
 	}
 	read := 0
