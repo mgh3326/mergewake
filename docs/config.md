@@ -414,8 +414,8 @@ output limit fails and is kept.
 In the reap role the stage runs after the PR loop, over each reachable host's
 job dirs — it needs no GitHub call and no pane close. A job is eligible only
 when no pane uses it anymore (neither by name nor by cwd), its hk job record
-— when one can be read — is terminal (`completed`, `escalated` or `lost`),
-and its own events say it finished. The first pass that sees all three writes
+is terminal (`completed`, `escalated` or `lost`), and its own events say it
+finished. A job the hk record does not name waits as `job-unknown`. The first pass that sees all three writes
 a sighting row (`skipped` `awaiting-min-age`); a later pass archives once that
 row is older than `min_age`, so the age counts from when reap first saw the
 gone state, not from any file time. Acting needs `reap.act` and `--apply`

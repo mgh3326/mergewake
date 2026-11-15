@@ -201,18 +201,26 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				// A reused job name is running again: its dir is not finished.
 				rec.Result, rec.Reason = "skipped", "pane-live"
 			default:
-				hkSkip := ""
-				if records != nil {
+				// Without hk proof of a terminal job the dir waits, however
+				// finished its events look: a job no record names may never
+				// have run through the harness at all.
+				hkSkip, hkErr := "", ""
+				if records == nil {
+					hkSkip = "job-unknown"
+				} else {
 					jr, e := records.job(ctx, job)
 					switch {
-					case e == nil && !terminalJob(jr.State):
-						hkSkip = "job-active"
 					case e != nil && !errors.Is(e, integrations.ErrJobNotFound):
-						rec.Result, rec.Reason = "error", "job record: "+integrations.Detail(e)
+						hkErr = "job record: " + integrations.Detail(e)
+					case e != nil:
+						hkSkip = "job-unknown"
+					case !terminalJob(jr.State):
+						hkSkip = "job-active"
 					}
 				}
 				switch {
-				case rec.Result != "":
+				case hkErr != "":
+					rec.Result, rec.Reason = "error", hkErr
 				case hkSkip != "":
 					rec.Result, rec.Reason = "skipped", hkSkip
 				case skipReason == "not-finished":

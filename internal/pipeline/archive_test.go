@@ -445,6 +445,22 @@ func newArchiveFixture(t *testing.T, agents string) archiveFixture {
 	return f
 }
 
+// withJobs points the fixture's hk sink at the given job states; a job dir
+// with no entry reads as a missing record.
+func (f archiveFixture) withJobs(t *testing.T, states map[string]string) {
+	t.Helper()
+	sink, ok := f.s.Sink.(*jobSink)
+	if !ok {
+		sink = &jobSink{jobs: map[string]string{}, recs: map[string]integrations.JobRecord{}}
+		f.s.Sink = sink
+	}
+	for job, state := range states {
+		rec := sink.recs[job]
+		rec.State = state
+		sink.recs[job] = rec
+	}
+}
+
 const noAgents = `{"result":{"agents":[]}}`
 
 // seedArchive writes one archive-job row, standing in for a prior pass, so a
@@ -486,6 +502,7 @@ func (f archiveFixture) rows(t *testing.T) []reapReceipt {
 func TestReapArchivesGoneJobOnceAndDeletesIt(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
 	// The first pass sights the ended job — pane gone, events finished —
 	// and records the sighting without touching the dir.
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -548,6 +565,7 @@ func TestReapArchivesGoneJobOnceAndDeletesIt(t *testing.T) {
 func TestReapArchiveShadowOnlyPlans(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
 	f.seedArchive(t, "wk-7", "skipped", "awaiting-min-age", time.Now().Add(-48*time.Hour))
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{Shadow: true}); err != nil {
 		t.Fatal(err)
@@ -593,6 +611,7 @@ func TestReapArchiveKeepsLiveActiveAndUnfinished(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newArchiveFixture(t, tc.agents)
 			dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+			f.withJobs(t, map[string]string{"wk-7": "completed"})
 			if tc.inDir {
 				f.run.script = &scriptRunner{outs: map[string]string{
 					key("herdr", "agent", "list"): tc.agents,
@@ -618,6 +637,31 @@ func TestReapArchiveKeepsLiveActiveAndUnfinished(t *testing.T) {
 				t.Fatalf("row = %q, hk calls = %d", got, f.hkCalls())
 			}
 		})
+	}
+}
+
+// A job dir no hk record names waits as job-unknown, however finished its
+// events look: without hk proof of a terminal job the dir is not archived.
+func TestReapArchiveSkipsJobWithoutRecord(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "skipped" || rows[0].Reason != "job-unknown" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job dir touched without hk proof")
+	}
+	// Once the sighting ages out the job still waits: the row is not rewritten.
+	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows(t)) != 1 || f.hkCalls() != 0 {
+		t.Fatalf("rows = %+v hk calls = %d", f.rows(t), f.hkCalls())
 	}
 }
 
@@ -690,7 +734,7 @@ func TestArchiveExcludesAndFinishedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(f.jobs, "open-job", "events", "00005-job.placement.json"), `{}`)
-	// The reap-stage path must apply the same name and event checks.
+	f.withJobs(t, map[string]string{"done-job": "completed", "open-job": "completed"})
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -761,6 +805,7 @@ func TestReapArchiveReusedNameArchivesAgain(t *testing.T) {
 	f.seedArchive(t, "wk-7", "archived", "", time.Now().Add(-29*24*time.Hour))
 	// The new incarnation's files are newer than the earlier archive row.
 	dir := jobDir(t, f.jobs, "wk-7", time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -786,6 +831,7 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.hk.Fail("POST /v1/tasks/{id}/comments", 500, "internal")
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
 	f.seedArchive(t, "wk-7", "skipped", "awaiting-min-age", time.Now().Add(-48*time.Hour))
 	err := f.s.Reap(context.Background(), testRepo, 0, Options{})
 	if err == nil || !strings.Contains(err.Error(), "hk comment") {
