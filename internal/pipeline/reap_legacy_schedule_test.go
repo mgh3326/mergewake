@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -142,4 +143,75 @@ func TestReapLegacyScheduledContinuesAfterAFailedRepo(t *testing.T) {
 		}
 	}
 	t.Fatalf("no reap-legacy-error audit row for %s:\n%s", broken.Name, decisions)
+}
+
+// legacyErrorRows counts one repo's reap-legacy-error audit rows.
+func legacyErrorRows(t *testing.T, s *Service, repo string) int {
+	t.Helper()
+	b, e := os.ReadFile(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if e != nil {
+		return 0
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.Contains(line, "reap-legacy-error") {
+			n++
+		}
+	}
+	return n
+}
+
+// (e) A corrupt legacy-sweep.json does not disable the sweep: it is treated
+// like a missing record, audited once, and the stamp write repairs the file.
+func TestReapLegacyScheduledRepairsCorruptSchedule(t *testing.T) {
+	s, _, gh := legacyFixture(t)
+	s.Config.Reap.LegacyEvery = "24h"
+	file := s.legacyScheduleFile(testRepo.Name)
+	if e := os.MkdirAll(filepath.Dir(file), 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(file, []byte("{not json"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.ReapLegacyScheduled(context.Background(), s.Config.Repos, apply()); e != nil {
+		t.Fatal(e)
+	}
+	if gh.closedCalls != 1 {
+		t.Fatalf("corrupt schedule swept %d times, want 1", gh.closedCalls)
+	}
+	b, e := os.ReadFile(file)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var last legacySchedule
+	if e := json.Unmarshal(b, &last); e != nil || last.LastRun.IsZero() {
+		t.Fatalf("schedule file not repaired: %q (%v)", b, e)
+	}
+	if n := legacyErrorRows(t, s, testRepo.Name); n != 1 {
+		t.Fatalf("want one reap-legacy-error audit row, got %d", n)
+	}
+	decisions, _ := os.ReadFile(filepath.Join(s.state(testRepo.Name), "decisions.jsonl"))
+	if !strings.Contains(string(decisions), `"file":"legacy-sweep.json"`) {
+		t.Fatalf("audit row does not name the file:\n%s", decisions)
+	}
+}
+
+// (f) An unreadable legacy-sweep.json stays not-due — the stamp write would
+// fail the same way — but the failure is still audited and returned.
+func TestReapLegacyScheduledAuditsUnreadableSchedule(t *testing.T) {
+	s, _, gh := legacyFixture(t)
+	s.Config.Reap.LegacyEvery = "24h"
+	if e := os.MkdirAll(s.legacyScheduleFile(testRepo.Name), 0700); e != nil {
+		t.Fatal(e)
+	}
+	e := s.ReapLegacyScheduled(context.Background(), s.Config.Repos, apply())
+	if e == nil || !strings.Contains(e.Error(), testRepo.Name) {
+		t.Fatalf("error = %v, want one naming %s", e, testRepo.Name)
+	}
+	if gh.closedCalls != 0 {
+		t.Fatalf("unreadable schedule swept %d times, want 0", gh.closedCalls)
+	}
+	if n := legacyErrorRows(t, s, testRepo.Name); n != 1 {
+		t.Fatalf("want one reap-legacy-error audit row, got %d", n)
+	}
 }
