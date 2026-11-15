@@ -636,17 +636,6 @@ func RepoFromRemote(raw string) string {
 	return parts[0] + "/" + parts[1]
 }
 
-// Protected reports whether a pane name matches the configured protect globs
-// (slash-aware policy globs; the documented defaults are single-segment).
-func Protected(name string, globs []string) bool {
-	for _, g := range globs {
-		if ok, _ := policy.Match(g, name); ok {
-			return true
-		}
-	}
-	return false
-}
-
 // Regenerable reports whether an ignored path inside a worktree matches the
 // regenerable allowlist — throwaway output that rebuilds on demand and is
 // safe to lose with the worktree. A pattern containing a slash must match

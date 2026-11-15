@@ -124,37 +124,47 @@ func rowSummary(rows []reapReceipt) []string {
 	return out
 }
 
-// (a) A completed reviewer job on a remote host, its pane matching the job
-// record with an empty composer, and a clean detached worktree: the pane
-// closes, the hub's guarded removal removes the worktree, one row and one
-// audit record per action.
-func TestReapReviewer_A_I1_I2_I4_I5_I6_ClosesPaneAndRemovesWorktree(t *testing.T) {
+// (a) A completed reviewer job on a remote host with a clean detached
+// worktree: while its pane lists, the sweep closes nothing and removes
+// nothing — one kept pane-in-use row and audit record. Once panewire's node
+// has closed the pane, the hub's guarded removal removes the worktree.
+func TestReapReviewer_A_I1_I2_I4_I5_I6_KeepsPaneAndRemovesWorktreeWhenGone(t *testing.T) {
 	f := newReviewerFix(t)
 	label := reviewerLabelFor(12, time.Hour)
 	f.addReviewer(label, "w1:p5")
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	closes := f.hub.ops("pane.close")
-	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p5" || closes[0]["name"] != label || closes[0]["cwd"] != "/repo/"+label {
-		t.Fatalf("closes: %v", closes)
-	}
-	removes := f.hub.ops("worktree.remove")
-	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label || removes[0]["detached"] != true || removes[0]["expect_head"] != headSHA || removes[0]["base"] != "main" {
-		t.Fatalf("removes: %v", removes)
+	if len(f.hub.ops("pane.close")) != 0 || len(f.hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("closed or removed with the pane present: %v", f.hub.commands)
 	}
 	if len(f.run.calls) != 0 {
 		t.Fatalf("hub host ran local or ssh commands: %q", f.run.calls)
 	}
 	rows := f.rows(t)
-	if len(rows) != 2 ||
-		rows[0].Label != label || rows[0].Host != "node" || rows[0].Pane != "w1:p5" || rows[0].Worktree != "" || rows[0].Result != "closed" ||
-		rows[1].Label != label || rows[1].Host != "node" || rows[1].Worktree != "/repo/"+label || rows[1].Result != "removed" {
+	if len(rows) != 1 ||
+		rows[0].Label != label || rows[0].Host != "node" || rows[0].Pane != "" || rows[0].Worktree != "/repo/"+label || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 	audits := f.audits(t)
-	if len(audits) != 2 || audits[0]["result"] != "closed" || audits[1]["result"] != "removed" || audits[0]["label"] != label {
+	if len(audits) != 1 || audits[0]["result"] != "kept" || audits[0]["label"] != label {
 		t.Fatalf("audits: %v", audits)
+	}
+	// Panewire's node closes the pane; the sweep then removes its worktree.
+	f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label || removes[0]["detached"] != true || removes[0]["expect_head"] != headSHA || removes[0]["base"] != "main" {
+		t.Fatalf("removes: %v", removes)
+	}
+	if len(f.hub.ops("pane.close")) != 0 {
+		t.Fatalf("closed: %v", f.hub.commands)
+	}
+	rows = f.rows(t)
+	if len(rows) != 2 || rows[1].Result != "removed" || rows[1].Worktree != "/repo/"+label {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }
 
@@ -216,8 +226,11 @@ func TestReapReviewerAcceptsOldAndRenamedWorkerRoles(t *testing.T) {
 				t.Fatal(err)
 			}
 			rows := f.rows(t)
-			if len(rows) < 1 || rows[0].Result != "closed" || rows[0].Reason == "role:"+role {
+			if len(rows) < 1 || rows[0].Result != "kept" || rows[0].Reason == "role:"+role {
 				t.Fatalf("role %q not accepted: %v", role, rowSummary(rows))
+			}
+			if len(f.hub.ops("pane.close")) != 0 {
+				t.Fatalf("closed: %v", f.hub.commands)
 			}
 		})
 	}
@@ -239,46 +252,43 @@ func TestReapReviewer_C_I3_LeavesYoungLabel(t *testing.T) {
 	}
 }
 
-// (d) The pane id, cwd or host differs from the job record: kept.
+// (d) The pane id or the host differs from the job record: kept. A pane whose
+// cwd is not the job's cwd does not block the job's own worktree.
 func TestReapReviewer_D_I4_KeepsPaneTheJobDoesNotName(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		edit func(f *reviewerFix, label string)
+		name   string
+		edit   func(f *reviewerFix, label string)
+		result string
+		reason string
 	}{
 		{"pane id", func(f *reviewerFix, label string) {
 			rec := f.sink.recs[label]
 			rec.PaneID = "w1:p9"
 			f.sink.recs[label] = rec
-		}},
+		}, "kept", "pane-in-use"},
 		{"pane id unrecorded", func(f *reviewerFix, label string) {
 			rec := f.sink.recs[label]
 			rec.PaneID = ""
 			f.sink.recs[label] = rec
-		}},
+		}, "kept", "pane-in-use"},
 		{"cwd", func(f *reviewerFix, label string) {
 			for _, list := range []string{"agents", "panes"} {
 				f.hub.agents[list].([]any)[0].(map[string]any)["cwd"] = "/repo/elsewhere"
 			}
 			// Still a worktree of this repo, so the pane is this sweep's
-			// candidate and the job/pane disagreement is what keeps it.
+			// candidate; the job's own unused worktree is removed anyway.
 			f.hub.detached["/repo/elsewhere"] = true
-		}},
-		{"job cwd", func(f *reviewerFix, label string) {
-			// Same base name, but not the cwd the job record names.
-			rec := f.sink.recs[label]
-			rec.Cwd = "/repo/other/" + label
-			f.sink.recs[label] = rec
-		}},
+		}, "removed", ""},
 		{"host", func(f *reviewerFix, label string) {
 			rec := f.sink.recs[label]
 			rec.Host = "node-b"
 			f.sink.recs[label] = rec
-		}},
+		}, "kept", "job record and pane disagree"},
 		{"no host", func(f *reviewerFix, label string) {
 			rec := f.sink.recs[label]
 			rec.Host = ""
 			f.sink.recs[label] = rec
-		}},
+		}, "kept", "job record and pane disagree"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newReviewerFix(t)
@@ -288,49 +298,11 @@ func TestReapReviewer_D_I4_KeepsPaneTheJobDoesNotName(t *testing.T) {
 			if err := f.reap(t, 0, Options{}); err != nil {
 				t.Fatal(err)
 			}
-			if f.acts() != 0 {
+			if len(f.hub.ops("pane.close"))+len(f.hub.ops("pane.read")) != 0 {
 				t.Fatalf("hub ops: %v", f.hub.commands)
 			}
 			rows := f.rows(t)
-			if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "job record and pane disagree" {
-				t.Fatalf("rows: %v", rowSummary(rows))
-			}
-		})
-	}
-}
-
-// (e) A composer with text, one that cannot be read, or a close whose recheck
-// does not close: kept, and the worktree is not removed.
-func TestReapReviewer_E_I5_KeepsPaneWithComposerOrFailedRecheck(t *testing.T) {
-	for _, test := range []struct {
-		name, composer string
-		forbid         bool
-		close          string
-		reason         string
-		closes         int
-	}{
-		{"draft", "has_text", false, "closed", "composer-text", 0},
-		{"unreadable", "empty", true, "closed", "composer-unknown", 0},
-		{"recheck changed", "empty", false, "pane-changed", "pane close recheck: pane-changed", 1},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			f := newReviewerFix(t)
-			label := reviewerLabelFor(12, time.Hour)
-			f.addReviewer(label, "w1:p5")
-			f.hub.composer = map[string]any{"outcome": "read", "composer": test.composer}
-			if test.forbid {
-				f.hub.forbid = map[string]bool{"pane.read": true}
-			}
-			f.hub.close = map[string]any{"outcome": test.close}
-			if err := f.reap(t, 0, Options{}); err != nil {
-				t.Fatal(err)
-			}
-			// Only the host scan inspects the pane's cwd; the sweep never reaches the worktree.
-			if len(f.hub.ops("pane.close")) != test.closes || len(f.hub.ops("worktree.remove")) != 0 || len(f.hub.ops("worktree.inspect")) != 1 {
-				t.Fatalf("hub ops: %v", f.hub.commands)
-			}
-			rows := f.rows(t)
-			if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != test.reason {
+			if len(rows) != 1 || rows[0].Result != test.result || rows[0].Reason != test.reason {
 				t.Fatalf("rows: %v", rowSummary(rows))
 			}
 		})
@@ -339,12 +311,18 @@ func TestReapReviewer_E_I5_KeepsPaneWithComposerOrFailedRecheck(t *testing.T) {
 
 // (f) The hub refuses the removal: pending-cleanup, and nothing removes the
 // worktree another way. Another pane working inside the worktree: no removal.
+// A pane still present keeps its worktree before any of that runs.
 func TestReapReviewer_F_I6_RemovesOnlyThroughHubGuard(t *testing.T) {
 	t.Run("refused", func(t *testing.T) {
 		f := newReviewerFix(t)
 		label := reviewerLabelFor(12, time.Hour)
 		f.addReviewer(label, "w1:p5")
 		f.hub.removeOutcome = "dirty"
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		// The pane is gone, so the sweep reaches the hub's guarded removal.
+		f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
@@ -368,7 +346,7 @@ func TestReapReviewer_F_I6_RemovesOnlyThroughHubGuard(t *testing.T) {
 			t.Fatalf("hub ops %v local %q", f.hub.commands, f.run.calls)
 		}
 		rows := f.rows(t)
-		if len(rows) != 2 || rows[0].Result != "closed" || rows[1].Result != "kept" || rows[1].Reason != "pane-in-use" {
+		if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 			t.Fatalf("rows: %v", rowSummary(rows))
 		}
 	})
@@ -377,6 +355,10 @@ func TestReapReviewer_F_I6_RemovesOnlyThroughHubGuard(t *testing.T) {
 		label := reviewerLabelFor(12, time.Hour)
 		f.addReviewer(label, "w1:p5")
 		f.hub.wtHead = "bbbb2222"
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
@@ -404,7 +386,7 @@ func TestReapReviewer_F_I6_RemovesGoneReviewerAtReceiptedPath(t *testing.T) {
 		t.Fatalf("hub ops: %v", f.hub.commands)
 	}
 	rows := f.rows(t)
-	if len(rows) != 2 || rows[0].Reason != "pane already gone" || rows[1].Result != "removed" || rows[1].Worktree != cwd {
+	if len(rows) != 1 || rows[0].Result != "removed" || rows[0].Worktree != cwd {
 		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }
@@ -486,10 +468,10 @@ func TestReapReviewer_G_I7_RemovesLocalCheckoutOnlyWhenUnused(t *testing.T) {
 	}
 }
 
-// (g) A local pass's reviewer-cleanup row says "closed" once the pane closed;
-// the pass then removes the checkout and may fail. The label stays open while
-// the checkout is on disk, and the sweep removes it.
-func TestReapReviewer_G_I7_RetriesCheckoutLeftAfterClosedPane(t *testing.T) {
+// (g) An old reviewer-cleanup "closed" row still releases the checkout: the
+// pane is long gone and the checkout was never removed, so the sweep removes
+// it once its reviewer job is done. Nothing is ever closed.
+func TestReapReviewer_G_I7_OldClosedRowStillReleasesCheckout(t *testing.T) {
 	f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
 	label := reviewerLabelFor(12, time.Hour)
 	path := localCheckout(t, f, label, false)
@@ -502,25 +484,11 @@ func TestReapReviewer_G_I7_RetriesCheckoutLeftAfterClosedPane(t *testing.T) {
 		t.Fatalf("checkout not removed; calls %q", f.run.calls)
 	}
 	rows := f.rows(t)
-	if got := rowSummary(rows); len(rows) != 2 || rows[0].Reason != "pane already gone" || rows[1].Result != "removed" || rows[1].Worktree != path {
-		t.Fatalf("rows: %v", got)
+	if len(rows) != 1 || rows[0].Result != "removed" || rows[0].Worktree != path {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
-
-	// Once the checkout is gone the closed row is terminal again: no visit.
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	before := len(f.run.calls)
-	if err := f.reap(t, 0, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if rows := f.rows(t); len(rows) != 2 {
-		t.Fatalf("second run rows: %v", rowSummary(rows))
-	}
-	for _, c := range f.run.calls[before:] {
-		if strings.Contains(c, path) {
-			t.Fatalf("second run touched the checkout: %q", c)
-		}
+	if len(f.hub.ops("pane.close")) != 0 {
+		t.Fatalf("closed: %v", f.hub.commands)
 	}
 }
 
@@ -537,11 +505,9 @@ func TestReapReviewer_H_I8_ShadowAndDryRunNeverAct(t *testing.T) {
 		{"dry-run", Options{DryRun: true}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			f := newReviewerFix(t, reap.Host{Name: "local", Jobs: "/jobs"})
+			f := newReviewerFix(t)
 			label := reviewerLabelFor(12, time.Hour)
 			f.addReviewer(label, "w1:p5")
-			path := localCheckout(t, f, label, false)
-			f.s.Config.Reap.Act = !test.noAct
 			var out strings.Builder
 			f.s.Out = &out
 			if err := f.reap(t, 0, test.o); err != nil {
@@ -550,13 +516,14 @@ func TestReapReviewer_H_I8_ShadowAndDryRunNeverAct(t *testing.T) {
 			if n := len(f.hub.ops("pane.close")) + len(f.hub.ops("worktree.remove")); n != 0 || f.run.called("worktree\x00remove") {
 				t.Fatalf("acted: hub %v local %q", f.hub.commands, f.run.calls)
 			}
-			for _, want := range []string{`"result":"would-close"`, `"worktree":"/repo/` + label + `","result":"would-remove"`, `"worktree":"` + path + `","result":"would-remove"`} {
-				if !strings.Contains(out.String(), want) {
-					t.Fatalf("missing %s in %s", want, out.String())
-				}
+			// The pane still uses the worktree, so the sweep keeps it and
+			// never reaches the local checkout, in shadow and in acting mode.
+			want := `"worktree":"/repo/` + label + `","result":"kept","reason":"pane-in-use"`
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("missing %s in %s", want, out.String())
 			}
 			rows := f.rows(t)
-			if test.o.DryRun && len(rows) != 0 || !test.o.DryRun && len(rows) != 3 {
+			if test.o.DryRun && len(rows) != 0 || !test.o.DryRun && len(rows) != 1 {
 				t.Fatalf("rows: %v", rowSummary(rows))
 			}
 		})
@@ -715,37 +682,43 @@ func TestReapReviewer_L5_UnknownRemotePathNeverActsInShadowOrDryRun(t *testing.T
 // a label still pending writes no repeat row either.
 func TestReapReviewer_I_I9_SecondRunIsQuiet(t *testing.T) {
 	t.Run("finished", func(t *testing.T) {
-		f := newReviewerFix(t)
-		f.hub.dropClosed, f.hub.dropRemoved = true, true
+		f := newFinalFix(t)
 		label := reviewerLabelFor(12, time.Hour)
 		f.addReviewer(label, "w1:p5")
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
-		rows, audits, ops := len(f.rows(t)), len(f.audits(t)), len(f.hub.commands)
-		if rows != 2 || audits != 2 {
+		rows, audits := len(f.rows(t)), len(f.audits(t))
+		if rows != 1 || audits != 1 {
 			t.Fatalf("first run rows %v", rowSummary(f.rows(t)))
 		}
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
-		if len(f.rows(t)) != rows || len(f.audits(t)) != audits || len(f.hub.commands) != ops {
-			t.Fatalf("second run: rows %v ops %v", rowSummary(f.rows(t)), f.hub.commands[ops:])
+		// The second run re-inspects the worktree to confirm the pane is
+		// still there, but writes no row and no audit record, and asks for
+		// no removal.
+		if len(f.rows(t)) != rows || len(f.audits(t)) != audits || len(f.hub.ops("worktree.remove")) != 0 {
+			t.Fatalf("second run: rows %v ops %v", rowSummary(f.rows(t)), f.hub.commands)
 		}
 	})
 	t.Run("pending", func(t *testing.T) {
-		f := newReviewerFix(t)
-		f.hub.dropClosed = true
+		f := newFinalFix(t)
 		f.hub.removeOutcome = "dirty"
 		label := reviewerLabelFor(12, time.Hour)
 		f.addReviewer(label, "w1:p5")
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		// The pane is gone, so the sweep reaches the hub's guarded removal.
+		f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
 		for range 3 {
 			if err := f.reap(t, 0, Options{}); err != nil {
 				t.Fatal(err)
 			}
 		}
 		rows := f.rows(t)
-		if len(rows) != 2 || rows[0].Result != "closed" || rows[1].Result != "pending-cleanup" || len(f.audits(t)) != 2 {
+		if len(rows) != 2 || rows[1].Result != "pending-cleanup" || len(f.audits(t)) != 2 {
 			t.Fatalf("rows: %v", rowSummary(rows))
 		}
 		// Still pending, but the hub is asked again only once a day.
@@ -772,22 +745,16 @@ func TestReapReviewer_J_I1_I10_LeavesAuthorPanes(t *testing.T) {
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
-		for _, op := range []string{"pane.read", "pane.close"} {
-			for _, args := range f.hub.ops(op) {
-				if args["pane_id"] != "w1:p5" {
-					t.Fatalf("%s on %v", op, args)
-				}
+		// No pane is read or closed; the reviewer's worktree waits for its
+		// pane, so nothing is removed either.
+		for _, op := range []string{"pane.read", "pane.close", "worktree.remove"} {
+			if len(f.hub.ops(op)) != 0 {
+				t.Fatalf("%s ran: %v", op, f.hub.ops(op))
 			}
 		}
-		for _, args := range f.hub.ops("worktree.remove") {
-			if args["cwd"] != "/repo/"+label {
-				t.Fatalf("removed %v", args)
-			}
-		}
-		for _, v := range f.rows(t) {
-			if v.Label != label {
-				t.Fatalf("rows: %v", rowSummary(f.rows(t)))
-			}
+		rows := f.rows(t)
+		if len(rows) != 1 || rows[0].Label != label || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
+			t.Fatalf("rows: %v", rowSummary(f.rows(t)))
 		}
 	})
 	t.Run("no reviewers", func(t *testing.T) {
@@ -803,7 +770,7 @@ func TestReapReviewer_J_I1_I10_LeavesAuthorPanes(t *testing.T) {
 			reason, _ := row["reason"].(string)
 			got = append(got, fmt.Sprintf("%s %s %s", row["action"], row["result"], reason))
 		}
-		want := []string{"close-pane skipped composer-unknown", "remove-worktree removed ", "delete-branch deleted "}
+		want := []string{"remove-worktree skipped pane-in-use"}
 		if !equalStrings(got, want) {
 			t.Fatalf("rows %q, want %q", got, want)
 		}
@@ -821,8 +788,9 @@ func (closedGH) Pull(_ context.Context, _ string, pr int) (github.Pull, error) {
 	return github.Pull{Number: pr, State: "closed", Head: github.Ref{Ref: "wk/y", SHA: headSHA}, Base: github.Ref{Ref: "main"}}, nil
 }
 
-// (k) A reviewer of a closed, unmerged PR is cleaned like (a), in the full
+// (k) A reviewer of a closed, unmerged PR waits like (a), in the full
 // sweep and with --pr naming that PR; --pr limits the sweep to its labels.
+// Once the pane is gone its worktree is removed.
 func TestReapReviewer_K_I2_I6_CleansReviewerOfClosedPR(t *testing.T) {
 	for _, pr := range []int{0, 34} {
 		t.Run(fmt.Sprintf("pr=%d", pr), func(t *testing.T) {
@@ -842,12 +810,29 @@ func TestReapReviewer_K_I2_I6_CleansReviewerOfClosedPR(t *testing.T) {
 					mine = append(mine, v)
 				}
 			}
-			if len(mine) != 2 || mine[0].PR != 34 || mine[0].Result != "closed" || mine[1].Result != "removed" {
+			if len(mine) != 1 || mine[0].PR != 34 || mine[0].Result != "kept" || mine[0].Reason != "pane-in-use" {
 				t.Fatalf("rows: %v", rowSummary(f.rows(t)))
 			}
 			others := len(f.rows(t)) - len(mine)
-			if pr == 34 && others != 0 || pr == 0 && others != 2 {
+			if pr == 34 && others != 0 || pr == 0 && others != 1 {
 				t.Fatalf("other labels: %v", rowSummary(f.rows(t)))
+			}
+			if len(f.hub.ops("pane.close")) != 0 {
+				t.Fatalf("closed: %v", f.hub.commands)
+			}
+			// Once panewire's node closes the pane, the worktree is removed.
+			f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
+			if err := f.reap(t, pr, Options{}); err != nil && pr == 0 {
+				t.Fatal(err)
+			}
+			mine = mine[:0]
+			for _, v := range f.rows(t) {
+				if v.Label == label {
+					mine = append(mine, v)
+				}
+			}
+			if len(mine) != 2 || mine[1].Result != "removed" {
+				t.Fatalf("rows: %v", rowSummary(f.rows(t)))
 			}
 		})
 	}
@@ -856,7 +841,7 @@ func TestReapReviewer_K_I2_I6_CleansReviewerOfClosedPR(t *testing.T) {
 // parseReviewerLabel accepts exactly the label a review pass writes.
 // (l) A label names a PR number, not a repo. A completed reviewer pane whose
 // worktree belongs to another repository is not this repo's sweep's: it is not
-// closed, read or receipted here, and this repo's own reviewer still is.
+// read or receipted here, and this repo's own reviewer still waits out its pane.
 func TestReapReviewer_L_I1_LeavesAnotherReposReviewer(t *testing.T) {
 	f := newReviewerFix(t)
 	other := reviewerLabelFor(141, time.Hour)
@@ -874,17 +859,17 @@ func TestReapReviewer_L_I1_LeavesAnotherReposReviewer(t *testing.T) {
 			}
 		}
 	}
-	closed := false
+	kept := false
 	for _, r := range f.rows(t) {
 		if r.Label == other {
 			t.Fatalf("another repo's reviewer was receipted here: %v", rowSummary(f.rows(t)))
 		}
-		if r.Label == own && r.Result == "closed" {
-			closed = true
+		if r.Label == own && r.Result == "kept" && r.Reason == "pane-in-use" {
+			kept = true
 		}
 	}
-	if !closed {
-		t.Fatalf("own reviewer not closed: %v", rowSummary(f.rows(t)))
+	if !kept {
+		t.Fatalf("own reviewer not kept: %v", rowSummary(f.rows(t)))
 	}
 }
 
@@ -917,7 +902,8 @@ func TestReapReviewersOnlyOfOpenPR(t *testing.T) {
 	if err := f.s.Reap(ctx, testRepo, 34, Options{}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if rows := f.rows(t); len(rows) != 2 || rows[0].Result != "closed" {
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 	if b, err := os.ReadFile(filepath.Join(f.s.state(testRepo.Name), "decisions.jsonl")); err == nil && strings.Contains(string(b), "reap-error") {
@@ -926,15 +912,16 @@ func TestReapReviewersOnlyOfOpenPR(t *testing.T) {
 }
 
 // (l) The PR merges while a review run is still in flight: the held path's
-// reviewersOnly sweep closes the reviewer pane, but the merged-PR cleanup
-// (the author's job pane, worktree and branch) does not run at all.
+// reviewersOnly sweep still waits out the reviewer pane, but the merged-PR
+// cleanup (the author's worktree and branch) does not run at all — and
+// nothing closes either pane.
 func TestReapReviewersOnlyOfMergedPRSkipsCleanup(t *testing.T) {
 	f := newReviewerFix(t)
 	merged := reviewerNow.Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "closed", Merged: true, MergedAt: &merged,
 		Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"}}}
 	// The author's pane sits in the merged PR's own worktree, so the merged path
-	// would close it and remove the worktree and branch.
+	// would remove the worktree and branch once the pane is gone.
 	f.addPane("w1:p1", "wk-7", "/repo.wt")
 	label := reviewerLabelFor(12, time.Hour)
 	f.addReviewer(label, "w1:p5")
@@ -942,18 +929,12 @@ func TestReapReviewersOnlyOfMergedPRSkipsCleanup(t *testing.T) {
 	if err := f.s.Reap(ctx, testRepo, 12, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	closes := f.hub.ops("pane.close")
-	if len(closes) != 1 || closes[0]["pane_id"] != "w1:p5" {
-		t.Fatalf("closes=%v, want only the reviewer pane", closes)
+	if len(f.hub.ops("pane.close")) != 0 || len(f.hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("acted: %v", f.hub.commands)
 	}
-	removes := f.hub.ops("worktree.remove")
-	if len(removes) != 1 || removes[0]["cwd"] != "/repo/"+label {
-		t.Fatalf("removes=%v, want only the reviewer worktree", removes)
-	}
-	for _, v := range f.rows(t) {
-		if v.Label != label {
-			t.Fatalf("merged-PR cleanup receipted: %v", rowSummary(f.rows(t)))
-		}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Label != label || rows[0].Result != "kept" {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }
 

@@ -147,8 +147,8 @@ func TestReapConfig(t *testing.T) {
 		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: 0s\n", true},
 		{"bad scan", "reap:\n  scan_after: 0s\n", true},
-		{"bad glob", "reap:\n  protect: ['..']\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
+		{"retired protect ignored", "reap:\n  protect: ['..']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
 		{"ssh host", "hosts:\n  - {name: node, ssh: ops@node.example}\n", false},
@@ -224,9 +224,6 @@ func TestReapConfig(t *testing.T) {
 				}
 				if c.Reap.ScanAfter != "720h" {
 					t.Fatal(c.Reap.ScanAfter)
-				}
-				if len(c.Reap.Protect) == 0 {
-					t.Fatal("missing default protect list")
 				}
 				if len(c.Reap.Regenerable) == 0 {
 					t.Fatal("missing default regenerable list")

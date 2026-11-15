@@ -128,10 +128,9 @@ func (s *Service) reapNote(v reapReceipt, dry bool) error {
 }
 
 // reapHost caches one host's agent list, full pane list and per-cwd worktree
-// inspection for a single pass; closed records panes this pass closed or would
-// close, and usageUnknown blocks removals when the full pane scan failed.
-// ops reaches the host's panes; exec runs worktree cleanup and is unused when
-// viaHub, since the hub carries no cleanup command yet.
+// inspection for a single pass; usageUnknown blocks removals when the full
+// pane scan failed. ops reaches the host's panes; exec runs worktree cleanup
+// and is unused when viaHub, since the hub carries no cleanup command yet.
 type reapHost struct {
 	host         reap.Host
 	ops          reap.Ops
@@ -140,7 +139,6 @@ type reapHost struct {
 	panes        []reap.Pane
 	all          []reap.Pane
 	trees        map[string]*reap.Worktree
-	closed       map[string]bool
 	failed       bool
 	usageUnknown bool
 }
@@ -165,20 +163,6 @@ func (hs *reapHost) refreshPanes(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// reclose closes a pane only when a fresh re-read still shows it unchanged:
-// the discovery list is a stale snapshot, and a pane that went back to work
-// since must survive. Over the hub the node itself re-reads and compares.
-func (s *Service) reclose(ctx context.Context, hs *reapHost, pane reap.Pane) (string, string) {
-	outcome, err := hs.ops.CloseExact(ctx, pane)
-	switch {
-	case err != nil:
-		return "error", err.Error()
-	case outcome != reap.CloseClosed:
-		return "skipped", outcome
-	}
-	return "closed", ""
 }
 
 // reapHub builds the pass's panewire hub client from reap.hub, or nil when
@@ -233,7 +217,7 @@ func filesSig(files []string) string {
 func (hs *reapHost) paneInUse(path string) bool {
 	clean := filepath.Clean(path)
 	for _, pane := range hs.all {
-		if pane.Cwd == "" || hs.closed[pane.ID] {
+		if pane.Cwd == "" {
 			continue
 		}
 		cwd := filepath.Clean(pane.Cwd)
@@ -382,7 +366,7 @@ func (h *reapHistory) prDone(pr int) bool {
 // still run locally.
 func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) (*reapHost, []error) {
 	var errs []error
-	hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
+	hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}}
 	hs.ops = hs.exec
 	if hub != nil && !h.Local() {
 		hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
@@ -431,9 +415,11 @@ type reviewersOnlyKey struct{}
 // the call then ends without the "not a merged PR" refusal.
 func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey{}) != nil }
 
-// Reap closes agent panes sitting in worktrees of merged-PR head branches, then
-// removes the worktree and local branch once the merge is older than
-// reap.worktree_after and no watch recovery PR landed. Anything dirty, unknown
+// Reap removes the worktrees and local branches of merged-PR head branches
+// once the merge is older than reap.worktree_after and no watch recovery PR
+// landed. It never closes a pane: panewire's node closes an ended job's pane
+// on pane-id + harness-session proof, so a worktree still in use simply waits
+// (pane-in-use) until that close lands. Anything dirty, unknown
 // or ambiguous is skipped and reported, never forced.
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
 	defer func() {
@@ -543,14 +529,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	reach := newReapJobReach()
 	// Errors are counted once, from errs: note itself appends every "error"
 	// row, so no row-level failure can be missing from the summary.
-	scanned, closed, planned, removed, deleted, skipped, archived, jobsDone := 0, 0, 0, 0, 0, 0, 0, 0
+	scanned, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0
 	note := func(v reapReceipt) {
 		switch v.Result {
-		case "closed":
-			closed++
-		case "done":
-			jobsDone++
-		case "would-close", "would-remove", "would-delete", "would-archive", "would-done", "would-abandon":
+		case "would-remove", "would-delete", "would-archive", "would-abandon":
 			planned++
 		case "archived":
 			archived++
@@ -563,9 +545,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		case "error":
 			subject := v.Worktree
 			switch v.Action {
-			case "close-pane":
-				subject = "pane " + v.Pane
-			case "archive-job", "job-done":
+			case "archive-job":
 				subject = "job " + v.Job
 			case "reviewer-reap":
 				subject = "reviewer " + v.Label
@@ -573,9 +553,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
-		// A failed archive always appends: its time spaces the next retry.
-		// So does a completed one, which carries its own Drive and hk record.
-		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived"))
+		// A failed or retained archive always appends: its time spaces the
+		// next retry. So does a completed one, which carries its own Drive
+		// and hk record.
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
 		h.lastRow[reapRowKey(v)] = reapRowSig(v)
 		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
 			errs = append(errs, e)
@@ -600,7 +581,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, e)
 		}
 	}
-	jobSeen := map[string]bool{}
 	// matches reports whether a worktree is merged PR p's own: it is on the PR's
 	// branch in this repo and its head is the PR head, or an ancestor of it, so
 	// every commit in the worktree is in the merged PR. A head that is an
@@ -643,8 +623,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 
 	// A call that wants only the reviewer sweep (the review path) never runs
 	// the merged-PR cleanup, even if the PR merged while the review ran: a held
-	// reviewer spawn must not close the author's job pane, remove its worktree,
-	// delete its branch or archive its job.
+	// reviewer spawn must not remove the author's worktree, delete its branch
+	// or archive its job.
 	if reviewersOnly(ctx) && prNum > 0 {
 		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)...)
 	}
@@ -667,60 +647,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if p.MergedAt != nil {
 			mergedAt = parsedTime(*p.MergedAt)
 		}
-		// A PR bound to a job reaps that job's pane, once per job per pass;
-		// worktree matching is the fallback for a PR with no bound job. A
-		// binding read error closes nothing this pass.
+		// A PR bound to a job still resolves the binding here: the worktree
+		// candidate source below reads the bound job's host and cwd, which
+		// outlives any pane. A binding read error only loses that source
+		// this pass.
 		bound, bindErr := s.reapBind(ctx, r, p)
-		switch {
-		case bindErr != nil:
+		if bindErr != nil {
 			errs = append(errs, fmt.Errorf("PR %d job binding: %s", p.Number, integrations.Detail(bindErr)))
-		case bound.Job != "":
-			if !jobSeen[bound.Job] {
-				jobSeen[bound.Job] = true
-				match := func(w *reap.Worktree) bool { return matches(w, p) }
-				s.reapJobPane(ctx, r, p, bound, hosts, byName, match, mergedAt, acting, records, h.jobClosed, h.jobEverClosed, note)
-			}
-		}
-		for _, hs := range hosts {
-			if hs.failed || bindErr != nil || bound.Job != "" {
-				continue
-			}
-			for _, pane := range hs.panes {
-				w := hs.trees[pane.Cwd]
-				if !matches(w, p) {
-					continue
-				}
-				rec := reapReceipt{Action: "close-pane", Repo: r.Name, PR: p.Number, Host: hs.host.Name, Pane: pane.ID, Cwd: pane.Cwd, Worktree: w.Path, Branch: w.Branch}
-				switch {
-				case pane.ID == "":
-					rec.Result, rec.Reason = "skipped", "pane-id-missing"
-				case pane.Status != "idle" && pane.Status != "done":
-					// An allowlist, not a denylist: blocked, waiting, unknown
-					// or empty states are live enough to keep.
-					st := pane.Status
-					if st == "" {
-						st = "unknown"
-					}
-					rec.Result, rec.Reason = "skipped", "status:"+st
-				case pane.Name == "":
-					rec.Result, rec.Reason = "skipped", "unnamed"
-				case reap.Protected(pane.Name, s.Config.Reap.Protect):
-					rec.Result, rec.Reason = "skipped", "protected:"+pane.Name
-				case hs.host.Jobs == "" && !hs.viaHub:
-					// Through the hub the node owns its jobs directory.
-					rec.Result, rec.Reason = "skipped", "jobs-dir-unset"
-				case !reap.ValidJobName(pane.Name):
-					rec.Result, rec.Reason = "skipped", "job-name-invalid"
-				case pane.Focused:
-					rec.Result, rec.Reason = "skipped", "operator-owned"
-				default:
-					// A PR whose task has no bound job still waits for the
-					// task's other open PRs; then the composer, capture and
-					// close rules of the job path apply (reapPaneClose).
-					s.reapPaneClose(ctx, &rec, hs, pane, pane.Name, bound.Task, mergedAt, acting)
-				}
-				note(rec)
-			}
 		}
 
 		if mergedAt == nil || now.Sub(*mergedAt) < after {
@@ -856,6 +789,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			case !matches(w, p):
 				rec.Result, rec.Reason = "skipped", "worktree-changed"
 			case c.hs.viaHub:
+				// Like the ssh path, a worktree a pane still uses waits:
+				// the pane list is re-read immediately before an acting
+				// removal, and the node re-checks once more at removal.
+				if c.hs.paneInUse(w.Path) {
+					rec.Result, rec.Reason = "skipped", "pane-in-use"
+					note(rec)
+					continue
+				}
 				if !acting {
 					rec.Result = "would-remove"
 					note(rec)
@@ -863,14 +804,19 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					note(brec)
 					continue
 				}
-				remover, ok := c.hs.ops.(interface {
-					WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
-				})
-				if !ok {
-					rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
-				} else {
-					result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false)
-					if err != nil {
+				switch e := c.hs.refreshPanes(ctx); {
+				case e != nil:
+					rec.Result, rec.Reason = "skipped", "pane-scan-failed"
+					errs = append(errs, fmt.Errorf("%s pane list: %w", c.hs.host.Name, e))
+				case c.hs.paneInUse(w.Path):
+					rec.Result, rec.Reason = "skipped", "pane-in-use"
+				default:
+					remover, ok := c.hs.ops.(interface {
+						WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
+					})
+					if !ok {
+						rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
+					} else if result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false); err != nil {
 						rec.Result, rec.Reason = "error", err.Error()
 					} else {
 						rec.Files = result.Files
@@ -981,24 +927,22 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
 	if s.Config.Reap.Archive.Enabled {
-		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, acting, note)...)
+		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
 	}
 	result := struct {
 		Action   string `json:"action"`
 		Repo     string `json:"repo"`
 		Shadow   bool   `json:"shadow"`
 		Scanned  int    `json:"prs_scanned"`
-		Closed   int    `json:"closed"`
 		Planned  int    `json:"planned"`
 		Removed  int    `json:"removed"`
 		Deleted  int    `json:"branches_deleted"`
 		Archived int    `json:"jobs_archived"`
-		JobsDone int    `json:"jobs_done"`
 		Skipped  int    `json:"skipped"`
 		ErrCount int    `json:"errors"`
 		// JobRecords is what the third discovery source reached: the job
 		// records of the tasks of the merged PRs past worktree_after.
 		JobRecords reapJobReach `json:"job_records"`
-	}{"reap", r.Name, !acting, scanned, closed, planned, removed, deleted, archived, jobsDone, skipped, len(errs), reach}
+	}{"reap", r.Name, !acting, scanned, planned, removed, deleted, archived, skipped, len(errs), reach}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }

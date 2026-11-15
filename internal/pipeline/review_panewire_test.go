@@ -228,7 +228,7 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 			return []byte(r.spawnOut), nil
 		}
 		// By default the pane reports a remote placement, so the pass keeps
-		// the local checkout cleanup it had before the reviewer-pane close.
+		// the local checkout until the pane is gone.
 		placement := r.placement
 		if placement == "" && !r.unplaced {
 			placement = " placement=" + base64.RawURLEncoding.EncodeToString([]byte(`{"chosen_host":"node-a","pane_id":"p1"}`))

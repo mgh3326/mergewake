@@ -19,39 +19,24 @@ import (
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// The reviewer sweep closes the leftover pane of a finished reviewer job and
-// removes its reviewer worktrees. A review pass already cleans up after itself
-// (panewire_cleanup.go); this sweep picks up what a pass had to keep: a pane
-// whose job was still running, a spawn whose wait timed out, an unconfirmed
-// placement, or a refused removal. It runs whatever the PR's state, because a
-// reviewer's job ends on its own clock, not on the merge.
+// The reviewer sweep removes the reviewer worktrees of finished reviewer jobs
+// once no pane uses them. A review pass already cleans up after itself
+// (panewire_cleanup.go); this sweep picks up what a pass had to keep: a
+// checkout whose pane was still running, a spawn whose wait timed out, an
+// unconfirmed placement, or a refused removal. It runs whatever the PR's
+// state, because a reviewer's job ends on its own clock, not on the merge.
+// Panes are never closed here: panewire's node closes an ended job's pane, so
+// a checkout still in use simply waits.
 //
-// Every action needs all of: a reviewer label, a completed reviewer job, a
-// pass that is over, a pane that is the one the job names, and an empty
-// composer. A remote worktree goes only through the hub's guarded removal; a
-// local checkout is removed only when it is clean, detached at the reviewed
-// head and no local pane runs in it.
+// Every action needs a reviewer label, a finished reviewer job and a pass
+// that is over. A remote worktree goes only through the hub's guarded
+// removal; a local checkout is removed only when it is clean, detached at
+// the reviewed head and no local pane runs in it.
 //
-// A reviewer-only exception keeps finished panes from piling up; it applies to
-// reviewer jobs only. An omp pane has a composer herdr cannot read, so a
-// reviewer pane whose job record says the job ended (completed or lost) closes
-// without the read. One whose job record does not say that waits: it closes
-// once it has stayed idle with an unreadable composer for
-// reviewerUnreadableIdle. And a reviewer job that never left spawned, whose
-// pane is idle and whose PR is closed or past the reviewed head, is closed
-// abandoned first (abandonSpawned). A worker pane keeps the composer read: a
-// person may type in it.
-
-// reviewerLabelPattern is the label a review pass gives its pane, job and
-// checkout: mwr-<pr>-<sha7>-p<pass>-<unix> (panewire.go). The hub's
-// replacement for a quota-stopped reviewer adds -q<n> (n >= 1) to the old job id.
-// reviewerUnreadableIdle is how long a reviewer pane must have sat idle with a
-// composer the hub could not read before the sweep closes it unread; a reviewer
-// job record that says the job ended skips the clock. The clock is the pane
-// stream's kept composer-unknown row: the receipts dedupe repeats, so that
-// row's time is when the sweep first saw this state, and a pane that worked in
-// between wrote a different row and started the clock again.
-const reviewerUnreadableIdle = 2 * time.Hour
+// A reviewer-only exception keeps finished checkouts from piling up; it
+// applies to reviewer jobs only. A reviewer job that never left spawned, whose
+// pane is idle and whose PR is closed or past the reviewed head, still has its
+// job closed abandoned first (abandonSpawned); its pane is left for the node.
 
 var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
 
@@ -84,8 +69,8 @@ func parseReviewerLabel(name string) (reviewerLabel, bool) {
 	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(unix, 0), replacement: repl}, true
 }
 
-// reviewerStream names one receipt stream of a label: the pane stream (gate
-// and close rows, no worktree) or one worktree on one host. rowKey dedupes
+// reviewerStream names one receipt stream of a label: the pane stream (the
+// gate row, no worktree) or one worktree on one host. rowKey dedupes
 // reviewer-reap rows by it.
 func reviewerStream(v reapReceipt) string {
 	if v.Worktree == "" {
@@ -179,7 +164,7 @@ type reviewerSweep struct {
 	remote map[string]map[string]string
 	// abandoned names labels an earlier pass closed abandoned. Their job record
 	// still reads spawned until panewire's sweep ends the job (then lost), so
-	// this receipt, not the record, stops a second abandon; the pane still needs reaping.
+	// this receipt, not the record, stops a second abandon.
 	abandoned map[string]bool
 	// pulls memoises the PR reads of one pass; a failed read is not kept.
 	pulls map[int]github.Pull
@@ -234,9 +219,8 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 	}
 	finished := func(label string) bool {
-		// A reviewer-cleanup "closed" row only says the pane closed: the pass
-		// removes its local checkout afterwards and may fail. A checkout still
-		// on disk keeps the label open until its own removal is confirmed.
+		// A checkout still on disk keeps the label open until its own removal
+		// is confirmed.
 		streams := w.streams[label]
 		waiting := false
 		for _, v := range streams {
@@ -273,8 +257,8 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		if hs.failed {
 			continue
 		}
-		// The agent list names panes and is what CloseExact re-reads; the
-		// full pane list only serves the in-use check.
+		// The agent list names panes; the full pane list serves the in-use
+		// check that keeps a checkout its pane still uses.
 		for i := range hs.panes {
 			pane := hs.panes[i]
 			l, ok := keep(pane.Name)
@@ -284,7 +268,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 			// A label names a PR number, not a repo: every repo's sweep sees
 			// every reviewer pane on the host. Only a pane standing in a
 			// worktree of this repo is this sweep's; an unknown worktree is
-			// not, so another repo's reviewer is never closed or receipted here.
+			// not, so another repo's reviewer is never receipted here.
 			if tree := hs.trees[pane.Cwd]; tree == nil || !strings.EqualFold(tree.Repo, w.r.Name) {
 				continue
 			}
@@ -358,8 +342,10 @@ func (w *reviewerSweep) record(v reapReceipt, result, reason string) {
 	w.note(v)
 }
 
-// visit applies the sweep to one label: the gates (I2–I4), the pane close
-// (I5), the remote worktree (I6) and the local checkout (I7), in that order.
+// visit applies the sweep to one label: the gates (I2–I4), the remote
+// worktree (I6) and the local checkout (I7), in that order. The pane itself
+// is never closed here: panewire's node closes an ended job's pane, and a
+// pane still using a worktree keeps it through the pane-in-use guards below.
 // Any step that does not finish stops the later ones.
 func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	l := c.label
@@ -394,8 +380,8 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		return
 	}
 	// A reviewer job stuck in spawned is closed abandoned when its review can
-	// no longer matter; the pane then goes through the normal reap below. The
-	// record still reads spawned, so the composer clock below keeps its wait.
+	// no longer matter; its pane is left for panewire's node to close, and the
+	// worktree cleanup below runs once no pane uses it.
 	reaped := job.State == "completed"
 	if job.State == "spawned" && job.Role == "reviewer" && c.pane != nil && !w.abandoned[l.name] {
 		if !w.abandonSpawned(ctx, c, gate, job) {
@@ -404,9 +390,9 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		reaped = true
 	}
 	held := !reaped && !w.abandoned[l.name]
-	// A lost reviewer job cannot be holding anyone's work either: its finished
-	// pane is reaped now, under the same composer read a completed job's gets.
-	// Only reviewer jobs get this; a lost worker or implementer keeps its hold.
+	// A lost reviewer job cannot be holding anyone's work either: its pane is
+	// left for panewire's node to close. Only reviewer jobs get this; a lost
+	// worker or implementer keeps its hold.
 	if held && job.Role == "reviewer" && job.State == "lost" && c.pane != nil && paneFinished(c.pane.Status) {
 		held = false
 	}
@@ -459,14 +445,12 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 			cwd = w.remote[l.name][hs.host.MachineID()]
 		}
 	}
+	if cwd == "" && c.pane != nil {
+		// A pane still around names the worktree it uses; the pane-in-use
+		// guards below keep it until panewire's node closes the pane.
+		cwd = c.pane.Cwd
+	}
 	if hs != nil {
-		pane, ok := w.closePane(ctx, gate, hs, job, l)
-		if !ok {
-			return
-		}
-		if pane != nil && pane.Cwd != "" {
-			cwd = pane.Cwd
-		}
 		// L1: an unknown remote path is recorded as pending-cleanup and does not
 		// block the local checkout. L2: a refused or failed removal does.
 		if !hs.host.Local() && w.removeRemote(ctx, hs, l, cwd) == remoteStop {
@@ -484,113 +468,6 @@ func reviewerReapRole(role string) bool {
 		return false
 	}
 }
-
-// closePane finds the label's pane on hs and closes it under I4 and I5. It
-// returns true once the pane is closed (or would be, in shadow) or gone.
-func (w *reviewerSweep) closePane(ctx context.Context, rec reapReceipt, hs *reapHost, job integrations.JobRecord, l reviewerLabel) (*reap.Pane, bool) {
-	var found []reap.Pane
-	for _, p := range hs.panes {
-		if p.Name == l.name && p.ID != "" {
-			found = append(found, p)
-		}
-	}
-	switch len(found) {
-	case 0:
-		// Gone. A pane this sweep closed before needs no second row.
-		if prior, ok := w.streams[l.name]["pane"]; !ok || prior.Result != "closed" {
-			rec.Pane = job.PaneID
-			w.record(rec, "skipped", "pane already gone")
-		}
-		return nil, true
-	case 1:
-	default:
-		w.record(rec, "kept", "pane-ambiguous")
-		return nil, false
-	}
-	pane := found[0]
-	rec.Pane, rec.Cwd = pane.ID, pane.Cwd
-	switch {
-	case job.PaneID == "" || pane.ID != job.PaneID || pane.Cwd == "" || filepath.Base(filepath.Clean(pane.Cwd)) != l.name,
-		job.Cwd != "" && filepath.Clean(job.Cwd) != filepath.Clean(pane.Cwd):
-		// The job record, when it names a cwd, must name this pane's.
-		w.record(rec, "kept", "job record and pane disagree")
-		return nil, false
-	case pane.Focused:
-		w.record(rec, "kept", "operator-owned")
-		return nil, false
-	}
-	// I5: an unsent draft, or a composer that cannot be read, keeps the pane. A
-	// reviewer pane whose composer the hub reports unreadable (not a failed
-	// read) closes once its job record says the job ended, or once it has been
-	// idle long enough; the row then carries the reason of that close.
-	closeReason := ""
-	switch composer, e := hs.ops.Composer(ctx, pane); {
-	case e != nil:
-		w.record(rec, "kept", reap.ComposerUnknown)
-		return nil, false
-	case composer == reap.ComposerUnknown && job.Role == "reviewer":
-		keep, reason := w.unreadableKeep(rec, pane, job)
-		if keep != "" {
-			w.record(rec, "kept", keep)
-			return nil, false
-		}
-		closeReason = reason
-	case composer != reap.ComposerEmpty:
-		w.record(rec, "kept", composer)
-		return nil, false
-	}
-	if !w.acting {
-		hs.closed[pane.ID] = true
-		w.record(rec, "would-close", closeReason)
-		return &pane, true
-	}
-	outcome, e := hs.ops.CloseExact(ctx, pane)
-	switch {
-	case e != nil:
-		w.record(rec, "error", "pane close: "+e.Error())
-		return nil, false
-	case outcome == reap.CloseClosed:
-		hs.closed[pane.ID] = true
-		w.record(rec, "closed", closeReason)
-		return &pane, true
-	case outcome == reap.CapturePaneGone:
-		// Not marked closed: the in-use check must still see any pane that
-		// remains in the worktree.
-		w.record(rec, "skipped", "pane already gone")
-		return &pane, true
-	}
-	w.record(rec, "kept", "pane close recheck: "+outcome)
-	return nil, false
-}
-
-// unreadableKeep is why a reviewer pane with an unreadable composer stays, or
-// "" once it may close, with the reason its close row carries. A job record
-// that says the job ended (terminalJob) ends the wait at once: a pane whose job
-// has ended can no longer hold anyone's work. Otherwise the pane must be idle
-// or done, and in the same unreadable state since a kept composer-unknown row
-// at least reviewerUnreadableIdle old. The first sighting writes that row and
-// keeps the pane.
-func (w *reviewerSweep) unreadableKeep(rec reapReceipt, pane reap.Pane, job integrations.JobRecord) (keep, closeReason string) {
-	if !paneFinished(pane.Status) {
-		st := pane.Status
-		if st == "" {
-			st = "unknown"
-		}
-		return "status:" + st, ""
-	}
-	if job.Role == "reviewer" && terminalJob(job.State) {
-		return "", composerUnknownJobEnded
-	}
-	prior, ok := w.streams[rec.Label]["pane"]
-	if !ok || prior.Result != "kept" || prior.Reason != reap.ComposerUnknown || w.now.Sub(prior.Time) < reviewerUnreadableIdle {
-		return reap.ComposerUnknown, ""
-	}
-	return "", ""
-}
-
-// composerUnknownJobEnded is the close reason of a reviewer pane whose composer
-// the hub could not read and whose job record says the job ended.
-const composerUnknownJobEnded = "composer-unknown-job-ended"
 
 // paneFinished reports whether a pane is idle or done: it is not running work
 // and is not waiting at a prompt, so a person is not typing in it.
@@ -670,9 +547,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	rec := w.row(l)
 	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
 	if cwd == "" || filepath.Base(filepath.Clean(cwd)) != l.name {
-		// Its own stream: the pane stream must keep its close. The path is not
-		// going to become known, so the outcome is final once the sweep acts;
-		// the host's own sweep owns the worktree. A shadow run stays pending.
+		// The path is not going to become known, so the outcome is final
+		// once the sweep acts; the host's own sweep owns the worktree. A
+		// shadow run stays pending.
 		rec.Worktree = l.name
 		if w.acting {
 			w.record(rec, "kept", reviewerPathUnknown)
@@ -769,7 +646,7 @@ func (w *reviewerSweep) localHost(ctx context.Context) *reapHost {
 		return w.local
 	}
 	ex := reap.Exec{Runner: w.s.Runner, Host: reap.Host{Name: "local"}}
-	w.local = &reapHost{host: ex.Host, exec: ex, ops: ex, trees: map[string]*reap.Worktree{}, closed: map[string]bool{}}
+	w.local = &reapHost{host: ex.Host, exec: ex, ops: ex, trees: map[string]*reap.Worktree{}}
 	if e := w.local.refreshPanes(ctx); e != nil {
 		w.local.usageUnknown = true
 	}

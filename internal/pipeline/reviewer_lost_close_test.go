@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/integrations"
-	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // lostPaneHub stands a fake hub in front of the lost reviewer's pane and gives
@@ -20,9 +19,10 @@ func lostPaneHub(t *testing.T, s *Service, runner *panewireRunner, job reviewerJ
 	return hub
 }
 
-// (a) A reviewer still working past the deadline is replaced: its screen is
-// saved, its pane closes though it is working, and the replacement runs.
-func TestLostOverdueReviewerScreenSavedAndPaneClosed(t *testing.T) {
+// (a) A reviewer still working past the deadline is replaced: its pane is left
+// for panewire's node to close, never captured or closed here, and the
+// replacement runs. The forced close that did not land is audited.
+func TestLostOverdueReviewerPaneLeftForNode(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
 	hub := lostPaneHub(t, s, runner, old, "working")
@@ -31,23 +31,19 @@ func TestLostOverdueReviewerScreenSavedAndPaneClosed(t *testing.T) {
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	captures := hub.ops("pane.capture")
-	if len(captures) != 1 || captures[0]["write"] != true || captures[0]["pane_id"] != "p1" {
-		t.Fatalf("pane.capture = %v", captures)
-	}
-	if closes := hub.ops("pane.close"); len(closes) != 1 || closes[0]["pane_id"] != "p1" {
-		t.Fatalf("pane.close = %v", closes)
+	if captures, closes := hub.ops("pane.capture"), hub.ops("pane.close"); len(captures)+len(closes) != 0 {
+		t.Fatalf("pane.capture = %v pane.close = %v", captures, closes)
 	}
 	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
 		t.Fatalf("spawns = %v", runner.spawns)
 	}
-	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 0 {
+	if rows := auditRows(t, s, r, "reviewer-close-skipped"); len(rows) != 1 {
 		t.Fatalf("reviewer-close-skipped = %v", rows)
 	}
 }
 
-// (b) A pane that no longer carries the pass's name and cwd is never closed;
-// the skip is audited and the replacement still runs.
+// (b) A pane that no longer carries the pass's name and cwd is still present
+// by id, so the checkout stays; the skip is audited and the replacement runs.
 func TestLostOverdueReviewerMismatchedPaneIsKept(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
@@ -64,7 +60,7 @@ func TestLostOverdueReviewerMismatchedPaneIsKept(t *testing.T) {
 		t.Fatalf("a mismatched pane was touched: capture=%v close=%v", captures, closes)
 	}
 	rows := auditRows(t, s, r, "reviewer-close-skipped")
-	if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), "name/cwd mismatch") {
+	if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), "pane still present") {
 		t.Fatalf("reviewer-close-skipped = %v", rows)
 	}
 	if len(runner.spawns) != 2 {
@@ -72,9 +68,9 @@ func TestLostOverdueReviewerMismatchedPaneIsKept(t *testing.T) {
 	}
 }
 
-// (d) A forced close that the hub refuses is audited with its reason and never
-// fails the pass: the replacement still runs.
-func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
+// (d) A refused close can no longer happen: nothing closes the pane, the
+// pending checkout is audited and the replacement still runs.
+func TestLostOverdueReviewerPaneCloseNeverRuns(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
 	hub := lostPaneHub(t, s, runner, old, "working")
@@ -85,7 +81,7 @@ func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := auditRows(t, s, r, "reviewer-close-skipped")
-	if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), "pane close") || rows[0]["pane"] != "p1" {
+	if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), "pane still present") || rows[0]["pane"] != "p1" {
 		t.Fatalf("reviewer-close-skipped = %v", rows)
 	}
 	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
@@ -93,52 +89,44 @@ func TestLostOverdueReviewerPaneCloseFailureIsAudited(t *testing.T) {
 	}
 }
 
-// (e) A forced close whose capture names a pane that is not a fleet job (its
-// job dir is missing) or that no longer matches is a refusal: the pane stays
-// open, the skip and its reason are audited, no worktree is removed, and the
-// replacement still runs.
-func TestLostOverdueReviewerCaptureSkipKeepsPane(t *testing.T) {
-	for _, skip := range []string{reap.CaptureNotAJob, reap.CapturePaneChanged} {
-		t.Run(skip, func(t *testing.T) {
-			s, g, r, runner, c := interruptedReviewer(t)
-			old := readReviewerJob(t, s, r, 1)
-			hub := lostPaneHub(t, s, runner, old, "working")
-			hub.capture = map[string]any{"outcome": skip}
-			hub.detached = map[string]bool{"/repo/" + old.Label: true}
-			hub.wtHead = shaA
-			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-			pastBudget(g, c)
-			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-				t.Fatal(err)
-			}
-			if captures := hub.ops("pane.capture"); len(captures) != 1 {
-				t.Fatalf("pane.capture = %v", captures)
-			}
-			if closes := hub.ops("pane.close"); len(closes) != 0 {
-				t.Fatalf("a pane the capture skipped was closed: %v", closes)
-			}
-			if removes := hub.ops("worktree.remove"); len(removes) != 0 {
-				t.Fatalf("a pane the capture skipped had its worktree removed: %v", removes)
-			}
-			rows := auditRows(t, s, r, "reviewer-close-skipped")
-			if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), skip) || rows[0]["pane"] != "p1" {
-				t.Fatalf("reviewer-close-skipped = %v", rows)
-			}
-			if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
-				t.Fatalf("spawns = %v", runner.spawns)
-			}
-		})
+// (e) Capture never runs anymore: a present pane keeps its checkout with a
+// pending-cleanup row, no worktree is removed, and the replacement runs.
+func TestLostOverdueReviewerCaptureNeverRuns(t *testing.T) {
+	s, g, r, runner, c := interruptedReviewer(t)
+	old := readReviewerJob(t, s, r, 1)
+	hub := lostPaneHub(t, s, runner, old, "working")
+	hub.detached = map[string]bool{"/repo/" + old.Label: true}
+	hub.wtHead = shaA
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	pastBudget(g, c)
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if captures, closes, removes := hub.ops("pane.capture"), hub.ops("pane.close"), hub.ops("worktree.remove"); len(captures)+len(closes)+len(removes) != 0 {
+		t.Fatalf("capture=%v close=%v remove=%v", captures, closes, removes)
+	}
+	rows := auditRows(t, s, r, "reviewer-close-skipped")
+	if len(rows) != 1 || !strings.Contains(rows[0]["reason"].(string), "pane still present") || rows[0]["pane"] != "p1" {
+		t.Fatalf("reviewer-close-skipped = %v", rows)
+	}
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "-l") == old.Label {
+		t.Fatalf("spawns = %v", runner.spawns)
 	}
 }
 
-// (f) A capture that names the pane gone is not a refusal: no pane is left, so
-// the close counts as done and both the guarded remote worktree removal and
-// the local mirror checkout removal run.
+// (f) A pane panewire's node already closed counts as gone: no pane is left,
+// so both the guarded remote worktree removal and the local mirror checkout
+// removal run.
 func TestLostOverdueReviewerGonePaneCountsAsClosed(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
 	hub := lostPaneHub(t, s, runner, old, "working")
-	hub.capture = map[string]any{"outcome": reap.CapturePaneGone}
+	// The job record still names the pane's cwd, but nothing lists the pane.
+	rec := runner.sink.jobs[old.Label]
+	rec.Cwd = "/repo/" + old.Label
+	runner.sink.jobs[old.Label] = rec
+	hub.agents["agents"] = []any{}
+	hub.agents["panes"] = []any{}
 	// The pass's detached checkout is still on the node at the reviewed head.
 	hub.detached = map[string]bool{"/repo/" + old.Label: true}
 	hub.wtHead = shaA

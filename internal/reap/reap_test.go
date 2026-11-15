@@ -344,20 +344,6 @@ func TestRegenerable(t *testing.T) {
 	}
 }
 
-func TestProtected(t *testing.T) {
-	globs := []string{"*-integrator", "director-*", "fleet-tooling-*", "consult-*", "cmd"}
-	for _, name := range []string{"at-integrator", "director-1", "fleet-tooling-2", "consult-g90", "cmd"} {
-		if !Protected(name, globs) {
-			t.Fatal(name)
-		}
-	}
-	for _, name := range []string{"mw-session-reap", "b2103-luna", "wk-7"} {
-		if Protected(name, globs) {
-			t.Fatal(name)
-		}
-	}
-}
-
 func TestComposerState(t *testing.T) {
 	claude := func(input string) string {
 		return "⏺ Done.\n\n────────────\n" + input + "\n────────────\n  ? for shortcuts\n"

@@ -209,6 +209,21 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			case outcome == "":
 				outcome = "removed"
 			}
+			// Like the real node, the fake refuses a removal while a pane
+			// uses the worktree: mergewake relies on that guard through the
+			// hub transport instead of closing the pane itself.
+			if outcome == "removed" {
+				cwd, _ := args["cwd"].(string)
+			loop:
+				for _, list := range []string{"agents", "panes"} {
+					for _, p := range h.agents[list].([]any) {
+						if c, _ := p.(map[string]any)["cwd"].(string); c == cwd || strings.HasPrefix(c, cwd+"/") {
+							outcome = "pane-in-use"
+							break loop
+						}
+					}
+				}
+			}
 			if h.dropRemoved && outcome == "removed" {
 				delete(h.detached, body["args"].(map[string]any)["cwd"].(string))
 			}
@@ -263,60 +278,44 @@ func TestReapPanewireKeepsPaneWithUnreadComposer(t *testing.T) {
 	if captures, closes := hub.ops("pane.capture"), hub.ops("pane.close"); len(captures)+len(closes) != 0 {
 		t.Fatalf("captured %v closed %v", captures, closes)
 	}
-	var kept, removed bool
+	var kept bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		kept = kept || row["action"] == "close-pane" && row["result"] == "skipped" && row["reason"] == "composer-unknown" && row["host"] == "node" && row["pane"] == "w1:p1"
-		removed = removed || row["action"] == "remove-worktree" && row["result"] == "removed"
+		kept = kept || row["action"] == "remove-worktree" && row["result"] == "skipped" && row["reason"] == "pane-in-use" && row["host"] == "node"
+		if row["action"] == "close-pane" {
+			t.Fatalf("close-pane row written: %v", reapLogRows(t, s, "example/project"))
+		}
 	}
-	if !kept || !removed {
+	if !kept {
 		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
 	}
-	removes := hub.ops("worktree.remove")
-	if len(removes) != 1 || len(removes[0]) != 5 || removes[0]["detached"] != false || removes[0]["cwd"] != "/repo.wt" || removes[0]["expect_head"] != headSHA || removes[0]["base"] != testRepo.Branch || removes[0]["regenerable"] == nil {
-		t.Fatalf("remove args: %#v", removes)
+	if removes := hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("removed a worktree still in use: %#v", removes)
 	}
 }
 
-func TestReapPanewireCodexComposerGuard(t *testing.T) {
-	for _, test := range []struct {
-		name, composer string
-		fail, close    bool
-	}{
-		{"empty", "empty", false, true},
-		{"draft", "has_text", false, false},
-		{"unknown", "unknown", false, false},
-		{"missing", "", false, false},
-		{"hub error", "empty", true, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+// The hub's composer is never read and no pane is ever captured or closed:
+// whatever it answers, the pane waits out panewire's own close.
+func TestReapPanewireNeverReadsComposerOrClosesPane(t *testing.T) {
+	for _, composer := range []string{"empty", "has_text", "unknown", ""} {
+		t.Run("composer="+composer, func(t *testing.T) {
 			hub := newFakeReapHub()
 			hub.agents["agents"].([]any)[0].(map[string]any)["agent"] = "codex"
-			hub.composer = map[string]any{"outcome": "read", "composer": test.composer}
-			if test.fail {
-				hub.forbid = map[string]bool{"pane.read": true}
-			}
+			hub.composer = map[string]any{"outcome": "read", "composer": composer}
 			r := &scriptRunner{}
 			s, _ := hubSvc(t, hub, r)
 			if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 				t.Fatal(err)
 			}
-			closes, captures := hub.ops("pane.close"), hub.ops("pane.capture")
-			want := 0
-			if test.close {
-				want = 1
-			}
-			if len(closes) != want || len(captures) != want || len(r.calls) != 0 {
-				t.Fatalf("closes=%v captures=%v local=%v", closes, captures, r.calls)
-			}
-			reads := hub.ops("pane.read")
-			if !test.fail && (len(reads) != 1 || reads[0]["tail_lines"] != float64(0) || reads[0]["name"] != "wk-7") {
-				t.Fatalf("read=%v", reads)
+			if closes, captures, reads := hub.ops("pane.close"), hub.ops("pane.capture"), hub.ops("pane.read"); len(closes)+len(captures)+len(reads) != 0 || len(r.calls) != 0 {
+				t.Fatalf("closes=%v captures=%v reads=%v local=%v", closes, captures, reads, r.calls)
 			}
 		})
 	}
 }
 
-func TestReapPanewireComposerErrorKeepsPaneAndContinues(t *testing.T) {
+// A forbidden composer read changes nothing: no pane is read or closed on any
+// host, and every worktree in use waits as pane-in-use.
+func TestReapPanewireUnreadableComposerKeepsPane(t *testing.T) {
 	hub := newFakeReapHub()
 	hub.forbid = map[string]bool{"pane.read": true}
 	r := &scriptRunner{outs: worktreeOuts("/repo"), fn: statAnswer("yes\n")}
@@ -324,21 +323,29 @@ func TestReapPanewireComposerErrorKeepsPaneAndContinues(t *testing.T) {
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(hub.ops("pane.capture"))+len(hub.ops("pane.close")) != 0 {
+	if len(hub.ops("pane.capture"))+len(hub.ops("pane.close"))+len(hub.ops("pane.read")) != 0 {
 		t.Fatal("acted on the pane with an unreadable composer")
 	}
-	if !r.called(key("herdr", "pane", "close", "w1:p1")) ||
-		!r.called(key("git", "-C", "/repo", "worktree", "remove", "/repo.wt")) ||
-		len(hub.ops("worktree.remove")) != 1 {
-		t.Fatalf("other pane or worktree cleanup skipped: local=%q hub=%v", r.calls, hub.ops("worktree.remove"))
+	if r.called(key("herdr", "pane", "close", "w1:p1")) || r.called("worktree\x00remove") {
+		t.Fatalf("acted while panes were in use: local=%q", r.calls)
 	}
 	for _, row := range reapLogRows(t, s, "example/project") {
-		if row["action"] == "close-pane" && row["host"] == "node" && row["pane"] == "w1:p1" &&
-			row["result"] == "skipped" && row["reason"] == reap.ComposerUnknown {
-			return
+		if row["result"] == "removed" || row["result"] == "would-remove" {
+			t.Fatalf("removed while panes were in use: %v", row)
 		}
 	}
-	t.Fatal("missing keep receipt for the unreadable composer")
+	kept := map[string]bool{}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["action"] == "close-pane" {
+			t.Fatalf("close-pane row written: %v", reapLogRows(t, s, "example/project"))
+		}
+		if row["action"] == "remove-worktree" && row["result"] == "skipped" && row["reason"] == "pane-in-use" {
+			kept[row["host"].(string)] = true
+		}
+	}
+	if !kept["node"] || !kept["local"] {
+		t.Fatalf("missing keep receipts: %v", reapLogRows(t, s, "example/project"))
+	}
 }
 
 func TestReapPanewireShadowNeverActs(t *testing.T) {
@@ -352,14 +359,17 @@ func TestReapPanewireShadowNeverActs(t *testing.T) {
 			t.Fatalf("shadow sent %s %v", op, sent)
 		}
 	}
-	var wouldRemove bool
+	var kept bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		wouldRemove = wouldRemove || row["action"] == "remove-worktree" && row["result"] == "would-remove"
+		kept = kept || row["action"] == "remove-worktree" && row["result"] == "skipped" && row["reason"] == "pane-in-use"
+		if row["result"] == "would-remove" {
+			t.Fatalf("shadow planned a removal for a worktree in use: %v", reapLogRows(t, s, "example/project"))
+		}
 	}
-	if !wouldRemove {
-		t.Fatalf("missing would-remove row: %v", reapLogRows(t, s, "example/project"))
+	if !kept {
+		t.Fatalf("missing kept row: %v", reapLogRows(t, s, "example/project"))
 	}
-	if !strings.Contains(out.String(), `"reason":"composer-unknown"`) {
+	if !strings.Contains(out.String(), `"reason":"pane-in-use"`) {
 		t.Fatal(out.String())
 	}
 }
@@ -394,8 +404,16 @@ func TestReapPanewireKeepsLocalHostLocal(t *testing.T) {
 			t.Fatalf("ssh used: %q", c)
 		}
 	}
-	if !r.called("herdr\x00agent\x00list") || len(hub.ops("pane.close")) != 0 || len(hub.ops("worktree.remove")) != 1 {
+	if !r.called("herdr\x00agent\x00list") || len(hub.ops("pane.close")) != 0 {
 		t.Fatalf("local calls %q hub closes %v", r.calls, hub.ops("pane.close"))
+	}
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["action"] == "remove-worktree" && row["host"] == "node" && (row["result"] != "skipped" || row["reason"] != "pane-in-use") {
+			t.Fatalf("node row: %v", row)
+		}
+		if row["action"] == "close-pane" {
+			t.Fatalf("close-pane row written: %v", row)
+		}
 	}
 }
 
@@ -460,7 +478,7 @@ func TestReapPanewireScopeForbiddenIsAnError(t *testing.T) {
 }
 
 // Under panewire a remote host is archived over no transport at all, even
-// when it also has an ssh destination: reap writes a skipped archive row and
+// when it also has an ssh destination: reap enumerates no job dirs there and
 // runs nothing locally or over ssh.
 func TestReapPanewireArchiveSkipsHubHostWithSSH(t *testing.T) {
 	hub := newFakeReapHub()
@@ -478,11 +496,9 @@ func TestReapPanewireArchiveSkipsHubHostWithSSH(t *testing.T) {
 	if len(r.calls) != 0 {
 		t.Fatalf("hub host reached over ssh or locally: %q", r.calls)
 	}
-	var skipped bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		skipped = skipped || row["action"] == "archive-job" && row["host"] == "node" && row["job"] == "wk-7" && row["result"] == "skipped" && row["reason"] == "archive-over-hub"
-	}
-	if !skipped {
-		t.Fatalf("receipts: %v", reapLogRows(t, s, "example/project"))
+		if row["action"] == "archive-job" {
+			t.Fatalf("hub host archived: %v", reapLogRows(t, s, "example/project"))
+		}
 	}
 }

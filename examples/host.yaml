@@ -80,17 +80,14 @@ discord:
 hosts:
   - {name: desk, jobs: ~/work/herdr-inbox/jobs}
   - {name: node, ssh: ops@node.example, jobs: /home/ops/herdr-inbox/jobs}
-# Close panes that worked on merged PRs (their report.md or last screen is
-# saved under jobs first), then remove the worktree and local branch after
-# worktree_after with no revert. Default protect list: *-integrator,
-# director-*, fleet-tooling-*, consult-*, cmd. Unnamed panes and panes outside
-# a linked worktree are always protected.
+# Panes are never closed here: panewire's node closes an ended job's pane, and
+# reap removes the worktree and local branch after worktree_after with no
+# revert, once no pane uses them anymore.
 reap:
   enabled: false
   act: false # reap's own acting opt-in; needs enabled, plus --apply or daemon
   worktree_after: 168h
   scan_after: 720h # merged-PR discovery window; older PRs arrive via receipts
-  protect: []
   regenerable: [] # gitignored paths safe to delete with a worktree (defaults:
   # .venv, node_modules, __pycache__, .pytest_cache, dist, build, target, obj,
   # bin, Library, Temp, Logs, UserSettings); anything else refuses removal

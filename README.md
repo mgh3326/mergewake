@@ -192,23 +192,18 @@ rules, and how to point the three channels.
 
 ## Reaping finished work
 
-With `reap.enabled`, the `reap` role closes the panes of merged work and
-cleans its worktrees. A merged PR carrying `Mergewake-Task` is reaped through
-its job — `Mergewake-Task` → hk task → bound job → the pane panewire recorded
-(host and label) — so a lead is found wherever it was launched, even in
-another repo's worktree. The lead closes only when the whole job is finished:
-no open PR in any configured repo carries the task, the pane is `idle` or
-`done`, its job dir exists, and its composer is empty. Its last screen is
-saved to `<job dir>/pane-screen.txt` (or a fresh `report.md` is kept), the
-pane closes, and mergewake runs `panewire done <job>`, so nobody has to tell the
-lead to finish. Protected labels, panes the operator has focused or that the
-job record does not name, panes without a job dir and panes with unsent
-composer text are never closed. A PR without the trailer keeps the worktree
-match. Every decision lands in `<state_dir>/<repo>/reap.jsonl`.
+With `reap.enabled`, the `reap` role cleans the worktrees of merged work. It
+never closes a pane: panewire's node closes an ended job's pane on pane-id +
+harness-session proof, so a worktree still in use simply waits until that
+close lands. A merged PR carrying `Mergewake-Task` is reaped through its job
+as well as its worktree — `Mergewake-Task` → hk task → bound job → the host
+and cwd panewire recorded — so a lead's worktree is found wherever it was
+launched, even in another repo's worktree. A PR without the trailer keeps the
+worktree match. Every decision lands in `<state_dir>/<repo>/reap.jsonl`.
 
 Enabling reap is the desk's call: run `mergewake reap --repo <repo> --dry-run`
-once per repo and compare the plan with the panes you expect to close, then
-set `reap.act: true`. Rollback is `reap.act: false`. See
+once per repo and compare the plan with the worktrees you expect to clean,
+then set `reap.act: true`. Rollback is `reap.act: false`. See
 [docs/config.md](docs/config.md#reap).
 
 ## Development

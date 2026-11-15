@@ -21,27 +21,29 @@ func newEndedFix(t *testing.T, state string) *stuckFix {
 	return f
 }
 
-// (a) A reviewer pane whose composer cannot be read closes on the first
-// sighting when its hk job record says the job is completed, and the close row
-// says why; (b) the same for a job the record says was lost. Neither waits for
-// the two-hour composer-unknown row.
-func TestReapReviewerEndedJobClosesUnreadablePaneAtOnce(t *testing.T) {
+// (a) A reviewer pane whose composer cannot be read is no longer read at all:
+// with the pane present the sweep keeps it for panewire's node to close,
+// however finished the hk job record says the job is. The close reason is
+// gone with the close.
+func TestReapReviewerEndedJobKeepsUnreadablePaneForNode(t *testing.T) {
 	for _, state := range []string{"completed", "lost"} {
 		t.Run(state, func(t *testing.T) {
 			f := newEndedFix(t, state)
 			f.passAfter(t, 0)
-			if f.closes() != 1 {
+			f.passAfter(t, 3*time.Hour)
+			if f.closes() != 0 {
 				t.Fatalf("closes=%d: %v", f.closes(), rowSummary(f.rows(t)))
 			}
 			rows := f.rows(t)
-			if len(rows) == 0 || rows[0].Label != f.label || rows[0].Pane != "w1:p5" || rows[0].Result != "closed" || rows[0].Reason != "composer-unknown-job-ended" {
+			if len(rows) != 1 || rows[0].Label != f.label || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
 				t.Fatalf("rows: %v", rowSummary(rows))
 			}
 		})
 	}
 }
 
-// A busy pane is never closed by that rule, however finished the job record is.
+// A busy pane is never touched by that rule either: it keeps the worktree
+// until panewire's node closes it.
 func TestReapReviewerEndedJobKeepsWorkingPane(t *testing.T) {
 	f := newEndedFix(t, "completed")
 	f.setPane("w1:p5", "agent_status", "working")
@@ -50,11 +52,14 @@ func TestReapReviewerEndedJobKeepsWorkingPane(t *testing.T) {
 	if f.closes() != 0 {
 		t.Fatalf("closes=%d: %v", f.closes(), rowSummary(f.rows(t)))
 	}
+	if rows := f.rows(t); len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
 }
 
-// (c) A reviewer pane whose job record still reads spawned keeps today's rule:
-// the pane waits for the two-hour composer-unknown row before it closes.
-func TestReapReviewerSpawnedJobKeepsUnreadablePaneUntilTwoHours(t *testing.T) {
+// (c) A reviewer pane whose job record still reads spawned is abandoned once
+// its review is over; the pane itself still waits for panewire's node.
+func TestReapReviewerSpawnedJobAbandonsJobButKeepsPane(t *testing.T) {
 	f := newEndedFix(t, "spawned")
 	merged := "2026-11-04T10:00:00Z"
 	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "closed", Merged: true, MergedAt: &merged, Head: github.Ref{SHA: headSHA}}}
@@ -63,11 +68,14 @@ func TestReapReviewerSpawnedJobKeepsUnreadablePaneUntilTwoHours(t *testing.T) {
 	f.passAfter(t, 0)
 	f.passAfter(t, 30*time.Minute)
 	if f.closes() != 0 {
-		t.Fatalf("closed before two idle hours: %v", rowSummary(f.rows(t)))
+		t.Fatalf("closed: %v", rowSummary(f.rows(t)))
 	}
-	f.passAfter(t, 2*time.Hour)
-	if f.closes() != 1 {
-		t.Fatalf("closes=%d: %v", f.closes(), rowSummary(f.rows(t)))
+	if n := len(f.jobCloses()); n != 1 {
+		t.Fatalf("job closes=%d: %v", n, rowSummary(f.rows(t)))
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[0].Result != "abandoned" || rows[1].Result != "kept" || rows[1].Reason != "pane-in-use" {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 }
 
@@ -116,13 +124,14 @@ func TestReapLostNonReviewerJobKeepsFinishedPane(t *testing.T) {
 	}
 }
 
-// (b) A lost reviewer job whose pane has an empty composer closes at once.
-func TestReapLostReviewerJobClosesEmptyPane(t *testing.T) {
+// (b) A lost reviewer job whose pane is still present keeps it for panewire's
+// node; an empty composer no longer closes anything.
+func TestReapLostReviewerJobKeepsPresentPane(t *testing.T) {
 	f := newEndedFix(t, "lost")
 	f.hub.composer = map[string]any{"outcome": "read", "composer": "empty"}
 	f.passAfter(t, 0)
 	rows := f.rows(t)
-	if f.closes() != 1 || len(rows) == 0 || rows[0].Result != "closed" {
-		t.Fatalf("closes=%d: %v", f.closes(), rowSummary(rows))
+	if f.closes() != 0 || len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "pane-in-use" {
+		t.Fatalf("closes=%d rows: %v", f.closes(), rowSummary(rows))
 	}
 }

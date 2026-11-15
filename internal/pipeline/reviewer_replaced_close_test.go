@@ -43,9 +43,10 @@ func laterSweep(t *testing.T, s *Service, r config.Repo, c *clock) {
 	_ = s.Review(context.Background(), r, 7, "anthropic", Options{})
 }
 
-// (a) A replaced pass's pane is force-closed in the same step as its job is
-// closed, though the pane's first close answers pane-changed.
-func TestReplacedPaneClosedInSameStep(t *testing.T) {
+// (a) A replaced pass's pane is left for panewire's node: the job is closed
+// in the same step, the pane stays listed, and the owed pane stays owed until
+// the pane is gone.
+func TestReplacedPaneOwedUntilNodeClosesIt(t *testing.T) {
 	for _, tt := range []struct{ name, status string }{
 		{"finished without a result", "done"},
 		{"running past the budget", "working"},
@@ -54,70 +55,52 @@ func TestReplacedPaneClosedInSameStep(t *testing.T) {
 			s, g, r, runner, c := interruptedReviewer(t)
 			old := readReviewerJob(t, s, r, 1)
 			hub := budgetPane(t, s, runner, old, tt.status)
-			hub.dropClosed = true
-			hub.close = map[string]any{"outcome": "closed"}
-			hub.closeOutcomes = []string{"pane-changed"}
 			runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
 			pastBudget(g, c)
 			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 				t.Fatal(err)
 			}
 			closedOnce(t, runner, old.Label)
-			if n := len(hub.agents["panes"].([]any)); n != 0 {
-				t.Fatalf("replaced pane still listed (%d panes), closes=%v", n, hub.ops("pane.close"))
+			if n := len(hub.agents["panes"].([]any)); n != 1 {
+				t.Fatalf("replaced pane gone without panewire closing it (%d panes), closes=%v", n, hub.ops("pane.close"))
+			}
+			if len(hub.ops("pane.close")) != 0 {
+				t.Fatalf("pane closed: %v", hub.ops("pane.close"))
+			}
+			m, owed := replacedMarker(t, s, r, old.Label)
+			if !owed || m.JobOpen || !m.PaneOpen {
+				t.Fatalf("want only the pane owed: marker=%+v owed=%v", m, owed)
 			}
 		})
 	}
 }
 
-// (a) A moved head's pane is force-closed with its job, not only the job.
-func TestReplacedPaneClosedOnMovedHead(t *testing.T) {
+// (a) A moved head's job is closed, but its pane is left for panewire's node.
+func TestReplacedPaneOwedOnMovedHead(t *testing.T) {
 	runner := &panewireRunner{family: "openai"}
 	old := integrations.JobRecord{State: "claimed", OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
 	s, _, r, labels := movedHeadSetup(t, runner, old)
 	hub := replacedHub(t, s, labels[0], "p1", "idle")
-	hub.dropClosed = true
-	hub.closeOutcomes = []string{"pane-changed"}
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	closes := hub.ops("pane.close")
-	if len(closes) == 0 || closes[0]["pane_id"] != "p1" || closes[0]["name"] != labels[0] {
-		t.Fatalf("pane closes=%v, want a close of %s's pane p1", closes, labels[0])
+	if closes := hub.ops("pane.close"); len(closes) != 0 {
+		t.Fatalf("pane closes=%v, want none", closes)
 	}
-	if n := len(hub.agents["panes"].([]any)); n != 0 {
-		t.Fatalf("moved head's pane still listed (%d panes), closes=%v", n, closes)
+	if n := len(hub.agents["panes"].([]any)); n != 1 {
+		t.Fatalf("moved head's pane gone without panewire closing it (%d)", n)
 	}
 	if len(runner.closes) != 2 {
 		t.Fatalf("job closes=%v, want both moved-head jobs closed", runner.closes)
 	}
-}
-
-// (b) A failed pane close is retried by the next reviewer sweep, which stops
-// once the pane is gone.
-func TestReplacedPaneCloseRetriedBySweep(t *testing.T) {
-	s, g, r, runner, c := interruptedReviewer(t)
-	old := readReviewerJob(t, s, r, 1)
-	hub := budgetPane(t, s, runner, old, "done")
-	hub.close = map[string]any{"outcome": "closed"}
-	hub.dropClosed = true
-	hub.closeFails = 1
-	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
-	pastBudget(g, c)
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(hub.agents["panes"].([]any)); n != 1 {
-		t.Fatalf("pane closed despite a failed close, panes=%d", n)
-	}
-	laterSweep(t, s, r, c)
-	if n := len(hub.agents["panes"].([]any)); n != 0 {
-		t.Fatalf("later sweep left the replaced pane, closes=%v", hub.ops("pane.close"))
+	m, owed := replacedMarker(t, s, r, labels[0])
+	if !owed || m.JobOpen || !m.PaneOpen {
+		t.Fatalf("want only the pane owed: marker=%+v owed=%v", m, owed)
 	}
 }
 
-// (b) A failed job close is retried by the next sweep even though the pane
-// closed in the same step.
+// (b) A failed job close is retried by the next sweep while the pane stays
+// owed to panewire's node.
 func TestReplacedJobCloseRetriedBySweep(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
@@ -169,8 +152,8 @@ func TestReplacedPaneGoneStopsRetry(t *testing.T) {
 	}
 }
 
-// (c) A live reviewer's pane keeps the recheck: a pane-changed answer keeps
-// it, with no replacement retry.
+// (c) A live reviewer's pane is never closed by the sweep: it waits out
+// panewire's node, with no replaced-close row.
 func TestLivePaneKeepsRecheck(t *testing.T) {
 	f := newReviewerFix(t)
 	label := reviewerLabelFor(12, time.Hour)
@@ -180,7 +163,7 @@ func TestLivePaneKeepsRecheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := f.rows(t)
-	if len(f.hub.ops("pane.close")) != 1 || len(rows) != 1 || rows[0].Reason != "pane close recheck: pane-changed" {
+	if len(f.hub.ops("pane.close")) != 0 || len(rows) != 1 || rows[0].Reason != "pane-in-use" {
 		t.Fatalf("closes=%v rows=%v", f.hub.ops("pane.close"), rowSummary(rows))
 	}
 	if n := len(auditRows(t, f.s, testRepo, "reviewer-replaced-close")); n != 0 {
@@ -261,14 +244,12 @@ func jobClosesOf(runner *panewireRunner, label string) int {
 }
 
 // (a) A job close that panewire refuses because the job already has a terminal
-// record has ended the job: it is not owed again, and the marker goes once the
-// pane is gone.
+// record has ended the job: it is not owed again, but the marker stays while
+// the pane lists — panewire's node still has to close it.
 func TestAlreadyClosedJobRefusalIsClosed(t *testing.T) {
 	s, g, r, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, r, 1)
-	hub := budgetPane(t, s, runner, old, "done")
-	hub.close = map[string]any{"outcome": "closed"}
-	hub.dropClosed = true
+	budgetPane(t, s, runner, old, "done")
 	runner.closeErrs = []error{
 		fmt.Errorf("hk unavailable"),
 		closeRefusal("close refused: job " + old.Label + " already has a terminal record (00002-job.revoked.json) after its latest claim"),
@@ -282,8 +263,8 @@ func TestAlreadyClosedJobRefusalIsClosed(t *testing.T) {
 		t.Fatalf("failed job close is not owed: marker=%+v owed=%v", m, owed)
 	}
 	laterSweep(t, s, r, c)
-	if m, owed := replacedMarker(t, s, r, old.Label); owed {
-		t.Fatalf("refused close still owed: marker=%+v", m)
+	if m, owed := replacedMarker(t, s, r, old.Label); !owed || m.JobOpen || !m.PaneOpen {
+		t.Fatalf("want only the pane owed after the refusal: marker=%+v owed=%v", m, owed)
 	}
 	before := jobClosesOf(runner, old.Label)
 	laterSweep(t, s, r, c)
@@ -322,52 +303,36 @@ func TestOtherCloseRefusalsStayOwed(t *testing.T) {
 }
 
 // (c) A terminal job of an older head holds no reservation: no job close is
-// sent, and its pane is still force-closed from the record's host and pane.
-func TestTerminalOldHeadClosesPaneOnly(t *testing.T) {
+// sent, and its pane is left for panewire's node — owed in the marker as
+// the pane alone until the pane is gone.
+func TestTerminalOldHeadLeavesPaneForNode(t *testing.T) {
 	for _, state := range []string{"completed", "lost"} {
 		t.Run(state, func(t *testing.T) {
 			runner := &panewireRunner{family: "openai"}
 			old := integrations.JobRecord{State: state, OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
 			s, _, r, labels := movedHeadSetup(t, runner, old)
 			hub := replacedHub(t, s, labels[0], "p1", "idle")
-			hub.dropClosed = true
-			hub.closeOutcomes = []string{"pane-changed"}
 			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 				t.Fatal(err)
 			}
 			if len(runner.closes) != 0 {
 				t.Fatalf("job closes=%v, want none for a %s job", runner.closes, state)
 			}
-			if n := len(hub.agents["panes"].([]any)); n != 0 {
-				t.Fatalf("%s job's old pane still listed (%d), closes=%v", state, n, hub.ops("pane.close"))
+			if n := len(hub.agents["panes"].([]any)); n != 1 {
+				t.Fatalf("%s job's old pane gone without panewire closing it (%d), closes=%v", state, n, hub.ops("pane.close"))
+			}
+			m, owed := replacedMarker(t, s, r, labels[0])
+			if !owed || m.JobOpen || !m.PaneOpen {
+				t.Fatalf("want only the pane owed: marker=%+v owed=%v", m, owed)
+			}
+			// Once panewire's node closes the pane, the marker goes with it.
+			hub.agents["agents"], hub.agents["panes"] = []any{}, []any{}
+			if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, owed := replacedMarker(t, s, r, labels[0]); owed {
+				t.Fatalf("marker still owed after its pane went")
 			}
 		})
-	}
-}
-
-// (c) A failed pane close of a terminal old-head job is owed in the marker as
-// the pane alone; the next sweep closes it.
-func TestTerminalOldHeadPaneCloseOwedInMarker(t *testing.T) {
-	runner := &panewireRunner{family: "openai"}
-	old := integrations.JobRecord{State: "completed", OwnerLane: "owner", Host: "node-a", PaneID: "p1"}
-	s, _, r, labels := movedHeadSetup(t, runner, old)
-	hub := replacedHub(t, s, labels[0], "p1", "idle")
-	hub.dropClosed = true
-	hub.closeFails = 1
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	m, owed := replacedMarker(t, s, r, labels[0])
-	if !owed || m.JobOpen || !m.PaneOpen {
-		t.Fatalf("want only the pane owed: marker=%+v owed=%v", m, owed)
-	}
-	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(hub.agents["panes"].([]any)); n != 0 {
-		t.Fatalf("later sweep left the old head's pane, closes=%v", hub.ops("pane.close"))
-	}
-	if _, owed := replacedMarker(t, s, r, labels[0]); owed {
-		t.Fatalf("marker still owed after its pane closed")
 	}
 }

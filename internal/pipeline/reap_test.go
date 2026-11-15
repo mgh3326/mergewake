@@ -120,7 +120,7 @@ func repoConfig(dir string) config.Config {
 		StateDir: dir,
 		Daemon:   config.Daemon{Act: true},
 		Hosts:    []reap.Host{{Name: "local", Jobs: "/jobs"}},
-		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", ScanAfter: "720h", Protect: []string{"*-integrator"}, Regenerable: config.DefaultReapRegenerable},
+		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", ScanAfter: "720h", Regenerable: config.DefaultReapRegenerable},
 		Repos:    []config.Repo{{Name: "example/project", Branch: "main"}},
 	}
 }
@@ -185,6 +185,14 @@ func worktreeOuts(cwd2 string) map[string]string {
 	}
 }
 
+// panegoneWorktreeOuts is worktreeOuts with an empty full pane list:
+// panewire's node already closed the pane, so worktree removal can proceed.
+func panegoneWorktreeOuts(cwd2 string) map[string]string {
+	outs := worktreeOuts(cwd2)
+	outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
+	return outs
+}
+
 func reapLogRows(t *testing.T, s *Service, repo string) []map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(s.reapLog(repo))
@@ -213,14 +221,20 @@ func seedWorktreeReceipt(t *testing.T, s *Service, repo, worktree string) {
 	}
 }
 
-func TestReapClosesPaneAndRemovesWorktree(t *testing.T) {
-	r := &scriptRunner{outs: worktreeOuts("/repo")}
+// A merged PR's idle worker pane is never closed: once the pane is gone the
+// worktree and its branch are removed, with no screen capture or composer
+// read. The pane list is empty here because panewire's node already closed
+// the pane; the agent list still names its worktree.
+func TestReapRemovesWorktreeWithoutClosingPane(t *testing.T) {
+	outs := worktreeOuts("/repo")
+	outs[key("herdr", "pane", "list")] = `{"result":{"panes":[]}}`
+	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if !r.called("herdr\x00pane\x00close\x00w1:p1") {
-		t.Fatal("pane never closed")
+	if r.called("herdr\x00pane\x00close") || r.called("herdr\x00pane\x00read") || r.called("pane\x00capture") {
+		t.Fatalf("pane touched: %q", r.calls)
 	}
 	if !r.called("git\x00-C\x00/repo\x00worktree\x00remove\x00/repo.wt") {
 		t.Fatal("worktree never removed")
@@ -233,32 +247,16 @@ func TestReapClosesPaneAndRemovesWorktree(t *testing.T) {
 			t.Fatal("forced mutation", c)
 		}
 	}
-	var closed, removed, deleted bool
+	var removed, deleted bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["result"] == "closed" && row["pane"] == "w1:p1" && row["saved"] == "/jobs/wk-7/report.md"
+		if row["action"] == "close-pane" {
+			t.Fatalf("close-pane row written: %v", row)
+		}
 		removed = removed || row["result"] == "removed"
 		deleted = deleted || row["result"] == "deleted"
 	}
-	if !closed || !removed || !deleted {
+	if !removed || !deleted {
 		t.Fatal("receipt log incomplete")
-	}
-}
-
-func TestReapCapturesScreenBeforeClose(t *testing.T) {
-	outs := worktreeOuts("/repo")
-	outs[key("sh", "-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-7/report.md")] = "no\n"
-	outs[key("sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", "/jobs/wk-7", "w1:p1")] = ""
-	r := &scriptRunner{outs: outs}
-	s := svc(t, &reapGH{}, r)
-	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	var closed bool
-	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["result"] == "closed" && row["saved"] == "/jobs/wk-7/pane-screen.txt"
-	}
-	if !closed {
-		t.Fatal("screen was not saved before close")
 	}
 }
 
@@ -275,7 +273,10 @@ func TestReapShadowAndDryRunMutateNothing(t *testing.T) {
 		if r.called("pane\x00close") || r.called("worktree\x00remove") || r.called("branch\x00-d") || r.called("herdr pane read") {
 			t.Fatalf("%s mutated", name)
 		}
-		if !strings.Contains(buf.String(), "would-close") || !strings.Contains(buf.String(), "would-remove") || !strings.Contains(buf.String(), "would-delete") {
+		if strings.Contains(buf.String(), "would-close") || strings.Contains(buf.String(), "would-remove") || strings.Contains(buf.String(), "would-delete") {
+			t.Fatalf("%s planned a removal for a worktree in use: %s", name, buf.String())
+		}
+		if !strings.Contains(buf.String(), `"reason":"pane-in-use"`) {
 			t.Fatalf("%s output: %s", name, buf.String())
 		}
 		if _, err := os.Stat(s.reapLog(c.Repos[0].Name)); o.DryRun != (err != nil) {
@@ -285,23 +286,23 @@ func TestReapShadowAndDryRunMutateNothing(t *testing.T) {
 }
 
 func TestReapGuards(t *testing.T) {
-	// pane2 sits in the same worktree but is still working: it must be
-	// skipped, which also leaves the worktree in use for cleanup.
+	// pane2 sits in the same worktree: whatever it is doing, the worktree is
+	// in use and waits out panewire's close. Nothing is ever closed.
 	outs := worktreeOuts("/repo.wt")
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	var sawWorking bool
+	if r.called("pane\x00close") {
+		t.Fatal("pane closed")
+	}
+	var inUse bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		sawWorking = sawWorking || row["result"] == "skipped" && row["reason"] == "status:working"
+		inUse = inUse || row["reason"] == "pane-in-use"
 	}
-	if !sawWorking {
-		t.Fatal("working pane not guarded")
-	}
-	if r.called("pane\x00close\x00w1:p2") {
-		t.Fatal("working pane closed")
+	if !inUse {
+		t.Fatal("in-use worktree not kept")
 	}
 }
 
@@ -324,7 +325,7 @@ func TestReapSkipsWorktreeInUse(t *testing.T) {
 }
 
 func TestReapSkipsUnpushedBranch(t *testing.T) {
-	r := &scriptRunner{outs: worktreeOuts("/repo"), errs: map[string]error{
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo"), errs: map[string]error{
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):            errors.New("exit 1"),
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "main"):                   errors.New("exit 1"),
 		key("git", "-C", "/repo", "rev-list", "--count", "--left-right", "wk/x...wk/x@{upstream}"): errors.New("no upstream"),
@@ -476,8 +477,8 @@ func (g *scanGH) MergedPulls(ctx context.Context, repo, branch string, since tim
 	return g.reapGH.MergedPulls(ctx, repo, branch, since)
 }
 
-func TestReapClosesOnlyIdleDone(t *testing.T) {
-	for _, st := range []string{"working", "blocked", "waiting", ""} {
+func TestReapPaneStatusNeverCloses(t *testing.T) {
+	for _, st := range []string{"working", "blocked", "waiting", "", "idle", "done"} {
 		outs := worktreeOuts("/repo")
 		outs[key("herdr", "agent", "list")] = `{"result":{"agents":[` +
 			`{"pane_id":"w1:p1","name":"wk-7","agent_status":"` + st + `","cwd":"/repo.wt"},` +
@@ -490,90 +491,49 @@ func TestReapClosesOnlyIdleDone(t *testing.T) {
 		if r.called("pane\x00close") {
 			t.Fatalf("status %q pane closed", st)
 		}
-		want := "status:" + st
-		if st == "" {
-			want = "status:unknown"
-		}
 		var saw bool
 		for _, row := range reapLogRows(t, s, "example/project") {
-			saw = saw || row["reason"] == want
+			saw = saw || row["reason"] == "pane-in-use"
 		}
 		if !saw {
-			t.Fatalf("status %q: no %s row", st, want)
+			t.Fatalf("status %q: no pane-in-use row", st)
 		}
-	}
-}
-
-func TestReapReverifiesBeforeClose(t *testing.T) {
-	agents, _ := paneJSON("/repo")
-	// The discovery list is a stale snapshot: re-read right before close and
-	// require the pane to be present and unchanged.
-	for name, second := range map[string]string{
-		"changed": strings.Replace(agents, `"idle"`, `"working"`, 1),
-		"gone":    `{"result":{"agents":[]}}`,
-	} {
-		r := &scriptRunner{outs: worktreeOuts("/repo"), queue: map[string][]string{
-			key("herdr", "agent", "list"): {agents, second},
-		}}
-		s := svc(t, &reapGH{}, r)
-		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-			t.Fatal(name, err)
-		}
-		if r.called("pane\x00close\x00w1:p1") {
-			t.Fatal(name, "stale pane closed")
-		}
-		want := "pane-" + name
-		var saw bool
-		for _, row := range reapLogRows(t, s, "example/project") {
-			saw = saw || row["reason"] == want
-		}
-		if !saw {
-			t.Fatalf("%s: no %s row", name, want)
-		}
-	}
-}
-
-func TestReapSkipsPaneWithoutJobDir(t *testing.T) {
-	outs := worktreeOuts("/repo")
-	outs[key("sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7")] = "no\n"
-	r := &scriptRunner{outs: outs}
-	s := svc(t, &reapGH{}, r)
-	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if r.called("pane\x00close") || r.called("report.md") || r.called("herdr pane read") {
-		t.Fatal("non-job pane touched")
-	}
-	var saw bool
-	for _, row := range reapLogRows(t, s, "example/project") {
-		saw = saw || row["reason"] == "not-a-job"
-	}
-	if !saw {
-		t.Fatal("not-a-job skip not recorded")
 	}
 }
 
 func TestReapRescansPanesBeforeRemoval(t *testing.T) {
-	_, panes := paneJSON("/repo")
-	// A worker spawned into the worktree after discovery must stop the removal.
+	// The pane list at discovery names no pane in the worktree; a worker
+	// spawned into it before the removal re-check must stop the removal.
+	// The receipt-seeded candidate names the worktree, as a legacy close-pane
+	// row still does.
+	noPane := `{"result":{"panes":[{"pane_id":"w1:p2","cwd":"/repo"}]}}`
 	fresh := `{"result":{"panes":[{"pane_id":"w1:p2","cwd":"/repo"},{"pane_id":"w1:p3","cwd":"/repo.wt"}]}}`
-	r := &scriptRunner{outs: worktreeOuts("/repo"), queue: map[string][]string{
-		key("herdr", "pane", "list"): {panes, fresh},
+	outs := worktreeOuts("/repo")
+	outs[key("herdr", "agent", "list")] = `{"result":{"agents":[{"pane_id":"w1:p2","agent_status":"working","cwd":"/repo"}]}}`
+	outs[key("herdr", "pane", "list")] = noPane
+	r := &scriptRunner{outs: outs, queue: map[string][]string{
+		key("herdr", "pane", "list"): {noPane, fresh},
 	}}
 	s := svc(t, &reapGH{}, r)
+	seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if r.called("worktree\x00remove") {
 		t.Fatal("worktree removed under a fresh pane")
 	}
-	var closed, inUse bool
+	var inUse, newClose bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["result"] == "closed"
+		// The seeded legacy close-pane row names the candidate worktree; no
+		// new close-pane row may follow it.
+		newClose = newClose || row["action"] == "close-pane" && row["result"] != "closed"
 		inUse = inUse || row["action"] == "remove-worktree" && row["reason"] == "pane-in-use"
 	}
-	if !closed || !inUse {
-		t.Fatal("expected pane closed and fresh-pane removal skip")
+	if newClose {
+		t.Fatal("new close-pane row written")
+	}
+	if !inUse {
+		t.Fatal("expected fresh-pane removal skip")
 	}
 }
 
@@ -665,7 +625,7 @@ func TestReapNoCandidateNoRows(t *testing.T) {
 }
 
 func TestReapResolvesMergeCommit(t *testing.T) {
-	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, &listNoSHAGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -674,7 +634,7 @@ func TestReapResolvesMergeCommit(t *testing.T) {
 		t.Fatal("merge_commit_sha was not resolved via the single-PR endpoint")
 	}
 
-	r = &scriptRunner{outs: worktreeOuts("/repo")}
+	r = &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s = svc(t, &stillNoSHAGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -767,7 +727,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 		t.Fatalf("no ETag replay to exercise: conditional=%d err=%v", conditional.Load(), err)
 	}
 
-	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -854,7 +814,7 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 	}
 	primed.Store(true)
 
-	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
@@ -884,10 +844,10 @@ func TestReapScanAfterBound(t *testing.T) {
 }
 
 func TestReapFetchErrorPerPR(t *testing.T) {
-	r := &scriptRunner{outs: worktreeOuts("/repo")}
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, &failPullGH{}, r)
-	// PR 77 still has pending work (closed pane, no remove row): the fetch is
-	// attempted, fails, and only that PR is lost this pass.
+	// PR 77 still has pending work (a legacy close row, no remove row): the
+	// fetch is attempted, fails, and only that PR is lost this pass.
 	seedReapRows(t, s, "example/project",
 		reapReceipt{Action: "close-pane", Repo: "example/project", PR: 77, Host: "local", Worktree: "/stale.wt", Result: "closed"},
 	)
@@ -895,17 +855,17 @@ func TestReapFetchErrorPerPR(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "77") {
 		t.Fatalf("expected per-PR error, got %v", err)
 	}
-	var closed bool
+	var removed bool
 	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["result"] == "closed" && row["pr"] == 12.0
+		removed = removed || row["result"] == "removed" && row["pr"] == 12.0
 	}
-	if !closed {
+	if !removed {
 		t.Fatal("PR 12 not processed after PR 77 fetch error")
 	}
 }
 
 func TestReapRemovesWithRegenerableIgnored(t *testing.T) {
-	outs := worktreeOuts("/repo")
+	outs := panegoneWorktreeOuts("/repo")
 	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .venv/\n!! node_modules/\n!! dist/\n"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
@@ -947,26 +907,6 @@ func TestReapSkipsIgnoredFiles(t *testing.T) {
 	}
 }
 
-func TestReapStaleReportCapturesScreen(t *testing.T) {
-	outs := worktreeOuts("/repo")
-	outs[key("sh", "-c", `herdr pane read "$2" > "$1/pane-screen.txt"`, "sh", "/jobs/wk-7", "w1:p1")] = ""
-	r := &scriptRunner{outs: outs, fn: statAnswer("no\n")}
-	s := svc(t, &reapGH{}, r)
-	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if !r.called("herdr pane read") {
-		t.Fatal("stale report not replaced by a screen capture")
-	}
-	var closed bool
-	for _, row := range reapLogRows(t, s, "example/project") {
-		closed = closed || row["result"] == "closed" && row["saved"] == "/jobs/wk-7/pane-screen.txt"
-	}
-	if !closed {
-		t.Fatal("close should save the screen, not trust a pre-merge report")
-	}
-}
-
 func TestReapActGate(t *testing.T) {
 	r := &scriptRunner{outs: worktreeOuts("/repo"), fn: statAnswer("yes\n")}
 	c := repoConfig(t.TempDir())
@@ -979,7 +919,10 @@ func TestReapActGate(t *testing.T) {
 	if r.called("pane\x00close") || r.called("worktree\x00remove") || r.called("branch\x00-d") || r.called("herdr pane read") {
 		t.Fatal("reap acted without reap.act")
 	}
-	if !strings.Contains(buf.String(), "would-close") || !strings.Contains(buf.String(), "would-remove") {
+	if strings.Contains(buf.String(), "would-close") || strings.Contains(buf.String(), "would-remove") {
+		t.Fatalf("reap.act off should not plan removals for a worktree in use: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `"reason":"pane-in-use"`) {
 		t.Fatalf("reap.act off should stay observational: %s", buf.String())
 	}
 }

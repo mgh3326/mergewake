@@ -16,11 +16,10 @@ import (
 )
 
 // cleanupOpts shape one review pass whose reviewer pane lands on node-a, the
-// hub's machine, in /repo/<label>. The zero value is a terminal pass with an
-// empty composer and a live pane named for its label.
+// hub's machine, in /repo/<label>. The zero value is a terminal pass with a
+// live pane named for its label.
 type cleanupOpts struct {
 	paneName         func(label string) string // the live pane's name; default is the label
-	composer         string                    // pane.read's composer answer; default "empty"
 	removeOutcome    string                    // worktree.remove's answer; default "removed"
 	forbid           []string                  // hub ops answered 403
 	waitTimeout      bool                      // the spawn's --wait timed out after its pane started
@@ -31,8 +30,7 @@ type cleanupOpts struct {
 	expireAfterSpawn bool                      // the review context expires once the spawn returns
 	spawnOut         string                    // the spawn's whole stdout, replacing the OK line
 	unnamedPanes     bool                      // the full pane list carries no names, as on a hub node
-	paneListStatus   string                    // the full pane list's agent_status when unnamedPanes; "idle" when empty
-	agentStatus      string                    // the agent list's agent_status; "idle" when empty
+	gonePane         bool                      // panewire's node already closed the pane: no pane lists on the host
 }
 
 type cleanupResult struct {
@@ -50,11 +48,6 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
 	hub := newFakeReapHub()
-	composer := o.composer
-	if composer == "" {
-		composer = "empty"
-	}
-	hub.composer = map[string]any{"outcome": "read", "composer": composer}
 	hub.removeOutcome = o.removeOutcome
 	hub.forbid = map[string]bool{}
 	for _, op := range o.forbid {
@@ -95,22 +88,20 @@ func runReviewerCleanup(t *testing.T, o cleanupOpts) cleanupResult {
 			job.Host, job.PaneID, job.Cwd = "", "", ""
 		}
 		runner.sink.jobs[label] = job
-		pane := map[string]any{"pane_id": "w1:p1", "name": name, "agent_status": "idle", "agent": "claude", "cwd": cwd}
-		hub.agents["agents"] = []any{pane}
-		hub.agents["panes"] = []any{pane}
-		if o.unnamedPanes {
-			// A hub node's full pane list comes from herdr's pane list,
-			// which carries no names; only the agent list names panes.
-			status := "idle"
-			if o.paneListStatus != "" {
-				status = o.paneListStatus
+		if o.gonePane {
+			// Panewire's node already closed the pane: nothing lists on the host.
+			hub.agents["agents"] = []any{}
+			hub.agents["panes"] = []any{}
+		} else {
+			pane := map[string]any{"pane_id": "w1:p1", "name": name, "agent_status": "idle", "agent": "claude", "cwd": cwd}
+			hub.agents["agents"] = []any{pane}
+			hub.agents["panes"] = []any{pane}
+			if o.unnamedPanes {
+				// A hub node's full pane list comes from herdr's pane list,
+				// which carries no names; only the agent list names panes.
+				hub.agents["panes"] = []any{map[string]any{"pane_id": "w1:p1", "cwd": cwd}}
 			}
-			hub.agents["panes"] = []any{map[string]any{"pane_id": "w1:p1", "name": nil, "agent_status": status, "cwd": cwd}}
 		}
-		if o.agentStatus != "" {
-			pane["agent_status"] = o.agentStatus
-		}
-		// Reviewer checkouts are detached, as on a real node.
 		hub.detached = map[string]bool{cwd: true}
 		if o.expireAfterSpawn {
 			cancel()
@@ -185,99 +176,86 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-func TestReviewerCleanupClosesThenRemovesWithReceipt(t *testing.T) {
+func TestReviewerCleanupKeepsRemoteWorktreeWhilePanePresent(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{})
 	if res.err != nil || res.out.executor != "panewire" {
 		t.Fatalf("outcome=%+v error=%v", res.out, res.err)
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+	// The pane lists, so no pane or remote worktree op runs; the local
+	// checkout mirror, which the pane never uses, is still released.
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("a present pane was touched: hub ops = %v", res.hubOps())
+	}
+	removed := false
+	for _, call := range gitCalls(res.runner, res.repo.Root) {
+		removed = removed || strings.Contains(call, "worktree remove")
+	}
+	if !removed {
+		t.Fatalf("the local mirror was kept: git %v", gitCalls(res.runner, res.repo.Root))
+	}
+	receipts := res.receipts(t)
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || !strings.Contains(receipts[0].Reason, "pane still present") {
+		t.Fatalf("receipts = %+v", receipts)
+	}
+	audits := res.audits(t)
+	if len(audits) != 1 || audits[0]["result"] != "pending-cleanup" || audits[0]["pane"] != "w1:p1" || audits[0]["head"] != headSHA || audits[0]["pass"] != float64(1) || audits[0]["pr"] != float64(7) {
+		t.Fatalf("audits = %+v", audits)
+	}
+}
+
+// Once panewire's node has closed the pane, the pass removes its remote
+// detached worktree through the hub's guarded removal and releases the local
+// checkout mirror.
+func TestReviewerCleanupRemovesWorktreeOncePaneGone(t *testing.T) {
+	res := runReviewerCleanup(t, cleanupOpts{gonePane: true})
+	if res.err != nil || res.out.executor != "panewire" {
+		t.Fatalf("outcome=%+v error=%v", res.out, res.err)
+	}
+	if want := []string{"worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
 		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
 	}
 	receipts := res.receipts(t)
 	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || !strings.HasPrefix(receipts[0].Worktree, "/repo/") {
 		t.Fatalf("receipts = %+v", receipts)
 	}
-	audits := res.audits(t)
-	if len(audits) != 1 || audits[0]["result"] != "removed" || audits[0]["pane"] != "w1:p1" || audits[0]["head"] != headSHA || audits[0]["pass"] != float64(1) || audits[0]["pr"] != float64(7) {
-		t.Fatalf("audits = %+v", audits)
+	removed := false
+	for _, call := range gitCalls(res.runner, res.repo.Root) {
+		removed = removed || strings.Contains(call, "worktree remove")
+	}
+	if !removed {
+		t.Fatalf("the checkout mirror was kept after the pane went: git %v", gitCalls(res.runner, res.repo.Root))
 	}
 }
 
 // A spawn the hub coordinator placed reports a SPAWNED line, not an OK line.
-// Its host and pane are the placement, so the pass closes the pane and removes
-// its worktree instead of keeping both as pending-cleanup.
+// Its host and pane are the placement, so a present pane keeps its checkout
+// as pending-cleanup.
 func TestReviewerCleanupReadsHubSpawnedReceipt(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{spawnOut: "ACCEPTED job=l request=r1\nSPAWNED job=l host=node-a profile=seat-y pane=w1:p1\nwait job=l outcome=completed report= pane=\n"})
 	if res.err != nil || res.out.executor != "panewire" || res.out.reviewer != "panewire:seat-y" {
 		t.Fatalf("outcome=%+v error=%v", res.out, res.err)
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("a present pane was touched: hub ops = %v", res.hubOps())
 	}
 	receipts := res.receipts(t)
-	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || receipts[0].Host != "node-a" {
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || receipts[0].Pane != "w1:p1" || receipts[0].Host != "node-a" {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 }
 
-// On a hub node the full pane list has no names. The pass takes the name from
-// the agent list for the same pane id and cwd, and closes the pane.
+// On a hub node the full pane list has no names. Presence is by pane id, so
+// a present pane still keeps its checkout.
 func TestReviewerCleanupNamesPaneFromAgentList(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("a present pane was touched: hub ops = %v", res.hubOps())
 	}
-	if r := res.receipts(t); len(r) != 1 || r[0].Result != "removed" {
+	if r := res.receipts(t); len(r) != 1 || r[0].Result != "pending-cleanup" {
 		t.Fatalf("receipts = %+v", r)
-	}
-}
-
-// The full pane list's status need not be the agent's: the close sends the
-// agent list's status, which the hub accepts.
-func TestReviewerCleanupTakesStatusFromAgentList(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, paneListStatus: "unknown", agentStatus: "done"})
-	if res.err != nil {
-		t.Fatalf("error=%v", res.err)
-	}
-	closes := res.hub.ops("pane.close")
-	if len(closes) != 1 || closes[0]["agent_status"] != "done" {
-		t.Fatalf("pane.close = %v", closes)
-	}
-	if r := res.receipts(t); len(r) != 1 || r[0].Result != "removed" {
-		t.Fatalf("receipts = %+v", r)
-	}
-}
-
-// An agent still working is not sent to the hub's close, which would refuse it.
-func TestReviewerCleanupKeepsWorkingPane(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, agentStatus: "working"})
-	if res.err != nil {
-		t.Fatalf("error=%v", res.err)
-	}
-	if len(res.hub.ops("pane.close")) != 0 || len(res.hub.ops("worktree.remove")) != 0 {
-		t.Fatalf("a working pane was closed: %v", res.hubOps())
-	}
-	if r := res.receipts(t); len(r) != 1 || r[0].Result != "kept" || !strings.Contains(r[0].Reason, "working") {
-		t.Fatalf("receipts = %+v", r)
-	}
-}
-
-// An agent entry with another name for the pane id still refuses the close.
-func TestReviewerCleanupUnnamedPaneWithOtherAgentNameIsKept(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{unnamedPanes: true, paneName: func(string) string { return "mw-author" }})
-	if res.err != nil {
-		t.Fatalf("error=%v", res.err)
-	}
-	if r := res.receipts(t); len(r) != 1 || r[0].Result != "kept" || r[0].Reason != "pane name/cwd mismatch" {
-		t.Fatalf("receipts = %+v", r)
-	}
-	for _, op := range res.hubOps() {
-		if op == "pane.close" || op == "worktree.remove" {
-			t.Fatalf("a mismatched pane was touched: %v", res.hubOps())
-		}
 	}
 }
 
@@ -301,22 +279,10 @@ func TestSpawnedPlacement(t *testing.T) {
 	}
 }
 
-func TestReviewerCleanupKeepsPaneWithComposerText(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{composer: "has_text"})
-	if res.err != nil {
-		t.Fatalf("error=%v", res.err)
-	}
-	if want := []string{"pane.read"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
-	}
-	receipts := res.receipts(t)
-	if len(receipts) != 1 || receipts[0].Result != "kept" || !strings.Contains(receipts[0].Reason, "composer") {
-		t.Fatalf("receipts = %+v", receipts)
-	}
-}
-
 func TestReviewerCleanupKeepsPaneOnIdentityMismatch(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{paneName: func(string) string { return "someone-else" }})
+	// Presence is by pane id: a pane under another name is still running, so
+	// the checkout stays for panewire's node to close it.
+	res := runReviewerCleanup(t, cleanupOpts{paneName: func(string) string { return "someone-else" }, gonePane: false})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
@@ -324,7 +290,7 @@ func TestReviewerCleanupKeepsPaneOnIdentityMismatch(t *testing.T) {
 		t.Fatalf("a mismatched pane was touched: hub ops = %v", res.hubOps())
 	}
 	receipts := res.receipts(t)
-	if len(receipts) != 1 || receipts[0].Result != "kept" || receipts[0].Reason != "pane name/cwd mismatch" {
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || !strings.Contains(receipts[0].Reason, "pane still present") {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 }
@@ -334,24 +300,23 @@ func TestReviewerCleanupRunsAfterExpiredReviewContext(t *testing.T) {
 	if res.ctx.Err() == nil {
 		t.Fatal("the review context did not expire")
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("a present pane was touched: hub ops = %v", res.hubOps())
 	}
-	if receipts := res.receipts(t); len(receipts) != 1 || receipts[0].Result != "removed" {
+	if receipts := res.receipts(t); len(receipts) != 1 || receipts[0].Result != "pending-cleanup" {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 }
 
 func TestReviewerCleanupRecordsHubErrorInReceipt(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{forbid: []string{"pane.close"}})
+	res := runReviewerCleanup(t, cleanupOpts{gonePane: true, forbid: []string{"worktree.inspect"}})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
-	if want := []string{"pane.read"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
-	}
+	// A forbidden inspect is answered 403, which the fake does not record as
+	// a command; the error lands in the receipt either way.
 	receipts := res.receipts(t)
-	if len(receipts) != 1 || receipts[0].Result != "error" || !strings.Contains(receipts[0].Reason, "pane close") {
+	if len(receipts) != 1 || receipts[0].Result != "error" || !strings.Contains(receipts[0].Reason, "worktree inspect") {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 	if audits := res.audits(t); len(audits) != 1 || audits[0]["result"] != "error" {
@@ -360,11 +325,11 @@ func TestReviewerCleanupRecordsHubErrorInReceipt(t *testing.T) {
 }
 
 func TestReviewerCleanupRecordsRefusedRemovalAsPending(t *testing.T) {
-	res := runReviewerCleanup(t, cleanupOpts{removeOutcome: "detached"})
+	res := runReviewerCleanup(t, cleanupOpts{gonePane: true, removeOutcome: "detached"})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
+	if want := []string{"worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
 		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
 	}
 	receipts := res.receipts(t)
@@ -445,18 +410,18 @@ func TestReviewerCleanupKeepsCheckoutWhenPlacementUnconfirmed(t *testing.T) {
 }
 
 // A spawn whose placement receipt came late still ran: when the completed job
-// record names the host and pane, the pass cleans up as if the spawn had named
-// them.
+// record names the host and pane, the pass treats the pane as present and
+// keeps its checkout as if the spawn had named them.
 func TestReviewerCleanupResolvesUnconfirmedPlacementFromJobRecord(t *testing.T) {
 	res := runReviewerCleanup(t, cleanupOpts{noPlacement: true})
 	if res.err != nil {
 		t.Fatalf("error=%v", res.err)
 	}
-	if want := []string{"pane.read", "pane.close", "worktree.inspect", "worktree.remove"}; !equalStrings(res.hubOps(), want) {
-		t.Fatalf("hub ops = %v, want %v", res.hubOps(), want)
+	if len(res.hubOps()) != 0 {
+		t.Fatalf("a present pane was touched: hub ops = %v", res.hubOps())
 	}
 	receipts := res.receipts(t)
-	if len(receipts) != 1 || receipts[0].Result != "removed" || receipts[0].Pane != "w1:p1" || !strings.HasPrefix(receipts[0].Worktree, "/repo/") {
+	if len(receipts) != 1 || receipts[0].Result != "pending-cleanup" || receipts[0].Pane != "w1:p1" || !strings.Contains(receipts[0].Reason, "pane still present") {
 		t.Fatalf("receipts = %+v", receipts)
 	}
 }
