@@ -199,11 +199,9 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.timeout: %w", e)}
 	}
-	stuckAfter := 6 * time.Hour
-	if v := s.Config.Review.Panewire.StuckAfter; v != "" {
-		if stuckAfter, e = config.Duration(v); e != nil {
-			return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
-		}
+	stuckAfter, e := reviewerStuckAfter(s.Config)
+	if e != nil {
+		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
 	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}}
 	w.jobs, _ = s.Sink.(reapJobs)
@@ -323,6 +321,16 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 	}
 	return w.errs
+}
+
+// reviewerStuckAfter is review.panewire.stuck_after: how old a claimed or
+// spawned reviewer job with no result may get before it counts as stuck. Six
+// hours when unset.
+func reviewerStuckAfter(c config.Config) (time.Duration, error) {
+	if v := c.Review.Panewire.StuckAfter; v != "" {
+		return config.Duration(v)
+	}
+	return 6 * time.Hour, nil
 }
 
 // remember records a remote path a receipt named for a label on a host; only
