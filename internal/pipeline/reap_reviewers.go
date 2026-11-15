@@ -37,6 +37,11 @@ import (
 // applies to reviewer jobs only. A reviewer job that never left spawned, whose
 // pane is idle and whose PR is closed or past the reviewed head, still has its
 // job closed abandoned first (abandonSpawned); its pane is left for the node.
+// A job still claimed or spawned with no result past review.panewire.stuck_after
+// is treated the same way once its pane is proven gone (abandonStuck): panewire's
+// node ends only finished records, so without the fallback its worktrees and its
+// hk record would wait forever. While its pane is still present the label is
+// marked stuck-reviewer once and everything waits.
 
 var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
 
@@ -146,15 +151,16 @@ func reviewerLabelOf(v reapReceipt) string {
 }
 
 type reviewerSweep struct {
-	s      *Service
-	r      config.Repo
-	hosts  []*reapHost
-	acting bool
-	now    time.Time
-	settle time.Duration // review.timeout + 1m: a younger label's pass may still run
-	jobs   reapJobs
-	note   func(reapReceipt)
-	errs   []error
+	s          *Service
+	r          config.Repo
+	hosts      []*reapHost
+	acting     bool
+	now        time.Time
+	settle     time.Duration // review.timeout + 1m: a younger label's pass may still run
+	stuckAfter time.Duration // review.panewire.stuck_after: a claimed/spawned job this old with no result is treated as ended once its pane is gone
+	jobs       reapJobs
+	note       func(reapReceipt)
+	errs       []error
 	// streams is the newest reviewer-reap row per label and stream, as the
 	// receipts stood when the pass started.
 	streams map[string]map[string]reapReceipt
@@ -166,6 +172,10 @@ type reviewerSweep struct {
 	// still reads spawned until panewire's sweep ends the job (then lost), so
 	// this receipt, not the record, stops a second abandon.
 	abandoned map[string]bool
+	// stuck names labels already marked stuck-reviewer: a reviewer job past
+	// the stuck bound whose pane is still present. The mark is written once;
+	// the label keeps being revisited for the pane or the fallback.
+	stuck map[string]bool
 	// pulls memoises the PR reads of one pass; a failed read is not kept.
 	pulls map[int]github.Pull
 }
@@ -189,7 +199,13 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.timeout: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, pulls: map[int]github.Pull{}}
+	stuckAfter := 6 * time.Hour
+	if v := s.Config.Review.Panewire.StuckAfter; v != "" {
+		if stuckAfter, e = config.Duration(v); e != nil {
+			return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
+		}
+	}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}}
 	w.jobs, _ = s.Sink.(reapJobs)
 	for _, hs := range hosts {
 		if hs.host.Local() && w.local == nil {
@@ -203,6 +219,9 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		case "reviewer-reap":
 			if rec.Result == "abandoned" {
 				w.abandoned[rec.Label] = true
+			}
+			if rec.Result == "stuck-reviewer" {
+				w.stuck[rec.Label] = true
 			}
 			if w.streams[rec.Label] == nil {
 				w.streams[rec.Label] = map[string]reapReceipt{}
@@ -383,11 +402,36 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	// no longer matter; its pane is left for panewire's node to close, and the
 	// worktree cleanup below runs once no pane uses it.
 	reaped := job.State == "completed"
+	stuck := w.stuckJob(job, l)
 	if job.State == "spawned" && job.Role == "reviewer" && c.pane != nil && !w.abandoned[l.name] {
 		if !w.abandonSpawned(ctx, c, gate, job) {
+			if stuck {
+				w.noteStuck(gate, l, job)
+			}
 			return
 		}
 		reaped = true
+	}
+	if stuck && !reaped {
+		switch {
+		case !unused:
+			// The pane is still there: panewire's node owns its close and
+			// the worktrees wait for it. The label is marked once so the
+			// owner sees it.
+			w.noteStuck(gate, l, job)
+			return
+		case !w.stuckPaneGone(job):
+			// No pane carries the label, but the job's own pane still
+			// lists: same mark, same wait.
+			w.noteStuck(gate, l, job)
+			return
+		case !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l):
+			return
+		default:
+			// The job can never report: treat it as ended for the cleanup
+			// below, the same as a finished record.
+			reaped = true
+		}
 	}
 	held := !reaped && !w.abandoned[l.name]
 	// A lost reviewer job cannot be holding anyone's work either: its pane is
@@ -509,6 +553,101 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	default:
 		return keep()
 	}
+	if !w.acting {
+		w.record(gate, "would-abandon", reason)
+		return true
+	}
+	if job.OwnerLane == "" {
+		w.record(gate, "error", "abandon job: owner lane unavailable")
+		return false
+	}
+	cmd := w.s.Config.Review.Panewire.Command
+	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
+	if _, e := w.s.Runner.Run(ctx, cmd, argv, "", ""); e != nil {
+		w.record(gate, "error", "abandon job: "+e.Error())
+		return false
+	}
+	w.abandoned[l.name] = true
+	w.record(gate, "abandoned", reason)
+	return true
+}
+
+// stuckJob reports whether job is a reviewer job that never left claimed or
+// spawned, carries no result, and is older than the stuck bound: panewire's
+// node ends only jobs whose record finished, so such a job's pane and
+// worktrees would otherwise wait forever.
+func (w *reviewerSweep) stuckJob(job integrations.JobRecord, l reviewerLabel) bool {
+	if job.State != "spawned" && job.State != "claimed" {
+		return false
+	}
+	return len(job.Result) == 0 && reviewerReapRole(job.Role) && !l.started.Add(w.stuckAfter).After(w.now)
+}
+
+// noteStuck marks a stuck reviewer once per label: its job is past the stuck
+// bound with no result and its pane is still present, so the owner can see
+// it. The pane is left for panewire's node and the worktrees keep waiting;
+// the row is not terminal, so the label stays a candidate.
+func (w *reviewerSweep) noteStuck(gate reapReceipt, l reviewerLabel, job integrations.JobRecord) {
+	if w.stuck[l.name] {
+		return
+	}
+	w.stuck[l.name] = true
+	w.record(gate, "stuck-reviewer", fmt.Sprintf("job %s with no result for %s; pane left for panewire's node", job.State, w.now.Sub(l.started).Round(time.Minute)))
+}
+
+// stuckPaneGone reports whether the job's recorded pane is absent from the
+// pane lists of the host the job names — every scanned host when it names
+// none. A host that failed its scan, or a named host that is not configured,
+// cannot prove the pane is gone.
+func (w *reviewerSweep) stuckPaneGone(job integrations.JobRecord) bool {
+	if job.PaneID == "" {
+		return true
+	}
+	hosts := w.hosts
+	if w.local != nil {
+		found := false
+		for _, hs := range hosts {
+			if hs == w.local {
+				found = true
+				break
+			}
+		}
+		if !found {
+			hosts = append(append([]*reapHost{}, hosts...), w.local)
+		}
+	}
+	var targets []*reapHost
+	for _, hs := range hosts {
+		if job.Host != "" && hs.host.Name != job.Host && hs.host.MachineID() != job.Host {
+			continue
+		}
+		targets = append(targets, hs)
+	}
+	if job.Host != "" && len(targets) == 0 {
+		return false
+	}
+	for _, hs := range targets {
+		if hs.failed || hs.usageUnknown {
+			return false
+		}
+		for _, list := range [][]reap.Pane{hs.panes, hs.all} {
+			for _, p := range list {
+				if p.ID == job.PaneID {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// abandonStuck closes a reviewer job that is still claimed or spawned, has no
+// result and is past the stuck bound once its pane is proven gone: the job
+// can never report, so the close is what lets panewire's sweep end the
+// record and the archive finish. It reports whether the sweep may go on to
+// the worktrees.
+func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job integrations.JobRecord, l reviewerLabel) bool {
+	reason := fmt.Sprintf("stuck reviewer job %s with no result for %s and no pane", job.State, w.now.Sub(l.started).Round(time.Minute))
 	if !w.acting {
 		w.record(gate, "would-abandon", reason)
 		return true

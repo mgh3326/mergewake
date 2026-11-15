@@ -156,7 +156,7 @@ func reviewerDayCounts(receipts []reapReceipt, hosts []*reapHost, host string, d
 			continue
 		case "removed":
 			st.removed = true
-		case "kept", "pending-cleanup":
+		case "kept", "pending-cleanup", "stuck-reviewer":
 			st.kept = true
 			st.reason = v.Reason
 		}
