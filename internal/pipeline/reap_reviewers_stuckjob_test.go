@@ -7,14 +7,15 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // stuckJobFix is a reviewer spawned at the given label age whose hk record
 // still reads spawned with no result. The PR stays open at the reviewed head,
 // so abandonSpawned keeps the job: only the stuck fallback may act on it.
-func newStuckJobFix(t *testing.T, age time.Duration) *stuckFix {
+func newStuckJobFix(t *testing.T, age time.Duration, hosts ...reap.Host) *stuckFix {
 	t.Helper()
-	f := newStuckFix(t)
+	f := newStuckFix(t, hosts...)
 	f.label = reviewerLabelFor(12, age)
 	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "open", Head: github.Ref{SHA: headSHA}}}
 	f.addReviewer(f.label, "w1:p5")
@@ -185,5 +186,110 @@ func TestReapReviewerStuckFallbackDryRunPlans(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %s in %s", want, out.String())
 		}
+	}
+}
+
+// (h) A job record that names no pane is not abandoned while a host it could
+// be on cannot prove the label absent: a failed scan is worth as much as a
+// live pane, so the job and its worktree wait.
+func TestReapReviewerStuckEmptyPaneIDUnprovenKeeps(t *testing.T) {
+	f := newStuckJobFix(t, 7*time.Hour, reap.Host{Name: "node-b", SSH: "ops@node.example", Machine: "node-b"})
+	// The job names neither host nor pane; this machine's lists are readable,
+	// so only node-b's failed scan stands between the sweep and an abandon.
+	f.setJob(func(j *integrations.JobRecord) { j.PaneID, j.Host = "", "" })
+	f.run.outs["herdr\x00pane\x00list"] = `{"result":{"panes":[]}}`
+	f.run.outs["herdr\x00agent\x00list"] = `{"result":{"agents":[]}}`
+	f.allowJobClose()
+	if err := f.reap(t, 0, Options{}); err == nil || !strings.Contains(err.Error(), "node-b") {
+		t.Fatalf("first pass error = %v, want node-b's scan failure", err)
+	}
+	f.clearPanes()
+	f.now = reviewerNow.Add(30 * time.Minute)
+	if err := f.reap(t, 0, Options{}); err == nil || !strings.Contains(err.Error(), "node-b") {
+		t.Fatalf("second pass error = %v, want node-b's scan failure", err)
+	}
+	if closes, removes := f.jobCloses(), f.hub.ops("worktree.remove"); len(closes) != 0 || len(removes) != 0 {
+		t.Fatalf("acted with a host unproven: closes=%v removes=%v", closes, removes)
+	}
+	if rows := f.resultRows(t, "stuck-reviewer"); len(rows) != 1 {
+		t.Fatalf("stuck rows: %v", rowSummary(f.rows(t)))
+	}
+}
+
+// (i) The same record, with every host it could be on scanned and the label
+// absent, is closed abandoned and its worktrees removed: absence by label is
+// proof once no host is left unproven.
+func TestReapReviewerStuckEmptyPaneIDLabelAbsentAbandons(t *testing.T) {
+	f := newStuckJobFix(t, 7*time.Hour)
+	f.setJob(func(j *integrations.JobRecord) { j.PaneID = "" })
+	f.allowJobClose()
+	f.passAfter(t, 0)
+	f.clearPanes()
+	f.passAfter(t, 30*time.Minute)
+	if close := f.jobCloses(); len(close) != 1 {
+		t.Fatalf("job closes=%v: %v", close, rowSummary(f.rows(t)))
+	}
+	if n := len(f.hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("worktree.remove=%d: %v", n, rowSummary(f.rows(t)))
+	}
+	if rows := f.resultRows(t, "abandoned"); len(rows) != 1 {
+		t.Fatalf("abandoned rows: %v", rowSummary(f.rows(t)))
+	}
+}
+
+// (j) A record with no pane id whose label still lists is kept like one with a
+// live pane: the label is what ties the job to its reviewer.
+func TestReapReviewerStuckEmptyPaneIDLabelPresentKeeps(t *testing.T) {
+	f := newStuckJobFix(t, 7*time.Hour)
+	f.setJob(func(j *integrations.JobRecord) { j.PaneID = "" })
+	f.passAfter(t, 0)
+	f.passAfter(t, 30*time.Minute)
+	if closes, removes := f.jobCloses(), f.hub.ops("worktree.remove"); len(closes) != 0 || len(removes) != 0 {
+		t.Fatalf("acted on a listed label: closes=%v removes=%v", closes, removes)
+	}
+	if rows := f.resultRows(t, "stuck-reviewer"); len(rows) != 1 {
+		t.Fatalf("stuck rows: %v", rowSummary(f.rows(t)))
+	}
+}
+
+// (k) The stuck fallback takes reviewer seats and the worker seat a refused
+// reviewer role retries as (implementer, or worker on a panewire that knows
+// only the older spelling). Every other role keeps its hold: no reviewer spawn
+// path writes one.
+func TestReapReviewerStuckRoleGate(t *testing.T) {
+	for _, role := range []string{"tester", "counsel", "consult"} {
+		t.Run(role, func(t *testing.T) {
+			f := newStuckJobFix(t, 7*time.Hour)
+			f.setJob(func(j *integrations.JobRecord) { j.Role = role })
+			f.allowJobClose()
+			f.passAfter(t, 0)
+			f.clearPanes()
+			f.passAfter(t, 30*time.Minute)
+			if closes, removes := f.jobCloses(), f.hub.ops("worktree.remove"); len(closes) != 0 || len(removes) != 0 {
+				t.Fatalf("stuck %s acted on: closes=%v removes=%v", role, closes, removes)
+			}
+			if rows := f.resultRows(t, "stuck-reviewer"); len(rows) != 0 {
+				t.Fatalf("stuck row for %s: %v", role, rowSummary(f.rows(t)))
+			}
+			if rows := f.rows(t); len(rows) == 0 || rows[len(rows)-1].Result != "kept" || rows[len(rows)-1].Reason != "job:spawned" {
+				t.Fatalf("rows for %s: %v", role, rowSummary(rows))
+			}
+		})
+	}
+	for _, role := range []string{"implementer", "worker"} {
+		t.Run(role, func(t *testing.T) {
+			f := newStuckJobFix(t, 7*time.Hour)
+			f.setJob(func(j *integrations.JobRecord) { j.Role = role })
+			f.allowJobClose()
+			f.passAfter(t, 0)
+			f.clearPanes()
+			f.passAfter(t, 30*time.Minute)
+			if close := f.jobCloses(); len(close) != 1 {
+				t.Fatalf("job closes=%v: %v", close, rowSummary(f.rows(t)))
+			}
+			if n := len(f.hub.ops("worktree.remove")); n != 1 {
+				t.Fatalf("worktree.remove=%d: %v", n, rowSummary(f.rows(t)))
+			}
+		})
 	}
 }

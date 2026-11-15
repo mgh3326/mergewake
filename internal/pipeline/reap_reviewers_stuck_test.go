@@ -8,6 +8,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // stuckFix is a reviewer fix whose clock the test moves and whose composer
@@ -18,9 +19,9 @@ type stuckFix struct {
 	label string
 }
 
-func newStuckFix(t *testing.T) *stuckFix {
+func newStuckFix(t *testing.T, hosts ...reap.Host) *stuckFix {
 	t.Helper()
-	f := &stuckFix{reviewerFix: newReviewerFix(t), now: reviewerNow}
+	f := &stuckFix{reviewerFix: newReviewerFix(t, hosts...), now: reviewerNow}
 	f.s.Now = func() time.Time { return f.now }
 	f.hub.composer = map[string]any{"outcome": "read", "composer": "unknown"}
 	f.label = reviewerLabelFor(12, time.Hour)

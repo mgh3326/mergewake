@@ -424,9 +424,10 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 			// owner sees it.
 			w.noteStuck(gate, l, job)
 			return
-		case !w.abandoned[l.name] && !w.stuckPaneGone(ctx, job):
+		case !w.abandoned[l.name] && !w.stuckPaneGone(ctx, l, job):
 			// No pane carries the label, but the job's own pane still
-			// lists: same mark, same wait.
+			// lists — or no host could prove it absent: same mark, same
+			// wait.
 			w.noteStuck(gate, l, job)
 			return
 		default:
@@ -575,6 +576,20 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	return true
 }
 
+// reviewerStuckRole reports whether role is a reviewer seat or the worker seat
+// a refused reviewer role is retried as. workerSeatArgs appends --role
+// implementer, and a panewire that knows only the older spelling records that
+// same seat as worker (panewireSpawnArgs, oldPanewireSpawnArgs). No other role
+// writes a reviewer label, so no other role takes the stuck fallback.
+func reviewerStuckRole(role string) bool {
+	switch role {
+	case "reviewer", "implementer", "worker":
+		return true
+	default:
+		return false
+	}
+}
+
 // stuckJob reports whether job is a reviewer job that never left claimed or
 // spawned, carries no result, and is older than the stuck bound: panewire's
 // node ends only jobs whose record finished, so such a job's pane and
@@ -583,7 +598,7 @@ func (w *reviewerSweep) stuckJob(job integrations.JobRecord, l reviewerLabel) bo
 	if job.State != "spawned" && job.State != "claimed" {
 		return false
 	}
-	return len(job.Result) == 0 && reviewerReapRole(job.Role) && !l.started.Add(w.stuckAfter).After(w.now)
+	return len(job.Result) == 0 && reviewerStuckRole(job.Role) && !l.started.Add(w.stuckAfter).After(w.now)
 }
 
 // noteStuck marks a stuck reviewer once per label: its job is past the stuck
@@ -610,15 +625,39 @@ func paneListed(hs *reapHost, id string) bool {
 	return false
 }
 
-// stuckPaneGone reports whether the job's recorded pane is absent from the
-// pane lists of the host the job names — every scanned host when it names
-// none. The discovery lists can be stale — a stuck job's pane may have spawned
-// since the scan — so an absence is proven on a refreshed list, and a host
-// that failed its scan or a named host that is not configured cannot prove it.
-func (w *reviewerSweep) stuckPaneGone(ctx context.Context, job integrations.JobRecord) bool {
-	if job.PaneID == "" {
-		return true
+// labelListed reports whether any pane on the host carries the label. It is
+// the absence proof for a job record that names no pane: the label, not an id,
+// is then the only thing tying the sweep to a live reviewer.
+func labelListed(hs *reapHost, name string) bool {
+	for _, list := range [][]reap.Pane{hs.panes, hs.all} {
+		for _, p := range list {
+			if p.Name == name {
+				return true
+			}
+		}
 	}
+	return false
+}
+
+// refreshPaneLists re-reads the host's full pane list and its agent list, so
+// an absence is proven on a current scan rather than the discovery snapshot.
+// Both are read because a label lives on the agent list; the full list answers
+// a recorded pane id and may not name every pane.
+func refreshPaneLists(ctx context.Context, hs *reapHost) error {
+	if e := hs.refreshPanes(ctx); e != nil {
+		return e
+	}
+	panes, e := hs.ops.Panes(ctx)
+	if e != nil {
+		return e
+	}
+	hs.panes = panes
+	return nil
+}
+
+// stuckHosts names the hosts a stuck job could be on: the one it records, or
+// every configured host plus this machine when it records none.
+func (w *reviewerSweep) stuckHosts(ctx context.Context, job integrations.JobRecord) []*reapHost {
 	if job.Host == "" && w.local == nil {
 		// The job names no host: this machine's panes count too, so the local
 		// fallback host must exist before an absence can be proven.
@@ -644,16 +683,35 @@ func (w *reviewerSweep) stuckPaneGone(ctx context.Context, job integrations.JobR
 		}
 		targets = append(targets, hs)
 	}
+	return targets
+}
+
+// stuckPaneGone reports whether the job's pane is absent from the pane lists
+// of the host the job names — every scanned host when it names none. A job
+// record that names no pane has its label scanned instead: a recorded id no
+// longer names anything, so only a successful scan of every host the job could
+// be on can prove that no pane carries the label. The discovery lists can be
+// stale — a stuck job's pane may have spawned since the scan — so an absence is
+// proven on a refreshed list, and a host that failed its scan, could not read
+// its full list or could not be refreshed cannot prove it.
+func (w *reviewerSweep) stuckPaneGone(ctx context.Context, l reviewerLabel, job integrations.JobRecord) bool {
+	listed := func(hs *reapHost) bool {
+		if job.PaneID != "" {
+			return paneListed(hs, job.PaneID)
+		}
+		return labelListed(hs, l.name)
+	}
+	targets := w.stuckHosts(ctx, job)
 	if len(targets) == 0 {
 		return false
 	}
 	for _, hs := range targets {
-		if hs.failed || hs.usageUnknown || paneListed(hs, job.PaneID) {
+		if hs.failed || hs.usageUnknown || listed(hs) {
 			return false
 		}
 	}
 	for _, hs := range targets {
-		if e := hs.refreshPanes(ctx); e != nil || paneListed(hs, job.PaneID) {
+		if e := refreshPaneLists(ctx, hs); e != nil || listed(hs) {
 			return false
 		}
 	}
