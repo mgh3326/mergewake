@@ -420,6 +420,28 @@ func TestChangeSyncTimeoutLeavesCursor(t *testing.T) {
 	}
 }
 
+// On a wrap the cursor drops back to the last row the run visited, so the
+// rotation keeps advancing instead of re-checking the same first rows.
+func TestChangeSyncWrapAdvancesCursor(t *testing.T) {
+	oldRows := changeSyncRows
+	changeSyncRows = 2
+	t.Cleanup(func() { changeSyncRows = oldRows })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 5; i++ {
+		f.hub.pulls[30+i] = syncPull(30+i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 30 + i, State: "open"})
+	}
+	f.sync.after = 5
+	for range 4 {
+		f.run(t)
+	}
+	want := []int{31, 32, 33, 34, 35, 31, 32}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+}
+
 // A row whose PR read fails is read again on the very next run, even when the
 // list is longer than one run's window.
 func TestChangeSyncRetriesFailedRowNextRun(t *testing.T) {

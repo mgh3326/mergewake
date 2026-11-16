@@ -153,9 +153,7 @@ func (s *changeSync) run(ctx context.Context) {
 			break
 		}
 		r := rows[i]
-		if r.ID > s.after {
-			s.after = r.ID
-		}
+		s.after = r.ID
 		if retried[r.ID] {
 			continue
 		}
