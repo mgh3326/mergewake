@@ -111,7 +111,10 @@ re-reads open PRs and re-inspects the worktree, and keeps it if the branch has
 an open PR or the checkout changed. Only PRs whose head is in the repo itself
 count: a fork's branch of the same name neither blocks nor selects a worktree.
 The newest closed PR of the branch decides, bound to a job or not. Every worktree gets one `legacy-sweep` row in `reap.jsonl` (plans too),
-and each host ends with a summary of counts by result and reason, plus `listed`,
+except a row that repeats the path's newest outcome for the same branch and head: a replacement checkout at that path — another
+branch, or the same branch at another head — is always written, so the newest row names the checkout that was removed. A row for a
+path an earlier sweep finished (removed or refused), reached again only through a stale job cwd and reported gone by inspection, is
+tallied as already-removed and not written again. Each host ends with a summary of counts by result and reason, plus `listed`,
 `candidates`, `would_remove`, `kept_by_reason`, `commons` and `commons_not_found`
 (commons the node refused to list). PRs with no
 trailer, no bound job or no job record cannot be reached this way and are only

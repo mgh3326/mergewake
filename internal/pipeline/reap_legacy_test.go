@@ -315,7 +315,8 @@ func TestLegacySweepRerunIsIdempotent(t *testing.T) {
 
 // A terminal receipt binds the checkout it names: the same branch and head
 // stays suppressed, while a replacement checkout at the same path — another
-// branch, or the same branch at another head — is evaluated again.
+// branch, or the same branch at another head — is evaluated again and its
+// removal is recorded as a new receipt.
 func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 	s, hub, _ := legacyFixture(t)
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
@@ -345,8 +346,8 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 	}
 
 	// Same branch at another head is a different checkout too: evaluated and
-	// removed again through the guard. The repeat removal writes no second
-	// receipt — the outcome did not change — so the remove count is the proof.
+	// removed again through the guard, and its removal is its own receipt, so
+	// the journal's newest row names the head that was removed.
 	s2, hub2, _ := legacyFixture(t)
 	if err := s2.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
@@ -358,6 +359,15 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 	removes := hub2.ops("worktree.remove")
 	if len(removes) != 2 || removes[1]["expect_head"] != "ffff9999" {
 		t.Fatalf("moved head not re-evaluated: %#v", removes)
+	}
+	rows = legacyRows(t, s2)
+	if len(rows) != 2 {
+		t.Fatalf("second removal wrote no receipt: %v", rows)
+	}
+	wantRow(t, rows[0], "removed", "")
+	wantRow(t, rows[1], "removed", "")
+	if rows[0]["head"] != headSHA || rows[1]["head"] != "ffff9999" || rows[1]["branch"] != "wk/x" {
+		t.Fatalf("removal receipts: %v", rows)
 	}
 }
 
@@ -374,6 +384,47 @@ func TestLegacySweepTerminalReceiptWithoutHeadStillMatches(t *testing.T) {
 	}
 	if n := len(hub.ops("worktree.remove")); n != 0 {
 		t.Fatalf("worktree.remove calls: %d", n)
+	}
+}
+
+// A path an earlier sweep removed is quiet on later sweeps even though a bound
+// job's cwd still reaches it: the worktree is no longer listed and inspection
+// reports it gone, so there is nothing new to journal.
+func TestLegacySweepGonePathReachedByJobCwdWritesNoRow(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	// A pane outside the worktree makes its common discoverable, so the first
+	// sweep lists the worktree; the later ones find it gone and unlisted.
+	hub.wtPaths["/repo.wt"] = true
+	pane := []any{map[string]any{"pane_id": "w3:p1", "agent_status": "idle", "cwd": "/repo.wt"}}
+	hub.agents["panes"], hub.agents["agents"] = pane, pane
+	hub.lists = map[string][]map[string]any{listCommon: {listedRow(legacyCwd, "wk/x")}}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "removed", "")
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("worktree.remove calls: %d", n)
+	}
+	// The node removed it: it is no longer listed and no longer inspects,
+	// while the finished job's cwd still names the path.
+	delete(hub.wtPaths, legacyCwd)
+	hub.lists[listCommon] = nil
+	for i := 0; i < 2; i++ {
+		var out strings.Builder
+		s.Out = &out
+		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+			t.Fatal(err)
+		}
+		if rows := legacyRows(t, s); len(rows) != 1 {
+			t.Fatalf("sweep %d wrote a row for a removed path: %v", i+2, rows)
+		}
+		results, _ := summaryOf(t, out.String())["results"].(map[string]any)
+		if _, ok := results["already-removed"].(map[string]any); !ok {
+			t.Fatalf("sweep %d did not tally the gone path as already-removed: %s", i+2, out.String())
+		}
+	}
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("worktree.remove calls after reruns: %d", n)
 	}
 }
 
