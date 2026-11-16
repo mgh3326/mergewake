@@ -514,6 +514,20 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 	return errs
 }
 
+// terminal is "removed" or "refused" when the path's newest row is final for
+// the path itself, whatever checkout it named. It is the gone case's
+// suppression: a path an earlier sweep finished cannot be listed any more, and
+// inspection of it has no branch or head to bind a row to — but a bound job's
+// cwd can still reach it, so a remove that was recorded once must not be
+// re-recorded as kept/gone on every sweep.
+func (w *legacySweep) terminal(host, path string) string {
+	switch l := w.lastRow[legacyKey(host, path)]; l.result {
+	case "removed", "refused":
+		return l.result
+	}
+	return ""
+}
+
 // prior is "removed" or "refused" when the worktree's newest row is final for
 // this checkout: a terminal row suppresses only the branch and head it
 // recorded, so a different checkout at the same path is evaluated again. A
@@ -531,12 +545,16 @@ func (w *legacySweep) prior(host, path, branch, head string) string {
 }
 
 // note prints a row and appends it to reap.jsonl unless it repeats the
-// worktree's newest outcome. Plans are written too: they are the list the
-// operator reviews before the apply.
+// worktree's newest outcome for the same checkout. A different checkout at the
+// same path — another branch, or the same branch at another head — is a new
+// removal and is always written, so the journal's newest row names the
+// checkout that was actually removed. Plans are written too: they are the list
+// the operator reviews before the apply.
 func (w *legacySweep) note(v reapReceipt) error {
 	v.Time = w.s.now().UTC()
 	key, sig := legacyKey(v.Host, v.Worktree), v.Result+"|"+v.Reason
-	repeat := w.lastRow[key].sig == sig
+	prev := w.lastRow[key]
+	repeat := prev.sig == sig && prev.branch == v.Branch && prev.head == v.Head
 	w.lastRow[key] = legacyLast{sig: sig, result: v.Result, branch: v.Branch, head: v.Head}
 	// The receipt is the durable record, so it is written before the row is
 	// printed: a failing stdout must not lose a removal.
@@ -555,7 +573,8 @@ func (w *legacySweep) note(v reapReceipt) error {
 // cheap rules come before GitHub calls and the node is asked last. It returns
 // a non-empty skip for a worktree that gets no row: "reviewer-checkout" is out
 // of scope, "already-removed" and "already-refused" are final rows of an
-// earlier run found under the inspected worktree root.
+// earlier run found under the inspected worktree root, or — when inspection
+// reports a path gone, so there is no identity to compare — at the path itself.
 func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand, rec *reapReceipt, errs *[]error) (skip string) {
 	keep := func(reason string) { rec.Result, rec.Reason = "kept", reason }
 	if hs == nil || hs.failed {
@@ -569,6 +588,15 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", c.host, c.cwd, e))
 		return ""
 	case wt == nil:
+		// Inspection has no identity to bind a row to. A path an earlier sweep
+		// finished, reached again only through a stale job cwd, is quiet: it
+		// is tallied, not re-recorded, on every sweep. A listed path was
+		// already matched against its listed identity by candidate.
+		if c.listed == nil {
+			if prior := w.terminal(c.host, c.cwd); prior != "" {
+				return "already-" + prior
+			}
+		}
 		keep("gone")
 		return ""
 	}
