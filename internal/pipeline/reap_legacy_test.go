@@ -503,6 +503,22 @@ func TestLegacySweepGoneRowIsNotDuplicated(t *testing.T) {
 	wantRow(t, rows[0], "kept", "gone")
 }
 
+// A receipt journaled with an unclean worktree path still suppresses: the
+// seed normalizes it the same way the lookups do.
+func TestLegacySweepUncleanReceiptPathStillMatches(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt/","branch":"wk/x","head":"`+headSHA+`","result":"removed"}`+"\n")
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := legacyRows(t, s); len(rows) != 1 {
+		t.Fatalf("unclean receipt path re-evaluated: %v", rows)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("worktree.remove calls: %d", n)
+	}
+}
+
 // A detached checkout at a path whose newest row is terminal is a different
 // checkout: the candidate's empty branch is not a wildcard, so it is
 // evaluated and journaled as kept/detached rather than suppressed as
