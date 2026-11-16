@@ -1021,7 +1021,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if err := s.audit(x.repo.Name, "review-reviewer-replaced", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "old_label": label, "new_label": replacement, "pool": pool}, false); err != nil {
 			return out, err
 		}
-		rj.Label, rj.Recorded = replacement, s.now()
+		// The replacement's budget starts at this handoff. The old reviewer's
+		// landing no longer applies, so Started is cleared and budgetStart falls
+		// back to Recorded, which is now.
+		rj.Label, rj.Recorded, rj.Started = replacement, s.now(), nil
 		for i := 0; i+1 < len(rj.Args); i++ {
 			if rj.Args[i] == "-l" {
 				rj.Args[i+1] = replacement

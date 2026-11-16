@@ -48,6 +48,42 @@ func TestQuotaReplacementFollowAndCollect(t *testing.T) {
 	}
 }
 
+// A replacement's budget starts at the handoff, not at the old reviewer's
+// landing. Forty minutes after the old landing (25m review.timeout), the
+// replacement has only been running 20 minutes, so it is not lost.
+func TestQuotaReplacementBudgetRestartsAtHandoff(t *testing.T) {
+	f := asyncReview(t)
+	if err := f.review(t); err != nil {
+		t.Fatal(err)
+	}
+	old := readReviewerJob(t, f.s, f.r, 1)
+	if old.Started == nil {
+		t.Fatal("reviewer landed without a start")
+	}
+	next := old.Label + "-q1"
+	f.c.t = old.Started.Add(20 * time.Minute)
+	f.runner.sink.jobs[old.Label] = integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=p replaced_by=" + next}
+	f.runner.sink.jobs[next] = integrations.JobRecord{State: "running", Host: "replacement-host", PaneID: "replacement-pane"}
+	if err := f.review(t); err != nil {
+		t.Fatal(err)
+	}
+	got := readReviewerJob(t, f.s, f.r, 1)
+	if got.Label != next || got.Started != nil || !got.Recorded.Equal(f.c.t) {
+		t.Fatalf("replacement record=%+v", got)
+	}
+	f.c.t = f.c.t.Add(20 * time.Minute)
+	f.g.leaseTimes[claimRef(7, shaA, 1)] = time.Now()
+	if err := f.review(t); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(auditRows(t, f.s, f.r, "review-result-lost")); n != 0 {
+		t.Fatalf("replacement lost on the old reviewer's budget: %d lost rows", n)
+	}
+	if still := readReviewerJob(t, f.s, f.r, 1); still.Label != next {
+		t.Fatalf("record=%+v", still)
+	}
+}
+
 func TestQuotaReplacementChain(t *testing.T) {
 	f := asyncReview(t)
 	if err := f.review(t); err != nil {
