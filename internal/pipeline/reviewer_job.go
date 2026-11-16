@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -67,6 +68,18 @@ type reviewerJob struct {
 	// no result, to write its output now. Nil when it was never nudged; a
 	// record written before the field existed reads as not nudged.
 	NudgedAt *time.Time `json:"nudged_at,omitempty"`
+	// Replaced lists the reviewers this pass replaced because they were lost
+	// overdue. A replaced reviewer may still finish validly while its
+	// replacement runs; the pass collects such a late result (lateReviewerResult).
+	Replaced []replacedReviewer `json:"replaced,omitempty"`
+}
+
+// replacedReviewer is a reviewer that was lost overdue and replaced: its label,
+// the head it reviewed, and when its job was first spawned.
+type replacedReviewer struct {
+	Label    string    `json:"label"`
+	Head     string    `json:"head"`
+	Recorded time.Time `json:"recorded"`
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {
@@ -240,6 +253,41 @@ func (x *panewireExecutor) saveReviewerJob(rj reviewerJob) error {
 	return fsutil.WriteJSON(x.s.reviewerJobPath(x.repo.Name, rj.PR, rj.Pass), rj)
 }
 
+// lateReviewerResult returns the result of a reviewer that rj replaced for an
+// overdue loss and that has since finished validly for this head, with that
+// reviewer's label. Nil means none is ready and the pass keeps its replacement.
+// A record or host that cannot be read is no result, never an error, so the
+// late check cannot fail the pass.
+func (x *panewireExecutor) lateReviewerResult(ctx context.Context, plan *passPlan, rj reviewerJob) ([]byte, replacedReviewer) {
+	for _, old := range rj.Replaced {
+		if old.Head != x.pr.Head.SHA {
+			continue
+		}
+		job, err := x.job(ctx, old.Label)
+		if err != nil || job.State != "completed" {
+			continue
+		}
+		b := []byte(job.Result)
+		if len(b) == 0 {
+			b, _ = x.completedHost(ctx, plan, job, old.Label)
+		}
+		if len(b) == 0 {
+			continue
+		}
+		var refusal struct {
+			Refused string `json:"refused"`
+		}
+		if json.Unmarshal(b, &refusal) == nil && refusal.Refused != "" {
+			continue
+		}
+		if _, _, err := parseFindings(b, x.diff); err != nil {
+			continue
+		}
+		return b, old
+	}
+	return nil, replacedReviewer{}
+}
+
 // dropReviewerJob removes the record of a pass that reached a terminal outcome.
 func (s *Service) dropReviewerJob(repo string, pr, pass int) error {
 	if e := os.Remove(s.reviewerJobPath(repo, pr, pass)); e != nil && !errors.Is(e, fs.ErrNotExist) {
@@ -377,6 +425,10 @@ func (s *Service) RecordedReviewerJobs(repo string) []daemon.WatchedJob {
 			continue
 		}
 		out = append(out, daemon.WatchedJob{Repo: repo, PR: rj.PR, Pass: rj.Pass, Label: rj.Label})
+		// A replaced reviewer's late result completes the pass, so the watch wakes it too.
+		for _, old := range rj.Replaced {
+			out = append(out, daemon.WatchedJob{Repo: repo, PR: rj.PR, Pass: rj.Pass, Label: old.Label})
+		}
 	}
 	return out
 }

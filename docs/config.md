@@ -684,6 +684,8 @@ worker-seat note from step 3.
 
 A reviewer that is replaced for any cause (a lost result, `review.timeout`, or a moved PR head) has its hk job closed `abandoned`. Its pane is never closed here: panewire's node closes it, and the owed pane is settled once the pane is gone. A job that already ended (`completed`, `escalated`, or `lost`) holds no hub claim, so it gets no job close. A job close that panewire refuses because the job already has a terminal record counts as closed; any other refusal stays owed. A failed close stays owed and is retried on each later review run of the PR until the job is closed or gone.
 
+A reviewer replaced for an overdue loss (`review.timeout` passed while it still ran) keeps its label on the replacement's record. While the replacement runs, a later review run of the same PR, head, and pass collects that reviewer's result if it has since completed validly, and the pass completes with it. The replacement is then closed as collected. A late result counts only for the head it reviewed; a reviewer replaced for any other cause is never collected late. Audit row `review-result-late-collected` records the late label, the current label, and `seconds_past_budget`.
+
 Under the panewire executor, review does not call the quota tool and does not
 read `review.profiles` or `review.pairings` to choose reviewers: panewire
 selects the reviewer. `review.profiles` is still read for the author's model

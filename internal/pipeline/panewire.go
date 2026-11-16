@@ -622,7 +622,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		overBudget := s.now().Sub(rj.Recorded) >= timeout
 		e := recErr
 		state := rec.State
-		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
+		// A reviewer this pass replaced for an overdue loss may finish validly
+		// while its replacement runs. Its result completes the pass; the
+		// replacement's own job is then closed as collected.
+		if e == nil && !terminalJob(state) && len(rj.Replaced) > 0 {
+			if b, old := x.lateReviewerResult(ctx, plan, rj); b != nil {
+				collected, remoteRecord, spawn = b, &rec, false
+				if err := s.audit(x.repo.Name, "review-result-late-collected", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label, "late_label": old.Label, "seconds_past_budget": int(s.now().Sub(old.Recorded.Add(timeout)).Seconds())}, false); err != nil {
+					return out, err
+				}
+			}
+		}
+		if e == nil && collected == nil && state != "completed" && state != "escalated" && state != "lost" {
 			finished, gone, err := x.reviewerFinished(ctx, rec, rj)
 			if err != nil {
 				return out, err
@@ -776,7 +787,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, auditErr
 				}
 			}
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
@@ -1430,6 +1441,12 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// A resumed pass may have been rebuilt from scratch; the job record is the
 	// durable source for how many replacements this reviewer has used.
 	plan.replacements = max(plan.replacements, rj.Replacements)
+	// The replacement's record carries the reviewers this pass already replaced,
+	// and the one lost overdue joins them: its late result may still arrive.
+	plan.replaced = slices.Clone(rj.Replaced)
+	if cause == lostOverdue {
+		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, Recorded: rj.Recorded})
+	}
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
 	if auditErr != nil || noticeErr != nil {
