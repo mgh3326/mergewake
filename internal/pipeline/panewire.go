@@ -602,6 +602,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	placed := true
 	var collected []byte
 	var remoteRecord *integrations.JobRecord
+	// lateLabel names the replaced reviewer whose late result completed this
+	// pass; lateCurrent is the replacement's own record, which the pass closes.
+	var lateLabel string
+	var lateCurrent *integrations.JobRecord
 	if resumed {
 		// A done context decides nothing about the reviewer: an hk or node read
 		// it cut short is no unreadable hk and no missing result. The record
@@ -622,7 +626,20 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		overBudget := s.now().Sub(rj.budgetStart()) >= timeout
 		e := recErr
 		state := rec.State
-		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
+		// A reviewer this pass replaced for an overdue loss may finish validly
+		// while its replacement runs. Its result completes the pass; the
+		// replacement's own job is then closed as collected.
+		if e == nil && !terminalJob(state) && len(rj.Replaced) > 0 {
+			if b, late, old := x.lateReviewerResult(ctx, plan, rj); b != nil {
+				collected, remoteRecord, spawn = b, &late, false
+				current := rec
+				lateLabel, lateCurrent = old.Label, &current
+				if err := s.audit(x.repo.Name, "review-result-late-collected", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label, "late_label": old.Label, "seconds_past_budget": int(s.now().Sub(old.BudgetStart.Add(timeout)).Seconds())}, false); err != nil {
+					return out, err
+				}
+			}
+		}
+		if e == nil && collected == nil && state != "completed" && state != "escalated" && state != "lost" {
 			finished, gone, err := x.reviewerFinished(ctx, rec, rj)
 			if err != nil {
 				return out, err
@@ -776,7 +793,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, auditErr
 				}
 			}
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
@@ -992,7 +1009,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	defer tracing.Finish(collectSpan)
 	var res jobOutcome
 	if remoteRecord != nil {
-		res = jobOutcome{rec: *remoteRecord, result: collected, reason: "remote result"}
+		res = jobOutcome{rec: *remoteRecord, result: collected, reason: "remote result", lateLabel: lateLabel, current: lateCurrent}
 	} else {
 		res, e = x.recordResult(collectCtx, label)
 	}
@@ -1113,7 +1130,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return skip("reviewer pane %s findings rejected: %v", label, e)
 	}
 	seat := ""
-	if m := spawnedSeat.FindSubmatch(stdout); m != nil {
+	if res.current != nil {
+		// A late result is credited to the reviewer that wrote it, not to the replacement now running.
+		seat = res.rec.Profile
+	} else if m := spawnedSeat.FindSubmatch(stdout); m != nil {
 		seat = string(m[1])
 	} else if placement.Profile != "" {
 		seat = placement.Profile
@@ -1125,12 +1145,20 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	if seat != "" {
 		out.reviewer = "panewire:" + seat
 	}
-	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, jobDir, seat))
+	attrDir := jobDir
+	if res.lateLabel != "" {
+		attrDir = filepath.Join(cfg.Jobs, res.lateLabel)
+	}
+	out.family = config.CanonicalFamily(x.reviewerFamily(res.rec, attrDir, seat))
 	out.fallback = note
 	keepJob = true
 	// Best effort: the findings are collected and accepted, so a close that
 	// cannot run (or its audit write) is logged and never fails the pass.
-	if cerr := x.closeCollectedJob(ctx, rj, res.rec); cerr != nil {
+	closeRec := res.rec
+	if res.current != nil {
+		closeRec = *res.current
+	}
+	if cerr := x.closeCollectedJob(ctx, rj, closeRec); cerr != nil {
 		_ = s.Print(map[string]any{"action": "review", "state": "close-failed", "pr": pr.Number, "head": short7(pr.Head.SHA), "pass": rj.Pass, "reviewer": rj.Label, "reason": fleetevent.Redact(cerr.Error())})
 	}
 	if rj.NudgedAt != nil {
@@ -1442,6 +1470,12 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// A resumed pass may have been rebuilt from scratch; the job record is the
 	// durable source for how many replacements this reviewer has used.
 	plan.replacements = max(plan.replacements, rj.Replacements)
+	// The replacement's record carries the reviewers this pass already replaced,
+	// and the one lost overdue joins them: its late result may still arrive.
+	plan.replaced = slices.Clone(rj.Replaced)
+	if cause == lostOverdue {
+		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart()})
+	}
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error(), "recorded": rj.Recorded, "started": rj.Started, "budget_from": rj.budgetFrom()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
 	if auditErr != nil || noticeErr != nil {
@@ -1640,6 +1674,11 @@ type jobOutcome struct {
 	rec    integrations.JobRecord
 	result []byte
 	reason string
+	// lateLabel and current are set when the result is a replaced reviewer's late
+	// result: rec is that reviewer's record, and current is the replacement's,
+	// the job this pass closes. Both are empty for the pass's own reviewer.
+	lateLabel string
+	current   *integrations.JobRecord
 }
 
 // recordResult reads the reviewer's hk job record by the W4 rule (design
