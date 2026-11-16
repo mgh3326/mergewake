@@ -12,9 +12,7 @@ import (
 
 // The unreconciled-row sync's bounds, vars so tests can shorten them.
 var (
-	// changeSyncScan is the page size requested from hk: the endpoint's
-	// maximum, since it pages by limit only. One page is the window a run
-	// rotates over.
+	// changeSyncScan is the page size requested from hk.
 	changeSyncScan = 1000
 	// changeSyncRows bounds the PRs one run checks, so a large backlog cannot
 	// make a run outlast its interval.
@@ -35,16 +33,19 @@ var (
 // merged and closed ones back, so a PR merged outside mergewake's pass no
 // longer holds its hk tasks open.
 type changeSync struct {
-	rows   func(context.Context, int) ([]integrations.UnreconciledChange, error)
+	rows   func(context.Context, int64, int) (integrations.UnreconciledPage, error)
 	pull   func(context.Context, string, int) (github.Pull, error)
 	record func(context.Context, string, github.Pull)
 	repos  map[string]bool
 	log    *slog.Logger
-	// after is the id of the last row the previous run checked. The endpoint
-	// takes no after_id, so a run starts there in the rows it reads and wraps
-	// at the end: rows that stay open at the head cannot starve the rest. A
-	// run whose context ends stops before it advances after, so the rows it
-	// did not reach are the next run's first rows.
+	// after is the id a run's window starts after: the last row the previous
+	// run reached. hk pages the unreconciled rows by after_id, so a run reads
+	// forward from it until it has checked changeSyncRows rows or the list
+	// ends; at the end the cursor goes back to 0 and the rotation covers the
+	// whole list. An hk without paging ignores after_id and answers one page
+	// without next_after_id: the run then rotates inside that page as it
+	// always did. A run whose context ends stops before it advances after,
+	// so the rows it did not reach are the next run's first rows.
 	after int64
 	// retry holds the ids of the rows the last run left unfinished — a failed
 	// PR read, or a merged row with no merge commit yet — so the next run
@@ -107,10 +108,6 @@ func (s *changeSync) run(ctx context.Context) {
 	}
 	started := time.Now()
 	var merged, closed, open, other, failures int
-	rows, readErr := s.rows(ctx, changeSyncScan)
-	if readErr != nil {
-		failures++
-	}
 	count := func(kind string) {
 		switch kind {
 		case "merged":
@@ -125,9 +122,9 @@ func (s *changeSync) run(ctx context.Context) {
 			failures++
 		}
 	}
-	// retried marks the rows this run already checked from the retry set, so
-	// the window pass does not read them twice; failed collects the rows this
-	// run leaves unfinished for the next run's retry set.
+	// retried marks the rows this run already checked, so a later pass does
+	// not read them twice; failed collects the rows this run leaves
+	// unfinished for the next run's retry set.
 	retried := make(map[int64]bool, len(s.retry))
 	var failed []int64
 	visit := func(r integrations.UnreconciledChange) {
@@ -139,39 +136,94 @@ func (s *changeSync) run(ctx context.Context) {
 		}
 	}
 
-	// Rows the last run left unfinished are read first, wherever the cursor
-	// sits; the cursor may pass them, the retry set brings them back. The
-	// pass is bounded in time so slow retries cannot starve the window.
-	retryUntil := started.Add(changeSyncRetryTime)
-	for i := range rows {
-		if ctx.Err() != nil || time.Now().After(retryUntil) {
-			break
+	// The first read starts just before the smallest retry id, so the retry
+	// pass finds a retry row wherever it sits; the largest bounds how far
+	// the scan must go before every retry id is behind it.
+	firstAfter := s.after
+	var minRetry, maxRetry int64
+	if len(s.retryOrder) > 0 {
+		minRetry, maxRetry = s.retryOrder[0], s.retryOrder[0]
+		for _, id := range s.retryOrder[1:] {
+			if id < minRetry {
+				minRetry = id
+			}
+			if id > maxRetry {
+				maxRetry = id
+			}
 		}
-		r := rows[i]
-		if _, ok := s.retry[r.ID]; ok {
+		firstAfter = minRetry - 1
+	}
+
+	var seen int
+	page, readErr := s.rows(ctx, firstAfter, changeSyncScan)
+	if readErr != nil {
+		failures++
+	}
+
+	// retryScanned reports that the retry pass covered every retry id, so
+	// one the list no longer has leaves the set.
+	retryScanned := false
+	if readErr == nil && page.Paged {
+		retryUntil := started.Add(changeSyncRetryTime)
+		if len(s.retryOrder) > 0 {
+			var e error
+			retryScanned, e = s.scanRetries(ctx, page, maxRetry, retryUntil, &seen, visit)
+			if e != nil {
+				if readErr == nil {
+					readErr = e
+				}
+				failures++
+			}
+			page = integrations.UnreconciledPage{}
+		}
+		var first *integrations.UnreconciledPage
+		if len(s.retryOrder) == 0 {
+			// The read above already started at the cursor.
+			first = &page
+		}
+		if e := s.scanWindow(ctx, first, &seen, retried, visit); e != nil {
+			if readErr == nil {
+				readErr = e
+			}
+			failures++
+		}
+	} else {
+		// An hk without after_id paging ignores the parameter and answers
+		// the first page with no next_after_id: the run keeps the one-page
+		// rotation it always had.
+		rows := page.Changes
+		seen = len(rows)
+		retryUntil := started.Add(changeSyncRetryTime)
+		for i := range rows {
+			if ctx.Err() != nil || time.Now().After(retryUntil) {
+				break
+			}
+			r := rows[i]
+			if _, ok := s.retry[r.ID]; ok {
+				visit(r)
+			}
+		}
+		start := changeSyncStart(rows, s.after)
+		for i := start; i < len(rows) && i-start < changeSyncRows; i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			r := rows[i]
+			s.after = r.ID
+			if retried[r.ID] {
+				continue
+			}
 			visit(r)
 		}
 	}
 
-	start := changeSyncStart(rows, s.after)
-	for i := start; i < len(rows) && i-start < changeSyncRows; i++ {
-		if ctx.Err() != nil {
-			break
-		}
-		r := rows[i]
-		s.after = r.ID
-		if retried[r.ID] {
-			continue
-		}
-		visit(r)
-	}
-
-	// The next run's retry set: ids the page did not show stay queued, this
-	// run's failures join them oldest-first, bounded by changeSyncRetries.
+	// The next run's retry set: ids the scan did not resolve stay queued,
+	// this run's failures join them oldest-first, bounded by
+	// changeSyncRetries.
 	next := make([]int64, 0, len(s.retryOrder)+len(failed))
 	nextSet := make(map[int64]struct{}, cap(next))
 	for _, id := range s.retryOrder {
-		if retried[id] {
+		if retried[id] || retryScanned {
 			continue
 		}
 		next = append(next, id)
@@ -192,11 +244,108 @@ func (s *changeSync) run(ctx context.Context) {
 	}
 	s.retryOrder, s.retry = next, nextSet
 
-	attrs := []any{"rows", len(rows), "merged", merged, "closed", closed, "open", open, "other_repo", other, "errors", failures, "elapsed_ms", time.Since(started).Milliseconds()}
+	attrs := []any{"rows", seen, "merged", merged, "closed", closed, "open", open, "other_repo", other, "errors", failures, "elapsed_ms", time.Since(started).Milliseconds()}
 	if readErr != nil {
 		attrs = append(attrs, "error", readErr.Error())
 	}
 	s.log.Info("hk change sync run", attrs...)
+}
+
+// scanRetries pages forward from first, visiting the rows still in the retry
+// set, until the scan passes the largest retry id or the list ends. It is
+// bounded by until and ctx, and reports whether it covered every retry id —
+// an id the list no longer has then leaves the set. A page read error is
+// returned for the run's log.
+func (s *changeSync) scanRetries(ctx context.Context, first integrations.UnreconciledPage, maxRetry int64, until time.Time, seen *int, visit func(integrations.UnreconciledChange)) (bool, error) {
+	page := first
+	for {
+		*seen += len(page.Changes)
+		bounded := false
+		for _, r := range page.Changes {
+			if ctx.Err() != nil || time.Now().After(until) {
+				bounded = true
+				break
+			}
+			if _, ok := s.retry[r.ID]; ok {
+				visit(r)
+			}
+		}
+		if bounded {
+			return false, nil
+		}
+		if len(page.Changes) == 0 {
+			return page.NextAfterID == nil, nil
+		}
+		last := page.Changes[len(page.Changes)-1].ID
+		if last >= maxRetry || page.NextAfterID == nil {
+			return true, nil
+		}
+		if *page.NextAfterID < last {
+			return false, nil
+		}
+		next, e := s.rows(ctx, *page.NextAfterID, changeSyncScan)
+		if e != nil {
+			return false, e
+		}
+		if !next.Paged {
+			return false, nil
+		}
+		page = next
+	}
+}
+
+// scanWindow pages forward from the cursor, visiting up to changeSyncRows
+// rows and advancing s.after over each row it reaches. It stops at the
+// list's end — where the cursor goes back to 0 for the next run — at ctx's
+// end, or at the row bound. first, when non-nil, is the page the run's first
+// read already fetched from the cursor.
+func (s *changeSync) scanWindow(ctx context.Context, first *integrations.UnreconciledPage, seen *int, retried map[int64]bool, visit func(integrations.UnreconciledChange)) error {
+	after := s.after
+	page := first
+	examined := 0
+	for {
+		if page == nil {
+			p, e := s.rows(ctx, after, changeSyncScan)
+			if e != nil {
+				return e
+			}
+			if !p.Paged {
+				return nil
+			}
+			page = &p
+		}
+		*seen += len(page.Changes)
+		stop := false
+		for _, r := range page.Changes {
+			if ctx.Err() != nil {
+				stop = true
+				break
+			}
+			s.after = r.ID
+			examined++
+			if retried[r.ID] {
+				continue
+			}
+			visit(r)
+			if examined >= changeSyncRows {
+				stop = true
+				break
+			}
+		}
+		if stop {
+			return nil
+		}
+		if len(page.Changes) == 0 || page.NextAfterID == nil {
+			s.after = 0
+			return nil
+		}
+		last := page.Changes[len(page.Changes)-1].ID
+		if *page.NextAfterID < last {
+			return nil
+		}
+		after = *page.NextAfterID
+		page = nil
+	}
 }
 
 // checkRow reads one row's PR and records the write when the PR reconciles.
@@ -229,7 +378,8 @@ func (s *changeSync) checkRow(ctx context.Context, r integrations.UnreconciledCh
 
 // changeSyncStart is the index of the first row whose id is after the last id
 // the previous run checked; the rows are id-ordered, so a run that reached the
-// end starts over.
+// end starts over. It serves the one-page rotation an hk without after_id
+// paging still gets.
 func changeSyncStart(rows []integrations.UnreconciledChange, after int64) int {
 	for i, r := range rows {
 		if r.ID > after {
