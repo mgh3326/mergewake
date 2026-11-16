@@ -349,15 +349,21 @@ func legacyKey(host, path string) string { return host + "\x00" + path }
 // is the worktree root when it is known — an inspected wt.Path or a listed
 // row. gone reports a path inspection found missing, reachable only through a
 // job cwd that may sit inside the worktree: it resolves to the nearest
-// ancestor that already has a receipt row, the root earlier sweeps saw, or
-// stays itself when no ancestor has one. A known root never resolves to an
-// ancestor: a fresh checkout must not inherit the rows of a worktree above it.
+// ancestor whose newest receipt is terminal — the finished worktree root
+// earlier sweeps saw. A nearer row that is not terminal means the path sits
+// under a live worktree's subtree, so the gone row keys the path itself
+// rather than overwriting that worktree's signature. A known root never
+// resolves to an ancestor: a fresh checkout must not inherit the rows of a
+// worktree above it.
 func (w *legacySweep) receiptPath(host, path string, gone bool) string {
 	p := filepath.Clean(path)
 	if gone {
-		for q := p; ; {
-			if _, ok := w.lastRow[legacyKey(host, q)]; ok {
-				return q
+		for q := filepath.Dir(p); ; {
+			if l, ok := w.lastRow[legacyKey(host, q)]; ok {
+				if l.result == "removed" || l.result == "refused" {
+					return q
+				}
+				break
 			}
 			parent := filepath.Dir(q)
 			if parent == q {
@@ -370,10 +376,12 @@ func (w *legacySweep) receiptPath(host, path string, gone bool) string {
 }
 
 // checkoutField reports whether a receipt's recorded branch or head matches
-// the candidate's: an empty value on either side is a wildcard — a row that
-// never recorded the field cannot tell checkouts apart.
+// the candidate's. A receipt that never recorded the field is a wildcard —
+// it cannot tell checkouts apart — but the candidate's empty field is not:
+// a detached or headless checkout is a different checkout and must be
+// evaluated, not suppressed by a row that named one.
 func checkoutField(recorded, have string) bool {
-	return recorded == "" || have == "" || recorded == have
+	return recorded == "" || recorded == have
 }
 
 // legacyLast is the newest legacy-sweep row of one worktree path: the
@@ -564,9 +572,10 @@ func (w *legacySweep) terminal(host, path string) string {
 // prior is "removed" or "refused" when the worktree's newest row is final for
 // this checkout: a terminal row suppresses only the branch and head it
 // recorded, so a different checkout at the same path is evaluated again. A
-// row or a candidate without a branch or head (rows written before they were
-// recorded, or a detached or unread head) is a wildcard on that field, so it
-// cannot tell checkouts apart.
+// row that never recorded a branch or head (rows written before they were
+// recorded) is a wildcard on that field, so old rows do not all re-evaluate
+// once; a candidate with an empty field is a different checkout, not a
+// wildcard.
 func (w *legacySweep) prior(host, path, branch, head string) string {
 	l, ok := w.lastRow[legacyKey(host, w.receiptPath(host, path, false))]
 	if !ok || (l.result != "removed" && l.result != "refused") {
@@ -580,8 +589,8 @@ func (w *legacySweep) prior(host, path, branch, head string) string {
 
 // note prints a row and appends it to reap.jsonl unless it repeats the
 // worktree's newest outcome for the same checkout, with the same wildcard
-// rule as prior: an empty branch or head on either side cannot tell
-// checkouts apart. A different checkout at the same path — another branch,
+// rule as prior: a row that never recorded the field cannot tell checkouts
+// apart. A different checkout at the same path — another branch,
 // or the same branch at another head — is a new
 // removal and is always written, so the journal's newest row names the
 // checkout that was actually removed. Plans are written too: they are the list
@@ -626,14 +635,14 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	case wt == nil:
 		// Inspection has no identity to bind a row to. The candidate's path
 		// may be a job cwd inside the gone worktree, so the receipt key is the
-		// nearest ancestor that already has a row — the worktree root earlier
-		// sweeps saw. A path an earlier sweep finished, reached again only
-		// through a stale job cwd, is quiet: it is tallied, not re-recorded,
-		// on every sweep. A listed path was already matched against its
-		// listed identity by candidate. A gone row names the path, not a
-		// checkout, so it carries no branch or head. A listed path is a known
-		// worktree root and keys itself; only an unlisted job cwd may resolve
-		// to an ancestor's receipt.
+		// nearest ancestor whose newest row is terminal — the worktree root
+		// earlier sweeps saw. A path an earlier sweep finished, reached again
+		// only through a stale job cwd, is quiet: it is tallied, not
+		// re-recorded, on every sweep. A listed path was already matched
+		// against its listed identity by candidate. A gone row names the
+		// path, not a checkout, so it carries no branch or head. A listed
+		// path is a known worktree root and keys itself; only an unlisted
+		// job cwd may resolve to an ancestor's receipt.
 		rec.Worktree = w.receiptPath(c.host, c.cwd, c.listed == nil)
 		if c.listed == nil {
 			if prior := w.terminal(c.host, rec.Worktree); prior != "" {

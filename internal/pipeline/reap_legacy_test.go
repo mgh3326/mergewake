@@ -503,6 +503,66 @@ func TestLegacySweepGoneRowIsNotDuplicated(t *testing.T) {
 	wantRow(t, rows[0], "kept", "gone")
 }
 
+// A detached checkout at a path whose newest row is terminal is a different
+// checkout: the candidate's empty branch is not a wildcard, so it is
+// evaluated and journaled as kept/detached rather than suppressed as
+// already-removed.
+func TestLegacySweepDetachedCheckoutAtTerminalPathIsEvaluated(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	wantRow(t, legacyOnly(t, s), "removed", "")
+	// The path now holds a detached checkout: no branch, same head.
+	hub.detached = map[string]bool{legacyCwd: true}
+	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+		t.Fatal(err)
+	}
+	rows := legacyRows(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("detached checkout suppressed or unrecorded: %v", rows)
+	}
+	wantRow(t, rows[1], "kept", "detached")
+}
+
+// A gone job cwd under a worktree whose newest row is not terminal keys
+// itself: it must not resolve to the live ancestor and overwrite that
+// worktree's signature, or the two candidates would journal rows every
+// sweep and the ancestor would be falsely recorded as gone.
+func TestLegacySweepGoneJobCwdUnderKeptWorktreeKeysItself(t *testing.T) {
+	s, hub, _ := legacyFixture(t)
+	sub := legacyCwd + "/sub"
+	s.Sink.(*jobSink).recs["job-a"] = integrations.JobRecord{Host: "node-a", Cwd: sub, Label: "job-a"}
+	// A pane outside the worktree makes its common discoverable, so
+	// worktree.list answers the dirty row for the candidate.
+	pane := []any{map[string]any{"pane_id": "w3:p1", "agent_status": "idle", "cwd": "/repo.wt"}}
+	hub.agents["panes"], hub.agents["agents"] = pane, pane
+	// The worktree itself stays listed and dirty — a kept, non-terminal row —
+	// while the job's cwd inside it no longer inspects.
+	hub.lists = map[string][]map[string]any{listCommon: {
+		withStatus(listedRow(legacyCwd, "wk/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
+	}}
+	for i := 0; i < 3; i++ {
+		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := legacyRows(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("rows: %v", rows)
+	}
+	wantRow(t, rows[0], "kept", "dirty")
+	wantRow(t, rows[1], "kept", "gone")
+	if rows[1]["worktree"] != sub {
+		t.Fatalf("gone row keyed to %v, want the job cwd itself %s", rows[1]["worktree"], sub)
+	}
+	for _, r := range rows {
+		if r["worktree"] == legacyCwd && r["reason"] == "gone" {
+			t.Fatalf("live worktree journaled as gone: %v", rows)
+		}
+	}
+}
+
 // Worktrees of another repository and detached ones are listed, never removed;
 // reviewer checkouts belong to the reviewer sweep and get no row.
 func TestLegacySweepKeepsForeignDetachedAndSkipsReviewerCheckouts(t *testing.T) {
