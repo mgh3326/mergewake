@@ -253,9 +253,9 @@ func (s *changeSync) run(ctx context.Context) {
 
 // scanRetries pages forward from first, visiting the rows still in the retry
 // set, until the scan passes the largest retry id or the list ends. It is
-// bounded by until and ctx, and reports whether it covered every retry id —
-// an id the list no longer has then leaves the set. A page read error is
-// returned for the run's log.
+// bounded by until and ctx, and makes no read once ctx has ended; it reports
+// whether it covered every retry id — an id the list no longer has then
+// leaves the set. A page read error is returned for the run's log.
 func (s *changeSync) scanRetries(ctx context.Context, first integrations.UnreconciledPage, maxRetry int64, until time.Time, seen *int, visit func(integrations.UnreconciledChange)) (bool, error) {
 	page := first
 	for {
@@ -283,6 +283,9 @@ func (s *changeSync) scanRetries(ctx context.Context, first integrations.Unrecon
 		if *page.NextAfterID < last {
 			return false, nil
 		}
+		if ctx.Err() != nil {
+			return false, nil
+		}
 		next, e := s.rows(ctx, *page.NextAfterID, changeSyncScan)
 		if e != nil {
 			return false, e
@@ -297,14 +300,18 @@ func (s *changeSync) scanRetries(ctx context.Context, first integrations.Unrecon
 // scanWindow pages forward from the cursor, visiting up to changeSyncRows
 // rows and advancing s.after over each row it reaches. It stops at the
 // list's end — where the cursor goes back to 0 for the next run — at ctx's
-// end, or at the row bound. first, when non-nil, is the page the run's first
-// read already fetched from the cursor.
+// end, or at the row bound, and makes no read once ctx has ended. first,
+// when non-nil, is the page the run's first read already fetched from the
+// cursor.
 func (s *changeSync) scanWindow(ctx context.Context, first *integrations.UnreconciledPage, seen *int, retried map[int64]bool, visit func(integrations.UnreconciledChange)) error {
 	after := s.after
 	page := first
 	examined := 0
 	for {
 		if page == nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			p, e := s.rows(ctx, after, changeSyncScan)
 			if e != nil {
 				return e

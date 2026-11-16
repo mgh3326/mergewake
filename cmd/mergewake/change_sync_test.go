@@ -633,6 +633,101 @@ func TestChangeSyncPagedTimeoutLeavesCursor(t *testing.T) {
 	}
 }
 
+// cancelAfter wraps pull so the cancelAt'th call cancels the run's context
+// once the read has answered, leaving the run's failure count untouched.
+func cancelAfter(pull func(context.Context, string, int) (github.Pull, error), cancelAt int, cancel context.CancelFunc) func(context.Context, string, int) (github.Pull, error) {
+	calls := 0
+	return func(ctx context.Context, repo string, n int) (github.Pull, error) {
+		calls++
+		p, e := pull(ctx, repo, n)
+		if calls == cancelAt {
+			cancel()
+		}
+		return p, e
+	}
+}
+
+// unreconciledReads copies the after_id of each unreconciled read the fake hk
+// received.
+func (h *syncHK) unreconciledReads() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.afters...)
+}
+
+// A context that ends during the retry pass stops the run before any window
+// read: the fake hk sees no request after it ended, the run logs no failure,
+// and the next run starts at the first row the cursor did not reach.
+func TestChangeSyncTimeoutDuringRetryMakesNoRead(t *testing.T) {
+	f := newSyncFixture(t)
+	f.hk.paged = true
+	for i := 1; i <= 6; i++ {
+		f.hub.pulls[i] = syncPull(i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: i, State: "open"})
+	}
+	f.sync.after = 2
+	f.sync.retry = map[int64]struct{}{5: {}}
+	f.sync.retryOrder = []int64{5}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.sync.pull = cancelAfter(f.sync.pull, 1, cancel)
+	f.sync.run(ctx)
+
+	if got := f.hk.unreconciledReads(); fmt.Sprint(got) != fmt.Sprint([]string{"4"}) {
+		t.Fatalf("unreconciled reads %v, want [4]", got)
+	}
+	if lines := f.logLines(t); len(lines) != 1 || lines[0]["errors"] != float64(0) {
+		t.Fatalf("log %v", lines)
+	}
+	if f.sync.after != 2 {
+		t.Fatalf("after %d, want 2", f.sync.after)
+	}
+	f.run(t)
+	if got := f.pulls(); got[0] != 5 || got[1] != 3 {
+		t.Fatalf("pull reads %v, want 5 then 3", got)
+	}
+	if got := f.hk.unreconciledReads(); len(got) != 2 || got[1] != "2" {
+		t.Fatalf("unreconciled reads %v, want a second read from 2", got)
+	}
+}
+
+// A context that ends exactly at a page boundary stops the run before the
+// next page's read: the fake hk sees no request after it ended, the run logs
+// no failure, and the next run starts at the first unchecked row.
+func TestChangeSyncTimeoutAtPageBoundaryMakesNoRead(t *testing.T) {
+	oldRows, oldScan := changeSyncRows, changeSyncScan
+	changeSyncRows, changeSyncScan = 10, 2
+	t.Cleanup(func() { changeSyncRows, changeSyncScan = oldRows, oldScan })
+
+	f := newSyncFixture(t)
+	f.hk.paged = true
+	for i := 1; i <= 4; i++ {
+		f.hub.pulls[i] = syncPull(i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: i, State: "open"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.sync.pull = cancelAfter(f.sync.pull, 2, cancel)
+	f.sync.run(ctx)
+
+	if got := f.hk.unreconciledReads(); fmt.Sprint(got) != fmt.Sprint([]string{"0"}) {
+		t.Fatalf("unreconciled reads %v, want [0]", got)
+	}
+	if lines := f.logLines(t); len(lines) != 1 || lines[0]["errors"] != float64(0) {
+		t.Fatalf("log %v", lines)
+	}
+	if f.sync.after != 2 {
+		t.Fatalf("after %d, want 2", f.sync.after)
+	}
+	f.run(t)
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint([]int{1, 2, 3, 4}) {
+		t.Fatalf("pull reads %v, want [1 2 3 4]", got)
+	}
+	if got := f.hk.unreconciledReads(); len(got) != 2 || got[1] != "2" {
+		t.Fatalf("unreconciled reads %v, want a second read from 2", got)
+	}
+}
+
 // A retry row that sits behind the cursor is checked first on the next run:
 // the retry pass reads from just before the smallest retry id.
 func TestChangeSyncRetryBehindCursor(t *testing.T) {
