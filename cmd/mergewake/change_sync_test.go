@@ -380,6 +380,144 @@ func TestChangeSyncMergedWithoutMergeCommitWritesNothing(t *testing.T) {
 	}
 }
 
+// A run whose context ends stops before it advances the cursor: the rows it
+// did not reach are the next run's first rows, and the row it was reading is
+// retried from the retry set.
+func TestChangeSyncTimeoutLeavesCursor(t *testing.T) {
+	oldRows := changeSyncRows
+	changeSyncRows = 3
+	t.Cleanup(func() { changeSyncRows = oldRows })
+
+	var rows []integrations.UnreconciledChange
+	for i := int64(1); i <= 5; i++ {
+		rows = append(rows, integrations.UnreconciledChange{ID: i, Repo: "o/one", PRNumber: int(10 + i), State: "open"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls []int
+	s := &changeSync{
+		rows: func(context.Context, int) ([]integrations.UnreconciledChange, error) { return rows, nil },
+		pull: func(pctx context.Context, repo string, n int) (github.Pull, error) {
+			calls = append(calls, n)
+			if len(calls) == 2 {
+				cancel()
+				return github.Pull{}, pctx.Err()
+			}
+			return github.Pull{State: "open"}, nil
+		},
+		record: func(context.Context, string, github.Pull) {},
+		repos:  map[string]bool{"o/one": true},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	s.run(ctx)
+	if s.after != 2 {
+		t.Fatalf("after %d, want 2", s.after)
+	}
+	s.run(context.Background())
+	want := []int{11, 12, 12, 13, 14, 15}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", calls, want)
+	}
+}
+
+// On a wrap the cursor drops back to the last row the run visited, so the
+// rotation keeps advancing instead of re-checking the same first rows.
+func TestChangeSyncWrapAdvancesCursor(t *testing.T) {
+	oldRows := changeSyncRows
+	changeSyncRows = 2
+	t.Cleanup(func() { changeSyncRows = oldRows })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 5; i++ {
+		f.hub.pulls[30+i] = syncPull(30+i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 30 + i, State: "open"})
+	}
+	f.sync.after = 5
+	for range 4 {
+		f.run(t)
+	}
+	want := []int{31, 32, 33, 34, 35, 31, 32}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+}
+
+// A row whose PR read fails is read again on the very next run, even when the
+// list is longer than one run's window.
+func TestChangeSyncRetriesFailedRowNextRun(t *testing.T) {
+	oldRows := changeSyncRows
+	changeSyncRows = 2
+	t.Cleanup(func() { changeSyncRows = oldRows })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 5; i++ {
+		if i != 1 {
+			f.hub.pulls[20+i] = syncPull(20+i, "open")
+		}
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 20 + i, State: "open"})
+	}
+	f.run(t)
+	f.hub.pulls[21] = syncPull(21, "open")
+	f.run(t)
+	want := []int{21, 22, 21, 23, 24}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+}
+
+// The retry set is bounded: past the bound the oldest unfinished rows wait
+// for the rotation like any other.
+func TestChangeSyncRetrySetBounded(t *testing.T) {
+	oldRetries := changeSyncRetries
+	changeSyncRetries = 2
+	t.Cleanup(func() { changeSyncRetries = oldRetries })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 4; i++ {
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 20 + i, State: "open"})
+	}
+	f.run(t)
+	if len(f.sync.retry) != 2 || len(f.sync.retryOrder) != 2 {
+		t.Fatalf("retry %v order %v, want 2 ids", f.sync.retry, f.sync.retryOrder)
+	}
+	for _, id := range []int64{1, 2} {
+		if _, ok := f.sync.retry[id]; ok {
+			t.Fatalf("retry keeps evicted id %d: %v", id, f.sync.retryOrder)
+		}
+	}
+	for _, id := range []int64{3, 4} {
+		if _, ok := f.sync.retry[id]; !ok {
+			t.Fatalf("retry lost id %d: %v", id, f.sync.retryOrder)
+		}
+	}
+}
+
+// When the retry pass's time bound is spent, the window still makes progress
+// and the unreached retries stay queued.
+func TestChangeSyncRetryTimeKeepsWindowProgress(t *testing.T) {
+	oldRows, oldTime := changeSyncRows, changeSyncRetryTime
+	changeSyncRows, changeSyncRetryTime = 2, -time.Second
+	t.Cleanup(func() { changeSyncRows, changeSyncRetryTime = oldRows, oldTime })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 4; i++ {
+		if i != 1 {
+			f.hub.pulls[40+i] = syncPull(40+i, "open")
+		}
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 40 + i, State: "open"})
+	}
+	f.run(t) // window=2: pull 41 fails (no hub entry), pull 42 open
+	f.hub.pulls[41] = syncPull(41, "open")
+	f.run(t) // retry budget spent: window rows 3-4 only
+	want := []int{41, 42, 43, 44}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+	if _, ok := f.sync.retry[1]; !ok {
+		t.Fatalf("retry lost id 1: %v", f.sync.retryOrder)
+	}
+}
+
 // The sync runs with the handoffkeep sink and a change-state writer, hourly
 // unless configured, and "off" stops it.
 func TestChangeSyncEnabled(t *testing.T) {
