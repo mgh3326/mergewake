@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -175,12 +176,89 @@ type State struct {
 	Published map[string]string
 }
 
+func emptyState() State {
+	return State{Latest: map[string]Outcome{}, Published: map[string]string{}}
+}
+
+// clone returns a State that shares no map, slice or pointer with s.
+func (s State) clone() State {
+	out := State{Latest: make(map[string]Outcome, len(s.Latest)), Published: maps.Clone(s.Published)}
+	for task, v := range s.Latest {
+		out.Latest[task] = v.clone()
+	}
+	return out
+}
+
+// clone returns a copy of v that shares no map, slice or pointer with v.
+func (v Outcome) clone() Outcome {
+	v.MergedAt = clonePtr(v.MergedAt)
+	v.ClosedAt = clonePtr(v.ClosedAt)
+	v.FirstCIGreen = clonePtr(v.FirstCIGreen)
+	v.TimeToMerge = clonePtr(v.TimeToMerge)
+	v.Reverted = clonePtr(v.Reverted)
+	v.ReconcileDueAt = clonePtr(v.ReconcileDueAt)
+	v.Findings = maps.Clone(v.Findings)
+	v.Reviews = cloneNested(v.Reviews)
+	v.ReviewedHeads = slices.Clone(v.ReviewedHeads)
+	v.ReviewersByHead = cloneNested(v.ReviewersByHead)
+	v.ReviewBlocked = maps.Clone(v.ReviewBlocked)
+	return v
+}
+
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	c := *p
+	return &c
+}
+
+func cloneNested[V any](m map[string]map[string]V) map[string]map[string]V {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]map[string]V, len(m))
+	for k, inner := range m {
+		out[k] = maps.Clone(inner)
+	}
+	return out
+}
+
+// ledgerFile is what this process knows of one ledger file: the state of the
+// file's bytes before offset. A call decodes only the bytes after offset, so
+// a row another process appended is seen by the next call.
+type ledgerFile struct {
+	dev, ino uint64
+	offset   int64
+	// tail holds the bytes just before offset. A file replaced in place keeps
+	// its inode, so the tail is what tells it apart from the one decoded.
+	tail  []byte
+	state State
+}
+
+// ledgerTailBytes is how many bytes before offset a ledgerFile keeps as tail.
+const ledgerTailBytes = 4096
+
+// ledgerFiles holds one ledgerFile per ledger path. flock orders the calls of
+// all processes; ledgerMu orders the calls of this process, whose goroutines
+// share the cache.
+var (
+	ledgerMu    sync.Mutex
+	ledgerFiles = map[string]*ledgerFile{}
+)
+
 func Key(repo string, pr int) string { return fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr) }
+
+// locked calls fn with the ledger state under the flock. The State is the
+// cache's own: fn must not keep it or change it, and must clone what it edits.
 func (l Ledger) locked(fn func(*os.File, State) error) error {
 	if err := os.MkdirAll(l.Dir, 0700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(l.Dir, "outcomes.jsonl"), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
+	path := filepath.Join(l.Dir, "outcomes.jsonl")
+	ledgerMu.Lock()
+	defer ledgerMu.Unlock()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -192,37 +270,99 @@ func (l Ledger) locked(fn func(*os.File, State) error) error {
 		return err
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	state, err := read(f)
+	state, err := load(path, f)
 	if err != nil {
 		return err
 	}
 	return fn(f, state)
 }
-func read(r io.Reader) (State, error) {
-	s := State{Latest: map[string]Outcome{}, Published: map[string]string{}}
+
+// load returns the state of the locked ledger file f at path. It decodes only
+// the bytes appended since the cache last decoded when f is still the file the
+// cache holds. On first use, for a different or replaced file, or for a file
+// that is now shorter than the cache covers, it decodes from the start. A
+// decode error drops the cache entry, so the next call starts from the start.
+func load(path string, f *os.File) (State, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return State{}, err
+	}
+	dev, ino := fileID(fi)
+	lf := ledgerFiles[path]
+	if lf == nil || lf.dev != dev || lf.ino != ino || fi.Size() < lf.offset || !lf.tailMatches(f) {
+		lf = &ledgerFile{dev: dev, ino: ino, state: emptyState()}
+		ledgerFiles[path] = lf
+	}
+	consumed, err := applyEvents(io.NewSectionReader(f, lf.offset, fi.Size()-lf.offset), &lf.state)
+	if err == nil {
+		lf.offset += consumed
+		err = lf.setTail(f)
+	}
+	if err != nil {
+		delete(ledgerFiles, path)
+		return State{}, err
+	}
+	return lf.state, nil
+}
+
+// fileID names the file behind fi by its device and inode.
+func fileID(fi os.FileInfo) (dev, ino uint64) {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Dev), uint64(st.Ino)
+	}
+	return 0, 0
+}
+
+// tailMatches reports whether the bytes before offset are still the tail the
+// cache holds.
+func (lf *ledgerFile) tailMatches(f *os.File) bool {
+	got := make([]byte, len(lf.tail))
+	if _, err := f.ReadAt(got, lf.offset-int64(len(lf.tail))); err != nil {
+		return false
+	}
+	return slices.Equal(got, lf.tail)
+}
+
+// setTail keeps the last ledgerTailBytes before offset.
+func (lf *ledgerFile) setTail(f *os.File) error {
+	n := min(lf.offset, ledgerTailBytes)
+	lf.tail = make([]byte, n)
+	_, err := f.ReadAt(lf.tail, lf.offset-n)
+	return err
+}
+
+// applyEvents applies the events in r to s, in order. It returns how many
+// bytes it consumed; without an error that is all of r.
+func applyEvents(r io.Reader, s *State) (int64, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 8<<20)
+	var consumed int64
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		advance, token, err := bufio.ScanLines(data, atEOF)
+		consumed += int64(advance)
+		return advance, token, err
+	})
 	for scanner.Scan() {
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			return s, fmt.Errorf("outcomes ledger corrupt: %w", err)
+			return consumed, fmt.Errorf("outcomes ledger corrupt: %w", err)
 		}
 		if e.Version != 1 {
-			return s, errors.New("unsupported outcomes ledger version")
+			return consumed, errors.New("unsupported outcomes ledger version")
 		}
 		switch e.Kind {
 		case "outcome":
 			if e.Outcome == nil {
-				return s, errors.New("missing outcome")
+				return consumed, errors.New("missing outcome")
 			}
 			s.Latest[e.Outcome.Task] = *e.Outcome
 		case "published":
 			s.Published[e.ID] = e.Rep
 		default:
-			return s, errors.New("unknown outcomes event")
+			return consumed, errors.New("unknown outcomes event")
 		}
 	}
-	return s, scanner.Err()
+	return consumed, scanner.Err()
 }
 func appendEvent(f *os.File, e Event) error {
 	b, err := json.Marshal(e)
@@ -236,13 +376,14 @@ func appendEvent(f *os.File, e Event) error {
 }
 func (l Ledger) Read() (State, error) {
 	var s State
-	err := l.locked(func(_ *os.File, state State) error { s = state; return nil })
+	err := l.locked(func(_ *os.File, state State) error { s = state.clone(); return nil })
 	return s, err
 }
 func (l Ledger) Update(repo string, pr int, fn func(*Outcome)) error {
 	return l.locked(func(f *os.File, s State) error {
 		key := Key(repo, pr)
-		v := s.Latest[key]
+		// fn edits maps in place, so it gets a copy of the row, never the cache's.
+		v := s.Latest[key].clone()
 		if v.Task == "" {
 			v = Outcome{Repo: repo, PR: pr, Task: key, Decision: "unknown", Reviews: map[string]map[string]int{}}
 		}
@@ -517,7 +658,7 @@ func (l Ledger) outbox(repo string) ([]Outcome, error) {
 			if !v.Final || !v.Attributed() || s.Published[v.ID] != "" {
 				continue
 			}
-			pending = append(pending, v)
+			pending = append(pending, v.clone())
 		}
 		return nil
 	})
