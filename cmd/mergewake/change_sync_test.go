@@ -492,6 +492,32 @@ func TestChangeSyncRetrySetBounded(t *testing.T) {
 	}
 }
 
+// When the retry pass's time bound is spent, the window still makes progress
+// and the unreached retries stay queued.
+func TestChangeSyncRetryTimeKeepsWindowProgress(t *testing.T) {
+	oldRows, oldTime := changeSyncRows, changeSyncRetryTime
+	changeSyncRows, changeSyncRetryTime = 2, -time.Second
+	t.Cleanup(func() { changeSyncRows, changeSyncRetryTime = oldRows, oldTime })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 4; i++ {
+		if i != 1 {
+			f.hub.pulls[40+i] = syncPull(40+i, "open")
+		}
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: 40 + i, State: "open"})
+	}
+	f.run(t) // window=2: pull 41 fails (no hub entry), pull 42 open
+	f.hub.pulls[41] = syncPull(41, "open")
+	f.run(t) // retry budget spent: window rows 3-4 only
+	want := []int{41, 42, 43, 44}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+	if _, ok := f.sync.retry[1]; !ok {
+		t.Fatalf("retry lost id 1: %v", f.sync.retryOrder)
+	}
+}
+
 // The sync runs with the handoffkeep sink and a change-state writer, hourly
 // unless configured, and "off" stops it.
 func TestChangeSyncEnabled(t *testing.T) {

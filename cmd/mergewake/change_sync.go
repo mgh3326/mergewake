@@ -25,6 +25,10 @@ var (
 	// changeSyncRetries bounds the rows a run leaves unfinished that the next
 	// run reads first; past it a row waits for the rotation like any other.
 	changeSyncRetries = 100
+	// changeSyncRetryTime bounds how much of one run the retry pass may take,
+	// so slow retries cannot starve the cursor's window; retries it does not
+	// reach stay queued for the next run.
+	changeSyncRetryTime = 5 * time.Minute
 )
 
 // changeSync checks hk's unreconciled PR rows against GitHub and records the
@@ -136,9 +140,11 @@ func (s *changeSync) run(ctx context.Context) {
 	}
 
 	// Rows the last run left unfinished are read first, wherever the cursor
-	// sits; the cursor may pass them, the retry set brings them back.
+	// sits; the cursor may pass them, the retry set brings them back. The
+	// pass is bounded in time so slow retries cannot starve the window.
+	retryUntil := started.Add(changeSyncRetryTime)
 	for i := range rows {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || time.Now().After(retryUntil) {
 			break
 		}
 		r := rows[i]
