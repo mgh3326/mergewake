@@ -1107,9 +1107,14 @@ reads hk's maximum page (1000 rows) and checks at most 500 rows, starting
 after the last row the previous run checked and wrapping at the end, so rows
 that stay open at the head of the list cannot starve the rest. A list longer
 than one page takes several runs to cover, and a still-open row is checked
-again only when the rotation reaches it or the page no longer fills. GitHub
-reads go through the client's memo and ETag cache, and the GraphQL resolver
-runs only for a merged PR. Each run logs one `hk change sync run` line with
+again only when the rotation reaches it or the page no longer fills. A run
+that uses up its time bound stops where it is: the cursor stays at the last
+row it finished, so the rows it did not reach are the next run's first. A row
+whose PR read fails, or that is merged with no merge commit yet, does not
+wait for the rotation either: the run keeps a bounded retry set (100 rows,
+oldest out first) and the next run reads those rows before the cursor's
+window. GitHub reads go through the client's memo and ETag cache, and the
+GraphQL resolver runs only for a merged PR. Each run logs one `hk change sync run` line with
 `rows`, `merged`, `closed`, `open`, `other_repo` and `errors`; a failed read
 (an hk without the endpoint answers 404) is in that line, and the next run
 retries.
