@@ -1102,22 +1102,24 @@ merged row is written with `merge_sha` and `merged_at`, a closed-unmerged row
 as `closed`, and a PR that is still open gets no write. Rows of repositories
 this host does not configure are counted and skipped, never read.
 
-The endpoint pages by `limit` only and takes no `after_id`. A run therefore
-reads hk's maximum page (1000 rows) and checks at most 500 rows, starting
-after the last row the previous run checked and wrapping at the end, so rows
-that stay open at the head of the list cannot starve the rest. A list longer
-than one page takes several runs to cover, and a still-open row is checked
-again only when the rotation reaches it or the page no longer fills. A run
-that uses up its time bound stops where it is: the cursor stays at the last
-row it finished, so the rows it did not reach are the next run's first. A row
-whose PR read fails, or that is merged with no merge commit yet, does not
-wait for the rotation either: the run keeps a bounded retry set (100 rows,
-oldest out first) and the next run reads those rows before the cursor's
-window. GitHub reads go through the client's memo and ETag cache, and the
-GraphQL resolver runs only for a merged PR. Each run logs one `hk change sync run` line with
-`rows`, `merged`, `closed`, `open`, `other_repo` and `errors`; a failed read
-(an hk without the endpoint answers 404) is in that line, and the next run
-retries.
+The endpoint pages by `after_id`: a run reads pages forward from the cursor —
+the last row the previous run reached — until it has checked 500 rows or the
+list ends (`next_after_id` null). At the end the cursor goes back to 0, so the
+rotation covers the whole list however long it grows, and rows past the first
+page are reached. A run that uses up its time bound stops where it is: the
+cursor stays at the last row it finished, so the rows it did not reach are the
+next run's first. A row whose PR read fails, or that is merged with no merge
+commit yet, does not wait for the rotation either: the next run reads from just
+before the smallest such row and checks those rows first, within a bounded
+retry pass (5 minutes, 100 rows, oldest out first); a retry id the list no
+longer has leaves the set. An hk without `after_id` paging ignores the
+parameter and answers one page with no `next_after_id`: the run then reads that
+page only and rotates inside it, starting after the last row the previous run
+checked and wrapping at the end. GitHub reads go through the client's memo and
+ETag cache, and the GraphQL resolver runs only for a merged PR. Each run logs
+one `hk change sync run` line with `rows`, `merged`, `closed`, `open`,
+`other_repo` and `errors`; a failed read (an hk without the endpoint answers
+404) is in that line, and the next run retries.
 
 #### hk HTTP credential
 

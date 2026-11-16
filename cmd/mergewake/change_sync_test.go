@@ -22,11 +22,16 @@ import (
 )
 
 // syncHK is a fake hk for the unreconciled read and the change-state batch
-// write, reached through the real svc-mergewake credential.
+// write, reached through the real svc-mergewake credential. With paged it
+// honors after_id and limit and answers next_after_id; without it the read
+// ignores after_id, returns every row, and sends no next_after_id, like an
+// hk without paging.
 type syncHK struct {
 	mu       sync.Mutex
 	rows     []integrations.UnreconciledChange
 	limits   []string
+	afters   []string
+	paged    bool
 	batches  [][]byte
 	readFail int // status of the next unreconciled read; 0 serves the rows
 }
@@ -36,6 +41,8 @@ func (h *syncHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/changes/unreconciled":
 		h.mu.Lock()
 		h.limits = append(h.limits, r.URL.Query().Get("limit"))
+		h.afters = append(h.afters, r.URL.Query().Get("after_id"))
+		paged := h.paged
 		fail := h.readFail
 		h.readFail = 0
 		rows := append([]integrations.UnreconciledChange(nil), h.rows...)
@@ -45,7 +52,24 @@ func (h *syncHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"changes": rows})
+		if !paged {
+			_ = json.NewEncoder(w).Encode(map[string]any{"changes": rows})
+			return
+		}
+		afterID, _ := strconv.ParseInt(r.URL.Query().Get("after_id"), 10, 64)
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		var page []integrations.UnreconciledChange
+		for _, row := range rows {
+			if row.ID > afterID {
+				page = append(page, row)
+			}
+		}
+		var next any
+		if limit > 0 && len(page) > limit {
+			page = page[:limit]
+			next = page[len(page)-1].ID
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"changes": page, "next_after_id": next})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/changes/batch":
 		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
@@ -311,9 +335,9 @@ func TestChangeSyncSkipsOtherRepos(t *testing.T) {
 	}
 }
 
-// The endpoint pages by limit only, so a run checks its bound from where the
-// previous run stopped and wraps at the end: rows that stay open at the head
-// do not starve the rest.
+// An hk without after_id paging answers one page, so a run checks its bound
+// from where the previous run stopped inside it and wraps at the end: rows
+// that stay open at the head do not starve the rest.
 func TestChangeSyncBoundRotates(t *testing.T) {
 	oldRows, oldScan := changeSyncRows, changeSyncScan
 	changeSyncRows, changeSyncScan = 2, 6
@@ -396,7 +420,9 @@ func TestChangeSyncTimeoutLeavesCursor(t *testing.T) {
 	defer cancel()
 	var calls []int
 	s := &changeSync{
-		rows: func(context.Context, int) ([]integrations.UnreconciledChange, error) { return rows, nil },
+		rows: func(context.Context, int64, int) (integrations.UnreconciledPage, error) {
+			return integrations.UnreconciledPage{Changes: rows}, nil
+		},
 		pull: func(pctx context.Context, repo string, n int) (github.Pull, error) {
 			calls = append(calls, n)
 			if len(calls) == 2 {
@@ -515,6 +541,146 @@ func TestChangeSyncRetryTimeKeepsWindowProgress(t *testing.T) {
 	}
 	if _, ok := f.sync.retry[1]; !ok {
 		t.Fatalf("retry lost id 1: %v", f.sync.retryOrder)
+	}
+}
+
+// pagedRows is a changeSync.rows over all that honors after_id and limit and
+// answers next_after_id, like a paging hk.
+func pagedRows(all []integrations.UnreconciledChange) func(context.Context, int64, int) (integrations.UnreconciledPage, error) {
+	return func(_ context.Context, after int64, limit int) (integrations.UnreconciledPage, error) {
+		var page []integrations.UnreconciledChange
+		for _, r := range all {
+			if r.ID > after {
+				page = append(page, r)
+			}
+		}
+		out := integrations.UnreconciledPage{Paged: true, Changes: page}
+		if limit > 0 && len(page) > limit {
+			page = page[:limit]
+			out.Changes = page
+			next := page[len(page)-1].ID
+			out.NextAfterID = &next
+		}
+		return out, nil
+	}
+}
+
+// A paging hk lets one run read past the first page: successive runs reach
+// every row, and the cursor wraps to the start after the list's end.
+func TestChangeSyncPagesForward(t *testing.T) {
+	oldRows, oldScan := changeSyncRows, changeSyncScan
+	changeSyncRows, changeSyncScan = 4, 3
+	t.Cleanup(func() { changeSyncRows, changeSyncScan = oldRows, oldScan })
+
+	f := newSyncFixture(t)
+	f.hk.paged = true
+	for i := 1; i <= 7; i++ {
+		f.hub.pulls[i] = syncPull(i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: i, State: "open"})
+	}
+	for range 3 {
+		f.run(t)
+	}
+	want := []int{1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+	f.hk.mu.Lock()
+	afters := append([]string(nil), f.hk.afters...)
+	f.hk.mu.Unlock()
+	if len(afters) < 2 || afters[0] != "0" || afters[1] != "3" {
+		t.Fatalf("after_ids %v", afters)
+	}
+}
+
+// A paged run whose context ends stops before it advances the cursor: the
+// rows it did not reach are the next run's first rows, and the row it was
+// reading is retried from the retry set.
+func TestChangeSyncPagedTimeoutLeavesCursor(t *testing.T) {
+	oldRows, oldScan := changeSyncRows, changeSyncScan
+	changeSyncRows, changeSyncScan = 3, 2
+	t.Cleanup(func() { changeSyncRows, changeSyncScan = oldRows, oldScan })
+
+	var all []integrations.UnreconciledChange
+	for i := int64(1); i <= 5; i++ {
+		all = append(all, integrations.UnreconciledChange{ID: i, Repo: "o/one", PRNumber: int(10 + i), State: "open"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls []int
+	s := &changeSync{
+		rows: pagedRows(all),
+		pull: func(pctx context.Context, repo string, n int) (github.Pull, error) {
+			calls = append(calls, n)
+			if len(calls) == 2 {
+				cancel()
+				return github.Pull{}, pctx.Err()
+			}
+			return github.Pull{State: "open"}, nil
+		},
+		record: func(context.Context, string, github.Pull) {},
+		repos:  map[string]bool{"o/one": true},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	s.run(ctx)
+	if s.after != 2 {
+		t.Fatalf("after %d, want 2", s.after)
+	}
+	s.run(context.Background())
+	want := []int{11, 12, 12, 13, 14, 15}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", calls, want)
+	}
+}
+
+// A retry row that sits behind the cursor is checked first on the next run:
+// the retry pass reads from just before the smallest retry id.
+func TestChangeSyncRetryBehindCursor(t *testing.T) {
+	oldRows, oldScan := changeSyncRows, changeSyncScan
+	changeSyncRows, changeSyncScan = 2, 3
+	t.Cleanup(func() { changeSyncRows, changeSyncScan = oldRows, oldScan })
+
+	f := newSyncFixture(t)
+	f.hk.paged = true
+	for i := 1; i <= 5; i++ {
+		if i != 1 {
+			f.hub.pulls[i] = syncPull(i, "open")
+		}
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: i, State: "open"})
+	}
+	f.run(t) // pull 1 fails and joins the retry set; the window checks 1-2
+	f.hub.pulls[1] = syncPull(1, "open")
+	f.run(t) // the retry pass reads row 1 first, then the window rows 3-4
+	want := []int{1, 2, 1, 3, 4}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+}
+
+// An hk answer without next_after_id gives the one-page behaviour: one read
+// per run and the cursor rotating inside the page.
+func TestChangeSyncUnpagedReadsOnePage(t *testing.T) {
+	oldRows := changeSyncRows
+	changeSyncRows = 2
+	t.Cleanup(func() { changeSyncRows = oldRows })
+
+	f := newSyncFixture(t)
+	for i := 1; i <= 5; i++ {
+		f.hub.pulls[i] = syncPull(i, "open")
+		f.hk.rows = append(f.hk.rows, integrations.UnreconciledChange{ID: int64(i), Repo: "o/one", PRNumber: i, State: "open"})
+	}
+	for range 4 {
+		f.run(t)
+	}
+	want := []int{1, 2, 3, 4, 5, 1, 2}
+	if got := f.pulls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("pull reads %v, want %v", got, want)
+	}
+	f.hk.mu.Lock()
+	reads := len(f.hk.limits)
+	f.hk.mu.Unlock()
+	if reads != 4 {
+		t.Fatalf("%d unreconciled reads, want one per run", reads)
 	}
 }
 
