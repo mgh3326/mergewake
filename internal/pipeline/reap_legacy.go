@@ -344,6 +344,46 @@ func openBranches(open []github.Pull, repo string) map[string]bool {
 
 func legacyKey(host, path string) string { return host + "\x00" + path }
 
+// receiptPath is the one normalization every legacy-sweep receipt key goes
+// through: receipts are keyed by legacyKey(host, receiptPath(...)). The path
+// is the worktree root when it is known — an inspected wt.Path or a listed
+// row. gone reports a path inspection found missing, reachable only through a
+// job cwd that may sit inside the worktree: it resolves to the nearest
+// ancestor whose newest receipt is terminal — the finished worktree root
+// earlier sweeps saw. A nearer row that is not terminal means the path sits
+// under a live worktree's subtree, so the gone row keys the path itself
+// rather than overwriting that worktree's signature. A known root never
+// resolves to an ancestor: a fresh checkout must not inherit the rows of a
+// worktree above it.
+func (w *legacySweep) receiptPath(host, path string, gone bool) string {
+	p := filepath.Clean(path)
+	if gone {
+		for q := filepath.Dir(p); ; {
+			if l, ok := w.lastRow[legacyKey(host, q)]; ok {
+				if l.result == "removed" || l.result == "refused" {
+					return q
+				}
+				break
+			}
+			parent := filepath.Dir(q)
+			if parent == q {
+				break
+			}
+			q = parent
+		}
+	}
+	return p
+}
+
+// checkoutField reports whether a receipt's recorded branch or head matches
+// the candidate's. A receipt that never recorded the field is a wildcard —
+// it cannot tell checkouts apart — but the candidate's empty field is not:
+// a detached or headless checkout is a different checkout and must be
+// evaluated, not suppressed by a row that named one.
+func checkoutField(recorded, have string) bool {
+	return recorded == "" || recorded == have
+}
+
 // legacyLast is the newest legacy-sweep row of one worktree path: the
 // result|reason signature note compares repeats against, and the checkout
 // identity (branch and head) a terminal row is bound to.
@@ -519,9 +559,10 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 // suppression: a path an earlier sweep finished cannot be listed any more, and
 // inspection of it has no branch or head to bind a row to — but a bound job's
 // cwd can still reach it, so a remove that was recorded once must not be
-// re-recorded as kept/gone on every sweep.
+// re-recorded as kept/gone on every sweep. path is already a receipt key:
+// evaluate resolves a gone job cwd to its worktree root before calling.
 func (w *legacySweep) terminal(host, path string) string {
-	switch l := w.lastRow[legacyKey(host, path)]; l.result {
+	switch l := w.lastRow[legacyKey(host, w.receiptPath(host, path, false))]; l.result {
 	case "removed", "refused":
 		return l.result
 	}
@@ -531,30 +572,34 @@ func (w *legacySweep) terminal(host, path string) string {
 // prior is "removed" or "refused" when the worktree's newest row is final for
 // this checkout: a terminal row suppresses only the branch and head it
 // recorded, so a different checkout at the same path is evaluated again. A
-// row without a head (written before heads were recorded) counts as matching,
-// so old rows do not all re-evaluate once.
+// row that never recorded a branch or head (rows written before they were
+// recorded) is a wildcard on that field, so old rows do not all re-evaluate
+// once; a candidate with an empty field is a different checkout, not a
+// wildcard.
 func (w *legacySweep) prior(host, path, branch, head string) string {
-	l, ok := w.lastRow[legacyKey(host, path)]
+	l, ok := w.lastRow[legacyKey(host, w.receiptPath(host, path, false))]
 	if !ok || (l.result != "removed" && l.result != "refused") {
 		return ""
 	}
-	if l.branch != branch || (l.head != "" && l.head != head) {
+	if !checkoutField(l.branch, branch) || !checkoutField(l.head, head) {
 		return ""
 	}
 	return l.result
 }
 
 // note prints a row and appends it to reap.jsonl unless it repeats the
-// worktree's newest outcome for the same checkout. A different checkout at the
-// same path — another branch, or the same branch at another head — is a new
+// worktree's newest outcome for the same checkout, with the same wildcard
+// rule as prior: a row that never recorded the field cannot tell checkouts
+// apart. A different checkout at the same path — another branch,
+// or the same branch at another head — is a new
 // removal and is always written, so the journal's newest row names the
 // checkout that was actually removed. Plans are written too: they are the list
 // the operator reviews before the apply.
 func (w *legacySweep) note(v reapReceipt) error {
 	v.Time = w.s.now().UTC()
-	key, sig := legacyKey(v.Host, v.Worktree), v.Result+"|"+v.Reason
+	key, sig := legacyKey(v.Host, w.receiptPath(v.Host, v.Worktree, false)), v.Result+"|"+v.Reason
 	prev := w.lastRow[key]
-	repeat := prev.sig == sig && prev.branch == v.Branch && prev.head == v.Head
+	repeat := prev.sig == sig && checkoutField(prev.branch, v.Branch) && checkoutField(prev.head, v.Head)
 	w.lastRow[key] = legacyLast{sig: sig, result: v.Result, branch: v.Branch, head: v.Head}
 	// The receipt is the durable record, so it is written before the row is
 	// printed: a failing stdout must not lose a removal.
@@ -588,15 +633,23 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", c.host, c.cwd, e))
 		return ""
 	case wt == nil:
-		// Inspection has no identity to bind a row to. A path an earlier sweep
-		// finished, reached again only through a stale job cwd, is quiet: it
-		// is tallied, not re-recorded, on every sweep. A listed path was
-		// already matched against its listed identity by candidate.
+		// Inspection has no identity to bind a row to. The candidate's path
+		// may be a job cwd inside the gone worktree, so the receipt key is the
+		// nearest ancestor whose newest row is terminal — the worktree root
+		// earlier sweeps saw. A path an earlier sweep finished, reached again
+		// only through a stale job cwd, is quiet: it is tallied, not
+		// re-recorded, on every sweep. A listed path was already matched
+		// against its listed identity by candidate. A gone row names the
+		// path, not a checkout, so it carries no branch or head. A listed
+		// path is a known worktree root and keys itself; only an unlisted
+		// job cwd may resolve to an ancestor's receipt.
+		rec.Worktree = w.receiptPath(c.host, c.cwd, c.listed == nil)
 		if c.listed == nil {
-			if prior := w.terminal(c.host, c.cwd); prior != "" {
+			if prior := w.terminal(c.host, rec.Worktree); prior != "" {
 				return "already-" + prior
 			}
 		}
+		rec.Branch, rec.Head = "", ""
 		keep("gone")
 		return ""
 	}
@@ -787,6 +840,9 @@ func (w *legacySweep) removeGuarded(ctx context.Context, hs *reapHost, wt *reap.
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, wt.Path, e))
 		return
 	case cur == nil:
+		// The checkout vanished between inspections: like the inspect-time
+		// gone, the row names the path and carries no checkout identity.
+		rec.Branch, rec.Head = "", ""
 		keep("gone")
 		return
 	case cur.Path != wt.Path || cur.Branch != wt.Branch || cur.Head != wt.Head:
