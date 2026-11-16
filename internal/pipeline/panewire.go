@@ -1607,9 +1607,10 @@ func (x *panewireExecutor) builderFamily(ctx context.Context, parent string) str
 // panewireBuilderFamily bounds the builder family to the values accepted by
 // panewire. Mergewake keeps the canonical family for its own review logic.
 func panewireBuilderFamily(family string) string {
-	switch family {
+	canonical := config.CanonicalFamily(family)
+	switch canonical {
 	case "anthropic", "openai", "google", "xai", "deepseek", "meta", "mistral", "other":
-		return family
+		return canonical
 	default:
 		return "other"
 	}

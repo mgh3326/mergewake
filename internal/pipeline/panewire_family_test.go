@@ -19,3 +19,33 @@ func TestReviewerFamilyFallbackIsStableAcrossProfiles(t *testing.T) {
 		}
 	}
 }
+
+func TestPanewireBuilderFamilyCanonicalizesAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		family string
+		want   string
+	}{
+		{name: "claude", family: "claude", want: "anthropic"},
+		{name: "capital claude", family: "Claude", want: "anthropic"},
+		{name: "padded opus", family: " opus ", want: "anthropic"},
+		{name: "codex", family: "codex", want: "openai"},
+		{name: "gemini", family: "gemini", want: "google"},
+		{name: "agy", family: "agy", want: "google"},
+		{name: "grok", family: "grok", want: "xai"},
+		{name: "deepseek", family: "deepseek", want: "deepseek"},
+		{name: "anthropic", family: "anthropic", want: "anthropic"},
+		{name: "openai", family: "openai", want: "openai"},
+		{name: "devin", family: "devin", want: "other"},
+		{name: "cognition", family: "cognition", want: "other"},
+		{name: "kimi", family: "kimi", want: "other"},
+		{name: "unknown", family: "unknown-x", want: "other"},
+		{name: "empty", family: "", want: "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := panewireBuilderFamily(tc.family); got != tc.want {
+				t.Fatalf("panewireBuilderFamily(%q)=%q, want %q", tc.family, got, tc.want)
+			}
+		})
+	}
+}
