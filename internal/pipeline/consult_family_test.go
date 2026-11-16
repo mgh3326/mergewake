@@ -37,6 +37,13 @@ func TestConsultRequestSendsBoundedAuthorFamily(t *testing.T) {
 			wantSource: "trailer",
 		},
 		{
+			name:       "no bound job, trailer claude is bounded to anthropic",
+			trailer:    "claude",
+			unbindJob:  true,
+			wantFamily: "anthropic",
+			wantSource: "trailer",
+		},
+		{
 			name:       "trailer and job record anthropic pass through",
 			trailer:    "anthropic",
 			jobFamily:  "anthropic",
