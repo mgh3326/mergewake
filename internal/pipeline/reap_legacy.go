@@ -186,7 +186,7 @@ func (s *Service) ReapLegacy(ctx context.Context, r config.Repo, host string, o 
 	lastRow := map[string]legacyLast{}
 	for _, rec := range receipts {
 		if legacyRow(rec) {
-			lastRow[legacyKey(rec.Host, rec.Worktree)] = legacyLast{sig: rec.Result + "|" + rec.Reason, result: rec.Result, branch: rec.Branch, head: rec.Head}
+			lastRow[legacyKey(rec.Host, filepath.Clean(rec.Worktree))] = legacyLast{sig: rec.Result + "|" + rec.Reason, result: rec.Result, branch: rec.Branch, head: rec.Head}
 		}
 	}
 
