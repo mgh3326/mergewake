@@ -238,6 +238,36 @@ func (s *Service) hubConsultAdvance(ctx context.Context, r config.Repo, pr githu
 	return s.hubConsultPoll(ctx, r, pr, o, st, now)
 }
 
+// consultAuthor is the author a consult request names. The hub needs the bound
+// job for repository evidence, and it reads the job's recorded family unless
+// the request names one, so the family is sent beside the job. The family is
+// bounded by panewireBuilderFamily, as the review spawn bounds its builder
+// family: the bound job's record when that is readable, else the
+// Mergewake-Author-Family trailer. source is "job", "trailer", or empty when
+// neither names a family. A read error leaves that source unnamed, as before.
+type consultAuthor struct {
+	job, family, source string
+}
+
+func (s *Service) consultAuthorFor(ctx context.Context, r config.Repo, pr github.Pull, task string) consultAuthor {
+	var a consultAuthor
+	if job, rec, ok, e := s.boundJob(ctx, task); e == nil && ok && job != "" {
+		a.job = job
+		if rec.Family != "" {
+			a.family, a.source = rec.Family, "job"
+		}
+	}
+	if a.family == "" {
+		if f, fe := s.prTrailer(ctx, r, pr, "Mergewake-Author-Family", familyValue.MatchString); fe == nil && f != "" {
+			a.family, a.source = f, "trailer"
+		}
+	}
+	if a.family != "" {
+		a.family = panewireBuilderFamily(a.family)
+	}
+	return a
+}
+
 // hubConsultRequest writes the question document to hk and POSTs one
 // `panewire consult request` through the hub credential. The caller holds
 // the round-rule state lock and has persisted the attempt time. A failure
@@ -276,10 +306,12 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 		"--task", task,
 		"--question", st.HubConsultQuestion,
 	}
-	if job, _, ok, e := s.boundJob(ctx, task); e == nil && ok && job != "" {
-		args = append(args, "--author-job", job)
-	} else if family, fe := s.prTrailer(ctx, r, pr, "Mergewake-Author-Family", familyValue.MatchString); fe == nil && family != "" {
-		args = append(args, "--author-family", family)
+	author := s.consultAuthorFor(ctx, r, pr, task)
+	if author.job != "" {
+		args = append(args, "--author-job", author.job)
+	}
+	if author.family != "" {
+		args = append(args, "--author-family", author.family)
 	}
 	args = append(args,
 		"--pr", fmt.Sprintf("%s#%d", r.Name, pr.Number),
@@ -342,6 +374,7 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	// this record, never by re-POSTing a row that may have gone terminal.
 	if e := s.audit(r.Name, "consult-request", map[string]any{
 		"pr": pr.Number, "head": pr.Head.SHA, "id": row.ID, "state": row.State, "question": st.HubConsultQuestion,
+		"author_job": author.job, "author_family": author.family, "family_source": author.source,
 	}, o.DryRun); e != nil && s.Log != nil {
 		s.Log.Warn("consult request audit failed", "pr", pr.Number, "error", e)
 	}

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -36,15 +37,17 @@ func TestTrailersReviewTakesProfileFromHeadCommit(t *testing.T) {
 }
 
 // A family and a profile that disagree are a conflict wherever they are
-// written: here both are only in the head commit.
+// written: here both are only in the head commit. The conflict blocks the head
+// with the author-family-conflict kind instead of failing the pass.
 func TestTrailersReviewFamilyAndProfileBothFromHeadCommit(t *testing.T) {
 	s, g, _, _, r := reviewSetup(t)
+	s.GH = &commentGH{fakeGH: g}
 	g.pull.Body = "no trailers\n"
 	g.messages = map[string]string{shaA: "subject\n\nMergewake-Author-Family: openai\nMergewake-Author-Profile: ds@high\n"}
 	reviewProfiles(s)
 	e := s.Review(context.Background(), r, 7, "", Options{})
-	if e == nil || !strings.Contains(e.Error(), "author family conflicts with configured profile") {
-		t.Fatalf("want a family/profile conflict: %v", e)
+	if !errors.Is(e, ErrReviewBlocked) || !strings.Contains(e.Error(), blockAuthorFamilyConflict) {
+		t.Fatalf("want an author-family-conflict block: %v", e)
 	}
 }
 

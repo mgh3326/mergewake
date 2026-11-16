@@ -23,10 +23,11 @@ var ErrReviewBlocked = errors.New("review blocked")
 
 // A review block is a closed set of outcomes recorded on the PR's outcome row.
 const (
-	blockMissingTrailer = "blocked: missing-task-trailer"
-	blockMissingMarker  = "blocked: task-missing-T-marker"
-	blockUnknownFamily  = "blocked: author-family-unknown"
-	blockSecretLike     = "blocked: secret-like-content"
+	blockMissingTrailer       = "blocked: missing-task-trailer"
+	blockMissingMarker        = "blocked: task-missing-T-marker"
+	blockUnknownFamily        = "blocked: author-family-unknown"
+	blockAuthorFamilyConflict = "blocked: author-family-conflict"
+	blockSecretLike           = "blocked: secret-like-content"
 )
 
 var secretLikeBlock = reviewBlock{blockSecretLike, "The diff contains a string that looks like a credential. Remove it, or if it is a test fixture make it obviously fake (for example, use a placeholder), and push a new head."}
@@ -35,6 +36,24 @@ var secretLikeBlock = reviewBlock{blockSecretLike, "The diff contains a string t
 type reviewBlock struct {
 	reason string
 	fix    string
+}
+
+// familyConflictBlock blocks a head whose Mergewake-Author-Family trailer
+// disagrees with the profile its Mergewake-Author-Profile trailer names. The
+// PR author fixes it in the PR body, so the comment names both values and the
+// line to change.
+func familyConflictBlock(pr github.Pull, family, profileName, profileFamily string) reviewBlock {
+	source := "head commit"
+	if familyValue.MatchString(trailer(pr.Body, "Mergewake-Author-Family")) {
+		source = "PR body"
+	}
+	return reviewBlock{blockAuthorFamilyConflict, fmt.Sprintf("The `Mergewake-Author-Family` trailer (in the %s) is `%s`, but profile `%s` is family `%s`. Set `Mergewake-Author-Family: %s` in the PR body, or remove the line.", source, family, profileName, profileFamily, profileFamily)}
+}
+
+// authorFixable reports the blocks the PR's author clears by editing the PR
+// body or head commit trailers; they go to the author's lane, not the owner's.
+func authorFixable(reason string) bool {
+	return reason == blockMissingTrailer || reason == blockUnknownFamily || reason == blockAuthorFamilyConflict
 }
 
 // reviewBlockFor finds a fleet PR the panewire executor could not place. Only
@@ -162,7 +181,7 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 	}
 	key := fmt.Sprintf("%d %s %s", pr.Number, pr.Head.SHA, b.reason)
 	eventKey := pr.Head.SHA
-	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
+	if authorFixable(b.reason) {
 		bodyDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(pr.Body)))
 		key = fmt.Sprintf("%d body:%s %s", pr.Number, bodyDigest, b.reason)
 		eventKey = "body-" + bodyDigest
@@ -211,7 +230,7 @@ func (s *Service) notifyReviewBlock(ctx context.Context, r config.Repo, pr githu
 // when none names the author, since an unreachable host must not fail the
 // review.
 func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, b reviewBlock) (lane, via string, err error) {
-	if b.reason == blockMissingTrailer || b.reason == blockUnknownFamily {
+	if authorFixable(b.reason) {
 		ctx = WithAuthorScan(ctx)
 		route, e := s.findingsRoute(ctx, r, pr)
 		switch {
