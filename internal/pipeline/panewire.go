@@ -613,13 +613,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// The record is answered in this order, and the total budget comes after
 		// the first two: a completed job or an available result is collected, a
 		// finished pane without one is replaced, and only then does a record older
-		// than review.timeout count as lost. A record never stays while every run
+		// than review.timeout since it landed count as lost. A record never stays while every run
 		// would return the same budget error.
 		timeout, err := config.Duration(s.Config.Review.Timeout)
 		if err != nil {
 			return out, err
 		}
-		overBudget := s.now().Sub(rj.Recorded) >= timeout
+		overBudget := s.now().Sub(rj.budgetStart()) >= timeout
 		e := recErr
 		state := rec.State
 		if e == nil && state != "completed" && state != "escalated" && state != "lost" {
@@ -642,7 +642,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					collected, remoteRecord, spawn = b, &fresh, false
 				} else if err := ctx.Err(); err != nil {
 					return out, fmt.Errorf("panewire reviewer %s: %w", label, err)
-				} else if retry && s.now().Sub(rj.Recorded)/2 < timeout {
+				} else if retry && s.now().Sub(rj.budgetStart())/2 < timeout {
 					// Give transient read errors one additional review budget to recover.
 					return out, errPassPending
 				} else {
@@ -734,7 +734,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if err != nil {
 				return out, err
 			}
-			wait = min(wait, timeout-s.now().Sub(rj.Recorded))
+			wait = min(wait, timeout-s.now().Sub(rj.budgetStart()))
 		}
 		if wait < minReviewerWait {
 			if resumed {
@@ -844,9 +844,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			return launch(c, legacy)
 		}
 		// The spawn is accepted once panewire placed the reviewer: its call
-		// returned, or its wait ended on a pane that runs on. A resumed job was
-		// placed by an earlier evaluation.
+		// returned, or its wait ended on a pane that runs on. That moment is when
+		// the reviewer landed, so Started starts its review budget. A resumed job
+		// was placed by an earlier evaluation: Started is set only when no landing
+		// was seen yet.
 		accepted := func() {
+			if rj.Started == nil {
+				landed := s.now()
+				rj.Started = &landed
+			}
 			if !resumed {
 				headLatencyOf(ctx).spawnAccepted(plan.pass, phases.Now())
 				attemptOf(ctx).reviewerPlaced()
@@ -933,6 +939,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// re-attached to produced no result.
 			if code == panewireWaitTimeout {
 				accepted()
+				if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+					return out, saveErr
+				}
 				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
@@ -1344,7 +1353,7 @@ func (x *panewireExecutor) pending(revisit Revisit, rj reviewerJob, why string) 
 		return e
 	}
 	soonest := s.now().Add(revisitMargin)
-	at := rj.Recorded.Add(timeout + revisitMargin)
+	at := rj.budgetStart().Add(timeout + revisitMargin)
 	if at.Before(soonest) {
 		at = soonest
 	}
@@ -1383,7 +1392,7 @@ func (x *panewireExecutor) nudgeIdleReviewer(ctx context.Context, plan *passPlan
 	skip := func(reason string) error {
 		return s.audit(x.repo.Name, "reviewer-nudge", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "status": "skipped", "reason": reason}, false)
 	}
-	if rj.Recorded.Add(timeout).Sub(now) < nudgeWait {
+	if rj.budgetStart().Add(timeout).Sub(now) < nudgeWait {
 		return skip("budget")
 	}
 	findings := filepath.Join(cfg.Jobs, rj.Label, "findings.json")
@@ -1430,7 +1439,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// A resumed pass may have been rebuilt from scratch; the job record is the
 	// durable source for how many replacements this reviewer has used.
 	plan.replacements = max(plan.replacements, rj.Replacements)
-	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error()}, false)
+	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error(), "recorded": rj.Recorded, "started": rj.Started, "budget_from": rj.budgetFrom()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
 	if auditErr != nil || noticeErr != nil {
 		return out, errors.Join(lost, auditErr, noticeErr)
