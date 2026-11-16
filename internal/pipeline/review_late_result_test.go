@@ -75,7 +75,7 @@ func TestLateResultForOtherHeadIsIgnored(t *testing.T) {
 	x := &panewireExecutor{s: s, repo: r, pr: g.pull}
 	const old = "old-reviewer"
 	runner.sink.jobs[old] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(lateFinding)}
-	rj := reviewerJob{Replaced: []replacedReviewer{{Label: old, Head: shaA, Recorded: c.t}}}
+	rj := reviewerJob{Replaced: []replacedReviewer{{Label: old, Head: shaA, BudgetStart: c.t}}}
 	if b, _, _ := x.lateReviewerResult(context.Background(), &passPlan{pass: 1}, rj); b == nil {
 		t.Fatal("same-head late result was not collected")
 	}

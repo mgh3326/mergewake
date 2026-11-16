@@ -43,7 +43,8 @@ const panewireWaitTimeout = 85
 // label. It is written before the spawn and removed when the pass reaches a
 // terminal outcome. Args is the exact panewire argument list spawned, --role
 // included; Recorded is when the job was first spawned and bounds how long a
-// live job is waited for.
+// live job is waited for; the wait starts when the reviewer landed (Started),
+// not when the record was written, and Recorded is the fallback when no landing was seen.
 type reviewerJob struct {
 	PR       int    `json:"pr"`
 	Head     string `json:"head"`
@@ -72,14 +73,35 @@ type reviewerJob struct {
 	// overdue. A replaced reviewer may still finish validly while its
 	// replacement runs; the pass collects such a late result (lateReviewerResult).
 	Replaced []replacedReviewer `json:"replaced,omitempty"`
+	// Started is when mergewake saw the reviewer pane land: the spawn call
+	// returned with a placement. Nil when no landing was seen yet, such as a
+	// spawn that never placed; then the review budget starts from Recorded.
+	Started *time.Time `json:"started,omitempty"`
 }
 
 // replacedReviewer is a reviewer that was lost overdue and replaced: its label,
-// the head it reviewed, and when its job was first spawned.
+// the head it reviewed, and when its review budget started (budgetStart), which
+// is the anchor its overdue loss was measured from.
 type replacedReviewer struct {
-	Label    string    `json:"label"`
-	Head     string    `json:"head"`
-	Recorded time.Time `json:"recorded"`
+	Label       string    `json:"label"`
+	Head        string    `json:"head"`
+	BudgetStart time.Time `json:"budget_start"`
+}
+
+// budgetStart is when the review budget of this reviewer starts.
+func (rj reviewerJob) budgetStart() time.Time {
+	if rj.Started != nil {
+		return *rj.Started
+	}
+	return rj.Recorded
+}
+
+// budgetFrom names the anchor budgetStart uses, for audit rows.
+func (rj reviewerJob) budgetFrom() string {
+	if rj.Started != nil {
+		return "started"
+	}
+	return "recorded"
 }
 
 func (s *Service) reviewerJobPath(repo string, pr, pass int) string {
