@@ -243,7 +243,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		if len(author) == 2 {
 			if profile, ok := s.Config.Review.Profiles[author[0]]; ok {
 				if family != "" && config.CanonicalFamily(family) != config.CanonicalFamily(profile.Family) {
-					return errors.New("author family conflicts with configured profile")
+					if familySource != "trailer" {
+						// A --family flag is the operator's to fix, not the PR author's.
+						return errors.New("author family conflicts with configured profile")
+					}
+					return s.blockReview(ctx, r, pr, familyConflictBlock(pr, family, author[0], profile.Family), o)
 				}
 				family, familySource = profile.Family, "profile"
 			}
