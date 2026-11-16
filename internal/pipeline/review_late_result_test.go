@@ -47,11 +47,17 @@ func TestLateResultCompletesPassWhileReplacementRuns(t *testing.T) {
 	old := rj.Replaced[0].Label
 	runner.sink.jobs[old] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(lateFinding)}
 	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
+	cur := runner.sink.jobs[rj.Label]
+	cur.Family = "anthropic"
+	runner.sink.jobs[rj.Label] = cur
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.spawns) != 2 || g.postCount != 1 || len(g.postedFindings) != 1 || !strings.Contains(g.postedFindings[0].Body, "A late bug") {
 		t.Fatalf("spawns=%d posts=%d findings=%+v", len(runner.spawns), g.postCount, g.postedFindings)
+	}
+	if pass := g.passes[shaA]; len(pass) != 1 || pass[0].Family != "openai" {
+		t.Fatalf("late result credited to the replacement's family: %+v", pass)
 	}
 	rows := auditRows(t, s, r, "review-result-late-collected")
 	if len(rows) != 1 || rows[0]["late_label"] != old || rows[0]["label"] != rj.Label || rows[0]["head"] != shaA {
@@ -70,11 +76,11 @@ func TestLateResultForOtherHeadIsIgnored(t *testing.T) {
 	const old = "old-reviewer"
 	runner.sink.jobs[old] = integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(lateFinding)}
 	rj := reviewerJob{Replaced: []replacedReviewer{{Label: old, Head: shaA, Recorded: c.t}}}
-	if b, _ := x.lateReviewerResult(context.Background(), &passPlan{pass: 1}, rj); b == nil {
+	if b, _, _ := x.lateReviewerResult(context.Background(), &passPlan{pass: 1}, rj); b == nil {
 		t.Fatal("same-head late result was not collected")
 	}
 	rj.Replaced[0].Head = "0000000000000000000000000000000000000000"
-	if b, _ := x.lateReviewerResult(context.Background(), &passPlan{pass: 1}, rj); b != nil {
+	if b, _, _ := x.lateReviewerResult(context.Background(), &passPlan{pass: 1}, rj); b != nil {
 		t.Fatalf("late result for an older head was collected: %s", b)
 	}
 }

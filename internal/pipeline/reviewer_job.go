@@ -255,10 +255,10 @@ func (x *panewireExecutor) saveReviewerJob(rj reviewerJob) error {
 
 // lateReviewerResult returns the result of a reviewer that rj replaced for an
 // overdue loss and that has since finished validly for this head, with that
-// reviewer's label. Nil means none is ready and the pass keeps its replacement.
+// reviewer's label and hk record. Nil means none is ready and the pass keeps its replacement.
 // A record or host that cannot be read is no result, never an error, so the
 // late check cannot fail the pass.
-func (x *panewireExecutor) lateReviewerResult(ctx context.Context, plan *passPlan, rj reviewerJob) ([]byte, replacedReviewer) {
+func (x *panewireExecutor) lateReviewerResult(ctx context.Context, plan *passPlan, rj reviewerJob) ([]byte, integrations.JobRecord, replacedReviewer) {
 	for _, old := range rj.Replaced {
 		if old.Head != x.pr.Head.SHA {
 			continue
@@ -283,9 +283,9 @@ func (x *panewireExecutor) lateReviewerResult(ctx context.Context, plan *passPla
 		if _, _, err := parseFindings(b, x.diff); err != nil {
 			continue
 		}
-		return b, old
+		return b, job, old
 	}
-	return nil, replacedReviewer{}
+	return nil, integrations.JobRecord{}, replacedReviewer{}
 }
 
 // dropReviewerJob removes the record of a pass that reached a terminal outcome.
