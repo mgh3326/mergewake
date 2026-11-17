@@ -2167,13 +2167,16 @@ supply the diff.
 `daemon.pr.review_retry` sets the first delay, maximum delay, and failure
 threshold. Failed attempts back off exponentially and persist per PR head in
 `<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
-`3` failures. A new head resets the counter. At the threshold, one
-`automation-failed` event interrupts `notifier.lane`; later attempts keep the
-bounded backoff. While a failed head conflicts or its required checks are
-red, retries and the failure escalation wait: the first wait per head and
-reason writes a `review-retry-waiting` row, and the count, backoff and last
-error stay as they were until the head can merge cleanly again. These
-counters are per host. GitHub review leases still
+`3` failures. A new head resets the counter, and so does a reviewer that really
+lands: a spawn receipt naming a pane or host, or an hk job record for its label.
+An asynchronous spawn's `ACCEPTED` receipt alone is no landing, so a request the
+hub accepts and then refuses keeps counting toward the threshold. At the
+threshold, one `automation-failed` event interrupts `notifier.lane`; later
+attempts keep the bounded backoff. While a failed head conflicts or its
+required checks are red, retries and the failure escalation wait: the first
+wait per head and reason writes a `review-retry-waiting` row, and the count,
+backoff and last error stay as they were until the head can merge cleanly
+again. These counters are per host. GitHub review leases still
 prevent simultaneous claims of a pass across hosts.
 
 A review poll the GitHub client skips inside its poll interval is a wait, not a failure: it counts as no review, does not back off or count toward escalation, and the head is not settled.

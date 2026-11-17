@@ -240,9 +240,11 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 	ctx, attempt := withAttempt(ctx)
 	err = s.Review(ctx, r, pr.Number, "", o)
 	if attempt.placed.Load() {
-		// A reviewer that no earlier run had placed starts a new attempt: the
-		// count of the earlier one must not hold it. Backoffs stay, so a
-		// spawn-and-lose loop still slows down.
+		// A reviewer that really landed starts a new attempt: the count of the
+		// earlier one must not hold it. An ACCEPTED receipt is no landing, so a
+		// request the hub refused after accepting it keeps counting, and
+		// repeated accepted-then-refused spawns reach the escalation threshold
+		// (hk 5005). Backoffs stay, so a spawn-and-lose loop still slows down.
 		state.Failures, state.Escalated, state.Held, state.QuotaStopped = 0, false, false, false
 		if saveErr := fsutil.WriteJSON(file, state); saveErr != nil {
 			return errors.Join(err, saveErr)

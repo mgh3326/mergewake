@@ -23,8 +23,10 @@ func attemptOf(ctx context.Context) *reviewAttempt {
 	return a
 }
 
-// reviewerPlaced notes that this run placed a reviewer that no earlier run
-// had: a new pass, a replaced one, or one whose lease and record were gone.
+// reviewerPlaced notes that this run saw a reviewer really land: a spawn
+// result naming a pane or host, or an hk job record for the reviewer. An
+// asynchronous spawn's ACCEPTED receipt alone is no landing, since the hub can
+// refuse the request after accepting it (hk 5005).
 func (a *reviewAttempt) reviewerPlaced() {
 	if a != nil {
 		a.placed.Store(true)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -17,8 +18,9 @@ import (
 // asyncRequestID is the hub request the recorded receipt names, and
 // asyncNextRequestID the one the replacement's receipt names.
 const (
-	asyncRequestID     = "6f2c1a34-8f0b-4c2d-9a51-2b7f0d3c9e11"
-	asyncNextRequestID = "0b9d47c6-2e51-4a83-8f07-6d1c5a2e9b40"
+	asyncRequestID      = "6f2c1a34-8f0b-4c2d-9a51-2b7f0d3c9e11"
+	asyncNextRequestID  = "0b9d47c6-2e51-4a83-8f07-6d1c5a2e9b40"
+	asyncThirdRequestID = "e2a7c9d1-4b63-4f80-9c25-7a1d8e6b3f52"
 )
 
 // spawnStatusReads answers `panewire spawn status <id>` with the exit panewire
@@ -179,8 +181,8 @@ func TestAsyncReplacementRefusedLaterIsNoLoop(t *testing.T) {
 	if len(f.runner.spawns) != 2 {
 		t.Fatalf("spawns %d, want no replacement in the failing evaluation", len(f.runner.spawns))
 	}
-	if st := retryStateOf(t, f.s, f.r); st.Failures != 1 || !st.Next.After(f.s.now()) {
-		t.Fatalf("retry state %+v, want the second refusal counted once with a backoff", st)
+	if st := retryStateOf(t, f.s, f.r); st.Failures != 2 || !st.Next.After(f.s.now()) {
+		t.Fatalf("retry state %+v, want the second refusal counted on top of the first with a backoff", st)
 	}
 	dead := auditRows(t, f.s, f.r, "reviewer-spawn-dead")
 	if len(dead) != 2 || dead[1]["label"] != fresh.Label || dead[1]["exit"] != float64(panewireQuotaEscalate) {
@@ -273,5 +275,121 @@ func TestAsyncUnendedRequestKeepsRecord(t *testing.T) {
 				t.Fatalf("reviewer-spawn-dead rows %v", rows)
 			}
 		})
+	}
+}
+
+// spawnCycleReceipts gives each asynchronous spawn in turn the next receipt,
+// so the loop's spawns hold hub requests of their own, and answers the status
+// reads with spawnStatusReads.
+type spawnCycleReceipts struct {
+	*spawnStatusReads
+	runner   *panewireRunner
+	receipts []string
+	spawns   int
+}
+
+func (x *spawnCycleReceipts) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && len(args) > 1 && args[0] == "spawn" && args[1] != "status" && x.spawns < len(x.receipts) {
+		x.runner.spawnOut = acceptedReceipt(arg(args, "-l"), x.receipts[x.spawns])
+		x.spawns++
+	}
+	return x.spawnStatusReads.Run(ctx, command, args, input, dir)
+}
+
+// (f) A spawn the hub accepted and then refused is no landing: each refused
+// request counts its own failure, so repeated ACCEPTED-then-87 cycles on one
+// head reach the escalation threshold instead of zeroing the count every time
+// (hk 5005).
+func TestAsyncAcceptedThenRefusedCountsEveryPass(t *testing.T) {
+	f, _ := recordedRequest(t)
+	f.s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1h", Maximum: "1h", Failures: 3}
+	status := &spawnCycleReceipts{
+		spawnStatusReads: &spawnStatusReads{next: f.runner, exits: map[string]int{
+			asyncRequestID:      panewireQuotaEscalate,
+			asyncNextRequestID:  panewireQuotaEscalate,
+			asyncThirdRequestID: panewireQuotaEscalate,
+		}},
+		runner:   f.runner.panewireRunner,
+		receipts: []string{asyncNextRequestID, asyncThirdRequestID},
+	}
+	f.s.Runner = status
+	// The recorded request was accepted and then refused: the pass fails once,
+	// and no receipt resets the count.
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
+		t.Fatal("a refused request must fail the pass")
+	}
+	failures := 1
+	if st := retryStateOf(t, f.s, f.r); st.Failures != failures {
+		t.Fatalf("failures=%d after the first refusal, want %d", st.Failures, failures)
+	}
+	// Two more cycles: past the backoff a replacement spawn is accepted and
+	// returns pending, and the next evaluation finds that request refused too.
+	for failures = 2; failures <= 3; failures++ {
+		f.c.t = retryStateOf(t, f.s, f.r).Next
+		expireLease(f.g)
+		if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
+			t.Fatalf("replacement spawn of cycle %d: %v", failures, err)
+		}
+		if got := retryStateOf(t, f.s, f.r).Failures; got != failures-1 {
+			t.Fatalf("an accepted spawn reset the count: failures=%d, want %d", got, failures-1)
+		}
+		f.c.t = f.c.t.Add(2 * time.Minute)
+		expireLease(f.g)
+		if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
+			t.Fatalf("cycle %d: a refused request must fail the pass", failures)
+		}
+		if st := retryStateOf(t, f.s, f.r); st.Failures != failures {
+			t.Fatalf("failures=%d after refusal %d, want %d", st.Failures, failures, failures)
+		}
+	}
+	if status.spawns != 2 || !slices.Contains(status.reads, asyncNextRequestID) || !slices.Contains(status.reads, asyncThirdRequestID) {
+		t.Fatalf("spawns %d reads %v, want each cycle's request read once", status.spawns, status.reads)
+	}
+	if st := retryStateOf(t, f.s, f.r); !st.Escalated {
+		t.Fatalf("state %+v, want the escalation at 3 failures", st)
+	}
+	if n := f.s.Notifier.(*fakeNotifier); n.count != 1 || !strings.Contains(n.events[0].Text, "review failed 3 times") {
+		t.Fatalf("notices %d %v, want one escalation at 3", n.count, n.events)
+	}
+}
+
+// (g) An asynchronous reviewer the hub really placed — an hk job record exists
+// for its label — still starts a new attempt: the earlier count is reset when
+// the landing is seen, and a reviewer lost after it counts as one failure
+// again.
+func TestAsyncLandedReviewerResetsTheCount(t *testing.T) {
+	f := asyncReview(t)
+	f.s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1h", Maximum: "1h", Failures: 10}
+	f.runner.spawnOut = acceptedReceipt("reviewer", asyncRequestID)
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
+		t.Fatalf("place the reviewer: %v", err)
+	}
+	// An earlier attempt failed: its count must not hold a landed reviewer.
+	stale := reviewRetryState{Head: shaA, Failures: 4, Escalated: true, Backoffs: 4, Next: f.c.t.Add(-time.Minute)}
+	if err := fsutil.WriteJSON(filepath.Join(f.s.state(f.r.Name), "review-retry-7.json"), stale); err != nil {
+		t.Fatal(err)
+	}
+	f.c.t = f.c.t.Add(2 * time.Minute)
+	expireLease(f.g)
+	// The resumed run reads the reviewer's hk record: it landed, so the count
+	// of the earlier attempt is reset.
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
+		t.Fatalf("resumed run: %v", err)
+	}
+	if st := retryStateOf(t, f.s, f.r); st.Failures != 0 || st.Escalated {
+		t.Fatalf("state %+v, want the landed reviewer to reset the count", st)
+	}
+	if rj := readReviewerJob(t, f.s, f.r, 1); !rj.Placed {
+		t.Fatalf("record %+v, want the accounted landing", rj)
+	}
+	// The landed reviewer is lost: that is a failure of the new attempt.
+	f.runner.sink.missing = &integrations.JobRecord{State: "lost"}
+	f.c.t = f.c.t.Add(2 * time.Minute)
+	expireLease(f.g)
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
+		t.Fatal("a lost reviewer must fail the pass")
+	}
+	if st := retryStateOf(t, f.s, f.r); st.Failures != 1 || st.Escalated {
+		t.Fatalf("state %+v, want one counted failure after the loss", st)
 	}
 }
