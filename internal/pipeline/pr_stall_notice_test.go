@@ -12,14 +12,16 @@ import (
 
 func TestPRIdleStallThresholdAndNewHead(t *testing.T) {
 	s, g, n, r := notifySetup(t)
+	g.refs = map[string]bool{}
+	g.reviewed = false
 	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
 	s.Now = func() time.Time { return now }
-	g.pull.CreatedAt = now.Add(-time.Hour).Format(time.RFC3339)
+	g.committedAt = map[string]time.Time{shaA: now.Add(-time.Hour)}
 	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
 		t.Fatal(err)
 	}
 	if n.count != 1 {
-		t.Fatalf("at threshold sent %d notices", n.count)
+		t.Fatalf("old head should alert at one hour after its commit: %d", n.count)
 	}
 	now = now.Add(time.Minute)
 	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
@@ -35,8 +37,52 @@ func TestPRIdleStallThresholdAndNewHead(t *testing.T) {
 	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
 		t.Fatal(err)
 	}
-	if n.count != 2 {
-		t.Fatalf("new head did not re-arm idle notice: %d", n.count)
+	if n.count != 1 {
+		t.Fatalf("new head should restart its clock: %d", n.count)
+	}
+	now = now.Add(time.Hour)
+	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 2 {
+		t.Fatalf("new head did not re-arm idle notice: events=%d err=%v", n.count, err)
+	}
+}
+
+func TestPRIdleIgnoresUpdatedAtAndBotCommentsButCountsHumanReviewActivity(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	g.refs = map[string]bool{}
+	g.reviewed = false
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	g.committedAt = map[string]time.Time{shaA: now}
+	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	// A bot post bumps updated_at but is not work on the PR.
+	g.pull.UpdatedAt = now.Add(55 * time.Minute).Format(time.RFC3339)
+	g.feedback.Threads = []github.ReviewThread{{Comments: []github.ReviewComment{{Author: "ci[bot]", AuthorType: "Bot", CreatedAt: now.Add(55 * time.Minute)}}}}
+	now = now.Add(time.Hour)
+	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 {
+		t.Fatalf("bot comment or updated_at postponed idle notice: events=%+v", n.events)
+	}
+
+	s, g, n, r = notifySetup(t)
+	g.refs = map[string]bool{}
+	g.reviewed = false
+	now = time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	g.committedAt = map[string]time.Time{shaA: now}
+	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	g.feedback.Threads = []github.ReviewThread{{Comments: []github.ReviewComment{{Author: "human-reviewer", AuthorType: "User", CreatedAt: now.Add(50 * time.Minute)}}}}
+	now = now.Add(time.Hour)
+	if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 0 {
+		t.Fatalf("human review activity within the hour should suppress notice: %+v", n.events)
 	}
 }
 
