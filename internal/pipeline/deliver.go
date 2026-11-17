@@ -454,7 +454,7 @@ func severityRank(s string) int {
 // counted, not dropped silently.
 func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding, directives ...string) string {
 	tag := "FINDINGS"
-	required := `required: every critical/high/Major finding needs a fix commit or a dismissal with evidence (a command and its output, or the code line that disproves it); accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition`
+	required := `critical/high/Major: fix commit or dismissal evidence (command+output or disproving code line); accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition. A "Fixed in <sha>" reply names a test that fails on the previous reviewed head and passes on the new one, and claims only what that test shows; when no test can be written (such as for a document line or build file), say so in one clause.`
 	if scope == "owner" {
 		tag = "OUT-OF-SCOPE"
 		required = "the reviewer marked these outside the PR's Acceptance contract: the owner decides (dismiss, defer to an hk task, or widen the contract); they do not block"

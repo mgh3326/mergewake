@@ -535,6 +535,7 @@ func TestAuthorPaneFindingsTextCarriesLaneInAck(t *testing.T) {
 		"read each item, act on it or record its disposition",
 		"panewire inbox ack <id>", "acknowledging does not resolve a finding",
 		"for lane w-9-lane",
+		`A "Fixed in <sha>" reply names a test that fails on the previous reviewed head and passes on the new one, and claims only what that test shows; when no test can be written (such as for a document line or build file), say so in one clause.`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %q", want, text)
