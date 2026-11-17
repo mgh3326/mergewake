@@ -89,6 +89,11 @@ func (s *Service) reviewerAuditLabels(repo string) (map[string]reviewerAudit, in
 	buf = buf[:cut+1]
 	labels := map[string]reviewerAudit{}
 	for _, line := range strings.Split(strings.TrimSuffix(string(buf), "\n"), "\n") {
+		// A reviewer audit row names its command; the journal's other kinds
+		// are skipped without decoding them.
+		if !strings.Contains(line, `"command":"reviewer`) {
+			continue
+		}
 		var row struct {
 			Command string `json:"command"`
 			Value   struct {
