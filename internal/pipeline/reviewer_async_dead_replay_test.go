@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -12,8 +14,12 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// asyncRequestID is the hub request the recorded receipt names.
-const asyncRequestID = "6f2c1a34-8f0b-4c2d-9a51-2b7f0d3c9e11"
+// asyncRequestID is the hub request the recorded receipt names, and
+// asyncNextRequestID the one the replacement's receipt names.
+const (
+	asyncRequestID     = "6f2c1a34-8f0b-4c2d-9a51-2b7f0d3c9e11"
+	asyncNextRequestID = "0b9d47c6-2e51-4a83-8f07-6d1c5a2e9b40"
+)
 
 // spawnStatusReads answers `panewire spawn status <id>` with the exit panewire
 // answers for the request's state, and runs every other call through next. It
@@ -60,7 +66,7 @@ func recordedRequest(t *testing.T) (*asyncFixture, reviewerJob) {
 		t.Fatalf("place the reviewer: %v", err)
 	}
 	rj := readReviewerJob(t, f.s, f.r, 1)
-	rj.Spawned = "ACCEPTED job=" + rj.Label + " request=" + asyncRequestID
+	rj.Spawned = acceptedReceipt(rj.Label, asyncRequestID)
 	if err := fsutil.WriteJSON(f.s.reviewerJobPath(f.r.Name, 7, 1), rj); err != nil {
 		t.Fatalf("save the receipt: %v", err)
 	}
@@ -72,28 +78,31 @@ func recordedRequest(t *testing.T) (*asyncFixture, reviewerJob) {
 	return f, rj
 }
 
+// acceptedReceipt is what panewire prints for a placed asynchronous spawn: the
+// hub holds the request, and no wait follows.
+func acceptedReceipt(label, request string) string {
+	return "ACCEPTED job=" + label + " request=" + request + "\n"
+}
+
 // (a) A resumed asynchronous record whose hub request already ended on a
-// refusal that is not parked is dead: the pass reads the operation once and a
-// fresh reviewer replaces the dead one, exactly as after a replayed refusal.
-// The request itself is never submitted again.
-func TestAsyncEndedRequestReplacesDeadReviewer(t *testing.T) {
+// refusal that is not parked is dead, and the pass fails once instead of
+// spawning a replacement no one counts: review-retry back offs, and the run
+// past the back-off is what spawns the replacement.
+func TestAsyncEndedRequestFailsThePass(t *testing.T) {
 	f, rj := recordedRequest(t)
 	status := &spawnStatusReads{next: f.runner, replay: rj.Label, exits: map[string]int{
 		asyncRequestID: panewireQuotaEscalate,
 	}}
 	f.s.Runner = status
-	// The replacement's own spawn is refused the same way, so the pass fails
-	// once and review-retry backs off.
-	f.runner.exits = []int{panewireQuotaEscalate}
 	f.s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1h", Maximum: "1h", Failures: 10}
 	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
-		t.Fatal("the replacement's refusal must fail the pass")
+		t.Fatal("an ended request must fail the pass")
 	}
 	if !slices.Equal(status.reads, []string{asyncRequestID}) || status.replays != 0 {
 		t.Fatalf("status reads %v replays %d, want one read and no replay", status.reads, status.replays)
 	}
-	if len(f.runner.spawns) != 2 || arg(f.runner.spawns[1], "-l") == rj.Label {
-		t.Fatalf("spawns %v, want the placement and one fresh reviewer", f.runner.spawns)
+	if len(f.runner.spawns) != 1 {
+		t.Fatalf("spawns %d, want no replacement in the failing evaluation", len(f.runner.spawns))
 	}
 	dead := auditRows(t, f.s, f.r, "reviewer-spawn-dead")
 	if len(dead) != 1 || dead[0]["label"] != rj.Label || dead[0]["exit"] != float64(panewireQuotaEscalate) {
@@ -103,22 +112,92 @@ func TestAsyncEndedRequestReplacesDeadReviewer(t *testing.T) {
 		t.Fatalf("reviewer-spawn-dead reason %q, want the request and its exit", reason)
 	}
 	reviewerJobGone(t, f.s, f.r, 1)
-	if st := retryStateOf(t, f.s, f.r); st.Failures != 1 {
-		t.Fatalf("review-retry failures %d, want the replacement's refusal counted once", st.Failures)
+	if _, err := os.Stat(f.s.deadLabelPath(f.r.Name, 7, 1)); err != nil {
+		t.Fatalf("dead-label marker: %v", err)
 	}
-	// The next evaluation inside the backoff neither reads nor replays it.
-	f.c.t = f.c.t.Add(time.Second)
+	st := retryStateOf(t, f.s, f.r)
+	if st.Failures != 1 || !st.Next.After(f.s.now()) {
+		t.Fatalf("retry state %+v, want one counted failure and a backoff", st)
+	}
+	// Inside the backoff nothing reads or spawns.
+	before := st.Next
+	f.c.t = before.Add(-time.Minute)
+	expireLease(f.g)
 	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err != nil {
-		t.Fatalf("next evaluation: %v", err)
+		t.Fatalf("evaluation inside the backoff: %v", err)
 	}
-	if len(status.reads) != 1 || status.replays != 0 || len(f.runner.spawns) != 2 {
-		t.Fatalf("next evaluation reads %v replays %d spawns %d", status.reads, status.replays, len(f.runner.spawns))
+	if len(status.reads) != 1 || len(f.runner.spawns) != 1 {
+		t.Fatalf("inside the backoff: reads %v spawns %d, want neither", status.reads, len(f.runner.spawns))
 	}
 }
 
-// (b) The other endings panewire reports for a request the hub will never run
-// are as dead as the escalation: a role/seat refusal and a request that ended
-// before it landed.
+// (b) The live loop, end to end: a dead request fails the pass, the run past
+// the backoff spawns a replacement whose hub request is refused later, and that
+// refusal fails the next pass instead of replacing the reviewer again in the
+// same evaluation. Failures are counted and no spawn happens before the next
+// backoff ends.
+func TestAsyncReplacementRefusedLaterIsNoLoop(t *testing.T) {
+	f, rj := recordedRequest(t)
+	status := &spawnStatusReads{next: f.runner, replay: rj.Label, exits: map[string]int{
+		asyncRequestID:     panewireQuotaEscalate,
+		asyncNextRequestID: panewireQuotaEscalate,
+	}}
+	// The replacement's spawn is accepted: an asynchronous spawn returns as soon
+	// as the hub holds the request, and its refusal arrives later.
+	f.runner.spawnOut = acceptedReceipt("replacement", asyncNextRequestID)
+	f.s.Runner = status
+	f.s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1h", Maximum: "1h", Failures: 10}
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
+		t.Fatal("the first ended request must fail the pass")
+	}
+	first := retryStateOf(t, f.s, f.r)
+	if first.Failures != 1 || len(f.runner.spawns) != 1 {
+		t.Fatalf("failures=%d spawns=%d, want one failure and no replacement", first.Failures, len(f.runner.spawns))
+	}
+
+	// Past the backoff the replacement spawns, accepted at once and pending.
+	f.c.t = first.Next.Add(time.Second)
+	expireLease(f.g)
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
+		t.Fatalf("replacement evaluation: %v", err)
+	}
+	fresh := readReviewerJob(t, f.s, f.r, 1)
+	if len(f.runner.spawns) != 2 || fresh.Label == rj.Label || fresh.Supersedes != rj.Label {
+		t.Fatalf("spawns %d record %+v, want a fresh label superseding %s", len(f.runner.spawns), fresh, rj.Label)
+	}
+	if !strings.Contains(fresh.Spawned, asyncNextRequestID) {
+		t.Fatalf("replacement receipt %q, want the request the hub holds", fresh.Spawned)
+	}
+
+	// The hub refused the replacement after its spawn: its status is read once,
+	// the pass fails and counts, and nothing is spawned before the next backoff.
+	f.c.t = f.c.t.Add(2 * time.Minute)
+	expireLease(f.g)
+	if err := f.s.RetryReview(f.ctx, f.r, f.g.pull, Options{}); err == nil {
+		t.Fatal("the replacement's ended request must fail the pass")
+	}
+	if len(f.runner.spawns) != 2 {
+		t.Fatalf("spawns %d, want no replacement in the failing evaluation", len(f.runner.spawns))
+	}
+	if st := retryStateOf(t, f.s, f.r); st.Failures != 1 || !st.Next.After(f.s.now()) {
+		t.Fatalf("retry state %+v, want the second refusal counted once with a backoff", st)
+	}
+	dead := auditRows(t, f.s, f.r, "reviewer-spawn-dead")
+	if len(dead) != 2 || dead[1]["label"] != fresh.Label || dead[1]["exit"] != float64(panewireQuotaEscalate) {
+		t.Fatalf("reviewer-spawn-dead rows %v, want the replacement's request named too", dead)
+	}
+	reviewerJobGone(t, f.s, f.r, 1)
+	if !slices.Equal(status.reads, []string{asyncRequestID, asyncNextRequestID}) {
+		t.Fatalf("status reads %v, want each dead request read once", status.reads)
+	}
+	if status.replays != 0 {
+		t.Fatalf("replays %d, want none: an ended request is never submitted again", status.replays)
+	}
+}
+
+// (c) The other endings panewire reports for a request the hub will never run
+// are as dead as the escalation: a role/seat refusal, an active-job refusal and
+// a request that ended before it landed.
 func TestAsyncEndedRequestCodesAreDead(t *testing.T) {
 	for name, code := range map[string]int{
 		"role refused":   panewireRefused,
@@ -129,22 +208,22 @@ func TestAsyncEndedRequestCodesAreDead(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f, rj := recordedRequest(t)
 			f.s.Runner = &spawnStatusReads{next: f.runner, replay: rj.Label, exits: map[string]int{asyncRequestID: code}}
-			if err := f.s.Review(f.ctx, f.r, 7, "", Options{}); err != nil {
-				t.Fatalf("review: %v", err)
+			if err := f.s.Review(f.ctx, f.r, 7, "", Options{}); err == nil {
+				t.Fatal("an ended request must fail the pass")
 			}
 			dead := auditRows(t, f.s, f.r, "reviewer-spawn-dead")
 			if len(dead) != 1 || dead[0]["label"] != rj.Label || dead[0]["exit"] != float64(code) {
 				t.Fatalf("reviewer-spawn-dead rows %v, want exit %d", dead, code)
 			}
-			fresh := readReviewerJob(t, f.s, f.r, 1)
-			if fresh.Label == rj.Label {
-				t.Fatalf("record label %s, want the fresh replacement", fresh.Label)
+			reviewerJobGone(t, f.s, f.r, 1)
+			if len(f.runner.spawns) != 1 {
+				t.Fatalf("spawns %d, want no replacement in the failing evaluation", len(f.runner.spawns))
 			}
 		})
 	}
 }
 
-// (c) A request the hub parked waits for quota: the record stays and the spawn
+// (d) A request the hub parked waits for quota: the record stays and the spawn
 // is replayed, as today.
 func TestAsyncParkedRequestKeepsRecord(t *testing.T) {
 	f, rj := recordedRequest(t)
@@ -164,10 +243,10 @@ func TestAsyncParkedRequestKeepsRecord(t *testing.T) {
 	}
 }
 
-// (d) A request the hub did not end, and a read that cannot answer, keep the
+// (e) A request the hub did not end, and a read that cannot answer, keep the
 // record and replay it, as today: a landed request, a deadline the hub did not
-// resolve, a landing timeout, a state this client does not know, and a
-// panewire too old to read a status.
+// resolve, a landing timeout, a state this client does not know, a read that
+// failed, and a panewire too old to read a status.
 func TestAsyncUnendedRequestKeepsRecord(t *testing.T) {
 	for name, code := range map[string]int{
 		"landed":            0,
