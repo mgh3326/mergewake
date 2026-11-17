@@ -365,6 +365,15 @@ type Webhook struct {
 	MinGap string `yaml:"min_gap"`
 }
 
+// Defaults for the daily reviewer-checkout balance (hk 5090): one audit row
+// per host per UTC day with checkouts created, removed and the trailing open
+// balance, plus a design-lane notice when removals stall.
+const (
+	BalanceMinCreatedDefault    = 20
+	BalanceMaxRemovedPctDefault = 70
+	BalanceWindowDaysDefault    = 7
+)
+
 // LegacyEveryDefault is how often the daemon runs a repo's legacy sweep when
 // reap.legacy_every is unset.
 const LegacyEveryDefault = "24h"
@@ -386,7 +395,18 @@ type Reap struct {
 	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
 	Transport string  `yaml:"transport"`
 	Hub       ReapHub `yaml:"hub"`
-	Archive   Archive `yaml:"archive"`
+	// BalanceMinCreated is the daily per-host created count at or above which
+	// the balance may notice: quiet hosts never alert. Zero means
+	// BalanceMinCreatedDefault.
+	BalanceMinCreated int `yaml:"balance_min_created"`
+	// BalanceMaxRemovedPct is the removed share of created below which the
+	// balance notices, as a percent. Zero means
+	// BalanceMaxRemovedPctDefault.
+	BalanceMaxRemovedPct int `yaml:"balance_max_removed_pct"`
+	// BalanceWindowDays is the trailing window the open balance cumulates
+	// over. Zero means BalanceWindowDaysDefault.
+	BalanceWindowDays int     `yaml:"balance_window_days"`
+	Archive           Archive `yaml:"archive"`
 }
 
 // LegacyInterval parses reap.legacy_every: the time between the starts of a
@@ -400,6 +420,33 @@ func (r Reap) LegacyInterval() (time.Duration, error) {
 		return 0, nil
 	}
 	return Duration(r.LegacyEvery)
+}
+
+// BalanceMinCreatedOrDefault is the daily per-host created count at or above
+// which the reviewer balance may notice.
+func (r Reap) BalanceMinCreatedOrDefault() int {
+	if r.BalanceMinCreated > 0 {
+		return r.BalanceMinCreated
+	}
+	return BalanceMinCreatedDefault
+}
+
+// BalanceMaxRemovedPctOrDefault is the removed share of created, as a
+// percent, below which the reviewer balance notices.
+func (r Reap) BalanceMaxRemovedPctOrDefault() int {
+	if r.BalanceMaxRemovedPct >= 1 && r.BalanceMaxRemovedPct <= 100 {
+		return r.BalanceMaxRemovedPct
+	}
+	return BalanceMaxRemovedPctDefault
+}
+
+// BalanceWindowDaysOrDefault is the trailing window, in days, the reviewer
+// balance cumulates the open balance over.
+func (r Reap) BalanceWindowDaysOrDefault() int {
+	if r.BalanceWindowDays >= 1 && r.BalanceWindowDays <= 31 {
+		return r.BalanceWindowDays
+	}
+	return BalanceWindowDaysDefault
 }
 
 // ReapHub locates the panewire hub and the credential files reap sends it.

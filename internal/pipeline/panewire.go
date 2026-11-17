@@ -1009,6 +1009,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				if saveErr := x.saveReviewerJob(rj); saveErr != nil {
 					return out, saveErr
 				}
+				if placement, ok := spawnPlacement(string(stdout)); ok {
+					x.auditReviewerSpawn(plan, rj.Label, placement.Host)
+				}
 				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
 			res, skipErr := skip("panewire spawn exit %d: %v", code, integrations.Detail(e))
@@ -1023,6 +1026,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			rj.Spawned = string(stdout[:min(len(stdout), spawnedKeep)])
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
+			}
+			if placement, ok := spawnPlacement(string(stdout)); ok {
+				x.auditReviewerSpawn(plan, rj.Label, placement.Host)
 			}
 			keepCheckout = true
 			if !resumed {
@@ -1039,6 +1045,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// so its pane and checkout stay with a pending-cleanup receipt.
 	keepCheckout = false
 	placement, confirmed := spawnPlacement(string(stdout))
+	if confirmed {
+		x.auditReviewerSpawn(plan, label, placement.Host)
+	}
 	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
 	cleanupPane := true
 	defer func() {
@@ -1216,6 +1225,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// The findings are accepted: an audit that cannot write is not a reason to fail the pass.
 		_ = s.audit(x.repo.Name, "reviewer-nudge-outcome", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "outcome": "result_found"}, false)
 	}
+	x.auditReviewerSpawn(plan, rj.Label, closeRec.Host)
 	x.note("collected", rj)
 	return out, nil
 }
