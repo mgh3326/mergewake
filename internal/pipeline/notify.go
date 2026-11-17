@@ -77,7 +77,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			_ = s.audit(r.Name, "merge-overdue-error", map[string]any{"pr": n, "head": pr.Head.SHA, "error": integrations.Detail(e)}, false)
 		}
 		if e := s.notifyPRIdle(ctx, r, pr); e != nil {
-			return e
+			if err := s.stallClockError(ctx, r, pr, prIdleCause, e); err != nil {
+				return err
+			}
 		}
 	}
 	baseSHA, e := s.GH.Head(ctx, r.Name, r.Branch)
@@ -94,7 +96,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	if o.Reporting() {
 		if e := s.notifyPRStalls(ctx, r, pr, p); e != nil {
-			return e
+			if err := s.stallClockError(ctx, r, pr, prCheckRedCause, e); err != nil {
+				return err
+			}
 		}
 	}
 	if slices.Contains(v.Reasons, "round_hold") {
