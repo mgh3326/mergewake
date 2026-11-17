@@ -43,6 +43,7 @@ type fakeGH struct {
 	findings                                       int
 	passes                                         map[string][]github.PassReceipt
 	feedback                                       github.ReviewFeedback
+	issueComments                                  []github.IssueComment
 	feedbackHead                                   string
 	feedbackHeads                                  []string // per-read GraphQL heads, consumed in order before feedbackHead
 	feedbackReads                                  int
@@ -145,6 +146,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 }
 func (g *fakeGH) PullReviewActivity(context.Context, string, int) ([]time.Time, error) {
 	return nil, nil
+}
+func (g *fakeGH) IssueComments(context.Context, string, int) ([]github.IssueComment, error) {
+	return g.issueComments, nil
 }
 func (g *fakeGH) RecoveryActive(context.Context, string) (bool, error) { return g.latch, nil }
 func (g *fakeGH) Head(_ context.Context, _, branch string) (string, error) {

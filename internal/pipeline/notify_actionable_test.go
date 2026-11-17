@@ -32,6 +32,7 @@ func TestNotifyActionableReviewMissingOnlyIsSilent(t *testing.T) {
 // is reviewed and blocks again follows the normal rules.
 func TestNotifyActionableStallAlertsOnceAcrossRestart(t *testing.T) {
 	s, g, n, _, r, now := deliverSetup(t)
+	s.Config.Daemon.PR.Notify.IdleAfter = "24h"
 	g.refs = map[string]bool{}
 	poll := func(svc *Service) {
 		t.Helper()
@@ -84,6 +85,7 @@ func TestNotifyActionableStallAlertsOnceAcrossRestart(t *testing.T) {
 
 func TestNotifyActionableStallNamesReviewerJob(t *testing.T) {
 	s, g, n, _, r, now := deliverSetup(t)
+	s.Config.Daemon.PR.Notify.IdleAfter = "24h"
 	g.refs = map[string]bool{}
 	rj := reviewerJob{PR: 7, Head: shaA, Pass: 1, Label: "review-7-p1"}
 	if e := fsutil.WriteJSON(s.reviewerJobPath(r.Name, 7, 1), rj); e != nil {
@@ -218,6 +220,7 @@ func TestNotifyActionableUnknownAuthorStaysDeskDecision(t *testing.T) {
 // event in total, polled every 10 minutes and across a restart.
 func TestNotifyActionableNinetyMinuteWaitIsOneStallEvent(t *testing.T) {
 	s, g, n, _, r, now := deliverSetup(t)
+	s.Config.Daemon.PR.Notify.IdleAfter = "24h"
 	g.refs = map[string]bool{}
 	for i := 0; i <= 9; i++ {
 		svc := s

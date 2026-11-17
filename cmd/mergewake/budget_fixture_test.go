@@ -60,6 +60,8 @@ func TestBudgetPassFixture(t *testing.T) {
 			fmt.Fprint(w, `{"check_runs":[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]}`)
 		case strings.HasSuffix(path, "/statuses"), strings.HasSuffix(path, "/reviews"), strings.HasSuffix(path, "/files"):
 			fmt.Fprint(w, `[]`)
+		case strings.HasSuffix(path, "/comments"):
+			fmt.Fprint(w, `[]`)
 		case strings.Contains(path, "/compare/"):
 			fmt.Fprintf(w, `{"status":"ahead","merge_base_commit":{"sha":%q}}`, base)
 		case strings.HasSuffix(path, "/commits/"+base), strings.HasSuffix(path, "/commits/"+head):
