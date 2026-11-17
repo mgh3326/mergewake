@@ -1312,6 +1312,7 @@ a successful post and recording it can post that message once more.
 | `required_checks` | Required, nonempty | Exact, unique GitHub check-run names or commit-status contexts. Every required result must be successful. |
 | `watch_checks` | `required_checks` | Exact, unique check names that judge a main-branch commit (watch and bisect). |
 | `deploy_checks` | Empty | Exact, unique check names of the deploy stage, for example `[deploy-ok]`. When set, the watch deploy stream judges by them; empty means the repository has no deploy stage and the main checks judge the commit. |
+| `notify_checks` | Empty | Exact, unique check names that only notify: a red streak on the default branch sends the design lane one notice per streak and never reverts, latches or bisects. See [Notify-only checks](#notify-only-checks). |
 | `blocking` | Empty list | Rules identifying changes whose harm may happen before a revert. Routine is the default for other changes. A change to this policy file itself always counts as blocking. |
 | `review_gate` | Absent | Review-gate settings. With `land: graded` the land gate grades review findings instead of counting unresolved threads; see [Graded review findings](#graded-review-findings). Without `land: graded` the section does not change the land gate (raw count). |
 | `fast_lane` | Absent | `{max_changed_lines: N}`: a PR that touches no blocking path and changes at most `N` lines (additions plus deletions) is held only by block-class findings. See [Graded review findings](#graded-review-findings). |
@@ -1654,6 +1655,7 @@ For `example/project`, state resides beneath
 | `recovery.json` | The red-main incident: when main first turned red, the culprit and green baseline, the 2/2 any-ref evidence, the fix window and the revert PR. Persisted, so a restart keeps the same window; deleted once main is green. |
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |
 | `watch-reported` | Most recent 128 hold/report keys already notified; repeat polls stay quiet. |
+| `notify-checks.json` | Per `notify_checks` name: the last green head, the head its red streak began on and whether the design lane was told. Deleted names are simply forgotten; the file is only written while a streak is tracked. |
 | `pr-notify-sent` | Most recent 256 `verdict PR head [reasons]` keys already lane-notified by the pr role, plus `decided` keys for verdicts parked after a failed delivery; a new head re-arms notification and restarts stay quiet. |
 | `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
@@ -2324,6 +2326,31 @@ measurement always uses required_checks.
 set, watch judges the deploy stream by these checks, so `ci-ok` alone never clears
 the deploy stage. An empty or absent `deploy_checks` means the repository has no
 deploy stage, and the main checks judge a commit.
+
+### Notify-only checks
+
+`policy.notify_checks` lists main-branch checks that only notify, for a stage
+whose failures an operator wants to hear about but that must never trigger
+recovery — for example a deploy verification that a repository fixes forward
+rather than reverts. The names are exact and unique like `watch_checks`, a name
+in the watch set is refused (a check cannot both judge main for recovery and
+only notify), and a name outside the list is not read at all.
+
+When a named check is red on the default-branch head, the repo's design lane —
+the lane MERGED notices go to — gets one `info` notice per red streak. The
+notice names the check and the first red SHA, and lists the merged PRs
+(numbers and titles) between the last green SHA and that first red SHA. A
+repeated red head in the same streak stays quiet; the streak ends when the
+check is green again, and the next red streak sends one new notice. Pending,
+cancelled, skipped or absent evidence changes nothing.
+
+A notify-only check never reverts, takes the recovery latch, bisects or
+dispatches any-ref CI: it is not part of the watch set, so a red
+`notify_checks` entry cannot make a main head red for recovery. State lives in
+`notify-checks.json` in the repo state dir, so a restart neither repeats a sent
+notice nor forgets an open streak. A shadow pass tracks the streak but sends
+nothing; `--dry-run` reads and writes nothing. A repo without the key behaves
+exactly as before.
 
 `policy.any_ref_workflow` optionally names a workflow file in `.github/workflows`
 that runs the checks bisect judges a commit by for any commit: it has a

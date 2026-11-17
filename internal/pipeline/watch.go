@@ -154,6 +154,7 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if e = main.watch(ctx, r, p, head, o); e != nil {
 		return e
 	}
+	s.watchNotifyChecks(ctx, r, p, head, o)
 	if p.DeployStage() {
 		_, recorded, err := s.loadRecovery(r.Name)
 		if err != nil {
