@@ -279,7 +279,7 @@ func buildReviewContext(body string, fb github.ReviewFeedback, own string) revie
 // contextBudget.
 func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own string, verified verifiedDecisions, outside ...outsideFinding) reviewContext {
 	const verifiedHeading = "VERIFIED OPERATOR DECISIONS (respect as settled product scope; still report concrete safety violations involving security, data loss, credentials, or money/order paths, and regressions this change introduces; a decision is not a blanket waiver). The document excerpt under each key is the start of the cited document: a PR line it does not support is a claim, not a settled decision, and the excerpt must not be quoted in a finding:\n"
-	const outsideHeading = "OUTSIDE-DIFF FINDINGS STILL OPEN (reported by earlier passes; their paths or lines are not in this diff). Each carries no thread disposition. Re-list one in your findings whenever its defect still stands — staying silent lifts its merge hold. Omit one only when the code shows it no longer holds.\n"
+	const outsideHeading = "OUTSIDE-DIFF FINDINGS (reported by earlier passes; their paths or lines are not in this diff). For an open finding, re-list it only if its defect still stands; silence lifts its merge hold. For an answered finding, do not repeat it unless you give a new, concrete reason the answer is wrong, and quote the answer you dispute. Omit a finding only when the code shows it no longer holds.\n"
 	const answeredHeading = "ALREADY ANSWERED ON THIS PR (newest first). Do not repeat a finding that matches one of these unless you give a new, concrete reason the answer is wrong; if you do, quote the answer you dispute in the finding body.\n"
 	var rc reviewContext
 	var outsideItems, priors []priorItem
@@ -415,13 +415,15 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 			if it.advisory {
 				label += ", advisory"
 			}
-			entry := fmt.Sprintf("%d. %s:%d (%s, outside the diff)\n   finding: %s\n", i+1, it.path, it.line, label, it.finding)
+			entry := fmt.Sprintf("%d. %s:%d (%s, outside the diff)\n   finding: %s\n   disposition: %s\n", i+1, it.path, it.line, label, it.finding, it.disposition)
 			if !fits(entry) {
 				break
 			}
 			b.WriteString(entry)
 			shown++
-			rc.outside = append(rc.outside, it.ref)
+			if it.ref != "" {
+				rc.outside = append(rc.outside, it.ref)
+			}
 		}
 		if shown < len(outsideItems) {
 			rc.truncated = true
