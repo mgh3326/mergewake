@@ -173,6 +173,15 @@ func (s Sink) ReconcileInterval() (time.Duration, bool) {
 	return d, true
 }
 
+// RepoReview configures a repository's reviewer checkout. Empty, the default
+// for every repository, means today's full checkout.
+type RepoReview struct {
+	// CheckoutExclude lists git non-cone patterns excluded from a
+	// spec-placed reviewer's sparse checkout, relative to the repo root
+	// and without a leading "!" or "/". Empty means a full checkout.
+	CheckoutExclude []string `yaml:"checkout_exclude"`
+}
+
 type Repo struct {
 	Name   string `yaml:"name"`
 	Root   string `yaml:"root"`
@@ -188,6 +197,10 @@ type Repo struct {
 	// POST /v1/task-events. Absent means on; false keeps a repo whose hk
 	// predates the endpoint (handoffkeep#136) from posting anything.
 	HKTaskEvents *bool `yaml:"hk_task_events"`
+	// Review holds per-repository review settings. CheckoutExclude opts
+	// the repo into a sparse reviewer checkout (hk 5099); empty keeps
+	// today's full checkout.
+	Review RepoReview `yaml:"review"`
 }
 
 // TaskEventsOn reports whether hk_task_events is unset or true.
@@ -998,6 +1011,38 @@ func validateOutcomes(c *Config) error {
 	return nil
 }
 
+// Bounds for the sparse reviewer checkout (hk 5099). The panewire node
+// refuses more than MaxCheckoutExcludes excludes or MaxCheckoutIncludes
+// includes, and every include comes from the PR's changed paths.
+const (
+	MaxCheckoutExcludes     = 64
+	MaxCheckoutIncludes     = 500
+	MaxCheckoutPatternBytes = 4096
+)
+
+// ValidateCheckoutExcludePattern reports whether a sparse-checkout exclude
+// pattern follows the node's rules: relative to the repo root, sent without
+// a leading "!" or "/", holding no "..", NUL or newline. Include paths are
+// literal file paths and need no validation beyond the count bound.
+func ValidateCheckoutExcludePattern(p string) error {
+	if p == "" {
+		return errors.New("checkout_exclude pattern is empty")
+	}
+	if len(p) > MaxCheckoutPatternBytes {
+		return fmt.Errorf("checkout_exclude pattern %q exceeds %d bytes", p, MaxCheckoutPatternBytes)
+	}
+	if strings.HasPrefix(p, "!") || strings.HasPrefix(p, "/") {
+		return fmt.Errorf("checkout_exclude pattern %q must not start with ! or /", p)
+	}
+	if strings.Contains(p, "..") {
+		return fmt.Errorf("checkout_exclude pattern %q must not hold ..", p)
+	}
+	if strings.ContainsRune(p, 0) || strings.ContainsRune(p, '\n') {
+		return fmt.Errorf("checkout_exclude pattern %q must not hold NUL or newline", p)
+	}
+	return nil
+}
+
 // validateRepos applies per-repository defaults and checks each repository's name, lane and branch.
 func validateRepos(c *Config) error {
 	seen := map[string]bool{}
@@ -1015,6 +1060,14 @@ func validateRepos(c *Config) error {
 		}
 		if r.Policy == "" {
 			r.Policy = ".mergewake/policy.yaml"
+		}
+		if len(r.Review.CheckoutExclude) > MaxCheckoutExcludes {
+			return fmt.Errorf("repos[%s].review.checkout_exclude holds %d patterns, at most %d", r.Name, len(r.Review.CheckoutExclude), MaxCheckoutExcludes)
+		}
+		for _, p := range r.Review.CheckoutExclude {
+			if e := ValidateCheckoutExcludePattern(p); e != nil {
+				return fmt.Errorf("repos[%s].review.checkout_exclude: %w", r.Name, e)
+			}
 		}
 	}
 	return nil

@@ -884,11 +884,12 @@ func (s *Service) balanceNoticeRow(repo, day, host string) (balanceNoticeReceipt
 }
 
 // auditReviewerSpawn writes one reviewer-spawn audit row naming the host a
-// review pass's reviewer landed on. It runs at each placement the pass sees —
+// review pass's reviewer landed on, with checkout_mode when the spawn answer
+// or job record names one (hk 5099). It runs at each placement the pass sees —
 // the async receipt, the sync result, a timed-out wait's stdout, or a resumed
 // run's job record — and keeps exactly one row per label, so placement and
 // collection never double-count the checkout's creation.
-func (x *panewireExecutor) auditReviewerSpawn(plan *passPlan, label, host string) {
+func (x *panewireExecutor) auditReviewerSpawn(plan *passPlan, label, host, checkoutMode string) {
 	if label == "" || host == "" {
 		return
 	}
@@ -903,9 +904,13 @@ func (x *panewireExecutor) auditReviewerSpawn(plan *passPlan, label, host string
 	if err != nil || sent.has(label) {
 		return
 	}
-	if err := x.s.audit(x.repo.Name, reviewerSpawnCommand, map[string]any{
+	value := map[string]any{
 		"pr": x.pr.Number, "pass": plan.pass, "label": label, "host": host,
-	}, false); err != nil {
+	}
+	if checkoutMode == "sparse" || checkoutMode == "full" {
+		value["checkout_mode"] = checkoutMode
+	}
+	if err := x.s.audit(x.repo.Name, reviewerSpawnCommand, value, false); err != nil {
 		return
 	}
 	_ = sent.add(label)

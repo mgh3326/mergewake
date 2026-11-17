@@ -33,11 +33,27 @@ type reviewerCheckoutSpec struct {
 	origin string // the repository's origin, as its checkout names it
 	commit string // the reviewed head
 	ref    string // pull/<n>/head, or refs/heads/<branch> when GitHub lost it
+	// exclude lists git non-cone patterns left out of the node's sparse
+	// checkout, relative to the repo root without a leading "!" or "/".
+	// include lists PR-changed paths kept on disk. Empty exclude means
+	// today's full checkout (hk 5099).
+	exclude []string
+	include []string
 }
 
 // args is the spawn's checkout flags, the alternative to -c <checkout>.
+// A non-empty exclude adds one --checkout-exclude per pattern and one
+// --checkout-include per PR-changed path; empty keeps today's three flags
+// byte-identical.
 func (sp reviewerCheckoutSpec) args() []string {
-	return []string{"--checkout-origin", sp.origin, "--checkout-commit", sp.commit, "--checkout-ref", sp.ref}
+	out := []string{"--checkout-origin", sp.origin, "--checkout-commit", sp.commit, "--checkout-ref", sp.ref}
+	for _, p := range sp.exclude {
+		out = append(out, "--checkout-exclude", p)
+	}
+	for _, p := range sp.include {
+		out = append(out, "--checkout-include", p)
+	}
+	return out
 }
 
 // reviewerSpecTTL bounds how long a refused checkout spec is remembered: after
@@ -194,6 +210,189 @@ func checkoutFallbackFailed(err error) bool {
 	return errors.As(err, &target)
 }
 
+// Sparse checkout bounds mirror the config: the node refuses more, and a PR
+// that changes more than MaxSparseIncludes paths takes the full checkout.
+const (
+	maxSparseExcludes = 64
+	maxSparseIncludes = 500
+)
+
+// reviewerSparseTTL bounds how long a refused sparse flag set is remembered:
+// after it, the hub is asked again, so an upgraded hub is picked up without
+// a restart. It matches reviewerSpecTTL.
+const reviewerSparseTTL = 10 * time.Minute
+
+// reviewerSparseCapability is the process's memory of a hub that refuses the
+// sparse checkout flags. One refusal stands for every spawn for
+// reviewerSparseTTL; later spawns send the full spec instead.
+type reviewerSparseCapability struct {
+	mu       sync.Mutex
+	legacyTo time.Time
+	now      func() time.Time
+}
+
+func (c *reviewerSparseCapability) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// legacy reports whether a sparse refusal is still remembered.
+func (c *reviewerSparseCapability) legacy() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clock().Before(c.legacyTo)
+}
+
+// refused remembers that a sparse checkout cannot be carried right now.
+func (c *reviewerSparseCapability) refused() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.legacyTo = c.clock().Add(reviewerSparseTTL)
+}
+
+var reviewerSparses reviewerSparseCapability
+
+// checkoutSparseRefused reports whether panewire refused this spawn over the
+// sparse flags it named (--checkout-exclude/--checkout-include): like the
+// spec refusal, its usage refusal (exit 2) or hub feature check (exit 70)
+// comes before submission, so nothing was placed.
+func checkoutSparseRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch exitStatus(err) {
+	case panewireUsage, panewireConfigRefused:
+	default:
+		return false
+	}
+	detail := integrations.Detail(err)
+	return strings.Contains(detail, "checkout-exclude") || strings.Contains(detail, "checkout-include")
+}
+
+// hubLacksSparseCheckout reports the refusals that mean the hub, or the local
+// CLI, cannot carry sparse flags at all. Remembering those is worth it: every
+// later sparse spawn would be refused the same way until one is upgraded.
+// A sparse refusal always falls back to the full spec, never to a local
+// checkout, so a review is never lost to this feature.
+func hubLacksSparseCheckout(err error) bool {
+	detail := integrations.Detail(err)
+	if !(strings.Contains(detail, "checkout-exclude") || strings.Contains(detail, "checkout-include")) {
+		return false
+	}
+	return strings.Contains(detail, "does not support --checkout-") ||
+		strings.Contains(detail, "unable to verify hub support for --checkout-") ||
+		strings.Contains(detail, "flag provided but not defined:")
+}
+
+// sparseFallbackArgs rewrites a spawn argv that names sparse flags into the
+// full-spec form: the three --checkout-* flags stay, the sparse flags go.
+// ok is false when the argv names no sparse flag, so the caller keeps its
+// original error.
+func sparseFallbackArgs(args []string) ([]string, bool) {
+	if !slices.Contains(args, "--checkout-exclude") && !slices.Contains(args, "--checkout-include") {
+		return nil, false
+	}
+	out := make([]string, 0, len(args))
+	stripped := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--checkout-exclude", "--checkout-include":
+			i++ // its value
+			stripped = true
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return out, stripped
+}
+
+// sparseIncludePaths lists the PR-changed paths a sparse checkout keeps on
+// disk, from the review diff: added, modified and renamed targets count;
+// deleted files do not. The result is sorted and unique.
+func sparseIncludePaths(diff string) []string {
+	set := map[string]bool{}
+	for _, f := range splitDiff(diff) {
+		if isDeletedDiffFile(f) {
+			continue
+		}
+		if p := diffFilePath(f); p != "" {
+			set[p] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// isDeletedDiffFile reports whether a diff file block deletes the file: the
+// new side is /dev/null or the header names a deleted file mode.
+func isDeletedDiffFile(f diffFile) bool {
+	for _, line := range f.head {
+		t := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(t, "+++ /dev/null") {
+			return true
+		}
+		if strings.HasPrefix(t, "deleted file mode") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkoutModeOf reads checkout_mode=sparse|full (or the hyphen spelling)
+// from a spawn answer, for the reviewer's audit row. "" means the answer
+// named none, as an older panewire does.
+func checkoutModeOf(stdout string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		for _, field := range strings.Fields(line) {
+			name, value, ok := strings.Cut(field, "=")
+			if !ok {
+				continue
+			}
+			if name != "checkout_mode" && name != "checkout-mode" {
+				continue
+			}
+			if value == "sparse" || value == "full" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+// checkoutModeRec prefers the job record's checkout_mode when present, else
+// the spawn answer. "" means neither names one, as an older panewire does.
+func checkoutModeRec(rec integrations.JobRecord, stdout string) string {
+	if rec.CheckoutMode == "sparse" || rec.CheckoutMode == "full" {
+		return rec.CheckoutMode
+	}
+	return checkoutModeOf(stdout)
+}
+
+// sparseCheckoutParagraph is the reviewer-brief paragraph for a repository
+// with a non-empty review.checkout_exclude list. The brief is written before
+// the spawn answer is known, so the paragraph is true in both modes: it
+// names the excluded patterns and tells the reviewer how to tell whether
+// this checkout is sparse.
+func sparseCheckoutParagraph(excludes []string) string {
+	return "## Sparse checkout\n\n" +
+		"This repository excludes `" + strings.Join(excludes, "`, `") + "` from the reviewer's checkout. " +
+		"Run `git sparse-checkout list` (or check `core.sparseCheckout`) to see whether this checkout is sparse. " +
+		"If it is, files under those patterns are absent on purpose, except the files this PR changes; " +
+		"an absent file is not a finding. Read one with `git show HEAD:<path>` when needed.\n"
+}
+
 // localArgs rewrites a spawn argv that names a checkout spec into the -c form
 // this daemon used before the spec existed. ok is false when the argv names no
 // spec, so the caller keeps its original error.
@@ -205,7 +404,7 @@ func localArgs(args []string, checkout string) ([]string, bool) {
 	replaced := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--checkout-origin", "--checkout-commit", "--checkout-ref":
+		case "--checkout-origin", "--checkout-commit", "--checkout-ref", "--checkout-exclude", "--checkout-include":
 			i++ // its value
 		case "spawn":
 			out = append(out, args[i], "-c", checkout)

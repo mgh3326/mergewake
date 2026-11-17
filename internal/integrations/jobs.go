@@ -45,6 +45,9 @@ type JobRecord struct {
 	// an exhausted quota pool is state lost with "quota_stop pool=<pool>
 	// reset_at=<RFC3339 UTC>"; reset_at is absent when unknown.
 	EndReason string `json:"end_reason"`
+	// CheckoutMode is how the node's checkout was prepared: "sparse" or
+	// "full". Older panewire leaves it empty (hk 5099).
+	CheckoutMode string `json:"checkout_mode,omitempty"`
 }
 
 // JobWorktree is the checkout a job record names: the remote origin, the
