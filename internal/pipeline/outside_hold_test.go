@@ -110,8 +110,15 @@ func TestOutsideHoldAnswerForms(t *testing.T) {
 		wantHold bool
 	}{
 		{"Fixed in a verified commit", holdComment("pr-author", "User", "Fixed in bbbbbbb: "+f.Ref+" the flag is gone"), false},
+		{"ref first Fixed in a verified commit", holdComment("pr-author", "User", f.Ref+": Fixed in bbbbbbb the flag is gone"), false},
+		{"path first Fixed in a verified commit", holdComment("pr-author", "User", "`docs/x.md:3` — Fixed in bbbbbbb the flag is gone"), false},
 		{"Dismiss with evidence", holdComment("pr-author", "User", "Dismiss: "+f.Ref+" — the file is generated, not source"), false},
+		{"ref first Dismiss with evidence", holdComment("pr-author", "User", f.Ref+" Dismiss: the file is generated, not source"), false},
+		{"path first Dismiss with evidence", holdComment("pr-author", "User", "docs/x.md:3 | Dismiss: the file is generated, not source"), false},
 		{"Disposition defer a task", holdComment("pr-author", "User", "Disposition: defer 4253 — "+f.Ref), false},
+		{"ref first Disposition defer a task", holdComment("pr-author", "User", f.Ref+" Disposition: defer 4253 — follow-up"), false},
+		{"path first Disposition defer a task", holdComment("pr-author", "User", "`docs/x.md:3`: Disposition: defer hk 4253"), false},
+		{"multiple refs before dismissal", holdComment("pr-author", "User", f.Ref+" docs/x.md:3 — Dismiss: generated file"), false},
 		{"Disposition defer a task as hk 4253", holdComment("pr-author", "User", "Disposition: defer hk 4253 — "+f.Ref), false},
 		{"Disposition defer a task as hk:4253", holdComment("pr-author", "User", "Disposition: defer hk:4253 — "+f.Ref), false},
 		{"Disposition defer a task as #4253", holdComment("pr-author", "User", "Disposition: defer #4253 — "+f.Ref), false},
@@ -125,6 +132,8 @@ func TestOutsideHoldAnswerForms(t *testing.T) {
 		{"an accepted form naming nothing holds", holdComment("pr-author", "User", "Dismiss: unrelated thread"), true},
 		{"a negated dismiss does not answer", holdComment("pr-author", "User", "Do not dismiss: docs/x.md:3 — still broken"), true},
 		{"a disposition mid-sentence does not answer", holdComment("pr-author", "User", "reminder: Dismiss: "+f.Ref+" later"), true},
+		{"ref-first negated dismissal does not answer", holdComment("pr-author", "User", f.Ref+" do not dismiss: still broken"), true},
+		{"ref-first mid-sentence dismissal does not answer", holdComment("pr-author", "User", "we should not "+f.Ref+" Dismiss: still broken"), true},
 		{"Disposition dismiss evidence answers", holdComment("pr-author", "User", "Disposition: dismiss "+f.Ref+" — generated file"), false},
 		{"a bot cannot answer", holdComment("ci[bot]", "Bot", "Dismiss: "+f.Ref), true},
 		{"the review identity may answer with an ordinary comment", holdComment("review-bot", "User", "Dismiss: "+f.Ref), false},
@@ -238,6 +247,38 @@ func TestOutsideSameHeadDuplicatePassesJoinOneRef(t *testing.T) {
 	}
 	if len(records[0].Aliases) != 1 || records[0].Aliases[0] != finding2.Ref {
 		t.Fatalf("expected alias %s, got %+v", finding2.Ref, records[0].Aliases)
+	}
+}
+
+func TestOutsideRefFirstAnswersResolveFoldedAliasesAfterFirstAt(t *testing.T) {
+	first := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	alias := holdFinding("internal/fleet/watch.go", 55, "high", "Keep the old binary watcher excluded when the node restarts")
+	reported := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	p1 := outsidePass(shaC, "p-old", 1, 1, first)
+	p1.SubmittedAt = &reported
+	p2 := outsidePass(shaC, "p-old", 2, 1, alias)
+	p2.SubmittedAt = &reported
+	records := foldOutside([]github.ReviewedPass{p1, p2}, shaC, "p-old", "", false)
+	if len(records) != 1 || len(records[0].Aliases) != 1 || records[0].Aliases[0] != alias.Ref {
+		t.Fatalf("folded records=%+v, want ref %s with alias %s", records, first.Ref, alias.Ref)
+	}
+
+	for _, tt := range []struct {
+		name string
+		ref  string
+	}{
+		{"canonical ref", first.Ref},
+		{"alias ref", alias.Ref},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			comments := holdComment("pr-author", "User", tt.ref+" Dismiss: the watcher is intentionally excluded")
+			comments[0].CreatedAt = reported.Add(time.Minute)
+			answered := append([]outsideFinding(nil), records...)
+			answerOutside(comments, answered, nil)
+			if answered[0].State != outsideAnswered {
+				t.Fatalf("state=%q want answered; FirstAt=%s comment=%s", answered[0].State, answered[0].FirstAt, comments[0].CreatedAt)
+			}
+		})
 	}
 }
 

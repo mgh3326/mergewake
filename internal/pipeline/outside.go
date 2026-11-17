@@ -324,16 +324,21 @@ func outsideLegacy(history []github.ReviewedPass, head, patch, inherited string)
 }
 
 var (
+	// outsideAnswerPrefix accepts one or more finding refs before an answer
+	// form. Refs can be stable outside ids or path:line locations, optionally
+	// quoted with backticks and separated from each other or the answer by
+	// whitespace or punctuation.
+	outsideAnswerPrefix = `\W*(?:(?:` + "`?od-[[:xdigit:]]+`?|`?[\\w./-]+:[0-9]+`?" + `)(?:\s*[:\-—|]\s*|\s+))*`
 	// outsideFixForm is the fix disposition in a PR comment. The forms are
 	// anchored to a line start so "do not dismiss:" or "not fixed in" mid-
 	// sentence cannot pass for an answer.
-	outsideFixForm = regexp.MustCompile(`(?im)^\W*fixed\s+in\b`)
+	outsideFixForm = regexp.MustCompile(`(?im)^` + outsideAnswerPrefix + `fixed\s+in\b`)
 	// outsideDismissForm is the dismiss disposition with its reason, bare
 	// ("Dismiss: …") or under "Disposition:" ("Disposition: dismiss …").
-	outsideDismissForm = regexp.MustCompile(`(?im)^\W*(?:disposition\s*:\s*)?dismiss\w*\s*:?\s*\S`)
+	outsideDismissForm = regexp.MustCompile(`(?im)^` + outsideAnswerPrefix + `(?:disposition\s*:\s*)?dismiss\w*\s*:?\s*\S`)
 	// outsideDeferForm is the defer disposition naming its task, in the form
 	// deferTaskRef accepts (gate.go).
-	outsideDeferForm = regexp.MustCompile(`(?im)^\W*disposition\s*:\s*defer\s+` + deferTaskRef)
+	outsideDeferForm = regexp.MustCompile(`(?im)^` + outsideAnswerPrefix + `disposition\s*:\s*defer\s+` + deferTaskRef)
 )
 
 // outsideTitle is the short text BLOCKED and answers show for a finding.
