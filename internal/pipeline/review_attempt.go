@@ -24,7 +24,7 @@ func attemptOf(ctx context.Context) *reviewAttempt {
 }
 
 // reviewerPlaced notes that this run saw a reviewer really land: a spawn
-// result naming a pane or host, or an hk job record for the reviewer. An
+// result naming a pane and its host, or an hk job record for the reviewer. An
 // asynchronous spawn's ACCEPTED receipt alone is no landing, since the hub can
 // refuse the request after accepting it (hk 5005).
 func (a *reviewAttempt) reviewerPlaced() {

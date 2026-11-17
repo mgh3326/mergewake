@@ -898,10 +898,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if !resumed {
 				headLatencyOf(ctx).spawnAccepted(plan.pass, phases.Now())
 				// A spawn whose wait returned proves the placement, and so does
-				// a receipt that names a pane or host. An asynchronous spawn's
-				// call returns as soon as the hub accepted the request, which
-				// the hub can still refuse (hk 5005): that landing is seen on
-				// the resumed run, from the reviewer's hk record.
+				// a receipt that names a pane and its host. An asynchronous
+				// spawn's call returns as soon as the hub accepted the request,
+				// which the hub can still refuse (hk 5005): that landing is
+				// seen on the resumed run, from the reviewer's hk record.
 				if _, placed := spawnPlacement(string(stdout)); placed || !async {
 					attemptOf(ctx).reviewerPlaced()
 					rj.Placed = true

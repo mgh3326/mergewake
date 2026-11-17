@@ -78,10 +78,10 @@ type reviewerJob struct {
 	// spawn that never placed; then the review budget starts from Recorded.
 	Started *time.Time `json:"started,omitempty"`
 	// Placed marks the landing review-retry already accounted for: the spawn
-	// named a pane or host, or an hk job record exists for the label. A bare
-	// ACCEPTED receipt is no landing, since the hub can refuse the request
-	// after accepting it (hk 5005), so the reset is applied once the landing
-	// is really seen, not once per evaluation that reads the record.
+	// named a pane and its host, or an hk job record exists for the label.
+	// A bare ACCEPTED receipt is no landing, since the hub can refuse the
+	// request after accepting it (hk 5005), so the reset is applied once the
+	// landing is really seen, not once per evaluation that reads the record.
 	Placed bool `json:"placed,omitempty"`
 }
 
