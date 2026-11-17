@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/outcomes"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 // prURL is the PR's canonical URL, the form hk takes as source_ref. It is the
@@ -299,33 +300,115 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 	return rec
 }
 
-func roundFindingFacts(findings []github.Finding, earlier []github.ReviewThread, rp roundPlan, earlierKnown bool) []integrations.ReviewFindingRecord {
+func roundFindingFacts(findings []github.Finding, earlier []github.ReviewThread, rp roundPlan, earlierKnown bool, prAuthor, reviewLogin string) []integrations.ReviewFindingRecord {
 	added := rp.addedAfterFirst
 	facts := make([]integrations.ReviewFindingRecord, 0, len(findings))
 	for _, f := range findings {
 		title := findingTitle(f.Body)
 		repeats := false
+		disputesReply := false
 		for _, thread := range earlier {
 			if len(thread.Comments) == 0 {
 				continue
 			}
 			priorTitle := findingTitle(stripFinding(thread.Comments[0].Body))
-			if (thread.Path == f.Path && thread.Line == f.Line) || (title != "" && strings.EqualFold(title, priorTitle)) {
+			matchingThread := (thread.Path == f.Path && thread.Line == f.Line) || (title != "" && strings.EqualFold(title, priorTitle))
+			if matchingThread {
 				repeats = true
-				break
+				for _, reply := range thread.Comments[1:] {
+					if authorReply(reply, prAuthor, reviewLogin) {
+						disputesReply = true
+						break
+					}
+				}
+			}
+			if !disputesReply {
+				for _, reply := range thread.Comments[1:] {
+					if authorReply(reply, prAuthor, reviewLogin) && quotesOrContradictsReply(f.Body, reply.Body) {
+						disputesReply = true
+						break
+					}
+				}
 			}
 		}
-		fact := integrations.ReviewFindingRecord{Path: f.Path, Line: f.Line, Title: title}
+		fact := integrations.ReviewFindingRecord{Path: f.Path, Line: f.Line, Title: title, Severity: f.Severity}
 		if rp.round == 1 || rp.firstDiffKnown {
 			addedAfterFirst := rp.round > 1 && added[f.Path][f.Line]
 			fact.AddedAfterFirst = &addedAfterFirst
 		}
 		if earlierKnown {
 			fact.RepeatsEarlier = &repeats
+			fact.DisputesEarlierReply = &disputesReply
 		}
 		facts = append(facts, fact)
 	}
 	return facts
+}
+
+func authorReply(comment github.ReviewComment, prAuthor, reviewLogin string) bool {
+	if comment.AuthorType == "Bot" || comment.Author == "" {
+		return false
+	}
+	author := policy.NormalizeAuthor(comment.Author)
+	return author == policy.NormalizeAuthor(prAuthor) || author == policy.NormalizeAuthor(reviewLogin)
+}
+
+// quotesOrContradictsReply recognizes a quoted phrase of five words or more,
+// or a reply-specific lexical overlap paired with an explicit rebuttal cue.
+func quotesOrContradictsReply(finding, reply string) bool {
+	findingWords := normalizedReplyWords(finding)
+	replyWords := normalizedReplyWords(reply)
+	if containsFiveWordQuote(findingWords, replyWords) {
+		return true
+	}
+	replyTerms := map[string]bool{}
+	for _, word := range replyWords {
+		if len(word) >= 4 {
+			replyTerms[word] = true
+		}
+	}
+	overlap := 0
+	text := " " + strings.Join(findingWords, " ") + " "
+	for term := range replyTerms {
+		if strings.Contains(text, " "+term+" ") {
+			overlap++
+		}
+	}
+	if overlap < 2 {
+		return false
+	}
+	for _, cue := range []string{" but ", " still ", " however ", " does not ", " doesn't ", " did not ", " didn't ", " not ", " fails ", " instead ", " contradicts "} {
+		if strings.Contains(text, cue) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedReplyWords(text string) []string {
+	words := strings.Fields(strings.ToLower(stripFinding(text)))
+	for i := range words {
+		words[i] = strings.Trim(words[i], "`*_\"'.,:;!?()[]{}")
+	}
+	return words
+}
+
+func containsFiveWordQuote(text, reply []string) bool {
+	for i := 0; i+5 <= len(reply); i++ {
+		for j := 0; j+5 <= len(text); j++ {
+			match := true
+			for k := 0; k < 5; k++ {
+				if reply[i+k] != text[j+k] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func findingTitle(body string) string {
@@ -407,7 +490,7 @@ func (s *Service) auditRoundFindingFacts(repo string, pr int, head string, pass,
 		if sent.has(key) {
 			continue
 		}
-		if err := s.audit(repo, "review-round-finding", map[string]any{"pr": pr, "round": round, "path": fact.Path, "line": fact.Line, "title": fact.Title, "added_after_first_head": fact.AddedAfterFirst, "repeats_earlier_thread": fact.RepeatsEarlier}, false); err != nil {
+		if err := s.audit(repo, "review-round-finding", map[string]any{"pr": pr, "head": head, "pass": pass, "round": round, "path": fact.Path, "line": fact.Line, "title": fact.Title, "severity": fact.Severity, "added_after_first_head": fact.AddedAfterFirst, "repeats_earlier_thread": fact.RepeatsEarlier, "disputes_earlier_reply": fact.DisputesEarlierReply}, false); err != nil {
 			return err
 		}
 		if err := sent.add(key); err != nil {

@@ -315,6 +315,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		action := "review-pending"
 		if len(pending) == 0 {
 			action = "already-reviewed"
+			round := 0
+			for _, receipt := range posted {
+				round = max(round, receipt.Round)
+			}
+			s.notifyCompletedLateRound(ctx, r, pr, round, posted, nil)
 			if e = s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(posted)), o.DryRun); e != nil {
 				return e
 			}
@@ -428,8 +433,9 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// Every missing pass of the head runs at once: no pass reads another's
 	// result, and each owns its claim ref, reviewer job record and outcome.
 	// mu guards what the passes of this run share: reviewStarted, reviews,
-	// known and runReceipts.
+	// known, runReceipts and the posted round's finding facts.
 	var mu sync.Mutex
+	var roundFacts []integrations.ReviewFindingRecord
 	runOne := func(plan *passPlan) error {
 		passStarted := s.now()
 		// A GitHub ref claims this PR head across hosts before any reviewer is
@@ -528,7 +534,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		findings := shape.kept
 		known = append(known, knownFromFindings(findings)...)
 		mu.Unlock()
-		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil)
+		findingFacts := roundFindingFacts(findings, feedback.Threads, rp, contextErr == nil, pr.User.Login, s.Config.Review.Login)
 		// same_family is a fact only when both families are known: an
 		// unnamed reviewer family is unknown, never the author's.
 		plan.sameFamily = out.family != "" && family != "" && out.family == family
@@ -582,6 +588,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		mu.Lock()
 		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
+		roundFacts = append(roundFacts, findingFacts...)
 		mu.Unlock()
 		// The pass is posted: its reviewer job record, if any, is spent. A
 		// record left behind is never resumed, since a posted pass is not run
@@ -679,6 +686,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return s.Print(map[string]any{"action": "review-pending", "head": pr.Head.SHA, "pass": plans[held].pass})
 	}
 	if len(posted)+len(plans) >= needed {
+		mu.Lock()
+		facts := slices.Clone(roundFacts)
+		mu.Unlock()
+		s.notifyCompletedLateRound(ctx, r, pr, rp.round, runReceipts, facts)
 		if e := s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(runReceipts)), o.DryRun); e != nil {
 			return e
 		}
