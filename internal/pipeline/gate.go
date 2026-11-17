@@ -555,7 +555,7 @@ func (s *Service) authorFixWait(ctx context.Context, r config.Repo, pr github.Pu
 	if window <= 0 {
 		return false, nil
 	}
-	posted := newestUnansweredFinding(fb, pr.Head.SHA, pr.User.Login)
+	posted := newestUnansweredFinding(fb, pr.Head.SHA)
 	if posted.IsZero() || s.now().Sub(posted) >= window {
 		return false, nil
 	}
@@ -563,33 +563,29 @@ func (s *Service) authorFixWait(ctx context.Context, r config.Repo, pr github.Pu
 	return live, err
 }
 
-// newestUnansweredFinding finds the latest finding whose first comment is on
-// head and which has no reply from the PR author. A missing timestamp cannot
-// start a bounded wait, so it is ignored.
-func newestUnansweredFinding(fb github.ReviewFeedback, head, author string) time.Time {
-	author = policy.NormalizeAuthor(author)
+// newestUnansweredFinding finds the latest mergewake finding whose first
+// comment is on head and which has no reply or resolution. Finding identity
+// comes from its severity marker, not its author: mergewake findings use the
+// repository's review identity, which can also own the PR. A missing
+// timestamp cannot start a bounded wait, so it is ignored.
+func newestUnansweredFinding(fb github.ReviewFeedback, head string) time.Time {
 	var newest time.Time
 	for _, thread := range fb.Threads {
-		if len(thread.Comments) == 0 {
+		if thread.IsResolved || len(thread.Comments) == 0 {
 			continue
 		}
 		first := thread.Comments[0]
-		if postedOn(first) != head || policy.NormalizeAuthor(first.Author) == author || first.CreatedAt.IsZero() {
+		if postedOn(first) != head || !mergewakeFindingMarker.MatchString(first.Body) || first.CreatedAt.IsZero() {
 			continue
 		}
-		replied := false
-		for _, comment := range thread.Comments[1:] {
-			if policy.NormalizeAuthor(comment.Author) == author {
-				replied = true
-				break
-			}
-		}
-		if !replied && first.CreatedAt.After(newest) {
+		if len(thread.Comments) == 1 && first.CreatedAt.After(newest) {
 			newest = first.CreatedAt
 		}
 	}
 	return newest
 }
+
+var mergewakeFindingMarker = regexp.MustCompile(`<!-- mergewake-severity:([a-z]+) -->`)
 
 // authorJobLive uses the same task-bound job and unique live head-pane lookup
 // as the findings route. Explicit lanes and task lanes alone do not make an
