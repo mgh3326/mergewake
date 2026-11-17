@@ -13,6 +13,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // cleanupOpts shape one review pass whose reviewer pane lands on node-a, the
@@ -435,5 +436,27 @@ func TestReviewerCleanupIgnoresPlacementOfJobNotCompleted(t *testing.T) {
 	}
 	if receipts := res.receipts(t); len(receipts) != 1 || receipts[0].Result != "pending-cleanup" {
 		t.Fatalf("receipts = %+v", receipts)
+	}
+}
+
+// A verified remote placement names its cwd in Cwd as well as Worktree, so the
+// sweep still knows the path when the pane and the job record are gone; a local
+// placement and a bare label never do.
+func TestReviewerCleanupPathsNameAVerifiedRemoteCwd(t *testing.T) {
+	x := &panewireExecutor{s: &Service{Config: config.Config{Hosts: []reap.Host{{Name: "local"}}}}}
+	label := reviewerLabelFor(12, time.Hour)
+	cwd := "/node/" + label + reviewerCheckoutSuffix
+	p := reviewerPane{label: label, placement: integrations.JobRecord{Host: "node-a", Cwd: cwd}}
+	if worktree, remote := x.reviewerCleanupPaths(p); worktree != cwd || remote != cwd {
+		t.Fatalf("worktree=%q remote=%q, want both %q", worktree, remote, cwd)
+	}
+	local := "/work/" + label
+	p = reviewerPane{label: label, placement: integrations.JobRecord{Host: "local", Cwd: local}}
+	if worktree, remote := x.reviewerCleanupPaths(p); worktree != local || remote != "" {
+		t.Fatalf("worktree=%q remote=%q, want the local path and no remote", worktree, remote)
+	}
+	p = reviewerPane{label: label, placement: integrations.JobRecord{Host: "node-a"}}
+	if worktree, remote := x.reviewerCleanupPaths(p); worktree != label+reviewerCheckoutSuffix || remote != "" {
+		t.Fatalf("worktree=%q remote=%q, want the node's name and no remote", worktree, remote)
 	}
 }

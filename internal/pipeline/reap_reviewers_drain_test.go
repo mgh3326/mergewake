@@ -492,3 +492,36 @@ func TestReapReviewerHostUnknownReopensWhenTheJournalNamesAHost(t *testing.T) {
 		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
 	}
 }
+
+// A host whose drain budget is spent must not consume the audit visits either:
+// its deferred labels are skipped without spending the allowance, so the next
+// host still drains in the same pass.
+func TestReapReviewerDrainedHostDoesNotSpendTheAuditAllowance(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}}
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 1, HostOrder: []string{"node-b", "node"}}
+	rows := make([]map[string]any, 0, 251)
+	for i := 0; i < 250; i++ {
+		label := reviewerLabelFor(500+i, 2*24*time.Hour)
+		f.hub.detached["/work-b/"+label+reviewerCheckoutSuffix] = true
+		f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-b"}
+		rows = append(rows, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 500 + i, "label": label, "host": "node-b", "pane": "w1:p1"}})
+	}
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	healthy := reviewerLabelFor(900, 2*24*time.Hour)
+	healthyPath := "/work/" + healthy + reviewerCheckoutSuffix
+	f.hub.detached[healthyPath] = true
+	f.sink.recs[healthy] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: healthy, Host: "node-a"}
+	rows = append(rows, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 900, "label": healthy, "host": "node-a", "pane": "w1:p2"}})
+	seedDecisionRows(t, f.s, testRepo.Name, rows...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var removed []string
+	for _, v := range f.hub.ops("worktree.remove") {
+		removed = append(removed, v["cwd"].(string))
+	}
+	if len(removed) != 2 || removed[1] != healthyPath {
+		t.Fatalf("removals %v, want one on node-b and the healthy label after it", removed)
+	}
+}

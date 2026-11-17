@@ -141,18 +141,8 @@ func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
 func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerPane) (closed bool) {
 	ctx, cancel := reportContext(parent)
 	defer cancel()
-	// A spec-placed reviewer holds no local checkout: the row names the label
-	// itself and the node's worktree, which is the placement cwd when it is the
-	// label's own directory and <label>-checkout otherwise. The reviewer sweep
-	// then has a candidate without needing the pane.
-	worktree := p.checkout
-	if worktree == "" {
-		worktree = p.label + reviewerCheckoutSuffix
-		if cwd := p.placement.Cwd; reviewerCheckoutDir(filepath.Base(filepath.Clean(cwd)), p.label) {
-			worktree = cwd
-		}
-	}
-	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: worktree, Label: p.label}}
+	worktree, remote := x.reviewerCleanupPaths(p)
+	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Cwd: remote, Worktree: worktree, Label: p.label}}
 	defer func() {
 		closed = c.paneGone
 		// A forced close that does not close the pane is a skip, never a pass
@@ -208,6 +198,29 @@ func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerP
 	host := reap.HubHost{Hub: hub, Machine: p.placement.Host}
 	c.cleanRemote(ctx, host)
 	return
+}
+
+// reviewerCleanupPaths is what a reviewer-cleanup row names: the worktree a
+// pass end holds, and the verified remote cwd where the sweep reads a remote
+// path first. A spec-placed reviewer holds no local checkout, so the row names
+// the label itself and the node's worktree: the placement cwd when it is the
+// label's own directory, <label>-checkout otherwise. The bare label is never a
+// filesystem path.
+func (x *panewireExecutor) reviewerCleanupPaths(p reviewerPane) (worktree, remote string) {
+	worktree = p.checkout
+	if worktree != "" {
+		return worktree, ""
+	}
+	worktree = p.label + reviewerCheckoutSuffix
+	cwd := p.placement.Cwd
+	if !reviewerCheckoutDir(filepath.Base(filepath.Clean(cwd)), p.label) {
+		return worktree, ""
+	}
+	worktree = cwd
+	if p.placement.Host != "" && p.placement.Host != "local" && !x.localReviewerHost(p.placement.Host) {
+		remote = cwd
+	}
+	return worktree, remote
 }
 
 // cleanLocal leaves the checkout while its pane is still present and releases
