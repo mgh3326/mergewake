@@ -537,7 +537,10 @@ func TestReapReviewerErrorRowDoesNotBlockTheJournalCheckpoint(t *testing.T) {
 	f.hub.forbid = map[string]bool{"worktree.remove": true}
 	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", Cwd: cwd}
 	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 601, "label": label, "host": "node-a"}})
-	_ = f.reap(t, 0, Options{}) // the error row is the pass's report
+	err := f.reap(t, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "reviewer") {
+		t.Fatalf("a failed removal reported success: %v", err)
+	}
 	var errored bool
 	for _, row := range f.rows(t) {
 		errored = errored || row.Result == "error"
