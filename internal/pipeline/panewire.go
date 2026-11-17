@@ -97,6 +97,14 @@ func reviewerRoleArgs(pass int) (args []string, ok bool) {
 func workerSeatArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
+		if isCheckoutFlag(args[i]) {
+			out = append(out, args[i])
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+			continue
+		}
 		if args[i] == "--role" || args[i] == "--review-pass" {
 			i++
 			continue
@@ -110,14 +118,14 @@ func workerSeatArgs(args []string) []string {
 // arguments replayed from reviewer-job records written by older versions.
 func panewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
-	if i := slices.Index(out, "--builder-family"); i >= 0 {
+	if i := indexFlag(out, "--builder-family"); i >= 0 {
 		out[i] = "--author-family"
 		if i+1 < len(out) {
 			out[i+1] = panewireBuilderFamily(out[i+1])
 		} else {
 			out = append(out, "other")
 		}
-	} else if i := slices.Index(out, "--author-family"); i >= 0 {
+	} else if i := indexFlag(out, "--author-family"); i >= 0 {
 		if i+1 < len(out) {
 			out[i+1] = panewireBuilderFamily(out[i+1])
 		} else {
@@ -127,6 +135,13 @@ func panewireSpawnArgs(args []string) []string {
 		out = append(out, "--author-family", "other")
 	}
 	for i := 0; i < len(out); i++ {
+		if isCheckoutFlag(out[i]) {
+			i++ // its value is data, even when it spells a flag
+			continue
+		}
+		if i > 0 && isCheckoutFlag(out[i-1]) {
+			continue // a checkout value a prior delete rewound onto
+		}
 		if out[i] == "--role" && i+1 < len(out) {
 			switch out[i+1] {
 			case "worker", "tester":
@@ -197,6 +212,10 @@ var panewireSpawnCompat panewireSpawnCompatibility
 func oldPanewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
 	for i := 0; i < len(out); i++ {
+		if isCheckoutFlag(out[i]) {
+			i++ // its value is data, even when it spells a flag
+			continue
+		}
 		switch out[i] {
 		case "--author-family":
 			out[i] = "--builder-family"
@@ -263,10 +282,13 @@ func stderrHasFlag(stderr, flag string) bool {
 // spawns a second, and its pass lease keeps another host from starting one.
 // A skip fails the pass, and the next review run spawns a new pane.
 type panewireExecutor struct {
-	s            *Service
-	repo         config.Repo
-	pr           github.Pull
-	diff         string
+	s    *Service
+	repo config.Repo
+	pr   github.Pull
+	diff string
+	// fullDiff is the whole PR patch, while diff may be the round's
+	// interdiff. Sparse includes come from the full PR paths (hk 5099).
+	fullDiff     string
 	delta        bool // diff is the interdiff since the last reviewed head
 	round        int
 	context      string // answered findings and operator decisions, as in the headless prompt
@@ -563,6 +585,24 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if !reviewerSpecs.legacy() {
 			if origin := s.specOrigin(ctx, root); origin != "" {
 				spec = &reviewerCheckoutSpec{origin: origin, commit: pr.Head.SHA, ref: ref}
+				if excludes := x.repo.Review.CheckoutExclude; len(excludes) > 0 && !reviewerSparses.legacy() {
+					includes := sparseIncludePaths(x.fullDiff)
+					if len(includes) == 0 {
+						includes = sparseIncludePaths(x.diff)
+					}
+					switch {
+					case len(includes) > maxSparseIncludes:
+						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "too-many-paths", "changed": len(includes), "limit": maxSparseIncludes}, false)
+					case !sparseValuesSafe(excludes, includes):
+						// A value that reads as a flag would corrupt the
+						// spawn-argv rewriters below; the full checkout
+						// keeps the review lossless instead (hk 5099).
+						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "flag-like-path", "changed": len(includes)}, false)
+					default:
+						spec.exclude = slices.Clone(excludes)
+						spec.include = includes
+					}
+				}
 				checkout = ""
 			}
 		}
@@ -867,8 +907,26 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// re-records the argv in the -c form and asks again. A refusal that names
 		// the hub's or the CLI's missing flag is remembered for reviewerSpecTTL;
 		// any other spec refusal is not, so a corrected spec is tried again.
-		place := func(c context.Context, a []string) ([]byte, error) {
+		// A sparse refusal retries the full spec through place itself, so a
+		// full-spec refusal still reaches the local checkout below.
+		var place func(c context.Context, a []string) ([]byte, error)
+		place = func(c context.Context, a []string) ([]byte, error) {
 			b, refusal := launch(c, a)
+			if refusal != nil && checkoutSparseRefused(refusal) {
+				if full, ok := sparseFallbackArgs(a); ok {
+					reason := fleetevent.Redact(integrations.Detail(refusal))
+					if hubLacksSparseCheckout(refusal) {
+						reviewerSparses.refused()
+					}
+					_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-refused", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": reason}, false)
+					rj.Args = full
+					if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+						return b, saveErr
+					}
+					note = "the hub carries no sparse checkout; the reviewer was placed from a full checkout"
+					return place(c, full)
+				}
+			}
 			if refusal == nil || !checkoutSpecRefused(refusal) {
 				return b, refusal
 			}
@@ -886,8 +944,6 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			prepErr := x.localReviewerCheckout(pc, checkout)
 			cancel()
 			if prepErr != nil {
-				// The directory was never made: no receipt and no record may
-				// name it, and the spawn placed nothing.
 				checkout = ""
 				return b, &checkoutSpecFallbackFailed{spec: reason, err: prepErr}
 			}
@@ -1010,7 +1066,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, saveErr
 				}
 				if placement, ok := spawnPlacement(string(stdout)); ok {
-					x.auditReviewerSpawn(plan, rj.Label, placement.Host)
+					x.auditReviewerSpawn(plan, rj.Label, placement.Host, checkoutModeOf(string(stdout)))
 				}
 				return out, fmt.Errorf("%w: panewire reviewer %s: the wait ended before the job finished (exit %d: %s); the next run resumes it", errPassPending, label, code, fleetevent.Redact(integrations.Detail(e)))
 			}
@@ -1028,7 +1084,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				return out, e
 			}
 			if placement, ok := spawnPlacement(string(stdout)); ok {
-				x.auditReviewerSpawn(plan, rj.Label, placement.Host)
+				x.auditReviewerSpawn(plan, rj.Label, placement.Host, checkoutModeOf(string(stdout)))
 			}
 			keepCheckout = true
 			if !resumed {
@@ -1046,7 +1102,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	keepCheckout = false
 	placement, confirmed := spawnPlacement(string(stdout))
 	if confirmed {
-		x.auditReviewerSpawn(plan, label, placement.Host)
+		x.auditReviewerSpawn(plan, label, placement.Host, checkoutModeOf(string(stdout)))
 	}
 	pane := reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass, placement: placement, confirmed: confirmed, keepLocalCheckout: &keepCheckout}
 	cleanupPane := true
@@ -1225,7 +1281,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// The findings are accepted: an audit that cannot write is not a reason to fail the pass.
 		_ = s.audit(x.repo.Name, "reviewer-nudge-outcome", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": rj.Label, "outcome": "result_found"}, false)
 	}
-	x.auditReviewerSpawn(plan, rj.Label, closeRec.Host)
+	x.auditReviewerSpawn(plan, rj.Label, closeRec.Host, checkoutModeRec(closeRec, string(stdout)))
 	x.note("collected", rj)
 	return out, nil
 }
@@ -2130,6 +2186,9 @@ Write a one-line summary to $J/report.md. %[13]s
 You have %[15]d minutes from the start of this review; findings returned after
 that are ignored.
 %[14]s`, x.repo.Name, x.pr.Number, plan.pass, plan.lens, "", x.pr.Head.SHA, x.pr.Base.Ref, x.pr.Base.SHA, focus, authorFamily, shellQuote(jobDir), label, ret, prContext, x.briefMinutes())
+	if excludes := x.repo.Review.CheckoutExclude; len(excludes) > 0 {
+		text = strings.Replace(text, "## Job directory", sparseCheckoutParagraph(excludes)+"\n## Job directory", 1)
+	}
 	if strings.Contains(x.context, "ACCEPTANCE CONTRACT") {
 		text = strings.Replace(text, "No other keys.", "No other keys except the optional boolean `advisory` the PR context asks for.", 1)
 	}

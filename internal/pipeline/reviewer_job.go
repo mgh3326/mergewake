@@ -230,7 +230,7 @@ func alreadyClosedRefusal(e error) bool {
 // reviewerLane is the owner lane a reviewer's hk job closes under: the hk
 // record's, else the --owner of the recorded spawn arguments, else "".
 func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
-	if i := slices.Index(rj.Args, "--owner"); job.OwnerLane == "" && i >= 0 && i+1 < len(rj.Args) {
+	if i := indexFlag(rj.Args, "--owner"); job.OwnerLane == "" && i >= 0 && i+1 < len(rj.Args) {
 		return rj.Args[i+1]
 	}
 	return job.OwnerLane
@@ -372,7 +372,7 @@ func (x *panewireExecutor) deadLabel(pass int) (deadReviewerLabel, bool, error) 
 // replay as the same spawn request and re-attaches a wait to its operation.
 func withWaitTimeout(args []string, wait time.Duration) []string {
 	out := slices.Clone(args)
-	if i := slices.Index(out, "--wait-timeout"); i >= 0 && i+1 < len(out) {
+	if i := indexFlag(out, "--wait-timeout"); i >= 0 && i+1 < len(out) {
 		secs := int(wait.Seconds())
 		if recorded, e := strconv.Atoi(out[i+1]); e == nil && recorded < secs {
 			secs = recorded
@@ -387,6 +387,14 @@ func withWaitTimeout(args []string, wait time.Duration) []string {
 func placeOnly(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
+		if isCheckoutFlag(args[i]) {
+			out = append(out, args[i])
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+			continue
+		}
 		switch args[i] {
 		case "--wait":
 		case "--wait-timeout":

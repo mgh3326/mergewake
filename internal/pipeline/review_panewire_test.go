@@ -76,13 +76,17 @@ type panewireRunner struct {
 	// does when the hub does not advertise checkout_spec_v1: exit 2, before any
 	// request is submitted.
 	specRefused bool
-	headless    int
-	remote      *taskJobSink
-	inbox       []string // lane.event items, as panewire inbox list prints them
-	inboxErr    error
-	acks        [][]string
-	late        int // inbox looks that still show nothing
-	looks       int
+	// sparseRefused makes a spawn that names sparse flags answer as panewire
+	// does when the hub does not advertise checkout_sparse_v1: exit 2, before
+	// any request is submitted. A retry without the sparse flags succeeds.
+	sparseRefused bool
+	headless      int
+	remote        *taskJobSink
+	inbox         []string // lane.event items, as panewire inbox list prints them
+	inboxErr      error
+	acks          [][]string
+	late          int // inbox looks that still show nothing
+	looks         int
 	// nodeResult answers `panewire node job-result` ({"found":false} when
 	// empty); nodeReads are the --job labels it was asked for.
 	nodeResult string
@@ -176,6 +180,10 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "panewire":
 		r.spawns = append(r.spawns, args)
+		if r.sparseRefused && slices.Contains(args, "--checkout-exclude") {
+			// panewire's pre-submit sparse feature check: no request, job or pane.
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-exclude; upgrade the hub before submitting"}
+		}
 		if r.specRefused && slices.Contains(args, "--checkout-origin") {
 			// panewire's pre-submit feature check: no request, job or pane.
 			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-origin; upgrade the hub before submitting"}
