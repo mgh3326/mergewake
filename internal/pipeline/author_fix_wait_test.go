@@ -19,7 +19,8 @@ func TestLandAuthorFixWait(t *testing.T) {
 		wait       string
 		live       bool
 		jobState   string
-		pane       bool
+		pane       string
+		paneState  string
 		replyBy    string
 		resolved   bool
 		advance    time.Duration
@@ -33,8 +34,9 @@ func TestLandAuthorFixWait(t *testing.T) {
 		{name: "resolved finding clears wait", wait: "30m", live: true, resolved: true, wantMerges: 1},
 		{name: "no live author merges at once", wait: "30m", wantMerges: 1},
 		{name: "zero disables wait", wait: "0s", live: true, wantMerges: 1},
-		{name: "terminal bound job ignores lingering head pane", wait: "30m", jobState: "completed", pane: true, wantMerges: 1},
-		{name: "unbound live head pane waits", wait: "30m", pane: true, wantReason: "author_fixing"},
+		{name: "terminal bound job ignores its lingering head pane", wait: "30m", jobState: "completed", pane: "author-job", wantMerges: 1},
+		{name: "terminal bound job waits for live takeover pane", wait: "30m", jobState: "completed", pane: "takeover-job", paneState: "running", wantReason: "author_fixing"},
+		{name: "unbound live head pane waits", wait: "30m", pane: "head-pane", paneState: "running", wantReason: "author_fixing"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
@@ -55,7 +57,7 @@ func TestLandAuthorFixWait(t *testing.T) {
 			}
 			g.feedback.Threads = []github.ReviewThread{thread}
 			g.findings = 1
-			if tc.live || tc.jobState != "" || tc.pane {
+			if tc.live || tc.jobState != "" || tc.pane != "" {
 				sink := &jobSink{jobs: map[string]string{}, recs: map[string]integrations.JobRecord{}}
 				if tc.live || tc.jobState != "" {
 					state := tc.jobState
@@ -65,9 +67,15 @@ func TestLandAuthorFixWait(t *testing.T) {
 					sink.jobs["42"] = "author-job"
 					sink.recs["author-job"] = integrations.JobRecord{State: state, Label: "author-job"}
 				}
-				if tc.pane {
-					sink.recs["head-pane"] = integrations.JobRecord{State: "spawned", Label: "head-pane-lane"}
-					s.Runner = authorHost(aPane{"w1:p1", "head-pane", "/wt/a", "feature", projectOrigin})
+				if tc.pane != "" {
+					if tc.pane != "author-job" {
+						state := tc.paneState
+						if state == "" {
+							state = "running"
+						}
+						sink.recs[tc.pane] = integrations.JobRecord{State: state, Label: tc.pane + "-lane"}
+					}
+					s.Runner = authorHost(aPane{"w1:p1", tc.pane, "/wt/a", "feature", projectOrigin})
 					s.Config.Hosts = []reap.Host{{Name: "local"}}
 				}
 				s.Sink = sink
