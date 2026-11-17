@@ -558,3 +558,99 @@ func TestOutsideHoldAuditStates(t *testing.T) {
 		t.Fatalf("rows=%v", rows)
 	}
 }
+
+func TestOutsideAnswerLineBindings(t *testing.T) {
+	fa := holdFinding("docs/a.go", 10, "high", "finding A in file a")
+	fb := holdFinding("docs/b.go", 20, "high", "finding B in file b")
+	passes := []github.ReviewedPass{outsidePass(shaC, "p-old", 1, 1, fa, fb)}
+	baseRecords := foldOutside(passes, shaC, "p-old", "", false)
+
+	first := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	alias := holdFinding("internal/fleet/watch.go", 55, "high", "Keep the old binary watcher excluded when the node restarts")
+	aliasRecords := foldOutside([]github.ReviewedPass{
+		outsidePass(shaC, "p-old", 1, 1, first),
+		outsidePass(shaC, "p-old", 2, 1, alias),
+	}, shaC, "p-old", "", false)
+	if len(aliasRecords) != 1 || len(aliasRecords[0].Aliases) != 1 {
+		t.Fatalf("alias setup failed: %+v", aliasRecords)
+	}
+
+	tests := []struct {
+		name       string
+		records    []outsideFinding
+		comment    string
+		wantStates map[string]string // ref -> state (outsideOpen or outsideAnswered)
+	}{
+		{
+			name:    "two lines: A dismissed, B noted but not dismissed",
+			records: baseRecords,
+			comment: fa.Ref + " Dismiss: generated file\n" + fb.Ref + " is still broken, see docs/x.md:3",
+			wantStates: map[string]string{
+				fa.Ref: outsideAnswered,
+				fb.Ref: outsideOpen,
+			},
+		},
+		{
+			name:    "single line naming both refs answers both",
+			records: baseRecords,
+			comment: fa.Ref + " " + fb.Ref + " Dismiss: both are intentionally ignored",
+			wantStates: map[string]string{
+				fa.Ref: outsideAnswered,
+				fb.Ref: outsideAnswered,
+			},
+		},
+		{
+			name:    "ref on line 1 and Dismiss on line 2 answers ref",
+			records: baseRecords,
+			comment: fa.Ref + "\nDismiss: generated file",
+			wantStates: map[string]string{
+				fa.Ref: outsideAnswered,
+				fb.Ref: outsideOpen,
+			},
+		},
+		{
+			name:    "alias named on an answer line answers its record",
+			records: aliasRecords,
+			comment: alias.Ref + " Dismiss: intentionally ignored",
+			wantStates: map[string]string{
+				first.Ref: outsideAnswered,
+			},
+		},
+		{
+			name:    "path:line named on answer line answers only that finding",
+			records: baseRecords,
+			comment: "docs/a.go:10 Dismiss: verified safe\nwe also looked at " + fb.Ref,
+			wantStates: map[string]string{
+				fa.Ref: outsideAnswered,
+				fb.Ref: outsideOpen,
+			},
+		},
+		{
+			name:    "line naming finding without answer form never answers",
+			records: baseRecords,
+			comment: fa.Ref + " Dismiss: fixed elsewhere\n" + fb.Ref + " needs investigation",
+			wantStates: map[string]string{
+				fa.Ref: outsideAnswered,
+				fb.Ref: outsideOpen,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recs := make([]outsideFinding, len(tt.records))
+			copy(recs, tt.records)
+			comments := holdComment("pr-author", "User", tt.comment)
+			answerOutside(comments, recs, nil)
+			for _, rec := range recs {
+				want, ok := tt.wantStates[rec.Ref]
+				if !ok {
+					t.Fatalf("unexpected ref in records: %s", rec.Ref)
+				}
+				if rec.State != want {
+					t.Errorf("finding %s state = %s, want %s", rec.Ref, rec.State, want)
+				}
+			}
+		})
+	}
+}
