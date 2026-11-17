@@ -431,11 +431,11 @@ func TestReapReviewerWriteFailureKeepsTheJournalWindow(t *testing.T) {
 	f := newReviewerFix(t)
 	label := reviewerLabelFor(93, 2*time.Hour)
 	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 93, "label": label}})
-	dir := f.s.state(testRepo.Name)
-	if err := os.Chmod(dir, 0o500); err != nil {
+	// The receipt log cannot be appended to, while the journal checkpoint
+	// still can: the pass holds the window because its row was lost.
+	if err := os.WriteFile(f.s.reapLog(testRepo.Name), nil, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	if err := f.reap(t, 0, Options{}); err == nil {
 		t.Fatal("a pass whose rows cannot be written reported no error")
 	}
