@@ -743,10 +743,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// A request the hub already ended is not replayed: a replay submits it
 		// again, which starts a fresh attempt re-refused on every evaluation
-		// (hk 5001). The hub operation the receipt names says whether it ended.
+		// (hk 5001). The hub operation the receipt names says whether it ended,
+		// and an ended one fails the pass here rather than spawning a
+		// replacement that no one counts.
 		if async && resumed && !placed {
-			if code, why, gone := x.reviewerRequestEnded(ctx, rj); gone {
-				return x.replaceDeadSpawn(ctx, plan, rj, code, why, leaseSHA)
+			if code, why, ended := x.reviewerRequestEnded(ctx, rj); ended {
+				if e := x.failEndedRequest(ctx, plan, rj, code, why, leaseSHA); e != nil {
+					return out, e
+				}
+				return skip("reviewer job %s: %s; its replacement spawns on the next run", rj.Label, why)
 			}
 		}
 		// The pane wait leaves time to validate and post the findings: a minute,
@@ -1351,6 +1356,41 @@ func (x *panewireExecutor) replaceDeadSpawn(ctx context.Context, plan *passPlan,
 	}
 	plan.supersedes = rj.Label
 	return x.runPass(ctx, plan, func() (string, bool, error) { return leaseSHA, true, nil })
+}
+
+// failEndedRequest answers a resumed asynchronous record whose hub request the
+// status read found ended. Nothing is spawned here: an asynchronous spawn
+// returns as soon as the hub accepts it, so a replacement spawned in this
+// evaluation would reach review-retry only once its own request ended — and
+// that is the evaluation after the next one, which replaces it again. Every
+// evaluation would then lose a reviewer with no failure counted and no
+// back-off (hk 5001). The record goes, its label is kept so the next run's
+// spawn supersedes it, and the lease is released, so the caller's skip fails
+// the pass: review retry backs off, and the run past the back-off spawns the
+// replacement.
+func (x *panewireExecutor) failEndedRequest(ctx context.Context, plan *passPlan, rj reviewerJob, code int, detail, leaseSHA string) error {
+	s, pr := x.s, x.pr
+	reason := fleetevent.Redact(detail)
+	if e := s.audit(x.repo.Name, "reviewer-spawn-dead", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": rj.Label, "exit": code, "reason": reason}, false); e != nil {
+		return e
+	}
+	// The next run's label comes from the clock, which can still read the dead
+	// label's second: the marker is written before the record goes, so a failed
+	// write leaves the record for the next run to answer again.
+	if e := s.saveDeadLabel(x.repo.Name, pr.Number, plan.pass, deadReviewerLabel{Head: pr.Head.SHA, Label: rj.Label, Replacements: rj.Replacements}); e != nil {
+		return e
+	}
+	if e := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); e != nil {
+		return e
+	}
+	// No pane was placed, so the dead checkout runs nothing and goes.
+	if rj.Checkout != "" {
+		c, cancel := reportContext(ctx)
+		_, _ = s.gitIn(c, config.Expand(x.repo.Root), "worktree", "remove", "--force", rj.Checkout)
+		cancel()
+	}
+	x.releaseLease(ctx, plan, leaseSHA, "reviewer-spawn-dead", reason)
+	return nil
 }
 
 // releaseLease expires the lease this run took, only while the branch still
