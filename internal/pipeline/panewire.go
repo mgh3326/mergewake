@@ -1314,7 +1314,7 @@ func spawnStatusJSONEndsRequest(data []byte, request string) (spawnStatusJSON, b
 	}
 	switch status.State {
 	case "failed", "refused", "retryable":
-		return status, status.RC != panewireQuotaWait && status.RC != panewireQuotaUnknown
+		return status, status.RC != panewireQuotaWait && status.RC != panewireQuotaUnknown && status.RC != panewireQuotaTimeout
 	default:
 		return status, false
 	}
