@@ -414,17 +414,48 @@ func outsideAnswerable(c github.IssueComment) bool {
 	return !strings.Contains(c.Body, "<!-- mergewake")
 }
 
-// outsideAnsweredBy reports whether a comment carries an accepted answer for
-// the finding: a fix naming a commit verify accepts, a dismiss with a reason,
-// or a defer naming a task.
-func outsideAnsweredBy(body string, f outsideFinding, verify func(sha, posted string) bool) bool {
-	if outsideDismissForm.MatchString(body) || outsideDeferForm.MatchString(body) {
+// outsideAnswerLine reports whether the line matches one of the accepted outside
+// answer forms (fix, dismiss or defer).
+func outsideAnswerLine(line string) bool {
+	return outsideDismissForm.MatchString(line) || outsideDeferForm.MatchString(line) || outsideFixForm.MatchString(line)
+}
+
+// outsideLineNames reports whether a single line names the finding by its ref,
+// an alias, or its path:line. A title match is intentionally excluded on answer
+// lines so that descriptive text does not accidentally bind.
+func outsideLineNames(line string, f outsideFinding) bool {
+	if strings.Contains(line, f.Ref) {
 		return true
 	}
-	if !outsideFixForm.MatchString(body) {
+	for _, alias := range f.Aliases {
+		if strings.Contains(line, alias) {
+			return true
+		}
+	}
+	if f.Path != "" {
+		if f.Line > 0 && outsidePathLine(line, f.Path, f.Line) {
+			return true
+		}
+		for _, l := range f.Lines {
+			if l > 0 && outsidePathLine(line, f.Path, l) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// outsideAnsweredBy reports whether a comment line carries an accepted answer for
+// the finding: a fix naming a commit verify accepts, a dismiss with a reason,
+// or a defer naming a task.
+func outsideAnsweredBy(line string, f outsideFinding, verify func(sha, posted string) bool) bool {
+	if outsideDismissForm.MatchString(line) || outsideDeferForm.MatchString(line) {
+		return true
+	}
+	if !outsideFixForm.MatchString(line) {
 		return false
 	}
-	for _, sha := range commitToken.FindAllString(body, -1) {
+	for _, sha := range commitToken.FindAllString(line, -1) {
 		if verify != nil && verify(sha, f.Head) {
 			return true
 		}
@@ -441,7 +472,7 @@ func answerOutside(comments []github.IssueComment, records []outsideFinding, ver
 		}
 		f := &records[i]
 		for _, c := range comments {
-			if !outsideAnswerable(c) || !outsideNames(c.Body, *f) {
+			if !outsideAnswerable(c) {
 				continue
 			}
 			// An answer written before the finding was first reported —
@@ -450,7 +481,44 @@ func answerOutside(comments []github.IssueComment, records []outsideFinding, ver
 			if !f.FirstAt.IsZero() && !c.CreatedAt.IsZero() && c.CreatedAt.Before(f.FirstAt) {
 				continue
 			}
-			if outsideAnsweredBy(c.Body, *f, verify) {
+
+			lines := strings.Split(c.Body, "\n")
+			answered := false
+			commentNamesFinding := false
+
+			// Check each line: an answer line naming one or more findings answers
+			// exactly those findings.
+			for _, line := range lines {
+				if outsideAnswerLine(line) {
+					namesAnyFinding := false
+					for _, other := range records {
+						if outsideLineNames(line, other) {
+							namesAnyFinding = true
+							break
+						}
+					}
+					if namesAnyFinding {
+						if outsideLineNames(line, *f) && outsideAnsweredBy(line, *f, verify) {
+							answered = true
+							break
+						}
+						// This answer line named other finding(s) but not f;
+						// do not fall back to comment-level matching for this line.
+						continue
+					}
+					// Answer line named no finding; it can answer findings named elsewhere
+					// in the comment.
+					if !commentNamesFinding {
+						commentNamesFinding = outsideNames(c.Body, *f)
+					}
+					if commentNamesFinding && outsideAnsweredBy(line, *f, verify) {
+						answered = true
+						break
+					}
+				}
+			}
+
+			if answered {
 				f.State = outsideAnswered
 				f.Via = "comment"
 				f.Answer = excerpt(c.Body, excerptLimit)
