@@ -492,7 +492,7 @@ to that limit and the summary reports `eligible_left` for a later run.
 | `profiles` | Empty map | Profile families and `args` model values support author and reviewer family and model lookup; `gate_profile` can match a panewire seat to its family. `command` and `gate_effort` are accepted but unused; other `args` are unused. |
 | `executor` | `panewire` | Panewire spawns a reviewer pane for each pass. `headless` is retired and rejected. See [Panewire executor](#panewire-executor). |
 | `panewire.command` | `panewire` | Single executable for spawn and inbox calls. |
-| `panewire.workspace` | `reviews` | herdr workspace (`-w`) for reviewer panes. |
+| `panewire.workspace` | Empty | Optional herdr workspace (`-w`) for reviewer panes. When empty, panewire uses the executing host's configured workspace. |
 | `panewire.owner` | Empty | Owner lane (`--owner`); empty inherits the author job's owner. |
 | `panewire.host` | `auto` | `--host`; anything but `auto` is passed with a recorded override reason. |
 | `panewire.jobs` | `~/work/herdr-inbox/jobs` | panewire's jobs root on this host; the brief lives in `<jobs>/<label>/`, and so do the findings and report of a pane that runs here. mergewake never reads those findings from there: they come back on the job record, or from the host through `panewire node job-result` (step 5). |
