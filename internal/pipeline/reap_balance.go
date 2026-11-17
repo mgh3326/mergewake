@@ -366,6 +366,67 @@ func (s *Service) reviewerBalanceSentFile() string {
 	return filepath.Join(s.Config.StateDir, "reviewer-balance-sent")
 }
 
+func (s *Service) reviewerBalanceReceiptsFile() string {
+	return filepath.Join(s.Config.StateDir, "reviewer-balance-receipts")
+}
+
+// balanceNoticeReceipt is the delivery payload stored alongside a balance
+// notice sent key, so a later pass can rewrite a lost notice audit row with
+// the original lane and counts instead of redelivering.
+type balanceNoticeReceipt struct {
+	Created int    `json:"created"`
+	Removed int    `json:"removed"`
+	Open    int    `json:"open_balance"`
+	Window  int    `json:"window_days"`
+	Lane    string `json:"lane"`
+	Via     string `json:"via"`
+}
+
+// loadBalanceReceipts reads the delivery payloads stored for balance notice
+// sent keys. A missing file means no receipts yet; a corrupt one is an
+// error, so a half-written payload never silently repairs the wrong row.
+func loadBalanceReceipts(file string) (map[string]balanceNoticeReceipt, error) {
+	out := map[string]balanceNoticeReceipt{}
+	b, err := os.ReadFile(file)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = map[string]balanceNoticeReceipt{}
+	}
+	return out, nil
+}
+
+// saveBalanceReceipt stores the delivery payload for key, dropping receipts
+// whose sent keys have aged out of the ledger so the file stays bounded.
+func saveBalanceReceipt(sentFile, file, key string, rec balanceNoticeReceipt) error {
+	sent, err := loadSentKeys(sentFile, 1024)
+	if err != nil {
+		return err
+	}
+	all, err := loadBalanceReceipts(file)
+	if err != nil {
+		return err
+	}
+	keep := map[string]balanceNoticeReceipt{key: rec}
+	for k, v := range all {
+		if sent.has(k) {
+			keep[k] = v
+		}
+	}
+	b, err := json.Marshal(keep)
+	if err != nil {
+		return err
+	}
+	return fsutil.Atomic(file, append(b, '\n'), 0600)
+}
+
 // reviewerBalanceDays scans and tallies every watched repo's reviewer
 // activity into per-day results.
 func (s *Service) reviewerBalanceDays() (map[string]*balanceDayResult, error) {
@@ -529,17 +590,62 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 			return err
 		}
 	}
+	// Reconcile sent keys even where the fresh scan no longer marks the
+	// host stalled: a delivered notice with no audit row still needs its
+	// row before the day advances.
+	if err := s.repairBalanceNotices(target, day, res.Noticed); err != nil {
+		return err
+	}
 	return nil
 }
 
-// balanceRowsWritten returns the hosts the target repo already holds a
-// reviewer-balance-daily row for on day. Daily rows are append-only, so a
-// retried day skips the rows it already wrote instead of duplicating them.
-func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) {
-	written := map[string]bool{}
+// repairBalanceNotices appends missing notice rows for the day's sent keys
+// whose hosts the fresh scan no longer marks stalled, without redelivering.
+// Hosts the caller already noticed are skipped; a stored receipt supplies
+// the original lane and counts, a legacy key falls back to the daily row's
+// counts. Any error returns before the day advances.
+func (s *Service) repairBalanceNotices(target config.Repo, day string, handled map[string]bool) error {
+	sent, err := loadSentKeys(s.reviewerBalanceSentFile(), 1024)
+	if err != nil {
+		return err
+	}
+	prefix := "balance " + day + " "
+	for _, key := range sent.All() {
+		host, ok := strings.CutPrefix(key, prefix)
+		if !ok || host == "" || handled[host] {
+			continue
+		}
+		noticed, err := s.balanceNoticeWritten(target.Name, day, host)
+		if err != nil {
+			return err
+		}
+		if noticed {
+			continue
+		}
+		rec, err := s.balanceReceipt(target.Name, day, host)
+		if err != nil {
+			return err
+		}
+		if err := s.auditNoticeBalance(target, day, host, rec.Created, rec.Removed, rec.Open, rec.Window, rec.Lane, rec.Via); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// balanceDailyValue is one host's stored reviewer-balance-daily counts.
+type balanceDailyValue struct {
+	Created, Removed, Open, Window int
+}
+
+// balanceDailyRows returns the daily counts the target repo already holds
+// for day, by host. Daily rows are append-only, so a retried day skips the
+// rows it already wrote instead of duplicating them.
+func (s *Service) balanceDailyRows(repo, day string) (map[string]balanceDailyValue, error) {
+	rows := map[string]balanceDailyValue{}
 	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
-		return written, nil
+		return rows, nil
 	}
 	if err != nil {
 		return nil, err
@@ -552,31 +658,77 @@ func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) 
 			var row struct {
 				Command string `json:"command"`
 				Value   struct {
-					Day  string `json:"day"`
-					Host string `json:"host"`
+					Day         string `json:"day"`
+					Host        string `json:"host"`
+					Created     int    `json:"created"`
+					Removed     int    `json:"removed"`
+					OpenBalance int    `json:"open_balance"`
+					WindowDays  int    `json:"window_days"`
 				} `json:"value"`
 			}
 			if json.Unmarshal(line, &row) == nil && row.Command == balanceDailyCommand && row.Value.Day == day {
-				written[row.Value.Host] = true
+				rows[row.Value.Host] = balanceDailyValue{
+					Created: row.Value.Created, Removed: row.Value.Removed,
+					Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
+				}
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				return written, nil
+				return rows, nil
 			}
 			return nil, err
 		}
 	}
 }
 
+// balanceRowsWritten returns the hosts the target repo already holds a
+// reviewer-balance-daily row for on day.
+func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) {
+	rows, err := s.balanceDailyRows(repo, day)
+	if err != nil {
+		return nil, err
+	}
+	written := make(map[string]bool, len(rows))
+	for h := range rows {
+		written[h] = true
+	}
+	return written, nil
+}
+
+// balanceReceipt returns the delivery payload to repair the host's missing
+// notice row: the stored receipt when one exists, else the daily row's
+// counts for a legacy key, with the lane left unspecified.
+func (s *Service) balanceReceipt(repo, day, host string) (balanceNoticeReceipt, error) {
+	all, err := loadBalanceReceipts(s.reviewerBalanceReceiptsFile())
+	if err != nil {
+		return balanceNoticeReceipt{}, err
+	}
+	if rec, ok := all["balance "+day+" "+host]; ok {
+		return rec, nil
+	}
+	rec := balanceNoticeReceipt{Via: "reviewer balance"}
+	daily, err := s.balanceDailyRows(repo, day)
+	if err != nil {
+		return balanceNoticeReceipt{}, err
+	}
+	if d, ok := daily[host]; ok {
+		rec.Created, rec.Removed, rec.Open, rec.Window = d.Created, d.Removed, d.Open, d.Window
+	}
+	return rec, nil
+}
+
 // noticeBalance sends one reviewer-balance notice for the host's day to
-// reap.balance_lane, or the desk lane when unset. The sent key covers the day
-// and host, so repeats stay quiet; a refused delivery is not recorded, so the
-// next pass retries. A key without its audit row repairs the row instead of
-// redelivering, and an audit row without its key restores the key, so every
-// partial failure recovers on retry.
+// reap.balance_lane, or the desk lane when unset. The notice carries a
+// deterministic event id, so a retry after a lost receipt redelivers as the
+// same event instead of a duplicate; a refused delivery is not recorded, so
+// the next pass retries. A key without its audit row repairs the row from
+// the stored delivery receipt instead of redelivering, and an audit row
+// without its key restores the key, so every partial failure recovers on
+// retry.
 func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, host string, created, removed, open, window int) error {
-	sent, err := loadSentKeys(s.reviewerBalanceSentFile(), 1024)
+	sentFile := s.reviewerBalanceSentFile()
+	sent, err := loadSentKeys(sentFile, 1024)
 	if err != nil {
 		return err
 	}
@@ -597,10 +749,22 @@ func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, ho
 	case keyed && !noticed:
 		// A previous pass delivered the notice but did not record it:
 		// repair the audit row instead of redelivering.
-		return s.auditNoticeBalance(target, day, host, created, removed, open, window, lane, via)
+		rec, err := s.balanceReceipt(target.Name, day, host)
+		if err != nil {
+			return err
+		}
+		return s.auditNoticeBalance(target, day, host, rec.Created, rec.Removed, rec.Open, rec.Window, rec.Lane, rec.Via)
 	case !keyed && noticed:
 		// The audit row proves delivery; the sent key was lost with its
-		// file. Restore the key instead of redelivering.
+		// file. Restore the key and the receipt it implies instead of
+		// redelivering.
+		if rec, ok, err := s.balanceNoticeRow(target.Name, day, host); err != nil {
+			return err
+		} else if ok {
+			if err := saveBalanceReceipt(sentFile, s.reviewerBalanceReceiptsFile(), key, rec); err != nil {
+				return err
+			}
+		}
 		return sent.add(key)
 	}
 	text := fmt.Sprintf("[mergewake] reviewer-checkout balance %s host=%s | created %d, removed %d, open %d over %dd | lane=%s via %s",
@@ -616,6 +780,11 @@ func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, ho
 		return fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(err))
 	}
 	if err := sent.add(key); err != nil {
+		return err
+	}
+	if err := saveBalanceReceipt(sentFile, s.reviewerBalanceReceiptsFile(), key, balanceNoticeReceipt{
+		Created: created, Removed: removed, Open: open, Window: window, Lane: lane, Via: via,
+	}); err != nil {
 		return err
 	}
 	return s.auditNoticeBalance(target, day, host, created, removed, open, window, lane, via)
@@ -663,6 +832,53 @@ func (s *Service) balanceNoticeWritten(repo, day, host string) (bool, error) {
 				return false, nil
 			}
 			return false, err
+		}
+	}
+}
+
+// balanceNoticeRow returns the stored reviewer-balance-notice payload for
+// the host's day, if the target repo holds one. The row carries the
+// delivery's lane and counts, so a lost sent key can be restored with the
+// receipt it implies.
+func (s *Service) balanceNoticeRow(repo, day, host string) (balanceNoticeReceipt, bool, error) {
+	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if errors.Is(err, os.ErrNotExist) {
+		return balanceNoticeReceipt{}, false, nil
+	}
+	if err != nil {
+		return balanceNoticeReceipt{}, false, err
+	}
+	defer f.Close()
+	rd := bufio.NewReader(f)
+	for {
+		line, err := rd.ReadBytes('\n')
+		if len(line) > 0 {
+			var row struct {
+				Command string `json:"command"`
+				Value   struct {
+					Day         string `json:"day"`
+					Host        string `json:"host"`
+					Created     int    `json:"created"`
+					Removed     int    `json:"removed"`
+					OpenBalance int    `json:"open_balance"`
+					WindowDays  int    `json:"window_days"`
+					Lane        string `json:"lane"`
+					Via         string `json:"via"`
+				} `json:"value"`
+			}
+			if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
+				return balanceNoticeReceipt{
+					Created: row.Value.Created, Removed: row.Value.Removed,
+					Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
+					Lane: row.Value.Lane, Via: row.Value.Via,
+				}, true, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return balanceNoticeReceipt{}, false, nil
+			}
+			return balanceNoticeReceipt{}, false, err
 		}
 	}
 }

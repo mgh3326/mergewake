@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
@@ -112,6 +114,32 @@ func balanceRowByHost(rows []map[string]any, host string) map[string]any {
 	for _, r := range rows {
 		if r["host"] == host {
 			return r
+		}
+	}
+	return nil
+}
+
+// noticeRowByHost returns the reviewer-balance-notice row value for the
+// host's day, or nil when the target repo holds none.
+func noticeRowByHost(t *testing.T, f *balanceFixture, repo, day, host string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(f.s.state(repo), "decisions.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var row struct {
+			Command string         `json:"command"`
+			Value   map[string]any `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row.Command == balanceNoticeCommand && row.Value["day"] == day && row.Value["host"] == host {
+			return row.Value
 		}
 	}
 	return nil
@@ -413,4 +441,226 @@ func TestReapBalanceNoticeAuditRepaired(t *testing.T) {
 			t.Fatalf("daily row changed: %v", row)
 		}
 	}
+}
+
+// sabotageNotifier delivers through the fixture notifier, then runs sabotage
+// once mid-run so a later persist in the same pass fails.
+type sabotageNotifier struct {
+	inner    *fakeNotifier
+	fired    bool
+	sabotage func() error
+	err      error
+}
+
+func (n *sabotageNotifier) Notify(ctx context.Context, e integrations.Event) error {
+	if err := n.inner.Notify(ctx, e); err != nil {
+		return err
+	}
+	if n.fired {
+		return nil
+	}
+	n.fired = true
+	if err := n.sabotage(); err != nil {
+		n.err = err
+	}
+	return nil
+}
+
+// A delivered notice whose audit row fails is repaired before the day
+// advances, through reviewerBalance: the first pass delivers, persists the
+// key, then fails the notice audit, so the checkpoint stays behind. The
+// retry appends the missing row with no second delivery and advances. A
+// second case fails the checkpoint persist after the notice row is written;
+// the retry repeats neither effect.
+func TestReapBalanceNoticeRepairThroughReviewerBalance(t *testing.T) {
+	day := "2026-11-17"
+	ctx := context.Background()
+
+	t.Run("audit fails after delivery", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		seedStalled(t, f, day)
+		decisions := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+		var stash []byte
+		sab := &sabotageNotifier{inner: f.n, sabotage: func() error {
+			raw, err := os.ReadFile(decisions)
+			if err != nil {
+				return err
+			}
+			stash = raw
+			if err := os.Remove(decisions); err != nil {
+				return err
+			}
+			return os.Mkdir(decisions, 0700)
+		}}
+		f.s.Notifier = sab
+
+		if err := f.s.reviewerBalance(ctx, Options{}); err == nil {
+			t.Fatal("reviewerBalance succeeded despite failing notice audit")
+		}
+		if sab.err != nil {
+			t.Fatalf("sabotage failed: %v", sab.err)
+		}
+		if _, err := os.Stat(f.s.reviewerBalanceStateFile()); !os.IsNotExist(err) {
+			t.Fatalf("checkpoint advanced despite audit failure: %v", err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("deliveries=%d, want 1", len(f.n.events))
+		}
+		sent, err := loadSentKeys(f.s.reviewerBalanceSentFile(), 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sent.has("balance " + day + " node-a") {
+			t.Fatal("sent key missing after delivery")
+		}
+		if err := os.Remove(decisions); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(decisions, stash, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if noticed, err := f.s.balanceNoticeWritten(f.repos[0].Name, day, "node-a"); err != nil || noticed {
+			t.Fatalf("notice row present despite audit failure: %v %v", noticed, err)
+		}
+		rows := balanceRows(t, f, f.repos[0].Name)
+		if len(rows) != 1 {
+			t.Fatalf("daily rows=%v", rows)
+		}
+		if err := f.s.reviewerBalance(ctx, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("retry redelivered: %+v", f.n.events)
+		}
+		rows = balanceRows(t, f, f.repos[0].Name)
+		if len(rows) != 1 || rows[0]["host"] != "node-a" || rows[0]["created"] != float64(25) || rows[0]["removed"] != float64(2) {
+			t.Fatalf("daily rows=%v", rows)
+		}
+		got := noticeRowByHost(t, f, f.repos[0].Name, day, "node-a")
+		if got == nil {
+			t.Fatal("repaired notice row missing")
+		}
+		if got["created"] != float64(25) || got["removed"] != float64(2) || got["lane"] != "fleet-desk" {
+			t.Fatalf("repaired row lost delivery payload: %v", got)
+		}
+		var st reviewerBalanceState
+		if _, err := fsutil.ReadJSON(f.s.reviewerBalanceStateFile(), &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Last != day {
+			t.Fatalf("checkpoint=%q, want %q", st.Last, day)
+		}
+	})
+
+	t.Run("checkpoint fails after notice row", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		seedStalled(t, f, day)
+		decisions := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+		stateFile := f.s.reviewerBalanceStateFile()
+		// The checkpoint is read before the day runs and written after the
+		// notice row, so the sabotage runs mid-pass from the notifier.
+		sab := &sabotageNotifier{inner: f.n, sabotage: func() error {
+			return os.MkdirAll(stateFile, 0700)
+		}}
+		f.s.Notifier = sab
+
+		if err := f.s.reviewerBalance(ctx, Options{}); err == nil {
+			t.Fatal("reviewerBalance succeeded despite failing checkpoint")
+		}
+		if sab.err != nil {
+			t.Fatalf("sabotage failed: %v", sab.err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("deliveries=%d, want 1", len(f.n.events))
+		}
+		if noticed, err := f.s.balanceNoticeWritten(f.repos[0].Name, day, "node-a"); err != nil || !noticed {
+			t.Fatalf("notice row missing after first pass: %v %v", noticed, err)
+		}
+		before, err := os.ReadFile(decisions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(f.s.reviewerBalanceStateFile()); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.s.reviewerBalance(ctx, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.ReadFile(decisions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(before) != string(after) {
+			t.Fatal("retry repeated audit effects")
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("retry redelivered: %+v", f.n.events)
+		}
+		var st reviewerBalanceState
+		if _, err := fsutil.ReadJSON(f.s.reviewerBalanceStateFile(), &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Last != day {
+			t.Fatalf("checkpoint=%q, want %q", st.Last, day)
+		}
+	})
+
+	t.Run("key host no longer stalled", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		f.s.Config.Reap.BalanceLane = "lane-one"
+		seedStalled(t, f, day)
+		if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("deliveries=%d, want 1", len(f.n.events))
+		}
+		// Lose the notice row, then change the world: the host no longer
+		// stalls and the lane moves. The sent key still demands its row,
+		// written with the original delivery payload.
+		path := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept []string
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.TrimSpace(line) == "" || strings.Contains(line, `"reviewer-balance-notice"`) {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		f.s.Config.Reap.BalanceMinCreated = 100
+		f.s.Config.Reap.BalanceLane = "lane-two"
+		if err := f.s.reviewerBalance(ctx, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("repair redelivered: %+v", f.n.events)
+		}
+		got := noticeRowByHost(t, f, f.repos[0].Name, day, "node-a")
+		if got == nil {
+			t.Fatal("sent key without a notice row was not repaired")
+		}
+		if got["created"] != float64(25) || got["removed"] != float64(2) || got["lane"] != "lane-one" {
+			t.Fatalf("repaired row lost delivery payload: %v", got)
+		}
+		rows := balanceRows(t, f, f.repos[0].Name)
+		if len(rows) != 1 {
+			t.Fatalf("daily rows=%v", rows)
+		}
+		var st reviewerBalanceState
+		if _, err := fsutil.ReadJSON(f.s.reviewerBalanceStateFile(), &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Last != day {
+			t.Fatalf("checkpoint=%q, want %q", st.Last, day)
+		}
+	})
 }
