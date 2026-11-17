@@ -113,6 +113,17 @@ func TestFailedCommandKeepsStderrOutOfMessage(t *testing.T) {
 	}
 }
 
+func TestExecRunWithOutputKeepsStdoutOnFailure(t *testing.T) {
+	got, err := (Exec{}).RunWithOutput(context.Background(), "sh", []string{"-c", "printf '{\\\"state\\\":\\\"failed\\\"}'; exit 70"}, "", "")
+	if err == nil || string(got) != `{"state":"failed"}` {
+		t.Fatalf("RunWithOutput=%q, %v; want stdout with exit error", got, err)
+	}
+	got, err = (Exec{}).Run(context.Background(), "sh", []string{"-c", "printf output; exit 70"}, "", "")
+	if err == nil || got != nil {
+		t.Fatalf("Run=%q, %v; existing failure contract must return no output", got, err)
+	}
+}
+
 // typeRunner refuses --type the way a panewire older than the type does, and
 // serves an inbox list.
 type typeRunner struct {

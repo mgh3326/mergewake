@@ -52,8 +52,18 @@ func (x Exec) Run(ctx context.Context, command string, args []string, input, dir
 	return x.RunEnv(ctx, command, args, input, dir, nil)
 }
 
+// RunWithOutput preserves stdout when a command exits unsuccessfully. Run keeps
+// its existing contract and still returns no output on failure.
+func (x Exec) RunWithOutput(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	return x.runEnv(ctx, command, args, input, dir, nil, true)
+}
+
 // RunEnv applies per-process overrides without changing the daemon environment.
 func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, dir string, env []string) ([]byte, error) {
+	return x.runEnv(ctx, command, args, input, dir, env, false)
+}
+
+func (x Exec) runEnv(ctx context.Context, command string, args []string, input, dir string, env []string, outputOnError bool) ([]byte, error) {
 	if command == "" {
 		return nil, errors.New("empty command")
 	}
@@ -77,6 +87,9 @@ func (x Exec) RunEnv(ctx context.Context, command string, args []string, input, 
 		e = stopped(ctx, command, e)
 		if ctx.Err() == nil && stderr.Len() > 0 {
 			e = &CommandError{Command: command, Err: errors.Unwrap(e), Stderr: tail(stderr.String(), stderrTail)}
+		}
+		if outputOnError && ctx.Err() == nil && !out.overflow {
+			return out.Bytes(), e
 		}
 		return nil, e
 	}
