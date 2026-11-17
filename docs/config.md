@@ -54,6 +54,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `ssh` | Empty / `local` | Empty or `local` (with no `machine`) runs commands on this machine. Any other value is a single `ssh(1)` destination such as `ops@node.example`, used by the ssh transport; options, whitespace and leading `-` are refused. |
 | `machine` | `name` | The panewire machine id a remote host is reached as under the panewire transport. Setting it makes the host remote; under the ssh transport such a host also needs `ssh`. A job-bound lead's worktree is looked for only on the host whose `name` or `machine` equals its hk job record's `host` (panewire's `HUB_MACHINE_ID`), so name a local host after its machine id. |
 | `jobs` | Empty | Base directory holding one job directory per named pane (`<jobs>/<pane name>`; `<jobs>/<job id>` for a job-bound lead). Reap's archive stage enumerates and archives these dirs; leading `~/` expands for local hosts only, ssh hosts must give an absolute path because `~` does not expand through the quoting used. Unused through the hub, where the node uses its own jobs inbox. |
+| `work_root` | Empty | The node's work root: the directory panewire prepares a spec-placed job's checkout in, as `<work_root>/<label>-checkout`. The reviewer sweep builds that path when no record names a reviewer worktree, so without it such a label can only end with a terminal `kept` row. Absolute; leading `~/` expands. |
 
 ### `reap`
 
@@ -71,6 +72,8 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
+| `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others; a label left pending for a missing `work_root` spends none of it. |
+| `reviewer_drain.host_order` | Config host order | Host names in the order the reviewer sweep visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 
 **Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
 runs one pass by hand; the daemon's reap role also runs the sweep for every
@@ -159,6 +162,37 @@ whose tip moved on does not match.
 
 The head commit is read once per PR per daemon process, shared with the task
 lookup below; a worktree that matches the head exactly costs no extra call.
+
+#### Reviewer checkouts
+
+A review pass creates one checkout per reviewer and never removes it itself
+while the pane may still run: a detached worktree at the PR head under
+`review.panewire.checkouts/<label>` on this machine, or, for a spec-placed
+reviewer, the node's own worktree named `<label>-checkout` under that host's
+`hosts[].work_root` (panewire's spec placement; the pass never holds its path).
+Every pass end writes one `reviewer-cleanup` receipt for the label, naming the
+worktree it holds, and leaves the pane for panewire's node to close.
+
+The reviewer sweep removes a checkout once no pane uses it and the label is
+older than `review.timeout` plus one minute — never because a pane is still
+listed, and never earlier: the pane that spawned the label may still be
+reviewing. Candidates come from those receipts, from a live pane named
+`<label>`, and from the reviewer rows in `decisions.jsonl`, which name labels
+whose receipts predate the label field; that journal is read incrementally, by
+byte offset, in bounded windows, so the leaked backlog drains without a hand
+step and no row is passed over. A remote worktree goes only through the hub's
+guarded `worktree.remove` (`detached: true`), which refuses a paned, dirty or
+different worktree; a local checkout is removed only when it is clean, detached
+at the reviewed head and no local pane runs in it. A refusal is a
+`pending-cleanup` row with the guard's reason and is asked again after a day,
+three times, then final. When no record names the worktree's path, the sweep
+builds `<hosts[].work_root>/<label>-checkout`; a host that names no work root
+leaves the row pending with `hosts[<name>].work_root` named, retried every pass
+and never counted against the drain cap, so configuring the key releases the
+label. Only a label no record names a host for ends with a terminal `kept` row. `reap.reviewer_drain.per_host` caps the guarded removals
+one host takes in one pass (default 20) and `reap.reviewer_drain.host_order`
+fixes which hosts are visited first; a host's remaining labels wait for the
+next pass.
 
 #### Job-bound leads
 
@@ -602,9 +636,9 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    guarded removal once its pane is gone. A spec-placed spawn that ends without
    a pane result writes a `pending-cleanup` receipt naming that
    `<label>-checkout` worktree by label, since the pass holds no node path; the
-   reviewer sweep resolves its host and path from the job record once the job
-   has ended, and leaves the worktree to the node's own sweep when the record
-   names no path.
+   reviewer sweep resolves its host from the job record and its path from that
+   host's `work_root` when no record names one, and keeps a terminal row only
+   when no record and no work root can build a path.
 4. The pane first checks `git rev-parse HEAD` against the head SHA; on a
    mismatch (a stale remote worktree) it writes
    `{"refused":"…"}` instead of reviewing, and the pass fails. Otherwise

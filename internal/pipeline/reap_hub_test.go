@@ -55,6 +55,9 @@ type fakeReapHub struct {
 	lists    map[string][]map[string]any
 	listPage int
 	listErr  map[string]string
+	// moreNodes are extra node rows GET /v1/nodes/agents reports beside the
+	// node-a row, so a test can place labels on more than one host.
+	moreNodes []any
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -87,14 +90,15 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/nodes/agents" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []any{h.agents}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": append([]any{h.agents}, h.moreNodes...)})
 			return
 		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/nodes/node-a/command" {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/v1/nodes/") || !strings.HasSuffix(r.URL.Path, "/command") {
 			t.Errorf("unexpected hub request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		machine := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/nodes/"), "/command")
 		h.commands = append(h.commands, body)
 		var result any
 		switch body["op"] {
@@ -229,7 +233,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			}
 			result = map[string]any{"outcome": outcome}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "cmd-1", "machine": "node-a", "op": body["op"], "result": result})
+		_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "cmd-1", "machine": machine, "op": body["op"], "result": result})
 	}))
 	t.Cleanup(server.Close)
 	return server

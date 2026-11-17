@@ -387,7 +387,24 @@ type Reap struct {
 	Transport string  `yaml:"transport"`
 	Hub       ReapHub `yaml:"hub"`
 	Archive   Archive `yaml:"archive"`
+	// ReviewerDrain bounds and orders the reviewer sweep: how many guarded
+	// worktree removals one host takes per pass, and which hosts are visited
+	// first.
+	ReviewerDrain ReviewerDrain `yaml:"reviewer_drain"`
 }
+
+// ReviewerDrain is reap.reviewer_drain. PerHost caps the hub guarded
+// removals the reviewer sweep asks of one host in one pass; the rest wait for
+// the next pass. HostOrder is the order the sweep visits hosts in, by
+// configured host name; hosts it does not name follow in config order.
+type ReviewerDrain struct {
+	PerHost   int      `yaml:"per_host"`
+	HostOrder []string `yaml:"host_order"`
+}
+
+// DefaultReviewerDrainPerHost applies when reap.reviewer_drain.per_host is
+// unset: a pass may ask one host for twenty guarded removals.
+const DefaultReviewerDrainPerHost = 20
 
 // LegacyInterval parses reap.legacy_every: the time between the starts of a
 // repo's legacy sweeps. Zero means the daemon does not run them, which "0" and
@@ -806,6 +823,9 @@ func validateReap(c *Config) error {
 	if e = validateArchive(&c.Reap.Archive); e != nil {
 		return e
 	}
+	if c.Reap.ReviewerDrain.PerHost < 0 {
+		return errors.New("reap.reviewer_drain.per_host must not be negative")
+	}
 	return nil
 }
 
@@ -825,6 +845,13 @@ func validateHosts(c *Config) error {
 		}
 		if c.Reap.Transport == ReapTransportSSH && !h.Local() && (h.SSH == "" || h.SSH == "local") {
 			return errors.New("hosts[].machine without ssh requires reap.transport panewire")
+		}
+		if h.WorkRoot != "" {
+			root := Expand(h.WorkRoot)
+			if !filepath.IsAbs(root) {
+				return errors.New("hosts[].work_root must be an absolute path")
+			}
+			c.Hosts[i].WorkRoot = root
 		}
 		if h.Jobs == "" {
 			continue

@@ -51,7 +51,7 @@ func TestSpecPlacedSpawnWithoutPaneResultIsReaped(t *testing.T) {
 			cleanups = append(cleanups, row)
 		}
 	}
-	if len(cleanups) != 1 || cleanups[0].Result != "pending-cleanup" || cleanups[0].Worktree != label+reviewerCheckoutSuffix {
+	if len(cleanups) != 1 || cleanups[0].Result != "pending-cleanup" || cleanups[0].Label != label || cleanups[0].Worktree != label+reviewerCheckoutSuffix {
 		t.Fatalf("cleanup receipts: %+v", cleanups)
 	}
 

@@ -41,7 +41,7 @@ type reapReceipt struct {
 	Job      string    `json:"job,omitempty"`    // job dir name of a closed pane or archived job
 	Task     string    `json:"task,omitempty"`   // Mergewake-Task of a job-bound row
 	Open     []string  `json:"open,omitempty"`   // open PRs (owner/name#N) keeping a job's pane
-	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap row
+	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap or reviewer-cleanup row
 	Head     string    `json:"head,omitempty"`   // checked-out commit of a legacy-sweep row
 	Source   string    `json:"source,omitempty"` // what named a merged-PR worktree: pane, receipt or job-record
 
@@ -530,7 +530,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// Errors are counted once, from errs: note itself appends every "error"
 	// row, so no row-level failure can be missing from the summary.
 	scanned, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0
-	note := func(v reapReceipt) {
+	noteErr := func(v reapReceipt) error {
 		switch v.Result {
 		case "would-remove", "would-delete", "would-archive", "would-abandon":
 			planned++
@@ -550,6 +550,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			case "reviewer-reap":
 				subject = "reviewer " + v.Label
 			}
+			// A row-level error is the pass's report, not a failed write.
 			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
@@ -561,27 +562,40 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// day (hk 4792).
 		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
 		h.lastRow[reapRowKey(v)] = reapRowSig(v)
-		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
+		return s.reapNote(v, o.DryRun || repeat)
+	}
+	note := func(v reapReceipt) {
+		if e := noteErr(v); e != nil {
 			errs = append(errs, e)
 		}
 	}
-	// reviewerNote is note plus one reviewer-reap audit record per new row: a
+	// reviewerNoteErr is note plus one reviewer-reap audit record per new row: a
 	// repeat of the stream's last result and reason writes neither, and is not
 	// printed either except by a dry run, whose output is the report. A repeated
 	// error still counts, so the pass reports it. The day's
-	// process-scan-unavailable row is never a repeat: see note.
-	reviewerNote := func(v reapReceipt) {
+	// process-scan-unavailable row is never a repeat: see note. It returns the
+	// write error so the reviewer sweep can hold its journal checkpoint until
+	// the row is durable.
+	reviewerNoteErr := func(v reapReceipt) error {
 		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v)
 		if repeat && !o.DryRun && v.Result != "error" {
-			return
+			return nil
 		}
-		note(v)
-		if repeat {
-			return
+		var out []error
+		if e := noteErr(v); e != nil {
+			out = append(out, e)
 		}
-		if e := s.audit(r.Name, "reviewer-reap", map[string]any{
-			"pr": v.PR, "label": v.Label, "host": v.Host, "pane": v.Pane, "worktree": v.Worktree, "result": v.Result, "reason": v.Reason,
-		}, o.DryRun); e != nil {
+		if !repeat {
+			if e := s.audit(r.Name, "reviewer-reap", map[string]any{
+				"pr": v.PR, "label": v.Label, "host": v.Host, "pane": v.Pane, "worktree": v.Worktree, "result": v.Result, "reason": v.Reason,
+			}, o.DryRun); e != nil {
+				out = append(out, e)
+			}
+		}
+		return errors.Join(out...)
+	}
+	reviewerNote := func(v reapReceipt) {
+		if e := reviewerNoteErr(v); e != nil {
 			errs = append(errs, e)
 		}
 	}
@@ -630,7 +644,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// reviewer spawn must not remove the author's worktree, delete its branch
 	// or archive its job.
 	if reviewersOnly(ctx) && prNum > 0 {
-		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)...)
+		// The sweep's rows report through noteErr, which appends to errs:
+		// evaluate it before the outer append reads errs.
+		revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
+		return errors.Join(append(errs, revErrs...)...)
 	}
 
 	for _, p := range pulls {
@@ -641,7 +658,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if prNum > 0 {
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
-				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
+				revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
+				errs = append(errs, revErrs...)
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue
@@ -931,7 +949,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			note(brec)
 		}
 	}
-	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
+	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
+	errs = append(errs, revErrs...)
 	if prNum == 0 {
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
 	}
