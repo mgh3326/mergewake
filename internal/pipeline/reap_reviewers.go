@@ -295,17 +295,28 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 			return append(w.errs, e)
 		}
 		if w.auditOnly[c.label.name] {
+			// A host whose scan failed can answer nothing this pass: its
+			// labels must not spend the visit budget the healthy hosts need.
+			if w.hostScanFailed(c.host) {
+				w.pendingAudit = true
+				continue
+			}
+			// Only a durable row spends a visit, so a label that is waiting
+			// (settle, a spent drain cap) cannot starve the rest.
 			if auditVisits >= reviewerAuditVisitMax {
 				w.pendingAudit = true
 				continue
 			}
-			auditVisits++
 		}
 		w.visit(ctx, c)
 		// An audit-only label with no row of its own is read again next pass:
 		// nothing else would name it.
-		if w.auditOnly[c.label.name] && !w.rowed[c.label.name] {
-			w.pendingAudit = true
+		if w.auditOnly[c.label.name] {
+			if !w.rowed[c.label.name] {
+				w.pendingAudit = true
+			} else {
+				auditVisits++
+			}
 		}
 	}
 	if acting {
@@ -472,6 +483,28 @@ func (w *reviewerSweep) takeDrain(host string) bool {
 	return true
 }
 
+// hostScanFailed reports whether a host named by a candidate could not be read
+// this pass, so nothing about it can be proven.
+func (w *reviewerSweep) hostScanFailed(name string) bool {
+	hs := w.scannedHost(name)
+	return hs != nil && hs.failed
+}
+
+// hostUnknownTerminal reports whether every stream of a label ended and one of
+// them ended because no host was named for it.
+func (w *reviewerSweep) hostUnknownTerminal(label string) bool {
+	found := false
+	for _, v := range w.streams[label] {
+		if !reviewerTerminal(v) {
+			return false
+		}
+		if v.Result == "kept" && v.Reason == reviewerHostUnknown {
+			found = true
+		}
+	}
+	return found
+}
+
 // hostIsLocal reports whether a candidate host is this machine, whose
 // checkouts are removed without the hub's guard and so without the cap.
 func (w *reviewerSweep) hostIsLocal(name string) bool {
@@ -563,22 +596,12 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 			cands = append(cands, reviewerCandidate{label: l, host: w.labelHost[label]})
 		}
 	}
+	// The journal names labels whose receipts predate the label field, and a
+	// later row can name the host an older row did not: merge what any row
+	// recorded before the receipts order and open the candidates below.
 	for name, a := range w.audits {
-		if w.streams[name] != nil {
-			continue
-		}
-		if _, ok := lastCleanup[name]; ok {
-			continue
-		}
 		l, ok := keep(name)
 		if !ok {
-			continue
-		}
-		// The label is named by the journal and has no receipt yet: even a
-		// live pane's candidate must not consume the window until a row of
-		// its own exists, or a crash could take the pane away unseen.
-		w.auditOnly[name] = true
-		if paned[name] {
 			continue
 		}
 		host := w.hostName(a.host)
@@ -591,7 +614,26 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		if host == "" {
 			host = w.labelHost[name]
 		}
-		cands = append(cands, reviewerCandidate{label: l, host: host})
+		if host != "" {
+			w.labelHost[name] = host
+		}
+		switch {
+		case w.streams[name] == nil:
+			if _, ok := lastCleanup[name]; ok {
+				continue // the receipts own it
+			}
+			// The label is named by the journal and has no receipt yet: even
+			// a live pane's candidate must not consume the window until a row
+			// of its own exists, or a crash could take the pane away unseen.
+			w.auditOnly[name] = true
+			if !paned[name] {
+				cands = append(cands, reviewerCandidate{label: l, host: host})
+			}
+		case host != "" && !paned[name] && w.hostUnknownTerminal(name):
+			// The label once ended because no host was named; a later journal
+			// row named one, so it is a candidate again.
+			cands = append(cands, reviewerCandidate{label: l, host: host})
+		}
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if ri, rj := w.rank(cands[i].host), w.rank(cands[j].host); ri != rj {
@@ -801,6 +843,10 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		hs = w.scannedHost(c.host)
 		if hs != nil {
 			gate.Host = hs.host.Name
+			if hs.failed {
+				// The host's scan already reported its error.
+				return
+			}
 		}
 	}
 	cwd := job.Cwd

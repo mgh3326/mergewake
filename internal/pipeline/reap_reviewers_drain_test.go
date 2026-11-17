@@ -443,3 +443,52 @@ func TestReapReviewerWriteFailureKeepsTheJournalWindow(t *testing.T) {
 		t.Fatalf("journal offset saved without its row: %v", err)
 	}
 }
+
+// A host whose scan failed must not spend the audit visit budget: otherwise
+// the labels sorted first would starve every healthy host's backlog.
+func TestReapReviewerBlockedHostDoesNotStarveTheVisitBudget(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b"})
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "disconnected"}}
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 20, HostOrder: []string{"node-b", "node"}}
+	rows := make([]map[string]any, 0, 251)
+	for i := 0; i < 250; i++ {
+		label := reviewerLabelFor(100+i, 2*24*time.Hour)
+		rows = append(rows, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 100 + i, "label": label, "host": "node-b", "pane": "w1:p1"}})
+	}
+	healthy := reviewerLabelFor(400, 2*24*time.Hour)
+	rows = append(rows, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 400, "label": healthy, "host": "node-a", "pane": "w1:p2"}})
+	seedDecisionRows(t, f.s, testRepo.Name, rows...)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	path := "/work/" + healthy + reviewerCheckoutSuffix
+	f.hub.detached[path] = true
+	f.sink.recs[healthy] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: healthy, Host: "node-a"}
+	// The node-b scan error is the pass's own report; only the removal matters here.
+	if err := f.reap(t, 0, Options{}); err != nil && !strings.Contains(err.Error(), "disconnected") {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("the healthy host's label was starved: removes %v (rows %d)", removes, len(f.rows(t)))
+	}
+}
+
+// A label that once ended with "no host" is a candidate again when a later
+// journal row names its host, so the checkout is still removed.
+func TestReapReviewerHostUnknownReopensWhenTheJournalNamesAHost(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	label := reviewerLabelFor(401, 3*24*time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.hub.detached[path] = true
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 401, Label: label,
+		Worktree: label, Result: "kept", Reason: reviewerHostUnknown})
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{
+		"pr": 401, "label": label, "host": "node-a", "pane": "w1:p3"}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}
