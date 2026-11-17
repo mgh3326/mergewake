@@ -2168,7 +2168,8 @@ supply the diff.
 threshold. Failed attempts back off exponentially and persist per PR head in
 `<state_dir>/<repo>/review-retry-<pr>.json`. The defaults are `1m`, `30m`, and
 `3` failures. A new head resets the counter, and so does a reviewer that really
-lands: a spawn receipt naming a pane or host, or an hk job record for its label.
+lands: a spawn receipt naming a pane and its host, or an hk job record for its
+label.
 An asynchronous spawn's `ACCEPTED` receipt alone is no landing, so a request the
 hub accepts and then refuses keeps counting toward the threshold. At the
 threshold, one `automation-failed` event interrupts `notifier.lane`; later
