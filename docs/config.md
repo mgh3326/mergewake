@@ -792,9 +792,11 @@ on it.
   When the previous patch cannot be read, the round reviews the whole diff and
   the audit event says why (`round_note`). A round counts only when the
   interdiff contains a hunk the previous reviewed patch did not carry. A new
-  head that adds no such hunk (including one that only removes earlier
-  PR-only hunks) reuses the previous round number, reviews the whole diff for
-  reference only, and reports only a new critical or high finding.
+  head that adds no such hunk (including one that removes earlier PR-only
+  hunks whole) reuses the previous round number, reviews the whole diff for
+  reference only, and reports only a new critical or high finding. Hunks are
+  compared by their changed lines, so reverting only part of a hunk leaves a
+  hunk the previous patch did not carry, and that head counts as a new round.
 - **Prior findings stay settled.** From round two the prompt lists every finding
   the review login posted in earlier rounds with its disposition (`resolved`,
   `answered: <latest reply>`, or `none yet (still open)`), and tells the reviewer
