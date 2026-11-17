@@ -40,6 +40,9 @@ func (l *sentKeys) read() error {
 
 func (l *sentKeys) has(key string) bool { return slices.Contains(l.keys, key) }
 
+// All returns a snapshot of the ledger's keys.
+func (l *sentKeys) All() []string { return slices.Clone(l.keys) }
+
 // add records key. It rereads the file under its lock first, so a key another
 // PR's goroutine added since this ledger was loaded is kept, not overwritten.
 func (l *sentKeys) add(key string) error {
