@@ -97,11 +97,13 @@ type ReviewRecord struct {
 // ReviewFindingRecord records each finding's relationship to new code and
 // earlier threads for the round that posted it.
 type ReviewFindingRecord struct {
-	Path            string `json:"path"`
-	Line            int    `json:"line"`
-	Title           string `json:"title"`
-	AddedAfterFirst *bool  `json:"added_after_first_head,omitempty"`
-	RepeatsEarlier  *bool  `json:"repeats_earlier_thread,omitempty"`
+	Path                 string `json:"path"`
+	Line                 int    `json:"line"`
+	Title                string `json:"title"`
+	Severity             string `json:"severity,omitempty"`
+	AddedAfterFirst      *bool  `json:"added_after_first_head,omitempty"`
+	RepeatsEarlier       *bool  `json:"repeats_earlier_thread,omitempty"`
+	DisputesEarlierReply *bool  `json:"disputes_earlier_reply,omitempty"`
 }
 
 var (
