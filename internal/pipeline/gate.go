@@ -587,23 +587,54 @@ func newestUnansweredFinding(fb github.ReviewFeedback, head string) time.Time {
 
 var mergewakeFindingMarker = regexp.MustCompile(`<!-- mergewake-severity:([a-z]+) -->`)
 
-// authorJobLive uses the same task-bound job and unique live head-pane lookup
-// as the findings route. Explicit lanes and task lanes alone do not make an
-// author job live.
+// authorJobLive reports whether a live author job can still answer findings.
+// A bound job record decides first: a live bound job is live, and a terminal
+// one is live only when another live pane took the PR head branch over — the
+// bound job's own lingering pane does not count. With no bound job record, the
+// unique live head-pane lookup decides, as the findings route does.
 func (s *Service) authorJobLive(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
 		return false, err
 	}
-	_, rec, ok, err := s.boundJob(ctx, task)
+	job, rec, ok, err := s.boundJob(ctx, task)
 	if err != nil {
 		return false, err
 	}
-	if ok && !terminalJob(rec.State) {
-		return true, nil
+	if ok {
+		if !terminalJob(rec.State) {
+			return true, nil
+		}
+		return s.takeoverJobLive(ctx, r, pr, job, rec)
 	}
 	_, _, livePane, err := s.authorPane(ctx, r, pr)
 	return livePane, err
+}
+
+// takeoverJobLive reports whether a terminal bound job was taken over by one
+// other live job pane on the PR head branch. The bound job's own pane is
+// excluded by takeoverPanes, so a pane that only lingers after the job ended
+// is not a takeover.
+func (s *Service) takeoverJobLive(ctx context.Context, r config.Repo, pr github.Pull, job string, rec integrations.JobRecord) (bool, error) {
+	others, err := s.takeoverPanes(ctx, r, pr, job, rec.Label)
+	if err != nil {
+		return false, err
+	}
+	if len(others) != 1 {
+		return false, nil
+	}
+	jobs, has := s.Sink.(reapJobs)
+	if !has {
+		return false, nil
+	}
+	takeover, e := jobs.Job(ctx, others[0])
+	if e != nil {
+		if errors.Is(e, integrations.ErrJobNotFound) {
+			return false, nil
+		}
+		return false, e
+	}
+	return !terminalJob(takeover.State), nil
 }
 
 // outsideBlocking counts the critical and high findings the review passes of
