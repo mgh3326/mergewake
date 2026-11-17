@@ -77,23 +77,29 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 		return err
 	}
 	now := s.now().UTC()
-	last := parsedTime(pr.CreatedAt)
-	if updated := parsedTime(pr.UpdatedAt); updated != nil && (last == nil || updated.After(*last)) {
-		last = updated
-	}
-	if last == nil {
-		return nil
-	}
 	previous, hasPrevious := clocks[prIdleCause]
+	// The pull's updated_at includes labels and arbitrary issue comments. Use
+	// the head commit's committer date as the baseline, with first-seen time
+	// for this head as a fallback when GitHub has no usable commit date.
+	last := time.Time{}
+	if commit, commitErr := s.GH.Commit(ctx, r.Name, pr.Head.SHA); commitErr == nil {
+		last = commit.Commit.Committer.Date
+	}
+	if last.IsZero() {
+		last = now
+		if hasPrevious && previous.Head == pr.Head.SHA && !previous.Since.IsZero() {
+			last = previous.Since
+		}
+	}
 	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
 	if err != nil {
 		return err
 	}
 	for _, thread := range fb.Threads {
 		for _, comment := range thread.Comments {
-			if !comment.CreatedAt.IsZero() && comment.CreatedAt.After(*last) {
+			if idleReviewComment(comment, s.Config.Review.Login) && !comment.CreatedAt.IsZero() && comment.CreatedAt.After(last) {
 				t := comment.CreatedAt
-				last = &t
+				last = t
 			}
 		}
 	}
@@ -102,18 +108,22 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 		return err
 	}
 	for _, submitted := range history {
-		if submitted.After(*last) {
-			t := submitted
-			last = &t
+		if submitted.After(last) {
+			last = submitted
 		}
+	}
+	// The review-completion ref is durable evidence of review activity even
+	// when the API's review list is unavailable or omits the submission.
+	if reviewed, reviewErr := s.GH.Reviewed(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login); reviewErr == nil && reviewed && len(history) == 0 {
+		return nil
 	}
 	entry, ok := clocks[prIdleCause]
 	if !ok || entry.Head != pr.Head.SHA {
-		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: *last, Since: *last}
-	} else if hasPrevious && previous.Head == pr.Head.SHA && previous.LastActivity.After(*last) {
+		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: last, Since: last}
+	} else if hasPrevious && previous.Head == pr.Head.SHA && previous.LastActivity.After(last) {
 		entry = previous
 	} else if last.After(entry.LastActivity) {
-		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: *last, Since: *last}
+		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: last, Since: last}
 	}
 	if now.Sub(entry.Since) >= s.Config.Daemon.PR.Notify.IdleWindow() && !entry.Sent {
 		if err := s.sendPRStall(ctx, r, pr, prIdleCause, s.Config.Daemon.PR.Notify.IdleWindow(), now.Sub(entry.Since)); err != nil {
@@ -123,6 +133,17 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 	}
 	clocks[prIdleCause] = entry
 	return fsutil.WriteJSON(file, clocks)
+}
+
+// idleReviewComment mirrors the gate's author checks: the configured review
+// identity cannot create activity by replying to its own findings, bot
+// accounts do not count, and Mergewake generated comments are marked.
+func idleReviewComment(c github.ReviewComment, reviewLogin string) bool {
+	author := policy.NormalizeAuthor(c.Author)
+	if author == "" || author == policy.NormalizeAuthor(reviewLogin) || c.AuthorType == "Bot" || strings.HasSuffix(strings.ToLower(c.Author), "[bot]") {
+		return false
+	}
+	return !strings.Contains(c.Body, "<!-- mergewake")
 }
 
 func (s *Service) sendPRStall(ctx context.Context, r config.Repo, pr github.Pull, cause string, threshold, elapsed time.Duration) error {
