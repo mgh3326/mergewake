@@ -347,7 +347,12 @@ type Policy struct {
 	// DeployChecks names the checks that judge a release commit on the deploy
 	// stage. Empty means the repository has no deploy stage: the main checks
 	// judge a commit.
-	DeployChecks []string    `yaml:"deploy_checks"`
+	DeployChecks []string `yaml:"deploy_checks"`
+	// NotifyChecks names main-branch checks that only notify: when one is red
+	// on the default-branch head the design lane gets one notice per red
+	// streak, with the merges since the last green, and watch never reverts,
+	// latches or bisects on them. Empty means no notify-only checks.
+	NotifyChecks []string    `yaml:"notify_checks"`
 	Blocking     []Rule      `yaml:"blocking"`
 	ReviewGate   *ReviewGate `yaml:"review_gate"`
 	FastLane     *FastLane   `yaml:"fast_lane"`
@@ -440,15 +445,25 @@ func (p Policy) Validate() error {
 		}
 		deployDup[n] = true
 	}
+	inWatch := map[string]bool{}
+	for _, n := range p.WatchSet() {
+		inWatch[n] = true
+	}
+	notifySeen := map[string]bool{}
+	for _, n := range p.NotifyChecks {
+		switch {
+		case strings.TrimSpace(n) == "" || notifySeen[n]:
+			return errors.New("notify_checks must be nonempty and unique")
+		case inWatch[n]:
+			return fmt.Errorf("notify_checks: %q is in the watch set; a check that judges main for recovery cannot also only notify", n)
+		}
+		notifySeen[n] = true
+	}
 	// An empty list is an error, not "unset": it would silently mean every
 	// candidate is judged by no check.
 	if p.AnyRefChecks != nil {
 		if len(p.AnyRefChecks) == 0 {
 			return errors.New("any_ref_checks must name at least one check")
-		}
-		inWatch := map[string]bool{}
-		for _, n := range p.WatchSet() {
-			inWatch[n] = true
 		}
 		anySeen := map[string]bool{}
 		for _, n := range p.AnyRefChecks {
