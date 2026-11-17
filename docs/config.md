@@ -166,7 +166,9 @@ the counts; the day-plus-host sent key suppresses repeats and a
 without writing or noticing. The balance
 runs only when the reap acts (not in shadow or dry-run) and advances one day
 at a time under the state dir's `reviewer-balance.json` lock, so a crash
-between days repeats at most that day.
+between days repeats at most that day. A retried day skips the daily rows it
+already wrote and reuses the delivered-notice keys, so neither audit rows nor
+notices duplicate.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role clean up merged-PR worktrees once they age out. Reap never closes

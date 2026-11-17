@@ -323,3 +323,33 @@ func TestReapBalanceBacklogHostStillReported(t *testing.T) {
 		t.Fatalf("backlog noticed: %+v", f.n.events)
 	}
 }
+
+// A retried day (rows written, notice failed) writes no duplicate rows:
+// reviewerBalanceDay skips the rows the target log already holds.
+func TestReapBalanceDayRetryNoDuplicates(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+	day := "2026-11-17"
+	seedStalled(t, f, day)
+	ctx := context.Background()
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("retried day duplicated audit rows")
+	}
+	if len(f.n.events) != 1 {
+		t.Fatalf("events=%+v", f.n.events)
+	}
+}

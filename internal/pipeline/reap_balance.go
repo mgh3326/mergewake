@@ -472,6 +472,12 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 	}
 	res := s.fillBalanceDay(days, day)
 	window := res.WindowDays
+	// Rows are append-only: a retry after a failed notice must not duplicate
+	// them. Skip every (day, host) row the target log already holds.
+	written, err := s.balanceRowsWritten(target.Name, day)
+	if err != nil {
+		return err
+	}
 	names := make([]string, 0, len(res.Hosts))
 	for h := range res.Hosts {
 		names = append(names, h)
@@ -479,7 +485,7 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 	sort.Strings(names)
 	for _, h := range names {
 		c := res.Hosts[h]
-		if c.Created == 0 && c.Removed == 0 && c.Open == 0 {
+		if written[h] {
 			continue
 		}
 		value := map[string]any{
@@ -496,7 +502,7 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 			return err
 		}
 	}
-	if res.UnattributedCreated+res.UnattributedRemoved > 0 {
+	if res.UnattributedCreated+res.UnattributedRemoved > 0 && !written[unattributedReviewerHost] {
 		value := map[string]any{
 			"day": day, "host": unattributedReviewerHost,
 			"created": res.UnattributedCreated, "removed": res.UnattributedRemoved,
@@ -524,6 +530,43 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 		}
 	}
 	return nil
+}
+
+// balanceRowsWritten returns the hosts the target repo already holds a
+// reviewer-balance-daily row for on day. Daily rows are append-only, so a
+// retried day skips the rows it already wrote instead of duplicating them.
+func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) {
+	written := map[string]bool{}
+	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if errors.Is(err, os.ErrNotExist) {
+		return written, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	rd := bufio.NewReader(f)
+	for {
+		line, err := rd.ReadBytes('\n')
+		if len(line) > 0 {
+			var row struct {
+				Command string `json:"command"`
+				Value   struct {
+					Day  string `json:"day"`
+					Host string `json:"host"`
+				} `json:"value"`
+			}
+			if json.Unmarshal(line, &row) == nil && row.Command == balanceDailyCommand && row.Value.Day == day {
+				written[row.Value.Host] = true
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return written, nil
+			}
+			return nil, err
+		}
+	}
 }
 
 // noticeBalance sends one reviewer-balance notice for the host's day to
