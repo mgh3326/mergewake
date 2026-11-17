@@ -193,6 +193,7 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 	})
 	t.Run("review stalled", func(t *testing.T) {
 		s, g, n, _, r, now := deliverSetup(t)
+		s.Config.Daemon.PR.Notify.IdleAfter = "24h"
 		g.refs = map[string]bool{}
 		if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 			t.Fatal(e)
@@ -212,6 +213,7 @@ func TestRecordOnlyBlockedKeepsRouting(t *testing.T) {
 func TestRecordOnlyReadyNeverReminds(t *testing.T) {
 	for _, setup := range []func(*testing.T) (*Service, *fakeGH, *fakeNotifier, config.Repo){workerNotifySetup, notifySetup} {
 		s, _, n, r := setup(t)
+		s.Config.Daemon.PR.Notify.IdleAfter = "24h"
 		now := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 		s.Now = func() time.Time { return now }
 		for _, d := range []time.Duration{0, 11 * time.Minute, 30 * time.Minute, time.Hour} {
