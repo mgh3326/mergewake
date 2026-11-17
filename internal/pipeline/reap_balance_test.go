@@ -121,6 +121,8 @@ func balanceRowByHost(rows []map[string]any, host string) map[string]any {
 // per day while a healthy host stays silent; counts aggregate across repos.
 func TestReapBalanceStallNoticesOnce(t *testing.T) {
 	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	// No balance_lane key: the notice defaults to the desk lane.
+	f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
 	ctx := context.Background()
 	day := "2026-11-17"
 	// node-a stalls: 25 created across both repos, only 2 removed.
@@ -166,8 +168,8 @@ func TestReapBalanceStallNoticesOnce(t *testing.T) {
 			t.Fatalf("notice %q missing %q", text, want)
 		}
 	}
-	if f.n.events[0].Lane != "design-lane" {
-		t.Fatalf("lane=%q", f.n.events[0].Lane)
+	if f.n.events[0].Lane != "fleet-desk" {
+		t.Fatalf("lane=%q, want desk lane fleet-desk", f.n.events[0].Lane)
 	}
 	// A second pass the same day writes no new rows and sends no new notice.
 	before, _ := os.ReadFile(filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl"))
@@ -235,5 +237,89 @@ func TestReapBalanceFallbackCounts(t *testing.T) {
 	}
 	if res.UnattributedCreated != 1 || len(res.Hosts) != 0 {
 		t.Fatalf("fallback created: %+v", res)
+	}
+}
+
+// seedStalled makes node-a stall on day: 25 created across both repos, 2
+// removed.
+func seedStalled(t *testing.T, f *balanceFixture, day string) {
+	t.Helper()
+	for i := range 25 {
+		at := balanceDayTime(day, i%24)
+		f.spawn(t, f.repos[i%2].Name, "node-a", balanceLabel(100+i, at), at)
+	}
+	f.removed(t, f.repos[0].Name, "node-a", balanceLabel(100, balanceDayTime(day, 0)), balanceDayTime(day, 20))
+	f.cleanupRemoved(t, f.repos[1].Name, "node-a", balanceLabel(101, balanceDayTime(day, 1)), balanceDayTime(day, 21))
+	f.s.Now = func() time.Time { return f.now }
+}
+
+// The stall notice goes to reap.balance_lane; when the key is unset it goes
+// to the desk lane, never the first repo's lane. Audit rows stay in the
+// first repo either way.
+func TestReapBalanceNoticeLane(t *testing.T) {
+	day := "2026-11-17"
+	t.Run("balance lane", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Repos[0].Lane = "repo-design-lane"
+		f.s.Config.Reap.BalanceLane = "balance-desk"
+		seedStalled(t, f, day)
+		if err := f.s.reviewerBalance(context.Background(), Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("events=%+v", f.n.events)
+		}
+		if f.n.events[0].Lane != "balance-desk" {
+			t.Fatalf("lane=%q, want balance-desk", f.n.events[0].Lane)
+		}
+		if rows := balanceRows(t, f, f.repos[0].Name); len(rows) == 0 {
+			t.Fatal("no audit rows in first repo")
+		}
+	})
+	t.Run("desk lane when unset", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Repos[0].Lane = "repo-design-lane"
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		seedStalled(t, f, day)
+		if err := f.s.reviewerBalance(context.Background(), Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("events=%+v", f.n.events)
+		}
+		if f.n.events[0].Lane != "fleet-desk" {
+			t.Fatalf("lane=%q, want fleet-desk", f.n.events[0].Lane)
+		}
+	})
+}
+
+// A host with an open balance from earlier in the window but no activity
+// today still gets a row with its trailing open balance — and no notice.
+func TestReapBalanceBacklogHostStillReported(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	prev := "2026-11-16"
+	for i := range 25 {
+		at := balanceDayTime(prev, i%24)
+		f.spawn(t, f.repos[i%2].Name, "node-c", balanceLabelUnix(90, at.Unix()+int64(i)), at)
+	}
+	for i := range 5 {
+		label := balanceLabelUnix(90, balanceDayTime(prev, i).Unix()+int64(i))
+		f.removed(t, f.repos[i%2].Name, "node-c", label, balanceDayTime(prev, 23))
+	}
+	f.s.Now = func() time.Time { return f.now }
+	ctx := context.Background()
+	if err := f.s.reviewerBalance(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := balanceRows(t, f, f.repos[0].Name)
+	row := balanceRowByHost(rows, "node-c")
+	if row == nil {
+		t.Fatalf("no backlog row: %v", rows)
+	}
+	if row["created"] != float64(0) || row["removed"] != float64(0) || row["open_balance"] != float64(20) {
+		t.Fatalf("backlog row: %v", row)
+	}
+	if len(f.n.events) != 0 {
+		t.Fatalf("backlog noticed: %+v", f.n.events)
 	}
 }

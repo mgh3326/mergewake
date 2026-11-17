@@ -405,8 +405,11 @@ type Reap struct {
 	BalanceMaxRemovedPct int `yaml:"balance_max_removed_pct"`
 	// BalanceWindowDays is the trailing window the open balance cumulates
 	// over. Zero means BalanceWindowDaysDefault.
-	BalanceWindowDays int     `yaml:"balance_window_days"`
-	Archive           Archive `yaml:"archive"`
+	BalanceWindowDays int `yaml:"balance_window_days"`
+	// BalanceLane names the lane the reviewer-balance stall notice goes to.
+	// Empty means the desk lane (notifier.fallback_lane, else notifier.lane).
+	BalanceLane string  `yaml:"balance_lane"`
+	Archive     Archive `yaml:"archive"`
 }
 
 // LegacyInterval parses reap.legacy_every: the time between the starts of a
@@ -1013,6 +1016,9 @@ func validateAdapters(c *Config) error {
 	}
 	if c.Notifier.FallbackLane != "" && !PanewireLane(c.Notifier.FallbackLane) {
 		return errors.New("notifier.fallback_lane must match panewire's lane rule")
+	}
+	if c.Reap.BalanceLane != "" && !PanewireLane(c.Reap.BalanceLane) {
+		return errors.New("reap.balance_lane must match panewire's lane rule")
 	}
 	if c.Sink.ReopenState == "" {
 		c.Sink.ReopenState = "reopened"

@@ -67,7 +67,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `balance_min_created` | `20` | Daily per-host created count at or above which the reviewer balance may notice: quiet hosts never alert. |
 | `balance_max_removed_pct` | `70` | Removed share of created, as a percent, below which the reviewer balance notices a stalled host. |
 | `balance_window_days` | `7` | Trailing window, in days, the reviewer balance cumulates the open balance over. |
-| `protect` | - | Retired: accepted but ignored. Mergewake never closes panes. Remove it from host configs when convenient. |
+| `balance_lane` | Desk lane | Lane the reviewer-balance stall notice goes to; empty means the desk (notifier.fallback_lane, else notifier.lane). |
 | `transport` | `panewire` when `hub.url` is set, else `ssh` | How remote hosts are reached: `panewire` sends every remote operation through the hub's node commands; `ssh` runs `herdr`/`git` over `ssh(1)`. Local hosts always run locally. |
 | `hub.url` | Empty | Panewire hub origin, `https://` (plain `http://` only on loopback), with no path, query or userinfo. Required by `transport: panewire`. |
 | `hub.token_file` | Required by `panewire` | Absolute path (leading `~/` expands) to the mode-0600 env file of a scoped hub service credential: `HUB_MACHINE_ID=svc-mergewake` and its `HUB_TOKEN` (see "Hub credential" below). A file whose `HUB_MACHINE_ID` is `operator`, or that has none, is refused when the config loads and again when each pass reads it; a file other users can read is refused. |
@@ -155,11 +155,12 @@ they left checkout evidence). Removed counts distinct checkout labels with a
 the host joined from the reap receipt when the audit row names none. When a
 host created at least `reap.balance_min_created` checkouts and removed less
 than `reap.balance_max_removed_pct` percent of that (defaults 20 and 70),
-mergewake sends one notice per host per day to that repo's design lane through
-the lane-event notify path, naming the host and the counts; the day-plus-host
-sent key suppresses repeats and a `reviewer-balance-notice` row records the
-delivery. `mergewake reap-balance [--repo owner/name] [--day YYYY-MM-DD]`
-prints the same numbers on demand without writing or noticing. The balance
+mergewake sends one notice per host per day to `reap.balance_lane` (or the
+desk lane when unset) through the lane-event notify path, naming the host and
+the counts; the day-plus-host sent key suppresses repeats and a
+`reviewer-balance-notice` row records the delivery. `mergewake reap-balance
+[--repo owner/name] [--day YYYY-MM-DD]` prints the same numbers on demand
+without writing or noticing. The balance
 runs only when the reap acts (not in shadow or dry-run) and advances one day
 at a time under the state dir's `reviewer-balance.json` lock, so a crash
 between days repeats at most that day.

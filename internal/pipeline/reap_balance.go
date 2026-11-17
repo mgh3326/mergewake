@@ -389,6 +389,20 @@ func (s *Service) fillBalanceDay(days map[string]*balanceDayResult, day string) 
 	maxRemovedPct := s.Config.Reap.BalanceMaxRemovedPctOrDefault()
 	res.Day, res.WindowDays = day, window
 	res.Noticed = map[string]bool{}
+	// A host with an open balance from earlier in the window but no activity
+	// today still gets a row: union the window's hosts before computing, so
+	// a quiet backlog never disappears from the audit or the CLI.
+	if end, err := time.Parse(reviewerSummaryDay, day); err == nil {
+		for i := range window {
+			if d, ok := days[end.AddDate(0, 0, -i).Format(reviewerSummaryDay)]; ok {
+				for h := range d.Hosts {
+					if _, ok := res.Hosts[h]; !ok {
+						res.Hosts[h] = &balanceHostCounts{}
+					}
+				}
+			}
+		}
+	}
 	for h, c := range res.Hosts {
 		c.Open = balanceOpen(days, h, day, window)
 		if balanceStalled(c.Created, c.Removed, minCreated, maxRemovedPct) {
@@ -413,9 +427,9 @@ func (s *Service) reviewerBalanceForDay(repos []config.Repo, day string) (*balan
 // completed one through yesterday (only ended days are summarized, so a row
 // stamped on the day but appended after the scan is counted by a later pass).
 // It writes one reviewer-balance-daily audit row per host into the first
-// configured repo and sends one notice per stalled host per day to that
-// repo's design lane. State advances one day at a time, so a crash between
-// days repeats at most that day.
+// configured repo and sends one notice per stalled host per day to
+// reap.balance_lane, or the desk lane when unset. State advances one day at a
+// time, so a crash between days repeats at most that day.
 func (s *Service) reviewerBalance(ctx context.Context, o Options) error {
 	if len(s.Config.Repos) == 0 {
 		return nil
@@ -512,9 +526,10 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 	return nil
 }
 
-// noticeBalance sends one reviewer-balance notice for the host's day to the
-// target repo's design lane. The sent key covers the day and host, so repeats
-// stay quiet; a refused delivery is not recorded, so the next pass retries.
+// noticeBalance sends one reviewer-balance notice for the host's day to
+// reap.balance_lane, or the desk lane when unset. The sent key covers the day
+// and host, so repeats stay quiet; a refused delivery is not recorded, so the
+// next pass retries.
 func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, host string, created, removed, open, window int) error {
 	sent, err := loadSentKeys(s.reviewerBalanceSentFile(), 1024)
 	if err != nil {
@@ -524,7 +539,7 @@ func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, ho
 	if sent.has(key) {
 		return nil
 	}
-	lane := s.ownerLane(target)
+	lane := s.Config.Reap.BalanceLane
 	if lane == "" {
 		lane = s.deskLane()
 	}
