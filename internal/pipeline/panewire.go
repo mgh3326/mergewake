@@ -459,6 +459,18 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	var recErr error
 	if resumed {
 		rec, recErr = x.job(ctx, rj.Label)
+		// A reviewer's hk record proves it really landed, even when no run of
+		// this evaluation spawned it. That landing starts a new attempt, so the
+		// failure count of the earlier one must not hold it; Placed keeps the
+		// reset to one per reviewer, since a record whose reviewer keeps
+		// running is read on every evaluation.
+		if recErr == nil && rec.State != "" && !rj.Placed {
+			attemptOf(ctx).reviewerPlaced()
+			rj.Placed = true
+			if e = x.saveReviewerJob(rj); e != nil {
+				return out, e
+			}
+		}
 	}
 	if resumed && !acquired {
 		renew, e := x.keepsLease(rec, recErr, rj)
@@ -885,7 +897,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			if !resumed {
 				headLatencyOf(ctx).spawnAccepted(plan.pass, phases.Now())
-				attemptOf(ctx).reviewerPlaced()
+				// A spawn whose wait returned proves the placement, and so does
+				// a receipt that names a pane or host. An asynchronous spawn's
+				// call returns as soon as the hub accepted the request, which
+				// the hub can still refuse (hk 5005): that landing is seen on
+				// the resumed run, from the reviewer's hk record.
+				if _, placed := spawnPlacement(string(stdout)); placed || !async {
+					attemptOf(ctx).reviewerPlaced()
+					rj.Placed = true
+				}
 			}
 		}
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
@@ -1056,8 +1076,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		// The replacement's budget starts at this handoff. The old reviewer's
 		// landing no longer applies, so Started is cleared and budgetStart falls
-		// back to Recorded, which is now.
-		rj.Label, rj.Recorded, rj.Started = replacement, s.now(), nil
+		// back to Recorded, which is now; its landing has already accounted for
+		// the earlier attempt, and the replacement's own is accounted when seen.
+		rj.Label, rj.Recorded, rj.Started, rj.Placed = replacement, s.now(), nil, false
 		for i := 0; i+1 < len(rj.Args); i++ {
 			if rj.Args[i] == "-l" {
 				rj.Args[i+1] = replacement

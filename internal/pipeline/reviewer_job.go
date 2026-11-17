@@ -77,6 +77,12 @@ type reviewerJob struct {
 	// returned with a placement. Nil when no landing was seen yet, such as a
 	// spawn that never placed; then the review budget starts from Recorded.
 	Started *time.Time `json:"started,omitempty"`
+	// Placed marks the landing review-retry already accounted for: the spawn
+	// named a pane or host, or an hk job record exists for the label. A bare
+	// ACCEPTED receipt is no landing, since the hub can refuse the request
+	// after accepting it (hk 5005), so the reset is applied once the landing
+	// is really seen, not once per evaluation that reads the record.
+	Placed bool `json:"placed,omitempty"`
 }
 
 // replacedReviewer is a reviewer that was lost overdue and replaced: its label,
