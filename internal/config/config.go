@@ -850,9 +850,6 @@ func validateReview(c *Config) error {
 	if rt.Command == "" {
 		rt.Command = "panewire"
 	}
-	if rt.Workspace == "" {
-		rt.Workspace = "reviews"
-	}
 	if rt.Host == "" {
 		rt.Host = "auto"
 	}

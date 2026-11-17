@@ -794,7 +794,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			} else {
 				args = append(args, "-c", checkout)
 			}
-			args = append(args, "-m", "auto", "-p", briefPath, "-w", cfg.Workspace, "-l", label, "--t", scale, "--task", task)
+			args = append(args, "-m", "auto", "-p", briefPath)
+			if cfg.Workspace != "" {
+				args = append(args, "-w", cfg.Workspace)
+			}
+			args = append(args, "-l", label, "--t", scale, "--task", task)
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}

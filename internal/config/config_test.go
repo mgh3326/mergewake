@@ -505,7 +505,7 @@ func TestReviewExecutor(t *testing.T) {
 	}
 	c, e := load("")
 	rt := c.Review.Panewire
-	if e != nil || c.Review.Executor != "panewire" || rt.Command != "panewire" || rt.Workspace != "reviews" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
+	if e != nil || c.Review.Executor != "panewire" || rt.Command != "panewire" || rt.Workspace != "" || rt.Host != "auto" || rt.Checkouts != "/state/review-checkouts" || !filepath.IsAbs(rt.Jobs) {
 		t.Fatalf("%+v %v", c.Review, e)
 	}
 	if _, e := load("review:\n  executor: headless\n"); e == nil || e.Error() != "review.executor must be panewire" {

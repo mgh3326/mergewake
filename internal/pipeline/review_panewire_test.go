@@ -476,6 +476,21 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	}
 }
 
+func TestPanewireSpawnOmitsEmptyWorkspace(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, _, r := panewireSetup(t, runner)
+	s.Config.Review.Panewire.Workspace = ""
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawn count = %d", len(runner.spawns))
+	}
+	if slices.Contains(runner.spawns[0], "-w") {
+		t.Fatalf("empty workspace emitted -w: %v", runner.spawns[0])
+	}
+}
+
 func TestPanewireLargeDeltaBriefCompletesBothPasses(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
