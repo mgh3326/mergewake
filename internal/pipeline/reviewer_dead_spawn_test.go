@@ -109,6 +109,78 @@ func TestReviewerActiveJobRefusalReplayIsDead(t *testing.T) {
 	reviewerJobGone(t, s, r, 1)
 }
 
+// The quota escalation (87) is no park: panewire ends the request and asks the
+// parent lane to act, so a replay the hub never started is dead, and a fresh
+// reviewer replaces it.
+func TestReviewerQuotaEscalateReplayIsDead(t *testing.T) {
+	s, g, r, runner, _, refuse := deadReplayRig(t, panewireQuotaEscalate)
+	old := readReviewerJob(t, s, r, 1).Label
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("review: %v", err)
+	}
+	if refuse.refused != 1 || len(runner.spawns) != 2 || g.postCount != 1 {
+		t.Fatalf("replays=%d spawns=%d posts=%d, want the replay and one fresh spawn", refuse.refused, len(runner.spawns), g.postCount)
+	}
+	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
+		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
+	}
+	dead := auditRows(t, s, r, "reviewer-spawn-dead")
+	if len(dead) != 1 || dead[0]["label"] != old || dead[0]["exit"] != float64(panewireQuotaEscalate) {
+		t.Fatalf("reviewer-spawn-dead rows %v", dead)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// A fresh spawn that ends on quota escalation (87) has no job a next run could
+// resume: its record goes, and the pass fails once, so review-retry backs off
+// instead of respawning at every evaluation.
+func TestReviewerFreshQuotaEscalateLeavesNoRecord(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireQuotaEscalate}}
+	s, g, r := panewireSetup(t, runner)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
+		t.Fatalf("err=%v, want the escalated pass to fail", err)
+	}
+	if len(runner.spawns) != 1 || g.postCount != 0 {
+		t.Fatalf("spawns=%d posts=%d, want one spawn and no review", len(runner.spawns), g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+	if st := retryStateOf(t, s, r); st.Failures != 1 || !st.Next.After(s.now()) {
+		t.Fatalf("retry state %+v, want one failure and a backoff", st)
+	}
+	if rows := auditRows(t, s, r, "reviewer-spawn-dead"); len(rows) != 0 {
+		t.Fatalf("reviewer-spawn-dead rows %v, want none for a fresh spawn", rows)
+	}
+}
+
+// A second quota escalation is still backed off: the failure was counted once,
+// so the next evaluation inside the backoff spawns nothing, and the one past
+// it runs the pass again and counts a second failure.
+func TestReviewerFreshQuotaEscalateBacksOff(t *testing.T) {
+	runner := &panewireRunner{family: "openai", exits: []int{panewireQuotaEscalate, panewireQuotaEscalate}}
+	s, g, r := panewireSetup(t, runner)
+	c := &clock{t: time.Date(2026, 11, 17, 2, 0, 0, 0, time.UTC)}
+	s.Now = c.now
+	_ = s.RetryReview(context.Background(), r, g.pull, Options{})
+	st := retryStateOf(t, s, r)
+	if st.Failures != 1 || len(runner.spawns) != 1 {
+		t.Fatalf("failures=%d spawns=%d, want one failure after one spawn", st.Failures, len(runner.spawns))
+	}
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil {
+		t.Fatalf("evaluation inside the backoff: %v", err)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns=%d inside the backoff, want none", len(runner.spawns))
+	}
+	c.t = st.Next.Add(time.Second)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewUnavailable) {
+		t.Fatalf("evaluation past the backoff: err=%v", err)
+	}
+	if again := retryStateOf(t, s, r); again.Failures != 2 || len(runner.spawns) != 2 {
+		t.Fatalf("failures=%d spawns=%d, want a second counted failure", again.Failures, len(runner.spawns))
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
 // A deferred chain in one clock second must advance beyond every dead label,
 // including the replacement that became the newest dead marker.
 func TestReviewerDeferredReplacementLabelsAdvanceMonotonically(t *testing.T) {
@@ -358,7 +430,6 @@ func TestReviewerReplayThatMayLandKeepsRecord(t *testing.T) {
 		"brief unconfirmed":  76,
 		"lane unregistered":  82,
 		"quota wait":         86,
-		"quota escalate":     87,
 		"quota unknown":      89,
 		"unclassified error": 1,
 	} {

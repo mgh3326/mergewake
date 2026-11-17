@@ -923,19 +923,22 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				x.releaseLease(ctx, plan, leaseSHA, "spawn-local-checkout-failed", "")
 			}
 			// A refused fresh spawn created no job, and neither did a refused
-			// spec whose fallback checkout failed: their record goes.
-			if !resumed && (spawnRefused(code) || unplaced) {
+			// spec whose fallback checkout failed: their record goes. So does a
+			// fresh spawn the hub ended on quota escalation (87), which no job
+			// will run.
+			if !resumed && (spawnEndsRequest(code) || unplaced) {
 				if dropErr := s.dropReviewerJob(x.repo.Name, pr.Number, plan.pass); dropErr != nil {
 					return out, errors.Join(e, dropErr)
 				}
 			}
-			// Every exit but the pre-start refusal may leave a pane running in
-			// this checkout: a timed-out --wait is one such exit. Keep the checkout
-			// and name it in a receipt for a later cleanup, naming the node's
-			// worktree when the spawn held no local checkout. A refused spawn
-			// started no pane, and a refused spec whose fallback checkout failed
-			// created nothing, so nothing is kept for either.
-			if (!spawnRefused(code) || resumed) && !unplaced {
+			// Every exit but the ones that end the request before any pane
+			// exists may leave a pane running in this checkout: a timed-out
+			// --wait is one such exit. Keep the checkout and name it in a
+			// receipt for a later cleanup, naming the node's worktree when the
+			// spawn held no local checkout. A refused spawn and a quota
+			// escalation started no pane, and a refused spec whose fallback
+			// checkout failed created nothing, so nothing is kept for either.
+			if (!spawnEndsRequest(code) || resumed) && !unplaced {
 				keepCheckout = true
 				x.keepUnfinishedCheckout(reviewerPane{label: label, checkout: checkout, head: pr.Head.SHA, pass: plan.pass}, "spawn ended before a pane result; the checkout may still run a pane")
 			}
@@ -1212,8 +1215,11 @@ func spawnNeverPlaced(code int) (string, bool) {
 		return "spawn-local-disabled", true
 	case panewireNoHost:
 		return "spawn-no-host", true
-	case panewireQuotaWait, panewireQuotaEscalate:
+	case panewireQuotaWait:
 		return "spawn-quota-exhausted", true
+	case panewireQuotaEscalate:
+		// No park: panewire ends the request and asks the parent lane to act.
+		return "spawn-quota-escalated", true
 	case panewireAuthUnavailable:
 		return "spawn-auth-unavailable", true
 	case panewireQuotaUnknown:
@@ -1229,11 +1235,25 @@ func spawnNeverPlaced(code int) (string, bool) {
 // no longer expected: it fails the pass like any other pre-start refusal.
 func spawnRefused(code int) bool { return code == panewireRefused || code == panewireHeld }
 
+// spawnEndsRequest reports the spawn exits that leave neither a pane nor a
+// record to replay: the pre-start refusals, and the quota escalation (87). The
+// escalation is no park: panewire ends the request and asks the parent lane to
+// act, so no job will ever run it (panewire docs/config.md, "Exit codes"; its
+// spawn park rule ends an escalated request and notifies). The quota wait (86)
+// and the unknown-quota answer (89) park the request instead, and their records
+// stay for the next run to replay.
+func spawnEndsRequest(code int) bool {
+	return spawnRefused(code) || code == panewireQuotaEscalate
+}
+
 // deadSpawn reports a terminal-not-landed exit of a replayed spawn: spawnNeverPlaced
-// without the answers that may still land. The quota waits (86, 87, 89) keep
-// the request queued until quota returns. The rest, the active-job refusal (74)
-// among them, end the request before any pane exists, and panewire left no job
-// to wait for. The quota-gate timeout (124) is among them.
+// without the answers that park the request and so may still land. The quota
+// wait (86) and the unknown-quota answer (89) park it until quota returns. The
+// quota escalation (87) does not: panewire ends the request and notifies the
+// parent lane, so no job will ever run it (panewire docs/config.md, "Exit
+// codes"). The rest, the active-job refusal (74) among them, end the request
+// before any pane exists, and panewire left no job to wait for. The
+// quota-gate timeout (124) is among them.
 func deadSpawn(code int) bool {
 	reason, never := spawnNeverPlaced(code)
 	return never && reason != "spawn-quota-exhausted" && reason != "spawn-quota-unknown"
