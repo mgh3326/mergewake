@@ -114,7 +114,7 @@ func TestFailedCommandKeepsStderrOutOfMessage(t *testing.T) {
 }
 
 func TestExecRunWithOutputKeepsStdoutOnFailure(t *testing.T) {
-	got, err := (Exec{}).RunWithOutput(context.Background(), "sh", []string{"-c", "printf '{\\\"state\\\":\\\"failed\\\"}'; exit 70"}, "", "")
+	got, err := (Exec{}).RunWithOutput(context.Background(), "sh", []string{"-c", `printf '%s' '{"state":"failed"}'; exit 70`}, "", "")
 	if err == nil || string(got) != `{"state":"failed"}` {
 		t.Fatalf("RunWithOutput=%q, %v; want stdout with exit error", got, err)
 	}
