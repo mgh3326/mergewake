@@ -1297,6 +1297,36 @@ func deadSpawn(code int) bool {
 	return never && reason != "spawn-quota-exhausted" && reason != "spawn-quota-unknown"
 }
 
+// spawnStatusUnsaid reports the `panewire spawn status` exits that answer about
+// the read or the landing rather than about the request: its own configuration
+// (70) or duplicate state (75) is unreadable, and the landing timed out (124),
+// so a pane may exist. None of them says the request ended, so the caller keeps
+// the record it has — though deadSpawn calls each one terminal for a spawn,
+// where a start that failed this way left no pane at all.
+func spawnStatusUnsaid(code int) bool {
+	switch code {
+	case panewireConfigRefused, panewireDuplicateState, panewireQuotaTimeout:
+		return true
+	}
+	return false
+}
+
+// statusEndsRequest reports the `panewire spawn status` exits that end the
+// reviewer request the read names: panewire answers with the hub's rc for a
+// request that failed, is retryable or was refused, and with 81 when the hub
+// recorded none, so the terminal refusals a spawn reports are the same set read
+// back from the record (panewire internal/fleet/spawn_request_state.go,
+// spawnStatusExit; its usage line names 81). Taking them from deadSpawn keeps
+// this read and the synchronous path one list: the pre-start refusals 77 and
+// 74, the preflight, mock-isolation, local-disabled, no-host, escalation and
+// auth-unavailable answers 78, 79, 80, 81, 87, 88 — never the parks 86 and 89,
+// whose requests wait for quota and may still land. 84 is its own answer here:
+// the request ended before it landed, cancelled or given up (panewire
+// docs/hub-spawn-operations.md, "Request states a client reads").
+func statusEndsRequest(code int) bool {
+	return code == panewireRequestEnded || (deadSpawn(code) && !spawnStatusUnsaid(code))
+}
+
 // spawnRequestID reads the request id a spawn receipt names: panewire prints
 // "ACCEPTED job=<job> request=<id>" once the hub holds the request.
 var spawnRequestID = regexp.MustCompile(`\brequest=(\S+)`)
@@ -1309,10 +1339,11 @@ var spawnRequestID = regexp.MustCompile(`\brequest=(\S+)`)
 // evaluation (hk 5001). The read answers by panewire's own state mapping
 // (internal/fleet/spawn_request_state.go, spawnStatusExit): a landed request
 // exits 0, a parked one 91, one that may still run 85. Only the answers that
-// end the request are taken: a refusal that is not parked (spawnEndsRequest),
-// and a request that ended before it landed. A read that fails answers its own
-// error (70 configuration, 75 unreadable state, 2 usage), which ends nothing,
-// so the caller keeps the record it has.
+// end the request are taken (statusEndsRequest): every terminal refusal a spawn
+// reports, the no-host answer 81 among them, and a request that ended before it
+// landed (84). A read that fails answers its own error (70 configuration, 75
+// unreadable state, 2 usage), and a landing timeout (124) may still hold a
+// pane; neither ends anything, so the caller keeps the record it has.
 func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewerJob) (int, string, bool) {
 	m := spawnRequestID.FindStringSubmatch(rj.Spawned)
 	if m == nil {
@@ -1327,7 +1358,7 @@ func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewer
 	defer cancel()
 	_, err := x.s.Runner.Run(readCtx, x.s.Config.Review.Panewire.Command, []string{"spawn", "status", id}, "", "")
 	code := exitStatus(err)
-	if !spawnEndsRequest(code) && code != panewireRequestEnded {
+	if !statusEndsRequest(code) {
 		return 0, "", false
 	}
 	return code, fmt.Sprintf("request %s ended with exit %d", id, code), true
