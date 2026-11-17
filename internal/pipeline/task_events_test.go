@@ -31,6 +31,7 @@ type fakeHK struct {
 	auth   []string
 	status int
 	code   string
+	field  string
 	delay  time.Duration
 	// refuseExtended answers 400 invalid_event to an event that carries any
 	// head/base/merge/reviews field, as an hk that predates them does.
@@ -87,7 +88,7 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.failTasks[ev.TaskID] = n - 1
 		status, code = http.StatusInternalServerError, "unavailable"
 	}
-	message := h.message
+	message, field := h.message, h.field
 	h.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -104,6 +105,9 @@ func (h *fakeHK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if status != 0 && status != http.StatusOK {
 		w.WriteHeader(status)
 		body := map[string]string{"error": code}
+		if field != "" {
+			body["field"] = field
+		}
 		if message != "" {
 			body["message"] = message
 		}

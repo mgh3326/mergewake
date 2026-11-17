@@ -85,13 +85,12 @@ type ReviewRecord struct {
 	// Review-history fields (hk 3296). A nil pointer is "unknown" and is left
 	// out of the JSON: hk reads a missing field as unknown and an explicit
 	// false or 0 as a fact, so mergewake sends one only for a value it knows.
-	Reviewer            *string                `json:"reviewer,omitempty"`
-	SameFamily          *bool                  `json:"same_family,omitempty"`
-	Delta               *bool                  `json:"delta,omitempty"`
-	Quiet               *bool                  `json:"quiet,omitempty"`
-	OutsideDiffBlocking *int                   `json:"outside_diff_blocking,omitempty"`
-	PatchDigest         *string                `json:"patch_digest,omitempty"`
-	FindingFacts        *[]ReviewFindingRecord `json:"finding_facts,omitempty"`
+	Reviewer            *string `json:"reviewer,omitempty"`
+	SameFamily          *bool   `json:"same_family,omitempty"`
+	Delta               *bool   `json:"delta,omitempty"`
+	Quiet               *bool   `json:"quiet,omitempty"`
+	OutsideDiffBlocking *int    `json:"outside_diff_blocking,omitempty"`
+	PatchDigest         *string `json:"patch_digest,omitempty"`
 }
 
 // ReviewFindingRecord records each finding's relationship to new code and
@@ -255,6 +254,8 @@ type TaskEventResult struct {
 	// extended payload (this is its error code, or "invalid" when it sent none)
 	// and the event was accepted only when resent with fewer optional fields.
 	FieldsRefused string `json:"-"`
+	// FieldsRefusedField is hk's optional field name from the first 400.
+	FieldsRefusedField string `json:"-"`
 	// FieldsRefusedMessage is hk's message on that first 400, bounded and
 	// redacted; empty when hk sent none. FieldsResend names the form that was
 	// accepted: ResendWithoutReviews keeps head, base and merge, ResendPlain
@@ -285,6 +286,7 @@ const (
 type HKError struct {
 	Status  int
 	Code    string
+	Field   string
 	Message string
 }
 
@@ -361,7 +363,7 @@ type resendForm struct {
 // reviews and head, base or merge is first resent with only the reviews dropped
 // (one bad review record never strips head and base); a 400 to that, or a
 // payload with nothing else to keep, is resent plain. The result then carries
-// FieldsRefused, hk's message on the first 400 and the form that was accepted.
+// FieldsRefused, hk's field and message on the first 400 and the accepted form.
 func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEventResult, error) {
 	res, used, e := h.postTaskEvent(ctx, ev, 0)
 	var first *HKError
@@ -383,7 +385,7 @@ func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEvent
 		res, n, e = h.postTaskEvent(ctx, form.ev, max(1, h.attempts()-used))
 		used += n
 		if e == nil {
-			res.FieldsRefused, res.FieldsRefusedMessage, res.FieldsResend = code, first.Message, form.name
+			res.FieldsRefused, res.FieldsRefusedField, res.FieldsRefusedMessage, res.FieldsResend = code, first.Field, first.Message, form.name
 			return res, nil
 		}
 		var again *HKError
@@ -456,6 +458,7 @@ func (c *hkJobs) postEvent(ctx context.Context, client *http.Client, body []byte
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var answer struct {
 			Error   string `json:"error"`
+			Field   string `json:"field"`
 			Message string `json:"message"`
 			Reason  string `json:"reason"`
 		}
@@ -467,7 +470,7 @@ func (c *hkJobs) postEvent(ctx context.Context, client *http.Client, body []byte
 		if message == "" {
 			message = answer.Reason
 		}
-		return TaskEventResult{}, &HKError{Status: resp.StatusCode, Code: answer.Error, Message: errorMessage(message)}
+		return TaskEventResult{}, &HKError{Status: resp.StatusCode, Code: answer.Error, Field: errorMessage(answer.Field), Message: errorMessage(message)}
 	}
 	var res TaskEventResult
 	if e := json.NewDecoder(limited).Decode(&res); e != nil {

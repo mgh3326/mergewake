@@ -581,13 +581,13 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			// is the only one that can carry its record.
 			if stored, readErr := s.GH.ReviewPasses(ctx, r.Name, n, pr.Head.SHA, s.Config.Review.Login); readErr == nil && slices.ContainsFunc(stored, func(p github.PassReceipt) bool { return p.Pass == plan.pass }) {
 				mu.Lock()
-				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
+				reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
 				mu.Unlock()
 			}
 			return e
 		}
 		mu.Lock()
-		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now(), findingFacts))
+		reviews = append(reviews, passRecord(pr, receipt, findings, rp.contractSource, passStarted, s.now()))
 		roundFacts = append(roundFacts, findingFacts...)
 		mu.Unlock()
 		// The pass is posted: its reviewer job record, if any, is spent. A

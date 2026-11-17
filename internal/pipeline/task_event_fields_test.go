@@ -160,6 +160,20 @@ func TestTaskEventFieldsRefusedResend(t *testing.T) {
 	}
 }
 
+func TestTaskEventRefusedFieldAudited(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	hk.refuseReviews = true
+	hk.field = "x"
+	g.blocking = true
+	if err := s.Review(context.Background(), r, 7, "openai", Options{Observed: true}); err != nil {
+		t.Fatal(err)
+	}
+	rows := eventAuditRows(t, s, r.Name, "task-event-fields-refused")
+	if len(rows) != 1 || rows[0]["field"] != "x" || rows[0]["resend"] != integrations.ResendWithoutReviews {
+		t.Fatalf("refused field audit %+v", rows)
+	}
+}
+
 // A lens (or family, executor, contract source) that is not a [a-z0-9_.-] token
 // is normalised or left out, never sent raw; counts follow the severity.
 func TestPassRecordTokens(t *testing.T) {

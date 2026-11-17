@@ -67,6 +67,7 @@ type fieldsRefusedRecord struct {
 	Task      string `json:"task"`
 	SourceRef string `json:"source_ref"`
 	Code      string `json:"code"`
+	Field     string `json:"field,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Resend    string `json:"resend"`
 }
@@ -205,7 +206,7 @@ func (s *Service) postTaskEventWith(ctx context.Context, r config.Repo, pr githu
 		}
 		auditTaskEvent(s, r, row, task, taskResult, postErr)
 		if postErr == nil && res.FieldsRefused != "" && i == 0 {
-			_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
+			_ = s.audit(r.Name, "task-event-fields-refused", fieldsRefusedRecord{Source: source, Task: task, SourceRef: row.SourceRef, Code: res.FieldsRefused, Field: res.FieldsRefusedField, Message: res.FieldsRefusedMessage, Resend: res.FieldsResend}, false)
 		}
 	}
 	return postSent
@@ -254,7 +255,7 @@ func (s *Service) mergeCommit(ctx context.Context, r config.Repo, pr github.Pull
 // passRecord is the hk reviews[] record of one posted pass: what the pass
 // reviewed (head, base, patch), who produced it and how many findings of each
 // severity it posted. Fields mergewake does not know here stay empty.
-func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Finding, contractSource string, started, finished time.Time, findingFacts ...[]integrations.ReviewFindingRecord) integrations.ReviewRecord {
+func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Finding, contractSource string, started, finished time.Time) integrations.ReviewRecord {
 	rec := integrations.ReviewRecord{
 		ReviewedHead:   pr.Head.SHA,
 		ReviewedBase:   integrations.SHA(pr.Base.SHA),
@@ -283,10 +284,6 @@ func passRecord(pr github.Pull, receipt github.PassReceipt, findings []github.Fi
 	}
 	if digest := patchDigest(receipt.Patch); digest != "" {
 		rec.PatchDigest = &digest
-	}
-	if len(findingFacts) > 0 {
-		facts := slices.Clone(findingFacts[0])
-		rec.FindingFacts = &facts
 	}
 	for _, f := range findings {
 		switch f.Severity {
