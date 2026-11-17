@@ -36,9 +36,10 @@ type reviewerAuditScan struct {
 	Offset int64 `json:"offset"`
 }
 
-// reviewerAuditReadMax bounds one read of decisions.jsonl: a first scan reads
-// the whole file, and a file larger than this is read from its end.
-const reviewerAuditReadMax = 64 << 20
+// reviewerAuditReadMax bounds one read of decisions.jsonl. A journal larger
+// than this is read in windows forward from the saved offset; each window's
+// rows are handled before the offset passes them, so no row is ever skipped.
+var reviewerAuditReadMax = int64(64 << 20)
 
 func (s *Service) reviewerAuditPath(repo string) string {
 	return filepath.Join(s.state(repo), "reviewer-audit-scan.json")
@@ -70,18 +71,16 @@ func (s *Service) reviewerAuditLabels(repo string) (map[string]reviewerAudit, in
 	if off < 0 || off > info.Size() {
 		off = 0
 	}
-	start := off
-	if info.Size()-start > reviewerAuditReadMax {
-		start = info.Size() - reviewerAuditReadMax
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return nil, 0, err
 	}
-	buf, err := io.ReadAll(f)
+	buf, err := io.ReadAll(io.LimitReader(f, reviewerAuditReadMax))
 	if err != nil {
 		return nil, 0, err
 	}
-	// Only complete lines are read; the rest is read again next time.
+	// Only complete lines are read; the rest is read again next time. A
+	// window that ends mid-line without a single complete line is re-read as
+	// a whole on the next pass rather than advanced past.
 	cut := lastNewline(buf)
 	if cut < 0 {
 		return nil, off, nil
@@ -120,7 +119,7 @@ func (s *Service) reviewerAuditLabels(repo string) (map[string]reviewerAudit, in
 		}
 		labels[v.label] = v
 	}
-	return labels, start + int64(cut) + 1, nil
+	return labels, off + int64(cut) + 1, nil
 }
 
 // saveReviewerAuditOffset records how much of decisions.jsonl the sweep has

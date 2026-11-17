@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -288,5 +289,157 @@ func TestReviewerAuditLabelsReadsEachRowOnce(t *testing.T) {
 	}
 	if labels, off4, err := s.reviewerAuditLabels(repo); err != nil || len(labels) != 1 || off4 != int64(len(row(first))) {
 		t.Fatalf("rewritten scan labels=%v off=%d err=%v", labels, off4, err)
+	}
+}
+
+// A host with no work root leaves the row pending with the missing key named,
+// and does not spend the drain cap; adding the work root removes the checkout
+// on the next pass.
+func TestReapReviewerMissingWorkRootStaysPendingThenIsRemoved(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(81, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a"}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 81, Host: "node-a",
+		Label: label, Worktree: label + reviewerCheckoutSuffix, Result: "pending-cleanup", Reason: "pane still present"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "pending-cleanup" || rows[0].Reason != fmt.Sprintf(reviewerPathUnknown, "node") {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+	if len(f.hub.ops("worktree.remove")) != 0 {
+		t.Fatalf("removal without a work root: %v", f.hub.ops("worktree.remove"))
+	}
+	// The operator configures the work root; the next pass releases it.
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.hub.detached[path] = true
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}
+
+// A row written since the label field exists names the node's checkout in
+// Worktree while its pane is still present (no Cwd); that path is the one the
+// sweep visits, not a guessed work-root path.
+func TestReapReviewerNewCleanupRowWorktreeIsARemotePath(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	label := reviewerLabelFor(82, 2*24*time.Hour)
+	path := "/node/checkouts/" + label + reviewerCheckoutSuffix
+	f.hub.detached[path] = true
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 82, Host: "node-a",
+		Label: label, Worktree: path, Result: "pending-cleanup", Reason: "pane still present"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}
+
+// An audit-only label with a live pane is not settled by that pane alone: no
+// row is written before settle, so the journal window stays pending until a
+// durable row exists.
+func TestReapReviewerAuditLabelWithALivePaneKeepsTheWindow(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(83, 5*time.Minute)
+	cwd := "/repo/" + label
+	f.addPane("w1:p9", label, cwd)
+	f.hub.detached[cwd] = true
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", Cwd: cwd}
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 83, "label": label, "pane": "w1:p9"}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(f.s.reviewerAuditPath(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatalf("journal offset advanced before a durable row: %v", err)
+	}
+	// Past settle, with the pane gone, the label is visited and removed.
+	f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
+	f.s.Now = func() time.Time { return reviewerNow.Add(time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(f.s.reviewerAuditPath(testRepo.Name)); err != nil {
+		t.Fatalf("journal offset not saved after a durable row: %v", err)
+	}
+	if rows := f.rows(t); len(rows) != 1 || rows[0].Result != "removed" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+// A host named by a record but absent from the configured hosts is a temporary
+// condition: the row stays non-terminal so a restored host still gets it.
+func TestReapReviewerUnconfiguredHostStaysPending(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(84, 2*24*time.Hour)
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 84, "label": label, "host": "node-z", "pane": "w1:p1"}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "job-host-unconfigured" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+// A journal larger than one read is read in windows forward from the saved
+// offset: no row is skipped and no offset passes beyond what was handled.
+func TestReviewerAuditScanReadsBoundedWindowsForward(t *testing.T) {
+	old := reviewerAuditReadMax
+	reviewerAuditReadMax = 150
+	t.Cleanup(func() { reviewerAuditReadMax = old })
+	dir := t.TempDir()
+	s := &Service{Config: config.Config{StateDir: dir}}
+	repo := "example/project"
+	path := filepath.Join(dir, repo, "decisions.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := reviewerLabelFor(91, time.Hour)
+	second := reviewerLabelFor(92, time.Hour)
+	row := func(label string) string {
+		b, _ := json.Marshal(map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 91, "label": label, "host": "node-a"}})
+		return string(b) + "\n"
+	}
+	if err := os.WriteFile(path, []byte(row(first)+row(second)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	labels, off, err := s.reviewerAuditLabels(repo)
+	if err != nil || len(labels) != 1 || labels[first].label != first || off != int64(len(row(first))) {
+		t.Fatalf("first window labels=%v off=%d err=%v", labels, off, err)
+	}
+	if err := s.saveReviewerAuditOffset(repo, off); err != nil {
+		t.Fatal(err)
+	}
+	labels, off2, err := s.reviewerAuditLabels(repo)
+	if err != nil || len(labels) != 1 || labels[second].label != second || off2 != int64(len(row(first)+row(second))) {
+		t.Fatalf("second window labels=%v off=%d err=%v", labels, off2, err)
+	}
+}
+
+// A receipt or audit row that cannot be written keeps the journal window: the
+// label must not be consumed while nothing durable names it.
+func TestReapReviewerWriteFailureKeepsTheJournalWindow(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(93, 2*time.Hour)
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 93, "label": label}})
+	dir := f.s.state(testRepo.Name)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := f.reap(t, 0, Options{}); err == nil {
+		t.Fatal("a pass whose rows cannot be written reported no error")
+	}
+	if _, err := os.Stat(f.s.reviewerAuditPath(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatalf("journal offset saved without its row: %v", err)
 	}
 }

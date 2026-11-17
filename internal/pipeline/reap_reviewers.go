@@ -106,10 +106,10 @@ const reviewerCheckoutTTL = 24 * time.Hour
 const reviewerAuditVisitMax = 200
 
 const (
-	// reviewerPathUnknown is the terminal reason of a remote worktree whose
-	// path no record names and whose host has no work root to build it from.
-	// Nothing else removes it.
-	reviewerPathUnknown = "remote worktree path unknown and no work root is configured for the host"
+	// reviewerPathUnknown formats the pending reason of a remote worktree whose
+	// path no record names because the host names no work root. It is retried
+	// every pass, so adding the setting releases the label.
+	reviewerPathUnknown = "remote worktree path unknown: hosts[%s].work_root is not configured"
 	// reviewerRefused starts the reason of a removal the hub's guard refused.
 	reviewerRefused = "hub guarded removal refused: "
 	// reviewerHostUnknown is the terminal reason of an aged label whose job
@@ -137,7 +137,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "skipped":
 		return strings.Contains(v.Reason, "already gone")
 	case "kept":
-		return v.Worktree != "" && (v.Reason == reviewerPathUnknown || v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
+		return v.Worktree != "" && (v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
 	return false
 }
@@ -189,7 +189,7 @@ type reviewerSweep struct {
 	settle     time.Duration // review.timeout + 1m: a younger label's pass may still run
 	stuckAfter time.Duration // review.panewire.stuck_after: a claimed/spawned job this old with no result is treated as ended once its pane is gone
 	jobs       reapJobs
-	note       func(reapReceipt)
+	note       func(reapReceipt) error
 	errs       []error
 	// streams is the newest reviewer-reap row per label and stream, as the
 	// receipts stood when the pass started.
@@ -230,8 +230,11 @@ type reviewerSweep struct {
 	paneConflict map[paneKey]bool
 	// labelHost is the newest host a receipt recorded for a label.
 	labelHost map[string]string
-	// rowed names labels this pass wrote a row for.
+	// rowed names labels this pass wrote a durable row for.
 	rowed map[string]bool
+	// writeFailed reports that a row could not be written, so the journal
+	// checkpoint must not pass the labels whose rows were lost.
+	writeFailed bool
 }
 
 // reviewerCandidate is one label to visit, the host it is known to run on and,
@@ -247,7 +250,7 @@ type reviewerCandidate struct {
 // that PR's labels. durable reports that this pass writes its rows: only then
 // is the audit scan's offset saved, so a dry run reads the same rows again.
 // note writes one reviewer-reap row and its audit record.
-func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, acting, durable bool, note func(reapReceipt)) []error {
+func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, acting, durable bool, note func(reapReceipt) error) []error {
 	timeout := s.Config.Review.Timeout
 	if timeout == "" {
 		timeout = "10m" // config's default when the key is unset
@@ -312,7 +315,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	}
 	// Only a pass that wrote its rows, and that visited every audit-only
 	// label it found, moves the journal offset: anything else is read again.
-	if durable && auditRead && !w.pendingAudit {
+	if durable && auditRead && !w.pendingAudit && !w.writeFailed {
 		if e := s.saveReviewerAuditOffset(r.Name, auditOffset); e != nil {
 			w.errs = append(w.errs, e)
 		}
@@ -357,9 +360,17 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 				continue
 			}
 			lastCleanup[label] = rec
-			// Cwd holds the remote pane's cwd or the remote worktree; the
-			// local checkout is only ever in Worktree.
-			w.remember(label, rec.Host, rec.Cwd)
+			// Cwd holds the remote pane's cwd or the remote worktree. A row
+			// written since the label field exists can name the node's
+			// worktree in Worktree while its pane is still present (Cwd
+			// empty); that path is remembered too. An older row's Worktree is
+			// this machine's checkout, which is no remote path, and so is
+			// <review.panewire.checkouts>/<label>.
+			path := rec.Cwd
+			if path == "" && rec.Label != "" && !w.isLocalCheckout(rec.Worktree, label) {
+				path = rec.Worktree
+			}
+			w.remember(label, rec.Host, path)
 			w.rememberHost(label, rec.Host)
 		}
 	}
@@ -553,7 +564,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 	}
 	for name, a := range w.audits {
-		if paned[name] || w.streams[name] != nil {
+		if w.streams[name] != nil {
 			continue
 		}
 		if _, ok := lastCleanup[name]; ok {
@@ -561,6 +572,13 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 		l, ok := keep(name)
 		if !ok {
+			continue
+		}
+		// The label is named by the journal and has no receipt yet: even a
+		// live pane's candidate must not consume the window until a row of
+		// its own exists, or a crash could take the pane away unseen.
+		w.auditOnly[name] = true
+		if paned[name] {
 			continue
 		}
 		host := w.hostName(a.host)
@@ -573,7 +591,6 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		if host == "" {
 			host = w.labelHost[name]
 		}
-		w.auditOnly[name] = true
 		cands = append(cands, reviewerCandidate{label: l, host: host})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -608,6 +625,16 @@ func (w *reviewerSweep) remember(label, host, path string) {
 	w.remote[label][host] = path
 }
 
+// isLocalCheckout reports whether path is the label's local reviewer checkout,
+// the one thing a receipt's Worktree names that is not on a remote host.
+func (w *reviewerSweep) isLocalCheckout(path, label string) bool {
+	dir := config.Expand(w.s.Config.Review.Panewire.Checkouts)
+	if path == "" || dir == "" {
+		return false
+	}
+	return filepath.Clean(path) == filepath.Clean(filepath.Join(dir, label))
+}
+
 // localCheckout is the label's local reviewer checkout
 // <review.panewire.checkouts>/<label>, or "" when it is not on disk.
 func (w *reviewerSweep) localCheckout(label string) string {
@@ -629,10 +656,14 @@ func (w *reviewerSweep) row(l reviewerLabel) reapReceipt {
 
 func (w *reviewerSweep) record(v reapReceipt, result, reason string) {
 	v.Result, v.Reason = result, fleetevent.Redact(reason)
+	if e := w.note(v); e != nil {
+		w.errs = append(w.errs, e)
+		w.writeFailed = true
+		return
+	}
 	if v.Label != "" {
 		w.rowed[v.Label] = true
 	}
-	w.note(v)
 }
 
 // visit applies the sweep to one label: the gates (I2–I4), the remote
@@ -1086,6 +1117,13 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 		if !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop {
 			return
 		}
+	} else if c.host != "" {
+		// A record names a host this pass could not scan, because it is not
+		// configured right now: keep the label pending so a restored host
+		// still gets its worktree.
+		rec := w.row(l)
+		rec.Host, rec.Worktree = c.host, l.name
+		w.record(rec, "kept", "job-host-unconfigured")
 	} else {
 		// No record, receipt or audit row names a host, so no remote path can
 		// be built: the label holds no worktree this sweep can find.
@@ -1124,15 +1162,12 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	rec := w.row(l)
 	rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, cwd, cwd
 	if cwd == "" {
-		// No record and no work root name the worktree: nothing can build
-		// its path, so the outcome is final once the sweep acts. A shadow run
-		// stays pending.
+		// No record and no work root name the worktree. This is a missing
+		// configuration, not a dead end: the row stays pending with the key
+		// that is missing, retried every pass, so adding the work root
+		// releases the label and it never counts against the drain cap.
 		rec.Worktree = l.name
-		if w.acting {
-			w.record(rec, "kept", reviewerPathUnknown)
-		} else {
-			w.record(rec, "pending-cleanup", "remote cwd unavailable or mismatched")
-		}
+		w.record(rec, "pending-cleanup", fmt.Sprintf(reviewerPathUnknown, hs.host.Name))
 		return remotePathUnknown
 	}
 	// The stream's newest row says whether the hub was asked already: a final

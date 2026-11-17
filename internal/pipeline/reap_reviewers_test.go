@@ -569,7 +569,7 @@ func TestReapReviewer_L1_UnknownRemotePathDoesNotBlockLocalRemoval(t *testing.T)
 			remote = &rows[i]
 		}
 	}
-	if remote == nil || remote.Result != "kept" || remote.Reason != reviewerPathUnknown {
+	if remote == nil || remote.Result != "pending-cleanup" || remote.Reason != fmt.Sprintf(reviewerPathUnknown, "node") {
 		t.Fatalf("remote row missing: %v", rowSummary(rows))
 	}
 	if local == nil || local.Result != "removed" || local.Worktree != path {

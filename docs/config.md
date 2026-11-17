@@ -72,7 +72,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
-| `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others. |
+| `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others; a label left pending for a missing `work_root` spends none of it. |
 | `reviewer_drain.host_order` | Config host order | Host names in the order the reviewer sweep visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 
 **Legacy sweep.** `mergewake reap --legacy [--repo owner/name] [--host H] [--dry-run|--apply]`
@@ -179,15 +179,17 @@ listed, and never earlier: the pane that spawned the label may still be
 reviewing. Candidates come from those receipts, from a live pane named
 `<label>`, and from the reviewer rows in `decisions.jsonl`, which name labels
 whose receipts predate the label field; that journal is read incrementally, by
-byte offset, so the leaked backlog drains without a hand step. A remote
-worktree goes only through the hub's guarded `worktree.remove`
-(`detached: true`), which refuses a paned, dirty or different worktree; a local
-checkout is removed only when it is clean, detached at the reviewed head and
-no local pane runs in it. A refusal is a `pending-cleanup` row with the guard's
-reason and is asked again after a day, three times, then final. When no record
-names the worktree's path, the sweep builds `<hosts[].work_root>/<label>-checkout`;
-only when no host and no work root can build a path does the label end with a
-terminal `kept` row. `reap.reviewer_drain.per_host` caps the guarded removals
+byte offset, in bounded windows, so the leaked backlog drains without a hand
+step and no row is passed over. A remote worktree goes only through the hub's
+guarded `worktree.remove` (`detached: true`), which refuses a paned, dirty or
+different worktree; a local checkout is removed only when it is clean, detached
+at the reviewed head and no local pane runs in it. A refusal is a
+`pending-cleanup` row with the guard's reason and is asked again after a day,
+three times, then final. When no record names the worktree's path, the sweep
+builds `<hosts[].work_root>/<label>-checkout`; a host that names no work root
+leaves the row pending with `hosts[<name>].work_root` named, retried every pass
+and never counted against the drain cap, so configuring the key releases the
+label. Only a label no record names a host for ends with a terminal `kept` row. `reap.reviewer_drain.per_host` caps the guarded removals
 one host takes in one pass (default 20) and `reap.reviewer_drain.host_order`
 fixes which hosts are visited first; a host's remaining labels wait for the
 next pass.

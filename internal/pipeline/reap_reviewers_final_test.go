@@ -45,13 +45,14 @@ func (f *finalFix) printed() int {
 }
 
 const (
-	unknownPathReason = reviewerPathUnknown
+	unknownPathReason = "remote worktree path unknown: hosts[node].work_root is not configured"
 	refusedDirty      = "hub guarded removal refused: dirty"
 )
 
-// (c) A completed job whose pane is gone and whose remote path nobody knows:
-// one terminal kept row, and the second sweep neither writes nor reads the job.
-func TestReapReviewerFinal_C_UnknownRemotePathIsTerminalAndNotRevisited(t *testing.T) {
+// (c) A completed job whose pane is gone and whose host names no work root:
+// the row stays pending with the missing key named and every later sweep asks
+// again, so a configured work root releases the label.
+func TestReapReviewerFinal_C_UnknownRemotePathIsPendingAndRetried(t *testing.T) {
 	f := newFinalFix(t)
 	label := reviewerLabelFor(12, time.Hour)
 	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", PaneID: "w1:p5"}
@@ -59,30 +60,23 @@ func TestReapReviewerFinal_C_UnknownRemotePathIsTerminalAndNotRevisited(t *testi
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	var terminal []reapReceipt
-	for _, v := range f.rows(t) {
-		if v.Result == "kept" && v.Reason == unknownPathReason {
-			terminal = append(terminal, v)
-		}
-		if v.Result == "pending-cleanup" {
-			t.Fatalf("a pending row is left behind: %v", rowSummary(f.rows(t)))
-		}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "pending-cleanup" || rows[0].Reason != unknownPathReason {
+		t.Fatalf("rows: %v", rowSummary(rows))
 	}
-	if len(terminal) != 1 {
-		t.Fatalf("want one terminal kept row, got rows %v", rowSummary(f.rows(t)))
+	reads := f.reads.Load()
+	f.clock = f.clock.Add(25 * time.Minute)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
 	}
-	rows, audits, reads, printed := len(f.rows(t)), len(f.audits(t)), f.reads.Load(), f.printed()
-	for range 3 {
-		f.clock = f.clock.Add(25 * time.Minute)
-		if err := f.reap(t, 0, Options{}); err != nil {
-			t.Fatal(err)
-		}
+	if f.reads.Load() == reads {
+		t.Fatalf("the pending label was not revisited")
 	}
-	if len(f.rows(t)) != rows || len(f.audits(t)) != audits || f.printed() != printed {
-		t.Fatalf("later sweeps wrote: rows %v printed %d", rowSummary(f.rows(t)), f.printed())
-	}
-	if f.reads.Load() != reads {
-		t.Fatalf("later sweeps revisited the label: %d job reads, was %d", f.reads.Load(), reads)
+	// The same pending row is asked again but not rewritten: one receipt
+	// stays until the outcome changes.
+	last := f.rows(t)
+	if len(last) != 1 || last[0].Result != "pending-cleanup" || last[0].Reason != unknownPathReason {
+		t.Fatalf("rows: %v", rowSummary(last))
 	}
 }
 
