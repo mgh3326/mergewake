@@ -1313,7 +1313,10 @@ func spawnStatusJSONEndsRequest(data []byte, request string) (spawnStatusJSON, b
 		return spawnStatusJSON{}, false
 	}
 	switch status.State {
+	case "given_up", "cancelled":
+		return status, true
 	case "failed", "refused", "retryable":
+		// Quota parks and landing timeouts may still produce a live pane.
 		return status, status.RC != panewireQuotaWait && status.RC != panewireQuotaUnknown && status.RC != panewireQuotaTimeout
 	default:
 		return status, false

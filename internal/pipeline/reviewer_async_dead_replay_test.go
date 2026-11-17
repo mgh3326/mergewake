@@ -265,6 +265,8 @@ func TestAsyncStatusJSONDecidesEndedRequest(t *testing.T) {
 		{name: "failed rc 70", code: 70, output: `{"request":"` + asyncRequestID + `","state":"failed","rc":70}`, ended: true},
 		{name: "failed parked rc 86", code: 86, output: `{"request":"` + asyncRequestID + `","state":"failed","rc":86}`},
 		{name: "retryable landing timeout rc 124", code: 124, output: `{"request":"` + asyncRequestID + `","state":"retryable","rc":124}`},
+		{name: "given up rc 84", code: 84, output: `{"request":"` + asyncRequestID + `","state":"given_up","rc":84}`, ended: true},
+		{name: "cancelled rc 84", code: 84, output: `{"request":"` + asyncRequestID + `","state":"cancelled","rc":84}`, ended: true},
 		{name: "landed", code: 0, output: `{"request":"` + asyncRequestID + `","state":"landed"}`},
 		{name: "unparsable", code: 70, output: "not json"},
 		{name: "empty", code: 70, empty: true},
