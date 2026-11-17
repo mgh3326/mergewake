@@ -34,6 +34,7 @@ Usage: mergewake <command> [flags]
   daemon     Run enabled pipeline roles (shadow by default)
   server     Migrate or check the durable PR server store
   reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
+  reap-balance Print the per-host reviewer checkout balance (read-only)
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   report     Report review latency from state and GitHub
   outcomes   Report or sync the shadow-safe model outcomes ledger
@@ -101,7 +102,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	command := args[0]
 	switch command {
-	case "land", "review", "watch", "daemon", "status", "reap":
+	case "land", "review", "watch", "daemon", "status", "reap", "reap-balance":
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
@@ -116,6 +117,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	var family *string
 	var shadow, once, legacy *bool
 	var legacyHost *string
+	var balanceDay *string
 	switch command {
 	case "land", "review", "reap":
 		pr = fs.Int("pr", 0, "pull request number (reap scans merged PRs when omitted)")
@@ -133,6 +135,8 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "watch":
 		shadow = fs.Bool("shadow", false, "force decision-only mode")
 		once = fs.Bool("once", false, "inspect once instead of polling")
+	case "reap-balance":
+		balanceDay = fs.String("day", "", "UTC day YYYY-MM-DD (default yesterday)")
 	}
 	if e := fs.Parse(args[1:]); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
@@ -158,7 +162,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return e
 	}
 	r := config.Repo{}
-	sweepAll := legacy != nil && *legacy && *repo == ""
+	sweepAll := (legacy != nil && *legacy && *repo == "") || (command == "reap-balance" && *repo == "")
 	if (command != "status" && command != "daemon" && !sweepAll) || *repo != "" {
 		if *repo == "" {
 			return errors.New("--repo is required")
@@ -261,8 +265,30 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			return runReapLegacy(ctx, &s, c, *repo, *legacyHost, o)
 		}
 		return s.Reap(ctx, r, *pr, o)
+	case "reap-balance":
+		return runReapBalance(ctx, &s, c, *repo, *balanceDay)
 	}
 	return nil
+}
+
+// runReapBalance prints one UTC day's reviewer-checkout balance across --repo
+// or, without it, every configured repo. It never writes audit rows or sends
+// notices: the daemon's reap role writes and notices once a day (hk 5090).
+func runReapBalance(ctx context.Context, s *pipeline.Service, c config.Config, repo, day string) error {
+	_ = ctx
+	repos := c.Repos
+	if repo != "" {
+		r, err := c.Repo(repo)
+		if err != nil {
+			return err
+		}
+		repos = []config.Repo{r}
+	}
+	if day == "" {
+		now := time.Now().UTC()
+		day = time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	}
+	return s.PrintReapBalance(repos, day)
 }
 
 // runReapLegacy runs the legacy sweep by hand over --repo or, without it,

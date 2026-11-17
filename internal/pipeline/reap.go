@@ -951,6 +951,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)
+	// The fleet-wide reviewer balance runs on whole-repo passes only, once a
+	// day: it counts checkouts created and removed per host across all
+	// watched repos and notices when a host's removals stall (hk 5090).
+	if acting && prNum == 0 {
+		if err := s.reviewerBalance(ctx, o); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if prNum == 0 {
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
 	}
