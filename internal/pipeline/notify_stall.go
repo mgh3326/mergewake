@@ -56,7 +56,7 @@ func (s *Service) notifyPRStalls(ctx context.Context, r config.Repo, pr github.P
 		entry := redCheckClock(clocks[cause], clocks[cause].Head != "", pr.Head.SHA, now)
 		if now.Sub(entry.Since) >= s.Config.Daemon.PR.Notify.CheckRedWindow() && !entry.Sent {
 			if err := s.sendPRStallAt(ctx, r, pr, cause, s.Config.Daemon.PR.Notify.CheckRedWindow(), now.Sub(entry.Since), entry.Since); err != nil {
-				return err
+				return fmt.Errorf("%s: %w", cause, err)
 			}
 			entry.Sent = true
 		}
@@ -133,6 +133,21 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 	}
 	clocks[prIdleCause] = entry
 	return fsutil.WriteJSON(file, clocks)
+}
+
+// stallClockError keeps a stall or idle clock failure from failing the PR's
+// notify verdict: the pass goes on as if no stall notice were due, the error
+// is logged and audited once with the PR, cause and error, and the next pass
+// tries the clock again. A cancelled context still propagates so shutdown is
+// not hidden.
+func (s *Service) stallClockError(ctx context.Context, r config.Repo, pr github.Pull, cause string, err error) error {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if s.Log != nil {
+		s.Log.Warn("stall clock failed", "repo", r.Name, "pr", pr.Number, "cause", cause, "error", integrations.Detail(err))
+	}
+	return s.audit(r.Name, "pr-stall-error", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "cause": cause, "error": integrations.Detail(err)}, false)
 }
 
 // idleReviewComment mirrors the gate's author checks: the configured review

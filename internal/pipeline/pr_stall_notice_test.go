@@ -1,11 +1,15 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -157,5 +161,110 @@ func TestRedCheckClockRearmsAfterClearAndNewHead(t *testing.T) {
 	newHead := redCheckClock(first, true, shaB, now.Add(3*time.Hour))
 	if !newHead.Since.Equal(now.Add(3 * time.Hour)) {
 		t.Fatalf("new head since=%s", newHead.Since)
+	}
+}
+
+// stallClockGH fails the GitHub reads the stall clocks make while the
+// matching error is set; everything else delegates to the fake. The gate
+// reads checks through CheckSnapshot, which the embedded fake answers itself,
+// so checkErr fails only the stall clock's CheckStates.
+type stallClockGH struct {
+	*fakeGH
+	activityErr error
+	activity    []time.Time
+	checkErr    error
+}
+
+func (g *stallClockGH) PullReviewActivity(context.Context, string, int) ([]time.Time, error) {
+	if g.activityErr != nil {
+		return nil, g.activityErr
+	}
+	return g.activity, nil
+}
+
+func (g *stallClockGH) CheckStates(ctx context.Context, repo, sha string, required []string) (map[string]github.CI, error) {
+	if g.checkErr != nil {
+		return nil, g.checkErr
+	}
+	return g.fakeGH.CheckStates(ctx, repo, sha, required)
+}
+
+// A failed read of the idle clock's inputs does not fail the notify verdict:
+// the pass audits the error, sends the BLOCKED notice and no stall notice,
+// and the next healthy pass sends the idle stall.
+func TestNotifyPRIdleClockErrorKeepsVerdict(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	var out bytes.Buffer
+	s.Out = &out
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	g.findings = 1
+	g.committedAt = map[string]time.Time{shaA: now.Add(-2 * time.Hour)}
+	gh := &stallClockGH{fakeGH: g, activityErr: errors.New("review activity unavailable")}
+	s.GH = gh
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || !strings.Contains(n.events[0].Text, "BLOCKED") || strings.Contains(n.events[0].Text, "STALLED") {
+		t.Fatalf("verdict events=%+v", n.events)
+	}
+	rows := auditRecords(t, out.Bytes(), "pr-stall-error")
+	if len(rows) != 1 || rows[0]["cause"] != "idle" || rows[0]["pr"] != float64(7) || !strings.Contains(rows[0]["error"].(string), "review activity unavailable") {
+		t.Fatalf("stall-error rows=%v out=%s", rows, out.String())
+	}
+
+	gh.activityErr = nil
+	gh.activity = []time.Time{now.Add(-2 * time.Hour)}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 2 || !strings.Contains(n.events[1].Text, "STALLED") || !strings.Contains(n.events[1].Text, "cause=idle") {
+		t.Fatalf("events=%+v", n.events)
+	}
+}
+
+// The same holds for the check-red clock: its CheckStates read fails, the
+// verdict still goes out, one row is audited, and the next healthy pass sends
+// the due stall notice.
+func TestNotifyPRCheckRedClockErrorKeepsVerdict(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	var out bytes.Buffer
+	s.Out = &out
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	g.checkNames = map[string]map[string]github.CI{shaA: {"CI": github.Red}}
+	seed := map[string]prActivityClock{prCheckRedCause + ":CI": {Since: now.Add(-time.Hour), Head: shaA}}
+	if err := fsutil.WriteJSON(filepath.Join(s.state(r.Name), "pr-7-stall-state.json"), seed); err != nil {
+		t.Fatal(err)
+	}
+	gh := &stallClockGH{fakeGH: g, checkErr: errors.New("check states unavailable")}
+	s.GH = gh
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 1 || !strings.Contains(n.events[0].Text, "BLOCKED") || strings.Contains(n.events[0].Text, "STALLED") {
+		t.Fatalf("verdict events=%+v", n.events)
+	}
+	rows := auditRecords(t, out.Bytes(), "pr-stall-error")
+	if len(rows) != 1 || rows[0]["cause"] != "check_red" || rows[0]["pr"] != float64(7) || !strings.Contains(rows[0]["error"].(string), "check states unavailable") {
+		t.Fatalf("stall-error rows=%v out=%s", rows, out.String())
+	}
+
+	gh.checkErr = nil
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 2 || !strings.Contains(n.events[1].Text, "STALLED") || !strings.Contains(n.events[1].Text, "cause=check_red:CI") {
+		t.Fatalf("events=%+v", n.events)
+	}
+}
+
+// A context cancellation inside a stall clock still fails the pass: shutdown
+// is not hidden behind the non-fatal clock errors.
+func TestNotifyPRStallClockCancellationPropagates(t *testing.T) {
+	s, g, _, r := notifySetup(t)
+	s.GH = &stallClockGH{fakeGH: g, activityErr: context.Canceled}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err == nil {
+		t.Fatal("a cancelled stall clock did not fail the pass")
 	}
 }
