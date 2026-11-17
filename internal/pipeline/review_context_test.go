@@ -185,6 +185,24 @@ func TestReviewContextQuotesLatestReplyIncludingRebuttal(t *testing.T) {
 	}
 }
 
+func TestReviewContextShowsAnsweredOutsideFindingAndItsAnswer(t *testing.T) {
+	f := outsideFinding{
+		Ref: "od-1234567890", Path: "internal/fleet/watch.go", Line: 54,
+		Severity: "high", Body: "Keep an old-binary watcher excluded across a node restart",
+		State: outsideAnswered, Answer: "Dismiss: od-1234567890 — the restart policy excludes old binaries",
+	}
+	rc := buildRoundContext("", github.ReviewFeedback{}, roundPlan{round: 2}, "review-bot", nil, []outsideFinding{f}...)
+	for _, want := range []string{
+		"OUTSIDE-DIFF FINDINGS", "internal/fleet/watch.go:54", "answered: Dismiss: od-1234567890",
+		"do not repeat it unless you give a new, concrete reason the answer is wrong",
+		"quote the answer you dispute",
+	} {
+		if !strings.Contains(rc.text, want) {
+			t.Fatalf("missing %q from context:\n%s", want, rc.text)
+		}
+	}
+}
+
 // slowFeedbackGH blocks the thread read until its context ends.
 type slowFeedbackGH struct{ *fakeGH }
 

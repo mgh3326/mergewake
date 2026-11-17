@@ -222,7 +222,8 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		summary += fmt.Sprintf(" | %d critical/high dismissed: check the evidence", n)
 	}
 	// A mixed verdict keeps the route its conflict gave it: the author's.
-	author := v.State == "blocked" && (conflicted || authorAction(summary))
+	designDispute := v.State == "blocked" && !conflicted && hasOutsideDispute(v.Outside)
+	author := v.State == "blocked" && !designDispute && (conflicted || authorAction(summary))
 	var notice func(room int) string
 	if v.State == "blocked" {
 		notice = func(room int) string { return holdingNotice(v, pr.Head.SHA, room) }
@@ -230,7 +231,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if identity == "" {
 		identity = summary
 	}
-	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author, notice)
+	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author, designDispute, notice)
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -270,7 +271,7 @@ var errNotifyDelivery = errors.New("notify delivery failed")
 // anything to do with it. It is recorded instead (see recordOnlyEvent), which
 // keeps the sent key and the READY clock.
 func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary string) (string, string, bool, error) {
-	return s.verdictEvent(ctx, r, pr, state, summary, summary, false, state == "blocked" && authorAction(summary), nil)
+	return s.verdictEvent(ctx, r, pr, state, summary, summary, false, state == "blocked" && authorAction(summary), false, nil)
 }
 
 // verdictEvent is laneEvent for a verdict whose gate result is known: a
@@ -281,7 +282,7 @@ func (s *Service) laneEvent(ctx context.Context, r config.Repo, pr github.Pull, 
 // the reason set with the conflict the text leaves out.
 // notice, when set, renders the BLOCKED notice into the text with the room the
 // rest of the text leaves under findingsLaneText.
-func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author bool, notice func(room int) string) (string, string, bool, error) {
+func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pull, state, summary, identity string, baseBehind, author, designDispute bool, notice func(room int) string) (string, string, bool, error) {
 	if state == "merged" {
 		return s.queueMerged(ctx, r, pr, summary)
 	}
@@ -290,6 +291,16 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	switch {
 	case state == "ready" || state == "merged":
 		// Recorded or sent below, once the sent key is known; each resolves its own lane.
+	case state == "blocked" && designDispute:
+		lane, via, e = s.mergedLane(ctx, r, pr)
+		if e != nil {
+			return "", "", false, e
+		}
+		if lane == "" {
+			lane, via = s.ownerLane(r), "outside-finding dispute"
+		} else {
+			via = "outside-finding dispute via " + via
+		}
 	case state == "blocked" && author:
 		route, err := s.findingsRoute(ctx, r, pr)
 		if err != nil {

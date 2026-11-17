@@ -36,6 +36,9 @@ const (
 // it cannot settle it.
 type outsideFinding struct {
 	Ref      string
+	Aliases  []string
+	Lines    []int
+	Titles   []string
 	Path     string
 	Line     int
 	Severity string
@@ -44,7 +47,55 @@ type outsideFinding struct {
 	Head     string
 	State    string
 	Via      string
+	Answer   string
 	FirstAt  time.Time
+}
+
+const outsideLineWindow = 3
+
+// sameOutsideFinding joins a re-listing to the earlier finding only when its
+// path and nearby line agree and its wording still describes the same issue.
+// The small line window tolerates shifted line numbers; the text check avoids
+// merging two distinct findings merely because they are nearby.
+func sameOutsideFinding(a outsideFinding, b github.OutsideFinding) bool {
+	distance := a.Line - b.Line
+	if distance < 0 {
+		distance = -distance
+	}
+	if a.Path != b.Path || a.Line <= 0 || b.Line <= 0 || distance > outsideLineWindow {
+		return false
+	}
+	return sameSubstance(a.Body, b.Body)
+}
+
+func markOutsideDisputes(records []outsideFinding) {
+	for i := range records {
+		if records[i].State != outsideOpen {
+			continue
+		}
+		for j := range records {
+			if records[j].State != outsideAnswered || records[i].Path != records[j].Path {
+				continue
+			}
+			distance := records[i].Line - records[j].Line
+			if distance < 0 {
+				distance = -distance
+			}
+			if distance <= outsideLineWindow && !sameSubstance(records[i].Body, records[j].Body) {
+				records[i].Via = "dispute"
+				break
+			}
+		}
+	}
+}
+
+func hasOutsideDispute(records []outsideFinding) bool {
+	for _, f := range records {
+		if f.State == outsideOpen && f.Via == "dispute" {
+			return true
+		}
+	}
+	return false
 }
 
 // foldOutside replays the posted passes oldest first and returns every
@@ -77,6 +128,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 	var out []outsideFinding
 	open := map[string]int{}
 	closed := map[string]bool{}
+	aliases := map[string]string{}
 	for _, h := range order {
 		passes := groups[h]
 		current := h == head || (inherited != "" && h == inherited)
@@ -90,20 +142,40 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 				continue
 			}
 			for _, ref := range strings.Fields(p.OutsideShown) {
+				if canonical, ok := aliases[ref]; ok {
+					ref = canonical
+				}
 				shown[ref] = true
 			}
 			for _, f := range p.Outside {
 				if !f.Blocking() {
 					continue
 				}
-				if p.SubmittedAt != nil {
-					if t, ok := reportedAt[f.Ref]; !ok || p.SubmittedAt.Before(t) {
-						reportedAt[f.Ref] = *p.SubmittedAt
+				ref := f.Ref
+				if canonical, ok := aliases[ref]; ok {
+					ref = canonical
+				} else {
+					for i := range out {
+						if sameOutsideFinding(out[i], f) {
+							ref = out[i].Ref
+							out[i].Lines = appendUniqueInt(out[i].Lines, f.Line)
+							out[i].Titles = appendUnique(out[i].Titles, f.Body)
+							if f.Ref != ref {
+								out[i].Aliases = appendUnique(out[i].Aliases, f.Ref)
+								aliases[f.Ref] = ref
+							}
+							break
+						}
 					}
 				}
-				if _, ok := reported[f.Ref]; !ok {
-					reported[f.Ref] = f
-					repOrder = append(repOrder, f.Ref)
+				if p.SubmittedAt != nil {
+					if t, ok := reportedAt[ref]; !ok || p.SubmittedAt.Before(t) {
+						reportedAt[ref] = *p.SubmittedAt
+					}
+				}
+				if _, ok := reported[ref]; !ok {
+					reported[ref] = f
+					repOrder = append(repOrder, ref)
 				}
 			}
 		}
@@ -135,7 +207,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 			}
 			f := reported[ref]
 			out = append(out, outsideFinding{
-				Ref: f.Ref, Path: f.Path, Line: f.Line, Severity: f.Severity,
+				Ref: ref, Path: f.Path, Line: f.Line, Severity: f.Severity,
 				Advisory: f.Advisory, Body: f.Body, Head: h, State: outsideOpen,
 				FirstAt: reportedAt[ref],
 			})
@@ -143,6 +215,24 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 		}
 	}
 	return out
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func appendUniqueInt(values []int, value int) []int {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 // outsideLegacy counts the outside-diff hold that receipts written before the
@@ -193,11 +283,32 @@ func outsideNames(comment string, f outsideFinding) bool {
 	if strings.Contains(comment, f.Ref) {
 		return true
 	}
-	if f.Path != "" && f.Line > 0 && outsidePathLine(comment, f.Path, f.Line) {
-		return true
+	for _, alias := range f.Aliases {
+		if strings.Contains(comment, alias) {
+			return true
+		}
+	}
+	if f.Path != "" {
+		if f.Line > 0 && outsidePathLine(comment, f.Path, f.Line) {
+			return true
+		}
+		for _, line := range f.Lines {
+			if line > 0 && outsidePathLine(comment, f.Path, line) {
+				return true
+			}
+		}
 	}
 	title := outsideTitle(f.Body)
-	return utf8.RuneCountInString(title) >= 12 && strings.Contains(comment, title)
+	if utf8.RuneCountInString(title) >= 12 && strings.Contains(comment, title) {
+		return true
+	}
+	for _, body := range f.Titles {
+		title = outsideTitle(body)
+		if utf8.RuneCountInString(title) >= 12 && strings.Contains(comment, title) {
+			return true
+		}
+	}
+	return false
 }
 
 // outsidePathLine reports whether comment carries "path:line" as a whole
@@ -226,13 +337,14 @@ func isNameByte(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b == '_'
 }
 
-// outsideAnswerable is the person check an answer needs: not a bot, and not
-// the review identity itself — the same trust bar as a round-hold release.
-func outsideAnswerable(c github.IssueComment, reviewLogin string) bool {
+// outsideAnswerable accepts human comments unless the body marks them as
+// generated by mergewake. The review login is allowed to answer; the content
+// marker, not the account identity, separates notices from human replies.
+func outsideAnswerable(c github.IssueComment) bool {
 	if c.User.Type == "Bot" || strings.HasSuffix(c.User.Login, "[bot]") {
 		return false
 	}
-	return reviewLogin == "" || c.User.Login != reviewLogin
+	return !strings.Contains(c.Body, "<!-- mergewake")
 }
 
 // outsideAnsweredBy reports whether a comment carries an accepted answer for
@@ -255,14 +367,14 @@ func outsideAnsweredBy(body string, f outsideFinding, verify func(sha, posted st
 
 // answerOutside marks every still-open finding a person's comment answers.
 // verify is the fix verifier for "Fixed in <sha>" claims; nil refuses them.
-func answerOutside(comments []github.IssueComment, records []outsideFinding, verify func(sha, posted string) bool, reviewLogin string) {
+func answerOutside(comments []github.IssueComment, records []outsideFinding, verify func(sha, posted string) bool) {
 	for i := range records {
 		if records[i].State != outsideOpen {
 			continue
 		}
 		f := &records[i]
 		for _, c := range comments {
-			if !outsideAnswerable(c, reviewLogin) || !outsideNames(c.Body, *f) {
+			if !outsideAnswerable(c) || !outsideNames(c.Body, *f) {
 				continue
 			}
 			// An answer written before the finding was first reported —
@@ -274,25 +386,29 @@ func answerOutside(comments []github.IssueComment, records []outsideFinding, ver
 			if outsideAnsweredBy(c.Body, *f, verify) {
 				f.State = outsideAnswered
 				f.Via = "comment"
+				f.Answer = excerpt(c.Body, excerptLimit)
 				break
 			}
 		}
 	}
 }
 
-// outsidePriorItems renders still-open outside-diff findings as prior
-// findings for the reviewer prompt, marked as outside the diff. They carry no
-// thread disposition: the gate's own answer tracking owns them.
-func outsidePriorItems(open []outsideFinding) []priorItem {
+// outsidePriorItems renders open and answered outside-diff findings as prior
+// findings for the reviewer prompt. Re-reviewed findings need no reminder.
+func outsidePriorItems(records []outsideFinding) []priorItem {
 	var out []priorItem
-	for _, f := range open {
-		if f.State != outsideOpen {
+	for _, f := range records {
+		if f.State != outsideOpen && f.State != outsideAnswered {
 			continue
+		}
+		disposition := "none yet (still open)"
+		if f.State == outsideAnswered {
+			disposition = "answered: " + f.Answer
 		}
 		out = append(out, priorItem{
 			path: f.Path, line: f.Line, severity: f.Severity,
 			ref:     f.Ref,
-			finding: excerpt(f.Body, excerptLimit), disposition: priorOpen,
+			finding: excerpt(f.Body, excerptLimit), disposition: disposition,
 		})
 	}
 	return out
@@ -316,10 +432,11 @@ func (s *Service) outsideGate(ctx context.Context, r config.Repo, pr github.Pull
 		if e != nil {
 			return nil, 0, e
 		}
-		answerOutside(comments, records, fixes.verified, s.Config.Review.Login)
+		answerOutside(comments, records, fixes.verified)
 		if fixes.err != nil {
 			return nil, 0, fixes.err
 		}
+		markOutsideDisputes(records)
 		// Receipts from before findings carried identity still answer the
 		// old way: a person's dismissal naming this head's SHA prefix.
 		if legacy > 0 && outsideDismissed(comments, pr.Head.SHA, s.Config.Review.Login) {
@@ -334,15 +451,22 @@ func (s *Service) outsideGate(ctx context.Context, r config.Repo, pr github.Pull
 // re-review, so nothing here is inherited and the current review is not
 // settled; answers apply with the real fix verifier, so an unverifiable
 // "Fixed in" claim leaves the finding visible.
-func (s *Service) openOutsideForPrompt(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, patch string) []outsideFinding {
+func (s *Service) outsideForPrompt(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, patch string) []outsideFinding {
 	records := foldOutside(history, pr.Head.SHA, patch, "", false)
 	comments, _ := s.issueComments(ctx, r.Name, pr.Number)
 	// Fix claims verify for real here too: an unverifiable "Fixed in" must
 	// not hide a finding from every later prompt, or its re-review exit
 	// becomes unreachable and the hold never lifts on its own.
-	answerOutside(comments, records, s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified, s.Config.Review.Login)
+	answerOutside(comments, records, s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified)
+	markOutsideDisputes(records)
+	return records
+}
+
+// openOutsideForPrompt keeps the gate's view limited to findings that can
+// still hold a merge; answered findings are included only in reviewer context.
+func (s *Service) openOutsideForPrompt(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, patch string) []outsideFinding {
 	var open []outsideFinding
-	for _, f := range records {
+	for _, f := range s.outsideForPrompt(ctx, r, pr, history, patch) {
 		if f.State == outsideOpen {
 			open = append(open, f)
 		}

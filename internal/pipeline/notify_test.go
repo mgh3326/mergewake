@@ -100,6 +100,18 @@ func TestNotifyEventIDUsesFullHead(t *testing.T) {
 	}
 }
 
+func TestOutsideDisputeBlockedEventRoutesToDesignLane(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	r.Lane = "design-lane"
+	lane, via, sent, err := s.verdictEvent(context.Background(), r, g.pull, "blocked", "finding_outside_diff:1", "finding_outside_diff:1", false, false, true, nil)
+	if err != nil || !sent {
+		t.Fatalf("sent=%t err=%v", sent, err)
+	}
+	if lane != "design-lane" || via != "outside-finding dispute via repo lane" || len(n.events) != 1 || n.events[0].Lane != "design-lane" {
+		t.Fatalf("lane=%q via=%q events=%+v", lane, via, n.events)
+	}
+}
+
 // Pending required checks emit nothing; a failing required check emits BLOCKED
 // naming the failed runs, once per head and state.
 func TestNotifyPendingSilentAndFailingNames(t *testing.T) {

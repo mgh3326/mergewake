@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -126,7 +127,7 @@ func TestOutsideHoldAnswerForms(t *testing.T) {
 		{"a disposition mid-sentence does not answer", holdComment("pr-author", "User", "reminder: Dismiss: "+f.Ref+" later"), true},
 		{"Disposition dismiss evidence answers", holdComment("pr-author", "User", "Disposition: dismiss "+f.Ref+" — generated file"), false},
 		{"a bot cannot answer", holdComment("ci[bot]", "Bot", "Dismiss: "+f.Ref), true},
-		{"the review identity cannot answer itself", holdComment("review-bot", "User", "Dismiss: "+f.Ref), true},
+		{"the review identity may answer with an ordinary comment", holdComment("review-bot", "User", "Dismiss: "+f.Ref), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			history := []github.ReviewedPass{outsidePass(shaC, "p-old", 1, 1, f)}
@@ -139,6 +140,85 @@ func TestOutsideHoldAnswerForms(t *testing.T) {
 				t.Fatalf("reasons=%q want the hold cleared", got)
 			}
 		})
+	}
+}
+
+func TestOutsideDismissalByReviewLoginRequiresNonMergewakeComment(t *testing.T) {
+	f := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	record := outsideFinding{Ref: f.Ref, Path: f.Path, Line: f.Line, Severity: f.Severity, Body: f.Body, State: outsideOpen}
+	for _, tt := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"human review-login dismissal", "Dismiss: " + f.Ref + " — the restart policy already excludes it", outsideAnswered},
+		{"mergewake notice", "<!-- mergewake-review-blocked:abc -->\nDismiss: " + f.Ref + " — the restart policy already excludes it", outsideOpen},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			records := []outsideFinding{record}
+			comments := holdComment("review-bot", "User", tt.body)
+			answerOutside(comments, records, nil)
+			if records[0].State != tt.want {
+				t.Fatalf("state=%q want %q", records[0].State, tt.want)
+			}
+		})
+	}
+}
+
+func TestOutsideRelistingsOnLaterHeadsJoinOneAnsweredRef(t *testing.T) {
+	first := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	passes := []github.ReviewedPass{outsidePass(shaC, "p1", 1, 1, first)}
+	variants := []string{
+		"Keep the old binary watcher excluded when the node restarts",
+		"Keep old-binary watchers excluded after a node restart",
+		"An old binary watcher must stay excluded across node restarts",
+	}
+	for round := 2; round <= 4; round++ {
+		var reports []github.OutsideFinding
+		for i := 0; i < 1<<(round-1); i++ {
+			reports = append(reports, holdFinding("internal/fleet/watch.go", 55, "high", variants[i%len(variants)]))
+		}
+		passes = append(passes, outsidePass(string(rune('a'+round)), "p"+strconv.Itoa(round), round, round, reports...))
+	}
+	records := foldOutside(passes, shaA, "", "", false)
+	if len(records) != 1 || records[0].Ref != first.Ref {
+		t.Fatalf("folded findings=%+v, want one stable ref %s", records, first.Ref)
+	}
+	comments := holdComment("review-bot", "User", "Dismiss: internal/fleet/watch.go:55 — validated restart policy")
+	answerOutside(comments, records, nil)
+	if records[0].State != outsideAnswered {
+		t.Fatalf("state=%q want answered", records[0].State)
+	}
+}
+
+func TestOutsideDisputeCreatesOneNewDesignLaneFinding(t *testing.T) {
+	answered := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	dispute := holdFinding("internal/fleet/watch.go", 55, "high", "An old-binary watcher can reappear after restart because filtering precedes node registration")
+	history := []github.ReviewedPass{
+		outsidePass(shaC, "p1", 1, 1, answered),
+		outsidePass(shaA, "p2", 2, 2, dispute),
+		outsidePass(shaB, "p3", 3, 3, dispute),
+		outsidePass(shaD, "p4", 4, 4, dispute),
+	}
+	records := foldOutside(history, shaD, "", "", false)
+	comments := holdComment("review-bot", "User", "Dismiss: "+answered.Ref+" — the restart policy excludes old binaries")
+	answerOutside(comments, records, nil)
+	markOutsideDisputes(records)
+	var open []outsideFinding
+	closed := false
+	for _, f := range records {
+		if f.Ref == answered.Ref && f.State == outsideAnswered {
+			closed = true
+		}
+		if f.State == outsideOpen {
+			open = append(open, f)
+		}
+	}
+	if !closed || len(open) != 1 || open[0].Ref != dispute.Ref || open[0].Via != "dispute" {
+		t.Fatalf("records=%+v", records)
+	}
+	if !hasOutsideDispute(records) {
+		t.Fatal("distinct nearby re-report was not marked for design review")
 	}
 }
 
@@ -269,8 +349,8 @@ func TestRoundTwoPromptCarriesOpenOutsideFinding(t *testing.T) {
 	}
 	ctx := run.prompt[:strings.Index(run.prompt, "## Delta to review")]
 	for _, want := range []string{
-		"OUTSIDE-DIFF FINDINGS STILL OPEN", "docs/x.md:3", "outside the diff",
-		"the stale claim about the config", "staying silent lifts its merge hold",
+		"OUTSIDE-DIFF FINDINGS", "docs/x.md:3", "outside the diff",
+		"the stale claim about the config", "silence lifts its merge hold",
 	} {
 		if !strings.Contains(ctx, want) {
 			t.Fatalf("missing %q in:\n%s", want, ctx)
