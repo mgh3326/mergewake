@@ -1301,34 +1301,26 @@ func deadSpawn(code int) bool {
 	return never && reason != "spawn-quota-exhausted" && reason != "spawn-quota-unknown"
 }
 
-// spawnStatusUnsaid reports the `panewire spawn status` exits that answer about
-// the read or the landing rather than about the request: its own configuration
-// (70) or duplicate state (75) is unreadable, and the landing timed out (124),
-// so a pane may exist. None of them says the request ended, so the caller keeps
-// the record it has — though deadSpawn calls each one terminal for a spawn,
-// where a start that failed this way left no pane at all.
-func spawnStatusUnsaid(code int) bool {
-	switch code {
-	case panewireConfigRefused, panewireDuplicateState, panewireQuotaTimeout:
-		return true
-	}
-	return false
+type spawnStatusJSON struct {
+	Request string `json:"request"`
+	State   string `json:"state"`
+	RC      int    `json:"rc"`
 }
 
-// statusEndsRequest reports the `panewire spawn status` exits that end the
-// reviewer request the read names: panewire answers with the hub's rc for a
-// request that failed, is retryable or was refused, and with 81 when the hub
-// recorded none, so the terminal refusals a spawn reports are the same set read
-// back from the record (panewire internal/fleet/spawn_request_state.go,
-// spawnStatusExit; its usage line names 81). Taking them from deadSpawn keeps
-// this read and the synchronous path one list: the pre-start refusals 77 and
-// 74, the preflight, mock-isolation, local-disabled, no-host, escalation and
-// auth-unavailable answers 78, 79, 80, 81, 87, 88 — never the parks 86 and 89,
-// whose requests wait for quota and may still land. 84 is its own answer here:
-// the request ended before it landed, cancelled or given up (panewire
-// docs/hub-spawn-operations.md, "Request states a client reads").
-func statusEndsRequest(code int) bool {
-	return code == panewireRequestEnded || (deadSpawn(code) && !spawnStatusUnsaid(code))
+func spawnStatusJSONEndsRequest(data []byte, request string) (spawnStatusJSON, bool) {
+	var status spawnStatusJSON
+	if len(strings.TrimSpace(string(data))) == 0 || json.Unmarshal(data, &status) != nil || status.Request != request {
+		return spawnStatusJSON{}, false
+	}
+	switch status.State {
+	case "given_up", "cancelled":
+		return status, true
+	case "failed", "refused", "retryable":
+		// Quota parks and landing timeouts may still produce a live pane.
+		return status, status.RC != panewireQuotaWait && status.RC != panewireQuotaUnknown && status.RC != panewireQuotaTimeout
+	default:
+		return status, false
+	}
 }
 
 // spawnRequestID reads the request id a spawn receipt names: panewire prints
@@ -1340,14 +1332,8 @@ var spawnRequestID = regexp.MustCompile(`\brequest=(\S+)`)
 // the operation `panewire spawn status` makes (panewire
 // internal/fleet/spawn_status_cli.go, hk 4855), never a submit: replaying the
 // request instead starts a new attempt that is refused again on every
-// evaluation (hk 5001). The read answers by panewire's own state mapping
-// (internal/fleet/spawn_request_state.go, spawnStatusExit): a landed request
-// exits 0, a parked one 91, one that may still run 85. Only the answers that
-// end the request are taken (statusEndsRequest): every terminal refusal a spawn
-// reports, the no-host answer 81 among them, and a request that ended before it
-// landed (84). A read that fails answers its own error (70 configuration, 75
-// unreadable state, 2 usage), and a landing timeout (124) may still hold a
-// pane; neither ends anything, so the caller keeps the record it has.
+// evaluation (hk 5001). The JSON distinguishes the request state and its rc
+// from status-read errors, whose exit codes can overlap the hub's rc.
 func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewerJob) (int, string, bool) {
 	m := spawnRequestID.FindStringSubmatch(rj.Spawned)
 	if m == nil {
@@ -1360,10 +1346,23 @@ func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewer
 	}
 	readCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := x.s.Runner.Run(readCtx, x.s.Config.Review.Panewire.Command, []string{"spawn", "status", id}, "", "")
-	code := exitStatus(err)
-	if !statusEndsRequest(code) {
+	args := []string{"spawn", "status", id, "--json"}
+	var output []byte
+	var err error
+	if runner, ok := x.s.Runner.(interface {
+		RunWithOutput(context.Context, string, []string, string, string) ([]byte, error)
+	}); ok {
+		output, err = runner.RunWithOutput(readCtx, x.s.Config.Review.Panewire.Command, args, "", "")
+	} else {
+		output, err = x.s.Runner.Run(readCtx, x.s.Config.Review.Panewire.Command, args, "", "")
+	}
+	status, ended := spawnStatusJSONEndsRequest(output, id)
+	if !ended {
 		return 0, "", false
+	}
+	code := status.RC
+	if code == 0 {
+		code = exitStatus(err)
 	}
 	return code, fmt.Sprintf("request %s ended with exit %d", id, code), true
 }

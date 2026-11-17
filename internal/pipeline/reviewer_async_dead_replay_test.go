@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,8 +29,10 @@ const (
 // counts the reads and the replays of one recorded label.
 type spawnStatusReads struct {
 	next    integrations.Runner
-	exits   map[string]int // request id → the exit `spawn status` answers
-	replay  string         // the recorded label whose replay it counts
+	exits   map[string]int    // request id → the exit `spawn status` answers
+	outputs map[string]string // request id → explicit `--json` output
+	empty   map[string]bool   // request ids whose status read produced no output
+	replay  string            // the recorded label whose replay it counts
 	reads   []string
 	replays int
 }
@@ -41,15 +44,34 @@ func (x *spawnStatusReads) Run(ctx context.Context, command string, args []strin
 			id = args[2]
 		}
 		x.reads = append(x.reads, id)
+		if !slices.Contains(args, "--json") {
+			return nil, errors.New("spawn status missing --json")
+		}
 		code, ok := x.exits[id]
 		if !ok {
 			// An older panewire has no status subcommand: a usage refusal.
 			return nil, panewireExit(panewireUsage)
 		}
-		if code == 0 {
-			return []byte("request=" + id + " state=succeeded\n"), nil
+		output, exists := x.outputs[id]
+		if exists {
+			return []byte(output), panewireExit(code)
 		}
-		return nil, panewireExit(code)
+		if x.empty[id] || code == panewireConfigRefused || code == panewireDuplicateState || code == panewireQuotaTimeout || code == panewireUsage {
+			return nil, panewireExit(code)
+		}
+		state, rc := "failed", code
+		switch code {
+		case 0:
+			state, rc = "landed", 0
+		case 85:
+			state, rc = "accepted", 0
+		case 91:
+			state, rc = "parked", 0
+		case 75:
+			state, rc = "deadline_exceeded", 0
+		}
+		body := fmt.Sprintf(`{"request":%q,"state":%q,"rc":%d}`, id, state, rc)
+		return []byte(body), panewireExit(code)
 	}
 	if command == "panewire" && len(args) > 0 && args[0] == "spawn" && x.replay != "" && arg(args, "-l") == x.replay {
 		x.replays++
@@ -232,6 +254,51 @@ func TestAsyncEndedRequestCodesAreDead(t *testing.T) {
 	}
 }
 
+func TestAsyncStatusJSONDecidesEndedRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		code   int
+		output string
+		empty  bool
+		ended  bool
+	}{
+		{name: "failed rc 70", code: 70, output: `{"request":"` + asyncRequestID + `","state":"failed","rc":70}`, ended: true},
+		{name: "failed parked rc 86", code: 86, output: `{"request":"` + asyncRequestID + `","state":"failed","rc":86}`},
+		{name: "retryable landing timeout rc 124", code: 124, output: `{"request":"` + asyncRequestID + `","state":"retryable","rc":124}`},
+		{name: "given up rc 84", code: 84, output: `{"request":"` + asyncRequestID + `","state":"given_up","rc":84}`, ended: true},
+		{name: "cancelled rc 84", code: 84, output: `{"request":"` + asyncRequestID + `","state":"cancelled","rc":84}`, ended: true},
+		{name: "landed", code: 0, output: `{"request":"` + asyncRequestID + `","state":"landed"}`},
+		{name: "unparsable", code: 70, output: "not json"},
+		{name: "empty", code: 70, empty: true},
+		{name: "failed rc 87", code: 87, output: `{"request":"` + asyncRequestID + `","state":"failed","rc":87}`, ended: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, rj := recordedRequest(t)
+			status := &spawnStatusReads{
+				next: f.runner, replay: rj.Label,
+				exits:   map[string]int{asyncRequestID: tc.code},
+				outputs: map[string]string{asyncRequestID: tc.output},
+				empty:   map[string]bool{asyncRequestID: tc.empty},
+			}
+			f.s.Runner = status
+			err := f.s.Review(f.ctx, f.r, 7, "", Options{})
+			if tc.ended {
+				if err == nil || status.replays != 0 {
+					t.Fatalf("review error=%v replays=%d, want ended request and no replay", err, status.replays)
+				}
+				reviewerJobGone(t, f.s, f.r, 1)
+			} else {
+				if err != nil || status.replays != 1 {
+					t.Fatalf("review error=%v replays=%d, want kept record replayed", err, status.replays)
+				}
+				if got := readReviewerJob(t, f.s, f.r, 1).Label; got != rj.Label {
+					t.Fatalf("record label=%s, want %s", got, rj.Label)
+				}
+			}
+		})
+	}
+}
+
 // (d) A request the hub parked waits for quota: the record stays and the spawn
 // is replayed, as today.
 func TestAsyncParkedRequestKeepsRecord(t *testing.T) {
@@ -269,6 +336,9 @@ func TestAsyncUnendedRequestKeepsRecord(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f, rj := recordedRequest(t)
 			status := &spawnStatusReads{next: f.runner, replay: rj.Label, exits: map[string]int{asyncRequestID: code}}
+			if name == "unreadable read" {
+				status.empty = map[string]bool{asyncRequestID: true}
+			}
 			f.s.Runner = status
 			if err := f.s.Review(f.ctx, f.r, 7, "", Options{}); err != nil {
 				t.Fatalf("review: %v", err)
