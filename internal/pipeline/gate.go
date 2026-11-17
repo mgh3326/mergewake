@@ -587,9 +587,9 @@ func newestUnansweredFinding(fb github.ReviewFeedback, head string) time.Time {
 
 var mergewakeFindingMarker = regexp.MustCompile(`<!-- mergewake-severity:([a-z]+) -->`)
 
-// authorJobLive uses the same task-bound job and unique live head-pane lookup
-// as the findings route. Explicit lanes and task lanes alone do not make an
-// author job live.
+// authorJobLive uses the task-bound job record when one exists; only a
+// missing record falls back to the unique live head-pane lookup. Explicit
+// lanes and task lanes alone do not make an author job live.
 func (s *Service) authorJobLive(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
@@ -599,8 +599,8 @@ func (s *Service) authorJobLive(ctx context.Context, r config.Repo, pr github.Pu
 	if err != nil {
 		return false, err
 	}
-	if ok && !terminalJob(rec.State) {
-		return true, nil
+	if ok {
+		return !terminalJob(rec.State), nil
 	}
 	_, _, livePane, err := s.authorPane(ctx, r, pr)
 	return livePane, err

@@ -8,6 +8,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 func TestLandAuthorFixWait(t *testing.T) {
@@ -17,6 +18,8 @@ func TestLandAuthorFixWait(t *testing.T) {
 		name       string
 		wait       string
 		live       bool
+		jobState   string
+		pane       bool
 		replyBy    string
 		resolved   bool
 		advance    time.Duration
@@ -30,6 +33,8 @@ func TestLandAuthorFixWait(t *testing.T) {
 		{name: "resolved finding clears wait", wait: "30m", live: true, resolved: true, wantMerges: 1},
 		{name: "no live author merges at once", wait: "30m", wantMerges: 1},
 		{name: "zero disables wait", wait: "0s", live: true, wantMerges: 1},
+		{name: "terminal bound job ignores lingering head pane", wait: "30m", jobState: "completed", pane: true, wantMerges: 1},
+		{name: "unbound live head pane waits", wait: "30m", pane: true, wantReason: "author_fixing"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, g, _, _, r := setup(t)
@@ -50,11 +55,22 @@ func TestLandAuthorFixWait(t *testing.T) {
 			}
 			g.feedback.Threads = []github.ReviewThread{thread}
 			g.findings = 1
-			if tc.live {
-				s.Sink = &jobSink{
-					jobs: map[string]string{"42": "author-job"},
-					recs: map[string]integrations.JobRecord{"author-job": {State: "running", Label: "author-job"}},
+			if tc.live || tc.jobState != "" || tc.pane {
+				sink := &jobSink{jobs: map[string]string{}, recs: map[string]integrations.JobRecord{}}
+				if tc.live || tc.jobState != "" {
+					state := tc.jobState
+					if state == "" {
+						state = "running"
+					}
+					sink.jobs["42"] = "author-job"
+					sink.recs["author-job"] = integrations.JobRecord{State: state, Label: "author-job"}
 				}
+				if tc.pane {
+					sink.recs["head-pane"] = integrations.JobRecord{State: "spawned", Label: "head-pane-lane"}
+					s.Runner = authorHost(aPane{"w1:p1", "head-pane", "/wt/a", "feature", projectOrigin})
+					s.Config.Hosts = []reap.Host{{Name: "local"}}
+				}
+				s.Sink = sink
 			}
 
 			err := s.Land(context.Background(), r, 7, Options{Observed: true})
