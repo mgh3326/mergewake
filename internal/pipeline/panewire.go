@@ -741,6 +741,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if reason := hubMissing(); reason != "" {
 			return skip("%s", reason)
 		}
+		// A request the hub already ended is not replayed: a replay submits it
+		// again, which starts a fresh attempt re-refused on every evaluation
+		// (hk 5001). The hub operation the receipt names says whether it ended.
+		if async && resumed && !placed {
+			if code, why, gone := x.reviewerRequestEnded(ctx, rj); gone {
+				return x.replaceDeadSpawn(ctx, plan, rj, code, why, leaseSHA)
+			}
+		}
 		// The pane wait leaves time to validate and post the findings: a minute,
 		// or a quarter of what is left when that is shorter.
 		deadline, _ := ctx.Deadline()
@@ -1189,6 +1197,10 @@ const (
 	panewireQuotaUnknown     = 89 // quota unknown after a bounded refresh
 	panewireBriefUnconfirmed = 76 // a pane may exist: the brief submission is unconfirmed
 	panewireLaneUnregistered = 82 // a pane is committed: its lane did not register
+	// panewireRequestEnded is what `panewire spawn status` answers for a request
+	// that ended before it landed: cancelled or given up (panewire
+	// docs/hub-spawn-operations.md, "Request states a client reads").
+	panewireRequestEnded = 84
 )
 
 // spawnNeverPlaced names the panewire exits that come before any pane exists:
@@ -1257,6 +1269,42 @@ func spawnEndsRequest(code int) bool {
 func deadSpawn(code int) bool {
 	reason, never := spawnNeverPlaced(code)
 	return never && reason != "spawn-quota-exhausted" && reason != "spawn-quota-unknown"
+}
+
+// spawnRequestID reads the request id a spawn receipt names: panewire prints
+// "ACCEPTED job=<job> request=<id>" once the hub holds the request.
+var spawnRequestID = regexp.MustCompile(`\brequest=(\S+)`)
+
+// reviewerRequestEnded reports whether the hub request a reviewer record's
+// spawn receipt names has ended, and the code it ended with. It is one read of
+// the operation `panewire spawn status` makes (panewire
+// internal/fleet/spawn_status_cli.go, hk 4855), never a submit: replaying the
+// request instead starts a new attempt that is refused again on every
+// evaluation (hk 5001). The read answers by panewire's own state mapping
+// (internal/fleet/spawn_request_state.go, spawnStatusExit): a landed request
+// exits 0, a parked one 91, one that may still run 85. Only the answers that
+// end the request are taken: a refusal that is not parked (spawnEndsRequest),
+// and a request that ended before it landed. A read that fails answers its own
+// error (70 configuration, 75 unreadable state, 2 usage), which ends nothing,
+// so the caller keeps the record it has.
+func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewerJob) (int, string, bool) {
+	m := spawnRequestID.FindStringSubmatch(rj.Spawned)
+	if m == nil {
+		return 0, "", false
+	}
+	id := m[1]
+	timeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, max(time.Until(deadline)/2, time.Second))
+	}
+	readCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	_, err := x.s.Runner.Run(readCtx, x.s.Config.Review.Panewire.Command, []string{"spawn", "status", id}, "", "")
+	code := exitStatus(err)
+	if !spawnEndsRequest(code) && code != panewireRequestEnded {
+		return 0, "", false
+	}
+	return code, fmt.Sprintf("request %s ended with exit %d", id, code), true
 }
 
 // replaceDeadSpawn answers a replayed request that deadSpawn ended, for which hk
