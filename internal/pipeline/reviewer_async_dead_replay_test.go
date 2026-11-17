@@ -198,14 +198,21 @@ func TestAsyncReplacementRefusedLaterIsNoLoop(t *testing.T) {
 }
 
 // (c) The other endings panewire reports for a request the hub will never run
-// are as dead as the escalation: a role/seat refusal, an active-job refusal and
-// a request that ended before it landed.
+// are as dead as the escalation: a role/seat refusal, an active-job refusal, a
+// request that ended before it landed, and the placement refusals that leave no
+// pane — no host admitted the seat, a remote preflight failed, mock isolation
+// refused, local spawning is disabled, and the account binding is unusable.
 func TestAsyncEndedRequestCodesAreDead(t *testing.T) {
 	for name, code := range map[string]int{
-		"role refused":   panewireRefused,
-		"active job":     panewireHeld,
-		"ended unlost":   panewireRequestEnded,
-		"quota escalate": panewireQuotaEscalate,
+		"role refused":     panewireRefused,
+		"active job":       panewireHeld,
+		"ended unlost":     panewireRequestEnded,
+		"quota escalate":   panewireQuotaEscalate,
+		"no host":          panewireNoHost,
+		"preflight":        panewirePreflight,
+		"mock isolation":   panewireMockIsolation,
+		"local disabled":   panewireLocalDisabled,
+		"auth unavailable": panewireAuthUnavailable,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f, rj := recordedRequest(t)
@@ -246,12 +253,13 @@ func TestAsyncParkedRequestKeepsRecord(t *testing.T) {
 }
 
 // (e) A request the hub did not end, and a read that cannot answer, keep the
-// record and replay it, as today: a landed request, a deadline the hub did not
-// resolve, a landing timeout, a state this client does not know, a read that
-// failed, and a panewire too old to read a status.
+// record and replay it, as today: a landed request, a parked one, an in-flight
+// or unknown one, a deadline the hub did not resolve, a landing timeout, a read
+// that failed, and a panewire too old to read a status.
 func TestAsyncUnendedRequestKeepsRecord(t *testing.T) {
 	for name, code := range map[string]int{
 		"landed":            0,
+		"parked":            91,
 		"unresolved":        panewireDuplicateState,
 		"landing timeout":   panewireQuotaTimeout,
 		"unknown state":     panewireWaitTimeout,
