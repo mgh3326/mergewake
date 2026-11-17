@@ -265,10 +265,14 @@ func (f PRFindings) AckWindow() time.Duration {
 // PRLoop extends the shared loop keys with the notify gate; other roles reject
 // the key as an unknown field.
 type PRLoop struct {
-	Loop        `yaml:",inline"`
-	Notify      PRNotify    `yaml:"notify"`
-	Findings    PRFindings  `yaml:"findings"`
-	ReviewRetry ReviewRetry `yaml:"review_retry"`
+	Loop     `yaml:",inline"`
+	Notify   PRNotify   `yaml:"notify"`
+	Findings PRFindings `yaml:"findings"`
+	// AuthorFixWait bounds how long a live author gets to respond to a
+	// current-head review finding before the merge gate proceeds. Empty means
+	// 30m; zero disables the wait.
+	AuthorFixWait string      `yaml:"author_fix_wait"`
+	ReviewRetry   ReviewRetry `yaml:"review_retry"`
 	// SkipBots leaves PRs opened by bot accounts (GitHub user type "Bot", e.g.
 	// Renovate) out of review, notify, landing and the stall alarm: they carry
 	// no author family, so a review can never start and the alarm only nags.
@@ -277,6 +281,22 @@ type PRLoop struct {
 	// once. Zero or unset means no bound; 1 reviews one PR at a time. Negative
 	// is refused.
 	ReviewParallel int `yaml:"review_parallel"`
+}
+
+const DefaultAuthorFixWait = 30 * time.Minute
+
+func (p PRLoop) AuthorFixWindow() time.Duration {
+	if p.AuthorFixWait == "" {
+		return DefaultAuthorFixWait
+	}
+	if p.AuthorFixWait == "0" || p.AuthorFixWait == "0s" {
+		return 0
+	}
+	d, err := Duration(p.AuthorFixWait)
+	if err != nil {
+		return DefaultAuthorFixWait
+	}
+	return d
 }
 
 // Parallel is the number of PR reviews a pass may run at once; zero means
@@ -660,6 +680,13 @@ func validateDaemon(c *Config) error {
 	if v := c.Daemon.PR.Notify.ConflictOwnerAfter; v != "" {
 		if _, e = Duration(v); e != nil {
 			return fmt.Errorf("daemon.pr.notify.conflict_owner_after: %w", e)
+		}
+	}
+	if v := c.Daemon.PR.AuthorFixWait; v != "" {
+		if v != "0" && v != "0s" {
+			if _, e = Duration(v); e != nil {
+				return fmt.Errorf("daemon.pr.author_fix_wait: %w", e)
+			}
 		}
 	}
 	if v := c.Daemon.PR.Findings.AckAfter; v != "" {

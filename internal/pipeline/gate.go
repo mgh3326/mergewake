@@ -25,7 +25,7 @@ import (
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, check_absent:<name> (a required check
 // with no run or status on the head, once the head has had time to start it), threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
-// path or line is not in the diff), review_missing and conflict. The two graded reasons replace threads_open when the policy has a
+// path or line is not in the diff), author_fixing, review_missing and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
 type gateVerdict struct {
 	State      string
@@ -530,13 +530,84 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")
 	}
+	if wait, e := s.authorFixWait(ctx, r, pr, fb); e != nil {
+		return v, e
+	} else if wait {
+		v.Reasons = append(v.Reasons, "author_fixing")
+	}
 	switch {
 	case len(v.Reasons) > 0:
 		v.State = "blocked"
+		if len(v.Reasons) == 1 && v.Reasons[0] == "author_fixing" {
+			v.State = "pending"
+		}
 	case pr.Mergeable == nil || pr.MergeableState == "unknown":
 		v.State = "pending"
 	}
 	return v, nil
+}
+
+// authorFixWait keeps a head pending while a live author job has an unanswered
+// finding posted on this head. The newest unanswered finding starts the bound;
+// an author reply or a new head removes that finding from the calculation.
+func (s *Service) authorFixWait(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (bool, error) {
+	window := s.Config.Daemon.PR.AuthorFixWindow()
+	if window <= 0 {
+		return false, nil
+	}
+	posted := newestUnansweredFinding(fb, pr.Head.SHA, pr.User.Login)
+	if posted.IsZero() || s.now().Sub(posted) >= window {
+		return false, nil
+	}
+	live, err := s.authorJobLive(WithAuthorScan(ctx), r, pr)
+	return live, err
+}
+
+// newestUnansweredFinding finds the latest finding whose first comment is on
+// head and which has no reply from the PR author. A missing timestamp cannot
+// start a bounded wait, so it is ignored.
+func newestUnansweredFinding(fb github.ReviewFeedback, head, author string) time.Time {
+	author = policy.NormalizeAuthor(author)
+	var newest time.Time
+	for _, thread := range fb.Threads {
+		if len(thread.Comments) == 0 {
+			continue
+		}
+		first := thread.Comments[0]
+		if postedOn(first) != head || policy.NormalizeAuthor(first.Author) == author || first.CreatedAt.IsZero() {
+			continue
+		}
+		replied := false
+		for _, comment := range thread.Comments[1:] {
+			if policy.NormalizeAuthor(comment.Author) == author {
+				replied = true
+				break
+			}
+		}
+		if !replied && first.CreatedAt.After(newest) {
+			newest = first.CreatedAt
+		}
+	}
+	return newest
+}
+
+// authorJobLive uses the same task-bound job and unique live head-pane lookup
+// as the findings route. Explicit lanes and task lanes alone do not make an
+// author job live.
+func (s *Service) authorJobLive(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
+	task, err := s.prTask(ctx, r, pr)
+	if err != nil {
+		return false, err
+	}
+	_, rec, ok, err := s.boundJob(ctx, task)
+	if err != nil {
+		return false, err
+	}
+	if ok && !terminalJob(rec.State) {
+		return true, nil
+	}
+	_, _, livePane, err := s.authorPane(ctx, r, pr)
+	return livePane, err
 }
 
 // outsideBlocking counts the critical and high findings the review passes of
