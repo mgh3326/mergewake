@@ -9,7 +9,7 @@ import (
 
 // Config validation refuses !x, /x, a/../b and more than 64 patterns.
 func TestSparseCheckoutConfigValidation(t *testing.T) {
-	for _, p := range []string{"!x", "/x", "a/../b", "a\x00b", "a\nb", ""} {
+	for _, p := range []string{"!x", "/x", "-x", "--routing-role", "a/../b", "a\x00b", "a\nb", ""} {
 		if e := ValidateCheckoutExcludePattern(p); e == nil {
 			t.Fatalf("pattern %q accepted", p)
 		}

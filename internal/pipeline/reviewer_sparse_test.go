@@ -130,7 +130,7 @@ func TestSparseCheckoutTooManyPathsSkipsAndAudits(t *testing.T) {
 
 // Config validation refuses !x, /x, a/../b and more than 64 patterns.
 func TestSparseCheckoutConfigValidation(t *testing.T) {
-	for _, p := range []string{"!x", "/x", "a/../b", "a\x00b", "a\nb", ""} {
+	for _, p := range []string{"!x", "/x", "-x", "--routing-role", "a/../b", "a\x00b", "a\nb", ""} {
 		if e := config.ValidateCheckoutExcludePattern(p); e == nil {
 			t.Fatalf("pattern %q accepted", p)
 		}
@@ -216,5 +216,130 @@ func TestSparseCheckoutModeRecorded(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("reviewer-spawn rows lack checkout_mode=sparse: %v", rows)
+	}
+}
+
+// A PR path that would read as a flag takes the full checkout instead of a
+// corruptible sparse spawn, with an audit row naming the reason.
+func TestSparseCheckoutFlagLikePathSkipsAndAudits(t *testing.T) {
+	freshReviewerSpecs(t)
+	freshReviewerSparses(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	r.Review.CheckoutExclude = []string{"Assets"}
+	g.diffs = map[string]string{shaA: "diff --git a/keep.txt b/keep.txt\n--- a/keep.txt\n+++ b/keep.txt\n@@ -1 +1 @@\n-old\n+new\n" +
+		"diff --git a/--role b/--role\n--- a/--role\n+++ b/--role\n@@ -1 +1 @@\n-old\n+new\n"}
+	reviewOrigin(runner, r.Root, "git@github.com:example/project.git")
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns: %v", runner.spawns)
+	}
+	sp := runner.spawns[0]
+	if slices.Contains(sp, "--checkout-exclude") || slices.Contains(sp, "--checkout-include") {
+		t.Fatalf("flag-like path must take the full checkout: %v", sp)
+	}
+	rows := auditRows(t, s, r, "reviewer-checkout-sparse-skipped")
+	if len(rows) != 1 || rows[0]["reason"] != "flag-like-path" {
+		t.Fatalf("sparse-skipped rows: %v", rows)
+	}
+}
+
+// A hub that refuses both the sparse and the spec flags still reaches the
+// local checkout: the sparse retry runs through place, not past it.
+func TestSparseCheckoutDoubleRefusalFallsBackToLocal(t *testing.T) {
+	freshReviewerSpecs(t)
+	freshReviewerSparses(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", sparseRefused: true, specRefused: true}
+	s, g, r := panewireSetup(t, runner)
+	r.Review.CheckoutExclude = []string{"Assets"}
+	g.diffs = map[string]string{shaA: sparseDiff()}
+	reviewOrigin(runner, r.Root, "git@github.com:example/project.git")
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(runner.spawns) != 3 {
+		t.Fatalf("spawns: %v", runner.spawns)
+	}
+	if !slices.Contains(runner.spawns[0], "--checkout-exclude") {
+		t.Fatalf("first spawn must name sparse flags: %v", runner.spawns[0])
+	}
+	retry := runner.spawns[1]
+	if !slices.Contains(retry, "--checkout-origin") || slices.Contains(retry, "--checkout-exclude") {
+		t.Fatalf("second spawn must be the full spec: %v", retry)
+	}
+	local := runner.spawns[2]
+	if slices.Contains(local, "--checkout-origin") || arg(local, "-c") == "" {
+		t.Fatalf("third spawn must be the local checkout: %v", local)
+	}
+	if len(auditRows(t, s, r, "reviewer-checkout-sparse-refused")) != 1 {
+		t.Fatalf("sparse-refused rows: %v", auditRows(t, s, r, "reviewer-checkout-sparse-refused"))
+	}
+	if len(auditRows(t, s, r, "reviewer-checkout-spec-refused")) != 1 {
+		t.Fatalf("spec-refused rows: %v", auditRows(t, s, r, "reviewer-checkout-spec-refused"))
+	}
+	if !reviewerSpecs.legacy() {
+		t.Fatal("the spec refusal was not remembered")
+	}
+}
+
+// panewireSpawnArgs canonicalizes the real family flag while leaving
+// checkout values that spell flags untouched, including across the
+// --routing-role deletion.
+func TestPanewireSpawnArgsSkipsCheckoutValues(t *testing.T) {
+	args := []string{"spawn", "--checkout-include", "--builder-family", "--checkout-include", "--author-family",
+		"--author-family", "claude", "--role", "reviewer"}
+	got := panewireSpawnArgs(args)
+	if i := indexFlag(got, "--builder-family"); i >= 0 {
+		t.Fatalf("--builder-family value leaked into a flag lookup: %v", got)
+	}
+	i := indexFlag(got, "--author-family")
+	if i < 0 || got[i+1] != "anthropic" {
+		t.Fatalf("real family flag not canonicalized: %v", got)
+	}
+	keep := 0
+	for j := 0; j+1 < len(got); j++ {
+		if got[j] == "--checkout-include" && (got[j+1] == "--builder-family" || got[j+1] == "--author-family") {
+			keep++
+		}
+	}
+	if keep != 2 {
+		t.Fatalf("checkout pairs not preserved: %v", got)
+	}
+	routed := []string{"spawn", "--checkout-exclude", "--routing-role", "--routing-role", "seat", "--role", "reviewer"}
+	// No family flag present, so the default --author-family other is appended.
+	if want, got := []string{"spawn", "--checkout-exclude", "--routing-role", "--role", "reviewer", "--author-family", "other"}, panewireSpawnArgs(routed); !slices.Equal(got, want) {
+		t.Fatalf("routing-role rewrite: got %v want %v", got, want)
+	}
+}
+
+// A later mode enriches a label recorded without one, and never overwrites
+// an already recorded mode or counts the spawn twice.
+func TestSparseCheckoutModeEnrichment(t *testing.T) {
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull}
+	plan := &passPlan{pass: 1}
+	label := "mwr-7-" + short7(shaA) + "-p1-1700000000"
+	x.auditReviewerSpawn(plan, label, "node-a", "")
+	x.auditReviewerSpawn(plan, label, "node-a", "sparse")
+	rows := auditRows(t, s, r, "reviewer-spawn")
+	if len(rows) != 2 {
+		t.Fatalf("enrichment rows: %v", rows)
+	}
+	modes := map[string]bool{}
+	for _, row := range rows {
+		if m, ok := row["checkout_mode"].(string); ok {
+			modes[m] = true
+		}
+	}
+	if len(modes) != 1 || !modes["sparse"] {
+		t.Fatalf("mode rows: %v", rows)
+	}
+	x.auditReviewerSpawn(plan, label, "node-a", "sparse")
+	x.auditReviewerSpawn(plan, label, "node-a", "full")
+	if rows := auditRows(t, s, r, "reviewer-spawn"); len(rows) != 2 {
+		t.Fatalf("repeat/mismatch rows: %v", rows)
 	}
 }

@@ -97,6 +97,14 @@ func reviewerRoleArgs(pass int) (args []string, ok bool) {
 func workerSeatArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
+		if isCheckoutFlag(args[i]) {
+			out = append(out, args[i])
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+			continue
+		}
 		if args[i] == "--role" || args[i] == "--review-pass" {
 			i++
 			continue
@@ -110,14 +118,14 @@ func workerSeatArgs(args []string) []string {
 // arguments replayed from reviewer-job records written by older versions.
 func panewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
-	if i := slices.Index(out, "--builder-family"); i >= 0 {
+	if i := indexFlag(out, "--builder-family"); i >= 0 {
 		out[i] = "--author-family"
 		if i+1 < len(out) {
 			out[i+1] = panewireBuilderFamily(out[i+1])
 		} else {
 			out = append(out, "other")
 		}
-	} else if i := slices.Index(out, "--author-family"); i >= 0 {
+	} else if i := indexFlag(out, "--author-family"); i >= 0 {
 		if i+1 < len(out) {
 			out[i+1] = panewireBuilderFamily(out[i+1])
 		} else {
@@ -127,6 +135,13 @@ func panewireSpawnArgs(args []string) []string {
 		out = append(out, "--author-family", "other")
 	}
 	for i := 0; i < len(out); i++ {
+		if isCheckoutFlag(out[i]) {
+			i++ // its value is data, even when it spells a flag
+			continue
+		}
+		if i > 0 && isCheckoutFlag(out[i-1]) {
+			continue // a checkout value a prior delete rewound onto
+		}
 		if out[i] == "--role" && i+1 < len(out) {
 			switch out[i+1] {
 			case "worker", "tester":
@@ -197,6 +212,10 @@ var panewireSpawnCompat panewireSpawnCompatibility
 func oldPanewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
 	for i := 0; i < len(out); i++ {
+		if isCheckoutFlag(out[i]) {
+			i++ // its value is data, even when it spells a flag
+			continue
+		}
 		switch out[i] {
 		case "--author-family":
 			out[i] = "--builder-family"
@@ -574,6 +593,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					switch {
 					case len(includes) > maxSparseIncludes:
 						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "too-many-paths", "changed": len(includes), "limit": maxSparseIncludes}, false)
+					case !sparseValuesSafe(excludes, includes):
+						// A value that reads as a flag would corrupt the
+						// spawn-argv rewriters below; the full checkout
+						// keeps the review lossless instead (hk 5099).
+						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "flag-like-path", "changed": len(includes)}, false)
 					default:
 						spec.exclude = slices.Clone(excludes)
 						spec.include = includes
@@ -883,7 +907,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// re-records the argv in the -c form and asks again. A refusal that names
 		// the hub's or the CLI's missing flag is remembered for reviewerSpecTTL;
 		// any other spec refusal is not, so a corrected spec is tried again.
-		place := func(c context.Context, a []string) ([]byte, error) {
+		// A sparse refusal retries the full spec through place itself, so a
+		// full-spec refusal still reaches the local checkout below.
+		var place func(c context.Context, a []string) ([]byte, error)
+		place = func(c context.Context, a []string) ([]byte, error) {
 			b, refusal := launch(c, a)
 			if refusal != nil && checkoutSparseRefused(refusal) {
 				if full, ok := sparseFallbackArgs(a); ok {
@@ -897,7 +924,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 						return b, saveErr
 					}
 					note = "the hub carries no sparse checkout; the reviewer was placed from a full checkout"
-					return launch(c, full)
+					return place(c, full)
 				}
 			}
 			if refusal == nil || !checkoutSpecRefused(refusal) {

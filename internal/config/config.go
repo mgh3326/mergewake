@@ -1021,8 +1021,10 @@ const (
 )
 
 // ValidateCheckoutExcludePattern reports whether a sparse-checkout exclude
-// pattern follows the node's rules: relative to the repo root, sent without
-// a leading "!" or "/", holding no "..", NUL or newline. Include paths are
+// pattern follows the node's rules plus one mergewake-side rule: relative to
+// the repo root, sent without a leading "!" or "/", holding no "..", NUL or
+// newline, and not starting with "-" (it would read as a spawn flag).
+// Include paths are
 // literal file paths and need no validation beyond the count bound.
 func ValidateCheckoutExcludePattern(p string) error {
 	if p == "" {
@@ -1033,6 +1035,9 @@ func ValidateCheckoutExcludePattern(p string) error {
 	}
 	if strings.HasPrefix(p, "!") || strings.HasPrefix(p, "/") {
 		return fmt.Errorf("checkout_exclude pattern %q must not start with ! or /", p)
+	}
+	if strings.HasPrefix(p, "-") {
+		return fmt.Errorf("checkout_exclude pattern %q must not start with -: it would read as a spawn flag", p)
 	}
 	if strings.Contains(p, "..") {
 		return fmt.Errorf("checkout_exclude pattern %q must not hold ..", p)

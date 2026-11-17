@@ -180,13 +180,13 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
 	case "panewire":
 		r.spawns = append(r.spawns, args)
-		if r.specRefused && slices.Contains(args, "--checkout-origin") {
-			// panewire's pre-submit feature check: no request, job or pane.
-			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-origin; upgrade the hub before submitting"}
-		}
 		if r.sparseRefused && slices.Contains(args, "--checkout-exclude") {
 			// panewire's pre-submit sparse feature check: no request, job or pane.
 			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-exclude; upgrade the hub before submitting"}
+		}
+		if r.specRefused && slices.Contains(args, "--checkout-origin") {
+			// panewire's pre-submit feature check: no request, job or pane.
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-origin; upgrade the hub before submitting"}
 		}
 		brief, job, e := r.spawnBrief(args)
 		if e != nil {

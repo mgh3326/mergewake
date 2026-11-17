@@ -371,6 +371,71 @@ func checkoutModeOf(stdout string) string {
 	return ""
 }
 
+// isCheckoutFlag reports whether s names a checkout flag whose value is a
+// pattern or path, never an option. Argv rewriters skip the token after one
+// of these (hk 5099): a PR-controlled path may otherwise read as a flag to a
+// scanner that does not know the flag's arity.
+func isCheckoutFlag(s string) bool {
+	switch s {
+	case "--checkout-origin", "--checkout-commit", "--checkout-ref",
+		"--checkout-exclude", "--checkout-include":
+		return true
+	}
+	return false
+}
+
+// indexFlag finds the first name token that is not the value of a checkout
+// flag, or -1. A checkout value that spells a flag is data, not an option.
+func indexFlag(args []string, name string) int {
+	skip := false
+	for i, a := range args {
+		if skip {
+			skip = false
+			continue
+		}
+		if isCheckoutFlag(a) {
+			skip = true
+			continue
+		}
+		if a == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// sparsePathSafe reports whether p may travel as a bare checkout argv value:
+// nothing starting with "-" (it would read as a flag to an argv scanner)
+// and no control characters. Anything else is data the list form carries
+// safely, whatever it spells.
+func sparsePathSafe(p string) bool {
+	if p == "" || strings.HasPrefix(p, "-") {
+		return false
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// sparseValuesSafe reports whether every exclude pattern and include path
+// may travel as a bare argv value (see sparsePathSafe).
+func sparseValuesSafe(excludes, includes []string) bool {
+	for _, p := range excludes {
+		if !sparsePathSafe(p) {
+			return false
+		}
+	}
+	for _, p := range includes {
+		if !sparsePathSafe(p) {
+			return false
+		}
+	}
+	return true
+}
+
 // checkoutModeRec prefers the job record's checkout_mode when present, else
 // the spawn answer. "" means neither names one, as an older panewire does.
 func checkoutModeRec(rec integrations.JobRecord, stdout string) string {
