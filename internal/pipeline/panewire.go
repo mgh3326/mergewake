@@ -747,7 +747,14 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// A reviewer the hub knows runs on its own: its finish, or its timer,
 		// brings the PR back. Only a record with no job behind it replays the
 		// spawn, in case the daemon stopped before it ran.
-		if async && resumed && placed {
+		//
+		// A placed record whose hk job names no pane has not landed: the hub can
+		// still refuse its request after accepting it (hk 5005), and then nothing
+		// brings the PR back. Its status is read like an unplaced record's. A
+		// landed record never reads the hub, and an unreadable hk record stays
+		// pending as before.
+		unlanded := placed && recErr == nil && !terminalJob(rec.State) && (rec.Host == "" || rec.PaneID == "")
+		if async && resumed && placed && !unlanded {
 			return out, x.pending(revisit, rj, "still running")
 		}
 		if reason := hubMissing(); reason != "" {
@@ -758,12 +765,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		// (hk 5001). The hub operation the receipt names says whether it ended,
 		// and an ended one fails the pass here rather than spawning a
 		// replacement that no one counts.
-		if async && resumed && !placed {
+		if async && resumed && (!placed || unlanded) {
 			if code, why, ended := x.reviewerRequestEnded(ctx, rj); ended {
 				if e := x.failEndedRequest(ctx, plan, rj, code, why, leaseSHA); e != nil {
 					return out, e
 				}
 				return skip("reviewer job %s: %s; its replacement spawns on the next run", rj.Label, why)
+			}
+			if placed {
+				return out, x.pending(revisit, rj, "still running")
 			}
 		}
 		// The pane wait leaves time to validate and post the findings: a minute,
