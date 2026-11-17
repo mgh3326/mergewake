@@ -572,21 +572,37 @@ func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) 
 // noticeBalance sends one reviewer-balance notice for the host's day to
 // reap.balance_lane, or the desk lane when unset. The sent key covers the day
 // and host, so repeats stay quiet; a refused delivery is not recorded, so the
-// next pass retries.
+// next pass retries. A key without its audit row repairs the row instead of
+// redelivering, and an audit row without its key restores the key, so every
+// partial failure recovers on retry.
 func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, host string, created, removed, open, window int) error {
 	sent, err := loadSentKeys(s.reviewerBalanceSentFile(), 1024)
 	if err != nil {
 		return err
-	}
-	key := fmt.Sprintf("balance %s %s", day, host)
-	if sent.has(key) {
-		return nil
 	}
 	lane := s.Config.Reap.BalanceLane
 	if lane == "" {
 		lane = s.deskLane()
 	}
 	via := "reviewer balance"
+	key := fmt.Sprintf("balance %s %s", day, host)
+	keyed := sent.has(key)
+	noticed, err := s.balanceNoticeWritten(target.Name, day, host)
+	if err != nil {
+		return err
+	}
+	switch {
+	case keyed && noticed:
+		return nil
+	case keyed && !noticed:
+		// A previous pass delivered the notice but did not record it:
+		// repair the audit row instead of redelivering.
+		return s.auditNoticeBalance(target, day, host, created, removed, open, window, lane, via)
+	case !keyed && noticed:
+		// The audit row proves delivery; the sent key was lost with its
+		// file. Restore the key instead of redelivering.
+		return sent.add(key)
+	}
 	text := fmt.Sprintf("[mergewake] reviewer-checkout balance %s host=%s | created %d, removed %d, open %d over %dd | lane=%s via %s",
 		day, host, created, removed, open, window, lane, via)
 	reportCtx, cancel := reportContext(ctx)
@@ -602,12 +618,53 @@ func (s *Service) noticeBalance(ctx context.Context, target config.Repo, day, ho
 	if err := sent.add(key); err != nil {
 		return err
 	}
+	return s.auditNoticeBalance(target, day, host, created, removed, open, window, lane, via)
+}
+
+// auditNoticeBalance writes one reviewer-balance-notice audit row recording
+// a delivered stall notice.
+func (s *Service) auditNoticeBalance(target config.Repo, day, host string, created, removed, open, window int, lane, via string) error {
 	return s.audit(target.Name, balanceNoticeCommand, map[string]any{
 		"day": day, "host": host,
 		"created": created, "removed": removed,
 		"open_balance": open, "window_days": window,
 		"lane": lane, "via": via, "sent": true,
 	}, false)
+}
+
+// balanceNoticeWritten reports whether the target repo already holds a
+// reviewer-balance-notice audit row for the host's day.
+func (s *Service) balanceNoticeWritten(repo, day, host string) (bool, error) {
+	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	rd := bufio.NewReader(f)
+	for {
+		line, err := rd.ReadBytes('\n')
+		if len(line) > 0 {
+			var row struct {
+				Command string `json:"command"`
+				Value   struct {
+					Day  string `json:"day"`
+					Host string `json:"host"`
+				} `json:"value"`
+			}
+			if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
+				return true, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return false, nil
+			}
+			return false, err
+		}
+	}
 }
 
 // auditReviewerSpawn writes one reviewer-spawn audit row naming the host a

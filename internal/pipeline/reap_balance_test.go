@@ -353,3 +353,64 @@ func TestReapBalanceDayRetryNoDuplicates(t *testing.T) {
 		t.Fatalf("events=%+v", f.n.events)
 	}
 }
+
+// A delivered notice whose audit row was lost is repaired, not redelivered:
+// deleting the reviewer-balance-notice row and rerunning the day rewrites
+// only that row, with no new lane event and no duplicate daily rows.
+func TestReapBalanceNoticeAuditRepaired(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+	day := "2026-11-17"
+	seedStalled(t, f, day)
+	ctx := context.Background()
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	notices := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var row struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row.Command == "reviewer-balance-notice" {
+			notices++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if notices != 1 {
+		t.Fatalf("notices=%d", notices)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(after), `"reviewer-balance-notice"`); got != 1 {
+		t.Fatalf("notice rows=%d", got)
+	}
+	if len(f.n.events) != 1 {
+		t.Fatalf("redelivered: %+v", f.n.events)
+	}
+	for _, row := range balanceRows(t, f, f.repos[0].Name) {
+		if row["host"] == "node-a" && (row["created"] != float64(25) || row["removed"] != float64(2)) {
+			t.Fatalf("daily row changed: %v", row)
+		}
+	}
+}
