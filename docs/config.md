@@ -1851,6 +1851,12 @@ Only enabled roles wake, and only for repositories in `repos`.
 `daemon.pr.notify` defaults to enabled and accepts `enabled` and
 `conflict_owner_after` (`30m` by default). `renotify_after` and `renotify_max`
 were removed with the READY reminder; a config that sets either fails at load.
+`daemon.pr.author_fix_wait` defaults to `30m`; set it to `0` to disable the
+bounded merge wait. When the PR's author job is live and a current-head review
+finding has no reply from the PR author, the gate reports `author_fixing` until
+the author replies, the head changes, the author job ends, or the newest such
+finding reaches this age. After the bound, findings keep their existing
+severity behavior.
 While the `pr` role runs, each poll runs the merge gate for every open,
 non-draft PR at its current head and sends one lane event for a BLOCKED verdict
 and records a READY one — the notify path observes rather than merges, so it

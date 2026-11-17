@@ -663,6 +663,35 @@ func TestFindingsAckConfig(t *testing.T) {
 	}
 }
 
+func TestAuthorFixWaitConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", DefaultAuthorFixWait, false},
+		{"45m", 45 * time.Minute, false},
+		{"0", 0, false},
+		{"never", 0, true},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "version: 1\nhost: host-a\n"
+		if tc.value != "" {
+			body += "daemon:\n  pr:\n    author_fix_wait: " + tc.value + "\n"
+		}
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if (err != nil) != tc.invalid {
+			t.Fatalf("value %q: %v", tc.value, err)
+		}
+		if err == nil && c.Daemon.PR.AuthorFixWindow() != tc.want {
+			t.Fatalf("value %q: got %v, want %v", tc.value, c.Daemon.PR.AuthorFixWindow(), tc.want)
+		}
+	}
+}
+
 func TestFindingsEscalationConfig(t *testing.T) {
 	for _, tc := range []struct {
 		settings string
