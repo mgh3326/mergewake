@@ -421,7 +421,9 @@ func buildRoundContext(body string, fb github.ReviewFeedback, rp roundPlan, own 
 			}
 			b.WriteString(entry)
 			shown++
-			rc.outside = append(rc.outside, it.ref)
+			if it.ref != "" {
+				rc.outside = append(rc.outside, it.ref)
+			}
 		}
 		if shown < len(outsideItems) {
 			rc.truncated = true

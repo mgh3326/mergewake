@@ -201,6 +201,9 @@ func TestReviewContextShowsAnsweredOutsideFindingAndItsAnswer(t *testing.T) {
 			t.Fatalf("missing %q from context:\n%s", want, rc.text)
 		}
 	}
+	if len(rc.outside) != 0 {
+		t.Fatalf("answered outside refs recorded as open in the receipt: %v", rc.outside)
+	}
 }
 
 // slowFeedbackGH blocks the thread read until its context ends.

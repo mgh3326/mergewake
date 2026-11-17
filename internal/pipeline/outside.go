@@ -405,11 +405,14 @@ func outsidePriorItems(records []outsideFinding) []priorItem {
 		if f.State == outsideAnswered {
 			disposition = "answered: " + f.Answer
 		}
-		out = append(out, priorItem{
+		item := priorItem{
 			path: f.Path, line: f.Line, severity: f.Severity,
-			ref:     f.Ref,
 			finding: excerpt(f.Body, excerptLimit), disposition: disposition,
-		})
+		}
+		if f.State == outsideOpen {
+			item.ref = f.Ref
+		}
+		out = append(out, item)
 	}
 	return out
 }
