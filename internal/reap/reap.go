@@ -37,6 +37,10 @@ type Host struct {
 	SSH     string `yaml:"ssh" json:"ssh"`
 	Machine string `yaml:"machine" json:"machine,omitempty"`
 	Jobs    string `yaml:"jobs" json:"jobs"`
+	// WorkRoot is the node's work root: the directory panewire prepares a
+	// spec-placed job's checkout in, as <work_root>/<label>-checkout. Empty
+	// means the sweep cannot build that path on this host.
+	WorkRoot string `yaml:"work_root" json:"work_root,omitempty"`
 }
 
 func (h Host) Local() bool { return (h.SSH == "" || h.SSH == "local") && h.Machine == "" }

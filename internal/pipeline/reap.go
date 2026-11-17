@@ -41,7 +41,7 @@ type reapReceipt struct {
 	Job      string    `json:"job,omitempty"`    // job dir name of a closed pane or archived job
 	Task     string    `json:"task,omitempty"`   // Mergewake-Task of a job-bound row
 	Open     []string  `json:"open,omitempty"`   // open PRs (owner/name#N) keeping a job's pane
-	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap row
+	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap or reviewer-cleanup row
 	Head     string    `json:"head,omitempty"`   // checked-out commit of a legacy-sweep row
 	Source   string    `json:"source,omitempty"` // what named a merged-PR worktree: pane, receipt or job-record
 
@@ -630,7 +630,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// reviewer spawn must not remove the author's worktree, delete its branch
 	// or archive its job.
 	if reviewersOnly(ctx) && prNum > 0 {
-		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)...)
+		return errors.Join(append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNote)...)...)
 	}
 
 	for _, p := range pulls {
@@ -641,7 +641,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if prNum > 0 {
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
-				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
+				errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNote)...)
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
 			continue
@@ -931,7 +931,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			note(brec)
 		}
 	}
-	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, reviewerNote)...)
+	errs = append(errs, s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNote)...)
 	if prNum == 0 {
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
 	}

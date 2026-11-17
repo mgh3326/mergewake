@@ -141,7 +141,18 @@ func spawnedPlacement(stdout string) (integrations.JobRecord, bool) {
 func (x *panewireExecutor) closeReviewerPane(parent context.Context, p reviewerPane) (closed bool) {
 	ctx, cancel := reportContext(parent)
 	defer cancel()
-	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: p.checkout}}
+	// A spec-placed reviewer holds no local checkout: the row names the label
+	// itself and the node's worktree, which is the placement cwd when it is the
+	// label's own directory and <label>-checkout otherwise. The reviewer sweep
+	// then has a candidate without needing the pane.
+	worktree := p.checkout
+	if worktree == "" {
+		worktree = p.label + reviewerCheckoutSuffix
+		if cwd := p.placement.Cwd; reviewerCheckoutDir(filepath.Base(filepath.Clean(cwd)), p.label) {
+			worktree = cwd
+		}
+	}
+	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Host: p.placement.Host, Pane: p.placement.PaneID, Worktree: worktree, Label: p.label}}
 	defer func() {
 		closed = c.paneGone
 		// A forced close that does not close the pane is a skip, never a pass
@@ -291,7 +302,7 @@ func (x *panewireExecutor) keepUnfinishedCheckout(p reviewerPane, reason string)
 	if worktree == "" {
 		worktree = p.label + reviewerCheckoutSuffix
 	}
-	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: worktree}}
+	c := &reviewerCleanup{x: x, p: p, row: reapReceipt{Action: "reviewer-cleanup", Repo: x.repo.Name, PR: x.pr.Number, Worktree: worktree, Label: p.label}}
 	c.record("pending-cleanup", reason)
 }
 
@@ -310,6 +321,7 @@ func (c *reviewerCleanup) record(result, reason string) {
 		"head":   c.p.head,
 		"pass":   c.p.pass,
 		"label":  c.p.label,
+		"host":   c.p.placement.Host,
 		"pane":   c.p.placement.PaneID,
 		"result": result,
 		"reason": reason,

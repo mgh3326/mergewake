@@ -45,7 +45,7 @@ func (f *finalFix) printed() int {
 }
 
 const (
-	unknownPathReason = "remote worktree path unknown; left for the host's own sweep"
+	unknownPathReason = reviewerPathUnknown
 	refusedDirty      = "hub guarded removal refused: dirty"
 )
 
