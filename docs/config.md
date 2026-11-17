@@ -831,6 +831,19 @@ on it.
   receipt carries `quiet: true`, and every pass records `round` and, for a delta
   round, `delta` (the previous reviewed head). Reviews posted before round
   counting count one round per reviewed head.
+- **Late-round findings notice** (`late-round-findings`). After all required
+  passes for the first round past `review.budget_rounds` (round 4 by default)
+  post, mergewake sends the PR's design lane one informational notice when that
+  round has at least one new critical/high finding on a line added after the
+  first head. It reports the round, total new critical/high findings, the
+  subset on lines added after the first head, the subset disputing an earlier
+  author reply, and the subset on documents (`*.md` or `docs/**`). It is
+  deduplicated by PR and round across restarts and does not hold or delay review.
+  A finding disputes an earlier reply when it repeats an earlier thread that
+  contains a reply by the PR author or review login, or when its text quotes at
+  least five consecutive words from such a reply, or shares at least two reply
+  terms of four or more characters alongside an explicit rebuttal cue (`but`,
+  `still`, `however`, a negation, `fails`, `instead`, or `contradicts`).
 - **Review-round rule (consult, ladder, hold).** A round ends without a pass when its review
   leaves at least one critical or high finding still open (not fixed or dismissed
   with evidence) after the verdict; the hub consult below uses its own, lower bar (any open

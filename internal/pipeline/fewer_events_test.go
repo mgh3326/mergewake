@@ -212,25 +212,28 @@ func TestLostReplacementUsesDurableReviewerReplacementCount(t *testing.T) {
 }
 
 func TestRoundFactsRecordNewCodeAndRepeatedThread(t *testing.T) {
-	prior := []github.ReviewThread{{Path: "a.go", Line: 5, Comments: []github.ReviewComment{{Body: "<!-- mergewake-severity:high -->\nSame bug title"}}}}
+	prior := []github.ReviewThread{{Path: "a.go", Line: 5, Comments: []github.ReviewComment{
+		{Author: "review-bot", AuthorType: "Bot", Body: "<!-- mergewake-severity:high -->\nSame bug title"},
+		{Author: "pr-author", AuthorType: "User", Body: "I fixed the lock ordering in the new helper."},
+	}}}
 	findings := []github.Finding{{Path: "a.go", Line: 5, Severity: "high", Body: "Same bug title"}}
 	rp := roundPlan{round: 2, firstDiffKnown: true, addedAfterFirst: map[string]map[int]bool{"a.go": {5: true}}}
-	facts := roundFindingFacts(findings, prior, rp, true)
-	if len(facts) != 1 || facts[0].AddedAfterFirst == nil || !*facts[0].AddedAfterFirst || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier {
+	facts := roundFindingFacts(findings, prior, rp, true, "pr-author", "review-bot")
+	if len(facts) != 1 || facts[0].AddedAfterFirst == nil || !*facts[0].AddedAfterFirst || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier || facts[0].DisputesEarlierReply == nil || !*facts[0].DisputesEarlierReply {
 		t.Fatalf("finding facts = %+v, want new and repeated", facts)
 	}
 	prior[0].Comments[0].Body = "<!-- mergewake-severity:high -->\nDifferent finding title"
-	if facts := roundFindingFacts(findings, prior, rp, true); len(facts) != 1 || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier {
+	if facts := roundFindingFacts(findings, prior, rp, true, "pr-author", "review-bot"); len(facts) != 1 || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier {
 		t.Fatalf("same path and line should count as an overlapping earlier thread: %+v", facts)
 	}
 	prior[0].Path = "elsewhere.go"
 	prior[0].Line = 99
 	prior[0].Comments[0].Body = "<!-- mergewake-severity:high -->\nSame bug title"
-	if facts := roundFindingFacts(findings, prior, rp, true); len(facts) != 1 || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier {
+	if facts := roundFindingFacts(findings, prior, rp, true, "pr-author", "review-bot"); len(facts) != 1 || facts[0].RepeatsEarlier == nil || !*facts[0].RepeatsEarlier {
 		t.Fatalf("same-title thread should count as repeated across paths: %+v", facts)
 	}
-	unknown := roundFindingFacts(findings, prior, roundPlan{round: 2}, false)
-	if unknown[0].AddedAfterFirst != nil || unknown[0].RepeatsEarlier != nil {
+	unknown := roundFindingFacts(findings, prior, roundPlan{round: 2}, false, "pr-author", "review-bot")
+	if unknown[0].AddedAfterFirst != nil || unknown[0].RepeatsEarlier != nil || unknown[0].DisputesEarlierReply != nil {
 		t.Fatalf("unknown round facts must remain unknown: %+v", unknown)
 	}
 	first := "diff --git a/a.go b/a.go\n+++ b/a.go\n@@ -4,0 +5,1 @@\n+old line\n"
@@ -240,7 +243,7 @@ func TestRoundFactsRecordNewCodeAndRepeatedThread(t *testing.T) {
 		t.Fatalf("line-level first-head comparison = %+v", newLines)
 	}
 	record := passRecord(github.Pull{Head: github.Ref{SHA: shaA}, Base: github.Ref{SHA: shaB}}, github.PassReceipt{Pass: 1, Round: 2, Lens: "default"}, findings, "", time.Now(), time.Now(), facts)
-	if record.FindingFacts == nil || len(*record.FindingFacts) != 1 || (*record.FindingFacts)[0].AddedAfterFirst == nil || !*(*record.FindingFacts)[0].AddedAfterFirst || (*record.FindingFacts)[0].RepeatsEarlier == nil || !*(*record.FindingFacts)[0].RepeatsEarlier {
+	if record.FindingFacts == nil || len(*record.FindingFacts) != 1 || (*record.FindingFacts)[0].AddedAfterFirst == nil || !*(*record.FindingFacts)[0].AddedAfterFirst || (*record.FindingFacts)[0].RepeatsEarlier == nil || !*(*record.FindingFacts)[0].RepeatsEarlier || (*record.FindingFacts)[0].Severity != "high" || (*record.FindingFacts)[0].DisputesEarlierReply == nil || !*(*record.FindingFacts)[0].DisputesEarlierReply {
 		t.Fatalf("land record finding facts = %+v", record.FindingFacts)
 	}
 	s, _, _, _, r := setup(t)
@@ -250,7 +253,7 @@ func TestRoundFactsRecordNewCodeAndRepeatedThread(t *testing.T) {
 	if err := s.auditRoundFindingFacts(r.Name, 7, shaA, 1, 2, facts); err != nil {
 		t.Fatal(err)
 	}
-	if rows := auditRows(t, s, r, "review-round-finding"); len(rows) != 1 || rows[0]["added_after_first_head"] != true || rows[0]["repeats_earlier_thread"] != true {
+	if rows := auditRows(t, s, r, "review-round-finding"); len(rows) != 1 || rows[0]["added_after_first_head"] != true || rows[0]["repeats_earlier_thread"] != true || rows[0]["disputes_earlier_reply"] != true || rows[0]["severity"] != "high" {
 		t.Fatalf("finding audit rows = %v", rows)
 	}
 }
