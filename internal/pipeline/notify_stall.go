@@ -103,6 +103,15 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 			}
 		}
 	}
+	comments, err := s.GH.IssueComments(ctx, r.Name, pr.Number)
+	if err != nil {
+		return err
+	}
+	for _, comment := range comments {
+		if idleIssueComment(comment, s.Config.Review.Login) && !comment.CreatedAt.IsZero() && comment.CreatedAt.After(last) {
+			last = comment.CreatedAt
+		}
+	}
 	history, err := s.GH.PullReviewActivity(ctx, r.Name, pr.Number)
 	if err != nil {
 		return err
@@ -115,7 +124,15 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 	// The review-completion ref is durable evidence of review activity even
 	// when the API's review list is unavailable or omits the submission.
 	if reviewed, reviewErr := s.GH.Reviewed(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login); reviewErr == nil && reviewed && len(history) == 0 {
-		return nil
+		// The marker API confirms completion but does not expose when its ref
+		// was created. Use first-seen time, preserving it on later polls.
+		markerAt := now
+		if hasPrevious && previous.Head == pr.Head.SHA && !previous.Since.IsZero() {
+			markerAt = previous.Since
+		}
+		if last.Before(markerAt) {
+			last = markerAt
+		}
 	}
 	entry, ok := clocks[prIdleCause]
 	if !ok || entry.Head != pr.Head.SHA {
@@ -141,6 +158,14 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 func idleReviewComment(c github.ReviewComment, reviewLogin string) bool {
 	author := policy.NormalizeAuthor(c.Author)
 	if author == "" || author == policy.NormalizeAuthor(reviewLogin) || c.AuthorType == "Bot" || strings.HasSuffix(strings.ToLower(c.Author), "[bot]") {
+		return false
+	}
+	return !strings.Contains(c.Body, "<!-- mergewake")
+}
+
+func idleIssueComment(c github.IssueComment, reviewLogin string) bool {
+	author := policy.NormalizeAuthor(c.User.Login)
+	if author == "" || author == policy.NormalizeAuthor(reviewLogin) || c.User.Type == "Bot" || strings.HasSuffix(strings.ToLower(c.User.Login), "[bot]") {
 		return false
 	}
 	return !strings.Contains(c.Body, "<!-- mergewake")

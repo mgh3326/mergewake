@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
@@ -84,6 +85,55 @@ func TestPRIdleIgnoresUpdatedAtAndBotCommentsButCountsHumanReviewActivity(t *tes
 	if n.count != 0 {
 		t.Fatalf("human review activity within the hour should suppress notice: %+v", n.events)
 	}
+}
+
+func TestPRIdleDoneMarkerWithoutHistoryKeepsClockAndCountsIssueComments(t *testing.T) {
+	newCase := func() (*Service, *fakeGH, *fakeNotifier, config.Repo, *time.Time) {
+		s, g, n, r := notifySetup(t)
+		g.refs = map[string]bool{}
+		g.reviewed = true
+		now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+		s.Now = func() time.Time { return now }
+		g.committedAt = map[string]time.Time{shaA: now.Add(-2 * time.Hour)}
+		return s, g, n, r, &now
+	}
+	t.Run("marker first seen starts clock", func(t *testing.T) {
+		s, g, n, r, now := newCase()
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+			t.Fatal(err)
+		}
+		*now = now.Add(time.Hour)
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 1 {
+			t.Fatalf("done marker should alert after an hour: events=%+v err=%v", n.events, err)
+		}
+	})
+	t.Run("human issue comment resets clock", func(t *testing.T) {
+		s, g, n, r, now := newCase()
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+			t.Fatal(err)
+		}
+		g.issueComments = []github.IssueComment{{User: github.PullUser{Login: "author", Type: "User"}, CreatedAt: now.Add(50 * time.Minute)}}
+		*now = now.Add(time.Hour)
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 0 {
+			t.Fatalf("human PR comment should suppress notice: events=%+v err=%v", n.events, err)
+		}
+	})
+	t.Run("bot and review identity do not reset clock", func(t *testing.T) {
+		for _, user := range []github.PullUser{{Login: "ci[bot]", Type: "Bot"}, {Login: "review-bot", Type: "User"}} {
+			t.Run(user.Login, func(t *testing.T) {
+				s, g, n, r, now := newCase()
+				s.Config.Review.Login = "review-bot"
+				if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+					t.Fatal(err)
+				}
+				g.issueComments = []github.IssueComment{{User: user, CreatedAt: now.Add(50 * time.Minute)}}
+				*now = now.Add(time.Hour)
+				if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 1 {
+					t.Fatalf("ignored comment should not suppress notice: events=%+v err=%v", n.events, err)
+				}
+			})
+		}
+	})
 }
 
 func TestPRCheckRedStallThresholdClearAndNewHead(t *testing.T) {
