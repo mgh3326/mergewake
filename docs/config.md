@@ -790,9 +790,11 @@ on it.
   Secret-like strings in removed lines are redacted, including in mixed hunks;
   added and context lines are verbatim.
   When the previous patch cannot be read, the round reviews the whole diff and
-  the audit event says why (`round_note`). When nothing changed at all, the round
-  does not count, reviews the whole diff for reference only, and reports only a
-  new critical or high finding.
+  the audit event says why (`round_note`). A round counts only when the
+  interdiff contains a hunk the previous reviewed patch did not carry. A new
+  head that adds no such hunk (including one that only removes earlier
+  PR-only hunks) reuses the previous round number, reviews the whole diff for
+  reference only, and reports only a new critical or high finding.
 - **Prior findings stay settled.** From round two the prompt lists every finding
   the review login posted in earlier rounds with its disposition (`resolved`,
   `answered: <latest reply>`, or `none yet (still open)`), and tells the reviewer
