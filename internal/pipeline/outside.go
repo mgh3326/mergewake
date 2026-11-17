@@ -58,14 +58,41 @@ const outsideLineWindow = 3
 // The small line window tolerates shifted line numbers; the text check avoids
 // merging two distinct findings merely because they are nearby.
 func sameOutsideFinding(a outsideFinding, b github.OutsideFinding) bool {
-	distance := a.Line - b.Line
-	if distance < 0 {
-		distance = -distance
+	if a.Path != b.Path || b.Line <= 0 {
+		return false
 	}
-	if a.Path != b.Path || a.Line <= 0 || b.Line <= 0 || distance > outsideLineWindow {
+	dist, ok := outsideDistance(a, b.Line)
+	if !ok || dist > outsideLineWindow {
 		return false
 	}
 	return sameSubstance(a.Body, b.Body)
+}
+
+func outsideDistance(a outsideFinding, line int) (int, bool) {
+	if a.Line <= 0 && len(a.Lines) == 0 {
+		return 0, false
+	}
+	minDist := -1
+	check := func(l int) {
+		if l <= 0 {
+			return
+		}
+		d := l - line
+		if d < 0 {
+			d = -d
+		}
+		if minDist == -1 || d < minDist {
+			minDist = d
+		}
+	}
+	check(a.Line)
+	for _, l := range a.Lines {
+		check(l)
+	}
+	if minDist == -1 {
+		return 0, false
+	}
+	return minDist, true
 }
 
 func markOutsideDisputes(records []outsideFinding) {
@@ -77,11 +104,8 @@ func markOutsideDisputes(records []outsideFinding) {
 			if records[j].State != outsideAnswered || records[i].Path != records[j].Path {
 				continue
 			}
-			distance := records[i].Line - records[j].Line
-			if distance < 0 {
-				distance = -distance
-			}
-			if distance <= outsideLineWindow && !sameSubstance(records[i].Body, records[j].Body) {
+			dist, ok := outsideDistance(records[j], records[i].Line)
+			if ok && dist <= outsideLineWindow && !sameSubstance(records[i].Body, records[j].Body) {
 				records[i].Via = "dispute"
 				break
 			}
@@ -137,6 +161,9 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 		var repOrder []string
 		shown := map[string]bool{}
 		reportedAt := map[string]time.Time{}
+		repLines := map[string][]int{}
+		repTitles := map[string][]string{}
+		repAliases := map[string][]string{}
 		for _, p := range passes {
 			if current && patch != "" && p.Patch != patch {
 				continue
@@ -155,6 +182,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 				if canonical, ok := aliases[ref]; ok {
 					ref = canonical
 				} else {
+					matched := false
 					for i := range out {
 						if sameOutsideFinding(out[i], f) {
 							ref = out[i].Ref
@@ -164,10 +192,27 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 								out[i].Aliases = appendUnique(out[i].Aliases, f.Ref)
 								aliases[f.Ref] = ref
 							}
+							matched = true
 							break
 						}
 					}
+					if !matched {
+						for _, prevRef := range repOrder {
+							prev := reported[prevRef]
+							if sameOutsideFinding(outsideFinding{Path: prev.Path, Line: prev.Line, Lines: repLines[prevRef], Body: prev.Body, Titles: repTitles[prevRef]}, f) {
+								ref = prevRef
+								if f.Ref != ref {
+									aliases[f.Ref] = ref
+									repAliases[ref] = appendUnique(repAliases[ref], f.Ref)
+								}
+								matched = true
+								break
+							}
+						}
+					}
 				}
+				repLines[ref] = appendUniqueInt(repLines[ref], f.Line)
+				repTitles[ref] = appendUnique(repTitles[ref], f.Body)
 				if p.SubmittedAt != nil {
 					if t, ok := reportedAt[ref]; !ok || p.SubmittedAt.Before(t) {
 						reportedAt[ref] = *p.SubmittedAt
@@ -202,13 +247,16 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 			if closed[ref] {
 				continue
 			}
-			if _, ok := open[ref]; ok {
+			if idx, ok := open[ref]; ok {
+				out[idx].Lines = appendUniqueInts(out[idx].Lines, repLines[ref])
+				out[idx].Titles = appendUniques(out[idx].Titles, repTitles[ref])
+				out[idx].Aliases = appendUniques(out[idx].Aliases, repAliases[ref])
 				continue
 			}
 			f := reported[ref]
 			out = append(out, outsideFinding{
-				Ref: ref, Path: f.Path, Line: f.Line, Severity: f.Severity,
-				Advisory: f.Advisory, Body: f.Body, Head: h, State: outsideOpen,
+				Ref: ref, Aliases: repAliases[ref], Path: f.Path, Line: f.Line, Lines: repLines[ref], Titles: repTitles[ref],
+				Severity: f.Severity, Advisory: f.Advisory, Body: f.Body, Head: h, State: outsideOpen,
 				FirstAt: reportedAt[ref],
 			})
 			open[ref] = len(out) - 1
@@ -226,6 +274,13 @@ func appendUnique(values []string, value string) []string {
 	return append(values, value)
 }
 
+func appendUniques(values []string, additions []string) []string {
+	for _, a := range additions {
+		values = appendUnique(values, a)
+	}
+	return values
+}
+
 func appendUniqueInt(values []int, value int) []int {
 	for _, existing := range values {
 		if existing == value {
@@ -233,6 +288,13 @@ func appendUniqueInt(values []int, value int) []int {
 		}
 	}
 	return append(values, value)
+}
+
+func appendUniqueInts(values []int, additions []int) []int {
+	for _, a := range additions {
+		values = appendUniqueInt(values, a)
+	}
+	return values
 }
 
 // outsideLegacy counts the outside-diff hold that receipts written before the

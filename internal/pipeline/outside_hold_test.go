@@ -222,6 +222,61 @@ func TestOutsideDisputeCreatesOneNewDesignLaneFinding(t *testing.T) {
 	}
 }
 
+func TestOutsideSameHeadDuplicatePassesJoinOneRef(t *testing.T) {
+	finding1 := holdFinding("internal/fleet/watch.go", 54, "high", "Keep an old-binary watcher excluded across a node restart")
+	finding2 := holdFinding("internal/fleet/watch.go", 56, "high", "Keep old-binary watchers excluded after a node restart")
+	passes := []github.ReviewedPass{
+		outsidePass(shaA, "p1", 1, 1, finding1),
+		outsidePass(shaA, "p1", 2, 1, finding2),
+	}
+	records := foldOutside(passes, shaA, "", "", false)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 folded finding, got %d: %+v", len(records), records)
+	}
+	if records[0].Ref != finding1.Ref {
+		t.Fatalf("expected ref %s, got %s", finding1.Ref, records[0].Ref)
+	}
+	if len(records[0].Aliases) != 1 || records[0].Aliases[0] != finding2.Ref {
+		t.Fatalf("expected alias %s, got %+v", finding2.Ref, records[0].Aliases)
+	}
+}
+
+func TestOutsideDisputeMatchesRelistedLines(t *testing.T) {
+	// answered finding originally at line 50, re-listed across heads at line 52 then line 54
+	first := holdFinding("internal/fleet/watch.go", 50, "high", "Keep an old-binary watcher excluded across a node restart")
+	step := holdFinding("internal/fleet/watch.go", 52, "high", "Keep the old binary watcher excluded when the node restarts")
+	relisted := holdFinding("internal/fleet/watch.go", 54, "high", "Keep old-binary watchers excluded after a node restart")
+	// dispute at line 55: distance to 50 is 5 (> outsideLineWindow=3), but distance to 54 is 1 (<= 3)
+	dispute := holdFinding("internal/fleet/watch.go", 55, "high", "An old-binary watcher can reappear after restart because filtering precedes node registration")
+
+	history := []github.ReviewedPass{
+		outsidePass(shaC, "p1", 1, 1, first),
+		outsidePass(shaD, "p2", 2, 2, step),
+		outsidePass(shaA, "p3", 3, 3, relisted),
+		outsidePass(shaB, "p4", 4, 4, dispute),
+	}
+	records := foldOutside(history, shaB, "", "", false)
+	comments := holdComment("review-bot", "User", "Dismiss: "+first.Ref+" — validated restart policy")
+	answerOutside(comments, records, nil)
+	markOutsideDisputes(records)
+
+	var open []outsideFinding
+	for _, f := range records {
+		if f.State == outsideOpen {
+			open = append(open, f)
+		}
+	}
+	if len(open) != 1 || open[0].Ref != dispute.Ref {
+		t.Fatalf("expected open dispute %s, got %+v", dispute.Ref, open)
+	}
+	if open[0].Via != "dispute" {
+		t.Fatalf("expected dispute via='dispute', got %q", open[0].Via)
+	}
+	if !hasOutsideDispute(records) {
+		t.Fatal("expected hasOutsideDispute to be true")
+	}
+}
+
 // (c) A completed review pass on a later head that does not report the finding
 // again clears it; one that reports the same content again keeps it open.
 func TestOutsideHoldReReviewedClears(t *testing.T) {
