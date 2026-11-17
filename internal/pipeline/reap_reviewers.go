@@ -1160,6 +1160,12 @@ func (w *reviewerSweep) remembered(l reviewerLabel, hs *reapHost) string {
 // ends with a terminal row.
 func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c reviewerCandidate) {
 	if hs := w.scannedHost(c.host); hs != nil {
+		if hs.failed {
+			// The host's scan already reported its error; nothing about it
+			// can be inspected or proven, so the label waits for a pass that
+			// reads the host.
+			return
+		}
 		if !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop {
 			return
 		}

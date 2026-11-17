@@ -531,7 +531,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// row, so no row-level failure can be missing from the summary.
 	scanned, planned, removed, deleted, skipped, archived := 0, 0, 0, 0, 0, 0
 	noteErr := func(v reapReceipt) error {
-		var noteErrs []error
 		switch v.Result {
 		case "would-remove", "would-delete", "would-archive", "would-abandon":
 			planned++
@@ -551,7 +550,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			case "reviewer-reap":
 				subject = "reviewer " + v.Label
 			}
-			noteErrs = append(noteErrs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
+			// A row-level error is the pass's report, not a failed write.
+			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
 		// A failed or retained archive always appends: its time spaces the
@@ -562,10 +562,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// day (hk 4792).
 		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
 		h.lastRow[reapRowKey(v)] = reapRowSig(v)
-		if e := s.reapNote(v, o.DryRun || repeat); e != nil {
-			noteErrs = append(noteErrs, e)
-		}
-		return errors.Join(noteErrs...)
+		return s.reapNote(v, o.DryRun || repeat)
 	}
 	note := func(v reapReceipt) {
 		if e := noteErr(v); e != nil {

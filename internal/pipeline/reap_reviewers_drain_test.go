@@ -525,3 +525,43 @@ func TestReapReviewerDrainedHostDoesNotSpendTheAuditAllowance(t *testing.T) {
 		t.Fatalf("removals %v, want one on node-b and the healthy label after it", removed)
 	}
 }
+
+// A reviewer row whose Result is "error" is still a durable row: it must not
+// keep the journal checkpoint from advancing, or one repeating failure would
+// stall the scan for every later label.
+func TestReapReviewerErrorRowDoesNotBlockTheJournalCheckpoint(t *testing.T) {
+	f := newReviewerFix(t)
+	label := reviewerLabelFor(601, time.Hour)
+	cwd := "/repo/" + label
+	f.hub.detached[cwd] = true
+	f.hub.forbid = map[string]bool{"worktree.remove": true}
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", Cwd: cwd}
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-cleanup", "value": map[string]any{"pr": 601, "label": label, "host": "node-a"}})
+	_ = f.reap(t, 0, Options{}) // the error row is the pass's report
+	var errored bool
+	for _, row := range f.rows(t) {
+		errored = errored || row.Result == "error"
+	}
+	if !errored {
+		t.Fatalf("rows: %v", rowSummary(f.rows(t)))
+	}
+	if _, err := os.Stat(f.s.reviewerAuditPath(testRepo.Name)); err != nil {
+		t.Fatalf("a durable error row stalled the journal checkpoint: %v", err)
+	}
+}
+
+// A label whose only named host failed its scan is not inspected: the host's
+// error is already reported, and a row here would repeat every pass.
+func TestReapReviewerFailedHostIsNotInspected(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "disconnected"}}
+	label := reviewerLabelFor(602, 2*24*time.Hour)
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 602, Host: "node-b",
+		Label: label, Worktree: label + reviewerCheckoutSuffix, Result: "pending-cleanup", Reason: "pane still present"})
+	if err := f.reap(t, 0, Options{}); err == nil || !strings.Contains(err.Error(), "disconnected") {
+		t.Fatalf("want the host scan error, got %v", err)
+	}
+	if rows := f.rows(t); len(rows) != 0 {
+		t.Fatalf("a failed host was inspected: %v", rowSummary(rows))
+	}
+}
