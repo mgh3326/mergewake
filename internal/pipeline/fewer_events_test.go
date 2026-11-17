@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -239,9 +240,9 @@ func TestRoundFactsRecordNewCodeAndRepeatedThread(t *testing.T) {
 	if newLines["a.go"][5] || !newLines["a.go"][6] {
 		t.Fatalf("line-level first-head comparison = %+v", newLines)
 	}
-	record := passRecord(github.Pull{Head: github.Ref{SHA: shaA}, Base: github.Ref{SHA: shaB}}, github.PassReceipt{Pass: 1, Round: 2, Lens: "default"}, findings, "", time.Now(), time.Now(), facts)
-	if record.FindingFacts == nil || len(*record.FindingFacts) != 1 || (*record.FindingFacts)[0].AddedAfterFirst == nil || !*(*record.FindingFacts)[0].AddedAfterFirst || (*record.FindingFacts)[0].RepeatsEarlier == nil || !*(*record.FindingFacts)[0].RepeatsEarlier {
-		t.Fatalf("land record finding facts = %+v", record.FindingFacts)
+	record := passRecord(github.Pull{Head: github.Ref{SHA: shaA}, Base: github.Ref{SHA: shaB}}, github.PassReceipt{Pass: 1, Round: 2, Lens: "default"}, findings, "", time.Now(), time.Now())
+	if b, err := json.Marshal(integrations.TaskEvent{Reviews: []integrations.ReviewRecord{record}}); err != nil || strings.Contains(string(b), `"finding_facts"`) {
+		t.Fatalf("task event JSON contains finding_facts: %s (err %v)", b, err)
 	}
 	s, _, _, _, r := setup(t)
 	if err := s.auditRoundFindingFacts(r.Name, 7, shaA, 1, 2, facts); err != nil {

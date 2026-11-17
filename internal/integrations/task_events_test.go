@@ -204,6 +204,7 @@ func TestPostTaskEventFieldsRefusedSharesBudget(t *testing.T) {
 // first 400 comes back redacted and bounded.
 func TestPostTaskEventReviewsRefusedKeepsHeadBase(t *testing.T) {
 	var bodies []map[string]any
+	field := "x"
 	message := "reviews[0]: lens must be a short token api_key=sk-live-0123456789abcdefghij é" + strings.Repeat("x", 300)
 	hkEventServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -212,7 +213,11 @@ func TestPostTaskEventReviewsRefusedKeepsHeadBase(t *testing.T) {
 		bodies = append(bodies, m)
 		if m["reviews"] != nil {
 			w.WriteHeader(400)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_context", "message": message})
+			answer := map[string]string{"error": "invalid_context", "message": message}
+			if field != "" {
+				answer["field"] = field
+			}
+			_ = json.NewEncoder(w).Encode(answer)
 			return
 		}
 		_, _ = w.Write([]byte(`{"applied":true}`))
@@ -222,7 +227,7 @@ func TestPostTaskEventReviewsRefusedKeepsHeadBase(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	ev := TaskEvent{Source: SourceReview, SourceRef: url, TaskID: 5, PR: url, HeadSHA: sha, BaseSHA: sha, Reviews: []ReviewRecord{{ReviewedHead: sha, Pass: 1}}}
 	res, e := h.PostTaskEvent(context.Background(), ev)
-	if e != nil || res.FieldsRefused != "invalid_context" || res.FieldsResend != ResendWithoutReviews || len(bodies) != 2 {
+	if e != nil || res.FieldsRefused != "invalid_context" || res.FieldsRefusedField != "x" || res.FieldsResend != ResendWithoutReviews || len(bodies) != 2 {
 		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
 	}
 	if bodies[1]["head_sha"] != sha || bodies[1]["base_sha"] != sha || bodies[1]["reviews"] != nil {
@@ -233,9 +238,10 @@ func TestPostTaskEventReviewsRefusedKeepsHeadBase(t *testing.T) {
 	}
 
 	bodies = nil
+	field = ""
 	ev.HeadSHA, ev.BaseSHA = "", ""
 	res, e = h.PostTaskEvent(context.Background(), ev)
-	if e != nil || res.FieldsResend != ResendPlain || len(bodies) != 2 || bodies[1]["reviews"] != nil {
+	if e != nil || res.FieldsRefusedField != "" || res.FieldsResend != ResendPlain || len(bodies) != 2 || bodies[1]["reviews"] != nil {
 		t.Fatalf("%+v %v bodies=%d", res, e, len(bodies))
 	}
 }
