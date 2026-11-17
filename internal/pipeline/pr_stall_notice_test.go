@@ -118,6 +118,30 @@ func TestPRIdleDoneMarkerWithoutHistoryKeepsClockAndCountsIssueComments(t *testi
 			t.Fatalf("human PR comment should suppress notice: events=%+v err=%v", n.events, err)
 		}
 	})
+	t.Run("marker first seen after existing idle clock", func(t *testing.T) {
+		s, g, n, r := notifySetup(t)
+		g.refs = map[string]bool{}
+		g.reviewed = false
+		now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+		s.Now = func() time.Time { return now }
+		g.committedAt = map[string]time.Time{shaA: now}
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+			t.Fatal(err)
+		}
+		g.reviewed = true
+		now = now.Add(10 * time.Minute)
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(59 * time.Minute)
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 0 {
+			t.Fatalf("pre-review idle baseline should not trigger early: events=%+v err=%v", n.events, err)
+		}
+		now = now.Add(time.Minute)
+		if err := s.notifyPRIdle(context.Background(), r, g.pull); err != nil || n.count != 1 {
+			t.Fatalf("marker should trigger after one hour: events=%+v err=%v", n.events, err)
+		}
+	})
 	t.Run("bot and review identity do not reset clock", func(t *testing.T) {
 		for _, user := range []github.PullUser{{Login: "ci[bot]", Type: "Bot"}, {Login: "review-bot", Type: "User"}} {
 			t.Run(user.Login, func(t *testing.T) {

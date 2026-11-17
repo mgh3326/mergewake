@@ -22,6 +22,7 @@ type prActivityClock struct {
 	Since        time.Time `json:"since"`
 	Head         string    `json:"head"`
 	LastActivity time.Time `json:"last_activity"`
+	ReviewMarker time.Time `json:"review_marker,omitempty"`
 	Sent         bool      `json:"sent,omitempty"`
 }
 
@@ -123,12 +124,15 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 	}
 	// The review-completion ref is durable evidence of review activity even
 	// when the API's review list is unavailable or omits the submission.
+	markerAt := time.Time{}
 	if reviewed, reviewErr := s.GH.Reviewed(ctx, r.Name, pr.Number, pr.Head.SHA, s.Config.Review.Login); reviewErr == nil && reviewed && len(history) == 0 {
 		// The marker API confirms completion but does not expose when its ref
-		// was created. Use first-seen time, preserving it on later polls.
-		markerAt := now
-		if hasPrevious && previous.Head == pr.Head.SHA && !previous.Since.IsZero() {
-			markerAt = previous.Since
+		// was created. Persist its first-seen time separately from the head's
+		// idle baseline, which may predate review completion.
+		if hasPrevious && previous.Head == pr.Head.SHA && !previous.ReviewMarker.IsZero() {
+			markerAt = previous.ReviewMarker
+		} else {
+			markerAt = now
 		}
 		if last.Before(markerAt) {
 			last = markerAt
@@ -141,6 +145,9 @@ func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pul
 		entry = previous
 	} else if last.After(entry.LastActivity) {
 		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: last, Since: last}
+	}
+	if !markerAt.IsZero() {
+		entry.ReviewMarker = markerAt
 	}
 	if now.Sub(entry.Since) >= s.Config.Daemon.PR.Notify.IdleWindow() && !entry.Sent {
 		if err := s.sendPRStall(ctx, r, pr, prIdleCause, s.Config.Daemon.PR.Notify.IdleWindow(), now.Sub(entry.Since)); err != nil {
