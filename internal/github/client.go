@@ -316,6 +316,21 @@ func (c *Client) Pull(ctx context.Context, repo string, n int) (Pull, error) {
 	})
 }
 
+// PullReviewActivity returns the submission timestamps of every review on a PR.
+func (c *Client) PullReviewActivity(ctx context.Context, repo string, n int) ([]time.Time, error) {
+	reviews, err := list[Review](ctx, c, fmt.Sprintf("%s/pulls/%d/reviews", base(repo), n))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]time.Time, 0, len(reviews))
+	for _, review := range reviews {
+		if review.SubmittedAt != nil {
+			out = append(out, *review.SubmittedAt)
+		}
+	}
+	return out, nil
+}
+
 // ReadPull reads a pull without recording the observation, for a caller that
 // writes the change state itself: Pull records every pull it reads, and a row
 // that is still open needs no write. It shares Pull's caches but keeps its own

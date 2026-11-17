@@ -205,17 +205,30 @@ type PRNotify struct {
 	// ConflictOwnerAfter delays the owner's conflict notice while the author
 	// route is active and the PR keeps the same conflicting head. Empty means 30m.
 	ConflictOwnerAfter string `yaml:"conflict_owner_after"`
+	IdleAfter          string `yaml:"idle_after"`
+	CheckRedAfter      string `yaml:"check_red_after"`
 }
 
 const DefaultConflictOwnerAfter = 30 * time.Minute
+const DefaultPRIdleAfter = time.Hour
+const DefaultPRCheckRedAfter = 30 * time.Minute
+
+func (n PRNotify) IdleWindow() time.Duration { return notifyDuration(n.IdleAfter, DefaultPRIdleAfter) }
+func (n PRNotify) CheckRedWindow() time.Duration {
+	return notifyDuration(n.CheckRedAfter, DefaultPRCheckRedAfter)
+}
 
 func (n PRNotify) ConflictOwnerWindow() time.Duration {
-	if n.ConflictOwnerAfter == "" {
-		return DefaultConflictOwnerAfter
+	return notifyDuration(n.ConflictOwnerAfter, DefaultConflictOwnerAfter)
+}
+
+func notifyDuration(raw string, fallback time.Duration) time.Duration {
+	if raw == "" {
+		return fallback
 	}
-	d, err := Duration(n.ConflictOwnerAfter)
+	d, err := Duration(raw)
 	if err != nil {
-		return DefaultConflictOwnerAfter
+		return fallback
 	}
 	return d
 }
@@ -680,6 +693,20 @@ func validateDaemon(c *Config) error {
 	if v := c.Daemon.PR.Notify.ConflictOwnerAfter; v != "" {
 		if _, e = Duration(v); e != nil {
 			return fmt.Errorf("daemon.pr.notify.conflict_owner_after: %w", e)
+		}
+	}
+	for _, kv := range []struct {
+		name  string
+		value string
+	}{
+		{"idle_after", c.Daemon.PR.Notify.IdleAfter},
+		{"check_red_after", c.Daemon.PR.Notify.CheckRedAfter},
+	} {
+		if kv.value == "" {
+			continue
+		}
+		if _, e = Duration(kv.value); e != nil {
+			return fmt.Errorf("daemon.pr.notify.%s: %w", kv.name, e)
 		}
 	}
 	if v := c.Daemon.PR.AuthorFixWait; v != "" {

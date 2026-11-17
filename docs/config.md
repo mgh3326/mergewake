@@ -1660,6 +1660,7 @@ For `example/project`, state resides beneath
 | `pr-notify-merged-pending.json` | MERGED notices awaiting successful delivery or suppression audit, keyed by PR and gated head; retained across restarts and retried on repository sweeps for up to 24 hours after the PR merged. |
 | `conflict-esc/<pr>.json` | Per PR: the heads whose conflict ESC a lane accepted (event id, lane, rule, time) and the heads still pending (attempts, next attempt, the lane pinned before it was last offered the ESC, last error). Never pruned; deleting it can send a head's ESC again (panewire drops it as a duplicate on the same lane). |
 | `pr-review-wait.json` | When this host first saw each `(PR, head)` waiting on its review — in the merge gate on `review_missing`, or on the review path while the review is held, quota-stopped, pending or its poll was skipped; the clock of the 60-minute review-stalled alert, kept a week. |
+| `pr-<PR>-stall-state.json` | Per open PR: the idle and per-check red clocks behind the `STALLED` notices — last activity, head and sent flag per cause. A new head or the cause clearing re-arms its notice. |
 | `pr-ready-renotify.json` | Per READY key: the worker lane it would have gone to, when it was recorded; kept a week. `merge_overdue` counts `ready_too_long` from it. |
 | `findings-deliveries.json` | Findings deliveries of the last 30 days: event id, PR, head, thread ids, lane, owner, sent/re-sent/escalated/acked times. Deleting it re-delivers every open unanswered finding once. |
 | `discord-sent` | Most recent 2048 Discord feed keys posted or dropped for this repo. Deleting it can post recent events again. |
@@ -1850,8 +1851,9 @@ two hooks apart when they send the same delivery id.
 
 Only enabled roles wake, and only for repositories in `repos`.
 
-`daemon.pr.notify` defaults to enabled and accepts `enabled` and
-`conflict_owner_after` (`30m` by default). `renotify_after` and `renotify_max`
+`daemon.pr.notify` defaults to enabled and accepts `enabled`,
+`conflict_owner_after` (`30m` by default), `idle_after` (`1h`) and
+`check_red_after` (`30m`). `renotify_after` and `renotify_max`
 were removed with the READY reminder; a config that sets either fails at load.
 `daemon.pr.author_fix_wait` defaults to `30m`; set it to `0` to disable the
 bounded merge wait. When the PR's author job is live and a current-head review
@@ -1977,10 +1979,19 @@ notifier refuses is retried on the next pass. The review path sends the alert
 and nothing else: findings delivery and Land wait for a review that posted
 something. On the gate path it is sent only while `review_missing` is the whole
 reason set. A head that is later reviewed and blocks
-again follows the rules above. This is the only stall alert: the older
+again follows the rules above. This is the only review stall alert: the older
 elapsed-time `STALLED review` alarm, which the daemon stopped calling when
 reviews moved to retry accounting, is removed with its `review-wait.json` and
 `review-stall-sent` state. The `daemon.pr.stall_after` key was removed; a config that sets it fails at load.
+
+Two stall notices cover waits no verdict names, each sent once per
+`(PR, head, cause)` as a `STALLED` event (type `blocked`) on the
+`notifyLane` lane. An open, non-draft PR with no new commit and no review
+activity for `idle_after` gets `cause=idle`; a required check red on the head
+for `check_red_after` gets `cause=check_red:<name>` per check. Activity is the
+later of the PR's creation and last update, its review submissions and its
+review-thread comments; a new head or the cause clearing re-arms the notice.
+The clocks live in `pr-<PR>-stall-state.json`.
 
 
 ##### Conflict ESC

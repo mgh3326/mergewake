@@ -12,7 +12,134 @@ import (
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
+
+const prIdleCause = "idle"
+const prCheckRedCause = "check_red"
+
+type prActivityClock struct {
+	Since        time.Time `json:"since"`
+	Head         string    `json:"head"`
+	LastActivity time.Time `json:"last_activity"`
+	Sent         bool      `json:"sent,omitempty"`
+}
+
+func redCheckClock(prior prActivityClock, exists bool, head string, now time.Time) prActivityClock {
+	if !exists || prior.Head != head {
+		return prActivityClock{Since: now, Head: head}
+	}
+	return prior
+}
+
+func (s *Service) notifyPRStalls(ctx context.Context, r config.Repo, pr github.Pull, p policy.Policy) error {
+	file := filepath.Join(s.state(r.Name), fmt.Sprintf("pr-%d-stall-state.json", pr.Number))
+	var clocks map[string]prActivityClock
+	if _, err := fsutil.ReadJSON(file, &clocks); err != nil {
+		return err
+	}
+	if clocks == nil {
+		clocks = map[string]prActivityClock{}
+	}
+	now := s.now().UTC()
+	states, err := s.GH.CheckStates(ctx, r.Name, pr.Head.SHA, p.RequiredChecks)
+	if err != nil {
+		return err
+	}
+	active := map[string]bool{}
+	for _, name := range p.RequiredChecks {
+		cause := prCheckRedCause + ":" + name
+		if states[name] != github.Red {
+			continue
+		}
+		active[cause] = true
+		entry := redCheckClock(clocks[cause], clocks[cause].Head != "", pr.Head.SHA, now)
+		if now.Sub(entry.Since) >= s.Config.Daemon.PR.Notify.CheckRedWindow() && !entry.Sent {
+			if err := s.sendPRStallAt(ctx, r, pr, cause, s.Config.Daemon.PR.Notify.CheckRedWindow(), now.Sub(entry.Since), entry.Since); err != nil {
+				return err
+			}
+			entry.Sent = true
+		}
+		clocks[cause] = entry
+	}
+	for cause := range clocks {
+		if strings.HasPrefix(cause, prCheckRedCause+":") && !active[cause] {
+			delete(clocks, cause)
+		}
+	}
+	return fsutil.WriteJSON(file, clocks)
+}
+
+func (s *Service) notifyPRIdle(ctx context.Context, r config.Repo, pr github.Pull) error {
+	file := filepath.Join(s.state(r.Name), fmt.Sprintf("pr-%d-stall-state.json", pr.Number))
+	clocks := map[string]prActivityClock{}
+	if _, err := fsutil.ReadJSON(file, &clocks); err != nil {
+		return err
+	}
+	now := s.now().UTC()
+	last := parsedTime(pr.CreatedAt)
+	if updated := parsedTime(pr.UpdatedAt); updated != nil && (last == nil || updated.After(*last)) {
+		last = updated
+	}
+	if last == nil {
+		return nil
+	}
+	previous, hasPrevious := clocks[prIdleCause]
+	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if err != nil {
+		return err
+	}
+	for _, thread := range fb.Threads {
+		for _, comment := range thread.Comments {
+			if !comment.CreatedAt.IsZero() && comment.CreatedAt.After(*last) {
+				t := comment.CreatedAt
+				last = &t
+			}
+		}
+	}
+	history, err := s.GH.PullReviewActivity(ctx, r.Name, pr.Number)
+	if err != nil {
+		return err
+	}
+	for _, submitted := range history {
+		if submitted.After(*last) {
+			t := submitted
+			last = &t
+		}
+	}
+	entry, ok := clocks[prIdleCause]
+	if !ok || entry.Head != pr.Head.SHA {
+		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: *last, Since: *last}
+	} else if hasPrevious && previous.Head == pr.Head.SHA && previous.LastActivity.After(*last) {
+		entry = previous
+	} else if last.After(entry.LastActivity) {
+		entry = prActivityClock{Head: pr.Head.SHA, LastActivity: *last, Since: *last}
+	}
+	if now.Sub(entry.Since) >= s.Config.Daemon.PR.Notify.IdleWindow() && !entry.Sent {
+		if err := s.sendPRStall(ctx, r, pr, prIdleCause, s.Config.Daemon.PR.Notify.IdleWindow(), now.Sub(entry.Since)); err != nil {
+			return err
+		}
+		entry.Sent = true
+	}
+	clocks[prIdleCause] = entry
+	return fsutil.WriteJSON(file, clocks)
+}
+
+func (s *Service) sendPRStall(ctx context.Context, r config.Repo, pr github.Pull, cause string, threshold, elapsed time.Duration) error {
+	return s.sendPRStallAt(ctx, r, pr, cause, threshold, elapsed, s.now().Add(-elapsed))
+}
+
+func (s *Service) sendPRStallAt(ctx context.Context, r config.Repo, pr github.Pull, cause string, threshold, elapsed time.Duration, since time.Time) error {
+	lane, via, err := s.notifyLane(ctx, r, pr)
+	if err != nil {
+		return err
+	}
+	text := fmt.Sprintf("[mergewake] STALLED %s#%d head=%s | cause=%s | elapsed=%s (threshold %s) | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), cause, elapsed.Round(time.Minute), threshold, lane, via)
+	if err := s.Notifier.Notify(ctx, integrations.Event{ID: fmt.Sprintf("mergewake-pr-stalled-%s-%d-%s-%s-%d", r.Name, pr.Number, pr.Head.SHA, cause, since.UnixNano()), Text: text, Lane: lane, Type: eventType("blocked")}); err != nil {
+		return fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(err))
+	}
+	return s.audit(r.Name, "pr-notify", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "state": "stalled", "cause": cause, "lane": lane, "via": via, "sent": true}, false)
+}
 
 // reviewStallAfter is how long one head may wait for its review before the
 // design session hears about it once.

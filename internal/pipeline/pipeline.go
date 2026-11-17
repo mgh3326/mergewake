@@ -20,6 +20,7 @@ import (
 
 type GitHub interface {
 	Pull(context.Context, string, int) (github.Pull, error)
+	PullReviewActivity(context.Context, string, int) ([]time.Time, error)
 	Files(context.Context, string, int) ([]policy.File, error)
 	Diff(context.Context, string, int) (string, error)
 	Merge(context.Context, string, int, string) error
