@@ -192,7 +192,7 @@ func worktreeOuts(cwd2 string) map[string]string {
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                               "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD aaaa\nbranch refs/heads/feat/x\n",
 		key("git", "-C", "/repo.wt", "status", "--porcelain"):                                                  "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z"):                               "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                      "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                    "",
@@ -398,7 +398,7 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/feat/x\n",
 		key("git", "-C", "/other", "worktree", "list", "--porcelain"):                                            "worktree /other\nHEAD bbbb\nbranch refs/heads/main\n",
 		key("git", "-C", "/repo.gone", "status", "--porcelain"):                                                  "",
-		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored"):                                     "",
+		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored", "-z"):                               "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                        "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.gone"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                      "",
@@ -893,12 +893,10 @@ func TestReapFetchErrorPerPR(t *testing.T) {
 
 func TestReapRemovesWithRegenerableIgnored(t *testing.T) {
 	outs := panegoneWorktreeOuts("/repo")
-	// Collapsed first listing plus real -uall per-dir output: every file
-	// inherits approval from its approved directory, so the worktree goes.
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .venv/\n!! node_modules/\n!! dist/\n"
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", ".venv/")] = "!! .venv/lib/x.py\n"
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "node_modules/")] = "!! node_modules/a/index.js\n"
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "dist/")] = "!! dist/bundle.js\n"
+	// Only explicit directory forms approve wholly ignored dirs, and only
+	// at the top level; node_modules/ and Library/ qualify, so the
+	// worktree goes.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z")] = "!! .venv/\x00!! node_modules/\x00!! Library/\x00"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -911,10 +909,9 @@ func TestReapRemovesWithRegenerableIgnored(t *testing.T) {
 
 func TestReapSkipsIgnoredFiles(t *testing.T) {
 	outs := worktreeOuts("/repo")
-	// .env and notes are not regenerable; .venv holds only regenerable files
-	// so it stays safe and unnamed.
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .venv/\n!! .env\n!! notes.md\n"
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", ".venv/")] = "!! .venv/lib/x.py\n"
+	// .env and notes are not regenerable; .venv/ is approved by its
+	// directory form so it stays safe and unnamed.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z")] = "!! .venv/\x00!! .env\x00!! notes.md\x00"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -941,19 +938,19 @@ func TestReapSkipsIgnoredFiles(t *testing.T) {
 	}
 }
 
-func TestReapRefusesSecretsInsideRegenerableDir(t *testing.T) {
+func TestReapRefusesUnapprovedDir(t *testing.T) {
 	outs := worktreeOuts("/repo")
-	// bin/ is regenerable by name, but its contents hold a secret: the
-	// per-dir -uall check refuses the whole directory.
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! bin/\n"
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "bin/")] = "!! bin/.env\n!! bin/output.dat\n"
+	// bin stays name-only in the defaults, so a wholly ignored bin/ refuses
+	// on both sides even though it could hold build output — and any secret
+	// inside it is never deleted.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z")] = "!! bin/\x00"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if r.called("worktree\x00remove") {
-		t.Fatal("worktree holding bin/.env deleted with the worktree")
+		t.Fatal("worktree holding bin/ deleted with the worktree")
 	}
 	var saw bool
 	for _, row := range reapLogRows(t, s, "example/project") {
@@ -968,8 +965,43 @@ func TestReapRefusesSecretsInsideRegenerableDir(t *testing.T) {
 	if !saw {
 		t.Fatal("ignored-files skip not recorded")
 	}
-	if !r.called("status\x00--porcelain\x00--ignored\x00-uall\x00--\x00bin/") {
-		t.Fatal("approved dir contents were not verified with -uall")
+}
+
+func TestReapRepoScopedRegenerable(t *testing.T) {
+	// .local/ is not a default; only a repo that lists it in its own
+	// reap.regenerable removes a worktree holding a wholly ignored
+	// .local/, and only there.
+	outs := panegoneWorktreeOuts("/repo")
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z")] = "!! .local/\x00"
+	r := &scriptRunner{outs: outs}
+	s := svc(t, &reapGH{}, r)
+	scoped := testRepo
+	scoped.Reap.Regenerable = []string{".local/"}
+	if err := s.Reap(context.Background(), scoped, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("repo-scoped .local/ blocked removal")
+	}
+	r2 := &scriptRunner{outs: outs}
+	s2 := svc(t, &reapGH{}, r2)
+	if err := s2.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r2.called("worktree\x00remove") {
+		t.Fatal("default list removed a .local/ worktree")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s2, "example/project") {
+		if strings.HasPrefix(fmt.Sprint(row["reason"]), "ignored-files:") {
+			saw = true
+			if files := fmt.Sprint(row["files"]); !strings.Contains(files, ".local/") {
+				t.Fatalf("files should name .local/, got %q", files)
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("ignored-files skip not recorded")
 	}
 }
 

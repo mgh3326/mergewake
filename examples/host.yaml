@@ -10,6 +10,12 @@ repos:
     policy: .mergewake/policy.yaml
     root: ~/.local/share/example-tools
     task: "42"
+    # Per-repo additions to reap.regenerable (validated like the global list;
+    # a trailing / is an explicit top-level directory approval). Empty means
+    # the global list. Example: panewire alone approves its .local/ test
+    # state dir here instead of the fleet-wide defaults.
+    # reap:
+    #   regenerable: ['.local/']
 review:
   login: review-bot
   timeout: 10m
@@ -90,5 +96,8 @@ reap:
   scan_after: 720h # merged-PR discovery window; older PRs arrive via receipts
   legacy_every: 24h # daemon's legacy sweep per repo; 0 or off disables it
   regenerable: [] # gitignored paths safe to delete with a worktree (defaults:
-  # .venv, node_modules, __pycache__, .pytest_cache, .local, dist, build,
-  # target, obj, bin, Library, Temp, Logs, UserSettings); anything else refuses removal
+  # .venv, node_modules, __pycache__, .pytest_cache, dist, build, target, obj,
+  # bin, Library, Temp, Logs, UserSettings, plus directory forms .venv/,
+  # node_modules/, __pycache__/, .pytest_cache/, Library/ and Temp/); a
+  # trailing / approves the whole top-level directory, so list only tool-owned
+  # dirs — anything else refuses removal

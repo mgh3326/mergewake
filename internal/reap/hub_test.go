@@ -264,41 +264,16 @@ func TestHubRefusesRedirect(t *testing.T) {
 	}
 }
 
-func TestExpandRegenerableForNode(t *testing.T) {
-	got := ExpandRegenerableForNode([]string{".venv", "node_modules", "vendor/**"})
-	for _, want := range []string{".venv", ".venv/", "node_modules", "node_modules/", "vendor/**"} {
-		found := false
-		for _, g := range got {
-			if g == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("expanded %v missing %q", got, want)
-		}
-	}
-	for _, bad := range []string{"vendor/**/"} {
-		for _, g := range got {
-			if g == bad {
-				t.Errorf("expanded %v should not contain %q", got, bad)
-			}
-		}
-	}
-	if got := ExpandRegenerableForNode([]string{".venv/"}); len(got) != 2 || got[0] != ".venv" || got[1] != ".venv/" {
-		t.Errorf("dir form normalized to %v, want [.venv .venv/]", got)
-	}
-	if got := ExpandRegenerableForNode(nil); len(got) != 0 {
-		t.Errorf("nil expanded to %v, want empty", got)
-	}
-}
-
-func TestWorktreeRemoveSendsDirectoryForms(t *testing.T) {
+func TestWorktreeRemoveSendsListAsConfigured(t *testing.T) {
 	hub, seen := fakeHub(t, func(r hubRequest) (int, any) {
 		return http.StatusOK, map[string]any{"result": map[string]any{"outcome": "removed"}}
 	})
 	host := HubHost{Hub: hub, Machine: "node-a"}
-	if _, err := host.WorktreeRemove(context.Background(), "/w/repo.wt", "aaaa", "main", []string{".venv", ".local", "vendor/**"}, false); err != nil {
+	// A slash-free name never becomes a directory approval: only an
+	// explicit pattern ending in `/` approves a wholly ignored `dir/`
+	// entry at the node, so the list goes exactly as configured.
+	want := []string{".venv", ".venv/", "node_modules/", "vendor/**"}
+	if _, err := host.WorktreeRemove(context.Background(), "/w/repo.wt", "aaaa", "main", want, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(*seen) != 1 {
@@ -311,16 +286,12 @@ func TestWorktreeRemoveSendsDirectoryForms(t *testing.T) {
 		s, _ := v.(string)
 		sent = append(sent, s)
 	}
-	for _, want := range []string{".venv", ".venv/", ".local", ".local/", "vendor/**"} {
-		found := false
-		for _, g := range sent {
-			if g == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("worktree.remove regenerable %v missing %q", sent, want)
+	if len(sent) != len(want) {
+		t.Fatalf("worktree.remove regenerable = %v, want %v", sent, want)
+	}
+	for i := range want {
+		if sent[i] != want[i] {
+			t.Fatalf("worktree.remove regenerable = %v, want %v", sent, want)
 		}
 	}
 }

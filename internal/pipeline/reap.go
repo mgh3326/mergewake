@@ -878,7 +878,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					})
 					if !ok {
 						rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
-					} else if result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false); err != nil {
+					} else if result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.ReapRegenerable(r), false); err != nil {
 						rec.Result, rec.Reason = "error", err.Error()
 					} else {
 						rec.Files = result.Files
@@ -925,10 +925,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					ignored, e = c.hs.exec.Ignored(ctx, w.Path)
 				}
 				var unsafe []string
-				if e == nil {
-					// A collapsed dir approved by name is verified file by
-					// file; a secret inside refuses the whole worktree.
-					unsafe, e = reap.UnsafeIgnored(ctx, c.hs.exec, w.Path, s.Config.Reap.Regenerable, ignored)
+				for _, f := range ignored {
+					if !reap.Regenerable(s.Config.ReapRegenerable(r), f) {
+						unsafe = append(unsafe, f)
+					}
 				}
 				switch {
 				case e != nil:

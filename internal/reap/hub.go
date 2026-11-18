@@ -421,43 +421,6 @@ func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base strin
 	return h.WorktreeRemoveDisposable(ctx, cwd, expectHead, base, regenerable, nil, detached)
 }
 
-// ExpandRegenerableForNode returns the wire form of the regenerable allowlist:
-// every slash-free pattern approves both the ignored file and the wholly
-// ignored directory of that name at the node, but the node reports a wholly
-// ignored directory as one `dir/` entry approved only by a pattern ending in
-// `/` (panewire docs/node-commands.md, `worktree.remove`). A trailing `/` in
-// config is accepted and normalized to both forms, so configured directory
-// forms keep their file approval too.
-func ExpandRegenerableForNode(in []string) []string {
-	out := make([]string, 0, 2*len(in))
-	seen := map[string]struct{}{}
-	add := func(s string) {
-		if _, ok := seen[s]; !ok {
-			seen[s] = struct{}{}
-			out = append(out, s)
-		}
-	}
-	for _, p := range in {
-		if p == "" {
-			continue
-		}
-		if strings.HasSuffix(p, "/") {
-			base := strings.TrimSuffix(p, "/")
-			if base == "" {
-				continue
-			}
-			add(base)
-			add(base + "/")
-			continue
-		}
-		add(p)
-		if !strings.Contains(p, "/") {
-			add(p + "/")
-		}
-	}
-	return out
-}
-
 // WorktreeRemoveDisposable sends the disposable untracked list with the same
 // guarded removal. A node that predates the argument refuses the whole
 // request; the call is then retried without it, so that node's own dirty check
@@ -465,13 +428,12 @@ func ExpandRegenerableForNode(in []string) []string {
 // upgrade instead of removing anything unguarded.
 func (h HubHost) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, base string, regenerable, disposable []string, detached bool) (WorktreeRemoveResult, error) {
 	// The node refuses a null list as invalid_request, so "no regenerable
-	// globs" is sent as an empty list.
+	// globs" is sent as an empty list. The list goes as configured: a
+	// slash-free name never becomes a directory approval, only an explicit
+	// pattern ending in `/` approves a wholly ignored `dir/` entry.
 	if regenerable == nil {
 		regenerable = []string{}
 	}
-	// A wholly ignored directory arrives as one `dir/` entry approved only by
-	// a pattern ending in `/`: expand every slash-free name to both forms.
-	regenerable = ExpandRegenerableForNode(regenerable)
 	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable, "detached": detached}
 	if len(disposable) > 0 {
 		args["disposable"] = disposable

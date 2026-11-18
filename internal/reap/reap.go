@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -598,109 +600,22 @@ func (e Exec) TrackedClean(ctx context.Context, path string) (bool, error) {
 
 // Ignored lists gitignored files inside the worktree. `git status --porcelain`
 // hides them, but `git worktree remove` deletes them anyway — callers refuse
-// the removal rather than silently lose an .env or notes file. A wholly
-// ignored directory arrives as one collapsed `dir/` entry approved by name;
-// an approved dir is then verified file by file with IgnoredIn, since the
-// collapsed entry cannot show a secret hiding inside. (An empty ignored dir
-// is unreported by git in either mode: nothing to lose.)
+// the removal rather than silently lose an .env or notes file. `-z` keeps
+// names unquoted and NUL-separated, the same listing the node checks, so both
+// sides see the same entries. A wholly ignored directory arrives as one
+// collapsed `dir/` entry.
 func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-z")
 	if err != nil {
 		return nil, err
 	}
-	return ignoredEntries(b), nil
-}
-
-// IgnoredIn lists the ignored files inside one directory of the worktree.
-// `-uall` expands wholly ignored directories into individual files, so the
-// caller sees every file a collapsed `dir/` entry hides.
-func (e Exec) IgnoredIn(ctx context.Context, path, dir string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-uall", "--", dir)
-	if err != nil {
-		return nil, err
-	}
-	return ignoredEntries(b), nil
-}
-
-func ignoredEntries(b []byte) []string {
 	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "!! ") {
-			out = append(out, strings.TrimSpace(line[3:]))
+	for _, f := range strings.Split(string(b), "\x00") {
+		if strings.HasPrefix(f, "!! ") {
+			out = append(out, f[3:])
 		}
 	}
-	return out
-}
-
-// secretBasename names files that location can never make regenerable:
-// dotenv files and well-known credential/note names. An explicit full-path
-// glob still matches them; only inherited approval from an approved
-// directory is denied.
-func secretBasename(base string) bool {
-	if strings.HasPrefix(base, ".env") {
-		return true
-	}
-	switch strings.ToLower(base) {
-	case "creds.json", "credentials.json", "token", "notes.md":
-		return true
-	}
-	return false
-}
-
-// RegenerableDir reports whether a collapsed ignored directory approved by
-// name is safe to lose with the worktree: every file in it must be
-// regenerable — directly, or by location under the approved directory
-// unless its own name is a secret/notes pattern. The unit is the directory
-// the node approves with `<p>/`; the secret exception is what keeps an
-// ignored .env, creds file or token refusing removal even inside a
-// regenerable dir. An empty directory lists no files and passes.
-func RegenerableDir(globs []string, dir string, files []string) bool {
-	if !Regenerable(globs, dir) {
-		return false
-	}
-	base := strings.TrimSuffix(dir, "/")
-	for _, f := range files {
-		if Regenerable(globs, f) {
-			continue
-		}
-		p := strings.TrimSuffix(f, "/")
-		if p != base && !strings.HasPrefix(p, base+"/") {
-			return false
-		}
-		seg := p
-		if i := strings.LastIndex(seg, "/"); i >= 0 {
-			seg = seg[i+1:]
-		}
-		if secretBasename(seg) {
-			return false
-		}
-	}
-	return true
-}
-
-// UnsafeIgnored returns the subset of ignored entries that refuse removal.
-// A collapsed directory entry approved by name is verified by listing its
-// files: the directory is unsafe when any file in it is not regenerable
-// under RegenerableDir.
-func UnsafeIgnored(ctx context.Context, ex Exec, path string, globs, ignored []string) ([]string, error) {
-	var unsafe []string
-	for _, f := range ignored {
-		if !Regenerable(globs, f) {
-			unsafe = append(unsafe, f)
-			continue
-		}
-		if !strings.HasSuffix(f, "/") {
-			continue
-		}
-		files, err := ex.IgnoredIn(ctx, path, f)
-		if err != nil {
-			return nil, err
-		}
-		if !RegenerableDir(globs, f, files) {
-			unsafe = append(unsafe, f)
-		}
-	}
-	return unsafe, nil
+	return out, nil
 }
 
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {
@@ -742,30 +657,73 @@ func RepoFromRemote(raw string) string {
 }
 
 // Regenerable reports whether an ignored path inside a worktree matches the
-// regenerable allowlist — throwaway output that rebuilds on demand and is
-// safe to lose with the worktree. A pattern containing a slash must match
-// the whole path; a slash-free pattern names a regenerable directory or
-// file and may match only the ignored entry's last segment — matching an
-// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file
-// like bin/local.env past the refusal.
-func Regenerable(globs []string, path string) bool {
-	p := strings.Trim(path, "/")
+// regenerable allowlist, using the node's rule (panewire docs/node-commands.md,
+// `worktree.remove`), so the precheck and the node refuse the same worktrees:
+// a `dir/` entry matches only a glob whose raw form ends in `/`, and that
+// directory form is a whole-path pattern approving only the top-level
+// directory — a nested `web/node_modules/` still refuses. A glob containing
+// `/` matches the whole trimmed path; a slash-free glob matches only the
+// ignored entry's last segment, and never a `dir/` entry — matching an
+// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file like
+// bin/local.env past the refusal.
+func Regenerable(globs []string, entry string) bool {
+	p := strings.Trim(entry, "/")
+	dir := strings.HasSuffix(entry, "/")
 	base := p
 	if i := strings.LastIndex(p, "/"); i >= 0 {
 		base = p[i+1:]
 	}
 	for _, g := range globs {
-		g = strings.Trim(g, "/")
 		if g == "" {
 			continue
 		}
-		match := base
-		if strings.Contains(g, "/") {
-			match = p
-		}
-		if ok, _ := policy.Match(g, match); ok {
-			return true
+		switch {
+		case strings.HasSuffix(g, "/"):
+			if ok, _ := policy.Match(strings.TrimSuffix(g, "/"), p); ok {
+				return true
+			}
+		case strings.Contains(g, "/"):
+			if ok, _ := policy.Match(g, p); ok {
+				return true
+			}
+		default:
+			if dir {
+				continue
+			}
+			if ok, _ := path.Match(g, base); ok {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// globClass strips bracket character classes for the wildcard-only check.
+var globClass = regexp.MustCompile(`\[[^\]]*\]`)
+
+// ValidRegenerableGlob reports whether the node accepts a regenerable glob,
+// mirroring its validNodeGlob rule: the pattern must be non-empty, relative,
+// at most 128 bytes with no control bytes, must not be wildcard-only (after
+// stripping character classes, trimming `*?/` leaves nothing), and may end
+// in `/` as an explicit top-level directory approval. Anything it refuses
+// fails every `worktree.remove`, so the config refuses it at load.
+func ValidRegenerableGlob(g string) error {
+	if g == "" || strings.HasPrefix(g, "/") {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	if len(g) > 128 {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	for i := range len(g) {
+		if g[i] < 0x20 || g[i] == 0x7f {
+			return fmt.Errorf("invalid path glob %q", g)
+		}
+	}
+	if strings.Trim(globClass.ReplaceAllString(g, ""), "*?/") == "" {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	if _, err := policy.Match(strings.TrimSuffix(g, "/"), "probe"); err != nil {
+		return err
+	}
+	return nil
 }
