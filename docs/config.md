@@ -560,25 +560,25 @@ configured repository's `decisions.jsonl`, tracking `day`, `mechanism`, `made`,
 | Key | Required / default | Meaning |
 | --- | --- | --- |
 | `lane` | Desk lane | Panewire lane receiving stall notices. When unset, falls back to `reap.balance_lane`, then to the desk (`notifier.fallback_lane`, else `notifier.lane`). |
-| `thresholds` | Default thresholds | Optional per-mechanism threshold overrides (`min_made` integer, `min_ratio` float between 0.0 and 1.0). |
+| `thresholds` | Default thresholds | Optional threshold overrides configured as flat fields on `liveness.thresholds`; see below. |
 
 #### Mechanisms and thresholds
 
-Every mechanism evaluates progress made against expected completions over the UTC day. A mechanism is considered `stalled` when `made >= min_made` and `ratio < min_ratio`. Quiet days (`made < min_made`) never stall.
+Every mechanism evaluates progress made against expected completions over the UTC day. A mechanism is considered `stalled` when its stall condition is met; quiet days below minimum attempts never stall.
 
-| # | Mechanism name | Made predicate | Done predicate | Default threshold |
-|---|----------------|----------------|----------------|-------------------|
-| 1 | `review-pass` | Distinct PR heads claimed for review (`review-claim`). | Distinct PR heads completing review with a verdict (`review-verdict`). | `min_made: 1`, `min_ratio: 0.90` |
-| 2 | `reviewer-landing` | Distinct reviewer placement attempts (`reviewer-spawn` with non-empty label). | Distinct reviewer labels landing on an execution host (`reviewer-job-landing`). | `min_made: 5`, `min_ratio: 0.80` |
-| 3 | `reviewer-checkout-removal` | Distinct checkouts created on or before the day (by `reviewer-spawn` or cleanup receipts). | Distinct checkouts removed that day (`reviewer-cleanup` or `reviewer-reap` with result `removed`). Also verifies per-host removal ratio (folded from mechanism 5). | Global: `min_made: 20`, `min_ratio: 0.70`<br>Per-host: `min_made: 20`, `min_ratio: 0.70` |
-| 4 | `merge` | Approved and CI-ready PRs eligible to merge (`pr-approval` or passing `ci-summary`). | PRs successfully merged (`pr-notify` state `merged` or `hk-task-event` with source `mergewake.merge`). | `min_made: 1`, `min_ratio: 0.80` |
-| 5 | *(folded into 3)* | Reviewer checkout removals per-host. | Folded into mechanism 3 (`reviewer-checkout-removal` stalls if any host with >= 20 checkouts removes < 70%). | `min_made: 20`, `min_ratio: 0.70` |
-| 6 | `ci-watch-revert` | Post-merge CI breaks detected by watch (`revert-needed`, `revert-plan`, `revert-created`). | Watch revert PRs merged or resolved (`revert-merged`, `revert-resolved`, `revert-pr`). | `min_made: 1`, `min_ratio: 0.90` |
-| 7 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`). | Successful task event posts (`status: "ok"` or HTTP 200/201). | `min_made: 5`, `min_ratio: 0.95` |
-| 8 | `outcome-publish` | Eligible outcomes recorded in `<state_dir>/outcomes.jsonl`. | Outcomes successfully published (`outcome-published` audit rows). | `min_made: 1`, `min_ratio: 0.90` |
-| 9 | `legacy-sweep` | Legacy sweeps due or started (`reap-legacy-start` or configured intervals). | Legacy sweeps completed without fatal error (`reap-legacy-summary` or `reap-legacy-complete`). | `min_made: 1`, `min_ratio: 0.80` |
-| 10 | `review-finding-dispatch` | Graded review findings identified in passes (`review-findings`). | Review findings dispatched or recorded on verdict (`review-finding-dispatched`). | `min_made: 1`, `min_ratio: 0.90` |
-| 11 | `review-retry` | Review passes deferred for retry > 24 hours without resolution (`review-deferred`). | Deferred review passes resolved or retried (`review-retry-resolved` or new claim/verdict). | `min_made: 1`, `min_ratio: 0.80` |
+| # | Mechanism name | Made predicate | Done predicate | Default threshold config |
+|---|----------------|----------------|----------------|--------------------------|
+| 1 | `review-pass` | Distinct PR heads claimed for review (`review-start`). | Distinct PR heads completing review with a verdict (`review` or `review-skipped`). | `review_pass_min_made: 10`<br>`review_pass_min_done_pct: 50` |
+| 2 | `reviewer-landing` | Reviewer placement requests created (`review-brief-hk` with label). | Reviewer jobs landed on an execution host (`reviewer-spawn`). | `reviewer_landing_min_made: 10`<br>`reviewer_landing_min_landed_pct: 50` |
+| 3 | `findings-delivery` | Distinct PR heads with critical or high review findings (`review-round-finding`). | Heads whose findings were delivered or acknowledged (`findings-delivered` or `findings-acked`). | `findings_delivery_min_made: 3`<br>(Stalls if made >= 3 and done == 0) |
+| 4 | `merge` | Approved and CI-ready PRs eligible to merge (`land` action `merge`). | PRs successfully merged (`pr-notify` state `merged` or `hk-task-event` with source `mergewake.merge`). | `merge_max_unmerged: 3`<br>(Stalls if unmerged >= 3 and made >= 3) |
+| 5 | `reviewer-checkout-removal` | Distinct checkouts created on or before the day (`reviewer-spawn`). | Distinct checkouts removed that day (`reviewer-cleanup` or `reviewer-reap` with result `removed`). | Inherits from `reap`:<br>`reap.balance_min_created: 20`<br>`reap.balance_max_removed_pct: 70` |
+| 6 | `author-worktree-sweep` | Candidate author worktrees inspected for removal in `reap.jsonl` (`remove-worktree`). | Worktrees removed or found already gone (`result: "removed"` or `reason: "worktree-gone"`). | `author_sweep_min_made: 5`<br>`author_sweep_min_done_pct: 30` |
+| 7 | `watch-revert` | Merges observed on base branch (`pr-notify` state `merged` or `land` action `merge`). | Base branch heads actively observed by CI watch (`watch`). | `watch_max_unverdicted_hours: 6`<br>(Stalls if repo has merges but zero watch observations) |
+| 8 | `lane-notices` | Attempted lane notifications (`pr-notify`, `review-blocked`, `conflict-esc`). | Successful notifications (attempts minus notification errors). | `lane_notices_min_attempts: 5`<br>`lane_notices_max_error_pct: 50` |
+| 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`) and field refusals. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
+| 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
+| 11 | `review-retry` | Review passes deferred for retry on the day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged). | `review_retry_max_deferred_hours: 24`<br>(Stalls if unresolved deferral >= 24h) |
 
 #### Stall notices and repeat rule
 
@@ -590,7 +590,7 @@ When a mechanism evaluates as stalled:
   mergewake liveness ack <mechanism> --reason "<text>"
   ```
   The acknowledgment records a `liveness-ack` row in `decisions.jsonl`. While acknowledged, repeat notices for that mechanism are suppressed.
-* If a subsequent daily evaluation marks the mechanism healthy (`stalled: false`), the acknowledgment is automatically cleared. Any future stall on that mechanism will alert again.
+* When a recovery daily row (`stalled: false`) is written after an acknowledgment, the ack is automatically cleared. Any future stall on that mechanism will alert again.
 
 #### Inspecting liveness
 

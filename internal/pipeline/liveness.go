@@ -62,17 +62,17 @@ func NormalizeMechanism(name string) (string, bool) {
 		return MechReviewPass, true
 	case MechReviewerLanding, "reviewer-spawn", "landing":
 		return MechReviewerLanding, true
-	case MechFindingsDelivery, "findings":
+	case MechFindingsDelivery, "findings", "review-finding-dispatch", "finding-dispatch":
 		return MechFindingsDelivery, true
 	case MechMerge, "landing-merge":
 		return MechMerge, true
 	case MechReviewerCheckoutRemoval, "reviewer-balance", "reap-balance", "checkout-removal":
 		return MechReviewerCheckoutRemoval, true
-	case MechAuthorWorktreeSweep, "author-sweep", "worktree-sweep":
+	case MechAuthorWorktreeSweep, "author-sweep", "worktree-sweep", "legacy-sweep", "reap-legacy":
 		return MechAuthorWorktreeSweep, true
-	case MechWatchRevert, "watch":
+	case MechWatchRevert, "watch", "ci-watch-revert":
 		return MechWatchRevert, true
-	case MechLaneNotices, "notices":
+	case MechLaneNotices, "notices", "lane-notice":
 		return MechLaneNotices, true
 	case MechTaskEvents, "hk-task-events", "task-event":
 		return MechTaskEvents, true
@@ -604,9 +604,10 @@ func (s *Service) livenessNoticeRow(repo, day, mech string) (livenessNoticeRecei
 }
 
 // activeLivenessAcks returns active answers by mechanism.
-// An ack holds for that stall until the mechanism recovers (a day under threshold clears it).
+// An ack holds for that stall until the mechanism recovers (a recovery row written after the ack clears it).
 func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string, error) {
 	active := map[string]string{}
+	ackTimes := map[string]time.Time{}
 	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
 		return active, nil
@@ -635,6 +636,7 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 					}
 					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" && v.Reason != "" {
 						active[v.Mechanism] = v.Reason
+						ackTimes[v.Mechanism] = row.Time
 					}
 				case livenessDailyCommand:
 					var v struct {
@@ -643,9 +645,10 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 						Stalled   bool   `json:"stalled"`
 					}
 					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" {
-						// A recovery day (stalled == false) on or after an ack clears it
-						if !v.Stalled && v.Day <= currentDay {
+						// A recovery day (stalled == false) written after an ack clears it
+						if !v.Stalled && row.Time.After(ackTimes[v.Mechanism]) {
 							delete(active, v.Mechanism)
+							delete(ackTimes, v.Mechanism)
 						}
 					}
 				}
@@ -693,16 +696,19 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	m8Errors := 0
 
 	m9Attempts := 0
+	m9Successes := 0
 	m9Refusals := 0
 
 	m10Errors := 0
 
 	type deferredEntry struct {
 		repo, head string
+		pr         int
 		first      time.Time
 	}
 	m11Deferred := map[string]deferredEntry{} // repo#head -> entry
 	m11Resolved := map[string]bool{}          // repo#head -> true
+	m11PRResolved := map[string]bool{}        // repo#pr -> true
 
 	// Scan decisions across all watched repos
 	for _, r := range repos {
@@ -727,16 +733,20 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 					rowDay := row.Time.UTC().Format(reviewerSummaryDay)
 					// Parse generic value fields
 					var v struct {
-						Head     string   `json:"head"`
-						PR       int      `json:"pr"`
-						Label    string   `json:"label"`
-						Action   string   `json:"action"`
-						State    string   `json:"state"`
-						Severity string   `json:"severity"`
-						Source   string   `json:"source"`
-						Ref      string   `json:"source_ref"`
-						OldLabel string   `json:"old_label"`
-						Sha      string   `json:"sha"`
+						Head     string          `json:"head"`
+						PR       int             `json:"pr"`
+						Label    string          `json:"label"`
+						Action   string          `json:"action"`
+						State    string          `json:"state"`
+						Severity string          `json:"severity"`
+						Source   string          `json:"source"`
+						Ref      string          `json:"source_ref"`
+						OldLabel string          `json:"old_label"`
+						OldHead  string          `json:"old_head"`
+						NewHead  string          `json:"new_head"`
+						Sha      string          `json:"sha"`
+						Error    string          `json:"error"`
+						Result   json.RawMessage `json:"result"`
 					}
 					_ = json.Unmarshal(row.Value, &v)
 					if v.Head == "" && v.Sha != "" {
@@ -807,6 +817,9 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						switch row.Command {
 						case "hk-task-event":
 							m9Attempts++
+							if v.Error == "" && len(v.Result) > 0 && string(v.Result) != "null" {
+								m9Successes++
+							}
 						case "task-event-fields-refused":
 							m9Attempts++
 							m9Refusals++
@@ -816,21 +829,26 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						if row.Command == "outcome-publish-error" {
 							m10Errors++
 						}
-					}
 
-					// M11: review-retry tracks deferrals and resolutions across the window
-					endOfDay, _ := time.Parse(reviewerSummaryDay, day)
-					endOfDay = endOfDay.Add(24 * time.Hour)
-					if row.Command == "review-retry-deferred" && v.Head != "" && row.Time.UTC().Before(endOfDay) {
-						if _, exists := m11Deferred[keyHead]; !exists {
-							m11Deferred[keyHead] = deferredEntry{repo: r.Name, head: v.Head, first: row.Time.UTC()}
+						// M11: review-retry
+						if row.Command == "review-retry-deferred" && v.Head != "" {
+							if _, exists := m11Deferred[keyHead]; !exists {
+								m11Deferred[keyHead] = deferredEntry{repo: r.Name, pr: v.PR, head: v.Head, first: row.Time.UTC()}
+							}
 						}
-					}
-					if (row.Command == "review" || row.Command == "escalate-author") && v.Head != "" && row.Time.UTC().Before(endOfDay) {
-						m11Resolved[keyHead] = true
-					}
-					if row.Command == "reviewer-head-moved" && v.OldLabel != "" && row.Time.UTC().Before(endOfDay) {
-						m11Resolved[r.Name+"#"+v.OldLabel] = true
+						if (row.Command == "review" || row.Command == "escalate-author" || row.Command == "review-skipped") && v.Head != "" {
+							m11Resolved[keyHead] = true
+						}
+						if row.Command == "reviewer-head-moved" && v.OldHead != "" {
+							m11Resolved[r.Name+"#"+v.OldHead] = true
+						}
+						if (row.Command == "pr-notify" && (v.State == "closed" || v.State == "merged")) ||
+							(row.Command == "land" && v.Action == "merge") ||
+							row.Command == "pr-closed" {
+							if v.PR > 0 {
+								m11PRResolved[fmt.Sprintf("%s#%d", r.Name, v.PR)] = true
+							}
+						}
 					}
 				}
 			}
@@ -1046,15 +1064,15 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	// 9. task-events
 	{
 		made := m9Attempts
-		ref := m9Refusals
-		done := made - ref
+		done := m9Successes
 		ratio := 1.0
 		if made > 0 {
 			ratio = float64(done) / float64(made)
 		}
 		minAttempts := cfg.TaskEventsMinAttemptsOrDefault()
 		maxRefusalPct := cfg.TaskEventsMaxRefusalPctOrDefault()
-		stalled := ref >= minAttempts && ref*100 >= maxRefusalPct*made
+		failed := made - done
+		stalled := made >= minAttempts && (failed*100 >= maxRefusalPct*made || m9Refusals*100 >= maxRefusalPct*made)
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechTaskEvents, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
 		})
@@ -1106,10 +1124,12 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		stalled := false
 		endOfDay, _ := time.Parse(reviewerSummaryDay, day)
 		endOfDay = endOfDay.Add(24 * time.Hour)
+		maxHours := time.Duration(cfg.ReviewRetryMaxDeferredHoursOrDefault()) * time.Hour
 		for k, entry := range m11Deferred {
-			if m11Resolved[k] {
+			prKey := fmt.Sprintf("%s#%d", entry.repo, entry.pr)
+			if m11Resolved[k] || (entry.pr > 0 && m11PRResolved[prKey]) {
 				done++
-			} else if endOfDay.Sub(entry.first) > time.Duration(cfg.ReviewRetryMaxDeferredHoursOrDefault())*time.Hour {
+			} else if endOfDay.Sub(entry.first) >= maxHours {
 				stalled = true
 			} else {
 				done++ // within grace window

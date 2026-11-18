@@ -447,7 +447,7 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 	t.Run(MechTaskEvents, func(t *testing.T) {
 		f := newLivenessFixture(t, dTime)
 		for i := 1; i <= 20; i++ {
-			f.audit(t, f.repos[0].Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i)}, dTime)
+			f.audit(t, f.repos[0].Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i), "result": map[string]any{"id": i}}, dTime)
 		}
 		res, err := f.s.livenessForDay(f.repos, day)
 		if err != nil {
@@ -463,11 +463,11 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 			t.Fatalf("healthy task-events: %+v", m)
 		}
 
-		// Stalled: 20 attempts, 10 refusals (50% >= 20% and >= 10)
+		// Stalled: 20 attempts, 10 errors (50% >= 20% and >= 10)
 		f2 := newLivenessFixture(t, dTime)
 		for i := 1; i <= 10; i++ {
-			f2.audit(t, f2.repos[0].Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i)}, dTime)
-			f2.audit(t, f2.repos[0].Name, "task-event-fields-refused", map[string]any{"task": strconv.Itoa(i)}, dTime)
+			f2.audit(t, f2.repos[0].Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i), "result": map[string]any{"id": i}}, dTime)
+			f2.audit(t, f2.repos[0].Name, "hk-task-event", map[string]any{"task": strconv.Itoa(100 + i), "error": "transport error"}, dTime)
 		}
 		res2, err := f2.s.livenessForDay(f2.repos, day)
 		if err != nil {
@@ -540,10 +540,10 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 			t.Fatalf("healthy review-retry: %+v", m)
 		}
 
-		// Stalled: deferred > 24h before end of day, unresolved
+		// Stalled: deferred at 12:00 UTC, unresolved by midnight with threshold 6h
 		f2 := newLivenessFixture(t, dTime)
-		early := balanceDayTime(day, 0).Add(-2 * time.Hour)
-		f2.audit(t, f2.repos[0].Name, "review-retry-deferred", map[string]any{"head": "head-ret-stuck"}, early)
+		f2.s.Config.Liveness.Thresholds.ReviewRetryMaxDeferredHours = 6
+		f2.audit(t, f2.repos[0].Name, "review-retry-deferred", map[string]any{"head": "head-ret-stuck"}, dTime)
 		res2, err := f2.s.livenessForDay(f2.repos, day)
 		if err != nil {
 			t.Fatal(err)
@@ -555,6 +555,42 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 		}
 		if !m.Stalled || m.Made != 1 || m.Done != 0 {
 			t.Fatalf("stalled review-retry: %+v", m)
+		}
+
+		// Resolved via reviewer-head-moved with OldHead
+		f3 := newLivenessFixture(t, dTime)
+		f3.s.Config.Liveness.Thresholds.ReviewRetryMaxDeferredHours = 6
+		f3.audit(t, f3.repos[0].Name, "review-retry-deferred", map[string]any{"head": "head-moved-old"}, dTime)
+		f3.audit(t, f3.repos[0].Name, "reviewer-head-moved", map[string]any{"old_head": "head-moved-old", "new_head": "head-moved-new"}, dTime.Add(1*time.Hour))
+		res3, err := f3.s.livenessForDay(f3.repos, day)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range res3.Mechanisms {
+			if item.Mechanism == MechReviewRetry {
+				m = item
+			}
+		}
+		if m.Stalled || m.Made != 1 || m.Done != 1 {
+			t.Fatalf("review-retry resolved via reviewer-head-moved: %+v", m)
+		}
+
+		// Resolved via PR closure
+		f4 := newLivenessFixture(t, dTime)
+		f4.s.Config.Liveness.Thresholds.ReviewRetryMaxDeferredHours = 6
+		f4.audit(t, f4.repos[0].Name, "review-retry-deferred", map[string]any{"pr": 99, "head": "head-pr-99"}, dTime)
+		f4.audit(t, f4.repos[0].Name, "pr-notify", map[string]any{"pr": 99, "state": "closed"}, dTime.Add(1*time.Hour))
+		res4, err := f4.s.livenessForDay(f4.repos, day)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range res4.Mechanisms {
+			if item.Mechanism == MechReviewRetry {
+				m = item
+			}
+		}
+		if m.Stalled || m.Made != 1 || m.Done != 1 {
+			t.Fatalf("review-retry resolved via PR closed: %+v", m)
 		}
 	})
 
@@ -638,9 +674,8 @@ func TestLiveness_AckClearedByRecovery(t *testing.T) {
 	t1 := balanceDayTime(day1, 12)
 	t2 := balanceDayTime(day2, 12)
 	t3 := balanceDayTime(day3, 12)
-	now := balanceDayTime("2026-11-17", 8)
 
-	f := newLivenessFixture(t, now)
+	f := newLivenessFixture(t, balanceDayTime(day1, 23))
 	target := f.repos[0]
 	ctx := context.Background()
 
@@ -657,13 +692,15 @@ func TestLiveness_AckClearedByRecovery(t *testing.T) {
 	}
 
 	// Ack day 1
+	f.now = balanceDayTime(day1, 23).Add(10 * time.Minute)
 	if err := f.s.AckLiveness(MechTaskEvents, "investigating"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Day 2: Recovers (healthy)
+	// Day 2: Recovers (healthy), runs on day 2 evening (after ack)
+	f.now = balanceDayTime(day2, 23)
 	for i := 1; i <= 20; i++ {
-		f.audit(t, target.Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i + 20)}, t2)
+		f.audit(t, target.Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i + 20), "result": map[string]any{"id": i}}, t2)
 	}
 	if err := f.s.livenessDay(ctx, target, day2, Options{}); err != nil {
 		t.Fatal(err)
@@ -673,6 +710,7 @@ func TestLiveness_AckClearedByRecovery(t *testing.T) {
 	}
 
 	// Day 3: Stalls again! Recovery cleared the ack, so notice must raise again!
+	f.now = balanceDayTime(day3, 23)
 	for i := 1; i <= 10; i++ {
 		f.audit(t, target.Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i + 50)}, t3)
 		f.audit(t, target.Name, "task-event-fields-refused", map[string]any{"task": strconv.Itoa(i + 50)}, t3)
@@ -682,6 +720,53 @@ func TestLiveness_AckClearedByRecovery(t *testing.T) {
 	}
 	if f.n.count != 2 {
 		t.Fatalf("expected new notice on day 3 after recovery cleared ack, got %d", f.n.count)
+	}
+}
+
+// TestLiveness_BackfilledHealthyRowDoesNotClearAck verifies that backfilled healthy daily
+// rows written for past days (e.g. during daemon catch-up) do not clear an ack that was recorded.
+func TestLiveness_BackfilledHealthyRowDoesNotClearAck(t *testing.T) {
+	now := balanceDayTime("2026-11-17", 12)
+	f := newLivenessFixture(t, now)
+	target := f.repos[0]
+
+	// Operator acknowledges a stall at now
+	f.s.Now = func() time.Time { return now }
+	if err := f.s.AckLiveness(MechTaskEvents, "operator investigating"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Catch-up backfills a healthy row for an earlier day (written with historical timestamp before ack)
+	pastTime := balanceDayTime("2026-11-15", 12)
+	f.audit(t, target.Name, livenessDailyCommand, map[string]any{
+		"day":       "2026-11-15",
+		"mechanism": MechTaskEvents,
+		"stalled":   false,
+	}, pastTime)
+
+	// Verify ack is still active
+	acks, err := f.s.activeLivenessAcks(target.Name, "2026-11-17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acks[MechTaskEvents] != "operator investigating" {
+		t.Fatalf("expected ack to remain active despite backfilled healthy row, got %+v", acks)
+	}
+
+	// Recovery row written AFTER the ack clears it
+	futureRecovery := now.Add(1 * time.Hour)
+	f.audit(t, target.Name, livenessDailyCommand, map[string]any{
+		"day":       "2026-11-18",
+		"mechanism": MechTaskEvents,
+		"stalled":   false,
+	}, futureRecovery)
+
+	acksAfter, err := f.s.activeLivenessAcks(target.Name, "2026-11-18")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := acksAfter[MechTaskEvents]; exists {
+		t.Fatalf("expected ack to be cleared after recovery written after ack, got %+v", acksAfter)
 	}
 }
 
