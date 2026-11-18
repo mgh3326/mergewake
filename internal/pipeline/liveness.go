@@ -687,10 +687,8 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	m4Land := map[string]bool{}   // repo#pr -> true
 	m4Merged := map[string]bool{} // repo#pr -> true
 
-	m7Merges := map[string]bool{}               // repo#head -> true
-	m7Watches := map[string]bool{}              // repo#head -> true
-	m7RepoMerges := map[string]map[string]bool{} // repo -> heads
-	m7RepoWatches := map[string]int{}           // repo -> watch count
+	m7Merges := map[string]string{}              // repo#pr -> repo
+	m7RepoWatches := map[string]int{}            // repo -> watch count
 
 	m8Attempts := 0
 	m8Errors := 0
@@ -712,7 +710,6 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 
 	// Scan decisions across all watched repos
 	for _, r := range repos {
-		m7RepoMerges[r.Name] = map[string]bool{}
 		f, err := os.Open(filepath.Join(s.state(r.Name), "decisions.jsonl"))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -734,6 +731,7 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 					// Parse generic value fields
 					var v struct {
 						Head     string          `json:"head"`
+						Heads    []string        `json:"heads"`
 						PR       int             `json:"pr"`
 						Label    string          `json:"label"`
 						Action   string          `json:"action"`
@@ -747,6 +745,9 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						Sha      string          `json:"sha"`
 						Error    string          `json:"error"`
 						Result   json.RawMessage `json:"result"`
+						Findings int             `json:"findings"`
+						Host     string          `json:"host"`
+						Pane     string          `json:"pane"`
 					}
 					_ = json.Unmarshal(row.Value, &v)
 					if v.Head == "" && v.Sha != "" {
@@ -773,13 +774,16 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						}
 
 						// M3: findings-delivery
-						if row.Command == "review-round-finding" && v.Head != "" {
-							sev := strings.ToLower(v.Severity)
-							if sev == "critical" || sev == "high" {
-								m3Critical[keyHead] = true
+						if (row.Command == "review" && v.Findings > 0 && v.Head != "") || (row.Command == "review-round-finding" && v.Head != "") {
+							m3Critical[keyHead] = true
+						}
+						if row.Command == "findings-delivered" || row.Command == "findings-acked" {
+							if v.Head != "" {
+								m3Delivered[keyHead] = true
 							}
-						} else if (row.Command == "findings-delivered" || row.Command == "findings-acked") && v.Head != "" {
-							m3Delivered[keyHead] = true
+							for _, h := range v.Heads {
+								m3Delivered[r.Name+"#"+h] = true
+							}
 						}
 
 						// M4: merge
@@ -795,13 +799,15 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						}
 
 						// M7: watch-revert
-						if row.Command == "watch" && v.Head != "" {
-							m7Watches[keyHead] = true
+						if row.Command == "watch" {
 							m7RepoWatches[r.Name]++
 						}
-						if (row.Command == "pr-notify" && v.State == "merged" && v.Head != "") || (row.Command == "land" && v.Action == "merge" && v.Head != "") {
-							m7Merges[keyHead] = true
-							m7RepoMerges[r.Name][v.Head] = true
+						if (row.Command == "pr-notify" && v.State == "merged" && (v.PR > 0 || v.Head != "")) || (row.Command == "land" && v.Action == "merge" && (v.PR > 0 || v.Head != "")) {
+							k := keyPR
+							if v.PR == 0 && v.Head != "" {
+								k = keyHead
+							}
+							m7Merges[k] = r.Name
 						}
 
 						// M8: lane-notices
@@ -900,7 +906,8 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		}
 		minMade := cfg.ReviewerLandingMinMadeOrDefault()
 		minLandedPct := cfg.ReviewerLandingMinLandedPctOrDefault()
-		stalled := made >= minMade && done*100 < minLandedPct*made
+		// reviewer-spawn row exists from 2026-11-17 (v0.5.388); older days stay quiet to avoid false stalls
+		stalled := day >= "2026-11-17" && made >= minMade && done*100 < minLandedPct*made
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechReviewerLanding, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
 		})
@@ -992,7 +999,7 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 							if wt == "" {
 								wt = fmt.Sprintf("pr-%d", row.PR)
 							}
-							key := r.Name + "#" + wt
+							key := fmt.Sprintf("%s#%s#%s", r.Name, row.Host, wt)
 							reapMade[key] = true
 							if row.Result == "removed" || row.Reason == "worktree-gone" || row.Reason == "already-gone" {
 								reapDone[key] = true
@@ -1024,20 +1031,17 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	{
 		made := len(m7Merges)
 		done := 0
-		for h := range m7Merges {
-			if m7Watches[h] {
+		stalled := false
+		for _, repoName := range m7Merges {
+			if m7RepoWatches[repoName] > 0 {
 				done++
+			} else {
+				stalled = true
 			}
 		}
 		ratio := 1.0
 		if made > 0 {
 			ratio = float64(done) / float64(made)
-		}
-		stalled := false
-		for r, merges := range m7RepoMerges {
-			if len(merges) > 0 && m7RepoWatches[r] == 0 {
-				stalled = true
-			}
 		}
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechWatchRevert, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
@@ -1055,7 +1059,7 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		}
 		minAttempts := cfg.LaneNoticesMinAttemptsOrDefault()
 		maxErrPct := cfg.LaneNoticesMaxErrorPctOrDefault()
-		stalled := errs >= minAttempts && errs*100 >= maxErrPct*made
+		stalled := made >= minAttempts && errs*100 >= maxErrPct*made
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechLaneNotices, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
 		})
@@ -1130,15 +1134,19 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 			if m11Resolved[k] || (entry.pr > 0 && m11PRResolved[prKey]) {
 				done++
 			} else if endOfDay.Sub(entry.first) >= maxHours {
-				stalled = true
+				// unresolved past threshold
 			} else {
 				done++ // within grace window
 			}
 		}
+		unresolved := made - done
 		ratio := 1.0
 		if made > 0 {
 			ratio = float64(done) / float64(made)
 		}
+		// A single miss must not raise; requires at least 3 unresolved deferrals
+		minUnresolved := 3
+		stalled = unresolved >= minUnresolved && (made > 0 && done*100 < 80*made)
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechReviewRetry, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
 		})

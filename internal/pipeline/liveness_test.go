@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,7 +73,7 @@ func livenessRows(t *testing.T, f *livenessFixture, repo, cmd string) []map[stri
 // TestLiveness_MechanismsHealthyAndStalled verifies that each mechanism stays quiet
 // on a synthetic healthy day and raises on a synthetic stalled day.
 func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
-	day := "2026-11-15"
+	day := "2026-11-17"
 	dTime := balanceDayTime(day, 12)
 	ctx := context.Background()
 
@@ -487,7 +488,7 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 	t.Run(MechOutcomePublish, func(t *testing.T) {
 		f := newLivenessFixture(t, dTime)
 		outcomesFile := filepath.Join(f.s.Config.StateDir, "outcomes.jsonl")
-		_ = os.WriteFile(outcomesFile, []byte(`{"kind":"published","at":"2026-11-15T12:00:00Z"}`+"\n"), 0600)
+		_ = os.WriteFile(outcomesFile, []byte(fmt.Sprintf(`{"kind":"published","at":"%sT12:00:00Z"}`+"\n", day)), 0600)
 		res, err := f.s.livenessForDay(f.repos, day)
 		if err != nil {
 			t.Fatal(err)
@@ -540,10 +541,12 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 			t.Fatalf("healthy review-retry: %+v", m)
 		}
 
-		// Stalled: deferred at 12:00 UTC, unresolved by midnight with threshold 6h
+		// Stalled: 3 deferred at 12:00 UTC, unresolved by midnight with threshold 6h
 		f2 := newLivenessFixture(t, dTime)
 		f2.s.Config.Liveness.Thresholds.ReviewRetryMaxDeferredHours = 6
-		f2.audit(t, f2.repos[0].Name, "review-retry-deferred", map[string]any{"head": "head-ret-stuck"}, dTime)
+		for i := 1; i <= 3; i++ {
+			f2.audit(t, f2.repos[0].Name, "review-retry-deferred", map[string]any{"head": "head-ret-stuck-" + strconv.Itoa(i)}, dTime)
+		}
 		res2, err := f2.s.livenessForDay(f2.repos, day)
 		if err != nil {
 			t.Fatal(err)
@@ -553,7 +556,7 @@ func TestLiveness_MechanismsHealthyAndStalled(t *testing.T) {
 				m = item
 			}
 		}
-		if !m.Stalled || m.Made != 1 || m.Done != 0 {
+		if !m.Stalled || m.Made != 3 || m.Done != 0 {
 			t.Fatalf("stalled review-retry: %+v", m)
 		}
 
@@ -784,6 +787,7 @@ func TestLiveness_IdempotentRetry(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		f.audit(t, target.Name, "land", map[string]any{"action": "merge", "pr": i}, t1)
 	}
+	f.audit(t, target.Name, "watch", map[string]any{"action": "healthy"}, t1)
 
 	// First pass
 	if err := f.s.livenessDay(ctx, target, day, Options{}); err != nil {
