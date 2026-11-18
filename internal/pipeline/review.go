@@ -118,7 +118,7 @@ type passPlan struct {
 	// supersedes is the label of a dead reviewer this run replaces (replaceDeadSpawn);
 	// the new label must differ from it.
 	supersedes string
-	// replaced are the reviewers this pass replaced for an overdue loss; the
+	// replaced are the reviewers this pass replaced for a lost result; the
 	// replacement's record carries them, so their late result can still complete the pass.
 	replaced []replacedReviewer
 }
