@@ -5,11 +5,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 )
 
-// A lost review is mergewake's own automation failing, so it goes to the
 // tool lane when one is set, and to the desk when it is not. The event id
 // is unchanged either way, so the hub dedupe still works.
 func TestLostReviewGoesToToolLaneWhenSet(t *testing.T) {
@@ -79,9 +80,9 @@ func TestReviewRetryEscalationNotifiesToolAndPRLanes(t *testing.T) {
 	}
 }
 
-// A tool-lane emit failure must not suppress the design-lane escalation: the
-// owner notice is always attempted, and its delivery counts even when the
-// tool copy fails.
+// A tool-lane emit failure must neither suppress the design-lane escalation
+// nor stall the retry: the owner notice is always attempted, the lost tool
+// copy is audited, and the escalation still counts as sent.
 func TestReviewRetryEscalationToolLaneFailureKeepsOwnerNotice(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
@@ -89,11 +90,48 @@ func TestReviewRetryEscalationToolLaneFailureKeepsOwnerNotice(t *testing.T) {
 	r.Lane = "owner-lane"
 	n.failLanes = map[string]error{"tool-lane": errors.New("lane not registered on this host")}
 	sent, err := s.escalateReviewFailure(context.Background(), r, g.pull, 3, "boom")
-	if err == nil || !sent {
-		t.Fatalf("escalate = %t, %v; want the owner delivery with a joined tool error", sent, err)
+	if err != nil || !sent {
+		t.Fatalf("escalate = %t, %v; want the owner delivery with the tool failure audited", sent, err)
 	}
 	if n.count != 1 || n.events[0].Lane != "owner-lane" || n.events[0].ID != "mergewake-review-failed-example/project-7-"+g.pull.Head.SHA {
 		t.Fatalf("escalation notices = %+v, want the owner copy delivered", n.events)
+	}
+	if rows := auditRows(t, s, r, "review-retry-tool-notice-failed"); len(rows) != 1 {
+		t.Fatalf("tool notice audit rows = %v, want one", rows)
+	}
+}
+
+// A failing tool lane must not stall the review retry: the design lane is
+// told, the escalation is recorded, and the next pass retries the review
+// instead of re-emitting the escalation.
+func TestReviewRetryWithFailingToolLaneStillRetries(t *testing.T) {
+	s, g, _, n, r := reviewSetup(t)
+	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
+	s.Config.Notifier.ToolLane = "tool-lane"
+	r.Lane = "owner-lane"
+	n.failLanes = map[string]error{"tool-lane": errors.New("lane not registered on this host")}
+	c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	s.Now = c.now
+	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "2m", Failures: 1}
+	g.pull.Body = "Mergewake-Author-Profile: unknown@v1"
+	s.Config.Review.DefaultFamily = ""
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err == nil {
+		t.Fatal("want a review failure")
+	} else if strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("tool-lane error stalled the retry: %v", err)
+	}
+	if n.count != 1 || n.events[0].Lane != "owner-lane" || !strings.Contains(n.events[0].Text, "review failed") {
+		t.Fatalf("escalation notices = %+v, want one owner event", n.events)
+	}
+	if rows := auditRows(t, s, r, "review-retry-tool-notice-failed"); len(rows) != 1 {
+		t.Fatalf("tool notice audit rows = %v, want one", rows)
+	}
+	c.t = c.t.Add(3 * time.Minute)
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err == nil {
+		t.Fatal("want the retry to run again past the backoff")
+	}
+	if n.count != 1 {
+		t.Fatalf("escalation re-emitted after Escalated: %+v", n.events)
 	}
 }
 
