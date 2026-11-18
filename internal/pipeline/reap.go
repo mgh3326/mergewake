@@ -925,10 +925,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					ignored, e = c.hs.exec.Ignored(ctx, w.Path)
 				}
 				var unsafe []string
-				for _, f := range ignored {
-					if !reap.Regenerable(s.Config.Reap.Regenerable, f) {
-						unsafe = append(unsafe, f)
-					}
+				if e == nil {
+					// A collapsed dir approved by name is verified file by
+					// file; a secret inside refuses the whole worktree.
+					unsafe, e = reap.UnsafeIgnored(ctx, c.hs.exec, w.Path, s.Config.Reap.Regenerable, ignored)
 				}
 				switch {
 				case e != nil:

@@ -1360,10 +1360,10 @@ func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
 		ignored, e = hs.exec.Ignored(ctx, path)
 	}
 	var unsafe []string
-	for _, f := range ignored {
-		if !reap.Regenerable(w.s.Config.Reap.Regenerable, f) {
-			unsafe = append(unsafe, f)
-		}
+	if e == nil {
+		// A collapsed dir approved by name is verified file by
+		// file; a secret inside keeps the whole checkout.
+		unsafe, e = reap.UnsafeIgnored(ctx, hs.exec, path, w.s.Config.Reap.Regenerable, ignored)
 	}
 	switch {
 	case e != nil:

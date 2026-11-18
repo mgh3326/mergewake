@@ -533,7 +533,12 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, receip
 			errs = append(errs, fmt.Errorf("orphan checkout %s: ignored: %w", path, e))
 			continue
 		}
-		if orphanHasUnsafeIgnored(s.Config.Reap.Regenerable, ignored) {
+		unsafe, e := orphanHasUnsafeIgnored(ctx, hs.exec, path, s.Config.Reap.Regenerable, ignored)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("orphan checkout %s: ignored: %w", path, e))
+			continue
+		}
+		if unsafe {
 			continue
 		}
 		if e := hs.refreshPanes(ctx); e != nil {
@@ -645,12 +650,13 @@ func orphanRow(r config.Repo, hs *reapHost, path, result, reason string) reapRec
 }
 
 // orphanHasUnsafeIgnored reports whether an ignored file outside the
-// regenerable list would be lost with the worktree.
-func orphanHasUnsafeIgnored(globs []string, ignored []string) bool {
-	for _, f := range ignored {
-		if !reap.Regenerable(globs, f) {
-			return true
-		}
+// regenerable list would be lost with the worktree. A collapsed directory
+// approved by name is verified file by file: a secret inside keeps the
+// checkout.
+func orphanHasUnsafeIgnored(ctx context.Context, ex reap.Exec, path string, globs []string, ignored []string) (bool, error) {
+	unsafe, err := reap.UnsafeIgnored(ctx, ex, path, globs, ignored)
+	if err != nil {
+		return false, err
 	}
-	return false
+	return len(unsafe) > 0, nil
 }

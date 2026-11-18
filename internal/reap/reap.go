@@ -598,23 +598,109 @@ func (e Exec) TrackedClean(ctx context.Context, path string) (bool, error) {
 
 // Ignored lists gitignored files inside the worktree. `git status --porcelain`
 // hides them, but `git worktree remove` deletes them anyway — callers refuse
-// the removal rather than silently lose an .env or notes file. `-uall` expands
-// wholly ignored directories into individual files, so the caller sees every
-// file: a `bin/` holding `bin/.env` is refused even though `bin` is
-// regenerable, while an empty regenerable dir yields no entries and passes.
-// (An empty ignored dir is unreported by git in either mode: nothing to lose.)
+// the removal rather than silently lose an .env or notes file. A wholly
+// ignored directory arrives as one collapsed `dir/` entry approved by name;
+// an approved dir is then verified file by file with IgnoredIn, since the
+// collapsed entry cannot show a secret hiding inside. (An empty ignored dir
+// is unreported by git in either mode: nothing to lose.)
 func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-uall")
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
 	if err != nil {
 		return nil, err
 	}
+	return ignoredEntries(b), nil
+}
+
+// IgnoredIn lists the ignored files inside one directory of the worktree.
+// `-uall` expands wholly ignored directories into individual files, so the
+// caller sees every file a collapsed `dir/` entry hides.
+func (e Exec) IgnoredIn(ctx context.Context, path, dir string) ([]string, error) {
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-uall", "--", dir)
+	if err != nil {
+		return nil, err
+	}
+	return ignoredEntries(b), nil
+}
+
+func ignoredEntries(b []byte) []string {
 	var out []string
 	for _, line := range strings.Split(string(b), "\n") {
 		if strings.HasPrefix(line, "!! ") {
 			out = append(out, strings.TrimSpace(line[3:]))
 		}
 	}
-	return out, nil
+	return out
+}
+
+// secretBasename names files that location can never make regenerable:
+// dotenv files and well-known credential/note names. An explicit full-path
+// glob still matches them; only inherited approval from an approved
+// directory is denied.
+func secretBasename(base string) bool {
+	if strings.HasPrefix(base, ".env") {
+		return true
+	}
+	switch strings.ToLower(base) {
+	case "creds.json", "credentials.json", "token", "notes.md":
+		return true
+	}
+	return false
+}
+
+// RegenerableDir reports whether a collapsed ignored directory approved by
+// name is safe to lose with the worktree: every file in it must be
+// regenerable — directly, or by location under the approved directory
+// unless its own name is a secret/notes pattern. The unit is the directory
+// the node approves with `<p>/`; the secret exception is what keeps an
+// ignored .env, creds file or token refusing removal even inside a
+// regenerable dir. An empty directory lists no files and passes.
+func RegenerableDir(globs []string, dir string, files []string) bool {
+	if !Regenerable(globs, dir) {
+		return false
+	}
+	base := strings.TrimSuffix(dir, "/")
+	for _, f := range files {
+		if Regenerable(globs, f) {
+			continue
+		}
+		p := strings.TrimSuffix(f, "/")
+		if p != base && !strings.HasPrefix(p, base+"/") {
+			return false
+		}
+		seg := p
+		if i := strings.LastIndex(seg, "/"); i >= 0 {
+			seg = seg[i+1:]
+		}
+		if secretBasename(seg) {
+			return false
+		}
+	}
+	return true
+}
+
+// UnsafeIgnored returns the subset of ignored entries that refuse removal.
+// A collapsed directory entry approved by name is verified by listing its
+// files: the directory is unsafe when any file in it is not regenerable
+// under RegenerableDir.
+func UnsafeIgnored(ctx context.Context, ex Exec, path string, globs, ignored []string) ([]string, error) {
+	var unsafe []string
+	for _, f := range ignored {
+		if !Regenerable(globs, f) {
+			unsafe = append(unsafe, f)
+			continue
+		}
+		if !strings.HasSuffix(f, "/") {
+			continue
+		}
+		files, err := ex.IgnoredIn(ctx, path, f)
+		if err != nil {
+			return nil, err
+		}
+		if !RegenerableDir(globs, f, files) {
+			unsafe = append(unsafe, f)
+		}
+	}
+	return unsafe, nil
 }
 
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {

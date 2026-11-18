@@ -192,7 +192,7 @@ func worktreeOuts(cwd2 string) map[string]string {
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                               "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD aaaa\nbranch refs/heads/feat/x\n",
 		key("git", "-C", "/repo.wt", "status", "--porcelain"):                                                  "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall"):                            "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                      "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                    "",
@@ -398,7 +398,7 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/feat/x\n",
 		key("git", "-C", "/other", "worktree", "list", "--porcelain"):                                            "worktree /other\nHEAD bbbb\nbranch refs/heads/main\n",
 		key("git", "-C", "/repo.gone", "status", "--porcelain"):                                                  "",
-		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored", "-uall"):                            "",
+		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                        "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.gone"):                                            "",
 		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                      "",
@@ -893,7 +893,12 @@ func TestReapFetchErrorPerPR(t *testing.T) {
 
 func TestReapRemovesWithRegenerableIgnored(t *testing.T) {
 	outs := panegoneWorktreeOuts("/repo")
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall")] = "!! .venv/\n!! node_modules/\n!! dist/\n"
+	// Collapsed first listing plus real -uall per-dir output: every file
+	// inherits approval from its approved directory, so the worktree goes.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .venv/\n!! node_modules/\n!! dist/\n"
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", ".venv/")] = "!! .venv/lib/x.py\n"
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "node_modules/")] = "!! node_modules/a/index.js\n"
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "dist/")] = "!! dist/bundle.js\n"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -906,8 +911,10 @@ func TestReapRemovesWithRegenerableIgnored(t *testing.T) {
 
 func TestReapSkipsIgnoredFiles(t *testing.T) {
 	outs := worktreeOuts("/repo")
-	// .env and notes are not regenerable; .venv would be expendable alone.
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall")] = "!! .venv/\n!! .env\n!! notes.md\n"
+	// .env and notes are not regenerable; .venv holds only regenerable files
+	// so it stays safe and unnamed.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! .venv/\n!! .env\n!! notes.md\n"
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", ".venv/")] = "!! .venv/lib/x.py\n"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -936,9 +943,10 @@ func TestReapSkipsIgnoredFiles(t *testing.T) {
 
 func TestReapRefusesSecretsInsideRegenerableDir(t *testing.T) {
 	outs := worktreeOuts("/repo")
-	// bin/ is regenerable, but -uall expands it so the .env inside is seen:
-	// a wholly ignored directory holding a non-regenerable file refuses.
-	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall")] = "!! bin/.env\n!! bin/output.dat\n"
+	// bin/ is regenerable by name, but its contents hold a secret: the
+	// per-dir -uall check refuses the whole directory.
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored")] = "!! bin/\n"
+	outs[key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall", "--", "bin/")] = "!! bin/.env\n!! bin/output.dat\n"
 	r := &scriptRunner{outs: outs}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -952,16 +960,16 @@ func TestReapRefusesSecretsInsideRegenerableDir(t *testing.T) {
 		reason := fmt.Sprint(row["reason"])
 		if strings.HasPrefix(reason, "ignored-files:") {
 			saw = true
-			if files := fmt.Sprint(row["files"]); !strings.Contains(files, "bin/.env") {
-				t.Fatalf("files should name bin/.env, got %q", files)
+			if files := fmt.Sprint(row["files"]); !strings.Contains(files, "bin/") {
+				t.Fatalf("files should name the refused bin/ dir, got %q", files)
 			}
 		}
 	}
 	if !saw {
 		t.Fatal("ignored-files skip not recorded")
 	}
-	if !r.called("status\x00--porcelain\x00--ignored\x00-uall") {
-		t.Fatal("ignored listing did not expand directories with -uall")
+	if !r.called("status\x00--porcelain\x00--ignored\x00-uall\x00--\x00bin/") {
+		t.Fatal("approved dir contents were not verified with -uall")
 	}
 }
 
