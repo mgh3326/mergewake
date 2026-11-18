@@ -128,8 +128,9 @@ func TestReviewerJobResumeBoundsBuilderFamily(t *testing.T) {
 	for _, tc := range []struct {
 		name, saved, want string
 	}{
-		{name: "unaccepted", saved: "cognition", want: "other"},
+		{name: "newly accepted", saved: "cognition", want: "cognition"},
 		{name: "accepted", saved: "google", want: "google"},
+		{name: "still unaccepted", saved: "moonshot", want: "other"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, r, runner, c := interruptedReviewer(t)

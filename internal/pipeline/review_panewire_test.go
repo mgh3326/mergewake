@@ -877,13 +877,13 @@ func TestPanewireBuilderFamilyFromRecord(t *testing.T) {
 }
 
 func TestPanewireBuilderFamilyArgUsesAcceptedFamilies(t *testing.T) {
-	accepted := []string{"anthropic", "openai", "google", "xai", "deepseek", "meta", "mistral", "other"}
+	accepted := []string{"anthropic", "cognition", "deepseek", "google", "meta", "minimax", "mistral", "mixed", "openai", "other", "qwen", "upstage", "xai", "zhipu"}
 	cases := map[string]struct {
 		author string
 		record *integrations.JobRecord
 		want   string
 	}{
-		"unsupported author family":  {author: "cognition", want: "other"},
+		"unsupported author family":  {author: "kimi", want: "other"},
 		"unsupported builder record": {author: "openai", record: &integrations.JobRecord{Family: "moonshot"}, want: "other"},
 		"unknown family":             {author: "some-new-family", want: "other"},
 	}
@@ -915,7 +915,7 @@ func TestPanewireBuilderFamilyArgUsesAcceptedFamilies(t *testing.T) {
 func TestPanewireUnsupportedBuilderFamilyPreservesAuthorFamily(t *testing.T) {
 	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 	s, g, r := panewireSetup(t, runner)
-	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: cognition\n"
+	g.pull.Body = "Mergewake-Task: 42\nMergewake-Author-Family: moonshot\n"
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -927,7 +927,7 @@ func TestPanewireUnsupportedBuilderFamilyPreservesAuthorFamily(t *testing.T) {
 		t.Fatalf("pass metadata changed: %+v", passes)
 	}
 	rows := auditRows(t, s, r, "review")
-	if len(rows) != 1 || rows[0]["author_family"] != "cognition" || rows[0]["same_family"] != false {
+	if len(rows) != 1 || rows[0]["author_family"] != "moonshot" || rows[0]["same_family"] != false {
 		t.Fatalf("review pass audit lost canonical author family: %+v", rows)
 	}
 }

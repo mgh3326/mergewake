@@ -20,7 +20,7 @@ func TestReviewerFamilyFallbackIsStableAcrossProfiles(t *testing.T) {
 	}
 }
 
-func TestPanewireBuilderFamilyCanonicalizesAliases(t *testing.T) {
+func TestPanewireAuthorFamilyCanonicalizesAliases(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		family string
@@ -33,18 +33,30 @@ func TestPanewireBuilderFamilyCanonicalizesAliases(t *testing.T) {
 		{name: "gemini", family: "gemini", want: "google"},
 		{name: "agy", family: "agy", want: "google"},
 		{name: "grok", family: "grok", want: "xai"},
-		{name: "deepseek", family: "deepseek", want: "deepseek"},
 		{name: "anthropic", family: "anthropic", want: "anthropic"},
+		{name: "cognition", family: "cognition", want: "cognition"},
+		{name: "deepseek", family: "deepseek", want: "deepseek"},
+		{name: "google", family: "google", want: "google"},
+		{name: "meta", family: "meta", want: "meta"},
+		{name: "minimax", family: "minimax", want: "minimax"},
+		{name: "mistral", family: "mistral", want: "mistral"},
+		{name: "mixed", family: "mixed", want: "mixed"},
 		{name: "openai", family: "openai", want: "openai"},
-		{name: "devin", family: "devin", want: "other"},
-		{name: "cognition", family: "cognition", want: "other"},
+		{name: "other", family: "other", want: "other"},
+		{name: "qwen", family: "qwen", want: "qwen"},
+		{name: "upstage", family: "upstage", want: "upstage"},
+		{name: "xai", family: "xai", want: "xai"},
+		{name: "zhipu", family: "zhipu", want: "zhipu"},
+		{name: "devin", family: "devin", want: "cognition"},
 		{name: "kimi", family: "kimi", want: "other"},
+		{name: "moonshot", family: "moonshot", want: "other"},
 		{name: "unknown", family: "unknown-x", want: "other"},
+		{name: "foo", family: "foo", want: "other"},
 		{name: "empty", family: "", want: "other"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := panewireBuilderFamily(tc.family); got != tc.want {
-				t.Fatalf("panewireBuilderFamily(%q)=%q, want %q", tc.family, got, tc.want)
+			if got := panewireAuthorFamily(tc.family); got != tc.want {
+				t.Fatalf("panewireAuthorFamily(%q)=%q, want %q", tc.family, got, tc.want)
 			}
 		})
 	}
