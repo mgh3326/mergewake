@@ -433,7 +433,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if prNum < 0 {
 		return errors.New("--pr must be positive")
 	}
-	after, e := config.Duration(s.Config.Reap.WorktreeAfter)
+	after, e := config.OptionalDuration(s.Config.Reap.WorktreeAfter)
 	if e != nil {
 		return e
 	}
@@ -678,7 +678,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, fmt.Errorf("PR %d job binding: %s", p.Number, integrations.Detail(bindErr)))
 		}
 
-		if mergedAt == nil || now.Sub(*mergedAt) < after {
+		if mergedAt == nil {
+			continue
+		}
+		// reap.worktree_after is an optional extra delay a host may set.
+		// Zero, the default, leaves the watch verdict below as the only gate.
+		if after > 0 && now.Sub(*mergedAt) < after {
 			continue
 		}
 
@@ -784,19 +789,47 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, fmt.Errorf("PR %d revert check: %w", p.Number, e))
 			continue
 		}
+		reverted := false
 		if recovery != nil {
 			reason := ""
 			if recovery.MergedAt != nil {
 				// Same convention as the watch role and outcomes ledger: a
 				// recovery PR merged within seven days reverted this PR.
 				if at := parsedTime(*recovery.MergedAt); at != nil && !at.Before(*mergedAt) && !at.After(mergedAt.Add(7*24*time.Hour)) {
-					reason = "reverted"
+					reason, reverted = "reverted", true
 				}
 			} else if recovery.State == "open" {
 				reason = "recovery-open"
 			}
+			if reverted {
+				// The follow-up ends when the revert itself is covered by a
+				// healthy watch verdict; until then the worktree stays. The
+				// head branch is never deleted, so reverted work stays
+				// fetchable from GitHub.
+				covers, e := s.watchCovers(ctx, r, recovery.MergeCommitSHA)
+				if e != nil {
+					errs = append(errs, fmt.Errorf("PR %d revert verdict: %w", p.Number, e))
+				}
+				if covers {
+					reason = ""
+				}
+			}
 			if reason != "" {
 				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: reason})
+				continue
+			}
+		}
+		// The watch verdict for the merge commit on main is the gate: a PR
+		// whose post-merge main has not passed CI keeps its worktree. A
+		// reverted PR's own merge never turns green, so its follow-up above
+		// decided instead.
+		if !reverted {
+			covers, e := s.watchCovers(ctx, r, p.MergeCommitSHA)
+			if e != nil {
+				errs = append(errs, fmt.Errorf("PR %d watch verdict: %w", p.Number, e))
+			}
+			if !covers {
+				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Result: "skipped", Reason: "watch-pending"})
 				continue
 			}
 		}
@@ -805,6 +838,11 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref, Source: c.source}
 			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
+			case w != nil && strings.HasPrefix(w.Branch, workerBranchPrefix):
+				// A worker checkout belongs to the worker-worktree pass, which
+				// has its own discovery, rules and hub-only guard. This older
+				// path neither removes nor records it.
+				continue
 			case e != nil:
 				rec.Result, rec.Reason = "skipped", "worktree-inspect-error"
 				errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, c.path, e))
@@ -859,7 +897,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 			rec.Worktree = w.Path
 			main := filepath.Dir(w.Common)
-			entries, e := c.hs.exec.WorktreeList(ctx, main)
+			entries, e := c.hs.exec.WorktreeEntries(ctx, main)
 			if e != nil {
 				errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, w.Path, e))
 				continue
@@ -922,6 +960,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					case c.hs.paneInUse(w.Path):
 						rec.Result, rec.Reason = "skipped", "pane-in-use"
 					default:
+						// A background process with no pane can hold the
+						// checkout; fail closed when this machine cannot say.
+						if reason := s.processInUse(ctx, w.Path); reason != "" {
+							rec.Result, rec.Reason = "skipped", reason
+							break
+						}
 						if e := c.hs.exec.RemoveWorktree(ctx, main, w.Path); e != nil {
 							rec.Result, rec.Reason = "error", e.Error()
 						} else {
@@ -948,6 +992,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			}
 			note(brec)
 		}
+	}
+	// The worker-worktree pass runs on whole-repo passes only: it discovers
+	// wk/ checkouts from the hosts' own worktree lists, so a worktree no pane,
+	// receipt or job record names is still removed once its work is on GitHub.
+	if prNum == 0 {
+		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, records, acting, note)...)
 	}
 	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)

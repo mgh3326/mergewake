@@ -404,6 +404,12 @@ type Reap struct {
 	// retirement still load; new configs should omit it.
 	Protect     []string `yaml:"protect"`
 	Regenerable []string `yaml:"regenerable"`
+	// Disposable are the untracked files a worker worktree may hold and still
+	// be removed: paths relative to the worktree root, matched exactly. The
+	// report draft lives in hk and is rewritten outside the worktree, so a
+	// leftover copy never keeps the checkout. Empty means
+	// DefaultReapDisposable; the key never disables the list.
+	Disposable []string `yaml:"disposable"`
 	// Transport reaches remote hosts: panewire (the hub's node commands) or
 	// ssh. Empty resolves to panewire when hub.url is set, else ssh.
 	Transport string  `yaml:"transport"`
@@ -427,6 +433,8 @@ type Reap struct {
 	// worktree removals one host takes per pass, and which hosts are visited
 	// first.
 	ReviewerDrain ReviewerDrain `yaml:"reviewer_drain"`
+	// WorktreeDrain bounds and orders the worker-worktree pass the same way.
+	WorktreeDrain ReviewerDrain `yaml:"worktree_drain"`
 }
 
 // ReviewerDrain is reap.reviewer_drain. PerHost caps the hub guarded
@@ -441,6 +449,20 @@ type ReviewerDrain struct {
 // DefaultReviewerDrainPerHost applies when reap.reviewer_drain.per_host is
 // unset: a pass may ask one host for twenty guarded removals.
 const DefaultReviewerDrainPerHost = 20
+
+// DefaultWorktreeDrainPerHost applies when reap.worktree_drain.per_host is
+// unset. The worker pass removes at most this many worktrees per host per
+// pass, so a host's first pass over a large backlog stays bounded.
+const DefaultWorktreeDrainPerHost = 20
+
+// DrainPerHost resolves per_host: zero means the default, and the caller
+// supplies which default (reviewer or worker) it wants.
+func (r ReviewerDrain) DrainPerHost(def int) int {
+	if r.PerHost > 0 {
+		return r.PerHost
+	}
+	return def
+}
 
 // LegacyInterval parses reap.legacy_every: the time between the starts of a
 // repo's legacy sweeps. Zero means the daemon does not run them, which "0" and
@@ -714,6 +736,11 @@ var DefaultReapRegenerable = []string{
 	"dist", "build", "target", "obj", "bin",
 	"Library", "Temp", "Logs", "UserSettings",
 }
+
+// DefaultReapDisposable names the untracked files a worker worktree may still
+// hold when it is removed: a worker's report draft, whose content is in hk.
+// The list is a worktree-relative path list, not a glob list.
+var DefaultReapDisposable = []string{"report.draft.md"}
 
 // Discord feed event kinds, the keys of discord.kinds.
 const (
@@ -1014,9 +1041,9 @@ func validateReap(c *Config) error {
 		return errors.New("reap.act requires reap.enabled")
 	}
 	if c.Reap.WorktreeAfter == "" {
-		c.Reap.WorktreeAfter = "168h"
+		c.Reap.WorktreeAfter = "0"
 	}
-	if _, e = Duration(c.Reap.WorktreeAfter); e != nil {
+	if _, e = OptionalDuration(c.Reap.WorktreeAfter); e != nil {
 		return e
 	}
 	if c.Reap.ScanAfter == "" {
@@ -1036,6 +1063,14 @@ func validateReap(c *Config) error {
 	}
 	for _, g := range c.Reap.Regenerable {
 		if _, e = policy.Match(g, "probe"); e != nil {
+			return e
+		}
+	}
+	if len(c.Reap.Disposable) == 0 {
+		c.Reap.Disposable = DefaultReapDisposable
+	}
+	for _, p := range c.Reap.Disposable {
+		if e = validDisposable(p); e != nil {
 			return e
 		}
 	}
@@ -1074,6 +1109,29 @@ func validateReap(c *Config) error {
 	}
 	if c.Reap.ReviewerDrain.PerHost < 0 {
 		return errors.New("reap.reviewer_drain.per_host must not be negative")
+	}
+	if c.Reap.WorktreeDrain.PerHost < 0 {
+		return errors.New("reap.worktree_drain.per_host must not be negative")
+	}
+	return nil
+}
+
+// validDisposable checks one reap.disposable entry: a relative path inside the
+// worktree, compared literally, so it can never name an absolute path or walk
+// out of the checkout it authorizes.
+func validDisposable(p string) error {
+	switch {
+	case p == "":
+		return errors.New("reap.disposable entries must not be empty")
+	case strings.HasPrefix(p, "/"), strings.HasPrefix(p, "\\"):
+		return fmt.Errorf("reap.disposable entry %q must be relative", p)
+	case strings.ContainsAny(p, "\x00\r\n\t"):
+		return fmt.Errorf("reap.disposable entry %q holds a control byte", p)
+	}
+	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return fmt.Errorf("reap.disposable entry %q must not leave the worktree", p)
+		}
 	}
 	return nil
 }
@@ -1428,6 +1486,16 @@ func Duration(s string) (time.Duration, error) {
 	d, e := time.ParseDuration(s)
 	if e != nil || d <= 0 {
 		return 0, fmt.Errorf("invalid positive duration %q", s)
+	}
+	return d, nil
+}
+
+// OptionalDuration parses a duration that may be zero: reap.worktree_after
+// uses zero for "no extra delay", which a positive-only parse would refuse.
+func OptionalDuration(s string) (time.Duration, error) {
+	d, e := time.ParseDuration(s)
+	if e != nil || d < 0 {
+		return 0, fmt.Errorf("invalid duration %q", s)
 	}
 	return d, nil
 }

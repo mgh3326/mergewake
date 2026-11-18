@@ -51,7 +51,7 @@ type fakeReapHub struct {
 	// served listPage rows at a time (all at once when zero) behind an offset
 	// cursor; listErr makes worktree.list of a common answer that node error.
 	commons  map[string]string
-	branches map[string]string // cwd → branch worktree.inspect reports (wk/x when absent)
+	branches map[string]string // cwd → branch worktree.inspect reports (feat/x when absent)
 	lists    map[string][]map[string]any
 	listPage int
 	listErr  map[string]string
@@ -109,7 +109,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				if head == "" {
 					head = headSHA
 				}
-				branch := "wk/x"
+				branch := "feat/x"
 				if b := h.branches[cwd]; b != "" {
 					branch = b
 				}
@@ -265,7 +265,9 @@ func hubSvc(t *testing.T, hub *fakeReapHub, run *scriptRunner, hosts ...reap.Hos
 	c.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
 	c.Hosts = append([]reap.Host{{Name: "node", SSH: "ops@node.example", Machine: "node-a"}}, hosts...)
 	var out strings.Builder
-	return &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}, &out
+	s := &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
+	return s, &out
 }
 
 // A missing composer answer keeps the pane while worktree cleanup still uses the node.

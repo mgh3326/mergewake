@@ -145,7 +145,7 @@ func TestReapConfig(t *testing.T) {
 		{"enabled", "reap:\n  enabled: true\n", false},
 		{"act", "reap:\n  enabled: true\n  act: true\n", false},
 		{"act no enable", "reap:\n  act: true\n", true},
-		{"bad after", "reap:\n  worktree_after: 0s\n", true},
+		{"bad after", "reap:\n  worktree_after: -1h\n", true},
 		{"bad scan", "reap:\n  scan_after: 0s\n", true},
 		{"legacy every default", "reap:\n  enabled: true\n", false},
 		{"legacy every", "reap:\n  legacy_every: 48h\n", false},
@@ -229,8 +229,11 @@ func TestReapConfig(t *testing.T) {
 				if tt.name == "defaults" && c.Reap.Archive.DriveMaxFileBytes != 0 {
 					t.Fatalf("default drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
 				}
-				if c.Reap.WorktreeAfter != "168h" {
+				if c.Reap.WorktreeAfter != "0" {
 					t.Fatal(c.Reap.WorktreeAfter)
+				}
+				if len(c.Reap.Disposable) != 1 || c.Reap.Disposable[0] != "report.draft.md" {
+					t.Fatalf("disposable = %v", c.Reap.Disposable)
 				}
 				if c.Reap.ScanAfter != "720h" {
 					t.Fatal(c.Reap.ScanAfter)

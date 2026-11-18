@@ -86,7 +86,7 @@ const headSHA = "aaaa1111"
 // mergedPull is the merged PR every reap test shares.
 var mergedPull = github.Pull{
 	Number: 12, State: "closed", Merged: true,
-	Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
+	Head: github.Ref{Ref: "feat/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "abc123",
 }
 
@@ -120,7 +120,7 @@ func repoConfig(dir string) config.Config {
 		StateDir: dir,
 		Daemon:   config.Daemon{Act: true},
 		Hosts:    []reap.Host{{Name: "local", Jobs: "/jobs"}},
-		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", ScanAfter: "720h", Regenerable: config.DefaultReapRegenerable},
+		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "0", ScanAfter: "720h", Regenerable: config.DefaultReapRegenerable, Disposable: config.DefaultReapDisposable},
 		Repos:    []config.Repo{{Name: "example/project", Branch: "main"}},
 	}
 }
@@ -140,7 +140,23 @@ func svc(t *testing.T, gh GitHub, run *scriptRunner) *Service {
 	if run.fn == nil {
 		run.fn = statAnswer("yes\n")
 	}
-	return &Service{Config: repoConfig(t.TempDir()), GH: gh, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: io.Discard}
+	s := &Service{Config: repoConfig(t.TempDir()), GH: gh, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: io.Discard}
+	// A watch verdict on main covers the merge: the merged-PR worktree path
+	// waits for one, so every test that expects a removal needs it.
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
+	return s
+}
+
+// greenHead records a healthy watch verdict on main at head for repo.
+func greenHead(t *testing.T, s *Service, r config.Repo, head string) {
+	t.Helper()
+	dir := s.state(r.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "last-green"), []byte(head+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // emptyComposer and draftComposer are claude screens whose input line, between
@@ -168,18 +184,18 @@ func worktreeOuts(cwd2 string) map[string]string {
 		key("herdr", "pane", "close", "w1:p1"):                       "",
 		key("herdr", "pane", "read", "w1:p1", "--source", "visible"): emptyComposer,
 		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
-		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "feat/x\n",
 		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
 		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"):    "/repo/.git\n/repo/.git\n/repo\n",
 		key("git", "-C", "/repo", "branch", "--show-current"):                                                  "main\n",
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                               "git@github.com:example/project.git\n",
-		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD aaaa\nbranch refs/heads/wk/x\n",
+		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD aaaa\nbranch refs/heads/feat/x\n",
 		key("git", "-C", "/repo.wt", "status", "--porcelain"):                                                  "",
 		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):                        "",
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                      "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
-		key("git", "-C", "/repo", "branch", "-d", "wk/x"):                                                      "",
+		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                    "",
 		key("sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/wk-7"):                             "yes\n",
 		key("sh", "-c", `test -f "$1" && echo yes || echo no`, "sh", "/jobs/wk-7/report.md"):                   "yes\n",
 	}
@@ -212,7 +228,7 @@ func reapLogRows(t *testing.T, s *Service, repo string) []map[string]any {
 
 func seedWorktreeReceipt(t *testing.T, s *Service, repo, worktree string) {
 	t.Helper()
-	b, _ := json.Marshal(reapReceipt{Action: "close-pane", Repo: repo, PR: 12, Host: "local", Worktree: worktree, Branch: "wk/x", Result: "closed"})
+	b, _ := json.Marshal(reapReceipt{Action: "close-pane", Repo: repo, PR: 12, Host: "local", Worktree: worktree, Branch: "feat/x", Result: "closed"})
 	if err := os.MkdirAll(filepath.Dir(s.reapLog(repo)), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +255,7 @@ func TestReapRemovesWorktreeWithoutClosingPane(t *testing.T) {
 	if !r.called("git\x00-C\x00/repo\x00worktree\x00remove\x00/repo.wt") {
 		t.Fatal("worktree never removed")
 	}
-	if !r.called("git\x00-C\x00/repo\x00branch\x00-d\x00wk/x") {
+	if !r.called("git\x00-C\x00/repo\x00branch\x00-d\x00feat/x") {
 		t.Fatal("branch never deleted")
 	}
 	for _, c := range r.calls {
@@ -267,6 +283,7 @@ func TestReapShadowAndDryRunMutateNothing(t *testing.T) {
 		c := repoConfig(dir)
 		var buf strings.Builder
 		s := &Service{Config: c, GH: &reapGH{}, Runner: r, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &buf}
+		greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
 		if err := s.Reap(context.Background(), testRepo, 0, o); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -326,10 +343,10 @@ func TestReapSkipsWorktreeInUse(t *testing.T) {
 
 func TestReapSkipsUnpushedBranch(t *testing.T) {
 	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo"), errs: map[string]error{
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):            errors.New("exit 1"),
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "main"):                   errors.New("exit 1"),
-		key("git", "-C", "/repo", "rev-list", "--count", "--left-right", "wk/x...wk/x@{upstream}"): errors.New("no upstream"),
-		key("git", "-C", "/repo", "rev-list", "--count", "--left-right", "wk/x...origin/wk/x"):     errors.New("unknown revision"),
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):              errors.New("exit 1"),
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "main"):                     errors.New("exit 1"),
+		key("git", "-C", "/repo", "rev-list", "--count", "--left-right", "feat/x...feat/x@{upstream}"): errors.New("no upstream"),
+		key("git", "-C", "/repo", "rev-list", "--count", "--left-right", "feat/x...origin/feat/x"):     errors.New("unknown revision"),
 	}}
 	s := svc(t, &reapGH{}, r)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -368,22 +385,23 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("herdr", "agent", "list"): agents,
 		key("herdr", "pane", "list"):  panes,
 		key("git", "-C", "/elsewhere", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/other/.git/worktrees/elsewhere\n/other/.git\n/elsewhere\n",
-		key("git", "-C", "/elsewhere", "branch", "--show-current"):                                               "wk/other\n",
+		key("git", "-C", "/elsewhere", "branch", "--show-current"):                                               "feat/other\n",
 		key("git", "-C", "/elsewhere", "rev-parse", "HEAD"):                                                      "bbbb2222\n",
 		key("git", "-C", "/elsewhere", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo.gone", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.gone\n/repo/.git\n/repo.gone\n",
-		key("git", "-C", "/repo.gone", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.gone", "branch", "--show-current"):                                               "feat/x\n",
 		key("git", "-C", "/repo.gone", "rev-parse", "HEAD"):                                                      headSHA + "\n",
 		key("git", "-C", "/repo.gone", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"):      "/repo/.git\n/repo/.git\n/repo\n",
 		key("git", "-C", "/repo", "branch", "--show-current"):                                                    "main\n",
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                                 "git@github.com:example/project.git\n",
-		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/wk/x\n",
+		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/feat/x\n",
+		key("git", "-C", "/other", "worktree", "list", "--porcelain"):                                            "worktree /other\nHEAD bbbb\nbranch refs/heads/main\n",
 		key("git", "-C", "/repo.gone", "status", "--porcelain"):                                                  "",
 		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored"):                                     "",
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):                          "",
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main"):                        "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.gone"):                                            "",
-		key("git", "-C", "/repo", "branch", "-d", "wk/x"):                                                        "",
+		key("git", "-C", "/repo", "branch", "-d", "feat/x"):                                                      "",
 	}}
 	s := svc(t, &reapGH{}, r)
 	seedWorktreeReceipt(t, s, "example/project", "/repo.gone")
@@ -683,7 +701,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 		case path == "/repos/example/project/pulls":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
-				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "feat/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 				"user": map[string]any{"login": "a"},
 			}})
 		case strings.HasSuffix(path, "/pulls/12/reviews"):
@@ -704,7 +722,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 			w.Header().Set("ETag", `"e1"`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
-				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "feat/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 				"user": map[string]any{"login": "a"},
 			})
 		default:
@@ -727,6 +745,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 
 	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
+	greenHead(t, s, testRepo, mergeSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -765,7 +784,7 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 		case path == "/repos/example/project/pulls":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
-				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "feat/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 				"user": map[string]any{"login": "a"},
 			}})
 		case strings.HasSuffix(path, "/pulls/12/reviews"):
@@ -785,14 +804,14 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 			unconditional.Add(1)
 			body := map[string]any{
 				"number": 12, "state": "open", "merged": false, "updated_at": updatedAt,
-				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+				"title": "t", "head": map[string]any{"sha": headSHA, "ref": "feat/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 				"user": map[string]any{"login": "a"},
 			}
 			etag := `"open"`
 			if primed.Load() {
 				body = map[string]any{
 					"number": 12, "state": "closed", "merged": true, "merged_at": mergedAt, "updated_at": updatedAt,
-					"title": "t", "head": map[string]any{"sha": headSHA, "ref": "wk/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
+					"title": "t", "head": map[string]any{"sha": headSHA, "ref": "feat/x"}, "base": map[string]any{"sha": "b1", "ref": "main"},
 					"user": map[string]any{"login": "a"},
 				}
 				etag = `"merged"`
@@ -820,6 +839,7 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 
 	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
+	greenHead(t, s, testRepo, mergeSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -920,6 +940,7 @@ func TestReapActGate(t *testing.T) {
 	c.Reap.Act = false
 	var buf strings.Builder
 	s := &Service{Config: c, GH: &reapGH{}, Runner: r, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &buf}
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -931,5 +952,50 @@ func TestReapActGate(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `"reason":"pane-in-use"`) {
 		t.Fatalf("reap.act off should stay observational: %s", buf.String())
+	}
+}
+
+// oldRecoveryGH answers WatchRevert with a recovery PR merged long before the
+// PR's own merge: outside the seven-day window, so it is not a revert.
+type oldRecoveryGH struct{ reapGH }
+
+func (oldRecoveryGH) WatchRevert(context.Context, string, int, string) (*github.Pull, error) {
+	return &github.Pull{Number: 99, State: "closed", Merged: true, MergedAt: rfc(time.Now().Add(-30 * 24 * time.Hour))}, nil
+}
+
+// A recovery PR merged outside the seven-day window does not excuse the watch
+// verdict: the merged-PR path still waits for main to be green.
+func TestReapOldRecoveryStillWaitsForWatchVerdict(t *testing.T) {
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
+	s := svc(t, &oldRecoveryGH{}, r)
+	seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
+	if err := os.Remove(filepath.Join(s.state("example/project"), "last-green")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removed without a watch verdict")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "watch-pending" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("watch-pending not recorded")
+	}
+
+	// With the verdict the same checkout is removed.
+	r = &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
+	s = svc(t, &oldRecoveryGH{}, r)
+	seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("healthy verdict did not remove")
 	}
 }

@@ -227,7 +227,7 @@ func TestEntriesAndClean(t *testing.T) {
 			t.Fatalf("%s: %v %v", tt.path, got, err)
 		}
 	}
-	got, err := e.WorktreeList(context.Background(), "/repo.wt")
+	got, err := e.WorktreeEntries(context.Background(), "/repo.wt")
 	if err != nil || len(got) != 3 {
 		t.Fatalf("%+v %v", got, err)
 	}

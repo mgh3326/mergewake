@@ -64,7 +64,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | --- | --- | --- |
 | `enabled` | `false` | Gates the `reap` command and daemon role. |
 | `act` | `false` | Reap's own acting opt-in, separate from `daemon.act`. Without it every mode — including `--apply` — stays observational. Requires `enabled`. |
-| `worktree_after` | `168h` | Earliest age of a merge before its worktree can be removed. |
+| `worktree_after` | `0` | Optional extra delay before a merged PR's worktree may be removed, added to the watch verdict below. `0`, the default, means the verdict alone decides: the worktree goes as soon as main's CI after the merge is green, never at the merge. A positive value keeps the worktree that long after the merge even once the verdict is healthy. |
 | `scan_after` | `720h` | Merged-PR listing window: only PRs merged within this span are discovered each pass. Older work still arrives via prior `reap.jsonl` rows. |
 | `legacy_every` | `24h` | How often the daemon's reap role runs the legacy sweep for a repo; `0` or `off` disables it. The last attempt per repo is kept in the state dir, so a restart inside the interval waits. |
 | `balance_min_created` | `20` | Daily per-host created count at or above which the reviewer balance may notice: quiet hosts never alert. |
@@ -77,6 +77,9 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
+| `disposable` | `report.draft.md` | Untracked files a worker worktree may still hold when it is removed, as worktree-relative paths matched exactly. A worker's report draft lives in hk, so a leftover copy inside the checkout is expendable; the pass never removes a worktree holding any other untracked file. An empty list means the default; entries must be relative and must not contain `..`. The list goes to the hub as `worktree.remove`'s `disposable` argument; an older node refuses the request, mergewake retries without the argument, and the node's own dirty check then keeps the worktree with a `skipped | dirty` row until a node accepts the list. |
+| `worktree_drain.per_host` | `20` | Maximum guarded removals the worker-worktree pass asks of one host in one pass; the host's remaining worktrees wait for the next pass. Zero means the default. It caps removals only, so one host's backlog never stalls the others. |
+| `worktree_drain.host_order` | Config host order | Host names in the order the worker-worktree pass visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 | `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others; a label left pending for a missing `work_root` spends none of it. |
 | `reviewer_drain.host_order` | Config host order | Host names in the order the reviewer sweep visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 
@@ -84,8 +87,10 @@ Session hosts where agent panes may run, used only by `reap`.
 runs one pass by hand; the daemon's reap role also runs the sweep for every
 configured repo, over all hosts at once, on `reap.legacy_every`. Both cover
 worktrees whose PR merged at least 14 days ago, however long ago (the daemon
-only sees merges inside `scan_after`; this ignores that window). Candidates
-come from two sources merged
+only sees merges inside `scan_after`; this ignores that window). A worker
+worktree (`wk/<job>`) is out of its scope: the worker-worktree pass above owns
+it on every reap pass, so this sweep's 14-day floor never delays or blocks
+one. Candidates come from two sources merged
 by worktree path. On each host the sweep takes the common git dirs of the
 worktrees reap already inspects (pane cwds and job cwds) whose origin is the
 configured repo, and pages the node's `worktree.list` for each; every listed
@@ -249,11 +254,18 @@ once per configured repo and compare the planned `would-remove` rows with the
 worktrees you expect, then set `reap.act: true`.
 Rollback: `reap.act: false`.
 
-After `worktree_after` with no revert, a merged PR's worktree is removed —
-but only for PRs that name a candidate worktree on some configured host (a
-matching pane cwd, a prior `reap.jsonl` row, or the job record of the task the
-PR carries); a merged PR with nothing to reap produces no rows and no
-follow-up GitHub calls. The third source reads the record of the task's bound
+A merged PR's worktree is removed once the watch verdict for its merge commit
+on main is healthy: the last green main head recorded by the watch role is the
+merge commit or a descendant of it. `reap.worktree_after`, when positive, adds
+an optional delay on top. A revert changes the rule: while its recovery PR is
+open the worktree stays, and a reverted PR's worktree stays until the revert's
+own merge is covered by a healthy verdict. A revert is opened from main through
+GitHub's API (`internal/github/recovery.go`), never from the worker's
+worktree, so the worktree is not needed to undo a merge. Removal only runs for
+PRs that name a candidate worktree on some configured host (a matching pane
+cwd, a prior `reap.jsonl` row, or the job record of the task the PR carries)
+or for a `wk/<job>` worktree the host's own worktree list names; a merged PR
+with nothing to reap produces no rows and no follow-up GitHub calls. The third source reads the record of the task's bound
 job — the binding the job path above already made, so no extra task read and no
 GitHub call — and takes its `host` and `cwd`, mapped to a configured host by
 name or machine id. It reaches a worktree whose pane panewire's node closed
@@ -286,7 +298,62 @@ the reason recorded; removal is `git worktree remove` without `--force` and the
 local branch is deleted with `git branch -d`, never `-D`. The remote branch
 stays. Worktrees are found from the panes, from prior `reap.jsonl` rows and from
 the job record of the PR's task, so a worktree whose pane panewire already
-closed still gets cleaned.
+closed still gets cleaned. A `wk/` worktree is not this path's: it is skipped
+here and left to the worker-worktree pass below. On a local or ssh host this
+path checks the machine's processes immediately before its `git worktree
+remove` and keeps a checkout a process holds (a process scan that cannot read
+every process keeps it too); under the hub transport the node's guard decides.
+
+#### Worker worktrees
+
+A worker's checkout is recognised by its branch: `wk/<job>`, where `<job>` is
+the hk job that worked it. This pass is the only code that removes a `wk/`
+checkout: the older merged-author cleanup above skips it, in whole-repo and
+PR-scoped passes alike. The pass runs on every whole-repo `reap` pass and
+discovers candidates through the hub's node commands only. Each clone's
+registered worktrees are listed by its git common dir: the common dirs reap
+already knows from panes, and the configured clone
+`<hosts[].work_root>/<repo>` when that host names a work root. A clone guessed
+from that path is admitted only after a registered worktree inspects as the
+configured repository and the same common dir; a stale registration is
+inconclusive and the next candidate is tried, a verified mismatch refuses the
+clone, and none proven keeps it out. A host with no node mapping or no guarded
+removal never falls back to ssh or local commands: a `wk/` checkout a pane
+already named stays, with one `hub-required` row. The main checkout and
+`mwr-*` reviewer checkouts are never candidates.
+
+A candidate goes when its work is on GitHub:
+
+- A merged PR's worktree goes once the watch verdict for its merge commit on
+  main is healthy (the last green main head is the merge commit or a
+  descendant), so a merge that broke main waits while its revert, if any, is
+  open and until that revert's own merge is green. The head branch is never
+  deleted on the remote, and a reverted PR's work stays fetchable from GitHub.
+- A worktree whose newest PR closed unmerged, or that has no PR at all, goes
+  once the hk job record encoded by `wk/<job>` on that host is terminal
+  (`completed`, `abandoned`, `escalated` or `lost`). A live job, an unknown
+  job, a record naming another host, or a PR binding a different job
+  (`job-conflict`) keeps it.
+
+Removal goes only through the node's guarded `worktree.remove`, with the
+disposable list. The node must find the worktree registered and unlocked, at
+the inspected commit, with no modified tracked file and no untracked file
+outside `reap.disposable`; gitignored files must match `reap.regenerable` (so
+Unity's `Library/`, `bin/` and `obj/` count as expendable when listed there, as
+the defaults do); the branch must be released — its origin head equal to the
+checkout, or, when the remote ref is gone as delete-branch-on-merge leaves it,
+the checkout's commit in the base the node proves — and no live pane (agent or
+plain shell) may use it. Immediately before the call the pass revalidates the
+whole candidate through the node — same origin, common dir, path, branch and
+head — and keeps a checkout that changed. The pass deletes nothing itself, so a
+refused removal leaves the checkout and its report draft as they were. Anything
+refused stays and gets one `remove-worktree` row with its precise reason —
+`unpushed`, `dirty`, `pane-in-use`, `locked`, `ignored-files:<count>-<hash>`, a
+guarded-removal refusal, or a rule keeping it (`watch-pending`,
+`recovery-open`, `reverted`, `job-active:<state>`, `job-conflict`, `open-pr`).
+A checkout whose only extra file is a disposable entry stays `skipped | dirty`
+until the node accepts `reap.disposable` (see the `disposable` key above). The
+row's `source` is `worktree-list` for a candidate only the listing reached.
 
 #### Panewire transport
 

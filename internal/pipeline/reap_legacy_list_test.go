@@ -82,9 +82,9 @@ func summaryOf(t *testing.T, out string) map[string]any {
 func TestLegacyListEnumeratesEveryPage(t *testing.T) {
 	s, hub := listFixture(t, []map[string]any{
 		listedRow("/repo", "main"),
-		listedRow("/a.wt", "wk/a"),
-		listedRow("/b.wt", "wk/b"),
-	}, listPR(40, "wk/a", 20))
+		listedRow("/a.wt", "feat/a"),
+		listedRow("/b.wt", "feat/b"),
+	}, listPR(40, "feat/a", 20))
 	var out strings.Builder
 	s.Out = &out
 	if err := s.ReapLegacy(context.Background(), testRepo, "", plan()); err != nil {
@@ -96,7 +96,7 @@ func TestLegacyListEnumeratesEveryPage(t *testing.T) {
 	}
 	a := rowFor(t, s, "/a.wt")
 	wantRow(t, a, "would-remove", legacyGuardNote)
-	if a["pr"] != float64(40) || a["branch"] != "wk/a" {
+	if a["pr"] != float64(40) || a["branch"] != "feat/a" {
 		t.Fatalf("receipt shape: %v", a)
 	}
 	wantRow(t, rowFor(t, s, "/b.wt"), "kept", "no-task")
@@ -117,10 +117,10 @@ func TestLegacyListEnumeratesEveryPage(t *testing.T) {
 // untracked or unreadable, and the guard is never asked.
 func TestLegacyListKeepsDirtyUntrackedAndUnreadable(t *testing.T) {
 	s, hub := listFixture(t, []map[string]any{
-		withStatus(listedRow("/d.wt", "wk/d"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
-		withStatus(listedRow("/u.wt", "wk/u"), map[string]any{"dirty": false, "untracked": 2, "ignored": 0}),
-		withStatus(listedRow("/e.wt", "wk/e"), map[string]any{"dirty": false, "untracked": 0, "ignored": 0, "error": "git status failed"}),
-	}, listPR(41, "wk/d", 20), listPR(42, "wk/u", 20), listPR(43, "wk/e", 20))
+		withStatus(listedRow("/d.wt", "feat/d"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
+		withStatus(listedRow("/u.wt", "feat/u"), map[string]any{"dirty": false, "untracked": 2, "ignored": 0}),
+		withStatus(listedRow("/e.wt", "feat/e"), map[string]any{"dirty": false, "untracked": 0, "ignored": 0, "error": "git status failed"}),
+	}, listPR(41, "feat/d", 20), listPR(42, "feat/u", 20), listPR(43, "feat/e", 20))
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestLegacyListKeepsDirtyUntrackedAndUnreadable(t *testing.T) {
 
 // (c) A listed worktree on a branch no PR of the repo used is kept.
 func TestLegacyListKeepsBranchWithNoPR(t *testing.T) {
-	s, hub := listFixture(t, []map[string]any{listedRow("/n.wt", "wk/none")}, listPR(40, "wk/a", 20))
+	s, hub := listFixture(t, []map[string]any{listedRow("/n.wt", "feat/none")}, listPR(40, "feat/a", 20))
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -149,9 +149,9 @@ func TestLegacyListKeepsBranchWithNoPR(t *testing.T) {
 func TestLegacyListSkipsMainCheckoutAndReviewerCheckouts(t *testing.T) {
 	const mwr = "/mwr-40-aaaa111-p1-1"
 	s, hub := listFixture(t, []map[string]any{
-		listedRow("/repo", "wk/a"), // the main checkout, on a branch with a merged PR
-		listedRow(mwr, "wk/a"),
-	}, listPR(40, "wk/a", 20))
+		listedRow("/repo", "feat/a"), // the main checkout, on a branch with a merged PR
+		listedRow(mwr, "feat/a"),
+	}, listPR(40, "feat/a", 20))
 	var out strings.Builder
 	s.Out = &out
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
@@ -171,7 +171,7 @@ func TestLegacyListSkipsMainCheckoutAndReviewerCheckouts(t *testing.T) {
 
 // (e) A common whose origin is another repository is never listed.
 func TestLegacyListIgnoresCommonOfAnotherRepo(t *testing.T) {
-	s, hub := listFixture(t, nil, listPR(40, "wk/a", 20))
+	s, hub := listFixture(t, nil, listPR(40, "feat/a", 20))
 	hub.agents["panes"] = []any{
 		map[string]any{"pane_id": "w1:p1", "agent_status": "idle", "cwd": "/repo.wt"},
 		map[string]any{"pane_id": "w2:p1", "agent_status": "idle", "cwd": "/other.wt"},
@@ -180,8 +180,8 @@ func TestLegacyListIgnoresCommonOfAnotherRepo(t *testing.T) {
 	hub.foreign = map[string]bool{"/other.wt": true}
 	hub.commons = map[string]string{"/other.wt": "/other/.git"}
 	hub.wtPaths["/foreign.wt"] = true
-	hub.branches["/foreign.wt"] = "wk/a"
-	hub.lists["/other/.git"] = []map[string]any{listedRow("/foreign.wt", "wk/a")}
+	hub.branches["/foreign.wt"] = "feat/a"
+	hub.lists["/other/.git"] = []map[string]any{listedRow("/foreign.wt", "feat/a")}
 	var out strings.Builder
 	s.Out = &out
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
@@ -208,9 +208,9 @@ func TestLegacyListIgnoresCommonOfAnotherRepo(t *testing.T) {
 func TestLegacyListApplyRemovesOnlyThroughGuardedRemove(t *testing.T) {
 	s, hub := listFixture(t, []map[string]any{
 		listedRow("/repo", "main"),
-		listedRow("/a.wt", "wk/a"),
-		withStatus(listedRow("/d.wt", "wk/d"), map[string]any{"dirty": true}),
-	}, listPR(40, "wk/a", 20), listPR(41, "wk/d", 20))
+		listedRow("/a.wt", "feat/a"),
+		withStatus(listedRow("/d.wt", "feat/d"), map[string]any{"dirty": true}),
+	}, listPR(40, "feat/a", 20), listPR(41, "feat/d", 20))
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestLegacyListApplyRemovesOnlyThroughGuardedRemove(t *testing.T) {
 // binding merge by path, and the receipt keeps the job.
 func TestLegacyListMergesWithJobBoundCandidate(t *testing.T) {
 	s, hub, _ := legacyFixture(t)
-	hub.lists = map[string][]map[string]any{listCommon: {listedRow(legacyCwd, "wk/x")}}
+	hub.lists = map[string][]map[string]any{listCommon: {listedRow(legacyCwd, "feat/x")}}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", plan()); err != nil {
 		t.Fatal(err)
 	}

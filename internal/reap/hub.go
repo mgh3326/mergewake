@@ -190,6 +190,15 @@ func InvalidArgs(err error) bool {
 	return errors.As(err, &h) && h.Code == "invalid_args"
 }
 
+// UnsupportedArg reports an argument the far side refused before dispatch: a
+// node that predates the field answers invalid_args, and the hub's own strict
+// validation answers invalid_request. Either way the argument must be
+// dropped, not the whole removal.
+func UnsupportedArg(err error) bool {
+	var h *hubError
+	return errors.As(err, &h) && (h.Code == "invalid_args" || h.Code == "invalid_request")
+}
+
 func (e *hubError) Is(target error) bool { return target == ErrHubAuth && e.auth() }
 
 func (h *Hub) do(ctx context.Context, method, path string, body any, out any) error {
@@ -409,17 +418,41 @@ func (h HubHost) WorktreeList(ctx context.Context, common, cursor string) (Workt
 // checkout (no branch): the node refuses a detached worktree unless the
 // request says so, and refuses a branch worktree when it does.
 func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base string, regenerable []string, detached bool) (WorktreeRemoveResult, error) {
-	var v struct {
-		Outcome     string   `json:"outcome"`
-		Files       []string `json:"files"`
-		RetryAfterS int      `json:"retry_after_s"`
-	}
+	return h.WorktreeRemoveDisposable(ctx, cwd, expectHead, base, regenerable, nil, detached)
+}
+
+// WorktreeRemoveDisposable sends the disposable untracked list with the same
+// guarded removal. A node that predates the argument refuses the whole
+// request; the call is then retried without it, so that node's own dirty check
+// decides and a worktree holding only a disposable file waits for the node
+// upgrade instead of removing anything unguarded.
+func (h HubHost) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, base string, regenerable, disposable []string, detached bool) (WorktreeRemoveResult, error) {
 	// The node refuses a null list as invalid_request, so "no regenerable
 	// globs" is sent as an empty list.
 	if regenerable == nil {
 		regenerable = []string{}
 	}
 	args := map[string]any{"cwd": cwd, "expect_head": expectHead, "base": base, "regenerable": regenerable, "detached": detached}
+	if len(disposable) > 0 {
+		args["disposable"] = disposable
+	}
+	v, err := h.removeCommand(ctx, args)
+	if err != nil && len(disposable) > 0 && UnsupportedArg(err) {
+		delete(args, "disposable")
+		v, err = h.removeCommand(ctx, args)
+	}
+	if err != nil {
+		return WorktreeRemoveResult{}, err
+	}
+	return v, nil
+}
+
+func (h HubHost) removeCommand(ctx context.Context, args map[string]any) (WorktreeRemoveResult, error) {
+	var v struct {
+		Outcome     string   `json:"outcome"`
+		Files       []string `json:"files"`
+		RetryAfterS int      `json:"retry_after_s"`
+	}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.remove", args, &v); err != nil {
 		return WorktreeRemoveResult{}, err
 	}

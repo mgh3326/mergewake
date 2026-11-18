@@ -568,7 +568,7 @@ func Entries(b []byte) ([]Entry, error) {
 	return out, nil
 }
 
-func (e Exec) WorktreeList(ctx context.Context, path string) ([]Entry, error) {
+func (e Exec) WorktreeEntries(ctx context.Context, path string) ([]Entry, error) {
 	b, err := e.Run(ctx, "git", "-C", path, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err
@@ -579,6 +579,17 @@ func (e Exec) WorktreeList(ctx context.Context, path string) ([]Entry, error) {
 // Clean reports whether the worktree has no modified or untracked files.
 func (e Exec) Clean(ctx context.Context, path string) (bool, error) {
 	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(b)) == "", nil
+}
+
+// TrackedClean reports whether the worktree has no modified tracked file.
+// Untracked entries are judged separately, because a disposable one is
+// allowed to go with the worktree.
+func (e Exec) TrackedClean(ctx context.Context, path string) (bool, error) {
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		return false, err
 	}
