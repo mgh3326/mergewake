@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -598,16 +600,19 @@ func (e Exec) TrackedClean(ctx context.Context, path string) (bool, error) {
 
 // Ignored lists gitignored files inside the worktree. `git status --porcelain`
 // hides them, but `git worktree remove` deletes them anyway — callers refuse
-// the removal rather than silently lose an .env or notes file.
+// the removal rather than silently lose an .env or notes file. `-z` keeps
+// names unquoted and NUL-separated, the same listing the node checks, so both
+// sides see the same entries. A wholly ignored directory arrives as one
+// collapsed `dir/` entry.
 func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-z")
 	if err != nil {
 		return nil, err
 	}
 	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "!! ") {
-			out = append(out, strings.TrimSpace(line[3:]))
+	for _, f := range strings.Split(string(b), "\x00") {
+		if strings.HasPrefix(f, "!! ") {
+			out = append(out, f[3:])
 		}
 	}
 	return out, nil
@@ -652,30 +657,73 @@ func RepoFromRemote(raw string) string {
 }
 
 // Regenerable reports whether an ignored path inside a worktree matches the
-// regenerable allowlist — throwaway output that rebuilds on demand and is
-// safe to lose with the worktree. A pattern containing a slash must match
-// the whole path; a slash-free pattern names a regenerable directory or
-// file and may match only the ignored entry's last segment — matching an
-// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file
-// like bin/local.env past the refusal.
-func Regenerable(globs []string, path string) bool {
-	p := strings.Trim(path, "/")
+// regenerable allowlist, using the node's rule (panewire docs/node-commands.md,
+// `worktree.remove`), so the precheck and the node refuse the same worktrees:
+// a `dir/` entry matches only a glob whose raw form ends in `/`, and that
+// directory form is a whole-path pattern approving only the top-level
+// directory — a nested `web/node_modules/` still refuses. A glob containing
+// `/` matches the whole trimmed path; a slash-free glob matches only the
+// ignored entry's last segment, and never a `dir/` entry — matching an
+// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file like
+// bin/local.env past the refusal.
+func Regenerable(globs []string, entry string) bool {
+	p := strings.Trim(entry, "/")
+	dir := strings.HasSuffix(entry, "/")
 	base := p
 	if i := strings.LastIndex(p, "/"); i >= 0 {
 		base = p[i+1:]
 	}
 	for _, g := range globs {
-		g = strings.Trim(g, "/")
 		if g == "" {
 			continue
 		}
-		match := base
-		if strings.Contains(g, "/") {
-			match = p
-		}
-		if ok, _ := policy.Match(g, match); ok {
-			return true
+		switch {
+		case strings.HasSuffix(g, "/"):
+			if ok, _ := policy.Match(strings.TrimSuffix(g, "/"), p); ok {
+				return true
+			}
+		case strings.Contains(g, "/"):
+			if ok, _ := policy.Match(g, p); ok {
+				return true
+			}
+		default:
+			if dir {
+				continue
+			}
+			if ok, _ := path.Match(g, base); ok {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// globClass strips bracket character classes for the wildcard-only check.
+var globClass = regexp.MustCompile(`\[[^\]]*\]`)
+
+// ValidRegenerableGlob reports whether the node accepts a regenerable glob,
+// mirroring its validNodeGlob rule: the pattern must be non-empty, relative,
+// at most 128 bytes with no control bytes, must not be wildcard-only (after
+// stripping character classes, trimming `*?/` leaves nothing), and may end
+// in `/` as an explicit top-level directory approval. Anything it refuses
+// fails every `worktree.remove`, so the config refuses it at load.
+func ValidRegenerableGlob(g string) error {
+	if g == "" || strings.HasPrefix(g, "/") {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	if len(g) > 128 {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	for i := range len(g) {
+		if g[i] < 0x20 || g[i] == 0x7f {
+			return fmt.Errorf("invalid path glob %q", g)
+		}
+	}
+	if strings.Trim(globClass.ReplaceAllString(g, ""), "*?/") == "" {
+		return fmt.Errorf("invalid path glob %q", g)
+	}
+	if _, err := policy.Match(strings.TrimSuffix(g, "/"), "probe"); err != nil {
+		return err
+	}
+	return nil
 }

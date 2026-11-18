@@ -263,3 +263,35 @@ func TestHubRefusesRedirect(t *testing.T) {
 		t.Fatalf("redirect followed: err=%v leaked=%v", err, leaked)
 	}
 }
+
+func TestWorktreeRemoveSendsListAsConfigured(t *testing.T) {
+	hub, seen := fakeHub(t, func(r hubRequest) (int, any) {
+		return http.StatusOK, map[string]any{"result": map[string]any{"outcome": "removed"}}
+	})
+	host := HubHost{Hub: hub, Machine: "node-a"}
+	// A slash-free name never becomes a directory approval: only an
+	// explicit pattern ending in `/` approves a wholly ignored `dir/`
+	// entry at the node, so the list goes exactly as configured.
+	want := []string{".venv", ".venv/", "node_modules/", "vendor/**"}
+	if _, err := host.WorktreeRemove(context.Background(), "/w/repo.wt", "aaaa", "main", want, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("saw %d requests", len(*seen))
+	}
+	args, _ := (*seen)[0].body["args"].(map[string]any)
+	raw, _ := args["regenerable"].([]any)
+	var sent []string
+	for _, v := range raw {
+		s, _ := v.(string)
+		sent = append(sent, s)
+	}
+	if len(sent) != len(want) {
+		t.Fatalf("worktree.remove regenerable = %v, want %v", sent, want)
+	}
+	for i := range want {
+		if sent[i] != want[i] {
+			t.Fatalf("worktree.remove regenerable = %v, want %v", sent, want)
+		}
+	}
+}

@@ -154,6 +154,14 @@ func TestReapConfig(t *testing.T) {
 		{"legacy every bad", "reap:\n  legacy_every: soon\n", true},
 		{"legacy every negative", "reap:\n  legacy_every: -24h\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
+		{"regenerable dir form", "reap:\n  regenerable: ['.venv/', 'Library/']\n", false},
+		{"regenerable class refused", "reap:\n  regenerable: ['[*]']\n", true},
+		{"regenerable class dir refused", "reap:\n  regenerable: ['[a-z]/']\n", true},
+		{"regenerable star refused", "reap:\n  regenerable: ['*']\n", true},
+		{"regenerable starstar refused", "reap:\n  regenerable: ['**']\n", true},
+		{"regenerable slash refused", "reap:\n  regenerable: ['/']\n", true},
+		{"regenerable repo scoped", "repos:\n  - {name: example/project, reap: {regenerable: ['.local/']}}\n", false},
+		{"regenerable repo bad", "repos:\n  - {name: example/project, reap: {regenerable: ['[*]']}}\n", true},
 		{"retired protect ignored", "reap:\n  protect: ['..']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
@@ -246,6 +254,29 @@ func TestReapConfig(t *testing.T) {
 				}
 				if len(c.Reap.Regenerable) == 0 {
 					t.Fatal("missing default regenerable list")
+				}
+				if tt.name == "defaults" && slices.Contains(c.Reap.Regenerable, ".local") {
+					t.Fatalf("default regenerable list must not scope .local fleet-wide: %v", c.Reap.Regenerable)
+				}
+				if tt.name == "defaults" {
+					for _, want := range []string{".venv/", "node_modules/", "__pycache__/", ".pytest_cache/", "Library/", "Temp/"} {
+						if !slices.Contains(c.Reap.Regenerable, want) {
+							t.Fatalf("default regenerable list missing directory form %q: %v", want, c.Reap.Regenerable)
+						}
+					}
+					for _, keep := range []string{"bin", "Logs", "obj", "build", "dist", "target", "UserSettings"} {
+						if !slices.Contains(c.Reap.Regenerable, keep) || slices.Contains(c.Reap.Regenerable, keep+"/") {
+							t.Fatalf("default %q must stay name-only: %v", keep, c.Reap.Regenerable)
+						}
+					}
+				}
+				if tt.name == "regenerable repo scoped" {
+					if len(c.Repos) != 1 || len(c.Repos[0].Reap.Regenerable) != 1 || c.Repos[0].Reap.Regenerable[0] != ".local/" {
+						t.Fatalf("per-repo regenerable list not kept: %+v", c.Repos)
+					}
+					if got := c.ReapRegenerable(c.Repos[0]); len(got) != len(c.Reap.Regenerable)+1 || got[len(got)-1] != ".local/" {
+						t.Fatalf("effective list not global plus repo: %v", got)
+					}
 				}
 				if tt.name == "regenerable" && c.Reap.Regenerable[1] != "vendor/**" {
 					t.Fatal("configured regenerable list did not replace defaults")

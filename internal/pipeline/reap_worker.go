@@ -543,7 +543,7 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 		return keep("worktree-changed")
 	}
 	result, e := remover.WorktreeRemoveDisposable(ctx, c.path, c.head, w.r.Branch,
-		w.s.Config.Reap.Regenerable, w.s.Config.Reap.Disposable, false)
+		w.s.Config.ReapRegenerable(w.r), w.s.Config.Reap.Disposable, false)
 	if e != nil {
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e))
 		return keep("guard-error")

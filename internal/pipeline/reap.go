@@ -878,7 +878,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					})
 					if !ok {
 						rec.Result, rec.Reason = "skipped", "cleanup-unknown:unsupported"
-					} else if result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.Reap.Regenerable, false); err != nil {
+					} else if result, err := remover.WorktreeRemove(ctx, w.Path, w.Head, r.Branch, s.Config.ReapRegenerable(r), false); err != nil {
 						rec.Result, rec.Reason = "error", err.Error()
 					} else {
 						rec.Files = result.Files
@@ -926,7 +926,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				}
 				var unsafe []string
 				for _, f := range ignored {
-					if !reap.Regenerable(s.Config.Reap.Regenerable, f) {
+					if !reap.Regenerable(s.Config.ReapRegenerable(r), f) {
 						unsafe = append(unsafe, f)
 					}
 				}

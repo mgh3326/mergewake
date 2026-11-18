@@ -204,11 +204,11 @@ func TestEntriesAndClean(t *testing.T) {
 	}
 
 	e, _ := testExec(map[string]string{
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                 "",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):              " M tool\n?? note.txt\n",
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored"}):    "?? new.txt\n!! .env\n!! build/\n",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored"}): " M tool\n",
-		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):       list,
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                       "",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):                    " M tool\n?? note.txt\n",
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored", "-z"}):    "!! .env\x00!! build/\x00",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored", "-z"}): " M tool\x00",
+		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):             list,
 	}, nil)
 	for _, tt := range []struct {
 		path string
@@ -230,6 +230,85 @@ func TestEntriesAndClean(t *testing.T) {
 	got, err := e.WorktreeEntries(context.Background(), "/repo.wt")
 	if err != nil || len(got) != 3 {
 		t.Fatalf("%+v %v", got, err)
+	}
+}
+
+func TestIgnoredNulSeparated(t *testing.T) {
+	e, f := testExec(map[string]string{
+		key("git", []string{"-C", "/wt", "status", "--porcelain", "--ignored", "-z"}): "!! .env\x00!! build/\x00",
+	}, nil)
+	got, err := e.Ignored(context.Background(), "/wt")
+	if err != nil {
+		t.Fatalf("Ignored: %v", err)
+	}
+	if len(got) != 2 || got[0] != ".env" || got[1] != "build/" {
+		t.Fatalf("Ignored = %q, want NUL-separated unquoted entries", got)
+	}
+	if len(f.calls) != 1 || !strings.Contains(f.calls[0], "\x00-z") {
+		t.Fatalf("Ignored ran %q, want -z like the node listing", f.calls)
+	}
+}
+
+func TestRegenerable(t *testing.T) {
+	def := []string{
+		".venv", "node_modules", "__pycache__", ".pytest_cache",
+		"dist", "build", "target", "obj", "bin",
+		"Library", "Temp", "Logs", "UserSettings",
+		".venv/", "node_modules/", "__pycache__/", ".pytest_cache/",
+		"Library/", "Temp/",
+	}
+	for _, tt := range []struct {
+		globs []string
+		path  string
+		want  bool
+	}{
+		// The node's rule, pinned entry by entry: a dir/ entry matches
+		// only a glob ending in `/`, as a top-level whole-path pattern.
+		{def, ".venv/", true},
+		{def, "node_modules/", true},
+		{def, "Library/", true},
+		{[]string{".venv"}, ".venv/", false},
+		{[]string{"bin"}, "bin/", false},
+		{[]string{".venv/"}, "sub/.venv/", false},
+		{[]string{".local/"}, ".local/", true},
+		{def, ".local/", false},
+		// Slash globs match the whole path.
+		{[]string{"vendor/**"}, "vendor/mod/x.go", true},
+		{[]string{"vendor/**"}, "a/vendor/mod", false},
+		// Files match by last segment; tracked ancestors never approve.
+		{def, "a/dist", true},
+		{def, "pkg/build/x", false},
+		{def, "bin/local.env", false},
+		{def, "Logs/notes.md", false},
+		{def, ".env", false},
+		{def, ".env.local", false},
+		{def, "notes.md", false},
+		{def, "src/bin.dat", false},
+		{def, "dist.env", false},
+		{def, "binary", false},
+	} {
+		if got := Regenerable(tt.globs, tt.path); got != tt.want {
+			t.Errorf("Regenerable(%q, %q) = %v, want %v", tt.globs, tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestValidRegenerableGlob(t *testing.T) {
+	for _, g := range []string{
+		".venv", ".venv/", "node_modules/", "vendor/**", "Library/",
+		"a/b", "*.log", ".local/",
+	} {
+		if err := ValidRegenerableGlob(g); err != nil {
+			t.Errorf("ValidRegenerableGlob(%q) = %v, want accept", g, err)
+		}
+	}
+	for _, g := range []string{
+		"", "/", "*", "**", "?", "[*]", "[abc]", "[a-z]/",
+		"..", "/abs", "a//b", "a\x01b", strings.Repeat("x", 129),
+	} {
+		if err := ValidRegenerableGlob(g); err == nil {
+			t.Errorf("ValidRegenerableGlob(%q) accepted, want refuse", g)
+		}
 	}
 }
 
@@ -310,37 +389,6 @@ func TestJobDirAndValidJobName(t *testing.T) {
 	}
 	if (Host{Name: "local"}).JobDir("wk-7") != "" {
 		t.Fatal("job dir without jobs base")
-	}
-}
-
-func TestRegenerable(t *testing.T) {
-	globs := []string{".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build", "target", "obj", "bin", "Library", "Temp", "Logs", "UserSettings"}
-	for _, tt := range []struct {
-		path string
-		want bool
-	}{
-		{".venv/", true}, {"node_modules/", true}, {"sub/node_modules/", true},
-		{"__pycache__/", true}, {".pytest_cache/", true}, {"dist/", true},
-		{"build/", true}, {"target/", true}, {"obj/", true}, {"bin/", true},
-		{"Library/", true}, {"Temp/", true}, {"Logs/", true}, {"UserSettings/", true},
-		{"a/dist", true},
-		// Slash-free patterns match the last segment only: an ignored file
-		// inside a tracked dir is not regenerable just because an ancestor
-		// shares the name.
-		{"pkg/build/x", false}, {"bin/local.env", false}, {"Logs/notes.md", false},
-		{".env", false}, {".env.local", false}, {"notes.md", false},
-		{"src/bin.dat", false}, {"dist.env", false}, {"binary", false},
-	} {
-		if got := Regenerable(globs, tt.path); got != tt.want {
-			t.Errorf("%q: %v != %v", tt.path, got, tt.want)
-		}
-	}
-	// Slash patterns match the full path, not a single segment.
-	if !Regenerable([]string{"vendor/**"}, "vendor/mod/x.go") {
-		t.Error("vendor/** not matched")
-	}
-	if Regenerable([]string{"vendor/**"}, "a/vendor/mod") {
-		t.Error("slash pattern matched a segment")
 	}
 }
 

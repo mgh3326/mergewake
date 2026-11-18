@@ -857,7 +857,7 @@ func (w *legacySweep) removeGuarded(ctx context.Context, hs *reapHost, wt *reap.
 		keep("worktree-changed")
 		return
 	}
-	result, e := remover.WorktreeRemove(ctx, wt.Path, wt.Head, w.r.Branch, w.s.Config.Reap.Regenerable, false)
+	result, e := remover.WorktreeRemove(ctx, wt.Path, wt.Head, w.r.Branch, w.s.Config.ReapRegenerable(w.r), false)
 	if e != nil {
 		rec.Result, rec.Reason = "error", e.Error()
 		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, wt.Path, e))

@@ -1361,7 +1361,7 @@ func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
 	}
 	var unsafe []string
 	for _, f := range ignored {
-		if !reap.Regenerable(w.s.Config.Reap.Regenerable, f) {
+		if !reap.Regenerable(w.s.Config.ReapRegenerable(w.r), f) {
 			unsafe = append(unsafe, f)
 		}
 	}

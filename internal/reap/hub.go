@@ -428,7 +428,9 @@ func (h HubHost) WorktreeRemove(ctx context.Context, cwd, expectHead, base strin
 // upgrade instead of removing anything unguarded.
 func (h HubHost) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, base string, regenerable, disposable []string, detached bool) (WorktreeRemoveResult, error) {
 	// The node refuses a null list as invalid_request, so "no regenerable
-	// globs" is sent as an empty list.
+	// globs" is sent as an empty list. The list goes as configured: a
+	// slash-free name never becomes a directory approval, only an explicit
+	// pattern ending in `/` approves a wholly ignored `dir/` entry.
 	if regenerable == nil {
 		regenerable = []string{}
 	}

@@ -533,7 +533,8 @@ func (s *Service) reapOrphanCheckouts(ctx context.Context, r config.Repo, receip
 			errs = append(errs, fmt.Errorf("orphan checkout %s: ignored: %w", path, e))
 			continue
 		}
-		if orphanHasUnsafeIgnored(s.Config.Reap.Regenerable, ignored) {
+		unsafe := orphanHasUnsafeIgnored(s.Config.ReapRegenerable(r), ignored)
+		if unsafe {
 			continue
 		}
 		if e := hs.refreshPanes(ctx); e != nil {

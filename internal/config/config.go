@@ -19,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/reap"
 	"gopkg.in/yaml.v3"
 )
@@ -201,6 +200,20 @@ type Repo struct {
 	// the repo into a sparse reviewer checkout (hk 5099); empty keeps
 	// today's full checkout.
 	Review RepoReview `yaml:"review"`
+	// Reap holds per-repository reap settings. Regenerable is additive
+	// to the global reap.regenerable list and validated with the same
+	// rule; it lets one repo approve its own state dir (for example
+	// panewire's `.local/`) without touching other repos. Empty keeps
+	// the global list.
+	Reap RepoReap `yaml:"reap"`
+}
+
+// RepoReap configures a repository's reap allowlist. Empty, the default
+// for every repository, means the global reap.regenerable list.
+type RepoReap struct {
+	// Regenerable lists gitignored path globs expendable for this repo
+	// only, on top of the global list. Directory forms end in `/`.
+	Regenerable []string `yaml:"regenerable"`
 }
 
 // TaskEventsOn reports whether hk_task_events is unset or true.
@@ -727,14 +740,33 @@ var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
 const ArchiveTextCap = 3 << 20
 
 // DefaultReapRegenerable names gitignored paths whose loss is acceptable
-// because they rebuild on demand: language caches, build output, vendored
-// deps, and Unity's generated directories. A configured reap.regenerable
-// list replaces this list; anything else ignored — .env*, notes, unknown
-// files — still refuses worktree removal.
+// because they rebuild on demand. Slash-free names approve ignored entries
+// of that name; only the explicit directory forms (a trailing `/`) approve
+// wholly ignored directories, and only at the top level — a nested
+// `web/node_modules/` still refuses, as it does at the node. Directory forms
+// go only to tool-owned caches (`.venv/`, `node_modules/`, `__pycache__/`,
+// `.pytest_cache/`) and the generated directories the contract names
+// (`Library/`, `Temp/`); `bin`, `obj`, `build`, `dist`, `target`, `Logs` and
+// `UserSettings` stay name-only, so a wholly ignored `bin/` holding
+// `bin/.env` still refuses on both sides. A configured reap.regenerable list
+// replaces this list; anything else ignored — .env*, notes, unknown files —
+// still refuses worktree removal.
 var DefaultReapRegenerable = []string{
 	".venv", "node_modules", "__pycache__", ".pytest_cache",
 	"dist", "build", "target", "obj", "bin",
 	"Library", "Temp", "Logs", "UserSettings",
+	".venv/", "node_modules/", "__pycache__/", ".pytest_cache/",
+	"Library/", "Temp/",
+}
+
+// ReapRegenerable returns the regenerable allowlist for one repository: the
+// global list plus that repo's own entries, if any. Per-repo entries scope
+// approvals like panewire's `.local/` to that repo instead of the fleet.
+func (c Config) ReapRegenerable(r Repo) []string {
+	if len(r.Reap.Regenerable) == 0 {
+		return c.Reap.Regenerable
+	}
+	return append(slices.Clone(c.Reap.Regenerable), r.Reap.Regenerable...)
 }
 
 // DefaultReapDisposable names the untracked files a worker worktree may still
@@ -1062,7 +1094,9 @@ func validateReap(c *Config) error {
 		c.Reap.Regenerable = DefaultReapRegenerable
 	}
 	for _, g := range c.Reap.Regenerable {
-		if _, e = policy.Match(g, "probe"); e != nil {
+		// What loads is exactly what the node accepts (validNodeGlob):
+		// directory forms included, wildcard-only refused.
+		if e = reap.ValidRegenerableGlob(g); e != nil {
 			return e
 		}
 	}
@@ -1316,6 +1350,11 @@ func validateRepos(c *Config) error {
 		for _, p := range r.Review.CheckoutExclude {
 			if e := ValidateCheckoutExcludePattern(p); e != nil {
 				return fmt.Errorf("repos[%s].review.checkout_exclude: %w", r.Name, e)
+			}
+		}
+		for _, g := range r.Reap.Regenerable {
+			if e := reap.ValidRegenerableGlob(g); e != nil {
+				return fmt.Errorf("repos[%s].reap.regenerable: %w", r.Name, e)
 			}
 		}
 	}
