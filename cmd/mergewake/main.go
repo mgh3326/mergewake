@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ Usage: mergewake <command> [flags]
   server     Migrate or check the durable PR server store
   reap       Close merged-PR sessions and clean old worktrees (needs reap.enabled)
   reap-balance Print the per-host reviewer checkout balance (read-only)
+  liveness   Print or answer the daily automatic-loop liveness checks (hk 5109)
   archive-jobs  Move old job dirs to the Drive archive and record them in hk (needs reap.archive.enabled)
   report     Report review latency from state and GitHub
   outcomes   Report or sync the shadow-safe model outcomes ledger
@@ -66,6 +68,7 @@ var ownFlagCommands = map[string]func(context.Context, []string, io.Writer, io.W
 	"pr-status":    runPRStatus,
 	"ci-policy":    runCIPolicy,
 	"server":       runServerStore,
+	"liveness":     runLivenessCLI,
 }
 
 // shadowMode decides, in one place, whether a shared-flag command only
@@ -289,6 +292,88 @@ func runReapBalance(ctx context.Context, s *pipeline.Service, c config.Config, r
 		day = time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 	}
 	return s.PrintReapBalance(repos, day)
+}
+
+// runLivenessCLI prints or acknowledges the daily automatic-loop liveness checks (hk 5109).
+func runLivenessCLI(ctx context.Context, args []string, out, stderr io.Writer) error {
+	_ = ctx
+	cfgPath := "~/.config/mergewake/config.yaml"
+	if len(args) > 0 && args[0] == "ack" {
+		fs := flag.NewFlagSet("liveness ack", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		cfg := fs.String("config", cfgPath, "host YAML config")
+		reason := fs.String("reason", "", "reason for acknowledging the stall (required)")
+		var positional []string
+		var flagArgs []string
+		for i := 0; i < len(args[1:]); i++ {
+			a := args[1:][i]
+			if strings.HasPrefix(a, "-") {
+				flagArgs = append(flagArgs, a)
+				if !strings.Contains(a, "=") && (a == "--reason" || a == "-reason" || a == "--config" || a == "-config") {
+					if i+1 < len(args[1:]) {
+						i++
+						flagArgs = append(flagArgs, args[1:][i])
+					}
+				}
+			} else {
+				positional = append(positional, a)
+			}
+		}
+		if err := fs.Parse(flagArgs); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
+			return err
+		}
+		if len(positional) != 1 {
+			return errors.New("usage: mergewake liveness ack <mechanism> --reason \"<text>\"")
+		}
+		mech := positional[0]
+		if *reason == "" {
+			return errors.New("--reason is required for liveness ack")
+		}
+		c, err := config.Load(config.Expand(*cfg))
+		if err != nil {
+			return err
+		}
+		s := pipeline.Service{Config: c, Out: out}
+		return s.AckLiveness(mech, *reason)
+	}
+
+	fs := flag.NewFlagSet("liveness", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg := fs.String("config", cfgPath, "host YAML config")
+	day := fs.String("day", "", "UTC day YYYY-MM-DD (default yesterday)")
+	mech := fs.String("mechanism", "", "inspect one mechanism only")
+	repo := fs.String("repo", "", "limit inspection to one configured repo")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	c, err := config.Load(config.Expand(*cfg))
+	if err != nil {
+		return err
+	}
+	repos := c.Repos
+	if *repo != "" {
+		r, err := c.Repo(*repo)
+		if err != nil {
+			return err
+		}
+		repos = []config.Repo{r}
+	}
+	dayStr := *day
+	if dayStr == "" {
+		now := time.Now().UTC()
+		dayStr = time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	}
+	s := pipeline.Service{Config: c, Out: out}
+	return s.PrintLiveness(repos, dayStr, *mech)
 }
 
 // runReapLegacy runs the legacy sweep by hand over --repo or, without it,

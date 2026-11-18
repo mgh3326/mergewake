@@ -482,6 +482,164 @@ func (r Reap) BalanceWindowDaysOrDefault() int {
 	return BalanceWindowDaysDefault
 }
 
+// LivenessThresholds holds configurable thresholds for the daily liveness check.
+type LivenessThresholds struct {
+	ReviewPassMinMade           int `yaml:"review_pass_min_made"`
+	ReviewPassMinDonePct        int `yaml:"review_pass_min_done_pct"`
+	ReviewerLandingMinMade      int `yaml:"reviewer_landing_min_made"`
+	ReviewerLandingMinLandedPct int `yaml:"reviewer_landing_min_landed_pct"`
+	FindingsDeliveryMinMade     int `yaml:"findings_delivery_min_made"`
+	MergeMaxUnmerged            int `yaml:"merge_max_unmerged"`
+	AuthorSweepMinMade          int `yaml:"author_sweep_min_made"`
+	AuthorSweepMinDonePct       int `yaml:"author_sweep_min_done_pct"`
+	WatchMaxUnverdictedHours    int `yaml:"watch_max_unverdicted_hours"`
+	LaneNoticesMinAttempts      int `yaml:"lane_notices_min_attempts"`
+	LaneNoticesMaxErrorPct      int `yaml:"lane_notices_max_error_pct"`
+	TaskEventsMinAttempts       int `yaml:"task_events_min_attempts"`
+	TaskEventsMaxRefusalPct     int `yaml:"task_events_max_refusal_pct"`
+	OutcomePublishMinErrors     int `yaml:"outcome_publish_min_errors"`
+	ReviewRetryMaxDeferredHours int `yaml:"review_retry_max_deferred_hours"`
+}
+
+const (
+	DefaultReviewPassMinMade           = 10
+	DefaultReviewPassMinDonePct        = 50
+	DefaultReviewerLandingMinMade      = 10
+	DefaultReviewerLandingMinLandedPct = 50
+	DefaultFindingsDeliveryMinMade     = 3
+	DefaultMergeMaxUnmerged            = 3
+	DefaultAuthorSweepMinMade          = 5
+	DefaultAuthorSweepMinDonePct       = 30
+	DefaultWatchMaxUnverdictedHours    = 6
+	DefaultLaneNoticesMinAttempts      = 5
+	DefaultLaneNoticesMaxErrorPct      = 50
+	DefaultTaskEventsMinAttempts       = 10
+	DefaultTaskEventsMaxRefusalPct     = 20
+	DefaultOutcomePublishMinErrors     = 5
+	DefaultReviewRetryMaxDeferredHours = 24
+)
+
+// Liveness configures the daily fleet-wide liveness checks (hk 5109).
+type Liveness struct {
+	Lane       string             `yaml:"lane"`
+	Thresholds LivenessThresholds `yaml:"thresholds"`
+}
+
+func (l Liveness) LaneOrDefault(fallbackLane, deskLane string) string {
+	if l.Lane != "" {
+		return l.Lane
+	}
+	if fallbackLane != "" {
+		return fallbackLane
+	}
+	return deskLane
+}
+
+func (l Liveness) ReviewPassMinMadeOrDefault() int {
+	if l.Thresholds.ReviewPassMinMade > 0 {
+		return l.Thresholds.ReviewPassMinMade
+	}
+	return DefaultReviewPassMinMade
+}
+
+func (l Liveness) ReviewPassMinDonePctOrDefault() int {
+	if l.Thresholds.ReviewPassMinDonePct > 0 {
+		return l.Thresholds.ReviewPassMinDonePct
+	}
+	return DefaultReviewPassMinDonePct
+}
+
+func (l Liveness) ReviewerLandingMinMadeOrDefault() int {
+	if l.Thresholds.ReviewerLandingMinMade > 0 {
+		return l.Thresholds.ReviewerLandingMinMade
+	}
+	return DefaultReviewerLandingMinMade
+}
+
+func (l Liveness) ReviewerLandingMinLandedPctOrDefault() int {
+	if l.Thresholds.ReviewerLandingMinLandedPct > 0 {
+		return l.Thresholds.ReviewerLandingMinLandedPct
+	}
+	return DefaultReviewerLandingMinLandedPct
+}
+
+func (l Liveness) FindingsDeliveryMinMadeOrDefault() int {
+	if l.Thresholds.FindingsDeliveryMinMade > 0 {
+		return l.Thresholds.FindingsDeliveryMinMade
+	}
+	return DefaultFindingsDeliveryMinMade
+}
+
+func (l Liveness) MergeMaxUnmergedOrDefault() int {
+	if l.Thresholds.MergeMaxUnmerged > 0 {
+		return l.Thresholds.MergeMaxUnmerged
+	}
+	return DefaultMergeMaxUnmerged
+}
+
+func (l Liveness) AuthorSweepMinMadeOrDefault() int {
+	if l.Thresholds.AuthorSweepMinMade > 0 {
+		return l.Thresholds.AuthorSweepMinMade
+	}
+	return DefaultAuthorSweepMinMade
+}
+
+func (l Liveness) AuthorSweepMinDonePctOrDefault() int {
+	if l.Thresholds.AuthorSweepMinDonePct > 0 {
+		return l.Thresholds.AuthorSweepMinDonePct
+	}
+	return DefaultAuthorSweepMinDonePct
+}
+
+func (l Liveness) WatchMaxUnverdictedHoursOrDefault() int {
+	if l.Thresholds.WatchMaxUnverdictedHours > 0 {
+		return l.Thresholds.WatchMaxUnverdictedHours
+	}
+	return DefaultWatchMaxUnverdictedHours
+}
+
+func (l Liveness) LaneNoticesMinAttemptsOrDefault() int {
+	if l.Thresholds.LaneNoticesMinAttempts > 0 {
+		return l.Thresholds.LaneNoticesMinAttempts
+	}
+	return DefaultLaneNoticesMinAttempts
+}
+
+func (l Liveness) LaneNoticesMaxErrorPctOrDefault() int {
+	if l.Thresholds.LaneNoticesMaxErrorPct > 0 {
+		return l.Thresholds.LaneNoticesMaxErrorPct
+	}
+	return DefaultLaneNoticesMaxErrorPct
+}
+
+func (l Liveness) TaskEventsMinAttemptsOrDefault() int {
+	if l.Thresholds.TaskEventsMinAttempts > 0 {
+		return l.Thresholds.TaskEventsMinAttempts
+	}
+	return DefaultTaskEventsMinAttempts
+}
+
+func (l Liveness) TaskEventsMaxRefusalPctOrDefault() int {
+	if l.Thresholds.TaskEventsMaxRefusalPct > 0 {
+		return l.Thresholds.TaskEventsMaxRefusalPct
+	}
+	return DefaultTaskEventsMaxRefusalPct
+}
+
+func (l Liveness) OutcomePublishMinErrorsOrDefault() int {
+	if l.Thresholds.OutcomePublishMinErrors > 0 {
+		return l.Thresholds.OutcomePublishMinErrors
+	}
+	return DefaultOutcomePublishMinErrors
+}
+
+func (l Liveness) ReviewRetryMaxDeferredHoursOrDefault() int {
+	if l.Thresholds.ReviewRetryMaxDeferredHours > 0 {
+		return l.Thresholds.ReviewRetryMaxDeferredHours
+	}
+	return DefaultReviewRetryMaxDeferredHours
+}
+
 // ReapHub locates the panewire hub and the credential files reap sends it.
 // TokenFile is a mode-0600 scoped service env file (HUB_MACHINE_ID, e.g.
 // svc-mergewake, and HUB_TOKEN); the operator credential is refused. CFFile
@@ -676,6 +834,7 @@ type Config struct {
 	Outcomes     Outcomes    `yaml:"outcomes"`
 	Notifier     Notifier    `yaml:"notifier"`
 	Sink         Sink        `yaml:"sink"`
+	Liveness     Liveness    `yaml:"liveness"`
 }
 
 func Decode(r io.Reader, v any) error {
@@ -1104,6 +1263,9 @@ func validateAdapters(c *Config) error {
 	}
 	if c.Reap.BalanceLane != "" && !PanewireLane(c.Reap.BalanceLane) {
 		return errors.New("reap.balance_lane must match panewire's lane rule")
+	}
+	if c.Liveness.Lane != "" && !PanewireLane(c.Liveness.Lane) {
+		return errors.New("liveness.lane must match panewire's lane rule")
 	}
 	if c.Sink.ReopenState == "" {
 		c.Sink.ReopenState = "reopened"

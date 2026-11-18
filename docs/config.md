@@ -31,6 +31,7 @@ host, model IDs, commands, and task ID are placeholders. None is a discovery rul
 | `review` | Empty object | Independent-review configuration described below. |
 | `notifier` | No-op | Notification adapter described below. |
 | `sink` | No-op | Task and report adapter described below. |
+| `liveness` | Optional | Daily made-against-done liveness checks across automatic mechanisms; see below. |
 
 ### `repos[]`
 
@@ -170,6 +171,12 @@ at a time under the state dir's `reviewer-balance.json` lock, so a crash
 between days repeats at most that day. A retried day skips the daily rows it
 already wrote and reuses the delivered-notice keys, so neither audit rows nor
 notices duplicate.
+
+**Loop liveness.** Once a day, alongside the reviewer balance, the first
+whole-repo reap pass after the UTC day boundary runs table-driven made-against-done
+liveness checks across mergewake's automatic mechanisms (review passes, reviewer
+landing, checkout removal, merges, CI watch reverts, task events, outcome publication,
+legacy sweep, finding dispatch, and review retries). See [`liveness`](#liveness) below.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role clean up merged-PR worktrees once they age out. Reap never closes
@@ -540,6 +547,57 @@ plans; rows go to `<state_dir>/archive-jobs.jsonl` unless `--dry-run`. It
 needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
+
+### `liveness`
+
+Automatic daily liveness checks evaluate made-against-done progress for all
+core mergewake loops once per UTC day during the first acting whole-repo reap pass.
+Daily evaluations write one `liveness-daily` row per mechanism into the primary
+configured repository's `decisions.jsonl`, tracking `day`, `mechanism`, `made`,
+`done`, `ratio`, and boolean `stalled`. The last processed day is tracked in
+`<state_dir>/liveness.json`.
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `lane` | Desk lane | Panewire lane receiving stall notices. When unset, falls back to `reap.balance_lane`, then to the desk (`notifier.fallback_lane`, else `notifier.lane`). |
+| `thresholds` | Default thresholds | Optional threshold overrides configured as flat fields on `liveness.thresholds`; see below. |
+
+#### Mechanisms and thresholds
+
+Every mechanism evaluates progress made against expected completions over the UTC day. A mechanism is considered `stalled` when its stall condition is met; quiet days below minimum attempts never stall.
+
+| # | Mechanism name | Made predicate | Done predicate | Default threshold config |
+|---|----------------|----------------|----------------|--------------------------|
+| 1 | `review-pass` | Distinct PR heads claimed for review (`review-start`). | Distinct PR heads completing review with a verdict (`review` or `review-skipped`). | `review_pass_min_made: 10`<br>`review_pass_min_done_pct: 50` |
+| 2 | `reviewer-landing` | Reviewer placement requests created (`review-brief-hk` with label). | Reviewer jobs landed on an execution host (`reviewer-spawn`). | `reviewer_landing_min_made: 10`<br>`reviewer_landing_min_landed_pct: 50` |
+| 3 | `findings-delivery` | Distinct PR heads with critical or high review findings (`review-round-finding`). | Heads whose findings were delivered or acknowledged (`findings-delivered` or `findings-acked`). | `findings_delivery_min_made: 3`<br>(Stalls if made >= 3 and done == 0) |
+| 4 | `merge` | Approved and CI-ready PRs eligible to merge (`land` action `merge`). | PRs successfully merged (`pr-notify` state `merged` or `hk-task-event` with source `mergewake.merge`). | `merge_max_unmerged: 3`<br>(Stalls if unmerged >= 3 and made >= 3) |
+| 5 | `reviewer-checkout-removal` | Distinct checkouts created on or before the day (`reviewer-spawn`). | Distinct checkouts removed that day (`reviewer-cleanup` or `reviewer-reap` with result `removed`). | Inherits from `reap`:<br>`reap.balance_min_created: 20`<br>`reap.balance_max_removed_pct: 70` |
+| 6 | `author-worktree-sweep` | Candidate author worktrees inspected for removal in `reap.jsonl` (`remove-worktree`). | Worktrees removed or found already gone (`result: "removed"` or `reason: "worktree-gone"`). | `author_sweep_min_made: 5`<br>`author_sweep_min_done_pct: 30` |
+| 7 | `watch-revert` | Merges observed on base branch (`pr-notify` state `merged` or `land` action `merge`). | Base branch heads actively observed by CI watch (`watch`). | `watch_max_unverdicted_hours: 6`<br>(Stalls if repo has merges but zero watch observations) |
+| 8 | `lane-notices` | Attempted lane notifications (`pr-notify`, `review-blocked`, `conflict-esc`). | Successful notifications (attempts minus notification errors). | `lane_notices_min_attempts: 5`<br>`lane_notices_max_error_pct: 50` |
+| 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`) and field refusals. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
+| 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
+| 11 | `review-retry` | Review passes deferred for retry up to the evaluated day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged) or within grace window. | `review_retry_max_deferred_hours: 24`<br>(Stalls if >= 2 unresolved deferrals exceed threshold; single miss does not alert) |
+
+#### Stall notices and repeat rule
+
+When a mechanism evaluates as stalled:
+* One notice per stalled mechanism per day is dispatched to `liveness.lane` (or fallback lanes) via panewire lane event.
+* The notice repeats daily while the stall holds.
+* An operator can acknowledge a stall:
+  ```bash
+  mergewake liveness ack <mechanism> --reason "<text>"
+  ```
+  The acknowledgment records a `liveness-ack` row in `decisions.jsonl`. While acknowledged, repeat notices for that mechanism are suppressed.
+* When a recovery daily row (`stalled: false`) is written after an acknowledgment, the ack is automatically cleared. Any future stall on that mechanism will alert again.
+
+#### Inspecting liveness
+
+To inspect daily mechanism status and audit history without modifying state:
+```bash
+mergewake liveness [--day YYYY-MM-DD] [--mechanism M]
+```
 
 ### `review`
 

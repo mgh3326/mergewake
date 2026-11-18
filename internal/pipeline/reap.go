@@ -958,6 +958,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if err := s.reviewerBalance(ctx, o); err != nil {
 			errs = append(errs, err)
 		}
+		if err := s.liveness(ctx, o); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if prNum == 0 {
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
