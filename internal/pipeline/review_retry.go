@@ -443,17 +443,21 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	// Mergewake's own automation gets its own copy on the tool lane, so the
 	// desk hears it only when no tool lane and no design lane resolve to
 	// anything else. The suffixed id keeps both copies deduped per lane and
-	// stable across retries. Until tool_lane is set the owner notice below
-	// is the only copy, exactly as before.
+	// stable across retries. Until tool_lane is set the owner notice is the
+	// only copy, exactly as before. The owner notice goes first and is
+	// always attempted: a failing tool-lane emit must not suppress the
+	// design-lane escalation.
+	ownerErr := s.Notifier.Notify(nctx, integrations.Event{ID: id, Lane: owner, Type: "automation-failed", Text: text})
+	var toolErr error
 	if s.Config.Notifier.ToolLane != "" {
 		if tool := s.toolLane(); tool != owner {
-			if err := s.Notifier.Notify(nctx, integrations.Event{ID: id + "-tool", Lane: tool, Type: "automation-failed", Text: text}); err != nil {
-				return false, err
-			}
+			toolErr = s.Notifier.Notify(nctx, integrations.Event{ID: id + "-tool", Lane: tool, Type: "automation-failed", Text: text})
 		}
 	}
-	err = s.Notifier.Notify(nctx, integrations.Event{ID: id, Lane: owner, Type: "automation-failed", Text: text})
-	return err == nil, err
+	if ownerErr != nil {
+		return false, errors.Join(ownerErr, toolErr)
+	}
+	return true, toolErr
 }
 
 // retryReviewStatus distinguishes a live lease from an unsuccessful attempt.

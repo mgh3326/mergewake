@@ -74,8 +74,26 @@ func TestReviewRetryEscalationNotifiesToolAndPRLanes(t *testing.T) {
 	if sent, err := s.escalateReviewFailure(context.Background(), r, g.pull, 3, "boom"); err != nil || !sent {
 		t.Fatalf("repeat escalate = %t, %v", sent, err)
 	}
-	if n.count != 2 || n.events[0].ID != wantID+"-tool" || n.events[1].ID != wantID {
+	if n.count != 2 || n.events[0].ID != wantID || n.events[1].ID != wantID+"-tool" {
 		t.Fatalf("repeat escalation ids = %+v, want stable ids", n.events)
+	}
+}
+
+// A tool-lane emit failure must not suppress the design-lane escalation: the
+// owner notice is always attempted, and its delivery counts even when the
+// tool copy fails.
+func TestReviewRetryEscalationToolLaneFailureKeepsOwnerNotice(t *testing.T) {
+	s, g, n, r := notifySetup(t)
+	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
+	s.Config.Notifier.ToolLane = "tool-lane"
+	r.Lane = "owner-lane"
+	n.failLanes = map[string]error{"tool-lane": errors.New("lane not registered on this host")}
+	sent, err := s.escalateReviewFailure(context.Background(), r, g.pull, 3, "boom")
+	if err == nil || !sent {
+		t.Fatalf("escalate = %t, %v; want the owner delivery with a joined tool error", sent, err)
+	}
+	if n.count != 1 || n.events[0].Lane != "owner-lane" || n.events[0].ID != "mergewake-review-failed-example/project-7-"+g.pull.Head.SHA {
+		t.Fatalf("escalation notices = %+v, want the owner copy delivered", n.events)
 	}
 }
 

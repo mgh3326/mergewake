@@ -517,6 +517,9 @@ type fakeNotifier struct {
 	count  int
 	err    error
 	events []integrations.Event
+	// failLanes fails delivery to the named lanes only, so a test can prove
+	// one copy is still attempted when the other lane refuses it.
+	failLanes map[string]error
 }
 
 func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
@@ -525,6 +528,9 @@ func (n *fakeNotifier) Notify(_ context.Context, e integrations.Event) error {
 	// own events, so they do not see the overdue ones.
 	if e.Lane == overdueLeadLane {
 		return nil
+	}
+	if err := n.failLanes[e.Lane]; err != nil {
+		return err
 	}
 	if n.err != nil {
 		return n.err
