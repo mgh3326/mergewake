@@ -90,5 +90,5 @@ reap:
   scan_after: 720h # merged-PR discovery window; older PRs arrive via receipts
   legacy_every: 24h # daemon's legacy sweep per repo; 0 or off disables it
   regenerable: [] # gitignored paths safe to delete with a worktree (defaults:
-  # .venv, node_modules, __pycache__, .pytest_cache, dist, build, target, obj,
-  # bin, Library, Temp, Logs, UserSettings); anything else refuses removal
+  # .venv, node_modules, __pycache__, .pytest_cache, .local, dist, build,
+  # target, obj, bin, Library, Temp, Logs, UserSettings); anything else refuses removal

@@ -263,3 +263,64 @@ func TestHubRefusesRedirect(t *testing.T) {
 		t.Fatalf("redirect followed: err=%v leaked=%v", err, leaked)
 	}
 }
+
+func TestExpandRegenerableForNode(t *testing.T) {
+	got := ExpandRegenerableForNode([]string{".venv", "node_modules", "vendor/**"})
+	for _, want := range []string{".venv", ".venv/", "node_modules", "node_modules/", "vendor/**"} {
+		found := false
+		for _, g := range got {
+			if g == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expanded %v missing %q", got, want)
+		}
+	}
+	for _, bad := range []string{"vendor/**/"} {
+		for _, g := range got {
+			if g == bad {
+				t.Errorf("expanded %v should not contain %q", got, bad)
+			}
+		}
+	}
+	if got := ExpandRegenerableForNode([]string{".venv/"}); len(got) != 2 || got[0] != ".venv" || got[1] != ".venv/" {
+		t.Errorf("dir form normalized to %v, want [.venv .venv/]", got)
+	}
+	if got := ExpandRegenerableForNode(nil); len(got) != 0 {
+		t.Errorf("nil expanded to %v, want empty", got)
+	}
+}
+
+func TestWorktreeRemoveSendsDirectoryForms(t *testing.T) {
+	hub, seen := fakeHub(t, func(r hubRequest) (int, any) {
+		return http.StatusOK, map[string]any{"result": map[string]any{"outcome": "removed"}}
+	})
+	host := HubHost{Hub: hub, Machine: "node-a"}
+	if _, err := host.WorktreeRemove(context.Background(), "/w/repo.wt", "aaaa", "main", []string{".venv", ".local", "vendor/**"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("saw %d requests", len(*seen))
+	}
+	args, _ := (*seen)[0].body["args"].(map[string]any)
+	raw, _ := args["regenerable"].([]any)
+	var sent []string
+	for _, v := range raw {
+		s, _ := v.(string)
+		sent = append(sent, s)
+	}
+	for _, want := range []string{".venv", ".venv/", ".local", ".local/", "vendor/**"} {
+		found := false
+		for _, g := range sent {
+			if g == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("worktree.remove regenerable %v missing %q", sent, want)
+		}
+	}
+}

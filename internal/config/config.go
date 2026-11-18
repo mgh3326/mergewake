@@ -728,11 +728,11 @@ const ArchiveTextCap = 3 << 20
 
 // DefaultReapRegenerable names gitignored paths whose loss is acceptable
 // because they rebuild on demand: language caches, build output, vendored
-// deps, and Unity's generated directories. A configured reap.regenerable
-// list replaces this list; anything else ignored — .env*, notes, unknown
-// files — still refuses worktree removal.
+// deps, Unity's generated directories, and panewire's test state dir. A
+// configured reap.regenerable list replaces this list; anything else
+// ignored — .env*, notes, unknown files — still refuses worktree removal.
 var DefaultReapRegenerable = []string{
-	".venv", "node_modules", "__pycache__", ".pytest_cache",
+	".venv", "node_modules", "__pycache__", ".pytest_cache", ".local",
 	"dist", "build", "target", "obj", "bin",
 	"Library", "Temp", "Logs", "UserSettings",
 }
@@ -1062,7 +1062,15 @@ func validateReap(c *Config) error {
 		c.Reap.Regenerable = DefaultReapRegenerable
 	}
 	for _, g := range c.Reap.Regenerable {
-		if _, e = policy.Match(g, "probe"); e != nil {
+		// The node approves a wholly ignored directory only by a pattern
+		// ending in `/`, so the directory form is accepted here and sent
+		// alongside the file form; the node refuses wildcard-only patterns,
+		// so this validation does too.
+		probe := strings.TrimSuffix(g, "/")
+		if probe == "" || strings.Trim(probe, "*?[]/") == "" {
+			return fmt.Errorf("invalid path glob %q", g)
+		}
+		if _, e = policy.Match(probe, "probe"); e != nil {
 			return e
 		}
 	}

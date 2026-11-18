@@ -314,13 +314,14 @@ func TestJobDirAndValidJobName(t *testing.T) {
 }
 
 func TestRegenerable(t *testing.T) {
-	globs := []string{".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build", "target", "obj", "bin", "Library", "Temp", "Logs", "UserSettings"}
+	globs := []string{".venv", "node_modules", "__pycache__", ".pytest_cache", ".local", "dist", "build", "target", "obj", "bin", "Library", "Temp", "Logs", "UserSettings"}
 	for _, tt := range []struct {
 		path string
 		want bool
 	}{
 		{".venv/", true}, {"node_modules/", true}, {"sub/node_modules/", true},
-		{"__pycache__/", true}, {".pytest_cache/", true}, {"dist/", true},
+		{"__pycache__/", true}, {".pytest_cache/", true}, {".local/", true}, {".local", true}, {"sub/.local/", true},
+		{"dist/", true},
 		{"build/", true}, {"target/", true}, {"obj/", true}, {"bin/", true},
 		{"Library/", true}, {"Temp/", true}, {"Logs/", true}, {"UserSettings/", true},
 		{"a/dist", true},

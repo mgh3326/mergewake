@@ -154,6 +154,10 @@ func TestReapConfig(t *testing.T) {
 		{"legacy every bad", "reap:\n  legacy_every: soon\n", true},
 		{"legacy every negative", "reap:\n  legacy_every: -24h\n", true},
 		{"regenerable", "reap:\n  regenerable: ['.venv', 'vendor/**']\n", false},
+		{"regenerable dir form", "reap:\n  regenerable: ['.venv/', '.local/']\n", false},
+		{"regenerable star refused", "reap:\n  regenerable: ['*']\n", true},
+		{"regenerable starstar refused", "reap:\n  regenerable: ['**']\n", true},
+		{"regenerable slash refused", "reap:\n  regenerable: ['/']\n", true},
 		{"retired protect ignored", "reap:\n  protect: ['..']\n", false},
 		{"bad regenerable", "reap:\n  regenerable: ['..']\n", true},
 		{"local host", "hosts:\n  - {name: desk}\n", false},
@@ -246,6 +250,9 @@ func TestReapConfig(t *testing.T) {
 				}
 				if len(c.Reap.Regenerable) == 0 {
 					t.Fatal("missing default regenerable list")
+				}
+				if tt.name == "defaults" && !slices.Contains(c.Reap.Regenerable, ".local") {
+					t.Fatalf("default regenerable list missing .local: %v", c.Reap.Regenerable)
 				}
 				if tt.name == "regenerable" && c.Reap.Regenerable[1] != "vendor/**" {
 					t.Fatal("configured regenerable list did not replace defaults")
