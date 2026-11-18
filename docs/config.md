@@ -570,13 +570,13 @@ Every mechanism evaluates progress made against expected completions over the UT
 |---|----------------|----------------|----------------|--------------------------|
 | 1 | `review-pass` | Distinct PR heads claimed for review (`review-start`). | Distinct PR heads completing review with a verdict (`review` or `review-skipped`). | `review_pass_min_made: 10`<br>`review_pass_min_done_pct: 50` |
 | 2 | `reviewer-landing` | Reviewer placement requests created (`review-brief-hk` with label). | Reviewer jobs landed on an execution host (`reviewer-spawn`). | `reviewer_landing_min_made: 10`<br>`reviewer_landing_min_landed_pct: 50` |
-| 3 | `findings-delivery` | Distinct PR heads with critical or high review findings (`review-round-finding`). | Heads whose findings were delivered or acknowledged (`findings-delivered` or `findings-acked`). | `findings_delivery_min_made: 3`<br>(Stalls if made >= 3 and done == 0) |
+| 3 | `findings-delivery` | Distinct PR heads with critical or high review findings (`review-round-finding`). | Heads whose findings were delivered or acknowledged (`findings-delivered` or `findings-acked` carrying a `head`). A `findings-acked` row without a `head` (written before the ack carried one) stays uncounted. | `findings_delivery_min_made: 3`<br>(Stalls if made >= 3 and done == 0) |
 | 4 | `merge` | Approved and CI-ready PRs eligible to merge (`land` action `merge`). | PRs successfully merged (`pr-notify` state `merged` or `hk-task-event` with source `mergewake.merge`). | `merge_max_unmerged: 3`<br>(Stalls if unmerged >= 3 and made >= 3) |
 | 5 | `reviewer-checkout-removal` | Distinct checkouts created on or before the day (`reviewer-spawn`). | Distinct checkouts removed that day (`reviewer-cleanup` or `reviewer-reap` with result `removed`). | Inherits from `reap`:<br>`reap.balance_min_created: 20`<br>`reap.balance_max_removed_pct: 70` |
 | 6 | `author-worktree-sweep` | Candidate author worktrees inspected for removal in `reap.jsonl` (`remove-worktree`). | Worktrees removed or found already gone (`result: "removed"` or `reason: "worktree-gone"`). | `author_sweep_min_made: 5`<br>`author_sweep_min_done_pct: 30` |
 | 7 | `watch-revert` | Merges observed on base branch (`pr-notify` state `merged` or `land` action `merge`). | Base branch heads actively observed by CI watch (`watch`). | `watch_max_unverdicted_hours: 6`<br>(Stalls if repo has merges but zero watch observations) |
 | 8 | `lane-notices` | Attempted lane notifications (`pr-notify`, `review-blocked`, `conflict-esc`). | Successful notifications (attempts minus notification errors). | `lane_notices_min_attempts: 5`<br>`lane_notices_max_error_pct: 50` |
-| 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`) and field refusals. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
+| 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`). A `task-event-fields-refused` row for an event that posted successfully is the same event, not a second attempt; only a refusal with no successful post counts. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
 | 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
 | 11 | `review-retry` | Review passes deferred for retry up to the evaluated day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged) or within grace window. | `review_retry_max_deferred_hours: 24`<br>(Stalls if >= 2 unresolved deferrals exceed threshold; single miss does not alert) |
 
@@ -584,12 +584,13 @@ Every mechanism evaluates progress made against expected completions over the UT
 
 When a mechanism evaluates as stalled:
 * One notice per stalled mechanism per day is dispatched to `liveness.lane` (or fallback lanes) via panewire lane event.
+* A notice the notifier refuses is recorded as a `liveness-notice-error` row and does not halt the day loop: the day still completes and advances, and the next pass retries the notice. Only a delivered notice writes `liveness-notice` and its sent key, so a notice is never delivered twice.
 * The notice repeats daily while the stall holds.
 * An operator can acknowledge a stall:
   ```bash
   mergewake liveness ack <mechanism> --reason "<text>"
   ```
-  The acknowledgment records a `liveness-ack` row in `decisions.jsonl`. While acknowledged, repeat notices for that mechanism are suppressed.
+  The acknowledgment records a `liveness-ack` row in `decisions.jsonl`. While acknowledged, repeat notices for that mechanism are suppressed. An ack is accepted only while the mechanism's latest daily row is stalled; otherwise it is refused. A late ack, written after recovery, can never silence a later, unrelated stall.
 * When a recovery daily row (`stalled: false`) is written after an acknowledgment, the ack is automatically cleared. Any future stall on that mechanism will alert again.
 
 #### Inspecting liveness

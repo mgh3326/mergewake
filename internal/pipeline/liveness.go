@@ -52,6 +52,11 @@ const (
 	livenessDailyCommand  = "liveness-daily"
 	livenessNoticeCommand = "liveness-notice"
 	livenessAckCommand    = "liveness-ack"
+	// livenessNoticeErrorCommand records a stall notice the notifier
+	// refused. It is not a notice: the sent-key discipline retries the
+	// notice on the next pass, and only a successful send writes
+	// liveness-notice.
+	livenessNoticeErrorCommand = "liveness-notice-error"
 )
 
 // NormalizeMechanism resolves aliases to canonical mechanism names.
@@ -228,7 +233,11 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 	}
 	target := s.Config.Repos[0]
 	now := s.now().UTC()
-	stalledDay := now.Format(reviewerSummaryDay)
+	// An ack answers the mechanism's current stall only: the latest daily
+	// row for the mechanism must be stalled. A late ack written after a
+	// recovery row would otherwise land after that row in file order and
+	// silence a later, unrelated stall.
+	latestDay, latestStalled := "", false
 	if f, err := os.Open(filepath.Join(s.state(target.Name), "decisions.jsonl")); err == nil {
 		rd := bufio.NewReader(f)
 		for {
@@ -244,8 +253,8 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 						Mechanism string `json:"mechanism"`
 						Stalled   bool   `json:"stalled"`
 					}
-					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism == norm && v.Stalled {
-						stalledDay = v.Day
+					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism == norm && v.Day >= latestDay {
+						latestDay, latestStalled = v.Day, v.Stalled
 					}
 				}
 			}
@@ -255,6 +264,13 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 		}
 		_ = f.Close()
 	}
+	if latestDay == "" {
+		return fmt.Errorf("liveness ack refused: mechanism %q has no daily rows; an ack only answers a current stall", norm)
+	}
+	if !latestStalled {
+		return fmt.Errorf("liveness ack refused: mechanism %q is not stalled (latest daily row for %s: stalled=false); an ack only answers a current stall", norm, latestDay)
+	}
+	stalledDay := latestDay
 	val := map[string]any{
 		"mechanism": norm,
 		"reason":    reason,
@@ -416,7 +432,20 @@ func (s *Service) noticeLiveness(ctx context.Context, target config.Repo, day st
 		Lane: lane,
 		Type: eventType("blocked"),
 	}); err != nil {
-		return fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(err))
+		// A refused notice is not a failed day: record the error and let
+		// the day complete and advance. No sent key is stored, so the next
+		// pass retries the notice; the sent key keeps a delivered notice
+		// from ever going out twice.
+		return s.audit(target.Name, livenessNoticeErrorCommand, map[string]any{
+			"day":       day,
+			"mechanism": m.Mechanism,
+			"made":      m.Made,
+			"done":      m.Done,
+			"ratio":     m.Ratio,
+			"lane":      lane,
+			"via":       via,
+			"error":     integrations.Detail(err),
+		}, false)
 	}
 	if err := sent.add(key); err != nil {
 		return err
@@ -736,6 +765,11 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	m9Attempts := 0
 	m9Successes := 0
 	m9Refusals := 0
+	// A fields-refused row that follows a successful hk-task-event for the
+	// same event is not a second attempt: successes are keyed so refusals
+	// can be matched after the scan, whatever order the rows land in.
+	m9Succeeded := map[string]bool{} // source\x00task\x00source_ref -> posted with a result
+	m9Refused := []string{}          // fields-refused keys in row order
 
 	m10Errors := 0
 
@@ -781,6 +815,7 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						State    string          `json:"state"`
 						Severity string          `json:"severity"`
 						Source   string          `json:"source"`
+						Task     string          `json:"task"`
 						Ref      string          `json:"source_ref"`
 						OldLabel string          `json:"old_label"`
 						OldHead  string          `json:"old_head"`
@@ -867,10 +902,13 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 							m9Attempts++
 							if v.Error == "" && len(v.Result) > 0 && string(v.Result) != "null" {
 								m9Successes++
+								m9Succeeded[v.Source+"\x00"+v.Task+"\x00"+v.Ref] = true
 							}
 						case "task-event-fields-refused":
-							m9Attempts++
-							m9Refusals++
+							// Counted after the scan: a refusal for an event
+							// that posted successfully is the same event,
+							// not a second attempt.
+							m9Refused = append(m9Refused, v.Source+"\x00"+v.Task+"\x00"+v.Ref)
 						}
 
 						// M10: outcome-publish errors
@@ -912,6 +950,15 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 			}
 		}
 		_ = f.Close()
+	}
+
+	// A fields-refused row for an event that posted successfully is that
+	// same event, not a second attempt: only unmatched refusals count.
+	for _, key := range m9Refused {
+		if !m9Succeeded[key] {
+			m9Attempts++
+			m9Refusals++
+		}
 	}
 
 	// 1. review-pass

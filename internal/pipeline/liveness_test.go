@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -892,5 +893,201 @@ func TestLiveness_FullLoopAdvancesDay(t *testing.T) {
 	}
 	if st.Last != day {
 		t.Fatalf("expected last=%s, got %s", day, st.Last)
+	}
+}
+
+// TestLiveness_FailingNoticeAdvancesDayAndRetriesOnce verifies that a
+// refused stall notice is recorded as a liveness-notice-error row without
+// failing the day loop, that the day still advances, and that the next pass
+// retries the notice exactly once.
+func TestLiveness_FailingNoticeAdvancesDayAndRetriesOnce(t *testing.T) {
+	day := "2026-11-15"
+	t1 := balanceDayTime(day, 12)
+	now := balanceDayTime("2026-11-16", 8) // yesterday is 2026-11-15
+
+	f := newLivenessFixture(t, now)
+	target := f.repos[0]
+	ctx := context.Background()
+
+	// 10 failed task-event posts stall task-events.
+	for i := 1; i <= 10; i++ {
+		f.audit(t, target.Name, "hk-task-event", map[string]any{"task": strconv.Itoa(i)}, t1)
+	}
+
+	f.n.err = errors.New("lane refused")
+	if err := f.s.liveness(ctx, Options{}); err != nil {
+		t.Fatalf("a refused notice must not fail the day loop: %v", err)
+	}
+	var st livenessState
+	if _, err := fsutil.ReadJSON(f.s.livenessStateFile(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Last != day {
+		t.Fatalf("expected last=%s after a refused notice, got %s", day, st.Last)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessNoticeCommand)); got != 0 {
+		t.Fatalf("a refused notice must not write a notice row, got %d", got)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessNoticeErrorCommand)); got != 1 {
+		t.Fatalf("a refused notice must write one error row, got %d", got)
+	}
+	if f.n.count != 0 {
+		t.Fatalf("expected no delivered notice, got %d", f.n.count)
+	}
+
+	// The next pass retries and sends exactly once.
+	f.n.err = nil
+	if err := f.s.livenessDay(ctx, target, day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("expected the retry to send once, got %d", f.n.count)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessNoticeCommand)); got != 1 {
+		t.Fatalf("expected one notice row after the retry, got %d", got)
+	}
+
+	// A further pass never delivers twice.
+	if err := f.s.livenessDay(ctx, target, day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.n.count != 1 {
+		t.Fatalf("expected still 1 notice after a second retry, got %d", f.n.count)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessDailyCommand)); got != 11 {
+		t.Fatalf("daily rows duplicated: got %d, want 11", got)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessNoticeCommand)); got != 1 {
+		t.Fatalf("notice rows duplicated: got %d, want 1", got)
+	}
+}
+
+// TestLiveness_AckOnHealthyMechanismRefused verifies that an ack is accepted
+// only while the mechanism's latest daily row is stalled.
+func TestLiveness_AckOnHealthyMechanismRefused(t *testing.T) {
+	f := newLivenessFixture(t, balanceDayTime("2026-11-18", 8))
+	target := f.repos[0]
+
+	// No daily rows at all: there is no stall to answer.
+	if err := f.s.AckLiveness(MechMerge, "ack with no rows"); err == nil {
+		t.Fatal("expected an ack with no daily rows to be refused")
+	} else if !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("refusal must say the ack is refused, got: %v", err)
+	}
+
+	// Stall on day 1, recovery on day 2: a late ack is refused.
+	d1 := balanceDayTime("2026-11-16", 12)
+	d2 := balanceDayTime("2026-11-17", 12)
+	f.audit(t, target.Name, livenessDailyCommand, map[string]any{"day": "2026-11-16", "mechanism": MechMerge, "stalled": true}, d1)
+	f.audit(t, target.Name, livenessDailyCommand, map[string]any{"day": "2026-11-17", "mechanism": MechMerge, "stalled": false}, d2)
+	if err := f.s.AckLiveness(MechMerge, "late ack after recovery"); err == nil {
+		t.Fatal("expected a late ack on a healthy mechanism to be refused")
+	} else if !strings.Contains(err.Error(), "not stalled") {
+		t.Fatalf("refusal must say the mechanism is not stalled, got: %v", err)
+	}
+	if got := len(livenessRows(t, f, target.Name, livenessAckCommand)); got != 0 {
+		t.Fatalf("a refused ack must not write an ack row, got %d", got)
+	}
+
+	// A stall on day 3 re-arms the ack.
+	d3 := balanceDayTime("2026-11-18", 12)
+	f.audit(t, target.Name, livenessDailyCommand, map[string]any{"day": "2026-11-18", "mechanism": MechMerge, "stalled": true}, d3)
+	if err := f.s.AckLiveness(MechMerge, "current stall"); err != nil {
+		t.Fatalf("an ack on a stalled mechanism must be accepted: %v", err)
+	}
+	rows := livenessRows(t, f, target.Name, livenessAckCommand)
+	if len(rows) != 1 || rows[0]["day"] != "2026-11-18" {
+		t.Fatalf("accepted ack must answer the latest stalled day, got %+v", rows)
+	}
+}
+
+// TestLiveness_TaskEventWithRefusedFieldsCountsOnce verifies that a
+// fields-refused row following a successful hk-task-event for the same event
+// is not a second attempt.
+func TestLiveness_TaskEventWithRefusedFieldsCountsOnce(t *testing.T) {
+	day := "2026-11-17"
+	dTime := balanceDayTime(day, 12)
+
+	f := newLivenessFixture(t, dTime)
+	for i := 1; i <= 10; i++ {
+		task := strconv.Itoa(i)
+		f.audit(t, f.repos[0].Name, "hk-task-event", map[string]any{
+			"source": "mergewake.review", "task": task,
+			"source_ref": "example/project/pull/1", "result": map[string]any{"id": i},
+		}, dTime)
+		f.audit(t, f.repos[0].Name, "task-event-fields-refused", map[string]any{
+			"source": "mergewake.review", "task": task, "source_ref": "example/project/pull/1",
+		}, dTime)
+	}
+	// A refusal with no successful post still counts as an attempt.
+	f.audit(t, f.repos[0].Name, "task-event-fields-refused", map[string]any{
+		"source": "mergewake.review", "task": "orphan", "source_ref": "example/project/pull/2",
+	}, dTime)
+
+	res, err := f.s.livenessForDay(f.repos, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m LivenessMechanismResult
+	for _, item := range res.Mechanisms {
+		if item.Mechanism == MechTaskEvents {
+			m = item
+		}
+	}
+	// 10 successful events (each refusal folded into its event) plus the
+	// one orphan refusal: 11 made, 10 done.
+	if m.Made != 11 || m.Done != 10 {
+		t.Fatalf("an event plus its fields-refused row is 1 made, 1 done: %+v", m)
+	}
+	if m.Stalled {
+		t.Fatalf("successful events with refused fields must not stall: %+v", m)
+	}
+}
+
+// TestLiveness_AckedFindingWithHeadCountsAsDelivered verifies that a
+// findings-acked row carrying a head counts as delivered, while old rows
+// without a head stay uncounted.
+func TestLiveness_AckedFindingWithHeadCountsAsDelivered(t *testing.T) {
+	day := "2026-11-17"
+	dTime := balanceDayTime(day, 12)
+
+	f := newLivenessFixture(t, dTime)
+	for i := 1; i <= 3; i++ {
+		head := "acked-head-" + strconv.Itoa(i)
+		f.audit(t, f.repos[0].Name, "review-round-finding", map[string]any{"head": head, "severity": "critical", "pr": i}, dTime)
+		f.audit(t, f.repos[0].Name, "findings-acked", map[string]any{"head": head, "pr": i}, dTime)
+	}
+	res, err := f.s.livenessForDay(f.repos, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m LivenessMechanismResult
+	for _, item := range res.Mechanisms {
+		if item.Mechanism == MechFindingsDelivery {
+			m = item
+		}
+	}
+	if m.Stalled || m.Made != 3 || m.Done != 3 {
+		t.Fatalf("an acked finding with a head counts as delivered: %+v", m)
+	}
+
+	// Old rows without a head stay uncounted.
+	f2 := newLivenessFixture(t, dTime)
+	for i := 1; i <= 3; i++ {
+		head := "unacked-head-" + strconv.Itoa(i)
+		f2.audit(t, f2.repos[0].Name, "review-round-finding", map[string]any{"head": head, "severity": "critical", "pr": i}, dTime)
+		f2.audit(t, f2.repos[0].Name, "findings-acked", map[string]any{"pr": i}, dTime)
+	}
+	res2, err := f2.s.livenessForDay(f2.repos, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range res2.Mechanisms {
+		if item.Mechanism == MechFindingsDelivery {
+			m = item
+		}
+	}
+	if !m.Stalled || m.Made != 3 || m.Done != 0 {
+		t.Fatalf("headless findings-acked rows stay uncounted: %+v", m)
 	}
 }
