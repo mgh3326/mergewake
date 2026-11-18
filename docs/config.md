@@ -31,6 +31,7 @@ host, model IDs, commands, and task ID are placeholders. None is a discovery rul
 | `review` | Empty object | Independent-review configuration described below. |
 | `notifier` | No-op | Notification adapter described below. |
 | `sink` | No-op | Task and report adapter described below. |
+| `liveness` | Optional | Daily made-against-done liveness checks across automatic mechanisms; see below. |
 
 ### `repos[]`
 
@@ -170,6 +171,12 @@ at a time under the state dir's `reviewer-balance.json` lock, so a crash
 between days repeats at most that day. A retried day skips the daily rows it
 already wrote and reuses the delivered-notice keys, so neither audit rows nor
 notices duplicate.
+
+**Loop liveness.** Once a day, alongside the reviewer balance, the first
+whole-repo reap pass after the UTC day boundary runs table-driven made-against-done
+liveness checks across mergewake's automatic mechanisms (review passes, reviewer
+landing, checkout removal, merges, CI watch reverts, task events, outcome publication,
+legacy sweep, finding dispatch, and review retries). See [`liveness`](#liveness) below.
 
 `mergewake reap --repo owner/name [--pr N] [--dry-run|--apply]` and the `reap`
 daemon role clean up merged-PR worktrees once they age out. Reap never closes
@@ -540,6 +547,57 @@ plans; rows go to `<state_dir>/archive-jobs.jsonl` unless `--dry-run`. It
 needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
+
+### `liveness`
+
+Automatic daily liveness checks evaluate made-against-done progress for all
+core mergewake loops once per UTC day during the first acting whole-repo reap pass.
+Daily evaluations write one `liveness-daily` row per mechanism into the primary
+configured repository's `decisions.jsonl`, tracking `day`, `mechanism`, `made`,
+`done`, `ratio`, and boolean `stalled`. The last processed day is tracked in
+`<state_dir>/liveness.json`.
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `lane` | Desk lane | Panewire lane receiving stall notices. When unset, falls back to `reap.balance_lane`, then to the desk (`notifier.fallback_lane`, else `notifier.lane`). |
+| `thresholds` | Default thresholds | Optional per-mechanism threshold overrides (`min_made` integer, `min_ratio` float between 0.0 and 1.0). |
+
+#### Mechanisms and thresholds
+
+Every mechanism evaluates progress made against expected completions over the UTC day. A mechanism is considered `stalled` when `made >= min_made` and `ratio < min_ratio`. Quiet days (`made < min_made`) never stall.
+
+| # | Mechanism name | Made predicate | Done predicate | Default threshold |
+|---|----------------|----------------|----------------|-------------------|
+| 1 | `review-pass` | Distinct PR heads claimed for review (`review-claim`). | Distinct PR heads completing review with a verdict (`review-verdict`). | `min_made: 1`, `min_ratio: 0.90` |
+| 2 | `reviewer-landing` | Distinct reviewer placement attempts (`reviewer-spawn` with non-empty label). | Distinct reviewer labels landing on an execution host (`reviewer-job-landing`). | `min_made: 5`, `min_ratio: 0.80` |
+| 3 | `reviewer-checkout-removal` | Distinct checkouts created on or before the day (by `reviewer-spawn` or cleanup receipts). | Distinct checkouts removed that day (`reviewer-cleanup` or `reviewer-reap` with result `removed`). Also verifies per-host removal ratio (folded from mechanism 5). | Global: `min_made: 20`, `min_ratio: 0.70`<br>Per-host: `min_made: 20`, `min_ratio: 0.70` |
+| 4 | `merge` | Approved and CI-ready PRs eligible to merge (`pr-approval` or passing `ci-summary`). | PRs successfully merged (`pr-notify` state `merged` or `hk-task-event` with source `mergewake.merge`). | `min_made: 1`, `min_ratio: 0.80` |
+| 5 | *(folded into 3)* | Reviewer checkout removals per-host. | Folded into mechanism 3 (`reviewer-checkout-removal` stalls if any host with >= 20 checkouts removes < 70%). | `min_made: 20`, `min_ratio: 0.70` |
+| 6 | `ci-watch-revert` | Post-merge CI breaks detected by watch (`revert-needed`, `revert-plan`, `revert-created`). | Watch revert PRs merged or resolved (`revert-merged`, `revert-resolved`, `revert-pr`). | `min_made: 1`, `min_ratio: 0.90` |
+| 7 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`). | Successful task event posts (`status: "ok"` or HTTP 200/201). | `min_made: 5`, `min_ratio: 0.95` |
+| 8 | `outcome-publish` | Eligible outcomes recorded in `<state_dir>/outcomes.jsonl`. | Outcomes successfully published (`outcome-published` audit rows). | `min_made: 1`, `min_ratio: 0.90` |
+| 9 | `legacy-sweep` | Legacy sweeps due or started (`reap-legacy-start` or configured intervals). | Legacy sweeps completed without fatal error (`reap-legacy-summary` or `reap-legacy-complete`). | `min_made: 1`, `min_ratio: 0.80` |
+| 10 | `review-finding-dispatch` | Graded review findings identified in passes (`review-findings`). | Review findings dispatched or recorded on verdict (`review-finding-dispatched`). | `min_made: 1`, `min_ratio: 0.90` |
+| 11 | `review-retry` | Review passes deferred for retry > 24 hours without resolution (`review-deferred`). | Deferred review passes resolved or retried (`review-retry-resolved` or new claim/verdict). | `min_made: 1`, `min_ratio: 0.80` |
+
+#### Stall notices and repeat rule
+
+When a mechanism evaluates as stalled:
+* One notice per stalled mechanism per day is dispatched to `liveness.lane` (or fallback lanes) via panewire lane event.
+* The notice repeats daily while the stall holds.
+* An operator can acknowledge a stall:
+  ```bash
+  mergewake liveness ack <mechanism> --reason "<text>"
+  ```
+  The acknowledgment records a `liveness-ack` row in `decisions.jsonl`. While acknowledged, repeat notices for that mechanism are suppressed.
+* If a subsequent daily evaluation marks the mechanism healthy (`stalled: false`), the acknowledgment is automatically cleared. Any future stall on that mechanism will alert again.
+
+#### Inspecting liveness
+
+To inspect daily mechanism status and audit history without modifying state:
+```bash
+mergewake liveness [--day YYYY-MM-DD] [--mechanism M]
+```
 
 ### `review`
 
