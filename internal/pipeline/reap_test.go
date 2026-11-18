@@ -47,14 +47,6 @@ func (s *scriptRunner) Run(_ context.Context, name string, args []string, _ stri
 			return []byte(o), nil
 		}
 	}
-	// A process scan on a test host sees one harmless process rooted at /,
-	// unless a test scripts lsof or ps itself.
-	if !s.scripted(k) && name == "lsof" {
-		return []byte("p1\nn/\n"), nil
-	}
-	if !s.scripted(k) && name == "ps" {
-		return []byte(fmt.Sprintf("1 %d Ss /sbin/launchd\n", os.Getuid())), nil
-	}
 	// An unscripted worktree probe is a path git refuses (not a repository, or
 	// a missing directory): exit 128, as git itself reports it. Only git's own
 	// refusal proves a path is not a worktree.
@@ -70,18 +62,6 @@ type gitRefusal struct{}
 
 func (gitRefusal) Error() string { return "exit status 128" }
 func (gitRefusal) ExitCode() int { return 128 }
-
-// scripted reports whether the runner has an answer, queued or fixed, for k.
-func (s *scriptRunner) scripted(k string) bool {
-	if _, ok := s.outs[k]; ok {
-		return true
-	}
-	if _, ok := s.errs[k]; ok {
-		return true
-	}
-	_, ok := s.queue[k]
-	return ok
-}
 
 func (s *scriptRunner) called(sub string) bool {
 	for _, c := range s.calls {

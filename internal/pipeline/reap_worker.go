@@ -639,11 +639,18 @@ func under(root, p string) bool {
 	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
 }
 
+// mergedProcessEvidence is the process scan the older merged-author path
+// consults before its Exec removal. It is a variable so a test can stand in for
+// the platform scan, which sees the test runner's own processes.
+var mergedProcessEvidence = func(ctx context.Context, s *Service) (procEvidence, error) {
+	return processScan(ctx, s.Runner)
+}
+
 // processInUse names the process evidence keeping the older merged-author path
 // from removing path on this machine, or "". A scan that cannot read every
 // process fails closed: no proof means the checkout stays.
 func (s *Service) processInUse(ctx context.Context, path string) string {
-	ev, e := processScan(ctx, s.Runner)
+	ev, e := mergedProcessEvidence(ctx, s)
 	if e != nil {
 		return "process-scan-unavailable"
 	}

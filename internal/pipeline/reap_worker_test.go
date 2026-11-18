@@ -533,9 +533,9 @@ func (workerBranchGH) Pull(context.Context, string, int) (github.Pull, error) {
 
 // The older merged-author path checks processes before its next removal.
 func TestMergedPathProcessCheck(t *testing.T) {
-	orig := processScan
-	t.Cleanup(func() { processScan = orig })
-	processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
+	orig := mergedProcessEvidence
+	t.Cleanup(func() { mergedProcessEvidence = orig })
+	mergedProcessEvidence = func(context.Context, *Service) (procEvidence, error) {
 		return procEvidence{cwds: []string{"/repo.wt/sub"}}, nil
 	}
 	outs := panegoneWorktreeOuts("/repo")
