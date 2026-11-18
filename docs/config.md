@@ -307,8 +307,11 @@ the hk job that worked it. The worker-worktree pass runs on every whole-repo
 `reap` pass and finds candidates from each host's own registered worktrees:
 the common git dirs reap already knows from panes and job records, the
 configured clone `<hosts[].work_root>/<repo>` when that host names a work root,
-and the local `repos[].root` checkout on a local host. A `wk/` worktree is a
-candidate even when no pane, receipt or job record names it. The main checkout
+and the local `repos[].root` checkout on a local host. A clone guessed from a
+path is used only when one of its worktrees inspects as the configured
+repository, so another owner's same-named clone can never be judged against
+this repository's PRs. A `wk/` worktree is a candidate even when no pane,
+receipt or job record names it. The main checkout
 and `mwr-*` reviewer checkouts are never candidates.
 
 A candidate goes when its work is on GitHub:
@@ -330,12 +333,14 @@ tracked file and no untracked file outside `reap.disposable`; gitignored files
 must match `reap.regenerable` (so Unity's `Library/`, `bin/` and `obj/` count
 as expendable when listed there, as the defaults do); the branch head must be
 on the origin remote (the remote is asked, not the local tracking copy) or,
-when the remote ref is gone as delete-branch-on-merge leaves it, already in
-`origin/<base>`; no live pane may use it; and a kept worktree keeps its draft,
+when the remote ref is gone as delete-branch-on-merge leaves it, already in a
+freshly fetched `origin/<base>` (a fetch that fails refuses the removal); no live pane may use it; and a kept worktree keeps its draft,
 because disposable files are deleted only immediately before the removal.
 On a local host the pass also reads every process's
-working directory and refuses a worktree any process holds; a remote host's
-pane list already includes its plain shells. Anything refused stays and gets
+working directory and open files and refuses a worktree one of them sits
+inside; a process in a parent directory does not count, and the scan is
+repeated immediately before an acting removal. A remote host's pane list
+already includes its plain shells. Anything refused stays and gets
 one `remove-worktree` row with its precise reason — `unpushed`, `dirty`,
 `pane-in-use`, `process-in-use`, `locked`, `ignored-files:<count>-<hash>`, a
 guarded-removal refusal, or a rule keeping it (`watch-pending`,

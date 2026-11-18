@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -420,6 +421,7 @@ func TestExecWorktreeRemoveDisposableKeepsDraftOnRefusal(t *testing.T) {
 			key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     ignored,
 			key("rm", "-rf", "/repo.wt/report.draft.md"):                                                           "",
 			key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         remoteHead + "\trefs/heads/wk/x\n",
+			key("git", "-C", "/repo", "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"):                "",
 			key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"):                       "",
 			key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
 		}
@@ -438,6 +440,7 @@ func TestExecWorktreeRemoveDisposableKeepsDraftOnRefusal(t *testing.T) {
 	t.Run("unpushed keeps the draft", func(t *testing.T) {
 		outs := base("ffff0000", "", "?? report.draft.md\n")
 		delete(outs, key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"))
+		delete(outs, key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "FETCH_HEAD"))
 		r := &scriptRunner{outs: outs}
 		e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
 		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
@@ -463,7 +466,8 @@ func TestExecWorktreeRemoveUsesBaseWhenRemoteBranchIsGone(t *testing.T) {
 		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
 		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         "",
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"):                       "",
+		key("git", "-C", "/repo", "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"):                "",
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "FETCH_HEAD"):                        "",
 		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
 	}}
 	e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
@@ -504,4 +508,111 @@ func TestWorkerBranchDeleteRefusalIsARow(t *testing.T) {
 	if len(rows) != 1 || rows[0].Action != "delete-branch" || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, "refused: ") {
 		t.Fatalf("rows: %#v", rows)
 	}
+}
+
+// A stale local origin/<base> is not proof: when the base cannot be read from
+// the remote now, the removal fails closed.
+func TestExecWorktreeRemoveFailsClosedOnUnverifiedBase(t *testing.T) {
+	r := &scriptRunner{outs: map[string]string{
+		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
+		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
+		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
+		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
+		key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         "",
+		// The stale tracking ref would still pass, but the fetch does not.
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"): "",
+		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                      "",
+	}}
+	e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
+	got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, nil, false)
+	if err != nil || got.Outcome != "unpushed" {
+		t.Fatalf("%v %v", got, err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removed without a verified base")
+	}
+}
+
+// A clone guessed from <work_root>/<repo> belongs to this repository only when
+// its worktrees' origin says so; another owner's clone is left alone.
+func TestWorkerWorktreeForeignCloneIsNotTouched(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.foreign = map[string]bool{workerCwd: true}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removes: %d", n)
+	}
+	if rows := workerLogRows(t, s); len(rows) != 0 {
+		t.Fatalf("rows: %v", rows)
+	}
+}
+
+// A past removed row does not hide a worktree that is checked out again.
+func TestWorkerWorktreeRecreatedAtSamePathIsEvaluated(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	row, _ := json.Marshal(reapReceipt{Action: "remove-worktree", Repo: "example/project", PR: 40, Host: "node",
+		Worktree: workerCwd, Branch: "wk/job", Head: headSHA, Result: "removed"})
+	if err := os.MkdirAll(filepath.Dir(s.reapLog("example/project")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.reapLog("example/project"), append(row, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 1 {
+		t.Fatalf("removes: %d", n)
+	}
+}
+
+// A process in a parent directory does not hold the checkout; a process that
+// enters after discovery does, because the removal rescans.
+func TestWorkerProcessUsage(t *testing.T) {
+	orig := processScan
+	t.Cleanup(func() { processScan = orig })
+
+	t.Run("parent cwd does not block", func(t *testing.T) {
+		processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
+			return procEvidence{cwds: []string{"/work"}}, nil
+		}
+		w := &workerPass{s: &Service{Runner: &scriptRunner{}}}
+		hs := &reapHost{host: reap.Host{Name: "local"}}
+		if got := w.inUse(context.Background(), hs, workerCwd, true); got != "" {
+			t.Fatalf("reason %q", got)
+		}
+	})
+	t.Run("a process entering after discovery blocks", func(t *testing.T) {
+		calls := 0
+		processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
+			calls++
+			if calls == 1 {
+				return procEvidence{}, nil
+			}
+			return procEvidence{cwds: []string{workerCwd + "/sub"}}, nil
+		}
+		f := &branchDeleteFake{path: workerCwd}
+		w := &workerPass{s: &Service{Config: repoConfig(t.TempDir()), Runner: &scriptRunner{}}, r: testRepo,
+			acting: true, note: func(reapReceipt) {}}
+		hs := &reapHost{host: reap.Host{Name: "local"}, ops: f, trees: map[string]*reap.Worktree{}}
+		cand := workerCand{path: workerCwd, branch: "wk/job", head: headSHA, common: "/repo"}
+		// The early decision sees no process...
+		if got := w.inUse(context.Background(), hs, cand.path, false); got != "" {
+			t.Fatalf("early reason %q", got)
+		}
+		// ...and the rescan immediately before removal does.
+		rec := &reapReceipt{Action: "remove-worktree", Repo: "example/project", Host: "local", Worktree: cand.path, Branch: cand.branch}
+		var errs []error
+		if got := w.remove(context.Background(), hs, cand, rec, &errs); got.Result != "skipped" || got.Reason != "process-in-use" {
+			t.Fatalf("%v %v", got, errs)
+		}
+	})
 }

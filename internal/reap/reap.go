@@ -765,9 +765,11 @@ func (e Exec) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, bas
 
 // released reports whether the branch's work is on the remote: its origin head
 // is exactly the checked-out commit, or — a merged branch whose remote ref was
-// deleted, as delete-branch-on-merge leaves it — the commit is already in
-// origin/<base>. The origin ref is read, never the local tracking copy for the
-// branch itself.
+// deleted, as delete-branch-on-merge leaves it — the commit is already in the
+// base branch. The base is fetched from origin first: the local origin/<base>
+// tracking copy can still hold a commit a force-push or reset removed, and
+// ancestry against it would not prove the commit is on the remote now. A fetch
+// that fails leaves the question open, which refuses the removal.
 func (e Exec) released(ctx context.Context, main, head, branch, base string) bool {
 	remote, err := e.RemoteHead(ctx, main, branch)
 	if err != nil {
@@ -779,7 +781,10 @@ func (e Exec) released(ctx context.Context, main, head, branch, base string) boo
 	if base == "" || base == branch {
 		return false
 	}
-	_, err = e.Run(ctx, "git", "-C", main, "merge-base", "--is-ancestor", head, "origin/"+base)
+	if _, err := e.Run(ctx, "git", "-C", main, "fetch", "--no-tags", "--quiet", "origin", "refs/heads/"+base); err != nil {
+		return false
+	}
+	_, err = e.Run(ctx, "git", "-C", main, "merge-base", "--is-ancestor", head, "FETCH_HEAD")
 	return err == nil
 }
 

@@ -47,7 +47,7 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		return []error{e}
 	}
 	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after, note: note,
-		healthyCache: map[string]bool{}, ancestry: map[string]bool{}, last: workerHistory(receipts)}
+		healthyCache: map[string]bool{}, ancestry: map[string]bool{}}
 	// Discovery comes first and is the only host read this pass costs when no
 	// worker worktree exists: the branch inventories below page every closed
 	// PR, so a quiet repo must never pay for them.
@@ -164,14 +164,11 @@ func workerHostOrder(c config.Config, hosts []*reapHost) []*reapHost {
 // workerPass is one repo's pass state: the ancestry and watch-verdict answers
 // it reads at most once each.
 type workerPass struct {
-	s       *Service
-	r       config.Repo
-	records *passJobRecords
-	acting  bool
-	note    func(reapReceipt)
-	// last is each path's newest worker-pass row, so a finished checkout is
-	// not inspected again while a replacement at the same path is.
-	last         map[string]workerLast
+	s            *Service
+	r            config.Repo
+	records      *passJobRecords
+	acting       bool
+	note         func(reapReceipt)
 	procOnce     sync.Once
 	procEv       procEvidence
 	procErr      error
@@ -179,32 +176,6 @@ type workerPass struct {
 	after        time.Duration
 	healthyCache map[string]bool
 	ancestry     map[string]bool
-}
-
-// workerLast is one path's newest worker-pass row.
-type workerLast struct {
-	sig    string
-	branch string
-	head   string
-}
-
-// workerHistory replays the worker-pass rows per host and path.
-func workerHistory(receipts []reapReceipt) map[string]workerLast {
-	out := map[string]workerLast{}
-	for _, rec := range receipts {
-		if rec.Action != "remove-worktree" {
-			continue
-		}
-		path := rec.Worktree
-		if path == "" {
-			path = rec.Cwd
-		}
-		if path == "" {
-			continue
-		}
-		out[rec.Host+"\x00"+path] = workerLast{sig: rec.Result + "|" + rec.Reason, branch: rec.Branch, head: rec.Head}
-	}
-	return out
 }
 
 // workerCand is one listed worktree on a worker branch.
@@ -228,12 +199,14 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 	}
 	var errs []error
 	seenCommon := map[string]bool{}
+	trusted := map[string]bool{}
 	var clones []string
-	add := func(path string) {
+	add := func(path string, known bool) {
 		if path == "" {
 			return
 		}
 		p := filepath.Clean(path)
+		trusted[p] = trusted[p] || known
 		if seenCommon[p] {
 			return
 		}
@@ -242,14 +215,18 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 	}
 	for _, t := range hs.trees {
 		if t != nil && t.Common != "" && strings.EqualFold(t.Repo, w.r.Name) {
-			add(filepath.Dir(t.Common))
+			add(filepath.Dir(t.Common), true)
 		}
 	}
+	// A clone guessed from a path is trusted only after its own origin says it
+	// is this repository: two configured repositories can share the last
+	// segment, and another owner's clone must never be judged against this
+	// repository's PRs and jobs.
 	if hs.host.WorkRoot != "" {
-		add(filepath.Join(hs.host.WorkRoot, repoSegment(w.r.Name)))
+		add(filepath.Join(hs.host.WorkRoot, repoSegment(w.r.Name)), false)
 	}
 	if hs.host.Local() && config.Expand(w.r.Root) != "" {
-		add(config.Expand(w.r.Root))
+		add(config.Expand(w.r.Root), false)
 	}
 	sort.Strings(clones)
 	seenPath := map[string]bool{}
@@ -266,6 +243,7 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 			continue
 		}
 		main := filepath.Clean(clone)
+		var listed []workerCand
 		for _, row := range rows {
 			if row.Detached || !strings.HasPrefix(row.Branch, workerBranchPrefix) {
 				continue
@@ -276,9 +254,28 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 			if strings.HasPrefix(filepath.Base(row.Path), "mwr-") || seenPath[row.Path] {
 				continue
 			}
-			seenPath[row.Path] = true
-			out = append(out, workerCand{path: row.Path, branch: row.Branch, head: row.Head,
+			listed = append(listed, workerCand{path: row.Path, branch: row.Branch, head: row.Head,
 				job: strings.TrimPrefix(row.Branch, workerBranchPrefix), common: clone})
+		}
+		if len(listed) == 0 {
+			continue
+		}
+		if !trusted[clone] {
+			// Every worktree of a clone shares its origin, so one inspection
+			// identifies the clone. An unreadable answer or another
+			// repository drops the whole clone: a path guess is not proof.
+			wt, e := hs.ops.Inspect(ctx, listed[0].path)
+			switch {
+			case e != nil:
+				errs = append(errs, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, clone, e))
+				continue
+			case wt == nil || !strings.EqualFold(wt.Repo, w.r.Name):
+				continue
+			}
+		}
+		for _, c := range listed {
+			seenPath[c.path] = true
+			out = append(out, c)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
@@ -311,20 +308,16 @@ func (w *workerPass) evaluate(ctx context.Context, hs *reapHost, c workerCand, n
 		rec.PR = q.Number
 		p = q
 	}
-	// A checkout this pass already finished is not inspected again: the row
-	// would only repeat. A replacement at the same path — another branch, or
-	// the same branch at another head — is a new identity and is evaluated.
-	if prev, ok := w.last[hs.host.Name+"\x00"+c.path]; ok && terminalWorktreeSig(prev.sig) &&
-		prev.head != "" && prev.head == c.head && prev.branch == c.branch {
-		return nil
-	}
+	// A past `removed` row never suppresses a currently listed worktree: the
+	// same branch tip can be checked out again at the same path, and the
+	// listing is the proof that something is there to evaluate.
 	keep := func(reason string) *reapReceipt {
 		rec.Result, rec.Reason = "skipped", reason
 		return &rec
 	}
 	// A pane or process in the checkout outranks every rule below: the row
 	// says why it stays so hk 5168 can list it.
-	if reason := w.inUse(ctx, hs, c.path); reason != "" {
+	if reason := w.inUse(ctx, hs, c.path, false); reason != "" {
 		return keep(reason)
 	}
 	switch {
@@ -358,7 +351,7 @@ func (w *workerPass) procs(ctx context.Context) (procEvidence, error) {
 // inUse names the live pane or process holding path, or "" when none does.
 // Processes are scanned only on this machine: a remote host's pane list
 // already includes its plain shells, and no node command reads its processes.
-func (w *workerPass) inUse(ctx context.Context, hs *reapHost, path string) string {
+func (w *workerPass) inUse(ctx context.Context, hs *reapHost, path string, fresh bool) string {
 	if hs.usageUnknown {
 		return "pane-scan-failed"
 	}
@@ -368,14 +361,20 @@ func (w *workerPass) inUse(ctx context.Context, hs *reapHost, path string) strin
 	if !hs.host.Local() {
 		return ""
 	}
+	// A cached scan is enough for the early decision; the removal rescans, so
+	// a process that entered after discovery still stops it. A held path
+	// counts only when it sits inside the checkout: a shell in the shared work
+	// root does not hold every worktree beneath it.
 	ev, e := w.procs(ctx)
+	if fresh {
+		ev, e = processScan(ctx, w.s.Runner)
+	}
 	if e != nil {
-		// No scan means no proof that no process holds the checkout.
 		return "process-scan-unavailable"
 	}
 	held, unresolved := ev.heldPaths()
 	for _, held := range held {
-		if under(path, held) || under(held, path) {
+		if under(path, held) {
 			return "process-in-use"
 		}
 	}
@@ -542,7 +541,7 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 		*errs = append(*errs, fmt.Errorf("%s pane list: %w", hs.host.Name, e))
 		return keep("pane-scan-failed")
 	}
-	if reason := w.inUse(ctx, hs, c.path); reason != "" {
+	if reason := w.inUse(ctx, hs, c.path, true); reason != "" {
 		return keep(reason)
 	}
 	result, e := remover.WorktreeRemoveDisposable(ctx, c.path, c.head, w.r.Branch,
