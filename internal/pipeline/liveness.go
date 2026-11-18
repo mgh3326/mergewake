@@ -26,6 +26,7 @@ const (
 	MechMerge                   = "merge"
 	MechReviewerCheckoutRemoval = "reviewer-checkout-removal"
 	MechAuthorWorktreeSweep     = "author-worktree-sweep"
+	MechWorkerWorktrees         = "worker-worktrees"
 	MechWatchRevert             = "watch-revert"
 	MechLaneNotices             = "lane-notices"
 	MechTaskEvents              = "task-events"
@@ -40,7 +41,7 @@ var AllMechanisms = []string{
 	MechFindingsDelivery,
 	MechMerge,
 	MechReviewerCheckoutRemoval,
-	MechAuthorWorktreeSweep,
+	MechWorkerWorktrees,
 	MechWatchRevert,
 	MechLaneNotices,
 	MechTaskEvents,
@@ -75,6 +76,8 @@ func NormalizeMechanism(name string) (string, bool) {
 		return MechReviewerCheckoutRemoval, true
 	case MechAuthorWorktreeSweep, "author-sweep", "worktree-sweep", "legacy-sweep", "reap-legacy":
 		return MechAuthorWorktreeSweep, true
+	case MechWorkerWorktrees, "worker-sweep", "worker-balance", "worktrees":
+		return MechWorkerWorktrees, true
 	case MechWatchRevert, "watch", "ci-watch-revert":
 		return MechWatchRevert, true
 	case MechLaneNotices, "notices", "lane-notice":
@@ -92,13 +95,14 @@ func NormalizeMechanism(name string) (string, bool) {
 
 // LivenessMechanismResult holds the daily verdict of one automatic mechanism.
 type LivenessMechanismResult struct {
-	Day       string  `json:"day"`
-	Mechanism string  `json:"mechanism"`
-	Made      int     `json:"made"`
-	Done      int     `json:"done"`
-	Ratio     float64 `json:"ratio"`
-	Stalled   bool    `json:"stalled"`
-	Reason    string  `json:"reason,omitempty"`
+	Day       string               `json:"day"`
+	Mechanism string               `json:"mechanism"`
+	Made      int                  `json:"made"`
+	Done      int                  `json:"done"`
+	Ratio     float64              `json:"ratio"`
+	Stalled   bool                 `json:"stalled"`
+	Reason    string               `json:"reason,omitempty"`
+	Hosts     []WorkerWorktreeHost `json:"hosts,omitempty"`
 }
 
 // LivenessDayResult holds all mechanisms' verdicts for one UTC day.
@@ -353,6 +357,11 @@ func (s *Service) livenessDay(ctx context.Context, target config.Repo, day strin
 		}
 		if err := s.audit(target.Name, livenessDailyCommand, val, !o.Acting()); err != nil {
 			return err
+		}
+		if m.Mechanism == MechWorkerWorktrees {
+			if err := s.auditWorkerWorktreesDay(target, day, m.Hosts, !o.Acting()); err != nil {
+				return err
+			}
 		}
 	}
 	if !o.Acting() {
@@ -1119,6 +1128,36 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		stalled := made >= minMade && done*100 < minDonePct*made
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechAuthorWorktreeSweep, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
+		})
+	}
+
+	// 6b. worker-worktrees: per-host made-vs-removed over reap rows (hk 5168).
+	{
+		hosts, unattributed, err := s.workerWorktreesForDay(repos, day)
+		if err != nil {
+			return nil, err
+		}
+		made := 0
+		done := 0
+		stalled := false
+		for _, h := range hosts {
+			made += h.Made
+			done += h.Removed
+			stalled = stalled || h.Stalled
+		}
+		ratio := 1.0
+		if made > 0 {
+			ratio = float64(done) / float64(made)
+		}
+		reason := workerWorktreesReason(hosts)
+		if unattributed > 0 {
+			if reason != "" {
+				reason += "; "
+			}
+			reason += fmt.Sprintf("%d hostless reap rows unattributed", unattributed)
+		}
+		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
+			Day: day, Mechanism: MechWorkerWorktrees, Made: made, Done: done, Ratio: ratio, Stalled: stalled, Reason: reason, Hosts: hosts,
 		})
 	}
 

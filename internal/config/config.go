@@ -484,39 +484,45 @@ func (r Reap) BalanceWindowDaysOrDefault() int {
 
 // LivenessThresholds holds configurable thresholds for the daily liveness check.
 type LivenessThresholds struct {
-	ReviewPassMinMade           int `yaml:"review_pass_min_made"`
-	ReviewPassMinDonePct        int `yaml:"review_pass_min_done_pct"`
-	ReviewerLandingMinMade      int `yaml:"reviewer_landing_min_made"`
-	ReviewerLandingMinLandedPct int `yaml:"reviewer_landing_min_landed_pct"`
-	FindingsDeliveryMinMade     int `yaml:"findings_delivery_min_made"`
-	MergeMaxUnmerged            int `yaml:"merge_max_unmerged"`
-	AuthorSweepMinMade          int `yaml:"author_sweep_min_made"`
-	AuthorSweepMinDonePct       int `yaml:"author_sweep_min_done_pct"`
-	WatchMaxUnverdictedHours    int `yaml:"watch_max_unverdicted_hours"`
-	LaneNoticesMinAttempts      int `yaml:"lane_notices_min_attempts"`
-	LaneNoticesMaxErrorPct      int `yaml:"lane_notices_max_error_pct"`
-	TaskEventsMinAttempts       int `yaml:"task_events_min_attempts"`
-	TaskEventsMaxRefusalPct     int `yaml:"task_events_max_refusal_pct"`
-	OutcomePublishMinErrors     int `yaml:"outcome_publish_min_errors"`
-	ReviewRetryMaxDeferredHours int `yaml:"review_retry_max_deferred_hours"`
+	ReviewPassMinMade            int `yaml:"review_pass_min_made"`
+	ReviewPassMinDonePct         int `yaml:"review_pass_min_done_pct"`
+	ReviewerLandingMinMade       int `yaml:"reviewer_landing_min_made"`
+	ReviewerLandingMinLandedPct  int `yaml:"reviewer_landing_min_landed_pct"`
+	FindingsDeliveryMinMade      int `yaml:"findings_delivery_min_made"`
+	MergeMaxUnmerged             int `yaml:"merge_max_unmerged"`
+	AuthorSweepMinMade           int `yaml:"author_sweep_min_made"`
+	AuthorSweepMinDonePct        int `yaml:"author_sweep_min_done_pct"`
+	WorkerWorktreesMinMade       int `yaml:"worker_worktrees_min_made"`
+	WorkerWorktreesMaxRemovedPct int `yaml:"worker_worktrees_max_removed_pct"`
+	WorkerWorktreesWindowDays    int `yaml:"worker_worktrees_window_days"`
+	WatchMaxUnverdictedHours     int `yaml:"watch_max_unverdicted_hours"`
+	LaneNoticesMinAttempts       int `yaml:"lane_notices_min_attempts"`
+	LaneNoticesMaxErrorPct       int `yaml:"lane_notices_max_error_pct"`
+	TaskEventsMinAttempts        int `yaml:"task_events_min_attempts"`
+	TaskEventsMaxRefusalPct      int `yaml:"task_events_max_refusal_pct"`
+	OutcomePublishMinErrors      int `yaml:"outcome_publish_min_errors"`
+	ReviewRetryMaxDeferredHours  int `yaml:"review_retry_max_deferred_hours"`
 }
 
 const (
-	DefaultReviewPassMinMade           = 10
-	DefaultReviewPassMinDonePct        = 50
-	DefaultReviewerLandingMinMade      = 10
-	DefaultReviewerLandingMinLandedPct = 50
-	DefaultFindingsDeliveryMinMade     = 3
-	DefaultMergeMaxUnmerged            = 3
-	DefaultAuthorSweepMinMade          = 5
-	DefaultAuthorSweepMinDonePct       = 30
-	DefaultWatchMaxUnverdictedHours    = 6
-	DefaultLaneNoticesMinAttempts      = 5
-	DefaultLaneNoticesMaxErrorPct      = 50
-	DefaultTaskEventsMinAttempts       = 10
-	DefaultTaskEventsMaxRefusalPct     = 20
-	DefaultOutcomePublishMinErrors     = 5
-	DefaultReviewRetryMaxDeferredHours = 24
+	DefaultReviewPassMinMade            = 10
+	DefaultReviewPassMinDonePct         = 50
+	DefaultReviewerLandingMinMade       = 10
+	DefaultReviewerLandingMinLandedPct  = 50
+	DefaultFindingsDeliveryMinMade      = 3
+	DefaultMergeMaxUnmerged             = 3
+	DefaultAuthorSweepMinMade           = 5
+	DefaultAuthorSweepMinDonePct        = 30
+	DefaultWorkerWorktreesMinMade       = 10
+	DefaultWorkerWorktreesMaxRemovedPct = 50
+	DefaultWorkerWorktreesWindowDays    = 7
+	DefaultWatchMaxUnverdictedHours     = 6
+	DefaultLaneNoticesMinAttempts       = 5
+	DefaultLaneNoticesMaxErrorPct       = 50
+	DefaultTaskEventsMinAttempts        = 10
+	DefaultTaskEventsMaxRefusalPct      = 20
+	DefaultOutcomePublishMinErrors      = 5
+	DefaultReviewRetryMaxDeferredHours  = 24
 )
 
 // Liveness configures the daily fleet-wide liveness checks (hk 5109).
@@ -589,6 +595,27 @@ func (l Liveness) AuthorSweepMinDonePctOrDefault() int {
 		return l.Thresholds.AuthorSweepMinDonePct
 	}
 	return DefaultAuthorSweepMinDonePct
+}
+
+func (l Liveness) WorkerWorktreesMinMadeOrDefault() int {
+	if l.Thresholds.WorkerWorktreesMinMade > 0 {
+		return l.Thresholds.WorkerWorktreesMinMade
+	}
+	return DefaultWorkerWorktreesMinMade
+}
+
+func (l Liveness) WorkerWorktreesMaxRemovedPctOrDefault() int {
+	if l.Thresholds.WorkerWorktreesMaxRemovedPct > 0 {
+		return l.Thresholds.WorkerWorktreesMaxRemovedPct
+	}
+	return DefaultWorkerWorktreesMaxRemovedPct
+}
+
+func (l Liveness) WorkerWorktreesWindowDaysOrDefault() int {
+	if l.Thresholds.WorkerWorktreesWindowDays > 0 {
+		return l.Thresholds.WorkerWorktreesWindowDays
+	}
+	return DefaultWorkerWorktreesWindowDays
 }
 
 func (l Liveness) WatchMaxUnverdictedHoursOrDefault() int {

@@ -579,6 +579,7 @@ Every mechanism evaluates progress made against expected completions over the UT
 | 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`). A `task-event-fields-refused` row for an event that posted successfully is the same event, not a second attempt; only a refusal with no successful post counts. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
 | 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
 | 11 | `review-retry` | Review passes deferred for retry up to the evaluated day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged) or within grace window. | `review_retry_max_deferred_hours: 24`<br>(Stalls if >= 2 unresolved deferrals exceed threshold; single miss does not alert) |
+| 12 | `worker-worktrees` | Worker worktrees the sweeps took custody of per host: the first `reap.jsonl` row (`remove-worktree` or `legacy-sweep`) naming the host's worktree. No spawn rows exist for workers, so first sighting is made. | Worktrees removed that day per host (`remove-worktree` with `result: "removed"` or `"already-gone"`, or a gone proof: `reason: "worktree-gone"`, `"already-gone"` or `"gone"`). Reviewer (`mwr-*`) and consult (`consult-*`) checkouts never count; hostless rows are unattributed, never stalling. | `worker_worktrees_min_made: 10`<br>`worker_worktrees_max_removed_pct: 50`<br>`worker_worktrees_window_days: 7`<br>(Stalls if any host reaches made and its removed share falls below the threshold; the trailing window feeds the per-host open balance) |
 
 #### Stall notices and repeat rule
 
@@ -599,6 +600,11 @@ To inspect daily mechanism status and audit history without modifying state:
 ```bash
 mergewake liveness [--day YYYY-MM-DD] [--mechanism M]
 ```
+With `--mechanism worker-worktrees` the result carries one entry per host with
+its made, removed and trailing open counts plus the `kept` list: every worker
+worktree staying past the removal rules with its reason, PR and repo. The
+daily pass also writes one `worker-worktrees-daily` audit row per host with
+the same counts and kept list.
 
 ### `review`
 
