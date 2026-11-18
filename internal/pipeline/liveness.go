@@ -41,6 +41,7 @@ var AllMechanisms = []string{
 	MechFindingsDelivery,
 	MechMerge,
 	MechReviewerCheckoutRemoval,
+	MechAuthorWorktreeSweep,
 	MechWorkerWorktrees,
 	MechWatchRevert,
 	MechLaneNotices,

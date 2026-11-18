@@ -124,6 +124,20 @@ func (s *Service) workerWorktreeScan(repos []config.Repo, fn func(workerWorktree
 					if wt == "" {
 						wt = row.Cwd
 					}
+					if row.Host == "" {
+						// Hostless rows (notably the hostless
+						// merge-commit-unknown skips) carry no worktree
+						// identity to tally; they are unattributed, never
+						// stalling, and must not be dropped here.
+						fn(workerWorktreeRow{
+							time:   row.Time.UTC(),
+							pr:     row.PR,
+							repo:   r.Name,
+							result: row.Result,
+							reason: row.Reason,
+						})
+						continue
+					}
 					if !isWorkerWorktree(wt) {
 						continue
 					}
@@ -173,7 +187,9 @@ func (s *Service) workerWorktreesForDay(repos []config.Repo, day string) ([]Work
 	unattributed := 0
 	err = s.workerWorktreeScan(repos, func(w workerWorktreeRow) {
 		if w.host == "" {
-			unattributed++
+			if w.time.Format(reviewerSummaryDay) == day {
+				unattributed++
+			}
 			return
 		}
 		k := key{w.host, w.worktree}
@@ -205,15 +221,18 @@ func (s *Service) workerWorktreesForDay(repos []config.Repo, day string) ([]Work
 	}
 	for _, k := range order {
 		first := seen[k]
+		if removedOn[k] {
+			// A removal on the evaluated day counts even when custody
+			// began before the trailing window; otherwise old worktrees
+			// removed today vanish from Done and stall falsely.
+			host(k.host).Removed++
+		}
 		if first.Before(windowStart) || !first.Before(end) {
 			continue
 		}
 		h := host(k.host)
 		if first.Format(reviewerSummaryDay) == day {
 			h.Made++
-		}
-		if removedOn[k] {
-			h.Removed++
 		}
 		// Open over the trailing window: custody minus removals.
 		if last, ok := latest[k]; ok && !workerWorktreeTerminal(last.result, last.reason) {

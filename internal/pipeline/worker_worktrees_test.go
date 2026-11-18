@@ -2,7 +2,29 @@ package pipeline
 
 import (
 	"testing"
+	"time"
 )
+
+// seedWorkerRowAt writes one reap row for a worker worktree at time at.
+func seedWorkerRowAt(t *testing.T, f *livenessFixture, action, host, wt, result, reason string, pr int, at time.Time) {
+	t.Helper()
+	prev := f.s.Now
+	f.s.Now = func() time.Time { return at }
+	defer func() { f.s.Now = prev }()
+	rec := reapReceipt{
+		Time:     at,
+		Action:   action,
+		Repo:     f.repos[0].Name,
+		PR:       pr,
+		Host:     host,
+		Worktree: wt,
+		Result:   result,
+		Reason:   reason,
+	}
+	if err := f.s.reapNote(rec, false); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // seedWorkerRow writes one reap row for a worker worktree on the fixture day.
 func seedWorkerRow(t *testing.T, f *livenessFixture, action, host, wt, result, reason string, pr int) {
@@ -126,6 +148,10 @@ func TestWorkerWorktrees_ExclusionsAndUnattributed(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		seedWorkerRow(t, f, "remove-worktree", "", "", "skipped", "merge-commit-unknown", i)
 	}
+	// Hostless rows on other days never leak into this day's unattributed
+	// count, whether or not they name a worktree.
+	seedWorkerRowAt(t, f, "remove-worktree", "", "", "skipped", "merge-commit-unknown", 4, balanceDayTime("2026-11-16", 12))
+	seedWorkerRowAt(t, f, "remove-worktree", "", "/work/example.wx1", "skipped", "dirty", 5, balanceDayTime("2026-11-16", 12))
 
 	m := workerMechanism(t, f, day)
 	if m.Stalled || m.Made != 0 || m.Done != 0 {
@@ -133,6 +159,9 @@ func TestWorkerWorktrees_ExclusionsAndUnattributed(t *testing.T) {
 	}
 	if len(m.Hosts) != 0 {
 		t.Fatalf("no attributed hosts expected: %+v", m.Hosts)
+	}
+	if want := "3 hostless reap rows unattributed"; m.Reason != want {
+		t.Fatalf("unattributed reason %q, want %q", m.Reason, want)
 	}
 }
 
@@ -206,5 +235,53 @@ func TestWorkerWorktrees_DailyRowsPerHost(t *testing.T) {
 	}
 	if rows := livenessRows(t, f, f.repos[0].Name, workerWorktreesDailyCommand); len(rows) != 2 {
 		t.Fatalf("retried day duplicated rows: %d", len(rows))
+	}
+}
+
+// Removals on the evaluated day count even when custody began before the
+// trailing window; otherwise old worktrees removed today vanish from Done.
+func TestWorkerWorktrees_OldRemovalsCountOnDay(t *testing.T) {
+	day := "2026-11-17"
+	f := newLivenessFixture(t, balanceDayTime(day, 12))
+	// 10 taken into custody today, 2 removed today: stalls on its own.
+	for i := 1; i <= 10; i++ {
+		wt := "/work/example.wo" + itoa(i)
+		if i <= 2 {
+			seedWorkerRow(t, f, "remove-worktree", "host-a", wt, "removed", "", i)
+			continue
+		}
+		seedWorkerRow(t, f, "remove-worktree", "host-a", wt, "skipped", "dirty", i)
+	}
+	// 8 worktrees from before the window, all removed today.
+	for i := 1; i <= 8; i++ {
+		wt := "/work/example.old" + itoa(i)
+		seedWorkerRowAt(t, f, "legacy-sweep", "host-a", wt, "kept", "too-young", 100+i, balanceDayTime("2026-11-07", 12))
+		seedWorkerRow(t, f, "remove-worktree", "host-a", wt, "removed", "", 100+i)
+	}
+	m := workerMechanism(t, f, day)
+	if m.Stalled || m.Made != 10 || m.Done != 10 {
+		t.Fatalf("old removals are done: %+v", m)
+	}
+}
+
+// Both sweeps stay registered: the worker check adds a mechanism, it never
+// replaces the author sweep.
+func TestWorkerWorktrees_MechanismRegistered(t *testing.T) {
+	if len(AllMechanisms) != 12 {
+		t.Fatalf("AllMechanisms has %d entries, want 12", len(AllMechanisms))
+	}
+	for _, mech := range []string{MechAuthorWorktreeSweep, MechWorkerWorktrees} {
+		found := false
+		for _, m := range AllMechanisms {
+			if m == mech {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%q missing from AllMechanisms", mech)
+		}
+		if _, ok := NormalizeMechanism(mech); !ok {
+			t.Fatalf("%q not normalizable", mech)
+		}
 	}
 }
