@@ -11,7 +11,7 @@ import (
 
 // A consult request names a family panewire accepts. The bound job's recorded
 // family wins over the PR trailer, as it does for the review spawn; both are
-// bounded by panewireBuilderFamily. The audit row records what was sent.
+// bounded by panewireAuthorFamily. The audit row records what was sent.
 func TestConsultRequestSendsBoundedAuthorFamily(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -23,15 +23,22 @@ func TestConsultRequestSendsBoundedAuthorFamily(t *testing.T) {
 		wantSource string
 	}{
 		{
-			name:       "job record cognition is bounded to other",
+			name:       "job record cognition passes through",
 			jobFamily:  "cognition",
 			wantJob:    true,
-			wantFamily: "other",
+			wantFamily: "cognition",
 			wantSource: "job",
 		},
 		{
-			name:       "no bound job, trailer cognition is bounded to other",
+			name:       "no bound job, trailer cognition passes through",
 			trailer:    "cognition",
+			unbindJob:  true,
+			wantFamily: "cognition",
+			wantSource: "trailer",
+		},
+		{
+			name:       "no bound job, trailer kimi is bounded to other",
+			trailer:    "kimi",
 			unbindJob:  true,
 			wantFamily: "other",
 			wantSource: "trailer",

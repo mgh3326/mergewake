@@ -241,7 +241,7 @@ func (s *Service) hubConsultAdvance(ctx context.Context, r config.Repo, pr githu
 // consultAuthor is the author a consult request names. The hub needs the bound
 // job for repository evidence, and it reads the job's recorded family unless
 // the request names one, so the family is sent beside the job. The family is
-// bounded by panewireBuilderFamily, as the review spawn bounds its builder
+// bounded by panewireAuthorFamily, as the review spawn bounds its author
 // family: the bound job's record when that is readable, else the
 // Mergewake-Author-Family trailer. source is "job", "trailer", or empty when
 // neither names a family. A read error leaves that source unnamed, as before.
@@ -263,7 +263,7 @@ func (s *Service) consultAuthorFor(ctx context.Context, r config.Repo, pr github
 		}
 	}
 	if a.family != "" {
-		a.family = panewireBuilderFamily(a.family)
+		a.family = panewireAuthorFamily(a.family)
 	}
 	return a
 }

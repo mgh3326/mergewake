@@ -121,13 +121,13 @@ func panewireSpawnArgs(args []string) []string {
 	if i := indexFlag(out, "--builder-family"); i >= 0 {
 		out[i] = "--author-family"
 		if i+1 < len(out) {
-			out[i+1] = panewireBuilderFamily(out[i+1])
+			out[i+1] = panewireAuthorFamily(out[i+1])
 		} else {
 			out = append(out, "other")
 		}
 	} else if i := indexFlag(out, "--author-family"); i >= 0 {
 		if i+1 < len(out) {
-			out[i+1] = panewireBuilderFamily(out[i+1])
+			out[i+1] = panewireAuthorFamily(out[i+1])
 		} else {
 			out = append(out, "other")
 		}
@@ -862,7 +862,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}
-			args = append(args, "--builder-family", panewireBuilderFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
+			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
 			if cfg.Owner != "" {
 				args = append(args, "--owner", cfg.Owner)
 			}
@@ -1908,12 +1908,15 @@ func (x *panewireExecutor) builderFamily(ctx context.Context, parent string) str
 	return x.authorFamily
 }
 
-// panewireBuilderFamily bounds the builder family to the values accepted by
-// panewire. Mergewake keeps the canonical family for its own review logic.
-func panewireBuilderFamily(family string) string {
+// panewireAuthorFamily bounds the family sent to panewire to the author
+// families it accepts for --author-family and a consult request's
+// author_family: the 14 names of panewire@5621de4
+// internal/spawnargs/author_family.go:14. Mergewake keeps the canonical
+// family for its own review logic.
+func panewireAuthorFamily(family string) string {
 	canonical := config.CanonicalFamily(family)
 	switch canonical {
-	case "anthropic", "openai", "google", "xai", "deepseek", "meta", "mistral", "other":
+	case "anthropic", "cognition", "deepseek", "google", "meta", "minimax", "mistral", "mixed", "openai", "other", "qwen", "upstage", "xai", "zhipu":
 		return canonical
 	default:
 		return "other"
