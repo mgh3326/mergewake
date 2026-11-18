@@ -265,7 +265,9 @@ func hubSvc(t *testing.T, hub *fakeReapHub, run *scriptRunner, hosts ...reap.Hos
 	c.Reap.Hub = config.ReapHub{URL: server.URL, TokenFile: token}
 	c.Hosts = append([]reap.Host{{Name: "node", SSH: "ops@node.example", Machine: "node-a"}}, hosts...)
 	var out strings.Builder
-	return &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}, &out
+	s := &Service{Config: c, GH: &reapGH{}, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &out}
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
+	return s, &out
 }
 
 // A missing composer answer keeps the pane while worktree cleanup still uses the node.

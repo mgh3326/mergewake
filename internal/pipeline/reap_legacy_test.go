@@ -66,12 +66,12 @@ func (g *legacyGH) Pull(_ context.Context, _ string, n int) (github.Pull, error)
 
 const legacyCwd = "/old.wt"
 
-// legacyPR is a PR of the repo whose branch wk/x was merged days ago, with the
+// legacyPR is a PR of the repo whose branch feat/x was merged days ago, with the
 // task trailer that binds it to job job-a.
 func legacyPR(number int, daysAgo int, merged bool) github.Pull {
 	p := github.Pull{
 		Number: number, State: "closed", Body: "Work.\n\nMergewake-Task: 3074\n",
-		Head: github.Ref{Ref: "wk/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
+		Head: github.Ref{Ref: "feat/x", SHA: headSHA}, Base: github.Ref{Ref: "main"},
 		MergeCommitSHA: "abc123",
 	}
 	p.Head.Repo.FullName = "example/project"
@@ -82,13 +82,14 @@ func legacyPR(number int, daysAgo int, merged bool) github.Pull {
 }
 
 // legacyFixture is a hub host node-a holding one linked worktree of the repo at
-// legacyCwd, on branch wk/x at headSHA, with no pane in it, and PR 40 merged
+// legacyCwd, on branch feat/x at headSHA, with no pane in it, and PR 40 merged
 // 20 days ago; hk binds task 3074 to job job-a, which ran in that worktree.
 func legacyFixture(t *testing.T) (*Service, *fakeReapHub, *legacyGH) {
 	t.Helper()
 	hub := newFakeReapHub()
 	hub.agents = map[string]any{"machine_id": "node-a", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}
 	hub.wtPaths = map[string]bool{legacyCwd: true}
+	hub.branches = map[string]string{legacyCwd: "feat/x"}
 	s, _ := hubSvc(t, hub, &scriptRunner{})
 	gh := &legacyGH{closed: []github.Pull{legacyPR(40, 20, true)}}
 	s.GH = gh
@@ -142,7 +143,7 @@ func TestLegacySweepRemovesCleanOldMergedWorktree(t *testing.T) {
 	}
 	row := legacyOnly(t, s)
 	wantRow(t, row, "would-remove", legacyGuardNote)
-	if row["host"] != "node" || row["worktree"] != legacyCwd || row["branch"] != "wk/x" || row["head"] != headSHA || row["pr"] != float64(40) {
+	if row["host"] != "node" || row["worktree"] != legacyCwd || row["branch"] != "feat/x" || row["head"] != headSHA || row["pr"] != float64(40) {
 		t.Fatalf("receipt shape: %v", row)
 	}
 	if n := len(hub.ops("worktree.remove")); n != 0 {
@@ -217,7 +218,7 @@ func TestLegacySweepKeepsClosedUnmergedPR(t *testing.T) {
 func TestLegacySweepKeepsWorktreeWithNoPR(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	p := legacyPR(40, 20, true)
-	p.Head.Ref = "wk/other"
+	p.Head.Ref = "feat/other"
 	gh.closed = []github.Pull{p}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
@@ -332,7 +333,7 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 	}
 	// A replacement on another branch at the same path is evaluated: its row
 	// says kept/no-task, not already-removed.
-	hub.branches = map[string]string{legacyCwd: "wk/y"}
+	hub.branches = map[string]string{legacyCwd: "feat/y"}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +342,7 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 		t.Fatalf("replacement checkout not evaluated: %v", rows)
 	}
 	wantRow(t, rows[1], "kept", "no-task")
-	if rows[1]["branch"] != "wk/y" {
+	if rows[1]["branch"] != "feat/y" {
 		t.Fatalf("row: %v", rows[1])
 	}
 
@@ -366,7 +367,7 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 	}
 	wantRow(t, rows[0], "removed", "")
 	wantRow(t, rows[1], "removed", "")
-	if rows[0]["head"] != headSHA || rows[1]["head"] != "ffff9999" || rows[1]["branch"] != "wk/x" {
+	if rows[0]["head"] != headSHA || rows[1]["head"] != "ffff9999" || rows[1]["branch"] != "feat/x" {
 		t.Fatalf("removal receipts: %v", rows)
 	}
 }
@@ -375,7 +376,7 @@ func TestLegacySweepTerminalReceiptBindsCheckoutIdentity(t *testing.T) {
 // suppresses the same branch, so old rows do not all re-evaluate once.
 func TestLegacySweepTerminalReceiptWithoutHeadStillMatches(t *testing.T) {
 	s, hub, _ := legacyFixture(t)
-	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt","branch":"wk/x","result":"removed"}`+"\n")
+	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt","branch":"feat/x","result":"removed"}`+"\n")
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +398,7 @@ func TestLegacySweepGonePathReachedByJobCwdWritesNoRow(t *testing.T) {
 	hub.wtPaths["/repo.wt"] = true
 	pane := []any{map[string]any{"pane_id": "w3:p1", "agent_status": "idle", "cwd": "/repo.wt"}}
 	hub.agents["panes"], hub.agents["agents"] = pane, pane
-	hub.lists = map[string][]map[string]any{listCommon: {listedRow(legacyCwd, "wk/x")}}
+	hub.lists = map[string][]map[string]any{listCommon: {listedRow(legacyCwd, "feat/x")}}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +508,7 @@ func TestLegacySweepGoneRowIsNotDuplicated(t *testing.T) {
 // seed normalizes it the same way the lookups do.
 func TestLegacySweepUncleanReceiptPathStillMatches(t *testing.T) {
 	s, hub, _ := legacyFixture(t)
-	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt/","branch":"wk/x","head":"`+headSHA+`","result":"removed"}`+"\n")
+	writeFile(t, s.reapLog("example/project"), `{"time":"2026-01-01T00:00:00Z","action":"legacy-sweep","repo":"example/project","host":"node","worktree":"/old.wt/","branch":"feat/x","head":"`+headSHA+`","result":"removed"}`+"\n")
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +557,7 @@ func TestLegacySweepGoneJobCwdUnderKeptWorktreeKeysItself(t *testing.T) {
 	// The worktree itself stays listed and dirty — a kept, non-terminal row —
 	// while the job's cwd inside it no longer inspects.
 	hub.lists = map[string][]map[string]any{listCommon: {
-		withStatus(listedRow(legacyCwd, "wk/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
+		withStatus(listedRow(legacyCwd, "feat/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
 	}}
 	for i := 0; i < 3; i++ {
 		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
@@ -688,7 +689,7 @@ func TestLegacySweepRereadsOpenPRsBeforeRemoval(t *testing.T) {
 // does not hold the worktree, the repo's own open PR does.
 func TestLegacySweepOpenPRsMatchBySourceRepository(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
-	gh.open = []github.Pull{forkPR(51, "wk/x")}
+	gh.open = []github.Pull{forkPR(51, "feat/x")}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +869,7 @@ func TestLegacySweepRemovesDroppedTaskWorktree(t *testing.T) {
 func TestLegacySweepRemovesNoPRDroppedTaskWorktree(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	p := legacyPR(40, 20, true)
-	p.Head.Ref = "wk/other"
+	p.Head.Ref = "feat/other"
 	gh.closed = []github.Pull{p}
 	s.Sink.(*jobSink).tasks = map[string]client.Task{"3074": {State: "dropped", UpdatedAt: time.Now().Add(-20 * 24 * time.Hour)}}
 	if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
@@ -922,7 +923,7 @@ func TestLegacySweepDroppedKeepsLocalOnly(t *testing.T) {
 		hub.agents["agents"] = []any{map[string]any{"pane_id": "w1:p9", "agent_status": "idle", "cwd": "/repo.wt"}}
 		hub.agents["panes"] = []any{map[string]any{"pane_id": "w1:p9", "agent_status": "idle", "cwd": "/repo.wt"}}
 		hub.lists = map[string][]map[string]any{listCommon: {
-			withStatus(listedRow(legacyCwd, "wk/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
+			withStatus(listedRow(legacyCwd, "feat/x"), map[string]any{"dirty": true, "untracked": 0, "ignored": 0}),
 		}}
 		if err := s.ReapLegacy(context.Background(), testRepo, "", apply()); err != nil {
 			t.Fatal(err)
@@ -979,9 +980,9 @@ func TestLegacySweepKeepsTaskReadError(t *testing.T) {
 func TestLegacySweepKeepsAmbiguousTaskMapping(t *testing.T) {
 	s, hub, gh := legacyFixture(t)
 	p1 := legacyPR(40, 20, true)
-	p1.Head.Ref = "wk/a1"
+	p1.Head.Ref = "feat/a1"
 	p2 := legacyPR(41, 20, true)
-	p2.Head.Ref = "wk/a2"
+	p2.Head.Ref = "feat/a2"
 	p2.Body = "Work.\n\nMergewake-Task: 9999\n"
 	gh.closed = []github.Pull{p1, p2}
 	s.Sink.(*jobSink).jobs["9999"] = "job-b"
@@ -1003,9 +1004,9 @@ func TestLegacySweepKeepsAmbiguousTaskMapping(t *testing.T) {
 // worktree: the foreign record cannot identify the task, so the row stays
 // no-task even though its task is dropped.
 func TestLegacySweepForeignHostJobRecordKeepsNoTask(t *testing.T) {
-	pr := listPR(41, "wk/other", 20)
+	pr := listPR(41, "feat/other", 20)
 	pr.Body = "Work.\n\nMergewake-Task: 9999\n"
-	s, hub := listFixture(t, []map[string]any{listedRow("/b.wt", "wk/b")}, pr)
+	s, hub := listFixture(t, []map[string]any{listedRow("/b.wt", "feat/b")}, pr)
 	sink := s.Sink.(*jobSink)
 	sink.jobs["9999"] = "job-b"
 	sink.recs["job-b"] = integrations.JobRecord{State: "completed", Host: "node-b", Cwd: "/b.wt", Label: "job-b"}
@@ -1043,9 +1044,9 @@ func TestLegacySweepKeepsWhenNewestPRBindingFails(t *testing.T) {
 // never matches — head and branch alone are not enough across repos.
 func TestJobRecordNamesHostAndOrigin(t *testing.T) {
 	host := reap.Host{Name: "node", Machine: "node-a"}
-	branch := "wk/b"
-	oldBranch := "wk/old"
-	wt := &reap.Worktree{Path: "/b.wt", Branch: "wk/b", Head: headSHA, Repo: "example/project"}
+	branch := "feat/b"
+	oldBranch := "feat/old"
+	wt := &reap.Worktree{Path: "/b.wt", Branch: "feat/b", Head: headSHA, Repo: "example/project"}
 	for _, tc := range []struct {
 		name string
 		rec  *integrations.JobRecord

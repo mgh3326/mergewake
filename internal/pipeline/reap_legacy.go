@@ -527,7 +527,9 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 			return nil
 		}
 	}
-	// The main checkout and reviewer checkouts are never this sweep's.
+	// The main checkout and reviewer checkouts are never this sweep's, and a
+	// worker worktree (wk/<job>) belongs to the worker-worktree pass: its
+	// rules, not this sweep's 14-day floor, decide when it goes.
 	switch {
 	case c.main:
 		tally.add("out-of-scope", "main-checkout")
@@ -535,12 +537,15 @@ func (w *legacySweep) candidate(ctx context.Context, hs *reapHost, c *legacyCand
 	case c.listed != nil && strings.HasPrefix(filepath.Base(c.cwd), "mwr-"):
 		tally.add("out-of-scope", "reviewer-checkout")
 		return nil
+	case c.listed != nil && strings.HasPrefix(c.listed.Branch, workerBranchPrefix):
+		tally.add("out-of-scope", "worker-worktree")
+		return nil
 	}
 	rec := reapReceipt{Action: legacyAction, Repo: w.r.Name, Host: c.host, Cwd: c.cwd, Worktree: c.cwd, Job: c.job, Task: c.task}
 	var errs []error
 	switch skip := w.evaluate(ctx, hs, c, &rec, &errs); skip {
 	case "":
-	case "reviewer-checkout":
+	case "reviewer-checkout", "worker-worktree":
 		tally.add("out-of-scope", skip)
 		return errs
 	default: // already-removed, already-refused
@@ -656,6 +661,9 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	// Reviewer checkouts (mwr-*) belong to the reviewer sweep, attached or not.
 	if strings.HasPrefix(filepath.Base(wt.Path), "mwr-") {
 		return "reviewer-checkout"
+	}
+	if strings.HasPrefix(wt.Branch, workerBranchPrefix) {
+		return "worker-worktree"
 	}
 	rec.Worktree, rec.Branch, rec.Head = wt.Path, wt.Branch, wt.Head
 	// Rows are keyed by the worktree root the node reported, which differs from

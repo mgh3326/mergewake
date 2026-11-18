@@ -120,7 +120,7 @@ func repoConfig(dir string) config.Config {
 		StateDir: dir,
 		Daemon:   config.Daemon{Act: true},
 		Hosts:    []reap.Host{{Name: "local", Jobs: "/jobs"}},
-		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "168h", ScanAfter: "720h", Regenerable: config.DefaultReapRegenerable},
+		Reap:     config.Reap{Enabled: true, Act: true, WorktreeAfter: "0", ScanAfter: "720h", Regenerable: config.DefaultReapRegenerable, Disposable: config.DefaultReapDisposable},
 		Repos:    []config.Repo{{Name: "example/project", Branch: "main"}},
 	}
 }
@@ -140,7 +140,23 @@ func svc(t *testing.T, gh GitHub, run *scriptRunner) *Service {
 	if run.fn == nil {
 		run.fn = statAnswer("yes\n")
 	}
-	return &Service{Config: repoConfig(t.TempDir()), GH: gh, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: io.Discard}
+	s := &Service{Config: repoConfig(t.TempDir()), GH: gh, Runner: run, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: io.Discard}
+	// A watch verdict on main covers the merge: the merged-PR worktree path
+	// waits for one, so every test that expects a removal needs it.
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
+	return s
+}
+
+// greenHead records a healthy watch verdict on main at head for repo.
+func greenHead(t *testing.T, s *Service, r config.Repo, head string) {
+	t.Helper()
+	dir := s.state(r.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "last-green"), []byte(head+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // emptyComposer and draftComposer are claude screens whose input line, between
@@ -267,6 +283,7 @@ func TestReapShadowAndDryRunMutateNothing(t *testing.T) {
 		c := repoConfig(dir)
 		var buf strings.Builder
 		s := &Service{Config: c, GH: &reapGH{}, Runner: r, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &buf}
+		greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
 		if err := s.Reap(context.Background(), testRepo, 0, o); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -379,6 +396,7 @@ func TestReapCleansReceiptedWorktree(t *testing.T) {
 		key("git", "-C", "/repo", "branch", "--show-current"):                                                    "main\n",
 		key("git", "-C", "/repo", "remote", "get-url", "origin"):                                                 "git@github.com:example/project.git\n",
 		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                             "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.gone\nHEAD aaaa\nbranch refs/heads/wk/x\n",
+		key("git", "-C", "/other", "worktree", "list", "--porcelain"):                                            "worktree /other\nHEAD bbbb\nbranch refs/heads/main\n",
 		key("git", "-C", "/repo.gone", "status", "--porcelain"):                                                  "",
 		key("git", "-C", "/repo.gone", "status", "--porcelain", "--ignored"):                                     "",
 		key("git", "-C", "/repo", "merge-base", "--is-ancestor", "wk/x", "origin/main"):                          "",
@@ -727,6 +745,7 @@ func TestReapMergeCommitPastStalePullCache(t *testing.T) {
 
 	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
+	greenHead(t, s, testRepo, mergeSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -820,6 +839,7 @@ func TestReapMergeCommitPastOpenPullReplay(t *testing.T) {
 
 	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
 	s := svc(t, pullCacheGH{gh}, r)
+	greenHead(t, s, testRepo, mergeSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -920,6 +940,7 @@ func TestReapActGate(t *testing.T) {
 	c.Reap.Act = false
 	var buf strings.Builder
 	s := &Service{Config: c, GH: &reapGH{}, Runner: r, Sink: &fakeSink{}, Notifier: &fakeNotifier{}, Out: &buf}
+	greenHead(t, s, testRepo, mergedPull.MergeCommitSHA)
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}

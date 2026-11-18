@@ -414,6 +414,7 @@ func localCheckout(t *testing.T, f *reviewerFix, label string, inUse bool) strin
 		key("git", "-C", path, "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
 		key("git", "-C", path, "status", "--porcelain"):                                                  "",
 		key("git", "-C", path, "status", "--porcelain", "--ignored"):                                     "",
+		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                     "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n",
 		key("git", "-C", "/repo", "worktree", "remove", path):                                            "",
 	} {
 		f.run.outs[k] = v
