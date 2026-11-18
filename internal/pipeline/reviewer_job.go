@@ -69,8 +69,8 @@ type reviewerJob struct {
 	// no result, to write its output now. Nil when it was never nudged; a
 	// record written before the field existed reads as not nudged.
 	NudgedAt *time.Time `json:"nudged_at,omitempty"`
-	// Replaced lists the reviewers this pass replaced because they were lost
-	// overdue. A replaced reviewer may still finish validly while its
+	// Replaced lists the reviewers this pass replaced for a lost result.
+	// A replaced reviewer may still finish validly while its
 	// replacement runs; the pass collects such a late result (lateReviewerResult).
 	Replaced []replacedReviewer `json:"replaced,omitempty"`
 	// Started is when mergewake saw the reviewer pane land: the spawn call
@@ -85,7 +85,7 @@ type reviewerJob struct {
 	Placed bool `json:"placed,omitempty"`
 }
 
-// replacedReviewer is a reviewer that was lost overdue and replaced: its label,
+// replacedReviewer is a reviewer that was lost and replaced: its label,
 // the head it reviewed, and when its review budget started (budgetStart), which
 // is the anchor its overdue loss was measured from.
 type replacedReviewer struct {
@@ -281,8 +281,8 @@ func (x *panewireExecutor) saveReviewerJob(rj reviewerJob) error {
 	return fsutil.WriteJSON(x.s.reviewerJobPath(x.repo.Name, rj.PR, rj.Pass), rj)
 }
 
-// lateReviewerResult returns the result of a reviewer that rj replaced for an
-// overdue loss and that has since finished validly for this head, with that
+// lateReviewerResult returns the result of a reviewer that rj replaced for a
+// lost result and that has since finished validly for this head, with that
 // reviewer's label and hk record. Nil means none is ready and the pass keeps its replacement.
 // A record or host that cannot be read is no result, never an error, so the
 // late check cannot fail the pass.

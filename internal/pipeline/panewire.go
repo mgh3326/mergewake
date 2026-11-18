@@ -688,7 +688,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		overBudget := s.now().Sub(rj.budgetStart()) >= timeout
 		e := recErr
 		state := rec.State
-		// A reviewer this pass replaced for an overdue loss may finish validly
+		// A reviewer this pass replaced for a lost result may finish validly
 		// while its replacement runs. Its result completes the pass; the
 		// replacement's own job is then closed as collected.
 		if e == nil && !terminalJob(state) && len(rj.Replaced) > 0 {
@@ -1644,6 +1644,14 @@ func (x *panewireExecutor) pending(revisit Revisit, rj reviewerJob, why string) 
 	return fmt.Errorf("%w: reviewer %s %s; its finish or its timer brings the PR back", errPassPending, rj.Label, why)
 }
 
+// neverRanReviewer reports whether a lost reviewer never ran: no landing was
+// ever seen for it and hk holds no record under its label, so no result can
+// arrive late under it. Anything placed or recorded may still finish and stays
+// collectible.
+func neverRanReviewer(rj reviewerJob, job integrations.JobRecord) bool {
+	return rj.Started == nil && job.State == "" && job.Host == "" && job.PaneID == ""
+}
+
 // lostOverdue is the lost cause of a reviewer that kept working past the review
 // deadline: mergewake replaces it, so its pane is merged into the close below
 // even while it is working. Every other lost cause leaves the pane alone.
@@ -1720,9 +1728,10 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// durable source for how many replacements this reviewer has used.
 	plan.replacements = max(plan.replacements, rj.Replacements)
 	// The replacement's record carries the reviewers this pass already replaced,
-	// and the one lost overdue joins them: its late result may still arrive.
+	// and the one just lost joins them unless it never ran: its late result
+	// may still arrive.
 	plan.replaced = slices.Clone(rj.Replaced)
-	if cause == lostOverdue {
+	if !neverRanReviewer(rj, job) {
 		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart()})
 	}
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error(), "recorded": rj.Recorded, "started": rj.Started, "budget_from": rj.budgetFrom()}, false)
