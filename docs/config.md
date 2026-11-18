@@ -329,8 +329,11 @@ worktree registered and unlocked, at the inspected commit, with no modified
 tracked file and no untracked file outside `reap.disposable`; gitignored files
 must match `reap.regenerable` (so Unity's `Library/`, `bin/` and `obj/` count
 as expendable when listed there, as the defaults do); the branch head must be
-on the origin remote (the remote is asked, not the local tracking copy); and no
-live pane may use it. On a local host the pass also reads every process's
+on the origin remote (the remote is asked, not the local tracking copy) or,
+when the remote ref is gone as delete-branch-on-merge leaves it, already in
+`origin/<base>`; no live pane may use it; and a kept worktree keeps its draft,
+because disposable files are deleted only immediately before the removal.
+On a local host the pass also reads every process's
 working directory and refuses a worktree any process holds; a remote host's
 pane list already includes its plain shells. Anything refused stays and gets
 one `remove-worktree` row with its precise reason — `unpushed`, `dirty`,

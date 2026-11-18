@@ -954,3 +954,48 @@ func TestReapActGate(t *testing.T) {
 		t.Fatalf("reap.act off should stay observational: %s", buf.String())
 	}
 }
+
+// oldRecoveryGH answers WatchRevert with a recovery PR merged long before the
+// PR's own merge: outside the seven-day window, so it is not a revert.
+type oldRecoveryGH struct{ reapGH }
+
+func (oldRecoveryGH) WatchRevert(context.Context, string, int, string) (*github.Pull, error) {
+	return &github.Pull{Number: 99, State: "closed", Merged: true, MergedAt: rfc(time.Now().Add(-30 * 24 * time.Hour))}, nil
+}
+
+// A recovery PR merged outside the seven-day window does not excuse the watch
+// verdict: the merged-PR path still waits for main to be green.
+func TestReapOldRecoveryStillWaitsForWatchVerdict(t *testing.T) {
+	r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
+	s := svc(t, &oldRecoveryGH{}, r)
+	seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
+	if err := os.Remove(filepath.Join(s.state("example/project"), "last-green")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removed without a watch verdict")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "watch-pending" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("watch-pending not recorded")
+	}
+
+	// With the verdict the same checkout is removed.
+	r = &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
+	s = svc(t, &oldRecoveryGH{}, r)
+	seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.called("worktree\x00remove") {
+		t.Fatal("healthy verdict did not remove")
+	}
+}

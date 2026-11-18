@@ -46,7 +46,7 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 	if e != nil {
 		return []error{e}
 	}
-	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after,
+	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after, note: note,
 		healthyCache: map[string]bool{}, ancestry: map[string]bool{}, last: workerHistory(receipts)}
 	// Discovery comes first and is the only host read this pass costs when no
 	// worker worktree exists: the branch inventories below page every closed
@@ -168,6 +168,7 @@ type workerPass struct {
 	r       config.Repo
 	records *passJobRecords
 	acting  bool
+	note    func(reapReceipt)
 	// last is each path's newest worker-pass row, so a finished checkout is
 	// not inspected again while a replacement at the same path is.
 	last         map[string]workerLast
@@ -566,12 +567,21 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 	if rec.Result == "removed" && !hs.viaHub {
 		// The hub node deletes the branch itself; a local or ssh host still
 		// needs the same -d, which git refuses on a branch it cannot prove
-		// merged. The remote head branch is never touched on either path.
+		// merged. The remote head branch is never touched on either path, and
+		// a refused local delete is a row, not a pass error: a squash-merged
+		// branch is refused on every removal.
 		if deleter, ok := hs.ops.(interface {
 			DeleteBranch(context.Context, string, string) error
 		}); ok {
+			brec := reapReceipt{Action: "delete-branch", Repo: w.r.Name, PR: rec.PR, Host: hs.host.Name,
+				Worktree: c.path, Branch: c.branch, Source: workerSource}
 			if err := deleter.DeleteBranch(ctx, c.common, c.branch); err != nil {
-				*errs = append(*errs, fmt.Errorf("%s branch %s: %w", hs.host.Name, c.branch, err))
+				brec.Result, brec.Reason = "skipped", "refused: "+err.Error()
+			} else {
+				brec.Result = "deleted"
+			}
+			if w.note != nil {
+				w.note(brec)
 			}
 		}
 	}

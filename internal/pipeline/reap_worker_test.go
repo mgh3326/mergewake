@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -402,4 +403,105 @@ func TestExecWorktreeRemoveDisposableList(t *testing.T) {
 			t.Fatalf("%v %v", got, err)
 		}
 	})
+}
+
+// A refusal keeps the draft: disposable files are deleted only immediately
+// before the removal, so ignored-files and unpushed checkouts keep them.
+func TestExecWorktreeRemoveDisposableKeepsDraftOnRefusal(t *testing.T) {
+	base := func(remoteHead, ignored, untracked string) map[string]string {
+		return map[string]string{
+			key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
+			key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
+			key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
+			key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
+			key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
+			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      untracked,
+			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
+			key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     ignored,
+			key("rm", "-rf", "/repo.wt/report.draft.md"):                                                           "",
+			key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         remoteHead + "\trefs/heads/wk/x\n",
+			key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"):                       "",
+			key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
+		}
+	}
+	t.Run("ignored files keep the draft", func(t *testing.T) {
+		r := &scriptRunner{outs: base(headSHA, "!! .env\n", "?? report.draft.md\n")}
+		e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
+		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
+		if err != nil || got.Outcome != "ignored-files" {
+			t.Fatalf("%v %v", got, err)
+		}
+		if r.called("rm\x00-rf") {
+			t.Fatal("draft deleted from a kept worktree")
+		}
+	})
+	t.Run("unpushed keeps the draft", func(t *testing.T) {
+		outs := base("ffff0000", "", "?? report.draft.md\n")
+		delete(outs, key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"))
+		r := &scriptRunner{outs: outs}
+		e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
+		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
+		if err != nil || got.Outcome != "unpushed" {
+			t.Fatalf("%v %v", got, err)
+		}
+		if r.called("rm\x00-rf") {
+			t.Fatal("draft deleted from a kept worktree")
+		}
+	})
+}
+
+// A merged branch whose remote ref was deleted (delete-branch-on-merge) passes
+// on base ancestry instead of being kept as unpushed for ever.
+func TestExecWorktreeRemoveUsesBaseWhenRemoteBranchIsGone(t *testing.T) {
+	r := &scriptRunner{outs: map[string]string{
+		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
+		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
+		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
+		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
+		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
+		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
+		key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         "",
+		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"):                       "",
+		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
+	}}
+	e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
+	got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, nil, false)
+	if err != nil || got.Outcome != "removed" {
+		t.Fatalf("%v %v", got, err)
+	}
+}
+
+// A refused local branch delete is a row, not a pass error.
+type branchDeleteFake struct {
+	reap.Ops
+	delErr error
+	path   string
+}
+
+func (f *branchDeleteFake) AllPanes(context.Context) ([]reap.Pane, error) { return nil, nil }
+func (f *branchDeleteFake) Inspect(context.Context, string) (*reap.Worktree, error) {
+	return &reap.Worktree{Path: f.path, Common: "/repo/.git", Branch: "wk/job", Head: headSHA, Repo: "example/project"}, nil
+}
+func (f *branchDeleteFake) WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error) {
+	return reap.WorktreeRemoveResult{Outcome: "removed"}, nil
+}
+func (f *branchDeleteFake) DeleteBranch(context.Context, string, string) error { return f.delErr }
+
+func TestWorkerBranchDeleteRefusalIsARow(t *testing.T) {
+	var rows []reapReceipt
+	f := &branchDeleteFake{delErr: errors.New("exit status 1"), path: "/work/project.job"}
+	w := &workerPass{s: &Service{Config: repoConfig(t.TempDir())}, r: testRepo, acting: true,
+		note: func(v reapReceipt) { rows = append(rows, v) }}
+	hs := &reapHost{host: reap.Host{Name: "node", SSH: "ops@node.example"}, ops: f, trees: map[string]*reap.Worktree{}}
+	rec := &reapReceipt{Action: "remove-worktree", Repo: "example/project", Host: "node", Worktree: f.path, Branch: "wk/job"}
+	var errs []error
+	got := w.remove(context.Background(), hs, workerCand{path: f.path, branch: "wk/job", head: headSHA, common: "/repo"}, rec, &errs)
+	if got.Result != "removed" || len(errs) != 0 {
+		t.Fatalf("%v %v", got, errs)
+	}
+	if len(rows) != 1 || rows[0].Action != "delete-branch" || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, "refused: ") {
+		t.Fatalf("rows: %#v", rows)
+	}
 }

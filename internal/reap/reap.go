@@ -734,13 +734,6 @@ func (e Exec) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, bas
 	if !clean {
 		return WorktreeRemoveResult{Outcome: "dirty"}, nil
 	}
-	// The disposable files are removed only after every other refusal has
-	// been ruled out, so a kept worktree keeps its draft.
-	for _, name := range disposableGo {
-		if _, err := e.Run(ctx, "rm", "-rf", filepath.Join(w.Path, filepath.FromSlash(strings.TrimSuffix(name, "/")))); err != nil {
-			return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
-		}
-	}
 	ignored, err := e.Ignored(ctx, w.Path)
 	if err != nil {
 		return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
@@ -754,19 +747,40 @@ func (e Exec) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, bas
 	if len(unsafe) > 0 {
 		return WorktreeRemoveResult{Outcome: "ignored-files", Files: unsafe}, nil
 	}
-	if !detached {
-		remote, err := e.RemoteHead(ctx, main, entry.Branch)
-		if err != nil {
-			return WorktreeRemoveResult{Outcome: "git-failed"}, nil
-		}
-		if remote == "" || !strings.EqualFold(remote, w.Head) {
-			return WorktreeRemoveResult{Outcome: "unpushed"}, nil
+	if !detached && !e.released(ctx, main, w.Head, entry.Branch, base) {
+		return WorktreeRemoveResult{Outcome: "unpushed"}, nil
+	}
+	// The disposable files go only now, after every other refusal has been
+	// ruled out, so a kept worktree always keeps its draft.
+	for _, name := range disposableGo {
+		if _, err := e.Run(ctx, "rm", "-rf", filepath.Join(w.Path, filepath.FromSlash(strings.TrimSuffix(name, "/")))); err != nil {
+			return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
 		}
 	}
 	if err := e.RemoveWorktree(ctx, main, w.Path); err != nil {
 		return WorktreeRemoveResult{}, err
 	}
 	return WorktreeRemoveResult{Outcome: "removed"}, nil
+}
+
+// released reports whether the branch's work is on the remote: its origin head
+// is exactly the checked-out commit, or — a merged branch whose remote ref was
+// deleted, as delete-branch-on-merge leaves it — the commit is already in
+// origin/<base>. The origin ref is read, never the local tracking copy for the
+// branch itself.
+func (e Exec) released(ctx context.Context, main, head, branch, base string) bool {
+	remote, err := e.RemoteHead(ctx, main, branch)
+	if err != nil {
+		return false
+	}
+	if remote != "" && strings.EqualFold(remote, head) {
+		return true
+	}
+	if base == "" || base == branch {
+		return false
+	}
+	_, err = e.Run(ctx, "git", "-C", main, "merge-base", "--is-ancestor", head, "origin/"+base)
+	return err == nil
 }
 
 // Disposable reports whether an untracked path is on the disposable list: the

@@ -789,9 +789,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			errs = append(errs, fmt.Errorf("PR %d revert check: %w", p.Number, e))
 			continue
 		}
+		reverted := false
 		if recovery != nil {
 			reason := ""
-			reverted := false
 			if recovery.MergedAt != nil {
 				// Same convention as the watch role and outcomes ledger: a
 				// recovery PR merged within seven days reverted this PR.
@@ -823,7 +823,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// whose post-merge main has not passed CI keeps its worktree. A
 		// reverted PR's own merge never turns green, so its follow-up above
 		// decided instead.
-		if !(recovery != nil && recovery.MergedAt != nil) {
+		if !reverted {
 			covers, e := s.watchCovers(ctx, r, p.MergeCommitSHA)
 			if e != nil {
 				errs = append(errs, fmt.Errorf("PR %d watch verdict: %w", p.Number, e))
