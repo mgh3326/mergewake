@@ -854,10 +854,14 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						if (row.Command == "review" && v.Findings > 0 && v.Head != "") || (row.Command == "review-round-finding" && v.Head != "") {
 							m3Critical[keyHead] = true
 						}
+						// An ack credits only the head it was sent for; a
+						// delivery's Heads list also spans later heads it stayed open across.
 						if row.Command == "findings-delivered" || row.Command == "findings-acked" {
 							if v.Head != "" {
 								m3Delivered[keyHead] = true
 							}
+						}
+						if row.Command == "findings-delivered" {
 							for _, h := range v.Heads {
 								m3Delivered[r.Name+"#"+h] = true
 							}
