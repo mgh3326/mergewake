@@ -459,35 +459,6 @@ func (h HubHost) removeCommand(ctx context.Context, args map[string]any) (Worktr
 	return WorktreeRemoveResult{Outcome: v.Outcome, Files: v.Files, RetryAfterS: v.RetryAfterS}, nil
 }
 
-// WorktreeCheck resolves a worktree and asks the node for its read-only
-// branch check (verify_branch): ok, dirty, locked, unpushed, unreadable, or
-// mismatch when expectedDir is set. The check reads origin, not a local
-// tracking copy.
-func (h HubHost) WorktreeCheck(ctx context.Context, cwd, expectedDir string) (*Worktree, string, error) {
-	var v struct {
-		Worktree *struct {
-			Path      string `json:"path"`
-			Branch    string `json:"branch"`
-			Head      string `json:"head"`
-			OriginURL string `json:"origin_url"`
-			Common    string `json:"common"`
-		} `json:"worktree"`
-		Check string `json:"check"`
-	}
-	args := map[string]any{"cwd": cwd, "verify_branch": true}
-	if expectedDir != "" {
-		args["expected_dir"] = expectedDir
-	}
-	if err := h.Hub.Command(ctx, h.Machine, "worktree.inspect", args, &v); err != nil {
-		return nil, "", err
-	}
-	if v.Worktree == nil {
-		return nil, v.Check, nil
-	}
-	w := v.Worktree
-	return &Worktree{Path: w.Path, Branch: w.Branch, Head: w.Head, Repo: RepoFromRemote(w.OriginURL), Common: w.Common}, v.Check, nil
-}
-
 // Capture saves into the node's <inbox>/jobs/<pane name>; a job whose dir is
 // named otherwise cannot be captured through the hub.
 func (h HubHost) Capture(ctx context.Context, pane Pane, job string, mergedAt *time.Time, write bool) (Capture, error) {

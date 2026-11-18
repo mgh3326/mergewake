@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -18,13 +17,13 @@ import (
 )
 
 // The worker-worktree pass removes a worker's checkout once its work is on
-// GitHub. Discovery is the host's own `git worktree list`: any worktree on a
-// wk/<job> branch is a candidate, whether or not a pane, an earlier receipt or
-// a job record ever named it. A merged PR's worktree goes when the watch
-// verdict for its merge commit is healthy, or when a revert's own follow-up is
-// green; an unmerged one goes when its PR is closed (or absent) and the hk job
-// is terminal. Every removal goes through the host's guarded removal, and
-// every refusal leaves one row naming its reason.
+// GitHub. It is the only code that removes a wk/ checkout: the older
+// merged-author cleanup hands these back to it. Discovery and removal both go
+// through the hub's node commands, the same transport reap uses: a host with no
+// node mapping or no guarded removal keeps its checkouts and records why.
+// A merged PR's worktree goes when the watch verdict for its merge commit is
+// healthy, or when a revert's own follow-up is green; an unmerged one goes when
+// its PR is closed (or absent) and the hk job on its branch is terminal.
 
 // workerBranchPrefix marks a worker's own worktree branch. The job name after
 // the slash binds the checkout to its hk job record.
@@ -41,12 +40,12 @@ type workerRows struct {
 }
 
 // reapWorkerWorktrees is one repo's worker-worktree pass over every host.
-func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, receipts []reapReceipt, records *passJobRecords, h *reapHistory, acting bool, note func(reapReceipt)) []error {
+func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, records *passJobRecords, acting bool, note func(reapReceipt)) []error {
 	after, e := config.OptionalDuration(s.Config.Reap.WorktreeAfter)
 	if e != nil {
 		return []error{e}
 	}
-	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after, note: note,
+	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after,
 		healthyCache: map[string]bool{}, ancestry: map[string]bool{}}
 	// Discovery comes first and is the only host read this pass costs when no
 	// worker worktree exists: the branch inventories below page every closed
@@ -61,6 +60,19 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 			break
 		}
 		if hs.failed {
+			continue
+		}
+		if _, ok := hs.ops.(reap.WorktreeLister); !ok || !hs.viaHub {
+			// No node mapping means no registered-worktree view and no
+			// guarded removal. A wk/ checkout some pane or job record already
+			// named stays and gets one row; there is no ssh or local fallback.
+			for _, t := range hs.trees {
+				if t == nil || !strings.HasPrefix(t.Branch, workerBranchPrefix) || !strings.EqualFold(t.Repo, r.Name) {
+					continue
+				}
+				note(reapReceipt{Action: "remove-worktree", Repo: r.Name, Host: hs.host.Name,
+					Worktree: t.Path, Cwd: t.Path, Branch: t.Branch, Result: "skipped", Reason: "hub-required", Source: workerSource})
+			}
 			continue
 		}
 		found, listErrs := w.discover(ctx, hs)
@@ -168,14 +180,21 @@ type workerPass struct {
 	r            config.Repo
 	records      *passJobRecords
 	acting       bool
-	note         func(reapReceipt)
-	procOnce     sync.Once
-	procEv       procEvidence
-	procErr      error
 	now          time.Time
 	after        time.Duration
 	healthyCache map[string]bool
 	ancestry     map[string]bool
+}
+
+// workerClone is one registered clone to list: its main checkout and its git
+// common dir, which is what the node's worktree.list takes.
+type workerClone struct {
+	main   string
+	common string
+	// trusted marks a clone reap already knows: a common dir of an inspected
+	// worktree whose origin is this repository. Any other clone is a path
+	// guess and must prove its origin before its worktrees count.
+	trusted bool
 }
 
 // workerCand is one listed worktree on a worker branch.
@@ -184,92 +203,103 @@ type workerCand struct {
 	branch string
 	head   string
 	job    string
-	common string // the clone the worktree was listed under
+	common string // the clone's git common dir
 }
 
-// discover lists every clone's registered worktrees on the host and keeps the
-// worker branches. The clones are the common git dirs reap already knows from
-// panes and job records, plus the configured clone itself
-// (<work_root>/<repo>, and the local checkout on a local host), so a worktree
-// no pane, receipt or job record names is still found.
+// discover lists every clone's registered worktrees on the hub host and keeps
+// the worker branches. Clones are the common dirs reap already knows from
+// panes, plus the configured clone `<work_root>/<repo>`; a worktree no pane,
+// receipt or job record names is still found.
 func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, []error) {
 	lister, ok := hs.ops.(reap.WorktreeLister)
 	if !ok {
 		return nil, nil
 	}
 	var errs []error
-	seenCommon := map[string]bool{}
-	trusted := map[string]bool{}
-	var clones []string
-	add := func(path string, known bool) {
-		if path == "" {
+	seen := map[string]bool{}
+	var clones []workerClone
+	add := func(c workerClone) {
+		c.main, c.common = filepath.Clean(c.main), filepath.Clean(c.common)
+		if c.main == "" || c.common == "" || seen[c.common] {
 			return
 		}
-		p := filepath.Clean(path)
-		trusted[p] = trusted[p] || known
-		if seenCommon[p] {
-			return
-		}
-		seenCommon[p] = true
-		clones = append(clones, p)
+		seen[c.common] = true
+		clones = append(clones, c)
 	}
 	for _, t := range hs.trees {
 		if t != nil && t.Common != "" && strings.EqualFold(t.Repo, w.r.Name) {
-			add(filepath.Dir(t.Common), true)
+			add(workerClone{main: filepath.Dir(t.Common), common: t.Common, trusted: true})
 		}
 	}
-	// A clone guessed from a path is trusted only after its own origin says it
-	// is this repository: two configured repositories can share the last
-	// segment, and another owner's clone must never be judged against this
-	// repository's PRs and jobs.
 	if hs.host.WorkRoot != "" {
-		add(filepath.Join(hs.host.WorkRoot, repoSegment(w.r.Name)), false)
+		main := filepath.Join(hs.host.WorkRoot, repoSegment(w.r.Name))
+		// A path guess is trusted only after its worktrees' origin says it is
+		// this repository: two configured repositories can share the last
+		// segment, and another owner's clone must never be judged against this
+		// repository's PRs and jobs.
+		add(workerClone{main: main, common: filepath.Join(main, ".git")})
 	}
-	if hs.host.Local() && config.Expand(w.r.Root) != "" {
-		add(config.Expand(w.r.Root), false)
-	}
-	sort.Strings(clones)
+	sort.Slice(clones, func(i, j int) bool { return clones[i].common < clones[j].common })
 	seenPath := map[string]bool{}
 	var out []workerCand
 	for _, clone := range clones {
-		rows, e := reap.ListWorktrees(ctx, lister, clone)
+		rows, e := reap.ListWorktrees(ctx, lister, clone.common)
 		if e != nil {
 			// A repository not cloned on this host answers invalid args: that
 			// is an absence, not a failure. Anything else is reported once.
-			if reap.InvalidArgs(e) || isNotARepo(e) {
+			if reap.InvalidArgs(e) {
 				continue
 			}
-			errs = append(errs, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, clone, e))
+			errs = append(errs, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, clone.common, e))
 			continue
 		}
-		main := filepath.Clean(clone)
 		var listed []workerCand
 		for _, row := range rows {
 			if row.Detached || !strings.HasPrefix(row.Branch, workerBranchPrefix) {
 				continue
 			}
-			if filepath.Clean(row.Path) == main {
+			if filepath.Clean(row.Path) == clone.main {
 				continue
 			}
 			if strings.HasPrefix(filepath.Base(row.Path), "mwr-") || seenPath[row.Path] {
 				continue
 			}
 			listed = append(listed, workerCand{path: row.Path, branch: row.Branch, head: row.Head,
-				job: strings.TrimPrefix(row.Branch, workerBranchPrefix), common: clone})
+				job: strings.TrimPrefix(row.Branch, workerBranchPrefix), common: clone.common})
 		}
 		if len(listed) == 0 {
 			continue
 		}
-		if !trusted[clone] {
-			// Every worktree of a clone shares its origin, so one inspection
-			// identifies the clone. An unreadable answer or another
-			// repository drops the whole clone: a path guess is not proof.
-			wt, e := hs.ops.Inspect(ctx, listed[0].path)
-			switch {
-			case e != nil:
-				errs = append(errs, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, clone, e))
-				continue
-			case wt == nil || !strings.EqualFold(wt.Repo, w.r.Name):
+		if !clone.trusted {
+			// Every worktree of a clone shares its origin. Inspect registered
+			// candidates in turn: a stale registration answers nothing and is
+			// inconclusive, a proven origin and common dir admit the clone,
+			// and a verified mismatch refuses it. None proven keeps it out.
+			sort.Slice(listed, func(i, j int) bool { return listed[i].path < listed[j].path })
+			admitted, proven := false, false
+			for _, c := range listed {
+				wt, e := hs.ops.Inspect(ctx, c.path)
+				switch {
+				case e != nil:
+					errs = append(errs, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, c.path, e))
+				case wt == nil:
+					// A registered worktree whose directory is gone: stale,
+					// inconclusive.
+				case !strings.EqualFold(wt.Repo, w.r.Name) || filepath.Clean(wt.Common) != clone.common:
+					// A proven different repository or clone: refuse the
+					// whole path guess.
+					proven = true
+				default:
+					proven, admitted = true, true
+				}
+				if proven {
+					break
+				}
+			}
+			if !admitted {
+				if !proven {
+					errs = append(errs, fmt.Errorf("%s clone %s: repository identity not established", hs.host.Name, clone.main))
+				}
 				continue
 			}
 		}
@@ -282,13 +312,6 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 	return out, errs
 }
 
-// isNotARepo reports an Exec worktree list on a path git refuses (exit 128):
-// the clone is not on this host.
-func isNotARepo(err error) bool {
-	var ex interface{ ExitCode() int }
-	return errors.As(err, &ex) && ex.ExitCode() == 128
-}
-
 // repoSegment is the clone directory name panewire prepares under a host's
 // work root: the last segment of owner/name.
 func repoSegment(repo string) string {
@@ -298,8 +321,7 @@ func repoSegment(repo string) string {
 	return repo
 }
 
-// evaluate decides one candidate and returns its row, or nil when an earlier
-// terminal row already covers this checkout.
+// evaluate decides one candidate and returns its row.
 func (w *workerPass) evaluate(ctx context.Context, hs *reapHost, c workerCand, newest map[string]*github.Pull, open map[string]bool, errs *[]error) *reapReceipt {
 	rec := reapReceipt{Action: "remove-worktree", Repo: w.r.Name, Host: hs.host.Name, Cwd: c.path,
 		Worktree: c.path, Branch: c.branch, Head: c.head, Job: c.job, Source: workerSource}
@@ -308,16 +330,11 @@ func (w *workerPass) evaluate(ctx context.Context, hs *reapHost, c workerCand, n
 		rec.PR = q.Number
 		p = q
 	}
-	// A past `removed` row never suppresses a currently listed worktree: the
-	// same branch tip can be checked out again at the same path, and the
-	// listing is the proof that something is there to evaluate.
 	keep := func(reason string) *reapReceipt {
 		rec.Result, rec.Reason = "skipped", reason
 		return &rec
 	}
-	// A pane or process in the checkout outranks every rule below: the row
-	// says why it stays so hk 5168 can list it.
-	if reason := w.inUse(ctx, hs, c.path, false); reason != "" {
+	if reason := paneUse(hs, c.path); reason != "" {
 		return keep(reason)
 	}
 	switch {
@@ -340,54 +357,16 @@ func (w *workerPass) evaluate(ctx context.Context, hs *reapHost, c workerCand, n
 	return w.remove(ctx, hs, c, &rec, errs)
 }
 
-// procs scans this machine's processes once per pass.
-func (w *workerPass) procs(ctx context.Context) (procEvidence, error) {
-	w.procOnce.Do(func() {
-		w.procEv, w.procErr = processScan(ctx, w.s.Runner)
-	})
-	return w.procEv, w.procErr
-}
-
-// inUse names the live pane or process holding path, or "" when none does.
-// Processes are scanned only on this machine: a remote host's pane list
-// already includes its plain shells, and no node command reads its processes.
-func (w *workerPass) inUse(ctx context.Context, hs *reapHost, path string, fresh bool) string {
+// paneUse names the pane evidence keeping path: the node's pane list includes
+// plain shells, so it is the usage evidence the guard observes.
+func paneUse(hs *reapHost, path string) string {
 	if hs.usageUnknown {
 		return "pane-scan-failed"
 	}
 	if hs.paneInUse(path) {
 		return "pane-in-use"
 	}
-	if !hs.host.Local() {
-		return ""
-	}
-	// A cached scan is enough for the early decision; the removal rescans, so
-	// a process that entered after discovery still stops it. A held path
-	// counts only when it sits inside the checkout: a shell in the shared work
-	// root does not hold every worktree beneath it.
-	ev, e := w.procs(ctx)
-	if fresh {
-		ev, e = processScan(ctx, w.s.Runner)
-	}
-	if e != nil {
-		return "process-scan-unavailable"
-	}
-	held, unresolved := ev.heldPaths()
-	for _, held := range held {
-		if under(path, held) {
-			return "process-in-use"
-		}
-	}
-	if len(unresolved) > 0 {
-		return "process-unknown"
-	}
 	return ""
-}
-
-// under reports whether p sits inside root.
-func under(root, p string) bool {
-	root, p = filepath.Clean(root), filepath.Clean(p)
-	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
 }
 
 // merged is the merged-PR rule: the merge is followed by a watch verdict that
@@ -462,17 +441,22 @@ func (w *workerPass) merged(ctx context.Context, hs *reapHost, c workerCand, p *
 	return "watch-pending"
 }
 
-// unmerged is the closed-unmerged and no-PR rule: the hk job that worked the
-// checkout must be terminal (completed, abandoned or lost).
+// unmerged is the closed-unmerged and no-PR rule: the hk job encoded by
+// wk/<job> on this host must be terminal. A PR binding another job refuses the
+// checkout instead of standing in for the branch's own job.
 func (w *workerPass) unmerged(ctx context.Context, hs *reapHost, c workerCand, p *github.Pull) string {
 	job := c.job
-	if p != nil {
-		if b, e := w.s.reapBind(ctx, w.r, *p); e == nil && b.Job != "" {
-			job = b.Job
-		}
-	}
 	if job == "" || !reap.ValidJobName(job) {
 		return "job-unknown"
+	}
+	if p != nil {
+		b, e := w.s.reapBind(ctx, w.r, *p)
+		switch {
+		case e != nil:
+			return "job-binding-error"
+		case b.Job != "" && b.Job != job:
+			return "job-conflict"
+		}
 	}
 	if w.records == nil {
 		return "job-unreadable"
@@ -517,9 +501,10 @@ func terminalJobState(state string) bool {
 	return false
 }
 
-// remove is the one removal path: inspect the checkout, re-check pane usage,
-// then ask the transport for its guarded removal with the disposable list. A
-// refusal is a row with its reason.
+// remove is the one removal path: re-read the pane list, revalidate the whole
+// candidate identity through the node, then ask the node's guarded removal
+// with the disposable list. A refusal is a row with its reason; nothing is
+// deleted here, so a refused removal leaves the checkout, draft included.
 func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec *reapReceipt, errs *[]error) *reapReceipt {
 	keep := func(reason string) *reapReceipt {
 		rec.Result, rec.Reason = "skipped", reason
@@ -528,8 +513,8 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 	remover, ok := hs.ops.(interface {
 		WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error)
 	})
-	if !ok {
-		return keep("no-guarded-remove")
+	if !ok || !hs.viaHub {
+		return keep("hub-guard-unavailable")
 	}
 	if !w.acting {
 		rec.Result, rec.Reason = "would-remove", ""
@@ -541,8 +526,21 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 		*errs = append(*errs, fmt.Errorf("%s pane list: %w", hs.host.Name, e))
 		return keep("pane-scan-failed")
 	}
-	if reason := w.inUse(ctx, hs, c.path, true); reason != "" {
+	if reason := paneUse(hs, c.path); reason != "" {
 		return keep(reason)
+	}
+	// Bind the policy to the checkout the node is about to act on: the same
+	// origin, common dir, path, branch and head that discovery proved.
+	wt, e := hs.ops.Inspect(ctx, c.path)
+	switch {
+	case e != nil:
+		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e))
+		return keep("worktree-inspect-error")
+	case wt == nil:
+		return keep("worktree-gone")
+	case wt.Path != c.path || wt.Branch != c.branch || wt.Head != c.head ||
+		filepath.Clean(wt.Common) != c.common || !strings.EqualFold(wt.Repo, w.r.Name):
+		return keep("worktree-changed")
 	}
 	result, e := remover.WorktreeRemoveDisposable(ctx, c.path, c.head, w.r.Branch,
 		w.s.Config.Reap.Regenerable, w.s.Config.Reap.Disposable, false)
@@ -562,27 +560,6 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 		rec.Result, rec.Reason = "skipped", "ignored-files:"+filesSig(result.Files)
 	default:
 		rec.Result, rec.Reason = worktreeRemoveVerdict(result)
-	}
-	if rec.Result == "removed" && !hs.viaHub {
-		// The hub node deletes the branch itself; a local or ssh host still
-		// needs the same -d, which git refuses on a branch it cannot prove
-		// merged. The remote head branch is never touched on either path, and
-		// a refused local delete is a row, not a pass error: a squash-merged
-		// branch is refused on every removal.
-		if deleter, ok := hs.ops.(interface {
-			DeleteBranch(context.Context, string, string) error
-		}); ok {
-			brec := reapReceipt{Action: "delete-branch", Repo: w.r.Name, PR: rec.PR, Host: hs.host.Name,
-				Worktree: c.path, Branch: c.branch, Source: workerSource}
-			if err := deleter.DeleteBranch(ctx, c.common, c.branch); err != nil {
-				brec.Result, brec.Reason = "skipped", "refused: "+err.Error()
-			} else {
-				brec.Result = "deleted"
-			}
-			if w.note != nil {
-				w.note(brec)
-			}
-		}
 	}
 	return rec
 }
@@ -654,4 +631,30 @@ func (w *workerPass) ancestor(ctx context.Context, older, newer string, errs *[]
 	}
 	w.ancestry[k] = ok
 	return ok
+}
+
+// under reports whether p sits inside root.
+func under(root, p string) bool {
+	root, p = filepath.Clean(root), filepath.Clean(p)
+	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
+}
+
+// processInUse names the process evidence keeping the older merged-author path
+// from removing path on this machine, or "". A scan that cannot read every
+// process fails closed: no proof means the checkout stays.
+func (s *Service) processInUse(ctx context.Context, path string) string {
+	ev, e := processScan(ctx, s.Runner)
+	if e != nil {
+		return "process-scan-unavailable"
+	}
+	held, unresolved := ev.heldPaths()
+	for _, p := range held {
+		if under(path, p) {
+			return "process-in-use"
+		}
+	}
+	if len(unresolved) > 0 {
+		return "process-unknown"
+	}
+	return ""
 }

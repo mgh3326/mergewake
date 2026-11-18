@@ -71,7 +71,7 @@ func TestReapSkipsGoneWorktreeTerminalPR(t *testing.T) {
 var settledLowPR = github.Pull{
 	Number: 11, State: "closed", Merged: true,
 	Body:     "Earlier PR of the same task.\n\nMergewake-Task: 4669\n",
-	Head:     github.Ref{Ref: "wk/y", SHA: "feedfeed"},
+	Head:     github.Ref{Ref: "feat/y", SHA: "feedfeed"},
 	Base:     github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "def456",
 }

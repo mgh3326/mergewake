@@ -77,7 +77,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
-| `disposable` | `report.draft.md` | Untracked files a worker worktree may still hold when it is removed, as worktree-relative paths matched exactly. A worker's report draft lives in hk, so a leftover copy inside the checkout is expendable; the pass never removes a worktree holding any other untracked file. An empty list means the default; entries must be relative and must not contain `..`. Passing the list through the hub needs a panewire node that accepts `worktree.remove`'s `disposable` argument; an older node refuses the request, mergewake retries without the argument, and the node's own dirty check then keeps the worktree with a `skipped | dirty` row until a node accepts the list. Local and ssh hosts apply the list directly. |
+| `disposable` | `report.draft.md` | Untracked files a worker worktree may still hold when it is removed, as worktree-relative paths matched exactly. A worker's report draft lives in hk, so a leftover copy inside the checkout is expendable; the pass never removes a worktree holding any other untracked file. An empty list means the default; entries must be relative and must not contain `..`. The list goes to the hub as `worktree.remove`'s `disposable` argument; an older node refuses the request, mergewake retries without the argument, and the node's own dirty check then keeps the worktree with a `skipped | dirty` row until a node accepts the list. |
 | `worktree_drain.per_host` | `20` | Maximum guarded removals the worker-worktree pass asks of one host in one pass; the host's remaining worktrees wait for the next pass. Zero means the default. It caps removals only, so one host's backlog never stalls the others. |
 | `worktree_drain.host_order` | Config host order | Host names in the order the worker-worktree pass visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 | `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others; a label left pending for a missing `work_root` spends none of it. |
@@ -298,21 +298,29 @@ the reason recorded; removal is `git worktree remove` without `--force` and the
 local branch is deleted with `git branch -d`, never `-D`. The remote branch
 stays. Worktrees are found from the panes, from prior `reap.jsonl` rows and from
 the job record of the PR's task, so a worktree whose pane panewire already
-closed still gets cleaned.
+closed still gets cleaned. A `wk/` worktree is not this path's: it is skipped
+here and left to the worker-worktree pass below. On a local or ssh host this
+path checks the machine's processes immediately before its `git worktree
+remove` and keeps a checkout a process holds (a process scan that cannot read
+every process keeps it too); under the hub transport the node's guard decides.
 
 #### Worker worktrees
 
 A worker's checkout is recognised by its branch: `wk/<job>`, where `<job>` is
-the hk job that worked it. The worker-worktree pass runs on every whole-repo
-`reap` pass and finds candidates from each host's own registered worktrees:
-the common git dirs reap already knows from panes and job records, the
-configured clone `<hosts[].work_root>/<repo>` when that host names a work root,
-and the local `repos[].root` checkout on a local host. A clone guessed from a
-path is used only when one of its worktrees inspects as the configured
-repository, so another owner's same-named clone can never be judged against
-this repository's PRs. A `wk/` worktree is a candidate even when no pane,
-receipt or job record names it. The main checkout
-and `mwr-*` reviewer checkouts are never candidates.
+the hk job that worked it. This pass is the only code that removes a `wk/`
+checkout: the older merged-author cleanup above skips it, in whole-repo and
+PR-scoped passes alike. The pass runs on every whole-repo `reap` pass and
+discovers candidates through the hub's node commands only. Each clone's
+registered worktrees are listed by its git common dir: the common dirs reap
+already knows from panes, and the configured clone
+`<hosts[].work_root>/<repo>` when that host names a work root. A clone guessed
+from that path is admitted only after a registered worktree inspects as the
+configured repository and the same common dir; a stale registration is
+inconclusive and the next candidate is tried, a verified mismatch refuses the
+clone, and none proven keeps it out. A host with no node mapping or no guarded
+removal never falls back to ssh or local commands: a `wk/` checkout a pane
+already named stays, with one `hub-required` row. The main checkout and
+`mwr-*` reviewer checkouts are never candidates.
 
 A candidate goes when its work is on GitHub:
 
@@ -322,36 +330,30 @@ A candidate goes when its work is on GitHub:
   open and until that revert's own merge is green. The head branch is never
   deleted on the remote, and a reverted PR's work stays fetchable from GitHub.
 - A worktree whose newest PR closed unmerged, or that has no PR at all, goes
-  once the hk job record that worked it is terminal (`completed`, `abandoned`,
-  `escalated` or `lost`). A live job, an unknown job or a record naming another
-  host keeps it.
+  once the hk job record encoded by `wk/<job>` on that host is terminal
+  (`completed`, `abandoned`, `escalated` or `lost`). A live job, an unknown
+  job, a record naming another host, or a PR binding a different job
+  (`job-conflict`) keeps it.
 
-Removal goes only through the host's guarded removal — the node's
-`worktree.remove`, or the same checks for a local or ssh host. It must find the
-worktree registered and unlocked, at the inspected commit, with no modified
-tracked file and no untracked file outside `reap.disposable`; gitignored files
-must match `reap.regenerable` (so Unity's `Library/`, `bin/` and `obj/` count
-as expendable when listed there, as the defaults do); the branch head must be
-on the origin remote (the remote is asked, not the local tracking copy) or,
-when the remote ref is gone as delete-branch-on-merge leaves it, already in a
-freshly fetched `origin/<base>` (a fetch that fails refuses the removal); no live pane may use it; and a kept worktree keeps its draft,
-because disposable files are deleted only immediately before the removal.
-On a local host the pass also reads every process's
-working directory and open files and refuses a worktree one of them sits
-inside; a process in a parent directory does not count, and the scan is
-repeated immediately before an acting removal. A remote host's pane list
-already includes its plain shells. Anything refused stays and gets
-one `remove-worktree` row with its precise reason — `unpushed`, `dirty`,
-`pane-in-use`, `process-in-use`, `locked`, `ignored-files:<count>-<hash>`, a
+Removal goes only through the node's guarded `worktree.remove`, with the
+disposable list. The node must find the worktree registered and unlocked, at
+the inspected commit, with no modified tracked file and no untracked file
+outside `reap.disposable`; gitignored files must match `reap.regenerable` (so
+Unity's `Library/`, `bin/` and `obj/` count as expendable when listed there, as
+the defaults do); the branch must be released — its origin head equal to the
+checkout, or, when the remote ref is gone as delete-branch-on-merge leaves it,
+the checkout's commit in the base the node proves — and no live pane (agent or
+plain shell) may use it. Immediately before the call the pass revalidates the
+whole candidate through the node — same origin, common dir, path, branch and
+head — and keeps a checkout that changed. The pass deletes nothing itself, so a
+refused removal leaves the checkout and its report draft as they were. Anything
+refused stays and gets one `remove-worktree` row with its precise reason —
+`unpushed`, `dirty`, `pane-in-use`, `locked`, `ignored-files:<count>-<hash>`, a
 guarded-removal refusal, or a rule keeping it (`watch-pending`,
-`recovery-open`, `reverted`, `job-active:<state>`, `open-pr`). A checkout
-whose only extra file is a disposable entry stays `skipped | dirty` until the
-node accepts `reap.disposable` (see the `disposable` key above). The row's
-`source` is `worktree-list` for a candidate only the listing reached.
-
-The local branch is deleted with `git branch -d` after removal, never `-D`;
-the remote head branch is never touched. `reap.worktree_drain.per_host` and
-`host_order` bound and order the removals per pass.
+`recovery-open`, `reverted`, `job-active:<state>`, `job-conflict`, `open-pr`).
+A checkout whose only extra file is a disposable entry stays `skipped | dirty`
+until the node accepts `reap.disposable` (see the `disposable` key above). The
+row's `source` is `worktree-list` for a candidate only the listing reached.
 
 #### Panewire transport
 

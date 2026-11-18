@@ -19,7 +19,7 @@ import (
 var jobRecordPR = github.Pull{
 	Number: 12, State: "closed", Merged: true,
 	Body:     "Reap through the job record.\n\nMergewake-Task: 4669\n",
-	Head:     github.Ref{Ref: "wk/x", SHA: headSHA},
+	Head:     github.Ref{Ref: "feat/x", SHA: headSHA},
 	Base:     github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "abc123",
 }
@@ -183,11 +183,11 @@ func TestReapJobRecordReadErrorIsNotAMiss(t *testing.T) {
 }
 
 // siblingPR is a second merged PR of the same task, on its own branch: the job's
-// worktree is on wk/x, so this PR must not be offered it.
+// worktree is on feat/x, so this PR must not be offered it.
 var siblingPR = github.Pull{
 	Number: 13, State: "closed", Merged: true,
 	Body:     "Sibling of the same task.\n\nMergewake-Task: 4669\n",
-	Head:     github.Ref{Ref: "wk/y", SHA: "feedfeed"},
+	Head:     github.Ref{Ref: "feat/y", SHA: "feedfeed"},
 	Base:     github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-8 * 24 * time.Hour)), MergeCommitSHA: "def456",
 }

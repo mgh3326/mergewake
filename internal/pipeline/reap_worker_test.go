@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +18,9 @@ import (
 // workerCwd is the worker worktree the hub fixture lists: a wk/<job> branch
 // under the host's work root, named by no pane, receipt or job record.
 const workerCwd = "/work/project.job"
+
+// workerCommon is the git common dir the fixture's clone is listed by.
+const workerCommon = "/work/project/.git"
 
 // workerGH is the closed/open inventory a worker pass reads, plus the revert
 // watch the merged rule consults.
@@ -46,7 +48,7 @@ func workerPR(number int, merged bool, mergeSHA string) github.Pull {
 }
 
 // workerFixture is one hub host whose repository clone holds the main checkout
-// and the worker's linked worktree, with i<0 panes anywhere.
+// and the worker's linked worktree.
 func workerFixture(t *testing.T, prs ...github.Pull) (*Service, *fakeReapHub, *workerGH) {
 	t.Helper()
 	hub := newFakeReapHub()
@@ -54,7 +56,8 @@ func workerFixture(t *testing.T, prs ...github.Pull) (*Service, *fakeReapHub, *w
 	hub.wtHead = headSHA
 	hub.wtPaths = map[string]bool{workerCwd: true}
 	hub.branches = map[string]string{workerCwd: "wk/job"}
-	hub.lists = map[string][]map[string]any{"/work/project": {
+	hub.commons = map[string]string{workerCwd: workerCommon}
+	hub.lists = map[string][]map[string]any{workerCommon: {
 		listedRow("/work/project", "main"),
 		listedRow(workerCwd, "wk/job"),
 	}}
@@ -87,7 +90,7 @@ func jobState(s *Service, job, state string) {
 
 // A worktree on a wk/ branch is discovered from the host's own worktree list,
 // with no pane, receipt or job record naming it, and removed once its merge has
-// a healthy watch verdict.
+// a healthy watch verdict. The clone is listed by its git common dir.
 func TestWorkerWorktreeDiscoveryNeedsNoPaneReceiptOrJob(t *testing.T) {
 	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
 	jobState(s, "job", "completed")
@@ -98,9 +101,34 @@ func TestWorkerWorktreeDiscoveryNeedsNoPaneReceiptOrJob(t *testing.T) {
 	if len(removes) != 1 || removes[0]["cwd"] != workerCwd || removes[0]["expect_head"] != headSHA {
 		t.Fatalf("removes: %#v", removes)
 	}
+	lists := hub.ops("worktree.list")
+	if len(lists) == 0 || lists[0]["common"] != workerCommon {
+		t.Fatalf("worktree.list args: %#v", lists)
+	}
 	rows := workerLogRows(t, s)
 	if len(rows) != 1 || rows[0]["result"] != "removed" || rows[0]["source"] != workerSource {
 		t.Fatalf("rows: %v", rows)
+	}
+}
+
+// A host with no node mapping never falls back to ssh or local commands: its
+// checkouts stay and one row names the refusal.
+func TestWorkerWorktreeNonHubHostIsRefused(t *testing.T) {
+	outs := worktreeOuts("/repo")
+	outs[key("git", "-C", "/repo.wt", "branch", "--show-current")] = "wk/x\n"
+	r := &scriptRunner{outs: outs}
+	s := svc(t, &workerGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "hub-required" && row["host"] == "local" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("hub-required row missing")
 	}
 }
 
@@ -190,8 +218,8 @@ func TestWorkerWorktreeRevertedWaitsForFollowUp(t *testing.T) {
 	})
 }
 
-// Unmerged work goes when its PR closed unmerged (or never existed) and the hk
-// job is terminal; a live job keeps it.
+// Unmerged work goes when its PR closed unmerged (or never existed) and the job
+// encoded by wk/<job> is terminal; a live job keeps it.
 func TestWorkerWorktreeUnmergedNeedsTerminalJob(t *testing.T) {
 	t.Run("closed unmerged, job completed", func(t *testing.T) {
 		s, hub, _ := workerFixture(t, workerPR(40, false, ""))
@@ -228,8 +256,26 @@ func TestWorkerWorktreeUnmergedNeedsTerminalJob(t *testing.T) {
 	})
 }
 
+// A closed PR that binds another job never stands in for the branch's own job:
+// the checkout is kept while its own job is live.
+func TestWorkerWorktreeConflictingJobBindingKeeps(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, false, ""))
+	s.Sink.(*jobSink).jobs["3074"] = "old"
+	s.Sink.(*jobSink).recs["old"] = integrations.JobRecord{State: "completed", Host: "node-a", Label: "old"}
+	jobState(s, "job", "working")
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removes: %d", n)
+	}
+	if rows := workerLogRows(t, s); len(rows) != 1 || rows[0]["reason"] != "job-conflict" {
+		t.Fatalf("rows: %v", rows)
+	}
+}
+
 // A merge whose list body carries no merge_commit_sha resolves it through Pull
-// and still removes: the merge-commit-unknown skip had no live cause left.
+// and still removes.
 func TestWorkerWorktreeMergeCommitResolvedThroughPull(t *testing.T) {
 	s, hub, gh := workerFixture(t, workerPR(40, true, ""))
 	jobState(s, "job", "completed")
@@ -247,8 +293,7 @@ func TestWorkerWorktreeMergeCommitResolvedThroughPull(t *testing.T) {
 	}
 }
 
-// Each guard failure keeps the worktree and names its reason; the unpushed
-// commit is the case that must never leave.
+// Each guard failure keeps the worktree and names its reason.
 func TestWorkerWorktreeGuardKeepsWithReason(t *testing.T) {
 	for _, tc := range []struct{ name, outcome, want string }{
 		{"unpushed", "unmerged-or-unpushed", "unpushed"},
@@ -275,7 +320,7 @@ func TestWorkerWorktreeGuardKeepsWithReason(t *testing.T) {
 	}
 }
 
-// A pane in the worktree keeps it, before any hk read or removal.
+// A pane in the worktree keeps it.
 func TestWorkerWorktreePaneInUseStays(t *testing.T) {
 	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
 	jobState(s, "job", "completed")
@@ -291,7 +336,7 @@ func TestWorkerWorktreePaneInUseStays(t *testing.T) {
 	}
 }
 
-// The disposable list is passed to the guarded removal, so a node that takes
+// The disposable list is passed to the guarded removal, so the node that takes
 // it may remove a checkout holding only the report draft.
 func TestWorkerWorktreeDisposablePassedToGuard(t *testing.T) {
 	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
@@ -324,15 +369,17 @@ func TestWorkerWorktreePerHostCap(t *testing.T) {
 	hub := newFakeReapHub()
 	hub.agents["agents"], hub.agents["panes"] = []any{}, []any{}
 	hub.wtHead = headSHA
+	common := "/work/project/.git"
 	hub.wtPaths = map[string]bool{"/work/a.wt": true, "/work/b.wt": true, "/work/c.wt": true}
 	hub.branches = map[string]string{"/work/a.wt": "wk/a", "/work/b.wt": "wk/b", "/work/c.wt": "wk/c"}
-	hub.lists = map[string][]map[string]any{"/work/project": {
+	hub.commons = map[string]string{"/work/a.wt": common, "/work/b.wt": common, "/work/c.wt": common}
+	hub.lists = map[string][]map[string]any{common: {
 		listedRow("/work/project", "main"),
 		listedRow("/work/a.wt", "wk/a"),
 		listedRow("/work/b.wt", "wk/b"),
 		listedRow("/work/c.wt", "wk/c"),
 	}}
-	s, out := hubSvc(t, hub, &scriptRunner{})
+	s, _ := hubSvc(t, hub, &scriptRunner{})
 	s.Config.Hosts[0].WorkRoot = "/work"
 	s.Config.Reap.WorktreeDrain = config.ReviewerDrain{PerHost: 1}
 	s.GH = &workerGH{legacyGH: legacyGH{}}
@@ -344,7 +391,7 @@ func TestWorkerWorktreePerHostCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n := len(hub.ops("worktree.remove")); n != 1 {
-		t.Fatalf("removes %d, want the per-host cap: %s", n, out.String())
+		t.Fatalf("removes %d, want the per-host cap", n)
 	}
 	// The next pass takes the next one.
 	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
@@ -355,190 +402,9 @@ func TestWorkerWorktreePerHostCap(t *testing.T) {
 	}
 }
 
-// The guarded removal's own disposable list allows an untracked report draft
-// and still refuses any other untracked file.
-func TestExecWorktreeRemoveDisposableList(t *testing.T) {
-	outs := func(remoteHead, untracked string) map[string]string {
-		return map[string]string{
-			key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
-			key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
-			key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
-			key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
-			key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      untracked,
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
-			key("rm", "-rf", "/repo.wt/report.draft.md"):                                                           "",
-			key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         remoteHead + "\trefs/heads/wk/x\n",
-			key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
-		}
-	}
-	run := func(remoteHead, untracked string) (*scriptRunner, reap.Exec) {
-		r := &scriptRunner{outs: outs(remoteHead, untracked)}
-		return r, reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
-	}
-	t.Run("disposable draft allowed", func(t *testing.T) {
-		r, e := run(headSHA, "?? report.draft.md\n")
-		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
-		if err != nil || got.Outcome != "removed" {
-			t.Fatalf("%v %v", got, err)
-		}
-		if !r.called("worktree\x00remove\x00/repo.wt") {
-			t.Fatal("worktree not removed")
-		}
-	})
-	t.Run("other untracked blocks", func(t *testing.T) {
-		r, e := run(headSHA, "?? notes.md\n")
-		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
-		if err != nil || got.Outcome != "dirty" {
-			t.Fatalf("%v %v", got, err)
-		}
-		if r.called("worktree\x00remove") || r.called("rm\x00-rf") {
-			t.Fatal("blocked worktree was touched")
-		}
-	})
-	t.Run("unpushed head blocks", func(t *testing.T) {
-		_, e := run("ffff0000", "")
-		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, nil, false)
-		if err != nil || got.Outcome != "unpushed" {
-			t.Fatalf("%v %v", got, err)
-		}
-	})
-}
-
-// A refusal keeps the draft: disposable files are deleted only immediately
-// before the removal, so ignored-files and unpushed checkouts keep them.
-func TestExecWorktreeRemoveDisposableKeepsDraftOnRefusal(t *testing.T) {
-	base := func(remoteHead, ignored, untracked string) map[string]string {
-		return map[string]string{
-			key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
-			key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
-			key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
-			key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
-			key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      untracked,
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
-			key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     ignored,
-			key("rm", "-rf", "/repo.wt/report.draft.md"):                                                           "",
-			key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         remoteHead + "\trefs/heads/wk/x\n",
-			key("git", "-C", "/repo", "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"):                "",
-			key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"):                       "",
-			key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
-		}
-	}
-	t.Run("ignored files keep the draft", func(t *testing.T) {
-		r := &scriptRunner{outs: base(headSHA, "!! .env\n", "?? report.draft.md\n")}
-		e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
-		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
-		if err != nil || got.Outcome != "ignored-files" {
-			t.Fatalf("%v %v", got, err)
-		}
-		if r.called("rm\x00-rf") {
-			t.Fatal("draft deleted from a kept worktree")
-		}
-	})
-	t.Run("unpushed keeps the draft", func(t *testing.T) {
-		outs := base("ffff0000", "", "?? report.draft.md\n")
-		delete(outs, key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"))
-		delete(outs, key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "FETCH_HEAD"))
-		r := &scriptRunner{outs: outs}
-		e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
-		got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, []string{"report.draft.md"}, false)
-		if err != nil || got.Outcome != "unpushed" {
-			t.Fatalf("%v %v", got, err)
-		}
-		if r.called("rm\x00-rf") {
-			t.Fatal("draft deleted from a kept worktree")
-		}
-	})
-}
-
-// A merged branch whose remote ref was deleted (delete-branch-on-merge) passes
-// on base ancestry instead of being kept as unpushed for ever.
-func TestExecWorktreeRemoveUsesBaseWhenRemoteBranchIsGone(t *testing.T) {
-	r := &scriptRunner{outs: map[string]string{
-		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
-		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
-		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
-		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
-		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
-		key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         "",
-		key("git", "-C", "/repo", "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"):                "",
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "FETCH_HEAD"):                        "",
-		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                                            "",
-	}}
-	e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
-	got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, nil, false)
-	if err != nil || got.Outcome != "removed" {
-		t.Fatalf("%v %v", got, err)
-	}
-}
-
-// A refused local branch delete is a row, not a pass error.
-type branchDeleteFake struct {
-	reap.Ops
-	delErr error
-	path   string
-}
-
-func (f *branchDeleteFake) AllPanes(context.Context) ([]reap.Pane, error) { return nil, nil }
-func (f *branchDeleteFake) Inspect(context.Context, string) (*reap.Worktree, error) {
-	return &reap.Worktree{Path: f.path, Common: "/repo/.git", Branch: "wk/job", Head: headSHA, Repo: "example/project"}, nil
-}
-func (f *branchDeleteFake) WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error) {
-	return reap.WorktreeRemoveResult{Outcome: "removed"}, nil
-}
-func (f *branchDeleteFake) DeleteBranch(context.Context, string, string) error { return f.delErr }
-
-func TestWorkerBranchDeleteRefusalIsARow(t *testing.T) {
-	var rows []reapReceipt
-	f := &branchDeleteFake{delErr: errors.New("exit status 1"), path: "/work/project.job"}
-	w := &workerPass{s: &Service{Config: repoConfig(t.TempDir())}, r: testRepo, acting: true,
-		note: func(v reapReceipt) { rows = append(rows, v) }}
-	hs := &reapHost{host: reap.Host{Name: "node", SSH: "ops@node.example"}, ops: f, trees: map[string]*reap.Worktree{}}
-	rec := &reapReceipt{Action: "remove-worktree", Repo: "example/project", Host: "node", Worktree: f.path, Branch: "wk/job"}
-	var errs []error
-	got := w.remove(context.Background(), hs, workerCand{path: f.path, branch: "wk/job", head: headSHA, common: "/repo"}, rec, &errs)
-	if got.Result != "removed" || len(errs) != 0 {
-		t.Fatalf("%v %v", got, errs)
-	}
-	if len(rows) != 1 || rows[0].Action != "delete-branch" || rows[0].Result != "skipped" || !strings.HasPrefix(rows[0].Reason, "refused: ") {
-		t.Fatalf("rows: %#v", rows)
-	}
-}
-
-// A stale local origin/<base> is not proof: when the base cannot be read from
-// the remote now, the removal fails closed.
-func TestExecWorktreeRemoveFailsClosedOnUnverifiedBase(t *testing.T) {
-	r := &scriptRunner{outs: map[string]string{
-		key("git", "-C", "/repo.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/repo/.git/worktrees/repo.wt\n/repo/.git\n/repo.wt\n",
-		key("git", "-C", "/repo.wt", "branch", "--show-current"):                                               "wk/x\n",
-		key("git", "-C", "/repo.wt", "rev-parse", "HEAD"):                                                      headSHA + "\n",
-		key("git", "-C", "/repo.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/project.git\n",
-		key("git", "-C", "/repo", "worktree", "list", "--porcelain"):                                           "worktree /repo\nHEAD bbbb\nbranch refs/heads/main\n\nworktree /repo.wt\nHEAD " + headSHA + "\nbranch refs/heads/wk/x\n",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=normal"):                      "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--untracked-files=no"):                          "",
-		key("git", "-C", "/repo.wt", "status", "--porcelain", "--ignored"):                                     "",
-		key("git", "-C", "/repo", "ls-remote", "--heads", "origin", "refs/heads/wk/x"):                         "",
-		// The stale tracking ref would still pass, but the fetch does not.
-		key("git", "-C", "/repo", "merge-base", "--is-ancestor", headSHA, "origin/main"): "",
-		key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"):                      "",
-	}}
-	e := reap.Exec{Runner: r, Host: reap.Host{Name: "local"}}
-	got, err := e.WorktreeRemoveDisposable(context.Background(), "/repo.wt", headSHA, "main", nil, nil, false)
-	if err != nil || got.Outcome != "unpushed" {
-		t.Fatalf("%v %v", got, err)
-	}
-	if r.called("worktree\x00remove") {
-		t.Fatal("removed without a verified base")
-	}
-}
-
 // A clone guessed from <work_root>/<repo> belongs to this repository only when
-// its worktrees' origin says so; another owner's clone is left alone.
+// its worktrees' origin says so; another owner's clone is left alone, and the
+// same-named clone is never listed as this repo.
 func TestWorkerWorktreeForeignCloneIsNotTouched(t *testing.T) {
 	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
 	jobState(s, "job", "completed")
@@ -551,6 +417,25 @@ func TestWorkerWorktreeForeignCloneIsNotTouched(t *testing.T) {
 	}
 	if rows := workerLogRows(t, s); len(rows) != 0 {
 		t.Fatalf("rows: %v", rows)
+	}
+}
+
+// A stale first registration is inconclusive: the clone's identity is proven by
+// the next registered candidate, which is then removed.
+func TestWorkerWorktreeStaleFirstRegistrationDoesNotDropTheClone(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.lists[workerCommon] = []map[string]any{
+		listedRow("/work/project", "main"),
+		listedRow("/work/gone.wt", "wk/gone"),
+		listedRow(workerCwd, "wk/job"),
+	}
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != workerCwd {
+		t.Fatalf("removes: %#v", removes)
 	}
 }
 
@@ -574,45 +459,115 @@ func TestWorkerWorktreeRecreatedAtSamePathIsEvaluated(t *testing.T) {
 	}
 }
 
-// A process in a parent directory does not hold the checkout; a process that
-// enters after discovery does, because the removal rescans.
-func TestWorkerProcessUsage(t *testing.T) {
+// guardFake is a hub host whose inspected identity a test controls.
+type guardFake struct {
+	reap.Ops
+	head    string
+	removes int
+}
+
+func (f *guardFake) AllPanes(context.Context) ([]reap.Pane, error) { return nil, nil }
+func (f *guardFake) Inspect(_ context.Context, path string) (*reap.Worktree, error) {
+	return &reap.Worktree{Path: path, Common: workerCommon, Branch: "wk/job", Head: f.head, Repo: "example/project"}, nil
+}
+func (f *guardFake) WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error) {
+	f.removes++
+	return reap.WorktreeRemoveResult{Outcome: "removed"}, nil
+}
+
+// The candidate tuple is revalidated immediately before the guarded removal:
+// a checkout whose head moved on is kept.
+func TestWorkerWorktreeIdentityRevalidatedBeforeRemoval(t *testing.T) {
+	f := &guardFake{head: "moved"}
+	w := &workerPass{s: &Service{Config: repoConfig(t.TempDir())}, r: testRepo, acting: true}
+	hs := &reapHost{host: reap.Host{Name: "node", Machine: "node-a"}, ops: f, viaHub: true, trees: map[string]*reap.Worktree{}}
+	cand := workerCand{path: workerCwd, branch: "wk/job", head: headSHA, common: workerCommon}
+	rec := &reapReceipt{Action: "remove-worktree", Repo: "example/project", Host: "node", Worktree: cand.path, Branch: cand.branch}
+	var errs []error
+	if got := w.remove(context.Background(), hs, cand, rec, &errs); got.Result != "skipped" || got.Reason != "worktree-changed" {
+		t.Fatalf("%v %v", got, errs)
+	}
+	if f.removes != 0 {
+		t.Fatal("removal dispatched for a changed checkout")
+	}
+	f.head = headSHA
+	if got := w.remove(context.Background(), hs, cand, rec, &errs); got.Result != "removed" {
+		t.Fatalf("%v %v", got, errs)
+	}
+	if f.removes != 1 {
+		t.Fatalf("removes %d", f.removes)
+	}
+}
+
+// The older merged-author path never removes a wk/ checkout: the worker pass
+// owns it, in whole-repo and PR-scoped passes alike.
+func TestNoExecRemovalForWorkerWorktree(t *testing.T) {
+	for _, pr := range []int{0, 12} {
+		r := &scriptRunner{outs: panegoneWorktreeOuts("/repo")}
+		s := svc(t, &workerBranchGH{}, r)
+		seedWorktreeReceipt(t, s, "example/project", "/repo.wt")
+		if err := s.Reap(context.Background(), testRepo, pr, Options{}); err != nil {
+			t.Fatalf("pr %d: %v", pr, err)
+		}
+		if r.called("worktree\x00remove") || r.called("branch\x00-d") {
+			t.Fatalf("pr %d removed a wk/ checkout: %q", pr, r.calls)
+		}
+	}
+}
+
+// workerBranchGH is a merged pull on the worktree's own wk/ branch, so the
+// older path is offered the checkout the worker pass owns.
+type workerBranchGH struct{ reapGH }
+
+func (workerBranchGH) MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error) {
+	p := mergedPull
+	p.Head.Ref = "wk/x"
+	return []github.Pull{p}, nil
+}
+
+func (workerBranchGH) Pull(context.Context, string, int) (github.Pull, error) {
+	p := mergedPull
+	p.Head.Ref = "wk/x"
+	return p, nil
+}
+
+// The older merged-author path checks processes before its next removal.
+func TestMergedPathProcessCheck(t *testing.T) {
 	orig := processScan
 	t.Cleanup(func() { processScan = orig })
+	processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
+		return procEvidence{cwds: []string{"/repo.wt/sub"}}, nil
+	}
+	outs := panegoneWorktreeOuts("/repo")
+	keyBranch := key("git", "-C", "/repo.wt", "branch", "--show-current")
+	outs[keyBranch] = "feat/x\n"
+	outs[key("git", "-C", "/repo", "merge-base", "--is-ancestor", "feat/x", "origin/main")] = ""
+	outs[key("git", "-C", "/repo", "branch", "-d", "feat/x")] = ""
+	delete(outs, key("git", "-C", "/repo", "worktree", "remove", "/repo.wt"))
+	r := &scriptRunner{outs: outs}
+	s := svc(t, &featGH{}, r)
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.called("worktree\x00remove") {
+		t.Fatal("removed a checkout a process holds")
+	}
+	var saw bool
+	for _, row := range reapLogRows(t, s, "example/project") {
+		if row["reason"] == "process-in-use" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("process-in-use not recorded")
+	}
+}
 
-	t.Run("parent cwd does not block", func(t *testing.T) {
-		processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
-			return procEvidence{cwds: []string{"/work"}}, nil
-		}
-		w := &workerPass{s: &Service{Runner: &scriptRunner{}}}
-		hs := &reapHost{host: reap.Host{Name: "local"}}
-		if got := w.inUse(context.Background(), hs, workerCwd, true); got != "" {
-			t.Fatalf("reason %q", got)
-		}
-	})
-	t.Run("a process entering after discovery blocks", func(t *testing.T) {
-		calls := 0
-		processScan = func(context.Context, integrations.Runner) (procEvidence, error) {
-			calls++
-			if calls == 1 {
-				return procEvidence{}, nil
-			}
-			return procEvidence{cwds: []string{workerCwd + "/sub"}}, nil
-		}
-		f := &branchDeleteFake{path: workerCwd}
-		w := &workerPass{s: &Service{Config: repoConfig(t.TempDir()), Runner: &scriptRunner{}}, r: testRepo,
-			acting: true, note: func(reapReceipt) {}}
-		hs := &reapHost{host: reap.Host{Name: "local"}, ops: f, trees: map[string]*reap.Worktree{}}
-		cand := workerCand{path: workerCwd, branch: "wk/job", head: headSHA, common: "/repo"}
-		// The early decision sees no process...
-		if got := w.inUse(context.Background(), hs, cand.path, false); got != "" {
-			t.Fatalf("early reason %q", got)
-		}
-		// ...and the rescan immediately before removal does.
-		rec := &reapReceipt{Action: "remove-worktree", Repo: "example/project", Host: "local", Worktree: cand.path, Branch: cand.branch}
-		var errs []error
-		if got := w.remove(context.Background(), hs, cand, rec, &errs); got.Result != "skipped" || got.Reason != "process-in-use" {
-			t.Fatalf("%v %v", got, errs)
-		}
-	})
+// featGH is the merged pull on a non-worker branch the older path cleans.
+type featGH struct{ reapGH }
+
+func (featGH) MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error) {
+	p := mergedPull
+	p.Head.Ref = "feat/x"
+	return []github.Pull{p}, nil
 }

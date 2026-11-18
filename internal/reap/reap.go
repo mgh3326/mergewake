@@ -530,7 +530,6 @@ func gitRefused(err error) bool {
 type Entry struct {
 	Path     string
 	Branch   string // short branch name; empty when detached or bare
-	Head     string // checked-out commit
 	Detached bool
 	Bare     bool
 	Locked   bool
@@ -555,8 +554,6 @@ func Entries(b []byte) ([]Entry, error) {
 			if strings.TrimSpace(line) != "" {
 				return nil, errors.New("malformed worktree list")
 			}
-		case strings.HasPrefix(line, "HEAD "):
-			cur.Head = strings.TrimPrefix(line, "HEAD ")
 		case strings.HasPrefix(line, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimPrefix(line, "branch "), "refs/heads/")
 		case line == "detached":
@@ -577,62 +574,6 @@ func (e Exec) WorktreeEntries(ctx context.Context, path string) ([]Entry, error)
 		return nil, err
 	}
 	return Entries(b)
-}
-
-// WorktreeList pages one clone's registered worktrees the way the hub's
-// worktree.list does, so the worker pass discovers them on a local host
-// without a pane, receipt or job record. Git answers every row at once, so the
-// first page is the whole list. Status is left to the guard: a local removal
-// reads it directly, and the listed status is only a shortcut for the hub.
-func (e Exec) WorktreeList(ctx context.Context, common, cursor string) (WorktreePage, error) {
-	if cursor != "" {
-		return WorktreePage{}, nil
-	}
-	entries, err := e.WorktreeEntries(ctx, common)
-	if err != nil {
-		return WorktreePage{}, err
-	}
-	page := WorktreePage{Total: len(entries)}
-	for _, r := range entries {
-		if r.Bare {
-			continue
-		}
-		page.Worktrees = append(page.Worktrees, ListedWorktree{Path: r.Path, Branch: r.Branch, Head: r.Head, Detached: r.Branch == ""})
-	}
-	return page, nil
-}
-
-// RemoteHead reads the branch's head from the origin remote itself, not the
-// local tracking copy: a worktree whose head the remote does not have holds
-// unpushed work. An absent remote branch is "" with no error.
-func (e Exec) RemoteHead(ctx context.Context, path, branch string) (string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 2 && f[1] == "refs/heads/"+branch {
-			return f[0], nil
-		}
-	}
-	return "", nil
-}
-
-// Untracked lists the untracked files and directories in a worktree, relative
-// to its root, as `git status --porcelain` names them.
-func (e Exec) Untracked(ctx context.Context, path string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--untracked-files=normal")
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "?? ") {
-			out = append(out, strings.TrimSpace(line[3:]))
-		}
-	}
-	return out, nil
 }
 
 // Clean reports whether the worktree has no modified or untracked files.
@@ -675,130 +616,6 @@ func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {
 	_, err := e.Run(ctx, "git", "-C", main, "worktree", "remove", path)
 	return err
-}
-
-// WorktreeRemoveDisposable is Exec's guarded removal with a disposable-file
-// list: it performs the same checks the hub node's worktree.remove performs and
-// answers the same outcomes, so one caller reads both transports alike. The
-// remote head is read from origin, never the local tracking copy.
-func (e Exec) WorktreeRemoveDisposable(ctx context.Context, cwd, expectHead, base string, regenerable, disposable []string, detached bool) (WorktreeRemoveResult, error) {
-	w, err := e.Inspect(ctx, cwd)
-	if err != nil {
-		return WorktreeRemoveResult{}, err
-	}
-	if w == nil {
-		return WorktreeRemoveResult{Outcome: "worktree-gone"}, nil
-	}
-	if w.Head != expectHead {
-		return WorktreeRemoveResult{Outcome: "worktree-changed"}, nil
-	}
-	main := filepath.Dir(w.Common)
-	entries, err := e.WorktreeEntries(ctx, main)
-	if err != nil {
-		return WorktreeRemoveResult{}, err
-	}
-	var entry *Entry
-	for i := range entries {
-		if entries[i].Path == w.Path {
-			entry = &entries[i]
-		}
-	}
-	switch {
-	case entry == nil:
-		return WorktreeRemoveResult{Outcome: "unregistered"}, nil
-	case entry.Locked:
-		return WorktreeRemoveResult{Outcome: "locked"}, nil
-	case detached != (entry.Branch == ""):
-		return WorktreeRemoveResult{Outcome: "detached"}, nil
-	}
-	untracked, err := e.Untracked(ctx, w.Path)
-	if err != nil {
-		return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
-	}
-	var disposableGo []string
-	var other []string
-	for _, name := range untracked {
-		if Disposable(disposable, name) {
-			disposableGo = append(disposableGo, name)
-		} else {
-			other = append(other, name)
-		}
-	}
-	if len(other) > 0 {
-		return WorktreeRemoveResult{Outcome: "dirty"}, nil
-	}
-	clean, err := e.TrackedClean(ctx, w.Path)
-	if err != nil {
-		return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
-	}
-	if !clean {
-		return WorktreeRemoveResult{Outcome: "dirty"}, nil
-	}
-	ignored, err := e.Ignored(ctx, w.Path)
-	if err != nil {
-		return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
-	}
-	var unsafe []string
-	for _, name := range ignored {
-		if !Regenerable(regenerable, name) {
-			unsafe = append(unsafe, name)
-		}
-	}
-	if len(unsafe) > 0 {
-		return WorktreeRemoveResult{Outcome: "ignored-files", Files: unsafe}, nil
-	}
-	if !detached && !e.released(ctx, main, w.Head, entry.Branch, base) {
-		return WorktreeRemoveResult{Outcome: "unpushed"}, nil
-	}
-	// The disposable files go only now, after every other refusal has been
-	// ruled out, so a kept worktree always keeps its draft.
-	for _, name := range disposableGo {
-		if _, err := e.Run(ctx, "rm", "-rf", filepath.Join(w.Path, filepath.FromSlash(strings.TrimSuffix(name, "/")))); err != nil {
-			return WorktreeRemoveResult{Outcome: "status-check-failed"}, nil
-		}
-	}
-	if err := e.RemoveWorktree(ctx, main, w.Path); err != nil {
-		return WorktreeRemoveResult{}, err
-	}
-	return WorktreeRemoveResult{Outcome: "removed"}, nil
-}
-
-// released reports whether the branch's work is on the remote: its origin head
-// is exactly the checked-out commit, or — a merged branch whose remote ref was
-// deleted, as delete-branch-on-merge leaves it — the commit is already in the
-// base branch. The base is fetched from origin first: the local origin/<base>
-// tracking copy can still hold a commit a force-push or reset removed, and
-// ancestry against it would not prove the commit is on the remote now. A fetch
-// that fails leaves the question open, which refuses the removal.
-func (e Exec) released(ctx context.Context, main, head, branch, base string) bool {
-	remote, err := e.RemoteHead(ctx, main, branch)
-	if err != nil {
-		return false
-	}
-	if remote != "" && strings.EqualFold(remote, head) {
-		return true
-	}
-	if base == "" || base == branch {
-		return false
-	}
-	if _, err := e.Run(ctx, "git", "-C", main, "fetch", "--no-tags", "--quiet", "origin", "refs/heads/"+base); err != nil {
-		return false
-	}
-	_, err = e.Run(ctx, "git", "-C", main, "merge-base", "--is-ancestor", head, "FETCH_HEAD")
-	return err == nil
-}
-
-// Disposable reports whether an untracked path is on the disposable list: the
-// entry is a worktree-relative path and matches exactly, with or without the
-// trailing slash git puts on a collapsed directory.
-func Disposable(list []string, path string) bool {
-	p := strings.TrimSuffix(strings.TrimPrefix(path, "./"), "/")
-	for _, d := range list {
-		if strings.TrimSuffix(strings.TrimPrefix(d, "./"), "/") == p {
-			return true
-		}
-	}
-	return false
 }
 
 func (e Exec) DeleteBranch(ctx context.Context, main, branch string) error {

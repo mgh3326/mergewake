@@ -838,6 +838,11 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref, Source: c.source}
 			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
+			case w != nil && strings.HasPrefix(w.Branch, workerBranchPrefix):
+				// A worker checkout belongs to the worker-worktree pass, which
+				// has its own discovery, rules and hub-only guard. This older
+				// path neither removes nor records it.
+				continue
 			case e != nil:
 				rec.Result, rec.Reason = "skipped", "worktree-inspect-error"
 				errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, c.path, e))
@@ -955,6 +960,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 					case c.hs.paneInUse(w.Path):
 						rec.Result, rec.Reason = "skipped", "pane-in-use"
 					default:
+						// A background process with no pane can hold the
+						// checkout; fail closed when this machine cannot say.
+						if reason := s.processInUse(ctx, w.Path); reason != "" {
+							rec.Result, rec.Reason = "skipped", reason
+							break
+						}
 						if e := c.hs.exec.RemoveWorktree(ctx, main, w.Path); e != nil {
 							rec.Result, rec.Reason = "error", e.Error()
 						} else {
@@ -986,7 +997,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// wk/ checkouts from the hosts' own worktree lists, so a worktree no pane,
 	// receipt or job record names is still removed once its work is on GitHub.
 	if prNum == 0 {
-		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, receipts, records, h, acting, note)...)
+		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, records, acting, note)...)
 	}
 	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)

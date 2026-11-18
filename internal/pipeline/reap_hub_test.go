@@ -51,7 +51,7 @@ type fakeReapHub struct {
 	// served listPage rows at a time (all at once when zero) behind an offset
 	// cursor; listErr makes worktree.list of a common answer that node error.
 	commons  map[string]string
-	branches map[string]string // cwd → branch worktree.inspect reports (wk/x when absent)
+	branches map[string]string // cwd → branch worktree.inspect reports (feat/x when absent)
 	lists    map[string][]map[string]any
 	listPage int
 	listErr  map[string]string
@@ -109,7 +109,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				if head == "" {
 					head = headSHA
 				}
-				branch := "wk/x"
+				branch := "feat/x"
 				if b := h.branches[cwd]; b != "" {
 					branch = b
 				}

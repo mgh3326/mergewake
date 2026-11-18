@@ -36,7 +36,7 @@ const leadScreen = `herdr pane read "$2" > "$1/pane-screen.txt"`
 // worktree of example/other.
 var leadPR = github.Pull{
 	Number: 12, State: "closed", Merged: true, Body: "Lead work.\n\nMergewake-Task: 2497\n",
-	Head: github.Ref{Ref: "wk/lead", SHA: "cccc3333"}, Base: github.Ref{Ref: "main"},
+	Head: github.Ref{Ref: "feat/lead", SHA: "cccc3333"}, Base: github.Ref{Ref: "main"},
 	MergedAt: rfc(time.Now().Add(-time.Hour)), MergeCommitSHA: "def456",
 }
 
@@ -60,7 +60,7 @@ func leadFixture(t *testing.T, pane string) (*Service, *jobGH, *jobSink, *script
 		key("herdr", "pane", "read", "w2:p1", "--source", "visible"): emptyComposer,
 		key("herdr", "pane", "close", "w2:p1"):                       "",
 		key("git", "-C", "/other.wt", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): "/other/.git/worktrees/other.wt\n/other/.git\n/other.wt\n",
-		key("git", "-C", "/other.wt", "branch", "--show-current"):                                               "wk/other\n",
+		key("git", "-C", "/other.wt", "branch", "--show-current"):                                               "feat/other\n",
 		key("git", "-C", "/other.wt", "rev-parse", "HEAD"):                                                      "dddd4444\n",
 		key("git", "-C", "/other.wt", "remote", "get-url", "origin"):                                            "git@github.com:example/other.git\n",
 		key("sh", "-c", `test -d "$1" && echo yes || echo no`, "sh", "/jobs/lead-a"):                            "yes\n",
