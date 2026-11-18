@@ -34,7 +34,22 @@ func TestLivenessCLI_FlagsAndAck(t *testing.T) {
 		t.Fatal("expected error without --reason")
 	}
 
-	// Test ack with reason succeeds
+	// Test ack with no stall is refused: an ack only answers a current stall.
+	out.Reset()
+	if err := run(ctx, []string{"liveness", "ack", "merge", "--reason", "fixing gate", "--config", cfgPath}, &out, &out); err == nil {
+		t.Fatal("expected an ack with no stalled row to be refused")
+	} else if !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+
+	// Seed a stalled daily row for merge, then the ack is accepted.
+	row := `{"time":"2026-11-17T12:00:00Z","command":"liveness-daily","value":{"day":"2026-11-17","mechanism":"merge","made":5,"done":0,"ratio":0.0,"stalled":true}}` + "\n"
+	if err := os.MkdirAll(filepath.Join(dir, "test", "repo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "test", "repo", "decisions.jsonl"), []byte(row), 0600); err != nil {
+		t.Fatal(err)
+	}
 	out.Reset()
 	if err := run(ctx, []string{"liveness", "ack", "merge", "--reason", "fixing gate", "--config", cfgPath}, &out, &out); err != nil {
 		t.Fatalf("ack failed: %v", err)
