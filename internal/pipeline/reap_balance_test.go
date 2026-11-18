@@ -664,3 +664,140 @@ func TestReapBalanceNoticeRepairThroughReviewerBalance(t *testing.T) {
 		}
 	})
 }
+
+// A stale orphan receipt for the same key must not overwrite the fresh
+// delivery: after planting a stale receipt (sent file without the key, as
+// after a sent-file loss) and delivering, the receipts file and a later
+// repair of the lost notice row carry the fresh counts.
+func TestReapBalanceFreshReceiptWinsOverStale(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+	day := "2026-11-17"
+	seedStalled(t, f, day)
+	key := "balance " + day + " node-a"
+	stale, err := json.Marshal(map[string]balanceNoticeReceipt{
+		key: {Created: 1, Removed: 1, Open: 1, Window: 7, Lane: "stale-lane", Via: "reviewer balance"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.s.reviewerBalanceReceiptsFile(), append(stale, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	all, err := loadBalanceReceipts(f.s.reviewerBalanceReceiptsFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := all[key]; got.Created != 25 || got.Removed != 2 || got.Lane != "fleet-desk" {
+		t.Fatalf("stored receipt not fresh: %+v", got)
+	}
+	path := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" || strings.Contains(line, `"reviewer-balance-notice"`) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.n.events) != 1 {
+		t.Fatalf("redelivered: %+v", f.n.events)
+	}
+	got := noticeRowByHost(t, f, f.repos[0].Name, day, "node-a")
+	if got == nil {
+		t.Fatal("repaired notice row missing")
+	}
+	if got["created"] != float64(25) || got["removed"] != float64(2) || got["lane"] != "fleet-desk" {
+		t.Fatalf("repaired row carried stale payload: %v", got)
+	}
+}
+
+// A receipt-less repair (pre-upgrade sent key, or a key whose receipt save
+// failed) records the lane the notice would go to now instead of an empty
+// lane: reap.balance_lane when set, else the desk lane.
+func TestReapBalanceReceiptlessRepairLane(t *testing.T) {
+	day := "2026-11-17"
+	ctx := context.Background()
+	loseNoticeAndReceipts := func(t *testing.T, f *balanceFixture) {
+		t.Helper()
+		path := filepath.Join(f.s.state(f.repos[0].Name), "decisions.jsonl")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept []string
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.TrimSpace(line) == "" || strings.Contains(line, `"reviewer-balance-notice"`) {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(f.s.reviewerBalanceReceiptsFile()); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	t.Run("balance lane", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		f.s.Config.Reap.BalanceLane = "balance-desk"
+		seedStalled(t, f, day)
+		if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		loseNoticeAndReceipts(t, f)
+		if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("redelivered: %+v", f.n.events)
+		}
+		got := noticeRowByHost(t, f, f.repos[0].Name, day, "node-a")
+		if got == nil {
+			t.Fatal("repaired notice row missing")
+		}
+		if got["lane"] != "balance-desk" || got["via"] != "reviewer balance" {
+			t.Fatalf("repaired row lost resolved lane: %v", got)
+		}
+		if got["created"] != float64(25) || got["removed"] != float64(2) {
+			t.Fatalf("repaired row lost daily counts: %v", got)
+		}
+	})
+	t.Run("desk lane", func(t *testing.T) {
+		f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+		f.s.Config.Notifier = config.Notifier{Type: "noop", Lane: "fleet-desk"}
+		seedStalled(t, f, day)
+		if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		loseNoticeAndReceipts(t, f)
+		if err := f.s.reviewerBalanceDay(ctx, f.repos[0], day, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.n.events) != 1 {
+			t.Fatalf("redelivered: %+v", f.n.events)
+		}
+		got := noticeRowByHost(t, f, f.repos[0].Name, day, "node-a")
+		if got == nil {
+			t.Fatal("repaired notice row missing")
+		}
+		if got["lane"] != "fleet-desk" || got["via"] != "reviewer balance" {
+			t.Fatalf("repaired row lost resolved lane: %v", got)
+		}
+	})
+}

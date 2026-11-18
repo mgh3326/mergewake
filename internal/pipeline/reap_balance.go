@@ -416,6 +416,9 @@ func saveBalanceReceipt(sentFile, file, key string, rec balanceNoticeReceipt) er
 	}
 	keep := map[string]balanceNoticeReceipt{key: rec}
 	for k, v := range all {
+		if k == key {
+			continue
+		}
 		if sent.has(k) {
 			keep[k] = v
 		}
@@ -603,7 +606,8 @@ func (s *Service) reviewerBalanceDay(ctx context.Context, target config.Repo, da
 // whose hosts the fresh scan no longer marks stalled, without redelivering.
 // Hosts the caller already noticed are skipped; a stored receipt supplies
 // the original lane and counts, a legacy key falls back to the daily row's
-// counts. Any error returns before the day advances.
+// counts with the lane the notice would go to now. Any error returns before
+// the day advances.
 func (s *Service) repairBalanceNotices(target config.Repo, day string, handled map[string]bool) error {
 	sent, err := loadSentKeys(s.reviewerBalanceSentFile(), 1024)
 	if err != nil {
@@ -698,7 +702,8 @@ func (s *Service) balanceRowsWritten(repo, day string) (map[string]bool, error) 
 
 // balanceReceipt returns the delivery payload to repair the host's missing
 // notice row: the stored receipt when one exists, else the daily row's
-// counts for a legacy key, with the lane left unspecified.
+// counts for a legacy key, with the lane the notice would go to now
+// (reap.balance_lane, else the desk lane).
 func (s *Service) balanceReceipt(repo, day, host string) (balanceNoticeReceipt, error) {
 	all, err := loadBalanceReceipts(s.reviewerBalanceReceiptsFile())
 	if err != nil {
@@ -707,7 +712,11 @@ func (s *Service) balanceReceipt(repo, day, host string) (balanceNoticeReceipt, 
 	if rec, ok := all["balance "+day+" "+host]; ok {
 		return rec, nil
 	}
-	rec := balanceNoticeReceipt{Via: "reviewer balance"}
+	lane := s.Config.Reap.BalanceLane
+	if lane == "" {
+		lane = s.deskLane()
+	}
+	rec := balanceNoticeReceipt{Lane: lane, Via: "reviewer balance"}
 	daily, err := s.balanceDailyRows(repo, day)
 	if err != nil {
 		return balanceNoticeReceipt{}, err
