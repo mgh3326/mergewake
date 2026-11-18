@@ -727,8 +727,8 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	m4Land := map[string]bool{}   // repo#pr -> true
 	m4Merged := map[string]bool{} // repo#pr -> true
 
-	m7Merges := map[string]string{}              // repo#pr -> repo
-	m7RepoWatches := map[string]int{}            // repo -> watch count
+	m7Merges := map[string]string{}   // repo#pr -> repo
+	m7RepoWatches := map[string]int{} // repo -> watch count
 
 	m8Attempts := 0
 	m8Errors := 0
