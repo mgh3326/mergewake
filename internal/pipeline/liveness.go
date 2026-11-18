@@ -228,9 +228,37 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 	}
 	target := s.Config.Repos[0]
 	now := s.now().UTC()
+	stalledDay := now.Format(reviewerSummaryDay)
+	if f, err := os.Open(filepath.Join(s.state(target.Name), "decisions.jsonl")); err == nil {
+		rd := bufio.NewReader(f)
+		for {
+			line, err := rd.ReadBytes('\n')
+			if len(line) > 0 {
+				var row struct {
+					Command string          `json:"command"`
+					Value   json.RawMessage `json:"value"`
+				}
+				if json.Unmarshal(line, &row) == nil && row.Command == livenessDailyCommand {
+					var v struct {
+						Day       string `json:"day"`
+						Mechanism string `json:"mechanism"`
+						Stalled   bool   `json:"stalled"`
+					}
+					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism == norm && v.Stalled {
+						stalledDay = v.Day
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		_ = f.Close()
+	}
 	val := map[string]any{
 		"mechanism": norm,
 		"reason":    reason,
+		"day":       stalledDay,
 		"time":      now.Format(time.RFC3339Nano),
 	}
 	if err := s.audit(target.Name, livenessAckCommand, val, false); err != nil {
@@ -240,6 +268,7 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 		"action":    "liveness-ack",
 		"mechanism": norm,
 		"reason":    reason,
+		"day":       stalledDay,
 		"time":      now.Format(time.RFC3339Nano),
 	})
 }
@@ -604,10 +633,11 @@ func (s *Service) livenessNoticeRow(repo, day, mech string) (livenessNoticeRecei
 }
 
 // activeLivenessAcks returns active answers by mechanism.
-// An ack holds for that stall until the mechanism recovers (a recovery row written after the ack clears it).
+// An ack holds for that stall until the mechanism recovers (a recovery day row for a day after the answered stall clears it).
 func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string, error) {
 	active := map[string]string{}
-	ackTimes := map[string]time.Time{}
+	ackStalledDay := map[string]string{}
+	lastStalledDay := map[string]string{}
 	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
 		return active, nil
@@ -629,15 +659,6 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 			}
 			if json.Unmarshal(line, &row) == nil {
 				switch row.Command {
-				case livenessAckCommand:
-					var v struct {
-						Mechanism string `json:"mechanism"`
-						Reason    string `json:"reason"`
-					}
-					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" && v.Reason != "" {
-						active[v.Mechanism] = v.Reason
-						ackTimes[v.Mechanism] = row.Time
-					}
 				case livenessDailyCommand:
 					var v struct {
 						Day       string `json:"day"`
@@ -645,11 +666,31 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 						Stalled   bool   `json:"stalled"`
 					}
 					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" {
-						// A recovery day (stalled == false) written after an ack clears it
-						if !v.Stalled && row.Time.After(ackTimes[v.Mechanism]) {
-							delete(active, v.Mechanism)
-							delete(ackTimes, v.Mechanism)
+						if v.Stalled {
+							lastStalledDay[v.Mechanism] = v.Day
+						} else {
+							// A recovery row clears the ack if its evaluated day is after the stalled day answered by the ack
+							if targetDay, hasAck := ackStalledDay[v.Mechanism]; hasAck {
+								if v.Day > targetDay {
+									delete(active, v.Mechanism)
+									delete(ackStalledDay, v.Mechanism)
+								}
+							}
 						}
+					}
+				case livenessAckCommand:
+					var v struct {
+						Day       string `json:"day"`
+						Mechanism string `json:"mechanism"`
+						Reason    string `json:"reason"`
+					}
+					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" && v.Reason != "" {
+						active[v.Mechanism] = v.Reason
+						stalledDay := v.Day
+						if stalledDay == "" {
+							stalledDay = lastStalledDay[v.Mechanism]
+						}
+						ackStalledDay[v.Mechanism] = stalledDay
 					}
 				}
 			}
@@ -676,7 +717,6 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 
 	m1Starts := map[string]int{} // repo#head -> pr
 	m1Done := map[string]bool{}  // repo#head -> reviewed/skipped
-	m1PRLatest := map[string]string{} // repo#pr -> latest head
 
 	m2Briefs := map[string]bool{} // label -> true
 	m2Landed := map[string]bool{} // label -> true
@@ -707,6 +747,9 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	m11Deferred := map[string]deferredEntry{} // repo#head -> entry
 	m11Resolved := map[string]bool{}          // repo#head -> true
 	m11PRResolved := map[string]bool{}        // repo#pr -> true
+
+	endOfDay, _ := time.Parse(reviewerSummaryDay, day)
+	endOfDay = endOfDay.Add(24 * time.Hour)
 
 	// Scan decisions across all watched repos
 	for _, r := range repos {
@@ -761,7 +804,6 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						// M1: review-pass
 						if row.Command == "review-start" && v.Head != "" {
 							m1Starts[keyHead] = v.PR
-							m1PRLatest[keyPR] = v.Head
 						} else if (row.Command == "review" || row.Command == "review-skipped") && v.Head != "" {
 							m1Done[keyHead] = true
 						}
@@ -836,7 +878,10 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 							m10Errors++
 						}
 
-						// M11: review-retry
+					}
+
+					// M11: review-retry tracks deferrals and resolutions across history up to endOfDay
+					if row.Time.UTC().Before(endOfDay) {
 						if row.Command == "review-retry-deferred" && v.Head != "" {
 							if _, exists := m11Deferred[keyHead]; !exists {
 								m11Deferred[keyHead] = deferredEntry{repo: r.Name, pr: v.PR, head: v.Head, first: row.Time.UTC()}
@@ -873,9 +918,8 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	{
 		made := len(m1Starts)
 		done := 0
-		for h, pr := range m1Starts {
-			keyPR := fmt.Sprintf("%s#%d", strings.Split(h, "#")[0], pr)
-			if m1Done[h] || (m1PRLatest[keyPR] != "" && m1PRLatest[keyPR] != strings.Split(h, "#")[1]) {
+		for h := range m1Starts {
+			if m1Done[h] {
 				done++
 			}
 		}
@@ -1125,28 +1169,24 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	{
 		made := len(m11Deferred)
 		done := 0
-		stalled := false
-		endOfDay, _ := time.Parse(reviewerSummaryDay, day)
-		endOfDay = endOfDay.Add(24 * time.Hour)
+		unresolvedPastThreshold := 0
 		maxHours := time.Duration(cfg.ReviewRetryMaxDeferredHoursOrDefault()) * time.Hour
 		for k, entry := range m11Deferred {
 			prKey := fmt.Sprintf("%s#%d", entry.repo, entry.pr)
 			if m11Resolved[k] || (entry.pr > 0 && m11PRResolved[prKey]) {
 				done++
 			} else if endOfDay.Sub(entry.first) >= maxHours {
-				// unresolved past threshold
+				unresolvedPastThreshold++
 			} else {
 				done++ // within grace window
 			}
 		}
-		unresolved := made - done
 		ratio := 1.0
 		if made > 0 {
 			ratio = float64(done) / float64(made)
 		}
-		// A single miss must not raise; requires at least 3 unresolved deferrals
-		minUnresolved := 3
-		stalled = unresolved >= minUnresolved && (made > 0 && done*100 < 80*made)
+		// A single miss does not alert; stalls if at least 2 unresolved deferrals exceed max deferred hours
+		stalled := unresolvedPastThreshold >= 2
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechReviewRetry, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
 		})

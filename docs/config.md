@@ -578,7 +578,7 @@ Every mechanism evaluates progress made against expected completions over the UT
 | 8 | `lane-notices` | Attempted lane notifications (`pr-notify`, `review-blocked`, `conflict-esc`). | Successful notifications (attempts minus notification errors). | `lane_notices_min_attempts: 5`<br>`lane_notices_max_error_pct: 50` |
 | 9 | `task-events` | Attempted handoffkeep task event posts (`hk-task-event`) and field refusals. | Successful task event posts (`hk-task-event` carrying `result` and no `error`). | `task_events_min_attempts: 10`<br>`task_events_max_refusal_pct: 20` |
 | 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
-| 11 | `review-retry` | Review passes deferred for retry on the day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged). | `review_retry_max_deferred_hours: 24`<br>(Stalls if unresolved deferral >= 24h) |
+| 11 | `review-retry` | Review passes deferred for retry up to the evaluated day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged) or within grace window. | `review_retry_max_deferred_hours: 24`<br>(Stalls if >= 2 unresolved deferrals exceed threshold; single miss does not alert) |
 
 #### Stall notices and repeat rule
 
