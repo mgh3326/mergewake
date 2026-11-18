@@ -661,7 +661,7 @@ func (s *Service) followUpDeliveries(ctx context.Context, r config.Repo, pr gith
 		switch {
 		case acked:
 			d.AckedAt, d.AckBy, changed = now, "inbox", true
-			errs = append(errs, s.audit(r.Name, "findings-acked", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane, "head": pr.Head.SHA}, o.DryRun))
+			errs = append(errs, s.audit(r.Name, "findings-acked", map[string]any{"pr": d.PR, "id": d.ID, "lane": d.Lane, "head": d.Head}, o.DryRun))
 		case d.ResentAt.IsZero() && now.Sub(d.SentAt) >= window:
 			if err := resolve(); err != nil {
 				// A route read error retries the re-send; it never reroutes it.

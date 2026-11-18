@@ -1044,6 +1044,31 @@ func TestLiveness_TaskEventWithRefusedFieldsCountsOnce(t *testing.T) {
 	}
 }
 
+// An ack credits only the head it was sent for: a critical finding on a later
+// head stays undelivered until that head's own delivery is acked.
+func TestLiveness_AckCreditsOnlyItsSentHead(t *testing.T) {
+	day := "2026-11-17"
+	dTime := balanceDayTime(day, 12)
+	f := newLivenessFixture(t, dTime)
+	repo := f.repos[0].Name
+	f.audit(t, repo, "review-round-finding", map[string]any{"head": "sent-head", "severity": "critical", "pr": 1}, dTime)
+	f.audit(t, repo, "findings-acked", map[string]any{"head": "sent-head", "pr": 1}, dTime)
+	f.audit(t, repo, "review-round-finding", map[string]any{"head": "later-head", "severity": "critical", "pr": 1}, dTime)
+	res, err := f.s.livenessForDay(f.repos, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range res.Mechanisms {
+		if item.Mechanism == MechFindingsDelivery {
+			if item.Made != 2 || item.Done != 1 {
+				t.Fatalf("the ack must not credit the later head: %+v", item)
+			}
+			return
+		}
+	}
+	t.Fatal("no findings-delivery mechanism in the result")
+}
+
 // TestLiveness_AckedFindingWithHeadCountsAsDelivered verifies that a
 // findings-acked row carrying a head counts as delivered, while old rows
 // without a head stay uncounted.

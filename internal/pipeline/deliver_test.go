@@ -232,6 +232,61 @@ func TestFindingsAckOrDispositionStopsFollowUp(t *testing.T) {
 	}
 }
 
+// An ack covers the head its delivery was sent for. A PR that moved on before
+// the ack leaves the new head undelivered until its own delivery is acked.
+func TestFindingsAckCreditsTheSentHeadOnly(t *testing.T) {
+	s, g, n, _, r, _ := deliverSetup(t)
+	var out bytes.Buffer
+	s.Out = &out
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
+	deliver(t, s, r)
+	g.pull.Head.SHA = shaC
+	n.acked[n.events[0].ID] = true
+	deliver(t, s, r)
+	ledger, e := s.loadDeliveries(r.Name)
+	if e != nil || len(ledger) != 1 || ledger[0].Head != shaA || ledger[0].AckBy != "inbox" {
+		t.Fatal(ledger, e)
+	}
+	acks := deliveredAckRows(t, out.Bytes(), "findings-acked")
+	if len(acks) != 1 || acks[0]["head"] != shaA {
+		t.Fatalf("the ack row must name the sent head: %v", acks)
+	}
+
+	g.feedback.Threads = append(g.feedback.Threads, ownFinding("T2", "high", 9))
+	deliver(t, s, r)
+	ledger, e = s.loadDeliveries(r.Name)
+	if e != nil || len(ledger) != 2 || ledger[1].Head != shaC || !ledger[1].AckedAt.IsZero() {
+		t.Fatalf("head C needs its own open delivery: %+v", ledger)
+	}
+	n.acked[n.events[1].ID] = true
+	deliver(t, s, r)
+	ledger, _ = s.loadDeliveries(r.Name)
+	acks = deliveredAckRows(t, out.Bytes(), "findings-acked")
+	if ledger[1].AckBy != "inbox" || len(acks) != 2 || acks[1]["head"] != shaC {
+		t.Fatalf("head C is delivered once its own delivery is acked: %+v %v", ledger, acks)
+	}
+}
+
+// deliveredAckRows returns the value of every audit row named command.
+func deliveredAckRows(t *testing.T, b []byte, command string) []map[string]any {
+	t.Helper()
+	var rows []map[string]any
+	dec := json.NewDecoder(bytes.NewReader(b))
+	for dec.More() {
+		var row struct {
+			Command string         `json:"command"`
+			Value   map[string]any `json:"value"`
+		}
+		if e := dec.Decode(&row); e != nil {
+			t.Fatal(e)
+		}
+		if row.Command == command {
+			rows = append(rows, row.Value)
+		}
+	}
+	return rows
+}
+
 // Acceptance 1: a PR without a bound job falls back to the repo lane, then
 // to the desk.
 func TestFindingsWithoutBoundJobFallBack(t *testing.T) {
