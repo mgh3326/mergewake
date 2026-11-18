@@ -316,8 +316,12 @@ func sparseFallbackArgs(args []string) ([]string, bool) {
 
 // sparseIncludePaths lists the PR-changed paths a sparse checkout keeps on
 // disk, from the review diff: added, modified and renamed targets count;
-// deleted files do not. The result is sorted and unique.
-func sparseIncludePaths(diff string) []string {
+// deleted files do not. The result is sorted and unique. ok is false when a
+// kept block's path is ambiguous (a binary or mode-only block whose
+// "diff --git" line holds an unquoted spaced path): the caller must take
+// the full checkout rather than guess, so a wrong include never drops a
+// changed file from the reviewer's disk.
+func sparseIncludePaths(diff string) ([]string, bool) {
 	set := map[string]bool{}
 	for _, f := range splitDiff(diff) {
 		if isDeletedDiffFile(f) {
@@ -325,14 +329,16 @@ func sparseIncludePaths(diff string) []string {
 		}
 		if p := diffFilePath(f); p != "" {
 			set[p] = true
+			continue
 		}
+		return nil, false
 	}
 	out := make([]string, 0, len(set))
 	for p := range set {
 		out = append(out, p)
 	}
 	slices.Sort(out)
-	return out
+	return out, true
 }
 
 // isDeletedDiffFile reports whether a diff file block deletes the file: the

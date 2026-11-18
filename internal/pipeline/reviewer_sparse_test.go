@@ -343,3 +343,73 @@ func TestSparseCheckoutModeEnrichment(t *testing.T) {
 		t.Fatalf("repeat/mismatch rows: %v", rows)
 	}
 }
+
+// Quoting edge cases for the sparse include list: a binary block with an
+// unquoted spaced path, a quoted path with an escaped character, a
+// mode-only change, and a rename with spaces each yield the right include;
+// a path holding the " b/" separator is ambiguous and refuses to guess.
+func TestSparseIncludePathsQuoting(t *testing.T) {
+	binarySpaced := "diff --git a/my img.png b/my img.png\nindex 45b983b..0f49c4a 100644\nBinary files a/my img.png and b/my img.png differ\n"
+	binaryQuoted := `diff --git "a/we\"ird.txt" "b/we\"ird.txt"` + "\nindex 7898192..badc806 100644\n" + `Binary files "a/we\"ird.txt" and "b/we\"ird.txt" differ` + "\n"
+	binaryOctal := `diff --git "a/tab\there.txt" "b/tab\there.txt"` + "\nindex 7898192..badc806 100644\n" + `Binary files "a/tab\there.txt" and "b/tab\there.txt" differ` + "\n"
+	modeOnly := "diff --git a/normal.txt b/normal.txt\nold mode 100644\nnew mode 100755\n"
+	modeSpaced := "diff --git a/my mode.sh b/my mode.sh\nold mode 100644\nnew mode 100755\n"
+	renameSpaces := "diff --git a/was dir/a.txt b/new dir/b.txt\nsimilarity index 90%\nrename from was dir/a.txt\nrename to new dir/b.txt\n"
+	ambiguous := "diff --git a/x b/y b/x b/y\nold mode 100644\nnew mode 100755\n"
+	deletedSpaced := "diff --git a/gone dir/o.png b/gone dir/o.png\ndeleted file mode 100644\nindex 45b983b..0000000\nBinary files a/gone dir/o.png and /dev/null differ\n"
+	for _, tc := range []struct {
+		name   string
+		diff   string
+		want   []string
+		wantOK bool
+	}{
+		{"binary spaced unquoted", binarySpaced, []string{"my img.png"}, true},
+		{"binary quoted escape", binaryQuoted, []string{`we"ird.txt`}, true},
+		{"binary quoted octal", binaryOctal, []string{"tab\there.txt"}, true},
+		{"mode-only", modeOnly, []string{"normal.txt"}, true},
+		{"mode-only spaced", modeSpaced, []string{"my mode.sh"}, true},
+		{"rename with spaces", renameSpaces, []string{"new dir/b.txt"}, true},
+		{"ambiguous separator in path", ambiguous, nil, false},
+		{"deleted binary spaced", deletedSpaced, []string{}, true},
+		{"combined", binarySpaced + modeOnly + renameSpaces, []string{"my img.png", "new dir/b.txt", "normal.txt"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := sparseIncludePaths(tc.diff)
+			if ok != tc.wantOK {
+				t.Fatalf("sparseIncludePaths ok = %v, want %v (got %q)", ok, tc.wantOK, got)
+			}
+			if ok && !slices.Equal(got, tc.want) {
+				t.Fatalf("sparseIncludePaths = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A block whose path cannot be split without guessing takes the full
+// checkout instead of a corruptible sparse spawn, with an audit row naming
+// the reason. The ambiguous block sits beside an ordinary one so the test
+// proves the good include does not stand in for it.
+func TestSparseCheckoutAmbiguousPathSkipsAndAudits(t *testing.T) {
+	freshReviewerSpecs(t)
+	freshReviewerSparses(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := panewireSetup(t, runner)
+	r.Review.CheckoutExclude = []string{"Assets"}
+	g.diffs = map[string]string{shaA: "diff --git a/keep.txt b/keep.txt\n--- a/keep.txt\n+++ b/keep.txt\n@@ -1 +1 @@\n-old\n+new\n" +
+		"diff --git a/x b/y b/x b/y\nold mode 100644\nnew mode 100755\n"}
+	reviewOrigin(runner, r.Root, "git@github.com:example/project.git")
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if len(runner.spawns) != 1 {
+		t.Fatalf("spawns: %v", runner.spawns)
+	}
+	sp := runner.spawns[0]
+	if slices.Contains(sp, "--checkout-exclude") || slices.Contains(sp, "--checkout-include") {
+		t.Fatalf("ambiguous path must take the full checkout: %v", sp)
+	}
+	rows := auditRows(t, s, r, "reviewer-checkout-sparse-skipped")
+	if len(rows) != 1 || rows[0]["reason"] != "ambiguous-path" {
+		t.Fatalf("sparse-skipped rows: %v", rows)
+	}
+}

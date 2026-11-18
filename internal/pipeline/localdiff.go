@@ -250,12 +250,93 @@ func diffFilePath(f diffFile) string {
 	if minus != "" && minus != "/dev/null" {
 		return minus
 	}
+
 	if len(f.head) > 0 {
-		if parts := strings.Fields(strings.TrimRight(f.head[0], "\r\n")); len(parts) >= 4 {
-			return cleanDiffPath(parts[3])
+		if old, new, ok := parseDiffGitPaths(strings.TrimRight(f.head[0], "\r\n")); ok {
+			if p := cleanDiffPath(new); p != "" {
+				return p
+			}
+			return cleanDiffPath(old)
 		}
 	}
 	return ""
+}
+
+// parseDiffGitPaths splits a "diff --git <old> <new>" header into its two
+// raw paths, honoring git's C-style quoting (core.quotePath): a path with
+// control characters, quotes, backslashes or high bytes arrives
+// double-quoted with C escapes, while plain spaces stay bare. ok is false
+// when the header cannot be split without guessing: a bare line whose
+// paths hold spaces is ambiguous, since the separator cannot be told
+// apart from a space inside a path.
+func parseDiffGitPaths(line string) (old, new string, ok bool) {
+	rest, found := strings.CutPrefix(line, "diff --git ")
+	if !found || rest == "" {
+		return "", "", false
+	}
+	// A bare path never holds a double quote (git would have quoted it),
+	// so the first quote, if any, opens a quoted token.
+	if !strings.HasPrefix(rest, `"`) {
+		if i := strings.IndexByte(rest, '"'); i >= 0 {
+			// Bare old path, quoted new path: the first quote ends the
+			// old side, the quoted token runs to the end of the line.
+			first, second := rest[:i], rest[i:]
+			tok, leftover, ok := cutQuoted(second)
+			if !ok || strings.TrimRight(leftover, "\r\n") != "" {
+				return "", "", false
+			}
+			if !strings.HasSuffix(first, " ") {
+				return "", "", false
+			}
+			return strings.TrimSuffix(first, " "), tok, true
+		}
+		// Both sides are bare: sound only when they agree on one path,
+		// i.e. rest rebuilds as a/<p> b/<p>. A path holding " b/" has
+		// more than one separator and fails the rebuild instead of
+		// guessing.
+		sep := strings.Index(rest, " b/")
+		if sep < 0 {
+			return "", "", false
+		}
+		first, second := rest[:sep], rest[sep+1:]
+		if !strings.HasPrefix(first, "a/") || !strings.HasPrefix(second, "b/") {
+			return "", "", false
+		}
+		p := strings.TrimPrefix(second, "b/")
+		if "a/"+p+" b/"+p != rest {
+			return "", "", false
+		}
+		return "a/" + p, "b/" + p, true
+	}
+	tok, leftover, ok := cutQuoted(rest)
+	if !ok || leftover == "" || leftover[0] != ' ' {
+		return "", "", false
+	}
+	second := leftover[1:]
+	if strings.HasPrefix(second, `"`) {
+		tok2, leftover2, ok := cutQuoted(second)
+		if !ok || strings.TrimRight(leftover2, "\r\n") != "" {
+			return "", "", false
+		}
+		return tok, tok2, true
+	}
+	// Quoted old path, bare new path running to the end of the line.
+	return tok, strings.TrimRight(second, "\r\n"), true
+}
+
+// cutQuoted splits a leading double-quoted token (git's C-style quoting,
+// with \" and \\ escapes) from the rest of the line. ok is false when the
+// quotes never close.
+func cutQuoted(s string) (tok, rest string, ok bool) {
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return s[:i+1], s[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 func cleanDiffPath(p string) string {

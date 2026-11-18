@@ -586,11 +586,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if origin := s.specOrigin(ctx, root); origin != "" {
 				spec = &reviewerCheckoutSpec{origin: origin, commit: pr.Head.SHA, ref: ref}
 				if excludes := x.repo.Review.CheckoutExclude; len(excludes) > 0 && !reviewerSparses.legacy() {
-					includes := sparseIncludePaths(x.fullDiff)
-					if len(includes) == 0 {
-						includes = sparseIncludePaths(x.diff)
+					includes, includesOK := sparseIncludePaths(x.fullDiff)
+					// The round diff is only a fallback for an empty full
+					// diff: when the full PR patch is ambiguous it already
+					// covers every changed path, so its subset must not
+					// stand in for it.
+					if includesOK && len(includes) == 0 {
+						includes, includesOK = sparseIncludePaths(x.diff)
 					}
 					switch {
+					case !includesOK:
+						// A binary or mode-only block with an ambiguous
+						// "diff --git" line (an unquoted spaced path) names
+						// no reliable include: the full checkout keeps the
+						// review lossless instead (hk 5102).
+						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "ambiguous-path"}, false)
 					case len(includes) > maxSparseIncludes:
 						_ = s.audit(x.repo.Name, "reviewer-checkout-sparse-skipped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "reason": "too-many-paths", "changed": len(includes), "limit": maxSparseIncludes}, false)
 					case !sparseValuesSafe(excludes, includes):
