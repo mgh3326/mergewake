@@ -77,7 +77,7 @@ Session hosts where agent panes may run, used only by `reap`.
 | `hub.cf_file` | Empty | Optional mode-0600 env file with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` for a hub behind Cloudflare Access. |
 | `archive` | Disabled | Job-dir archiving to a synced Google Drive folder plus hk; see `reap.archive` below. |
 | `regenerable` | `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `dist`, `build`, `target`, `obj`, `bin`, `Library`, `Temp`, `Logs`, `UserSettings` | Gitignored path globs that are expendable (build/cache output), so a worktree holding only them may still be removed. A pattern without `/` matches only the ignored entry's last segment — an ignored file inside a tracked `bin/` or `Logs/` dir is not regenerable just because an ancestor shares the name; a pattern with `/` matches the whole path. Any other ignored path — `.env`, notes, unknown output — refuses removal. A non-empty configured list replaces the defaults. |
-| `disposable` | `report.draft.md` | Untracked files a worker worktree may still hold when it is removed, as worktree-relative paths matched exactly. A worker's report draft lives in hk, so a leftover copy inside the checkout is expendable; the pass never removes a worktree holding any other untracked file. An empty list means the default; entries must be relative and must not contain `..`. Passing the list through the hub needs a panewire node that accepts `worktree.remove`'s `disposable` argument; an older node refuses the request, mergewake retries without the argument, and the node's own dirty check then keeps the worktree. |
+| `disposable` | `report.draft.md` | Untracked files a worker worktree may still hold when it is removed, as worktree-relative paths matched exactly. A worker's report draft lives in hk, so a leftover copy inside the checkout is expendable; the pass never removes a worktree holding any other untracked file. An empty list means the default; entries must be relative and must not contain `..`. Passing the list through the hub needs a panewire node that accepts `worktree.remove`'s `disposable` argument; an older node refuses the request, mergewake retries without the argument, and the node's own dirty check then keeps the worktree with a `skipped | dirty` row until a node accepts the list. Local and ssh hosts apply the list directly. |
 | `worktree_drain.per_host` | `20` | Maximum guarded removals the worker-worktree pass asks of one host in one pass; the host's remaining worktrees wait for the next pass. Zero means the default. It caps removals only, so one host's backlog never stalls the others. |
 | `worktree_drain.host_order` | Config host order | Host names in the order the worker-worktree pass visits them, first to last; hosts it does not name follow in `hosts[]` order. With `per_host`, this decides which host's backlog drains first. |
 | `reviewer_drain.per_host` | `20` | Maximum hub guarded removals the reviewer sweep asks of one host in one pass; the host's remaining labels wait for the next pass. Zero means the default. It does not cap pane or job reads, only removals, so one drained host never stalls the others; a label left pending for a missing `work_root` spends none of it. |
@@ -336,7 +336,9 @@ pane list already includes its plain shells. Anything refused stays and gets
 one `remove-worktree` row with its precise reason — `unpushed`, `dirty`,
 `pane-in-use`, `process-in-use`, `locked`, `ignored-files:<count>-<hash>`, a
 guarded-removal refusal, or a rule keeping it (`watch-pending`,
-`recovery-open`, `reverted`, `job-active:<state>`, `open-pr`). The row's
+`recovery-open`, `reverted`, `job-active:<state>`, `open-pr`). A checkout
+whose only extra file is a disposable entry stays `skipped | dirty` until the
+node accepts `reap.disposable` (see the `disposable` key above). The row's
 `source` is `worktree-list` for a candidate only the listing reached.
 
 The local branch is deleted with `git branch -d` after removal, never `-D`;
