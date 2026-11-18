@@ -883,6 +883,17 @@ func (s *Service) ownerLane(r config.Repo) string {
 	return desk
 }
 
+// toolLane is the lane that owns mergewake's own automation
+// (notifier.tool_lane): lost review results and exhausted review retries go
+// here instead of the desk. Empty means the desk (notifier.fallback_lane,
+// else notifier.lane), so nothing changes until it is set.
+func (s *Service) toolLane() string {
+	if laneName.MatchString(s.Config.Notifier.ToolLane) {
+		return s.Config.Notifier.ToolLane
+	}
+	return s.deskLane()
+}
+
 // isDeskLane reports whether lane is the desk lane (notifier.fallback_lane, else
 // notifier.lane). An empty lane goes to the notifier's own default, the desk.
 func (s *Service) isDeskLane(lane string) bool {

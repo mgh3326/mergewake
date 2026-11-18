@@ -54,6 +54,10 @@ notifier:
   type: stdout
   command: panewire
   lane: operator-desk
+  # Lane that owns mergewake's own automation (lost reviews, exhausted
+  # retries). Empty means the desk lanes above: uncomment to route those
+  # notices elsewhere, e.g. the design lane.
+  # tool_lane: operator-desk
 sink:
   type: noop
   command: handoffkeep

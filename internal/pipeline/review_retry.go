@@ -437,8 +437,35 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	}
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
-	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.ownerLane(r), Type: "automation-failed", Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA), lastErrorNote(lastError))})
-	return err == nil, err
+	id := fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA)
+	text := fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA), lastErrorNote(lastError))
+	owner := s.ownerLane(r)
+	// Mergewake's own automation gets its own copy on the tool lane, so the
+	// desk hears it only when no tool lane and no design lane resolve to
+	// anything else. The suffixed id keeps both copies deduped per lane and
+	// stable across retries. Until tool_lane is set the owner notice is the
+	// only copy, exactly as before. The owner notice goes first and is
+	// always attempted: a failing tool-lane emit must neither suppress the
+	// design-lane escalation nor stall the retry. A tool copy lost this way
+	// is audited and dropped; the next head escalates again on its own ids.
+	ownerErr := s.Notifier.Notify(nctx, integrations.Event{ID: id, Lane: owner, Type: "automation-failed", Text: text})
+	var toolErr error
+	tool := ""
+	if s.Config.Notifier.ToolLane != "" {
+		if tool = s.toolLane(); tool != owner {
+			toolErr = s.Notifier.Notify(nctx, integrations.Event{ID: id + "-tool", Lane: tool, Type: "automation-failed", Text: text})
+		}
+	}
+	if ownerErr != nil {
+		return false, errors.Join(ownerErr, toolErr)
+	}
+	if toolErr != nil {
+		row := map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "lane": tool, "error": reviewErrorText(toolErr)}
+		if aerr := s.audit(r.Name, "review-retry-tool-notice-failed", row, false); aerr != nil && s.Log != nil {
+			s.Log.Warn("review retry tool notice audit failed", "pr", pr.Number, "error", aerr)
+		}
+	}
+	return true, nil
 }
 
 // retryReviewStatus distinguishes a live lease from an unsuccessful attempt.
