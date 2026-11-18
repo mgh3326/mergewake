@@ -598,9 +598,13 @@ func (e Exec) TrackedClean(ctx context.Context, path string) (bool, error) {
 
 // Ignored lists gitignored files inside the worktree. `git status --porcelain`
 // hides them, but `git worktree remove` deletes them anyway — callers refuse
-// the removal rather than silently lose an .env or notes file.
+// the removal rather than silently lose an .env or notes file. `-uall` expands
+// wholly ignored directories into individual files, so the caller sees every
+// file: a `bin/` holding `bin/.env` is refused even though `bin` is
+// regenerable, while an empty regenerable dir yields no entries and passes.
+// (An empty ignored dir is unreported by git in either mode: nothing to lose.)
 func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
-	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
+	b, err := e.Run(ctx, "git", "-C", path, "status", "--porcelain", "--ignored", "-uall")
 	if err != nil {
 		return nil, err
 	}

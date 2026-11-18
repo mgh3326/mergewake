@@ -204,11 +204,11 @@ func TestEntriesAndClean(t *testing.T) {
 	}
 
 	e, _ := testExec(map[string]string{
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                 "",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):              " M tool\n?? note.txt\n",
-		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored"}):    "?? new.txt\n!! .env\n!! build/\n",
-		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored"}): " M tool\n",
-		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):       list,
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain"}):                          "",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain"}):                       " M tool\n?? note.txt\n",
+		key("git", []string{"-C", "/repo.wt", "status", "--porcelain", "--ignored", "-uall"}):    "?? new.txt\n!! .env\n!! build/output.dat\n",
+		key("git", []string{"-C", "/repo.dirty", "status", "--porcelain", "--ignored", "-uall"}): " M tool\n",
+		key("git", []string{"-C", "/repo.wt", "worktree", "list", "--porcelain"}):                list,
 	}, nil)
 	for _, tt := range []struct {
 		path string
@@ -230,6 +230,28 @@ func TestEntriesAndClean(t *testing.T) {
 	got, err := e.WorktreeEntries(context.Background(), "/repo.wt")
 	if err != nil || len(got) != 3 {
 		t.Fatalf("%+v %v", got, err)
+	}
+}
+
+func TestIgnoredListsFilesInsideIgnoredDirs(t *testing.T) {
+	e, f := testExec(map[string]string{
+		key("git", []string{"-C", "/wt", "status", "--porcelain", "--ignored", "-uall"}): "!! bin/.env\n!! bin/output.dat\n",
+	}, nil)
+	got, err := e.Ignored(context.Background(), "/wt")
+	if err != nil {
+		t.Fatalf("Ignored: %v", err)
+	}
+	if len(got) != 2 || got[0] != "bin/.env" || got[1] != "bin/output.dat" {
+		t.Fatalf("Ignored = %q, want per-file entries", got)
+	}
+	if len(f.calls) != 1 || !strings.Contains(f.calls[0], "\x00-uall") {
+		t.Fatalf("Ignored ran %q, want -uall so wholly ignored dirs expand to files", f.calls)
+	}
+	if Regenerable([]string{"bin"}, "bin/output.dat") {
+		t.Fatal("file inside a regenerable dir must not pass by its own name")
+	}
+	if Regenerable([]string{"bin"}, "bin/.env") {
+		t.Fatal("an ignored .env inside a regenerable dir must still refuse removal")
 	}
 }
 
