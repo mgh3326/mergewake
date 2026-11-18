@@ -69,6 +69,38 @@ func TestNotifierPanewireLaneValidation(t *testing.T) {
 	}
 }
 
+func TestConfigToolLaneValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name, toolLane, wantError, want string
+	}{
+		{"unset", "", "", ""},
+		{"valid", "tool_lane: mergewake-design\n", "", "mergewake-design"},
+		{"invalid", "tool_lane: desk/a\n", "notifier.tool_lane", ""},
+		{"too long", "tool_lane: " + strings.Repeat("a", 129) + "\n", "notifier.tool_lane", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			contents := "version: 1\nhost: host-a\nnotifier:\n  type: stdout\n  lane: operator-desk\n  " + strings.ReplaceAll(tt.toolLane, "\n", "\n  ")
+			if err := os.WriteFile(p, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := Load(p)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("Load error = %v, want error naming %s", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Notifier.ToolLane != tt.want {
+				t.Fatalf("tool_lane = %q, want %q", c.Notifier.ToolLane, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidGradeScale(t *testing.T) {
 	for _, grade := range []string{"C", "B", "A", "A+", "S", "S+", "SS"} {
 		if !ValidGrade(grade) {

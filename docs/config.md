@@ -1269,6 +1269,7 @@ through the configured reps CLI, not other manual bench records.
 | `command` | `panewire` for that adapter | Executable path. Ignored for noop/stdout. |
 | `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. Must match panewire's lane rule: 1–128 characters, starting with an ASCII letter or digit and continuing with ASCII letters, digits, `.`, `_`, `:`, or `-`. |
 | `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. Must match the same panewire lane rule as `lane`. |
+| `tool_lane` | Desk lane | Lane that owns mergewake's own automation (lost review results, exhausted review retries). Empty falls back to the desk (`notifier.fallback_lane`, else `notifier.lane`), so nothing changes until it is set. Must match the same panewire lane rule as `lane`. |
 
 The panewire adapter executes literal arguments equivalent to:
 
@@ -1282,6 +1283,19 @@ an explicit event lane overrides `notifier.lane` for that emit only.
 No-op emits nothing; stdout prints event ID and text. Review and landing produce
 local decision output; CI recovery and attempted installs also use the adapters.
 Healthy repeated agent polls do not emit a fresh installation notification.
+
+#### Notice routing
+
+Notices mergewake's own automation raises go to the tool lane
+(`notifier.tool_lane`), not the desk; notices that need a person go to the
+PR's design lane. Event ids are stable, so the hub dedupe still works.
+
+| Notice | Lane | Fallback |
+| --- | --- | --- |
+| Lost review result (`mergewake-review-result-lost-…`) | Tool lane | The desk, when no tool lane is set. One notice per incident; the 10-minute dedupe still applies. |
+| Lost review, retries exhausted (`…-owner-pr-<pr>`) | PR's design lane (`repos[].lane`) | The desk, when the repo names no lane. One notice per PR, as before. |
+| Review retries exhausted (`mergewake-review-failed-…`) | PR's design lane, plus the tool lane (same text, `…-tool` event id) | Without a tool lane the design-lane notice is the only copy, exactly as before. One notice per PR and head on each lane. |
+| Round hold / ladder ended (`mergewake-round-hold-…`, `mergewake-ladder-ended-…`) | The `Mergewake-Notify-Lane` trailer, else the task's lane, else the repo's lane | The desk, only when no lane resolves (a repo with no design session). |
 
 ### `sink`
 
@@ -2404,7 +2418,8 @@ lands: a synchronous spawn whose wait returned or timed out on a placed pane, a
 spawn receipt naming a pane and its host, or an hk job record for its label.
 An asynchronous spawn's `ACCEPTED` receipt alone is no landing, so a request the
 hub accepts and then refuses keeps counting toward the threshold. At the
-threshold, one `automation-failed` event interrupts `notifier.lane`; later
+threshold, one `automation-failed` event goes to the PR's design lane and one
+(same text, `…-tool` event id) to the tool lane; later
 attempts keep the bounded backoff. While a failed head conflicts or its
 required checks are red, retries and the failure escalation wait: the first
 wait per head and reason writes a `review-retry-waiting` row, and the count,

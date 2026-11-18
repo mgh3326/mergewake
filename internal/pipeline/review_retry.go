@@ -437,7 +437,22 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	}
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
-	err = s.Notifier.Notify(nctx, integrations.Event{ID: fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Lane: s.ownerLane(r), Type: "automation-failed", Text: fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA), lastErrorNote(lastError))})
+	id := fmt.Sprintf("mergewake-review-failed-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA)
+	text := fmt.Sprintf("[mergewake] review failed %d times for %s#%d head=%s%s; decision needed", failures, r.Name, pr.Number, short7(pr.Head.SHA), lastErrorNote(lastError))
+	owner := s.ownerLane(r)
+	// Mergewake's own automation gets its own copy on the tool lane, so the
+	// desk hears it only when no tool lane and no design lane resolve to
+	// anything else. The suffixed id keeps both copies deduped per lane and
+	// stable across retries. Until tool_lane is set the owner notice below
+	// is the only copy, exactly as before.
+	if s.Config.Notifier.ToolLane != "" {
+		if tool := s.toolLane(); tool != owner {
+			if err := s.Notifier.Notify(nctx, integrations.Event{ID: id + "-tool", Lane: tool, Type: "automation-failed", Text: text}); err != nil {
+				return false, err
+			}
+		}
+	}
+	err = s.Notifier.Notify(nctx, integrations.Event{ID: id, Lane: owner, Type: "automation-failed", Text: text})
 	return err == nil, err
 }
 

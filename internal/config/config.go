@@ -141,6 +141,10 @@ type Notifier struct {
 	// FallbackLane receives events for PRs with no owning lane; empty means
 	// Lane, the operator lane.
 	FallbackLane string `yaml:"fallback_lane"`
+	// ToolLane owns mergewake's own automation notices (lost review results,
+	// exhausted review retries); empty means the desk (fallback_lane, else
+	// lane), so nothing changes until it is set.
+	ToolLane string `yaml:"tool_lane"`
 }
 type Sink struct {
 	Type        string `yaml:"type"`
@@ -1345,6 +1349,9 @@ func validateAdapters(c *Config) error {
 	}
 	if c.Notifier.FallbackLane != "" && !PanewireLane(c.Notifier.FallbackLane) {
 		return errors.New("notifier.fallback_lane must match panewire's lane rule")
+	}
+	if c.Notifier.ToolLane != "" && !PanewireLane(c.Notifier.ToolLane) {
+		return errors.New("notifier.tool_lane must match panewire's lane rule")
 	}
 	if c.Reap.BalanceLane != "" && !PanewireLane(c.Reap.BalanceLane) {
 		return errors.New("reap.balance_lane must match panewire's lane rule")

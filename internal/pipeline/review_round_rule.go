@@ -532,25 +532,18 @@ func checkRoundHoldRelease(comments []github.IssueComment) (bool, string) {
 	return false, ""
 }
 
-// designLane returns the task's lane, falling back to desk when the lane is
-// the desk or unknown.
+// designLane returns the PR's design lane for holds that need a person: the
+// lane the PR names outright (its Mergewake-Notify-Lane trailer) or its
+// task's lane, then the repo's lane. The desk takes it only when no lane
+// resolves, i.e. a repo with no design session.
 func (s *Service) designLane(ctx context.Context, r config.Repo, pr github.Pull) string {
 	desk := s.deskLane()
-	task, err := s.prTask(ctx, r, pr)
-	if err != nil || task == "" {
-		return desk
+	if task, err := s.prTask(ctx, r, pr); err == nil {
+		if lane, _, err := s.explicitLane(ctx, r, pr, task, desk); err == nil && lane != "" {
+			return lane
+		}
 	}
-	l, ok := s.Sink.(interface {
-		Lane(context.Context, string) (string, error)
-	})
-	if !ok {
-		return desk
-	}
-	lane, err := l.Lane(ctx, task)
-	if err != nil || lane == "" || lane == desk {
-		return desk
-	}
-	return lane
+	return s.ownerLane(r)
 }
 
 // emitSafe replaces every control byte and rune (0x00-0x1f, 0x7f-0x9f) with a
