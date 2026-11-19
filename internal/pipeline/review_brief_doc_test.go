@@ -473,7 +473,7 @@ func TestReviewBriefFallbackSpawnsRoundOneBrief(t *testing.T) {
 	}
 	body := hk.Documents()["review/"+label].Body
 	family := x.builderFamily(context.Background(), "author-job")
-	if want := x.briefDelta(context.Background(), plan, label, jobDir, family, false); body != want {
+	if want := x.briefDelta(context.Background(), plan, label, jobDir, family, false, x.context); body != want {
 		t.Fatalf("hk doc is not the round-1 brief:\n%s\n--- want ---\n%s", body, want)
 	}
 	if strings.Contains(body, "Delta to review") || !strings.Contains(body, "git diff "+shaB+"..."+shaA) {
@@ -567,5 +567,30 @@ func TestPublishBriefPointerFailureIsNotFallback(t *testing.T) {
 		filepath.Join(jobDir, "review-brief.md"), jobDir, strings.Repeat("brief\n", inlineBriefLimit))
 	if e == nil || errors.Is(e, errBriefPublish) {
 		t.Fatalf("publishBrief err=%v, want an unmarked local failure", e)
+	}
+}
+
+// The fallback keeps the rest of the round-2 context but not its scope
+// note: "the diff below is NOT the whole PR ... do not hunt" would contradict
+// the whole-PR diff the fallback brief points the reviewer at. Budget lines
+// and later sections survive.
+func TestReviewBriefFallbackRewritesDeltaScopeNote(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	notes := roundPlan{round: 2, base: shaB, quiet: true, budget: 3}.notes()
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: oversizeDelta(), delta: true, round: 2,
+		context: contextHeader + notes + "\nPRIOR FINDINGS (rounds 1-1 of this PR, newest first)\n1. tool:1 (high)\n   finding: earlier\n   disposition: fixed\n"}
+	runner.sink.uploadErr = errors.New("attachment_object_store_unavailable")
+	out, plan := runDeltaPass(t, s, g, r, x, time.Minute)
+	if len(out.skips) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("outcome %+v spawns=%d", out, len(runner.spawns))
+	}
+	body := hk.Documents()["review/"+plan.label].Body
+	if strings.Contains(body, "NOT the whole PR") || strings.Contains(body, "do not hunt for anything else") {
+		t.Fatalf("fallback brief keeps the delta scope note:\n%s", body)
+	}
+	if !strings.Contains(body, "(whole diff)") || !strings.Contains(body, "REVIEW BUDGET SPENT") || !strings.Contains(body, "PRIOR FINDINGS") {
+		t.Fatalf("fallback brief context:\n%s", body)
 	}
 }
