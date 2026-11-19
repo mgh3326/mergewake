@@ -28,6 +28,27 @@ const roundHoldNotifyDetailLimit = 512
 // be retried before the outcome is treated as ended without a successor.
 const ladderPendingBound = 2 * time.Hour
 
+// ladderPaneBusyMaxCalls bounds retries after panewire cannot reach the author pane.
+const ladderPaneBusyMaxCalls = 3
+
+var ladderHubRefusalCodes = map[string]bool{
+	"no_rung": true, "successor_invalid": true, "job_unreadable": true,
+	"job_changed": true, "job_not_live": true, "pane_busy": true,
+	"quota_refused": true, "pane_unavailable": true, "worktree_unreadable": true,
+}
+
+func ladderRefusal(output string) (code string, hub bool) {
+	text := strings.TrimSpace(output)
+	text = strings.TrimPrefix(text, "panewire: ")
+	if i := strings.IndexByte(text, ':'); i > 0 {
+		candidate := strings.TrimSpace(text[:i])
+		if ladderHubRefusalCodes[candidate] {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
 // roundHoldNotifyDetail is a failed notify's error with panewire's stderr,
 // redacted, as one line of at most roundHoldNotifyDetailLimit bytes. The
 // stderr is the reason panewire refused the event; CommandError keeps it out
@@ -112,8 +133,13 @@ type roundRuleState struct {
 	LadderPendingSince time.Time `json:"ladder_pending_since,omitzero"`
 	// LadderEndedNoSuccessor records an ended or unconfirmed outcome;
 	// LadderEndedEventSent marks its one owner-lane decision event delivered.
-	LadderEndedNoSuccessor bool `json:"ladder_ended_no_successor,omitempty"`
-	LadderEndedEventSent   bool `json:"ladder_ended_event_sent,omitempty"`
+	LadderEndedNoSuccessor bool   `json:"ladder_ended_no_successor,omitempty"`
+	LadderEndedEventSent   bool   `json:"ladder_ended_event_sent,omitempty"`
+	LadderPaneBusyCalls    int    `json:"ladder_pane_busy_calls,omitempty"`
+	LadderRefusalCode      string `json:"ladder_refusal_code,omitempty"`
+	LadderRefusalText      string `json:"ladder_refusal_text,omitempty"`
+	LadderRefusalRound     int    `json:"ladder_refusal_round,omitempty"`
+	LadderRefusalEventSent bool   `json:"ladder_refusal_event_sent,omitempty"`
 
 	// Hold
 	HoldHeld               bool      `json:"hold_held,omitempty"`
@@ -367,6 +393,7 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 	*st = s.loadRoundRuleState(r.Name, pr.Number)
 	if st.escalated() {
 		s.sendLadderEndedDecision(ctx, r, pr, o, st)
+		s.sendLadderRefusalDecision(ctx, r, pr, ladderRound, o, st)
 		return
 	}
 
@@ -446,16 +473,38 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 
 	switch exitCode {
 	case 2:
+		code, hub := ladderRefusal(outputStr)
+		st.LadderRefusalCode = code
+		if hub && code == "pane_busy" {
+			st.LadderPaneBusyCalls++
+			if st.LadderPaneBusyCalls < ladderPaneBusyMaxCalls {
+				st.LadderOutput = outputStr
+				_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+				_ = s.audit(r.Name, "ladder-pane-busy-retry", map[string]any{
+					"pr": pr.Number, "round": ladderRound, "rc": 2,
+					"code": code, "calls": st.LadderPaneBusyCalls, "output": outputStr,
+				}, o.DryRun)
+				return
+			}
+		}
 		st.setEscalated(true, now, outputStr)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "ladder-intact", map[string]any{
 			"pr":                pr.Number,
 			"round":             ladderRound,
 			"rc":                2,
+			"code":              code,
 			"output":            outputStr,
 			"findings_sent":     fit.sent,
 			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
+		if !hub {
+			st.LadderRefusalText = outputStr
+			st.LadderRefusalRound = ladderRound
+			st.LadderRefusalEventSent = false
+			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+			s.sendLadderRefusalDecision(ctx, r, pr, ladderRound, o, st)
+		}
 		if s.Log != nil {
 			s.Log.Info("escalate-author intact", "pr", pr.Number, "output", outputStr)
 		}
@@ -497,6 +546,36 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			s.Log.Warn("escalate-author error", "pr", pr.Number, "error", err, "output", outputStr)
 		}
 	}
+}
+
+// sendLadderRefusalDecision tells the owner when CLI preflight prevented the
+// ladder step from replacing the author. The event identity is stable across retries.
+func (s *Service) sendLadderRefusalDecision(ctx context.Context, r config.Repo, pr github.Pull, ladderRound int, o Options, st *roundRuleState) {
+	if st.LadderRefusalText == "" || st.LadderRefusalEventSent || !o.Reporting() {
+		return
+	}
+	lane := s.designLane(ctx, r, pr)
+	if !config.PanewireLane(lane) {
+		lane = s.deskLane()
+	}
+	round := st.LadderRefusalRound
+	if round == 0 {
+		round = ladderRound
+	}
+	eventID := fmt.Sprintf("mergewake-ladder-refusal-%s-%d-%d", r.Name, pr.Number, round)
+	text := emitSafe(clip(fmt.Sprintf("PR %s#%d round %d: escalate-author was refused before replacing the author: %s", r.Name, pr.Number, round, strings.TrimPrefix(strings.TrimSpace(st.LadderRefusalText), "panewire: ")), findingsLaneText))
+	ctx, cancel := reportContext(ctx)
+	defer cancel()
+	if err := s.Notifier.Notify(ctx, integrations.Event{ID: eventID, Lane: lane, Type: "decision", Text: text}); err != nil {
+		_ = s.audit(r.Name, "ladder-refusal-notify-failed", map[string]any{"pr": pr.Number, "round": round, "error": roundHoldNotifyDetail(err)}, o.DryRun)
+		return
+	}
+	st.LadderRefusalEventSent = true
+	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+}
+
+func (st roundRuleState) ladderRefusalOwed() bool {
+	return st.LadderRefusalText != "" && !st.LadderRefusalEventSent
 }
 
 // ladderEnded records the ended-without-successor outcome: the step is done

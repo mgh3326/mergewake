@@ -92,6 +92,19 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	v, e := s.mergeGate(ctx, r, pr, p, baseSHA)
 	if e != nil {
+		// mergeGate hands back the verdict it had reached. A round hold it set
+		// before the failing read still gets its decision (hk 5536); the read
+		// error returns after it. Outside findings settled before the failure
+		// are audited the same way; recordStatus needs a finished verdict and
+		// waits for the next pass.
+		if slices.Contains(v.Reasons, "round_hold") {
+			s.notifyRoundHold(ctx, r, pr, v, o)
+		}
+		if !o.DryRun {
+			if ae := s.auditOutsideFindings(r, pr, v); ae != nil {
+				return errors.Join(e, ae)
+			}
+		}
 		return e
 	}
 	if o.Reporting() {
@@ -102,16 +115,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		}
 	}
 	if slices.Contains(v.Reasons, "round_hold") {
-		fb, fbErr := s.GH.ReviewFeedback(ctx, r.Name, n)
-		if fbErr != nil {
-			if s.Log != nil {
-				s.Log.Warn("round-hold review feedback failed", "pr", n, "error", fbErr)
-			}
-		} else {
-			if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil {
-				s.roundHoldNotifyFailed(r, pr, v.Review.Rounds, err, o)
-			}
-		}
+		s.notifyRoundHold(ctx, r, pr, v, o)
 	}
 	if !o.DryRun {
 		s.recordStatus(r, pr, v, started)
@@ -722,6 +726,22 @@ func (s *Service) startReadyClock(r config.Repo, key, lane string) error {
 	now := s.now().UTC()
 	clocks[key] = readyClock{Lane: lane, First: now, Last: now}
 	return s.saveReadyClocks(r.Name, clocks)
+}
+
+// notifyRoundHold sends the round-hold decision for a verdict that holds the
+// PR. A feedback read failure is logged and a refused notify is audited; either
+// way the event stays unsent for a later pass.
+func (s *Service) notifyRoundHold(ctx context.Context, r config.Repo, pr github.Pull, v gateVerdict, o Options) {
+	fb, fbErr := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if fbErr != nil {
+		if s.Log != nil {
+			s.Log.Warn("round-hold review feedback failed", "pr", pr.Number, "error", fbErr)
+		}
+		return
+	}
+	if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil {
+		s.roundHoldNotifyFailed(r, pr, v.Review.Rounds, err, o)
+	}
 }
 
 // notifyLane resolves the destination lane without guessing: the PR's author
