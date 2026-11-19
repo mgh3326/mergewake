@@ -1097,8 +1097,9 @@ on it.
     disposed (a medium finding by any human answer, a critical or high one only by a verified fix or a reasoned
     dismissal). An all-low round requests nothing (decision 250); with the switch off, the directive path below keeps
     its blocking condition. The consult is owed on the first done round at or after the consult round that has
-    such a finding open, and is requested at most once per PR (decision 250). mergewake writes a question document to hk (the PR, the reviewed head, every open
-    finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR,
+    such a finding open; a consult already requested at an earlier round is not asked again (decision 250), while a
+    new head in the round it was requested for still starts its own, as below. mergewake writes a question document to hk (the PR, the reviewed head, every open
+    finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR and head,
     on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
@@ -1108,14 +1109,18 @@ on it.
     terminal row would retry it), until `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout)
     passes; the wait also bounds a failed task read or question write, and it is measured from the first attempt.
     The obligation is owed until its outcome is delivered, whatever the current review round says: a push that
-    changes the head supersedes the old row (recorded, never delivered as the new head's answer), and no second
-    consult is requested for the PR. While the consult is queued or running that
+    changes the head supersedes the old row (recorded, never delivered as the new head's answer) and the new head
+    starts its own consult when its round reaches the consult round. While the consult is queued or running that
     round's findings wait — a restart resumes the poll from the state file. The row is journaled in the audit log
     before the state file, so an id lost to a failed state write is reconciled from it instead of re-requested.
     `answered` delivers the findings with the `answer_doc` key (passed through unread) and no ask-a-consult
     directive; `refused`, `failed`, `cancelled`, an rc 1/2 request failure or an expired wait delivers them as today
     plus one line saying the consult could not be had and why. A settled consult records one hk task comment (id,
-    state, seat, answer_doc) that retries on its own until hk accepts it. Request, state change, supersession,
+    state, seat, answer_doc) that retries on its own until hk accepts it. The reset of a superseded row waits for
+    its own comment only while recording it can still succeed: a sink without `Comment` (`sink.type` ""/`noop`)
+    or a PR with no task never waits, and a failed write or task read holds the next head for at most 10 minutes
+    from the first failure — then the reset proceeds and the drop is audited as `consult-comment-dropped` once,
+    so the round's findings are never held past that bound. Request, state change, supersession,
     outcome and delivery are audited as `consult-request` / `consult-state` / `consult-superseded` /
     `consult-outcome` / `consult-delivered`.
   - **Round ladder (`review.round_rule.ladder`, default 5):** on the first done round at or after the ladder round

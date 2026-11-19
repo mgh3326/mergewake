@@ -574,9 +574,8 @@ func TestHubConsult_NoTaskFallsBack(t *testing.T) {
 }
 
 // A consult is keyed by head: a new head that inherits the reviewed patch
-// and stays in the consult round never reuses the old head's row. The old row
-// is superseded and recorded, and — one consult runs per PR — no second one is
-// requested: the new head's findings go out at once.
+// and stays in the consult round never reuses the old head's row. The old
+// row is superseded and recorded, and the new head gets its own consult.
 func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
 	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
@@ -593,18 +592,25 @@ func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
 	}
 
 	// The author pushes; the same reviewed patch keeps the round at the
-	// consult round. The consult was already asked for this PR.
+	// consult round, so a new consult is owed for the new head.
 	g.pull.Head.SHA = shaC
 	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-3", Round: 3}}
 	g.refs[doneRef(7, shaC)] = true
 
 	deliver(t, s, r)
 
-	if run.requestCount() != 1 {
-		t.Fatalf("a second consult was requested for the PR: %v", run.requests)
+	if run.requestCount() != 2 {
+		t.Fatalf("want a consult for the new head, requests=%v", run.requests)
 	}
-	if n.count != 1 || strings.Contains(n.events[0].Text, "hub consult") {
-		t.Fatalf("the new head's findings must go out without the stale outcome: %+v", n.events)
+	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
+		t.Fatalf("new request --head=%q, want %q", got, shaC)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	if st.HubConsultID != "c-2" || st.HubConsultHead != shaC {
+		t.Fatalf("state not re-keyed to the new head: %+v", st)
+	}
+	if n.count != 0 {
+		t.Fatalf("findings delivered while the new consult is queued: %+v", n.events)
 	}
 	if hub.getCount() != 0 {
 		t.Fatalf("old head's row polled %d times", hub.getCount())
@@ -614,11 +620,6 @@ func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
 	}
 	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "superseded") {
 		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
-	}
-	// Later passes neither deliver again nor ask again.
-	deliver(t, s, r)
-	if n.count != 1 || run.requestCount() != 1 {
-		t.Fatalf("a later pass acted again: events=%d requests=%d", n.count, run.requestCount())
 	}
 }
 

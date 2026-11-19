@@ -116,3 +116,30 @@ func TestRoundSteps_LadderOnTheFirstQualifyingRound(t *testing.T) {
 		t.Fatalf("ladder ran again: %d calls", run.escalateCalls)
 	}
 }
+
+// One consult runs per PR across rounds: a consult requested at the first done
+// round at or after the consult round is not asked again at a later round, even
+// when a push superseded it before it answered.
+func TestRoundSteps_ConsultIsNotAskedAgainAtALaterRound(t *testing.T) {
+	s, g, n, _, run, hub, r, _ := hubConsultSetup(t, 4)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	deliver(t, s, r)
+	if run.requestCount() != 1 || n.count != 0 {
+		t.Fatalf("first pass: requests=%d events=%d", run.requestCount(), n.count)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); st.HubConsultRound != 4 {
+		t.Fatalf("request round not recorded: %+v", st)
+	}
+
+	pushHead(g, shaC, "patch-5", 5, true)
+	g.feedback.Threads = append(g.feedback.Threads, ownFinding("T2", "high", 20))
+	deliver(t, s, r)
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("a second consult was requested at a later round: %v", run.requests)
+	}
+	if n.count != 1 {
+		t.Fatalf("the later round's findings were not delivered once: %+v", n.events)
+	}
+}

@@ -131,3 +131,51 @@ func TestHubConsult_DirectiveSanitisesAnswerFields(t *testing.T) {
 		t.Fatalf("answer fields stored raw: %+v", st)
 	}
 }
+
+// Gap 4: when the head moves, the old consult's task comment must be finished
+// or retried before the new head resets the state, or its ID is lost.
+func TestHubConsult_SupersededCommentRetriedBeforeReset(t *testing.T) {
+	s, g, n, sink, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.queue = []consultResp{
+		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
+		{rc: 0, out: `{"id":"c-2","state":"queued"}`},
+	}
+
+	deliver(t, s, r)
+	if run.requestCount() != 1 || n.count != 0 {
+		t.Fatalf("first pass: requests=%d events=%d", run.requestCount(), n.count)
+	}
+
+	// The author pushes; the same round owes a new-head consult while the
+	// supersession comment cannot be recorded.
+	g.pull.Head.SHA = shaC
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-3", Round: 3}}
+	g.refs[doneRef(7, shaC)] = true
+	sink.commentErr = errors.New("hk unavailable")
+	if err := s.DeliverFindings(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if run.requestCount() != 1 {
+		t.Fatalf("new head re-requested before the old comment was retried: %v", run.requests)
+	}
+	if len(sink.comments) != 0 {
+		t.Fatalf("comment recorded despite the failure: %v", sink.comments)
+	}
+
+	// Once hk recovers the old comment goes out, then the new head requests.
+	sink.commentErr = nil
+	deliver(t, s, r)
+	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "c-1") {
+		t.Fatalf("old consult comment lost on reset: %v", sink.comments)
+	}
+	if run.requestCount() != 2 {
+		t.Fatalf("want the new head consult after the retry, got %v", run.requests)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); st.HubConsultID != "c-2" || st.HubConsultHead != shaC {
+		t.Fatalf("state not re-keyed to the new head: %+v", st)
+	}
+	if n.count != 0 {
+		t.Fatalf("findings delivered while the new consult is queued: %+v", n.events)
+	}
+}
