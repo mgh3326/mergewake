@@ -3,6 +3,8 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -334,6 +336,45 @@ func TestArchiveJobsApplyFailureAfterMaxRunWritesErrorRow(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("partial apply result missing from durable row: %s", b)
+	}
+}
+
+func TestArchiveJobsBusyApplyLockRemainsSkipped(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	h := f.s.Config.Hosts[0]
+	p, err := f.s.archiver().Plan(context.Background(), h, "old-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDigest := sha256.Sum256([]byte(p.Dest))
+	lockDir := filepath.Join(f.drive, ".locks", hex.EncodeToString(lockDigest[:]))
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(lockDir, "owner"), "another-owner 9999999999\n")
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("routine archive lock skip failed the run: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var skipped, summary bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("bad archive row %q: %v", line, err)
+		}
+		if row["action"] == "archive-job" && row["job"] == "old-job" {
+			skipped = row["result"] == "skipped" && row["reason"] == "archive-lock-busy"
+		}
+		if row["action"] == "archive-jobs" {
+			summary = row["errors"] == float64(0)
+		}
+	}
+	if !skipped || !summary {
+		t.Fatalf("busy lock was not recorded as a successful skip: %s", b)
 	}
 }
 

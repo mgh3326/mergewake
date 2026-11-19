@@ -495,7 +495,6 @@ hosts:
 				continue
 			}
 			row := archiveRow{Action: "archive-job", Host: h.Name, Job: job}
-			rowErrorRecorded := false
 			if !reap.ValidJobName(job) {
 				row.Result, row.Reason = "skipped", "job-name-invalid"
 			} else if archive.ExcludedName(s.Config.Reap.Archive.Exclude, job) {
@@ -569,8 +568,6 @@ hosts:
 						row.Archive = res
 						if applyErr != nil {
 							row.Result, row.Reason = archiveJobsReason(applyErr)
-							errs = append(errs, fmt.Errorf("%s job %s apply: %w", h.Name, job, applyErr))
-							rowErrorRecorded = true
 						} else if len(res.Retained) != 0 {
 							row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 						} else {
@@ -582,7 +579,7 @@ hosts:
 					}
 				}
 			}
-			if row.Result == "error" && !rowErrorRecorded {
+			if row.Result == "error" {
 				errs = append(errs, fmt.Errorf("%s job %s: %s", h.Name, job, row.Reason))
 			}
 			counts[row.Result]++
