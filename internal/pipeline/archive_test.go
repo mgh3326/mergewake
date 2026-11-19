@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +55,28 @@ func (r archiveBlockRunner) Run(ctx context.Context, name string, args []string,
 	if strings.Contains(name+" "+strings.Join(args, " "), r.match) {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+type archivePauseDeleteRunner struct {
+	base        integrations.Runner
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+	fail        bool
+}
+
+func (r *archivePauseDeleteRunner) unblock() { r.releaseOnce.Do(func() { close(r.release) }) }
+
+func (r *archivePauseDeleteRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && strings.Contains(strings.Join(args, " "), `rm -rf "$1" || {`) {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+		if r.fail {
+			return nil, errors.New("injected delete failure")
+		}
 	}
 	return r.base.Run(ctx, name, args, input, dir)
 }
@@ -207,6 +230,110 @@ func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
 	}
 	if !strings.Contains(out, `"phase":"pane_scan"`) {
 		t.Fatalf("deadline run lacks pane scan timing row: %s", out)
+	}
+}
+
+func TestArchiveJobsBudgetStopDuringHostScanAdvancesRotation(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "50ms"
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "herdr agent list"}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("deadline stopped the run with error: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"unscanned_hosts":["local","other"]`) {
+		t.Fatalf("summary omitted current scan host: %s", out)
+	}
+	if b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, archiveNextHostFile)); err != nil || string(b) != "other\n" {
+		t.Fatalf("next-host state = %q, %v; want other host", b, err)
+	}
+}
+
+func TestArchiveJobsApplyFinishesAndRecordsAfterMaxRun(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	dir := jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archivePauseDeleteRunner{base: f.run, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(runner.unblock)
+	f.s.Runner = runner
+	done := make(chan error, 1)
+	go func() { done <- f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}) }()
+	select {
+	case <-runner.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive apply never reached source delete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	runner.unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("apply after max_run returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive run did not finish after delete was released")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("completed archive left source dir: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			found = row.Result == "archived" && row.Archive != nil && row.Archive.Deleted
+		}
+	}
+	if !found {
+		t.Fatalf("durable archive result missing after apply completed: %s", b)
+	}
+}
+
+func TestArchiveJobsApplyFailureAfterMaxRunWritesErrorRow(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archivePauseDeleteRunner{base: f.run, entered: make(chan struct{}), release: make(chan struct{}), fail: true}
+	t.Cleanup(runner.unblock)
+	f.s.Runner = runner
+	done := make(chan error, 1)
+	go func() { done <- f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}) }()
+	select {
+	case <-runner.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive apply never reached source delete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	runner.unblock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("apply failure was not returned")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive run did not finish after delete failed")
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			found = row.Result == "error" && row.Archive != nil && row.Archive.Manifest != "" && !row.Archive.Deleted
+		}
+	}
+	if !found {
+		t.Fatalf("partial apply result missing from durable row: %s", b)
 	}
 }
 

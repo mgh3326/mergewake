@@ -369,9 +369,11 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	var errs []error
 	counts := map[string]int{}
 	archivedThisRun, eligibleLeft := 0, 0
-	// entered counts the hosts whose gate passed; after a budget stop the
-	// hosts from entered onward were not scanned.
+	// entered is the gate boundary. rotationCursor advances past a started
+	// host even when its scan exceeds the budget.
 	entered := 0
+	rotationCursor := 0
+	unscannedStart := -1
 	stoppedOnBudget := false
 	unscannedReasons := map[string]string{}
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
@@ -386,6 +388,7 @@ hosts:
 			break
 		}
 		entered++
+		rotationCursor = entered
 		if h.Jobs == "" {
 			errs = append(errs, fmt.Errorf("%s: hosts[].jobs is unset", h.Name))
 			continue
@@ -409,7 +412,7 @@ hosts:
 			if errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during pane scan"
-				entered--
+				unscannedStart = entered - 1
 				break
 			}
 			unscannedReasons[h.Name] = "pane scan: " + e.Error()
@@ -427,7 +430,7 @@ hosts:
 			if budgetSpent() && ctx.Err() == nil {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during jobs directory lookup"
-				entered--
+				unscannedStart = entered - 1
 				break
 			}
 			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
@@ -443,7 +446,7 @@ hosts:
 			if budgetSpent() && ctx.Err() == nil {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during jobs listing"
-				entered--
+				unscannedStart = entered - 1
 				break
 			}
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
@@ -472,7 +475,7 @@ hosts:
 				if errors.Is(e, context.DeadlineExceeded) && ctx.Err() == nil {
 					stoppedOnBudget = true
 					unscannedReasons[h.Name] = "max_run deadline during job scan"
-					entered--
+					unscannedStart = entered - 1
 				}
 				break hosts
 			}
@@ -492,6 +495,7 @@ hosts:
 				continue
 			}
 			row := archiveRow{Action: "archive-job", Host: h.Name, Job: job}
+			rowErrorRecorded := false
 			if !reap.ValidJobName(job) {
 				row.Result, row.Reason = "skipped", "job-name-invalid"
 			} else if archive.ExcludedName(s.Config.Reap.Archive.Exclude, job) {
@@ -513,7 +517,7 @@ hosts:
 					if budgetSpent() && ctx.Err() == nil {
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline during job reads"
-						entered--
+						unscannedStart = entered - 1
 						break hosts
 					}
 					row.Result, row.Reason = archiveJobsReason(refreshErr)
@@ -535,10 +539,15 @@ hosts:
 						if budgetSpent() && ctx.Err() == nil {
 							stoppedOnBudget = true
 							unscannedReasons[h.Name] = "max_run deadline during hk reads"
-							entered--
+							unscannedStart = entered - 1
 							break hosts
 						}
 						row.Result, row.Reason = archiveJobsReason(planErr)
+					} else if budgetSpent() {
+						stoppedOnBudget = true
+						unscannedReasons[h.Name] = "max_run deadline before archive apply"
+						unscannedStart = entered - 1
+						break hosts
 					} else if e := s.Print(p); e != nil {
 						row.Result, row.Reason = "error", e.Error()
 					} else if !acting {
@@ -546,20 +555,22 @@ hosts:
 						archivedThisRun++
 					} else {
 						timed.phase = "archive_apply"
-						res, applyErr := a.Apply(runCtx, p, now)
+						// Once apply starts, let it finish its publish/delete boundary.
+						// Cancelling a remote rm mid-command can leave a partial tree
+						// with a published manifest and no durable archive row.
+						res, applyErr := a.Apply(ctx, p, now)
 						timed.phase = ""
+						if budgetSpent() {
+							stoppedOnBudget = true
+						}
 						if phaseErr := s.archivePhase(h.Name, "archive_apply", takePhase(timed, "archive_apply"), applyErr, o.DryRun); phaseErr != nil {
 							errs = append(errs, phaseErr)
 						}
 						row.Archive = res
 						if applyErr != nil {
-							if budgetSpent() && ctx.Err() == nil {
-								stoppedOnBudget = true
-								unscannedReasons[h.Name] = "max_run deadline during archive apply"
-								entered--
-								break hosts
-							}
 							row.Result, row.Reason = archiveJobsReason(applyErr)
+							errs = append(errs, fmt.Errorf("%s job %s apply: %w", h.Name, job, applyErr))
+							rowErrorRecorded = true
 						} else if len(res.Retained) != 0 {
 							row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 						} else {
@@ -571,7 +582,7 @@ hosts:
 					}
 				}
 			}
-			if row.Result == "error" {
+			if row.Result == "error" && !rowErrorRecorded {
 				errs = append(errs, fmt.Errorf("%s job %s: %s", h.Name, job, row.Reason))
 			}
 			counts[row.Result]++
@@ -582,7 +593,11 @@ hosts:
 	}
 	var unscanned []string
 	if stoppedOnBudget {
-		for _, h := range order[entered:] {
+		unscannedFrom := entered
+		if unscannedStart >= 0 {
+			unscannedFrom = unscannedStart
+		}
+		for _, h := range order[unscannedFrom:] {
 			unscanned = append(unscanned, h.Name)
 		}
 	}
@@ -596,7 +611,7 @@ hosts:
 		unscanned = compactStrings(unscanned)
 	}
 	if host == "" && !o.DryRun && ctx.Err() == nil {
-		if e := saveArchiveNextHost(s.Config.StateDir, order, entered, stoppedOnBudget); e != nil {
+		if e := saveArchiveNextHost(s.Config.StateDir, order, rotationCursor, stoppedOnBudget); e != nil {
 			errs = append(errs, e)
 		}
 	}
@@ -699,10 +714,10 @@ func (s *Service) archiveRunOrder(hosts []reap.Host) []reap.Host {
 }
 
 // saveArchiveNextHost records where the next full run starts. A budget stop
-// names the host after the last one entered (entered is the count of hosts
+// names the host after the last one started (cursor is the count of hosts
 // whose gate passed). A run that walked every host clears the state, so config
 // order resumes.
-func saveArchiveNextHost(stateDir string, order []reap.Host, entered int, stopped bool) error {
+func saveArchiveNextHost(stateDir string, order []reap.Host, cursor int, stopped bool) error {
 	file := filepath.Join(stateDir, archiveNextHostFile)
 	if !stopped {
 		if e := os.Remove(file); e != nil && !errors.Is(e, fs.ErrNotExist) {
@@ -710,7 +725,7 @@ func saveArchiveNextHost(stateDir string, order []reap.Host, entered int, stoppe
 		}
 		return nil
 	}
-	return fsutil.Atomic(file, []byte(order[entered%len(order)].Name+"\n"), 0600)
+	return fsutil.Atomic(file, []byte(order[cursor%len(order)].Name+"\n"), 0600)
 }
 
 func archiveJobsReason(err error) (string, string) {

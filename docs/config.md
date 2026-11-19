@@ -616,10 +616,11 @@ needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
 
-A run's `reap.archive.max_run` deadline covers pane scans, SSH listings, job reads,
-Handoffkeep event reads, and archive commands. A command still running at the
-deadline is cancelled, then the run writes its summary with
-`stopped_on_budget: true` and names the current and later hosts in
+A run's `reap.archive.max_run` deadline bounds pane scans, SSH listings, job reads,
+and Handoffkeep event reads, and is checked before an archive apply starts. An
+apply already in progress finishes its publish/delete boundary before the run
+writes its summary, so that single apply can extend the deadline. The summary
+has `stopped_on_budget: true` and names unscanned hosts in
 `unscanned_hosts`. Each host phase writes an `archive-phase` row with its
 duration in milliseconds. A caller-cancelled run writes its summary and returns
 the cancellation error. A pane scan failure skips that host, records its reason
