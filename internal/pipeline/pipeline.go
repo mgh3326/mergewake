@@ -62,6 +62,9 @@ type Service struct {
 	// patches caches each PR head's patch id (see patchIDOf), guarded by
 	// patchMu.
 	patches map[string]string
+	// ancestorOnBase and cleanMerged cache the base-merge checks of base_merge.go
+	// that came back true (see baseMergeMu).
+	ancestorOnBase, cleanMerged map[string]bool
 	// reapBinds caches each merged PR's task/job binding for reap (see
 	// reapBinding), guarded by reapBindMu.
 	reapBinds map[string]reapBinding

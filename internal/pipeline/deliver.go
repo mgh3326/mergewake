@@ -122,7 +122,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
 	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
-	rounds, _ := reviewRounds(history)
+	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
 	st := s.loadRoundRuleState(r.Name, n)
@@ -229,11 +229,12 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// with an unsent decision retries the notify, even after the ladder
 	// round has passed.
 	ladderOwed := st.LadderEndedNoSuccessor && !st.LadderEndedEventSent
-	ladderRetry := !st.escalated() && !st.LadderPendingSince.IsZero()
+	ladderRefusalOwed := st.ladderRefusalOwed()
+	ladderRetry := !st.escalated() && (!st.LadderPendingSince.IsZero() || st.LadderPaneBusyCalls > 0)
 	// The ladder runs on the first done round at or after its round that has a
 	// critical/high finding open, once per PR: a round that was not done, or
 	// had nothing open, does not use it up.
-	if (done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRetry {
+	if (done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRefusalOwed || ladderRetry {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {

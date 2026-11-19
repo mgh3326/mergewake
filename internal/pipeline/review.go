@@ -191,7 +191,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			diff = src.text
 			patch = s.rememberPatch(patchKey(r.Name, n, pr.Head.SHA), reviewPatchID(diff))
 		}
-		if from, inherited, ok := inheritedPasses(history, patch, pr.Head.SHA, needed); ok {
+		from, inherited, ok := inheritedPasses(history, patch, pr.Head.SHA, needed)
+		if !ok {
+			from, inherited, ok = s.cleanBaseMergePasses(ctx, r, pr, history, needed)
+		}
+		if ok {
 			if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {
 				return e
 			}
