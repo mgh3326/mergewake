@@ -86,12 +86,15 @@ type reviewerJob struct {
 }
 
 // replacedReviewer is a reviewer that was lost and replaced: its label,
-// the head it reviewed, and when its review budget started (budgetStart), which
-// is the anchor its overdue loss was measured from.
+// the head it reviewed, when its review budget started (budgetStart), which
+// is the anchor its overdue loss was measured from, and the quota pool it ran
+// on (empty when its hk record named none). A replacement spawn leaves that
+// pool out of its placement.
 type replacedReviewer struct {
 	Label       string    `json:"label"`
 	Head        string    `json:"head"`
 	BudgetStart time.Time `json:"budget_start"`
+	Pool        string    `json:"pool,omitempty"`
 }
 
 // budgetStart is when the review budget of this reviewer starts.
