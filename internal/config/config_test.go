@@ -230,6 +230,8 @@ func TestReapConfig(t *testing.T) {
 		{"archive drive cap", "reap:\n  archive: {drive_max_file_bytes: 104857600}\n", false},
 		{"archive job cap", "reap:\n  archive: {max_jobs_per_run: 2}\n", false},
 		{"archive negative job cap", "reap:\n  archive: {max_jobs_per_run: -1}\n", true},
+		{"archive max run", "reap:\n  archive: {max_run: 25m}\n", false},
+		{"archive negative max run", "reap:\n  archive: {max_run: -1s}\n", true},
 		{"archive invalid exclude", "reap:\n  archive: {exclude: ['[']}\n", true},
 		{"archive empty exclude", "reap:\n  archive: {exclude: []}\n", false},
 		{"archive negative drive cap", "reap:\n  archive: {drive_max_file_bytes: -1}\n", true},

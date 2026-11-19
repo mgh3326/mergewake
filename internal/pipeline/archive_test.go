@@ -31,10 +31,34 @@ type archiveRunner struct {
 	vanishDuringRefresh string
 	afterTreeListing    func()
 	treeBytes           int
+	failCatPath         string
+	failTarDir          string
+	failReadProbe       bool
+	failCatError        string
+	tarProbes           int
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	a.calls++
+	if name == "cat" && a.failCatPath != "" && strings.HasSuffix(args[len(args)-1], a.failCatPath) {
+		if a.failCatError != "" {
+			return nil, errors.New(a.failCatError)
+		}
+		return nil, errors.New("exit status 1")
+	}
+	if name == "true" && a.failReadProbe {
+		return nil, errors.New("ssh: exit status 255")
+	}
+	if (name == "tar" || name == "env") && a.failTarDir != "" {
+		if name == "env" && strings.Contains(strings.Join(args, " "), "tar") {
+			a.tarProbes++
+		}
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-C" && args[i+1] == a.failTarDir && (name == "tar" || strings.Contains(strings.Join(args[:i], " "), "tar")) {
+				return nil, errors.New("exit status 1")
+			}
+		}
+	}
 	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
 		a.hkCLI = append(a.hkCLI, append([]string{name}, args...))
 		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
@@ -329,6 +353,122 @@ func TestArchiveJobsUnreadableSubtreeDoesNotSkipOtherJobs(t *testing.T) {
 	}
 	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || !strings.Contains(f.out.String(), `"job":"bad-events","result":"error"`) || !strings.Contains(f.out.String(), `"job":"good-job","result":"would-archive"`) {
 		t.Fatalf("one unreadable job affected other rows: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsUnreadableReadSkipsAndContinues(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	jobDir(t, f.jobs, "good-job", 20*24*time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("unreadable job failed the run: %v", err)
+	}
+	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"unreadable: cat brief.md: exit status 1"`, `"job":"good-job","result":"would-archive"`} {
+		if !strings.Contains(f.out.String(), want) {
+			t.Fatalf("missing %s in output: %s", want, f.out.String())
+		}
+	}
+}
+
+func TestReapArchiveUnreadableTaskReadRemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	f.run.failCatPath = "00004-job.task_link.json"
+	rec := reapReceipt{Host: "local", Job: "bad-job"}
+	f.s.archiveJob(context.Background(), f.s.Config.Hosts[0], "bad-job", false, &rec)
+	if rec.Result != "error" || !strings.Contains(rec.Reason, "unreadable: cat events/00004-job.task_link.json") {
+		t.Fatalf("reap archive row = %+v, want error for the same unreadable task read", rec)
+	}
+}
+
+func TestArchiveJobsUnreadableProbeFailureRemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	f.run.failReadProbe = true
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("read failure with an unavailable host probe should fail the run")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
+		t.Fatalf("transport failure was not recorded as a run error: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	base := time.Now()
+	calls := 0
+	f.s.Now = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
+		calls++
+		return at
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("budget stop failed the run: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":1`) || !strings.Contains(f.out.String(), `"unscanned_hosts":["other"]`) {
+		t.Fatalf("budget summary or boundary is wrong: %s", f.out.String())
+	}
+	if strings.Contains(f.out.String(), `"job":"second"`) {
+		t.Fatalf("walk processed a job after budget: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsTransportCatExit255RemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	f.run.failCatError = "ssh: exit status 255"
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("cat transport failure must fail the run even when a later probe could succeed")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
+		t.Fatalf("transport failure was not recorded as an error row: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsFailedBatchReadProbesAreBounded(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "many-files", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		file := filepath.Join(bad, fmt.Sprintf("file-%03d.md", i))
+		writeFile(t, file, "body")
+		old := time.Now().Add(-20 * 24 * time.Hour)
+		if err := os.Chtimes(file, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.run.failTarDir = bad
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("generic batch read failure should remain an error")
+	}
+	if f.run.tarProbes > 33 {
+		t.Fatalf("failed batch read issued %d tar commands, want at most 33", f.run.tarProbes)
 	}
 }
 

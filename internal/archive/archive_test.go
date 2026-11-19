@@ -879,6 +879,17 @@ func TestPlanExcludesCredentialsAndListsThem(t *testing.T) {
 	}
 }
 
+func TestUnreadableReasonRemainsAnErrorForDefaultCallers(t *testing.T) {
+	err := &Unreadable{Path: "events/example.json", Err: errors.New("exit status 1")}
+	result, reason := Reason(err)
+	if result != "error" || reason != err.Error() {
+		t.Fatalf("Reason(%v) = %q, %q; want error and the unreadable detail", err, result, reason)
+	}
+	if got, ok := UnreadableReason(err); !ok || got != err.Error() {
+		t.Fatalf("UnreadableReason(%v) = %q, %v", err, got, ok)
+	}
+}
+
 func TestPlanSkips(t *testing.T) {
 	e := setup(t)
 	a := archiver(e, "")
