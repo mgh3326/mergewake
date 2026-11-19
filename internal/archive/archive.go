@@ -417,7 +417,7 @@ func (a *Archiver) task(ctx context.Context, h reap.Host, dir string, files []Fi
 		for i := len(names) - 1; i >= 0; i-- {
 			b, err := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, names[i]))
 			if err != nil {
-				return "", a.readFailure(ctx, h.SSH, names[i], err)
+				return "", a.readFailure(names[i], err)
 			}
 			var v struct {
 				Payload struct {
@@ -606,7 +606,7 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 	}
 	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 	if err != nil {
-		return false, a.readFailure(ctx, a.SSH, path.Base(mpath), err)
+		return false, a.readFailure(path.Base(mpath), err)
 	}
 	var m manifest
 	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -847,7 +847,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		// to the delete; anything else never overwrites it.
 		raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 		if err != nil {
-			return nil, a.readFailure(ctx, a.SSH, path.Base(mpath), err)
+			return nil, a.readFailure(path.Base(mpath), err)
 		}
 		var m manifest
 		if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -1011,73 +1011,82 @@ func (a *Archiver) readText(ctx context.Context, ssh, dir string, files []File) 
 	}
 	b, err := a.on(ctx, ssh, listInput(filePaths(files)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
 	if err != nil {
-		if readErr := a.findUnreadableText(ctx, ssh, dir, files, err); readErr != nil {
-			return nil, readErr
+		if exitCode(err) == 1 {
+			if rel, ok := a.unreadableText(ctx, ssh, dir, files); ok {
+				return nil, &Unreadable{Path: rel, Err: errors.New("cat exit status 1")}
+			}
 		}
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
 	return parseText(dir, files, b)
 }
 
-const maxReadFailureProbes = 32
+// unreadableProbeTimeout bounds the one remote command that names an
+// unreadable text candidate after a failed batch read.
+const unreadableProbeTimeout = time.Minute
 
-// findUnreadableText narrows a failed batch read with bounded batch probes,
-// then confirms a single candidate with cat. If the initial or a probe
-// indicates transport loss, it returns that error instead of a job skip.
-func (a *Archiver) findUnreadableText(ctx context.Context, ssh, dir string, files []File, original error) error {
-	if hasExitStatus(original, 255) {
-		return original
-	}
-	if _, err := a.on(ctx, ssh, "", "true"); err != nil {
-		return original
-	}
-	probes := 0
-	var search func([]File) error
-	search = func(group []File) error {
-		if len(group) == 1 {
-			f := group[0]
-			_, err := a.on(ctx, ssh, "", "cat", filepath.Join(dir, f.Path))
-			if err == nil {
-				return nil
-			}
-			return a.readFailure(ctx, ssh, f.Path, err)
+// unreadableProbeScript runs under sh -c with the job dir as $1 and one
+// job-relative path per stdin line. It cats each path and prints the first
+// failing one as "<status> <path>", exiting 0; a clean run prints nothing.
+// Only POSIX sh features are used, so dash and bash hosts run it alike.
+const unreadableProbeScript = `cd "$1" || exit 2
+while IFS= read -r p; do
+  cat -- "$p" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then printf '%s %s\n' "$rc" "$p"; exit 0; fi
+done
+`
+
+// unreadableText names the candidate a failed batch read could not open, with
+// one remote command rather than a bisection of the batch. Only a cat that
+// exits exactly 1 on a candidate the batch listed confirms it as unreadable;
+// no answer, any other status, a probe failure or a name that needs a newline
+// to list keeps the batch error as a run error.
+func (a *Archiver) unreadableText(ctx context.Context, ssh, dir string, files []File) (string, bool) {
+	paths := filePaths(files)
+	known := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if strings.Contains(p, "\n") {
+			return "", false
 		}
-		mid := len(group) / 2
-		for _, half := range [][]File{group[:mid], group[mid:]} {
-			if probes >= maxReadFailureProbes {
-				return nil
-			}
-			probes++
-			_, err := a.on(ctx, ssh, listInput(filePaths(half)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
-			if err == nil {
-				continue
-			}
-			if hasExitStatus(err, 255) {
-				return err
-			}
-			if err := search(half); err != nil {
-				return err
-			}
-		}
-		return nil
+		known[p] = true
 	}
-	return search(files)
+	pctx, cancel := context.WithTimeout(ctx, unreadableProbeTimeout)
+	defer cancel()
+	out, err := a.on(pctx, ssh, strings.Join(paths, "\n")+"\n", "sh", "-c", unreadableProbeScript, "sh", dir)
+	if err != nil {
+		return "", false
+	}
+	line, ok := strings.CutSuffix(string(out), "\n")
+	if !ok {
+		return "", false
+	}
+	status, rel, ok := strings.Cut(line, " ")
+	if !ok || status != "1" || !known[rel] {
+		return "", false
+	}
+	return rel, true
 }
 
-// readFailure classifies only a remote command exit status of 1 as an
-// unreadable file, and only when a separate command confirms the host answers.
-func (a *Archiver) readFailure(ctx context.Context, ssh, rel string, err error) error {
-	if !hasExitStatus(err, 1) {
-		return err
-	}
-	if _, probeErr := a.on(ctx, ssh, "", "true"); probeErr != nil {
+// readFailure classifies a single-file read: a cat that exits exactly 1 is an
+// unreadable file, and any other failure stays a run error.
+func (a *Archiver) readFailure(rel string, err error) error {
+	if exitCode(err) != 1 {
 		return err
 	}
 	return &Unreadable{Path: rel, Err: err}
 }
 
-func hasExitStatus(err error, status int) bool {
-	return strings.Contains(err.Error(), fmt.Sprintf("exit status %d", status))
+// exitCode returns the exit status of a command that ran and exited with one,
+// found through the runner's wrapping, or -1 when err carries none (a start,
+// transport or context failure). Callers compare the number; no message is
+// parsed.
+func exitCode(err error) int {
+	var coded interface{ ExitCode() int }
+	if errors.As(err, &coded) {
+		return coded.ExitCode()
+	}
+	return -1
 }
 
 // parseText maps a tar stream's regular entries to their bytes. A candidate

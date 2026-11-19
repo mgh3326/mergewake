@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -304,7 +307,9 @@ type archiveRow struct {
 // ArchiveJobs archives the backlog of job dirs on configured hosts whose
 // newest entry is older than olderThan, through the same plan/apply pipeline
 // reap uses. A job whose name is a live pane is never touched, and a host
-// whose pane list cannot be read is skipped whole.
+// whose pane list cannot be read is skipped whole. The run ends before the next
+// remote command once its budget is spent or its context is cancelled; a full
+// run starts at the host the previous budget stop left (archiveRunOrder).
 func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.Duration, o Options) error {
 	if !s.Config.Reap.Archive.Enabled {
 		return errors.New("archive-jobs requires reap.archive.enabled in host config")
@@ -313,22 +318,42 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	now := s.now()
 	started := now
 	maxRun, _ := config.OptionalDuration(s.Config.Reap.Archive.MaxRun)
+	// budgetSpent is the budget half of the gate that runs before every host
+	// and every job; the cancel half comes first there, so a cancelled run
+	// returns its error even when the budget is spent too.
+	budgetSpent := func() bool { return maxRun > 0 && s.now().Sub(started) >= maxRun }
+	var selected []reap.Host
+	for _, h := range s.Config.Hosts {
+		if host == "" || h.Name == host {
+			selected = append(selected, h)
+		}
+	}
+	if len(selected) == 0 {
+		return fmt.Errorf("no configured host %q", host)
+	}
+	order := selected
+	if host == "" {
+		order = s.archiveRunOrder(selected)
+	}
 	var errs []error
-	found := false
 	counts := map[string]int{}
 	archivedThisRun, eligibleLeft := 0, 0
+	// entered counts the hosts whose gate passed; after a budget stop the
+	// hosts from entered onward were not scanned.
+	entered := 0
 	stoppedOnBudget := false
-	var unscannedHosts []string
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
-	for _, h := range s.Config.Hosts {
-		if host != "" && h.Name != host {
-			continue
+hosts:
+	for _, h := range order {
+		// The gate comes before the first remote command for this host.
+		if e := ctx.Err(); e != nil {
+			return errors.Join(append(errs, e)...)
 		}
-		found = true
-		if stoppedOnBudget {
-			unscannedHosts = append(unscannedHosts, h.Name)
-			continue
+		if budgetSpent() {
+			stoppedOnBudget = true
+			break
 		}
+		entered++
 		if h.Jobs == "" {
 			errs = append(errs, fmt.Errorf("%s: hosts[].jobs is unset", h.Name))
 			continue
@@ -376,7 +401,10 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			jobs[i] = ordered[i].name
 		}
 		for jobIndex, job := range jobs {
-			if stoppedOnBudget || maxRun > 0 && s.now().Sub(started) >= maxRun {
+			if e := ctx.Err(); e != nil {
+				return errors.Join(append(errs, e)...)
+			}
+			if budgetSpent() {
 				stoppedOnBudget = true
 				for _, pending := range jobs[jobIndex:] {
 					if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
@@ -386,10 +414,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 						eligibleLeft++
 					}
 				}
-				break
-			}
-			if e := ctx.Err(); e != nil {
-				return errors.Join(append(errs, e)...)
+				break hosts
 			}
 			if job == "" {
 				continue
@@ -444,8 +469,19 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			}
 		}
 	}
-	if !found {
-		return fmt.Errorf("no configured host %q", host)
+	if e := ctx.Err(); e != nil {
+		return errors.Join(append(errs, e)...)
+	}
+	var unscanned []string
+	if stoppedOnBudget {
+		for _, h := range order[entered:] {
+			unscanned = append(unscanned, h.Name)
+		}
+	}
+	if host == "" && !o.DryRun {
+		if e := saveArchiveNextHost(s.Config.StateDir, order, entered, stoppedOnBudget); e != nil {
+			errs = append(errs, e)
+		}
 	}
 	summary := struct {
 		Action          string   `json:"action"`
@@ -457,10 +493,53 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		Skipped         int      `json:"skipped"`
 		ErrCount        int      `json:"errors"`
 		EligibleLeft    int      `json:"eligible_left"`
+		EligibleScope   string   `json:"eligible_left_scope"`
 		StoppedOnBudget bool     `json:"stopped_on_budget"`
 		UnscannedHosts  []string `json:"unscanned_hosts,omitempty"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, stoppedOnBudget, unscannedHosts}
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, archiveEligibleScope, stoppedOnBudget, unscanned}
 	return errors.Join(append(errs, s.Print(summary))...)
+}
+
+// archiveNextHostFile holds the name of the host the next full archive-jobs
+// run starts at, next to the run's other state.
+const archiveNextHostFile = "archive-jobs-next-host"
+
+// archiveEligibleScope is what the summary's eligible_left counts: jobs still
+// waiting on the hosts a run scanned. Hosts it never reached are named in
+// unscanned_hosts and are not scanned just to be counted.
+const archiveEligibleScope = "jobs left on scanned hosts only; jobs on unscanned_hosts are not counted"
+
+// archiveRunOrder returns the hosts a full run walks. A run that stopped on its
+// budget leaves the host after the last one it entered in the state file, and
+// the next run starts there, wrapping. No state, an unreadable file or a name
+// that is no longer configured keeps config order.
+func (s *Service) archiveRunOrder(hosts []reap.Host) []reap.Host {
+	b, err := os.ReadFile(filepath.Join(s.Config.StateDir, archiveNextHostFile))
+	if err != nil {
+		return hosts
+	}
+	next := strings.TrimSpace(string(b))
+	for i, h := range hosts {
+		if h.Name == next {
+			return append(append([]reap.Host{}, hosts[i:]...), hosts[:i]...)
+		}
+	}
+	return hosts
+}
+
+// saveArchiveNextHost records where the next full run starts. A budget stop
+// names the host after the last one entered (entered is the count of hosts
+// whose gate passed). A run that walked every host clears the state, so config
+// order resumes.
+func saveArchiveNextHost(stateDir string, order []reap.Host, entered int, stopped bool) error {
+	file := filepath.Join(stateDir, archiveNextHostFile)
+	if !stopped {
+		if e := os.Remove(file); e != nil && !errors.Is(e, fs.ErrNotExist) {
+			return e
+		}
+		return nil
+	}
+	return fsutil.Atomic(file, []byte(order[entered%len(order)].Name+"\n"), 0600)
 }
 
 func archiveJobsReason(err error) (string, string) {
