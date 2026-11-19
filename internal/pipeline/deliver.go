@@ -351,7 +351,7 @@ func (s *Service) boundJob(ctx context.Context, task string) (job string, rec in
 	if e != nil || job == "" {
 		return "", rec, false, e
 	}
-	rec, e = jobs.Job(ctx, job)
+	rec, e = integrations.JobReadOnce(ctx, jobs, job)
 	if e != nil {
 		if errors.Is(e, integrations.ErrJobNotFound) {
 			return "", rec, false, nil

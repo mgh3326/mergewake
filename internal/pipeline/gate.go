@@ -631,7 +631,7 @@ func (s *Service) takeoverJobLive(ctx context.Context, r config.Repo, pr github.
 	if !has {
 		return false, nil
 	}
-	takeover, e := jobs.Job(ctx, others[0])
+	takeover, e := integrations.JobReadOnce(ctx, jobs, others[0])
 	if e != nil {
 		if errors.Is(e, integrations.ErrJobNotFound) {
 			return false, nil

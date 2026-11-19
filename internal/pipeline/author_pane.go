@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -81,6 +82,87 @@ func hostScanOnly(err error) bool {
 	return false
 }
 
+// authorScanTTL is how long one host's pane scan serves every evaluation that
+// asks for it. A burst of notify, delivery and review passes over several PRs
+// lands inside it, so the burst costs one pane list per host. A route never
+// reads a scan older than this.
+var authorScanTTL = 30 * time.Second
+
+// hostScanMu guards Service.hostScans. Like the other Service caches, the map
+// is shared by copies of a Service.
+var hostScanMu sync.Mutex
+
+// hostScanEntry is one host's scan. done closes once hs and at are set; both
+// are written under hostScanMu before that. A scan that failed stays a
+// failure for the TTL, never a healthy answer, and the next scan after the TTL
+// is its retry. A failed scan cut short by its own evaluation's cancellation
+// proves nothing about the host: it is dropped, not kept.
+type hostScanEntry struct {
+	done    chan struct{}
+	hs      *reapHost
+	at      time.Time
+	dropped bool
+}
+
+func (e *hostScanEntry) finished() bool {
+	select {
+	case <-e.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// hostScan returns host h's pane scan: the shared one while it is fresh, or
+// one a concurrent evaluation is already running. Otherwise it scans h under
+// ctx and shares the result.
+func (s *Service) hostScan(ctx context.Context, hub *reap.Hub, h reap.Host) *reapHost {
+	for {
+		hostScanMu.Lock()
+		e := s.hostScans[h.Name]
+		if e != nil && e.finished() && s.now().Sub(e.at) >= authorScanTTL {
+			e = nil
+		}
+		if e == nil {
+			if s.hostScans == nil {
+				s.hostScans = map[string]*hostScanEntry{}
+			}
+			e = &hostScanEntry{done: make(chan struct{})}
+			s.hostScans[h.Name] = e
+			hostScanMu.Unlock()
+			return s.runHostScan(ctx, hub, h, e)
+		}
+		hostScanMu.Unlock()
+		select {
+		case <-e.done:
+		case <-ctx.Done():
+			return &reapHost{host: h, failed: true}
+		}
+		// A dropped entry names no answer; ask again, which starts a fresh scan.
+		if !e.dropped {
+			return e.hs
+		}
+	}
+}
+
+func (s *Service) runHostScan(ctx context.Context, hub *reap.Hub, h reap.Host, e *hostScanEntry) *reapHost {
+	hs, _ := s.reapScanHost(ctx, hub, h)
+	hostScanMu.Lock()
+	e.hs, e.at = hs, s.now()
+	if hs.failed && ctx.Err() != nil {
+		e.dropped = true
+		if s.hostScans[h.Name] == e {
+			delete(s.hostScans, h.Name)
+		}
+	}
+	hostScanMu.Unlock()
+	close(e.done)
+	return hs
+}
+
+// authorHosts returns every configured host's pane scan for this evaluation.
+// Within one evaluation (ctx from WithAuthorScan) each host is read once; across
+// evaluations the scan is shared for authorScanTTL (see hostScan).
 func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 	scan, ok := ctx.Value(authorScanKey{}).(*authorScan)
 	if !ok {
@@ -94,7 +176,7 @@ func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 		}
 		var errs []error
 		for _, h := range s.Config.Hosts {
-			hs, _ := s.reapScanHost(ctx, hub, h)
+			hs := s.hostScan(ctx, hub, h)
 			if hs.failed {
 				errs = append(errs, hostScanError{h.Name})
 				scan.failedHosts = append(scan.failedHosts, h.Name)
@@ -144,7 +226,7 @@ func (s *Service) authorPaneOn(ctx context.Context, jobs reapJobs, hosts []*reap
 	if n != 1 || job == "" {
 		return "", "", false, nil
 	}
-	rec, e := jobs.Job(ctx, job)
+	rec, e := integrations.JobReadOnce(ctx, jobs, job)
 	if errors.Is(e, integrations.ErrJobNotFound) {
 		return "", "", false, nil
 	}
@@ -219,7 +301,7 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	case 0:
 	case 1:
 		jobs := s.Sink.(reapJobs)
-		takeover, e := jobs.Job(ctx, others[0])
+		takeover, e := integrations.JobReadOnce(ctx, jobs, others[0])
 		if e != nil && !errors.Is(e, integrations.ErrJobNotFound) {
 			return authorRoute{}, e
 		}
