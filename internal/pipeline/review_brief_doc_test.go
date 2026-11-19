@@ -568,6 +568,9 @@ func TestPublishBriefPointerFailureIsNotFallback(t *testing.T) {
 	if e == nil || errors.Is(e, errBriefPublish) {
 		t.Fatalf("publishBrief err=%v, want an unmarked local failure", e)
 	}
+	if !strings.HasPrefix(e.Error(), "publish brief: ") {
+		t.Fatalf("publishBrief err=%q, want the publish brief skip label", e)
+	}
 }
 
 // The fallback keeps the rest of the round-2 context but not its scope

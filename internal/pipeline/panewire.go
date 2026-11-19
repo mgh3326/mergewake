@@ -1907,7 +1907,13 @@ func (x *panewireExecutor) publishBrief(ctx context.Context, plan *passPlan, lab
 	if e := os.WriteFile(briefPath, []byte(text), 0600); e != nil {
 		return "", fmt.Errorf("write brief: %w", e)
 	}
-	return x.spawnBrief(ctx, briefPath, jobDir)
+	p, e := x.spawnBrief(ctx, briefPath, jobDir)
+	if e != nil && !errors.Is(e, errBriefPublish) {
+		// Local failures keep the skip label the attachment path carries
+		// through errBriefPublish; only the sentinel marks a fallback.
+		return "", fmt.Errorf("publish brief: %w", e)
+	}
+	return p, e
 }
 
 // errJobRecords means the configured sink cannot read hk job records at all
