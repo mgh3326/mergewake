@@ -31,10 +31,22 @@ type archiveRunner struct {
 	vanishDuringRefresh string
 	afterTreeListing    func()
 	treeBytes           int
+	failCatPath         string
+	failTarDir          string
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	a.calls++
+	if name == "cat" && a.failCatPath != "" && strings.HasSuffix(args[len(args)-1], a.failCatPath) {
+		return nil, errors.New("exit status 1")
+	}
+	if (name == "tar" || name == "env") && a.failTarDir != "" {
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-C" && args[i+1] == a.failTarDir && (name == "tar" || strings.Contains(strings.Join(args[:i], " "), "tar")) {
+				return nil, errors.New("exit status 1")
+			}
+		}
+	}
 	if name == "handoffkeep" || len(args) > 0 && (args[0] == "attach" || args[0] == "tasks" || args[0] == "doc") {
 		a.hkCLI = append(a.hkCLI, append([]string{name}, args...))
 		return nil, errors.New("hk CLI subprocess refused: " + strings.Join(args, " "))
@@ -329,6 +341,48 @@ func TestArchiveJobsUnreadableSubtreeDoesNotSkipOtherJobs(t *testing.T) {
 	}
 	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || !strings.Contains(f.out.String(), `"job":"bad-events","result":"error"`) || !strings.Contains(f.out.String(), `"job":"good-job","result":"would-archive"`) {
 		t.Fatalf("one unreadable job affected other rows: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsUnreadableReadSkipsAndContinues(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	jobDir(t, f.jobs, "good-job", 20*24*time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("unreadable job failed the run: %v", err)
+	}
+	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"unreadable: cat brief.md: exit status 1"`, `"job":"good-job","result":"would-archive"`} {
+		if !strings.Contains(f.out.String(), want) {
+			t.Fatalf("missing %s in output: %s", want, f.out.String())
+		}
+	}
+}
+
+func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	base := time.Now()
+	calls := 0
+	f.s.Now = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
+		calls++
+		return at
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("budget stop failed the run: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":1`) {
+		t.Fatalf("budget summary or boundary is wrong: %s", f.out.String())
+	}
+	if strings.Contains(f.out.String(), `"job":"second"`) {
+		t.Fatalf("walk processed a job after budget: %s", f.out.String())
 	}
 }
 

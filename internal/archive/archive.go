@@ -396,7 +396,7 @@ func (a *Archiver) task(ctx context.Context, h reap.Host, dir string, files []Fi
 		for i := len(names) - 1; i >= 0; i-- {
 			b, err := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, names[i]))
 			if err != nil {
-				return "", err
+				return "", &Skip{fmt.Sprintf("unreadable: cat %s: %v", names[i], err)}
 			}
 			var v struct {
 				Payload struct {
@@ -585,7 +585,7 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 	}
 	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 	if err != nil {
-		return false, err
+		return false, &Skip{fmt.Sprintf("unreadable: cat %s: %v", path.Base(mpath), err)}
 	}
 	var m manifest
 	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -826,7 +826,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		// to the delete; anything else never overwrites it.
 		raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 		if err != nil {
-			return nil, err
+			return nil, &Skip{fmt.Sprintf("unreadable: cat %s: %v", path.Base(mpath), err)}
 		}
 		var m manifest
 		if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -990,6 +990,13 @@ func (a *Archiver) readText(ctx context.Context, ssh, dir string, files []File) 
 	}
 	b, err := a.on(ctx, ssh, listInput(filePaths(files)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
 	if err != nil {
+		// The batch read does not identify which candidate failed. Probe each
+		// candidate only on this error path so the receipt can name the file.
+		for _, f := range files {
+			if _, readErr := a.on(ctx, ssh, "", "cat", filepath.Join(dir, f.Path)); readErr != nil {
+				return nil, &Skip{fmt.Sprintf("unreadable: cat %s: %v", f.Path, readErr)}
+			}
+		}
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
 	return parseText(dir, files, b)

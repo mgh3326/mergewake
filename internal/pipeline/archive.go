@@ -311,11 +311,15 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	}
 	acting := o.Acting()
 	now := s.now()
+	started := now
+	maxRun, _ := config.OptionalDuration(s.Config.Reap.Archive.MaxRun)
 	var errs []error
 	found := false
 	counts := map[string]int{}
 	archivedThisRun, eligibleLeft := 0, 0
+	stoppedOnBudget := false
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
+jobsWalk:
 	for _, h := range s.Config.Hosts {
 		if host != "" && h.Name != host {
 			continue
@@ -367,7 +371,19 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		for i := range ordered {
 			jobs[i] = ordered[i].name
 		}
-		for _, job := range jobs {
+		for jobIndex, job := range jobs {
+			if maxRun > 0 && s.now().Sub(started) >= maxRun {
+				stoppedOnBudget = true
+				for _, pending := range jobs[jobIndex:] {
+					if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
+						continue
+					}
+					if reason, newest := archive.HostSkipReason(jobsByName[pending]); reason == "" && (jobsByName[pending].NeedsRefresh || now.Sub(time.Unix(newest, 0)) >= olderThan) {
+						eligibleLeft++
+					}
+				}
+				break jobsWalk
+			}
 			if e := ctx.Err(); e != nil {
 				return errors.Join(append(errs, e)...)
 			}
@@ -428,16 +444,17 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		return fmt.Errorf("no configured host %q", host)
 	}
 	summary := struct {
-		Action       string `json:"action"`
-		Shadow       bool   `json:"shadow"`
-		OlderThan    string `json:"older_than"`
-		Archived     int    `json:"archived"`
-		Retained     int    `json:"archived_retained"`
-		Planned      int    `json:"planned"`
-		Skipped      int    `json:"skipped"`
-		ErrCount     int    `json:"errors"`
-		EligibleLeft int    `json:"eligible_left"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft}
+		Action          string `json:"action"`
+		Shadow          bool   `json:"shadow"`
+		OlderThan       string `json:"older_than"`
+		Archived        int    `json:"archived"`
+		Retained        int    `json:"archived_retained"`
+		Planned         int    `json:"planned"`
+		Skipped         int    `json:"skipped"`
+		ErrCount        int    `json:"errors"`
+		EligibleLeft    int    `json:"eligible_left"`
+		StoppedOnBudget bool   `json:"stopped_on_budget"`
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, stoppedOnBudget}
 	return errors.Join(append(errs, s.Print(summary))...)
 }
 
