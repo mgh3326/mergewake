@@ -300,7 +300,7 @@ func (s *Service) RetryReview(ctx context.Context, r config.Repo, pr github.Pull
 			}
 			_ = s.audit(r.Name, "review-failed", row, false)
 		}
-		state.LastError = reviewErrorText(class.failures[len(class.failures)-1].err)
+		state.LastError = lastFailureText(class.failures, s.Config.Review.Login)
 	}
 	for _, q := range class.quotas {
 		// A reset not yet reached is waited for, but never longer than the
@@ -546,6 +546,27 @@ func (s *Service) reviewPassesNeeded(ctx context.Context, r config.Repo, pr gith
 		return 2, true, nil
 	}
 	return 1, true, nil
+}
+
+// lastFailureText is the LastError a notice names. A pending review by the
+// posting account is named in plain words: it is not a reviewer's failure to
+// retry through, and only its owner can submit or delete it. Otherwise the
+// last failure's text, as the audit row keeps it.
+func lastFailureText(failures []countedFailure, login string) string {
+	for _, f := range failures {
+		if github.PendingReviewConflict(f.err) {
+			return pendingReviewText(login)
+		}
+	}
+	return reviewErrorText(failures[len(failures)-1].err)
+}
+
+func pendingReviewText(login string) string {
+	by := "the posting account"
+	if login != "" {
+		by = login
+	}
+	return "a pending review by " + by + " on this PR blocks posting; the PR's owner submits or deletes it"
 }
 
 // lastErrorNote is the notice clause naming the last failure, or nothing when
