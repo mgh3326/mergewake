@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/daemon"
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -49,12 +50,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	ctx = WithAuthorScan(ctx)
 	started := s.now()
+	ctx, trace := withNotifyTrace(ctx)
+	defer func() { trace.logIfSlow(s.Log, r.Name, n, s.now().Sub(started)) }()
+	defer daemon.PhasesOf(ctx).Notify()()
+	end := notifyStart(ctx, "pull")
 	pr, e := s.GH.Pull(ctx, r.Name, n)
+	end()
 	if e != nil {
 		return e
 	}
 	// The ESC never holds up the verdict: its error is returned with the rest.
-	escErr := s.EscalateConflict(ctx, r, pr, o)
+	escErr := notifyStep(ctx, "conflict_esc", func() error { return s.EscalateConflict(ctx, r, pr, o) })
 	defer func() { retErr = errors.Join(retErr, escErr) }()
 	if pr.State != "open" || pr.Base.Ref != r.Branch {
 		return nil
@@ -76,21 +82,27 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		if e := s.noteOpenPass(r, pr); e != nil {
 			_ = s.audit(r.Name, "merge-overdue-error", map[string]any{"pr": n, "head": pr.Head.SHA, "error": integrations.Detail(e)}, false)
 		}
-		if e := s.notifyPRIdle(ctx, r, pr); e != nil {
+		if e := notifyStep(ctx, "idle", func() error { return s.notifyPRIdle(ctx, r, pr) }); e != nil {
 			if err := s.stallClockError(ctx, r, pr, prIdleCause, e); err != nil {
 				return err
 			}
 		}
 	}
+	end = notifyStart(ctx, "head")
 	baseSHA, e := s.GH.Head(ctx, r.Name, r.Branch)
+	end()
 	if e != nil {
 		return e
 	}
+	end = notifyStart(ctx, "policy")
 	p, e := s.Policy(ctx, r, baseSHA)
+	end()
 	if e != nil {
 		return e
 	}
+	end = notifyStart(ctx, "gate")
 	v, e := s.mergeGate(ctx, r, pr, p, baseSHA)
+	end()
 	if e != nil {
 		// mergeGate hands back the verdict it had reached. A round hold it set
 		// before the failing read still gets its decision (hk 5536); the read
@@ -98,7 +110,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		// are audited the same way; recordStatus needs a finished verdict and
 		// waits for the next pass.
 		if slices.Contains(v.Reasons, "round_hold") {
-			s.notifyRoundHold(ctx, r, pr, v.Review.Rounds, o)
+			notifyStep(ctx, "round_hold", func() error { s.notifyRoundHold(ctx, r, pr, v.Review.Rounds, o); return nil })
 		}
 		if !o.DryRun {
 			if ae := s.auditOutsideFindings(r, pr, v); ae != nil {
@@ -108,14 +120,14 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return e
 	}
 	if o.Reporting() {
-		if e := s.notifyPRStalls(ctx, r, pr, p); e != nil {
+		if e := notifyStep(ctx, "stalls", func() error { return s.notifyPRStalls(ctx, r, pr, p) }); e != nil {
 			if err := s.stallClockError(ctx, r, pr, prCheckRedCause, e); err != nil {
 				return err
 			}
 		}
 	}
 	if slices.Contains(v.Reasons, "round_hold") {
-		s.notifyRoundHold(ctx, r, pr, v.Review.Rounds, o)
+		notifyStep(ctx, "round_hold", func() error { s.notifyRoundHold(ctx, r, pr, v.Review.Rounds, o); return nil })
 	}
 	if !o.DryRun {
 		s.recordStatus(r, pr, v, started)
@@ -146,7 +158,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
 	s.mergeOverdue(ctx, r, pr, p, v)
-	if e := s.ageCheckFailures(ctx, r, pr, v.Reasons); e != nil {
+	if e := notifyStep(ctx, "age_check", func() error { return s.ageCheckFailures(ctx, r, pr, v.Reasons) }); e != nil {
 		return e
 	}
 	if v.State == "pending" {
@@ -172,7 +184,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			if len(reasons) == 0 && !conflicted {
 				// Only mergewake's own queue holds the head: nothing for any
 				// session to do until the wait outlasts reviewStallAfter.
+				end := notifyStart(ctx, "review_stalled")
 				lane, via, sent, e := s.reviewStalled(ctx, r, pr, s.reviewState(r, pr, v), "", since)
+				end()
 				if e != nil {
 					if !errors.Is(e, errNotifyDelivery) {
 						return e
@@ -235,7 +249,9 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	if identity == "" {
 		identity = summary
 	}
+	end = notifyStart(ctx, "verdict")
 	lane, via, sent, e := s.verdictEvent(ctx, r, pr, v.State, summary, identity, v.Review.BaseBehind, author, designDispute, notice)
+	end()
 	if e != nil {
 		if !errors.Is(e, errNotifyDelivery) {
 			return e
@@ -296,7 +312,9 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 	case state == "ready" || state == "merged":
 		// Recorded or sent below, once the sent key is known; each resolves its own lane.
 	case state == "blocked" && designDispute:
+		end := notifyStart(ctx, "merged_lane")
 		lane, via, e = s.mergedLane(ctx, r, pr)
+		end()
 		if e != nil {
 			return "", "", false, e
 		}
@@ -306,13 +324,17 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 			via = "outside-finding dispute via " + via
 		}
 	case state == "blocked" && author:
+		end := notifyStart(ctx, "findings_route")
 		route, err := s.findingsRoute(ctx, r, pr)
+		end()
 		if err != nil {
 			return "", "", false, err
 		}
 		lane, via = route.lane, route.via
 	default:
+		end := notifyStart(ctx, "lane")
 		lane, via, e = s.notifyLane(ctx, r, pr)
+		end()
 	}
 	if e != nil {
 		return "", "", false, e
@@ -365,12 +387,15 @@ func (s *Service) verdictEvent(ctx context.Context, r config.Repo, pr github.Pul
 		sum := sha256.Sum256([]byte(identity))
 		id += "-" + hex.EncodeToString(sum[:4])
 	}
-	if e = s.Notifier.Notify(reportCtx, integrations.Event{
+	end := notifyStart(ctx, "emit")
+	e = s.Notifier.Notify(reportCtx, integrations.Event{
 		ID:   id,
 		Text: textFor(lane, via),
 		Lane: lane,
 		Type: verdictType(state, via),
-	}); e != nil {
+	})
+	end()
+	if e != nil {
 		fallback := s.Config.Notifier.FallbackLane
 		// An author-action BLOCKED never falls back to the desk: it is parked
 		// with the decided key.
@@ -751,19 +776,25 @@ func (s *Service) notifyRoundHold(ctx context.Context, r config.Repo, pr github.
 // configured notifier lane. The returned rule names the choosing source and is
 // recorded in the event text; a sink read error retries rather than reroutes.
 func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull) (string, string, error) {
+	end := notifyStart(ctx, "task")
 	task, e := s.prTask(ctx, r, pr)
+	end()
 	if e != nil {
 		return "", "", e
 	}
 	// A task with a bound job keeps the rules below; the author pane stands in
 	// only where the task names no job, as for FINDINGS.
 	if len(s.Config.Hosts) > 0 {
+		end = notifyStart(ctx, "bound_job")
 		bound, _, e := s.boundJobLane(ctx, task)
+		end()
 		if e != nil {
 			return "", "", e
 		}
 		if bound == "" {
+			end = notifyStart(ctx, "author_scan")
 			lane, via, ok, e := s.authorPane(ctx, r, pr)
+			end()
 			if e != nil {
 				return "", "", e
 			}
@@ -776,7 +807,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 		if l, ok := s.Sink.(interface {
 			Lane(context.Context, string) (string, error)
 		}); ok {
+			end = notifyStart(ctx, "task_lane")
 			lane, e := l.Lane(ctx, task)
+			end()
 			if e != nil {
 				return "", "", e
 			}
@@ -785,7 +818,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 			}
 		}
 	}
+	end = notifyStart(ctx, "trailer")
 	notify, e := s.prTrailer(ctx, r, pr, "Mergewake-Notify-Lane", nil)
+	end()
 	if e != nil {
 		return "", "", e
 	}

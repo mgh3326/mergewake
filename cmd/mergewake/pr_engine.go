@@ -176,6 +176,8 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 		return
 	}
 	ctx = daemon.WithPhases(ctx, w.Phases)
+	// Each evaluation reads an hk task once, however many of its steps ask for it.
+	ctx = integrations.WithTaskMemo(ctx)
 	w.Phases.Enter(daemon.PhaseRead)
 	ctx, transaction := tracing.Pass(ctx, "pr")
 	defer tracing.Finish(transaction)

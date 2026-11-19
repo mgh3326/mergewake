@@ -32,9 +32,10 @@ const (
 // line. Its methods accept a nil receiver, so code that also runs outside an
 // evaluation records nothing.
 //
-// The top-level phases are disjoint. Gate and Spawn are nested: the time
-// inside the merge gate (it runs in the settle phase) and inside the panewire
-// spawn call (it runs in the review phase).
+// The top-level phases are disjoint. Gate, Notify and Spawn are nested: the
+// time inside the merge gate and inside the notify stage (both run in the
+// settle phase) and inside the panewire spawn call (it runs in the review
+// phase).
 type Phases struct {
 	now func() time.Time
 
@@ -43,6 +44,7 @@ type Phases struct {
 	since    time.Time
 	took     [numPhases]time.Duration
 	gate     time.Duration
+	notify   time.Duration
 	spawn    time.Duration
 	settling []string
 }
@@ -85,6 +87,21 @@ func (p *Phases) Gate() (stop func()) {
 		d := p.Now().Sub(start)
 		p.mu.Lock()
 		p.gate += d
+		p.mu.Unlock()
+	}
+}
+
+// Notify times the notify stage, the verdict's delivery and its recording;
+// call the result when it ends. The stages of several runs add up.
+func (p *Phases) Notify() (stop func()) {
+	if p == nil {
+		return func() {}
+	}
+	start := p.Now()
+	return func() {
+		d := p.Now().Sub(start)
+		p.mu.Lock()
+		p.notify += d
 		p.mu.Unlock()
 	}
 }
@@ -132,6 +149,7 @@ func (p *Phases) attrs() []any {
 		"lock_wait_ms", p.took[PhaseLockWait].Milliseconds(),
 		"settle_ms", p.took[PhaseSettle].Milliseconds(),
 		"gate_ms", p.gate.Milliseconds(),
+		"notify_ms", p.notify.Milliseconds(),
 	}
 	if len(p.settling) > 0 {
 		out = append(out, "settling", strings.Join(p.settling, "+"))

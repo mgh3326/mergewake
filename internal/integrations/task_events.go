@@ -365,6 +365,7 @@ type resendForm struct {
 // payload with nothing else to keep, is resent plain. The result then carries
 // FieldsRefused, hk's field and message on the first 400 and the accepted form.
 func (h Handoffkeep) PostTaskEvent(ctx context.Context, ev TaskEvent) (TaskEventResult, error) {
+	defer taskMemoOf(ctx).forget(append([]int64{ev.TaskID}, ev.Tasks...)...)
 	res, used, e := h.postTaskEvent(ctx, ev, 0)
 	var first *HKError
 	if e == nil || !ev.extended() || !errors.As(e, &first) || first.Status != http.StatusBadRequest {
