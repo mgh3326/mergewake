@@ -132,7 +132,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		followErr = errors.Join(followErr, s.trackHead(ctx, r, pr, !openBlocking, s.openLowerFindings(fb, verify), o))
 	}
 	st := s.loadRoundRuleState(r.Name, n)
-	s.recordHoldDue(ctx, r, pr, o, &st, done, rounds, openBlockingThreads, history)
+	followErr = errors.Join(followErr, s.recordHoldDue(ctx, r, pr, o, &st, done, rounds, openBlockingThreads, history))
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
 	// The hub consult (review.round_rule.hub_consult) replaces the author

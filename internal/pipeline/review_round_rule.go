@@ -292,33 +292,42 @@ func endedFindings(threads []github.ReviewThread) []endedFinding {
 // needs nothing, a dry run writes nothing, and a head already recorded keeps
 // its snapshot: how the round ended does not change when its findings are
 // resolved afterwards.
-func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread, history []github.ReviewedPass) {
+//
+// Evidence that cannot be read (the PR's comments, a fix check) is not a clean
+// round: the record stays as it was and the error is returned, so the pass
+// reports it and the next pass on this head takes the snapshot again.
+func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread, history []github.ReviewedPass) error {
 	if !o.Reporting() || !done || rounds < s.Config.Review.RoundRuleHold() || st.held() {
-		return
+		return nil
 	}
 	if st.HoldDue && st.HoldDueHead == pr.Head.SHA {
-		return
+		return nil
 	}
 	// The round's open findings: inline threads, plus the outside-diff findings
 	// its passes listed that no answer has disposed of by now (the gate's own
 	// fold, so a dismissal is respected and an open one survives the push).
 	ended := endedFindings(open)
-	for _, f := range s.openOutsideAtDone(ctx, r, pr, history) {
+	outside, err := s.openOutsideAtDone(ctx, r, pr, history)
+	if err != nil {
+		_ = s.audit(r.Name, "round-hold-evidence-unavailable", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "error": integrations.Detail(err)}, o.DryRun)
+		return err
+	}
+	for _, f := range outside {
 		ended = append(ended, endedFinding{Ref: f.Ref, Severity: f.Severity, Path: f.Path, Line: f.Line})
 	}
 	if len(ended) == 0 && !st.HoldDue {
-		return
+		return nil
 	}
 	file := s.roundRuleFile(r.Name, pr.Number)
 	defer lockPath(file)()
 	unlock, err := fsutil.Lock(file+".lock", true)
 	if err != nil {
-		return
+		return nil
 	}
 	defer unlock()
 	*st = s.loadRoundRuleState(r.Name, pr.Number)
 	if st.held() || (st.HoldDue && st.HoldDueHead == pr.Head.SHA) {
-		return
+		return nil
 	}
 	if len(ended) == 0 {
 		st.HoldDue, st.HoldDueHead, st.HoldDueRound, st.HoldDueFindings = false, "", 0, nil
@@ -330,13 +339,15 @@ func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pu
 	if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil && s.Log != nil {
 		s.Log.Warn("round-hold state write failed", "pr", pr.Number, "error", e)
 	}
+	return nil
 }
 
 // openOutsideAtDone lists the outside-diff findings still open on pr's done
 // head, as the merge gate folds them: the passes' listings, then the PR's
-// comments as answers with fix claims verified against this head. A read that
-// fails leaves the list empty, as the inline threads' read error does.
-func (s *Service) openOutsideAtDone(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) []outsideFinding {
+// comments as answers with fix claims verified against this head. An answer
+// that cannot be read (the comments, a fix check) is an error, never an empty
+// list: it would read as a clean round.
+func (s *Service) openOutsideAtDone(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) ([]outsideFinding, error) {
 	records := foldOutside(history, pr.Head.SHA, s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA), "", true)
 	var open []outsideFinding
 	for _, f := range records {
@@ -345,16 +356,16 @@ func (s *Service) openOutsideAtDone(ctx context.Context, r config.Repo, pr githu
 		}
 	}
 	if len(open) == 0 {
-		return nil
+		return nil, nil
 	}
 	comments, err := s.GH.IssueComments(github.FreshEvidence(ctx), r.Name, pr.Number)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
 	answerOutside(comments, records, fixes.verified)
 	if fixes.err != nil {
-		return nil
+		return nil, fixes.err
 	}
 	markOutsideDisputes(records)
 	open = open[:0]
@@ -363,7 +374,7 @@ func (s *Service) openOutsideAtDone(ctx context.Context, r config.Repo, pr githu
 			open = append(open, f)
 		}
 	}
-	return open
+	return open, nil
 }
 
 // roundEndsWithoutPass reports whether the PR has at least one critical or high
@@ -956,7 +967,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if reviewed && rounds >= holdRound && open || st.HoldDue && (!reviewed || st.HoldDueHead == pr.Head.SHA || st.HoldDuePatch != "" && st.HoldDuePatch == v.Review.PatchID) {
+	if reviewed && rounds >= holdRound && open || st.HoldDue && (!reviewed || st.HoldDueHead == pr.Head.SHA || st.HoldDuePatch != "" && st.HoldDuePatch == v.Review.PatchID || st.HoldDueHead == v.Review.Inherited) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false

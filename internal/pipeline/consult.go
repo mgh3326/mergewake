@@ -244,17 +244,26 @@ func (s *Service) consultAuthorFor(ctx context.Context, r config.Repo, pr github
 // cancel, killed child) may have reached the hub and created a paid row, so
 // it holds for reconcile instead of settling.
 func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, now time.Time) (string, bool) {
-	// The request names the head it was first made for, whatever head the PR
-	// has now: a POST that reached the hub but lost its row to a timeout is
-	// retried with the same key and --head, so the hub answers the same row
-	// instead of opening a second paid consult for the new head.
-	if st.HubConsultHead != "" {
+	// Once the question is written the request has an identity: the head it was
+	// made for, whatever head the PR has now. A POST that reached the hub but
+	// lost its row to a timeout is retried with the same key and --head, so the
+	// hub answers the same row instead of opening a second paid consult for the
+	// new head. Before that nothing has been sent, so the request is still free to
+	// take the PR's current head: its question, key and --head then all describe
+	// one head, never a new head's findings under an old head's key.
+	if st.HubConsultQuestion != "" && st.HubConsultHead != "" {
 		pr.Head.SHA = st.HubConsultHead
+	} else {
+		st.HubConsultHead = pr.Head.SHA
+		st.HubConsultTask = ""
 	}
 	// The task is read once and kept with the question: the hub keys a consult
 	// by task, PR and head, so a retry after the PR's trailer was edited must
 	// still name the task the question document was written for.
-	task := st.HubConsultTask
+	task := ""
+	if st.HubConsultQuestion != "" {
+		task = st.HubConsultTask
+	}
 	if task == "" {
 		var err error
 		task, err = s.prTask(ctx, r, pr)

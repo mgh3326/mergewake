@@ -1093,7 +1093,8 @@ on it.
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
     (`reap.hub`); a retry of a request whose row never came back replays the same request — the head and task it was first made for
-    and the question document already written — without rewriting the document. A PR
+    and the question document already written — without rewriting the document. Until the question document is
+    written nothing has been sent, so a request that could not write it takes the PR's current head. A PR
     without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
     file, keyed by the head it was requested for. Later passes read a non-terminal row with
     `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
@@ -1133,7 +1134,10 @@ on it.
     not settled; an outstanding hub consult is read there too, and its row is read before its wait bound is judged). The
     record also holds the done head it was taken on, and any head with that head's patch (a rebase or base merge
     inherits the round), whatever its findings' state by then. A recorded hold whose promotion cannot be written still
-    refuses the dispatch. The record is per done head: delivering the same head again after its
+    refuses the dispatch. Evidence the snapshot needs but cannot read (the PR's comments, a fix check) is not a clean
+    round: the record stays as it was, the pass reports the error (`round-hold-evidence-unavailable`) and the next
+    pass on that head takes the snapshot again. A head that inherits the recorded head's review through a clean base
+    merge is held like a same-patch head. The record is per done head: delivering the same head again after its
     finding was resolved keeps it, and only a later done head that ends clean clears it. The decision event names the
     recorded round and findings even when the push already fixed them.
   - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began

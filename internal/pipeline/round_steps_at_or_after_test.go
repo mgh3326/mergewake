@@ -566,3 +566,115 @@ func TestRoundSteps_HoldDueFollowsTheSamePatch(t *testing.T) {
 		t.Fatalf("same-patch head escaped the recorded round: %v", v.Reasons)
 	}
 }
+
+// Before the question document exists nothing has been sent, so a request that
+// could not write it takes the PR's current head: the new head's findings are
+// never written under the old head's key.
+func TestRoundSteps_ConsultWithoutAQuestionTakesTheCurrentHead(t *testing.T) {
+	s, g, _, sink, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	sink.recordErr = errors.New("hk unavailable")
+	deliver(t, s, r)
+	if run.requestCount() != 0 {
+		t.Fatalf("requested without a question: %v", run.requests)
+	}
+
+	sink.recordErr = nil
+	pushHead(g, shaC, "patch-4", 4, true)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T2", "high", 20)}
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("want one request, got %v", run.requests)
+	}
+	args := run.lastRequest()
+	if flagValue(args, "--head") != shaC {
+		t.Fatalf("request names %q, want the current head", flagValue(args, "--head"))
+	}
+	key := strings.TrimPrefix(flagValue(args, "--question"), "hk:doc/")
+	if !strings.Contains(key, short7(shaC)) || !strings.Contains(sink.docs[key], "T2") {
+		t.Fatalf("question for %q does not describe the current head:\n%s", key, sink.docs[key])
+	}
+	for k, doc := range sink.docs {
+		if strings.Contains(k, short7(shaA)) {
+			t.Fatalf("a document was written under the old head's key: %s\n%s", k, doc)
+		}
+	}
+}
+
+// failingComments is an outsideGH whose issue-comment read fails.
+type failingComments struct{ *outsideGH }
+
+func (g failingComments) IssueComments(context.Context, string, int) ([]github.IssueComment, error) {
+	return nil, errors.New("GitHub GET /issues/7/comments: HTTP 502")
+}
+
+// An answer that cannot be read is not a clean round: the record is neither
+// skipped nor erased, the pass reports the error, and the next pass takes the
+// snapshot again.
+func TestRoundSteps_UnreadableEvidenceKeepsTheRecord(t *testing.T) {
+	f := holdFinding("docs/x.md", 3, "high", "the stale claim about the config")
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	patch := s.patchIDOf(context.Background(), r.Name, 7, shaA)
+	var history []github.ReviewedPass
+	for i := 1; i < 7; i++ {
+		history = append(history, github.ReviewedPass{Head: strings.Repeat(string(rune('0'+i)), 40), PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-" + string(rune('0'+i))}})
+	}
+	history = append(history, github.ReviewedPass{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Patch: patch, Round: 7}, Outside: []github.OutsideFinding{f}})
+	oh := &outsideGH{fakeGH: g.fakeGH, history: history}
+	g.feedback.Threads = nil
+
+	s.GH = failingComments{oh}
+	if err := s.DeliverFindings(context.Background(), r, 7, Options{}); err == nil {
+		t.Fatal("an unreadable comment list was read as a clean round")
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); st.HoldDue {
+		t.Fatalf("recorded without evidence: %+v", st)
+	}
+	if !auditHas(t, s, r.Name, "round-hold-evidence-unavailable") {
+		t.Fatal("the unreadable evidence was not audited")
+	}
+
+	// The read recovers: the same head is snapshotted, and the outside finding
+	// is recorded.
+	s.GH = oh
+	deliver(t, s, r)
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueHead != shaA {
+		t.Fatalf("not recorded once the evidence was readable: %+v", st)
+	}
+
+	// A later done head whose evidence is unreadable leaves the record alone.
+	pushHead(g, shaD, "patch-8", 8, true)
+	history = append(history, github.ReviewedPass{Head: shaD, PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-8", Round: 8}, Outside: []github.OutsideFinding{f}})
+	oh.history = history
+	s.GH = failingComments{oh}
+	_ = s.DeliverFindings(context.Background(), r, 7, Options{})
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueHead != shaA {
+		t.Fatalf("unreadable evidence erased the record: %+v", st)
+	}
+}
+
+// A clean base merge inherits the recorded head's review though its patch id
+// differs: the record holds it too.
+func TestRoundSteps_HoldDueFollowsACleanBaseMerge(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+	resolved := ownFinding("T1", "high", 10)
+	resolved.IsResolved = true
+	g.feedback.Threads = []github.ReviewThread{resolved}
+
+	// shaC merges the base (shaB) into the recorded head: a different patch id,
+	// a merge that resolves no conflict.
+	s.rememberPatch(patchKey(r.Name, 7, shaC), "patch-changed")
+	g.parents2 = map[string][]string{shaC: {shaA, shaB}}
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	v := gateHoldVerdict(t, s, g, r)
+	if v.Review.Inherited != shaA || v.Review.PatchID == "" {
+		t.Fatalf("fixture: the merge should inherit the recorded head's review: %+v", v.Review)
+	}
+	if !roundHeld(v) {
+		t.Fatalf("a clean base merge escaped the recorded round: %v", v.Reasons)
+	}
+}
