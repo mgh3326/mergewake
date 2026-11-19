@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -48,20 +47,19 @@ func TestReviewResultLost(t *testing.T) {
 			if lost[0]["collect_error"] == "" || lost[0]["collect_error"] == nil {
 				t.Errorf("missing error: %v", lost[0])
 			}
-			n := s.Notifier.(*fakeNotifier)
-			if n.count != 1 || n.events[0].Lane != "desk" {
+			// A single lost result is counted by cause and not told (hk 5361).
+			if n := s.Notifier.(*fakeNotifier); n.count != 0 {
 				t.Fatalf("events=%v", n.events)
 			}
-			for _, part := range []string{"reviewer finished", "result was lost", r.Name + "#7", shaA, "pass=1", "lens=default", arg(sp, "-l"), arg(sp, "--report")} {
-				if !strings.Contains(n.events[0].Text, part) {
-					t.Errorf("event missing %q: %s", part, n.events[0].Text)
-				}
+			causeRows := auditRows(t, s, r, "notice-cause")
+			if len(causeRows) != 1 || causeRows[0]["sent"] != false || causeRows[0]["cause"] != "lost:other" || causeRows[0]["pr"] != float64(7) || causeRows[0]["head"] != shaA {
+				t.Fatalf("notice-cause rows=%v", causeRows)
 			}
 		})
 	}
 }
 
-func TestRetryReviewResultLostDedupes(t *testing.T) {
+func TestRetryReviewResultLostBelowThresholdIsQuiet(t *testing.T) {
 	runner := &panewireRunner{}
 	s, g, r := panewireSetup(t, runner)
 	s.Config.Notifier.Lane = "desk"
@@ -80,7 +78,7 @@ func TestRetryReviewResultLostDedupes(t *testing.T) {
 		t.Fatal("second review did not fail")
 	}
 	n := s.Notifier.(*fakeNotifier)
-	if len(runner.spawns) != 2 || runner.headless != 0 || n.count != 1 {
+	if len(runner.spawns) != 2 || runner.headless != 0 || n.count != 0 {
 		t.Fatalf("spawns=%d headless=%d events=%v", len(runner.spawns), runner.headless, n.events)
 	}
 }

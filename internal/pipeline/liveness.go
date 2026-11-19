@@ -32,6 +32,7 @@ const (
 	MechTaskEvents              = "task-events"
 	MechOutcomePublish          = "outcome-publish"
 	MechReviewRetry             = "review-retry"
+	MechNotices                 = "notices"
 )
 
 // AllMechanisms is the list of supported automatic mechanisms.
@@ -48,6 +49,7 @@ var AllMechanisms = []string{
 	MechTaskEvents,
 	MechOutcomePublish,
 	MechReviewRetry,
+	MechNotices,
 }
 
 const (
@@ -81,7 +83,7 @@ func NormalizeMechanism(name string) (string, bool) {
 		return MechWorkerWorktrees, true
 	case MechWatchRevert, "watch", "ci-watch-revert":
 		return MechWatchRevert, true
-	case MechLaneNotices, "notices", "lane-notice":
+	case MechLaneNotices, "lane-notice":
 		return MechLaneNotices, true
 	case MechTaskEvents, "hk-task-events", "task-event":
 		return MechTaskEvents, true
@@ -89,6 +91,8 @@ func NormalizeMechanism(name string) (string, bool) {
 		return MechOutcomePublish, true
 	case MechReviewRetry, "retry":
 		return MechReviewRetry, true
+	case MechNotices, "notice-cause", "cause-notices":
+		return MechNotices, true
 	default:
 		return "", false
 	}
@@ -783,6 +787,12 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 
 	m10Errors := 0
 
+	// Reviewer-problem events by cause (notice-cause rows, hk 5361): all repos
+	// and per repo, and how many of them became a notice.
+	m12Events := map[string]int{}
+	m12Sent := map[string]int{}
+	m12RepoEvents := map[string]int{} // repo\x00cause -> events on the day
+
 	type deferredEntry struct {
 		repo, head string
 		pr         int
@@ -836,6 +846,8 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						Findings int             `json:"findings"`
 						Host     string          `json:"host"`
 						Pane     string          `json:"pane"`
+						Cause    string          `json:"cause"`
+						Sent     bool            `json:"sent"`
 					}
 					_ = json.Unmarshal(row.Value, &v)
 					if v.Head == "" && v.Sha != "" {
@@ -928,6 +940,15 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 						// M10: outcome-publish errors
 						if row.Command == "outcome-publish-error" {
 							m10Errors++
+						}
+
+						// M12: reviewer-problem events by cause (notice-cause rows)
+						if row.Command == "notice-cause" && v.Cause != "" {
+							m12Events[v.Cause]++
+							m12RepoEvents[r.Name+"\x00"+v.Cause]++
+							if v.Sent {
+								m12Sent[v.Cause]++
+							}
 						}
 
 					}
@@ -1280,6 +1301,52 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		stalled := unresolvedPastThreshold >= 2
 		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
 			Day: day, Mechanism: MechReviewRetry, Made: made, Done: done, Ratio: ratio, Stalled: stalled,
+		})
+	}
+
+	// 12. notices: a finding when a fix-needed cause appears at all, or a cause
+	// passes notifier.cause_threshold in one repo that day.
+	{
+		made, done := 0, 0
+		causes := make([]string, 0, len(m12Events))
+		for c, n := range m12Events {
+			made += n
+			done += m12Sent[c]
+			causes = append(causes, c)
+		}
+		sort.Strings(causes)
+		threshold := s.Config.Notifier.CauseThresholdOrDefault()
+		var parts, findings []string
+		for _, c := range causes {
+			parts = append(parts, fmt.Sprintf("%s %d (sent %d)", c, m12Events[c], m12Sent[c]))
+			if fixNeededCauses[c] {
+				findings = append(findings, "fix needed: "+c)
+			}
+		}
+		repoKeys := make([]string, 0, len(m12RepoEvents))
+		for k := range m12RepoEvents {
+			repoKeys = append(repoKeys, k)
+		}
+		sort.Strings(repoKeys)
+		for _, k := range repoKeys {
+			if n := m12RepoEvents[k]; n >= threshold {
+				repo, cause, _ := strings.Cut(k, "\x00")
+				findings = append(findings, fmt.Sprintf("threshold passed: %s in %s (%d >= %d)", cause, repo, n, threshold))
+			}
+		}
+		reason := strings.Join(parts, "; ")
+		if len(findings) > 0 {
+			if reason != "" {
+				reason += "; "
+			}
+			reason += strings.Join(findings, "; ")
+		}
+		ratio := 1.0
+		if made > 0 {
+			ratio = float64(done) / float64(made)
+		}
+		res.Mechanisms = append(res.Mechanisms, LivenessMechanismResult{
+			Day: day, Mechanism: MechNotices, Made: made, Done: done, Ratio: ratio, Stalled: len(findings) > 0, Reason: reason,
 		})
 	}
 

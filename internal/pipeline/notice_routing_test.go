@@ -17,27 +17,35 @@ func TestLostReviewGoesToToolLaneWhenSet(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
 	s.Config.Notifier.ToolLane = "tool-lane"
-	lost := &reviewResultLost{label: "reviewer", cause: errors.New("result file missing")}
-	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, &passPlan{pass: 1, lens: "default"}, lost); err != nil {
-		t.Fatal(err)
-	}
+	lostBurst(t, s, g, r, s.Config.Notifier.CauseThresholdOrDefault())
 	if n.count != 1 || n.events[0].Lane != "tool-lane" {
 		t.Fatalf("lost-review notice = %+v, want one tool-lane event", n.events)
 	}
-	if !strings.HasPrefix(n.events[0].ID, "mergewake-review-result-lost-") {
-		t.Fatalf("lost-review event id changed: %q", n.events[0].ID)
+	if !strings.HasPrefix(n.events[0].ID, "mergewake-cause-") {
+		t.Fatalf("lost-review event id = %q, want a notice-cause id", n.events[0].ID)
 	}
 }
 
 func TestLostReviewFallsBackToDeskWithoutToolLane(t *testing.T) {
 	s, g, n, r := notifySetup(t)
 	s.Config.Notifier.Lane, s.Config.Notifier.FallbackLane = "operator-desk", "operator-desk"
-	lost := &reviewResultLost{label: "reviewer", cause: errors.New("result file missing")}
-	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, &passPlan{pass: 1, lens: "default"}, lost); err != nil {
-		t.Fatal(err)
-	}
+	lostBurst(t, s, g, r, s.Config.Notifier.CauseThresholdOrDefault())
 	if n.count != 1 || n.events[0].Lane != "operator-desk" {
 		t.Fatalf("lost-review notice = %+v, want one desk event", n.events)
+	}
+}
+
+// lostBurst reports n lost reviewer results one minute apart for one PR.
+func lostBurst(t *testing.T, s *Service, g *fakeGH, r config.Repo, n int) {
+	t.Helper()
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return now }
+	for i := 1; i <= n; i++ {
+		lost := &reviewResultLost{label: "reviewer", cause: errors.New("result file missing")}
+		if err := s.notifyReviewResultLost(context.Background(), r, g.pull, &passPlan{pass: 1, lens: "default"}, lost); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
 	}
 }
 

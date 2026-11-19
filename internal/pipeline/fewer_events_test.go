@@ -148,23 +148,14 @@ func TestWorkerDeferLookupErrorDoesNotEraseEarlierAnswer(t *testing.T) {
 	}
 }
 
-func TestLostReviewBurstNotifiesOneDesignIncident(t *testing.T) {
+func TestLostReviewBurstBelowThresholdStaysQuiet(t *testing.T) {
 	s, g, n, r := notifySetup(t)
-	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
-	s.Now = func() time.Time { return now }
-	for i := 1; i <= 3; i++ {
-		plan := &passPlan{pass: i, lens: "default"}
-		lost := &reviewResultLost{label: "reviewer", cause: errors.New("result file missing")}
-		if err := s.notifyReviewResultLost(context.Background(), r, g.pull, plan, lost); err != nil {
-			t.Fatal(err)
-		}
-		now = now.Add(2 * time.Minute)
+	lostBurst(t, s, g, r, 3)
+	if n.count != 0 {
+		t.Fatalf("burst below the threshold notified: %+v", n.events)
 	}
-	if n.count != 1 || n.events[0].Lane != s.deskLane() {
-		t.Fatalf("burst notifications = %+v, want one design lane event", n.events)
-	}
-	if rows := auditRows(t, s, r, "review-result-lost-suppressed"); len(rows) != 2 {
-		t.Fatalf("suppressed incident audit rows = %v, want two", rows)
+	if rows := auditRows(t, s, r, "notice-cause"); len(rows) != 3 || rows[2]["sent"] != false || rows[2]["reason"] != "below threshold" {
+		t.Fatalf("notice-cause rows = %v, want three quiet rows", rows)
 	}
 }
 
@@ -177,8 +168,8 @@ func TestLostReviewExhaustedReplacementNotifiesOwnerOnce(t *testing.T) {
 	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, &passPlan{pass: 1, lens: "default"}, lost); err != nil {
 		t.Fatal(err)
 	}
-	if n.count != 1 || n.events[0].Lane != s.deskLane() {
-		t.Fatalf("initial lost-review notice = %+v, want one design-lane incident", n.events)
+	if n.count != 0 {
+		t.Fatalf("first lost review (no replacement yet) notified: %+v", n.events)
 	}
 	plan := &passPlan{pass: 1, lens: "default", replacements: 1}
 	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, plan, lost); err != nil {
@@ -187,11 +178,13 @@ func TestLostReviewExhaustedReplacementNotifiesOwnerOnce(t *testing.T) {
 	if err := s.notifyReviewResultLost(context.Background(), r, g.pull, plan, lost); err != nil {
 		t.Fatal(err)
 	}
-	if n.count != 2 || n.events[1].Lane != s.ownerLane(r) || !strings.Contains(n.events[1].Text, "retries are exhausted") {
+	if n.count != 1 || n.events[0].Lane != s.ownerLane(r) || !strings.Contains(n.events[0].Text, "retries are exhausted") {
 		t.Fatalf("exhausted lost-review notices = %+v, want one owner follow-up", n.events)
 	}
-	if rows := auditRows(t, s, r, "review-result-lost-suppressed"); len(rows) != 2 {
-		t.Fatalf("lost-review suppression audit rows = %v, want two", rows)
+	// Each loss is a row; the first replacement's give-up is sent, the repeat is not.
+	rows := auditRows(t, s, r, "notice-cause")
+	if len(rows) != 5 || rows[2]["cause"] != causeGaveUp || rows[2]["sent"] != true || rows[4]["cause"] != causeGaveUp || rows[4]["sent"] != false {
+		t.Fatalf("notice-cause rows = %v, want give-up sent then give-up quiet", rows)
 	}
 }
 
@@ -207,8 +200,8 @@ func TestLostReplacementUsesDurableReviewerReplacementCount(t *testing.T) {
 	if plan.replacements != 1 {
 		t.Fatalf("plan replacement count = %d, want durable count 1", plan.replacements)
 	}
-	if n.count != 2 || n.events[0].Lane != s.deskLane() || n.events[1].Lane != s.ownerLane(r) {
-		t.Fatalf("lost result notices = %+v, want design then owner", n.events)
+	if n.count != 1 || n.events[0].Lane != s.ownerLane(r) {
+		t.Fatalf("lost result notices = %+v, want the owner only (the loss itself is below threshold)", n.events)
 	}
 }
 

@@ -994,7 +994,8 @@ func TestPanewireRemotePaneReturnsFindingsOnRecord(t *testing.T) {
 			if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label {
 				t.Fatalf("lost rows=%v", rows)
 			}
-			if n := s.Notifier.(*fakeNotifier); n.count != 1 || !strings.Contains(n.events[0].Text, "result was lost") {
+			// A single lost result is recorded, not told (hk 5361).
+			if n := s.Notifier.(*fakeNotifier); n.count != 0 {
 				t.Fatalf("notices=%+v", n.events)
 			}
 		})
@@ -1305,9 +1306,10 @@ func TestPanewireInvalidResumedReplacementResultNotifiesOwner(t *testing.T) {
 	if !errors.As(err, &lost) || !strings.Contains(err.Error(), "invalid finding severity") {
 		t.Fatalf("err=%v, want lost malformed result", err)
 	}
+	// The loss is below the threshold, so only the exhausted owner escalation is told (hk 5361).
 	n := s.Notifier.(*fakeNotifier)
-	if n.count != 2 || n.events[0].Lane != s.deskLane() || n.events[1].Lane != s.ownerLane(r) || !strings.Contains(n.events[1].Text, "retries are exhausted") {
-		t.Fatalf("lost result notices = %+v, want design notice followed by exhausted owner escalation", n.events)
+	if n.count != 1 || n.events[0].Lane != s.ownerLane(r) || !strings.Contains(n.events[0].Text, "retries are exhausted") {
+		t.Fatalf("lost result notices = %+v, want the exhausted owner escalation only", n.events)
 	}
 }
 

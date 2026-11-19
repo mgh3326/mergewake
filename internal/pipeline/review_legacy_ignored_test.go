@@ -217,7 +217,8 @@ func TestLegacyIgnoredCompletedNoResultFresh(t *testing.T) {
 				if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 1 || rows[0]["label"] != label {
 					t.Fatalf("lost rows=%v", rows)
 				}
-				if n := s.Notifier.(*fakeNotifier); n.count != 1 || !strings.Contains(n.events[0].Text, "result was lost") {
+				// A single lost result is counted by cause and not told (hk 5361).
+				if n := s.Notifier.(*fakeNotifier); n.count != 0 {
 					t.Fatalf("notices=%+v", n.events)
 				}
 				switch host {
@@ -386,7 +387,8 @@ func TestLegacyIgnoredRetryClasses(t *testing.T) {
 			lost, failed := resultLostNotices(s)
 			lostRows := len(auditRows(t, s, r, "review-result-lost"))
 			if lostClass {
-				if st.Failures != 0 || st.Escalated || st.Backoffs != 1 || lost != 1 || failed != 0 || lostRows != 1 {
+				// A single lost result is counted by cause and not told (hk 5361).
+				if st.Failures != 0 || st.Escalated || st.Backoffs != 1 || lost != 0 || failed != 0 || lostRows != 1 || len(auditRows(t, s, r, "notice-cause")) != 1 {
 					t.Fatalf("state=%+v lost=%d failed=%d rows=%d", st, lost, failed, lostRows)
 				}
 				return

@@ -267,8 +267,8 @@ func TestWorkerWorktrees_OldRemovalsCountOnDay(t *testing.T) {
 // Both sweeps stay registered: the worker check adds a mechanism, it never
 // replaces the author sweep.
 func TestWorkerWorktrees_MechanismRegistered(t *testing.T) {
-	if len(AllMechanisms) != 12 {
-		t.Fatalf("AllMechanisms has %d entries, want 12", len(AllMechanisms))
+	if len(AllMechanisms) != 13 {
+		t.Fatalf("AllMechanisms has %d entries, want 13", len(AllMechanisms))
 	}
 	for _, mech := range []string{MechAuthorWorktreeSweep, MechWorkerWorktrees} {
 		found := false

@@ -954,8 +954,8 @@ func TestLiveness_FailingNoticeAdvancesDayAndRetriesOnce(t *testing.T) {
 	if f.n.count != 1 {
 		t.Fatalf("expected still 1 notice after a second retry, got %d", f.n.count)
 	}
-	if got := len(livenessRows(t, f, target.Name, livenessDailyCommand)); got != 12 {
-		t.Fatalf("daily rows duplicated: got %d, want 12", got)
+	if got := len(livenessRows(t, f, target.Name, livenessDailyCommand)); got != 13 {
+		t.Fatalf("daily rows duplicated: got %d, want 13", got)
 	}
 	if got := len(livenessRows(t, f, target.Name, livenessNoticeCommand)); got != 1 {
 		t.Fatalf("notice rows duplicated: got %d, want 1", got)

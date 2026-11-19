@@ -46,9 +46,13 @@ func TestOwnerLaneRoutesHumanJudgmentNotices(t *testing.T) {
 				if err := s.Review(context.Background(), r, 7, "", Options{}); err == nil {
 					t.Fatal("want a lost result")
 				}
+				// A single lost result is recorded, not told (hk 5361).
 				n := s.Notifier.(*fakeNotifier)
-				if n.count != 1 || n.events[0].Lane != s.deskLane() || !strings.Contains(n.events[0].Text, "result was lost") {
+				if n.count != 0 {
 					t.Fatalf("events: %+v", n.events)
+				}
+				if rows := auditRows(t, s, r, "notice-cause"); len(rows) != 1 || rows[0]["sent"] != false {
+					t.Fatalf("notice-cause rows: %v", rows)
 				}
 			})
 
