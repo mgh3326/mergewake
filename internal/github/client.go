@@ -103,10 +103,17 @@ func New(token string) *Client {
 type APIError struct {
 	Code         int
 	Method, Path string
+	// Message is GitHub's own error text from the response body, bounded and
+	// redacted (see apiMessage). Empty when the body had none.
+	Message string
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("GitHub %s %s: HTTP %d", e.Method, e.Path, e.Code)
+	s := fmt.Sprintf("GitHub %s %s: HTTP %d", e.Method, e.Path, e.Code)
+	if e.Message != "" {
+		s += ": " + e.Message
+	}
+	return s
 }
 func NotFound(e error) bool { var a *APIError; return errors.As(e, &a) && a.Code == 404 }
 
@@ -154,7 +161,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if hit, e := c.pollShortcut(key); e != nil {
 			return nil, e
 		} else if hit.Replay && hit.Code == http.StatusNotFound {
-			return nil, &APIError{http.StatusNotFound, method, strings.Split(route, "?")[0]}
+			return nil, &APIError{Code: http.StatusNotFound, Method: method, Path: strings.Split(route, "?")[0]}
 		} else if hit.ETag != "" || hit.Replay {
 			return append([]byte(nil), hit.Body...), nil
 		}
@@ -216,7 +223,7 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 		if method == "GET" && resp.StatusCode == http.StatusNotFound && c.Polling {
 			c.cacheNotFound(key, mark)
 		}
-		return nil, &APIError{resp.StatusCode, method, strings.Split(route, "?")[0]}
+		return nil, &APIError{Code: resp.StatusCode, Method: method, Path: strings.Split(route, "?")[0], Message: readAPIMessage(resp.Body)}
 	}
 	mutation := method != "GET" && route != "/graphql"
 	if mutation {

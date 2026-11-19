@@ -255,7 +255,7 @@ func (a *appAuth) send(ctx context.Context, c *Client, method, target, route str
 	defer resp.Body.Close()
 	recordRequest(ctx, method, route, resp.StatusCode, credApp, requestTime)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, resp.Header, &APIError{resp.StatusCode, method, route}
+		return resp.StatusCode, resp.Header, &APIError{Code: resp.StatusCode, Method: method, Path: route, Message: readAPIMessage(resp.Body)}
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if e != nil {
