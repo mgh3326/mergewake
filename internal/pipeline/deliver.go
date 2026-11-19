@@ -146,7 +146,14 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	if consultOn {
 		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, consultOwed)
 	}
-	if done && rounds == consultRound && consultOwed && !st.directiveSent() && len(inScope) == 0 && !consultPending {
+	// With the hub consult on, an outcome settled on this pass is what makes
+	// the round owe a delivery of its own; a row still outstanding for an
+	// earlier head leaves nothing to say yet.
+	forceDirective := done && rounds >= consultRound && consultOwed && !st.directiveSent() && len(inScope) == 0 && !consultPending
+	if consultOn {
+		forceDirective = forceDirective && consultDirective != ""
+	}
+	if forceDirective {
 		for _, t := range consultThreads {
 			first := t.Comments[0]
 			inScope = append(inScope, pendingFinding{
@@ -183,7 +190,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 					// A settled consult answers for this head: its answer, or
 					// the could-not-be-had line, replaces today's directive.
 					directive = consultDirective
-				} else if done && rounds == consultRound && openBlocking {
+				} else if done && rounds >= consultRound && openBlocking {
 					directive = RoundDirective
 				}
 			}
@@ -222,7 +229,10 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// round has passed.
 	ladderOwed := st.LadderEndedNoSuccessor && !st.LadderEndedEventSent
 	ladderRetry := !st.escalated() && !st.LadderPendingSince.IsZero()
-	if (done && rounds == ladderRound && openBlocking) || ladderOwed || ladderRetry {
+	// The ladder runs on the first done round at or after its round that has a
+	// critical/high finding open, once per PR: a round that was not done, or
+	// had nothing open, does not use it up.
+	if (done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRetry {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {

@@ -70,13 +70,13 @@ type roundRuleState struct {
 	ConsultAt            time.Time `json:"consult_at,omitzero"`
 
 	// Hub consult (review.round_rule.hub_consult, hk 4551): one hub consult
-	// per PR and head. The stored row fields let a later pass or a restart
-	// poll instead of requesting again.
+	// per PR. The stored row fields let a later pass or a restart poll instead
+	// of requesting again.
 	//
 	// Owed marks an outstanding consult and is independent of the current
-	// round: it is set when the consult is requested and cleared once its
-	// outcome went out with a delivery (or its head was superseded). Head is
-	// the commit the row was requested for — the hub keys consults by
+	// round and head: it is set when the consult is requested and cleared once
+	// its outcome went out with a delivery. Head is the commit the row was
+	// requested for — the hub keys consults by
 	// (task, repo#pr, head), so a row of another head is never applied here.
 	// Posted records that the request may have reached the hub, so an id lost
 	// to a failed state write is reconciled from the audit journal instead of
@@ -95,10 +95,9 @@ type roundRuleState struct {
 	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
 	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
 	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
-	// CommentAt is the first pass a settled row's task comment could not be
-	// recorded; the next head waits only consultCommentBound past it.
-	// CommentDropped records that the bound was reached, so the drop is
-	// audited once.
+	// CommentAt and CommentDropped are no longer written: a second consult is
+	// never requested, so nothing waits on an earlier row's task comment. They
+	// stay so an older state file reads as before.
 	HubConsultCommentAt      time.Time `json:"hub_consult_comment_at,omitzero"`
 	HubConsultCommentDropped bool      `json:"hub_consult_comment_dropped,omitempty"`
 
@@ -619,12 +618,59 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 }
 
 // checkRound5Gate evaluates the round hold condition during gate evaluation.
-func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
-	return s.checkRoundHoldGate(ctx, r, pr, fb, rounds, reviewed, v)
+func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass, rounds int, reviewed bool, v *gateVerdict) bool {
+	return s.checkRoundHoldGate(ctx, r, pr, fb, history, rounds, reviewed, v)
+}
+
+// endedBlocking reports whether the newest fully reviewed head before pr's —
+// the newest earlier head with a pass in history and its -done marker — ended
+// with a critical/high finding: an inline mergewake finding posted on it or an
+// outside-diff one its pass listed. What the author did about them since does
+// not change how that round ended. A read the done marker could not make
+// counts as no.
+func (s *Service) endedBlocking(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass) bool {
+	head := ""
+	for i := len(history) - 1; i >= 0 && head == ""; i-- {
+		h := history[i].Head
+		if h == "" || h == pr.Head.SHA {
+			continue
+		}
+		if done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, h+"-done"); err == nil && done {
+			head = h
+		}
+	}
+	if head == "" {
+		return false
+	}
+	for _, p := range history {
+		if p.Head == head && p.OutsideBlocking > 0 {
+			return true
+		}
+	}
+	own := policy.NormalizeAuthor(s.Config.Review.Login)
+	for _, t := range fb.Threads {
+		if len(t.Comments) == 0 {
+			continue
+		}
+		first := t.Comments[0]
+		if own == "" || policy.NormalizeAuthor(first.Author) != own || !strings.Contains(first.Body, "<!-- mergewake-severity:") || postedOn(first) != head {
+			continue
+		}
+		if mustFix(github.ThreadSeverity(first.Author, first.Body)) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
-func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
+//
+// The hold is per PR, not per head: at the hold round, a reviewed head that
+// ends with a critical/high finding open holds the PR, and so does a newer head
+// whose review has not finished when the newest fully reviewed head before it
+// ended that way — the author's push cannot step around a hold the gate had not
+// recorded yet. The release stays the PR comment.
+func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass, rounds int, reviewed bool, v *gateVerdict) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
 	holdRound := s.Config.Review.RoundRuleHold()
@@ -654,7 +700,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if reviewed && rounds >= holdRound && open {
+	if rounds >= holdRound && (reviewed && open || !reviewed && s.endedBlocking(ctx, r, pr, fb, history)) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false

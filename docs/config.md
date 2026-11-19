@@ -1059,7 +1059,10 @@ on it.
   leaves at least one critical or high finding still open (not fixed or dismissed
   with evidence) after the verdict; the hub consult below uses its own, lower bar (any open
   finding above low). The round thresholds come from configuration
-  (`review.round_rule`, defaults 3 / 5 / 7):
+  (`review.round_rule`, defaults 3 / 5 / 7). Each step acts on the first qualifying round at or after its
+  number, not at one exact round: a round that was not done before the author pushed, or that had nothing
+  open, does not use the step up, and a round that reaches its number with nothing qualifying still does
+  nothing (an all-low round gets no consult, decision 250):
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
     `stop patching; ask your design lane for a consult one grade above your seat in another family: ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself`
     No panewire call or lane event is emitted.
@@ -1071,8 +1074,9 @@ on it.
     severities come from the PR's review threads, as the gate reads them: the first comment's label, unresolved and not
     disposed (a medium finding by any human answer, a critical or high one only by a verified fix or a reasoned
     dismissal). An all-low round requests nothing (decision 250); with the switch off, the directive path below keeps
-    its blocking condition. mergewake writes a question document to hk (the PR, the reviewed head, every open
-    finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR and head,
+    its blocking condition. The consult is owed on the first done round at or after the consult round that has
+    such a finding open, once per PR whatever head it was asked on (decision 250). mergewake writes a question document to hk (the PR, the reviewed head, every open
+    finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR,
     on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
@@ -1081,22 +1085,20 @@ on it.
     `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
     terminal row would retry it), until `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout)
     passes; the wait also bounds a failed task read or question write, and it is measured from the first attempt.
-    The obligation is owed until its outcome is delivered, whatever the current review round says: a push that
-    changes the head supersedes the old row (recorded, never delivered as the new head's answer) and the new head
-    starts its own consult when its round reaches the consult round. While the consult is queued or running that
-    round's findings wait — a restart resumes the poll from the state file. The row is journaled in the audit log
-    before the state file, so an id lost to a failed state write is reconciled from it instead of re-requested.
+    The obligation is owed until its outcome is delivered, whatever the current head or review round says: a push
+    does not drop the row and does not start a second consult. The row keeps being read until it settles
+    (answered, refused, failed, cancelled or the wait expired), and its outcome goes out with the next author
+    delivery; the new head's own findings are not held behind a row requested for an earlier head. While the consult
+    requested for the current head is queued or running that round's findings wait — a restart resumes the poll from
+    the state file. The row is journaled in the audit log before the state file, so an id lost to a failed state
+    write is reconciled from it instead of re-requested.
     `answered` delivers the findings with the `answer_doc` key (passed through unread) and no ask-a-consult
     directive; `refused`, `failed`, `cancelled`, an rc 1/2 request failure or an expired wait delivers them as today
     plus one line saying the consult could not be had and why. A settled consult records one hk task comment (id,
-    state, seat, answer_doc) that retries on its own until hk accepts it. The reset of a superseded row waits for
-    its own comment only while recording it can still succeed: a sink without `Comment` (`sink.type` ""/`noop`)
-    or a PR with no task never waits, and a failed write or task read holds the next head for at most 10 minutes
-    from the first failure — then the reset proceeds and the drop is audited as `consult-comment-dropped` once,
-    so the round's findings are never held past that bound. Request, state change, supersession,
-    outcome and delivery are audited as `consult-request` / `consult-state` / `consult-superseded` /
-    `consult-outcome` / `consult-delivered`.
-  - **Round ladder (`review.round_rule.ladder`, default 5):** mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
+    state, seat, answer_doc) that retries on its own until hk accepts it. Request, state change, outcome and delivery
+    are audited as `consult-request` / `consult-state` / `consult-outcome` / `consult-delivered`.
+  - **Round ladder (`review.round_rule.ladder`, default 5):** on the first done round at or after the ladder round
+    with a critical or high finding open, mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
     `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round <n> --findings-file <path>`,
     where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
     rc 0 marks the step escalated (`ladder-escalated`); rc 2 marks it escalated too, the author
@@ -1108,6 +1110,10 @@ on it.
     review continues. The whole step runs under the round-rule state lock, so concurrent evaluations
     of one PR cannot call it twice.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
+    once a reviewed head at or after the hold round ends with a critical or high finding open. The hold is per PR, not
+    per head: a newer head whose review has not finished is held too when the newest fully reviewed head before it
+    ended that way (an inline finding posted on it or an outside-diff one its pass listed), even if the author's push
+    already fixed those findings.
     and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
     round count, open findings, and the two choices: cut the scope or request one SS consult on the design.
   - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began
