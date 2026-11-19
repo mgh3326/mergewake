@@ -183,13 +183,15 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	if data != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	requestStarted := time.Now()
 	resp, e := c.HTTP.Do(req)
+	requestTime := time.Since(requestStarted)
 	if e != nil {
-		recordRequest(ctx, method, route, 0, cred.kind)
+		recordRequest(ctx, method, route, 0, cred.kind, requestTime)
 		return nil, fmt.Errorf("GitHub %s request failed", method)
 	}
 	defer resp.Body.Close()
-	recordRequest(ctx, method, route, resp.StatusCode, cred.kind)
+	recordRequest(ctx, method, route, resp.StatusCode, cred.kind, requestTime)
 	if cred.kind == credApp && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 		// A refusal for a missing permission says nothing about the budget; one
 		// from an exhausted budget or a secondary limit does, and is recorded.

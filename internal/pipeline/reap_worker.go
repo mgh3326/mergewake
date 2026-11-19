@@ -55,6 +55,10 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 	cands := map[*reapHost][]workerCand{}
 	total := 0
 	for _, hs := range order {
+		if e := reapBudgetCheck(ctx, "worker worktree discovery and cleanup"); e != nil {
+			errs = append(errs, e)
+			break
+		}
 		if e := ctx.Err(); e != nil {
 			errs = append(errs, e)
 			break
@@ -123,6 +127,10 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		rows := &workerRows{Kept: map[string]int{}}
 		rows.Candidates = len(cands[hs])
 		for _, c := range cands[hs] {
+			if e := reapBudgetCheck(ctx, "worker worktree candidates"); e != nil {
+				errs = append(errs, e)
+				break
+			}
 			if e := ctx.Err(); e != nil {
 				errs = append(errs, e)
 				break

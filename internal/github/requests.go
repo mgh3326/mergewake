@@ -24,8 +24,9 @@ type requestKey struct {
 	status        int
 }
 
-// RequestCounts is the accounting of one run of passes: request counts and
-// cache counters. The ctx that CountRequests returns carries it.
+// RequestCounts is the accounting of one run of passes: request counts,
+// cumulative HTTP Do time and cache counters. The ctx that CountRequests
+// returns carries it.
 type RequestCounts struct {
 	mu                     sync.Mutex
 	role                   string
@@ -34,6 +35,7 @@ type RequestCounts struct {
 	hits, misses, memoHits int
 	notModified            int
 	gateWait               time.Duration
+	requestTime            time.Duration
 }
 type requestCountsKey struct{}
 
@@ -58,7 +60,7 @@ func (c *RequestCounts) Add(other *RequestCounts) {
 	}
 	other.mu.Lock()
 	counts, byCredential := maps.Clone(other.counts), maps.Clone(other.byCredential)
-	hits, misses, memoHits, notModified, gateWait := other.hits, other.misses, other.memoHits, other.notModified, other.gateWait
+	hits, misses, memoHits, notModified, gateWait, requestTime := other.hits, other.misses, other.memoHits, other.notModified, other.gateWait, other.requestTime
 	other.mu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -76,6 +78,7 @@ func (c *RequestCounts) Add(other *RequestCounts) {
 	}
 	c.hits, c.misses, c.memoHits, c.notModified = c.hits+hits, c.misses+misses, c.memoHits+memoHits, c.notModified+notModified
 	c.gateWait = max(c.gateWait, gateWait)
+	c.requestTime += requestTime
 }
 
 // ContinueRequests is CountRequests for work that may run inside a run that is
@@ -126,7 +129,7 @@ func routeTemplate(route string) string {
 
 // recordRequest counts one HTTP response, or a failed attempt as status 0,
 // against the credential kind ("user" or "app") that sent it.
-func recordRequest(ctx context.Context, method, route string, status int, credential string) {
+func recordRequest(ctx context.Context, method, route string, status int, credential string, elapsed time.Duration) {
 	c, ok := ctx.Value(requestCountsKey{}).(*RequestCounts)
 	if !ok {
 		return
@@ -135,10 +138,18 @@ func recordRequest(ctx context.Context, method, route string, status int, creden
 	c.mu.Lock()
 	c.counts[k]++
 	c.byCredential[credential]++
+	c.requestTime += elapsed
 	if status == http.StatusNotModified {
 		c.notModified++
 	}
 	c.mu.Unlock()
+}
+
+// RequestTimeTotal is the cumulative HTTP Do time charged to this run.
+func (c *RequestCounts) RequestTimeTotal() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requestTime
 }
 
 // recordGateWait counts the longest wait for a credential's request gate in

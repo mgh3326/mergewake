@@ -134,8 +134,25 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						tracing.Finish(span)
 					case "reap":
 						sweepCtx, span := tracing.Span(ctx, "mergewake.reap")
+						sweepCtx, telemetry := pipeline.WithReapTelemetry(sweepCtx)
+						started := time.Now()
+						githubBefore := counts.RequestTimeTotal()
+						githubCallsBefore := requestTotal(counts.Snapshot())
 						err = s.Reap(sweepCtx, r, 0, o)
+						elapsed := time.Since(started)
+						githubMS := (counts.RequestTimeTotal() - githubBefore).Milliseconds()
+						githubCalls := requestTotal(counts.Snapshot()) - githubCallsBefore
+						times, callCounts := telemetry.Snapshot()
+						attrs := []any{"repo", r.Name, "total_ms", elapsed.Milliseconds(), "git_ms", times["git"], "github_ms", githubMS, "hosts_ms", times["hosts"], "panewire_ms", times["panewire"], "hk_ms", times["hk"], "git_calls", callCounts["git"], "github_calls", githubCalls, "hosts_calls", callCounts["hosts"], "panewire_calls", callCounts["panewire"], "hk_calls", callCounts["hk"]}
 						tracing.Finish(span)
+						if errors.Is(err, pipeline.ErrReapRepoBudget) {
+							log.Warn("repository reap stopped on budget", append(attrs, "left", err.Error())...)
+							err = nil // a budget stop is a completed, resumable repository pass
+						} else if err != nil {
+							log.Error("repository reap failed", append(attrs, "error", err.Error())...)
+						} else {
+							log.Info("repository reap completed", attrs...)
+						}
 					}
 				}()
 				return err
@@ -304,6 +321,14 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		}()
 	}
 	return d.Run(ctx, loops)
+}
+
+func requestTotal(requests []github.RequestCount) int {
+	total := 0
+	for _, request := range requests {
+		total += request.Count
+	}
+	return total
 }
 
 // forRepos runs fn for each repository and joins the errors in config order,

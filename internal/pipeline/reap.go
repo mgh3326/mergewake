@@ -366,10 +366,10 @@ func (h *reapHistory) prDone(pr int) bool {
 // still run locally.
 func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) (*reapHost, []error) {
 	var errs []error
-	hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}}
+	hs := &reapHost{host: h, exec: reap.Exec{Runner: reapRunner(ctx, s.Runner), Host: h}, trees: map[string]*reap.Worktree{}}
 	hs.ops = hs.exec
 	if hub != nil && !h.Local() {
-		hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
+		hs.ops, hs.viaHub = timedHubOps{Ops: reap.HubHost{Hub: hub, Machine: h.MachineID()}, telemetry: telemetryFrom(ctx)}, true
 	}
 	panes, e := hs.ops.Panes(ctx)
 	if e != nil {
@@ -387,6 +387,9 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	hs.all = all
 	for _, list := range [][]reap.Pane{panes, all} {
 		for _, p := range list {
+			if e := reapBudgetCheck(ctx, "host pane/worktree scan"); e != nil {
+				return hs, append(errs, e)
+			}
 			if p.Cwd != "" {
 				if _, ok := hs.trees[p.Cwd]; !ok {
 					w, e := hs.ops.Inspect(ctx, p.Cwd)
@@ -411,6 +414,61 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 
 type reviewersOnlyKey struct{}
 
+var ErrReapRepoBudget = errors.New("reap repository budget exhausted")
+
+type reapRetry struct {
+	failure  string
+	attempts int
+	retryAt  time.Time
+}
+
+func (s *Service) reapRetryAllowed(repo, job string) bool {
+	s.reapRetryMu.Lock()
+	defer s.reapRetryMu.Unlock()
+	if s.reapRetries == nil {
+		return true
+	}
+	v, ok := s.reapRetries[repo+"\x00"+job]
+	return !ok || !time.Now().Before(v.retryAt)
+}
+
+func (s *Service) reapRetryFailed(repo, job, failure string) {
+	s.reapRetryMu.Lock()
+	defer s.reapRetryMu.Unlock()
+	if s.reapRetries == nil {
+		s.reapRetries = map[string]reapRetry{}
+	}
+	k := repo + "\x00" + job
+	v := s.reapRetries[k]
+	if v.failure != failure {
+		v = reapRetry{failure: failure}
+	}
+	v.attempts++
+	d := time.Minute * time.Duration(1<<min(v.attempts-1, 6))
+	if d > time.Hour {
+		d = time.Hour
+	}
+	v.retryAt = time.Now().Add(d)
+	s.reapRetries[k] = v
+}
+
+func (s *Service) reapRetrySucceeded(repo, job string) {
+	s.reapRetryMu.Lock()
+	defer s.reapRetryMu.Unlock()
+	delete(s.reapRetries, repo+"\x00"+job)
+}
+
+type reapBudgetKey struct{}
+type reapBudget struct{ deadline time.Time }
+
+func reapBudgetCheck(ctx context.Context, remaining string) error {
+	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
+	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+		return fmt.Errorf("%w; left: %s", ErrReapRepoBudget, remaining)
+	}
+	return nil
+}
+
 // reviewersOnly marks a Reap call that only wants an open PR's reviewer sweep:
 // the call then ends without the "not a merged PR" refusal.
 func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey{}) != nil }
@@ -422,8 +480,19 @@ func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey
 // (pane-in-use) until that close lands. Anything dirty, unknown
 // or ambiguous is skipped and reported, never forced.
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
+	budgetText := s.Config.Reap.RepoBudget
+	if budgetText == "" {
+		budgetText = config.RepoBudgetDefault
+	}
+	budget, budgetErr := config.Duration(budgetText)
+	if budgetErr != nil {
+		return fmt.Errorf("reap.repo_budget: %w", budgetErr)
+	}
+	if budget > 0 {
+		ctx = context.WithValue(ctx, reapBudgetKey{}, reapBudget{deadline: time.Now().Add(budget)})
+	}
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && !errors.Is(retErr, ErrReapRepoBudget) {
 			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": retErr.Error()}, o.DryRun))
 		}
 	}()
@@ -514,7 +583,15 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	hosts := []*reapHost{}
 	byName := map[string]*reapHost{}
 	for _, h := range s.Config.Hosts {
+		if e := reapBudgetCheck(ctx, "host scans and cleanup"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		hs, hostErrs := s.reapScanHost(ctx, hub, h)
+		for _, hostErr := range hostErrs {
+			if errors.Is(hostErr, ErrReapRepoBudget) {
+				return errors.Join(append(errs, hostErr)...)
+			}
+		}
 		errs = append(errs, hostErrs...)
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
@@ -524,7 +601,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// both.
 	var records *passJobRecords
 	if jobs, ok := s.Sink.(reapJobs); ok {
-		records = newPassJobRecords(jobs)
+		records = newPassJobRecords(reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)})
 	}
 	reach := newReapJobReach()
 	// Errors are counted once, from errs: note itself appends every "error"
@@ -651,6 +728,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 
 	for _, p := range pulls {
+		if e := reapBudgetCheck(ctx, "remaining merged PRs, cleanup, reviewer sweep and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
@@ -835,6 +915,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 
 		for _, c := range cands {
+			if e := reapBudgetCheck(ctx, "remaining worktree candidates, reviewer sweep and archive"); e != nil {
+				return errors.Join(append(errs, e)...)
+			}
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref, Source: c.source}
 			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
@@ -997,7 +1080,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// wk/ checkouts from the hosts' own worktree lists, so a worktree no pane,
 	// receipt or job record names is still removed once its work is on GitHub.
 	if prNum == 0 {
+		if e := reapBudgetCheck(ctx, "worker worktrees, reviewer sweep and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, records, acting, note)...)
+	}
+	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
+		return errors.Join(append(errs, e)...)
 	}
 	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)
@@ -1013,9 +1102,15 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 	if prNum == 0 {
+		if e := reapBudgetCheck(ctx, "orphan scan and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
 	}
 	if s.Config.Reap.Archive.Enabled {
+		if e := reapBudgetCheck(ctx, "archive jobs"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
 	}
 	result := struct {
