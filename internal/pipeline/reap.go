@@ -416,23 +416,64 @@ type reviewersOnlyKey struct{}
 
 var ErrReapRepoBudget = errors.New("reap repository budget exhausted")
 
-type reapRetry struct {
-	failure  string
-	attempts int
-	retryAt  time.Time
+// ReapNonBudgetErrors removes budget-stop leaves while preserving all other
+// failures in a joined Reap result.
+func ReapNonBudgetErrors(err error) error {
+	var leaves []error
+	var collect func(error)
+	collect = func(current error) {
+		if current == nil {
+			return
+		}
+		if many, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range many.Unwrap() {
+				collect(child)
+			}
+			return
+		}
+		if one, ok := current.(interface{ Unwrap() error }); ok {
+			collect(one.Unwrap())
+			return
+		}
+		if !errors.Is(current, ErrReapRepoBudget) {
+			leaves = append(leaves, current)
+		}
+	}
+	collect(err)
+	return errors.Join(leaves...)
 }
 
-func (s *Service) reapRetryAllowed(repo, job string) bool {
+// ReapBudgetOnly is true only when a pass stopped for budget and has no other
+// error leaf to audit or report.
+func ReapBudgetOnly(err error) bool {
+	return errors.Is(err, ErrReapRepoBudget) && ReapNonBudgetErrors(err) == nil
+}
+
+type reapRetry struct {
+	failure         string
+	attempts        int
+	retryAt         time.Time
+	nextAllowedPass uint64
+}
+
+type reapPassKey struct{}
+
+func reapPass(ctx context.Context) uint64 {
+	pass, _ := ctx.Value(reapPassKey{}).(uint64)
+	return pass
+}
+
+func (s *Service) reapRetryAllowed(repo, job string, pass uint64) bool {
 	s.reapRetryMu.Lock()
 	defer s.reapRetryMu.Unlock()
 	if s.reapRetries == nil {
 		return true
 	}
 	v, ok := s.reapRetries[repo+"\x00"+job]
-	return !ok || !time.Now().Before(v.retryAt)
+	return !ok || (pass >= v.nextAllowedPass && !s.now().Before(v.retryAt))
 }
 
-func (s *Service) reapRetryFailed(repo, job, failure string) {
+func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
 	s.reapRetryMu.Lock()
 	defer s.reapRetryMu.Unlock()
 	if s.reapRetries == nil {
@@ -448,8 +489,25 @@ func (s *Service) reapRetryFailed(repo, job, failure string) {
 	if d > time.Hour {
 		d = time.Hour
 	}
-	v.retryAt = time.Now().Add(d)
+	v.retryAt = s.now().Add(d)
+	v.nextAllowedPass = pass + 2 // skip the immediately following reap pass
 	s.reapRetries[k] = v
+}
+
+func (s *Service) reapRetryRestore(repo, job, failure string, pass uint64) bool {
+	s.reapRetryMu.Lock()
+	defer s.reapRetryMu.Unlock()
+	if s.reapRetries == nil {
+		s.reapRetries = map[string]reapRetry{}
+	}
+	k := repo + "\x00" + job
+	if _, ok := s.reapRetries[k]; ok {
+		return false
+	}
+	// A durable failure receipt surviving a restart suppresses this pass even
+	// when the prior pass took longer than the time backoff.
+	s.reapRetries[k] = reapRetry{failure: failure, attempts: 1, retryAt: s.now(), nextAllowedPass: pass + 1}
+	return true
 }
 
 func (s *Service) reapRetrySucceeded(repo, job string) {
@@ -480,6 +538,11 @@ func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey
 // (pane-in-use) until that close lands. Anything dirty, unknown
 // or ambiguous is skipped and reported, never forced.
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
+	s.reapRetryMu.Lock()
+	s.reapPass++
+	pass := s.reapPass
+	s.reapRetryMu.Unlock()
+	ctx = context.WithValue(ctx, reapPassKey{}, pass)
 	budgetText := s.Config.Reap.RepoBudget
 	if budgetText == "" {
 		budgetText = config.RepoBudgetDefault
@@ -492,8 +555,8 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		ctx = context.WithValue(ctx, reapBudgetKey{}, reapBudget{deadline: time.Now().Add(budget)})
 	}
 	defer func() {
-		if retErr != nil && !errors.Is(retErr, ErrReapRepoBudget) {
-			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": retErr.Error()}, o.DryRun))
+		if nonBudget := ReapNonBudgetErrors(retErr); nonBudget != nil {
+			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": nonBudget.Error()}, o.DryRun))
 		}
 	}()
 	if !s.Config.Reap.Enabled {
@@ -587,12 +650,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			return errors.Join(append(errs, e)...)
 		}
 		hs, hostErrs := s.reapScanHost(ctx, hub, h)
+		errs = append(errs, hostErrs...)
 		for _, hostErr := range hostErrs {
 			if errors.Is(hostErr, ErrReapRepoBudget) {
-				return errors.Join(append(errs, hostErr)...)
+				return errors.Join(errs...)
 			}
 		}
-		errs = append(errs, hostErrs...)
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
 	}

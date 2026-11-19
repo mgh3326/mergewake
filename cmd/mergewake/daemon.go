@@ -146,8 +146,13 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						attrs := []any{"repo", r.Name, "total_ms", elapsed.Milliseconds(), "git_ms", times["git"], "github_ms", githubMS, "hosts_ms", times["hosts"], "panewire_ms", times["panewire"], "hk_ms", times["hk"], "git_calls", callCounts["git"], "github_calls", githubCalls, "hosts_calls", callCounts["hosts"], "panewire_calls", callCounts["panewire"], "hk_calls", callCounts["hk"]}
 						tracing.Finish(span)
 						if errors.Is(err, pipeline.ErrReapRepoBudget) {
-							log.Warn("repository reap stopped on budget", append(attrs, "left", err.Error())...)
-							err = nil // a budget stop is a completed, resumable repository pass
+							if budgetErr := pipeline.ReapNonBudgetErrors(err); budgetErr != nil {
+								log.Error("repository reap stopped on budget with errors", append(attrs, "left", err.Error(), "error", budgetErr.Error())...)
+								err = budgetErr
+							} else {
+								log.Warn("repository reap stopped on budget", append(attrs, "left", err.Error())...)
+								err = nil // a budget stop alone is a completed, resumable repository pass
+							}
 						} else if err != nil {
 							log.Error("repository reap failed", append(attrs, "error", err.Error())...)
 						} else {

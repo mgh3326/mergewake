@@ -932,7 +932,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		w.record(gate, "would-abandon", reason)
 		return true
 	}
-	if w.closeRetryBlocked(l.name) {
+	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
 		return false
 	}
 	if job.OwnerLane == "" {
@@ -942,7 +942,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	cmd := w.s.Config.Review.Panewire.Command
 	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
-		w.s.reapRetryFailed(w.r.Name, l.name, e.Error())
+		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
 	}
@@ -955,13 +955,13 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 // closeRetryBlocked also honors the last durable close failure after a daemon
 // restart. The in-memory schedule provides increasing delays; the receipt
 // keeps a restart from immediately repeating the same failing CLI call.
-func (w *reviewerSweep) closeRetryBlocked(label string) bool {
-	if !w.s.reapRetryAllowed(w.r.Name, label) {
+func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
+	if !w.s.reapRetryAllowed(w.r.Name, label, pass) {
 		return true
 	}
 	for _, row := range w.streams[label] {
-		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") && time.Since(row.Time) < time.Minute {
-			return true
+		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") {
+			return w.s.reapRetryRestore(w.r.Name, label, strings.TrimPrefix(row.Reason, "abandon job: "), pass)
 		}
 	}
 	return false
@@ -1120,7 +1120,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		w.record(gate, "would-abandon", reason)
 		return true
 	}
-	if w.closeRetryBlocked(l.name) {
+	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
 		return false
 	}
 	if job.OwnerLane == "" {
@@ -1130,7 +1130,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 	cmd := w.s.Config.Review.Panewire.Command
 	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
-		w.s.reapRetryFailed(w.r.Name, l.name, e.Error())
+		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
 	}
