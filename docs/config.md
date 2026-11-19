@@ -618,9 +618,19 @@ needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
 
-A run whose `reap.archive.max_run` budget is spent stops before the next remote command: a
-spent budget is checked before each host and each job, and a cancelled run
-returns its error. The hosts are then walked from the one after the last host
+A run's `reap.archive.max_run` deadline bounds pane scans, SSH listings, job reads,
+and Handoffkeep event reads, and is checked before an archive apply starts. An
+apply already in progress finishes its publish/delete boundary before the run
+writes its summary, so that single apply can extend the deadline. The summary
+has `stopped_on_budget: true` and names unscanned hosts in
+`unscanned_hosts`. Each host phase writes an `archive-phase` row with its
+duration in milliseconds. A caller-cancelled run writes its summary and returns
+the cancellation error. A pane scan failure skips that host, records its reason
+in `unscanned_host_reasons`, and does not by itself make the command fail; errors
+from jobs on hosts that were scanned do make the command fail. The command exits
+zero when the run completes or stops on `max_run` without other errors, and
+nonzero for job, configuration, state-write, or caller-cancellation errors.
+The hosts are then walked from the one after the last host
 it entered, so a host late in `hosts` is not starved by the earlier ones; the
 next full run starts there, and a run that finishes every host returns to
 config order. A `--host` run neither reads nor writes that state. A `--dry-run` run reads it, so its preview lists hosts in the order the next apply run will use, and never writes it. The summary

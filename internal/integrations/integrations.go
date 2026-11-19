@@ -282,6 +282,7 @@ func (h Handoffkeep) Reopen(ctx context.Context, task, note string) error {
 	if e != nil {
 		return e
 	}
+	defer taskMemoOf(ctx).forget(id)
 	current, e := getTask(ctx, c, id)
 	if e != nil {
 		return e

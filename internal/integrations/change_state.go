@@ -3,9 +3,12 @@ package integrations
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,9 +45,12 @@ type ChangeCounts = changestate.Counts
 // ChangeWriter sends observations without holding the caller on hk. It folds
 // bursts by PR and section, retaining the newest observation in each section.
 type ChangeWriter struct {
-	mu                                   sync.Mutex
-	sendMu                               sync.Mutex
-	pending                              map[changeKey]*changePending
+	mu      sync.Mutex
+	sendMu  sync.Mutex
+	pending map[changeKey]*changePending
+	// sent holds, per change and section, the sectionKey of the value last
+	// written for it in this process; sendMu guards it.
+	sent                                 map[changeKey]map[string]string
 	outbox                               string
 	seen                                 map[string]bool
 	retryTimer                           *time.Timer
@@ -55,6 +61,7 @@ type ChangeWriter struct {
 	unavailableUntil                     time.Time
 	claims                               map[string]*os.File
 	writes, stale, rejected, unavailable atomic.Uint64
+	unchanged                            atomic.Uint64
 }
 
 func NewChangeWriter(log *slog.Logger, stateDir ...string) *ChangeWriter {
@@ -72,7 +79,7 @@ func (w *ChangeWriter) Counts() ChangeCounts {
 	if w == nil {
 		return ChangeCounts{}
 	}
-	return ChangeCounts{Writes: w.writes.Load(), Stale: w.stale.Load(), Rejected: w.rejected.Load(), Unavailable: w.unavailable.Load()}
+	return ChangeCounts{Writes: w.writes.Load(), Stale: w.stale.Load(), Rejected: w.rejected.Load(), Unavailable: w.unavailable.Load(), Unchanged: w.unchanged.Load()}
 }
 func (w *ChangeWriter) Queue(repo string, pr int, name string, s ChangeSection) {
 	if w == nil || repo == "" || pr < 1 || s.Value == nil || s.At.IsZero() {
@@ -165,8 +172,17 @@ func (w *ChangeWriter) flush() {
 	w.timer = nil
 	w.mu.Unlock()
 	for k, p := range pending {
+		last := w.sent[k]
+		keys := map[string]string{}
 		b := ChangeBatch{Repo: k.repo, PR: k.pr}
 		for name, s := range p.sections {
+			key := sectionKey(s.Value)
+			if last[name] == key {
+				// The change's value is what this process last wrote for it.
+				w.unchanged.Add(1)
+				continue
+			}
+			keys[name] = key
 			switch name {
 			case "state":
 				b.State = s.Value
@@ -178,13 +194,19 @@ func (w *ChangeWriter) flush() {
 				b.Gate = s.Value
 			}
 		}
-		slices.SortStableFunc(p.findings, func(a, b ChangeSection) int { return a.At.Compare(b.At) })
-		if len(p.findings) > 0 {
-			b.Findings = p.findings[0].Value
+		// Findings are a log of review passes, each written in order and never
+		// re-observed by a pending change, so they are all sent (see replay).
+		findings := p.findings
+		slices.SortStableFunc(findings, func(a, b ChangeSection) int { return a.At.Compare(b.At) })
+		if len(findings) > 0 {
+			b.Findings = findings[0].Value
 		}
-		done := w.send(b)
-		for i := 1; done && i < len(p.findings); i++ {
-			if !w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Findings: p.findings[i].Value}) {
+		done := true
+		if b.State != nil || b.Checks != nil || b.Threads != nil || b.Gate != nil || b.Findings != nil {
+			done = w.send(b)
+		}
+		for i := 1; done && i < len(findings); i++ {
+			if !w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Findings: findings[i].Value}) {
 				done = false
 			}
 		}
@@ -206,7 +228,50 @@ func (w *ChangeWriter) flush() {
 			w.retryLocked(time.Until(w.unavailableUntil))
 		}
 		w.mu.Unlock()
+		w.noteSent(k, keys, done)
 	}
+}
+
+// noteSent records the sections a flush wrote for k. A flush that did not
+// finish may have reached hk in part, so the sections it tried lose their
+// recorded value and the next flush writes them again.
+func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, done bool) {
+	if !done {
+		for name := range keys {
+			delete(w.sent[k], name)
+		}
+		return
+	}
+	if len(keys) == 0 {
+		return
+	}
+	if w.sent == nil {
+		w.sent = map[changeKey]map[string]string{}
+	}
+	if w.sent[k] == nil {
+		w.sent[k] = map[string]string{}
+	}
+	maps.Copy(w.sent[k], keys)
+}
+
+// sectionKey identifies a section's value for the unchanged check: a hash of
+// its canonical JSON without the observation times (observed_at, decided_at),
+// so the same state observed again keys alike. Queue stores the value as
+// JSON.
+func sectionKey(v any) string {
+	raw, _ := v.(json.RawMessage)
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(&m) == nil && m != nil {
+		delete(m, "observed_at")
+		delete(m, "decided_at")
+		if canon, e := json.Marshal(m); e == nil {
+			raw = canon
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // Wait drains queued writes, bounded by the caller's deadline.

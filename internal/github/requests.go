@@ -81,6 +81,22 @@ func (c *RequestCounts) Add(other *RequestCounts) {
 	c.requestTime += requestTime
 }
 
+// RequestTotal is the requests counted under ctx so far, failed attempts
+// included; zero when ctx counts nothing.
+func RequestTotal(ctx context.Context) int {
+	c, _ := ctx.Value(requestCountsKey{}).(*RequestCounts)
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	total := 0
+	for _, n := range c.counts {
+		total += n
+	}
+	return total
+}
+
 // ContinueRequests is CountRequests for work that may run inside a run that is
 // counting already: it joins that run's accounting under a new pass, or starts
 // one when ctx counts nothing.
