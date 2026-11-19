@@ -1007,6 +1007,98 @@ func TestRoundRule_LadderTerminalOutcomes(t *testing.T) {
 	}
 }
 
+func TestRoundRule_LadderRc2Refusals(t *testing.T) {
+	setup := func(t *testing.T, output string) (*Service, *roundRuleGH, *ackNotifier, *roundRuleRunner, config.Repo) {
+		t.Helper()
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+		run.escalateRC = 2
+		run.escalateOutput = output
+		return s, g, n, run, r
+	}
+	refusalEvents := func(n *ackNotifier) []integrations.Event {
+		var events []integrations.Event
+		for _, event := range n.events {
+			if event.ID == "mergewake-ladder-refusal-example/project-7-5" {
+				events = append(events, event)
+			}
+		}
+		return events
+	}
+
+	t.Run("cli_preflight_not_live_notifies_once", func(t *testing.T) {
+		s, _, n, run, r := setup(t, `panewire: job hk5000-dots-answer is not live (state "completed"); nothing to escalate`)
+		deliver(t, s, r)
+		deliver(t, s, r)
+		st := s.loadRoundRuleState(r.Name, 7)
+		if !st.escalated() || !st.LadderRefusalEventSent {
+			t.Fatalf("CLI refusal state not settled/sent: %+v", st)
+		}
+		if calls, _, _ := escalateSnapshot(run); calls != 1 {
+			t.Fatalf("CLI preflight refusal calls = %d, want 1", calls)
+		}
+		events := refusalEvents(n)
+		if len(events) != 1 {
+			t.Fatalf("CLI refusal events = %d, want 1: %+v", len(events), n.events)
+		}
+		for _, want := range []string{"example/project#7", "round 5", "not live", "did not replace"} {
+			if !strings.Contains(events[0].Text, want) && !(want == "did not replace" && strings.Contains(events[0].Text, "before replacing the author")) {
+				t.Errorf("refusal notice missing %q: %s", want, events[0].Text)
+			}
+		}
+	})
+
+	t.Run("pane_busy_retries_but_hub_job_not_live_does_not", func(t *testing.T) {
+		t.Run("pane_busy", func(t *testing.T) {
+			s, _, n, run, r := setup(t, "panewire: pane_busy: the author pane is busy")
+			for i := 0; i < ladderPaneBusyMaxCalls; i++ {
+				deliver(t, s, r)
+				st := s.loadRoundRuleState(r.Name, 7)
+				if i < ladderPaneBusyMaxCalls-1 && st.escalated() {
+					t.Fatalf("pane_busy settled after call %d", i+1)
+				}
+			}
+			if calls, _, _ := escalateSnapshot(run); calls != ladderPaneBusyMaxCalls {
+				t.Fatalf("pane_busy calls = %d, want %d", calls, ladderPaneBusyMaxCalls)
+			}
+			if st := s.loadRoundRuleState(r.Name, 7); st.LadderRefusalCode != "pane_busy" {
+				t.Fatalf("pane_busy code in state = %q", st.LadderRefusalCode)
+			}
+			if !strings.Contains(strings.Join(auditLines(t, s, r.Name), "\n"), `"code":"pane_busy"`) {
+				t.Fatal("pane_busy code missing from audit")
+			}
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("pane_busy sent CLI refusal notice: %+v", n.events)
+			}
+			st := s.loadRoundRuleState(r.Name, 7)
+			if !st.escalated() {
+				t.Fatal("pane_busy did not settle at retry bound")
+			}
+		})
+		t.Run("hub_job_not_live", func(t *testing.T) {
+			s, _, n, run, r := setup(t, "panewire: job_not_live: task is no longer live")
+			deliver(t, s, r)
+			deliver(t, s, r)
+			if calls, _, _ := escalateSnapshot(run); calls != 1 {
+				t.Fatalf("hub job_not_live calls = %d, want 1", calls)
+			}
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("hub refusal sent CLI refusal notice: %+v", n.events)
+			}
+			st := s.loadRoundRuleState(r.Name, 7)
+			if !st.escalated() {
+				t.Fatal("hub refusal did not settle")
+			}
+			if st.LadderRefusalCode != "job_not_live" {
+				t.Fatalf("hub refusal code in state = %q", st.LadderRefusalCode)
+			}
+			if !strings.Contains(strings.Join(auditLines(t, s, r.Name), "\n"), `"code":"job_not_live"`) {
+				t.Fatal("hub refusal code missing from audit")
+			}
+		})
+	})
+}
+
 // A pending (rc 124) call keeps retrying and an ended ladder keeps retrying
 // its owed decision after the ladder round has passed: reviewRounds is
 // monotonic, so rounds == ladderRound never holds again once a new round is
