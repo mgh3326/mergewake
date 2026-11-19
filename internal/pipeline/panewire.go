@@ -842,7 +842,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		deadline, _ := ctx.Deadline()
 		left := time.Until(deadline)
 		wait := min(reviewerPassWait, left-min(postReserve, left/4))
-		// The request expires with the pass budget: a request still parked
+		// A fresh request expires with the pass budget: a request still parked
 		// after the pass has ended would land on no one (hk 5428).
 		expires := left
 		if resumed {
@@ -850,9 +850,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if err != nil {
 				return out, err
 			}
-			budget := timeout - s.now().Sub(rj.budgetStart())
-			wait = min(wait, budget)
-			expires = budget
+			wait = min(wait, timeout-s.now().Sub(rj.budgetStart()))
 		}
 		if wait < minReviewerWait {
 			if resumed {
@@ -862,7 +860,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		var args []string
 		if resumed {
-			args = withExpires(withWaitTimeout(rj.Args, wait), expires)
+			// Only --wait-timeout changes on a replay: --expires is part of the
+			// submission panewire fingerprints, so the recorded value stays.
+			args = withWaitTimeout(rj.Args, wait)
 		} else {
 			args = []string{"spawn"}
 			if spec != nil {

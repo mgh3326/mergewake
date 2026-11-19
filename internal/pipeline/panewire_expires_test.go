@@ -3,10 +3,10 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -61,18 +61,16 @@ func TestPanewireFreshSpawnExpiresWithPass(t *testing.T) {
 	}
 }
 
-// A resumed replay of a reviewer spawn carries the pass budget that is left
-// at the replay, not the --expires its record was spawned with.
-func TestPanewireResumedReplayExpiresWithBudget(t *testing.T) {
+// A resumed replay keeps its recorded --expires: panewire fingerprints the
+// submission, so a replay with another value is refused (errSpawnClaimed).
+// Only --wait-timeout may differ from the recorded argv.
+func TestPanewireResumedReplayKeepsRecordedExpires(t *testing.T) {
 	s, _, r, runner, c := interruptedReviewer(t)
 	first := runner.spawns[0]
-	// The first pass ran on the test's short budget; the replay reads the
-	// budget as configured now, so a 25 minute pass is set for it.
+	// The first pass ran on the test's short budget. The replay reads the
+	// budget as configured now, so its remaining budget differs from the
+	// recorded --expires: a rewrite would show up as a different value.
 	s.Config.Review.Timeout = "25m"
-	timeout, err := config.Duration(s.Config.Review.Timeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	firstExpires := arg(first, "--expires")
 	if firstExpires == "" {
 		t.Fatalf("first spawn has no --expires: %v", first)
@@ -83,8 +81,10 @@ func TestPanewireResumedReplayExpiresWithBudget(t *testing.T) {
 		t.Fatalf("no replay: %d spawns", len(runner.spawns))
 	}
 	replay := runner.spawns[1]
-	want := reviewerExpires(timeout - 10*time.Minute)
-	if got := arg(replay, "--expires"); got != want || got == firstExpires {
-		t.Fatalf("replay --expires=%q, want %q (first %q): %v", got, want, firstExpires, replay)
+	if got := arg(replay, "--expires"); got != firstExpires {
+		t.Fatalf("replay --expires=%q, want the recorded %q: %v", got, firstExpires, replay)
+	}
+	if !slices.Equal(withoutWait(replay), withoutWait(first)) {
+		t.Fatalf("replay changed recorded args beyond --wait-timeout:\n%v\n%v", first, replay)
 	}
 }
