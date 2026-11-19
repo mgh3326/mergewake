@@ -529,7 +529,7 @@ func TestAuthorPaneFindingsTextCarriesLaneInAck(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	text := findingsText(testRepoFor(s), pr, "author", rt.lane, []pendingFinding{{thread: "T1", severity: "high", path: "tool", line: 3}})
+	text := findingsText(testRepoFor(s), pr, "author", rt.lane, []pendingFinding{{thread: "T1", severity: "high", path: "tool", line: 3}}, "", "")
 	for _, want := range []string{
 		"ack: panewire inbox list --lane w-9-lane --unread",
 		"read each item, act on it or record its disposition",

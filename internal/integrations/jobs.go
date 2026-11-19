@@ -21,10 +21,13 @@ import (
 // (hk docs/jobs.md): the panewire-written state, the spawn's model family and
 // profile, and the result `panewire done --result` stored with `completed`.
 type JobRecord struct {
-	State   string          `json:"state"`
-	Family  string          `json:"family"`
-	Profile string          `json:"profile"`
-	Result  json.RawMessage `json:"result"`
+	State   string `json:"state"`
+	Family  string `json:"family"`
+	Profile string `json:"profile"`
+	// Pool is the quota pool the spawn was placed on, as panewire recorded it
+	// at spawn (the spawned record's "pool"); empty when the record names none.
+	Pool   string          `json:"pool"`
+	Result json.RawMessage `json:"result"`
 	// Role, Label and OwnerLane are what panewire records at spawn: a worker's
 	// hub lane is its label, and owner_lane is the lane that owns its work.
 	Role      string `json:"role"`
