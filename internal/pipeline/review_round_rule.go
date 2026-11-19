@@ -102,8 +102,11 @@ type roundRuleState struct {
 	// Posted records that the request may have reached the hub, so an id lost
 	// to a failed state write is reconciled from the audit journal instead of
 	// a re-POST. Done marks the outcome settled and audited.
-	HubConsultOwed      bool      `json:"hub_consult_owed,omitempty"`
-	HubConsultHead      string    `json:"hub_consult_head,omitempty"`
+	HubConsultOwed bool   `json:"hub_consult_owed,omitempty"`
+	HubConsultHead string `json:"hub_consult_head,omitempty"`
+	// HubConsultRound is the round the consult was requested at, so a later
+	// round does not ask again.
+	HubConsultRound     int       `json:"hub_consult_round,omitempty"`
 	HubConsultPosted    bool      `json:"hub_consult_posted,omitempty"`
 	HubConsultID        string    `json:"hub_consult_id,omitempty"`
 	HubConsultState     string    `json:"hub_consult_state,omitempty"`

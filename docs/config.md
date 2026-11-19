@@ -1081,7 +1081,10 @@ on it.
   leaves at least one critical or high finding still open (not fixed or dismissed
   with evidence) after the verdict; the hub consult below uses its own, lower bar (any open
   finding above low). The round thresholds come from configuration
-  (`review.round_rule`, defaults 3 / 5 / 7):
+  (`review.round_rule`, defaults 3 / 5 / 7). The consult and the ladder act on the first qualifying round at or
+  after their number, once per PR, not at one exact round: a round that was not done before the author pushed, or
+  that had nothing open, does not use the step up, and a round that reaches its number with nothing qualifying still
+  does nothing (an all-low round gets no consult, decision 250):
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
     `stop patching; ask your design lane for a consult one grade above your seat in another family: ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself`
     No panewire call or lane event is emitted.
@@ -1093,7 +1096,9 @@ on it.
     severities come from the PR's review threads, as the gate reads them: the first comment's label, unresolved and not
     disposed (a medium finding by any human answer, a critical or high one only by a verified fix or a reasoned
     dismissal). An all-low round requests nothing (decision 250); with the switch off, the directive path below keeps
-    its blocking condition. mergewake writes a question document to hk (the PR, the reviewed head, every open
+    its blocking condition. The consult is owed on the first done round at or after the consult round that has
+    such a finding open; a consult already requested at an earlier round is not asked again (decision 250), while a
+    new head in the round it was requested for still starts its own, as below. mergewake writes a question document to hk (the PR, the reviewed head, every open
     finding with id, severity, path:line and text, and the task's contract pointer), then runs once per PR and head,
     on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
@@ -1118,7 +1123,8 @@ on it.
     so the round's findings are never held past that bound. Request, state change, supersession,
     outcome and delivery are audited as `consult-request` / `consult-state` / `consult-superseded` /
     `consult-outcome` / `consult-delivered`.
-  - **Round ladder (`review.round_rule.ladder`, default 5):** mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
+  - **Round ladder (`review.round_rule.ladder`, default 5):** on the first done round at or after the ladder round
+    with a critical or high finding open, mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
     `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round <n> --findings-file <path>`,
     where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
     rc 0 marks the step escalated (`ladder-escalated`); rc 2 marks it escalated too, the author
