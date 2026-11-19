@@ -663,8 +663,9 @@ func RepoFromRemote(raw string) string {
 // refuse the same worktrees. The node reads each glob without its trailing
 // `/` for the slash test: a glob with no other `/` (`name/`, `logs/`,
 // `node_modules`) matches the entry's last segment at any depth, while a glob
-// with an inner or leading `/` (`a/b/`, `dotnet/*/bin/`, `/build`) matches
-// the whole path. A trailing-slash glob approves only a `dir/` entry, and a
+// with an inner `/` (`a/b/`, `dotnet/*/bin/`) matches the whole path. A
+// leading `/` is refused at load (ValidRegenerableGlob), so it never reaches
+// this rule. A trailing-slash glob approves only a `dir/` entry, and a
 // `dir/` entry needs a trailing-slash glob, so a slash-free `name/` approves
 // a wholly ignored directory at any depth (`a/b/__pycache__/`) but never an
 // ignored file of that name. A slash-free glob matches only the last segment
