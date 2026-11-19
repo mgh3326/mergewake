@@ -549,3 +549,23 @@ func TestReviewBriefFallbackAttachmentFailureSkips(t *testing.T) {
 		t.Fatalf("fallback rows %v", rows)
 	}
 }
+
+// A failure past the attachment step is not a publication failure: when the
+// review-prompt.md pointer cannot be written, publishBrief returns the local
+// error unmarked, so runPass skips the pass instead of taking the round-1
+// fallback.
+func TestPublishBriefPointerFailureIsNotFallback(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{family: "openai"}
+	s, _, _ := briefDocSetup(t, runner, hk)
+	jobDir := t.TempDir()
+	if e := os.Mkdir(filepath.Join(jobDir, "review-prompt.md"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	x := &panewireExecutor{s: s}
+	_, e := x.publishBrief(context.Background(), &passPlan{}, "label", "1",
+		filepath.Join(jobDir, "review-brief.md"), jobDir, strings.Repeat("brief\n", inlineBriefLimit))
+	if e == nil || errors.Is(e, errBriefPublish) {
+		t.Fatalf("publishBrief err=%v, want an unmarked local failure", e)
+	}
+}

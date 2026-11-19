@@ -1877,23 +1877,23 @@ func (x *panewireExecutor) spawnBrief(ctx context.Context, path, jobDir string) 
 		AttachmentCommand() string
 	})
 	if !ok {
-		return "", errors.New("task sink cannot publish a large review brief")
+		return "", fmt.Errorf("%w: task sink cannot publish a large review brief", errBriefPublish)
 	}
 	id, e := files.PutAttachment(ctx, path)
 	if e != nil {
-		return "", e
+		return "", fmt.Errorf("%w: %w", errBriefPublish, e)
 	}
 	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
-		return "", errors.New("uploaded review brief sha256 mismatch")
+		return "", fmt.Errorf("%w: uploaded review brief sha256 mismatch", errBriefPublish)
 	}
 	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal.\n", id, len(body), shellQuote(filepath.Base(files.AttachmentCommand())), id)
 	pointer := filepath.Join(jobDir, "review-prompt.md")
 	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
 }
 
-// errBriefPublish marks the attachment step of publishBrief, so an oversize
-// delta brief falls back to the round-1 brief only when the upload failed —
-// a local write failure skips the pass as before.
+// errBriefPublish marks spawnBrief's attachment step, so an oversize delta
+// brief falls back to the round-1 brief only when the upload failed — a
+// local read or write failure skips the pass as before.
 var errBriefPublish = errors.New("publish brief")
 
 // publishBrief stores text where the spawn's -p value reaches it and returns
@@ -1907,11 +1907,7 @@ func (x *panewireExecutor) publishBrief(ctx context.Context, plan *passPlan, lab
 	if e := os.WriteFile(briefPath, []byte(text), 0600); e != nil {
 		return "", fmt.Errorf("write brief: %w", e)
 	}
-	p, e := x.spawnBrief(ctx, briefPath, jobDir)
-	if e != nil {
-		return "", fmt.Errorf("%w: %w", errBriefPublish, e)
-	}
-	return p, nil
+	return x.spawnBrief(ctx, briefPath, jobDir)
 }
 
 // errJobRecords means the configured sink cannot read hk job records at all
