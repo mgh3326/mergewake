@@ -251,17 +251,25 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	if st.HubConsultHead != "" {
 		pr.Head.SHA = st.HubConsultHead
 	}
-	task, err := s.prTask(ctx, r, pr)
-	if err != nil {
-		_ = s.audit(r.Name, "consult-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, o.DryRun)
-		return "", true
-	}
+	// The task is read once and kept with the question: the hub keys a consult
+	// by task, PR and head, so a retry after the PR's trailer was edited must
+	// still name the task the question document was written for.
+	task := st.HubConsultTask
 	if task == "" {
-		st.HubConsultDone = true
-		st.HubConsultReason = "PR carries no Mergewake-Task trailer"
-		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-		_ = s.audit(r.Name, "consult-skipped", map[string]any{"pr": pr.Number, "reason": st.HubConsultReason}, o.DryRun)
-		return st.hubConsultDirective(), false
+		var err error
+		task, err = s.prTask(ctx, r, pr)
+		if err != nil {
+			_ = s.audit(r.Name, "consult-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, o.DryRun)
+			return "", true
+		}
+		if task == "" {
+			st.HubConsultDone = true
+			st.HubConsultReason = "PR carries no Mergewake-Task trailer"
+			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+			_ = s.audit(r.Name, "consult-skipped", map[string]any{"pr": pr.Number, "reason": st.HubConsultReason}, o.DryRun)
+			return st.hubConsultDirective(), false
+		}
+		st.HubConsultTask = task
 	}
 
 	key := fmt.Sprintf("mergewake/consult/%s-%d-%s", strings.ReplaceAll(r.Name, "/", "-"), pr.Number, short7(pr.Head.SHA))
@@ -378,7 +386,10 @@ func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.P
 		return s.hubConsultSettle(ctx, r, pr, o, st)
 	}
 	wait := s.Config.Review.RoundRuleHubConsultWait()
-	if now.Sub(st.HubConsultAt) >= wait {
+	// The row is read before the wait is judged: a consult the hub answered
+	// while its PR was held, or between two passes, is delivered, not expired.
+	expired := now.Sub(st.HubConsultAt) >= wait
+	expire := func() (string, bool) {
 		st.HubConsultDone = true
 		st.HubConsultReason = fmt.Sprintf("no terminal state within %s (last state %s)", wait, st.HubConsultState)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
@@ -393,11 +404,17 @@ func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.P
 		if err != nil {
 			_ = s.audit(r.Name, "consult-poll-error", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "error": integrations.Detail(err)}, o.DryRun)
 		}
+		if expired {
+			return expire()
+		}
 		return "", true
 	}
 	row, err := hub.Consult(ctx, st.HubConsultID)
 	if err != nil {
 		_ = s.audit(r.Name, "consult-poll-error", map[string]any{"pr": pr.Number, "id": st.HubConsultID, "error": integrations.Detail(err)}, o.DryRun)
+		if expired {
+			return expire()
+		}
 		return "", true
 	}
 	if row.State != st.HubConsultState {
@@ -405,7 +422,40 @@ func (s *Service) hubConsultPoll(ctx context.Context, r config.Repo, pr github.P
 	}
 	s.hubConsultApply(st, row)
 	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	if expired && !consultTerminal(st.HubConsultState) {
+		return expire()
+	}
 	return s.hubConsultSettle(ctx, r, pr, o, st)
+}
+
+// advanceHeldConsult keeps an outstanding hub consult moving while the PR is
+// held: a held head is not settled, so the findings delivery that normally
+// advances the consult does not run for it. The row is polled and settled (and
+// its task comment retried) here; its outcome waits in the state for the next
+// author delivery, as for any settled consult.
+func (s *Service) advanceHeldConsult(ctx context.Context, r config.Repo, pr github.Pull, o Options) {
+	if !s.Config.Review.RoundRule.HubConsult || o.DryRun {
+		return
+	}
+	func() {
+		file := s.roundRuleFile(r.Name, pr.Number)
+		defer lockPath(file)()
+		unlock, err := fsutil.Lock(file+".lock", true)
+		if err != nil {
+			return
+		}
+		defer unlock()
+		st := s.loadRoundRuleState(r.Name, pr.Number)
+		if !st.HubConsultOwed || st.HubConsultDone || (st.HubConsultID == "" && !st.HubConsultPosted) {
+			return
+		}
+		fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+		if err != nil {
+			return
+		}
+		s.hubConsultAdvance(ctx, r, pr, fb, o, &st, s.now().UTC())
+	}()
+	s.hubConsultCommentRetry(ctx, r, pr, o)
 }
 
 // hubConsultApply copies the row fields the state file keeps.

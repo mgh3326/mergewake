@@ -108,6 +108,7 @@ type roundRuleState struct {
 	HubConsultID        string    `json:"hub_consult_id,omitempty"`
 	HubConsultState     string    `json:"hub_consult_state,omitempty"`
 	HubConsultQuestion  string    `json:"hub_consult_question,omitempty"`
+	HubConsultTask      string    `json:"hub_consult_task,omitempty"`
 	HubConsultAnswerDoc string    `json:"hub_consult_answer_doc,omitempty"`
 	HubConsultVerdict   string    `json:"hub_consult_verdict,omitempty"`
 	HubConsultSeat      string    `json:"hub_consult_seat,omitempty"`
@@ -151,9 +152,12 @@ type roundRuleState struct {
 	//
 	// HoldDueHead is the done head the record was taken on: delivering that
 	// head again (a finding resolved while CI is pending) never rewrites it,
-	// only a later done head replaces or clears it.
+	// only a later done head replaces or clears it. HoldDuePatch is that head's
+	// patch id: a head with the same patch (a rebase, a base merge) inherits the
+	// review and the round, and so the record.
 	HoldDue         bool           `json:"hold_due,omitempty"`
 	HoldDueHead     string         `json:"hold_due_head,omitempty"`
+	HoldDuePatch    string         `json:"hold_due_patch,omitempty"`
 	HoldDueRound    int            `json:"hold_due_round,omitempty"`
 	HoldDueFindings []endedFinding `json:"hold_due_findings,omitempty"`
 
@@ -318,8 +322,10 @@ func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pu
 	}
 	if len(ended) == 0 {
 		st.HoldDue, st.HoldDueHead, st.HoldDueRound, st.HoldDueFindings = false, "", 0, nil
+		st.HoldDuePatch = ""
 	} else {
 		st.HoldDue, st.HoldDueHead, st.HoldDueRound, st.HoldDueFindings = true, pr.Head.SHA, rounds, ended
+		st.HoldDuePatch = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
 	}
 	if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil && s.Log != nil {
 		s.Log.Warn("round-hold state write failed", "pr", pr.Number, "error", e)
@@ -842,6 +848,14 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		}
 		s.holdFromDue(ctx, r, pr)
 		st = s.loadRoundRuleState(r.Name, pr.Number)
+		if !st.held() && !st.released() {
+			// The promotion could not be persisted: the record alone refuses the
+			// dispatch, and the next evaluation tries again.
+			if s.Log != nil {
+				s.Log.Warn("round-hold promotion not persisted; review refused on the saved record", "pr", pr.Number)
+			}
+			return true
+		}
 	}
 	if !st.held() || st.released() {
 		return false
@@ -861,8 +875,10 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 			return false
 		}
 	}
-	// A held head is not settled, so NotifyPR does not run for it: the decision
-	// the hold owes retries here until it is sent (its event id is stable).
+	// A held head is not settled, so neither NotifyPR nor the findings delivery
+	// runs for it: an outstanding consult keeps being read here, and the
+	// decision the hold owes retries until it is sent (its event id is stable).
+	s.advanceHeldConsult(ctx, r, pr, o)
 	if o.Reporting() && !st.eventSent() {
 		rounds := st.HoldDueRound
 		if rounds == 0 {
@@ -911,7 +927,8 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 // read cannot see, a thread resolved while CI was pending), and on a newer head
 // whose review has not finished, before the author's push could step around a
 // hold the gate had not recorded yet. A newer reviewed head is judged by its own
-// round. The release stays the PR comment.
+// round — and one that only inherited the recorded head's review (the same
+// patch) is that round. The release stays the PR comment.
 func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
@@ -942,7 +959,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if reviewed && rounds >= holdRound && open || st.HoldDue && (!reviewed || st.HoldDueHead == pr.Head.SHA) {
+	if reviewed && rounds >= holdRound && open || st.HoldDue && (!reviewed || st.HoldDueHead == pr.Head.SHA || st.HoldDuePatch != "" && st.HoldDuePatch == v.Review.PatchID) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false

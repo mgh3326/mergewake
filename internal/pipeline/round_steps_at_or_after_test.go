@@ -3,9 +3,12 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
@@ -315,6 +318,9 @@ func TestRoundSteps_ConsultRetryKeepsTheOriginalHead(t *testing.T) {
 
 	// The next head resolves T1 and adds T2 before the queued consult reads
 	// its question: the document at the key must stay the original one.
+	// A maintainer also corrects the PR's task trailer: the retry still names
+	// the task the question document was written for.
+	g.pull.Body = "Summary\n\nMergewake-Task: 9999\n"
 	pushHead(g, shaC, "patch-4", 4, true)
 	resolved := ownFinding("T1", "high", 10)
 	resolved.IsResolved = true
@@ -327,6 +333,9 @@ func TestRoundSteps_ConsultRetryKeepsTheOriginalHead(t *testing.T) {
 		t.Fatalf("want the retry, got %d requests", run.requestCount())
 	}
 	retry := run.lastRequest()
+	if flagValue(retry, "--task") != "2481" {
+		t.Fatalf("retry changed the task: first %v retry %v", first, retry)
+	}
 	if flagValue(retry, "--head") != shaA || flagValue(retry, "--question") != flagValue(first, "--question") {
 		t.Fatalf("retry changed the request identity: first %v retry %v", first, retry)
 	}
@@ -465,4 +474,95 @@ func TestRoundSteps_HoldDueHoldsItsOwnHead(t *testing.T) {
 			t.Fatalf("outside-only round did not hold its own head: %v", v.Reasons)
 		}
 	})
+}
+
+// A held head is not settled, so the findings delivery that advances a hub
+// consult does not run for it. The review guard reads the outstanding row on
+// held evaluations, and reads it before judging the wait: a consult answered
+// while the PR was held is not expired.
+func TestRoundSteps_HeldPRKeepsReadingItsConsult(t *testing.T) {
+	s, g, _, _, run, hub, r, now := hubConsultSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	deliver(t, s, r) // requests the consult and records the round's hold
+	if run.requestCount() != 1 {
+		t.Fatalf("consult not requested: %v", run.requests)
+	}
+
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	// The hub answers after the wait bound has already passed locally.
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "answered", AnswerDoc: "reports/c-1/sha256/aa.md"}
+	*now = now.Add(s.Config.Review.RoundRuleHubConsultWait() + time.Minute)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("want ErrReviewHeld, got %v", err)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	if !st.HubConsultDone || st.HubConsultState != "answered" || st.HubConsultAnswerDoc == "" {
+		t.Fatalf("held evaluation did not settle the consult from the hub: %+v", st)
+	}
+}
+
+// A saved hold whose promotion cannot be persisted still refuses the dispatch,
+// and the next evaluation persists it.
+func TestRoundSteps_SavedHoldRefusesDispatchWhenPromotionFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not bind root")
+	}
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	dir := filepath.Dir(s.roundRuleFile(r.Name, 7))
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() { _ = os.Chmod(dir, 0o700) }
+	t.Cleanup(restore)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("promotion failure let a round dispatch: %v", err)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); st.held() {
+		t.Fatalf("hold persisted despite the unwritable state: %+v", st)
+	}
+	restore()
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("want ErrReviewHeld, got %v", err)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.held() {
+		t.Fatalf("hold not persisted on the next evaluation: %+v", st)
+	}
+}
+
+// A head with the recorded head's patch inherits its review and its round: the
+// record holds it though its own thread was resolved and it never completed a
+// round of its own.
+func TestRoundSteps_HoldDueFollowsTheSamePatch(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	patch := s.patchIDOf(context.Background(), r.Name, 7, shaA)
+	var history []github.ReviewedPass
+	for i := 1; i < 7; i++ {
+		history = append(history, github.ReviewedPass{Head: strings.Repeat(string(rune('0'+i)), 40), PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-" + string(rune('0'+i))}})
+	}
+	history = append(history, github.ReviewedPass{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Patch: patch, Round: 7}})
+	s.GH = &outsideGH{fakeGH: g.fakeGH, history: history}
+
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+	resolved := ownFinding("T1", "high", 10)
+	resolved.IsResolved = true
+	g.feedback.Threads = []github.ReviewThread{resolved}
+
+	// The rebase: same patch, new SHA, no done marker of its own.
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	v := gateHoldVerdict(t, s, g, r)
+	if v.Review.Inherited == "" {
+		t.Fatalf("fixture: the new head should inherit the review: %+v", v.Review)
+	}
+	if !roundHeld(v) {
+		t.Fatalf("same-patch head escaped the recorded round: %v", v.Reasons)
+	}
 }
