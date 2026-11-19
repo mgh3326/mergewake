@@ -137,6 +137,14 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		s.hubConsultSupersede(ctx, r, pr, o, st)
 	}
 
+	// State written before the request round was kept learns it the first time a
+	// pass sees the head the consult was requested for: that head's round now is
+	// the round it was requested at.
+	if st.consultAsked() && st.HubConsultRound == 0 && st.HubConsultHead == pr.Head.SHA && rounds > 0 {
+		st.HubConsultRound = rounds
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	}
+
 	// An owed consult is advanced on every pass, whatever the current round
 	// or done marker says: a push or a new review round must not orphan the
 	// row, its wait bound or its outcome.
@@ -215,17 +223,11 @@ func (s *Service) consultDue(st *roundRuleState, done bool, rounds int, open boo
 	if !done || rounds < s.Config.Review.RoundRuleConsult() || !open || st.directiveSent() {
 		return false
 	}
-	return !st.consultAsked() || s.consultRequestRound(st) == rounds
-}
-
-// consultRequestRound is the round the stored consult was requested at. State
-// written before the round was kept has none: the former rule requested only at
-// exactly the consult round, so that is the round it was asked at.
-func (s *Service) consultRequestRound(st *roundRuleState) int {
-	if st.HubConsultRound != 0 {
-		return st.HubConsultRound
-	}
-	return s.Config.Review.RoundRuleConsult()
+	// A consult whose request round is unknown (state written before the round
+	// was kept, not yet backfilled) counts as asked: losing a same-round
+	// replacement is safe, a second paid consult is not, and the round is never
+	// guessed from today's configuration, which may have changed since.
+	return !st.consultAsked() || (st.HubConsultRound != 0 && st.HubConsultRound == rounds)
 }
 
 // consultAsked reports whether a consult request may have reached the hub: the

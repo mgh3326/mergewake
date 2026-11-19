@@ -145,9 +145,10 @@ func TestRoundSteps_ConsultIsNotAskedAgainAtALaterRound(t *testing.T) {
 	}
 }
 
-// State written before the request round was kept has no round: a same-round
-// push still owes the replacement consult, as it did on the former exact rule.
-func TestRoundSteps_ConsultFromBeforeTheUpgradeKeepsItsRound(t *testing.T) {
+// State written before the request round was kept learns it the first time a
+// pass sees the head the consult was requested for, so a same-round push after
+// the upgrade still owes the replacement consult.
+func TestRoundSteps_ConsultFromBeforeTheUpgradeLearnsItsRound(t *testing.T) {
 	s, g, n, _, run, hub, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
 	run.queue = []consultResp{
@@ -166,6 +167,12 @@ func TestRoundSteps_ConsultFromBeforeTheUpgradeKeepsItsRound(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The first pass of the new build sees the requested head and learns the round.
+	deliver(t, s, r)
+	if st := s.loadRoundRuleState(r.Name, 7); st.HubConsultRound != 3 {
+		t.Fatalf("request round not learned: %+v", st)
+	}
+
 	// A same-patch rebase: still round 3, done, the same open finding.
 	pushHead(g, shaC, "patch-3", 3, true)
 	deliver(t, s, r)
@@ -174,6 +181,34 @@ func TestRoundSteps_ConsultFromBeforeTheUpgradeKeepsItsRound(t *testing.T) {
 	}
 	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
 		t.Fatalf("replacement names %q, want the new head", got)
+	}
+}
+
+// A consult whose request round is unknown is never guessed from today's
+// configuration: after the threshold was raised, a push first done at the new
+// threshold does not POST a second paid consult for the PR.
+func TestRoundSteps_ConsultWithAnUnknownRoundIsNotAskedAgain(t *testing.T) {
+	s, g, _, _, run, hub, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("first pass: %v", run.requests)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	st.HubConsultRound = 0
+	if err := s.saveRoundRuleState(r.Name, 7, st); err != nil {
+		t.Fatal(err)
+	}
+
+	// The operator raised the consult round, and the author pushed before any
+	// pass saw the requested head: the request round cannot be learned.
+	s.Config.Review.RoundRule.Consult = 5
+	pushHead(g, shaD, "patch-4", 4, true)
+	pushHead(g, shaC, "patch-5", 5, true)
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("a second paid consult was requested: %v", run.requests)
 	}
 }
 
