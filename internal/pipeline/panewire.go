@@ -842,12 +842,17 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		deadline, _ := ctx.Deadline()
 		left := time.Until(deadline)
 		wait := min(reviewerPassWait, left-min(postReserve, left/4))
+		// The request expires with the pass budget: a request still parked
+		// after the pass has ended would land on no one (hk 5428).
+		expires := left
 		if resumed {
 			timeout, err := config.Duration(s.Config.Review.Timeout)
 			if err != nil {
 				return out, err
 			}
-			wait = min(wait, timeout-s.now().Sub(rj.budgetStart()))
+			budget := timeout - s.now().Sub(rj.budgetStart())
+			wait = min(wait, budget)
+			expires = budget
 		}
 		if wait < minReviewerWait {
 			if resumed {
@@ -857,7 +862,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		var args []string
 		if resumed {
-			args = withWaitTimeout(rj.Args, wait)
+			args = withExpires(withWaitTimeout(rj.Args, wait), expires)
 		} else {
 			args = []string{"spawn"}
 			if spec != nil {
@@ -873,7 +878,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}
-			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
+			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())), "--expires", reviewerExpires(expires))
 			if cfg.Owner != "" {
 				args = append(args, "--owner", cfg.Owner)
 			}

@@ -382,6 +382,27 @@ func withWaitTimeout(args []string, wait time.Duration) []string {
 	return out
 }
 
+// reviewerExpires is the --expires value of a reviewer request that must not
+// outlive its pass: d rounded up to whole minutes, within panewire's 1m..24h.
+// A whole number of hours is written in hours, as panewire's examples do.
+func reviewerExpires(d time.Duration) string {
+	mins := min(max(int(math.Ceil(d.Minutes())), 1), 24*60)
+	if mins%60 == 0 {
+		return strconv.Itoa(mins/60) + "h"
+	}
+	return strconv.Itoa(mins) + "m"
+}
+
+// withExpires sets the --expires of a recorded reviewer spawn to d. A replayed
+// argv with no --expires (a record from before the flag) keeps none.
+func withExpires(args []string, d time.Duration) []string {
+	out := slices.Clone(args)
+	if i := indexFlag(out, "--expires"); i >= 0 && i+1 < len(out) {
+		out[i+1] = reviewerExpires(d)
+	}
+	return out
+}
+
 // placeOnly returns args without --wait and --wait-timeout: the spawn
 // places the reviewer and returns.
 func placeOnly(args []string) []string {
