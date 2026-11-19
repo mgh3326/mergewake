@@ -797,8 +797,11 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    reviewer, and the audit row lists it as unknown. When the exclusion leaves
    panewire no candidate (exit 80 or 81 with a "no host admitted" or "no
    placement candidate accepted" text), the spawn is placed once more without
-   `--exclude-pool`, audited as `review-replacement-pool-fallback`. A resumed
-   replay keeps its recorded arguments.
+   `--exclude-pool`, audited as `review-replacement-pool-fallback`; a resumed
+   replay is retried the same way, and its record is rewritten to the argv that
+   was sent. The lost reviewers of a pass stay in `replaced-reviewers/<pr>-p<pass>.json`
+   beyond the reviewer record, so a later spawn of that pass still excludes their
+   pools.
    The hub's `checkout_spec_v1` support is read by panewire itself: it asks the
    hub for the feature before it submits, and stops with exit 2 (`hub does not
    support --checkout-origin`) or 70 (`unable to verify hub support`) before a
