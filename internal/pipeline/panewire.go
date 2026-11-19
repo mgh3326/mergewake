@@ -864,6 +864,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			// submission panewire fingerprints, so the recorded value stays.
 			args = withWaitTimeout(rj.Args, wait)
 		} else {
+			// The lost reviewers of this pass outlive the record they were replaced
+			// under: a fresh spawn after a refused or dead one still excludes their pools.
+			durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass)
+			if loadErr != nil {
+				return out, loadErr
+			}
+			plan.replaced = mergeReplaced(plan.replaced, durable)
 			args = []string{"spawn"}
 			if spec != nil {
 				args = append(args, spec.args()...)
@@ -1021,11 +1028,19 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		tracing.Finish(runSpan)
 		// The pool exclusion of a replacement can leave panewire no candidate at
 		// all. The pass must not wait on that forever, so the spawn is placed
-		// once more without the exclusion; the record keeps what was sent, and
-		// the audit names the pools that were left out of the first try.
-		if e != nil && !resumed && ctx.Err() == nil && slices.Contains(rj.Args, "--exclude-pool") && noCandidateRefusal(stdout, e) {
+		// once more without the exclusion, on a fresh or a resumed replay alike:
+		// exit 80 and 81 refuse before any pane exists, so no request is
+		// duplicated. The record is rewritten to what is now sent, so later
+		// replays do not repeat the refused argv.
+		if e != nil && ctx.Err() == nil && slices.Contains(rj.Args, "--exclude-pool") && noCandidateRefusal(stdout, e) {
 			if auditErr := s.audit(x.repo.Name, "review-replacement-pool-fallback", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "excluded_pools": argAfter(rj.Args, "--exclude-pool"), "exit": exitStatus(e), "reason": fleetevent.Redact(integrations.Detail(e))}, false); auditErr != nil {
 				return out, auditErr
+			}
+			// A resumed replay retries with the wait it was given now; its record
+			// keeps the recorded wait, as every replay does.
+			retry := withoutFlag(rj.Args, "--exclude-pool")
+			if resumed {
+				retry = withoutFlag(args, "--exclude-pool")
 			}
 			rj.Args = withoutFlag(rj.Args, "--exclude-pool")
 			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
@@ -1033,7 +1048,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			note = "no placement candidate was left outside the lost reviewers' pools; placed without the pool exclusion"
 			runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
-			stdout, e = place(runCtx, rj.Args)
+			stdout, e = place(runCtx, retry)
 			tracing.Finish(runSpan)
 		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
@@ -1508,6 +1523,9 @@ func (x *panewireExecutor) reviewerRequestEnded(ctx context.Context, rj reviewer
 func (x *panewireExecutor) replaceDeadSpawn(ctx context.Context, plan *passPlan, rj reviewerJob, code int, detail, leaseSHA string) (passOutcome, error) {
 	s, pr := x.s, x.pr
 	out := passOutcome{}
+	// The dead record carried the reviewers its pass replaced; the next spawn
+	// keeps excluding their pools.
+	plan.replaced = mergeReplaced(plan.replaced, rj.Replaced)
 	reason := fleetevent.Redact(detail)
 	if e := s.audit(x.repo.Name, "reviewer-spawn-dead", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": rj.Label, "exit": code, "reason": reason}, false); e != nil {
 		return out, e
@@ -1859,6 +1877,14 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	plan.replaced = slices.Clone(rj.Replaced)
 	if !neverRanReviewer(rj, job) {
 		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart(), Pool: validPool(job.Pool)})
+	}
+	durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass)
+	if loadErr != nil {
+		return out, loadErr
+	}
+	plan.replaced = mergeReplaced(plan.replaced, durable)
+	if saveErr := s.saveReplacedReviewers(x.repo.Name, pr.Number, plan.pass, plan.replaced); saveErr != nil {
+		return out, saveErr
 	}
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error(), "recorded": rj.Recorded, "started": rj.Started, "budget_from": rj.budgetFrom()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)
