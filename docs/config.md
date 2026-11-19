@@ -1080,7 +1080,8 @@ on it.
     on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
-    (`reap.hub`); a retry of a request whose row never came back repeats it for the head it was first made for. A PR
+    (`reap.hub`); a retry of a request whose row never came back replays the same request — the head it was first made for and the
+    question document already written — without rewriting the document. A PR
     without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
     file, keyed by the head it was requested for. Later passes read a non-terminal row with
     `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
@@ -1116,7 +1117,8 @@ on it.
     inline thread, or an outside-diff finding no accepted answer had disposed of — it records that head, round and its
     findings in the round-rule state (before the author can fix and push). A newer head whose review has not finished
     is held from the record alone, and the review guard turns it into the hold (and sends the decision) before it
-    dispatches another round for that head. The record is per done head: delivering the same head again after its
+    dispatches another round for that head (a held PR whose decision was refused retries it there, since a held head is
+    not settled). The record also holds the done head it was taken on, whatever its findings' state by then. The record is per done head: delivering the same head again after its
     finding was resolved keeps it, and only a later done head that ends clean clears it. The decision event names the
     recorded round and findings even when the push already fixed them.
   - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began

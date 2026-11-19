@@ -267,11 +267,17 @@ func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr githu
 	key := fmt.Sprintf("mergewake/consult/%s-%d-%s", strings.ReplaceAll(r.Name, "/", "-"), pr.Number, short7(pr.Head.SHA))
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
-	if e := s.Sink.Record(reportCtx, key, buildConsultQuestion(r, pr, task, fb)); e != nil {
-		_ = s.audit(r.Name, "consult-question-error", map[string]any{"pr": pr.Number, "key": key, "error": integrations.Detail(e)}, o.DryRun)
-		return "", true
+	// The question is written once, before the first POST. A retry of a POST
+	// whose row never came back replays the same request: the document at that
+	// key is the one the possibly-queued consult will read, and writing it again
+	// would hand the same paid consult newer findings under the old head.
+	if st.HubConsultQuestion == "" {
+		if e := s.Sink.Record(reportCtx, key, buildConsultQuestion(r, pr, task, fb)); e != nil {
+			_ = s.audit(r.Name, "consult-question-error", map[string]any{"pr": pr.Number, "key": key, "error": integrations.Detail(e)}, o.DryRun)
+			return "", true
+		}
+		st.HubConsultQuestion = "hk:doc/" + key
 	}
-	st.HubConsultQuestion = "hk:doc/" + key
 
 	args := []string{
 		"consult", "request",

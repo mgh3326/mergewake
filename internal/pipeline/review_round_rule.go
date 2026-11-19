@@ -840,7 +840,7 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		if !o.Reporting() {
 			return true
 		}
-		s.holdFromDue(ctx, r, pr, o)
+		s.holdFromDue(ctx, r, pr)
 		st = s.loadRoundRuleState(r.Name, pr.Number)
 	}
 	if !st.held() || st.released() {
@@ -853,9 +853,7 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 	if !st.baselineCaptured() {
 		st.setHeld(true, st.HoldAt, len(comments), true)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
-		return true
-	}
-	if len(comments) > st.commentCount() {
+	} else if len(comments) > st.commentCount() {
 		if released, by := checkRoundHoldRelease(comments[st.commentCount():]); released {
 			st.setReleased(true, by)
 			_ = s.saveRoundRuleState(r.Name, pr.Number, st)
@@ -863,35 +861,40 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 			return false
 		}
 	}
+	// A held head is not settled, so NotifyPR does not run for it: the decision
+	// the hold owes retries here until it is sent (its event id is stable).
+	if o.Reporting() && !st.eventSent() {
+		rounds := st.HoldDueRound
+		if rounds == 0 {
+			if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
+				rounds, _ = reviewRounds(history)
+			}
+		}
+		s.notifyRoundHold(ctx, r, pr, rounds, o)
+	}
 	return true
 }
 
 // holdFromDue turns the recorded round-end hold into the PR's hold, as the gate
-// does for a reviewed head, and sends the one decision event.
-func (s *Service) holdFromDue(ctx context.Context, r config.Repo, pr github.Pull, o Options) {
+// does for a reviewed head. The decision event follows from the caller.
+func (s *Service) holdFromDue(ctx context.Context, r config.Repo, pr github.Pull) {
 	file := s.roundRuleFile(r.Name, pr.Number)
-	func() {
-		defer lockPath(file)()
-		unlock, err := fsutil.Lock(file+".lock", true)
-		if err != nil {
-			return
-		}
-		defer unlock()
-		st := s.loadRoundRuleState(r.Name, pr.Number)
-		if st.held() || st.released() || !st.holdDueFor(pr.Head.SHA) {
-			return
-		}
-		count, captured := 0, false
-		if comments, err := s.issueComments(ctx, r.Name, pr.Number); err == nil {
-			count, captured = len(comments), true
-		}
-		st.setHeld(true, s.now().UTC(), count, captured)
-		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
-	}()
-	st := s.loadRoundRuleState(r.Name, pr.Number)
-	if st.held() {
-		s.notifyRoundHold(ctx, r, pr, st.HoldDueRound, o)
+	defer lockPath(file)()
+	unlock, err := fsutil.Lock(file+".lock", true)
+	if err != nil {
+		return
 	}
+	defer unlock()
+	st := s.loadRoundRuleState(r.Name, pr.Number)
+	if st.held() || st.released() || !st.holdDueFor(pr.Head.SHA) {
+		return
+	}
+	count, captured := 0, false
+	if comments, err := s.issueComments(ctx, r.Name, pr.Number); err == nil {
+		count, captured = len(comments), true
+	}
+	st.setHeld(true, s.now().UTC(), count, captured)
+	_ = s.saveRoundRuleState(r.Name, pr.Number, st)
 }
 
 // checkRound5Gate evaluates the round hold condition during gate evaluation.
@@ -902,11 +905,13 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
 //
 // The hold is per PR, not per head: at the hold round, a reviewed head that
-// ends with a critical/high finding open holds the PR, and so does a newer head
-// whose review has not finished when the round before it ended that way — the
-// state DeliverFindings recorded for the done head (HoldDue), before the author
-// could push, so a push cannot step around a hold the gate had not recorded
-// yet. The release stays the PR comment.
+// ends with a critical/high finding open holds the PR, and so does the round
+// DeliverFindings recorded for a done head (HoldDue) — on that head itself,
+// whatever its findings' state by now (an outside-diff finding the open-thread
+// read cannot see, a thread resolved while CI was pending), and on a newer head
+// whose review has not finished, before the author's push could step around a
+// hold the gate had not recorded yet. A newer reviewed head is judged by its own
+// round. The release stays the PR comment.
 func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
@@ -937,7 +942,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if reviewed && rounds >= holdRound && open || !reviewed && st.holdDueFor(pr.Head.SHA) {
+	if reviewed && rounds >= holdRound && open || st.HoldDue && (!reviewed || st.HoldDueHead == pr.Head.SHA) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false

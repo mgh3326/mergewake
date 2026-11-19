@@ -296,7 +296,7 @@ func TestRoundSteps_ReviewIsHeldByARecordedRound(t *testing.T) {
 // is retried for the head it was first made for, not for a head the author
 // pushed meanwhile: a second paid consult is never opened.
 func TestRoundSteps_ConsultRetryKeepsTheOriginalHead(t *testing.T) {
-	s, g, _, _, run, _, r, _ := hubConsultSetup(t, 3)
+	s, g, _, sink, run, _, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
 	run.queue = []consultResp{
 		{rc: -1, out: ""},
@@ -307,9 +307,22 @@ func TestRoundSteps_ConsultRetryKeepsTheOriginalHead(t *testing.T) {
 		t.Fatalf("first request: %v", run.requests)
 	}
 	first := run.lastRequest()
+	key := strings.TrimPrefix(flagValue(first, "--question"), "hk:doc/")
+	question := sink.docs[key]
+	if !strings.Contains(question, "T1") {
+		t.Fatalf("question not recorded: %q", question)
+	}
 
+	// The next head resolves T1 and adds T2 before the queued consult reads
+	// its question: the document at the key must stay the original one.
 	pushHead(g, shaC, "patch-4", 4, true)
+	resolved := ownFinding("T1", "high", 10)
+	resolved.IsResolved = true
+	g.feedback.Threads = []github.ReviewThread{resolved, ownFinding("T2", "high", 20)}
 	deliver(t, s, r)
+	if sink.docs[key] != question {
+		t.Fatalf("retry rewrote the question document:\n%s", sink.docs[key])
+	}
 	if run.requestCount() != 2 {
 		t.Fatalf("want the retry, got %d requests", run.requestCount())
 	}
@@ -363,4 +376,93 @@ func TestRoundSteps_HoldDueCountsOutsideFindings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A hold that is active but whose decision was refused is retried on the next
+// held evaluation: the held head is not settled, so NotifyPR does not run.
+func TestRoundSteps_HeldPRRetriesTheUnsentDecision(t *testing.T) {
+	s, g, n, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	n.failLanes = map[string]error{"design-lane": errors.New("notifier unavailable")}
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("want ErrReviewHeld, got %v", err)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.held() || st.eventSent() {
+		t.Fatalf("want a held PR with an unsent decision: %+v", st)
+	}
+
+	n.failLanes = nil
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("want ErrReviewHeld, got %v", err)
+	}
+	decisions := 0
+	for _, e := range n.events {
+		if e.Type == "decision" && strings.Contains(e.Text, "round 7 ended without a pass (1 open finding(s))") {
+			decisions++
+		}
+	}
+	if decisions != 1 {
+		t.Fatalf("want the decision sent once after the retry, got %d: %+v", decisions, n.events)
+	}
+	// Sent: later evaluations send nothing more.
+	_ = s.Review(context.Background(), r, 7, "google", Options{})
+	after := 0
+	for _, e := range n.events {
+		if e.Type == "decision" {
+			after++
+		}
+	}
+	if after != 1 {
+		t.Fatalf("decision repeated: %+v", n.events)
+	}
+}
+
+// The recorded round holds the head it was recorded on as well: an outside-diff
+// finding the open-thread read cannot see, or a thread resolved while CI was
+// pending, cannot let that same SHA merge without the release comment.
+func TestRoundSteps_HoldDueHoldsItsOwnHead(t *testing.T) {
+	t.Run("inline resolved while CI was pending", func(t *testing.T) {
+		s, g, _, _, _, r := roundRuleSetup(t, 7)
+		g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+		deliver(t, s, r)
+		resolved := ownFinding("T1", "high", 10)
+		resolved.IsResolved = true
+		g.feedback.Threads = []github.ReviewThread{resolved}
+		v := gateHoldVerdict(t, s, g, r)
+		if !roundHeld(v) || v.State != "blocked" {
+			t.Fatalf("the done head merges past its own round: %s %v", v.State, v.Reasons)
+		}
+		// The release comment still ends it.
+		if err := g.PostIssueComment(context.Background(), r.Name, 7, "Mergewake-Round-Hold: release"); err != nil {
+			t.Fatal(err)
+		}
+		if v := gateHoldVerdict(t, s, g, r); roundHeld(v) {
+			t.Fatalf("release comment ignored: %v", v.Reasons)
+		}
+	})
+	t.Run("outside-only round", func(t *testing.T) {
+		f := holdFinding("docs/x.md", 3, "high", "the stale claim about the config")
+		s, g, _, _, _, r := roundRuleSetup(t, 7)
+		history := []github.ReviewedPass{
+			{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Patch: s.patchIDOf(context.Background(), r.Name, 7, shaA), Round: 7}, Outside: []github.OutsideFinding{f}},
+		}
+		for i := 1; i < 7; i++ {
+			history = append([]github.ReviewedPass{{Head: strings.Repeat(string(rune('0'+i)), 40), PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-" + string(rune('0'+i))}}}, history...)
+		}
+		oh := &outsideGH{fakeGH: g.fakeGH, history: history}
+		s.GH = oh
+		g.feedback.Threads = nil
+		deliver(t, s, r)
+		// The finding is dismissed after the round was delivered: the same SHA
+		// would otherwise merge with CI green.
+		oh.comments = holdComment("pr-author", "User", "Dismiss: "+f.Ref+" — the file is generated, not source")
+		v := gateHoldVerdict(t, s, g, r)
+		if !roundHeld(v) {
+			t.Fatalf("outside-only round did not hold its own head: %v", v.Reasons)
+		}
+	})
 }
