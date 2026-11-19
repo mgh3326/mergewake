@@ -678,3 +678,34 @@ func TestRoundSteps_HoldDueFollowsACleanBaseMerge(t *testing.T) {
 		t.Fatalf("a clean base merge escaped the recorded round: %v", v.Reasons)
 	}
 }
+
+// A pass history that failed to read is not a clean round: the pass reports it
+// (audited like the other unreadable evidence) and the record stands.
+func TestRoundSteps_UnreadableHistoryKeepsTheRecord(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueHead != shaA {
+		t.Fatalf("fixture: no record: %+v", st)
+	}
+
+	pushHead(g, shaD, "patch-8", 8, true)
+	g.feedback.Threads = nil
+	g.historyErr = errors.New("GitHub GET /pulls/7/reviews: HTTP 502")
+	if err := s.DeliverFindings(context.Background(), r, 7, Options{}); err == nil {
+		t.Fatal("an unreadable pass history was read as a clean round")
+	}
+	if !auditHas(t, s, r.Name, "round-hold-evidence-unavailable") {
+		t.Fatal("the unreadable history was not audited")
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueHead != shaA {
+		t.Fatalf("unreadable history erased the record: %+v", st)
+	}
+
+	// The read recovers: the clean later head clears the record as before.
+	g.historyErr = nil
+	deliver(t, s, r)
+	if st := s.loadRoundRuleState(r.Name, 7); st.HoldDue {
+		t.Fatalf("clean later round did not clear the record: %+v", st)
+	}
+}

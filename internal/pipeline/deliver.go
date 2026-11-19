@@ -121,7 +121,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
-	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
+	history, historyErr := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
 	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
@@ -132,7 +132,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		followErr = errors.Join(followErr, s.trackHead(ctx, r, pr, !openBlocking, s.openLowerFindings(fb, verify), o))
 	}
 	st := s.loadRoundRuleState(r.Name, n)
-	followErr = errors.Join(followErr, s.recordHoldDue(ctx, r, pr, o, &st, done, rounds, openBlockingThreads, history))
+	followErr = errors.Join(followErr, s.recordHoldDue(ctx, r, pr, o, &st, done, rounds, openBlockingThreads, history, historyErr))
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
 	// The hub consult (review.round_rule.hub_consult) replaces the author

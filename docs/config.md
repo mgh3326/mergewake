@@ -1134,7 +1134,7 @@ on it.
     not settled; an outstanding hub consult is read there too, and its row is read before its wait bound is judged). The
     record also holds the done head it was taken on, and any head with that head's patch (a rebase or base merge
     inherits the round), whatever its findings' state by then. A recorded hold whose promotion cannot be written still
-    refuses the dispatch. Evidence the snapshot needs but cannot read (the PR's comments, a fix check) is not a clean
+    refuses the dispatch. Evidence the snapshot needs but cannot read (the pass history, the PR's comments, a fix check) is not a clean
     round: the record stays as it was, the pass reports the error (`round-hold-evidence-unavailable`) and the next
     pass on that head takes the snapshot again. A head that inherits the recorded head's review through a clean base
     merge is held like a same-patch head. The record is per done head: delivering the same head again after its

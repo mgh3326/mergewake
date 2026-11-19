@@ -293,11 +293,20 @@ func endedFindings(threads []github.ReviewThread) []endedFinding {
 // its snapshot: how the round ended does not change when its findings are
 // resolved afterwards.
 //
-// Evidence that cannot be read (the PR's comments, a fix check) is not a clean
+// Evidence that cannot be read (the pass history, the PR's comments, a fix check) is not a clean
 // round: the record stays as it was and the error is returned, so the pass
 // reports it and the next pass on this head takes the snapshot again.
-func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread, history []github.ReviewedPass) error {
-	if !o.Reporting() || !done || rounds < s.Config.Review.RoundRuleHold() || st.held() {
+func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread, history []github.ReviewedPass, historyErr error) error {
+	if !o.Reporting() || !done || st.held() {
+		return nil
+	}
+	// A pass history that failed to read cannot tell the round count or the
+	// outside findings the passes listed: not a clean round either.
+	if historyErr != nil {
+		_ = s.audit(r.Name, "round-hold-evidence-unavailable", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "error": integrations.Detail(historyErr)}, o.DryRun)
+		return historyErr
+	}
+	if rounds < s.Config.Review.RoundRuleHold() {
 		return nil
 	}
 	if st.HoldDue && st.HoldDueHead == pr.Head.SHA {
