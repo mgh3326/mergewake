@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -218,19 +219,148 @@ func TestRoundSteps_HoldFollowsThePRToItsNextHead(t *testing.T) {
 	}
 }
 
-// A done head at or after the hold round that ends clean clears what an earlier
-// done head recorded, so a later unreviewed head is not held for a round that
-// no longer stands.
-func TestRoundSteps_HoldDueClearedByACleanRound(t *testing.T) {
+// What a round ended with is recorded once per done head. Delivering the same
+// head again after its finding was resolved (CI still pending) keeps the
+// record; only a later done head that ends clean clears it.
+func TestRoundSteps_HoldDueIsPerDoneHead(t *testing.T) {
 	s, g, _, _, _, r := roundRuleSetup(t, 7)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
 	deliver(t, s, r)
-	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueRound != 7 {
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue || st.HoldDueRound != 7 || st.HoldDueHead != shaA {
 		t.Fatalf("hold not recorded: %+v", st)
 	}
-	g.feedback.Threads = nil
+
+	// The finding is resolved while the same head waits: the record stands, and
+	// a push that follows is still held.
+	resolved := ownFinding("T1", "high", 10)
+	resolved.IsResolved = true
+	g.feedback.Threads = []github.ReviewThread{resolved}
 	deliver(t, s, r)
-	if st := s.loadRoundRuleState(r.Name, 7); st.HoldDue {
-		t.Fatalf("hold still recorded after a clean round: %+v", st)
+	if st := s.loadRoundRuleState(r.Name, 7); !st.HoldDue {
+		t.Fatalf("same-head delivery erased the round's outcome: %+v", st)
+	}
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	if v := gateHoldVerdict(t, s, g, r); !roundHeld(v) {
+		t.Fatalf("push after a same-head resolution escaped the hold: %v", v.Reasons)
+	}
+
+	// A genuinely later round that ends clean clears it (a fresh PR state, as
+	// the hold is not yet set on the first one).
+	s2, g2, _, _, _, r2 := roundRuleSetup(t, 7)
+	g2.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s2, r2)
+	pushHead(g2, shaD, "patch-8", 8, true)
+	g2.feedback.Threads = nil
+	deliver(t, s2, r2)
+	if st := s2.loadRoundRuleState(r2.Name, 7); st.HoldDue {
+		t.Fatalf("a later clean round did not clear the record: %+v", st)
+	}
+}
+
+// The daemon reviews a pushed head before it settles it, so the review guard
+// turns the recorded hold into the hold and sends the decision itself: no
+// further round is dispatched for the new head.
+func TestRoundSteps_ReviewIsHeldByARecordedRound(t *testing.T) {
+	s, g, n, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	deliver(t, s, r)
+
+	g.reviewed = false
+	g.pull.Head.SHA = shaC
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review of the next head want ErrReviewHeld, got: %v", err)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.held() {
+		t.Fatalf("hold not persisted: %+v", st)
+	}
+	decisions := 0
+	for _, e := range n.events {
+		if e.Type == "decision" && strings.Contains(e.Text, "round 7 ended without a pass (1 open finding(s))") {
+			decisions++
+		}
+	}
+	if decisions != 1 {
+		t.Fatalf("want one decision event, got %d: %+v", decisions, n.events)
+	}
+	// The release comment still ends it.
+	if err := g.PostIssueComment(context.Background(), r.Name, 7, "Mergewake-Round-Hold: release"); err != nil {
+		t.Fatal(err)
+	}
+	if s.isRoundHoldActive(context.Background(), r, g.pull, Options{}) {
+		t.Fatal("release comment did not end the hold")
+	}
+}
+
+// A consult POST that reached the hub but timed out before its row came back
+// is retried for the head it was first made for, not for a head the author
+// pushed meanwhile: a second paid consult is never opened.
+func TestRoundSteps_ConsultRetryKeepsTheOriginalHead(t *testing.T) {
+	s, g, _, _, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.queue = []consultResp{
+		{rc: -1, out: ""},
+		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
+	}
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("first request: %v", run.requests)
+	}
+	first := run.lastRequest()
+
+	pushHead(g, shaC, "patch-4", 4, true)
+	deliver(t, s, r)
+	if run.requestCount() != 2 {
+		t.Fatalf("want the retry, got %d requests", run.requestCount())
+	}
+	retry := run.lastRequest()
+	if flagValue(retry, "--head") != shaA || flagValue(retry, "--question") != flagValue(first, "--question") {
+		t.Fatalf("retry changed the request identity: first %v retry %v", first, retry)
+	}
+}
+
+// A round whose only open critical/high finding is outside the diff also ends
+// without a pass: its record survives the push, and an answer the PR had
+// accepted by the time the round was delivered keeps it from being recorded.
+func TestRoundSteps_HoldDueCountsOutsideFindings(t *testing.T) {
+	f := holdFinding("docs/x.md", 3, "high", "the stale claim about the config")
+	for _, tt := range []struct {
+		name     string
+		comments []github.IssueComment
+		wantHold bool
+	}{
+		{"open outside finding", nil, true},
+		{"dismissed before the round was delivered", holdComment("pr-author", "User", "Dismiss: "+f.Ref+" — the file is generated, not source"), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, _, r := roundRuleSetup(t, 7)
+			// The done head's passes carry their own patch: the pushed head is a
+			// different patch, not an inheritor of this review.
+			patch := s.rememberPatch(patchKey(r.Name, 7, shaA), "patch-7")
+			s.rememberPatch(patchKey(r.Name, 7, shaC), "patch-pushed")
+			var history []github.ReviewedPass
+			for i := 1; i < 7; i++ {
+				history = append(history, github.ReviewedPass{Head: strings.Repeat(string(rune('0'+i)), 40), PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-" + string(rune('0'+i))}})
+			}
+			history = append(history,
+				github.ReviewedPass{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Patch: patch, Round: 7}, Outside: []github.OutsideFinding{f}},
+				github.ReviewedPass{Head: shaA, PassReceipt: github.PassReceipt{Pass: 2, Patch: patch, Round: 7}},
+			)
+			oh := &outsideGH{fakeGH: g.fakeGH, history: history, comments: tt.comments}
+			s.GH = oh
+			g.feedback.Threads = nil
+			deliver(t, s, r)
+			if st := s.loadRoundRuleState(r.Name, 7); st.HoldDue != tt.wantHold {
+				t.Fatalf("HoldDue=%v, want %v: %+v", st.HoldDue, tt.wantHold, st)
+			}
+			if !tt.wantHold {
+				return
+			}
+			g.reviewed = false
+			g.pull.Head.SHA = shaC
+			if v := gateHoldVerdict(t, s, g, r); !roundHeld(v) {
+				t.Fatalf("outside-only round did not hold the next head: %v", v.Reasons)
+			}
+		})
 	}
 }

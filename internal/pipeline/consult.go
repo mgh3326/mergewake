@@ -244,6 +244,13 @@ func (s *Service) consultAuthorFor(ctx context.Context, r config.Repo, pr github
 // cancel, killed child) may have reached the hub and created a paid row, so
 // it holds for reconcile instead of settling.
 func (s *Service) hubConsultRequest(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, now time.Time) (string, bool) {
+	// The request names the head it was first made for, whatever head the PR
+	// has now: a POST that reached the hub but lost its row to a timeout is
+	// retried with the same key and --head, so the hub answers the same row
+	// instead of opening a second paid consult for the new head.
+	if st.HubConsultHead != "" {
+		pr.Head.SHA = st.HubConsultHead
+	}
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
 		_ = s.audit(r.Name, "consult-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(err)}, o.DryRun)

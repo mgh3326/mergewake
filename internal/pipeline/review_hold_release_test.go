@@ -25,7 +25,7 @@ func holdAtRound7(t *testing.T) (*Service, *roundRuleGH, config.Repo) {
 	if err != nil {
 		t.Fatalf("mergeGate err: %v", err)
 	}
-	if !s.isRoundHoldActive(context.Background(), r, g.pull) {
+	if !s.isRoundHoldActive(context.Background(), r, g.pull, Options{}) {
 		t.Fatalf("round 7 without a pass must hold the PR: %+v", v.Reasons)
 	}
 	return s, g, r

@@ -1080,7 +1080,8 @@ on it.
     on the daemon host bounded at 60 s:
     `panewire consult request --task <id> --question hk:doc/<key> [--author-job <job> | --author-family <family>]
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
-    (`reap.hub`). A PR without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
+    (`reap.hub`); a retry of a request whose row never came back repeats it for the head it was first made for. A PR
+    without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
     file, keyed by the head it was requested for. Later passes read a non-terminal row with
     `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
     terminal row would retry it), until `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout)
@@ -1111,10 +1112,13 @@ on it.
     of one PR cannot call it twice.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
     once a reviewed head at or after the hold round ends with a critical or high finding open. The hold is per PR, not
-    per head: when the findings delivery sees a done head at or after the hold round with such a finding open, it
-    records that round and its findings in the round-rule state (before the author can fix and push), and a newer head
-    whose review has not finished is held from the state alone. A later done head that ends clean clears the record.
-    The decision event names the recorded round and findings even when the push already fixed them.
+    per head: when the findings delivery sees a done head at or after the hold round with such a finding open — an
+    inline thread, or an outside-diff finding no accepted answer had disposed of — it records that head, round and its
+    findings in the round-rule state (before the author can fix and push). A newer head whose review has not finished
+    is held from the record alone, and the review guard turns it into the hold (and sends the decision) before it
+    dispatches another round for that head. The record is per done head: delivering the same head again after its
+    finding was resolved keeps it, and only a later done head that ends clean clears it. The decision event names the
+    recorded round and findings even when the push already fixed them.
   - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began
     by a non-bot account — the review login counts, since it is also the operator's account. Comments mergewake generated
     (they carry a `<!-- mergewake` marker, including the hold decision text itself) never count. Once released, review and gate resume;

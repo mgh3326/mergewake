@@ -148,7 +148,12 @@ type roundRuleState struct {
 	// head before the author's fix and push can replace it, and the gate turns
 	// it into the hold when the next head is still unreviewed. A later done head
 	// that ends clean clears it.
+	//
+	// HoldDueHead is the done head the record was taken on: delivering that
+	// head again (a finding resolved while CI is pending) never rewrites it,
+	// only a later done head replaces or clears it.
 	HoldDue         bool           `json:"hold_due,omitempty"`
+	HoldDueHead     string         `json:"hold_due_head,omitempty"`
 	HoldDueRound    int            `json:"hold_due_round,omitempty"`
 	HoldDueFindings []endedFinding `json:"hold_due_findings,omitempty"`
 
@@ -188,6 +193,12 @@ func (st *roundRuleState) setEscalated(v bool, now time.Time, output string) {
 	st.LadderAt = now
 	st.LadderOutput = output
 	st.LadderPendingSince = time.Time{}
+}
+
+// holdDueFor reports whether a recorded round-end hold applies to head: the
+// record was taken on another (earlier) done head.
+func (st *roundRuleState) holdDueFor(head string) bool {
+	return st.HoldDue && st.HoldDueHead != head
 }
 
 func (st *roundRuleState) held() bool {
@@ -274,12 +285,24 @@ func endedFindings(threads []github.ReviewThread) []endedFinding {
 // recordHoldDue notes, on a done head at or after the hold round, whether the
 // round ended with a critical/high finding open (see roundRuleState.HoldDue).
 // It runs under the round-rule state lock and refreshes st; a PR already held
-// needs nothing, and a dry run writes nothing.
-func (s *Service) recordHoldDue(r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread) {
+// needs nothing, a dry run writes nothing, and a head already recorded keeps
+// its snapshot: how the round ended does not change when its findings are
+// resolved afterwards.
+func (s *Service) recordHoldDue(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, done bool, rounds int, open []github.ReviewThread, history []github.ReviewedPass) {
 	if !o.Reporting() || !done || rounds < s.Config.Review.RoundRuleHold() || st.held() {
 		return
 	}
-	if len(open) == 0 && !st.HoldDue {
+	if st.HoldDue && st.HoldDueHead == pr.Head.SHA {
+		return
+	}
+	// The round's open findings: inline threads, plus the outside-diff findings
+	// its passes listed that no answer has disposed of by now (the gate's own
+	// fold, so a dismissal is respected and an open one survives the push).
+	ended := endedFindings(open)
+	for _, f := range s.openOutsideAtDone(ctx, r, pr, history) {
+		ended = append(ended, endedFinding{Ref: f.Ref, Severity: f.Severity, Path: f.Path, Line: f.Line})
+	}
+	if len(ended) == 0 && !st.HoldDue {
 		return
 	}
 	file := s.roundRuleFile(r.Name, pr.Number)
@@ -290,17 +313,51 @@ func (s *Service) recordHoldDue(r config.Repo, pr github.Pull, o Options, st *ro
 	}
 	defer unlock()
 	*st = s.loadRoundRuleState(r.Name, pr.Number)
-	if st.held() {
+	if st.held() || (st.HoldDue && st.HoldDueHead == pr.Head.SHA) {
 		return
 	}
-	if len(open) == 0 {
-		st.HoldDue, st.HoldDueRound, st.HoldDueFindings = false, 0, nil
+	if len(ended) == 0 {
+		st.HoldDue, st.HoldDueHead, st.HoldDueRound, st.HoldDueFindings = false, "", 0, nil
 	} else {
-		st.HoldDue, st.HoldDueRound, st.HoldDueFindings = true, rounds, endedFindings(open)
+		st.HoldDue, st.HoldDueHead, st.HoldDueRound, st.HoldDueFindings = true, pr.Head.SHA, rounds, ended
 	}
 	if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil && s.Log != nil {
 		s.Log.Warn("round-hold state write failed", "pr", pr.Number, "error", e)
 	}
+}
+
+// openOutsideAtDone lists the outside-diff findings still open on pr's done
+// head, as the merge gate folds them: the passes' listings, then the PR's
+// comments as answers with fix claims verified against this head. A read that
+// fails leaves the list empty, as the inline threads' read error does.
+func (s *Service) openOutsideAtDone(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) []outsideFinding {
+	records := foldOutside(history, pr.Head.SHA, s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA), "", true)
+	var open []outsideFinding
+	for _, f := range records {
+		if f.State == outsideOpen {
+			open = append(open, f)
+		}
+	}
+	if len(open) == 0 {
+		return nil
+	}
+	comments, err := s.GH.IssueComments(github.FreshEvidence(ctx), r.Name, pr.Number)
+	if err != nil {
+		return nil
+	}
+	fixes := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	answerOutside(comments, records, fixes.verified)
+	if fixes.err != nil {
+		return nil
+	}
+	markOutsideDisputes(records)
+	open = open[:0]
+	for _, f := range records {
+		if f.State == outsideOpen {
+			open = append(open, f)
+		}
+	}
+	return open
 }
 
 // roundEndsWithoutPass reports whether the PR has at least one critical or high
@@ -730,8 +787,20 @@ func (s *Service) issueComments(ctx context.Context, repo string, n int) (commen
 }
 
 // isRoundHoldActive checks whether PR is held under round hold and not released.
-func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr github.Pull) bool {
+// A round-end hold the findings delivery recorded for an earlier done head
+// becomes the hold here, before another review round is dispatched for a newer
+// head: the daemon reviews a pushed head before it settles it, so waiting for
+// the gate would let the next round start. Turning it into the hold also sends
+// the decision event, which the skipped settle would not.
+func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr github.Pull, o Options) bool {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
+	if !st.held() && !st.released() && st.holdDueFor(pr.Head.SHA) {
+		if !o.Reporting() {
+			return true
+		}
+		s.holdFromDue(ctx, r, pr, o)
+		st = s.loadRoundRuleState(r.Name, pr.Number)
+	}
 	if !st.held() || st.released() {
 		return false
 	}
@@ -753,6 +822,34 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 		}
 	}
 	return true
+}
+
+// holdFromDue turns the recorded round-end hold into the PR's hold, as the gate
+// does for a reviewed head, and sends the one decision event.
+func (s *Service) holdFromDue(ctx context.Context, r config.Repo, pr github.Pull, o Options) {
+	file := s.roundRuleFile(r.Name, pr.Number)
+	func() {
+		defer lockPath(file)()
+		unlock, err := fsutil.Lock(file+".lock", true)
+		if err != nil {
+			return
+		}
+		defer unlock()
+		st := s.loadRoundRuleState(r.Name, pr.Number)
+		if st.held() || st.released() || !st.holdDueFor(pr.Head.SHA) {
+			return
+		}
+		count, captured := 0, false
+		if comments, err := s.issueComments(ctx, r.Name, pr.Number); err == nil {
+			count, captured = len(comments), true
+		}
+		st.setHeld(true, s.now().UTC(), count, captured)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+	}()
+	st := s.loadRoundRuleState(r.Name, pr.Number)
+	if st.held() {
+		s.notifyRoundHold(ctx, r, pr, st.HoldDueRound, o)
+	}
 }
 
 // checkRound5Gate evaluates the round hold condition during gate evaluation.
@@ -798,7 +895,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if reviewed && rounds >= holdRound && open || !reviewed && st.HoldDue {
+	if reviewed && rounds >= holdRound && open || !reviewed && st.holdDueFor(pr.Head.SHA) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false
