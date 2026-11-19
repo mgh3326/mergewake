@@ -125,6 +125,12 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
+	// A head's review outcome is recorded once its review ends, for the
+	// head-after-clean row of the next head (head_trail.go). It never holds
+	// the deliveries below.
+	if done {
+		followErr = errors.Join(followErr, s.trackHead(ctx, r, pr, !openBlocking, s.openLowerFindings(fb, verify), o))
+	}
 	st := s.loadRoundRuleState(r.Name, n)
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
@@ -187,7 +193,13 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 					directive = RoundDirective
 				}
 			}
-			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive)
+			// The defer rule rides with an author delivery whose head has no
+			// open critical/high; a head with one keeps today's delivery.
+			rule := ""
+			if batch.scope == "author" && !openBlocking {
+				rule = deferRuleLine(pr.Number)
+			}
+			d, e := s.sendFindings(ctx, r, pr, route, batch.scope, batch.findings, o, directive, rule)
 			if e != nil {
 				// Keep what was already delivered; a retry of the failed batch
 				// reuses its event ID, which panewire dedupes.
@@ -450,10 +462,17 @@ func severityRank(s string) int {
 	return 5
 }
 
+// deferRuleLine is the defer rule (operator decision 449) an author delivery
+// carries when the head has no open critical/high finding: the medium and low
+// findings go to one follow-up task, and the PR merges at this head.
+func deferRuleLine(pr int) string {
+	return fmt.Sprintf(`rule: this head has no open critical/high finding; defer each open medium/low finding to ONE follow-up hk task for this PR (this PR task's project and lane, kind fix, title "PR #%d follow-ups: ..."), answer each open medium thread "disposition: defer hk <id>", and push nothing more for them; the PR merges at this head once required checks pass, and a failed required check is still fixed in the PR`, pr)
+}
+
 // findingsText renders one delivery: what was found, what is required and how
 // to acknowledge, within the lane event bound. Findings that do not fit are
 // counted, not dropped silently.
-func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding, directives ...string) string {
+func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendingFinding, directive, rule string) string {
 	tag := "FINDINGS"
 	required := `critical/high/Major: fix commit or dismissal evidence (command+output or disproving code line); accepted replies: "Fixed in <sha>", "Dismiss: <evidence>", "Disposition: fixed <sha>", "Disposition: dismiss <evidence>", or "Disposition: defer <hk task>" (defer only for nonblocking findings); fixes require a commit in the PR after the finding; reply to every other with a disposition. A "Fixed in <sha>" reply names a test that fails on the previous reviewed head and passes on the new one, and claims only what that test shows; when no test can be written (such as for a document line or build file), say so in one clause.`
 	if scope == "owner" {
@@ -462,8 +481,11 @@ func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendin
 	}
 	head := fmt.Sprintf("[mergewake] %s %s#%d head=%s | %d finding(s) for lane %s: ", tag, r.Name, pr.Number, short7(pr.Head.SHA), len(fs), lane)
 	tail := " | " + required
-	if len(directives) > 0 && directives[0] != "" {
-		tail = " | directive: " + directives[0] + tail
+	if rule != "" {
+		tail = " | " + rule + tail
+	}
+	if directive != "" {
+		tail = " | directive: " + directive + tail
 	}
 	if scope == "author" {
 		tail += fmt.Sprintf(" | ack: panewire inbox list --lane %s --unread; read each item, act on it or record its disposition, then panewire inbox ack <id>; acknowledging does not resolve a finding", lane)
@@ -498,8 +520,9 @@ func findingsText(r config.Repo, pr github.Pull, scope, lane string, fs []pendin
 }
 
 // sendFindings emits one delivery and returns its ledger record. Dry-run
-// records the decision only.
-func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pull, rt findingsRoute, scope string, fs []pendingFinding, o Options, directives ...string) (findingsDelivery, error) {
+// records the decision only. The event ID keys on the named threads and the
+// directive only: the rule line is text, so it never changes a delivery's ID.
+func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pull, rt findingsRoute, scope string, fs []pendingFinding, o Options, directive, rule string) (findingsDelivery, error) {
 	slices.SortStableFunc(fs, func(a, b pendingFinding) int {
 		if d := severityRank(a.severity) - severityRank(b.severity); d != 0 {
 			return d
@@ -513,10 +536,7 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 	for i, f := range fs {
 		ids[i] = f.thread
 	}
-	key := strings.Join(ids, "\n")
-	if len(directives) > 0 {
-		key += "\n" + strings.Join(directives, "\n")
-	}
+	key := strings.Join(ids, "\n") + "\n" + directive
 	sum := sha256.Sum256([]byte(key))
 	lane, via := rt.lane, rt.via
 	d := findingsDelivery{
@@ -528,7 +548,7 @@ func (s *Service) sendFindings(ctx context.Context, r config.Repo, pr github.Pul
 		Lane:    lane,
 		Via:     via,
 		Owner:   rt.owner,
-		Text:    findingsText(r, pr, scope, lane, fs, directives...),
+		Text:    findingsText(r, pr, scope, lane, fs, directive, rule),
 		SentAt:  s.now().UTC(),
 		Heads:   []string{pr.Head.SHA},
 	}
