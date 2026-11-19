@@ -304,6 +304,31 @@ type archiveRow struct {
 	Archive *archive.Result `json:"archive,omitempty"`
 }
 
+type archivePhaseRow struct {
+	Time       time.Time `json:"time"`
+	Action     string    `json:"action"`
+	Host       string    `json:"host"`
+	Phase      string    `json:"phase"`
+	DurationMS float64   `json:"duration_ms"`
+	Result     string    `json:"result,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+}
+
+type archiveTimedRunner struct {
+	base  integrations.Runner
+	phase string
+	spent map[string]time.Duration
+}
+
+func (r *archiveTimedRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	start := time.Now()
+	b, err := r.base.Run(ctx, command, args, input, dir)
+	if r.phase != "" {
+		r.spent[r.phase] += time.Since(start)
+	}
+	return b, err
+}
+
 // ArchiveJobs archives the backlog of job dirs on configured hosts whose
 // newest entry is older than olderThan, through the same plan/apply pipeline
 // reap uses. A job whose name is a live pane is never touched, and a host
@@ -318,10 +343,16 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	now := s.now()
 	started := now
 	maxRun, _ := config.OptionalDuration(s.Config.Reap.Archive.MaxRun)
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if maxRun > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, maxRun)
+		defer cancel()
+	}
 	// budgetSpent is the budget half of the gate that runs before every host
 	// and every job; the cancel half comes first there, so a cancelled run
 	// returns its error even when the budget is spent too.
-	budgetSpent := func() bool { return maxRun > 0 && s.now().Sub(started) >= maxRun }
+	budgetSpent := func() bool { return maxRun > 0 && (runCtx.Err() != nil || s.now().Sub(started) >= maxRun) }
 	var selected []reap.Host
 	for _, h := range s.Config.Hosts {
 		if host == "" || h.Name == host {
@@ -338,22 +369,26 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	var errs []error
 	counts := map[string]int{}
 	archivedThisRun, eligibleLeft := 0, 0
-	// entered counts the hosts whose gate passed; after a budget stop the
-	// hosts from entered onward were not scanned.
+	// entered is the gate boundary. rotationCursor advances past a started
+	// host even when its scan exceeds the budget.
 	entered := 0
+	rotationCursor := 0
+	unscannedStart := -1
 	stoppedOnBudget := false
+	unscannedReasons := map[string]string{}
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
 hosts:
 	for _, h := range order {
 		// The gate comes before the first remote command for this host.
 		if e := ctx.Err(); e != nil {
-			return errors.Join(append(errs, e)...)
+			break
 		}
 		if budgetSpent() {
 			stoppedOnBudget = true
 			break
 		}
 		entered++
+		rotationCursor = entered
 		if h.Jobs == "" {
 			errs = append(errs, fmt.Errorf("%s: hosts[].jobs is unset", h.Name))
 			continue
@@ -362,23 +397,58 @@ hosts:
 			errs = append(errs, fmt.Errorf("%s: archive does not run over reap.transport panewire", h.Name))
 			continue
 		}
-		hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}}
+		timed := &archiveTimedRunner{base: s.Runner, spent: make(map[string]time.Duration)}
+		hs := &reapHost{host: h, exec: reap.Exec{Runner: timed, Host: h}}
 		var e error
-		if hs.panes, e = hs.exec.Panes(ctx); e == nil {
-			hs.all, e = hs.exec.AllPanes(ctx)
+		timed.phase = "pane_scan"
+		if hs.panes, e = hs.exec.Panes(runCtx); e == nil {
+			hs.all, e = hs.exec.AllPanes(runCtx)
+		}
+		timed.phase = ""
+		if phaseErr := s.archivePhase(h.Name, "pane_scan", takePhase(timed, "pane_scan"), e, o.DryRun); phaseErr != nil {
+			errs = append(errs, phaseErr)
 		}
 		if e != nil {
-			errs = append(errs, fmt.Errorf("%s: pane scan: %w", h.Name, e))
+			if errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				stoppedOnBudget = true
+				unscannedReasons[h.Name] = "max_run deadline during pane scan"
+				unscannedStart = entered - 1
+				break
+			}
+			unscannedReasons[h.Name] = "pane scan: " + e.Error()
 			continue
 		}
 		a := s.archiver()
-		root, e := a.Jobs(ctx, h)
+		a.Runner = timed
+		timed.phase = "jobs_dir"
+		root, e := a.Jobs(runCtx, h)
+		timed.phase = ""
+		if phaseErr := s.archivePhase(h.Name, "jobs_dir", takePhase(timed, "jobs_dir"), e, o.DryRun); phaseErr != nil {
+			errs = append(errs, phaseErr)
+		}
 		if e != nil {
+			if budgetSpent() && ctx.Err() == nil {
+				stoppedOnBudget = true
+				unscannedReasons[h.Name] = "max_run deadline during jobs directory lookup"
+				unscannedStart = entered - 1
+				break
+			}
 			errs = append(errs, fmt.Errorf("%s: jobs dir: %w", h.Name, e))
 			continue
 		}
-		jobsByName, e := a.HostJobs(ctx, h, root)
+		timed.phase = "ssh_listing"
+		jobsByName, e := a.HostJobs(runCtx, h, root)
+		timed.phase = ""
+		if phaseErr := s.archivePhase(h.Name, "ssh_listing", takePhase(timed, "ssh_listing"), e, o.DryRun); phaseErr != nil {
+			errs = append(errs, phaseErr)
+		}
 		if e != nil {
+			if budgetSpent() && ctx.Err() == nil {
+				stoppedOnBudget = true
+				unscannedReasons[h.Name] = "max_run deadline during jobs listing"
+				unscannedStart = entered - 1
+				break
+			}
 			errs = append(errs, fmt.Errorf("%s: list jobs: %w", h.Name, e))
 			continue
 		}
@@ -401,8 +471,13 @@ hosts:
 			jobs[i] = ordered[i].name
 		}
 		for jobIndex, job := range jobs {
-			if e := ctx.Err(); e != nil {
-				return errors.Join(append(errs, e)...)
+			if e := runCtx.Err(); e != nil {
+				if errors.Is(e, context.DeadlineExceeded) && ctx.Err() == nil {
+					stoppedOnBudget = true
+					unscannedReasons[h.Name] = "max_run deadline during job scan"
+					unscannedStart = entered - 1
+				}
+				break hosts
 			}
 			if budgetSpent() {
 				stoppedOnBudget = true
@@ -430,34 +505,78 @@ hosts:
 				row.Result, row.Reason = "skipped", reason
 			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
-			} else if files, reason, newest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
-				row.Result, row.Reason = archiveJobsReason(e)
-			} else if reason != "" {
-				row.Result, row.Reason = "skipped", reason
-			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
-				row.Result, row.Reason = "skipped", "too-new"
-			} else if maxJobs > 0 && archivedThisRun >= maxJobs {
-				eligibleLeft++
-				continue
-			} else if p, e := a.PlanListed(ctx, h, job, filepath.Join(root, job), files); e != nil {
-				row.Result, row.Reason = archiveJobsReason(e)
-			} else if e := s.Print(p); e != nil {
-				return errors.Join(append(errs, e)...)
-			} else if !acting {
-				row.Result = "would-archive"
-				archivedThisRun++
 			} else {
-				res, e := a.Apply(ctx, p, now)
-				row.Archive = res
-				if e != nil {
-					row.Result, row.Reason = archiveJobsReason(e)
-				} else if len(res.Retained) != 0 {
-					row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
-				} else {
-					row.Result = "archived"
+				timed.phase = "job_reads"
+				files, reason, newest, refreshErr := a.RefreshJob(runCtx, h, job, filepath.Join(root, job))
+				timed.phase = ""
+				if phaseErr := s.archivePhase(h.Name, "job_reads", takePhase(timed, "job_reads"), refreshErr, o.DryRun); phaseErr != nil {
+					errs = append(errs, phaseErr)
 				}
-				if row.Result == "archived" || row.Result == "archived-retained" {
-					archivedThisRun++
+				if refreshErr != nil {
+					if budgetSpent() && ctx.Err() == nil {
+						stoppedOnBudget = true
+						unscannedReasons[h.Name] = "max_run deadline during job reads"
+						unscannedStart = entered - 1
+						break hosts
+					}
+					row.Result, row.Reason = archiveJobsReason(refreshErr)
+				} else if reason != "" {
+					row.Result, row.Reason = "skipped", reason
+				} else if now.Sub(time.Unix(newest, 0)) < olderThan {
+					row.Result, row.Reason = "skipped", "too-new"
+				} else if maxJobs > 0 && archivedThisRun >= maxJobs {
+					eligibleLeft++
+					continue
+				} else {
+					timed.phase = "hk_reads"
+					p, planErr := a.PlanListed(runCtx, h, job, filepath.Join(root, job), files)
+					timed.phase = ""
+					if phaseErr := s.archivePhase(h.Name, "hk_reads", takePhase(timed, "hk_reads"), planErr, o.DryRun); phaseErr != nil {
+						errs = append(errs, phaseErr)
+					}
+					if planErr != nil {
+						if budgetSpent() && ctx.Err() == nil {
+							stoppedOnBudget = true
+							unscannedReasons[h.Name] = "max_run deadline during hk reads"
+							unscannedStart = entered - 1
+							break hosts
+						}
+						row.Result, row.Reason = archiveJobsReason(planErr)
+					} else if budgetSpent() {
+						stoppedOnBudget = true
+						unscannedReasons[h.Name] = "max_run deadline before archive apply"
+						unscannedStart = entered - 1
+						break hosts
+					} else if e := s.Print(p); e != nil {
+						row.Result, row.Reason = "error", e.Error()
+					} else if !acting {
+						row.Result = "would-archive"
+						archivedThisRun++
+					} else {
+						timed.phase = "archive_apply"
+						// Once apply starts, let it finish its publish/delete boundary.
+						// Cancelling a remote rm mid-command can leave a partial tree
+						// with a published manifest and no durable archive row.
+						res, applyErr := a.Apply(ctx, p, now)
+						timed.phase = ""
+						if budgetSpent() {
+							stoppedOnBudget = true
+						}
+						if phaseErr := s.archivePhase(h.Name, "archive_apply", takePhase(timed, "archive_apply"), applyErr, o.DryRun); phaseErr != nil {
+							errs = append(errs, phaseErr)
+						}
+						row.Archive = res
+						if applyErr != nil {
+							row.Result, row.Reason = archiveJobsReason(applyErr)
+						} else if len(res.Retained) != 0 {
+							row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
+						} else {
+							row.Result = "archived"
+						}
+						if row.Result == "archived" || row.Result == "archived-retained" {
+							archivedThisRun++
+						}
+					}
 				}
 			}
 			if row.Result == "error" {
@@ -469,35 +588,99 @@ hosts:
 			}
 		}
 	}
-	if e := ctx.Err(); e != nil {
-		return errors.Join(append(errs, e)...)
-	}
 	var unscanned []string
 	if stoppedOnBudget {
-		for _, h := range order[entered:] {
+		unscannedFrom := entered
+		if unscannedStart >= 0 {
+			unscannedFrom = unscannedStart
+		}
+		for _, h := range order[unscannedFrom:] {
 			unscanned = append(unscanned, h.Name)
 		}
 	}
-	if host == "" && !o.DryRun {
-		if e := saveArchiveNextHost(s.Config.StateDir, order, entered, stoppedOnBudget); e != nil {
+	for _, h := range order {
+		if _, ok := unscannedReasons[h.Name]; ok {
+			unscanned = append(unscanned, h.Name)
+		}
+	}
+	if len(unscanned) != 0 {
+		sort.Strings(unscanned)
+		unscanned = compactStrings(unscanned)
+	}
+	if host == "" && !o.DryRun && ctx.Err() == nil {
+		if e := saveArchiveNextHost(s.Config.StateDir, order, rotationCursor, stoppedOnBudget); e != nil {
 			errs = append(errs, e)
 		}
 	}
+	if e := ctx.Err(); e != nil {
+		errs = append(errs, e)
+	}
 	summary := struct {
-		Action          string   `json:"action"`
-		Shadow          bool     `json:"shadow"`
-		OlderThan       string   `json:"older_than"`
-		Archived        int      `json:"archived"`
-		Retained        int      `json:"archived_retained"`
-		Planned         int      `json:"planned"`
-		Skipped         int      `json:"skipped"`
-		ErrCount        int      `json:"errors"`
-		EligibleLeft    int      `json:"eligible_left"`
-		EligibleScope   string   `json:"eligible_left_scope"`
-		StoppedOnBudget bool     `json:"stopped_on_budget"`
-		UnscannedHosts  []string `json:"unscanned_hosts,omitempty"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, archiveEligibleScope, stoppedOnBudget, unscanned}
-	return errors.Join(append(errs, s.Print(summary))...)
+		Action           string            `json:"action"`
+		Shadow           bool              `json:"shadow"`
+		OlderThan        string            `json:"older_than"`
+		Archived         int               `json:"archived"`
+		Retained         int               `json:"archived_retained"`
+		Planned          int               `json:"planned"`
+		Skipped          int               `json:"skipped"`
+		ErrCount         int               `json:"errors"`
+		EligibleLeft     int               `json:"eligible_left"`
+		EligibleScope    string            `json:"eligible_left_scope"`
+		StoppedOnBudget  bool              `json:"stopped_on_budget"`
+		UnscannedHosts   []string          `json:"unscanned_hosts,omitempty"`
+		UnscannedReasons map[string]string `json:"unscanned_host_reasons,omitempty"`
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, archiveEligibleScope, stoppedOnBudget, unscanned, unscannedReasons}
+	if e := s.Print(summary); e != nil {
+		errs = append(errs, e)
+	}
+	if !o.DryRun {
+		b, e := json.Marshal(summary)
+		if e != nil {
+			errs = append(errs, e)
+		} else if e = appendLine(filepath.Join(s.Config.StateDir, "archive-jobs.jsonl"), b); e != nil {
+			errs = append(errs, e)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func compactStrings(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	out := in[:1]
+	for _, v := range in[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func takePhase(r *archiveTimedRunner, phase string) time.Duration {
+	d := r.spent[phase]
+	r.spent[phase] = 0
+	return d
+}
+
+func (s *Service) archivePhase(host, phase string, duration time.Duration, err error, dry bool) error {
+	row := archivePhaseRow{Time: s.now().UTC(), Action: "archive-phase", Host: host, Phase: phase, DurationMS: float64(duration) / float64(time.Millisecond)}
+	if err != nil {
+		row.Result, row.Reason = "error", err.Error()
+	} else {
+		row.Result = "ok"
+	}
+	if e := s.Print(row); e != nil {
+		return e
+	}
+	if dry {
+		return nil
+	}
+	b, e := json.Marshal(row)
+	if e != nil {
+		return e
+	}
+	return appendLine(filepath.Join(s.Config.StateDir, "archive-jobs.jsonl"), b)
 }
 
 // archiveNextHostFile holds the name of the host the next full archive-jobs
@@ -528,10 +711,10 @@ func (s *Service) archiveRunOrder(hosts []reap.Host) []reap.Host {
 }
 
 // saveArchiveNextHost records where the next full run starts. A budget stop
-// names the host after the last one entered (entered is the count of hosts
+// names the host after the last one started (cursor is the count of hosts
 // whose gate passed). A run that walked every host clears the state, so config
 // order resumes.
-func saveArchiveNextHost(stateDir string, order []reap.Host, entered int, stopped bool) error {
+func saveArchiveNextHost(stateDir string, order []reap.Host, cursor int, stopped bool) error {
 	file := filepath.Join(stateDir, archiveNextHostFile)
 	if !stopped {
 		if e := os.Remove(file); e != nil && !errors.Is(e, fs.ErrNotExist) {
@@ -539,7 +722,7 @@ func saveArchiveNextHost(stateDir string, order []reap.Host, entered int, stoppe
 		}
 		return nil
 	}
-	return fsutil.Atomic(file, []byte(order[entered%len(order)].Name+"\n"), 0600)
+	return fsutil.Atomic(file, []byte(order[cursor%len(order)].Name+"\n"), 0600)
 }
 
 func archiveJobsReason(err error) (string, string) {
