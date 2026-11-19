@@ -215,12 +215,25 @@ func (s *Service) consultDue(st *roundRuleState, done bool, rounds int, open boo
 	if !done || rounds < s.Config.Review.RoundRuleConsult() || !open || st.directiveSent() {
 		return false
 	}
-	return !st.consultAsked() || st.HubConsultRound == rounds
+	return !st.consultAsked() || s.consultRequestRound(st) == rounds
 }
 
-// consultAsked reports whether a consult was ever requested for the PR.
+// consultRequestRound is the round the stored consult was requested at. State
+// written before the round was kept has none: the former rule requested only at
+// exactly the consult round, so that is the round it was asked at.
+func (s *Service) consultRequestRound(st *roundRuleState) int {
+	if st.HubConsultRound != 0 {
+		return st.HubConsultRound
+	}
+	return s.Config.Review.RoundRuleConsult()
+}
+
+// consultAsked reports whether a consult request may have reached the hub: the
+// POST was recorded as attempted, or its row came back. An attempt that failed
+// before the POST (a question the hk write refused, a task read that failed)
+// asked nothing, and a qualifying later head still owes the consult.
 func (st *roundRuleState) consultAsked() bool {
-	return st.HubConsultOwed || st.HubConsultPosted || st.HubConsultID != "" || st.HubConsultDone || !st.HubConsultAt.IsZero()
+	return st.HubConsultPosted || st.HubConsultID != ""
 }
 
 // hubConsultAdvance moves an owed consult one step: request it when no row

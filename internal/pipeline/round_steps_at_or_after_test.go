@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -141,5 +142,59 @@ func TestRoundSteps_ConsultIsNotAskedAgainAtALaterRound(t *testing.T) {
 	}
 	if n.count != 1 {
 		t.Fatalf("the later round's findings were not delivered once: %+v", n.events)
+	}
+}
+
+// State written before the request round was kept has no round: a same-round
+// push still owes the replacement consult, as it did on the former exact rule.
+func TestRoundSteps_ConsultFromBeforeTheUpgradeKeepsItsRound(t *testing.T) {
+	s, g, n, _, run, hub, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.queue = []consultResp{
+		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
+		{rc: 0, out: `{"id":"c-2","state":"queued"}`},
+	}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("first pass: %v", run.requests)
+	}
+	// The state file as the previous build wrote it: no request round.
+	st := s.loadRoundRuleState(r.Name, 7)
+	st.HubConsultRound = 0
+	if err := s.saveRoundRuleState(r.Name, 7, st); err != nil {
+		t.Fatal(err)
+	}
+
+	// A same-patch rebase: still round 3, done, the same open finding.
+	pushHead(g, shaC, "patch-3", 3, true)
+	deliver(t, s, r)
+	if run.requestCount() != 2 {
+		t.Fatalf("the same-round head got no replacement consult: %v (events %+v)", run.requests, n.events)
+	}
+	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
+		t.Fatalf("replacement names %q, want the new head", got)
+	}
+}
+
+// An attempt that failed before the POST asked nothing: after hk recovers, a
+// qualifying later head still gets the consult.
+func TestRoundSteps_ConsultFailedBeforeThePostIsNotConsumed(t *testing.T) {
+	s, g, _, sink, run, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	sink.recordErr = errors.New("hk unavailable")
+	deliver(t, s, r)
+	if run.requestCount() != 0 {
+		t.Fatalf("requested without a question: %v", run.requests)
+	}
+
+	sink.recordErr = nil
+	pushHead(g, shaC, "patch-4", 4, true)
+	deliver(t, s, r)
+	if run.requestCount() != 1 {
+		t.Fatalf("the consult was consumed by an attempt that never reached the hub: %v", run.requests)
+	}
+	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
+		t.Fatalf("request names %q, want the new head", got)
 	}
 }
