@@ -879,14 +879,11 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 	// runs for it: an outstanding consult keeps being read here, and the
 	// decision the hold owes retries until it is sent (its event id is stable).
 	s.advanceHeldConsult(ctx, r, pr, o)
-	if o.Reporting() && !st.eventSent() {
-		rounds := st.HoldDueRound
-		if rounds == 0 {
-			if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
-				rounds, _ = reviewRounds(history)
-			}
-		}
-		s.notifyRoundHold(ctx, r, pr, rounds, o)
+	// Only a hold that carries the round it ended with is retried here: its
+	// decision names that round and its findings. A hold the gate set for a
+	// reviewed head sends its own decision from NotifyPR.
+	if o.Reporting() && !st.eventSent() && st.HoldDue && len(st.HoldDueFindings) > 0 {
+		s.notifyRoundHold(ctx, r, pr, st.HoldDueRound, o)
 	}
 	return true
 }
