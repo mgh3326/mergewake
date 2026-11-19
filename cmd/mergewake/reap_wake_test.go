@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/pipeline"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 const (
@@ -155,6 +156,81 @@ func TestDaemonMergeWakesReapRole(t *testing.T) {
 				t.Fatalf("merges=%d wakes=%d, want %d and %d\n%s", merges, wakes, tt.merges, tt.wakes, stderr.String())
 			}
 		})
+	}
+}
+
+func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
+	var mu sync.Mutex
+	requests := map[string]int{}
+	var firstStarted time.Time
+	firstCanceled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "closed" {
+			parts := strings.Split(r.URL.Path, "/")
+			repo := parts[3]
+			mu.Lock()
+			requests[repo]++
+			first := requests[repo] == 1
+			if repo == "one" && first {
+				firstStarted = time.Now()
+			}
+			mu.Unlock()
+			if repo == "one" && first {
+				select {
+				case <-r.Context().Done():
+					mu.Lock()
+					firstCanceled = true
+					mu.Unlock()
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	gh := github.New("")
+	gh.BaseURL, gh.Stderr = srv.URL, io.Discard
+	repos := []config.Repo{{Name: "o/one", Branch: "main"}, {Name: "o/two", Branch: "main"}}
+	cfg := config.Config{StateDir: t.TempDir(), Repos: repos, PollInterval: "1h", Hosts: []reap.Host{{Name: "host-a"}}, Reap: config.Reap{Enabled: true, RepoBudget: "100ms", ScanAfter: "720h", WorktreeAfter: "0"}}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: integrations.Noop{}, Out: io.Discard}
+	var stderr lockedBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	exit := make(chan error, 1)
+	go func() { exit <- runDaemonLoops(ctx, s, gh, "", pipeline.Options{Shadow: true}, &stderr) }()
+	waitFor(t, "first repository reap request", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return !firstStarted.IsZero()
+	})
+	waitFor(t, "second repository reap request", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return requests["two"] > 0
+	})
+	mu.Lock()
+	firstDuration := time.Since(firstStarted)
+	mu.Unlock()
+	if firstDuration >= 400*time.Millisecond {
+		t.Fatalf("next repository waited for the blocked request: %s", firstDuration)
+	}
+	cancel()
+	select {
+	case <-exit:
+	case <-time.After(20 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+	if !strings.Contains(stderr.String(), `"repo":"o/one"`) || !strings.Contains(stderr.String(), "stopped on budget") {
+		t.Fatalf("budget stop for first repo not logged: %s", stderr.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !firstCanceled {
+		t.Fatal("first repository request did not observe budget cancellation")
+	}
+	if requests["two"] == 0 {
+		t.Fatal("next repository did not run")
 	}
 }
 

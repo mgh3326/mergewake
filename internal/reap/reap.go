@@ -27,6 +27,39 @@ type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
 
+type mutationParentContextKey struct{}
+
+type mutationParent struct {
+	ctx     context.Context
+	timeout time.Duration
+}
+
+const mutationTimeout = time.Minute
+
+// WithMutationParent gives guarded mutations a bounded context independent of
+// the repository budget, while retaining daemon shutdown cancellation.
+func WithMutationParent(ctx, parent context.Context, timeout ...time.Duration) context.Context {
+	limit := mutationTimeout
+	if len(timeout) > 0 && timeout[0] > 0 {
+		limit = timeout[0]
+	}
+	return context.WithValue(ctx, mutationParentContextKey{}, mutationParent{ctx: parent, timeout: limit})
+}
+
+func mutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if parent, ok := ctx.Value(mutationParentContextKey{}).(mutationParent); ok && parent.ctx != nil {
+		return context.WithTimeout(parent.ctx, parent.timeout)
+	}
+	return ctx, func() {}
+}
+
+// MutationContext returns a bounded context for one guarded mutation. Its
+// deadline is independent of the repository budget, but daemon cancellation
+// still propagates.
+func MutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return mutationContext(ctx)
+}
+
 // Host is one configured session host. An empty or "local" SSH value with no
 // Machine means the commands run directly on this machine; otherwise the host
 // is remote, reached by ssh(1) to SSH (a destination such as user@host) or,
@@ -619,14 +652,18 @@ func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
 }
 
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {
-	_, err := e.Run(ctx, "git", "-C", main, "worktree", "remove", path)
+	mutationCtx, cancel := mutationContext(ctx)
+	defer cancel()
+	_, err := e.Run(mutationCtx, "git", "-C", main, "worktree", "remove", path)
 	return err
 }
 
 func (e Exec) DeleteBranch(ctx context.Context, main, branch string) error {
 	// -d, never -D: git still refuses a branch that is not merged into its
 	// upstream or HEAD, so an unpushed or unmerged branch is retained.
-	_, err := e.Run(ctx, "git", "-C", main, "branch", "-d", branch)
+	mutationCtx, cancel := mutationContext(ctx)
+	defer cancel()
+	_, err := e.Run(mutationCtx, "git", "-C", main, "branch", "-d", branch)
 	return err
 }
 

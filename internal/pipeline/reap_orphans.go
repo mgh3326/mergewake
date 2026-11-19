@@ -418,7 +418,7 @@ func (s *Service) orphanLocalHost(ctx context.Context, hosts []*reapHost) *reapH
 			return hs
 		}
 	}
-	ex := reap.Exec{Runner: s.Runner, Host: reap.Host{Name: "local"}}
+	ex := reap.Exec{Runner: reapRunner(ctx, s.Runner), Host: reap.Host{Name: "local"}}
 	hs := &reapHost{host: ex.Host, exec: ex, ops: ex, trees: map[string]*reap.Worktree{}}
 	if e := hs.refreshPanes(ctx); e != nil {
 		hs.usageUnknown = true

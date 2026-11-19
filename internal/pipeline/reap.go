@@ -366,10 +366,10 @@ func (h *reapHistory) prDone(pr int) bool {
 // still run locally.
 func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) (*reapHost, []error) {
 	var errs []error
-	hs := &reapHost{host: h, exec: reap.Exec{Runner: s.Runner, Host: h}, trees: map[string]*reap.Worktree{}}
+	hs := &reapHost{host: h, exec: reap.Exec{Runner: reapRunner(ctx, s.Runner), Host: h}, trees: map[string]*reap.Worktree{}}
 	hs.ops = hs.exec
 	if hub != nil && !h.Local() {
-		hs.ops, hs.viaHub = reap.HubHost{Hub: hub, Machine: h.MachineID()}, true
+		hs.ops, hs.viaHub = timedHubOps{Ops: reap.HubHost{Hub: hub, Machine: h.MachineID()}, telemetry: telemetryFrom(ctx)}, true
 	}
 	panes, e := hs.ops.Panes(ctx)
 	if e != nil {
@@ -387,6 +387,9 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	hs.all = all
 	for _, list := range [][]reap.Pane{panes, all} {
 		for _, p := range list {
+			if e := reapBudgetCheck(ctx, "host pane/worktree scan"); e != nil {
+				return hs, append(errs, e)
+			}
 			if p.Cwd != "" {
 				if _, ok := hs.trees[p.Cwd]; !ok {
 					w, e := hs.ops.Inspect(ctx, p.Cwd)
@@ -411,6 +414,240 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 
 type reviewersOnlyKey struct{}
 
+var ErrReapRepoBudget = errors.New("reap repository budget exhausted")
+
+// ReapNonBudgetErrors removes budget-stop leaves while preserving all other
+// failures in a joined Reap result.
+func ReapNonBudgetErrors(err error) error {
+	var leaves []error
+	var collect func(error)
+	collect = func(current error) {
+		if current == nil {
+			return
+		}
+		if !errors.Is(current, ErrReapRepoBudget) {
+			leaves = append(leaves, current)
+			return
+		}
+		if many, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range many.Unwrap() {
+				collect(child)
+			}
+			return
+		}
+		if one, ok := current.(interface{ Unwrap() error }); ok {
+			collect(one.Unwrap())
+			return
+		}
+	}
+	collect(err)
+	return errors.Join(leaves...)
+}
+
+// ReapBudgetOnly is true only when a pass stopped for budget and has no other
+// error leaf to audit or report.
+func ReapBudgetOnly(err error) bool {
+	return errors.Is(err, ErrReapRepoBudget) && ReapNonBudgetErrors(err) == nil
+}
+
+type reapRetry struct {
+	failure         string
+	attempts        int
+	retryAt         time.Time
+	nextAllowedPass uint64
+}
+
+type reapRetryState struct {
+	mu      sync.Mutex
+	retries map[string]reapRetry
+	passes  map[string]uint64
+}
+
+var reapRetryStateInitMu sync.Mutex
+
+func (s *Service) reapState() *reapRetryState {
+	// Service is copied by a few restart tests. Keep the lock behind a pointer
+	// so those copies remain vet-safe, and serialize zero-value initialization.
+	reapRetryStateInitMu.Lock()
+	defer reapRetryStateInitMu.Unlock()
+	if s.reapRetryState == nil {
+		s.reapRetryState = &reapRetryState{}
+	}
+	return s.reapRetryState
+}
+
+type reapPassKey struct{}
+
+func reapPass(ctx context.Context) uint64 {
+	pass, _ := ctx.Value(reapPassKey{}).(uint64)
+	return pass
+}
+
+func (s *Service) nextReapPass(repo string, wholeRepo bool) uint64 {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.passes == nil {
+		state.passes = map[string]uint64{}
+	}
+	if wholeRepo {
+		state.passes[repo]++
+	}
+	return state.passes[repo]
+}
+
+func (s *Service) reapRetryAllowed(repo, job string, pass uint64) bool {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		return true
+	}
+	v, ok := state.retries[repo+"\x00"+job]
+	return !ok || (pass >= v.nextAllowedPass && !s.now().Before(v.retryAt))
+}
+
+func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		state.retries = map[string]reapRetry{}
+	}
+	k := repo + "\x00" + job
+	v := state.retries[k]
+	if v.failure != failure {
+		v = reapRetry{failure: failure}
+	}
+	v.attempts++
+	d := time.Minute * time.Duration(1<<min(v.attempts-1, 6))
+	if d > time.Hour {
+		d = time.Hour
+	}
+	v.retryAt = s.now().Add(d)
+	v.nextAllowedPass = pass + 2 // skip the immediately following reap pass
+	state.retries[k] = v
+}
+
+func (s *Service) reapRetryRestore(repo, job, failure string, pass uint64) bool {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		state.retries = map[string]reapRetry{}
+	}
+	k := repo + "\x00" + job
+	if _, ok := state.retries[k]; ok {
+		return false
+	}
+	// A durable failure receipt surviving a restart suppresses this pass even
+	// when the prior pass took longer than the time backoff.
+	state.retries[k] = reapRetry{failure: failure, attempts: 1, retryAt: s.now(), nextAllowedPass: pass + 1}
+	return true
+}
+
+func (s *Service) reapRetrySucceeded(repo, job string) {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	delete(state.retries, repo+"\x00"+job)
+}
+
+type reapBudgetKey struct{}
+type reapBudget struct{ deadline time.Time }
+
+type reapPassStateKey struct{}
+
+type reapPassState struct {
+	mu       sync.Mutex
+	left     string
+	inflight string
+}
+
+func (s *reapPassState) recordStage(stage string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.left == "" {
+		s.left = stage
+	}
+}
+
+func (s *reapPassState) recordCut(operation string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == "" {
+		s.inflight = operation
+	}
+}
+
+func (s *reapPassState) snapshot() (left, inflight string) {
+	if s == nil {
+		return "", ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.left, s.inflight
+}
+
+// ReapBudgetStop marks a repository pass that stopped at a safe point or
+// returned from an operation cut short by its budget.
+type ReapBudgetStop struct {
+	Left     string
+	Failures error
+}
+
+func (e *ReapBudgetStop) Error() string {
+	if e.Failures == nil {
+		return fmt.Sprintf("%v; left: %s", ErrReapRepoBudget, e.Left)
+	}
+	return fmt.Sprintf("%v; left: %s; errors: %v", ErrReapRepoBudget, e.Left, e.Failures)
+}
+
+func (e *ReapBudgetStop) Unwrap() []error {
+	if e.Failures == nil {
+		return []error{ErrReapRepoBudget}
+	}
+	return []error{ErrReapRepoBudget, e.Failures}
+}
+
+func reapBudgetResult(state *reapPassState, failures error) error {
+	left, inflight := state.snapshot()
+	if left == "" && inflight == "" {
+		return failures
+	}
+	if left == "" {
+		left = "in-flight " + inflight
+	}
+	return &ReapBudgetStop{Left: left, Failures: failures}
+}
+
+func budgetCut(ctx context.Context, err error, operation string) error {
+	if err == nil || context.Cause(ctx) != ErrReapRepoBudget {
+		return err
+	}
+	if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
+		state.recordCut(operation)
+	}
+	return fmt.Errorf("%w: %s: %v", ErrReapRepoBudget, operation, err)
+}
+
+func reapBudgetCheck(ctx context.Context, remaining string) error {
+	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
+	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+		if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
+			state.recordStage(remaining)
+		}
+		return fmt.Errorf("%w; left: %s", ErrReapRepoBudget, remaining)
+	}
+	return nil
+}
+
 // reviewersOnly marks a Reap call that only wants an open PR's reviewer sweep:
 // the call then ends without the "not a merged PR" refusal.
 func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey{}) != nil }
@@ -422,10 +659,39 @@ func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey
 // (pane-in-use) until that close lands. Anything dirty, unknown
 // or ambiguous is skipped and reported, never forced.
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
+	pass := s.nextReapPass(r.Name, prNum == 0)
+	ctx = context.WithValue(ctx, reapPassKey{}, pass)
+	passState := &reapPassState{}
+	ctx = context.WithValue(ctx, reapPassStateKey{}, passState)
+	budgetText := s.Config.Reap.RepoBudget
+	if budgetText == "" {
+		budgetText = config.RepoBudgetDefault
+	}
+	budget, budgetErr := config.Duration(budgetText)
+	if budgetErr != nil {
+		return fmt.Errorf("reap.repo_budget: %w", budgetErr)
+	}
+	var budgetDeadline time.Time
+	if budget > 0 {
+		mutationParent := ctx
+		budgetDeadline = time.Now().Add(budget)
+		budgetCtx, cancel := context.WithDeadlineCause(ctx, budgetDeadline, ErrReapRepoBudget)
+		defer cancel()
+		ctx = context.WithValue(budgetCtx, reapBudgetKey{}, reapBudget{deadline: budgetDeadline})
+		ctx = reap.WithMutationParent(ctx, mutationParent)
+	}
 	defer func() {
-		if retErr != nil {
-			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": retErr.Error()}, o.DryRun))
+		failures := ReapNonBudgetErrors(retErr)
+		if failures != nil {
+			failures = errors.Join(failures, s.audit(r.Name, "reap-error", map[string]any{"error": failures.Error()}, o.DryRun))
 		}
+		left, inflight := passState.snapshot()
+		if errors.Is(retErr, ErrReapRepoBudget) && left == "" && inflight == "" {
+			// GitHub transport boundaries carry the budget cause directly; they
+			// cannot update this package's pass state at the call site.
+			passState.recordCut("external operation")
+		}
+		retErr = reapBudgetResult(passState, failures)
 	}()
 	if !s.Config.Reap.Enabled {
 		return errors.New("reap requires reap.enabled in host config")
@@ -514,8 +780,16 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	hosts := []*reapHost{}
 	byName := map[string]*reapHost{}
 	for _, h := range s.Config.Hosts {
+		if e := reapBudgetCheck(ctx, "host scans and cleanup"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		hs, hostErrs := s.reapScanHost(ctx, hub, h)
 		errs = append(errs, hostErrs...)
+		for _, hostErr := range hostErrs {
+			if errors.Is(hostErr, ErrReapRepoBudget) {
+				return errors.Join(errs...)
+			}
+		}
 		hosts = append(hosts, hs)
 		byName[h.Name] = hs
 	}
@@ -524,7 +798,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// both.
 	var records *passJobRecords
 	if jobs, ok := s.Sink.(reapJobs); ok {
-		records = newPassJobRecords(jobs)
+		records = newPassJobRecords(reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)})
 	}
 	reach := newReapJobReach()
 	// Errors are counted once, from errs: note itself appends every "error"
@@ -651,6 +925,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 
 	for _, p := range pulls {
+		if e := reapBudgetCheck(ctx, "remaining merged PRs, cleanup, reviewer sweep and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		if e = ctx.Err(); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
@@ -835,6 +1112,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 
 		for _, c := range cands {
+			if e := reapBudgetCheck(ctx, "remaining worktree candidates, reviewer sweep and archive"); e != nil {
+				return errors.Join(append(errs, e)...)
+			}
 			rec := reapReceipt{Action: "remove-worktree", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Cwd: c.path, Worktree: c.path, Branch: p.Head.Ref, Source: c.source}
 			w, e := c.hs.ops.Inspect(ctx, c.path)
 			switch {
@@ -966,7 +1246,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 							rec.Result, rec.Reason = "skipped", reason
 							break
 						}
-						if e := c.hs.exec.RemoveWorktree(ctx, main, w.Path); e != nil {
+						if e := budgetCut(ctx, c.hs.exec.RemoveWorktree(ctx, main, w.Path), "guarded worktree removal"); e != nil {
 							rec.Result, rec.Reason = "error", e.Error()
 						} else {
 							rec.Result = "removed"
@@ -982,7 +1262,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			// -d only: git itself refuses a branch that never merged anywhere.
 			brec := reapReceipt{Action: "delete-branch", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Worktree: w.Path, Branch: entry.Branch}
 			if acting {
-				if e := c.hs.exec.DeleteBranch(ctx, main, entry.Branch); e != nil {
+				if e := budgetCut(ctx, c.hs.exec.DeleteBranch(ctx, main, entry.Branch), "branch deletion"); e != nil {
 					brec.Result, brec.Reason = "skipped", "refused: "+e.Error()
 				} else {
 					brec.Result = "deleted"
@@ -997,7 +1277,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	// wk/ checkouts from the hosts' own worktree lists, so a worktree no pane,
 	// receipt or job record names is still removed once its work is on GitHub.
 	if prNum == 0 {
+		if e := reapBudgetCheck(ctx, "worker worktrees, reviewer sweep and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, records, acting, note)...)
+	}
+	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
+		return errors.Join(append(errs, e)...)
 	}
 	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)
@@ -1013,10 +1299,19 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		}
 	}
 	if prNum == 0 {
+		if e := reapBudgetCheck(ctx, "orphan scan and archive"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapOrphanCheckouts(ctx, r, receipts, hosts, acting, reviewerNote)...)
 	}
 	if s.Config.Reap.Archive.Enabled {
+		if e := reapBudgetCheck(ctx, "archive jobs"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
+	}
+	if e := reapBudgetCheck(ctx, "final receipt and pass audit"); e != nil {
+		return errors.Join(append(errs, e)...)
 	}
 	result := struct {
 		Action   string `json:"action"`

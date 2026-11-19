@@ -242,13 +242,18 @@ func (a *appAuth) send(ctx context.Context, c *Client, method, target, route str
 	req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
 	req.Header.Set("User-Agent", "mergewake")
 	req.Header.Set("Authorization", "Bearer "+jwt)
+	requestStarted := time.Now()
 	resp, e := c.HTTP.Do(req)
+	requestTime := time.Since(requestStarted)
 	if e != nil {
-		recordRequest(ctx, method, route, 0, credApp)
-		return 0, nil, fmt.Errorf("GitHub App %s request failed", method)
+		recordRequest(ctx, method, route, 0, credApp, requestTime)
+		if cause := context.Cause(ctx); cause != nil {
+			e = cause
+		}
+		return 0, nil, fmt.Errorf("GitHub App %s request failed: %w", method, e)
 	}
 	defer resp.Body.Close()
-	recordRequest(ctx, method, route, resp.StatusCode, credApp)
+	recordRequest(ctx, method, route, resp.StatusCode, credApp, requestTime)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, resp.Header, &APIError{resp.StatusCode, method, route}
 	}

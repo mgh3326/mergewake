@@ -76,7 +76,8 @@ type Service struct {
 	OutcomesChanged func()
 	// hostScans shares each configured host's pane scan across evaluations for
 	// authorScanTTL, guarded by hostScanMu (see hostScan).
-	hostScans map[string]*hostScanEntry
+	hostScans      map[string]*hostScanEntry
+	reapRetryState *reapRetryState
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
