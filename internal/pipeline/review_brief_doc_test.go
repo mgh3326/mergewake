@@ -431,3 +431,169 @@ func TestReviewBriefDocJobDirFindingsAreNotRead(t *testing.T) {
 		t.Fatalf("lost rows=%v", rows)
 	}
 }
+
+// oversizeDelta is a delta patch big enough to push the brief over
+// inlineBriefLimit by itself; the round-1 brief built from the same pass
+// stays under it.
+func oversizeDelta() string {
+	return "diff --git a/big b/big\n--- a/big\n+++ b/big\n@@ -1,0 +1,6000 @@\n" + strings.Repeat("+padding line\n", 6000)
+}
+
+// runDeltaPass runs one fresh pass whose executor carries a delta brief.
+func runDeltaPass(t *testing.T, s *Service, g *fakeGH, r config.Repo, x *panewireExecutor, timeout time.Duration) (passOutcome, *passPlan) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	plan := &passPlan{pass: 2, lens: "state-risk"}
+	out, e := x.runPass(ctx, plan, func() (string, bool, error) { return "lease", true, nil })
+	if e != nil {
+		t.Fatalf("pass: %v", e)
+	}
+	return out, plan
+}
+
+// An oversize delta brief whose attachment put fails does not fail the
+// pass: it falls back to the round-1 brief — no "Delta to review" section,
+// `git diff base...head` in the checkout — published the normal way, with a
+// review-brief-fallback row recording the delta brief's size and the error.
+func TestReviewBriefFallbackSpawnsRoundOneBrief(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	runner.sink.uploadErr = errors.New("attachment_object_store_unavailable")
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: oversizeDelta(), delta: true, round: 2}
+	out, plan := runDeltaPass(t, s, g, r, x, time.Minute)
+	if len(out.skips) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("outcome %+v spawns=%d", out, len(runner.spawns))
+	}
+	label := plan.label
+	jobDir := filepath.Join(s.Config.Review.Panewire.Jobs, label)
+	if got := arg(runner.spawns[0], "-p"); got != "hk:doc/review/"+label {
+		t.Fatalf("-p %q, want hk:doc/review/%s", got, label)
+	}
+	body := hk.Documents()["review/"+label].Body
+	family := x.builderFamily(context.Background(), "author-job")
+	if want := x.briefDelta(context.Background(), plan, label, jobDir, family, false, x.context); body != want {
+		t.Fatalf("hk doc is not the round-1 brief:\n%s\n--- want ---\n%s", body, want)
+	}
+	if strings.Contains(body, "Delta to review") || !strings.Contains(body, "git diff "+shaB+"..."+shaA) {
+		t.Fatalf("fallback brief:\n%s", body)
+	}
+	rows := auditRows(t, s, r, "review-brief-fallback")
+	if len(rows) != 1 || rows[0]["pr"] != float64(7) || rows[0]["head"] != shaA || rows[0]["pass"] != float64(2) || rows[0]["label"] != label || rows[0]["round"] != float64(2) {
+		t.Fatalf("fallback audit %v", rows)
+	}
+	if n, ok := rows[0]["bytes"].(float64); !ok || int(n) <= inlineBriefLimit {
+		t.Fatalf("fallback audit bytes %v", rows[0]["bytes"])
+	}
+	if msg, ok := rows[0]["error"].(string); !ok || !strings.Contains(msg, "attachment_object_store_unavailable") {
+		t.Fatalf("fallback audit error %v", rows[0]["error"])
+	}
+	// The delta brief the failed put carried stays in the job dir.
+	if b, e := os.ReadFile(filepath.Join(jobDir, "review-brief.md")); e != nil || !strings.Contains(string(b), "Delta to review") {
+		t.Fatalf("review-brief.md: %v", e)
+	}
+}
+
+// When the attachment put succeeds the oversize delta brief is unchanged:
+// the spawn carries the prompt pointer, the attachment holds the delta
+// brief, no hk doc is written and no fallback row exists.
+func TestReviewBriefDeltaOversizeAttachmentUnchanged(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: oversizeDelta(), delta: true, round: 2}
+	out, plan := runDeltaPass(t, s, g, r, x, time.Minute)
+	if len(out.skips) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("outcome %+v spawns=%d", out, len(runner.spawns))
+	}
+	jobDir := filepath.Join(s.Config.Review.Panewire.Jobs, plan.label)
+	if got := arg(runner.spawns[0], "-p"); got != filepath.Join(jobDir, "review-prompt.md") {
+		t.Fatalf("-p %q", got)
+	}
+	body, e := os.ReadFile(filepath.Join(jobDir, "review-brief.md"))
+	if e != nil || len(body) <= inlineBriefLimit || !strings.Contains(string(body), "Delta to review") {
+		t.Fatalf("local brief %d bytes: %v", len(body), e)
+	}
+	if len(runner.sink.files) != 1 {
+		t.Fatalf("attachments %d", len(runner.sink.files))
+	}
+	for id, b := range runner.sink.files {
+		if string(b) != string(body) {
+			t.Fatalf("attachment %s is not the delta brief", id)
+		}
+	}
+	if rows := auditRows(t, s, r, "review-brief-fallback"); len(rows) != 0 {
+		t.Fatalf("fallback rows %v", rows)
+	}
+	for _, q := range hk.Requests() {
+		if strings.HasPrefix(q.Path, "/v1/documents/") {
+			t.Fatalf("oversize brief went to an hk doc: %s", q.Route())
+		}
+	}
+}
+
+// When the fallback brief also cannot be published the pass skips with
+// "publish brief" as before, and the fallback row is still written.
+func TestReviewBriefFallbackAttachmentFailureSkips(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: briefFindings, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	runner.sink.uploadErr = errors.New("attachment_object_store_unavailable")
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: "diff --git a/tool b/tool\n+x\n", delta: true, round: 2, context: strings.Repeat("context ", 10000)}
+	out, _ := runDeltaPass(t, s, g, r, x, time.Minute)
+	if len(runner.spawns) != 0 || len(out.skips) != 1 || !strings.Contains(out.skips[0].Reason, "publish brief: attachment_object_store_unavailable") {
+		t.Fatalf("spawns=%d outcome=%+v", len(runner.spawns), out)
+	}
+	if rows := auditRows(t, s, r, "review-brief-fallback"); len(rows) != 1 {
+		t.Fatalf("fallback rows %v", rows)
+	}
+}
+
+// A failure past the attachment step is not a publication failure: when the
+// review-prompt.md pointer cannot be written, publishBrief returns the local
+// error unmarked, so runPass skips the pass instead of taking the round-1
+// fallback.
+func TestPublishBriefPointerFailureIsNotFallback(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{family: "openai"}
+	s, _, _ := briefDocSetup(t, runner, hk)
+	jobDir := t.TempDir()
+	if e := os.Mkdir(filepath.Join(jobDir, "review-prompt.md"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	x := &panewireExecutor{s: s}
+	_, e := x.publishBrief(context.Background(), &passPlan{}, "label", "1",
+		filepath.Join(jobDir, "review-brief.md"), jobDir, strings.Repeat("brief\n", inlineBriefLimit))
+	if e == nil || errors.Is(e, errBriefPublish) {
+		t.Fatalf("publishBrief err=%v, want an unmarked local failure", e)
+	}
+	if !strings.HasPrefix(e.Error(), "publish brief: ") {
+		t.Fatalf("publishBrief err=%q, want the publish brief skip label", e)
+	}
+}
+
+// The fallback keeps the rest of the round-2 context but not its scope
+// note: "the diff below is NOT the whole PR ... do not hunt" would contradict
+// the whole-PR diff the fallback brief points the reviewer at. Budget lines
+// and later sections survive.
+func TestReviewBriefFallbackRewritesDeltaScopeNote(t *testing.T) {
+	hk := hktest.New(t)
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+	s, g, r := briefDocSetup(t, runner, hk)
+	notes := roundPlan{round: 2, base: shaB, quiet: true, budget: 3}.notes()
+	x := &panewireExecutor{s: s, repo: r, pr: g.pull, diff: oversizeDelta(), delta: true, round: 2,
+		context: contextHeader + notes + "\nPRIOR FINDINGS (rounds 1-1 of this PR, newest first)\n1. tool:1 (high)\n   finding: earlier\n   disposition: fixed\n"}
+	runner.sink.uploadErr = errors.New("attachment_object_store_unavailable")
+	out, plan := runDeltaPass(t, s, g, r, x, time.Minute)
+	if len(out.skips) != 0 || len(runner.spawns) != 1 {
+		t.Fatalf("outcome %+v spawns=%d", out, len(runner.spawns))
+	}
+	body := hk.Documents()["review/"+plan.label].Body
+	if strings.Contains(body, "NOT the whole PR") || strings.Contains(body, "do not hunt for anything else") {
+		t.Fatalf("fallback brief keeps the delta scope note:\n%s", body)
+	}
+	if !strings.Contains(body, "(whole diff)") || !strings.Contains(body, "REVIEW BUDGET SPENT") || !strings.Contains(body, "PRIOR FINDINGS") {
+		t.Fatalf("fallback brief context:\n%s", body)
+	}
+}

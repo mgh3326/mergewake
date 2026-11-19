@@ -643,16 +643,27 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// recorded spawn arguments, -p included, and never PUTs it again.
 	if !resumed {
 		text := x.brief(ctx, plan, label, jobDir, builderFamily)
-		if doc, ok := x.briefDoc(ctx, plan, label, task, text); ok {
-			briefPath = doc
-		} else {
-			if e = os.WriteFile(briefPath, []byte(text), 0600); e != nil {
-				return skip("write brief: %v", e)
+		var p string
+		p, e = x.publishBrief(ctx, plan, label, task, briefPath, jobDir, text)
+		if errors.Is(e, errBriefPublish) && x.delta && len(text) > inlineBriefLimit {
+			// hk attachments can refuse every put (a monthly byte limit): the
+			// oversize brief is almost all inline delta, so the pass falls back
+			// to the round-1 brief — the reviewer reads `git diff base...head`
+			// in its checkout, a superset of the delta — published the same
+			// way. The row keeps the fallback countable.
+			_ = x.s.audit(x.repo.Name, "review-brief-fallback", map[string]any{
+				"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass,
+				"label": label, "round": x.round, "bytes": len(text),
+				"error": fleetevent.Redact(integrations.Detail(e)),
+			}, false)
+			fallback := x.briefDelta(ctx, plan, label, jobDir, builderFamily, false, x.fallbackContext())
+			if p, e = x.publishBrief(ctx, plan, label, task, briefPath, jobDir, fallback); e != nil {
+				return skip("%v", e)
 			}
-			if briefPath, e = x.spawnBrief(ctx, briefPath, jobDir); e != nil {
-				return skip("publish brief: %v", e)
-			}
+		} else if e != nil {
+			return skip("%v", e)
 		}
+		briefPath = p
 	}
 
 	// A resumed job that already finished answers through its record below,
@@ -1866,18 +1877,43 @@ func (x *panewireExecutor) spawnBrief(ctx context.Context, path, jobDir string) 
 		AttachmentCommand() string
 	})
 	if !ok {
-		return "", errors.New("task sink cannot publish a large review brief")
+		return "", fmt.Errorf("%w: task sink cannot publish a large review brief", errBriefPublish)
 	}
 	id, e := files.PutAttachment(ctx, path)
 	if e != nil {
-		return "", e
+		return "", fmt.Errorf("%w: %w", errBriefPublish, e)
 	}
 	if id != fmt.Sprintf("%x", sha256.Sum256(body)) {
-		return "", errors.New("uploaded review brief sha256 mismatch")
+		return "", fmt.Errorf("%w: uploaded review brief sha256 mismatch", errBriefPublish)
 	}
 	prompt := fmt.Sprintf("Read and follow the complete review brief before reviewing. It is a handoffkeep attachment (sha256 %s, %d bytes). Run `%s attach get %s` to read the entire brief on this host. Do not review without reading it; report retrieval failure as a refusal.\n", id, len(body), shellQuote(filepath.Base(files.AttachmentCommand())), id)
 	pointer := filepath.Join(jobDir, "review-prompt.md")
 	return pointer, os.WriteFile(pointer, []byte(prompt), 0600)
+}
+
+// errBriefPublish marks spawnBrief's attachment step, so an oversize delta
+// brief falls back to the round-1 brief only when the upload failed — a
+// local read or write failure skips the pass as before.
+var errBriefPublish = errors.New("publish brief")
+
+// publishBrief stores text where the spawn's -p value reaches it and returns
+// that value: an hk doc for a brief within inlineBriefLimit, else
+// review-brief.md uploaded as an hk attachment behind a review-prompt.md
+// pointer (a local path when the written brief still fits).
+func (x *panewireExecutor) publishBrief(ctx context.Context, plan *passPlan, label, task, briefPath, jobDir, text string) (string, error) {
+	if doc, ok := x.briefDoc(ctx, plan, label, task, text); ok {
+		return doc, nil
+	}
+	if e := os.WriteFile(briefPath, []byte(text), 0600); e != nil {
+		return "", fmt.Errorf("write brief: %w", e)
+	}
+	p, e := x.spawnBrief(ctx, briefPath, jobDir)
+	if e != nil && !errors.Is(e, errBriefPublish) {
+		// Local failures keep the skip label the attachment path carries
+		// through errBriefPublish; only the sentinel marks a fallback.
+		return "", fmt.Errorf("publish brief: %w", e)
+	}
+	return p, e
 }
 
 // errJobRecords means the configured sink cannot read hk job records at all
@@ -2137,13 +2173,22 @@ func (x *panewireExecutor) briefMinutes() int {
 }
 
 func (x *panewireExecutor) brief(ctx context.Context, plan *passPlan, label, jobDir, authorFamily string) string {
+	return x.briefDelta(ctx, plan, label, jobDir, authorFamily, x.delta, x.context)
+}
+
+// briefDelta is brief with the inline delta patch under the caller's control:
+// delta false is the round-1 brief, which reviews `git diff base...head` in
+// the checkout. contextText is the PR context the brief embeds; the
+// oversize-brief fallback passes fallbackContext so the delta round notes do
+// not contradict the whole-PR diff.
+func (x *panewireExecutor) briefDelta(ctx context.Context, plan *passPlan, label, jobDir, authorFamily string, delta bool, contextText string) string {
 	focus := "concrete bugs"
 	if f, ok := lensFocus[plan.lens]; ok {
 		focus += "; this pass focuses on " + f
 	}
 	prContext := ""
-	if x.context != "" {
-		prContext = "\n## PR context\n\n" + strings.TrimRight(x.context, "\n") + "\n"
+	if contextText != "" {
+		prContext = "\n## PR context\n\n" + strings.TrimRight(contextText, "\n") + "\n"
 	}
 	// `panewire done --result` stores the findings on the job's hk record in
 	// the same PUT as `completed`, so mergewake reads them back through the
@@ -2211,10 +2256,10 @@ that are ignored.
 	if excludes := x.repo.Review.CheckoutExclude; len(excludes) > 0 {
 		text = strings.Replace(text, "## Job directory", sparseCheckoutParagraph(excludes)+"\n## Job directory", 1)
 	}
-	if strings.Contains(x.context, "ACCEPTANCE CONTRACT") {
+	if strings.Contains(contextText, "ACCEPTANCE CONTRACT") {
 		text = strings.Replace(text, "No other keys.", "No other keys except the optional boolean `advisory` the PR context asks for.", 1)
 	}
-	if x.delta {
+	if delta {
 		// Round two onwards reviews the interdiff, which a checkout cannot
 		// reproduce (a base merge pollutes `git diff`), so the patch is inline.
 		text = strings.Replace(text, fmt.Sprintf("review the changes in `git diff %s...%s`", x.pr.Base.SHA, x.pr.Head.SHA),
@@ -2248,6 +2293,38 @@ that are ignored.
 		}
 	}
 	return text
+}
+
+// fallbackContext is x.context for the oversize-delta fallback. The round
+// notes lead the context by scoping the reviewer to the interdiff hunks —
+// "the diff below is NOT the whole PR ... do not hunt for anything else" —
+// which contradicts the whole-PR diff the fallback brief points the reviewer
+// at, so the round line is rewritten. Budget lines after it and every section
+// below (decisions, prior findings, the acceptance contract) still apply.
+func (x *panewireExecutor) fallbackContext() string {
+	rest := strings.TrimPrefix(x.context, contextHeader)
+	if rest == x.context {
+		return x.context
+	}
+	end := strings.Index(rest, "\n\n")
+	if end < 0 || !strings.HasPrefix(rest, "REVIEW ROUND") {
+		return x.context
+	}
+	kept := ""
+	if nl := strings.IndexByte(rest[:end], '\n'); nl >= 0 {
+		kept = rest[nl+1 : end]
+	}
+	note := fmt.Sprintf("REVIEW ROUND %d (whole diff). The delta brief could not be published, so this pass reviews `git diff %s...%s` in the checkout — the whole PR, a superset of the delta — not only the hunks since the last reviewed head.\n",
+		x.round, x.pr.Base.SHA, x.pr.Head.SHA)
+	var b strings.Builder
+	b.WriteString(contextHeader)
+	b.WriteString(note)
+	if kept != "" {
+		b.WriteString(kept + "\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(rest[end+2:])
+	return b.String()
 }
 
 type mergeBaser interface {
