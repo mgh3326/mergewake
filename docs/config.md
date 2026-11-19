@@ -648,6 +648,7 @@ Every mechanism evaluates progress made against expected completions over the UT
 | 10 | `outcome-publish` | Eligible outcomes published (`outcome-published` in `outcomes.jsonl`) plus errors. | Outcomes successfully published. | `outcome_publish_min_errors: 5`<br>(Stalls if errors >= 5 and published == 0) |
 | 11 | `review-retry` | Review passes deferred for retry up to the evaluated day (`review-retry-deferred`). | Deferred review passes resolved (retried, superseded via `reviewer-head-moved`, or PR closed/merged) or within grace window. | `review_retry_max_deferred_hours: 24`<br>(Stalls if >= 2 unresolved deferrals exceed threshold; single miss does not alert) |
 | 12 | `worker-worktrees` | Worker worktrees the sweeps took custody of per host: the first `reap.jsonl` row (`remove-worktree` or `legacy-sweep`) naming the host's worktree. No spawn rows exist for workers, so first sighting is made. | Worktrees removed that day per host (`remove-worktree` with `result: "removed"` or `"already-gone"`, or a gone proof: `reason: "worktree-gone"`, `"already-gone"` or `"gone"`). Reviewer (`mwr-*`) and consult (`consult-*`) checkouts never count; hostless rows are unattributed, never stalling. | `worker_worktrees_min_made: 10`<br>`worker_worktrees_max_removed_pct: 50`<br>`worker_worktrees_window_days: 7`<br>(Stalls if any host reaches made and its removed share falls below the threshold; the trailing window feeds the per-host open balance) |
+| 13 | `notices` | Reviewer-problem events recorded that day, by cause (`notice-cause` rows; a `gave-up` row is an event too). | Events that became a notice (`sent: true`). | Stalls if a fix-needed cause (`spawn:auth`, `spawn:workspace`, `spawn:node-upgrade`, `spawn:host-unconfigured`, `spawn:repo-root`, `spawn:brief-upload`) appears at all that day, or a cause passes `notifier.cause_threshold` in one repo that day. Its `reason` names each cause's counts. |
 
 #### Stall notices and repeat rule
 
@@ -855,10 +856,13 @@ unavailable". The daemon's review retry backs off, runs the review again and
 so spawns a new reviewer pane, and escalates once after
 `daemon.pr.review_retry.failures` failures. A pane cut off by `review.timeout`
 records `review_deadline` instead, and a completed reviewer whose result was
-lost records `review-result-lost` and notifies the design lane once per cause
-incident; losses with the same cause within 10 minutes share one event, and
-each suppressed loss remains in the audit log. Exhausted retries still notify
-the repository owner lane through the normal review-failure escalation. Both
+lost records `review-result-lost` and a `notice-cause` row (hk 5361). Such a
+loss is told to `notifier.tool_lane` only when one cause repeats past
+`notifier.cause_threshold` in one repo within `notifier.cause_window`, and then
+once per window; a single loss is recorded with `sent: false`. The cause is
+`lost:overdue`, `lost:pane-finished`, `lost:never-placed` or `lost:other`.
+Exhausted retries still notify the repository owner lane once per head and
+cause, with a `notice-cause` row of cause `gave-up`. Both
 are retried the same way, with one difference: a lost result is mergewake's collection
 failure, not the review's, so its retries back off without counting toward
 the escalation. A fresh pass whose completed record has no result, on the
@@ -1271,6 +1275,8 @@ through the configured reps CLI, not other manual bench records.
 | `lane` | Required for panewire | Destination lane; e.g. `operator-desk`. Must match panewire's lane rule: 1–128 characters, starting with an ASCII letter or digit and continuing with ASCII letters, digits, `.`, `_`, `:`, or `-`. |
 | `fallback_lane` | `lane` | Lane for PRs whose task trailer resolves to no lane and which carry no `Mergewake-Notify-Lane` trailer; also retried once when delivery to the resolved lane fails. Must match the same panewire lane rule as `lane`. |
 | `tool_lane` | Desk lane | Lane that owns mergewake's own automation (lost review results, exhausted review retries). Empty falls back to the desk (`notifier.fallback_lane`, else `notifier.lane`), so nothing changes until it is set. Must match the same panewire lane rule as `lane`. |
+| `cause_threshold` | `10` | Reviewer-problem events of one cause in one repo, within `cause_window`, at which one notice goes to `tool_lane` with the cause and the count; the notice then stays quiet for the rest of the window. Must be a positive integer when set. Every such event is recorded as a `notice-cause` audit row, sent or not. A fix-needed cause (`spawn:auth`, `spawn:workspace`, `spawn:node-upgrade`, `spawn:host-unconfigured`, `spawn:repo-root`, `spawn:brief-upload`) is told once per repo per hour at once, whatever its count. Spawn causes come from the reviewer skip text (`spawn:quota`, `spawn:admission-refused`, `spawn:timeout`, `spawn:expired`, `spawn:other`, and the fix-needed ones above). |
+| `cause_window` | `1h` | The window `cause_threshold` counts in, and the quiet time after a threshold notice. Must be a positive duration when set. |
 
 The panewire adapter executes literal arguments equivalent to:
 

@@ -144,7 +144,43 @@ type Notifier struct {
 	// exhausted review retries); empty means the desk (fallback_lane, else
 	// lane), so nothing changes until it is set.
 	ToolLane string `yaml:"tool_lane"`
+	// CauseThreshold is how many reviewer-problem events of one cause in one
+	// repo, within CauseWindow, make one notice. Unset means
+	// DefaultCauseThreshold; an explicit value must be positive.
+	CauseThreshold *int `yaml:"cause_threshold"`
+	// CauseWindow is the window the threshold counts in, and the quiet time
+	// after a threshold notice. Empty means DefaultCauseWindow.
+	CauseWindow string `yaml:"cause_window"`
 }
+
+// DefaultCauseThreshold and DefaultCauseWindow are notifier.cause_threshold
+// and notifier.cause_window when they are unset.
+const (
+	DefaultCauseThreshold = 10
+	DefaultCauseWindow    = time.Hour
+)
+
+// CauseThresholdOrDefault is the count of same-cause events in one repo, within
+// the cause window, at which one notice goes out.
+func (n Notifier) CauseThresholdOrDefault() int {
+	if n.CauseThreshold != nil {
+		return *n.CauseThreshold
+	}
+	return DefaultCauseThreshold
+}
+
+// CauseWindowOrDefault is the window the cause threshold counts in.
+func (n Notifier) CauseWindowOrDefault() time.Duration {
+	if n.CauseWindow == "" {
+		return DefaultCauseWindow
+	}
+	d, e := Duration(n.CauseWindow)
+	if e != nil {
+		return DefaultCauseWindow
+	}
+	return d
+}
+
 type Sink struct {
 	Type        string `yaml:"type"`
 	Command     string `yaml:"command"`
@@ -1392,6 +1428,14 @@ func validateAdapters(c *Config) error {
 	}
 	if c.Notifier.ToolLane != "" && !PanewireLane(c.Notifier.ToolLane) {
 		return errors.New("notifier.tool_lane must match panewire's lane rule")
+	}
+	if c.Notifier.CauseThreshold != nil && *c.Notifier.CauseThreshold < 1 {
+		return errors.New("notifier.cause_threshold must be a positive integer")
+	}
+	if c.Notifier.CauseWindow != "" {
+		if _, e := Duration(c.Notifier.CauseWindow); e != nil {
+			return errors.New("notifier.cause_window must be a positive duration")
+		}
 	}
 	if c.Reap.BalanceLane != "" && !PanewireLane(c.Reap.BalanceLane) {
 		return errors.New("reap.balance_lane must match panewire's lane rule")

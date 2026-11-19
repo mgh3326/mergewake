@@ -449,6 +449,11 @@ func (s *Service) escalateReviewFailure(ctx context.Context, r config.Repo, pr g
 	// design-lane escalation nor stall the retry. A tool copy lost this way
 	// is audited and dropped; the next head escalates again on its own ids.
 	ownerErr := s.Notifier.Notify(nctx, integrations.Event{ID: id, Lane: owner, Type: "automation-failed", Text: text})
+	// The give-up is always sent (rule 1 of notice_cause.go); its row says so.
+	// A row that cannot be written is logged: it must not change the escalation.
+	if aerr := s.noteGaveUp(r, pr, 0, ownerErr == nil, fmt.Sprintf("review failed %d times", failures)); aerr != nil && s.Log != nil {
+		s.Log.Warn("review give-up audit failed", "pr", pr.Number, "error", aerr)
+	}
 	var toolErr error
 	tool := ""
 	if s.Config.Notifier.ToolLane != "" {

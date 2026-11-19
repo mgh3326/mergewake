@@ -736,11 +736,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					// Give transient read errors one additional review budget to recover.
 					return out, errPassPending
 				} else {
-					cause := "pane finished without a result"
+					cause := lostPaneFinished
 					switch {
 					case finished:
 					case fresh.Host == "":
-						cause = "reviewer never placed before the review deadline"
+						cause = lostNeverPlaced
 					default:
 						cause = lostOverdue
 					}
@@ -1667,6 +1667,14 @@ func neverRanReviewer(rj reviewerJob, job integrations.JobRecord) bool {
 // deadline: mergewake replaces it, so its pane is merged into the close below
 // even while it is working. Every other lost cause leaves the pane alone.
 const lostOverdue = "reviewer still running past the review deadline"
+
+// lostPaneFinished and lostNeverPlaced are the other lost causes a pass records
+// for a reviewer that has a pane or never got one (hk 5361 names them in the
+// notice-cause rows).
+const (
+	lostPaneFinished = "pane finished without a result"
+	lostNeverPlaced  = "reviewer never placed before the review deadline"
+)
 
 // nudgeWait is how long a reviewer nudged on a finished pane has to write its
 // output before its pass is lost. It is a constant, not a config key.
