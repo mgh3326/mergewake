@@ -141,7 +141,7 @@ func (o timedHubOps) WorktreeRemove(ctx context.Context, cwd, head, base string,
 	st := time.Now()
 	v, e := o.Ops.(interface {
 		WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
-	}).WorktreeRemove(ctx, cwd, head, base, regenerable, detached)
+	}).WorktreeRemove(reap.MutationContext(ctx), cwd, head, base, regenerable, detached)
 	o.measure(st)
 	return v, e
 }
@@ -149,7 +149,7 @@ func (o timedHubOps) WorktreeRemoveDisposable(ctx context.Context, cwd, head, ba
 	st := time.Now()
 	v, e := o.Ops.(interface {
 		WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error)
-	}).WorktreeRemoveDisposable(ctx, cwd, head, base, regenerable, disposable, detached)
+	}).WorktreeRemoveDisposable(reap.MutationContext(ctx), cwd, head, base, regenerable, disposable, detached)
 	o.measure(st)
 	return v, e
 }

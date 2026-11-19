@@ -27,6 +27,24 @@ type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
 
+type safeMutationContextKey struct{}
+
+// WithBudgetSafeMutations lets one reap call put deadlines on reads while an
+// already-started removal or branch deletion finishes as an atomic unit.
+func WithBudgetSafeMutations(ctx context.Context) context.Context {
+	return context.WithValue(ctx, safeMutationContextKey{}, true)
+}
+
+func mutationContext(ctx context.Context) context.Context {
+	if safe, _ := ctx.Value(safeMutationContextKey{}).(bool); safe {
+		return context.WithoutCancel(ctx)
+	}
+	return ctx
+}
+
+// MutationContext applies the reap budget's no-mid-removal rule when enabled.
+func MutationContext(ctx context.Context) context.Context { return mutationContext(ctx) }
+
 // Host is one configured session host. An empty or "local" SSH value with no
 // Machine means the commands run directly on this machine; otherwise the host
 // is remote, reached by ssh(1) to SSH (a destination such as user@host) or,
@@ -619,14 +637,14 @@ func (e Exec) Ignored(ctx context.Context, path string) ([]string, error) {
 }
 
 func (e Exec) RemoveWorktree(ctx context.Context, main, path string) error {
-	_, err := e.Run(ctx, "git", "-C", main, "worktree", "remove", path)
+	_, err := e.Run(mutationContext(ctx), "git", "-C", main, "worktree", "remove", path)
 	return err
 }
 
 func (e Exec) DeleteBranch(ctx context.Context, main, branch string) error {
 	// -d, never -D: git still refuses a branch that is not merged into its
 	// upstream or HEAD, so an unpushed or unmerged branch is retained.
-	_, err := e.Run(ctx, "git", "-C", main, "branch", "-d", branch)
+	_, err := e.Run(mutationContext(ctx), "git", "-C", main, "branch", "-d", branch)
 	return err
 }
 

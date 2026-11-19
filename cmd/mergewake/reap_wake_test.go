@@ -162,6 +162,7 @@ func TestDaemonMergeWakesReapRole(t *testing.T) {
 func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 	var mu sync.Mutex
 	requests := map[string]int{}
+	var firstStarted time.Time
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "closed" {
 			parts := strings.Split(r.URL.Path, "/")
@@ -169,9 +170,15 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 			mu.Lock()
 			requests[repo]++
 			first := requests[repo] == 1
+			if repo == "one" && first {
+				firstStarted = time.Now()
+			}
 			mu.Unlock()
 			if repo == "one" && first {
-				time.Sleep(25 * time.Millisecond)
+				select {
+				case <-r.Context().Done():
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 			fmt.Fprint(w, `[]`)
 			return
@@ -193,6 +200,12 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 		defer mu.Unlock()
 		return requests["two"] > 0
 	})
+	mu.Lock()
+	firstDuration := time.Since(firstStarted)
+	mu.Unlock()
+	if firstDuration >= 250*time.Millisecond {
+		t.Fatalf("next repository waited for the blocked request: %s", firstDuration)
+	}
 	cancel()
 	select {
 	case <-exit:

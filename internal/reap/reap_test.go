@@ -437,3 +437,22 @@ func TestComposerState(t *testing.T) {
 		}
 	}
 }
+
+type cancellationRunner struct{ done <-chan struct{} }
+
+func (r *cancellationRunner) Run(ctx context.Context, _ string, _ []string, _, _ string) ([]byte, error) {
+	r.done = ctx.Done()
+	return nil, nil
+}
+
+func TestBudgetSafeRemovalFinishesDespiteBudgetCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner := &cancellationRunner{}
+	if err := (Exec{Runner: runner}).RemoveWorktree(WithBudgetSafeMutations(ctx), "/main", "/tree"); err != nil {
+		t.Fatal(err)
+	}
+	if runner.done != nil {
+		t.Fatal("budget-safe worktree removal received a cancellable context")
+	}
+}

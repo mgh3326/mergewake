@@ -77,7 +77,7 @@ type Service struct {
 	OutcomesChanged func()
 	reapRetryMu     sync.Mutex
 	reapRetries     map[string]reapRetry
-	reapPass        uint64
+	reapPasses      map[string]uint64
 }
 type Options struct {
 	DryRun, Shadow, Observed bool

@@ -425,6 +425,10 @@ func ReapNonBudgetErrors(err error) error {
 		if current == nil {
 			return
 		}
+		if !errors.Is(current, ErrReapRepoBudget) {
+			leaves = append(leaves, current)
+			return
+		}
 		if many, ok := current.(interface{ Unwrap() []error }); ok {
 			for _, child := range many.Unwrap() {
 				collect(child)
@@ -435,8 +439,30 @@ func ReapNonBudgetErrors(err error) error {
 			collect(one.Unwrap())
 			return
 		}
-		if !errors.Is(current, ErrReapRepoBudget) {
+	}
+	collect(err)
+	return errors.Join(leaves...)
+}
+
+func reapErrorsExcept(err, ignored error) error {
+	var leaves []error
+	var collect func(error)
+	collect = func(current error) {
+		if current == nil {
+			return
+		}
+		if !errors.Is(current, ignored) {
 			leaves = append(leaves, current)
+			return
+		}
+		if many, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range many.Unwrap() {
+				collect(child)
+			}
+			return
+		}
+		if one, ok := current.(interface{ Unwrap() error }); ok {
+			collect(one.Unwrap())
 		}
 	}
 	collect(err)
@@ -461,6 +487,18 @@ type reapPassKey struct{}
 func reapPass(ctx context.Context) uint64 {
 	pass, _ := ctx.Value(reapPassKey{}).(uint64)
 	return pass
+}
+
+func (s *Service) nextReapPass(repo string, wholeRepo bool) uint64 {
+	s.reapRetryMu.Lock()
+	defer s.reapRetryMu.Unlock()
+	if s.reapPasses == nil {
+		s.reapPasses = map[string]uint64{}
+	}
+	if wholeRepo {
+		s.reapPasses[repo]++
+	}
+	return s.reapPasses[repo]
 }
 
 func (s *Service) reapRetryAllowed(repo, job string, pass uint64) bool {
@@ -538,10 +576,7 @@ func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey
 // (pane-in-use) until that close lands. Anything dirty, unknown
 // or ambiguous is skipped and reported, never forced.
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
-	s.reapRetryMu.Lock()
-	s.reapPass++
-	pass := s.reapPass
-	s.reapRetryMu.Unlock()
+	pass := s.nextReapPass(r.Name, prNum == 0)
 	ctx = context.WithValue(ctx, reapPassKey{}, pass)
 	budgetText := s.Config.Reap.RepoBudget
 	if budgetText == "" {
@@ -551,10 +586,18 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if budgetErr != nil {
 		return fmt.Errorf("reap.repo_budget: %w", budgetErr)
 	}
+	var budgetDeadline time.Time
 	if budget > 0 {
-		ctx = context.WithValue(ctx, reapBudgetKey{}, reapBudget{deadline: time.Now().Add(budget)})
+		budgetDeadline = time.Now().Add(budget)
+		budgetCtx, cancel := context.WithDeadlineCause(ctx, budgetDeadline, ErrReapRepoBudget)
+		defer cancel()
+		ctx = context.WithValue(budgetCtx, reapBudgetKey{}, reapBudget{deadline: budgetDeadline})
+		ctx = reap.WithBudgetSafeMutations(ctx)
 	}
 	defer func() {
+		if !budgetDeadline.IsZero() && context.Cause(ctx) == ErrReapRepoBudget {
+			retErr = errors.Join(reapErrorsExcept(retErr, context.DeadlineExceeded), fmt.Errorf("%w; left: in-flight operation", ErrReapRepoBudget))
+		}
 		if nonBudget := ReapNonBudgetErrors(retErr); nonBudget != nil {
 			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": nonBudget.Error()}, o.DryRun))
 		}
@@ -1175,6 +1218,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			return errors.Join(append(errs, e)...)
 		}
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
+	}
+	if e := reapBudgetCheck(ctx, "final receipt and pass audit"); e != nil {
+		return errors.Join(append(errs, e)...)
 	}
 	result := struct {
 		Action   string `json:"action"`
