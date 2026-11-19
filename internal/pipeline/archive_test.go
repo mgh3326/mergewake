@@ -3,6 +3,8 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +46,41 @@ type archiveRunner struct {
 	failProbeExit int
 	tarProbes     int
 	probes        int
+}
+
+type archiveBlockRunner struct {
+	base  integrations.Runner
+	match string
+}
+
+func (r archiveBlockRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if strings.Contains(name+" "+strings.Join(args, " "), r.match) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+type archivePauseDeleteRunner struct {
+	base        integrations.Runner
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+	fail        bool
+}
+
+func (r *archivePauseDeleteRunner) unblock() { r.releaseOnce.Do(func() { close(r.release) }) }
+
+func (r *archivePauseDeleteRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && strings.Contains(strings.Join(args, " "), `rm -rf "$1" || {`) {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+		if r.fail {
+			return nil, errors.New("injected delete failure")
+		}
+	}
+	return r.base.Run(ctx, name, args, input, dir)
 }
 
 // testExitStatus is a typed failure carrying an exit code, the shape the real
@@ -156,6 +194,215 @@ func TestArchiveJobsPreflightCallCountDoesNotScaleWithSkippedJobs(t *testing.T) 
 				t.Fatalf("host calls = %d, want <= 5", f.run.calls)
 			}
 		})
+	}
+}
+
+func TestArchiveJobsPaneScanFailureIsUnscannedWithoutFailingRun(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	f.run.script.errs = map[string]error{}
+	f.run.script.errs[key("herdr", "pane", "list")] = errors.New("pane response truncated")
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("pane scan failure made run fail: %v", err)
+	}
+	out := f.out.String()
+	if strings.Contains(out, `"action":"archive-job"`) || strings.Contains(out, `"job":"old-job"`) {
+		t.Fatalf("job on unscanned host was archived or recorded: %s", out)
+	}
+	if !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"unscanned_host_reasons":{"local":"pane scan: pane response truncated"}`) {
+		t.Fatalf("summary lacks pane scan failure reason: %s", out)
+	}
+}
+
+func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "50ms"
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "herdr agent list"}
+	started := time.Now()
+	err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true})
+	if err != nil {
+		t.Fatalf("deadline stopped the run with error: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("run exceeded max_run by too much: %s", elapsed)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"max_run deadline during pane scan"`) {
+		t.Fatalf("deadline run lacks final summary: %s", out)
+	}
+	if !strings.Contains(out, `"phase":"pane_scan"`) {
+		t.Fatalf("deadline run lacks pane scan timing row: %s", out)
+	}
+}
+
+func TestArchiveJobsBudgetStopDuringHostScanAdvancesRotation(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "50ms"
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "herdr agent list"}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("deadline stopped the run with error: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"unscanned_hosts":["local","other"]`) {
+		t.Fatalf("summary omitted current scan host: %s", out)
+	}
+	if b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, archiveNextHostFile)); err != nil || string(b) != "other\n" {
+		t.Fatalf("next-host state = %q, %v; want other host", b, err)
+	}
+}
+
+func TestArchiveJobsApplyFinishesAndRecordsAfterMaxRun(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	dir := jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archivePauseDeleteRunner{base: f.run, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(runner.unblock)
+	f.s.Runner = runner
+	done := make(chan error, 1)
+	go func() { done <- f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}) }()
+	select {
+	case <-runner.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive apply never reached source delete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	runner.unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("apply after max_run returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive run did not finish after delete was released")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("completed archive left source dir: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			found = row.Result == "archived" && row.Archive != nil && row.Archive.Deleted
+		}
+	}
+	if !found {
+		t.Fatalf("durable archive result missing after apply completed: %s", b)
+	}
+}
+
+func TestArchiveJobsApplyFailureAfterMaxRunWritesErrorRow(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archivePauseDeleteRunner{base: f.run, entered: make(chan struct{}), release: make(chan struct{}), fail: true}
+	t.Cleanup(runner.unblock)
+	f.s.Runner = runner
+	done := make(chan error, 1)
+	go func() { done <- f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}) }()
+	select {
+	case <-runner.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive apply never reached source delete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	runner.unblock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("apply failure was not returned")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("archive run did not finish after delete failed")
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			found = row.Result == "error" && row.Archive != nil && row.Archive.Manifest != "" && !row.Archive.Deleted
+		}
+	}
+	if !found {
+		t.Fatalf("partial apply result missing from durable row: %s", b)
+	}
+}
+
+func TestArchiveJobsBusyApplyLockRemainsSkipped(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	h := f.s.Config.Hosts[0]
+	p, err := f.s.archiver().Plan(context.Background(), h, "old-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDigest := sha256.Sum256([]byte(p.Dest))
+	lockDir := filepath.Join(f.drive, ".locks", hex.EncodeToString(lockDigest[:]))
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(lockDir, "owner"), "another-owner 9999999999\n")
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("routine archive lock skip failed the run: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var skipped, summary bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("bad archive row %q: %v", line, err)
+		}
+		if row["action"] == "archive-job" && row["job"] == "old-job" {
+			skipped = row["result"] == "skipped" && row["reason"] == "archive-lock-busy"
+		}
+		if row["action"] == "archive-jobs" {
+			summary = row["errors"] == float64(0)
+		}
+	}
+	if !skipped || !summary {
+		t.Fatalf("busy lock was not recorded as a successful skip: %s", b)
+	}
+}
+
+func TestArchiveJobsPersistsPhaseAndSummaryRows(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var phase, summary bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("bad archive run row %q: %v", line, err)
+		}
+		switch row["action"] {
+		case "archive-phase":
+			phase = phase || row["phase"] == "pane_scan"
+		case "archive-jobs":
+			summary = true
+		}
+	}
+	if !phase || !summary {
+		t.Fatalf("archive log lacks phase or summary row: %s", b)
 	}
 }
 
@@ -644,6 +891,9 @@ func TestArchiveJobsCancelledRunWithSpentBudgetReturnsContextError(t *testing.T)
 	}
 	if f.run.calls != 0 {
 		t.Fatalf("cancelled run issued %d commands", f.run.calls)
+	}
+	if !strings.Contains(f.out.String(), `"action":"archive-jobs"`) {
+		t.Fatalf("cancelled run omitted summary row: %s", f.out.String())
 	}
 }
 
