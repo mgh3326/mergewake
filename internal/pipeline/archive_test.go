@@ -557,6 +557,78 @@ func TestArchiveJobsNextRunStartsAtHostAfterBudgetStop(t *testing.T) {
 	}
 }
 
+// seedNextHost writes a next-host state naming host and backdates it, so a
+// test can tell whether a run touched the file.
+func seedNextHost(t *testing.T, f archiveFixture, host string) string {
+	t.Helper()
+	if err := os.MkdirAll(f.s.Config.StateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(f.s.Config.StateDir, archiveNextHostFile)
+	writeFile(t, file, host+"\n")
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(file, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+func TestArchiveJobsDryRunPreviewsRotatedOrderAndLeavesNextHostState(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	file := seedNextHost(t, f, "other")
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if i, j := strings.Index(out, `"host":"other"`), strings.Index(out, `"host":"local"`); i < 0 || j < 0 || i > j {
+		t.Fatalf("dry run did not preview the rotated order (host other first): %s", out)
+	}
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatalf("dry run removed the next-host state: %v", err)
+	}
+	if b, _ := os.ReadFile(file); string(b) != "other\n" {
+		t.Fatalf("dry run changed the next-host state to %q", b)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("dry run touched the next-host state: mtime %v -> %v", before.ModTime(), after.ModTime())
+	}
+}
+
+func TestArchiveJobsApplyBudgetStopUpdatesNextHostState(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	// Seeded at "local", the walk is local then other. The budget runs out
+	// after local's first job, so the next run should start at "other".
+	file := seedNextHost(t, f, "local")
+	base := time.Now()
+	f.s.Now = budgetClock(f, base, time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(file); err != nil || string(b) != "other\n" {
+		t.Fatalf("apply budget stop left next-host state %q, %v; want %q", b, err, "other\n")
+	}
+}
+
 func TestArchiveJobsCancelledRunWithSpentBudgetReturnsContextError(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
