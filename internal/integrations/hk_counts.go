@@ -3,7 +3,6 @@ package integrations
 import (
 	"context"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -25,7 +24,7 @@ type HKRouteCount struct {
 }
 
 // HKRouteCounts returns the process's hk request counts by route, sorted by
-// route. A route is its method and path with numeric segments as {id}, so
+// route. A route is its method and path template (see hkRoute), so
 // GET /v1/tasks/42 and GET /v1/tasks/7 are one route.
 func HKRouteCounts() []HKRouteCount {
 	hkRoutes.mu.Lock()
@@ -65,18 +64,38 @@ func HKRequestTotal(ctx context.Context) int {
 	return c.Total()
 }
 
-var numericPathSegment = regexp.MustCompile(`^[0-9]+$`)
+// hkRouteWords are the path segments hk's routes spell out. Every other
+// segment is an id (a task, job, change, document key or machine name).
+var hkRouteWords = map[string]bool{
+	"v1": true, "tasks": true, "jobs": true, "changes": true, "batch": true,
+	"unreconciled": true, "comments": true, "reopen": true, "decision-request": true,
+	"attachments": true, "documents": true, "consults": true, "nodes": true,
+	"agents": true, "command": true, "task-events": true,
+}
 
-// hkRoute names the route of one request: its method and path, numeric
-// segments as {id}, and no query.
+// hkRoute names the route of one request: its method and path template, with
+// each id segment (and each run of them, so a document key with slashes is one
+// id) as {id}, and no query. The keys are bounded by the route words, so a
+// process's count lines stay small however many ids it touches.
 func hkRoute(req *http.Request) string {
-	parts := strings.Split(req.URL.Path, "/")
-	for i, part := range parts {
-		if numericPathSegment.MatchString(part) {
-			parts[i] = "{id}"
+	var b strings.Builder
+	b.WriteString(req.Method + " ")
+	inID := false
+	for _, part := range strings.Split(req.URL.Path, "/") {
+		if part == "" {
+			continue
+		}
+		if hkRouteWords[part] {
+			b.WriteString("/" + part)
+			inID = false
+			continue
+		}
+		if !inID {
+			b.WriteString("/{id}")
+			inID = true
 		}
 	}
-	return req.Method + " " + strings.Join(parts, "/")
+	return b.String()
 }
 
 // hkCountingTransport counts each request attempt before it is sent.
