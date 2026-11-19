@@ -100,7 +100,7 @@ func (s *Service) consultWaitExpired(at, now time.Time) bool {
 // of one PR cannot request or settle twice.
 func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, o Options, st *roundRuleState, done bool, rounds int, openAboveLow bool) (directive string, hold bool) {
 	if o.DryRun {
-		if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
+		if s.consultDue(st, done, rounds, openAboveLow) {
 			// A dry run decides only: it neither requests nor delivers the
 			// held round's findings.
 			return "", true
@@ -137,6 +137,14 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		s.hubConsultSupersede(ctx, r, pr, o, st)
 	}
 
+	// State written before the request round was kept learns it the first time a
+	// pass sees the head the consult was requested for: that head's round now is
+	// the round it was requested at.
+	if st.consultAsked() && st.HubConsultRound == 0 && st.HubConsultHead == pr.Head.SHA && rounds > 0 {
+		st.HubConsultRound = rounds
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	}
+
 	// An owed consult is advanced on every pass, whatever the current round
 	// or done marker says: a push or a new review round must not orphan the
 	// row, its wait bound or its outcome.
@@ -144,7 +152,7 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		return s.hubConsultAdvance(ctx, r, pr, fb, o, st, s.now().UTC())
 	}
 
-	if done && rounds == s.Config.Review.RoundRuleConsult() && openAboveLow && !st.directiveSent() {
+	if s.consultDue(st, done, rounds, openAboveLow) {
 		// The reset below drops the old row's id: finish its task comment
 		// first, or a superseded comment a transient hk failure left
 		// unrecorded could never be retried.
@@ -182,6 +190,7 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		// is measured from here, so an hk outage retries only inside the wait.
 		st.HubConsultOwed = true
 		st.HubConsultHead = pr.Head.SHA
+		st.HubConsultRound = rounds
 		st.HubConsultAt = s.now().UTC()
 		st.HubConsultPosted = false
 		st.HubConsultID = ""
@@ -203,6 +212,30 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		return s.hubConsultAdvance(ctx, r, pr, fb, o, st, s.now().UTC())
 	}
 	return "", false
+}
+
+// consultDue reports whether the consult (or, with the hub consult off, the
+// directive) is owed now: the first done round at or after the consult round
+// with a finding open above the bar. A consult already requested for an earlier
+// round is not asked again (one per PR, decision 250); a new head in the round
+// it was requested for still gets its own, as before.
+func (s *Service) consultDue(st *roundRuleState, done bool, rounds int, open bool) bool {
+	if !done || rounds < s.Config.Review.RoundRuleConsult() || !open || st.directiveSent() {
+		return false
+	}
+	// A consult whose request round is unknown (state written before the round
+	// was kept, not yet backfilled) counts as asked: losing a same-round
+	// replacement is safe, a second paid consult is not, and the round is never
+	// guessed from today's configuration, which may have changed since.
+	return !st.consultAsked() || (st.HubConsultRound != 0 && st.HubConsultRound == rounds)
+}
+
+// consultAsked reports whether a consult request may have reached the hub: the
+// POST was recorded as attempted, or its row came back. An attempt that failed
+// before the POST (a question the hk write refused, a task read that failed)
+// asked nothing, and a qualifying later head still owes the consult.
+func (st *roundRuleState) consultAsked() bool {
+	return st.HubConsultPosted || st.HubConsultID != ""
 }
 
 // hubConsultAdvance moves an owed consult one step: request it when no row
