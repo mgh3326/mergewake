@@ -782,10 +782,11 @@ const ArchiveTextCap = 3 << 20
 
 // DefaultReapRegenerable names gitignored paths whose loss is acceptable
 // because they rebuild on demand. Slash-free names approve ignored entries
-// of that name; only the explicit directory forms (a trailing `/`) approve
-// wholly ignored directories, and only at the top level — a nested
-// `web/node_modules/` still refuses, as it does at the node. Directory forms
-// go only to tool-owned caches (`.venv/`, `node_modules/`, `__pycache__/`,
+// of that name; a slash-free directory form (a trailing `/`, e.g.
+// `node_modules/`) approves a wholly ignored directory of that name at any
+// depth, so `web/node_modules/` is approved too, as the node's
+// `nodeRegenerable` (panewire@d2501b1 node_worktree.go) approves it. Directory
+// forms go only to tool-owned caches (`.venv/`, `node_modules/`, `__pycache__/`,
 // `.pytest_cache/`) and the generated directories the contract names
 // (`Library/`, `Temp/`); `bin`, `obj`, `build`, `dist`, `target`, `Logs` and
 // `UserSettings` stay name-only, so a wholly ignored `bin/` holding

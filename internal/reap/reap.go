@@ -657,42 +657,39 @@ func RepoFromRemote(raw string) string {
 }
 
 // Regenerable reports whether an ignored path inside a worktree matches the
-// regenerable allowlist, using the node's rule (panewire docs/node-commands.md,
-// `worktree.remove`), so the precheck and the node refuse the same worktrees:
-// a `dir/` entry matches only a glob whose raw form ends in `/`, and that
-// directory form is a whole-path pattern approving only the top-level
-// directory — a nested `web/node_modules/` still refuses. A glob containing
-// `/` matches the whole trimmed path; a slash-free glob matches only the
-// ignored entry's last segment, and never a `dir/` entry — matching an
-// ancestor would let a tracked bin/ or Logs/ dir smuggle an ignored file like
-// bin/local.env past the refusal.
+// regenerable allowlist, using the node's rule (panewire
+// `panewire@d2501b1 node_worktree.go nodeRegenerable`, documented under
+// `worktree.remove` in docs/node-commands.md), so the precheck and the node
+// refuse the same worktrees. The node reads each glob without its trailing
+// `/` for the slash test: a glob with no other `/` (`name/`, `logs/`,
+// `node_modules`) matches the entry's last segment at any depth, while a glob
+// with an inner or leading `/` (`a/b/`, `dotnet/*/bin/`, `/build`) matches
+// the whole path. A trailing-slash glob approves only a `dir/` entry, and a
+// `dir/` entry needs a trailing-slash glob, so a slash-free `name/` approves
+// a wholly ignored directory at any depth (`a/b/__pycache__/`) but never an
+// ignored file of that name. A slash-free glob matches only the last segment
+// of an ignored file, never a `dir/` entry: matching an ancestor would let a
+// tracked bin/ or Logs/ dir smuggle an ignored file like bin/local.env past
+// the refusal. Globs use path.Match, as the node does, so `*` never crosses a
+// `/` and `**` is not a recursive wildcard.
 func Regenerable(globs []string, entry string) bool {
+	dirEntry := strings.HasSuffix(entry, "/")
 	p := strings.Trim(entry, "/")
-	dir := strings.HasSuffix(entry, "/")
 	base := p
 	if i := strings.LastIndex(p, "/"); i >= 0 {
 		base = p[i+1:]
 	}
-	for _, g := range globs {
-		if g == "" {
+	for _, raw := range globs {
+		g := strings.Trim(raw, "/")
+		if g == "" || dirEntry != strings.HasSuffix(raw, "/") {
 			continue
 		}
-		switch {
-		case strings.HasSuffix(g, "/"):
-			if ok, _ := policy.Match(strings.TrimSuffix(g, "/"), p); ok {
-				return true
-			}
-		case strings.Contains(g, "/"):
-			if ok, _ := policy.Match(g, p); ok {
-				return true
-			}
-		default:
-			if dir {
-				continue
-			}
-			if ok, _ := path.Match(g, base); ok {
-				return true
-			}
+		match := base
+		if strings.Contains(strings.TrimSuffix(raw, "/"), "/") {
+			match = p
+		}
+		if ok, _ := path.Match(g, match); ok {
+			return true
 		}
 	}
 	return false
@@ -705,7 +702,7 @@ var globClass = regexp.MustCompile(`\[[^\]]*\]`)
 // mirroring its validNodeGlob rule: the pattern must be non-empty, relative,
 // at most 128 bytes with no control bytes, must not be wildcard-only (after
 // stripping character classes, trimming `*?/` leaves nothing), and may end
-// in `/` as an explicit top-level directory approval. Anything it refuses
+// in `/` as an explicit directory approval. Anything it refuses
 // fails every `worktree.remove`, so the config refuses it at load.
 func ValidRegenerableGlob(g string) error {
 	if g == "" || strings.HasPrefix(g, "/") {
