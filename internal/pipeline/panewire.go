@@ -888,6 +888,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if len(cfg.ExcludeHosts) > 0 {
 				args = append(args, "--exclude-host", strings.Join(cfg.ExcludeHosts, ","))
 			}
+			// A replacement leaves out the quota pools its lost reviewers ran on,
+			// so placement does not pick the same pool again. A reviewer whose pool
+			// its record did not name excludes nothing, and the spawn audits it.
+			excludedPools, unknownPools := replacedPools(plan.replaced, pr.Head.SHA)
+			if len(excludedPools) > 0 {
+				args = append(args, "--exclude-pool", strings.Join(excludedPools, ","))
+			}
 			// The record names the job before it is spawned, so a wait that
 			// ends early leaves a job the next run can resume.
 			roleArgs, inRange := reviewerRoleArgs(plan.pass)
@@ -908,6 +915,11 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			}
 			if plan.supersedes != "" {
 				if e = s.audit(x.repo.Name, "reviewer-spawn-replaced", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "old_label": plan.supersedes, "label": label}, false); e != nil {
+					return out, e
+				}
+			}
+			if len(plan.replaced) > 0 {
+				if e = s.audit(x.repo.Name, "review-replacement-pools", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "excluded_pools": excludedPools, "unknown_pools": unknownPools}, false); e != nil {
 					return out, e
 				}
 			}
@@ -1007,6 +1019,23 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
 		stdout, e = place(runCtx, args)
 		tracing.Finish(runSpan)
+		// The pool exclusion of a replacement can leave panewire no candidate at
+		// all. The pass must not wait on that forever, so the spawn is placed
+		// once more without the exclusion; the record keeps what was sent, and
+		// the audit names the pools that were left out of the first try.
+		if e != nil && !resumed && ctx.Err() == nil && slices.Contains(rj.Args, "--exclude-pool") && noCandidateRefusal(stdout, e) {
+			if auditErr := s.audit(x.repo.Name, "review-replacement-pool-fallback", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "excluded_pools": argAfter(rj.Args, "--exclude-pool"), "exit": exitStatus(e), "reason": fleetevent.Redact(integrations.Detail(e))}, false); auditErr != nil {
+				return out, auditErr
+			}
+			rj.Args = withoutFlag(rj.Args, "--exclude-pool")
+			if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+				return out, saveErr
+			}
+			note = "no placement candidate was left outside the lost reviewers' pools; placed without the pool exclusion"
+			runCtx, runSpan := tracing.Span(ctx, "mergewake.spawn_wait")
+			stdout, e = place(runCtx, rj.Args)
+			tracing.Finish(runSpan)
+		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = workerSeatArgs(rj.Args)
@@ -1668,6 +1697,79 @@ func neverRanReviewer(rj reviewerJob, job integrations.JobRecord) bool {
 	return rj.Started == nil && job.State == "" && job.Host == "" && job.PaneID == ""
 }
 
+// poolPattern is the shape panewire accepts for a --exclude-pool value (its
+// fleet id pattern). A pool outside it is treated as unknown, never passed on:
+// panewire would refuse the whole spawn for it.
+var poolPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// validPool returns pool when panewire accepts it as a --exclude-pool value,
+// and "" when it does not or none was recorded.
+func validPool(pool string) string {
+	if poolPattern.MatchString(pool) {
+		return pool
+	}
+	return ""
+}
+
+// replacedPools returns the quota pools of the reviewers a pass replaced on
+// head (sorted, each once), and the labels of those whose pool is unknown.
+func replacedPools(replaced []replacedReviewer, head string) (pools, unknown []string) {
+	// Empty, not nil: the audit row carries them as JSON arrays.
+	pools, unknown = []string{}, []string{}
+	for _, old := range replaced {
+		if old.Head != head {
+			continue
+		}
+		if old.Pool == "" {
+			unknown = append(unknown, old.Label)
+			continue
+		}
+		if !slices.Contains(pools, old.Pool) {
+			pools = append(pools, old.Pool)
+		}
+	}
+	slices.Sort(pools)
+	return pools, unknown
+}
+
+// noCandidateTexts are the refusals panewire gives when no host or placement
+// candidate can take a spawn: no host admitted it (81), or no remote host did
+// (80). The hub's parked-request reasons read the same texts.
+var noCandidateTexts = []string{"no host admitted", "no remote host admitted", "no placement candidate accepted", "no remote candidate completed"}
+
+// noCandidateRefusal reports whether a spawn that ended with exit 80 or 81 says
+// that no candidate could take it, from its output or its error text.
+func noCandidateRefusal(stdout []byte, e error) bool {
+	if code := exitStatus(e); code != 80 && code != 81 {
+		return false
+	}
+	text := string(stdout) + "\n" + integrations.Detail(e)
+	return slices.ContainsFunc(noCandidateTexts, func(s string) bool { return strings.Contains(text, s) })
+}
+
+// argAfter returns the value that follows flag in args, or "" when absent.
+func argAfter(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// withoutFlag returns args without flag and the value that follows it.
+func withoutFlag(args []string, flag string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == flag {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
 // lostOverdue is the lost cause of a reviewer that kept working past the review
 // deadline: mergewake replaces it, so its pane is merged into the close below
 // even while it is working. Every other lost cause leaves the pane alone.
@@ -1756,7 +1858,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// may still arrive.
 	plan.replaced = slices.Clone(rj.Replaced)
 	if !neverRanReviewer(rj, job) {
-		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart()})
+		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart(), Pool: validPool(job.Pool)})
 	}
 	auditErr := s.audit(x.repo.Name, "review-result-lost", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "lens": plan.lens, "label": lost.label, "record": lost.record, "profile": lost.profile, "report": lost.report, "collect_error": lost.cause.Error(), "recorded": rj.Recorded, "started": rj.Started, "budget_from": rj.budgetFrom()}, false)
 	noticeErr := s.notifyReviewResultLost(ctx, x.repo, pr, plan, lost)

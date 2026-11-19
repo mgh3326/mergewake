@@ -783,13 +783,22 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    `panewire spawn (-c <checkout> | --checkout-origin <origin>
    --checkout-commit <sha> --checkout-ref <ref>) -m auto -p <brief> -l
    mwr-<pr>-<sha7>-p<pass>-<unix> --t <T> --task <task> [--builder-job <author job>] --builder-family <family from the author's job record, else inferred> --role
-   reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] --wait
+   reviewer --report <jobs>/<label>/report.md [--exclude-host <hosts>] [--exclude-pool <pools>] --wait
    --wait-timeout <rest of review.timeout>`. panewire picks host and model and,
    for the reviewer role, excludes the author job's family; on another host it
    clones the repo under `$HOME/work` and adds a worktree detached at the same
    head, fetched as the ref the spawn named. Exit 77 (no admitted seat outside that family) retries
    once with `--role worker`, which may pick the author's family; the receipt
    records that as `fallback`.
+   A replacement of a lost or timed-out reviewer also passes `--exclude-pool`
+   with the quota pools its lost reviewers ran on, read from the `pool` of their
+   hk job records and written to the `review-replacement-pools` audit row. A
+   lost reviewer whose record names no valid pool excludes nothing for that
+   reviewer, and the audit row lists it as unknown. When the exclusion leaves
+   panewire no candidate (exit 80 or 81 with a "no host admitted" or "no
+   placement candidate accepted" text), the spawn is placed once more without
+   `--exclude-pool`, audited as `review-replacement-pool-fallback`. A resumed
+   replay keeps its recorded arguments.
    The hub's `checkout_spec_v1` support is read by panewire itself: it asks the
    hub for the feature before it submits, and stops with exit 2 (`hub does not
    support --checkout-origin`) or 70 (`unable to verify hub support`) before a

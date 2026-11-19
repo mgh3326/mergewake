@@ -80,13 +80,19 @@ type panewireRunner struct {
 	// does when the hub does not advertise checkout_sparse_v1: exit 2, before
 	// any request is submitted. A retry without the sparse flags succeeds.
 	sparseRefused bool
-	headless      int
-	remote        *taskJobSink
-	inbox         []string // lane.event items, as panewire inbox list prints them
-	inboxErr      error
-	acks          [][]string
-	late          int // inbox looks that still show nothing
-	looks         int
+
+	// noCandidateExcluded makes a spawn that names --exclude-pool answer as panewire
+	// does when no host or placement candidate is left outside the excluded pools:
+	// exit 81 with its refusal text, and nothing placed.
+	noCandidateExcluded bool
+
+	headless int
+	remote   *taskJobSink
+	inbox    []string // lane.event items, as panewire inbox list prints them
+	inboxErr error
+	acks     [][]string
+	late     int // inbox looks that still show nothing
+	looks    int
 	// nodeResult answers `panewire node job-result` ({"found":false} when
 	// empty); nodeReads are the --job labels it was asked for.
 	nodeResult string
@@ -183,6 +189,9 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		if r.sparseRefused && slices.Contains(args, "--checkout-exclude") {
 			// panewire's pre-submit sparse feature check: no request, job or pane.
 			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-exclude; upgrade the hub before submitting"}
+		}
+		if r.noCandidateExcluded && slices.Contains(args, "--exclude-pool") {
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(81), Stderr: "spawn refused: no placement candidate accepted spawn; no local fallback"}
 		}
 		if r.specRefused && slices.Contains(args, "--checkout-origin") {
 			// panewire's pre-submit feature check: no request, job or pane.
