@@ -616,6 +616,16 @@ needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
 
+A run whose `reap.archive.max_run` budget is spent stops before the next remote command: a
+spent budget is checked before each host and each job, and a cancelled run
+returns its error. The hosts are then walked from the one after the last host
+it entered, so a host late in `hosts` is not starved by the earlier ones; the
+next full run starts there, and a run that finishes every host returns to
+config order. A `--host` or `--dry-run` run neither reads nor writes that state. The summary
+lists the hosts it did not reach in `unscanned_hosts`; `eligible_left` counts
+only the jobs left on hosts it scanned (`eligible_left_scope` says so), and
+unscanned hosts are not scanned just to be counted.
+
 ### `liveness`
 
 Automatic daily liveness checks evaluate made-against-done progress for all
@@ -1881,6 +1891,7 @@ For `example/project`, state resides beneath
 | `decisions.jsonl` | Append-only observations/intent and completed recovery records. A planned action is not proof it completed. |
 | `reap.jsonl` | Append-only reap receipts: worktree removals, branch deletions, reviewer-reap and reviewer-cleanup rows, skips and `would-*` plans, each with repo, PR, host and worktree; `archive-job` rows record job-dir archives; `check-pr` rows stamp refetch attempts and `files` names refusing ignored paths. Old `close-pane` and `job-done` rows from before panewire's node took over pane closes still load but no new ones are written. |
 | `../archive-jobs.jsonl` | `<state_dir>/archive-jobs.jsonl`, host-wide: one `archive-job` row per job dir `archive-jobs` looked at — archived (with the Drive directory, hk ids and excluded names), planned or skipped with its reason. |
+| `../archive-jobs-next-host` | `<state_dir>/archive-jobs-next-host`, host-wide: the host name a full `archive-jobs` run starts at after a run stopped on its budget. Absent means config order. |
 | `last-green` | Last observed green main SHA; validated again during diagnosis. |
 | `recovery.json` | The red-main incident: when main first turned red, the culprit and green baseline, the 2/2 any-ref evidence, the fix window and the revert PR. Persisted, so a restart keeps the same window; deleted once main is green. |
 | `recovery-urgent.json` | PRs watch named as the fix for a red main (`Fixes-Red-Main`). The review queue reads it through `ReviewPriority`, so the fix is reviewed first. Deleted with the incident. |

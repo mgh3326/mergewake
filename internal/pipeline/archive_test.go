@@ -31,23 +31,51 @@ type archiveRunner struct {
 	vanishDuringRefresh string
 	afterTreeListing    func()
 	treeBytes           int
-	failCatPath         string
-	failTarDir          string
-	failReadProbe       bool
-	failCatError        string
-	tarProbes           int
+	// failCatPath is a job-relative file the remote reads cannot open. A cat
+	// of it exits failCatRC (1 when zero); the batch read's diagnosis command
+	// reports that same status for it.
+	failCatPath string
+	failCatRC   int
+	// failTarDir makes the batch read of that dir exit failTarCode (1 when zero).
+	failTarDir  string
+	failTarCode int
+	// failProbeExit makes the diagnosis command itself exit with that status.
+	failProbeExit int
+	tarProbes     int
+	probes        int
+}
+
+// testExitStatus is a typed failure carrying an exit code, the shape the real
+// runner's *exec.ExitError has. Its text deliberately omits "exit status N".
+type testExitStatus int
+
+func (e testExitStatus) Error() string { return fmt.Sprintf("exited with code %d", int(e)) }
+func (e testExitStatus) ExitCode() int { return int(e) }
+
+func orDefault(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	a.calls++
 	if name == "cat" && a.failCatPath != "" && strings.HasSuffix(args[len(args)-1], a.failCatPath) {
-		if a.failCatError != "" {
-			return nil, errors.New(a.failCatError)
-		}
-		return nil, errors.New("exit status 1")
+		return nil, testExitStatus(orDefault(a.failCatRC, 1))
 	}
-	if name == "true" && a.failReadProbe {
-		return nil, errors.New("ssh: exit status 255")
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], `cat -- "$p"`) {
+		a.probes++
+		if a.failProbeExit != 0 {
+			return nil, testExitStatus(a.failProbeExit)
+		}
+		if a.failCatPath != "" {
+			for _, p := range strings.Split(strings.TrimSuffix(input, "\n"), "\n") {
+				if p == a.failCatPath {
+					return []byte(fmt.Sprintf("%d %s\n", orDefault(a.failCatRC, 1), p)), nil
+				}
+			}
+		}
 	}
 	if (name == "tar" || name == "env") && a.failTarDir != "" {
 		if name == "env" && strings.Contains(strings.Join(args, " "), "tar") {
@@ -55,7 +83,7 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 		}
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "-C" && args[i+1] == a.failTarDir && (name == "tar" || strings.Contains(strings.Join(args[:i], " "), "tar")) {
-				return nil, errors.New("exit status 1")
+				return nil, testExitStatus(orDefault(a.failTarCode, 1))
 			}
 		}
 	}
@@ -83,7 +111,7 @@ func (a *archiveRunner) Run(ctx context.Context, name string, args []string, inp
 	var out, stderr bytes.Buffer
 	c.Stdout, c.Stderr = &out, &stderr
 	if err := c.Run(); err != nil {
-		return nil, errors.New(name + ": " + err.Error() + ": " + stderr.String())
+		return nil, fmt.Errorf("%s: %w: %s", name, err, stderr.String())
 	}
 	if name == "sh" && strings.Contains(strings.Join(args, " "), "for d in *; do") {
 		a.treeBytes = out.Len()
@@ -368,10 +396,70 @@ func TestArchiveJobsUnreadableReadSkipsAndContinues(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
 		t.Fatalf("unreadable job failed the run: %v", err)
 	}
-	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"unreadable: cat brief.md: exit status 1"`, `"job":"good-job","result":"would-archive"`} {
+	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"unreadable: cat brief.md: cat exit status 1"`, `"job":"good-job","result":"would-archive"`} {
 		if !strings.Contains(f.out.String(), want) {
 			t.Fatalf("missing %s in output: %s", want, f.out.String())
 		}
+	}
+	if f.run.probes != 1 {
+		t.Fatalf("diagnosis commands = %d, want exactly 1", f.run.probes)
+	}
+}
+
+// Only a cat that exits exactly 1 makes a file unreadable; 126, 127 and 137
+// (and 255 from a transport) are run errors, whether they come from the batch
+// read or from the diagnosis that names the file.
+func TestArchiveJobsUnreadableExitCodesOtherThanOneRemainRunErrors(t *testing.T) {
+	for _, rc := range []int{126, 127, 137, 255} {
+		t.Run(strconv.Itoa(rc), func(t *testing.T) {
+			f := newArchiveFixture(t, noAgents)
+			bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+			if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+				t.Fatal(err)
+			}
+			f.run.failTarDir = bad
+			f.run.failCatPath = "brief.md"
+			f.run.failCatRC = rc
+			if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+				t.Fatalf("cat status %d must fail the run", rc)
+			}
+			if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) || strings.Contains(f.out.String(), "unreadable") {
+				t.Fatalf("cat status %d was not a run error: %s", rc, f.out.String())
+			}
+		})
+	}
+}
+
+func TestArchiveJobsBatchReadTransportExit255IsARunErrorWithoutDiagnosis(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failTarCode = 255
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("batch read exit 255 must fail the run")
+	}
+	if f.run.probes != 0 {
+		t.Fatalf("exit 255 ran the diagnosis %d times, want 0", f.run.probes)
+	}
+}
+
+func TestArchiveJobsDiagnosisTransportFailureRemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	f.run.failProbeExit = 255
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("diagnosis exit 255 must fail the run")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
+		t.Fatalf("transport failure was not recorded as a run error: %s", f.out.String())
 	}
 }
 
@@ -386,24 +474,108 @@ func TestReapArchiveUnreadableTaskReadRemainsRunError(t *testing.T) {
 	}
 }
 
-func TestArchiveJobsUnreadableProbeFailureRemainsRunError(t *testing.T) {
-	f := newArchiveFixture(t, noAgents)
-	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
-	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
-		t.Fatal(err)
-	}
-	f.run.failTarDir = bad
-	f.run.failCatPath = "brief.md"
-	f.run.failReadProbe = true
-	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
-		t.Fatal("read failure with an unavailable host probe should fail the run")
-	}
-	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
-		t.Fatalf("transport failure was not recorded as a run error: %s", f.out.String())
+// budgetClock is a run clock that is past the budget from the moment the
+// first row for job "first" is printed, so the gate's next look sees a spent
+// budget and nothing before it moved time.
+func budgetClock(f archiveFixture, base time.Time, budget time.Duration) func() time.Time {
+	return func() time.Time {
+		if strings.Contains(f.out.String(), `"job":"first"`) {
+			return base.Add(budget)
+		}
+		return base
 	}
 }
 
-func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
+func TestArchiveJobsBudgetSpentOnHostALastJobRunsNoCommandOnHostB(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	base := time.Now()
+	clock := budgetClock(f, base, time.Hour)
+	stopAt := -1
+	f.s.Now = func() time.Time {
+		// The first look after host A's last row marks the stop point.
+		if stopAt < 0 && strings.Contains(f.out.String(), `"job":"first"`) {
+			stopAt = f.run.calls
+		}
+		return clock()
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("budget stop failed the run: %v", err)
+	}
+	if stopAt < 0 {
+		t.Fatal("budget never ran out after host A's last job")
+	}
+	if f.run.calls != stopAt {
+		t.Fatalf("runner calls after the budget ran out: %d more", f.run.calls-stopAt)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"job":"first","result":"would-archive"`) || !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"unscanned_hosts":["other"]`) {
+		t.Fatalf("budget summary is wrong: %s", out)
+	}
+	if strings.Contains(out, `"job":"third"`) {
+		t.Fatalf("host B was walked after the budget: %s", out)
+	}
+	if b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, archiveNextHostFile)); err != nil || string(b) != "other\n" {
+		t.Fatalf("next-host state = %q, %v; want %q", b, err, "other\n")
+	}
+}
+
+func TestArchiveJobsNextRunStartsAtHostAfterBudgetStop(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	base := time.Now()
+	f.s.Now = budgetClock(f, base, time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	f.out.Reset()
+	f.s.Config.Reap.Archive.MaxRun = ""
+	f.s.Now = func() time.Time { return base }
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if i, j := strings.Index(out, `"host":"other"`), strings.Index(out, `"host":"local"`); i < 0 || j < 0 || i > j {
+		t.Fatalf("second run did not start at host other: %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(f.s.Config.StateDir, archiveNextHostFile)); !os.IsNotExist(err) {
+		t.Fatalf("a complete run must clear the next-host state, stat err = %v", err)
+	}
+}
+
+func TestArchiveJobsCancelledRunWithSpentBudgetReturnsContextError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	base := time.Now()
+	f.s.Now = func() time.Time { return base.Add(time.Hour) }
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.run.calls = 0
+	err := f.s.ArchiveJobs(ctx, "", 14*24*time.Hour, Options{Shadow: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
+	}
+	if f.run.calls != 0 {
+		t.Fatalf("cancelled run issued %d commands", f.run.calls)
+	}
+}
+
+func TestArchiveJobsSummaryNamesUnscannedHostsAndEligibleScope(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
 	jobDir(t, f.jobs, "first", 20*24*time.Hour)
@@ -415,37 +587,16 @@ func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
 	jobDir(t, otherJobs, "third", 20*24*time.Hour)
 	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
 	base := time.Now()
-	calls := 0
-	f.s.Now = func() time.Time {
-		at := base.Add(time.Duration(calls) * time.Second)
-		calls++
-		return at
-	}
+	f.s.Now = budgetClock(f, base, time.Hour)
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
-		t.Fatalf("budget stop failed the run: %v", err)
-	}
-	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":1`) || !strings.Contains(f.out.String(), `"unscanned_hosts":["other"]`) {
-		t.Fatalf("budget summary or boundary is wrong: %s", f.out.String())
-	}
-	if strings.Contains(f.out.String(), `"job":"second"`) {
-		t.Fatalf("walk processed a job after budget: %s", f.out.String())
-	}
-}
-
-func TestArchiveJobsTransportCatExit255RemainsRunError(t *testing.T) {
-	f := newArchiveFixture(t, noAgents)
-	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
-	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
 		t.Fatal(err)
 	}
-	f.run.failTarDir = bad
-	f.run.failCatPath = "brief.md"
-	f.run.failCatError = "ssh: exit status 255"
-	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
-		t.Fatal("cat transport failure must fail the run even when a later probe could succeed")
+	out := f.out.String()
+	if !strings.Contains(out, `"unscanned_hosts":["other"]`) || !strings.Contains(out, `"eligible_left":1`) || !strings.Contains(out, `"eligible_left_scope":"jobs left on scanned hosts only`) {
+		t.Fatalf("summary does not name unscanned hosts or scope eligible_left: %s", out)
 	}
-	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
-		t.Fatalf("transport failure was not recorded as an error row: %s", f.out.String())
+	if strings.Contains(out, `"job":"third"`) {
+		t.Fatalf("unscanned host was scanned to count it: %s", out)
 	}
 }
 
@@ -467,8 +618,10 @@ func TestArchiveJobsFailedBatchReadProbesAreBounded(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
 		t.Fatal("generic batch read failure should remain an error")
 	}
-	if f.run.tarProbes > 33 {
-		t.Fatalf("failed batch read issued %d tar commands, want at most 33", f.run.tarProbes)
+	// No bisection: one batch read, then one diagnosis command that finds no
+	// unreadable file, so the batch error stays a run error.
+	if f.run.tarProbes != 1 || f.run.probes != 1 {
+		t.Fatalf("failed batch read issued %d tar and %d diagnosis commands, want 1 and 1", f.run.tarProbes, f.run.probes)
 	}
 }
 
