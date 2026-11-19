@@ -70,7 +70,7 @@ func TestRoundHoldRelease_ReviewLoginWithoutMarkerReleases(t *testing.T) {
 // it, so a comment carrying that text never releases the hold it describes.
 func TestRoundHoldRelease_MergewakeDecisionCommentNeverReleases(t *testing.T) {
 	s, g, r := holdAtRound7(t)
-	text := round5DecisionText(r, g.pull, 7, []github.ReviewThread{ownFinding("T1", "high", 10)})
+	text := round5DecisionText(r, g.pull, 7, endedFindings([]github.ReviewThread{ownFinding("T1", "high", 10)}))
 	if !strings.Contains(text, "<!-- mergewake") {
 		t.Fatalf("round-hold decision text carries no mergewake marker: %q", text)
 	}

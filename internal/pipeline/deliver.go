@@ -126,6 +126,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
 	st := s.loadRoundRuleState(r.Name, n)
+	s.recordHoldDue(r, pr, o, &st, done, rounds, openBlockingThreads)
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
 	// The hub consult (review.round_rule.hub_consult) replaces the author
