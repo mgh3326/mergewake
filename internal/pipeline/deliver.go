@@ -221,8 +221,9 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// with an unsent decision retries the notify, even after the ladder
 	// round has passed.
 	ladderOwed := st.LadderEndedNoSuccessor && !st.LadderEndedEventSent
-	ladderRetry := !st.escalated() && !st.LadderPendingSince.IsZero()
-	if (done && rounds == ladderRound && openBlocking) || ladderOwed || ladderRetry {
+	ladderRefusalOwed := st.ladderRefusalOwed()
+	ladderRetry := !st.escalated() && (!st.LadderPendingSince.IsZero() || st.LadderPaneBusyCalls > 0)
+	if (done && rounds == ladderRound && openBlocking) || ladderOwed || ladderRefusalOwed || ladderRetry {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
