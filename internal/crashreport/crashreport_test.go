@@ -118,13 +118,12 @@ func TestCrashOutputCapturesAGoroutinePanic(t *testing.T) {
 	}
 	if state := os.Getenv("MERGEWAKE_CRASH_CHILD"); state != "" {
 		Start(state, "mergewake", "v-test")
-		done := make(chan struct{})
+		// Nothing signals main: the only way out of this child is the
+		// panic, so the runtime finishes the traceback before exit.
 		go func() {
-			defer close(done)
 			panic("crash-child-boom")
 		}()
-		<-done
-		return
+		select {}
 	}
 	state := t.TempDir()
 	command := exec.Command(os.Args[0], "-test.run=^TestCrashOutputCapturesAGoroutinePanic$")
