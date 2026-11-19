@@ -163,6 +163,7 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 	var mu sync.Mutex
 	requests := map[string]int{}
 	var firstStarted time.Time
+	firstCanceled := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/pulls") && r.URL.Query().Get("state") == "closed" {
 			parts := strings.Split(r.URL.Path, "/")
@@ -177,6 +178,9 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 			if repo == "one" && first {
 				select {
 				case <-r.Context().Done():
+					mu.Lock()
+					firstCanceled = true
+					mu.Unlock()
 				case <-time.After(500 * time.Millisecond):
 				}
 			}
@@ -189,12 +193,17 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 	gh := github.New("")
 	gh.BaseURL, gh.Stderr = srv.URL, io.Discard
 	repos := []config.Repo{{Name: "o/one", Branch: "main"}, {Name: "o/two", Branch: "main"}}
-	cfg := config.Config{StateDir: t.TempDir(), Repos: repos, PollInterval: "1h", Hosts: []reap.Host{{Name: "host-a"}}, Reap: config.Reap{Enabled: true, RepoBudget: "1ms", ScanAfter: "720h", WorktreeAfter: "0"}}
+	cfg := config.Config{StateDir: t.TempDir(), Repos: repos, PollInterval: "1h", Hosts: []reap.Host{{Name: "host-a"}}, Reap: config.Reap{Enabled: true, RepoBudget: "100ms", ScanAfter: "720h", WorktreeAfter: "0"}}
 	s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: integrations.Noop{}, Out: io.Discard}
 	var stderr lockedBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	exit := make(chan error, 1)
 	go func() { exit <- runDaemonLoops(ctx, s, gh, "", pipeline.Options{Shadow: true}, &stderr) }()
+	waitFor(t, "first repository reap request", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return !firstStarted.IsZero()
+	})
 	waitFor(t, "second repository reap request", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -203,7 +212,7 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 	mu.Lock()
 	firstDuration := time.Since(firstStarted)
 	mu.Unlock()
-	if firstDuration >= 250*time.Millisecond {
+	if firstDuration >= 400*time.Millisecond {
 		t.Fatalf("next repository waited for the blocked request: %s", firstDuration)
 	}
 	cancel()
@@ -217,6 +226,9 @@ func TestDaemonReapBudgetStopsRepoAndContinues(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if !firstCanceled {
+		t.Fatal("first repository request did not observe budget cancellation")
+	}
 	if requests["two"] == 0 {
 		t.Fatal("next repository did not run")
 	}
