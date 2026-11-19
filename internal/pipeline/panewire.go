@@ -842,6 +842,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		deadline, _ := ctx.Deadline()
 		left := time.Until(deadline)
 		wait := min(reviewerPassWait, left-min(postReserve, left/4))
+		// A fresh request expires with the pass budget: a request still parked
+		// after the pass has ended would land on no one (hk 5428).
+		expires := left
 		if resumed {
 			timeout, err := config.Duration(s.Config.Review.Timeout)
 			if err != nil {
@@ -857,6 +860,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		var args []string
 		if resumed {
+			// Only --wait-timeout changes on a replay: --expires is part of the
+			// submission panewire fingerprints, so the recorded value stays.
 			args = withWaitTimeout(rj.Args, wait)
 		} else {
 			args = []string{"spawn"}
@@ -873,7 +878,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}
-			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())))
+			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())), "--expires", reviewerExpires(expires))
 			if cfg.Owner != "" {
 				args = append(args, "--owner", cfg.Owner)
 			}
