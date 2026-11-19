@@ -598,12 +598,12 @@ func TestRoundRule_DirectiveEventIDDistinctFromPriorFindings(t *testing.T) {
 	}
 	route := findingsRoute{lane: "author-lane", via: "author"}
 
-	d1, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{})
+	d1, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{}, "", "")
 	if err != nil {
 		t.Fatalf("sendFindings without directive: %v", err)
 	}
 
-	d2, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{}, Round3Directive)
+	d2, err := s.sendFindings(context.Background(), r, github.Pull{Number: 7, Head: github.Ref{SHA: shaA}}, route, "author", fs, Options{}, Round3Directive, "")
 	if err != nil {
 		t.Fatalf("sendFindings with directive: %v", err)
 	}
