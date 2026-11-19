@@ -56,13 +56,21 @@ func getTask(ctx context.Context, c client.Client, id int64) (client.Task, error
 	return x, nil
 }
 
-// task reads one task by its ID string.
+// task reads one task by its ID string, once per evaluation (see WithTaskMemo).
 func (Handoffkeep) task(ctx context.Context, task string) (client.Task, error) {
 	c, id, e := taskClient(task)
 	if e != nil {
 		return client.Task{}, e
 	}
-	return getTask(ctx, c, id)
+	memo := taskMemoOf(ctx)
+	if x, ok := memo.get(id); ok {
+		return x, nil
+	}
+	x, e := getTask(ctx, c, id)
+	if e == nil {
+		memo.put(id, x)
+	}
+	return x, e
 }
 
 // Comment appends body to the task's comments as svc-mergewake.
@@ -71,6 +79,7 @@ func (Handoffkeep) Comment(ctx context.Context, task, body string) error {
 	if e != nil {
 		return e
 	}
+	defer taskMemoOf(ctx).forget(id)
 	_, e = c.CommentTask(ctx, id, body)
 	return e
 }

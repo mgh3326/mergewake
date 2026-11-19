@@ -13,7 +13,9 @@ type Section struct {
 
 // Skipped counts merged state writes withheld because GitHub gave no
 // merge_commit_sha or merged_at even to the GraphQL merge commit resolver.
-type Counts struct{ Writes, Stale, Rejected, Unavailable, Skipped uint64 }
+// Unchanged counts sections not written because their value is what the
+// process last wrote for the change (observation times aside).
+type Counts struct{ Writes, Stale, Rejected, Unavailable, Skipped, Unchanged uint64 }
 type Writer interface {
 	Queue(repo string, pr int, name string, s Section)
 	Async(func())

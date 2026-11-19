@@ -193,7 +193,7 @@ type hkJobs struct {
 // over plain HTTP, ignores any proxy.
 func (c *hkJobs) client(timeout time.Duration) *http.Client {
 	if c.HTTP != nil {
-		return c.HTTP
+		return countedHK(c.HTTP)
 	}
 	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	if strings.HasPrefix(c.base, "http://") {
@@ -203,7 +203,7 @@ func (c *hkJobs) client(timeout time.Duration) *http.Client {
 		t.Proxy = nil
 		client.Transport = t
 	}
-	return client
+	return countedHK(client)
 }
 
 // authorize sets the bearer credential and the CF Access pair, if any.
