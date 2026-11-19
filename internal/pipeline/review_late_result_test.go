@@ -3,6 +3,9 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -113,6 +116,11 @@ func TestReplacementCarriesEveryLossButNeverRan(t *testing.T) {
 		if !slices.Equal(got, []string{"earlier", "lost-now"}) {
 			t.Fatalf("%s: carried reviewers = %v, want [earlier lost-now]", cause, got)
 		}
+	}
+	// The lost reviewers above are kept for their pass: the case below starts
+	// from a pass that replaced only "earlier".
+	if err := os.Remove(s.replacedReviewersPath(r.Name, g.pull.Number, 1)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
 	}
 	// A reviewer that never ran — no landing seen and no hk record — joins
 	// nothing: no result can arrive late under its label.
