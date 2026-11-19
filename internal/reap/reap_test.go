@@ -263,18 +263,36 @@ func TestRegenerable(t *testing.T) {
 		want  bool
 	}{
 		// The node's rule, pinned entry by entry: a dir/ entry matches
-		// only a glob ending in `/`, as a top-level whole-path pattern.
+		// only a glob ending in `/`, at any depth for a slash-free name.
 		{def, ".venv/", true},
 		{def, "node_modules/", true},
 		{def, "Library/", true},
 		{[]string{".venv"}, ".venv/", false},
 		{[]string{"bin"}, "bin/", false},
-		{[]string{".venv/"}, "sub/.venv/", false},
+		{[]string{".venv/"}, "sub/.venv/", true},
+		{[]string{".venv/"}, ".venv", false},
 		{[]string{".local/"}, ".local/", true},
 		{def, ".local/", false},
-		// Slash globs match the whole path.
-		{[]string{"vendor/**"}, "vendor/mod/x.go", true},
+		// Slash globs match the whole path, with path.Match as the node
+		// uses it: `*` stays inside one segment, so `vendor/**` reaches
+		// vendor/mod but not vendor/mod/x.go.
+		{[]string{"vendor/**"}, "vendor/mod", true},
+		{[]string{"vendor/**"}, "vendor/mod/x.go", false},
 		{[]string{"vendor/**"}, "a/vendor/mod", false},
+		// A trailing-slash glob with no other slash matches a wholly
+		// ignored directory at any depth, never an ignored file of that name.
+		{[]string{"__pycache__/"}, "__pycache__/", true},
+		{[]string{"__pycache__/"}, "a/b/__pycache__/", true},
+		{[]string{"__pycache__/"}, "a/__pycache__", false},
+		// A glob with an inner slash anchors the whole path.
+		{[]string{"dotnet/*/bin/"}, "dotnet/X/bin/", true},
+		{[]string{"dotnet/*/bin/"}, "bin/", false},
+		{[]string{"dotnet/*/bin/"}, "x/dotnet/X/bin/", false},
+		// A slash-free name matches the file entry at any depth, never the
+		// directory entry of the same name.
+		{[]string{"node_modules"}, "a/node_modules", true},
+		{[]string{"node_modules"}, "node_modules/", false},
+		{[]string{"*.csproj"}, "a/B.csproj", true},
 		// Files match by last segment; tracked ancestors never approve.
 		{def, "a/dist", true},
 		{def, "pkg/build/x", false},
