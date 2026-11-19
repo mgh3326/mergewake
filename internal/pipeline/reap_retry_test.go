@@ -58,9 +58,10 @@ func TestReapRetryPassGenerationIsRepositoryScoped(t *testing.T) {
 		t.Fatal("expected missing-hosts error before the reviewer-only sweep")
 	}
 	call("o/one")
-	s.reapRetryMu.Lock()
-	pass := s.reapPasses["o/one"]
-	s.reapRetryMu.Unlock()
+	state := s.reapState()
+	state.mu.Lock()
+	pass := state.passes["o/one"]
+	state.mu.Unlock()
 	if pass != 2 {
 		t.Fatalf("o/one pass=%d, want 2", pass)
 	}
@@ -79,7 +80,50 @@ func TestReapBudgetDoesNotHidePriorFailures(t *testing.T) {
 	if got := ReapNonBudgetErrors(joined); !errors.Is(got, failure) || !strings.Contains(got.Error(), "host-a /tree: "+failure.Error()) {
 		t.Fatalf("non-budget failure lost: %v", got)
 	}
-	if !ReapBudgetOnly(fmt.Errorf("%w; left: archive", ErrReapRepoBudget)) {
+	if !ReapBudgetOnly(&ReapBudgetStop{Left: "archive"}) {
 		t.Fatal("budget-only stop not recognized")
+	}
+}
+
+func TestReapBudgetKeepsUnrelatedDeadlineErrors(t *testing.T) {
+	timeout := fmt.Errorf("GitHub request: %w", context.DeadlineExceeded)
+	joined := errors.Join(timeout, fmt.Errorf("%w; left: host scans", ErrReapRepoBudget))
+	got := ReapNonBudgetErrors(joined)
+	if !errors.Is(got, context.DeadlineExceeded) || !strings.Contains(got.Error(), timeout.Error()) {
+		t.Fatalf("unrelated timeout lost while filtering budget stop: %v", got)
+	}
+}
+
+func TestReapBudgetStopUsesOneRecordedLeftValue(t *testing.T) {
+	state := &reapPassState{}
+	state.recordStage("final receipt and pass audit")
+	state.recordCut("git worktree remove")
+	stop := reapBudgetResult(state, nil)
+	if got := stop.Error(); strings.Count(got, "left:") != 1 || !errors.Is(stop, ErrReapRepoBudget) {
+		t.Fatalf("budget stop must carry one left clause and the sentinel: %v", got)
+	}
+	if ReapBudgetOnly(&ReapBudgetStop{Left: "hosts", Failures: context.DeadlineExceeded}) {
+		t.Fatal("budget stop with an independent timeout counted as budget-only")
+	}
+}
+
+func TestReapBudgetDoesNotMarkCompletedPassStopped(t *testing.T) {
+	if err := reapBudgetResult(&reapPassState{}, nil); err != nil {
+		t.Fatalf("completed pass acquired a false budget stop: %v", err)
+	}
+}
+
+func TestReapBudgetCutRecordsTheInterruptedOperation(t *testing.T) {
+	ctx, cancel := context.WithDeadlineCause(context.Background(), time.Now().Add(-time.Second), ErrReapRepoBudget)
+	defer cancel()
+	state := &reapPassState{}
+	ctx = context.WithValue(ctx, reapPassStateKey{}, state)
+	err := budgetCut(ctx, context.DeadlineExceeded, "host worktree inspect")
+	if !errors.Is(err, ErrReapRepoBudget) || ReapNonBudgetErrors(err) != nil {
+		t.Fatalf("budget cancellation was not classified as a budget cut: %v", err)
+	}
+	left, inflight := state.snapshot()
+	if left != "" || inflight != "host worktree inspect" {
+		t.Fatalf("cut state left=%q in-flight=%q", left, inflight)
 	}
 }

@@ -188,6 +188,9 @@ func (c *Client) send(ctx context.Context, method, route, accept string, data []
 	requestTime := time.Since(requestStarted)
 	if e != nil {
 		recordRequest(ctx, method, route, 0, cred.kind, requestTime)
+		if cause := context.Cause(ctx); cause != nil {
+			e = cause
+		}
 		return nil, fmt.Errorf("GitHub %s request failed: %w", method, e)
 	}
 	defer resp.Body.Close()

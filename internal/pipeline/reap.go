@@ -444,31 +444,6 @@ func ReapNonBudgetErrors(err error) error {
 	return errors.Join(leaves...)
 }
 
-func reapErrorsExcept(err, ignored error) error {
-	var leaves []error
-	var collect func(error)
-	collect = func(current error) {
-		if current == nil {
-			return
-		}
-		if !errors.Is(current, ignored) {
-			leaves = append(leaves, current)
-			return
-		}
-		if many, ok := current.(interface{ Unwrap() []error }); ok {
-			for _, child := range many.Unwrap() {
-				collect(child)
-			}
-			return
-		}
-		if one, ok := current.(interface{ Unwrap() error }); ok {
-			collect(one.Unwrap())
-		}
-	}
-	collect(err)
-	return errors.Join(leaves...)
-}
-
 // ReapBudgetOnly is true only when a pass stopped for budget and has no other
 // error leaf to audit or report.
 func ReapBudgetOnly(err error) bool {
@@ -482,6 +457,25 @@ type reapRetry struct {
 	nextAllowedPass uint64
 }
 
+type reapRetryState struct {
+	mu      sync.Mutex
+	retries map[string]reapRetry
+	passes  map[string]uint64
+}
+
+var reapRetryStateInitMu sync.Mutex
+
+func (s *Service) reapState() *reapRetryState {
+	// Service is copied by a few restart tests. Keep the lock behind a pointer
+	// so those copies remain vet-safe, and serialize zero-value initialization.
+	reapRetryStateInitMu.Lock()
+	defer reapRetryStateInitMu.Unlock()
+	if s.reapRetryState == nil {
+		s.reapRetryState = &reapRetryState{}
+	}
+	return s.reapRetryState
+}
+
 type reapPassKey struct{}
 
 func reapPass(ctx context.Context) uint64 {
@@ -490,35 +484,38 @@ func reapPass(ctx context.Context) uint64 {
 }
 
 func (s *Service) nextReapPass(repo string, wholeRepo bool) uint64 {
-	s.reapRetryMu.Lock()
-	defer s.reapRetryMu.Unlock()
-	if s.reapPasses == nil {
-		s.reapPasses = map[string]uint64{}
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.passes == nil {
+		state.passes = map[string]uint64{}
 	}
 	if wholeRepo {
-		s.reapPasses[repo]++
+		state.passes[repo]++
 	}
-	return s.reapPasses[repo]
+	return state.passes[repo]
 }
 
 func (s *Service) reapRetryAllowed(repo, job string, pass uint64) bool {
-	s.reapRetryMu.Lock()
-	defer s.reapRetryMu.Unlock()
-	if s.reapRetries == nil {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
 		return true
 	}
-	v, ok := s.reapRetries[repo+"\x00"+job]
+	v, ok := state.retries[repo+"\x00"+job]
 	return !ok || (pass >= v.nextAllowedPass && !s.now().Before(v.retryAt))
 }
 
 func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
-	s.reapRetryMu.Lock()
-	defer s.reapRetryMu.Unlock()
-	if s.reapRetries == nil {
-		s.reapRetries = map[string]reapRetry{}
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		state.retries = map[string]reapRetry{}
 	}
 	k := repo + "\x00" + job
-	v := s.reapRetries[k]
+	v := state.retries[k]
 	if v.failure != failure {
 		v = reapRetry{failure: failure}
 	}
@@ -529,37 +526,123 @@ func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
 	}
 	v.retryAt = s.now().Add(d)
 	v.nextAllowedPass = pass + 2 // skip the immediately following reap pass
-	s.reapRetries[k] = v
+	state.retries[k] = v
 }
 
 func (s *Service) reapRetryRestore(repo, job, failure string, pass uint64) bool {
-	s.reapRetryMu.Lock()
-	defer s.reapRetryMu.Unlock()
-	if s.reapRetries == nil {
-		s.reapRetries = map[string]reapRetry{}
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		state.retries = map[string]reapRetry{}
 	}
 	k := repo + "\x00" + job
-	if _, ok := s.reapRetries[k]; ok {
+	if _, ok := state.retries[k]; ok {
 		return false
 	}
 	// A durable failure receipt surviving a restart suppresses this pass even
 	// when the prior pass took longer than the time backoff.
-	s.reapRetries[k] = reapRetry{failure: failure, attempts: 1, retryAt: s.now(), nextAllowedPass: pass + 1}
+	state.retries[k] = reapRetry{failure: failure, attempts: 1, retryAt: s.now(), nextAllowedPass: pass + 1}
 	return true
 }
 
 func (s *Service) reapRetrySucceeded(repo, job string) {
-	s.reapRetryMu.Lock()
-	defer s.reapRetryMu.Unlock()
-	delete(s.reapRetries, repo+"\x00"+job)
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	delete(state.retries, repo+"\x00"+job)
 }
 
 type reapBudgetKey struct{}
 type reapBudget struct{ deadline time.Time }
 
+type reapPassStateKey struct{}
+
+type reapPassState struct {
+	mu       sync.Mutex
+	left     string
+	inflight string
+}
+
+func (s *reapPassState) recordStage(stage string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.left == "" {
+		s.left = stage
+	}
+}
+
+func (s *reapPassState) recordCut(operation string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == "" {
+		s.inflight = operation
+	}
+}
+
+func (s *reapPassState) snapshot() (left, inflight string) {
+	if s == nil {
+		return "", ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.left, s.inflight
+}
+
+// ReapBudgetStop marks a repository pass that stopped at a safe point or
+// returned from an operation cut short by its budget.
+type ReapBudgetStop struct {
+	Left     string
+	Failures error
+}
+
+func (e *ReapBudgetStop) Error() string {
+	if e.Failures == nil {
+		return fmt.Sprintf("%v; left: %s", ErrReapRepoBudget, e.Left)
+	}
+	return fmt.Sprintf("%v; left: %s; errors: %v", ErrReapRepoBudget, e.Left, e.Failures)
+}
+
+func (e *ReapBudgetStop) Unwrap() []error {
+	if e.Failures == nil {
+		return []error{ErrReapRepoBudget}
+	}
+	return []error{ErrReapRepoBudget, e.Failures}
+}
+
+func reapBudgetResult(state *reapPassState, failures error) error {
+	left, inflight := state.snapshot()
+	if left == "" && inflight == "" {
+		return failures
+	}
+	if left == "" {
+		left = "in-flight " + inflight
+	}
+	return &ReapBudgetStop{Left: left, Failures: failures}
+}
+
+func budgetCut(ctx context.Context, err error, operation string) error {
+	if err == nil || context.Cause(ctx) != ErrReapRepoBudget {
+		return err
+	}
+	if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
+		state.recordCut(operation)
+	}
+	return fmt.Errorf("%w: %s: %v", ErrReapRepoBudget, operation, err)
+}
+
 func reapBudgetCheck(ctx context.Context, remaining string) error {
 	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
 	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+		if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
+			state.recordStage(remaining)
+		}
 		return fmt.Errorf("%w; left: %s", ErrReapRepoBudget, remaining)
 	}
 	return nil
@@ -578,6 +661,8 @@ func reviewersOnly(ctx context.Context) bool { return ctx.Value(reviewersOnlyKey
 func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options) (retErr error) {
 	pass := s.nextReapPass(r.Name, prNum == 0)
 	ctx = context.WithValue(ctx, reapPassKey{}, pass)
+	passState := &reapPassState{}
+	ctx = context.WithValue(ctx, reapPassStateKey{}, passState)
 	budgetText := s.Config.Reap.RepoBudget
 	if budgetText == "" {
 		budgetText = config.RepoBudgetDefault
@@ -588,19 +673,25 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	}
 	var budgetDeadline time.Time
 	if budget > 0 {
+		mutationParent := ctx
 		budgetDeadline = time.Now().Add(budget)
 		budgetCtx, cancel := context.WithDeadlineCause(ctx, budgetDeadline, ErrReapRepoBudget)
 		defer cancel()
 		ctx = context.WithValue(budgetCtx, reapBudgetKey{}, reapBudget{deadline: budgetDeadline})
-		ctx = reap.WithBudgetSafeMutations(ctx)
+		ctx = reap.WithMutationParent(ctx, mutationParent)
 	}
 	defer func() {
-		if !budgetDeadline.IsZero() && context.Cause(ctx) == ErrReapRepoBudget {
-			retErr = errors.Join(reapErrorsExcept(retErr, context.DeadlineExceeded), fmt.Errorf("%w; left: in-flight operation", ErrReapRepoBudget))
+		failures := ReapNonBudgetErrors(retErr)
+		if failures != nil {
+			failures = errors.Join(failures, s.audit(r.Name, "reap-error", map[string]any{"error": failures.Error()}, o.DryRun))
 		}
-		if nonBudget := ReapNonBudgetErrors(retErr); nonBudget != nil {
-			retErr = errors.Join(retErr, s.audit(r.Name, "reap-error", map[string]any{"error": nonBudget.Error()}, o.DryRun))
+		left, inflight := passState.snapshot()
+		if errors.Is(retErr, ErrReapRepoBudget) && left == "" && inflight == "" {
+			// GitHub transport boundaries carry the budget cause directly; they
+			// cannot update this package's pass state at the call site.
+			passState.recordCut("external operation")
 		}
+		retErr = reapBudgetResult(passState, failures)
 	}()
 	if !s.Config.Reap.Enabled {
 		return errors.New("reap requires reap.enabled in host config")
@@ -1155,7 +1246,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 							rec.Result, rec.Reason = "skipped", reason
 							break
 						}
-						if e := c.hs.exec.RemoveWorktree(ctx, main, w.Path); e != nil {
+						if e := budgetCut(ctx, c.hs.exec.RemoveWorktree(ctx, main, w.Path), "guarded worktree removal"); e != nil {
 							rec.Result, rec.Reason = "error", e.Error()
 						} else {
 							rec.Result = "removed"
@@ -1171,7 +1262,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			// -d only: git itself refuses a branch that never merged anywhere.
 			brec := reapReceipt{Action: "delete-branch", Repo: r.Name, PR: p.Number, Host: c.hs.host.Name, Worktree: w.Path, Branch: entry.Branch}
 			if acting {
-				if e := c.hs.exec.DeleteBranch(ctx, main, entry.Branch); e != nil {
+				if e := budgetCut(ctx, c.hs.exec.DeleteBranch(ctx, main, entry.Branch), "branch deletion"); e != nil {
 					brec.Result, brec.Reason = "skipped", "refused: "+e.Error()
 				} else {
 					brec.Result = "deleted"

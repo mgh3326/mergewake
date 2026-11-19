@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeRunner struct {
@@ -438,21 +439,47 @@ func TestComposerState(t *testing.T) {
 	}
 }
 
-type cancellationRunner struct{ done <-chan struct{} }
-
-func (r *cancellationRunner) Run(ctx context.Context, _ string, _ []string, _, _ string) ([]byte, error) {
-	r.done = ctx.Done()
-	return nil, nil
+type mutationContextRunner struct {
+	hasDeadline bool
+	err         error
 }
 
-func TestBudgetSafeRemovalFinishesDespiteBudgetCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	runner := &cancellationRunner{}
-	if err := (Exec{Runner: runner}).RemoveWorktree(WithBudgetSafeMutations(ctx), "/main", "/tree"); err != nil {
-		t.Fatal(err)
+func (r *mutationContextRunner) Run(ctx context.Context, _ string, _ []string, _, _ string) ([]byte, error) {
+	_, r.hasDeadline = ctx.Deadline()
+	r.err = ctx.Err()
+	return nil, r.err
+}
+
+type blockingMutationRunner struct{}
+
+func (blockingMutationRunner) Run(ctx context.Context, _ string, _ []string, _, _ string) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestBudgetSafeRemovalIsBoundedAndHonorsShutdown(t *testing.T) {
+	parent := context.Background()
+	budgetCtx, cancelBudget := context.WithCancel(parent)
+	cancelBudget()
+	runner := &mutationContextRunner{}
+	ctx := WithMutationParent(budgetCtx, parent)
+	if err := (Exec{Runner: runner}).RemoveWorktree(ctx, "/main", "/tree"); err != nil {
+		t.Fatalf("budget canceled an already-started guarded removal: %v", err)
 	}
-	if runner.done != nil {
-		t.Fatal("budget-safe worktree removal received a cancellable context")
+	if !runner.hasDeadline {
+		t.Fatal("guarded removal did not receive an independent deadline")
+	}
+	started := time.Now()
+	err := (Exec{Runner: blockingMutationRunner{}}).RemoveWorktree(WithMutationParent(budgetCtx, parent, 20*time.Millisecond), "/main", "/tree")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatalf("blocked guarded removal was not bounded: elapsed=%s err=%v", time.Since(started), err)
+	}
+
+	shutdown, cancelShutdown := context.WithCancel(context.Background())
+	cancelShutdown()
+	runner = &mutationContextRunner{}
+	ctx = WithMutationParent(context.Background(), shutdown)
+	if err := (Exec{Runner: runner}).RemoveWorktree(ctx, "/main", "/tree"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown cancellation was not propagated: %v", err)
 	}
 }

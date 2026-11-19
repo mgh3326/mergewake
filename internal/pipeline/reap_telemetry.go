@@ -71,14 +71,15 @@ func (r reapTimedRunner) Run(ctx context.Context, command string, args []string,
 	started := time.Now()
 	out, err := r.base.Run(ctx, command, args, input, dir)
 	r.telemetry.add(category, time.Since(started))
-	return out, err
+	operation := filepath.Base(command)
+	if len(args) > 0 {
+		operation += " " + args[0]
+	}
+	return out, budgetCut(ctx, err, operation)
 }
 
 func reapRunner(ctx context.Context, base integrations.Runner) integrations.Runner {
-	if t := telemetryFrom(ctx); t != nil {
-		return reapTimedRunner{base: base, telemetry: t}
-	}
-	return base
+	return reapTimedRunner{base: base, telemetry: telemetryFrom(ctx)}
 }
 
 // timedHubOps includes the optional guarded worktree calls so host wait time
@@ -93,65 +94,69 @@ func (o timedHubOps) Panes(ctx context.Context) ([]reap.Pane, error) {
 	st := time.Now()
 	v, e := o.Ops.Panes(ctx)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "host panes")
 }
 func (o timedHubOps) AllPanes(ctx context.Context) ([]reap.Pane, error) {
 	st := time.Now()
 	v, e := o.Ops.AllPanes(ctx)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "host all-panes scan")
 }
 func (o timedHubOps) Inspect(ctx context.Context, path string) (*reap.Worktree, error) {
 	st := time.Now()
 	v, e := o.Ops.Inspect(ctx, path)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "worktree inspect")
 }
 func (o timedHubOps) Capture(ctx context.Context, p reap.Pane, dir string, since *time.Time, append bool) (reap.Capture, error) {
 	st := time.Now()
 	v, e := o.Ops.Capture(ctx, p, dir, since, append)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "pane capture")
 }
 func (o timedHubOps) Composer(ctx context.Context, p reap.Pane) (string, error) {
 	st := time.Now()
 	v, e := o.Ops.Composer(ctx, p)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "pane composer scan")
 }
 func (o timedHubOps) CloseExact(ctx context.Context, p reap.Pane) (string, error) {
 	st := time.Now()
 	v, e := o.Ops.CloseExact(ctx, p)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "pane close")
 }
 func (o timedHubOps) JobDone(ctx context.Context, job, lane string) error {
 	st := time.Now()
 	e := o.Ops.JobDone(ctx, job, lane)
 	o.measure(st)
-	return e
+	return budgetCut(ctx, e, "panewire job-done check")
 }
 func (o timedHubOps) WorktreeList(ctx context.Context, common, cursor string) (reap.WorktreePage, error) {
 	st := time.Now()
 	v, e := o.Ops.(reap.WorktreeLister).WorktreeList(ctx, common, cursor)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "worktree list")
 }
 func (o timedHubOps) WorktreeRemove(ctx context.Context, cwd, head, base string, regenerable []string, detached bool) (reap.WorktreeRemoveResult, error) {
 	st := time.Now()
+	mutationCtx, cancel := reap.MutationContext(ctx)
+	defer cancel()
 	v, e := o.Ops.(interface {
 		WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)
-	}).WorktreeRemove(reap.MutationContext(ctx), cwd, head, base, regenerable, detached)
+	}).WorktreeRemove(mutationCtx, cwd, head, base, regenerable, detached)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "guarded worktree removal")
 }
 func (o timedHubOps) WorktreeRemoveDisposable(ctx context.Context, cwd, head, base string, regenerable, disposable []string, detached bool) (reap.WorktreeRemoveResult, error) {
 	st := time.Now()
+	mutationCtx, cancel := reap.MutationContext(ctx)
+	defer cancel()
 	v, e := o.Ops.(interface {
 		WorktreeRemoveDisposable(context.Context, string, string, string, []string, []string, bool) (reap.WorktreeRemoveResult, error)
-	}).WorktreeRemoveDisposable(reap.MutationContext(ctx), cwd, head, base, regenerable, disposable, detached)
+	}).WorktreeRemoveDisposable(mutationCtx, cwd, head, base, regenerable, disposable, detached)
 	o.measure(st)
-	return v, e
+	return v, budgetCut(ctx, e, "guarded worktree removal")
 }
 
 type reapTimedJobs struct {
@@ -163,12 +168,12 @@ func (j reapTimedJobs) TaskJob(ctx context.Context, task string) (string, string
 	started := time.Now()
 	job, state, err := j.base.TaskJob(ctx, task)
 	j.telemetry.add("hk", time.Since(started))
-	return job, state, err
+	return job, state, budgetCut(ctx, err, "hk task-job lookup")
 }
 
 func (j reapTimedJobs) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
 	started := time.Now()
 	job, err := j.base.Job(ctx, id)
 	j.telemetry.add("hk", time.Since(started))
-	return job, err
+	return job, budgetCut(ctx, err, "hk job lookup")
 }

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
@@ -75,9 +74,7 @@ type Service struct {
 	// has new outcomes (see OutcomePublisher.Nudge). It must not block. Nil
 	// means nobody is told; the publisher's timer finds them.
 	OutcomesChanged func()
-	reapRetryMu     sync.Mutex
-	reapRetries     map[string]reapRetry
-	reapPasses      map[string]uint64
+	reapRetryState  *reapRetryState
 }
 type Options struct {
 	DryRun, Shadow, Observed bool

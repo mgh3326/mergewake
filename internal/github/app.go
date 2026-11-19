@@ -247,6 +247,9 @@ func (a *appAuth) send(ctx context.Context, c *Client, method, target, route str
 	requestTime := time.Since(requestStarted)
 	if e != nil {
 		recordRequest(ctx, method, route, 0, credApp, requestTime)
+		if cause := context.Cause(ctx); cause != nil {
+			e = cause
+		}
 		return 0, nil, fmt.Errorf("GitHub App %s request failed: %w", method, e)
 	}
 	defer resp.Body.Close()
