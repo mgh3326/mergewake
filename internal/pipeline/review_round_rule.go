@@ -272,8 +272,18 @@ type escalateFinding struct {
 	Body     string `json:"body"`
 }
 
-func buildFindingsFile(fb github.ReviewFeedback) ([]byte, error) {
+// findingsFit counts the findings in an escalate-author file: sent ones and
+// those left out to keep the file within escalateAuthorFindingsMax.
+type findingsFit struct {
+	sent, leftOut int
+}
+
+// buildFindingsFile encodes every open thread as an escalateFinding, within
+// escalateAuthorFindingsMax. Bodies are cut before a finding is left out (see
+// keepFindings); a file that fits unchanged is the same bytes as before.
+func buildFindingsFile(fb github.ReviewFeedback) ([]byte, findingsFit, error) {
 	list := make([]escalateFinding, 0, len(fb.Threads))
+	sevs := make([]string, 0, len(fb.Threads))
 	for _, t := range fb.Threads {
 		if len(t.Comments) == 0 {
 			continue
@@ -299,8 +309,30 @@ func buildFindingsFile(fb github.ReviewFeedback) ([]byte, error) {
 			Title:    title,
 			Body:     first.Body,
 		})
+		sevs = append(sevs, sev)
 	}
-	return json.Marshal(list)
+	keep, cut := keepFindings(sevs, escalateAuthorFindingsMax, func(keep []int, cut int) int {
+		data, err := findingsJSON(list, keep, cut)
+		if err != nil {
+			return escalateAuthorFindingsMax + 1 // strings and ints cannot fail to encode
+		}
+		return len(data)
+	})
+	data, err := findingsJSON(list, keep, cut)
+	return data, findingsFit{sent: len(keep), leftOut: len(list) - len(keep)}, err
+}
+
+// findingsJSON encodes the findings at keep (ascending indices) with each text
+// field cut to cut bytes.
+func findingsJSON(list []escalateFinding, keep []int, cut int) ([]byte, error) {
+	out := make([]escalateFinding, 0, len(keep))
+	for _, i := range keep {
+		f := list[i]
+		f.Title = cutText(f.Title, cut)
+		f.Body = cutText(f.Body, cut)
+		out = append(out, f)
+	}
+	return json.Marshal(out)
 }
 
 // escalateAuthorRound3 executes `panewire escalate-author` for compatibility.
@@ -341,7 +373,7 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 	task, _ := s.prTask(ctx, r, pr)
 	job, _, _, _ := s.boundJob(ctx, task)
 
-	data, err := buildFindingsFile(fb)
+	data, fit, err := buildFindingsFile(fb)
 	if err != nil {
 		_ = s.audit(r.Name, "escalate-author-error", map[string]any{"pr": pr.Number, "error": err.Error()}, o.DryRun)
 		return
@@ -382,10 +414,12 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 		st.setEscalated(true, now, outputStr)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "ladder-escalated", map[string]any{
-			"pr":     pr.Number,
-			"round":  ladderRound,
-			"rc":     0,
-			"output": outputStr,
+			"pr":                pr.Number,
+			"round":             ladderRound,
+			"rc":                0,
+			"output":            outputStr,
+			"findings_sent":     fit.sent,
+			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
 		if s.Log != nil {
 			s.Log.Info("escalate-author escalated", "pr", pr.Number, "output", outputStr)
@@ -415,10 +449,12 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 		st.setEscalated(true, now, outputStr)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "ladder-intact", map[string]any{
-			"pr":     pr.Number,
-			"round":  ladderRound,
-			"rc":     2,
-			"output": outputStr,
+			"pr":                pr.Number,
+			"round":             ladderRound,
+			"rc":                2,
+			"output":            outputStr,
+			"findings_sent":     fit.sent,
+			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
 		if s.Log != nil {
 			s.Log.Info("escalate-author intact", "pr", pr.Number, "output", outputStr)
@@ -430,28 +466,32 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 		if now.Sub(st.LadderPendingSince) < ladderPendingBound {
 			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 			_ = s.audit(r.Name, "ladder-pending", map[string]any{
-				"pr":     pr.Number,
-				"round":  ladderRound,
-				"rc":     exitCode,
-				"output": outputStr,
+				"pr":                pr.Number,
+				"round":             ladderRound,
+				"rc":                exitCode,
+				"output":            outputStr,
+				"findings_sent":     fit.sent,
+				"findings_left_out": fit.leftOut,
 			}, o.DryRun)
 			if s.Log != nil {
 				s.Log.Info("escalate-author pending", "pr", pr.Number, "output", outputStr)
 			}
 			return
 		}
-		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode)
+		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode, fit)
 	case 1:
-		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode)
+		s.ladderEnded(ctx, r, pr, o, st, now, outputStr, ladderRound, exitCode, fit)
 	default:
 		st.setEscalated(true, now, outputStr)
 		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 		_ = s.audit(r.Name, "escalate-author-error", map[string]any{
-			"pr":     pr.Number,
-			"round":  ladderRound,
-			"rc":     exitCode,
-			"error":  err.Error(),
-			"output": outputStr,
+			"pr":                pr.Number,
+			"round":             ladderRound,
+			"rc":                exitCode,
+			"error":             err.Error(),
+			"output":            outputStr,
+			"findings_sent":     fit.sent,
+			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
 		if s.Log != nil {
 			s.Log.Warn("escalate-author error", "pr", pr.Number, "error", err, "output", outputStr)
@@ -462,15 +502,17 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 // ladderEnded records the ended-without-successor outcome: the step is done
 // (marked escalated so it is not retried), audited, and the owner lane gets
 // one decision event. The caller holds the round-rule state lock.
-func (s *Service) ladderEnded(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, now time.Time, output string, ladderRound, exitCode int) {
+func (s *Service) ladderEnded(ctx context.Context, r config.Repo, pr github.Pull, o Options, st *roundRuleState, now time.Time, output string, ladderRound, exitCode int, fit findingsFit) {
 	st.setEscalated(true, now, output)
 	st.LadderEndedNoSuccessor = true
 	_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
 	_ = s.audit(r.Name, "ladder-ended-no-successor", map[string]any{
-		"pr":     pr.Number,
-		"round":  ladderRound,
-		"rc":     exitCode,
-		"output": output,
+		"pr":                pr.Number,
+		"round":             ladderRound,
+		"rc":                exitCode,
+		"output":            output,
+		"findings_sent":     fit.sent,
+		"findings_left_out": fit.leftOut,
 	}, o.DryRun)
 	if s.Log != nil {
 		s.Log.Warn("escalate-author ended without successor", "pr", pr.Number, "rc", exitCode, "output", output)
