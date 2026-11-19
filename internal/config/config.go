@@ -444,9 +444,13 @@ const (
 // reap.legacy_every is unset.
 const LegacyEveryDefault = "24h"
 
+// RepoBudgetDefault limits one repository's reap work in each daemon pass.
+const RepoBudgetDefault = "3m"
+
 type Reap struct {
 	Enabled       bool   `yaml:"enabled"`
 	Act           bool   `yaml:"act"`
+	RepoBudget    string `yaml:"repo_budget"`
 	WorktreeAfter string `yaml:"worktree_after"`
 	ScanAfter     string `yaml:"scan_after"`
 	// LegacyEvery is how often the daemon runs the legacy sweep for a repo;
@@ -1119,6 +1123,12 @@ func validateReap(c *Config) error {
 	}
 	if _, e = OptionalDuration(c.Reap.WorktreeAfter); e != nil {
 		return e
+	}
+	if c.Reap.RepoBudget == "" {
+		c.Reap.RepoBudget = RepoBudgetDefault
+	}
+	if _, e = Duration(c.Reap.RepoBudget); e != nil {
+		return fmt.Errorf("reap.repo_budget: %w", e)
 	}
 	if c.Reap.ScanAfter == "" {
 		c.Reap.ScanAfter = "720h"

@@ -179,6 +179,7 @@ func TestReapConfig(t *testing.T) {
 		{"act no enable", "reap:\n  act: true\n", true},
 		{"bad after", "reap:\n  worktree_after: -1h\n", true},
 		{"bad scan", "reap:\n  scan_after: 0s\n", true},
+		{"bad repo budget", "reap:\n  repo_budget: soon\n", true},
 		{"legacy every default", "reap:\n  enabled: true\n", false},
 		{"legacy every", "reap:\n  legacy_every: 48h\n", false},
 		{"legacy every off", "reap:\n  legacy_every: off\n", false},

@@ -74,6 +74,7 @@ type Service struct {
 	// has new outcomes (see OutcomePublisher.Nudge). It must not block. Nil
 	// means nobody is told; the publisher's timer finds them.
 	OutcomesChanged func()
+	reapRetryState  *reapRetryState
 }
 type Options struct {
 	DryRun, Shadow, Observed bool
