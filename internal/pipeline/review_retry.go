@@ -497,6 +497,9 @@ func (s *Service) retryReviewStatus(ctx context.Context, r config.Repo, pr githu
 			return true, false, nil
 		}
 	}
+	if _, _, covered := s.cleanBaseMergePasses(ctx, r, pr, history, needed); covered {
+		return true, false, nil
+	}
 	ttl, err := s.reviewLeaseTTL()
 	if err != nil {
 		return false, false, err
