@@ -583,12 +583,17 @@ func commandExitCode(err error) int {
 
 // buildConsultQuestion writes the question document the hub consult runs
 // on: the PR, the reviewed head, the task's contract pointer and every
-// open finding with its id, severity, path:line and text.
+// open finding with its id, severity, path:line and text. The document stays
+// within consultQuestionMax; findings and text are cut as keepFindings
+// describes, and a note says how many were left out.
 func buildConsultQuestion(r config.Repo, pr github.Pull, task string, fb github.ReviewFeedback) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Consult question — %s#%d\n\n", r.Name, pr.Number)
 	fmt.Fprintf(&b, "- PR: %s#%d\n- Reviewed head: %s\n- Task: hk %s (the task record is the contract pointer)\n\n", r.Name, pr.Number, pr.Head.SHA, task)
 	b.WriteString("The PR's review round reached the consult round without a pass. Find the root cause of the open findings and answer with the consult report shape (Verdict / Root cause / Design / Findings).\n\n## Open findings\n\n")
+
+	var open []consultFinding
+	var sevs []string
 	for _, t := range fb.Threads {
 		if t.IsResolved || len(t.Comments) == 0 {
 			continue
@@ -602,7 +607,33 @@ func buildConsultQuestion(r config.Repo, pr github.Pull, task string, fb github.
 		if id == "" {
 			id = first.URL
 		}
-		fmt.Fprintf(&b, "### %s — %s %s:%d\n\n%s\n\n", id, sev, t.Path, t.Line, first.Body)
+		open = append(open, consultFinding{id: id, sev: sev, path: t.Path, line: t.Line, body: first.Body})
+		sevs = append(sevs, sev)
 	}
+	keep, cut := keepFindings(sevs, consultQuestionMax-b.Len(), func(keep []int, cut int) int {
+		return len(consultFindingsSection(open, keep, cut))
+	})
+	b.WriteString(consultFindingsSection(open, keep, cut))
 	return []byte(b.String())
+}
+
+// consultFinding is one open thread as the consult question lists it.
+type consultFinding struct {
+	id, sev, path string
+	line          int
+	body          string
+}
+
+// consultFindingsSection renders the findings at keep (ascending indices),
+// each body cut to cut bytes, and a note when findings were left out.
+func consultFindingsSection(open []consultFinding, keep []int, cut int) string {
+	var b strings.Builder
+	for _, i := range keep {
+		f := open[i]
+		fmt.Fprintf(&b, "### %s — %s %s:%d\n\n%s\n\n", f.id, f.sev, f.path, f.line, cutText(f.body, cut))
+	}
+	if left := len(open) - len(keep); left > 0 {
+		fmt.Fprintf(&b, "%d open findings are left out of this question to fit its size bound; they remain open on the PR.\n\n", left)
+	}
+	return b.String()
 }
