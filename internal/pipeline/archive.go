@@ -319,7 +319,6 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	archivedThisRun, eligibleLeft := 0, 0
 	stoppedOnBudget := false
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
-jobsWalk:
 	for _, h := range s.Config.Hosts {
 		if host != "" && h.Name != host {
 			continue
@@ -372,7 +371,7 @@ jobsWalk:
 			jobs[i] = ordered[i].name
 		}
 		for jobIndex, job := range jobs {
-			if maxRun > 0 && s.now().Sub(started) >= maxRun {
+			if stoppedOnBudget || maxRun > 0 && s.now().Sub(started) >= maxRun {
 				stoppedOnBudget = true
 				for _, pending := range jobs[jobIndex:] {
 					if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
@@ -382,7 +381,7 @@ jobsWalk:
 						eligibleLeft++
 					}
 				}
-				break jobsWalk
+				break
 			}
 			if e := ctx.Err(); e != nil {
 				return errors.Join(append(errs, e)...)

@@ -33,12 +33,16 @@ type archiveRunner struct {
 	treeBytes           int
 	failCatPath         string
 	failTarDir          string
+	failReadProbe       bool
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	a.calls++
 	if name == "cat" && a.failCatPath != "" && strings.HasSuffix(args[len(args)-1], a.failCatPath) {
 		return nil, errors.New("exit status 1")
+	}
+	if name == "true" && a.failReadProbe {
+		return nil, errors.New("ssh: exit status 255")
 	}
 	if (name == "tar" || name == "env") && a.failTarDir != "" {
 		for i := 0; i+1 < len(args); i++ {
@@ -363,11 +367,34 @@ func TestArchiveJobsUnreadableReadSkipsAndContinues(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsUnreadableProbeFailureRemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	f.run.failReadProbe = true
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("read failure with an unavailable host probe should fail the run")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
+		t.Fatalf("transport failure was not recorded as a run error: %s", f.out.String())
+	}
+}
+
 func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
 	jobDir(t, f.jobs, "first", 20*24*time.Hour)
 	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobDir(t, otherJobs, "third", 20*24*time.Hour)
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
 	base := time.Now()
 	calls := 0
 	f.s.Now = func() time.Time {
@@ -378,7 +405,7 @@ func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
 		t.Fatalf("budget stop failed the run: %v", err)
 	}
-	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":1`) {
+	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":2`) {
 		t.Fatalf("budget summary or boundary is wrong: %s", f.out.String())
 	}
 	if strings.Contains(f.out.String(), `"job":"second"`) {

@@ -396,7 +396,7 @@ func (a *Archiver) task(ctx context.Context, h reap.Host, dir string, files []Fi
 		for i := len(names) - 1; i >= 0; i-- {
 			b, err := a.on(ctx, h.SSH, "", "cat", filepath.Join(dir, names[i]))
 			if err != nil {
-				return "", &Skip{fmt.Sprintf("unreadable: cat %s: %v", names[i], err)}
+				return "", a.readFailure(ctx, h.SSH, names[i], err)
 			}
 			var v struct {
 				Payload struct {
@@ -585,7 +585,7 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 	}
 	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 	if err != nil {
-		return false, &Skip{fmt.Sprintf("unreadable: cat %s: %v", path.Base(mpath), err)}
+		return false, a.readFailure(ctx, a.SSH, path.Base(mpath), err)
 	}
 	var m manifest
 	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -826,7 +826,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		// to the delete; anything else never overwrites it.
 		raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
 		if err != nil {
-			return nil, &Skip{fmt.Sprintf("unreadable: cat %s: %v", path.Base(mpath), err)}
+			return nil, a.readFailure(ctx, a.SSH, path.Base(mpath), err)
 		}
 		var m manifest
 		if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
@@ -994,12 +994,22 @@ func (a *Archiver) readText(ctx context.Context, ssh, dir string, files []File) 
 		// candidate only on this error path so the receipt can name the file.
 		for _, f := range files {
 			if _, readErr := a.on(ctx, ssh, "", "cat", filepath.Join(dir, f.Path)); readErr != nil {
-				return nil, &Skip{fmt.Sprintf("unreadable: cat %s: %v", f.Path, readErr)}
+				return nil, a.readFailure(ctx, ssh, f.Path, readErr)
 			}
 		}
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
 	return parseText(dir, files, b)
+}
+
+// readFailure classifies an individual cat failure as unreadable only when a
+// separate command confirms that the host still answers. A transport failure
+// keeps the original command error and therefore remains a run error.
+func (a *Archiver) readFailure(ctx context.Context, ssh, rel string, err error) error {
+	if _, probeErr := a.on(ctx, ssh, "", "true"); probeErr != nil {
+		return err
+	}
+	return &Skip{fmt.Sprintf("unreadable: cat %s: %v", rel, err)}
 }
 
 // parseText maps a tar stream's regular entries to their bytes. A candidate
