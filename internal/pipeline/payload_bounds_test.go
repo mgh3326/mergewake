@@ -150,6 +150,56 @@ func TestFindingsFileBoundDropsLowestTierFirst(t *testing.T) {
 	}
 }
 
+// Ladder: 200 highs whose 400-byte paths alone exceed 32 KiB, then three
+// criticals last. The criticals are kept, and only a prefix of the highs in
+// current order is kept. If critical and high shared a tier, the criticals at
+// the end would be dropped and this test would fail.
+func TestFindingsFileBoundCriticalBeforeHigh(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 5)
+	path := strings.Repeat("p", 400)
+	var threads []github.ReviewThread
+	for i := 0; i < 200; i++ {
+		threads = append(threads, boundFinding(fmt.Sprintf("H%03d", i), "high", path, i+1, strings.Repeat("x", 2000)))
+	}
+	for i := 0; i < 3; i++ {
+		threads = append(threads, boundFinding(fmt.Sprintf("C%d", i), "critical", path, 300+i, strings.Repeat("y", 2000)))
+	}
+	g.feedback.Threads = threads
+
+	deliver(t, s, r)
+
+	_, _, findings := escalateSnapshot(run)
+	if len(findings) > panewireFindingsMax {
+		t.Fatalf("findings file is %d bytes; panewire refuses above %d", len(findings), panewireFindingsMax)
+	}
+	got := decodeEscalated(t, findings)
+	criticals := 0
+	var highs []string
+	for _, f := range got {
+		switch f.Severity {
+		case "critical":
+			criticals++
+		case "high":
+			highs = append(highs, f.Ref)
+		}
+	}
+	if criticals != 3 {
+		t.Fatalf("kept %d of 3 critical findings", criticals)
+	}
+	if len(highs) == 0 || len(highs) >= 200 {
+		t.Fatalf("want some but not all highs kept, got %d", len(highs))
+	}
+	for i, ref := range highs {
+		if want := fmt.Sprintf("H%03d", i); ref != want {
+			t.Fatalf("kept highs are not a prefix in current order: position %d is %s, want %s", i, ref, want)
+		}
+	}
+	sent, left := ladderAuditFindings(t, s, r.Name)
+	if sent != float64(len(got)) || left != float64(203-len(got)) {
+		t.Fatalf("audit sent=%v left_out=%v; file has %d findings", sent, left, len(got))
+	}
+}
+
 // Consult: 300 high findings with long bodies and a critical last. The
 // question fits the brief bound with panewire's preamble and key line, the
 // critical is kept, and the note says findings were left out.
@@ -188,13 +238,13 @@ func TestConsultQuestionSmallKeepsEveryFinding(t *testing.T) {
 		boundFinding("T2", "low", "tool", 11, "short"),
 	}}
 	q := string(buildConsultQuestion(r, pr, "2481", fb))
-	for _, id := range []string{"### T1 ", "### T2 "} {
-		if !strings.Contains(q, id) {
-			t.Fatalf("missing %q in the consult question", id)
-		}
-	}
-	if strings.Contains(q, "left out") {
-		t.Fatalf("a question that fits carries a left-out note")
+	// The findings section is byte-for-byte what the builder wrote before the
+	// bound: headings and bodies in thread order, no note.
+	const findings = "## Open findings\n\n" +
+		"### T1 — high tool:10\n\n<!-- mergewake-severity:high -->\nshort\n\n" +
+		"### T2 — low tool:11\n\n<!-- mergewake-severity:low -->\nshort\n\n"
+	if !strings.HasSuffix(q, findings) {
+		t.Fatalf("findings section changed for a question that fits:\n%q", q)
 	}
 }
 
