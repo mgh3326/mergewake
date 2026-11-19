@@ -86,6 +86,27 @@ type Skip struct{ Reason string }
 
 func (s *Skip) Error() string { return "skipped: " + s.Reason }
 
+// Unreadable records a confirmed per-file read failure. It remains an error
+// by default; archive-jobs alone converts it to a skipped receipt.
+type Unreadable struct {
+	Path string
+	Err  error
+}
+
+func (u *Unreadable) Error() string {
+	return fmt.Sprintf("unreadable: cat %s: %v", u.Path, u.Err)
+}
+
+// UnreadableReason identifies a confirmed per-file read failure for the
+// archive-jobs receipt path without changing other callers' error semantics.
+func UnreadableReason(err error) (string, bool) {
+	var unreadable *Unreadable
+	if errors.As(err, &unreadable) {
+		return unreadable.Error(), true
+	}
+	return "", false
+}
+
 // Archiver holds the archive destination. SSH is the archive host as an
 // ssh(1) destination reachable from this machine; empty or "local" means the
 // Drive folder is on this machine. DriveDir must be absolute on that host.
@@ -990,26 +1011,73 @@ func (a *Archiver) readText(ctx context.Context, ssh, dir string, files []File) 
 	}
 	b, err := a.on(ctx, ssh, listInput(filePaths(files)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
 	if err != nil {
-		// The batch read does not identify which candidate failed. Probe each
-		// candidate only on this error path so the receipt can name the file.
-		for _, f := range files {
-			if _, readErr := a.on(ctx, ssh, "", "cat", filepath.Join(dir, f.Path)); readErr != nil {
-				return nil, a.readFailure(ctx, ssh, f.Path, readErr)
-			}
+		if readErr := a.findUnreadableText(ctx, ssh, dir, files, err); readErr != nil {
+			return nil, readErr
 		}
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
 	return parseText(dir, files, b)
 }
 
-// readFailure classifies an individual cat failure as unreadable only when a
-// separate command confirms that the host still answers. A transport failure
-// keeps the original command error and therefore remains a run error.
+const maxReadFailureProbes = 32
+
+// findUnreadableText narrows a failed batch read with bounded batch probes,
+// then confirms a single candidate with cat. If the initial or a probe
+// indicates transport loss, it returns that error instead of a job skip.
+func (a *Archiver) findUnreadableText(ctx context.Context, ssh, dir string, files []File, original error) error {
+	if hasExitStatus(original, 255) {
+		return original
+	}
+	if _, err := a.on(ctx, ssh, "", "true"); err != nil {
+		return original
+	}
+	probes := 0
+	var search func([]File) error
+	search = func(group []File) error {
+		if len(group) == 1 {
+			f := group[0]
+			_, err := a.on(ctx, ssh, "", "cat", filepath.Join(dir, f.Path))
+			if err == nil {
+				return nil
+			}
+			return a.readFailure(ctx, ssh, f.Path, err)
+		}
+		mid := len(group) / 2
+		for _, half := range [][]File{group[:mid], group[mid:]} {
+			if probes >= maxReadFailureProbes {
+				return nil
+			}
+			probes++
+			_, err := a.on(ctx, ssh, listInput(filePaths(half)), "env", "COPYFILE_DISABLE=1", "tar", "-C", dir, "--null", "-T", "-", "-cf", "-")
+			if err == nil {
+				continue
+			}
+			if hasExitStatus(err, 255) {
+				return err
+			}
+			if err := search(half); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return search(files)
+}
+
+// readFailure classifies only a remote command exit status of 1 as an
+// unreadable file, and only when a separate command confirms the host answers.
 func (a *Archiver) readFailure(ctx context.Context, ssh, rel string, err error) error {
+	if !hasExitStatus(err, 1) {
+		return err
+	}
 	if _, probeErr := a.on(ctx, ssh, "", "true"); probeErr != nil {
 		return err
 	}
-	return &Skip{fmt.Sprintf("unreadable: cat %s: %v", rel, err)}
+	return &Unreadable{Path: rel, Err: err}
+}
+
+func hasExitStatus(err error, status int) bool {
+	return strings.Contains(err.Error(), fmt.Sprintf("exit status %d", status))
 }
 
 // parseText maps a tar stream's regular entries to their bytes. A candidate

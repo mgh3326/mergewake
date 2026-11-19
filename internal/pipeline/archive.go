@@ -318,12 +318,17 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	counts := map[string]int{}
 	archivedThisRun, eligibleLeft := 0, 0
 	stoppedOnBudget := false
+	var unscannedHosts []string
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
 	for _, h := range s.Config.Hosts {
 		if host != "" && h.Name != host {
 			continue
 		}
 		found = true
+		if stoppedOnBudget {
+			unscannedHosts = append(unscannedHosts, h.Name)
+			continue
+		}
 		if h.Jobs == "" {
 			errs = append(errs, fmt.Errorf("%s: hosts[].jobs is unset", h.Name))
 			continue
@@ -401,7 +406,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
 			} else if files, reason, newest, e := a.RefreshJob(ctx, h, job, filepath.Join(root, job)); e != nil {
-				row.Result, row.Reason = archive.Reason(e)
+				row.Result, row.Reason = archiveJobsReason(e)
 			} else if reason != "" {
 				row.Result, row.Reason = "skipped", reason
 			} else if now.Sub(time.Unix(newest, 0)) < olderThan {
@@ -410,7 +415,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				eligibleLeft++
 				continue
 			} else if p, e := a.PlanListed(ctx, h, job, filepath.Join(root, job), files); e != nil {
-				row.Result, row.Reason = archive.Reason(e)
+				row.Result, row.Reason = archiveJobsReason(e)
 			} else if e := s.Print(p); e != nil {
 				return errors.Join(append(errs, e)...)
 			} else if !acting {
@@ -420,7 +425,7 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 				res, e := a.Apply(ctx, p, now)
 				row.Archive = res
 				if e != nil {
-					row.Result, row.Reason = archive.Reason(e)
+					row.Result, row.Reason = archiveJobsReason(e)
 				} else if len(res.Retained) != 0 {
 					row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 				} else {
@@ -443,18 +448,26 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 		return fmt.Errorf("no configured host %q", host)
 	}
 	summary := struct {
-		Action          string `json:"action"`
-		Shadow          bool   `json:"shadow"`
-		OlderThan       string `json:"older_than"`
-		Archived        int    `json:"archived"`
-		Retained        int    `json:"archived_retained"`
-		Planned         int    `json:"planned"`
-		Skipped         int    `json:"skipped"`
-		ErrCount        int    `json:"errors"`
-		EligibleLeft    int    `json:"eligible_left"`
-		StoppedOnBudget bool   `json:"stopped_on_budget"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, stoppedOnBudget}
+		Action          string   `json:"action"`
+		Shadow          bool     `json:"shadow"`
+		OlderThan       string   `json:"older_than"`
+		Archived        int      `json:"archived"`
+		Retained        int      `json:"archived_retained"`
+		Planned         int      `json:"planned"`
+		Skipped         int      `json:"skipped"`
+		ErrCount        int      `json:"errors"`
+		EligibleLeft    int      `json:"eligible_left"`
+		StoppedOnBudget bool     `json:"stopped_on_budget"`
+		UnscannedHosts  []string `json:"unscanned_hosts,omitempty"`
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, stoppedOnBudget, unscannedHosts}
 	return errors.Join(append(errs, s.Print(summary))...)
+}
+
+func archiveJobsReason(err error) (string, string) {
+	if reason, ok := archive.UnreadableReason(err); ok {
+		return "skipped", reason
+	}
+	return archive.Reason(err)
 }
 
 func (s *Service) archiveNote(v archiveRow, dry bool) error {

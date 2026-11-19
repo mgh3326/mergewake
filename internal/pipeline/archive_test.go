@@ -34,17 +34,25 @@ type archiveRunner struct {
 	failCatPath         string
 	failTarDir          string
 	failReadProbe       bool
+	failCatError        string
+	tarProbes           int
 }
 
 func (a *archiveRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	a.calls++
 	if name == "cat" && a.failCatPath != "" && strings.HasSuffix(args[len(args)-1], a.failCatPath) {
+		if a.failCatError != "" {
+			return nil, errors.New(a.failCatError)
+		}
 		return nil, errors.New("exit status 1")
 	}
 	if name == "true" && a.failReadProbe {
 		return nil, errors.New("ssh: exit status 255")
 	}
 	if (name == "tar" || name == "env") && a.failTarDir != "" {
+		if name == "env" && strings.Contains(strings.Join(args, " "), "tar") {
+			a.tarProbes++
+		}
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "-C" && args[i+1] == a.failTarDir && (name == "tar" || strings.Contains(strings.Join(args[:i], " "), "tar")) {
 				return nil, errors.New("exit status 1")
@@ -367,6 +375,17 @@ func TestArchiveJobsUnreadableReadSkipsAndContinues(t *testing.T) {
 	}
 }
 
+func TestReapArchiveUnreadableTaskReadRemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	f.run.failCatPath = "00004-job.task_link.json"
+	rec := reapReceipt{Host: "local", Job: "bad-job"}
+	f.s.archiveJob(context.Background(), f.s.Config.Hosts[0], "bad-job", false, &rec)
+	if rec.Result != "error" || !strings.Contains(rec.Reason, "unreadable: cat events/00004-job.task_link.json") {
+		t.Fatalf("reap archive row = %+v, want error for the same unreadable task read", rec)
+	}
+}
+
 func TestArchiveJobsUnreadableProbeFailureRemainsRunError(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
@@ -405,11 +424,51 @@ func TestArchiveJobsStopsAtMaxRunBoundary(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
 		t.Fatalf("budget stop failed the run: %v", err)
 	}
-	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":2`) {
+	if !strings.Contains(f.out.String(), `"job":"first","result":"would-archive"`) || !strings.Contains(f.out.String(), `"stopped_on_budget":true`) || !strings.Contains(f.out.String(), `"eligible_left":1`) || !strings.Contains(f.out.String(), `"unscanned_hosts":["other"]`) {
 		t.Fatalf("budget summary or boundary is wrong: %s", f.out.String())
 	}
 	if strings.Contains(f.out.String(), `"job":"second"`) {
 		t.Fatalf("walk processed a job after budget: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsTransportCatExit255RemainsRunError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	f.run.failTarDir = bad
+	f.run.failCatPath = "brief.md"
+	f.run.failCatError = "ssh: exit status 255"
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("cat transport failure must fail the run even when a later probe could succeed")
+	}
+	if !strings.Contains(f.out.String(), `"job":"bad-job","result":"error"`) {
+		t.Fatalf("transport failure was not recorded as an error row: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsFailedBatchReadProbesAreBounded(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	bad := jobDir(t, f.jobs, "many-files", 20*24*time.Hour)
+	if err := os.RemoveAll(filepath.Join(bad, "events")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		file := filepath.Join(bad, fmt.Sprintf("file-%03d.md", i))
+		writeFile(t, file, "body")
+		old := time.Now().Add(-20 * 24 * time.Hour)
+		if err := os.Chtimes(file, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.run.failTarDir = bad
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err == nil {
+		t.Fatal("generic batch read failure should remain an error")
+	}
+	if f.run.tarProbes > 33 {
+		t.Fatalf("failed batch read issued %d tar commands, want at most 33", f.run.tarProbes)
 	}
 }
 
