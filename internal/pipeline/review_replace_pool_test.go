@@ -2,9 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -52,7 +54,7 @@ func TestReplacementNoCandidateRetriesOnceWithoutExclusion(t *testing.T) {
 	s, g, r, runner, old := lostReviewerSetup(t, integrations.JobRecord{State: "claimed", OwnerLane: "owner", Pool: "devin"})
 	runner.noCandidateExcluded = true
 	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; spawns=%d exclusions=%q", err, len(runner.spawns), spawnExclusions(runner.spawns))
 	}
 	if len(runner.spawns) != 3 {
 		t.Fatalf("spawns = %d, want first, refused replacement, retry: %v", len(runner.spawns), runner.spawns)
@@ -106,4 +108,63 @@ func TestNoCandidateRefusalKeysOnExitAndText(t *testing.T) {
 	if noCandidateRefusal([]byte("no placement candidate accepted"), panewireExit(77)) {
 		t.Fatal("another exit is not no candidate")
 	}
+}
+
+// The replacement's spawn ends on a quota escalation: panewire ends the
+// request, the record goes, and the next run's fresh spawn of the same pass
+// still leaves the lost devin pool out.
+func TestReplacementPoolSurvivesADroppedRecord(t *testing.T) {
+	s, _, r, runner, _ := lostReviewerSetup(t, integrations.JobRecord{State: "claimed", OwnerLane: "owner", Pool: "devin"})
+	runner.exits = []int{panewireQuotaEscalate}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err == nil {
+		t.Fatal("escalated replacement reported no failure")
+	}
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "--exclude-pool") != "devin" {
+		t.Fatalf("spawns=%v", runner.spawns)
+	}
+	reviewerJobGone(t, s, r, 1)
+	runner.exits = nil
+	runner.sink.missing = &integrations.JobRecord{State: "completed", Family: "openai", Result: json.RawMessage(`{"findings":[]}`)}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 3 || arg(runner.spawns[2], "--exclude-pool") != "devin" {
+		t.Fatalf("next run's spawn lost the exclusion: %v", runner.spawns)
+	}
+}
+
+// A resumed replay of a replacement that the no-candidate exclusion refuses
+// is placed once more without it, and the record keeps what is now sent.
+func TestResumedReplacementNoCandidateRetriesWithoutExclusion(t *testing.T) {
+	s, g, r, runner, _ := lostReviewerSetup(t, integrations.JobRecord{State: "claimed", OwnerLane: "owner", Pool: "devin"})
+	runner.exits = []int{panewireWaitTimeout}
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 2 || arg(runner.spawns[1], "--exclude-pool") != "devin" {
+		t.Fatalf("replacement spawns=%v", runner.spawns)
+	}
+	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
+	g.leaseTimes[claimRef(7, shaA, 1)] = time.Now().Add(-time.Hour)
+	runner.findings = `{"findings":[]}`
+	runner.noCandidateExcluded = true
+	if err := s.Review(context.Background(), r, 7, "", Options{}); err != nil {
+		t.Fatalf("second review: %v; spawns=%d exclusions=%q", err, len(runner.spawns), spawnExclusions(runner.spawns))
+	}
+	if len(runner.spawns) != 4 || arg(runner.spawns[2], "--exclude-pool") != "devin" || slices.Contains(runner.spawns[3], "--exclude-pool") {
+		t.Fatalf("resumed replay: %d spawns, exclusions=%q", len(runner.spawns), spawnExclusions(runner.spawns))
+	}
+	if g.postCount != 1 {
+		t.Fatalf("posts=%d, want the retried reviewer's findings", g.postCount)
+	}
+	reviewerJobGone(t, s, r, 1)
+}
+
+// spawnExclusions lists each spawn's --exclude-pool value, "" when none.
+func spawnExclusions(spawns [][]string) []string {
+	var out []string
+	for _, sp := range spawns {
+		out = append(out, arg(sp, "--exclude-pool"))
+	}
+	return out
 }
