@@ -573,13 +573,19 @@ func TestHubConsult_NoTaskFallsBack(t *testing.T) {
 	}
 }
 
-// One consult runs per PR: a push that keeps the PR in the consult round does
-// not request a second one. The row requested for the old head is followed on
-// until it settles, and its outcome goes out with the next author delivery.
-func TestHubConsult_NewHeadFollowsOldRowAndAsksNoSecond(t *testing.T) {
+// A consult is keyed by head: a new head that inherits the reviewed patch
+// and stays in the consult round never reuses the old head's row. The old row
+// is superseded and recorded, and — one consult runs per PR — no second one is
+// requested: the new head's findings go out at once.
+func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
 	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	run.queue = []consultResp{
+		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
+		{rc: 0, out: `{"id":"c-2","state":"queued"}`},
+	}
 	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+	hub.rows["c-2"] = reap.ConsultRow{ID: "c-2", State: "queued"}
 
 	deliver(t, s, r)
 	if run.requestCount() != 1 || n.count != 0 {
@@ -587,45 +593,38 @@ func TestHubConsult_NewHeadFollowsOldRowAndAsksNoSecond(t *testing.T) {
 	}
 
 	// The author pushes; the same reviewed patch keeps the round at the
-	// consult round. The old row is still queued: the new head's pass asks
-	// nothing more and does not wait on it.
+	// consult round. The consult was already asked for this PR.
 	g.pull.Head.SHA = shaC
 	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-3", Round: 3}}
 	g.refs[doneRef(7, shaC)] = true
 
 	deliver(t, s, r)
+
 	if run.requestCount() != 1 {
-		t.Fatalf("a second consult was requested: %v", run.requests)
-	}
-	if hub.getCount() == 0 {
-		t.Fatal("old head's row not followed")
-	}
-	st := s.loadRoundRuleState(r.Name, 7)
-	if st.HubConsultID != "c-1" || st.HubConsultHead != shaA || !st.HubConsultOwed {
-		t.Fatalf("state lost the old row: %+v", st)
+		t.Fatalf("a second consult was requested for the PR: %v", run.requests)
 	}
 	if n.count != 1 || strings.Contains(n.events[0].Text, "hub consult") {
 		t.Fatalf("the new head's findings must go out without the stale outcome: %+v", n.events)
 	}
-
-	// The row answers later; its outcome rides the next author delivery.
-	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "answered", AnswerDoc: "reports/c-1/sha256/aa.md"}
-	g.feedback.Threads = append(g.feedback.Threads, ownFinding("T2", "medium", 20))
+	if hub.getCount() != 0 {
+		t.Fatalf("old head's row polled %d times", hub.getCount())
+	}
+	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 || rows[0]["head"] != shaA {
+		t.Fatalf("supersession not audited: %v", rows)
+	}
+	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "superseded") {
+		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
+	}
+	// Later passes neither deliver again nor ask again.
 	deliver(t, s, r)
-	if n.count != 2 || !strings.Contains(n.events[1].Text, "reports/c-1/") {
-		t.Fatalf("settled outcome not delivered: %+v", n.events)
-	}
-	if run.requestCount() != 1 {
-		t.Fatalf("a second consult was requested: %v", run.requests)
-	}
-	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "answered") {
-		t.Fatalf("outcome not recorded on the task: %v", sink.comments)
+	if n.count != 1 || run.requestCount() != 1 {
+		t.Fatalf("a later pass acted again: events=%d requests=%d", n.count, run.requestCount())
 	}
 }
 
-// When the pushed head's round is past the consult round, the new round's
-// findings go out at once: they are never held behind another head's row. The
-// row is still followed, and its outcome is delivered once.
+// When the pushed head's round is past the consult round, the owed consult
+// is superseded and the new round's findings go out at once: they are never
+// held behind another head's row or answered with its answer.
 func TestHubConsult_NewRoundReleasesHeldFindings(t *testing.T) {
 	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
@@ -647,25 +646,24 @@ func TestHubConsult_NewRoundReleasesHeldFindings(t *testing.T) {
 		t.Fatalf("new round's findings still held: %+v", n.events)
 	}
 	if strings.Contains(n.events[0].Text, "hub consult") {
-		t.Fatalf("stale consult text attached before it settled: %s", n.events[0].Text)
+		t.Fatalf("stale consult text attached to the new head: %s", n.events[0].Text)
 	}
 	if run.requestCount() != 1 {
-		t.Fatalf("round 4 requested a second consult: %v", run.requests)
+		t.Fatalf("round 4 requested a consult: %v", run.requests)
 	}
-
-	// The row settles: its outcome goes out once, with the next delivery.
-	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "answered", AnswerDoc: "reports/c-1/sha256/aa.md"}
-	g.feedback.Threads = append(g.feedback.Threads, ownFinding("T2", "high", 20))
-	deliver(t, s, r)
-	deliver(t, s, r)
-	if n.count != 2 || !strings.Contains(n.events[1].Text, "reports/c-1/") {
-		t.Fatalf("settled outcome not delivered once: %+v", n.events)
+	if hub.getCount() != 0 {
+		t.Fatalf("old head's row polled %d times", hub.getCount())
 	}
-	if run.requestCount() != 1 {
-		t.Fatalf("a second consult was requested: %v", run.requests)
+	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 {
+		t.Fatalf("supersession not audited: %v", rows)
 	}
 	if len(sink.comments) != 1 {
-		t.Fatalf("outcome not recorded once on the task: %v", sink.comments)
+		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
+	}
+	// Nothing more is polled or delivered on later passes.
+	deliver(t, s, r)
+	if n.count != 1 || run.requestCount() != 1 || hub.getCount() != 0 {
+		t.Fatalf("superseded consult acted again: events=%d requests=%d gets=%d", n.count, run.requestCount(), hub.getCount())
 	}
 }
 

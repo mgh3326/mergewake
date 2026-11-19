@@ -121,7 +121,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
-	history, historyErr := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
+	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
 	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
@@ -132,7 +132,6 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		followErr = errors.Join(followErr, s.trackHead(ctx, r, pr, !openBlocking, s.openLowerFindings(fb, verify), o))
 	}
 	st := s.loadRoundRuleState(r.Name, n)
-	followErr = errors.Join(followErr, s.recordHoldDue(ctx, r, pr, o, &st, done, rounds, openBlockingThreads, history, historyErr))
 	consultRound := s.Config.Review.RoundRuleConsult()
 	ladderRound := s.Config.Review.RoundRuleLadder()
 	// The hub consult (review.round_rule.hub_consult) replaces the author
@@ -153,9 +152,9 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	if consultOn {
 		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, consultOwed)
 	}
-	// With the hub consult on, an outcome settled on this pass is what makes
-	// the round owe a delivery of its own; a row still outstanding for an
-	// earlier head leaves nothing to say yet.
+	// With the hub consult on, a forced delivery is owed only for an outcome the
+	// consult step settled on this pass; a row superseded by a push leaves
+	// nothing to say and must not re-deliver the open findings on every pass.
 	forceDirective := done && rounds >= consultRound && consultOwed && !st.directiveSent() && len(inScope) == 0 && !consultPending
 	if consultOn {
 		forceDirective = forceDirective && consultDirective != ""
@@ -244,8 +243,8 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	ladderRefusalOwed := st.ladderRefusalOwed()
 	ladderRetry := !st.escalated() && (!st.LadderPendingSince.IsZero() || st.LadderPaneBusyCalls > 0)
 	// The ladder runs on the first done round at or after its round that has a
-	// critical/high finding open, once per PR: a round that was not done, or
-	// had nothing open, does not use it up.
+	// critical/high finding open, once per PR: a round that was not done, or had
+	// nothing open, does not use it up.
 	if (done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRefusalOwed || ladderRetry {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}

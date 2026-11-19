@@ -159,7 +159,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if e = (&panewireExecutor{s: s, repo: r, pr: pr}).retryReplacedCloses(ctx); e != nil && ctx.Err() != nil {
 		return e
 	}
-	if s.isRoundHoldActive(ctx, r, pr, o) {
+	if s.isRoundHoldActive(ctx, r, pr) {
 		return ErrReviewHeld
 	}
 	needed, settled, e := s.reviewPassesNeeded(ctx, r, pr)

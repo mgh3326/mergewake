@@ -566,7 +566,7 @@ func TestRoundRule_StaleReleaseCommentDoesNotReleaseNewHold(t *testing.T) {
 	}
 
 	// Verify isRoundHoldActive also considers it active
-	if !s.isRoundHoldActive(context.Background(), r, g.pull, Options{}) {
+	if !s.isRoundHoldActive(context.Background(), r, g.pull) {
 		t.Fatalf("isRoundHoldActive returned false with stale comment, want true")
 	}
 
@@ -586,7 +586,7 @@ func TestRoundRule_StaleReleaseCommentDoesNotReleaseNewHold(t *testing.T) {
 			t.Fatalf("gate still has round_hold after fresh release: %v", v2.Reasons)
 		}
 	}
-	if s.isRoundHoldActive(context.Background(), r, g.pull, Options{}) {
+	if s.isRoundHoldActive(context.Background(), r, g.pull) {
 		t.Fatalf("isRoundHoldActive returned true after fresh release, want false")
 	}
 }
