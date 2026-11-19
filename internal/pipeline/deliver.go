@@ -122,7 +122,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
 	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
-	rounds, _ := reviewRounds(history)
+	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
 	st := s.loadRoundRuleState(r.Name, n)
