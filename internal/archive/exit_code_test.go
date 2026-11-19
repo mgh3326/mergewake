@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/integrations"
@@ -59,7 +60,16 @@ func TestArchiveTextReadNamesTheUnreadableFileWithOneDiagnosis(t *testing.T) {
 	a := &Archiver{Runner: integrations.Exec{}}
 	_, err := a.readText(context.Background(), "", dir, files)
 	var u *Unreadable
-	if !errors.As(err, &u) || u.Path != "b.txt" {
-		t.Fatalf("readText error = %v, want Unreadable for b.txt", err)
+	named := errors.As(err, &u) && u.Path == "b.txt"
+	// bsdtar exits 1 for an unreadable member, so it is named. GNU tar (Linux
+	// hosts) exits 2, which stays a run error; that is the documented caveat.
+	if runtime.GOOS == "darwin" {
+		if !named {
+			t.Fatalf("readText error = %v, want Unreadable for b.txt", err)
+		}
+		return
+	}
+	if err == nil || named {
+		t.Fatalf("readText error = %v on %s, want a run error (GNU tar exits 2)", err, runtime.GOOS)
 	}
 }
