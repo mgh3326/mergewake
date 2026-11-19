@@ -2,9 +2,12 @@ package pipeline
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/policy"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -158,5 +161,76 @@ func TestRoundSteps_HoldFollowsThePRToItsNextHead(t *testing.T) {
 				t.Fatalf("held head state %q, want blocked", v.State)
 			}
 		})
+	}
+}
+
+// threadPostedOn is an own finding whose first comment was posted on head.
+func threadPostedOn(id, severity, head string, replies ...github.ReviewComment) github.ReviewThread {
+	th := ownFinding(id, severity, 10, replies...)
+	th.Comments[0].CommitSHA, th.Comments[0].OriginalCommitSHA = head, head
+	return th
+}
+
+func gateHoldVerdict(t *testing.T, s *Service, g *roundRuleGH, r config.Repo) gateVerdict {
+	t.Helper()
+	p := policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}}
+	v, err := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func roundHeld(v gateVerdict) bool { return slices.Contains(v.Reasons, "round_hold") }
+
+// The reviewer does not repeat a finding that is still open, so round 7 can
+// end with a high finding first posted on round 6. The hold follows it to the
+// pending head; a finding the author answered before round 7 finished does not.
+func TestRoundSteps_HoldCountsFindingsCarriedIntoTheRound(t *testing.T) {
+	done := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC)
+	round6 := strings.Repeat("6", 40)
+	fixed := func(at time.Time) github.ReviewComment {
+		return github.ReviewComment{Author: "dev", AuthorType: "User", Body: "Fixed in abc1234.", CreatedAt: at}
+	}
+	for _, tt := range []struct {
+		name     string
+		thread   github.ReviewThread
+		wantHold bool
+	}{
+		{"carried from round 6, open through round 7", threadPostedOn("T1", "high", round6), true},
+		{"carried from round 6, fixed after round 7 finished", threadPostedOn("T1", "high", round6, fixed(done.Add(time.Hour))), true},
+		{"carried from round 6, fixed before round 7 finished", threadPostedOn("T1", "high", round6, fixed(done.Add(-time.Hour))), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, g, _, _, _, r := roundRuleSetup(t, 7)
+			g.submitted = map[string]time.Time{shaA: done}
+			g.feedback.Threads = []github.ReviewThread{tt.thread}
+			g.reviewed = false
+			g.pull.Head.SHA = shaC
+			if got := roundHeld(gateHoldVerdict(t, s, g, r)); got != tt.wantHold {
+				t.Fatalf("round_hold=%v, want %v", got, tt.wantHold)
+			}
+		})
+	}
+}
+
+// The hold threshold is the selected head's own round. Round 6 completed with
+// a high finding open and round 7's first receipt is partial: the PR has seven
+// reviewed patches but no round 7 has finished, so nothing is held yet.
+func TestRoundSteps_HoldThresholdIsTheCompletedHeadsRound(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 6)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	g.reviewed = false
+	pushHead(g, shaC, "patch-7", 7, false)
+	if v := gateHoldVerdict(t, s, g, r); roundHeld(v) {
+		t.Fatalf("held before any round 7 finished: %v", v.Reasons)
+	}
+
+	// Round 7 finishes with the finding still open: now the PR is held.
+	g.refs[doneRef(7, shaC)] = true
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-7", Round: 7}, {Pass: 2, Patch: "patch-7", Round: 7}}
+	g.reviewed = true
+	if v := gateHoldVerdict(t, s, g, r); !roundHeld(v) {
+		t.Fatalf("round 7 ended with a high open and no hold: %v", v.Reasons)
 	}
 }

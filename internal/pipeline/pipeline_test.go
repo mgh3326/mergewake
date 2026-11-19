@@ -95,6 +95,9 @@ type fakeGH struct {
 	dispatchInputs []map[string]string
 	statuses       map[[2]string]statusRecord
 	openPulls      []github.Pull
+
+	// submitted is when a head's passes were posted, for the heads that name it.
+	submitted map[string]time.Time
 }
 
 type statusRecord struct {
@@ -286,7 +289,11 @@ func (g *fakeGH) ReviewHistory(_ context.Context, _ string, _ int, _ string) ([]
 	var out []github.ReviewedPass
 	for _, sha := range slices.Sorted(maps.Keys(g.passes)) {
 		for _, p := range g.passes[sha] {
-			out = append(out, github.ReviewedPass{Head: sha, PassReceipt: p})
+			rp := github.ReviewedPass{Head: sha, PassReceipt: p}
+			if at, ok := g.submitted[sha]; ok {
+				rp.SubmittedAt = &at
+			}
+			out = append(out, rp)
 		}
 	}
 	if g.reviewed && len(g.passes[g.pull.Head.SHA]) == 0 {

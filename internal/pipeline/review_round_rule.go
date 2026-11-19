@@ -623,40 +623,71 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 }
 
 // endedBlocking reports whether the newest fully reviewed head before pr's —
-// the newest earlier head with a pass in history and its -done marker — ended
-// with a critical/high finding: an inline mergewake finding posted on it or an
-// outside-diff one its pass listed. What the author did about them since does
-// not change how that round ended. A read the done marker could not make
-// counts as no.
-func (s *Service) endedBlocking(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass) bool {
-	head := ""
-	for i := len(history) - 1; i >= 0 && head == ""; i-- {
+// the newest earlier head with a pass in history and its -done marker — was a
+// round at or after holdRound and ended with a critical/high finding open: an
+// outside-diff one its pass listed, or an inline mergewake finding posted on
+// that head or an earlier one (the reviewer does not repeat a finding that is
+// still open) that no reply had disposed by the time the head's last pass was
+// posted. What the author did since does not change how that round ended. The
+// threshold is that head's own round, never the PR's total, which a later
+// partial round also raises. A read the done marker could not make counts as no.
+func (s *Service) endedBlocking(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass, holdRound int) bool {
+	idx := -1
+	for i := len(history) - 1; i >= 0 && idx < 0; i-- {
 		h := history[i].Head
 		if h == "" || h == pr.Head.SHA {
 			continue
 		}
 		if done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, h+"-done"); err == nil && done {
-			head = h
+			idx = i
 		}
 	}
-	if head == "" {
+	if idx < 0 {
 		return false
 	}
-	for _, p := range history {
-		if p.Head == head && p.OutsideBlocking > 0 {
-			return true
+	head := history[idx].Head
+	if rounds, _ := reviewRounds(history[:idx+1]); rounds < holdRound {
+		return false
+	}
+	// The head's completion is its last pass; later partial receipts of other
+	// heads are not part of the round.
+	upto := map[string]bool{}
+	var completed time.Time
+	for _, p := range history[:idx+1] {
+		upto[p.Head] = true
+		if p.Head == head {
+			if p.OutsideBlocking > 0 {
+				return true
+			}
+			if p.SubmittedAt != nil && p.SubmittedAt.After(completed) {
+				completed = *p.SubmittedAt
+			}
 		}
 	}
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
+	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
 	for _, t := range fb.Threads {
 		if len(t.Comments) == 0 {
 			continue
 		}
 		first := t.Comments[0]
-		if own == "" || policy.NormalizeAuthor(first.Author) != own || !strings.Contains(first.Body, "<!-- mergewake-severity:") || postedOn(first) != head {
+		if own == "" || policy.NormalizeAuthor(first.Author) != own || !strings.Contains(first.Body, "<!-- mergewake-severity:") || !upto[postedOn(first)] {
 			continue
 		}
-		if mustFix(github.ThreadSeverity(first.Author, first.Body)) {
+		if !mustFix(github.ThreadSeverity(first.Author, first.Body)) {
+			continue
+		}
+		// The thread as the round left it: replies after the completion (or
+		// with no time to place them) are the author's answer to it.
+		at := t
+		at.IsResolved = false
+		at.Comments = []github.ReviewComment{first}
+		for _, c := range t.Comments[1:] {
+			if !completed.IsZero() && !c.CreatedAt.IsZero() && c.CreatedAt.Before(completed) {
+				at.Comments = append(at.Comments, c)
+			}
+		}
+		if !disposed(at, own, verify, s.Config.Review.FleetAuthors) {
 			return true
 		}
 	}
@@ -700,7 +731,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return true
 	}
 
-	if rounds >= holdRound && (reviewed && open || !reviewed && s.endedBlocking(ctx, r, pr, fb, history)) {
+	if reviewed && rounds >= holdRound && open || !reviewed && s.endedBlocking(ctx, r, pr, fb, history, holdRound) {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		count := 0
 		captured := false

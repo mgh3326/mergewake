@@ -1112,8 +1112,9 @@ on it.
   - **Round hold (`review.round_rule.hold`, default 7):** mergewake holds the PR (no further review rounds or merges for it; gate blocks with `round_hold`)
     once a reviewed head at or after the hold round ends with a critical or high finding open. The hold is per PR, not
     per head: a newer head whose review has not finished is held too when the newest fully reviewed head before it
-    ended that way (an inline finding posted on it or an outside-diff one its pass listed), even if the author's push
-    already fixed those findings.
+    was a round at or after the hold round (that head's own round, not the PR's total) and ended with a critical or
+    high finding open — an outside-diff one its pass listed, or an inline one posted on it or on an earlier head that
+    no reply had disposed of when its last pass was posted — even if the author's push already fixed those findings.
     and sends the design lane (the task's lane, else the desk) exactly one `decision` event naming the PR,
     round count, open findings, and the two choices: cut the scope or request one SS consult on the design.
   - **Releasing the hold:** The hold ends when a PR comment matching `Mergewake-Round-Hold: release` is posted after the hold began
