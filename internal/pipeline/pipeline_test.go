@@ -29,7 +29,9 @@ var shaD = strings.Repeat("d", 40)
 type fakeGH struct {
 	fixtureTask bool
 	GitHub
-	pullCalls                                      int
+	pullCalls int
+	// pullErr, when set, answers every Pull call with this error.
+	pullErr                                        error
 	commitCalls                                    int
 	nextHead                                       string
 	nextBase                                       string // base ref from the second Pull on
@@ -132,6 +134,9 @@ func (g *fakeGH) Pull(context.Context, string, int) (github.Pull, error) {
 	fakeGHMu.Lock()
 	defer fakeGHMu.Unlock()
 	g.pullCalls++
+	if g.pullErr != nil {
+		return github.Pull{}, g.pullErr
+	}
 	p := g.pull
 	if g.pullCalls > 1 && g.nextHead != "" {
 		p.Head.SHA = g.nextHead
@@ -424,11 +429,21 @@ func (g *fakeGH) Commit(_ context.Context, _, sha string) (github.Commit, error)
 	}
 	return v, nil
 }
+
+// PRsForCommit answers in the list shape GitHub uses: the commits/{sha}/pulls
+// body carries no changed_files count, so ChangedFiles is 0 here and only the
+// full pull (Pull) has it.
 func (g *fakeGH) PRsForCommit(_ context.Context, _, sha string) ([]github.Pull, error) {
-	if prs, ok := g.commitPRs[sha]; ok {
-		return prs, nil
+	prs, ok := g.commitPRs[sha]
+	if !ok {
+		prs = []github.Pull{g.pull}
 	}
-	return []github.Pull{g.pull}, nil
+	out := make([]github.Pull, len(prs))
+	for i, p := range prs {
+		p.ChangedFiles = 0
+		out[i] = p
+	}
+	return out, nil
 }
 func (g *fakeGH) Revert(ctx context.Context, repo, branch, head, culprit string, pr int) (string, error) {
 	commit, err := g.Commit(ctx, repo, culprit)

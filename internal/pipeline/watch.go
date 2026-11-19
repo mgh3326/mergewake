@@ -480,7 +480,13 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	if e != nil {
 		return e
 	}
-	if len(files) != origin.ChangedFiles {
+	// The commits/{sha}/pulls list body carries no changed_files count, so the
+	// count comes from the full pull the list entry names.
+	full, e := s.GH.Pull(ctx, r.Name, origin.Number)
+	if e != nil {
+		return e
+	}
+	if len(files) != full.ChangedFiles {
 		return hold("culprit file list is incomplete")
 	}
 	if p.Classify(files).Class == "blocking" {
