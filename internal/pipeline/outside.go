@@ -125,10 +125,10 @@ func hasOutsideDispute(records []outsideFinding) bool {
 // foldOutside replays the posted passes oldest first and returns every
 // outside-diff finding they reported, each in its current state. Passes are
 // grouped by head; a head's passes union into what that head's review
-// reported. The current head (and the inherited head, when the gate adopted
-// an earlier head's review) contributes only passes whose patch id matches —
-// hk 3190's rule — while every earlier head contributes all of its passes,
-// because its findings are exactly what must persist across the push.
+// reported. The gated head contributes only passes whose patch id matches —
+// hk 3190's rule — while every earlier head, the inherited head included,
+// contributes all of its passes, because its findings are exactly what must
+// persist across the push.
 //
 // A finding stays open until a settled later head does not report it again:
 // settled means the head is not the gated one, or the gated head's own review
@@ -155,8 +155,21 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 	aliases := map[string]string{}
 	for _, h := range order {
 		passes := groups[h]
-		current := h == head || (inherited != "" && h == inherited)
-		settled := !current || settledCurrent
+		// The inherited head's findings persist whatever its patch: a clean
+		// base merge inherits a review of a different patch, and dropping its
+		// passes would let the chain clear a finding it never settled. Only
+		// the gated head's own passes are patch-filtered, and an inherited
+		// head settles only when one of its passes carries the current patch.
+		own := h == head
+		settled := !(own || (inherited != "" && h == inherited)) || settledCurrent
+		if inherited != "" && h == inherited && !own && patch != "" && settledCurrent {
+			settled = false
+			for _, p := range passes {
+				if p.Patch == patch {
+					settled = true
+				}
+			}
+		}
 		reported := map[string]github.OutsideFinding{}
 		var repOrder []string
 		shown := map[string]bool{}
@@ -165,7 +178,7 @@ func foldOutside(history []github.ReviewedPass, head, patch, inherited string, s
 		repTitles := map[string][]string{}
 		repAliases := map[string][]string{}
 		for _, p := range passes {
-			if current && patch != "" && p.Patch != patch {
+			if own && patch != "" && p.Patch != patch {
 				continue
 			}
 			for _, ref := range strings.Fields(p.OutsideShown) {
