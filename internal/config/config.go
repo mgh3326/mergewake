@@ -38,7 +38,7 @@ type Review struct {
 	DefaultGrade string              `yaml:"default_grade"`
 	// FirstRoundGrade maps a PR grade to the grade asked for every pass of the
 	// PR's first review round. A grade not in the map is asked at its own
-	// grade. Unset means {B: A, C: B}; an empty map turns the raise off.
+	// grade. Unset means {B: A, C: A}; an empty map turns the raise off.
 	FirstRoundGrade map[string]string `yaml:"first_round_grade"`
 	// DefaultFamily is the reviewer family used when the PR carries no
 	// author-family trailer and the head commit identities yield no known
@@ -1278,7 +1278,7 @@ func validateReview(c *Config) error {
 		return errors.New("invalid review.default_grade")
 	}
 	if c.Review.FirstRoundGrade == nil {
-		c.Review.FirstRoundGrade = map[string]string{"B": "A", "C": "B"}
+		c.Review.FirstRoundGrade = map[string]string{"B": "A", "C": "A"}
 	}
 	for pr, asked := range c.Review.FirstRoundGrade {
 		if !ValidGrade(pr) || !ValidGrade(asked) {

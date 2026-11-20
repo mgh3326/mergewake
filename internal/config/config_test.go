@@ -171,7 +171,7 @@ func TestLoadReviewFirstRoundGrade(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := c.Review.FirstRoundGrade; len(got) != 2 || got["B"] != "A" || got["C"] != "B" {
+		if got := c.Review.FirstRoundGrade; len(got) != 2 || got["B"] != "A" || got["C"] != "A" {
 			t.Fatalf("review.first_round_grade = %v", got)
 		}
 	})
