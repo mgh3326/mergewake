@@ -33,6 +33,8 @@ func TestFirstRoundGradeAskedPerRound(t *testing.T) {
 			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
 			s, g, r := panewireSetup(t, runner)
 			s.Config.Review.FirstRoundGrade = tc.firstMap
+			// The title's grade is the floor: equal to the PR grade, it leaves the policy under test alone.
+			runner.sink.title = "Fix the thing (grade " + tc.prGrade + ", T2)"
 			g.pull.Body += "Mergewake-Grade: " + tc.prGrade + "\n"
 			if tc.earlier {
 				if g.passes == nil {
@@ -75,9 +77,46 @@ func TestFirstReviewRoundCountsOtherHeadsOnly(t *testing.T) {
 		"own passes only":             {[]github.ReviewedPass{own}, true},
 		"an earlier head":             {[]github.ReviewedPass{other}, false},
 		"an earlier head and own one": {[]github.ReviewedPass{other, own}, false},
+		// The PR moved to other, then reset to shaA: shaA's first pass is still round one.
+		"reset to the first head": {[]github.ReviewedPass{own, other}, true},
 	} {
 		if got := firstReviewRound(tc.history, shaA); got != tc.want {
 			t.Errorf("%s: firstReviewRound = %v, want %v", name, got, tc.want)
 		}
+	}
+}
+
+// The task title's grade is a floor: panewire's explicit --grade overrides it,
+// so a round-one raise is not stated when the title grade is stronger.
+func TestFirstRoundGradeFloorIsTaskTitle(t *testing.T) {
+	for name, tc := range map[string]struct {
+		title     string
+		wantFlag  string
+		wantAsked string
+	}{
+		"title stronger than the raise": {"Fix the thing (grade S, T1)", "", "A"},
+		"title equal to the raise":      {"Fix the thing (grade A, T2)", "A", "A"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai"}
+			s, g, r := panewireSetup(t, runner)
+			s.Config.Review.FirstRoundGrade = map[string]string{"B": "A"}
+			runner.sink.title = tc.title
+			g.pull.Body += "Mergewake-Grade: B\n"
+			if e := s.Review(context.Background(), r, 7, "", Options{}); e != nil {
+				t.Fatal(e)
+			}
+			if len(runner.spawns) != 1 {
+				t.Fatalf("spawns = %d", len(runner.spawns))
+			}
+			sp := runner.spawns[0]
+			if got := arg(sp, "--grade"); got != tc.wantFlag || (tc.wantFlag == "" && slices.Contains(sp, "--grade")) {
+				t.Fatalf("--grade = %q, want %q in %v", got, tc.wantFlag, sp)
+			}
+			rows := auditRows(t, s, r, "review")
+			if len(rows) != 1 || rows[0]["grade_asked"] != tc.wantAsked || rows[0]["first_round"] != true {
+				t.Fatalf("audit rows = %v", rows)
+			}
+		})
 	}
 }
