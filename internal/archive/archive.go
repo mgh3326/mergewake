@@ -297,8 +297,12 @@ find . ! -type d -exec sh -c 'for f; do if [ -L "$f" ]; then t=l; elif [ -f "$f"
 
 // hostListScript emits one compact summary per job, avoiding output growth with
 // each job's file count. Per-job refresh supplies full file metadata only for
-// jobs that pass these skip checks.
+// jobs that pass these skip checks. The stat flavour is probed once per run
+// (GNU stat -c, else BSD stat -f), and each find batch hands many paths to one
+// stat. Its exit status is dropped, so a file that vanishes mid-scan is skipped
+// as before; only the find's own failure marks a job uncertain.
 const hostListScript = `cd "$1" || exit 1
+if stat -c %Y . >/dev/null 2>&1; then sf=gnu; else sf=bsd; fi
 for d in *; do
   if [ -L "$d" ]; then printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$d" l 0 0 0 0; continue; fi
   [ -d "$d" ] || continue
@@ -314,7 +318,7 @@ for d in *; do
       if [ "$rc" -ne 0 ]; then uncertain=1; fi
     fi
   fi
-  newestSummary=$({ find "$d" ! -type d -exec sh -c 'for f; do m=$(stat -c "%s %Y" "$f" 2>/dev/null || stat -f "%z %m" "$f") || continue; printf "%s\n" "${m#* }"; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} NR == 1 || $1+0 > max {max=$1+0} END {printf "%.0f %d\n", max, rc+0}')
+  newestSummary=$({ find "$d" ! -type d -exec sh -c 'f=$1; shift; if [ "$f" = gnu ]; then stat -c %Y "$@"; else stat -f %m "$@"; fi 2>/dev/null; exit 0' sh "$sf" {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} NR == 1 || $1+0 > max {max=$1+0} END {printf "%.0f %d\n", max, rc+0}')
   set -- $newestSummary; newest=$1; rc=$2
   if [ "$rc" -ne 0 ]; then uncertain=1; fi
   if [ "$uncertain" -eq 1 ]; then
@@ -330,6 +334,11 @@ func (a *Archiver) HostJobs(ctx context.Context, h reap.Host, root string) (map[
 	if err != nil {
 		return nil, fmt.Errorf("list jobs tree %s: %w", root, err)
 	}
+	return parseHostJobs(root, b)
+}
+
+// parseHostJobs decodes hostListScript's NUL-separated six-field records.
+func parseHostJobs(root string, b []byte) (map[string]HostJobSummary, error) {
 	fields := strings.Split(string(b), "\x00")
 	if fields[len(fields)-1] == "" {
 		fields = fields[:len(fields)-1]
