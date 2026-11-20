@@ -33,6 +33,37 @@ func TestHKRouteTemplates(t *testing.T) {
 	}
 }
 
+// The literal section names of PUT /v1/changes/<section> are route words, not
+// ids, so the five sections stay five routes.
+func TestHKRouteChangeSectionWords(t *testing.T) {
+	for _, section := range []string{"state", "checks", "threads", "findings", "gate"} {
+		req := &http.Request{Method: http.MethodPut, URL: &url.URL{Path: "/v1/changes/" + section}}
+		want := "PUT /v1/changes/" + section
+		if got := hkRoute(req); got != want {
+			t.Errorf("hkRoute(PUT /v1/changes/%s) = %q, want %q", section, got, want)
+		}
+	}
+}
+
+// The handoffkeep task routes spell claim, rebind, decision-request/ask and
+// projects/{p}/owner; their words must not be taken for ids.
+func TestHKRouteTaskRouteWords(t *testing.T) {
+	cases := []struct {
+		method, path, want string
+	}{
+		{http.MethodPost, "/v1/tasks/42/claim", "POST /v1/tasks/{id}/claim"},
+		{http.MethodPost, "/v1/tasks/42/rebind", "POST /v1/tasks/{id}/rebind"},
+		{http.MethodPost, "/v1/tasks/42/decision-request/ask", "POST /v1/tasks/{id}/decision-request/ask"},
+		{http.MethodPut, "/v1/tasks/projects/mergewake/owner", "PUT /v1/tasks/projects/{id}/owner"},
+	}
+	for _, c := range cases {
+		req := &http.Request{Method: c.method, URL: &url.URL{Path: c.path}}
+		if got := hkRoute(req); got != c.want {
+			t.Errorf("hkRoute(%s %s) = %q, want %q", c.method, c.path, got, c.want)
+		}
+	}
+}
+
 // Many distinct ids must not grow the route counts: the key set is bounded by
 // the route templates, and the serialized counts stay well under the 4 KiB the
 // daemon's journal keeps per line.
