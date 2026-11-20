@@ -500,7 +500,17 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	v.SameFamily = sameFamilyOf(countedPasses)
 	v.PassClean = reviewed && !holdsPostedOn(v.Holds, pr.Head.SHA)
-	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, roundHistory{passes: counted, needed: needed, own: ownReviewed}, &v)
+	if _, e := s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, roundHistory{all: history, counted: counted, own: ownReviewed}, &v); errors.Is(e, github.ErrPollSkipped) {
+		// A completion marker probe is inside its poll interval: hold the
+		// verdict quiet this round, as for the head's own marker.
+		v.State = "blocked"
+		if len(v.Reasons) == 0 {
+			v.State = "pending"
+		}
+		return v, nil
+	} else if e != nil {
+		return v, e
+	}
 	records, legacyOutside, e := s.outsideGate(ctx, r, pr, history, v.Review.PatchID, v.Review.Inherited, reviewed, fixes)
 	if e != nil {
 		return v, e

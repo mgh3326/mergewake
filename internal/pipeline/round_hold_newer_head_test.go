@@ -72,6 +72,10 @@ func nhReply(i int, d time.Duration, body string) github.ReviewComment {
 // (each by one pass), the last of them ended with a high open, and the PR's
 // current head is a newer one nobody has reviewed. The gate is evaluated on it.
 func newerHeadSetup(t *testing.T, rounds int) (*Service, *nhGH, func() gateVerdict, config.Repo) {
+	return newerHeadSetupPolicy(t, rounds, policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}})
+}
+
+func newerHeadSetupPolicy(t *testing.T, rounds int, p policy.Policy) (*Service, *nhGH, func() gateVerdict, config.Repo) {
 	t.Helper()
 	s, g, _, _, _, r := roundRuleSetup(t, 1)
 	hh := &nhGH{roundRuleGH: g}
@@ -79,11 +83,13 @@ func newerHeadSetup(t *testing.T, rounds int) (*Service, *nhGH, func() gateVerdi
 	for i := 1; i <= rounds; i++ {
 		hh.history = append(hh.history, nhPass(i))
 	}
-	// The current head has no pass; its done marker is not set either.
+	// Each reviewed head is done; the current head has no pass and no marker.
 	g.fakeGH.refs = map[string]bool{}
+	for i := 1; i <= rounds; i++ {
+		g.fakeGH.refs[doneRef(g.pull.Number, nhHead(i))] = true
+	}
 	g.fakeGH.reviewed = false
 	g.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", rounds)}
-	p := policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}}
 	return s, hh, func() gateVerdict {
 		t.Helper()
 		v, err := s.mergeGate(context.Background(), r, g.pull, p, shaB)
@@ -334,5 +340,97 @@ func TestRoundHoldNewerHead_OneDecisionEvent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("decision events = %d, want 1: %+v", count, n.events)
+	}
+}
+
+// Each reviewed head is judged by its own required pass count: a push that
+// adds a guarded path (two passes needed now) does not make the routine
+// one-pass rounds before it incomplete.
+func TestRoundHoldNewerHead_CompletenessIsPerHead(t *testing.T) {
+	// The pending head touches a guarded path: it needs two passes.
+	_, _, gate, _ := newerHeadSetupPolicy(t, 7, policy.Policy{
+		ReviewGate: &policy.ReviewGate{Land: "graded"},
+		Blocking:   []policy.Rule{{Paths: []string{"**"}, Reason: "guarded"}},
+	})
+	if v := gate(); !nhHeld(v) {
+		t.Fatalf("one-pass routine rounds stopped counting when the new head needs two passes: %v", v.Reasons)
+	}
+}
+
+// And the inverse: a head that needed two passes and has one, no completion
+// marker, is not a completed round, whatever the current head needs.
+func TestRoundHoldNewerHead_UnfinishedHeadIsNotARound(t *testing.T) {
+	_, hh, gate, _ := newerHeadSetup(t, 7)
+	delete(hh.fakeGH.refs, doneRef(hh.pull.Number, nhHead(7)))
+	if v := gate(); nhHeld(v) {
+		t.Fatalf("a head without its completion marker counted a round: %v", v.Reasons)
+	}
+}
+
+// A fix reply made before round 7 ended is checked against round 7's head: a
+// later push that rewrote the fix commit away does not reopen the finding.
+func TestRoundHoldNewerHead_FixIsVerifiedAgainstTheRoundsHead(t *testing.T) {
+	_, hh, gate, _ := newerHeadSetup(t, 7)
+	hh.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", 7, nhReply(7, -time.Minute, "Fixed in "+shaC[:7]))}
+	// The current head no longer contains the fix commit; round 7's head does.
+	hh.fakeGH.notAncestor = map[[2]string]bool{{shaC, shaA}: true}
+	if v := gate(); nhHeld(v) {
+		t.Fatalf("a fix verified at round 7 was reopened by a later push: %v", v.Reasons)
+	}
+}
+
+// The latest completed review is chosen from every pass, base merges included:
+// a conflict-resolving base merge reviewed after a valid dismissal is the
+// newest completed head, and it ended with nothing open.
+func TestRoundHoldNewerHead_BaseMergeReviewIsTheLatest(t *testing.T) {
+	_, hh, gate, _ := newerHeadSetup(t, 7)
+	merge := nhHead(8)
+	second := strings.Repeat("e", 40)
+	hh.fakeGH.parents2 = map[string][]string{merge: {nhHead(7), second}}
+	hh.fakeGH.pull.Base.SHA = shaB
+	p := nhPass(8)
+	p.Patch = "patch-8"
+	hh.history = append(hh.history, p)
+	hh.fakeGH.refs[doneRef(hh.pull.Number, merge)] = true
+	// Dismissed after round 7 ended, before the merge's review.
+	hh.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", 7, nhReply(7, 30*time.Minute, "Dismiss: the code line disproves it"))}
+	if v := gate(); nhHeld(v) {
+		t.Fatalf("round 7's snapshot held a PR whose later reviewed head had nothing open: %v", v.Reasons)
+	}
+}
+
+// An inherited review with a partial round before it is not round 7.
+func TestRoundHoldNewerHead_InheritedHeadUsesCompletedRounds(t *testing.T) {
+	_, hh, gate, _ := newerHeadSetup(t, 6)
+	// An abandoned seventh patch with one pass and no marker.
+	hh.history = append(hh.history, nhPass(7))
+	diff, _ := hh.fakeGH.Diff(context.Background(), "", 0)
+	hh.history[5].Patch = reviewPatchID(diff) // the current head inherits round 6
+	hh.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", 6)}
+	v := gate()
+	if v.Review.Inherited == "" {
+		t.Fatalf("head did not inherit: %+v", v.Review)
+	}
+	if nhHeld(v) {
+		t.Fatalf("six completed rounds plus a partial seventh held an inheriting head: %v", v.Reasons)
+	}
+}
+
+// A release posted while the comments could not be read is not lost when the
+// baseline is taken afterwards.
+func TestRoundHoldNewerHead_ReleaseDuringCommentOutageCounts(t *testing.T) {
+	s, hh, gate, r := newerHeadSetup(t, 7)
+	hh.commentsErr = errors.New("comments unavailable")
+	if v := gate(); !nhHeld(v) {
+		t.Fatalf("not held: %v", v.Reasons)
+	}
+	held := s.loadRoundRuleState(r.Name, hh.pull.Number).HoldAt
+	hh.issueComments = append(hh.issueComments, github.IssueComment{
+		User: github.PullUser{Login: "operator", Type: "User"}, Body: "Mergewake-Round-Hold: release",
+		CreatedAt: held.Add(time.Minute),
+	})
+	hh.commentsErr = nil
+	if v := gate(); nhHeld(v) {
+		t.Fatalf("a release posted during the outage was lost: %v", v.Reasons)
 	}
 }
