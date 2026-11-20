@@ -877,6 +877,18 @@ func (s *Service) roundHoldDue(ctx context.Context, r config.Repo, pr github.Pul
 // head's own history does not contain. A thread resolved since is left out, as
 // everywhere else.
 func (s *Service) earlierHeadHold(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, h roundHistory) ([]github.ReviewThread, error) {
+	head, at, err := s.earlierHoldRound(ctx, r, pr, h)
+	if err != nil || head == "" {
+		return nil, err
+	}
+	return s.openFindingsAt(ctx, r, head, fb, at)
+}
+
+// earlierHoldRound is the head earlierHeadHold reads the findings of, and the
+// time its last pass was posted: the newest fully reviewed head other than the
+// current one, when its round is at or past the hold round; empty otherwise.
+// It needs the history only, so a PR short of the hold round reads nothing else.
+func (s *Service) earlierHoldRound(ctx context.Context, r config.Repo, pr github.Pull, h roundHistory) (string, *time.Time, error) {
 	holdRound := s.Config.Review.RoundRuleHold()
 	// Few heads cannot make the hold round: no marker is read for them.
 	patches := map[string]bool{}
@@ -886,7 +898,7 @@ func (s *Service) earlierHeadHold(ctx context.Context, r config.Repo, pr github.
 		}
 	}
 	if len(patches) < holdRound {
-		return nil, nil
+		return "", nil, nil
 	}
 	full := map[string]bool{}
 	last := map[string]int{}
@@ -897,9 +909,17 @@ func (s *Service) earlierHeadHold(ctx context.Context, r config.Repo, pr github.
 		if head == pr.Head.SHA {
 			continue
 		}
+		// The posted passes show a head's review complete when they meet the
+		// requirement they name; the marker is the other proof. The marker
+		// alone would lose a head whose last pass posted but whose marker
+		// write failed before a push.
+		if receiptsComplete(passesFor(h.all, head)) {
+			full[head] = true
+			continue
+		}
 		done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, head+"-done")
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 		full[head] = done
 	}
@@ -910,7 +930,7 @@ func (s *Service) earlierHeadHold(ctx context.Context, r config.Repo, pr github.
 		}
 	}
 	if newest == "" {
-		return nil, nil
+		return "", nil, nil
 	}
 	var reviewed []github.ReviewedPass
 	for _, p := range h.counted {
@@ -919,9 +939,24 @@ func (s *Service) earlierHeadHold(ctx context.Context, r config.Repo, pr github.
 		}
 	}
 	if rounds, _ := reviewRounds(reviewed); rounds < holdRound {
-		return nil, nil
+		return "", nil, nil
 	}
-	return s.openFindingsAt(ctx, r, newest, fb, h.all[last[newest]].SubmittedAt), nil
+	return newest, h.all[last[newest]].SubmittedAt, nil
+}
+
+// receiptsComplete reports whether a head's receipts alone show its review
+// complete: the passes meet the count the receipts themselves name, or two
+// distinct passes are posted, the most any policy asks for. A lone receipt that
+// names no count proves nothing: it may be the first of two.
+func receiptsComplete(receipts []github.PassReceipt) bool {
+	needed := 2
+	for _, r := range receipts {
+		if r.Needed > 0 && r.Needed < needed {
+			needed = r.Needed
+		}
+	}
+	_, ok := distinctPasses(receipts, needed)
+	return ok
 }
 
 // roundKey is the key reviewRounds counts a pass's round by.
@@ -937,8 +972,9 @@ func roundKey(p github.ReviewedPass) string {
 // when its first comment is no later than at and the replies no later than at
 // do not dispose of it; a fix reply is checked against head, not the PR's
 // current head, which a later push may have rewritten.
-func (s *Service) openFindingsAt(ctx context.Context, r config.Repo, head string, fb github.ReviewFeedback, at *time.Time) []github.ReviewThread {
-	verify := s.fixVerifier(ctx, r.Name, head).verified
+func (s *Service) openFindingsAt(ctx context.Context, r config.Repo, head string, fb github.ReviewFeedback, at *time.Time) ([]github.ReviewThread, error) {
+	verifier := s.fixVerifier(ctx, r.Name, head)
+	verify := verifier.verified
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
 	before := func(c github.ReviewComment) bool {
 		return at == nil || c.CreatedAt.IsZero() || !c.CreatedAt.After(*at)
@@ -964,7 +1000,9 @@ func (s *Service) openFindingsAt(ctx context.Context, r config.Repo, head string
 		}
 		out = append(out, t)
 	}
-	return out
+	// A fix claim the lookups could not settle is no open finding: a hold built
+	// on it would stick. The caller gets the error instead.
+	return out, verifier.err
 }
 
 // recordRoundHold saves the hold. The comment count is the baseline a release
@@ -990,28 +1028,69 @@ func (s *Service) recordRoundHold(ctx context.Context, r config.Repo, pr github.
 	}
 }
 
+// roundHoldEvidenceTimeout bounds the feedback read the hold makes before a
+// review starts; the review's own deadline does not yet run.
+const roundHoldEvidenceTimeout = 30 * time.Second
+
 // holdBeforeReview is the round hold's check before a head without its own
 // review is reviewed: when the newest fully reviewed head ended at or past the
 // hold round with a critical/high open, the hold is saved now (not left to a
 // later gate pass, which a finished review of the new head could outrun) and
-// the review does not start. A dry run saves nothing.
+// the review does not start. A release already saved wins, and a dry run saves
+// nothing. Threads are read only for a PR whose history reaches the hold round.
 func (s *Service) holdBeforeReview(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, o Options) (bool, error) {
-	if s.GH == nil {
+	saved := s.loadRoundRuleState(r.Name, pr.Number)
+	if s.GH == nil || saved.released() {
 		return false, nil
 	}
-	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	h := roundHistory{all: history, counted: s.countedHistory(ctx, r, pr, history)}
+	head, at, err := s.earlierHoldRound(ctx, r, pr, h)
+	if err != nil || head == "" {
+		return false, err
+	}
+	readCtx, cancel := context.WithTimeout(ctx, roundHoldEvidenceTimeout)
+	defer cancel()
+	fb, err := s.GH.ReviewFeedback(readCtx, r.Name, pr.Number)
 	if err != nil {
 		return false, err
 	}
-	h := roundHistory{all: history, counted: s.countedHistory(ctx, r, pr, history)}
-	held, err := s.earlierHeadHold(ctx, r, pr, fb, h)
-	if err != nil || len(held) == 0 {
+	open, err := s.openFindingsAt(readCtx, r, head, fb, at)
+	if err != nil || len(open) == 0 {
 		return false, err
 	}
 	if o.Acting() {
 		s.recordRoundHold(ctx, r, pr)
 	}
 	return true, nil
+}
+
+// NotifyRoundHold sends the round-hold decision for a PR whose review the hold
+// stopped. The daemon's review-first path ends there without settling the PR,
+// so the decision cannot wait for NotifyPR. It only reads the saved hold: no
+// hold, a released one and a decision already sent send nothing, and the
+// decision's stable event ID dedupes a retry. A failed read is returned and
+// retried on the next pass.
+func (s *Service) NotifyRoundHold(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
+	if !o.Reporting() || s.GH == nil {
+		return nil
+	}
+	st := s.loadRoundRuleState(r.Name, pr.Number)
+	if !st.held() || st.released() || st.eventSent() {
+		return nil
+	}
+	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if err != nil {
+		return err
+	}
+	history, err := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login)
+	if err != nil {
+		return err
+	}
+	counted := s.countedHistory(ctx, r, pr, history)
+	rounds, _ := reviewRounds(counted)
+	// The findings the hold was owed for; failing that, those open now.
+	held, _ := s.earlierHeadHold(ctx, r, pr, fb, roundHistory{all: history, counted: counted})
+	return s.sendRoundHoldDecision(ctx, r, pr, fb, rounds, held, o)
 }
 
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
@@ -1069,7 +1148,9 @@ func (s *Service) sendRound5Decision(ctx context.Context, r config.Repo, pr gith
 // are named.
 func (s *Service) sendRoundHoldDecision(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, held []github.ReviewThread, o Options) error {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
-	if st.eventSent() || st.released() {
+	// The decision asks for a release comment: it goes out only once the hold
+	// is saved, so the release has a baseline to come after.
+	if !st.held() || st.eventSent() || st.released() {
 		return nil
 	}
 	openThreads := held

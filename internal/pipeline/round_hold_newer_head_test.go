@@ -480,3 +480,129 @@ func TestRoundHoldNewerHead_DryRunReviewHoldSavesNothing(t *testing.T) {
 		t.Fatal("a dry run saved the hold")
 	}
 }
+
+func nhDecisions(s *Service) int {
+	n := s.Notifier.(*ackNotifier)
+	count := 0
+	for _, e := range n.events {
+		if e.Type == "decision" && strings.Contains(e.Text, "round-hold") {
+			count++
+		}
+	}
+	return count
+}
+
+// The daemon's review-first path ends at ErrReviewHeld without settling the
+// head, so NotifyRoundHold sends the decision there: once, from the saved
+// hold, with no done marker on the head.
+func TestRoundHoldNewerHead_HeldReviewPathSendsTheDecisionOnce(t *testing.T) {
+	s, hh, _, r := newerHeadSetup(t, 7)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review: %v, want ErrReviewHeld", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.NotifyRoundHold(context.Background(), r, hh.pull, Options{}); err != nil {
+			t.Fatalf("NotifyRoundHold: %v", err)
+		}
+	}
+	if got := nhDecisions(s); got != 1 {
+		t.Fatalf("decisions = %d, want 1", got)
+	}
+	if err := s.NotifyRoundHold(context.Background(), r, hh.pull, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRoundHoldNewerHead_NoHoldNoHeldReviewDecision(t *testing.T) {
+	s, hh, _, r := newerHeadSetup(t, 6)
+	if err := s.NotifyRoundHold(context.Background(), r, hh.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nhDecisions(s); got != 0 {
+		t.Fatalf("decisions = %d, want 0", got)
+	}
+}
+
+// A feedback outage on the held-review path is returned for a retry, and the
+// retry then sends the one decision.
+func TestRoundHoldNewerHead_HeldReviewDecisionRetriesAfterOutage(t *testing.T) {
+	s, hh, _, r := newerHeadSetup(t, 7)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review: %v", err)
+	}
+	hh.historyErr = errors.New("history unavailable")
+	if err := s.NotifyRoundHold(context.Background(), r, hh.pull, Options{}); err == nil {
+		t.Fatal("outage not returned")
+	}
+	if got := nhDecisions(s); got != 0 {
+		t.Fatalf("decision sent during the outage: %d", got)
+	}
+	hh.historyErr = nil
+	if err := s.NotifyRoundHold(context.Background(), r, hh.pull, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nhDecisions(s); got != 1 {
+		t.Fatalf("decisions = %d, want 1", got)
+	}
+}
+
+// A saved release wins over the history: the next Review starts on the head.
+func TestRoundHoldNewerHead_ReleasedHoldLetsReviewStart(t *testing.T) {
+	s, hh, _, r := newerHeadSetup(t, 7)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review: %v", err)
+	}
+	hh.issueComments = append(hh.issueComments, github.IssueComment{User: github.PullUser{Login: "operator", Type: "User"}, Body: "Mergewake-Round-Hold: release", CreatedAt: time.Now().Add(time.Minute)})
+	err := s.Review(context.Background(), r, 7, "google", Options{})
+	if errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review stayed held after a release: %v", err)
+	}
+	// And once more, from the saved release alone.
+	hh.issueComments = nil
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("saved release not honored: %v", err)
+	}
+}
+
+// A head whose last pass posted but whose completion marker was never written
+// is still a completed round when its receipts name the count they met.
+func TestRoundHoldNewerHead_ReceiptsProveCompletionWithoutMarker(t *testing.T) {
+	_, hh, gate, _ := newerHeadSetup(t, 7)
+	delete(hh.fakeGH.refs, doneRef(hh.pull.Number, nhHead(7)))
+	hh.history[6].Needed = 1
+	if v := gate(); !nhHeld(v) {
+		t.Fatalf("a completed round without a marker hid the hold: %v", v.Reasons)
+	}
+}
+
+// A fix claim the historical lookup cannot settle is an error, not an open
+// finding: no sticky hold is built from it (the gate's own current-head
+// verifier is a separate lookup that may have succeeded).
+func TestRoundHoldNewerHead_UnsettledFixLookupIsAnErrorNotAFinding(t *testing.T) {
+	s, hh, _, r := newerHeadSetup(t, 7)
+	hh.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", 7, nhReply(7, -time.Minute, "Fixed in "+shaC[:7]))}
+	hh.fakeGH.commitErr = map[string]error{shaC[:7]: errors.New("github down")}
+	at := nhT0.Add(7 * time.Hour)
+	open, err := s.openFindingsAt(context.Background(), r, nhHead(7), hh.feedback, &at)
+	if err == nil {
+		t.Fatalf("an unsettled fix lookup was not returned: open %v", open)
+	}
+}
+
+// The decision asks for a release: it is not sent while the hold is unsaved.
+func TestRoundHoldNewerHead_NoDecisionUntilTheHoldIsSaved(t *testing.T) {
+	s, _, gate, r := newerHeadSetup(t, 7)
+	file := s.roundRuleFile(r.Name, 7)
+	if err := os.MkdirAll(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if v := gate(); !nhHeld(v) {
+		t.Fatalf("failed write did not block: %v", v.Reasons)
+	}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nhDecisions(s); got != 0 {
+		t.Fatalf("a decision was sent with no saved hold: %d", got)
+	}
+}

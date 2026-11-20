@@ -798,6 +798,12 @@ type PassReceipt struct {
 	// silently dropped. A string keeps PassReceipt comparable.
 	DiffSource     string `json:"diff_source,omitempty"`
 	DiffSummarized string `json:"diff_summarized,omitempty"`
+	// Needed is how many distinct passes the head required when the pass was
+	// posted. It lets the pass history alone show that the head's review was
+	// complete, whatever policy a later head is under and whether or not the
+	// head's completion marker was written. Receipts posted before it existed
+	// carry none.
+	Needed int `json:"needed,omitempty"`
 }
 
 // ReviewedPass is one posted pass together with the head it reviewed.

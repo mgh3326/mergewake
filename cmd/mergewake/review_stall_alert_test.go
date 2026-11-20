@@ -37,6 +37,22 @@ func (a *stallAlerts) texts() []string {
 	return append([]string(nil), a.sent...)
 }
 
+// stalls is the alerts without the round-hold decision, which the held-review
+// path now sends as well (once; see TestRoundHoldStallAlertsOnce).
+func (a *stallAlerts) stalls() []string {
+	var out []string
+	for _, t := range a.texts() {
+		if !strings.Contains(t, "<!-- mergewake-round-hold -->") {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (a *stallAlerts) holdDecisions() int {
+	return len(a.texts()) - len(a.stalls())
+}
+
 // stallClock is the fixture's clock: a pass reads it, the test moves it.
 type stallClock struct{ at time.Time }
 
@@ -108,13 +124,13 @@ func TestRoundHoldStallAlertsOnce(t *testing.T) {
 
 	// Under reviewStallAfter the wait is young: no alert.
 	s.pass(t)
-	if got := s.alerts.texts(); len(got) != 0 {
+	if got := s.alerts.stalls(); len(got) != 0 {
 		t.Fatalf("alerted before the stall window: %q", got)
 	}
 
 	s.clock.advance(61 * time.Minute)
 	s.pass(t)
-	got := s.alerts.texts()
+	got := s.alerts.stalls()
 	if len(got) != 1 {
 		t.Fatalf("alerts=%q, want one held stall alert", got)
 	}
@@ -127,8 +143,13 @@ func TestRoundHoldStallAlertsOnce(t *testing.T) {
 
 	// Once per head: a second pass at the same head stays quiet.
 	s.pass(t)
-	if got := s.alerts.texts(); len(got) != 1 {
+	if got := s.alerts.stalls(); len(got) != 1 {
 		t.Fatalf("a second pass alerted again: %q", got)
+	}
+
+	// The held-review path sent the round-hold decision, once.
+	if n := s.alerts.holdDecisions(); n != 1 {
+		t.Fatalf("round-hold decisions = %d, want 1", n)
 	}
 
 	// Only the stall check ran: a held review delivers no findings and lands
@@ -138,7 +159,7 @@ func TestRoundHoldStallAlertsOnce(t *testing.T) {
 			t.Fatalf("a held review landed: %v", s.f.trace.snapshot())
 		}
 	}
-	for _, text := range s.alerts.texts() {
+	for _, text := range s.alerts.stalls() {
 		if strings.Contains(text, "FINDINGS") {
 			t.Fatalf("a held review delivered findings: %q", text)
 		}

@@ -462,6 +462,13 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 	// happen. They can still stall: a head that has waited out
 	// reviewStallAfter is told to its owner lane once, naming this wait, and
 	// only the stall check runs here.
+	if errors.Is(e, pipeline.ErrReviewHeld) {
+		// The hold stopped the review and nothing settles the head, so its
+		// decision is sent here: no findings delivery, no Land.
+		if holdErr := s.NotifyRoundHold(ctx, r, pr, o); holdErr != nil {
+			errs = append(errs, fmt.Errorf("PR %d round hold: %w", pr.Number, holdErr))
+		}
+	}
 	if unreviewed {
 		if stallErr := s.NotifyReviewStall(ctx, r, pr, o, e); stallErr != nil {
 			errs = append(errs, fmt.Errorf("PR %d review stall: %w", pr.Number, stallErr))
