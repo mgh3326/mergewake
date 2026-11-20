@@ -869,7 +869,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		} else {
 			// The lost reviewers of this pass outlive the record they were replaced
 			// under: a fresh spawn after a refused or dead one still excludes their pools.
-			durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass)
+			durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass, pr.Head.SHA)
 			if loadErr != nil {
 				return out, loadErr
 			}
@@ -1885,7 +1885,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	if !neverRanReviewer(rj, job) {
 		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart(), Pool: validPool(job.Pool)})
 	}
-	durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass)
+	durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass, pr.Head.SHA)
 	if loadErr != nil {
 		return out, loadErr
 	}

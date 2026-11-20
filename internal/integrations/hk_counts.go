@@ -71,6 +71,11 @@ var hkRouteWords = map[string]bool{
 	"unreconciled": true, "comments": true, "reopen": true, "decision-request": true,
 	"attachments": true, "documents": true, "consults": true, "nodes": true,
 	"agents": true, "command": true, "task-events": true,
+	// The change sections a PUT /v1/changes/<section> or a batch names.
+	"state": true, "checks": true, "threads": true, "findings": true, "gate": true,
+	// The task routes of the handoffkeep client (claim, rebind, decision-request/ask,
+	// projects/{p}/owner).
+	"claim": true, "rebind": true, "ask": true, "projects": true, "owner": true,
 }
 
 // hkRoute names the route of one request: its method and path template, with
