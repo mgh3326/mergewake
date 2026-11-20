@@ -37,6 +37,25 @@ var ladderHubRefusalCodes = map[string]bool{
 	"quota_refused": true, "pane_unavailable": true, "worktree_unreadable": true,
 }
 
+// escalateExitCode is the exit code of a failed panewire call, or -1 when there
+// is none. integrations.Exec wraps the process error with a prefix ("panewire
+// failed: exit status 2"), so the code is found anywhere in the message, not
+// only at its start.
+func escalateExitCode(err error) int {
+	var ee interface{ ExitCode() int }
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	msg := err.Error()
+	if i := strings.LastIndex(msg, "exit status "); i >= 0 {
+		var code int
+		if _, scanErr := fmt.Sscanf(msg[i:], "exit status %d", &code); scanErr == nil {
+			return code
+		}
+	}
+	return -1
+}
+
 func ladderRefusal(output string) (code string, hub bool) {
 	text := strings.TrimSpace(output)
 	text = strings.TrimPrefix(text, "panewire: ")
@@ -436,7 +455,16 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	out, err := s.Runner.Run(cmdCtx, "panewire", args, "", "")
+	// Run drops stdout on a failed exit; RunWithOutput keeps it, so a refusal
+	// that panewire prints there reaches ladderRefusal.
+	var out []byte
+	if withOutput, ok := s.Runner.(interface {
+		RunWithOutput(context.Context, string, []string, string, string) ([]byte, error)
+	}); ok {
+		out, err = withOutput.RunWithOutput(cmdCtx, "panewire", args, "", "")
+	} else {
+		out, err = s.Runner.Run(cmdCtx, "panewire", args, "", "")
+	}
 	outputStr := strings.TrimSpace(string(out))
 	now := s.now().UTC()
 
@@ -457,21 +485,10 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 		return
 	}
 
-	exitCode := -1
+	exitCode := escalateExitCode(err)
 	var ce *integrations.CommandError
-	if errors.As(err, &ce) {
-		if ee, ok := ce.Err.(interface{ ExitCode() int }); ok {
-			exitCode = ee.ExitCode()
-		} else if strings.Contains(ce.Err.Error(), "exit status ") {
-			fmt.Sscanf(ce.Err.Error(), "exit status %d", &exitCode)
-		}
-		if outputStr == "" && ce.Stderr != "" {
-			outputStr = strings.TrimSpace(ce.Stderr)
-		}
-	} else if ee, ok := err.(interface{ ExitCode() int }); ok {
-		exitCode = ee.ExitCode()
-	} else if strings.Contains(err.Error(), "exit status ") {
-		fmt.Sscanf(err.Error(), "exit status %d", &exitCode)
+	if errors.As(err, &ce) && outputStr == "" && ce.Stderr != "" {
+		outputStr = strings.TrimSpace(ce.Stderr)
 	}
 
 	switch exitCode {
@@ -502,7 +519,13 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
 		if !hub {
-			st.LadderRefusalText = outputStr
+			// Empty output must still owe the owner a notice: an empty text
+			// would skip the send and leave the refusal owed with no retry.
+			refusal := outputStr
+			if refusal == "" {
+				refusal = "panewire exited 2 with no output"
+			}
+			st.LadderRefusalText = refusal
 			st.LadderRefusalRound = ladderRound
 			st.LadderRefusalEventSent = false
 			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
