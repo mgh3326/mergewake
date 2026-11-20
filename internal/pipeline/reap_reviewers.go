@@ -116,6 +116,13 @@ const (
 	// record is gone and whose receipts and audit rows name no host: nothing
 	// can build a remote path for it.
 	reviewerHostUnknown = "no record names a host for this reviewer label"
+	// reviewerAlreadyClosed is the reason of a closed row: panewire refused the
+	// job close because the job already has a terminal record, so the job has
+	// ended and nothing is owed for it.
+	reviewerAlreadyClosed = "already closed"
+	// reviewerOtherRepo starts the reason of a skipped row: a journal-only label
+	// whose job record names another repository is not this sweep's to close.
+	reviewerOtherRepo = "job names another repository: "
 	// reviewerDrainHold is the pending reason of a removal held back by
 	// reap.reviewer_drain.per_host: the next pass takes it.
 	reviewerDrainHold = "drain cap reached for this host; the next pass continues"
@@ -135,7 +142,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "closed", "removed":
 		return true
 	case "skipped":
-		return strings.Contains(v.Reason, "already gone")
+		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo)
 	case "kept":
 		return v.Worktree != "" && (v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
@@ -347,7 +354,9 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 	for _, rec := range receipts {
 		switch rec.Action {
 		case "reviewer-reap":
-			if rec.Result == "abandoned" {
+			// An abandoned row, or a closed row for a job panewire already closed,
+			// means the job close is not owed again: the restart keeps it so.
+			if rec.Result == "abandoned" || (rec.Result == "closed" && rec.Reason == reviewerAlreadyClosed) {
 				w.abandoned[rec.Label] = true
 			}
 			if rec.Result == "stuck-reviewer" {
@@ -758,6 +767,15 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		w.record(gate, "error", "job record: "+integrations.Detail(e))
 		return
 	}
+	// A journal-only label (no pane in this repo's worktree) whose job record
+	// names another repository is that repository's reviewer: nothing here is
+	// owed for it, so it gets no close and no removal, only a terminal row.
+	if c.seen == nil {
+		if other := jobOtherRepo(job, w.r.Name); other != "" {
+			w.record(gate, "skipped", reviewerOtherRepo+other)
+			return
+		}
+	}
 	// A reviewer job stuck in spawned is closed abandoned when its review can
 	// no longer matter; its pane is left for panewire's node to close, and the
 	// worktree cleanup below runs once no pane uses it.
@@ -951,6 +969,9 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	cmd := w.s.Config.Review.Panewire.Command
 	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
+		if alreadyClosedRefusal(e) {
+			return w.alreadyClosed(gate, l)
+		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
@@ -959,6 +980,30 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	w.abandoned[l.name] = true
 	w.record(gate, "abandoned", reason)
 	return true
+}
+
+// alreadyClosed settles a close panewire refused because the job already has a
+// terminal record: the job has ended, so the label gets a closed row, its retry
+// state clears and no later pass closes it again. The sweep goes on to cleanup
+// as after a close.
+func (w *reviewerSweep) alreadyClosed(gate reapReceipt, l reviewerLabel) bool {
+	w.s.reapRetrySucceeded(w.r.Name, l.name)
+	w.abandoned[l.name] = true
+	w.record(gate, "closed", reviewerAlreadyClosed)
+	return true
+}
+
+// jobOtherRepo is the repository a job record's worktree origin names when it
+// is not repo, "" when the record names no repository or names repo itself.
+func jobOtherRepo(job integrations.JobRecord, repo string) string {
+	if job.Worktree == nil {
+		return ""
+	}
+	origin := reap.RepoFromRemote(job.Worktree.Origin)
+	if origin == "" || strings.EqualFold(origin, repo) {
+		return ""
+	}
+	return origin
 }
 
 // closeRetryBlocked also honors the last durable close failure after a daemon
@@ -1156,6 +1201,9 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 	cmd := w.s.Config.Review.Panewire.Command
 	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
+		if alreadyClosedRefusal(e) {
+			return w.alreadyClosed(gate, l)
+		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
