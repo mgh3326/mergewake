@@ -286,15 +286,18 @@ func aboveLow(severity string) bool {
 // and up, the hub consult's trigger, operator decision 250: one consult per PR
 // and round, none for an all-low round). A thread can be in both.
 func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread) {
-	blocking, above, _ = s.openFindingsChecked(ctx, r, pr, fb)
+	blocking, above, _ = s.openFindingsChecked(ctx, r, pr, pr.Head.SHA, fb)
 	return blocking, above
 }
 
 // openFindingsChecked is openFindings with the fix verifier's error: a fix
 // claim the lookups could not settle counts as open, and the error says so. A
-// caller that persists something on the result returns the error instead.
-func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread, err error) {
-	verifier := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+// caller that persists something on the result returns the error instead. A
+// fix claim is checked against head: the head whose round is being decided,
+// which is not the PR's head when a newer one was pushed meanwhile (a fix that
+// only the newer head carries is no fix for the older head's finding).
+func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr github.Pull, head string, fb github.ReviewFeedback) (blocking, above []github.ReviewThread, err error) {
+	verifier := s.fixVerifier(ctx, r.Name, head)
 	verify := verifier.verified
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
 	for _, t := range fb.Threads {
@@ -874,6 +877,19 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return hold()
 	}
 
+	// A head that inherits an earlier head's review carries that review's
+	// round end: unfinished there (its last pass posted, no marker, no hold
+	// saved), it is finished now, before any ready verdict.
+	if v.Review.Inherited != "" {
+		saved, err := s.finishRoundEnd(ctx, r, pr, v.Review.Inherited, history, Options{})
+		if err != nil {
+			return false, err
+		}
+		if saved {
+			return hold()
+		}
+	}
+
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
 	if !reviewed || !open {
 		return false, nil
@@ -969,7 +985,7 @@ func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.P
 	if err != nil {
 		return err
 	}
-	open, _, err := s.openFindingsChecked(ctx, r, pr, fb)
+	open, _, err := s.openFindingsChecked(ctx, r, pr, head, fb)
 	if err != nil {
 		return err
 	}
@@ -993,18 +1009,10 @@ func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.P
 	return s.recordRoundHold(ctx, r, pr)
 }
 
-// recoverRoundEnd finishes the round end of the newest earlier head when its
-// passes are all posted but its completion marker was never written: the run
-// that posted the last pass stopped before the round's hold was saved (a failed
-// write) and the author pushed before the retry. The hold is saved before this
-// newer head is reviewed. It reports whether a hold is now saved.
+// recoverRoundEnd finishes the round end of the newest earlier head (see
+// finishRoundEnd) before this newer head is reviewed. It reports whether a hold
+// is now saved.
 func (s *Service) recoverRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, o Options) (bool, error) {
-	if !o.Acting() || s.GH == nil {
-		return false, nil
-	}
-	if st := s.loadRoundRuleState(r.Name, pr.Number); st.held() || st.released() {
-		return false, nil
-	}
 	prev := ""
 	for i := len(history) - 1; i >= 0; i-- {
 		if history[i].Head != pr.Head.SHA {
@@ -1012,18 +1020,31 @@ func (s *Service) recoverRoundEnd(ctx context.Context, r config.Repo, pr github.
 			break
 		}
 	}
-	if prev == "" {
+	return s.finishRoundEnd(ctx, r, pr, prev, history, o)
+}
+
+// finishRoundEnd finishes head's round end when its passes are all posted but
+// its completion marker was never written: the run that posted the last pass
+// stopped before the round's hold was saved (a failed write) and the author
+// pushed, or rebased onto the same patch, before the retry. The hold is saved
+// before a newer head is reviewed or a head inheriting this review passes the
+// gate. It reports whether a hold is now saved.
+func (s *Service) finishRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, head string, history []github.ReviewedPass, o Options) (bool, error) {
+	if head == "" || !o.Acting() || s.GH == nil {
 		return false, nil
 	}
-	receipts := passesFor(history, prev)
+	if st := s.loadRoundRuleState(r.Name, pr.Number); st.held() || st.released() {
+		return false, nil
+	}
+	receipts := passesFor(history, head)
 	if !receiptsComplete(receipts) {
 		return false, nil
 	}
-	done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, prev+"-done")
+	done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, head+"-done")
 	if err != nil || done {
 		return false, err
 	}
-	if err := s.holdAtRoundEnd(ctx, r, pr, prev, history, receipts, o); err != nil {
+	if err := s.holdAtRoundEnd(ctx, r, pr, head, history, receipts, o); err != nil {
 		return false, err
 	}
 	st := s.loadRoundRuleState(r.Name, pr.Number)

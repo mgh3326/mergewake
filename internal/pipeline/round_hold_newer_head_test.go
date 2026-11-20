@@ -471,3 +471,57 @@ func TestRoundHoldNewerHead_PushBeforeTheRetryStillMeetsTheHold(t *testing.T) {
 		t.Fatalf("recovery did not save the hold before the newer review: posts %d->%d held %v", posts, hh.postCount, nhSaved(s, r).held())
 	}
 }
+
+// nhFailedRoundEnd runs round 7 with a high posted and the hold write failing:
+// every pass is posted, no marker, no hold.
+func nhFailedRoundEnd(t *testing.T) (*Service, *nhGH, config.Repo) {
+	t.Helper()
+	s, hh, r := nhSetup(t, 6, nhHigh)
+	file := s.roundRuleFile(r.Name, 7)
+	if err := os.MkdirAll(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := nhReview(s, r, Options{}); err == nil {
+		t.Fatal("a failed hold write did not stop the review")
+	}
+	if err := os.RemoveAll(file); err != nil {
+		t.Fatal(err)
+	}
+	return s, hh, r
+}
+
+// A fix that only the newer head carries is no fix for the older head's
+// finding: recovery verifies fix replies against the head being finalized.
+func TestRoundHoldNewerHead_RecoveryDoesNotTakeAFixFromTheNewerHead(t *testing.T) {
+	s, hh, r := nhFailedRoundEnd(t)
+	nhPush(hh)
+	// The thread is visible, unresolved, answered with a fix that exists on the
+	// newer head only (shaC is not an ancestor of the round's head, shaA).
+	hh.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 2, github.ReviewComment{Author: "pr-author", Body: "Fixed in " + shaC[:7]})}
+	hh.notAncestor = map[[2]string]bool{{shaC, shaA}: true}
+	if err := nhReview(s, r, Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("review of the newer head: %v, want ErrReviewHeld", err)
+	}
+	if !nhSaved(s, r).held() {
+		t.Fatal("a fix on the newer head disposed round 7's high during recovery")
+	}
+}
+
+// A same-patch rebase inherits the unfinished head's receipts: the gate
+// finishes that round end first, so no ready verdict precedes the hold, even
+// while the thread is not yet visible.
+func TestRoundHoldNewerHead_InheritedHeadFinishesTheUnfinishedRoundEnd(t *testing.T) {
+	s, hh, r := nhFailedRoundEnd(t)
+	nhPush(hh)
+	hh.diffs[shaB] = hh.diffs[shaA]
+	v := nhGate(t, s, hh, r)
+	if v.Review.Inherited == "" {
+		t.Fatalf("head did not inherit: %+v", v.Review)
+	}
+	if !nhHeld(v) || v.State != "blocked" {
+		t.Fatalf("an inherited head passed the gate before the hold: %q %v", v.State, v.Reasons)
+	}
+	if !nhSaved(s, r).held() {
+		t.Fatal("the gate did not save the owed hold")
+	}
+}
