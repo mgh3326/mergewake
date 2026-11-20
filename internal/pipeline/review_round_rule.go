@@ -31,10 +31,16 @@ const ladderPendingBound = 2 * time.Hour
 // ladderPaneBusyMaxCalls bounds retries after panewire cannot reach the author pane.
 const ladderPaneBusyMaxCalls = 3
 
+// ladderHubRefusalCodes are the codes panewire's hub relays to the owner lane
+// itself (panewire@2b1e4bfe hub_escalate_author.go: escalateAuthorRefusal and
+// the close-step cancels), so mergewake sends no second notice for them.
 var ladderHubRefusalCodes = map[string]bool{
 	"no_rung": true, "successor_invalid": true, "job_unreadable": true,
 	"job_changed": true, "job_not_live": true, "pane_busy": true,
 	"quota_refused": true, "pane_unavailable": true, "worktree_unreadable": true,
+	"claim_refused": true, "job_mismatch": true, "job_not_marked": true,
+	"job_unknown": true, "staged_expired": true, "task_closed": true,
+	"pane_not_closed": true,
 }
 
 // escalateExitCode is the exit code of a failed panewire call, or -1 when there

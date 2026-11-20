@@ -1117,6 +1117,19 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 				t.Fatal("pane_busy did not settle at retry bound")
 			}
 		})
+		t.Run("hub_pane_not_closed", func(t *testing.T) {
+			// panewire's hub relays pane_not_closed to the owner lane itself
+			// (mergewake#488 round 5 got two notices before this was listed).
+			s, _, n, run, r := setup(t, "panewire: pane_not_closed: the author pane could not be closed: pane_changed")
+			deliver(t, s, r)
+			deliver(t, s, r)
+			if calls, _, _ := escalateSnapshot(run); calls != 1 {
+				t.Fatalf("hub pane_not_closed calls = %d, want 1", calls)
+			}
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("hub pane_not_closed sent a second notice: %+v", n.events)
+			}
+		})
 		t.Run("hub_job_not_live", func(t *testing.T) {
 			s, _, n, run, r := setup(t, "panewire: job_not_live: task is no longer live")
 			deliver(t, s, r)
