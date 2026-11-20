@@ -236,10 +236,12 @@ func (s *Service) blockLane(ctx context.Context, r config.Repo, pr github.Pull, 
 		switch {
 		case e == nil && route.via != "unknown author; desk":
 			return route.lane, route.via, nil
-		case e != nil && hostScanOnly(e):
-			return s.blockLanePartial(ctx, r, pr)
 		case e != nil:
 			return "", "", fmt.Errorf("review block route: %w", e)
+		case len(route.failedHosts) > 0:
+			// No author lane on the hosts that answered: the lane the PR names,
+			// else the owner lane, with the partial scan named in via.
+			return s.blockLanePartial(ctx, r, pr)
 		}
 	}
 	return s.ownerLane(r), "owner lane", nil

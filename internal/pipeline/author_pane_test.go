@@ -311,16 +311,25 @@ func TestFullAuthorScanStillTakesOverUniquePane(t *testing.T) {
 	}
 }
 
-func TestPartialAuthorScanWithoutBoundJobRetries(t *testing.T) {
+// (hk 5817) A partial scan with no bound job routes on the host that answered:
+// its author pane is the route, and the audit names the unreadable host.
+func TestPartialAuthorScanWithoutBoundJobRoutesOnAnsweringHost(t *testing.T) {
 	s, sink, run := takeoverSetup(t, paneB)
 	delete(sink.jobs, "2481")
 	setPartialAuthorScan(s, run)
+	var out bytes.Buffer
+	s.Out = &out
 	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
-	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e == nil {
-		t.Fatal("partial scan without a bound job did not return an error")
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e != nil {
+		t.Fatalf("partial scan without a bound job returned %v", e)
 	}
-	if n := s.Notifier.(*ackNotifier); n.count != 0 {
-		t.Fatalf("event sent without a bound author lane: %+v", n.events)
+	n := s.Notifier.(*ackNotifier)
+	if n.count != 1 || n.events[0].Lane != "w-9-lane" {
+		t.Fatalf("want one event on the answering author's lane w-9-lane, got %+v", n.events)
+	}
+	rows := auditRecords(t, out.Bytes(), "findings-route-partial")
+	if len(rows) != 1 || rows[0]["lane"] != "w-9-lane" || !strings.Contains(fmt.Sprint(rows[0]["failed_hosts"]), "unavailable") {
+		t.Fatalf("partial-route audit rows %+v", rows)
 	}
 }
 
@@ -355,17 +364,27 @@ func TestPartialAuthorScanWorkerVerdictRouteAndReadyAudit(t *testing.T) {
 		t.Fatalf("partial verdict route missing from audit: %+v", rows)
 	}
 
-	s2, _, _, r2 := workerNotifySetup(t)
+	// hk 5817: with no author pane on the hosts that answered, the verdict falls
+	// back exactly as a full scan with no author pane does, and is no error.
+	s2, _, n2, r2 := workerNotifySetup(t)
 	run2 := authorHost()
 	s2.Runner = run2
 	setPartialAuthorScan(s2, run2)
 	delete(s2.Sink.(*jobSink).jobs, "42")
 	s2.GH.(*fakeGH).ci = github.Red
-	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e == nil {
-		t.Fatal("author verdict without a bound job did not retry on partial scan")
+	if e := s2.NotifyPR(context.Background(), r2, 7, Options{}); e != nil {
+		t.Fatalf("author verdict without a bound job on a partial scan returned %v", e)
 	}
-	if n := s2.Notifier.(*fakeNotifier); n.count != 0 {
-		t.Fatalf("verdict delivered without a bound author lane: %+v", n.events)
+	s4, _, n4, r4 := workerNotifySetup(t)
+	s4.Runner = authorHost()
+	s4.Config.Hosts = []reap.Host{{Name: "healthy"}}
+	delete(s4.Sink.(*jobSink).jobs, "42")
+	s4.GH.(*fakeGH).ci = github.Red
+	if e := s4.NotifyPR(context.Background(), r4, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if n2.count != 1 || n4.count != 1 || n2.events[0].Lane != n4.events[0].Lane {
+		t.Fatalf("partial verdict %+v, full scan with no author pane %+v: want the same lane", n2.events, n4.events)
 	}
 }
 
@@ -382,20 +401,21 @@ func TestAuthorPaneHubErrorStillRetriesBoundLane(t *testing.T) {
 	}
 }
 
-// (takeover g) A host read error during the takeover scan is returned: the
-// pass retries and sends nothing, rather than picking a lane.
-func TestTakeoverScanErrorRetriesWithoutSending(t *testing.T) {
+// (takeover g) A host whose pane list fails during the takeover scan is a
+// partial scan (hk 5817): the bound lane stands, and the route names the host.
+func TestTakeoverScanErrorKeepsBoundLane(t *testing.T) {
 	s, _, run := takeoverSetup(t, paneB)
 	run.errs = map[string]error{key("herdr", "agent", "list"): errors.New("herdr unreachable")}
 	s.GH.(*fakeGH).feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 3)}
-	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e == nil {
-		t.Fatal("scan error was not returned")
+	if e := s.DeliverFindings(context.Background(), testRepoFor(s), 7, Options{}); e != nil {
+		t.Fatalf("host scan failure returned %v", e)
 	}
-	if n := s.Notifier.(*ackNotifier); n.count != 0 {
-		t.Fatalf("event sent during a failed scan: %+v", n.events)
+	if n := s.Notifier.(*ackNotifier); n.count != 1 || n.events[0].Lane != "w-7" {
+		t.Fatalf("want one event on the bound lane w-7, got %+v", n.events)
 	}
-	if rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull); e == nil {
-		t.Fatalf("route picked %q via %q", rt.lane, rt.via)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil || rt.lane != "w-7" || len(rt.failedHosts) != 1 {
+		t.Fatalf("route %q via %q failed %v err %v, want bound lane w-7 with one failed host", rt.lane, rt.via, rt.failedHosts, e)
 	}
 }
 
@@ -506,17 +526,18 @@ func TestAuthorPaneOtherRepositoryNotMatched(t *testing.T) {
 	}
 }
 
-// (g) A host that cannot list its panes is an error to retry, in both routes,
-// not a reroute to the trailer.
-func TestAuthorPaneHostErrorRetries(t *testing.T) {
+// (g) A host that cannot list its panes, and no other host to answer, is no
+// route error (hk 5817): both routes fall back exactly as with no author pane.
+func TestAuthorPaneHostErrorFallsBack(t *testing.T) {
 	s, _, run := authorPaneSetup(t)
 	run.errs = map[string]error{key("herdr", "agent", "list"): errors.New("herdr unreachable")}
 	pr := s.GH.(*fakeGH).pull
-	if rt, e := s.findingsRoute(context.Background(), testRepoFor(s), pr); e == nil {
-		t.Fatalf("findings rerouted to %q via %q", rt.lane, rt.via)
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), pr)
+	if e != nil || rt.lane != "trailer-lane" || len(rt.failedHosts) != 1 {
+		t.Fatalf("findings route %q via %q failed %v err %v, want the trailer lane with one failed host", rt.lane, rt.via, rt.failedHosts, e)
 	}
-	if lane, via, e := s.notifyLane(context.Background(), testRepoFor(s), pr); e == nil {
-		t.Fatalf("ready rerouted to %q via %q", lane, via)
+	if lane, via, e := s.notifyLane(context.Background(), testRepoFor(s), pr); e != nil || lane != "task-lane" {
+		t.Fatalf("ready route %q via %q err %v, want the task lane", lane, via, e)
 	}
 }
 

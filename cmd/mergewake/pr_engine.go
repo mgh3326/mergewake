@@ -454,7 +454,14 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	e.q.Enqueue(daemon.SourceSweep, keys...)
 	e.skips.forget(r.Name, seen)
 	errs = append(errs, e.takeErrors(r.Name)...)
-	return errors.Join(mergedErr, errors.Join(errs...))
+	// A host that could not list its panes is not this sweep's failure: its PRs
+	// routed on the hosts that answered. It is logged once, so the outage
+	// stays visible without a failed pass.
+	rest, hosts := pipeline.SplitHostScan(errors.Join(mergedErr, errors.Join(errs...)))
+	if len(hosts) > 0 && e.log != nil {
+		e.log.Warn("pr sweep: pane scan failed on hosts; PRs routed on the hosts that answered", "repo", r.Name, "hosts", hosts)
+	}
+	return rest
 }
 
 // openSet is the open PRs of one repo for the closed-row reconcile. It is the

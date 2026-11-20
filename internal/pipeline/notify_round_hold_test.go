@@ -22,10 +22,9 @@ func (p scanFailRunner) Run(ctx context.Context, command string, args []string, 
 	return p.roundRuleRunner.Run(ctx, command, args, input, dir)
 }
 
-// A round hold whose verdict cannot finish (the author pane scan fails while a
-// recent finding waits on the author) still sends its one decision event.
-// NotifyPR returns the read error after the decision, and a later pass sends
-// no second decision (hk 5536).
+// A round hold whose author pane scan fails (while a recent finding waits on
+// the author) still sends its one decision event. A failed pane list is not a
+// notice error (hk 5817), and a later pass sends no second decision (hk 5536).
 func TestNotifyRoundHoldSentWhenAuthorScanFails(t *testing.T) {
 	s, g, n, sink, run, r := roundRuleSetup(t, 7)
 	th := ownFinding("T1", "high", 10)
@@ -35,9 +34,8 @@ func TestNotifyRoundHoldSentWhenAuthorScanFails(t *testing.T) {
 	s.Config.Hosts = []reap.Host{{Name: "remote", SSH: "remote"}}
 	s.Runner = scanFailRunner{run}
 
-	err := s.NotifyPR(context.Background(), r, 7, Options{})
-	if err == nil || !strings.Contains(err.Error(), "pane list failed") {
-		t.Fatalf("NotifyPR err = %v, want the author pane scan error", err)
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatalf("NotifyPR err = %v, want none for a failed pane list", err)
 	}
 	decisions := func() (count int) {
 		for _, e := range n.events {
