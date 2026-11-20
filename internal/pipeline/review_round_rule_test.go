@@ -1068,6 +1068,28 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 		}
 	})
 
+	t.Run("silent_exit_2_as_integrations_reports_it_notifies_once", func(t *testing.T) {
+		// integrations.Exec returns a silent failed exit as a plain error with
+		// the process prefix, not a CommandError; exit 2 must still be read.
+		s, _, n, run, r := setup(t, "")
+		run.escalateErr = fmt.Errorf("panewire failed: exit status 2")
+		deliver(t, s, r)
+		deliver(t, s, r)
+		st := s.loadRoundRuleState(r.Name, 7)
+		if !st.escalated() || !st.LadderRefusalEventSent {
+			t.Fatalf("silent exit 2 not settled/sent: %+v", st)
+		}
+		if !strings.Contains(strings.Join(auditLines(t, s, r.Name), "\n"), `"rc":2`) {
+			t.Fatalf("silent exit 2 not audited as rc 2: %v", auditLines(t, s, r.Name))
+		}
+		if calls, _, _ := escalateSnapshot(run); calls != 1 {
+			t.Fatalf("silent exit 2 calls = %d, want 1", calls)
+		}
+		if events := refusalEvents(n); len(events) != 1 {
+			t.Fatalf("silent exit 2 events = %d, want 1: %+v", len(events), n.events)
+		}
+	})
+
 	t.Run("pane_busy_retries_but_hub_job_not_live_does_not", func(t *testing.T) {
 		t.Run("pane_busy", func(t *testing.T) {
 			s, _, n, run, r := setup(t, "panewire: pane_busy: the author pane is busy")
@@ -1222,5 +1244,23 @@ func TestRoundRule_LadderConcurrentEvaluationsSingleCall(t *testing.T) {
 	}
 	if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
 		t.Fatalf("the evaluation that ran did not record the outcome")
+	}
+}
+
+func TestEscalateExitCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"integrations silent exit", fmt.Errorf("panewire failed: exit status 2"), 2},
+		{"bare exit status", fmt.Errorf("exit status 124"), 124},
+		{"command error", &integrations.CommandError{Command: "panewire", Err: fmt.Errorf("exit status 1"), Stderr: "x"}, 1},
+		{"no exit status", fmt.Errorf("panewire failed: boom"), -1},
+	}
+	for _, tt := range cases {
+		if got := escalateExitCode(tt.err); got != tt.want {
+			t.Errorf("%s: escalateExitCode = %d, want %d", tt.name, got, tt.want)
+		}
 	}
 }
