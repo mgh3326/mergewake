@@ -24,6 +24,9 @@ type JobRecord struct {
 	State   string `json:"state"`
 	Family  string `json:"family"`
 	Profile string `json:"profile"`
+	// Effort is the reasoning effort the spawn ran at (the spawned record's
+	// "effort"); empty when the record names none.
+	Effort string `json:"effort"`
 	// Pool is the quota pool the spawn was placed on, as panewire recorded it
 	// at spawn (the spawned record's "pool"); empty when the record names none.
 	Pool   string          `json:"pool"`

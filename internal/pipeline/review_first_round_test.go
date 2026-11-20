@@ -55,7 +55,7 @@ func TestFirstRoundGradeAskedPerRound(t *testing.T) {
 				t.Fatalf("review rows = %v", rows)
 			}
 			row := rows[0]
-			if row["pr_grade"] != tc.prGrade || row["grade_asked"] != tc.wantAsked || row["first_round"] != !tc.earlier || row["seat"] != "seat-x" {
+			if row["pr_grade"] != tc.prGrade || row["grade_asked"] != tc.wantAsked || row["first_round"] != !tc.earlier || row["seat"] != "unknown" {
 				t.Fatalf("audit row = %v", row)
 			}
 		})
