@@ -22,6 +22,9 @@ type nhGH struct {
 	historyErr  error
 	// onComments runs when the PR's comments are read.
 	onComments func()
+	// submitted is when each head's passes were posted, as the history read
+	// returns it.
+	submitted map[string]time.Time
 }
 
 func (g *nhGH) IssueComments(ctx context.Context, repo string, n int) ([]github.IssueComment, error) {
@@ -38,7 +41,14 @@ func (g *nhGH) ReviewHistory(ctx context.Context, repo string, n int, login stri
 	if g.historyErr != nil {
 		return nil, g.historyErr
 	}
-	return g.fakeGH.ReviewHistory(ctx, repo, n, login)
+	h, err := g.fakeGH.ReviewHistory(ctx, repo, n, login)
+	for i := range h {
+		if at, ok := g.submitted[h[i].Head]; ok {
+			t := at
+			h[i].SubmittedAt = &t
+		}
+	}
+	return h, err
 }
 
 func nhHead(i int) string { return strings.Repeat(string(rune('0'+i)), 40) }
@@ -410,7 +420,7 @@ func TestRoundHoldNewerHead_PostedHighAnsweredBeforeTheEndIsNotOpen(t *testing.T
 	t1.IsResolved = true
 	hh.feedback.Threads = []github.ReviewThread{t1}
 	rc := github.PassReceipt{Pass: 1, Needed: 1, Patch: "patch-7", Round: 7, Blocking: 1}
-	if err := s.holdAtRoundEnd(context.Background(), r, hh.pull, shaA, nhHistory(hh), []github.PassReceipt{rc}, Options{}); err != nil {
+	if err := s.holdAtRoundEnd(context.Background(), r, hh.pull, shaA, nil, nhHistory(hh), []github.PassReceipt{rc}, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if nhSaved(s, r).held() {
@@ -523,5 +533,52 @@ func TestRoundHoldNewerHead_InheritedHeadFinishesTheUnfinishedRoundEnd(t *testin
 	}
 	if !nhSaved(s, r).held() {
 		t.Fatal("the gate did not save the owed hold")
+	}
+}
+
+// The hold is the PR's: B returns to the patch reviewed on an earlier completed
+// head P while A's round end is unfinished. B inherits P, whose marker is set,
+// but the gate still finishes A's round end before a ready verdict.
+func TestRoundHoldNewerHead_InheritedFromAnEarlierHeadStillFinishesTheNewestRoundEnd(t *testing.T) {
+	s, hh, r := nhFailedRoundEnd(t)
+	nhPush(hh)
+	// B carries the patch of head 3 (completed, marker set), not A's.
+	p3 := hh.passes[nhHead(3)][0].Patch
+	_ = p3
+	diff, _ := hh.fakeGH.Diff(context.Background(), "", 0)
+	hh.passes[nhHead(3)][0].Patch = reviewPatchID(diff)
+	hh.diffs[shaB] = diff
+	v := nhGate(t, s, hh, r)
+	if v.Review.Inherited != nhHead(3) {
+		t.Fatalf("head inherited %q, want head 3: %+v", v.Review.Inherited, v.Review)
+	}
+	if !nhHeld(v) || !nhSaved(s, r).held() {
+		t.Fatalf("an inheriting head passed with A's round end unfinished: %q %v", v.State, v.Reasons)
+	}
+}
+
+// Recovery bounds the threads to those that existed when the recovered round
+// ended: a finding first posted after it belongs to a later head and is judged
+// by the current head's gate, not counted into the old round.
+func TestRoundHoldNewerHead_RecoveryIgnoresThreadsPostedAfterTheRound(t *testing.T) {
+	s, hh, r := nhSetup(t, 6, `{"findings":[]}`)
+	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	// Round 7 on A finished clean; only its marker write failed.
+	hh.passes[shaA] = []github.PassReceipt{{Pass: 1, Needed: 1, Patch: "patch-7", Round: 7}}
+	hh.submitted = map[string]time.Time{shaA: at}
+	late := ownFinding("T9", "high", 8)
+	late.Comments[0].CreatedAt = at.Add(time.Hour)
+	hh.feedback.Threads = []github.ReviewThread{late}
+	nhPush(hh)
+	saved, err := s.recoverRoundEnd(context.Background(), r, hh.pull, nhHistory(hh), Options{})
+	if err != nil || saved || nhSaved(s, r).held() {
+		t.Fatalf("a thread posted after the round ended counted into it: saved %v err %v", saved, err)
+	}
+	// A thread that existed when the round ended does count.
+	early := ownFinding("T8", "high", 7)
+	early.Comments[0].CreatedAt = at.Add(-time.Hour)
+	hh.feedback.Threads = []github.ReviewThread{early, late}
+	if saved, err := s.recoverRoundEnd(context.Background(), r, hh.pull, nhHistory(hh), Options{}); err != nil || !saved {
+		t.Fatalf("a thread open when the round ended did not hold: saved %v err %v", saved, err)
 	}
 }

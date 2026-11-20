@@ -334,7 +334,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			s.notifyCompletedLateRound(ctx, r, pr, round, posted, nil)
 			// A run that posted the last pass but stopped before the end of the
 			// round (a failed hold write, a failed marker) is finished here.
-			if e = s.holdAtRoundEnd(ctx, r, pr, pr.Head.SHA, history, slices.Collect(maps.Values(posted)), o); e != nil {
+			if e = s.holdAtRoundEnd(ctx, r, pr, pr.Head.SHA, nil, history, slices.Collect(maps.Values(posted)), o); e != nil {
 				return e
 			}
 			if e = s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(posted)), o.DryRun); e != nil {
@@ -729,7 +729,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		mu.Unlock()
 		// The round has ended: a hold it owes is saved before the completion
 		// marker, so nothing the author does next can come first.
-		if e := s.holdAtRoundEnd(ctx, r, pr, pr.Head.SHA, history, slices.Collect(maps.Values(runReceipts)), o); e != nil {
+		if e := s.holdAtRoundEnd(ctx, r, pr, pr.Head.SHA, nil, history, slices.Collect(maps.Values(runReceipts)), o); e != nil {
 			return e
 		}
 		s.notifyCompletedLateRound(ctx, r, pr, rp.round, runReceipts, facts)

@@ -286,7 +286,7 @@ func aboveLow(severity string) bool {
 // and up, the hub consult's trigger, operator decision 250: one consult per PR
 // and round, none for an all-low round). A thread can be in both.
 func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread) {
-	blocking, above, _ = s.openFindingsChecked(ctx, r, pr, pr.Head.SHA, fb)
+	blocking, above, _ = s.openFindingsChecked(ctx, r, pr, pr.Head.SHA, nil, fb)
 	return blocking, above
 }
 
@@ -295,13 +295,18 @@ func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pul
 // caller that persists something on the result returns the error instead. A
 // fix claim is checked against head: the head whose round is being decided,
 // which is not the PR's head when a newer one was pushed meanwhile (a fix that
-// only the newer head carries is no fix for the older head's finding).
-func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr github.Pull, head string, fb github.ReviewFeedback) (blocking, above []github.ReviewThread, err error) {
+// only the newer head carries is no fix for the older head's finding). With at
+// set, only what existed then counts: a thread first posted after it is left
+// out, and a reply after it disposes of nothing.
+func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr github.Pull, head string, at *time.Time, fb github.ReviewFeedback) (blocking, above []github.ReviewThread, err error) {
 	verifier := s.fixVerifier(ctx, r.Name, head)
 	verify := verifier.verified
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
+	existed := func(c github.ReviewComment) bool {
+		return at == nil || c.CreatedAt.IsZero() || !c.CreatedAt.After(*at)
+	}
 	for _, t := range fb.Threads {
-		if t.IsResolved || len(t.Comments) == 0 {
+		if t.IsResolved || len(t.Comments) == 0 || !existed(t.Comments[0]) {
 			continue
 		}
 		first := t.Comments[0]
@@ -310,7 +315,16 @@ func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr git
 		if !must && !aboveLow(sev) {
 			continue
 		}
-		if disposed(t, own, verify, s.Config.Review.FleetAuthors) {
+		then := t
+		if at != nil {
+			then.Comments = nil
+			for _, c := range t.Comments {
+				if existed(c) {
+					then.Comments = append(then.Comments, c)
+				}
+			}
+		}
+		if disposed(then, own, verify, s.Config.Review.FleetAuthors) {
 			continue
 		}
 		if must {
@@ -877,11 +891,16 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		return hold()
 	}
 
-	// A head that inherits an earlier head's review carries that review's
-	// round end: unfinished there (its last pass posted, no marker, no hold
-	// saved), it is finished now, before any ready verdict.
+	// A head that inherits an earlier head's review is checked for unfinished
+	// round ends (a last pass posted, no marker, no hold saved): they are
+	// finished now, before any ready verdict.
+	// The hold is the PR's, so the newest earlier head's unfinished round end
+	// counts too, whichever head supplied the inherited passes.
 	if v.Review.Inherited != "" {
-		saved, err := s.finishRoundEnd(ctx, r, pr, v.Review.Inherited, history, Options{})
+		saved, err := s.recoverRoundEnd(ctx, r, pr, history, Options{})
+		if err == nil && !saved {
+			saved, err = s.finishRoundEnd(ctx, r, pr, v.Review.Inherited, history, Options{})
+		}
 		if err != nil {
 			return false, err
 		}
@@ -961,8 +980,10 @@ func blockingPosted(findings []github.Finding) int {
 //   - A lookup that cannot settle a fix claim is returned, not persisted: the
 //     review stops before the marker and is retried. So is a failed write.
 //
-// A dry run saves nothing.
-func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, head string, history []github.ReviewedPass, receipts []github.PassReceipt, o Options) error {
+// at is when the round ended, for a recovery run later: only what existed then
+// counts (nil for the run that ends the round, which reads the threads now). A
+// dry run saves nothing.
+func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, head string, at *time.Time, history []github.ReviewedPass, receipts []github.PassReceipt, o Options) error {
 	if !o.Acting() || s.GH == nil {
 		return nil
 	}
@@ -985,7 +1006,7 @@ func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.P
 	if err != nil {
 		return err
 	}
-	open, _, err := s.openFindingsChecked(ctx, r, pr, head, fb)
+	open, _, err := s.openFindingsChecked(ctx, r, pr, head, at, fb)
 	if err != nil {
 		return err
 	}
@@ -1044,7 +1065,14 @@ func (s *Service) finishRoundEnd(ctx context.Context, r config.Repo, pr github.P
 	if err != nil || done {
 		return false, err
 	}
-	if err := s.holdAtRoundEnd(ctx, r, pr, head, history, receipts, o); err != nil {
+	// The round ended when the head's last pass posted.
+	var at *time.Time
+	for _, p := range history {
+		if p.Head == head && p.SubmittedAt != nil && (at == nil || p.SubmittedAt.After(*at)) {
+			at = p.SubmittedAt
+		}
+	}
+	if err := s.holdAtRoundEnd(ctx, r, pr, head, at, history, receipts, o); err != nil {
 		return false, err
 	}
 	st := s.loadRoundRuleState(r.Name, pr.Number)
