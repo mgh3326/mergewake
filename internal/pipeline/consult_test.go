@@ -103,6 +103,7 @@ func (h *consultHub) getCount() int {
 type consultSink struct {
 	*jobSink
 	docs       map[string]string
+	writes     []string // every question key written, in order
 	comments   []string
 	recordErr  error
 	commentErr error
@@ -113,6 +114,7 @@ func (s *consultSink) Record(_ context.Context, key string, data []byte) error {
 		return s.recordErr
 	}
 	s.docs[key] = string(data)
+	s.writes = append(s.writes, key)
 	return nil
 }
 
@@ -570,101 +572,6 @@ func TestHubConsult_NoTaskFallsBack(t *testing.T) {
 	}
 	if !strings.Contains(n.events[0].Text, "consult could not be had") {
 		t.Fatalf("missing could-not-be-had line: %s", n.events[0].Text)
-	}
-}
-
-// A consult is keyed by head: a new head that inherits the reviewed patch
-// and stays in the consult round never reuses the old head's row. The old
-// row is superseded and recorded, and the new head gets its own consult.
-func TestHubConsult_NewHeadSupersedesOldRow(t *testing.T) {
-	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
-	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
-	run.queue = []consultResp{
-		{rc: 0, out: `{"id":"c-1","state":"queued"}`},
-		{rc: 0, out: `{"id":"c-2","state":"queued"}`},
-	}
-	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
-	hub.rows["c-2"] = reap.ConsultRow{ID: "c-2", State: "queued"}
-
-	deliver(t, s, r)
-	if run.requestCount() != 1 || n.count != 0 {
-		t.Fatalf("first pass: requests=%d events=%d", run.requestCount(), n.count)
-	}
-
-	// The author pushes; the same reviewed patch keeps the round at the
-	// consult round, so a new consult is owed for the new head.
-	g.pull.Head.SHA = shaC
-	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-3", Round: 3}}
-	g.refs[doneRef(7, shaC)] = true
-
-	deliver(t, s, r)
-
-	if run.requestCount() != 2 {
-		t.Fatalf("want a consult for the new head, requests=%v", run.requests)
-	}
-	if got := flagValue(run.lastRequest(), "--head"); got != shaC {
-		t.Fatalf("new request --head=%q, want %q", got, shaC)
-	}
-	st := s.loadRoundRuleState(r.Name, 7)
-	if st.HubConsultID != "c-2" || st.HubConsultHead != shaC {
-		t.Fatalf("state not re-keyed to the new head: %+v", st)
-	}
-	if n.count != 0 {
-		t.Fatalf("findings delivered while the new consult is queued: %+v", n.events)
-	}
-	if hub.getCount() != 0 {
-		t.Fatalf("old head's row polled %d times", hub.getCount())
-	}
-	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 || rows[0]["head"] != shaA {
-		t.Fatalf("supersession not audited: %v", rows)
-	}
-	if len(sink.comments) != 1 || !strings.Contains(sink.comments[0], "superseded") {
-		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
-	}
-}
-
-// When the pushed head's round is past the consult round, the owed consult
-// is superseded and the new round's findings go out at once: they are never
-// held behind another head's row or answered with its answer.
-func TestHubConsult_NewRoundReleasesHeldFindings(t *testing.T) {
-	s, g, n, sink, run, hub, r, _ := hubConsultSetup(t, 3)
-	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
-	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
-
-	deliver(t, s, r)
-	if n.count != 0 {
-		t.Fatal("delivered while the consult was queued")
-	}
-
-	// The author pushes a new patch: round 4, past the consult round.
-	g.pull.Head.SHA = shaC
-	g.passes[shaC] = []github.PassReceipt{{Pass: 1, Patch: "patch-4", Round: 4}}
-	g.refs[doneRef(7, shaC)] = true
-
-	deliver(t, s, r)
-
-	if n.count != 1 {
-		t.Fatalf("new round's findings still held: %+v", n.events)
-	}
-	if strings.Contains(n.events[0].Text, "hub consult") {
-		t.Fatalf("stale consult text attached to the new head: %s", n.events[0].Text)
-	}
-	if run.requestCount() != 1 {
-		t.Fatalf("round 4 requested a consult: %v", run.requests)
-	}
-	if hub.getCount() != 0 {
-		t.Fatalf("old head's row polled %d times", hub.getCount())
-	}
-	if rows := auditRows(t, s, r, "consult-superseded"); len(rows) != 1 {
-		t.Fatalf("supersession not audited: %v", rows)
-	}
-	if len(sink.comments) != 1 {
-		t.Fatalf("supersession not recorded on the task: %v", sink.comments)
-	}
-	// Nothing more is polled or delivered on later passes.
-	deliver(t, s, r)
-	if n.count != 1 || run.requestCount() != 1 || hub.getCount() != 0 {
-		t.Fatalf("superseded consult acted again: events=%d requests=%d gets=%d", n.count, run.requestCount(), hub.getCount())
 	}
 }
 

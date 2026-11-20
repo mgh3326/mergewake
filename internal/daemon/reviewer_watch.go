@@ -18,9 +18,12 @@ const (
 	reviewerWatchMax = 50
 	// reviewerReadTimeout bounds one hk read, so a hung hk delays the tick, not the role.
 	reviewerReadTimeout = 5 * time.Second
-	// reviewerNotFoundEvery is how often a job with no hk record yet is read
-	// again. Its record appears when its spawn lands, so a job still missing
-	// is not worth a read every tick.
+	// reviewerNotFoundFirst is the wait after a job's record is first found
+	// missing. A spawn lands soon after its record is saved, so the record is
+	// read again within a tick or two of the miss.
+	reviewerNotFoundFirst = 15 * time.Second
+	// reviewerNotFoundEvery caps the wait for a job whose record stays missing,
+	// which doubles on each miss from reviewerNotFoundFirst.
 	reviewerNotFoundEvery = 5 * time.Minute
 )
 
@@ -61,14 +64,30 @@ type ReviewerWatch struct {
 	Log  *slog.Logger
 	// Every is the tick; zero means ReviewerWatchEvery. Tests shorten it.
 	Every time.Duration
+	// now is the clock; nil means time.Now. Tests set it.
+	now func() time.Time
 
 	// woken holds the jobs already reported, so a finished job whose record
 	// outlives a pass wakes the role once, not every tick.
 	woken map[string]bool
-	// missing holds when each job's record was last found missing; such a job
-	// is read again only after reviewerNotFoundEvery.
-	missing map[string]time.Time
+	// missing holds each job whose record was found missing: when, and how long
+	// until it is read again.
+	missing map[string]notFound
 	outage  bool
+}
+
+// notFound is a job's missing record: when the read found it missing, and the
+// wait before the record is read again.
+type notFound struct {
+	at   time.Time
+	wait time.Duration
+}
+
+func (w *ReviewerWatch) clock() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
 }
 
 // Run ticks until ctx ends.
@@ -101,7 +120,6 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 	if len(jobs) > reviewerWatchMax {
 		jobs = jobs[:reviewerWatchMax]
 	}
-	at := time.Now()
 	live := make(map[string]bool, len(jobs))
 	for _, j := range jobs {
 		live[j.Label] = true
@@ -120,7 +138,7 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 		if w.woken[j.Label] {
 			continue
 		}
-		if seen, ok := w.missing[j.Label]; ok && at.Sub(seen) < reviewerNotFoundEvery {
+		if seen, ok := w.missing[j.Label]; ok && w.clock().Sub(seen.at) < seen.wait {
 			continue
 		}
 		readCtx, cancel := context.WithTimeout(ctx, reviewerReadTimeout)
@@ -131,10 +149,16 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 		}
 		if err != nil {
 			if w.NotFound != nil && w.NotFound(err) {
-				if w.missing == nil {
-					w.missing = map[string]time.Time{}
+				// The wait starts when the read returns: earlier reads in this
+				// tick can take seconds each, and the miss is what the wait follows.
+				wait := reviewerNotFoundFirst
+				if prev, ok := w.missing[j.Label]; ok {
+					wait = min(2*prev.wait, reviewerNotFoundEvery)
 				}
-				w.missing[j.Label] = at
+				if w.missing == nil {
+					w.missing = map[string]notFound{}
+				}
+				w.missing[j.Label] = notFound{at: w.clock(), wait: wait}
 				continue
 			}
 			if !w.outage {

@@ -1,20 +1,29 @@
 package pipeline
 
-import "github.com/mgh3326/mergewake/internal/github"
+import (
+	"slices"
+
+	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/github"
+)
 
 // firstReviewRound reports whether head's passes belong to the PR's first
-// review round: no patch other than head's own has been reviewed yet, counted
-// the way reviewRounds counts. A later whole-diff review of the same PR (a
-// delta that fell back to the whole diff, a head after base_stale) has an
-// earlier reviewed head in its history and is not round one.
+// review round: no patch reviewed before head's first receipt has been
+// reviewed yet, counted the way reviewRounds counts. history is oldest first.
+// Passes of head after its first receipt do not count: a reset to an earlier
+// head keeps that head's round one, as planRound does. A later whole-diff
+// review of the same PR (a delta that fell back to the whole diff, a head
+// after base_stale) has an earlier reviewed head before its first receipt and
+// is not round one.
 func firstReviewRound(history []github.ReviewedPass, head string) bool {
-	var earlier []github.ReviewedPass
-	for _, p := range history {
-		if p.Head != head {
-			earlier = append(earlier, p)
+	end := len(history)
+	for i, p := range history {
+		if p.Head == head {
+			end = i
+			break
 		}
 	}
-	rounds, _ := reviewRounds(earlier)
+	rounds, _ := reviewRounds(history[:end])
 	return rounds == 0
 }
 
@@ -37,4 +46,12 @@ func raisedGrade(prGrade, asked string) string {
 		return ""
 	}
 	return asked
+}
+
+// gradeStronger reports whether grade a is stronger than grade b on the config
+// scale, strongest first. A grade the scale does not name is never stronger.
+func gradeStronger(a, b string) bool {
+	grades := config.Grades()
+	ai, bi := slices.Index(grades, a), slices.Index(grades, b)
+	return ai >= 0 && (bi < 0 || ai < bi)
 }

@@ -1478,13 +1478,14 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 // whose delete did not: the job's files must still hash to the manifest.
 func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (*Result, error) {
 	m := p.done
-	for _, f := range m.Files {
-		if src[f.Path] != f.SHA256 {
-			return nil, &Skip{"drive-dir-exists"}
-		}
-	}
 	sum := sha256.Sum256(p.doneRaw)
 	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
+	for _, f := range m.Files {
+		if src[f.Path] != f.SHA256 {
+			// The manifest is already published: carry it so the caller records it.
+			return res, &Skip{"drive-dir-exists"}
+		}
+	}
 	return a.remove(ctx, p, res, m)
 }
 

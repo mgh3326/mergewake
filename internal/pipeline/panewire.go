@@ -293,7 +293,9 @@ type panewireExecutor struct {
 	round    int
 	// spawnGrade is the grade a fresh reviewer spawn states with --grade; empty
 	// leaves panewire to the task title's grade, as before.
-	spawnGrade   string
+	spawnGrade string
+	// routing is the grade decision a fresh reviewer spawn records with its job.
+	routing      *reviewRouting
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
 	jobMu        sync.Mutex // one pass at a time closes the records of older heads
@@ -429,6 +431,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		return skip("task %s title has no grade/T marker", task)
 	}
 	scale := tier
+	// panewire's explicit --grade overrides the task title's grade, so a raise
+	// is stated only when it is stronger than the title's grade (the floor).
+	titleGrade := strings.ToUpper(taskMarkerMatch(title)[1])
 	// The builder's hk job record carries the family panewire actually launched
 	// with; a builder from before job records leaves none, and the
 	// trailer/commit inference still answers. A task with no bound job (a
@@ -682,6 +687,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	// pass; lateCurrent is the replacement's own record, which the pass closes.
 	var lateLabel string
 	var lateCurrent *integrations.JobRecord
+	var lateRouting *reviewRouting
 	if resumed {
 		// A done context decides nothing about the reviewer: an hk or node read
 		// it cut short is no unreadable hk and no missing result. The record
@@ -709,7 +715,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			if b, late, old := x.lateReviewerResult(ctx, plan, rj); b != nil {
 				collected, remoteRecord, spawn = b, &late, false
 				current := rec
-				lateLabel, lateCurrent = old.Label, &current
+				lateLabel, lateCurrent, lateRouting = old.Label, &current, old.Routing
 				if err := s.audit(x.repo.Name, "review-result-late-collected", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": label, "late_label": old.Label, "seconds_past_budget": int(s.now().Sub(old.BudgetStart.Add(timeout)).Seconds())}, false); err != nil {
 					return out, err
 				}
@@ -885,7 +891,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				args = append(args, "-w", cfg.Workspace)
 			}
 			args = append(args, "-l", label, "--t", scale, "--task", task)
-			if x.spawnGrade != "" {
+			if x.spawnGrade != "" && !gradeStronger(titleGrade, x.spawnGrade) {
 				args = append(args, "--grade", x.spawnGrade)
 			}
 			if parent != "" {
@@ -918,7 +924,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, auditErr
 				}
 			}
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced, Routing: x.routing}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
@@ -1335,6 +1341,12 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 	}
 	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
 	out.seat, out.pool = auditSeat(res.rec), res.rec.Pool
+	// The audit row carries the decision of the job that produced the result: a
+	// late result's replaced reviewer, else this pass's own reviewer job.
+	out.routing = rj.Routing
+	if lateLabel != "" {
+		out.routing = lateRouting
+	}
 	if seat != "" {
 		out.reviewer = "panewire:" + seat
 	}
@@ -1883,7 +1895,7 @@ func (x *panewireExecutor) replaceLostReviewer(ctx context.Context, plan *passPl
 	// may still arrive.
 	plan.replaced = slices.Clone(rj.Replaced)
 	if !neverRanReviewer(rj, job) {
-		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart(), Pool: validPool(job.Pool)})
+		plan.replaced = append(plan.replaced, replacedReviewer{Label: rj.Label, Head: rj.Head, BudgetStart: rj.budgetStart(), Pool: validPool(job.Pool), Routing: rj.Routing})
 	}
 	durable, loadErr := s.loadReplacedReviewers(x.repo.Name, pr.Number, plan.pass, pr.Head.SHA)
 	if loadErr != nil {

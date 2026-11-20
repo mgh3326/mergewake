@@ -84,11 +84,12 @@ func (x Exec) runEnv(ctx context.Context, command string, args []string, input, 
 	}
 	c.finish(ctx, x.ReapGroup)
 	if e != nil {
+		own := selfExited(e)
 		e = stopped(ctx, command, e)
-		if ctx.Err() == nil && stderr.Len() > 0 {
+		if (ctx.Err() == nil || own) && stderr.Len() > 0 {
 			e = &CommandError{Command: command, Err: errors.Unwrap(e), Stderr: tail(stderr.String(), stderrTail)}
 		}
-		if outputOnError && ctx.Err() == nil && !out.overflow {
+		if outputOnError && (ctx.Err() == nil || own) && !out.overflow {
 			return out.Bytes(), e
 		}
 		return nil, e

@@ -16,6 +16,10 @@ type passOutcome struct {
 	// "unknown" when its record names no profile; pool is its quota pool.
 	seat string
 	pool string
+	// routing is the grade decision of the reviewer job that produced the pass,
+	// nil when its record predates the field; the audit row then uses the
+	// policy of the collecting run.
+	routing *reviewRouting
 	// fallback notes a less preferred path inside the executor that still
 	// produced the pass, such as panewire's worker-seat retry.
 	fallback string

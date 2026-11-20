@@ -90,9 +90,20 @@ func signalGroup(c *exec.Cmd, sig syscall.Signal) error {
 	return err
 }
 
+// selfExited reports whether the command ended by its own exit status. A
+// process that a cancel signalled ends by signal and reports no exit code.
+func selfExited(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() >= 0
+}
+
 // stopped names why a context-bound process ended, instead of exec's bare
-// "signal: killed".
+// "signal: killed". A command that exited on its own keeps its failure: a
+// deadline that passed meanwhile did not cause it.
 func stopped(ctx context.Context, command string, err error) error {
+	if selfExited(err) {
+		return fmt.Errorf("%s failed: %w", command, err)
+	}
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return fmt.Errorf("%s timed out; process group terminated: %w", command, ctx.Err())

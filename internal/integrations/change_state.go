@@ -205,9 +205,21 @@ func (w *ChangeWriter) flush() {
 		if len(findings) > 0 {
 			b.Findings = findings[0].Value
 		}
+		// A check set over the request limit goes in partial chunks, each a
+		// request of its own; the first rides with the other sections.
+		var checkParts []json.RawMessage
+		if raw, ok := b.Checks.(json.RawMessage); ok {
+			checkParts = splitChecks(raw)
+			b.Checks = checkParts[0]
+		}
 		done := true
 		if b.State != nil || b.Checks != nil || b.Threads != nil || b.Gate != nil || b.Findings != nil {
 			done = w.send(b)
+		}
+		for i := 1; done && i < len(checkParts); i++ {
+			if !w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Checks: checkParts[i]}) {
+				done = false
+			}
 		}
 		for i := 1; done && i < len(findings); i++ {
 			if !w.send(ChangeBatch{Repo: k.repo, PR: k.pr, Findings: findings[i].Value}) {
@@ -267,19 +279,50 @@ func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, stale map[s
 	maps.Copy(w.sent[k], keys)
 }
 
+// changeChecksPerRequest bounds the checks one request carries; hk takes at
+// most this many in a checks section.
+const changeChecksPerRequest = 500
+
+// splitChecks returns the requests that carry a checks section. A set within
+// the limit is one request, unchanged. A larger set is split in sorted order
+// into partial chunks (complete false): hk merges partial rows, so a check in
+// any chunk reaches hk, and the whole set is recorded only when every chunk lands.
+func splitChecks(raw json.RawMessage) []json.RawMessage {
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(&m) != nil || m == nil {
+		return []json.RawMessage{raw}
+	}
+	list, ok := m["checks"].([]any)
+	if !ok || len(list) <= changeChecksPerRequest {
+		return []json.RawMessage{raw}
+	}
+	var parts []json.RawMessage
+	for start := 0; start < len(list); start += changeChecksPerRequest {
+		part := maps.Clone(m)
+		part["checks"] = list[start:min(start+changeChecksPerRequest, len(list))]
+		part["complete"] = false
+		chunk, _ := json.Marshal(part)
+		parts = append(parts, chunk)
+	}
+	return parts
+}
+
 // sectionKey identifies a section's value for the unchanged check: a hash of
-// its canonical JSON without the observation times (observed_at, decided_at)
-// and without the provenance of the observation (source: fresh, poll, webhook
-// or review; delivery_id: the webhook delivery that carried it). The same
-// state observed again keys alike, whichever read or delivery saw it. Queue
-// stores the value as JSON.
+// its canonical JSON without the observation times (observed_at, decided_at).
+// The provenance of the observation (source: fresh, poll, webhook or review;
+// delivery_id: the webhook delivery that carried it) stays in the key, because
+// hk keeps it and orders writes by it: a suppressed write from another source
+// or delivery would leave hk's freshness watermark behind what was observed.
+// Queue stores the value as JSON.
 func sectionKey(v any) string {
 	raw, _ := v.(json.RawMessage)
 	var m map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	if dec.Decode(&m) == nil && m != nil {
-		for _, k := range []string{"observed_at", "decided_at", "source", "delivery_id"} {
+		for _, k := range []string{"observed_at", "decided_at"} {
 			delete(m, k)
 		}
 		if canon, e := json.Marshal(m); e == nil {

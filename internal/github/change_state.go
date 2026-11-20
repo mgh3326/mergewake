@@ -383,14 +383,12 @@ func (c *Client) writeChecks(ctx context.Context, repo, sha string, runs []check
 		latest[st.Context] = selected{st.ID, map[string]any{"name": st.Context, "state": st.State, "url": st.TargetURL, "required": requiredSet[st.Context]}}
 	}
 	// Map order is random: list the checks by name, so the same set hashes
-	// alike and an unchanged set is not written again (see sectionKey).
+	// alike and an unchanged set is not written again (see sectionKey). The
+	// whole set is sent: the writer splits a large one into partial requests,
+	// so no check is left out by a cut.
 	checks := make([]map[string]any, 0, len(latest))
 	for _, name := range slices.Sorted(maps.Keys(latest)) {
 		checks = append(checks, latest[name].item)
-	}
-	complete := len(checks) <= 500
-	if !complete {
-		checks = checks[:500]
 	}
 	at := time.Now().UTC()
 	prefix := repo + "\x00"
@@ -401,7 +399,7 @@ func (c *Client) writeChecks(ctx context.Context, repo, sha string, runs []check
 		}
 		n, e := strconv.Atoi(strings.TrimPrefix(key, prefix))
 		if e == nil {
-			c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: map[string]any{"head_sha": sha, "checks": checks, "observed_at": at, "source": changeSource(ctx), "complete": complete}})
+			c.Changes.Queue(repo, n, "checks", changestate.Section{At: at, Value: map[string]any{"head_sha": sha, "checks": checks, "observed_at": at, "source": changeSource(ctx), "complete": true}})
 		}
 		return true
 	})
