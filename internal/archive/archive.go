@@ -1482,11 +1482,36 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
 	for _, f := range m.Files {
 		if src[f.Path] != f.SHA256 {
+			if !settledBefore(p, m) {
+				// A reused job name: the files were written after this manifest
+				// was published, so the manifest describes an earlier instance.
+				return nil, &Skip{"drive-dir-exists"}
+			}
 			// The manifest is already published: carry it so the caller records it.
 			return res, &Skip{"drive-dir-exists"}
 		}
 	}
 	return a.remove(ctx, p, res, m)
+}
+
+// settledBefore reports whether every archived file was last written at or
+// before the manifest was published, so the manifest describes this job's
+// current files. A manifest with no parseable time is never taken as current.
+func settledBefore(p *Plan, m *manifest) bool {
+	archived, err := time.Parse(time.RFC3339, m.ArchivedAt)
+	if err != nil {
+		return false
+	}
+	moving := map[string]bool{}
+	for _, rel := range p.Move {
+		moving[rel] = true
+	}
+	for _, f := range p.entries {
+		if moving[f.Path] && f.mtime > archived.Unix() {
+			return false
+		}
+	}
+	return true
 }
 
 // remove deletes the job dir only when a re-listing shows it unchanged: a
