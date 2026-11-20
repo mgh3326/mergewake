@@ -66,6 +66,21 @@ func escalateExitCode(err error) int {
 	return -1
 }
 
+// ladderNotifiedField matches the trailing notified=owner-lane|none field that
+// panewire's hub prints on a refusal (hk 5739): owner-lane when the relay to the
+// owner lane was enqueued, none when it was not. An old hub prints no field.
+var ladderNotifiedField = regexp.MustCompile(`(?:^|\s+)notified=(owner-lane|none)\s*$`)
+
+// ladderNotified splits the notified field off an rc 2 refusal. It returns the
+// field's value ("" when the hub printed none) and the refusal without it.
+func ladderNotified(output string) (notified, text string) {
+	text = strings.TrimSpace(output)
+	if m := ladderNotifiedField.FindStringSubmatch(text); m != nil {
+		return m[1], strings.TrimSpace(text[:len(text)-len(m[0])])
+	}
+	return "", text
+}
+
 func ladderRefusal(output string) (code string, hub bool) {
 	text := strings.TrimSpace(output)
 	text = strings.TrimPrefix(text, "panewire: ")
@@ -502,7 +517,8 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 
 	switch exitCode {
 	case 2:
-		code, hub := ladderRefusal(outputStr)
+		notified, text := ladderNotified(outputStr)
+		code, hub := ladderRefusal(text)
 		st.LadderRefusalCode = code
 		if hub && code == "pane_busy" {
 			st.LadderPaneBusyCalls++
@@ -516,9 +532,14 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 				return
 			}
 		}
-		st.setEscalated(true, now, outputStr)
-		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-		_ = s.audit(r.Name, "ladder-intact", map[string]any{
+		// The hub's notified field decides whether the owner already has the
+		// refusal: owner-lane means the relay was enqueued, none means it was
+		// not. Without the field the code list decides, as before.
+		relayed := hub
+		if notified != "" {
+			relayed = notified == "owner-lane"
+		}
+		intact := map[string]any{
 			"pr":                pr.Number,
 			"round":             ladderRound,
 			"rc":                2,
@@ -526,11 +547,17 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			"output":            outputStr,
 			"findings_sent":     fit.sent,
 			"findings_left_out": fit.leftOut,
-		}, o.DryRun)
-		if !hub {
+		}
+		if notified != "" {
+			intact["notified"] = notified
+		}
+		st.setEscalated(true, now, outputStr)
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		_ = s.audit(r.Name, "ladder-intact", intact, o.DryRun)
+		if !relayed {
 			// Empty output must still owe the owner a notice: an empty text
 			// would skip the send and leave the refusal owed with no retry.
-			refusal := outputStr
+			refusal := text
 			if refusal == "" {
 				refusal = "panewire exited 2 with no output"
 			}
