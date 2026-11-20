@@ -26,14 +26,23 @@ func (s *Service) saveReplacedReviewers(repo string, pr, pass int, replaced []re
 	return fsutil.WriteJSON(s.replacedReviewersPath(repo, pr, pass), replacedReviewersRecord{Replaced: replaced})
 }
 
-// loadReplacedReviewers reads the pass's replaced list; none when absent.
-func (s *Service) loadReplacedReviewers(repo string, pr, pass int) ([]replacedReviewer, error) {
+// loadReplacedReviewers reads the pass's replaced list for head; none when
+// absent. An entry of another head is a reviewer of a moved head: it no longer
+// excludes a pool, and the reviewer watch must not read its label, so it is
+// dropped here rather than carried into the next head's records.
+func (s *Service) loadReplacedReviewers(repo string, pr, pass int, head string) ([]replacedReviewer, error) {
 	var rec replacedReviewersRecord
 	ok, err := fsutil.ReadJSON(s.replacedReviewersPath(repo, pr, pass), &rec)
 	if err != nil || !ok {
 		return nil, err
 	}
-	return rec.Replaced, nil
+	var out []replacedReviewer
+	for _, old := range rec.Replaced {
+		if old.Head == head {
+			out = append(out, old)
+		}
+	}
+	return out, nil
 }
 
 // mergeReplaced returns replaced with each reviewer of more that it does not
