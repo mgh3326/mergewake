@@ -58,6 +58,7 @@ type fakeReapHub struct {
 	// moreNodes are extra node rows GET /v1/nodes/agents reports beside the
 	// node-a row, so a test can place labels on more than one host.
 	moreNodes []any
+	onInspect func()
 }
 
 func (h *fakeReapHub) ops(op string) []map[string]any {
@@ -103,6 +104,9 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		var result any
 		switch body["op"] {
 		case "worktree.inspect":
+			if h.onInspect != nil {
+				h.onInspect()
+			}
 			result = map[string]any{"worktree": nil}
 			if cwd := body["args"].(map[string]any)["cwd"].(string); cwd == "/repo.wt" || h.wtPaths[cwd] || h.detached[cwd] {
 				head := h.wtHead

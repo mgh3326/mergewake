@@ -119,6 +119,27 @@ func TestAuthorScanCancelledEvaluationIsNotKept(t *testing.T) {
 	}
 }
 
+// Cancellation after Panes succeeds but before worktree inspection completes
+// can leave a non-failed scan with missing tree entries. That partial answer
+// must not be shared with the next evaluation.
+func TestAuthorScanCancelledAfterPaneListIsNotKept(t *testing.T) {
+	hub := newFakeReapHub()
+	run := &scriptRunner{}
+	s, _ := hubSvc(t, hub, run, reap.Host{})
+	s.Config.Hosts = []reap.Host{{Name: "node", Machine: "node-a"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	hub.onInspect = func() { cancel() }
+	_, _ = s.authorHosts(ctx)
+	hub.onInspect = nil
+
+	if _, err := s.authorHosts(context.Background()); err != nil {
+		t.Fatalf("healthy retry authorHosts error = %v", err)
+	}
+	if got := s.hostScans["node"]; got == nil || got.hs == nil || got.hs.trees["/repo.wt"] == nil {
+		t.Fatalf("cached retry scan = %#v; want inspected /wt/a", got)
+	}
+}
+
 // jobReadCounter counts the job reads that reach the test sink.
 type jobReadCounter struct {
 	*jobSink
