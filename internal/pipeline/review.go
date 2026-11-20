@@ -610,8 +610,12 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		event["round"] = rp.round
 		event["pr_grade"], event["grade_asked"], event["first_round"] = grade, gradeAsked, firstRound
-		if seat := strings.TrimPrefix(selected, "panewire:"); seat != "" {
-			event["seat"] = seat
+		event["seat"] = "unknown"
+		if out.seat != "" {
+			event["seat"] = out.seat
+		}
+		if out.pool != "" {
+			event["pool"] = out.pool
 		}
 		if rp.base != "" {
 			event["delta_base"] = rp.base

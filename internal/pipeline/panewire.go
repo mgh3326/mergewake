@@ -1334,6 +1334,7 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		_ = s.audit(x.repo.Name, "review-finding-dropped", map[string]any{"pr": pr.Number, "pass": plan.pass, "label": label, "path": d.Path, "line": d.Line, "reason": d.Reason}, false)
 	}
 	out.reviewer, out.executor, out.findings = "panewire", "panewire", findings
+	out.seat, out.pool = auditSeat(res.rec), res.rec.Pool
 	if seat != "" {
 		out.reviewer = "panewire:" + seat
 	}
@@ -2278,6 +2279,20 @@ func (x *panewireExecutor) task(ctx context.Context) (string, error) {
 // then a configured profile whose gate profile is the seat. An unknown
 // family returns "" and the pass records same_family false: an unnamed
 // family is never the author's.
+// auditSeat names the reviewer job that ran a pass for the review audit row:
+// its launch profile and effort from the hk record. A record that names no
+// profile reads "unknown".
+func auditSeat(rec integrations.JobRecord) string {
+	if rec.Profile == "" {
+		return "unknown"
+	}
+	effort := rec.Effort
+	if effort == "" {
+		effort = "unknown"
+	}
+	return rec.Profile + "@" + effort
+}
+
 func (x *panewireExecutor) reviewerFamily(rec integrations.JobRecord, jobDir, seat string) string {
 	if rec.Family != "" {
 		return rec.Family
