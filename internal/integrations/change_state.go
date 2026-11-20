@@ -62,6 +62,9 @@ type ChangeWriter struct {
 	claims                               map[string]*os.File
 	writes, stale, rejected, unavailable atomic.Uint64
 	unchanged                            atomic.Uint64
+	// stale holds the sections hk rejected as stale in the flush under way;
+	// sendMu guards it.
+	staleNow map[string]bool
 }
 
 func NewChangeWriter(log *slog.Logger, stateDir ...string) *ChangeWriter {
@@ -172,6 +175,7 @@ func (w *ChangeWriter) flush() {
 	w.timer = nil
 	w.mu.Unlock()
 	for k, p := range pending {
+		w.staleNow = nil
 		last := w.sent[k]
 		keys := map[string]string{}
 		b := ChangeBatch{Repo: k.repo, PR: k.pr}
@@ -228,19 +232,28 @@ func (w *ChangeWriter) flush() {
 			w.retryLocked(time.Until(w.unavailableUntil))
 		}
 		w.mu.Unlock()
-		w.noteSent(k, keys, done)
+		stale := w.staleNow
+		w.staleNow = nil
+		w.noteSent(k, keys, stale, done)
 	}
 }
 
 // noteSent records the sections a flush wrote for k. A flush that did not
 // finish may have reached hk in part, so the sections it tried lose their
 // recorded value and the next flush writes them again.
-func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, done bool) {
+func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, stale map[string]bool, done bool) {
 	if !done {
 		for name := range keys {
 			delete(w.sent[k], name)
 		}
 		return
+	}
+	// hk holds a newer value for a section it rejected as stale, so nothing is
+	// recorded for that section: the next observation of it is written, even
+	// when it matches the value that was rejected.
+	for name := range stale {
+		delete(w.sent[k], name)
+		delete(keys, name)
 	}
 	if len(keys) == 0 {
 		return
@@ -395,6 +408,9 @@ func (w *ChangeWriter) send(b ChangeBatch) bool {
 					w.log.Warn("hk change response incomplete")
 					return false
 				}
+				if !section.Applied {
+					w.markStale(name)
+				}
 			}
 		}
 		w.count(result)
@@ -403,6 +419,16 @@ func (w *ChangeWriter) send(b ChangeBatch) bool {
 	w.log.Warn("hk change request failed", "status", status)
 	return false
 }
+
+// markStale records that hk rejected name as stale in the flush under way, so
+// the flush does not record the value it sent as written. The caller holds sendMu.
+func (w *ChangeWriter) markStale(name string) {
+	if w.staleNow == nil {
+		w.staleNow = map[string]bool{}
+	}
+	w.staleNow[name] = true
+}
+
 func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) (bool, bool) {
 	sections := []struct {
 		name  string
@@ -447,6 +473,9 @@ func (w *ChangeWriter) sections(c *hkJobs, b ChangeBatch, probe bool) (bool, boo
 				w.log.Warn("hk change response incomplete", "section", s.name)
 				done = false
 				continue
+			}
+			if !section.Applied {
+				w.markStale(s.name)
 			}
 			w.count(result)
 		} else {
