@@ -1289,7 +1289,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "error", "worktree inspect: "+e.Error())
 		return remoteStop
 	case tree == nil:
-		w.record(rec, "skipped", "worktree already gone")
+		w.record(rec, "skipped", reviewerAlreadyGone)
 		return remoteDone
 	case !w.reviewedTree(tree, cwd, l):
 		w.record(rec, "kept", "worktree identity changed")
@@ -1315,7 +1315,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "removed", "")
 		return remoteDone
 	case reason == "worktree-gone":
-		w.record(rec, "skipped", "worktree already gone")
+		w.record(rec, "skipped", reviewerAlreadyGone)
 		return remoteDone
 	}
 	rec.Files = removed.Files
@@ -1430,4 +1430,19 @@ func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
 // author: the PR scan and its worktree candidates ignore these rows.
 func reviewerRow(v reapReceipt) bool {
 	return v.Action == "reviewer-cleanup" || v.Action == "reviewer-reap"
+}
+
+// reviewerAlreadyGone is the reason a guarded removal records when the
+// checkout was already gone before mergewake's removal ran.
+const reviewerAlreadyGone = "worktree already gone"
+
+// reviewerCheckoutRemoved reports whether a reviewer receipt proves its
+// checkout left the disk: a reviewer-reap removal, or a removal that found the
+// worktree already gone (hk 5665: another actor removed it first). A pane
+// already gone is not a checkout removal.
+func reviewerCheckoutRemoved(v reapReceipt) bool {
+	if v.Action == "reviewer-reap" && v.Result == "removed" {
+		return true
+	}
+	return v.Result == "skipped" && v.Reason == reviewerAlreadyGone
 }

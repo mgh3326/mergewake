@@ -298,7 +298,7 @@ func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost,
 	case result == "removed":
 		c.record("removed", "")
 	case reason == "worktree-gone":
-		c.record("skipped", "worktree already gone")
+		c.record("skipped", reviewerAlreadyGone)
 	default:
 		c.record("pending-cleanup", "hub guarded removal refused: "+reason)
 	}
