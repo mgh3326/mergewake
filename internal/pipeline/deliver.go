@@ -413,10 +413,13 @@ func (s *Service) findingsRoute(ctx context.Context, r config.Repo, pr github.Pu
 		rt.lane, rt.via, rt.ambiguous = al.lane, al.via, al.candidates
 		return rt, nil
 	}
-	if lane, via, ok, e := s.authorPane(ctx, r, pr); e != nil {
+	pane, ok, e := s.routePane(ctx, r, pr)
+	if e != nil {
 		return rt, e
-	} else if ok {
-		rt.lane, rt.via = lane, via
+	}
+	rt.failedHosts = append(rt.failedHosts, pane.failedHosts...)
+	if ok {
+		rt.lane, rt.via = pane.lane, pane.via
 		return rt, nil
 	}
 	lane, via, e := s.explicitLane(ctx, r, pr, task, desk)

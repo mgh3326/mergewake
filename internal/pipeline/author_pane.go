@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,54 @@ func hostScanOnly(err error) bool {
 		return hostScanOnly(u.Unwrap())
 	}
 	return false
+}
+
+// SplitHostScan separates the pane-scan failures of unreadable hosts from every
+// other error. rest is what still fails the pass; hosts names the unreadable
+// hosts once each, for the one line the pass logs.
+func SplitHostScan(err error) (rest error, hosts []string) {
+	if err == nil {
+		return nil, nil
+	}
+	if hostScanOnly(err) {
+		return nil, uniqueSorted(hostScanNames(err))
+	}
+	u, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return err, nil
+	}
+	var keep []error
+	var names []string
+	for _, e := range u.Unwrap() {
+		r, h := SplitHostScan(e)
+		if r != nil {
+			keep = append(keep, r)
+		}
+		names = append(names, h...)
+	}
+	return errors.Join(keep...), uniqueSorted(names)
+}
+
+// hostScanNames lists the hosts named by the hostScanError leaves of err.
+func hostScanNames(err error) []string {
+	switch u := err.(type) {
+	case hostScanError:
+		return []string{u.host}
+	case interface{ Unwrap() []error }:
+		var names []string
+		for _, e := range u.Unwrap() {
+			names = append(names, hostScanNames(e)...)
+		}
+		return names
+	case interface{ Unwrap() error }:
+		return hostScanNames(u.Unwrap())
+	}
+	return nil
+}
+
+func uniqueSorted(names []string) []string {
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // authorScanTTL is how long one host's pane scan serves every evaluation that
@@ -207,6 +256,34 @@ func (s *Service) authorPane(ctx context.Context, r config.Repo, pr github.Pull)
 	return s.authorPaneOn(ctx, jobs, hosts, r, pr)
 }
 
+// routePane is the author pane a route (findings, notice or worker lane) goes
+// to. A scan that lost hosts routes on the hosts that answered, as
+// blockLanePartial does: a pane there is the route, named partial in via, and
+// none is ok=false, exactly as a full scan with no pane. failedHosts names the
+// hosts that could not be read. Any other error is returned.
+func (s *Service) routePane(ctx context.Context, r config.Repo, pr github.Pull) (rt authorRoute, ok bool, err error) {
+	lane, via, ok, err := s.authorPane(ctx, r, pr)
+	if err == nil || !hostScanOnly(err) {
+		return authorRoute{lane: lane, via: via}, ok, err
+	}
+	jobs, has := s.Sink.(reapJobs)
+	if !has {
+		return authorRoute{}, false, err
+	}
+	hosts, _ := s.authorHosts(ctx)
+	for _, hs := range hosts {
+		if hs.failed {
+			rt.failedHosts = append(rt.failedHosts, hs.host.Name)
+		}
+	}
+	lane, via, ok, err = s.authorPaneOn(ctx, jobs, hosts, r, pr)
+	if err != nil {
+		return authorRoute{}, false, err
+	}
+	rt.lane, rt.via = lane, via+" (partial pane scan)"
+	return rt, ok, nil
+}
+
 // authorPaneOn is authorPane over an already-read host scan. A failed host
 // has no panes, so the hosts that answered still give the route; the caller
 // decides whether a scan error beside them is fatal.
@@ -266,6 +343,9 @@ type authorRoute struct {
 // finished so a delivery still on it can be rerouted. A host or job read error
 // is returned so the caller retries rather than picking a lane.
 func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.Pull, task string) (authorRoute, error) {
+	// One scan record for the whole route, so the hosts that failed are the
+	// ones this route read, and a route with no answering host still names them.
+	ctx = WithAuthorScan(ctx)
 	job, rec, ok, e := s.boundJob(ctx, task)
 	if e != nil || !ok {
 		return authorRoute{}, e
@@ -281,11 +361,16 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	bound := authorRoute{lane: lane, via: "task " + task + " job " + job}
 	others, e := s.takeoverPanes(ctx, r, pr, job, rec.Label)
 	if e != nil {
-		scan, _ := ctx.Value(authorScanKey{}).(*authorScan)
-		if scan == nil || scan.readHosts == 0 {
+		// A host whose pane list failed is a partial scan, even when no host
+		// answered: the bound lane stands, named partial and unknown, as it does
+		// for a scan that answered.
+		if !hostScanOnly(e) {
 			return authorRoute{}, e
 		}
-		bound.failedHosts = append([]string(nil), scan.failedHosts...)
+		scan, _ := ctx.Value(authorScanKey{}).(*authorScan)
+		if scan != nil {
+			bound.failedHosts = append([]string(nil), scan.failedHosts...)
+		}
 		bound.via += " (partial pane scan)"
 	}
 	// A partial scan cannot establish that one observed pane is the unique

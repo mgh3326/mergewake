@@ -592,11 +592,24 @@ func newestUnansweredFinding(fb github.ReviewFeedback, head string) time.Time {
 var mergewakeFindingMarker = regexp.MustCompile(`<!-- mergewake-severity:([a-z]+) -->`)
 
 // authorJobLive reports whether a live author job can still answer findings.
-// A bound job record decides first: a live bound job is live, and a terminal
-// one is live only when another live pane took the PR head branch over — the
-// bound job's own lingering pane does not count. With no bound job record, the
-// unique live head-pane lookup decides, as the findings route does.
+// A host whose pane list failed may hold the author, so a host-scan failure
+// keeps the head pending rather than failing the gate: a live author pane on a
+// host that answered is live, and none found is still pending, bounded by the
+// author-fix window (authorFixWait). Any other read error is returned.
 func (s *Service) authorJobLive(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
+	live, err := s.authorJobLiveOn(ctx, r, pr)
+	if err != nil && hostScanOnly(err) {
+		return true, nil
+	}
+	return live, err
+}
+
+// authorJobLiveOn is the liveness check authorJobLive wraps. A bound job record
+// decides first: a live bound job is live, and a terminal one is live only when
+// another live pane took the PR head branch over — the bound job's own
+// lingering pane does not count. With no bound job record, the unique live
+// head-pane lookup decides, as the findings route does.
+func (s *Service) authorJobLiveOn(ctx context.Context, r config.Repo, pr github.Pull) (bool, error) {
 	task, err := s.prTask(ctx, r, pr)
 	if err != nil {
 		return false, err

@@ -447,12 +447,12 @@ func (s *Service) workerLane(ctx context.Context, r config.Repo, pr github.Pull)
 	if al.lane != "" {
 		return al.lane, al.via, nil
 	}
-	lane, via, ok, e := s.authorPane(ctx, r, pr)
+	pane, ok, e := s.routePane(ctx, r, pr)
 	if e != nil {
 		return "", "", e
 	}
 	if ok {
-		return lane, via, nil
+		return pane.lane, pane.via, nil
 	}
 	if al.finished != "" {
 		return s.explicitLane(ctx, r, pr, task, s.deskLane())
@@ -793,13 +793,13 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 		}
 		if bound == "" {
 			end = notifyStart(ctx, "author_scan")
-			lane, via, ok, e := s.authorPane(ctx, r, pr)
+			pane, ok, e := s.routePane(ctx, r, pr)
 			end()
 			if e != nil {
 				return "", "", e
 			}
 			if ok {
-				return lane, via, nil
+				return pane.lane, pane.via, nil
 			}
 		}
 	}
