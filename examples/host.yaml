@@ -20,6 +20,8 @@ review:
   login: review-bot
   timeout: 10m
   default_grade: B
+  # Grade asked for round 1 of a PR, by PR grade (default shown); later rounds ask at the PR grade.
+  # first_round_grade: {B: A, C: B}
   # Optional fixed order for other-family reviewers.
   # pairings:
   #   openai: [claude, deepseek]
