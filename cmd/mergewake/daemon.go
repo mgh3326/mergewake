@@ -89,6 +89,10 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 		loops = append(loops, daemon.Loop{Role: role, Interval: interval, Requests: func() any { return requests }, Run: func(ctx context.Context) error {
 			ctx, transaction := tracing.Pass(ctx, role)
 			defer tracing.Finish(transaction)
+			if role == "reap" {
+				// Every repository of this pass reuses one scan of each host.
+				ctx = pipeline.WithReapPassHosts(ctx)
+			}
 			ctx, counts := github.CountRequests(ctx, role)
 			defer func() {
 				requests = counts.Snapshot()

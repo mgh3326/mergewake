@@ -255,17 +255,20 @@ func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, done bool) 
 }
 
 // sectionKey identifies a section's value for the unchanged check: a hash of
-// its canonical JSON without the observation times (observed_at, decided_at),
-// so the same state observed again keys alike. Queue stores the value as
-// JSON.
+// its canonical JSON without the observation times (observed_at, decided_at)
+// and without the provenance of the observation (source: fresh, poll, webhook
+// or review; delivery_id: the webhook delivery that carried it). The same
+// state observed again keys alike, whichever read or delivery saw it. Queue
+// stores the value as JSON.
 func sectionKey(v any) string {
 	raw, _ := v.(json.RawMessage)
 	var m map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	if dec.Decode(&m) == nil && m != nil {
-		delete(m, "observed_at")
-		delete(m, "decided_at")
+		for _, k := range []string{"observed_at", "decided_at", "source", "delivery_id"} {
+			delete(m, k)
+		}
 		if canon, e := json.Marshal(m); e == nil {
 			raw = canon
 		}

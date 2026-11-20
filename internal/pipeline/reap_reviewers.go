@@ -250,7 +250,7 @@ type reviewerCandidate struct {
 // that PR's labels. durable reports that this pass writes its rows: only then
 // is the audit scan's offset saved, so a dry run reads the same rows again.
 // note writes one reviewer-reap row and its audit record.
-func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, acting, durable bool, note func(reapReceipt) error) []error {
+func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, records *passJobRecords, acting, durable bool, note func(reapReceipt) error) []error {
 	timeout := s.Config.Review.Timeout
 	if timeout == "" {
 		timeout = "10m" // config's default when the key is unset
@@ -264,7 +264,11 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
 	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}}
-	if jobs, ok := s.Sink.(reapJobs); ok {
+	// The pass's records answer a job it already read (the merged-PR candidates
+	// read the same jobs), so a reviewer's record is read once per pass.
+	if records != nil {
+		w.jobs = records
+	} else if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
 	for _, hs := range hosts {

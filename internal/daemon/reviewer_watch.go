@@ -18,6 +18,10 @@ const (
 	reviewerWatchMax = 50
 	// reviewerReadTimeout bounds one hk read, so a hung hk delays the tick, not the role.
 	reviewerReadTimeout = 5 * time.Second
+	// reviewerNotFoundEvery is how often a job with no hk record yet is read
+	// again. Its record appears when its spawn lands, so a job still missing
+	// is not worth a read every tick.
+	reviewerNotFoundEvery = 5 * time.Minute
 )
 
 // WatchedJob is a live reviewer job the pr role recorded: the PR whose pass
@@ -60,8 +64,11 @@ type ReviewerWatch struct {
 
 	// woken holds the jobs already reported, so a finished job whose record
 	// outlives a pass wakes the role once, not every tick.
-	woken  map[string]bool
-	outage bool
+	woken map[string]bool
+	// missing holds when each job's record was last found missing; such a job
+	// is read again only after reviewerNotFoundEvery.
+	missing map[string]time.Time
+	outage  bool
 }
 
 // Run ticks until ctx ends.
@@ -94,6 +101,7 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 	if len(jobs) > reviewerWatchMax {
 		jobs = jobs[:reviewerWatchMax]
 	}
+	at := time.Now()
 	live := make(map[string]bool, len(jobs))
 	for _, j := range jobs {
 		live[j.Label] = true
@@ -103,8 +111,16 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 			delete(w.woken, label)
 		}
 	}
+	for label := range w.missing {
+		if !live[label] {
+			delete(w.missing, label)
+		}
+	}
 	for _, j := range jobs {
 		if w.woken[j.Label] {
+			continue
+		}
+		if seen, ok := w.missing[j.Label]; ok && at.Sub(seen) < reviewerNotFoundEvery {
 			continue
 		}
 		readCtx, cancel := context.WithTimeout(ctx, reviewerReadTimeout)
@@ -115,6 +131,10 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 		}
 		if err != nil {
 			if w.NotFound != nil && w.NotFound(err) {
+				if w.missing == nil {
+					w.missing = map[string]time.Time{}
+				}
+				w.missing[j.Label] = at
 				continue
 			}
 			if !w.outage {
@@ -124,6 +144,7 @@ func (w *ReviewerWatch) Tick(ctx context.Context) {
 			return
 		}
 		w.outage = false
+		delete(w.missing, j.Label)
 		if !v.Terminal() && !v.HasResult {
 			continue
 		}
