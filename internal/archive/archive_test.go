@@ -2227,6 +2227,81 @@ func TestArchiveResumesFailedDelete(t *testing.T) {
 	}
 }
 
+// A reused job name whose files were rewritten after an earlier manifest was
+// published is a routine drive-dir-exists skip with no published result: the
+// manifest describes an earlier instance, not a half-archived job.
+func TestArchiveReusedJobNameAfterManifestIsRoutineSkip(t *testing.T) {
+	e := setup(t)
+	job(t, e.jobs, "wk-reuse")
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, "wk-reuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(context.Background(), p, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Birth time is whole seconds: recreate the name in a later second so the
+	// new directory is a different instance, as a real later job would be.
+	time.Sleep(1100 * time.Millisecond)
+	dir := job(t, e.jobs, "wk-reuse")
+	write(t, filepath.Join(dir, "report.md"), "# REPORT\n")
+	p, err = a.Plan(context.Background(), h, "wk-reuse")
+	if err != nil || !p.Resume {
+		t.Fatalf("reused plan: %+v %v", p, err)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" {
+		t.Fatalf("reused job: res=%+v err=%v, want drive-dir-exists skip", res, err)
+	}
+	if res != nil {
+		t.Fatalf("reused job carried a published result: %+v", res)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("reused job dir was removed: %v", err)
+	}
+}
+
+// The job directory is the same instance, but a file rewritten after publish
+// has a newer mtime and the same size; another file predates the manifest. The published manifest must still be
+// carried with the skip, so the run records the half-archived job as an error.
+func TestArchiveRewrittenSourceAfterPublishKeepsPublishedResult(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-rewrite")
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, "wk-rewrite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	res, err := a.Apply(context.Background(), p, time.Now().Add(-time.Hour))
+	e.run.failRm = false
+	if err == nil || res == nil || res.Manifest == "" || res.Deleted {
+		t.Fatalf("published, undeleted archive: res=%+v err=%v", res, err)
+	}
+	write(t, filepath.Join(dir, "report.md"), "# REPORT\n")
+	// Mixed timestamps: brief.md predates the manifest, report.md postdates it.
+	older := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "brief.md"), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "report.md"), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p, err = a.Plan(context.Background(), h, "wk-rewrite")
+	if err != nil || !p.Resume {
+		t.Fatalf("resume plan: %+v %v", p, err)
+	}
+	res, err = a.Apply(context.Background(), p, time.Now())
+	var skip *Skip
+	if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" || res == nil || res.Manifest == "" || res.Deleted {
+		t.Fatalf("rewritten source: res=%+v err=%v, want drive-dir-exists with the published result", res, err)
+	}
+}
+
 // A job whose every file is excluded still records and deletes without a copy.
 func TestApplyNothingToMove(t *testing.T) {
 	e := setup(t)
