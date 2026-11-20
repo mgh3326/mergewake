@@ -277,6 +277,19 @@ func (h *Hub) Consult(ctx context.Context, id string) (ConsultRow, error) {
 
 // Agents returns one machine's row of GET /v1/nodes/agents, fetched once per
 // Hub. A machine the hub does not know is an error, never an empty host.
+// HostUnreachable is the hub's answer that a machine's node cannot be reached,
+// so its panes cannot be read at all: the node is unavailable or timed out, or
+// the hub does not know the machine (Reason "unknown"). A scan that fails this
+// way skipped the host; any other failure is a real error.
+type HostUnreachable struct {
+	Machine string
+	Reason  string
+}
+
+func (e *HostUnreachable) Error() string {
+	return fmt.Sprintf("hub: machine %s %s", e.Machine, e.Reason)
+}
+
 func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error) {
 	h.once.Do(func() {
 		var v struct {
@@ -296,7 +309,9 @@ func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error)
 	row, ok := h.agents[machine]
 	switch {
 	case !ok:
-		return hubNodeAgents{}, fmt.Errorf("hub: machine %s unknown", machine)
+		return hubNodeAgents{}, &HostUnreachable{Machine: machine, Reason: "unknown"}
+	case row.Error == "node_unavailable" || row.Error == "node_timeout":
+		return hubNodeAgents{}, &HostUnreachable{Machine: machine, Reason: row.Error}
 	case row.Error != "":
 		return hubNodeAgents{}, fmt.Errorf("hub: machine %s %s", machine, row.Error)
 	case row.State != "connected":

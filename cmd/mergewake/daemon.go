@@ -119,6 +119,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			// The pr role runs every repository at once: a pass is as long as
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
+			var passSkips reapPassSkips
 			err := forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 				tracing.Tag(repoSpan, "repo", r.Name)
@@ -152,24 +153,44 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						times, callCounts := telemetry.Snapshot()
 						attrs := []any{"repo", r.Name, "total_ms", elapsed.Milliseconds(), "git_ms", times["git"], "github_ms", githubMS, "hosts_ms", times["hosts"], "panewire_ms", times["panewire"], "hk_ms", times["hk"], "git_calls", callCounts["git"], "github_calls", githubCalls, "hosts_calls", callCounts["hosts"], "panewire_calls", callCounts["panewire"], "hk_calls", callCounts["hk"]}
 						tracing.Finish(span)
+						// A host whose node is unreachable is skipped, not failed: it is
+						// logged once per pass below, and the repository is only an error
+						// for its other failures.
 						var budgetStop *pipeline.ReapBudgetStop
+						failures := err
 						if errors.As(err, &budgetStop) {
-							if budgetStop.Failures != nil {
-								log.Error("repository reap stopped on budget with errors", append(attrs, "left", budgetStop.Left, "error", budgetStop.Failures.Error())...)
-								err = budgetStop.Failures
-							} else {
-								log.Warn("repository reap stopped on budget", append(attrs, "left", budgetStop.Left)...)
-								err = nil // a budget stop alone is a completed, resumable repository pass
-							}
-						} else if err != nil {
+							failures = budgetStop.Failures
+						}
+						skips, rest := pipeline.SplitReapHostSkips(failures)
+						passSkips.add(skips)
+						var skipped []any
+						if len(skips) > 0 {
+							skipped = []any{"skipped_hosts", hostSkipNames(skips)}
+						}
+						switch {
+						case budgetStop != nil && rest != nil:
+							log.Error("repository reap stopped on budget with errors", append(attrs, "left", budgetStop.Left, "error", budgetStop.Failures.Error())...)
+							err = budgetStop.Failures
+						case budgetStop != nil:
+							// a budget stop alone is a completed, resumable repository pass
+							log.Warn("repository reap stopped on budget", append(append(attrs, "left", budgetStop.Left), skipped...)...)
+							err = nil
+						case err != nil && rest != nil:
 							log.Error("repository reap failed", append(attrs, "error", err.Error())...)
-						} else {
+						case err != nil:
+							log.Info("repository reap completed", append(attrs, skipped...)...)
+							err = nil
+						default:
 							log.Info("repository reap completed", attrs...)
 						}
 					}
 				}()
 				return err
 			})
+			if hosts := passSkips.names(); len(hosts) > 0 {
+				// Once per pass: every repository reported these same host scans.
+				log.Warn("reap skipped unreachable hosts", "skipped_hosts", hosts)
+			}
 			if role == "reap" && ctx.Err() == nil {
 				// The legacy sweep has an interval of its own
 				// (reap.legacy_every), so this pass only asks whether it is
