@@ -124,3 +124,46 @@ func TestReviewSchedulesConflictedBaseMerge(t *testing.T) {
 		t.Fatalf("a conflicted base merge was not reviewed: calls=%d posts=%d", runner.calls, g.postCount)
 	}
 }
+
+// A base merge of a head that was itself a clean base merge inherits the review
+// of the reviewed head behind the chain: the chain adds no pass and no round.
+func TestReviewInheritsBaseMergeOfInheritedMerge(t *testing.T) {
+	s, g, runner, review := baseMergedAtB(t)
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+	var out bytes.Buffer
+	s.Out = &out
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if runner.calls != 1 || len(g.passes[shaB]) != 0 {
+		t.Fatalf("the clean base merge B was reviewed: calls=%d", runner.calls)
+	}
+	out.Reset()
+	g.parents2[shaD] = []string{shaB, shaC}
+	g.pull.Head.SHA = shaD
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if runner.calls != 1 || len(g.passes[shaD]) != 0 {
+		t.Fatalf("a base merge of an inherited merge was reviewed again: calls=%d passes=%d", runner.calls, len(g.passes[shaD]))
+	}
+	var got map[string]any
+	if e := json.Unmarshal(out.Bytes(), &got); e != nil || got["action"] != "inherited-review" || got["inherited_from"] != shaA {
+		t.Fatalf("%v %s", e, out.String())
+	}
+}
+
+// A base merge behind an inherited merge that conflicts is new text: the chain
+// stops there, so the head is reviewed as before.
+func TestReviewSchedulesBaseMergeOfConflictedMerge(t *testing.T) {
+	s, g, runner, review := baseMergedAtB(t)
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", conflict: true}
+	g.parents2[shaD] = []string{shaB, shaC}
+	g.pull.Head.SHA = shaD
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if runner.calls != 2 || len(g.passes[shaD]) != 1 {
+		t.Fatalf("a base merge behind a conflicted merge was not reviewed: calls=%d passes=%d", runner.calls, len(g.passes[shaD]))
+	}
+}
