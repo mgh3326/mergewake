@@ -353,6 +353,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	if !config.ValidGrade(grade) {
 		return errors.New("invalid PR review grade")
 	}
+	// Round one asks for a reviewer a grade up from config: what it misses is
+	// merged, because later rounds read only the delta. Every later round asks
+	// at the PR grade, as before.
+	firstRound := firstReviewRound(history, pr.Head.SHA)
+	gradeAsked := s.firstRoundGrade(grade, firstRound)
 	var plans []*passPlan
 	for _, pass := range missing {
 		plans = append(plans, &passPlan{pass: pass})
@@ -374,7 +379,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			row := map[string]any{"pass": plan.pass, "lens": plan.lens, "executor": "panewire"}
 			out = append(out, row)
 		}
-		plan := map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true}
+		plan := map[string]any{"action": "review", "head": pr.Head.SHA, "grade": grade, "grade_asked": gradeAsked, "first_round": firstRound, "needed": needed, "pending_claims": pending, "passes": out, "dry_run": true}
 		return s.Print(plan)
 	}
 	if diff == "" {
@@ -419,7 +424,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)
-	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, fullDiff: diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, authorFamily: family, opts: o}
+	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, fullDiff: diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, spawnGrade: raisedGrade(grade, gradeAsked), authorFamily: family, opts: o}
 	// The review event is posted when the run ends, so a slow hk never
 	// spends the reviewers' deadline.
 	var reviewStarted *time.Time
@@ -604,6 +609,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 			event["context_truncated"] = true
 		}
 		event["round"] = rp.round
+		event["pr_grade"], event["grade_asked"], event["first_round"] = grade, gradeAsked, firstRound
+		if seat := strings.TrimPrefix(selected, "panewire:"); seat != "" {
+			event["seat"] = seat
+		}
 		if rp.base != "" {
 			event["delta_base"] = rp.base
 		}

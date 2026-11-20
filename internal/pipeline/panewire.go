@@ -288,9 +288,12 @@ type panewireExecutor struct {
 	diff string
 	// fullDiff is the whole PR patch, while diff may be the round's
 	// interdiff. Sparse includes come from the full PR paths (hk 5099).
-	fullDiff     string
-	delta        bool // diff is the interdiff since the last reviewed head
-	round        int
+	fullDiff string
+	delta    bool // diff is the interdiff since the last reviewed head
+	round    int
+	// spawnGrade is the grade a fresh reviewer spawn states with --grade; empty
+	// leaves panewire to the task title's grade, as before.
+	spawnGrade   string
 	context      string // answered findings and operator decisions, as in the headless prompt
 	authorFamily string
 	jobMu        sync.Mutex // one pass at a time closes the records of older heads
@@ -882,6 +885,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				args = append(args, "-w", cfg.Workspace)
 			}
 			args = append(args, "-l", label, "--t", scale, "--task", task)
+			if x.spawnGrade != "" {
+				args = append(args, "--grade", x.spawnGrade)
+			}
 			if parent != "" {
 				args = append(args, "--builder-job", parent)
 			}

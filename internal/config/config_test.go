@@ -158,6 +158,48 @@ func TestLoadReviewDefaultGradeSS(t *testing.T) {
 	}
 }
 
+func TestLoadReviewFirstRoundGrade(t *testing.T) {
+	load := func(review string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\nreview:\n"+review), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(p)
+	}
+	t.Run("default", func(t *testing.T) {
+		c, err := load("  default_grade: B\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Review.FirstRoundGrade; len(got) != 2 || got["B"] != "A" || got["C"] != "B" {
+			t.Fatalf("review.first_round_grade = %v", got)
+		}
+	})
+	t.Run("configured", func(t *testing.T) {
+		c, err := load("  first_round_grade: {C: A}\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Review.FirstRoundGrade; len(got) != 1 || got["C"] != "A" {
+			t.Fatalf("review.first_round_grade = %v", got)
+		}
+	})
+	t.Run("empty map turns it off", func(t *testing.T) {
+		c, err := load("  first_round_grade: {}\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.Review.FirstRoundGrade) != 0 {
+			t.Fatalf("review.first_round_grade = %v", c.Review.FirstRoundGrade)
+		}
+	})
+	for _, bad := range []string{"  first_round_grade: {B: Z}\n", "  first_round_grade: {Q: A}\n"} {
+		if _, err := load(bad); err == nil || !strings.Contains(err.Error(), "review.first_round_grade") {
+			t.Fatalf("%q: err = %v", bad, err)
+		}
+	}
+}
+
 func TestReviewerArgs(t *testing.T) {
 	for _, args := range [][]string{{"--continue"}, {"--tools", "read"}, {"--model", "x", "--resume", "old"}, {"--model"}} {
 		if ValidateReviewArgs(args) == nil {

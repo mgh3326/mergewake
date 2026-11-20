@@ -36,6 +36,10 @@ type Review struct {
 	Pairings     map[string][]string `yaml:"pairings"`
 	Profiles     map[string]Reviewer `yaml:"profiles"`
 	DefaultGrade string              `yaml:"default_grade"`
+	// FirstRoundGrade maps a PR grade to the grade asked for every pass of the
+	// PR's first review round. A grade not in the map is asked at its own
+	// grade. Unset means {B: A, C: B}; an empty map turns the raise off.
+	FirstRoundGrade map[string]string `yaml:"first_round_grade"`
 	// DefaultFamily is the reviewer family used when the PR carries no
 	// author-family trailer and the head commit identities yield no known
 	// model alias. Reviewed heads record that the family was inferred.
@@ -1272,6 +1276,14 @@ func validateReview(c *Config) error {
 	}
 	if !ValidGrade(c.Review.DefaultGrade) {
 		return errors.New("invalid review.default_grade")
+	}
+	if c.Review.FirstRoundGrade == nil {
+		c.Review.FirstRoundGrade = map[string]string{"B": "A", "C": "B"}
+	}
+	for pr, asked := range c.Review.FirstRoundGrade {
+		if !ValidGrade(pr) || !ValidGrade(asked) {
+			return fmt.Errorf("invalid review.first_round_grade entry %q: %q (grades: %s)", pr, asked, strings.Join(grades, ", "))
+		}
 	}
 	if _, e = Duration(c.Review.Timeout); e != nil {
 		return e
