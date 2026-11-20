@@ -49,10 +49,6 @@ type gateVerdict struct {
 	// BLOCKED notice only; they never feed a decision.
 	Holds     []holdingThread
 	PassClean bool
-	// RoundHold is the critical/high findings a round hold names for a head
-	// without its own review: those open when the last fully reviewed head's
-	// review ended. It feeds the round-hold decision text only.
-	RoundHold []github.ReviewThread
 }
 
 // gateEvidence is the part of a gate pass the PR status snapshot carries
@@ -458,8 +454,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	posted, complete := distinctPasses(receipts, needed)
 	v.HeadPasses, v.PassesNeeded = posted, needed
 	v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
-	counted := s.countedHistory(ctx, r, pr, history)
-	v.Review.Rounds, v.Review.Reviewed = reviewRounds(counted)
+	v.Review.Rounds, v.Review.Reviewed = reviewRounds(s.countedHistory(ctx, r, pr, history))
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if errors.Is(e, github.ErrPollSkipped) {
 		// The done-marker probe is inside its poll interval: hold the verdict
@@ -475,15 +470,11 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	v.Status.Done = done
 	reviewed := done && complete
-	// ownReviewed says the head's own passes reviewed it, not an inherited
-	// review; a head without its own review is held by the round hold from
-	// the last fully reviewed head's findings.
-	ownReviewed := reviewed
-	// countedPasses is the pass set same_family is computed over: the head's own
+	// counted is the pass set same_family is computed over: the head's own
 	// receipts, or the inherited head's alone when the verdict inherits —
 	// the head's own partial receipts never join them, and nothing ORs the
 	// flag across heads.
-	countedPasses := receipts
+	counted := receipts
 	if !reviewed {
 		// A verdict covers a patch: an earlier head with the same patch id, such
 		// as this head before the base was merged into it, already carries the
@@ -495,22 +486,12 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		if ok {
 			reviewed = true
 			v.Review.Inherited = from
-			countedPasses = inherited
+			counted = inherited
 		}
 	}
-	v.SameFamily = sameFamilyOf(countedPasses)
+	v.SameFamily = sameFamilyOf(counted)
 	v.PassClean = reviewed && !holdsPostedOn(v.Holds, pr.Head.SHA)
-	if _, e := s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, roundHistory{all: history, counted: counted, own: ownReviewed}, &v); errors.Is(e, github.ErrPollSkipped) {
-		// A completion marker probe is inside its poll interval: hold the
-		// verdict quiet this round, as for the head's own marker.
-		v.State = "blocked"
-		if len(v.Reasons) == 0 {
-			v.State = "pending"
-		}
-		return v, nil
-	} else if e != nil {
-		return v, e
-	}
+	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
 	records, legacyOutside, e := s.outsideGate(ctx, r, pr, history, v.Review.PatchID, v.Review.Inherited, reviewed, fixes)
 	if e != nil {
 		return v, e

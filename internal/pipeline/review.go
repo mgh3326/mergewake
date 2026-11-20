@@ -178,16 +178,6 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return e
 	}
 	receipts := passesFor(history, pr.Head.SHA)
-	// A head without its own review is held by an earlier round's hold before
-	// its review starts: a review that finished first could leave no hold to
-	// find (round hold, hk 5634).
-	if _, own := distinctPasses(receipts, needed); !own {
-		if held, e := s.holdBeforeReview(ctx, r, pr, history, o); e != nil {
-			return e
-		} else if held {
-			return ErrReviewHeld
-		}
-	}
 	// A review covers a patch, not a SHA. A head whose patch id equals a
 	// reviewed head's, such as the same patch after the base was merged into it,
 	// inherits that review: it gets its completion marker and no pass is
@@ -332,6 +322,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 				round = max(round, receipt.Round)
 			}
 			s.notifyCompletedLateRound(ctx, r, pr, round, posted, nil)
+			// A run that posted the last pass but stopped before the end of the
+			// round (a failed hold write, a failed marker) is finished here.
+			if e = s.holdAtRoundEnd(ctx, r, pr, history, slices.Collect(maps.Values(posted)), o); e != nil {
+				return e
+			}
 			if e = s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(posted)), o.DryRun); e != nil {
 				return e
 			}
@@ -558,7 +553,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		// same_family is a fact only when both families are known: an
 		// unnamed reviewer family is unknown, never the author's.
 		plan.sameFamily = out.family != "" && family != "" && out.family == family
-		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AuthorFamily: family, AnsweredContext: prContext.answered, OutsideShown: strings.Join(prContext.outside, " "), Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n"), Needed: needed}
+		receipt := github.PassReceipt{Pass: plan.pass, Lens: plan.lens, Reviewer: selected, Family: out.family, SameFamily: plan.sameFamily, AuthorFamily: family, AnsweredContext: prContext.answered, OutsideShown: strings.Join(prContext.outside, " "), Executor: out.executor, Fallback: out.fallback, Round: rp.round, Delta: rp.base, Quiet: rp.quiet, Patch: patch, DiffSource: src.source, DiffSummarized: strings.Join(src.summarized, "\n"), Blocking: blockingPosted(findings)}
 		mu.Lock()
 		runReceipts[plan.pass] = receipt
 		mu.Unlock()
@@ -722,6 +717,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		mu.Lock()
 		facts := slices.Clone(roundFacts)
 		mu.Unlock()
+		// The round has ended: a hold it owes is saved before the completion
+		// marker, so nothing the author does next can come first.
+		if e := s.holdAtRoundEnd(ctx, r, pr, history, slices.Collect(maps.Values(runReceipts)), o); e != nil {
+			return e
+		}
 		s.notifyCompletedLateRound(ctx, r, pr, rp.round, runReceipts, facts)
 		if e := s.recordHeadSameFamily(r.Name, n, pr.Head.SHA, slices.Collect(maps.Values(runReceipts)), o.DryRun); e != nil {
 			return e
