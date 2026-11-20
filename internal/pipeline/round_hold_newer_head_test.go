@@ -382,3 +382,92 @@ func TestRoundHoldNewerHead_NoDecisionUntilTheHoldIsSaved(t *testing.T) {
 		t.Fatal("a decision was sent with no saved hold")
 	}
 }
+
+// Five completed rounds, one abandoned two-pass patch that posted only its
+// first pass, and a new patch that completes with a high: six rounds finished,
+// so no hold.
+func TestRoundHoldNewerHead_AbandonedPartialPatchCountsNoRound(t *testing.T) {
+	s, hh, r := nhSetup(t, 5, nhHigh)
+	hh.passes[nhHead(6)] = []github.PassReceipt{{Pass: 1, Patch: "patch-6", Round: 6, Needed: 2}}
+	if err := nhReview(s, r, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if nhSaved(s, r).held() {
+		t.Fatal("an abandoned partial patch counted a round: hold saved at six completed rounds")
+	}
+}
+
+// Pass 1 posted a high; a reasoned dismissal resolved it before the round ended.
+// Its receipt still names a posted high, but its thread is visible and
+// disposed: nothing is open at the round's end, so no hold.
+func TestRoundHoldNewerHead_PostedHighAnsweredBeforeTheEndIsNotOpen(t *testing.T) {
+	s, hh, r := nhSetup(t, 6, nhHigh)
+	for i := 1; i <= 6; i++ {
+		hh.refs[doneRef(7, nhHead(i))] = true
+	}
+	t1 := ownFinding("T1", "high", 2)
+	t1.Comments[0].CommitSHA, t1.Comments[0].OriginalCommitSHA = shaA, shaA
+	t1.IsResolved = true
+	hh.feedback.Threads = []github.ReviewThread{t1}
+	rc := github.PassReceipt{Pass: 1, Needed: 1, Patch: "patch-7", Round: 7, Blocking: 1}
+	if err := s.holdAtRoundEnd(context.Background(), r, hh.pull, shaA, nhHistory(hh), []github.PassReceipt{rc}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if nhSaved(s, r).held() {
+		t.Fatal("a posted high already resolved at the round's end saved a hold")
+	}
+}
+
+// nhHistory is the PR's recorded passes as the history read returns them.
+func nhHistory(hh *nhGH) []github.ReviewedPass {
+	h, _ := hh.ReviewHistory(context.Background(), "", 7, "")
+	return h
+}
+
+// A fix claim the lookups cannot settle is returned before any hold is saved:
+// the review stops before the marker and is retried.
+func TestRoundHoldNewerHead_UnsettledFixLookupSavesNoHold(t *testing.T) {
+	s, hh, r := nhSetup(t, 6, `{"findings":[]}`)
+	carried := ownFinding("T0", "high", 5, github.ReviewComment{Author: "pr-author", Body: "Fixed in " + shaC[:7]})
+	hh.feedback.Threads = []github.ReviewThread{carried}
+	hh.commitErr = map[string]error{shaC[:7]: errors.New("github down")}
+	if err := nhReview(s, r, Options{}); err == nil {
+		t.Fatal("an unsettled fix lookup did not stop the review")
+	}
+	if nhSaved(s, r).held() || hh.refs[doneRef(7, shaA)] {
+		t.Fatal("a hold or a marker was saved from a failed lookup")
+	}
+	// GitHub recovers and verifies the fix: the retry saves no hold.
+	hh.commitErr = nil
+	if err := nhReview(s, r, Options{}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if nhSaved(s, r).held() {
+		t.Fatal("a verified fix left a hold")
+	}
+}
+
+// Round 7 posts its last pass with a high, the hold write fails, and the author
+// pushes before the retry: the newer head's review recovers the owed hold
+// before it starts.
+func TestRoundHoldNewerHead_PushBeforeTheRetryStillMeetsTheHold(t *testing.T) {
+	s, hh, r := nhSetup(t, 6, nhHigh)
+	file := s.roundRuleFile(r.Name, 7)
+	if err := os.MkdirAll(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := nhReview(s, r, Options{}); err == nil {
+		t.Fatal("a failed hold write did not stop the review")
+	}
+	if err := os.RemoveAll(file); err != nil {
+		t.Fatal(err)
+	}
+	nhPush(hh)
+	posts := hh.postCount
+	if err := nhReview(s, r, Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("review of the newer head: %v, want ErrReviewHeld", err)
+	}
+	if hh.postCount != posts || !nhSaved(s, r).held() {
+		t.Fatalf("recovery did not save the hold before the newer review: posts %d->%d held %v", posts, hh.postCount, nhSaved(s, r).held())
+	}
+}

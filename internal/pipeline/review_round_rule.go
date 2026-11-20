@@ -286,7 +286,16 @@ func aboveLow(severity string) bool {
 // and up, the hub consult's trigger, operator decision 250: one consult per PR
 // and round, none for an all-low round). A thread can be in both.
 func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread) {
-	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA).verified
+	blocking, above, _ = s.openFindingsChecked(ctx, r, pr, fb)
+	return blocking, above
+}
+
+// openFindingsChecked is openFindings with the fix verifier's error: a fix
+// claim the lookups could not settle counts as open, and the error says so. A
+// caller that persists something on the result returns the error instead.
+func (s *Service) openFindingsChecked(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (blocking, above []github.ReviewThread, err error) {
+	verifier := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	verify := verifier.verified
 	own := policy.NormalizeAuthor(s.Config.Review.Login)
 	for _, t := range fb.Threads {
 		if t.IsResolved || len(t.Comments) == 0 {
@@ -306,7 +315,7 @@ func (s *Service) openFindings(ctx context.Context, r config.Repo, pr github.Pul
 		}
 		above = append(above, t)
 	}
-	return blocking, above
+	return blocking, above, verifier.err
 }
 
 type escalateFinding struct {
@@ -831,8 +840,8 @@ func (s *Service) roundHoldStateError(r config.Repo, pr github.Pull, err error) 
 }
 
 // checkRound5Gate evaluates the round hold condition during gate evaluation.
-func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
-	return s.checkRoundHoldGate(ctx, r, pr, fb, rounds, reviewed, v)
+func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass, reviewed bool, v *gateVerdict) (bool, error) {
+	return s.checkRoundHoldGate(ctx, r, pr, fb, history, reviewed, v)
 }
 
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
@@ -841,35 +850,44 @@ func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.
 // PR is held until the release comment, whichever head is current. holdAtRoundEnd
 // saves it when a round at or past the hold round ends with a critical/high
 // open, so a head pushed right after that round (handoffkeep#482) meets a saved
-// hold; this gate saves it too, for a head it sees reviewed in that state.
-func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
-	hold := func() bool {
+// hold; this gate saves it too, for a head it sees reviewed in that state, by
+// the same count of completed rounds. A read the count needs that fails is
+// returned: the gate then has no verdict, which never passes.
+func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, history []github.ReviewedPass, reviewed bool, v *gateVerdict) (bool, error) {
+	hold := func() (bool, error) {
 		v.Reasons = append(v.Reasons, "round_hold")
 		v.Review.Block = "round_hold"
 		v.Review.Hold = "round_hold"
 		v.State = "blocked"
-		return true
+		return true, nil
 	}
 	st := s.loadRoundRuleState(r.Name, pr.Number)
 
 	if st.held() {
 		if st.released() {
-			return false
+			return false, nil
 		}
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		if err == nil && s.applyHoldComments(r, pr, comments) {
-			return false
+			return false, nil
 		}
 		return hold()
 	}
 
 	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
-	if reviewed && rounds >= s.Config.Review.RoundRuleHold() && open {
-		// A failed write still blocks; the next pass saves the hold again.
-		_ = s.recordRoundHold(ctx, r, pr)
-		return hold()
+	if !reviewed || !open {
+		return false, nil
 	}
-	return false
+	rounds, err := s.completedRounds(ctx, r, pr, pr.Head.SHA, history)
+	if err != nil {
+		return false, err
+	}
+	if rounds < s.Config.Review.RoundRuleHold() {
+		return false, nil
+	}
+	// A failed write still blocks; the next pass saves the hold again.
+	_ = s.recordRoundHold(ctx, r, pr)
+	return hold()
 }
 
 // recordRoundHold saves the hold. The comment count is the baseline a release
@@ -911,15 +929,24 @@ func blockingPosted(findings []github.Finding) int {
 	return n
 }
 
-// holdAtRoundEnd saves the round hold when the head's review has just completed
-// a round at or past the hold round with a critical/high finding open: one it
-// just posted (known from the receipts, so a feedback read that has not caught
-// up with the post cannot hide it), or one still open from an earlier head. It runs inside the review, before the head's completion marker, so no
-// push, resolution or later review can come first. The hold names the PR, not
-// the head: a newer head the author pushes next meets it saved. A failed state
-// write is returned: the review then stops before the marker and is retried,
-// finding every pass posted. A dry run saves nothing.
-func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, receipts []github.PassReceipt, o Options) error {
+// holdAtRoundEnd saves the round hold when head's review has just completed a
+// round at or past the hold round with a critical/high finding open. It runs
+// inside the review, before the head's completion marker, so no push,
+// resolution or later review can come first. The hold names the PR, not the
+// head: a newer head the author pushes next meets it saved.
+//
+//   - The round count is of completed rounds: a head counts when its own
+//     required passes are posted (see receiptsComplete) or its marker is set,
+//     so an abandoned partial patch counts none.
+//   - Open at the end is the threads open now, fix claims checked, plus the
+//     highs this head's receipts say it posted that no thread shows yet: a
+//     feedback read that has not caught up with the post cannot hide one, and a
+//     posted high a thread now shows resolved or answered is not counted again.
+//   - A lookup that cannot settle a fix claim is returned, not persisted: the
+//     review stops before the marker and is retried. So is a failed write.
+//
+// A dry run saves nothing.
+func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, head string, history []github.ReviewedPass, receipts []github.PassReceipt, o Options) error {
 	if !o.Acting() || s.GH == nil {
 		return nil
 	}
@@ -927,31 +954,143 @@ func (s *Service) holdAtRoundEnd(ctx context.Context, r config.Repo, pr github.P
 	if saved.held() || saved.released() {
 		return nil
 	}
-	// This head's receipts joined to the history read before the run: the round
-	// that just ended is counted like the gate counts it.
+	// This head's receipts joined to the history read before the run.
 	all := slices.Clone(history)
 	for _, rc := range receipts {
-		if !slices.ContainsFunc(all, func(p github.ReviewedPass) bool { return p.Head == pr.Head.SHA && p.Pass == rc.Pass }) {
-			all = append(all, github.ReviewedPass{Head: pr.Head.SHA, PassReceipt: rc})
+		if !slices.ContainsFunc(all, func(p github.ReviewedPass) bool { return p.Head == head && p.Pass == rc.Pass }) {
+			all = append(all, github.ReviewedPass{Head: head, PassReceipt: rc})
 		}
 	}
-	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, all))
-	if rounds < s.Config.Review.RoundRuleHold() {
+	rounds, err := s.completedRounds(ctx, r, pr, head, all)
+	if err != nil || rounds < s.Config.Review.RoundRuleHold() {
+		return err
+	}
+	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if err != nil {
+		return err
+	}
+	open, _, err := s.openFindingsChecked(ctx, r, pr, fb)
+	if err != nil {
+		return err
+	}
+	posted, seen := 0, 0
+	for _, rc := range receipts {
+		posted += rc.Blocking
+	}
+	own := policy.NormalizeAuthor(s.Config.Review.Login)
+	for _, t := range fb.Threads {
+		if len(t.Comments) == 0 {
+			continue
+		}
+		first := t.Comments[0]
+		if postedOn(first) == head && policy.NormalizeAuthor(first.Author) == own && mustFix(github.ThreadSeverity(first.Author, first.Body)) {
+			seen++
+		}
+	}
+	if len(open) == 0 && posted <= seen {
 		return nil
 	}
-	// A finding a pass posted is on its receipt; one still open from an earlier
-	// head is read from the threads.
-	posted := slices.ContainsFunc(receipts, func(rc github.PassReceipt) bool { return rc.Blocking > 0 })
-	if !posted {
-		fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
-		if err != nil {
-			return err
-		}
-		if open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb); !open {
-			return nil
+	return s.recordRoundHold(ctx, r, pr)
+}
+
+// recoverRoundEnd finishes the round end of the newest earlier head when its
+// passes are all posted but its completion marker was never written: the run
+// that posted the last pass stopped before the round's hold was saved (a failed
+// write) and the author pushed before the retry. The hold is saved before this
+// newer head is reviewed. It reports whether a hold is now saved.
+func (s *Service) recoverRoundEnd(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, o Options) (bool, error) {
+	if !o.Acting() || s.GH == nil {
+		return false, nil
+	}
+	if st := s.loadRoundRuleState(r.Name, pr.Number); st.held() || st.released() {
+		return false, nil
+	}
+	prev := ""
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Head != pr.Head.SHA {
+			prev = history[i].Head
+			break
 		}
 	}
-	return s.recordRoundHold(ctx, r, pr)
+	if prev == "" {
+		return false, nil
+	}
+	receipts := passesFor(history, prev)
+	if !receiptsComplete(receipts) {
+		return false, nil
+	}
+	done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, prev+"-done")
+	if err != nil || done {
+		return false, err
+	}
+	if err := s.holdAtRoundEnd(ctx, r, pr, prev, history, receipts, o); err != nil {
+		return false, err
+	}
+	st := s.loadRoundRuleState(r.Name, pr.Number)
+	return st.held(), nil
+}
+
+// completedRounds counts the rounds up to head that finished: the distinct
+// patches, base merges left out as everywhere else, of the heads whose own
+// review is complete, head's own included. A head is complete by its receipts
+// (receiptsComplete) or its marker; a patch that only ever got a partial review
+// counts none. A PR with too few patches to reach the hold round reads no
+// marker.
+func (s *Service) completedRounds(ctx context.Context, r config.Repo, pr github.Pull, head string, all []github.ReviewedPass) (int, error) {
+	counted := s.countedHistory(ctx, r, pr, all)
+	keys := map[string]bool{}
+	for _, p := range counted {
+		keys[roundKey(p)] = true
+	}
+	if len(keys) < s.Config.Review.RoundRuleHold() {
+		return len(keys), nil
+	}
+	complete := map[string]bool{head: true}
+	for _, p := range counted {
+		if _, known := complete[p.Head]; known {
+			continue
+		}
+		ok := receiptsComplete(passesFor(all, p.Head))
+		if !ok {
+			done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, p.Head+"-done")
+			if err != nil {
+				return 0, err
+			}
+			ok = done
+		}
+		complete[p.Head] = ok
+	}
+	var kept []github.ReviewedPass
+	for _, p := range counted {
+		if complete[p.Head] {
+			kept = append(kept, p)
+		}
+	}
+	rounds, _ := reviewRounds(kept)
+	return rounds, nil
+}
+
+// receiptsComplete reports whether a head's receipts alone show its review
+// complete: the passes meet the count the receipts themselves name, or two
+// distinct passes are posted, the most any policy asks for. A lone receipt that
+// names no count proves nothing: it may be the first of two.
+func receiptsComplete(receipts []github.PassReceipt) bool {
+	needed := 2
+	for _, r := range receipts {
+		if r.Needed > 0 && r.Needed < needed {
+			needed = r.Needed
+		}
+	}
+	_, ok := distinctPasses(receipts, needed)
+	return ok
+}
+
+// roundKey is the key reviewRounds counts a pass's round by.
+func roundKey(p github.ReviewedPass) string {
+	if p.Patch == "" {
+		return "head:" + p.Head
+	}
+	return p.Patch
 }
 
 // NotifyRoundHold sends the round-hold decision for a PR whose review the hold
