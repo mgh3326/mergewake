@@ -1128,7 +1128,7 @@ on it.
   - **Round ladder (`review.round_rule.ladder`, default 5):** on the first done round at or after the ladder round
     with a critical or high finding open, mergewake runs, once per (task, PR, round ladder), on the daemon host bounded at 60 s:
     `panewire escalate-author --task <id> --job <author job id> --pr <owner/repo#n> --round <n> --findings-file <path>`,
-    where the file is a JSON array of `{ref, severity, path, line, title, body}` for every finding so far.
+    where the file is a JSON array of `{ref, severity, path, line, title, body}` for every unresolved finding so far (resolved threads are left out).
     rc 0 marks the step escalated (`ladder-escalated`); rc 2 marks it escalated too, the author
     untouched (`ladder-intact`); rc 124 is pending — audited `ladder-pending`, not marked, and
     retried by a later evaluation with the same arguments until a 2-hour bound, after which it is

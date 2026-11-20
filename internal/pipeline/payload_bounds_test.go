@@ -248,6 +248,39 @@ func TestConsultQuestionSmallKeepsEveryFinding(t *testing.T) {
 	}
 }
 
+// Ladder: 150 resolved criticals on a 400-byte path alone exceed 32 KiB. The
+// payload carries only open findings, so the one open high is sent and no
+// resolved ref is, and the audit row counts only the open finding.
+func TestFindingsFileBoundSkipsResolvedThreads(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 5)
+	path := strings.Repeat("p", 400)
+	var threads []github.ReviewThread
+	for i := 0; i < 150; i++ {
+		th := boundFinding(fmt.Sprintf("R%03d", i), "critical", path, i+1, "old")
+		th.IsResolved = true
+		threads = append(threads, th)
+	}
+	threads = append(threads, boundFinding("H1", "high", path, 500, "open"))
+	g.feedback.Threads = threads
+
+	deliver(t, s, r)
+
+	calls, _, findings := escalateSnapshot(run)
+	if calls != 1 {
+		t.Fatalf("want 1 escalate-author call, got %d", calls)
+	}
+	if len(findings) > panewireFindingsMax {
+		t.Fatalf("findings file is %d bytes; panewire refuses above %d", len(findings), panewireFindingsMax)
+	}
+	got := decodeEscalated(t, findings)
+	if len(got) != 1 || got[0].Ref != "H1" {
+		t.Fatalf("payload carries %d findings (%v); want only the open high H1", len(got), got)
+	}
+	if sent, left := ladderAuditFindings(t, s, r.Name); sent != 1 || left != 0 {
+		t.Fatalf("audit says sent=%v left_out=%v; want sent=1 left_out=0", sent, left)
+	}
+}
+
 // cutText never splits a rune, so cut findings stay valid UTF-8.
 func TestFindingsCutTextRuneBoundary(t *testing.T) {
 	s := "가나다라 mergewake"
