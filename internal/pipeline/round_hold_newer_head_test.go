@@ -434,3 +434,49 @@ func TestRoundHoldNewerHead_ReleaseDuringCommentOutageCounts(t *testing.T) {
 		t.Fatalf("a release posted during the outage was lost: %v", v.Reasons)
 	}
 }
+
+// The review of a newer head does not start before the hold is saved: a review
+// that finished clean first would leave no hold to find. The saved hold then
+// survives that head's clean review and delivers its one decision.
+func TestRoundHoldNewerHead_ReviewIsHeldBeforeItStarts(t *testing.T) {
+	s, hh, gate, r := newerHeadSetup(t, 7)
+	if err := s.Review(context.Background(), r, 7, "google", Options{}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("Review of a newer head after a round-7 high: %v, want ErrReviewHeld", err)
+	}
+	if hh.postCount != 0 {
+		t.Fatalf("a review was posted: %d", hh.postCount)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); !st.held() {
+		t.Fatal("Review did not save the hold")
+	}
+	// The head is later reviewed clean after a dismissal of the old finding.
+	hh.feedback.Threads = []github.ReviewThread{nhFinding("T1", "high", 7, nhReply(7, 40*time.Second, "Dismiss: the code line disproves it"))}
+	hh.history = append(hh.history, github.ReviewedPass{Head: shaA, PassReceipt: github.PassReceipt{Pass: 1, Patch: "patch-8"}})
+	hh.fakeGH.refs[doneRef(7, shaA)] = true
+	if v := gate(); !nhHeld(v) {
+		t.Fatalf("a clean review of the newer head released the hold: %v", v.Reasons)
+	}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	n := s.Notifier.(*ackNotifier)
+	count := 0
+	for _, e := range n.events {
+		if e.Type == "decision" && strings.Contains(e.Text, "round-hold") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("decision events = %d, want 1", count)
+	}
+}
+
+func TestRoundHoldNewerHead_DryRunReviewHoldSavesNothing(t *testing.T) {
+	s, _, _, r := newerHeadSetup(t, 7)
+	if err := s.Review(context.Background(), r, 7, "google", Options{DryRun: true}); !errors.Is(err, ErrReviewHeld) {
+		t.Fatalf("dry-run Review: %v, want ErrReviewHeld", err)
+	}
+	if st := s.loadRoundRuleState(r.Name, 7); st.held() {
+		t.Fatal("a dry run saved the hold")
+	}
+}

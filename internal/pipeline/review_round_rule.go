@@ -967,6 +967,53 @@ func (s *Service) openFindingsAt(ctx context.Context, r config.Repo, head string
 	return out
 }
 
+// recordRoundHold saves the hold. The comment count is the baseline a release
+// comment must come after; a failed read leaves the baseline uncaptured, to be
+// taken on a later pass. The hold is saved on a fresh copy of the state under
+// its lock, so a consult row settled while the comments were read is kept; a
+// failed write is audited, and the next pass derives and saves the hold again.
+func (s *Service) recordRoundHold(ctx context.Context, r config.Repo, pr github.Pull) {
+	comments, cerr := s.issueComments(ctx, r.Name, pr.Number)
+	count, captured := 0, false
+	if cerr == nil {
+		count, captured = len(comments), true
+	}
+	now := s.now().UTC()
+	if _, err := s.updateRoundRuleState(r.Name, pr.Number, func(st *roundRuleState) bool {
+		if st.held() {
+			return false
+		}
+		st.setHeld(true, now, count, captured)
+		return true
+	}); err != nil {
+		s.roundHoldStateError(r, pr, err)
+	}
+}
+
+// holdBeforeReview is the round hold's check before a head without its own
+// review is reviewed: when the newest fully reviewed head ended at or past the
+// hold round with a critical/high open, the hold is saved now (not left to a
+// later gate pass, which a finished review of the new head could outrun) and
+// the review does not start. A dry run saves nothing.
+func (s *Service) holdBeforeReview(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, o Options) (bool, error) {
+	if s.GH == nil {
+		return false, nil
+	}
+	fb, err := s.GH.ReviewFeedback(ctx, r.Name, pr.Number)
+	if err != nil {
+		return false, err
+	}
+	h := roundHistory{all: history, counted: s.countedHistory(ctx, r, pr, history)}
+	held, err := s.earlierHeadHold(ctx, r, pr, fb, h)
+	if err != nil || len(held) == 0 {
+		return false, err
+	}
+	if o.Acting() {
+		s.recordRoundHold(ctx, r, pr)
+	}
+	return true, nil
+}
+
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
 // A failed read of the evidence it needs is returned: the gate then has no
 // verdict, which never passes.
@@ -1006,26 +1053,7 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 	if !due {
 		return false, nil
 	}
-	// The comment count is the baseline a release comment must come after. A
-	// failed read leaves the baseline uncaptured, to be taken on a later pass.
-	comments, cerr := s.issueComments(ctx, r.Name, pr.Number)
-	count, captured := 0, false
-	if cerr == nil {
-		count, captured = len(comments), true
-	}
-	now := s.now().UTC()
-	// The hold is saved on a fresh copy of the state under its lock, so a
-	// consult row settled while the comments were read is kept; a failed write
-	// still blocks, and the next pass derives and saves the hold again.
-	if _, err := s.updateRoundRuleState(r.Name, pr.Number, func(st *roundRuleState) bool {
-		if st.held() {
-			return false
-		}
-		st.setHeld(true, now, count, captured)
-		return true
-	}); err != nil {
-		s.roundHoldStateError(r, pr, err)
-	}
+	s.recordRoundHold(ctx, r, pr)
 	v.RoundHold = held
 	return hold()
 }

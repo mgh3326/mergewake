@@ -178,6 +178,16 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		return e
 	}
 	receipts := passesFor(history, pr.Head.SHA)
+	// A head without its own review is held by an earlier round's hold before
+	// its review starts: a review that finished first could leave no hold to
+	// find (round hold, hk 5634).
+	if _, own := distinctPasses(receipts, needed); !own {
+		if held, e := s.holdBeforeReview(ctx, r, pr, history, o); e != nil {
+			return e
+		} else if held {
+			return ErrReviewHeld
+		}
+	}
 	// A review covers a patch, not a SHA. A head whose patch id equals a
 	// reviewed head's, such as the same patch after the base was merged into it,
 	// inherits that review: it gets its completion marker and no pass is
