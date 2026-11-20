@@ -1130,6 +1130,27 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 				t.Fatalf("hub pane_not_closed sent a second notice: %+v", n.events)
 			}
 		})
+		t.Run("ownerless_job_unknown_still_notifies", func(t *testing.T) {
+			// The hub refuses job_unknown with no owner and relays nothing, so
+			// mergewake's own notice is the only one (hk 5738).
+			s, _, n, run, r := setup(t, "panewire: job_unknown: no spawn operation for job-x")
+			deliver(t, s, r)
+			deliver(t, s, r)
+			if calls, _, _ := escalateSnapshot(run); calls != 1 {
+				t.Fatalf("job_unknown calls = %d, want 1", calls)
+			}
+			if len(refusalEvents(n)) != 1 {
+				t.Fatalf("job_unknown notices = %d, want 1: %+v", len(refusalEvents(n)), n.events)
+			}
+		})
+		t.Run("hub_author_kept", func(t *testing.T) {
+			// The hub relays author_kept to the owner as a decision itself.
+			s, _, n, _, r := setup(t, "panewire: author_kept: the author was spawned with --keep; its pane is protected")
+			deliver(t, s, r)
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("author_kept sent a second notice: %+v", n.events)
+			}
+		})
 		t.Run("hub_job_not_live", func(t *testing.T) {
 			s, _, n, run, r := setup(t, "panewire: job_not_live: task is no longer live")
 			deliver(t, s, r)
