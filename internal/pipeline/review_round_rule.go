@@ -502,7 +502,13 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			"findings_left_out": fit.leftOut,
 		}, o.DryRun)
 		if !hub {
-			st.LadderRefusalText = outputStr
+			// Empty output must still owe the owner a notice: an empty text
+			// would skip the send and leave the refusal owed with no retry.
+			refusal := outputStr
+			if refusal == "" {
+				refusal = "panewire exited 2 with no output"
+			}
+			st.LadderRefusalText = refusal
 			st.LadderRefusalRound = ladderRound
 			st.LadderRefusalEventSent = false
 			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)

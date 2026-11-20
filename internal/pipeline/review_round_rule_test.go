@@ -1048,6 +1048,26 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 		}
 	})
 
+	t.Run("empty_output_still_notifies_once", func(t *testing.T) {
+		s, _, n, run, r := setup(t, "")
+		deliver(t, s, r)
+		deliver(t, s, r)
+		st := s.loadRoundRuleState(r.Name, 7)
+		if !st.escalated() || !st.LadderRefusalEventSent {
+			t.Fatalf("empty-output refusal not settled/sent: %+v", st)
+		}
+		if calls, _, _ := escalateSnapshot(run); calls != 1 {
+			t.Fatalf("empty-output refusal calls = %d, want 1", calls)
+		}
+		events := refusalEvents(n)
+		if len(events) != 1 {
+			t.Fatalf("empty-output refusal events = %d, want 1: %+v", len(events), n.events)
+		}
+		if !strings.Contains(events[0].Text, "exited 2 with no output") {
+			t.Errorf("empty-output refusal notice missing fallback text: %s", events[0].Text)
+		}
+	})
+
 	t.Run("pane_busy_retries_but_hub_job_not_live_does_not", func(t *testing.T) {
 		t.Run("pane_busy", func(t *testing.T) {
 			s, _, n, run, r := setup(t, "panewire: pane_busy: the author pane is busy")
