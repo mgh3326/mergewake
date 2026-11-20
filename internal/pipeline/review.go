@@ -424,7 +424,7 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 	// Findings already on the PR, and those posted by earlier passes of this
 	// run, are never posted again.
 	known := knownThreads(feedback)
-	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, fullDiff: diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, spawnGrade: raisedGrade(grade, gradeAsked), authorFamily: family, opts: o}
+	x := &panewireExecutor{s: s, repo: r, pr: pr, diff: rp.diff, fullDiff: diff, delta: rp.base != "" && !rp.empty, round: rp.round, context: prContext.text, spawnGrade: raisedGrade(grade, gradeAsked), routing: &reviewRouting{PRGrade: grade, GradeAsked: gradeAsked, FirstRound: firstRound}, authorFamily: family, opts: o}
 	// The review event is posted when the run ends, so a slow hk never
 	// spends the reviewers' deadline.
 	var reviewStarted *time.Time
@@ -610,6 +610,11 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		event["round"] = rp.round
 		event["pr_grade"], event["grade_asked"], event["first_round"] = grade, gradeAsked, firstRound
+		// A pass whose reviewer job recorded its decision is audited with that
+		// decision, not the policy of this run.
+		if out.routing != nil {
+			event["pr_grade"], event["grade_asked"], event["first_round"] = out.routing.PRGrade, out.routing.GradeAsked, out.routing.FirstRound
+		}
 		event["seat"] = "unknown"
 		if out.seat != "" {
 			event["seat"] = out.seat

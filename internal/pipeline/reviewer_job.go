@@ -83,6 +83,20 @@ type reviewerJob struct {
 	// request after accepting it (hk 5005), so the reset is applied once the
 	// landing is really seen, not once per evaluation that reads the record.
 	Placed bool `json:"placed,omitempty"`
+	// Routing is the grade decision this pass was spawned under. It is kept with
+	// the record so a result collected later is audited with the decision of the
+	// job that produced it, not the policy at collection time. Nil on a record
+	// written before the field existed.
+	Routing *reviewRouting `json:"routing,omitempty"`
+}
+
+// reviewRouting is the grade decision of a reviewer pass: the PR grade, the
+// grade asked of the reviewer, and whether the pass is in the PR's first
+// review round.
+type reviewRouting struct {
+	PRGrade    string `json:"pr_grade"`
+	GradeAsked string `json:"grade_asked"`
+	FirstRound bool   `json:"first_round"`
 }
 
 // replacedReviewer is a reviewer that was lost and replaced: its label,
@@ -95,6 +109,9 @@ type replacedReviewer struct {
 	Head        string    `json:"head"`
 	BudgetStart time.Time `json:"budget_start"`
 	Pool        string    `json:"pool,omitempty"`
+	// Routing is the grade decision the replaced reviewer ran under, kept for a
+	// late result the pass collects from it.
+	Routing *reviewRouting `json:"routing,omitempty"`
 }
 
 // budgetStart is when the review budget of this reviewer starts.
