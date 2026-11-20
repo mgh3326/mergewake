@@ -115,16 +115,15 @@ type roundRuleState struct {
 	//
 	// Owed marks an outstanding consult and is independent of the current
 	// round: it is set when the consult is requested and cleared once its
-	// outcome went out with a delivery (or its head was superseded). Head is
-	// the commit the row was requested for — the hub keys consults by
-	// (task, repo#pr, head), so a row of another head is never applied here.
+	// outcome went out with a delivery. Head is the commit the row was requested
+	// for — the hub keys consults by (task, repo#pr, head); after a push the
+	// row is still followed and its outcome names this head.
 	// Posted records that the request may have reached the hub, so an id lost
 	// to a failed state write is reconciled from the audit journal instead of
 	// a re-POST. Done marks the outcome settled and audited.
 	HubConsultOwed bool   `json:"hub_consult_owed,omitempty"`
 	HubConsultHead string `json:"hub_consult_head,omitempty"`
-	// HubConsultRound is the round the consult was requested at, so a later
-	// round does not ask again.
+	// HubConsultRound is the round the consult was requested at.
 	HubConsultRound     int       `json:"hub_consult_round,omitempty"`
 	HubConsultPosted    bool      `json:"hub_consult_posted,omitempty"`
 	HubConsultID        string    `json:"hub_consult_id,omitempty"`
@@ -138,12 +137,10 @@ type roundRuleState struct {
 	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
 	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
 	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
-	// CommentAt is the first pass a settled row's task comment could not be
-	// recorded; the next head waits only consultCommentBound past it.
-	// CommentDropped records that the bound was reached, so the drop is
-	// audited once.
-	HubConsultCommentAt      time.Time `json:"hub_consult_comment_at,omitzero"`
-	HubConsultCommentDropped bool      `json:"hub_consult_comment_dropped,omitempty"`
+	// HubConsultCarried records that a push moved the head while the row was
+	// outstanding: from then on its POST is never replayed, whatever head the
+	// PR is on, since the row may have settled at the hub.
+	HubConsultCarried bool `json:"hub_consult_carried,omitempty"`
 
 	// Ladder
 	LadderEscalated bool      `json:"ladder_escalated,omitempty"`

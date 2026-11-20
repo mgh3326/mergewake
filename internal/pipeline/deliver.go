@@ -153,8 +153,9 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, consultOwed)
 	}
 	// With the hub consult on, a forced delivery is owed only for an outcome the
-	// consult step settled on this pass; a row superseded by a push leaves
-	// nothing to say and must not re-deliver the open findings on every pass.
+	// consult step settled on this pass (a row carried across a push included:
+	// it names its head); nothing else leaves a line to say, and the open
+	// findings are not re-delivered on every pass.
 	forceDirective := done && rounds >= consultRound && consultOwed && !st.directiveSent() && len(inScope) == 0 && !consultPending
 	if consultOn {
 		forceDirective = forceDirective && consultDirective != ""
