@@ -1191,6 +1191,45 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 				t.Fatalf("notified value missing from ladder audit: %v", auditLines(t, s, r.Name))
 			}
 		})
+		t.Run("pane_busy_owner_lane_retries_then_no_notice", func(t *testing.T) {
+			// pane_busy keeps its retries whatever the field says; at the bound
+			// the owner-lane field means the hub already told the owner.
+			s, _, n, run, r := setup(t, "panewire: pane_busy: the author pane is busy notified=owner-lane")
+			for i := 0; i < ladderPaneBusyMaxCalls; i++ {
+				deliver(t, s, r)
+			}
+			if calls, _, _ := escalateSnapshot(run); calls != ladderPaneBusyMaxCalls {
+				t.Fatalf("pane_busy owner-lane calls = %d, want %d", calls, ladderPaneBusyMaxCalls)
+			}
+			if st := s.loadRoundRuleState(r.Name, 7); !st.escalated() {
+				t.Fatal("pane_busy owner-lane did not settle at retry bound")
+			}
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("pane_busy owner-lane sent a notice: %+v", n.events)
+			}
+		})
+		t.Run("pane_busy_none_retries_then_notifies_once", func(t *testing.T) {
+			// The hub failed to relay: mergewake's one notice comes at the bound,
+			// after the retries, not before them.
+			s, _, n, run, r := setup(t, "panewire: pane_busy: the author pane is busy notified=none")
+			for i := 0; i < ladderPaneBusyMaxCalls-1; i++ {
+				deliver(t, s, r)
+			}
+			if len(refusalEvents(n)) != 0 {
+				t.Fatalf("pane_busy none notified before the retry bound: %+v", n.events)
+			}
+			deliver(t, s, r)
+			if calls, _, _ := escalateSnapshot(run); calls != ladderPaneBusyMaxCalls {
+				t.Fatalf("pane_busy none calls = %d, want %d", calls, ladderPaneBusyMaxCalls)
+			}
+			events := refusalEvents(n)
+			if len(events) != 1 {
+				t.Fatalf("pane_busy none notices = %d, want 1: %+v", len(events), n.events)
+			}
+			if strings.Contains(events[0].Text, "notified=") {
+				t.Errorf("notice carries the field: %s", events[0].Text)
+			}
+		})
 		t.Run("none_on_listed_code_notifies_once", func(t *testing.T) {
 			s, _, n, run, r := setup(t, "panewire: job_not_live: task is no longer live notified=none")
 			deliver(t, s, r)

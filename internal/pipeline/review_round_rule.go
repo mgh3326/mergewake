@@ -525,10 +525,14 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			if st.LadderPaneBusyCalls < ladderPaneBusyMaxCalls {
 				st.LadderOutput = outputStr
 				_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-				_ = s.audit(r.Name, "ladder-pane-busy-retry", map[string]any{
+				retry := map[string]any{
 					"pr": pr.Number, "round": ladderRound, "rc": 2,
 					"code": code, "calls": st.LadderPaneBusyCalls, "output": outputStr,
-				}, o.DryRun)
+				}
+				if notified != "" {
+					retry["notified"] = notified
+				}
+				_ = s.audit(r.Name, "ladder-pane-busy-retry", retry, o.DryRun)
 				return
 			}
 		}
