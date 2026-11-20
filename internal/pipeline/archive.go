@@ -56,6 +56,24 @@ func liveName(hs *reapHost, job string) bool {
 	return false
 }
 
+// archiveRechecked is archiveJob for a job dir the pass has decided to archive.
+// An acting pass first re-reads the host's panes: the scan the decision read may
+// predate this repository's turn in the pass, and a shell opened in the dir
+// since then must still hold it.
+func (s *Service) archiveRechecked(ctx context.Context, hs *reapHost, root, job string, acting bool, rec *reapReceipt) {
+	if acting {
+		if e := refreshPaneLists(ctx, hs); e != nil {
+			rec.Result, rec.Reason = "error", "refresh: pane read: "+e.Error()
+			return
+		}
+		if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
+			rec.Result, rec.Reason = "skipped", "pane-live"
+			return
+		}
+	}
+	s.archiveJob(ctx, hs.host, job, acting, rec)
+}
+
 // archiveJob plans one job, prints the plan, and applies it when acting.
 // viaHub reports a remote host reap reaches through the panewire hub. Archive
 // moves files over ssh, so such a host is not archived: under panewire no
@@ -268,7 +286,7 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 					if tried && (prior.Result == "archived-retained" || prior.Result == "error" && !strings.HasPrefix(prior.Reason, "job record: ") && !strings.HasPrefix(prior.Reason, "refresh: ")) {
 						// The retry waited out its hour: attempt the archive
 						// again now instead of starting a fresh sighting.
-						s.archiveJob(ctx, h, job, acting, &rec)
+						s.archiveRechecked(ctx, hs, root, job, acting, &rec)
 					} else {
 						// First sighting of the gone state: record it; a later
 						// pass archives once it is older than min_age.
@@ -277,7 +295,7 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 				case now.Sub(prior.Time) < minAge:
 					continue
 				default:
-					s.archiveJob(ctx, h, job, acting, &rec)
+					s.archiveRechecked(ctx, hs, root, job, acting, &rec)
 				}
 			}
 			if reset && (rec.Result == "skipped" && rec.Reason == "awaiting-min-age" || !acting && rec.Result == "would-archive") {

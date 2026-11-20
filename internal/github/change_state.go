@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -231,9 +233,10 @@ func (c *Client) WebhookDelivery(repo, event, delivery string, body []byte) {
 		}
 		checks[st.Context] = map[string]any{"name": st.Context, "state": st.State, "url": st.TargetURL}
 	}
+	// Listed by name: checks is a map, and its order would change the hash.
 	list := make([]map[string]any, 0, len(checks))
-	for _, v := range checks {
-		list = append(list, v)
+	for _, name := range slices.Sorted(maps.Keys(checks)) {
+		list = append(list, checks[name])
 	}
 	for n := range numbers {
 		v := map[string]any{"head_sha": sha, "checks": list, "observed_at": at, "source": "webhook", "complete": false}
@@ -379,9 +382,11 @@ func (c *Client) writeChecks(ctx context.Context, repo, sha string, runs []check
 		}
 		latest[st.Context] = selected{st.ID, map[string]any{"name": st.Context, "state": st.State, "url": st.TargetURL, "required": requiredSet[st.Context]}}
 	}
+	// Map order is random: list the checks by name, so the same set hashes
+	// alike and an unchanged set is not written again (see sectionKey).
 	checks := make([]map[string]any, 0, len(latest))
-	for _, v := range latest {
-		checks = append(checks, v.item)
+	for _, name := range slices.Sorted(maps.Keys(latest)) {
+		checks = append(checks, latest[name].item)
 	}
 	complete := len(checks) <= 500
 	if !complete {

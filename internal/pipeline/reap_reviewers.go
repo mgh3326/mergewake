@@ -932,6 +932,15 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		w.record(gate, "would-abandon", reason)
 		return true
 	}
+	// The pane's status came from a host scan that an earlier repository of the
+	// pass may have taken. Read the pane again before the close, so a pane that
+	// started work since the scan keeps its job.
+	if fresh, e := freshPaneFinished(ctx, c); e != nil {
+		w.record(gate, "error", "abandon job: pane read: "+e.Error())
+		return false
+	} else if !fresh {
+		return keep()
+	}
 	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
 		return false
 	}
@@ -1044,6 +1053,23 @@ func refreshPaneLists(ctx context.Context, hs *reapHost) error {
 	}
 	hs.panes = panes
 	return nil
+}
+
+// freshPaneFinished re-reads the candidate's host and reports whether the same
+// pane (id and cwd) is still idle or done on that read.
+func freshPaneFinished(ctx context.Context, c reviewerCandidate) (bool, error) {
+	if c.seen == nil || c.pane == nil {
+		return false, nil
+	}
+	if e := refreshPaneLists(ctx, c.seen); e != nil {
+		return false, e
+	}
+	for _, p := range c.seen.panes {
+		if p.ID == c.pane.ID {
+			return p.Cwd == c.pane.Cwd && paneFinished(p.Status), nil
+		}
+	}
+	return false, nil
 }
 
 // stuckHosts names the hosts a stuck job could be on: the one it records, or

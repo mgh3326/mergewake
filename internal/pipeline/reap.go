@@ -783,7 +783,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if e := reapBudgetCheck(ctx, "host scans and cleanup"); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
-		hs, hostErrs := s.reapScanHost(ctx, hub, h)
+		hs, hostErrs := s.reapHostScan(ctx, hub, h)
 		errs = append(errs, hostErrs...)
 		for _, hostErr := range hostErrs {
 			if errors.Is(hostErr, ErrReapRepoBudget) {

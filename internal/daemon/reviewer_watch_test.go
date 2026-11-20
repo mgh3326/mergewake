@@ -475,3 +475,16 @@ func TestPassLogNamesWakeSource(t *testing.T) {
 		}
 	}
 }
+
+// A job whose hk record is missing is read again only after reviewerNotFoundEvery:
+// the record appears with its spawn, so a missing one is not read on every tick.
+func TestReviewerWatchMissingRecordReadBacksOff(t *testing.T) {
+	h := newHK(WatchedJob{Repo: repo, PR: 7, Label: "rev-7"})
+	w := watchFor(h, &syncBuf{}, &Dirty{}, func() {})
+	for range 20 {
+		w.Tick(context.Background())
+	}
+	if h.readCount() != 1 {
+		t.Fatalf("reads of a missing record over 20 ticks = %d, want 1", h.readCount())
+	}
+}
