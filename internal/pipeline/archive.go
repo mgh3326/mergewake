@@ -591,6 +591,11 @@ hosts:
 						row.Archive = res
 						if applyErr != nil {
 							row.Result, row.Reason = archiveJobsReason(applyErr)
+							// A skip after publish leaves a half-archived job (manifest
+							// written, source still present); it must not read as routine.
+							if row.Result == "skipped" && res != nil && res.Manifest != "" && !res.Deleted {
+								row.Result, row.Reason = "error", applyErr.Error()
+							}
 						} else if len(res.Retained) != 0 {
 							row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 						} else {
