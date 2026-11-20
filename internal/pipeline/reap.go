@@ -374,7 +374,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	panes, e := hs.ops.Panes(ctx)
 	if e != nil {
 		hs.failed = true
-		return hs, append(errs, fmt.Errorf("%s: %w", h.Name, e))
+		return hs, append(errs, hostScanFailure(h.Name, e))
 	}
 	hs.panes = panes
 	// The full pane list also covers non-agent shells and jobs: without it
