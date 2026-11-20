@@ -914,7 +914,7 @@ func TestArchiveJobsSummaryNamesUnscannedHostsAndEligibleScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := f.out.String()
-	if !strings.Contains(out, `"unscanned_hosts":["other"]`) || !strings.Contains(out, `"eligible_left":1`) || !strings.Contains(out, `"eligible_left_scope":"jobs left on scanned hosts only`) {
+	if !strings.Contains(out, `"unscanned_hosts":["local","other"]`) || !strings.Contains(out, `"eligible_left":1`) || !strings.Contains(out, `"eligible_left_scope":"jobs left on scanned hosts only`) {
 		t.Fatalf("summary does not name unscanned hosts or scope eligible_left: %s", out)
 	}
 	if strings.Contains(out, `"job":"third"`) {
@@ -1668,5 +1668,67 @@ func TestArchiveJobsSkipsHubHost(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 		t.Fatal("job dir touched")
+	}
+}
+
+// archiveFailRunner fails every command of one executable with err while fail
+// reports true; other commands run on the wrapped runner.
+type archiveFailRunner struct {
+	base integrations.Runner
+	name string
+	err  error
+	fail func() bool
+}
+
+func (r archiveFailRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == r.name && r.fail() {
+		return nil, r.err
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+func TestArchiveJobsNonDeadlineErrorAfterMaxRunFailsRun(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	base := time.Now()
+	// The wall clock reads as spent from the first command on, while the run's
+	// own timer never fires: the listing failure is a real error, not a stop.
+	f.s.Now = func() time.Time {
+		if f.run.calls > 0 {
+			return base.Add(time.Hour)
+		}
+		return base
+	}
+	f.s.Runner = archiveFailRunner{base: f.run, name: "sh", err: errors.New("permission denied"), fail: func() bool { return f.run.calls > 0 }}
+	err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true})
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("listing failure after max_run was not returned as a run error: %v", err)
+	}
+	if out := f.out.String(); strings.Contains(out, `"stopped_on_budget":true`) {
+		t.Fatalf("real failure was classified as a budget stop: %s", out)
+	}
+}
+
+func TestArchiveJobsBudgetGateBetweenJobsNamesCurrentHost(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "a-job", 20*24*time.Hour)
+	jobDir(t, f.jobs, "b-job", 20*24*time.Hour)
+	base := time.Now()
+	// The wall clock passes max_run after the first job's row; the run's own
+	// timer has not fired, so the between-jobs gate is what stops the run.
+	f.s.Now = func() time.Time {
+		if strings.Contains(f.out.String(), `"action":"archive-job"`) {
+			return base.Add(time.Hour)
+		}
+		return base
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("budget stop failed the run: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"max_run deadline during job scan"`) {
+		t.Fatalf("summary omits the host stopped between jobs: %s", out)
 	}
 }
