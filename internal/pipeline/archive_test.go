@@ -72,6 +72,24 @@ type archivePauseDeleteRunner struct {
 
 func (r *archivePauseDeleteRunner) unblock() { r.releaseOnce.Do(func() { close(r.release) }) }
 
+// archiveLateWriteRunner overwrites file with content right after the first
+// manifest publish, so the job changes between publish and delete.
+type archiveLateWriteRunner struct {
+	base     integrations.Runner
+	file     string
+	content  string
+	once     sync.Once
+	writeErr error
+}
+
+func (r *archiveLateWriteRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	out, err := r.base.Run(ctx, name, args, input, dir)
+	if err == nil && name == "sh" && strings.Contains(strings.Join(args, " "), `mv -f "$1.partial" "$1"`) {
+		r.once.Do(func() { r.writeErr = os.WriteFile(r.file, []byte(r.content), 0o644) })
+	}
+	return out, err
+}
+
 func (r *archivePauseDeleteRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	if name == "sh" && strings.Contains(strings.Join(args, " "), `rm -rf "$1" || {`) {
 		r.once.Do(func() { close(r.entered) })
@@ -375,6 +393,57 @@ func TestArchiveJobsBusyApplyLockRemainsSkipped(t *testing.T) {
 	}
 	if !skipped || !summary {
 		t.Fatalf("busy lock was not recorded as a successful skip: %s", b)
+	}
+}
+
+func TestArchiveJobsPostPublishSkipFailsRunAndRecordsError(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archiveLateWriteRunner{base: f.run, file: filepath.Join(dir, "late.txt"), content: "written after publish\n"}
+	f.s.Runner = runner
+	err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{})
+	if runner.writeErr != nil {
+		t.Fatalf("late write failed: %v", runner.writeErr)
+	}
+	if err == nil {
+		t.Fatal("post-publish job-changed skip was treated as routine; run did not fail")
+	}
+	b, rerr := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			found = row.Result == "error" && row.Archive != nil && row.Archive.Manifest != "" && !row.Archive.Deleted
+		}
+	}
+	if !found {
+		t.Fatalf("published-but-undeleted job was not recorded as an error row: %s", b)
+	}
+}
+
+// The next run finds the published manifest, whose file now hashes differently
+// (same size, so the manifest still matches the plan). That resume skip must
+// also stay visible instead of recording as a routine skip every run.
+func TestArchiveJobsResumeAfterPublishedManifestChangedFailsRun(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	runner := &archiveLateWriteRunner{base: f.run, file: filepath.Join(dir, "brief.md"), content: "# BRIEF\n"}
+	f.s.Runner = runner
+	_ = f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{})
+	if runner.writeErr != nil {
+		t.Fatalf("rewrite failed: %v", runner.writeErr)
+	}
+	// Keep the job old so the next run plans it instead of skipping it as too-new.
+	old := time.Now().Add(-20 * 24 * time.Hour)
+	if err := os.Chtimes(runner.file, old, old); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Runner = f.run
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err == nil {
+		t.Fatal("next run skipped the published-but-changed job as routine; run did not fail")
 	}
 }
 
