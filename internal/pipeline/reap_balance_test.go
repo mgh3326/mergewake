@@ -801,3 +801,63 @@ func TestReapBalanceReceiptlessRepairLane(t *testing.T) {
 		}
 	})
 }
+
+// hk 5665: a reviewer checkout whose guarded removal found the worktree
+// already gone left the disk, so it counts as removed once. The fixture is
+// shaped like the 2026-11-19 receipts: 41 checkouts created on node-a, 3 removed
+// by mergewake, the rest skipped as "worktree already gone". It also covers a
+// label gone on two days, a real removal that is gone again later, and a
+// "pane already gone" skip, which is not a checkout removal.
+func TestReapBalanceAlreadyGoneCountsRemoved(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	day := "2026-11-17"
+	repo := f.repos[0].Name
+	labels := make([]string, 41)
+	for i := range labels {
+		at := balanceDayTime(day, i%24)
+		labels[i] = balanceLabelUnix(200+i, at.Unix())
+		f.spawn(t, f.repos[i%2].Name, "node-a", labels[i], at)
+	}
+	// mergewake's own removals: decisions rows, as the pass writes them.
+	for i := range 3 {
+		f.removed(t, repo, "node-a", labels[i], balanceDayTime(day, 20))
+	}
+	gone := func(i int, at time.Time, reason string) {
+		t.Helper()
+		f.s.Now = func() time.Time { return at }
+		rec := reapReceipt{Action: "reviewer-reap", Repo: repo, PR: 200 + i, Label: labels[i], Host: "node-a", Result: "skipped", Reason: reason}
+		if err := f.s.reapNote(rec, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 3; i < 39; i++ {
+		gone(i, balanceDayTime(day, 22), reviewerAlreadyGone)
+	}
+	gone(39, balanceDayTime(day, 23), reviewerAlreadyGone)
+	gone(39, balanceDayTime("2026-11-18", 1), reviewerAlreadyGone) // repeat on a later day
+	gone(0, balanceDayTime("2026-11-18", 2), reviewerAlreadyGone)  // real removal gone again
+	gone(40, balanceDayTime(day, 21), "pane already gone")         // not a checkout removal
+	f.s.Now = func() time.Time { return f.now }
+
+	res, err := f.s.reviewerBalanceForDay(f.repos, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := res.Hosts["node-a"]
+	if c == nil {
+		t.Fatalf("node-a missing: %+v", res.Hosts)
+	}
+	if c.Created != 41 || c.Removed != 40 || c.Open != 1 {
+		t.Fatalf("node-a created=%d removed=%d open=%d, want 41/40/1", c.Created, c.Removed, c.Open)
+	}
+	if res.Noticed["node-a"] {
+		t.Fatal("node-a noticed: removals keep up once already-gone checkouts count")
+	}
+	next, err := f.s.reviewerBalanceForDay(f.repos, "2026-11-18")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := next.Hosts["node-a"]; n == nil || n.Removed != 0 || n.Created != 0 {
+		t.Fatalf("repeat days counted again: %+v", next.Hosts["node-a"])
+	}
+}

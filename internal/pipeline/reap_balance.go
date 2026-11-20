@@ -32,10 +32,13 @@ import (
 // refused or quota-stopped spawn, a dead spawn replaced before placement —
 // and are not counted.
 //
-// Removed counts distinct checkout labels with a reviewer-cleanup or
-// reviewer-reap row with result removed that day. The open balance is created
-// minus removed cumulated over the trailing window (reap.balance_window_days,
-// default 7).
+// Removed counts distinct checkout labels that left the disk: a reviewer-cleanup
+// or reviewer-reap row with result removed, or a reap receipt skipped as
+// "worktree already gone" (hk 5665). The second kind is a checkout another
+// actor removed before mergewake's guarded removal ran, so the checkout is
+// gone and must not stay open. Each label counts once across the scan, on its
+// earliest day. The open balance is created minus removed cumulated over the
+// trailing window (reap.balance_window_days, default 7).
 const (
 	balanceDailyCommand  = "reviewer-balance-daily"
 	balanceNoticeCommand = "reviewer-balance-notice"
@@ -101,8 +104,17 @@ func (s *Service) reviewerBalanceScan(repos []config.Repo) (created, removed []b
 	labelDay := map[string]string{} // label -> UTC day of its label timestamp
 	labelHost := map[string]string{}
 	evidence := map[string]bool{}
-	removedSeen := map[string]bool{} // day\x00label dedupes cleanup+reap rows
-	var removedOut []balanceDayHost
+	// removedBy keeps one removal per checkout label across the whole scan, so
+	// cleanup+reap rows and repeated receipts never count twice. The earliest
+	// (day, host) wins, which keeps the result independent of the order repos
+	// and log rows are read in.
+	removedBy := map[string]balanceDayHost{}
+	noteRemoved := func(o balanceDayHost) {
+		cur, ok := removedBy[o.label]
+		if !ok || o.day < cur.day || (o.day == cur.day && o.host < cur.host) {
+			removedBy[o.label] = o
+		}
+	}
 
 	noteHost := func(label, host string) {
 		if host == "" {
@@ -140,12 +152,7 @@ func (s *Service) reviewerBalanceScan(repos []config.Repo) (created, removed []b
 			if command != "reviewer-cleanup" && command != "reviewer-reap" {
 				return
 			}
-			key := day + "\x00" + label
-			if removedSeen[key] {
-				return
-			}
-			removedSeen[key] = true
-			removedOut = append(removedOut, balanceDayHost{day: day, host: s.balanceHost(host), label: label})
+			noteRemoved(balanceDayHost{day: day, host: s.balanceHost(host), label: label})
 		}); e != nil {
 			err = errors.Join(err, e)
 		}
@@ -163,12 +170,7 @@ func (s *Service) reviewerBalanceScan(repos []config.Repo) (created, removed []b
 			if !removed {
 				return
 			}
-			key := day + "\x00" + label
-			if removedSeen[key] {
-				return
-			}
-			removedSeen[key] = true
-			removedOut = append(removedOut, balanceDayHost{day: day, host: s.balanceHost(host), label: label})
+			noteRemoved(balanceDayHost{day: day, host: s.balanceHost(host), label: label})
 		}); e != nil {
 			err = errors.Join(err, e)
 		}
@@ -194,12 +196,24 @@ func (s *Service) reviewerBalanceScan(repos []config.Repo) (created, removed []b
 		seen[label] = true
 		createdOut = append(createdOut, balanceDayHost{day: day, host: labelHost[label], label: label})
 	}
-	// A hostless audit row joins the host its label's reap receipt names:
-	// the pass audits cleanup rows without a host while the receipt keeps it.
-	for i, o := range removedOut {
+	// A hostless removal joins the host its label was spawned on, else the
+	// host its reap receipt names: the pass audits cleanup rows without a
+	// host while the receipt keeps it.
+	labels := make([]string, 0, len(removedBy))
+	for l := range removedBy {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	removedOut := make([]balanceDayHost, 0, len(labels))
+	for _, l := range labels {
+		o := removedBy[l]
 		if o.host == "" {
-			removedOut[i].host = labelHost[o.label]
+			o.host = spawnHost[l]
 		}
+		if o.host == "" {
+			o.host = labelHost[l]
+		}
+		removedOut = append(removedOut, o)
 	}
 	return createdOut, removedOut, err
 }
@@ -267,8 +281,9 @@ func (s *Service) scanBalanceDecisions(repo string, fn func(day, command, host, 
 }
 
 // scanBalanceReceipts streams one repo's reap log, calling fn for every
-// reviewer receipt that names a checkout label. removed is true only for
-// reviewer-reap rows with result removed; the host comes from the receipt.
+// reviewer receipt that names a checkout label. removed is true when the
+// receipt proves the checkout left the disk (see reviewerCheckoutRemoved); the
+// host comes from the receipt.
 func (s *Service) scanBalanceReceipts(repo string, fn func(day, host, label string, removed bool)) error {
 	f, err := os.Open(filepath.Join(s.state(repo), "reap.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -286,7 +301,7 @@ func (s *Service) scanBalanceReceipts(repo string, fn func(day, host, label stri
 			if e := json.Unmarshal(line, &v); e == nil && reviewerRow(v) {
 				if label := reviewerLabelOf(v); label != "" {
 					if _, ok := parseReviewerLabel(label); ok {
-						fn(v.Time.UTC().Format(reviewerSummaryDay), v.Host, label, v.Action == "reviewer-reap" && v.Result == "removed")
+						fn(v.Time.UTC().Format(reviewerSummaryDay), v.Host, label, reviewerCheckoutRemoved(v))
 					}
 				}
 			}
