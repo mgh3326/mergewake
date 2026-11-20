@@ -585,9 +585,6 @@ hosts:
 						// with a published manifest and no durable archive row.
 						res, applyErr := a.Apply(ctx, p, now)
 						timed.phase = ""
-						if budgetSpent() {
-							stoppedOnBudget = true
-						}
 						if phaseErr := s.archivePhase(h.Name, "archive_apply", takePhase(timed, "archive_apply"), applyErr, o.DryRun); phaseErr != nil {
 							errs = append(errs, phaseErr)
 						}

@@ -876,6 +876,22 @@ func TestArchiveJobsApplyBudgetStopUpdatesNextHostState(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsApplyCrossingBudgetOnLastJobLeavesRotationReset(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	base := time.Now()
+	f.s.Now = budgetClock(f, base, time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// The only job finished, so no work remains: the run must reset rotation
+	// instead of recording a budget stop that restarts at this host.
+	if _, err := os.Stat(filepath.Join(f.s.Config.StateDir, archiveNextHostFile)); !os.IsNotExist(err) {
+		t.Fatalf("apply crossing max_run on the last job left next-host state (stat err %v)", err)
+	}
+}
+
 func TestArchiveJobsCancelledRunWithSpentBudgetReturnsContextError(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
