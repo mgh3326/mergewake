@@ -74,10 +74,11 @@ func (st *roundRuleState) hubConsultDirective(head string) string {
 	if reason == "" {
 		reason = st.HubConsultState
 	}
+	reason = clip(emitSafe(reason), 200)
 	if asked != "" {
 		reason += " (" + asked + ")"
 	}
-	return "the hub consult could not be had: " + clip(emitSafe(reason), 200) + " | directive stands: " + RoundDirective
+	return "the hub consult could not be had: " + reason + " | directive stands: " + RoundDirective
 }
 
 // consultCmd is the panewire binary hub calls go through.
@@ -151,7 +152,13 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 	// followed on its row and its outcome goes out with the next author
 	// delivery, naming the head it was asked for. The PR's one consult
 	// (decision 250) is never requested again.
-	carried := st.HubConsultOwed && st.consultAsked() && st.HubConsultHead != pr.Head.SHA
+	carried := st.HubConsultOwed && st.consultAsked() && (st.HubConsultCarried || st.HubConsultHead != pr.Head.SHA)
+	if carried && !st.HubConsultCarried {
+		// Remember it: a force-push back to the requested head must not turn a
+		// carried row into one this pass may replay.
+		st.HubConsultCarried = true
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+	}
 
 	// An owed consult is advanced on every pass, whatever the current round
 	// or done marker says: a push or a new review round must not orphan the
@@ -181,6 +188,7 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 		st.HubConsultReason = ""
 		st.HubConsultDone = false
 		st.HubConsultCommented = false
+		st.HubConsultCarried = false
 		if e := s.saveRoundRuleState(r.Name, pr.Number, *st); e != nil {
 			_ = s.audit(r.Name, "consult-state-error", map[string]any{"pr": pr.Number, "error": integrations.Detail(e)}, o.DryRun)
 			return "", true
@@ -238,7 +246,7 @@ func (s *Service) hubConsultAdvance(ctx context.Context, r config.Repo, pr githu
 			_ = s.audit(r.Name, "consult-outcome", map[string]any{"pr": pr.Number, "state": "wait-expired", "reason": st.HubConsultReason}, o.DryRun)
 			return st.hubConsultDirective(pr.Head.SHA), false
 		}
-		if st.HubConsultHead != pr.Head.SHA {
+		if st.HubConsultCarried {
 			// A carried row no poll has reached: replaying its POST on this
 			// head would rewrite its question and could restart a finished
 			// paid consult. It waits for its id or the wait bound.

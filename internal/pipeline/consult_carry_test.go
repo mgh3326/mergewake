@@ -134,3 +134,31 @@ func eventTexts(n *ackNotifier) []string {
 	}
 	return out
 }
+
+// A force-push back to the requested head does not make a carried row
+// replayable: the POST marker, not the current head, decides.
+func TestConsultCarry_ForcePushBackToTheRequestedHeadDoesNotReplayThePost(t *testing.T) {
+	s, g, _, sink, _, _, r, _ := hubConsultSetup(t, 3)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	tr := &timeoutRunner{inner: s.Runner}
+	s.Runner = tr
+
+	deliver(t, s, r)
+	pushHead(g, shaC, "patch-3", 3, true)
+	deliver(t, s, r)
+	pushHead(g, shaA, "patch-3", 3, true)
+	deliver(t, s, r)
+	deliver(t, s, r)
+	if tr.calls != 1 || len(sink.writes) != 1 {
+		t.Fatalf("the POST was replayed after a force-push back: calls=%d writes=%v", tr.calls, sink.writes)
+	}
+}
+
+// A reason of 200 bytes or more is clipped before the head label is added, so
+// the label always survives.
+func TestConsultCarry_LongFailureReasonKeepsTheHeadLabel(t *testing.T) {
+	st := &roundRuleState{HubConsultHead: shaA, HubConsultState: "failed", HubConsultReason: strings.Repeat("x", 400)}
+	if d := st.hubConsultDirective(shaC); !strings.Contains(d, "asked for head "+short7(shaA)) {
+		t.Fatalf("head label clipped away: %s", d)
+	}
+}

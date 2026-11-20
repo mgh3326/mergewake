@@ -137,6 +137,10 @@ type roundRuleState struct {
 	HubConsultAt        time.Time `json:"hub_consult_at,omitzero"`
 	HubConsultDone      bool      `json:"hub_consult_done,omitempty"`
 	HubConsultCommented bool      `json:"hub_consult_commented,omitempty"`
+	// HubConsultCarried records that a push moved the head while the row was
+	// outstanding: from then on its POST is never replayed, whatever head the
+	// PR is on, since the row may have settled at the hub.
+	HubConsultCarried bool `json:"hub_consult_carried,omitempty"`
 
 	// Ladder
 	LadderEscalated bool      `json:"ladder_escalated,omitempty"`
