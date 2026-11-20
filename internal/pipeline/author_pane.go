@@ -149,7 +149,7 @@ func (s *Service) runHostScan(ctx context.Context, hub *reap.Hub, h reap.Host, e
 	hs, _ := s.reapScanHost(ctx, hub, h)
 	hostScanMu.Lock()
 	e.hs, e.at = hs, s.now()
-	if hs.failed && ctx.Err() != nil {
+	if ctx.Err() != nil {
 		e.dropped = true
 		if s.hostScans[h.Name] == e {
 			delete(s.hostScans, h.Name)
