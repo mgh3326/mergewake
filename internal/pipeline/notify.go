@@ -764,7 +764,7 @@ func (s *Service) notifyRoundHold(ctx context.Context, r config.Repo, pr github.
 		}
 		return
 	}
-	if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, o); err != nil {
+	if err := s.sendRound5Decision(ctx, r, pr, fb, v.Review.Rounds, v.RoundHold, o); err != nil {
 		s.roundHoldNotifyFailed(r, pr, v.Review.Rounds, err, o)
 	}
 }
