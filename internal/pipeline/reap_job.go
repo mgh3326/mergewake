@@ -62,17 +62,6 @@ func (c *passJobRecords) job(ctx context.Context, id string) (integrations.JobRe
 	return rec, nil
 }
 
-// Job is job, so the pass's memo can stand in for the job source of any sweep
-// that reads a record the pass has already read.
-func (c *passJobRecords) Job(ctx context.Context, id string) (integrations.JobRecord, error) {
-	return c.job(ctx, id)
-}
-
-// TaskJob is the job source's own task lookup, unchanged by the memo.
-func (c *passJobRecords) TaskJob(ctx context.Context, task string) (string, string, error) {
-	return c.jobs.TaskJob(ctx, task)
-}
-
 // jobCand is one worktree a merged PR's job record named: a configured host and
 // the directory of an attempt that worked the PR.
 type jobCand struct{ host, path string }

@@ -920,7 +920,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if reviewersOnly(ctx) && prNum > 0 {
 		// The sweep's rows report through noteErr, which appends to errs:
 		// evaluate it before the outer append reads errs.
-		revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, records, acting, !o.DryRun, reviewerNoteErr)
+		revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 		return errors.Join(append(errs, revErrs...)...)
 	}
 
@@ -935,7 +935,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			if prNum > 0 {
 				// A reviewer's job ends whatever its PR's state: sweep the
 				// PR's reviewers before refusing the author's path.
-				revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, records, acting, !o.DryRun, reviewerNoteErr)
+				revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 				errs = append(errs, revErrs...)
 				return errors.Join(append(errs, fmt.Errorf("PR #%d is not a merged PR against %s", p.Number, r.Branch))...)
 			}
@@ -1285,7 +1285,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
 		return errors.Join(append(errs, e)...)
 	}
-	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, records, acting, !o.DryRun, reviewerNoteErr)
+	revErrs := s.reapReviewers(ctx, r, prNum, receipts, now, hosts, acting, !o.DryRun, reviewerNoteErr)
 	errs = append(errs, revErrs...)
 	// The fleet-wide reviewer balance runs on whole-repo passes only, once a
 	// day: it counts checkouts created and removed per host across all

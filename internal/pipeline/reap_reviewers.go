@@ -250,7 +250,7 @@ type reviewerCandidate struct {
 // that PR's labels. durable reports that this pass writes its rows: only then
 // is the audit scan's offset saved, so a dry run reads the same rows again.
 // note writes one reviewer-reap row and its audit record.
-func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, records *passJobRecords, acting, durable bool, note func(reapReceipt) error) []error {
+func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, receipts []reapReceipt, snapshot time.Time, hosts []*reapHost, acting, durable bool, note func(reapReceipt) error) []error {
 	timeout := s.Config.Review.Timeout
 	if timeout == "" {
 		timeout = "10m" // config's default when the key is unset
@@ -264,11 +264,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
 	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}}
-	// The pass's records answer a job it already read (the merged-PR candidates
-	// read the same jobs), so a reviewer's record is read once per pass.
-	if records != nil {
-		w.jobs = records
-	} else if jobs, ok := s.Sink.(reapJobs); ok {
+	if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
 	for _, hs := range hosts {
@@ -936,6 +932,15 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		w.record(gate, "would-abandon", reason)
 		return true
 	}
+	// The pane's status came from a host scan that an earlier repository of the
+	// pass may have taken. Read the pane again before the close, so a pane that
+	// started work since the scan keeps its job.
+	if fresh, e := freshPaneFinished(ctx, c); e != nil {
+		w.record(gate, "error", "abandon job: pane read: "+e.Error())
+		return false
+	} else if !fresh {
+		return keep()
+	}
 	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
 		return false
 	}
@@ -1048,6 +1053,23 @@ func refreshPaneLists(ctx context.Context, hs *reapHost) error {
 	}
 	hs.panes = panes
 	return nil
+}
+
+// freshPaneFinished re-reads the candidate's host and reports whether the same
+// pane (id and cwd) is still idle or done on that read.
+func freshPaneFinished(ctx context.Context, c reviewerCandidate) (bool, error) {
+	if c.seen == nil || c.pane == nil {
+		return false, nil
+	}
+	if e := refreshPaneLists(ctx, c.seen); e != nil {
+		return false, e
+	}
+	for _, p := range c.seen.panes {
+		if p.ID == c.pane.ID {
+			return p.Cwd == c.pane.Cwd && paneFinished(p.Status), nil
+		}
+	}
+	return false, nil
 }
 
 // stuckHosts names the hosts a stuck job could be on: the one it records, or

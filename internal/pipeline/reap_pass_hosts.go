@@ -50,7 +50,7 @@ func (s *Service) reapHostScan(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	pass.mu.Lock()
 	defer pass.mu.Unlock()
 	if sc, ok := pass.scans[h.Name]; ok {
-		return sc.hs, sc.errs
+		return s.rebindHostScan(ctx, hub, sc.hs), sc.errs
 	}
 	hs, errs := s.reapScanHost(ctx, hub, h)
 	budgetCut := slices.ContainsFunc(errs, func(e error) bool { return errors.Is(e, ErrReapRepoBudget) })
@@ -58,4 +58,20 @@ func (s *Service) reapHostScan(ctx context.Context, hub *reap.Hub, h reap.Host) 
 		pass.scans[h.Name] = reapPassScan{hs: hs, errs: errs}
 	}
 	return hs, errs
+}
+
+// rebindHostScan answers a repository with its own copy of a pass scan. The
+// discovery data is shared; the host operations are not. They are built from
+// the hub client and telemetry of the call that uses them: a hub client memoizes
+// its agent list, so an operation bound to the first repository's client would
+// answer every later refresh from that first read.
+func (s *Service) rebindHostScan(ctx context.Context, hub *reap.Hub, scan *reapHost) *reapHost {
+	hs := *scan
+	h := scan.host
+	hs.exec = reap.Exec{Runner: reapRunner(ctx, s.Runner), Host: h}
+	hs.ops, hs.viaHub = hs.exec, false
+	if hub != nil && !h.Local() {
+		hs.ops, hs.viaHub = timedHubOps{Ops: reap.HubHost{Hub: hub, Machine: h.MachineID()}, telemetry: telemetryFrom(ctx)}, true
+	}
+	return &hs
 }
