@@ -1220,6 +1220,7 @@ type manifest struct {
 	Host            string      `json:"host"`
 	Task            string      `json:"task"`
 	Source          string      `json:"source"`
+	SourceInstance  string      `json:"source_instance,omitempty"`
 	ArchivedAt      string      `json:"archived_at"`
 	Files           []File      `json:"files"`
 	TotalBytes      int64       `json:"total_bytes"`
@@ -1420,6 +1421,10 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	if completed {
 		return a.resume(ctx, p, src)
 	}
+	instance, err := a.instance(ctx, p.host.SSH, p.Dir)
+	if err != nil {
+		return nil, err
+	}
 	for _, rel := range p.Text {
 		if src[rel] != snapshotSHA(p.textSnapshots[rel]) {
 			return nil, &Skip{"job-changed"}
@@ -1440,7 +1445,7 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 	for i := range oversized {
 		oversized[i].SHA256 = p.oversizedHashes[oversized[i].Path]
 	}
-	m := manifest{Version: 2, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, ArchivedAt: now.UTC().Format(time.RFC3339),
+	m := manifest{Version: 2, Job: p.Job, Host: p.Host, Task: p.Task, Source: p.Dir, SourceInstance: instance, ArchivedAt: now.UTC().Format(time.RFC3339),
 		Files: []File{}, Oversized: oversized, Excluded: p.Excluded, ExcludedEntries: p.ExcludedEntries, Skipped: p.Skipped, AppleDouble: p.AppleDouble}
 	moving := map[string]bool{}
 	for _, rel := range p.Move {
@@ -1482,36 +1487,45 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
 	for _, f := range m.Files {
 		if src[f.Path] != f.SHA256 {
-			if !settledBefore(p, m) {
-				// A reused job name: the files were written after this manifest
-				// was published, so the manifest describes an earlier instance.
+			cur, err := a.instance(ctx, p.host.SSH, p.Dir)
+			if err != nil {
+				return nil, err
+			}
+			if m.SourceInstance != "" && cur != "" && m.SourceInstance != cur {
+				// A reused job name: the directory was recreated after this
+				// manifest was published, so the manifest describes an earlier job.
 				return nil, &Skip{"drive-dir-exists"}
 			}
-			// The manifest is already published: carry it so the caller records it.
+			// Same job instance, or reuse cannot be established: the manifest is
+			// already published, so carry it so the caller records it.
 			return res, &Skip{"drive-dir-exists"}
 		}
 	}
 	return a.remove(ctx, p, res, m)
 }
 
-// settledBefore reports whether every archived file was last written at or
-// before the manifest was published, so the manifest describes this job's
-// current files. A manifest with no parseable time is never taken as current.
-func settledBefore(p *Plan, m *manifest) bool {
-	archived, err := time.Parse(time.RFC3339, m.ArchivedAt)
+// instanceScript prints the job directory's inode and birth time. Both change
+// when a job name is recreated, not when files inside it are rewritten. GNU
+// stat is tried first; BSD stat takes over where -c is not understood.
+const instanceScript = `stat -c '%i %W' "$1" 2>/dev/null || stat -f '%i %B' "$1"`
+
+// instance returns "<inode>:<birth>" for a job directory, or "" when the
+// platform reports no birth time. An empty instance never proves reuse.
+func (a *Archiver) instance(ctx context.Context, ssh, dir string) (string, error) {
+	b, err := a.on(ctx, ssh, "", "sh", "-c", instanceScript, "sh", dir)
 	if err != nil {
-		return false
+		return "", fmt.Errorf("stat %s: %w", dir, err)
 	}
-	moving := map[string]bool{}
-	for _, rel := range p.Move {
-		moving[rel] = true
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return "", nil
 	}
-	for _, f := range p.entries {
-		if moving[f.Path] && f.mtime > archived.Unix() {
-			return false
-		}
+	ino, err1 := strconv.ParseInt(f[0], 10, 64)
+	birth, err2 := strconv.ParseInt(f[1], 10, 64)
+	if err1 != nil || err2 != nil || birth <= 0 {
+		return "", nil
 	}
-	return true
+	return fmt.Sprintf("%d:%d", ino, birth), nil
 }
 
 // remove deletes the job dir only when a re-listing shows it unchanged: a
