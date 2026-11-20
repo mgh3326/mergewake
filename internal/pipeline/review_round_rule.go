@@ -326,14 +326,16 @@ type findingsFit struct {
 	sent, leftOut int
 }
 
-// buildFindingsFile encodes every open thread as an escalateFinding, within
-// escalateAuthorFindingsMax. Bodies are cut before a finding is left out (see
-// keepFindings); a file that fits unchanged is the same bytes as before.
+// buildFindingsFile encodes every unresolved thread as an escalateFinding, within
+// escalateAuthorFindingsMax. Resolved threads are left out: they no longer need
+// the author, and they must not take the bound from open findings. Bodies are
+// cut before a finding is left out (see keepFindings); a file that fits
+// unchanged is the same bytes as before.
 func buildFindingsFile(fb github.ReviewFeedback) ([]byte, findingsFit, error) {
 	list := make([]escalateFinding, 0, len(fb.Threads))
 	sevs := make([]string, 0, len(fb.Threads))
 	for _, t := range fb.Threads {
-		if len(t.Comments) == 0 {
+		if t.IsResolved || len(t.Comments) == 0 {
 			continue
 		}
 		first := t.Comments[0]
