@@ -371,6 +371,12 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	// and every job; the cancel half comes first there, so a cancelled run
 	// returns its error even when the budget is spent too.
 	budgetSpent := func() bool { return maxRun > 0 && (runCtx.Err() != nil || s.now().Sub(started) >= maxRun) }
+	// deadlineErr classifies an error by its cause: it is the max_run stop only
+	// when the run's own timer fired and the command failed with that deadline.
+	// Any other error that finishes after the budget elapsed is a real failure.
+	deadlineErr := func(err error) bool {
+		return ctx.Err() == nil && runCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
+	}
 	var selected []reap.Host
 	for _, h := range s.Config.Hosts {
 		if host == "" || h.Name == host {
@@ -427,7 +433,7 @@ hosts:
 			errs = append(errs, phaseErr)
 		}
 		if e != nil {
-			if errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			if deadlineErr(e) {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during pane scan"
 				unscannedStart = entered - 1
@@ -445,7 +451,7 @@ hosts:
 			errs = append(errs, phaseErr)
 		}
 		if e != nil {
-			if budgetSpent() && ctx.Err() == nil {
+			if deadlineErr(e) {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during jobs directory lookup"
 				unscannedStart = entered - 1
@@ -461,7 +467,7 @@ hosts:
 			errs = append(errs, phaseErr)
 		}
 		if e != nil {
-			if budgetSpent() && ctx.Err() == nil {
+			if deadlineErr(e) {
 				stoppedOnBudget = true
 				unscannedReasons[h.Name] = "max_run deadline during jobs listing"
 				unscannedStart = entered - 1
@@ -499,6 +505,8 @@ hosts:
 			}
 			if budgetSpent() {
 				stoppedOnBudget = true
+				unscannedStart = entered - 1
+				unscannedReasons[h.Name] = "max_run deadline during job scan"
 				for _, pending := range jobs[jobIndex:] {
 					if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
 						continue
@@ -531,7 +539,7 @@ hosts:
 					errs = append(errs, phaseErr)
 				}
 				if refreshErr != nil {
-					if budgetSpent() && ctx.Err() == nil {
+					if deadlineErr(refreshErr) {
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline during job reads"
 						unscannedStart = entered - 1
@@ -553,7 +561,7 @@ hosts:
 						errs = append(errs, phaseErr)
 					}
 					if planErr != nil {
-						if budgetSpent() && ctx.Err() == nil {
+						if deadlineErr(planErr) {
 							stoppedOnBudget = true
 							unscannedReasons[h.Name] = "max_run deadline during hk reads"
 							unscannedStart = entered - 1
