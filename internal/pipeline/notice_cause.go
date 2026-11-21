@@ -30,9 +30,19 @@ import (
 // Everything else, a single lost review or a replayed timeout for instance, is
 // recorded with sent=false and emits nothing.
 
-// causeGaveUp is the cause of a notice that the daemon has stopped retrying.
-const causeGaveUp = "gave-up"
+// causeReapCloseScopeForbidden is the cause of a reap close the hub refused
+// as scope_forbidden for a job owned by mergewake's own lane. The credential
+// may have lost its close grant, so it notifies at most once a day (hk 6010).
+const causeReapCloseScopeForbidden = "reap:close-scope-forbidden"
 
+// reapCloseScopeForbiddenQuiet is how long the own-lane close-scope-forbidden
+// cause stays quiet after its notice: one notice a day. Every other
+// fix-needed cause renotifies after fixNeededQuiet.
+const reapCloseScopeForbiddenQuiet = 24 * time.Hour
+
+ // causeGaveUp is the cause of a notice that the daemon has stopped retrying.
+ const causeGaveUp = "gave-up"
+ 
 // Lost-result causes, named by the lost reason the pass recorded.
 const (
 	causeLostOverdue     = "lost:overdue"
@@ -40,20 +50,21 @@ const (
 	causeLostNeverPlaced = "lost:never-placed"
 	causeLostOther       = "lost:other"
 )
-
-// fixNeededCauses are the causes a person must fix: the notice is not left to
-// the threshold alone.
-var fixNeededCauses = map[string]bool{
-	"spawn:auth":              true,
-	"spawn:workspace":         true,
-	"spawn:node-upgrade":      true,
-	"spawn:host-unconfigured": true,
-	"spawn:repo-root":         true,
-	"spawn:brief-upload":      true,
-}
-
-// fixNeededQuiet is how long a fix-needed cause stays quiet after its notice.
-const fixNeededQuiet = time.Hour
+ 
+ // fixNeededCauses are the causes a person must fix: the notice is not left to
+ // the threshold alone.
+ var fixNeededCauses = map[string]bool{
+ 	"spawn:auth":              true,
+ 	"spawn:workspace":         true,
+ 	"spawn:node-upgrade":      true,
+ 	"spawn:host-unconfigured": true,
+ 	"spawn:repo-root":         true,
+ 	"spawn:brief-upload":       true,
+	causeReapCloseScopeForbidden: true,
+ }
+ 
+ // fixNeededQuiet is how long a fix-needed cause stays quiet after its notice.
+ const fixNeededQuiet = time.Hour
 
 // lostCause names the cause of a lost reviewer result from the reason its pass
 // recorded.
@@ -154,8 +165,16 @@ func (s *Service) noteCause(ctx context.Context, r config.Repo, ev causeEvent) e
 	rec.Times = append(kept, now)
 	count := len(rec.Times)
 	fix := fixNeededCauses[ev.Cause]
-	fixDue := fix && (rec.Notified.IsZero() || now.Sub(rec.Notified) >= fixNeededQuiet)
-	thresholdDue := count >= threshold && (rec.Notified.IsZero() || now.Sub(rec.Notified) >= window)
+	fixQuiet := fixNeededQuiet
+	thresholdQuiet := window
+	if ev.Cause == causeReapCloseScopeForbidden {
+		fixQuiet = reapCloseScopeForbiddenQuiet
+		if thresholdQuiet < reapCloseScopeForbiddenQuiet {
+			thresholdQuiet = reapCloseScopeForbiddenQuiet
+		}
+	}
+	fixDue := fix && (rec.Notified.IsZero() || now.Sub(rec.Notified) >= fixQuiet)
+	thresholdDue := count >= threshold && (rec.Notified.IsZero() || now.Sub(rec.Notified) >= thresholdQuiet)
 	send := fixDue || thresholdDue
 	reason := "below threshold"
 	switch {
@@ -167,8 +186,14 @@ func (s *Service) noteCause(ctx context.Context, r config.Repo, ev causeEvent) e
 		reason = "threshold"
 	case fix:
 		reason = "fix-needed, noticed within the hour"
+		if ev.Cause == causeReapCloseScopeForbidden {
+			reason = "fix-needed, noticed within the day"
+		}
 	case count >= threshold:
 		reason = "threshold, noticed within the window"
+		if ev.Cause == causeReapCloseScopeForbidden {
+			reason = "threshold, noticed within the day"
+		}
 	}
 	var sendErr error
 	if send {
@@ -219,6 +244,9 @@ func (s *Service) noteSpawnCauses(ctx context.Context, r config.Repo, pr github.
 func causeKind(ev causeEvent) string {
 	if ev.Lost {
 		return "lost"
+	}
+	if strings.HasPrefix(ev.Cause, "reap:") {
+		return "reap"
 	}
 	return "spawn"
 }
