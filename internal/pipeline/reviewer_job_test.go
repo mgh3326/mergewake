@@ -280,7 +280,7 @@ func TestReviewerJobOldHeadDropped(t *testing.T) {
 	if len(runner.spawns) != 1 || runner.headless != 0 || g.postCount != 1 {
 		t.Fatalf("spawns=%d headless=%d posts=%d", len(runner.spawns), runner.headless, g.postCount)
 	}
-	if l := arg(runner.spawns[0], "-l"); !strings.HasPrefix(l, "mwr-7-"+shaA[:7]+"-p1-") {
+	if l := arg(runner.spawns[0], "-l"); !strings.HasPrefix(l, "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("label %s", l)
 	}
 	// Pass 2 never runs on this single-pass head, so only the old-head drop
@@ -628,7 +628,7 @@ func TestReviewerHeadMovedClosesLiveJob(t *testing.T) {
 	if len(runner.spawns) != 1 || g.postCount != 1 {
 		t.Fatalf("spawns=%d posts=%d", len(runner.spawns), g.postCount)
 	}
-	if l := arg(runner.spawns[0], "-l"); !strings.HasPrefix(l, "mwr-7-"+shaA[:7]+"-p1-") {
+	if l := arg(runner.spawns[0], "-l"); !strings.HasPrefix(l, "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("label %s", l)
 	}
 	rows := auditRows(t, s, r, "reviewer-head-moved")

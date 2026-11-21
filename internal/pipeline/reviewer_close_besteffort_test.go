@@ -125,7 +125,7 @@ func TestReviewerHeadMovedWithoutOwnerLaneIsDropped(t *testing.T) {
 	if rows := auditRows(t, s, r, "reviewer-head-moved"); len(rows) != 0 {
 		t.Fatalf("head-moved audit=%v", rows)
 	}
-	if !strings.HasPrefix(arg(runner.spawns[0], "-l"), "mwr-7-"+shaA[:7]+"-p1-") {
+	if !strings.HasPrefix(arg(runner.spawns[0], "-l"), "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("spawn %v", runner.spawns[0])
 	}
 }

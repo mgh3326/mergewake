@@ -64,7 +64,7 @@ func TestReviewerDeadReplayIsDroppedAndRespawned(t *testing.T) {
 		t.Fatalf("spawns=%d, want the first spawn and the fresh replacement", len(runner.spawns))
 	}
 	fresh := arg(runner.spawns[1], "-l")
-	if fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
+	if fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
 	}
 	if got, want := assertLabelStamp(t, fresh), assertLabelStamp(t, old)+1; got != want {
@@ -96,7 +96,7 @@ func TestReviewerActiveJobRefusalReplayIsDead(t *testing.T) {
 	if refuse.refused != 1 || len(runner.spawns) != 2 || g.postCount != 1 {
 		t.Fatalf("replays=%d spawns=%d posts=%d, want the replay and one fresh spawn", refuse.refused, len(runner.spawns), g.postCount)
 	}
-	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
+	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
 	}
 	dead := auditRows(t, s, r, "reviewer-spawn-dead")
@@ -121,7 +121,7 @@ func TestReviewerQuotaEscalateReplayIsDead(t *testing.T) {
 	if refuse.refused != 1 || len(runner.spawns) != 2 || g.postCount != 1 {
 		t.Fatalf("replays=%d spawns=%d posts=%d, want the replay and one fresh spawn", refuse.refused, len(runner.spawns), g.postCount)
 	}
-	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"-p1-") {
+	if fresh := arg(runner.spawns[1], "-l"); fresh == old || !strings.HasPrefix(fresh, "mwr-7-"+shaA[:7]+"p1t") {
 		t.Fatalf("fresh label %s must differ from recorded %s", fresh, old)
 	}
 	dead := auditRows(t, s, r, "reviewer-spawn-dead")
@@ -403,7 +403,7 @@ func TestReviewerDeadReplayDeferredHeadMoves(t *testing.T) {
 	if len(runner.spawns) != 2 {
 		t.Fatalf("spawns=%d, want the new head's spawn", len(runner.spawns))
 	}
-	if fresh := arg(runner.spawns[1], "-l"); !strings.HasPrefix(fresh, "mwr-7-"+shaC[:7]+"-p1-") {
+	if fresh := arg(runner.spawns[1], "-l"); !strings.HasPrefix(fresh, "mwr-7-"+shaC[:7]+"p1t") {
 		t.Fatalf("fresh label %s is not the new head's", fresh)
 	}
 }

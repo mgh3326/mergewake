@@ -42,7 +42,7 @@ func TestReviewPostPendingConflictIsNamedAndBacksOff(t *testing.T) {
 	client := github.New("placeholder")
 	client.BaseURL, client.UploadURL, client.HTTP = server.URL, server.URL, server.Client()
 
-	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"-p2-": stateRiskFinding}}
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"p2t": stateRiskFinding}}
 	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
 	g.diffs = map[string]string{shaA: workflowDiff()}
