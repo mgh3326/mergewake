@@ -1561,7 +1561,7 @@ func ValidGrade(s string) bool {
 
 // familyAliases maps model and CLI names to one canonical model family, so an
 // author family like "claude" and a reviewer profile family like "anthropic"
-// compare equal and a same-family reviewer is never counted as independent.
+// compare equal, so same_family is recorded for that reviewer.
 var familyAliases = map[string]string{
 	"anthropic": "anthropic", "claude": "anthropic", "sonnet": "anthropic", "opus": "anthropic", "haiku": "anthropic", "fable": "anthropic", "kiro": "anthropic",
 	"openai": "openai", "codex": "openai", "sol": "openai", "gpt": "openai",

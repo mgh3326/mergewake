@@ -135,8 +135,9 @@ func (s *Service) Policy(ctx context.Context, r config.Repo, sha string) (policy
 	return p, p.Validate()
 }
 
-// distinctPasses validates numbered passes and independent lenses when the
-// same reviewer family supplies both passes. Duplicates never add coverage.
+// distinctPasses counts passes 1..needed, one receipt per pass number, whatever
+// reviewer family supplied them (decision 462). Two different receipts for one
+// pass number make the set incomplete; identical duplicates add no coverage.
 func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
 	passes := map[int]github.PassReceipt{}
 	for _, r := range receipts {
@@ -150,15 +151,6 @@ func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
 	}
 	if len(passes) < needed {
 		return len(passes), false
-	}
-	if needed == 2 {
-		a, b := passes[1], passes[2]
-		if a.Family == "" || b.Family == "" {
-			return len(passes), false
-		}
-		if config.CanonicalFamily(a.Family) == config.CanonicalFamily(b.Family) && (a.Lens == "" || b.Lens == "" || a.Lens == "default" || b.Lens == "default" || a.Lens == b.Lens) {
-			return len(passes), false
-		}
 	}
 	return len(passes), true
 }

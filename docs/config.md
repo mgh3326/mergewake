@@ -986,8 +986,9 @@ the pass number, lens, reviewer profile, family, and `same_family` flag;
 receipts and outcomes bind to the exact PR head, so a head change invalidates
 them. Blocking PRs use a correctness/regressions lens for pass 1 and a
 state/migration/security/deploy lens for pass 2.
-Landing counts distinct pass numbers and requires distinct lenses when the
-reviewer family is the same. Routine PRs use the default lens.
+Landing counts distinct pass numbers, whatever the reviewer family: a pass by
+the author's family is a full pass, and `same_family` only records it. Routine
+PRs use the default lens.
 Before invoking a reviewer, the review adds PR context ahead of the diff so a
 settled point is not re-flagged on every new head. It lists this PR's review
 threads whose finding has a reply from someone other than its author (resolved

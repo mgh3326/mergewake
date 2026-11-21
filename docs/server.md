@@ -369,14 +369,12 @@ readiness checks satisfied. Final green CI is still required at landing.
    resume records why a new cycle is allowed; operator sees only aging unless
    the author requests a decision.
 
-Same-family output is reference-only. It cannot satisfy full or delta review,
-create a gate-satisfying completion, or be reused as qualifying patch evidence.
-Unknown actual family is also nonqualifying. Cross-family capacity exhaustion
-waits rather than falling back. Update the shared gate and its current
-same-family landing tests, not just worker selection. Existing historical
-same-family receipts remain audit evidence but require a new qualifying pass.
+Same-family output is a full pass (decision 462). It satisfies full or delta
+review and counts toward landing like any other pass; `same_family` stays on the
+pass marker and audit row so same-family merges can be listed. An unknown
+reviewer family is not same-family and counts as a pass.
 
-Required companion edits in rstack: make `wake` state the reference-only rule
+Required companion edits in rstack: make `wake` state the same-family-counts rule
 and waiting behavior; make `fleet-review` use the identical full/delta/reuse
 contract; align their two-fix-round and docs-only guidance; ensure spawn/result
 templates include actual family, head, scope and receipt provenance. Those are
@@ -511,7 +509,7 @@ automatic request stays queued, then admits an authenticated request to reach N.
 Replay changing load/performance/quota to prove a fast busy host can win, stale
 telemetry defers work, quota ceilings hold, and uncertainty keeps reservations.
 Review fixtures cover docs exemption, full/delta/reuse chains, same-family
-refusal and two-round stop. Reap fixtures include identical visible fields but
+passes counting in full, and two-round stop. Reap fixtures include identical visible fields but
 changed sequence, missing sequence, composer text and profile argv dispatch.
 
 Run only changed-package tests locally (`go test -p 2 ./<pkg>/...`), never a
