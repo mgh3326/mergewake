@@ -170,3 +170,31 @@ func TestReapReviewerOwnRepoJournalJobIsClosed(t *testing.T) {
 		t.Fatalf("job closes=%d: %v", n, rowSummary(f.rows(t)))
 	}
 }
+
+// (d) A daemon restart restores the retry state from the error row, and the
+// next failure continues the same backoff: the row's reason and the retry key
+// are the same text, so the attempt count goes on instead of starting over
+// (PR #502 follow-up, hk 5996).
+func TestReapReviewerCloseRetryBackoffSurvivesRestart(t *testing.T) {
+	f := newStuckJobFix(t, 7*time.Hour)
+	refuseJobClose(f.reviewerFix, "close refused: job "+f.label+" owner_mismatch")
+	f.passAfter(t, 0)
+	f.clearPanes()
+	_ = f.passAt(t, 30*time.Minute)
+	// Restart: the in-memory retry state is gone; the journal row remains.
+	f.s.reapRetryState = nil
+	_ = f.passAt(t, 3*time.Hour) // restores from the row and waits one pass
+	_ = f.passAt(t, 3*time.Hour) // retries the close, which fails again
+	state := f.s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	var got reapRetry
+	for k, v := range state.retries {
+		if strings.HasSuffix(k, "\x00"+f.label) {
+			got = v
+		}
+	}
+	if got.attempts != 2 {
+		t.Fatalf("retry after a restart has attempts=%d (failure %q), want 2: the restored key must match the next failure", got.attempts, got.failure)
+	}
+}

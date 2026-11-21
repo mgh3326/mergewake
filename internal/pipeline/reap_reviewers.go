@@ -1013,8 +1013,11 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		if unknownJobRefusal(e) {
 			return w.unknownJob(ctx, gate, l, hs)
 		}
-		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
+		// The row's reason is the retry key a restart restores
+		// (closeRetryBlocked), so both carry the same text.
+		failure := fleetevent.Redact(integrations.Detail(e))
+		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
+		w.record(gate, "error", "abandon job: "+failure)
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
@@ -1307,8 +1310,11 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		if unknownJobRefusal(e) {
 			return w.unknownJob(ctx, gate, l, hs)
 		}
-		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
+		// The row's reason is the retry key a restart restores
+		// (closeRetryBlocked), so both carry the same text.
+		failure := fleetevent.Redact(integrations.Detail(e))
+		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
+		w.record(gate, "error", "abandon job: "+failure)
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
