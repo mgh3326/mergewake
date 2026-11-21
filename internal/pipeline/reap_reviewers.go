@@ -45,6 +45,27 @@ import (
 
 var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
 
+// reviewerLabelEpoch is the origin of a reviewer label's stamp: seconds since
+// 2026-01-01T00:00:00Z, 8 digits until 2029. A Unix-seconds stamp (10 digits)
+// made the label 30 characters at a 4-digit PR, so panewire's quota-replace
+// suffix -q<n> pushed it past herdr's 32-character agent name (hk 5960).
+// Labels written before still parse: a stamp of 1e9 or more is Unix seconds.
+const reviewerLabelEpoch int64 = 1767225600
+
+// reviewerLabelName is the job id of a reviewer for pr, head sha7 and pass,
+// started at unix seconds.
+func reviewerLabelName(pr int, sha7 string, pass int, unix int64) string {
+	return fmt.Sprintf("mwr-%d-%s-p%d-%d", pr, sha7, pass, unix-reviewerLabelEpoch)
+}
+
+// reviewerLabelUnix reads a label stamp back as Unix seconds.
+func reviewerLabelUnix(stamp int64) int64 {
+	if stamp < 1_000_000_000 {
+		return stamp + reviewerLabelEpoch
+	}
+	return stamp
+}
+
 type reviewerLabel struct {
 	name    string
 	pr      int
@@ -71,7 +92,7 @@ func parseReviewerLabel(name string) (reviewerLabel, bool) {
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || pr <= 0 {
 		return reviewerLabel{}, false
 	}
-	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(unix, 0), replacement: repl}, true
+	return reviewerLabel{name: name, pr: pr, sha7: m[2], pass: pass, started: time.Unix(reviewerLabelUnix(unix), 0), replacement: repl}, true
 }
 
 // reviewerStream names one receipt stream of a label: the pane stream (the
