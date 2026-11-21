@@ -472,6 +472,9 @@ func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
 // terminalJobEvents are the events that end a job on its node.
 var terminalJobEvents = map[string]bool{"job.revoked": true, "job.reaped": true, "job.completed": true, "job.lost": true}
 
+// IsTerminalJobEvent reports whether kind is an event that ends a job.
+func IsTerminalJobEvent(kind string) bool { return terminalJobEvents[kind] }
+
 // TerminalEvent names the terminal event of a job's directory on this host:
 // the newest events/NNNNN-<kind>.json whose kind ends the job, "" when the
 // directory holds none. It only reads; an unreadable directory is an error.
