@@ -247,6 +247,13 @@ func alreadyClosedRefusal(e error) bool {
 	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "already has a terminal record")
 }
 
+// unknownJobRefusal reports whether panewire refused a job close because its hub
+// does not know the job: exit 5 with job_unknown on stderr. The refusal is
+// permanent for a job the hub never stored (unknownJob).
+func unknownJobRefusal(e error) bool {
+	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "job_unknown")
+}
+
 // reviewerLane is the owner lane a reviewer's hk job closes under: the hk
 // record's, else the --owner of the recorded spawn arguments, else "".
 func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {

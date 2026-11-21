@@ -120,6 +120,11 @@ const (
 	// job close because the job already has a terminal record, so the job has
 	// ended and nothing is owed for it.
 	reviewerAlreadyClosed = "already closed"
+	// reviewerNotClosable is the reason of a kept row: panewire refused the job
+	// close as job_unknown, the hub does not know the job, and the node's job
+	// dir holds no terminal event. The hub cannot close the job, so the sweep
+	// leaves it to reap and never asks the hub again.
+	reviewerNotClosable = "hub does not know the job; not closable via hub"
 	// reviewerOtherRepo starts the reason of a skipped row: a journal-only label
 	// whose job record names another repository is not this sweep's to close.
 	reviewerOtherRepo = "job names another repository: "
@@ -209,6 +214,10 @@ type reviewerSweep struct {
 	// still reads spawned until panewire's sweep ends the job (then lost), so
 	// this receipt, not the record, stops a second abandon.
 	abandoned map[string]bool
+	// unclosable names labels whose close the hub refused as job_unknown with no
+	// terminal event in the node's job dir (unknownJob). The hub never knows the
+	// job, so no later pass or restart closes it again.
+	unclosable map[string]bool
 	// stuck names labels already marked stuck-reviewer: a reviewer job past
 	// the stuck bound whose pane is still present. The mark is written once;
 	// the label keeps being revisited for the pane or the fallback.
@@ -270,7 +279,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, unclosable: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}}
 	if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
@@ -356,8 +365,11 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 		case "reviewer-reap":
 			// An abandoned row, or a closed row for a job panewire already closed,
 			// means the job close is not owed again: the restart keeps it so.
-			if rec.Result == "abandoned" || (rec.Result == "closed" && rec.Reason == reviewerAlreadyClosed) {
+			if rec.Result == "abandoned" || (rec.Result == "closed" && strings.HasPrefix(rec.Reason, reviewerAlreadyClosed)) {
 				w.abandoned[rec.Label] = true
+			}
+			if rec.Result == "kept" && rec.Reason == reviewerNotClosable {
+				w.unclosable[rec.Label] = true
 			}
 			if rec.Result == "stuck-reviewer" {
 				w.stuck[rec.Label] = true
@@ -884,7 +896,7 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		// guards below keep it until panewire's node closes the pane.
 		cwd = c.pane.Cwd
 	}
-	if stuckEnded && !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l) {
+	if stuckEnded && !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l, hs) {
 		return
 	}
 	if hs != nil {
@@ -919,6 +931,10 @@ func paneFinished(status string) bool {
 // reviewer's replacement takes; a PR still open at the reviewed head, an
 // unreadable PR or a busy pane leaves the job spawned.
 func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate, gate reapReceipt, job integrations.JobRecord) bool {
+	if w.unclosable[c.label.name] {
+		return false
+	}
+	hs := c.seen
 	keep := func() bool {
 		w.record(gate, "kept", "job:spawned")
 		return false
@@ -972,6 +988,9 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		if alreadyClosedRefusal(e) {
 			return w.alreadyClosed(gate, l)
 		}
+		if unknownJobRefusal(e) {
+			return w.unknownJob(ctx, gate, l, hs)
+		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
 		return false
@@ -991,6 +1010,53 @@ func (w *reviewerSweep) alreadyClosed(gate reapReceipt, l reviewerLabel) bool {
 	w.abandoned[l.name] = true
 	w.record(gate, "closed", reviewerAlreadyClosed)
 	return true
+}
+
+// unknownJob settles a close panewire refused as job_unknown: the hub does not
+// know the job, so the close cannot succeed and is not sent again. A terminal
+// event in the job's node dir means the job has ended: the label gets a closed
+// row that names the event, as alreadyClosed does, and the sweep goes on to
+// cleanup. Without one the job is not closable through the hub: the label gets
+// one kept row, no error, and stays unclosable, so reap leaves it be.
+func (w *reviewerSweep) unknownJob(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost) bool {
+	w.s.reapRetrySucceeded(w.r.Name, l.name)
+	if kind := w.terminalEvent(ctx, hs, l.name); kind != "" {
+		w.abandoned[l.name] = true
+		w.record(gate, "closed", "already closed (job_unknown, terminal event "+kind+")")
+		return true
+	}
+	w.unclosable[l.name] = true
+	w.record(gate, "kept", reviewerNotClosable)
+	return false
+}
+
+// terminalEvent names the terminal event in a job's node dir, "" when none can
+// be read. A host the daemon reaches directly is read in its job dir, which
+// holds every terminal kind. A hub host's job dir belongs to its node, which the
+// daemon cannot read; the node's job.result answers for it and reports only the
+// job.completed event, so a revoked, reaped or lost job reads as none there.
+func (w *reviewerSweep) terminalEvent(ctx context.Context, hs *reapHost, label string) string {
+	switch {
+	case hs == nil:
+		return ""
+	case !hs.viaHub:
+		kind, e := hs.exec.TerminalEvent(ctx, label)
+		if e != nil {
+			return ""
+		}
+		return kind
+	}
+	hub, e := w.s.reapHub()
+	if e != nil || hub == nil {
+		return ""
+	}
+	var v struct {
+		Completed bool `json:"completed"`
+	}
+	if e := hub.Command(ctx, hs.host.MachineID(), "job.result", map[string]string{"job": label}, &v); e != nil || !v.Completed {
+		return ""
+	}
+	return "job.completed"
 }
 
 // jobOtherRepo is the repository a job record's worktree origin names when it
@@ -1185,7 +1251,10 @@ func (w *reviewerSweep) stuckPaneGone(ctx context.Context, l reviewerLabel, job 
 // can never report, so the close is what lets panewire's sweep end the
 // record and the archive finish. It reports whether the sweep may go on to
 // the worktrees.
-func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job integrations.JobRecord, l reviewerLabel) bool {
+func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job integrations.JobRecord, l reviewerLabel, hs *reapHost) bool {
+	if w.unclosable[l.name] {
+		return false
+	}
 	reason := fmt.Sprintf("stuck reviewer job %s with no result for %s and no pane", job.State, w.now.Sub(l.started).Round(time.Minute))
 	if !w.acting {
 		w.record(gate, "would-abandon", reason)
@@ -1203,6 +1272,9 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
 		if alreadyClosedRefusal(e) {
 			return w.alreadyClosed(gate, l)
+		}
+		if unknownJobRefusal(e) {
+			return w.unknownJob(ctx, gate, l, hs)
 		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
 		w.record(gate, "error", "abandon job: "+e.Error())
