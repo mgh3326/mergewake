@@ -485,13 +485,19 @@ func TestPRRoleSweepDeadlineLetsOtherReposRunAndSkipsUntilReturn(t *testing.T) {
 	if !strings.Contains(logLine, `"repo":"o/one"`) || !strings.Contains(logLine, `"step":"open_pulls"`) || !strings.Contains(logLine, `"age":`) {
 		t.Fatalf("still-running log lacks repo, step or age: %s", logLine)
 	}
+	// Assert on the same snapshot the wait accepted: a re-read could land
+	// after the next pass has started, and that pass is not a skipped one.
+	var later daemon.Status
 	waitFor(t, "a later pass to finish", func() bool {
 		var state daemon.Status
 		b, err := os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
-		return err == nil && json.Unmarshal(b, &state) == nil && state.LastFinish.After(firstFinish)
+		if err != nil || json.Unmarshal(b, &state) != nil || state.Running || !state.LastFinish.After(firstFinish) {
+			return false
+		}
+		later = state
+		return true
 	})
-	statusBytes, _ = os.ReadFile(filepath.Join(m.s.Config.StateDir, "daemon", "pr.json"))
-	_ = json.Unmarshal(statusBytes, &st)
+	st = later
 	if st.Running || st.Failures != 0 || st.LastError != "" {
 		t.Fatalf("skipped pass recorded a role failure: %+v; log=%s", st, m.stderr.String())
 	}
