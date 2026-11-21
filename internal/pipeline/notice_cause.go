@@ -128,6 +128,10 @@ type causeEvent struct {
 	Head   string
 	Pass   int
 	Detail string
+	// Within, when set, bounds the send by the caller's context and this
+	// duration instead of the detached report context: a notice sent from a
+	// serial sweep must not outlast the sweep's deadline (hk 6014).
+	Within time.Duration
 }
 
 // causeRecord is what the gate keeps per cause in one repo: the event times in
@@ -197,7 +201,13 @@ func (s *Service) noteCause(ctx context.Context, r config.Repo, ev causeEvent) e
 	}
 	var sendErr error
 	if send {
-		nctx, cancel := reportContext(ctx)
+		var nctx context.Context
+		var cancel context.CancelFunc
+		if ev.Within > 0 {
+			nctx, cancel = context.WithTimeout(ctx, ev.Within)
+		} else {
+			nctx, cancel = reportContext(ctx)
+		}
 		sendErr = s.Notifier.Notify(nctx, integrations.Event{
 			ID:   fmt.Sprintf("mergewake-cause-%s-%s-%d", r.Name, strings.ReplaceAll(ev.Cause, ":", "-"), now.UnixNano()),
 			Lane: s.toolLane(), Type: "automation-failed",

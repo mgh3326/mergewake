@@ -47,6 +47,10 @@ type reapReceipt struct {
 	Source   string    `json:"source,omitempty"`    // what named a merged-PR worktree: pane, receipt or job-record
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
+
+	// RetryAfter is the deadline of a kept not-closable row's backoff. A later
+	// invocation, a fresh process, retries once it has passed (hk 6014).
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
@@ -261,7 +265,15 @@ func reapRowKey(v reapReceipt) string {
 	return fmt.Sprintf("%s|%d|%s|%s", v.Action, v.PR, v.Host, path)
 }
 
-func reapRowSig(v reapReceipt) string { return v.Result + "|" + v.Reason }
+// reapRowSig names a row's result and reason. A kept not-closable row also
+// names its backoff deadline: a refusal that repeats moves the deadline out, and
+// that new deadline is state a later invocation must read, not a repeat (hk 6014).
+func reapRowSig(v reapReceipt) string {
+	if v.RetryAfter.IsZero() {
+		return v.Result + "|" + v.Reason
+	}
+	return v.Result + "|" + v.Reason + "|" + v.RetryAfter.UTC().Format(time.RFC3339Nano)
+}
 
 // terminalWorktreeSig reports whether a worktree's latest row is a terminal
 // outcome: removed, or proven gone (every writer records a gone worktree as
@@ -495,7 +507,9 @@ func (s *Service) reapRetryAllowed(repo, job string, pass uint64) bool {
 	return !ok || (pass >= v.nextAllowedPass && !s.now().Before(v.retryAt))
 }
 
-func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
+// reapRetryFailed records a failed close and returns the instant its backoff
+// ends, the deadline a kept row persists (hk 6014).
+func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) time.Time {
 	state := s.reapState()
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -515,6 +529,7 @@ func (s *Service) reapRetryFailed(repo, job, failure string, pass uint64) {
 	v.retryAt = s.now().Add(d)
 	v.nextAllowedPass = pass + 2 // skip the immediately following reap pass
 	state.retries[k] = v
+	return v.retryAt
 }
 
 func (s *Service) reapRetryRestore(repo, job, failure string, pass uint64) bool {

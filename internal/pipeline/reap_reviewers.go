@@ -326,6 +326,15 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 	}
 	w.initDrain()
+	// A credential-wide close failure: several scope_forbidden refusals in one
+	// pass mean the hub credential may have lost its close grant. One ERROR
+	// line per pass names the count and a sample label (hk 6010). It is logged
+	// on every exit once the sweep has started, an early return included (hk 6014).
+	defer func() {
+		if w.scopeForbidden >= 3 && s.Log != nil {
+			s.Log.Error("reap: the hub credential may have lost its close grant: scope_forbidden closes refused", "repo", r.Name, "count", w.scopeForbidden, "sample", w.scopeForbiddenSample)
+		}
+	}()
 
 	lastCleanup := w.collect(receipts)
 	// The audit journal names labels whose rows predate the label field or
@@ -381,12 +390,6 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		if e := s.reviewerDailySummary(r.Name, receipts, hosts, snapshot); e != nil {
 			w.errs = append(w.errs, e)
 		}
-	}
-	// A credential-wide close failure: several scope_forbidden refusals in one
-	// pass mean the hub credential may have lost its close grant. One ERROR
-	// line per pass names the count and a sample label (hk 6010).
-	if w.scopeForbidden >= 3 && s.Log != nil {
-		s.Log.Error("reap: the hub credential may have lost its close grant: scope_forbidden closes refused", "repo", r.Name, "count", w.scopeForbidden, "sample", w.scopeForbiddenSample)
 	}
 	// Only a pass that wrote its rows, and that visited every audit-only
 	// label it found, moves the journal offset: anything else is read again.
@@ -1095,7 +1098,7 @@ func (w *reviewerSweep) settleScopeForbidden(ctx context.Context, gate reapRecei
 		w.noteScopeForbidden(ctx, l, job, closeErr)
 		return false
 	}
-	w.s.reapRetryFailed(w.r.Name, l.name, reviewerOutOfScope, reapPass(ctx))
+	gate.RetryAfter = w.s.reapRetryFailed(w.r.Name, l.name, reviewerOutOfScope, reapPass(ctx))
 	w.record(gate, "kept", reviewerOutOfScope)
 	return false
 }
@@ -1108,6 +1111,10 @@ func (w *reviewerSweep) ownsJob(job integrations.JobRecord) bool {
 	return owner != "" && job.OwnerLane == owner
 }
 
+// reapScopeNoticeWithin bounds the delivery of a scope_forbidden notice, inside
+// the reap context, so the serial repo sweep is not held past its deadline (hk 6014).
+const reapScopeNoticeWithin = 10 * time.Second
+
 // noteScopeForbidden counts one own-lane scope_forbidden refusal by its cause.
 // The gate in notice_cause.go sends at most one notice a day. A counting
 // failure is logged, not returned: it must not change the close.
@@ -1116,7 +1123,7 @@ func (w *reviewerSweep) noteScopeForbidden(ctx context.Context, l reviewerLabel,
 	if d := fleetevent.Redact(integrations.Detail(closeErr)); d != "" {
 		detail += ": " + d
 	}
-	ev := causeEvent{Cause: causeReapCloseScopeForbidden, PR: l.pr, Head: l.sha7, Pass: l.pass, Detail: detail}
+	ev := causeEvent{Cause: causeReapCloseScopeForbidden, PR: l.pr, Head: l.sha7, Pass: l.pass, Detail: detail, Within: reapScopeNoticeWithin}
 	if err := w.s.noteCause(ctx, w.r, ev); err != nil && w.s.Log != nil {
 		w.s.Log.Warn("reap close-scope-forbidden notice failed", "repo", w.r.Name, "label", l.name, "cause", ev.Cause, "error", err)
 	}
@@ -1134,7 +1141,7 @@ func (w *reviewerSweep) notClosable(ctx context.Context, gate reapReceipt, l rev
 		w.record(gate, "closed", "already closed ("+code+", terminal event "+kind+")")
 		return true
 	}
-	w.s.reapRetryFailed(w.r.Name, l.name, why, reapPass(ctx))
+	gate.RetryAfter = w.s.reapRetryFailed(w.r.Name, l.name, why, reapPass(ctx))
 	w.record(gate, "kept", why)
 	return false
 }
@@ -1211,6 +1218,12 @@ func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 			return w.s.reapRetryRestore(w.r.Name, label, key, pass)
 		}
 		if row.Result == "kept" && (row.Reason == reviewerNotClosable || row.Reason == reviewerOutOfScope) {
+			if !row.RetryAfter.IsZero() {
+				// The row's own deadline governs, so a standalone reap in a fresh
+				// process retries once it has passed (hk 6014). Nothing is restored
+				// in memory: the row is read again on every visit.
+				return w.s.now().Before(row.RetryAfter)
+			}
 			return w.s.reapRetryRestore(w.r.Name, label, row.Reason, pass)
 		}
 	}
