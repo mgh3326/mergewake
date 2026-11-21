@@ -254,6 +254,13 @@ func unknownJobRefusal(e error) bool {
 	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "job_unknown")
 }
 
+// scopeForbiddenRefusal reports whether the hub refused a job close because the
+// caller's credential may not close jobs of that lane (scope_forbidden). Like
+// job_unknown, no retry under the same credential changes the answer.
+func scopeForbiddenRefusal(e error) bool {
+	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "scope_forbidden")
+}
+
 // reviewerLane is the owner lane a reviewer's hk job closes under: the hk
 // record's, else the --owner of the recorded spawn arguments, else "".
 func reviewerLane(job integrations.JobRecord, rj reviewerJob) string {
