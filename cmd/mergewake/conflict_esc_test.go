@@ -82,8 +82,8 @@ func TestConflictEscEnginePendingAndQuotaReview(t *testing.T) {
 	defer cancel()
 
 	runSkippedPassWithin(t, ctx, "pending pass", f, skips, logs)
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
+	if runner.placedCount() != 1 {
+		t.Fatalf("reviewers placed=%d, want 1", runner.placedCount())
 	}
 	wantEngineEscs(t, n, 1, "fixture-lane")
 
@@ -92,9 +92,12 @@ func TestConflictEscEnginePendingAndQuotaReview(t *testing.T) {
 	f.hub.refs["mergewake/reviews/1/"+hubHead(1)+"-done"] = hubHead(1)
 	f.hub.mu.Unlock()
 	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset.Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
+	// A give-up is replaced at once; no placement candidate is left here, so
+	// the pass waits for the pool's reset and spawns no other reviewer.
+	runner.refuseSpawns(true)
 	runSkippedPassWithin(t, ctx, "quota pass", f, skips, logs)
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
+	if runner.placedCount() != 1 {
+		t.Fatalf("reviewers placed=%d, want 1", runner.placedCount())
 	}
 	wantEngineEscs(t, n, 1, "fixture-lane")
 }
@@ -205,8 +208,8 @@ func TestConflictEscEngineQuotaStoppedWhenConflictAppears(t *testing.T) {
 	defer cancel()
 
 	runSkippedPassWithin(t, ctx, "pending pass", f, skips, logs)
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
+	if runner.placedCount() != 1 {
+		t.Fatalf("reviewers placed=%d, want 1", runner.placedCount())
 	}
 	wantEngineEscs(t, n, 0, "fixture-lane")
 
@@ -216,10 +219,13 @@ func TestConflictEscEngineQuotaStoppedWhenConflictAppears(t *testing.T) {
 	f.hub.conflicting = true
 	f.hub.mu.Unlock()
 	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset.Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
+	// A give-up is replaced at once; no placement candidate is left here, so
+	// the pass waits for the pool's reset and spawns no other reviewer.
+	runner.refuseSpawns(true)
 	runSkippedPassWithin(t, ctx, "quota pass", f, skips, logs)
 	runSkippedPassWithin(t, ctx, "quota wait pass", f, skips, logs)
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
+	if runner.placedCount() != 1 {
+		t.Fatalf("reviewers placed=%d, want 1", runner.placedCount())
 	}
 	wantEngineEscs(t, n, 1, "fixture-lane")
 }
