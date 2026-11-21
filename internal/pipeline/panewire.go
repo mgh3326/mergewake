@@ -1072,6 +1072,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		if e != nil && ctx.Err() == nil && plan.givenUp != nil && noCandidateRefusal(stdout, e) {
 			return out, x.giveUpWait(ctx, plan, rj, plan.givenUp, leaseSHA)
 		}
+		// The give-up's replacement spawn is decided here, placed or refused and
+		// handled. It governs no later spawn of this pass, which may follow it
+		// through a replacement of its own (hk 6027).
+		plan.givenUp = nil
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = workerSeatArgs(rj.Args)
@@ -1285,9 +1289,10 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		x.noteResultLost(plan, label, res.rec.Host, "quota give-up on pool "+quotaPoolText(pool))
 		plan.givenUp = givenUp
-		// The replacement is the pass's now: its record stays, and the given-up
-		// pane is closed by replaceLostReviewer, not by this run's cleanup.
-		keepJob, cleanupPane = true, false
+		// The replacement is the pass's now: its record stays. The given-up
+		// pane's cleanup stays on for every path, so a replacement that returns
+		// before replaceLostReviewer closes the pane still releases it (hk 6027).
+		keepJob = true
 		rec := res.rec
 		// end_reason names the stop's own pool (panewire hk 5690), which is the
 		// one to leave out of the replacement's placement.

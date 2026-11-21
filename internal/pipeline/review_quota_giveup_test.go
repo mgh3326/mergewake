@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -139,5 +141,74 @@ func TestQuotaGiveUpWithoutAPlacementCandidateWaitsForReset(t *testing.T) {
 	}
 	if got := arg(f.runner.spawns[3], "--exclude-pool"); got != "devin-free" {
 		t.Fatalf("fresh spawn --exclude-pool = %q, want the stopped pool kept out", got)
+	}
+}
+
+// A give-up whose replacement fails before closeReplaced runs still gets the
+// given-up pane's cleanup: the cleanup stays on for every path (hk 6027).
+func TestQuotaGiveUpCleanupRunsWhenReplacementFails(t *testing.T) {
+	f := asyncReview(t)
+	if err := f.review(t); err != nil {
+		t.Fatal(err)
+	}
+	old := readReviewerJob(t, f.s, f.r, 1)
+	f.runner.sink.jobs[old.Label] = jobGiveUp("devin-free", f.c.t.Add(3*time.Hour))
+	// A directory where the replaced-reviewers state file goes makes it neither
+	// readable nor writable, so the replacement returns before closeReplaced.
+	if err := os.MkdirAll(f.s.replacedReviewersPath(f.r.Name, 7, 1), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.review(t); err == nil {
+		t.Fatal("the review passed with unusable replaced-reviewers state")
+	}
+	rows := auditRows(t, f.s, f.r, "reviewer-cleanup")
+	if !slices.ContainsFunc(rows, func(row map[string]any) bool { return row["label"] == old.Label }) {
+		t.Fatalf("the given-up pane's cleanup did not run: %v", rows)
+	}
+}
+
+// A give-up's replacement governs only its own spawn. Once that spawn is
+// placed, a later spawn of the same pass is not held for the stopped pool's
+// reset: the replacement's replacement, dead on its replay, is refused without
+// a placement candidate and must not write a quota stop (hk 6027).
+func TestGiveUpReplacementDoesNotGovernLaterSpawns(t *testing.T) {
+	f := asyncReview(t)
+	if err := f.review(t); err != nil {
+		t.Fatal(err)
+	}
+	old := readReviewerJob(t, f.s, f.r, 1)
+	// The give-up's pass, as the quota case leaves it: its record is dropped
+	// as replaceLostReviewer does, and the replacement spawns on the same plan.
+	stopped := &reviewQuotaStopped{label: old.Label, pool: "devin-free", resetAt: f.c.t.Add(time.Hour)}
+	if err := f.s.dropReviewerJob(f.r.Name, 7, 1); err != nil {
+		t.Fatal(err)
+	}
+	// A deadline with time to spare: a dead replacement without one is deferred
+	// to the next run instead of spawning here.
+	ctx, cancel := context.WithTimeout(f.ctx, time.Hour)
+	defer cancel()
+	x := &panewireExecutor{s: f.s, repo: f.r, pr: f.g.pull}
+	plan := &passPlan{pass: 1, lens: "default", givenUp: stopped}
+	lease := func() (string, bool, error) { return f.g.pull.Head.SHA, true, nil }
+	if _, err := x.runPass(ctx, plan, lease); !errors.Is(err, errPassPending) {
+		t.Fatalf("replacement err=%v, want it placed and pending", err)
+	}
+	if plan.givenUp != nil {
+		t.Fatalf("the give-up still governs the pass after its replacement was placed")
+	}
+	// The replacement dies on replay, and the pass spawns once more with no
+	// placement candidate left.
+	dead := readReviewerJob(t, f.s, f.r, 1)
+	f.runner.noCandidateAlways = true
+	_, err := x.replaceDeadSpawn(ctx, plan, dead, 74, "active job refusal", f.g.pull.Head.SHA)
+	if len(f.runner.spawns) != 3 {
+		t.Fatalf("spawns=%d, want the later spawn to run: err=%v", len(f.runner.spawns), err)
+	}
+	var quota *reviewQuotaStopped
+	if errors.As(err, &quota) {
+		t.Fatalf("a later spawn waited for the give-up's pool reset: %v", err)
+	}
+	if rows := auditRows(t, f.s, f.r, "review-quota-stopped"); len(rows) != 0 {
+		t.Fatalf("quota-stopped rows for a later spawn: %v", rows)
 	}
 }
