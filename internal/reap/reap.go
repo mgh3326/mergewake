@@ -469,6 +469,46 @@ func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// terminalJobEvents are the events that end a job on its node.
+var terminalJobEvents = map[string]bool{"job.revoked": true, "job.reaped": true, "job.completed": true, "job.lost": true}
+
+// IsTerminalJobEvent reports whether kind is an event that ends a job.
+func IsTerminalJobEvent(kind string) bool { return terminalJobEvents[kind] }
+
+// TerminalEvent names the terminal event of a job's directory on this host:
+// the newest events/NNNNN-<kind>.json whose kind ends the job, "" when the
+// directory holds none. It only reads; an unreadable directory is an error.
+func (e Exec) TerminalEvent(ctx context.Context, job string) (string, error) {
+	dir := e.Host.JobDir(job)
+	if dir == "" {
+		return "", errors.New("job dir unavailable")
+	}
+	b, err := e.Run(ctx, "sh", "-c", `ls -1 "$1/events"`, "sh", dir)
+	if err != nil {
+		return "", err
+	}
+	return newestTerminalEvent(string(b)), nil
+}
+
+// newestTerminalEvent picks the kind of the newest terminal event in an events
+// directory listing: one NNNNN-<kind>.json name per line, the sequence padded to
+// five digits, so the names order by sequence as strings.
+func newestTerminalEvent(listing string) string {
+	var best, kind string
+	for _, name := range strings.Fields(listing) {
+		seq, rest, ok := strings.Cut(name, "-")
+		if !ok || len(seq) != 5 || strings.Trim(seq, "0123456789") != "" {
+			continue
+		}
+		k, ok := strings.CutSuffix(rest, ".json")
+		if !ok || !terminalJobEvents[k] || seq <= best {
+			continue
+		}
+		best, kind = seq, k
+	}
+	return kind
+}
+
 // NewerThan reports whether path's mtime is later than epoch seconds. GNU
 // stat is tried first so a BSD -f flag can never be parsed as GNU's
 // --file-system mode; either failure is reported, not guessed.
