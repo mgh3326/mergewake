@@ -49,3 +49,30 @@ func TestHostScanFailureOtherErrorsStayFailures(t *testing.T) {
 		t.Fatalf("skips=%v rest=%v", skips, rest)
 	}
 }
+
+func TestSplitReapRepoErrorKeepsOnlyRealFailures(t *testing.T) {
+	skip := hostScanFailure("node-a", &reap.HostUnreachable{Machine: "node-a", Reason: "node_unavailable"})
+	real := errors.New("node-b /tree: removal refused")
+
+	budget, skips, kept := SplitReapRepoError(errors.Join(skip, real))
+	if budget != nil || len(skips) != 1 || kept == nil {
+		t.Fatalf("budget=%v skips=%v kept=%v", budget, skips, kept)
+	}
+	if strings.Contains(kept.Error(), "node-a") || !strings.Contains(kept.Error(), "removal refused") {
+		t.Fatalf("skipped host kept in the repository error: %v", kept)
+	}
+
+	stop := &ReapBudgetStop{Left: "hosts", Failures: errors.Join(skip, real)}
+	budget, skips, kept = SplitReapRepoError(stop)
+	if budget == nil || budget.Left != "hosts" || len(skips) != 1 {
+		t.Fatalf("budget=%v skips=%v", budget, skips)
+	}
+	if strings.Contains(kept.Error(), "node-a") || !strings.Contains(kept.Error(), "removal refused") {
+		t.Fatalf("skipped host kept under a budget stop: %v", kept)
+	}
+
+	budget, skips, kept = SplitReapRepoError(errors.Join(skip))
+	if budget != nil || len(skips) != 1 || kept != nil {
+		t.Fatalf("skip alone: budget=%v skips=%v kept=%v", budget, skips, kept)
+	}
+}

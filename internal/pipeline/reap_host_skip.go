@@ -37,6 +37,19 @@ func hostScanFailure(host string, cause error) error {
 	return wrapped
 }
 
+// SplitReapRepoError splits one repository's reap error for the daemon: the
+// budget stop it hit (nil when none), the hosts it skipped, and the failure the
+// pass keeps. A skipped host is never kept, so it cannot reappear in the
+// repository's error line or its persisted role failure.
+func SplitReapRepoError(err error) (budget *ReapBudgetStop, skips []HostSkip, kept error) {
+	failures := err
+	if errors.As(err, &budget) {
+		failures = budget.Failures
+	}
+	skips, kept = SplitReapHostSkips(failures)
+	return budget, skips, kept
+}
+
 // SplitReapHostSkips separates the host skips in a reap failure from every other
 // error. rest is nil when the only failures were unreachable hosts, and it keeps
 // budget and other leaves as they were. Only the top-level joined leaves are

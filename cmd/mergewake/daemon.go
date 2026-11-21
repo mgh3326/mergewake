@@ -156,12 +156,7 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						// A host whose node is unreachable is skipped, not failed: it is
 						// logged once per pass below, and the repository is only an error
 						// for its other failures.
-						var budgetStop *pipeline.ReapBudgetStop
-						failures := err
-						if errors.As(err, &budgetStop) {
-							failures = budgetStop.Failures
-						}
-						skips, rest := pipeline.SplitReapHostSkips(failures)
+						budgetStop, skips, rest := pipeline.SplitReapRepoError(err)
 						passSkips.add(skips)
 						var skipped []any
 						if len(skips) > 0 {
@@ -169,14 +164,15 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 						}
 						switch {
 						case budgetStop != nil && rest != nil:
-							log.Error("repository reap stopped on budget with errors", append(attrs, "left", budgetStop.Left, "error", budgetStop.Failures.Error())...)
-							err = budgetStop.Failures
+							log.Error("repository reap stopped on budget with errors", append(attrs, "left", budgetStop.Left, "error", rest.Error())...)
+							err = rest
 						case budgetStop != nil:
 							// a budget stop alone is a completed, resumable repository pass
 							log.Warn("repository reap stopped on budget", append(append(attrs, "left", budgetStop.Left), skipped...)...)
 							err = nil
 						case err != nil && rest != nil:
-							log.Error("repository reap failed", append(attrs, "error", err.Error())...)
+							log.Error("repository reap failed", append(attrs, "error", rest.Error())...)
+							err = rest
 						case err != nil:
 							log.Info("repository reap completed", append(attrs, skipped...)...)
 							err = nil
