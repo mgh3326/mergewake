@@ -43,7 +43,33 @@ import (
 // hk record would wait forever. While its pane is still present the label is
 // marked stuck-reviewer once and everything waits.
 
-var reviewerLabelPattern = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)(?:-q([1-9]\d*))?$`)
+// reviewerLabelPattern matches the original label form,
+// mwr-<pr>-<sha7>-p<pass>-<unix seconds>, still found on hosts and in
+// journals. reviewerLabelPatternT matches the compact form new reviewers get,
+// mwr-<pr>-<sha7>p<pass>t<base36 seconds since reviewerLabelEpoch> (hk 5960).
+// The original pattern rejects the compact form, so a release without it
+// ignores compact labels instead of reading their stamp as a 1970s start.
+// Both accept panewire's quota-replace chain: one -q<n> per replacement,
+// appended to the label it replaces (-q1-q2).
+var (
+	reviewerLabelPattern  = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})-p(\d+)-(\d+)((?:-q[1-9]\d*)*)$`)
+	reviewerLabelPatternT = regexp.MustCompile(`^mwr-(\d+)-([0-9a-f]{7})p(\d+)t([0-9a-z]+)((?:-q[1-9]\d*)*)$`)
+	reviewerQuotaSuffix   = regexp.MustCompile(`-q([1-9]\d*)`)
+)
+
+// reviewerLabelEpoch is the origin of a compact label's stamp. A label with a
+// Unix-seconds stamp was 30 characters at a 4-digit PR, so panewire's -q<n>
+// successors went past herdr's 32-character agent name. From this origin the
+// base36 stamp has 6 digits from 2020-01-23 to 2089, so the compact form is 25
+// characters at a 4-digit PR and 26 at a 5-digit PR, and two quota successors
+// (-q1-q2, six characters) still fit in 32.
+const reviewerLabelEpoch int64 = 1577836800 // 2020-01-01T00:00:00Z
+
+// reviewerLabelName is the job id of a new reviewer for pr, head sha7 and
+// pass, started at unix seconds.
+func reviewerLabelName(pr int, sha7 string, pass int, unix int64) string {
+	return fmt.Sprintf("mwr-%d-%sp%dt%s", pr, sha7, pass, strconv.FormatInt(max(unix-reviewerLabelEpoch, 0), 36))
+}
 
 type reviewerLabel struct {
 	name    string
@@ -51,22 +77,29 @@ type reviewerLabel struct {
 	sha7    string
 	pass    int
 	started time.Time
-	// replacement is n of the -q<n> suffix, 0 for an original label.
+	// replacement is n of the last -q<n> suffix, 0 for an original label.
 	replacement int
 }
 
 func parseReviewerLabel(name string) (reviewerLabel, bool) {
+	var unix int64
+	var e3 error
 	m := reviewerLabelPattern.FindStringSubmatch(name)
-	if m == nil {
+	if m != nil {
+		unix, e3 = strconv.ParseInt(m[4], 10, 64)
+	} else if m = reviewerLabelPatternT.FindStringSubmatch(name); m != nil {
+		var off int64
+		off, e3 = strconv.ParseInt(m[4], 36, 64)
+		unix = reviewerLabelEpoch + off
+	} else {
 		return reviewerLabel{}, false
 	}
 	pr, e1 := strconv.Atoi(m[1])
 	pass, e2 := strconv.Atoi(m[3])
-	unix, e3 := strconv.ParseInt(m[4], 10, 64)
 	repl := 0
 	var e4 error
-	if m[5] != "" {
-		repl, e4 = strconv.Atoi(m[5])
+	if q := reviewerQuotaSuffix.FindAllStringSubmatch(m[5], -1); len(q) > 0 {
+		repl, e4 = strconv.Atoi(q[len(q)-1][1])
 	}
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || pr <= 0 {
 		return reviewerLabel{}, false

@@ -134,7 +134,7 @@ func TestLensesOfAHeadStartTogether(t *testing.T) {
 func TestLensFailureDoesNotStopTheOther(t *testing.T) {
 	s, g, r, runner, gate, _ := lensSetup(t, 2)
 	gate.want = 1
-	s.Runner = failPass{Runner: runner, label: "-p1-"}
+	s.Runner = failPass{Runner: runner, label: "p1t"}
 	e := s.Review(context.Background(), r, 7, "openai", Options{})
 	if !errors.Is(e, ErrReviewUnavailable) || !strings.Contains(e.Error(), "pass 1") {
 		t.Fatalf("error = %v", e)
@@ -152,7 +152,7 @@ func TestLensFailureDoesNotStopTheOther(t *testing.T) {
 	if e = s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if got := runner.pane.spawns[spawns:]; len(got) != 1 || !strings.Contains(arg(got[0], "-l"), "-p1-") {
+	if got := runner.pane.spawns[spawns:]; len(got) != 1 || !strings.Contains(arg(got[0], "-l"), "p1t") {
 		t.Fatalf("retry spawns %v", got)
 	}
 	if len(g.passes[shaA]) != 2 || !g.refs[doneRef(7, shaA)] {
@@ -167,7 +167,7 @@ func TestPostedLensIsNotStartedAgain(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(runner.pane.spawns) != 1 || !strings.Contains(arg(runner.pane.spawns[0], "-l"), "-p2-") || gate.peak != 1 {
+	if len(runner.pane.spawns) != 1 || !strings.Contains(arg(runner.pane.spawns[0], "-l"), "p2t") || gate.peak != 1 {
 		t.Fatalf("spawns %v peak %d", runner.pane.spawns, gate.peak)
 	}
 	if _, ok := lensOf(g.passes[shaA], 2); !ok || len(g.passes[shaA]) != 2 || !g.refs[doneRef(7, shaA)] {
@@ -210,7 +210,7 @@ func TestHeldLensDoesNotBlockTheOther(t *testing.T) {
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
 	}
-	if len(runner.pane.spawns) != 1 || !strings.Contains(arg(runner.pane.spawns[0], "-l"), "-p2-") || gate.peak != 1 {
+	if len(runner.pane.spawns) != 1 || !strings.Contains(arg(runner.pane.spawns[0], "-l"), "p2t") || gate.peak != 1 {
 		t.Fatalf("spawns %v", runner.pane.spawns)
 	}
 	if _, ok := lensOf(g.passes[shaA], 2); !ok || len(g.passes[shaA]) != 1 {

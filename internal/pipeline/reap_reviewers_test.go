@@ -966,7 +966,10 @@ func TestReapReviewerLabel_ReplacementSuffixParses(t *testing.T) {
 
 // (c) A malformed replacement suffix is not a reviewer label.
 func TestReapReviewerLabel_MalformedReplacementRejected(t *testing.T) {
-	for _, suffix := range []string{"-q", "-q0", "-q01", "-qx", "-q1x", "-q-1", "-q1-q2", "q1", "-Q1"} {
+	// "-q1-q2" is panewire's real second successor (hub_quota_replace.go,
+	// quotaReplaceMax = 2) and parses since hk 5960; a malformed link in a chain
+	// does not.
+	for _, suffix := range []string{"-q", "-q0", "-q01", "-qx", "-q1x", "-q-1", "-q1-q0", "-q1-qx", "q1", "-Q1"} {
 		if _, ok := parseReviewerLabel("mwr-283-7e8272c-p1-1794000000" + suffix); ok {
 			t.Errorf("suffix %q accepted", suffix)
 		}

@@ -90,7 +90,7 @@ func (x *githubShapedGH) PostReview(ctx context.Context, repo string, n int, sha
 // hunks of a file the PR changes.
 func twoPassRound(t *testing.T) (*Service, *fakeGH, *githubShapedGH, config.Repo) {
 	t.Helper()
-	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"-p2-": stateRiskFinding}}
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"p2t": stateRiskFinding}}
 	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
 	g.diffs = map[string]string{shaA: workflowDiff()}
@@ -144,7 +144,7 @@ func (g refusedPostGH) PostReview(ctx context.Context, repo string, n int, sha s
 // per attempt with the redacted error, counts the failure, and the escalation
 // notice carries the clipped last error.
 func TestReviewPostFailureIsLoggedAndEscalated(t *testing.T) {
-	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"-p2-": stateRiskFinding}}
+	runner := &panewireRunner{findings: `{"findings":[]}`, family: "openai", byLabel: map[string]string{"p2t": stateRiskFinding}}
 	s, g, r := panewireSetup(t, runner)
 	g.blocking = true
 	g.diffs = map[string]string{shaA: workflowDiff()}
@@ -165,7 +165,7 @@ func TestReviewPostFailureIsLoggedAndEscalated(t *testing.T) {
 	}
 	row := rows[0]
 	text, _ := row["error"].(string)
-	if row["pr"] != float64(7) || row["head"] != shaA || row["pass"] != float64(2) || !strings.HasPrefix(fmt.Sprint(row["label"]), "mwr-7-"+shaA[:7]+"-p2-") || !strings.Contains(text, "HTTP 422") || strings.Contains(text, "dev@example.com") || len(text) > 400 {
+	if row["pr"] != float64(7) || row["head"] != shaA || row["pass"] != float64(2) || !strings.HasPrefix(fmt.Sprint(row["label"]), "mwr-7-"+shaA[:7]+"p2t") || !strings.Contains(text, "HTTP 422") || strings.Contains(text, "dev@example.com") || len(text) > 400 {
 		t.Fatalf("row=%v", row)
 	}
 	n := s.Notifier.(*fakeNotifier)
