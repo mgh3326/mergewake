@@ -119,6 +119,10 @@ func TestReapReviewerOtherCloseRefusalStaysOwed(t *testing.T) {
 	if len(errs) != 1 || !strings.HasPrefix(errs[0].Reason, "abandon job: ") {
 		t.Fatalf("error rows: %v", rowSummary(f.rows(t)))
 	}
+	// The row names panewire's refusal, not only its exit status.
+	if !strings.Contains(errs[0].Reason, "owner_mismatch") {
+		t.Fatalf("error row %q does not carry the refusal text", errs[0].Reason)
+	}
 	// The next pass waits out the retry backoff; a later pass retries the close.
 	_ = f.passAt(t, 30*time.Minute)
 	_ = f.passAt(t, 3*time.Hour)
