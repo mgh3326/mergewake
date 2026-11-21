@@ -293,13 +293,19 @@ func (e *HostUnreachable) Error() string {
 func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error) {
 	h.once.Do(func() {
 		var v struct {
-			Nodes []hubNodeAgents `json:"nodes"`
+			// A pointer tells a missing or non-array `nodes` apart from an
+			// empty inventory: only the latter is a valid answer with no hosts.
+			Nodes *[]hubNodeAgents `json:"nodes"`
 		}
 		if h.err = h.do(ctx, http.MethodGet, "/v1/nodes/agents", nil, &v); h.err != nil {
 			return
 		}
+		if v.Nodes == nil {
+			h.err = errors.New("hub: agents response has no nodes array")
+			return
+		}
 		h.agents = map[string]hubNodeAgents{}
-		for _, n := range v.Nodes {
+		for _, n := range *v.Nodes {
 			h.agents[n.MachineID] = n
 		}
 	})
