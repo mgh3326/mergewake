@@ -40,9 +40,9 @@ const causeReapCloseScopeForbidden = "reap:close-scope-forbidden"
 // fix-needed cause renotifies after fixNeededQuiet.
 const reapCloseScopeForbiddenQuiet = 24 * time.Hour
 
- // causeGaveUp is the cause of a notice that the daemon has stopped retrying.
- const causeGaveUp = "gave-up"
- 
+// causeGaveUp is the cause of a notice that the daemon has stopped retrying.
+const causeGaveUp = "gave-up"
+
 // Lost-result causes, named by the lost reason the pass recorded.
 const (
 	causeLostOverdue     = "lost:overdue"
@@ -50,21 +50,21 @@ const (
 	causeLostNeverPlaced = "lost:never-placed"
 	causeLostOther       = "lost:other"
 )
- 
- // fixNeededCauses are the causes a person must fix: the notice is not left to
- // the threshold alone.
- var fixNeededCauses = map[string]bool{
- 	"spawn:auth":              true,
- 	"spawn:workspace":         true,
- 	"spawn:node-upgrade":      true,
- 	"spawn:host-unconfigured": true,
- 	"spawn:repo-root":         true,
- 	"spawn:brief-upload":       true,
+
+// fixNeededCauses are the causes a person must fix: the notice is not left to
+// the threshold alone.
+var fixNeededCauses = map[string]bool{
+	"spawn:auth":                 true,
+	"spawn:workspace":            true,
+	"spawn:node-upgrade":         true,
+	"spawn:host-unconfigured":    true,
+	"spawn:repo-root":            true,
+	"spawn:brief-upload":         true,
 	causeReapCloseScopeForbidden: true,
- }
- 
- // fixNeededQuiet is how long a fix-needed cause stays quiet after its notice.
- const fixNeededQuiet = time.Hour
+}
+
+// fixNeededQuiet is how long a fix-needed cause stays quiet after its notice.
+const fixNeededQuiet = time.Hour
 
 // lostCause names the cause of a lost reviewer result from the reason its pass
 // recorded.

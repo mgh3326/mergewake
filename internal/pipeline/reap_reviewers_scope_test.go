@@ -197,4 +197,3 @@ func TestReapReviewerScopeForbiddenNoticeOncePerDay(t *testing.T) {
 		t.Fatalf("notice-cause rows = %v", rows)
 	}
 }
-
