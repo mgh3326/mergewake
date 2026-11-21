@@ -283,6 +283,11 @@ type reviewerSweep struct {
 	// writeFailed reports that a row could not be written, so the journal
 	// checkpoint must not pass the labels whose rows were lost.
 	writeFailed bool
+	// scopeForbidden counts the closes this pass the hub refused as
+	// scope_forbidden, and scopeForbiddenSample names one of them. Three or
+	// more mean the hub credential may have lost its close grant (hk 6010).
+	scopeForbidden       int
+	scopeForbiddenSample string
 }
 
 // reviewerCandidate is one label to visit, the host it is known to run on and,
@@ -376,6 +381,12 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		if e := s.reviewerDailySummary(r.Name, receipts, hosts, snapshot); e != nil {
 			w.errs = append(w.errs, e)
 		}
+	}
+	// A credential-wide close failure: several scope_forbidden refusals in one
+	// pass mean the hub credential may have lost its close grant. One ERROR
+	// line per pass names the count and a sample label (hk 6010).
+	if w.scopeForbidden >= 3 && s.Log != nil {
+		s.Log.Error("reap: the hub credential may have lost its close grant: scope_forbidden closes refused", "repo", r.Name, "count", w.scopeForbidden, "sample", w.scopeForbiddenSample)
 	}
 	// Only a pass that wrote its rows, and that visited every audit-only
 	// label it found, moves the journal offset: anything else is read again.
@@ -1018,7 +1029,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 			return w.unknownJob(ctx, gate, l, hs)
 		}
 		if scopeForbiddenRefusal(e) {
-			return w.notClosable(ctx, gate, l, hs, "scope_forbidden", reviewerOutOfScope)
+			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
 		}
 		// The row's reason is the retry key a restart restores
 		// (closeRetryBlocked), so both carry the same text.
@@ -1055,10 +1066,65 @@ func (w *reviewerSweep) unknownJob(ctx context.Context, gate reapReceipt, l revi
 	return w.notClosable(ctx, gate, l, hs, "job_unknown", reviewerNotClosable)
 }
 
+// settleScopeForbidden settles a close the hub refused as scope_forbidden: the
+// credential may not close jobs of that lane. A terminal event in the job's
+// node dir means the job has ended and the label is closed, whatever lane
+// owns it. Otherwise a job owned by the lane mergewake closes under (the
+// configured review.panewire.owner) is an error, as before hk 6009, plus one
+// notice a day; any other lane's job takes the benign kept path (hk 6010).
+// Every refusal counts toward the pass's credential-wide failure.
+func (w *reviewerSweep) settleScopeForbidden(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost, job integrations.JobRecord, closeErr error) bool {
+	w.scopeForbidden++
+	if w.scopeForbiddenSample == "" {
+		w.scopeForbiddenSample = l.name
+	}
+	if kind := w.terminalEvent(ctx, hs, l.name); kind != "" {
+		w.s.reapRetrySucceeded(w.r.Name, l.name)
+		w.abandoned[l.name] = true
+		w.record(gate, "closed", "already closed (scope_forbidden, terminal event "+kind+")")
+		return true
+	}
+	if w.ownsJob(job) {
+		// The row's reason is the retry key a restart restores
+		// (closeRetryBlocked), so both carry the same text.
+		failure := fleetevent.Redact(integrations.Detail(closeErr))
+		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
+		w.record(gate, "error", "abandon job: "+failure)
+		w.noteScopeForbidden(ctx, l, job, closeErr)
+		return false
+	}
+	w.s.reapRetryFailed(w.r.Name, l.name, reviewerOutOfScope, reapPass(ctx))
+	w.record(gate, "kept", reviewerOutOfScope)
+	return false
+}
+
+// ownsJob reports whether job belongs to the lane mergewake closes under (the
+// configured review.panewire.owner). Only that lane's scope_forbidden refusal
+// is mergewake's own failure; another lane's job is benign (hk 6010).
+func (w *reviewerSweep) ownsJob(job integrations.JobRecord) bool {
+	owner := w.s.Config.Review.Panewire.Owner
+	return owner != "" && job.OwnerLane == owner
+}
+
+// noteScopeForbidden counts one own-lane scope_forbidden refusal by its cause.
+// The gate in notice_cause.go sends at most one notice a day. A counting
+// failure is logged, not returned: it must not change the close.
+func (w *reviewerSweep) noteScopeForbidden(ctx context.Context, l reviewerLabel, job integrations.JobRecord, closeErr error) {
+	detail := fmt.Sprintf("close of %s refused: scope_forbidden (own lane %s)", l.name, job.OwnerLane)
+	if d := fleetevent.Redact(integrations.Detail(closeErr)); d != "" {
+		detail += ": " + d
+	}
+	ev := causeEvent{Cause: causeReapCloseScopeForbidden, PR: l.pr, Head: l.sha7, Pass: l.pass, Detail: detail}
+	if err := w.s.noteCause(ctx, w.r, ev); err != nil && w.s.Log != nil {
+		w.s.Log.Warn("reap close-scope-forbidden notice failed", "repo", w.r.Name, "label", l.name, "cause", ev.Cause, "error", err)
+	}
+}
+
 // notClosable settles a close the hub refused for a reason no retry changes
-// (job_unknown, scope_forbidden): a terminal event in the job's node dir means
-// it has ended and the label is closed; otherwise one kept row with why, no
-// error, and the close backs off like a failed one.
+// (job_unknown): a terminal event in the job's node dir means it has ended
+// and the label is closed; otherwise one kept row with why, no error, and the
+// close backs off like a failed one. A scope_forbidden refusal for another
+// lane's job settles the same way through scopeForbidden.
 func (w *reviewerSweep) notClosable(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost, code, why string) bool {
 	if kind := w.terminalEvent(ctx, hs, l.name); kind != "" {
 		w.s.reapRetrySucceeded(w.r.Name, l.name)
@@ -1126,7 +1192,9 @@ func jobOtherRepo(job integrations.JobRecord, repo string) string {
 
 // closeRetryBlocked also honors the last durable close failure after a daemon
 // restart. The in-memory schedule provides increasing delays; the receipt
-// keeps a restart from immediately repeating the same failing CLI call.
+// keeps a restart from immediately repeating the same failing CLI call. A kept
+// not-closable row (reviewerNotClosable or reviewerOutOfScope) restores the
+// backoff the same way an abandon-job error row does (hk 6010).
 func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 	if !w.s.reapRetryAllowed(w.r.Name, label, pass) {
 		return true
@@ -1134,6 +1202,9 @@ func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 	for _, row := range w.streams[label] {
 		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") {
 			return w.s.reapRetryRestore(w.r.Name, label, strings.TrimPrefix(row.Reason, "abandon job: "), pass)
+		}
+		if row.Result == "kept" && (row.Reason == reviewerNotClosable || row.Reason == reviewerOutOfScope) {
+			return w.s.reapRetryRestore(w.r.Name, label, row.Reason, pass)
 		}
 	}
 	return false
@@ -1326,7 +1397,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 			return w.unknownJob(ctx, gate, l, hs)
 		}
 		if scopeForbiddenRefusal(e) {
-			return w.notClosable(ctx, gate, l, hs, "scope_forbidden", reviewerOutOfScope)
+			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
 		}
 		// The row's reason is the retry key a restart restores
 		// (closeRetryBlocked), so both carry the same text.
