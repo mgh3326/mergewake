@@ -157,6 +157,10 @@ const (
 	// close as job_unknown and no terminal kind is known yet. The close is backed
 	// off and retried, so the row is not final.
 	reviewerNotClosable = "hub does not know the job; not closable via hub"
+	// reviewerOutOfScope is the reason of a kept row: the hub refused the close
+	// as scope_forbidden, so the job belongs to a lane this credential may not
+	// close (an old reviewer another lane already closed, typically).
+	reviewerOutOfScope = "job is outside this credential's close scope; not closable via hub"
 	// reviewerOtherRepo starts the reason of a skipped row: a journal-only label
 	// whose job record names another repository is not this sweep's to close.
 	reviewerOtherRepo = "job names another repository: "
@@ -1013,6 +1017,9 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		if unknownJobRefusal(e) {
 			return w.unknownJob(ctx, gate, l, hs)
 		}
+		if scopeForbiddenRefusal(e) {
+			return w.notClosable(ctx, gate, l, hs, "scope_forbidden", reviewerOutOfScope)
+		}
 		// The row's reason is the retry key a restart restores
 		// (closeRetryBlocked), so both carry the same text.
 		failure := fleetevent.Redact(integrations.Detail(e))
@@ -1045,14 +1052,22 @@ func (w *reviewerSweep) alreadyClosed(gate reapReceipt, l reviewerLabel) bool {
 // recorded as permanent: a later pass retries once the backoff passes, so the
 // label settles when the node reports a terminal kind.
 func (w *reviewerSweep) unknownJob(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost) bool {
+	return w.notClosable(ctx, gate, l, hs, "job_unknown", reviewerNotClosable)
+}
+
+// notClosable settles a close the hub refused for a reason no retry changes
+// (job_unknown, scope_forbidden): a terminal event in the job's node dir means
+// it has ended and the label is closed; otherwise one kept row with why, no
+// error, and the close backs off like a failed one.
+func (w *reviewerSweep) notClosable(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost, code, why string) bool {
 	if kind := w.terminalEvent(ctx, hs, l.name); kind != "" {
 		w.s.reapRetrySucceeded(w.r.Name, l.name)
 		w.abandoned[l.name] = true
-		w.record(gate, "closed", "already closed (job_unknown, terminal event "+kind+")")
+		w.record(gate, "closed", "already closed ("+code+", terminal event "+kind+")")
 		return true
 	}
-	w.s.reapRetryFailed(w.r.Name, l.name, reviewerNotClosable, reapPass(ctx))
-	w.record(gate, "kept", reviewerNotClosable)
+	w.s.reapRetryFailed(w.r.Name, l.name, why, reapPass(ctx))
+	w.record(gate, "kept", why)
 	return false
 }
 
@@ -1309,6 +1324,9 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		}
 		if unknownJobRefusal(e) {
 			return w.unknownJob(ctx, gate, l, hs)
+		}
+		if scopeForbiddenRefusal(e) {
+			return w.notClosable(ctx, gate, l, hs, "scope_forbidden", reviewerOutOfScope)
 		}
 		// The row's reason is the retry key a restart restores
 		// (closeRetryBlocked), so both carry the same text.

@@ -231,3 +231,43 @@ func notClosableRows(t *testing.T, f *stuckFix) []reapReceipt {
 	}
 	return out
 }
+
+// (e) A close the hub refuses as scope_forbidden (the job belongs to a lane
+// this credential may not close) is settled like job_unknown: with no terminal
+// event the label gets one kept row and no error, and the close backs off.
+// Live case 2026-11-21: three reviewers operator-desk closed on 11-06.
+func TestReapReviewerScopeForbiddenWithoutTerminalEventIsKept(t *testing.T) {
+	f := newReviewerFix(t)
+	merged := "2026-11-04T10:00:00Z"
+	f.s.GH = &stateGH{pull: github.Pull{Number: 12, State: "closed", Merged: true, MergedAt: &merged, Head: github.Ref{SHA: headSHA}}}
+	label := reviewerLabelFor(12, time.Hour)
+	f.addReviewer(label, "w1:p5")
+	rec := f.sink.recs[label]
+	rec.State, rec.OwnerLane = "spawned", "lane-x"
+	f.sink.recs[label] = rec
+	f.setPane("w1:p5", "agent_status", "done")
+	f.hub.jobResult = json.RawMessage(`{"found":true,"completed":false}`)
+	refuseJobClose(f, "panewire job: close refused: scope_forbidden")
+
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.jobCloses()); n != 1 {
+		t.Fatalf("job closes=%d: %v", n, rowSummary(f.rows(t)))
+	}
+	var kept int
+	for _, r := range f.rows(t) {
+		if r.Result == "error" {
+			t.Fatalf("error row: %v", rowSummary(f.rows(t)))
+		}
+		if r.Result == "kept" && r.Reason == reviewerOutOfScope {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Fatalf("out-of-scope rows=%d: %v", kept, rowSummary(f.rows(t)))
+	}
+}
