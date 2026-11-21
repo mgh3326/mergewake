@@ -346,22 +346,24 @@ readiness checks satisfied. Final green CI is still required at landing.
 
 1. Docs-only: no model review only for <=50 changed lines when every change is
    an allowlisted prose file and no executable/config/build/generator/symlink/
-   submodule change exists. Larger docs-only diffs get one cross-family
-   delta-scale pass.
+   submodule change exists. Larger docs-only diffs get one delta-scale review
+   pass.
    Classifier uncertainty requires full review. The gate records the exemption
    against exact head and policy; CI and disposition checks still apply.
-2. First code-ready patch: one full cross-family pass. Explicit stricter
+2. First code-ready patch: one full review pass, from any reviewer family;
+   another family is preferred when one is available. Explicit stricter
    blocking-path policy can require more passes; the server does not silently
    weaken a repository's required evidence.
-3. Equal nonempty stable patch-id: reuse only trusted cross-family evidence
-   with matching repository/PR, policy/context/classification and review scope.
-   Preserve chain provenance and revalidate current CI, base and findings.
-   Empty/unknown patch IDs never compare equal. A delta receipt alone cannot
-   stand for an initial full pass; its full-pass chain must validate.
-4. Small fix: one cross-family delta pass with prior findings and acceptance
-   context. Initial conservative bound: <=200 added/deleted lines, <=5 files,
-   no policy/dependency/interface/security-sensitive path change. Unreadable or
-   broader changes require full review, while retaining the cycle budget.
+3. Equal nonempty stable patch-id: reuse trusted evidence from any reviewer
+   family with matching repository/PR, policy/context/classification and review
+   scope. Preserve chain provenance and revalidate current CI, base and
+   findings. Empty/unknown patch IDs never compare equal. A delta receipt alone
+   cannot stand for an initial full pass; its full-pass chain must validate.
+4. Small fix: one delta review pass, from any reviewer family, with prior
+   findings and acceptance context. Initial conservative bound: <=200
+   added/deleted lines, <=5 files, no policy/dependency/interface/
+   security-sensitive path change. Unreadable or broader changes require full
+   review, while retaining the cycle budget.
 5. Initial pass plus at most two changed-patch fix rounds per cycle. Rebase-only
    equivalent patches do not consume a fix round. If findings remain after
    round two, enter blocked_author, stop automatic reviews/fixes, and notify the

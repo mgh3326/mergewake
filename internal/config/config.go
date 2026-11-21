@@ -1518,9 +1518,8 @@ func validateProfiles(c *Config) error {
 		}
 		pairings[canonical] = names
 		for _, name := range names {
-			p, ok := c.Review.Profiles[name]
-			if !ok || p.Family == canonical {
-				return errors.New("pairings must name configured profiles from a different family")
+			if _, ok := c.Review.Profiles[name]; !ok {
+				return errors.New("pairings must name configured profiles")
 			}
 		}
 	}

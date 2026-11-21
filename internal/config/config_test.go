@@ -576,6 +576,30 @@ review:
 	}
 }
 
+// A pairing may name a profile of the same family as its key (decision 462: a
+// same-family review pass counts in full), but it must still name a configured
+// profile.
+func TestPairingsAcceptSameFamilyRejectUnknownProfile(t *testing.T) {
+	load := func(pairings string) error {
+		yaml := "version: 1\nhost: host-a\nreview:\n  profiles:\n" +
+			"    sonnet: {family: sonnet, command: pi, args: [--model, m1]}\n" +
+			"    gpt: {family: codex, command: pi, args: [--model, m2]}\n" +
+			"  pairings:\n" + pairings
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if e := os.WriteFile(p, []byte(yaml), 0600); e != nil {
+			t.Fatal(e)
+		}
+		_, e := Load(p)
+		return e
+	}
+	if e := load("    claude: [sonnet]\n"); e != nil {
+		t.Fatalf("same-family pairing refused: %v", e)
+	}
+	if e := load("    claude: [ghost]\n"); e == nil {
+		t.Fatal("pairing naming an unconfigured profile accepted")
+	}
+}
+
 // fallback_lane defaults to the operator lane; default_family must name a
 // configured profile family and normalises like every other family key.
 func TestFallbackLaneAndDefaultFamily(t *testing.T) {
