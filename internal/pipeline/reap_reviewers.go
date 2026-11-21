@@ -1014,7 +1014,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 			return w.unknownJob(ctx, gate, l, hs)
 		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+e.Error())
+		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
@@ -1308,7 +1308,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 			return w.unknownJob(ctx, gate, l, hs)
 		}
 		w.s.reapRetryFailed(w.r.Name, l.name, e.Error(), reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+e.Error())
+		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
