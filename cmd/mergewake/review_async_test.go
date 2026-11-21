@@ -54,11 +54,27 @@ type asyncRunner struct {
 	// that asked to wait.
 	labels map[int][]string
 	waited int
+	// refusePlacement makes every spawn answer as panewire does when no
+	// placement candidate at all can take it, so a give-up's replacement is
+	// waited out at the pool's reset (hk 6023).
+	refusePlacement bool
+}
+
+func (r *asyncRunner) refuseSpawns(on bool) {
+	r.mu.Lock()
+	r.refusePlacement = on
+	r.mu.Unlock()
 }
 
 func (r *asyncRunner) Run(ctx context.Context, command string, args []string, _, _ string) ([]byte, error) {
 	if command != "panewire" || len(args) == 0 || args[0] != "spawn" {
 		return nil, nil
+	}
+	r.mu.Lock()
+	refuse := r.refusePlacement
+	r.mu.Unlock()
+	if refuse {
+		return nil, noCandidateErr()
 	}
 	brief, err := os.ReadFile(args[slices.Index(args, "-p")+1])
 	if err != nil {

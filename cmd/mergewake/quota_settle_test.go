@@ -15,11 +15,33 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
+// noCandidateExit is a panewire spawn refused because no host or placement
+// candidate could take it (exit 81 with its refusal text).
+type noCandidateExit struct{}
+
+func (noCandidateExit) Error() string { return "spawn refused" }
+func (noCandidateExit) ExitCode() int { return 81 }
+
+func noCandidateErr() error {
+	return &integrations.CommandError{Command: "panewire", Err: noCandidateExit{}, Stderr: "spawn refused: no placement candidate accepted spawn; no local fallback"}
+}
+
 // quotaRunner places a reviewer and returns at once, as the async fixture's
 // runner does; every other command succeeds with no output.
 type quotaRunner struct {
 	mu     sync.Mutex
 	spawns int
+	placed int
+	// refuse placement makes every spawn answer as panewire does when no
+	// placement candidate at all can take it: a give-up's replacement is then
+	// waited out at the pool's reset (hk 6023).
+	refusePlacement bool
+}
+
+func (r *quotaRunner) refuseSpawns(on bool) {
+	r.mu.Lock()
+	r.refusePlacement = on
+	r.mu.Unlock()
 }
 
 func (r *quotaRunner) Run(_ context.Context, command string, args []string, _, _ string) ([]byte, error) {
@@ -28,8 +50,23 @@ func (r *quotaRunner) Run(_ context.Context, command string, args []string, _, _
 	}
 	r.mu.Lock()
 	r.spawns++
+	refuse := r.refusePlacement
+	r.mu.Unlock()
+	if refuse {
+		return nil, noCandidateErr()
+	}
+	r.mu.Lock()
+	r.placed++
 	r.mu.Unlock()
 	return []byte("OK pane=p1 host=node-a status=working landed=yes\n"), nil
+}
+
+// placed counts the reviewers this runner actually placed; a refused spawn is
+// no reviewer.
+func (r *quotaRunner) placedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.placed
 }
 
 func (r *quotaRunner) count() int {
@@ -115,8 +152,8 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 	if skipped, evaluated := runSkippedPassWithin(t, ctx, "first pass", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("first pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
-	if runner.count() != 1 {
-		t.Fatalf("spawns=%d, want 1", runner.count())
+	if runner.placedCount() != 1 {
+		t.Fatalf("reviewers placed=%d, want 1", runner.placedCount())
 	}
 
 	// A completion marker appears with no receipt, and the placed reviewer's
@@ -125,6 +162,9 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 	reset := now.Add(10 * time.Minute)
 	f.hub.refs["mergewake/reviews/1/"+hubHead(1)+"-done"] = hubHead(1)
 	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset.Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
+	// A give-up is replaced at once; no placement candidate is left here, so
+	// the pass falls back to waiting for the pool's reset.
+	runner.refuseSpawns(true)
 	if skipped, evaluated := runSkippedPassWithin(t, ctx, "quota pass", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("quota pass: skipped=%d evaluated=%d", skipped, evaluated)
 	}
@@ -143,10 +183,11 @@ func TestQuotaStoppedOnlyEvaluationIsNotSettled(t *testing.T) {
 
 	// At the reset the retry runs and places a fresh reviewer.
 	now = reset.Add(time.Second)
+	runner.refuseSpawns(false)
 	if skipped, evaluated := runSkippedPassWithin(t, ctx, "after the reset", f, skips, logs); evaluated != 1 || skipped != 0 {
 		t.Fatalf("after the reset: skipped=%d evaluated=%d", skipped, evaluated)
 	}
-	if runner.count() != 2 {
-		t.Fatalf("spawns=%d, want a retry once the pool resets", runner.count())
+	if runner.placedCount() != 2 {
+		t.Fatalf("reviewers placed=%d, want a retry once the pool resets", runner.placedCount())
 	}
 }

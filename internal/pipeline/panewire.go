@@ -321,9 +321,11 @@ type collectionFailure struct{ err error }
 func (e *collectionFailure) Error() string { return e.err.Error() }
 func (e *collectionFailure) Unwrap() error { return e.err }
 
-// reviewQuotaStopped is a reviewer panewire stopped on an exhausted quota pool
-// before it produced a result. It is no review failure and no lost result: the
-// pass is retried once the pool resets (ResetAt zero when unknown).
+// reviewQuotaStopped is a reviewer panewire gave up on (or, when the gave-up
+// reviewer's replacement found no placement candidate at all, that
+// replacement): no result was produced and the pass is retried once the pool
+// resets (ResetAt zero when unknown). A give-up alone is a loss mergewake
+// replaces at once; this wait is its fallback only (hk 6023).
 type reviewQuotaStopped struct {
 	label, pool string
 	resetAt     time.Time
@@ -1063,6 +1065,13 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			stdout, e = place(runCtx, retry)
 			tracing.Finish(runSpan)
 		}
+		// A give-up's replacement that finds no placement candidate at all,
+		// with the stopped pool left out or after the one retry without it,
+		// does not drop the review: the pass waits for the pool's reset as a
+		// quota stop always did (hk 6023).
+		if e != nil && ctx.Err() == nil && plan.givenUp != nil && noCandidateRefusal(stdout, e) {
+			return out, x.giveUpWait(ctx, plan, rj, plan.givenUp, leaseSHA)
+		}
 		if e != nil && !resumed && exitStatus(e) == panewireRefused && ctx.Err() == nil {
 			note = "panewire admitted no reviewer outside the author family; ran as a worker seat"
 			rj.Args = workerSeatArgs(rj.Args)
@@ -1264,16 +1273,26 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		}
 		return out, fmt.Errorf("%w: reviewer replaced by %s", errPassPending, replacement)
 	case quota:
-		// panewire stopped the reviewer on an exhausted pool: no result was
-		// ever lost. The record goes with the lease, so the pass retried after
-		// the reset starts a fresh reviewer with its one replacement unspent.
-		stopped := &reviewQuotaStopped{label: label, pool: pool, resetAt: resetAt}
-		if e := s.audit(x.repo.Name, "review-quota-stopped", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "pool": pool, "reset_at": stopped.resetText()}, false); e != nil {
-			return out, errors.Join(stopped, e)
+		// panewire ended the reviewer on an exhausted pool with no successor:
+		// no other pool could take it (hk 5690). That is a loss mergewake
+		// replaces now through the same accounting as a real loss, leaving the
+		// stopped pool out of the replacement's placement (hk 6023). Only if no
+		// candidate is left at all does the pass wait for the pool's reset,
+		// as it always did (giveUpWait).
+		givenUp := &reviewQuotaStopped{label: label, pool: pool, resetAt: resetAt}
+		if e := s.audit(x.repo.Name, "review-quota-given-up", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "pass": plan.pass, "label": label, "pool": pool, "reset_at": givenUp.resetText(), "replacements": rj.Replacements}, false); e != nil {
+			return out, errors.Join(givenUp, e)
 		}
-		x.releaseLease(ctx, plan, leaseSHA, "reviewer-quota-stopped", "")
-		x.note("quota-stopped", rj)
-		return out, stopped
+		x.noteResultLost(plan, label, res.rec.Host, "quota give-up on pool "+quotaPoolText(pool))
+		plan.givenUp = givenUp
+		// The replacement is the pass's now: its record stays, and the given-up
+		// pane is closed by replaceLostReviewer, not by this run's cleanup.
+		keepJob, cleanupPane = true, false
+		rec := res.rec
+		// end_reason names the stop's own pool (panewire hk 5690), which is the
+		// one to leave out of the replacement's placement.
+		rec.Pool = pool
+		return x.replaceLostReviewer(ctx, plan, rj, rec, "reviewer gave up on quota pool "+quotaPoolText(pool), leaseSHA)
 	case res.reason == "escalated" || res.reason == "lost":
 		pane.hold = "reviewer job " + res.reason + "; the pane stays for the operator"
 		return skip("reviewer job record %s", res.reason)
@@ -1873,6 +1892,32 @@ func (x *panewireExecutor) awaitNudge(revisit Revisit, rj reviewerJob, due time.
 		revisit(x.repo.Name, x.pr.Number, rj.Label, due.Add(revisitMargin))
 	}
 	return fmt.Errorf("%w: reviewer %s was nudged to write its output; its result or the end of the nudge wait brings the PR back", errPassPending, rj.Label)
+}
+
+// quotaPoolText names a give-up's pool in prose, "an unnamed pool" when
+// panewire's end_reason named none.
+func quotaPoolText(pool string) string {
+	if pool == "" {
+		return "an unnamed pool"
+	}
+	return pool
+}
+
+// giveUpWait is the older quota-stop behaviour, kept as the fallback of a
+// give-up's replacement: when its spawn finds no placement candidate even
+// without the stopped pool left out, the review is not dropped. The failed
+// attempt's record goes with the lease, so the run after the pool's reset
+// starts a fresh reviewer with its one replacement unspent (hk 6023).
+func (x *panewireExecutor) giveUpWait(ctx context.Context, plan *passPlan, rj reviewerJob, stopped *reviewQuotaStopped, leaseSHA string) error {
+	if e := x.s.audit(x.repo.Name, "review-quota-stopped", map[string]any{"pr": x.pr.Number, "head": x.pr.Head.SHA, "pass": plan.pass, "label": stopped.label, "pool": stopped.pool, "reset_at": stopped.resetText(), "replacement": rj.Label}, false); e != nil {
+		return errors.Join(stopped, e)
+	}
+	if e := x.s.dropReviewerJob(x.repo.Name, x.pr.Number, plan.pass); e != nil {
+		return errors.Join(stopped, e)
+	}
+	x.releaseLease(ctx, plan, leaseSHA, "reviewer-quota-stopped", "")
+	x.note("quota-stopped", rj)
+	return stopped
 }
 
 // replaceLostReviewer is the lost path for a resumed reviewer that will not

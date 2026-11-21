@@ -85,6 +85,10 @@ type panewireRunner struct {
 	// does when no host or placement candidate is left outside the excluded pools:
 	// exit 81 with its refusal text, and nothing placed.
 	noCandidateExcluded bool
+	// noCandidateAlways makes every spawn answer as panewire does when no host
+	// or placement candidate at all can take it: exit 81 with its refusal text,
+	// and nothing placed.
+	noCandidateAlways bool
 
 	headless int
 	remote   *taskJobSink
@@ -192,6 +196,9 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 		}
 		if r.noCandidateExcluded && slices.Contains(args, "--exclude-pool") {
 			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(81), Stderr: "spawn refused: no placement candidate accepted spawn; no local fallback"}
+		}
+		if r.noCandidateAlways {
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(81), Stderr: "spawn refused: no host admitted spawn; no local fallback"}
 		}
 		if r.specRefused && slices.Contains(args, "--checkout-origin") {
 			// panewire's pre-submit feature check: no request, job or pane.

@@ -150,6 +150,9 @@ func TestEngineQuotaStoppedPassLeavesThePendingTimerArmed(t *testing.T) {
 	// The reviewer's hk record says panewire stopped it on an exhausted pool.
 	reset := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	a.sink.set(label, integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + reset, Host: "node-a", PaneID: "p1"})
+	// The give-up's replacement has no placement candidate left, so the pass
+	// waits for the pool's reset rather than placing another reviewer.
+	a.runner.refuseSpawns(true)
 	a.e.q.EnqueueNamed(daemon.SourceReviewer, repo, 1, "")
 	a.idle(t, "the quota-stop pass ends")
 

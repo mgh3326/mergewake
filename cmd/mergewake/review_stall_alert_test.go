@@ -180,6 +180,9 @@ func TestQuotaStoppedReviewStallNamesThePool(t *testing.T) {
 	// Past the window the reviewer is found stopped on an exhausted pool.
 	s.clock.advance(61 * time.Minute)
 	sink.setRecord(integrations.JobRecord{State: "lost", EndReason: "quota_stop pool=seat reset_at=" + s.clock.past(time.Minute).Format(time.RFC3339), Host: "node-a", PaneID: "p1"})
+	// The give-up's replacement has no placement candidate left, so the pass
+	// waits for the pool's reset and is reported as quota-stopped.
+	runner.refuseSpawns(true)
 	s.pass(t)
 	got := s.alerts.texts()
 	if len(got) != 1 {

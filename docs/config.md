@@ -703,7 +703,7 @@ the same counts and kept list.
 | --- | --- | --- |
 | `login` | Required | GitHub identity posting the independent exact-head review. |
 | `fleet_authors` | Empty | Additional fleet accounts. Their replies count under the same fix and dismissal checks as `login`. A PR that `login` or one of these accounts opened must carry a task under `executor: panewire` (see [Blocked fleet reviews](#blocked-fleet-reviews)). |
-| `timeout` | `10m` | Bounds reviewer placement, execution and submission. |
+| `timeout` | `10m` | Bounds reviewer placement, execution and submission. A live reviewer record is never declared lost or replaced before this budget is spent; it must outlast panewire's ten-minute carry window for a quota-stopped reviewer, which the default does. |
 | `default_grade` | `B` | Fallback grade shown in review plans when the PR has no `Mergewake-Grade: A` body trailer. Accepted grades, weakest to strongest: `C`, `B`, `A`, `A+`, `S`, `S+`, `SS`. Panewire placement uses the task title grade and tier. Outcomes never use this fallback. |
 | `first_round_grade` | `{B: A, C: A}` | Map from PR grade to the grade asked for every reviewer pass of the PR's first review round, so the round that reads the whole diff gets a stronger reviewer than the rounds that read only the delta. The PR grade is the `Mergewake-Grade` trailer, else `default_grade`; a grade not in the map (A and above) is asked at the PR grade, as is every later round. Round one is the PR's first review round: no patch of an earlier head was reviewed (the same count the merge gate uses for rounds), so a later whole-diff review of the same PR, such as a delta that fell back to the whole diff or a head after `base_stale`, is not round one. A raised grade reaches panewire as `spawn --grade`; an unraised pass sends no `--grade` and panewire uses the task title grade. Keys and values must be accepted grades or the config does not load; an empty map (`first_round_grade: {}`) turns the raise off. Each `review` audit row records `pr_grade`, `grade_asked`, `first_round` and the `seat` that ran. |
 | `default_family` | Empty | Reviewer family used when the PR has no author-family trailer and the head commit's Co-Authored-By/author identities hold no known model alias. Must name a configured profile family; reviewed heads record the inference. |
@@ -815,6 +815,23 @@ With `executor: panewire` each missing pass is first offered to a reviewer pane:
    was sent. The lost reviewers of a pass stay in `replaced-reviewers/<pr>-p<pass>.json`
    beyond the reviewer record, so a later spawn of that pass still excludes their
    pools.
+   A reviewer's hk record that ended `lost` with an end_reason
+   `quota_stop pool=<p> ... replaced_by=<job>` was carried by panewire onto
+   another pool, not lost: the pass follows `<job>` (at most the two hops
+   panewire writes, `<old>-q1` and `<old>-q1-q2`), writes
+   `review-reviewer-replaced` with the stop's pool, counts no loss and spawns
+   no reviewer of its own. The same end_reason with no `replaced_by=` is a
+   give-up: no other pool could take the review. The pass writes
+   `review-quota-given-up` with the pool, counts the review as lost
+   (`review-result-lost`) and replaces it at once through the lost path,
+   leaving the give-up's own pool out of the replacement's placement. When the
+   pass's replacement is already spent, a give-up behaves as a spent lost
+   result. When no placement candidate is left even without the exclusion, the
+   pass does not drop the review: it writes `review-quota-stopped` and waits
+   for that pool's reset, and the failed attempt's record goes so the run after
+   the reset starts a fresh reviewer with its one replacement unspent. A live
+   record is never a loss before `review.timeout`, which outlasts panewire's
+   ten-minute carry window.
    The hub's `checkout_spec_v1` support is read by panewire itself: it asks the
    hub for the feature before it submits, and stops with exit 2 (`hub does not
    support --checkout-origin`) or 70 (`unable to verify hub support`) before a

@@ -108,6 +108,21 @@ func TestQuotaReplacementChain(t *testing.T) {
 	if f.g.postCount != 1 {
 		t.Fatalf("posts=%d", f.g.postCount)
 	}
+	// A carried chain is not a loss: no row counts a lost result, nothing was
+	// given up, and mergewake spawned no replacement of its own.
+	if rows := auditRows(t, f.s, f.r, "review-result-lost"); len(rows) != 0 {
+		t.Fatalf("a carried chain counted a lost result: %v", rows)
+	}
+	if rows := auditRows(t, f.s, f.r, "review-quota-given-up"); len(rows) != 0 {
+		t.Fatalf("a carried chain was counted given up: %v", rows)
+	}
+	if len(f.runner.spawns) != 1 {
+		t.Fatalf("a carried chain spawned a replacement: %v", spawnExclusions(f.runner.spawns))
+	}
+	carried := auditRows(t, f.s, f.r, "review-reviewer-replaced")
+	if len(carried) != 2 || carried[0]["pool"] != "p" || carried[1]["pool"] != "p" {
+		t.Fatalf("carried rows = %v, want one per hop", carried)
+	}
 }
 
 func TestQuotaReplacementMissingRevisitsSoon(t *testing.T) {

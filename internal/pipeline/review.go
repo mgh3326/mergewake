@@ -119,6 +119,11 @@ type passPlan struct {
 	// replaced are the reviewers this pass replaced for a lost result; the
 	// replacement's record carries them, so their late result can still complete the pass.
 	replaced []replacedReviewer
+	// givenUp is the quota give-up this pass is replacing, set only while its
+	// replacement spawn is placed: if no placement candidate is left even
+	// without the stopped pool, the pass waits for that pool's reset instead of
+	// dropping the review (hk 6023).
+	givenUp *reviewQuotaStopped
 }
 
 // passFailure is a pass that did not post, with the pass number and the
