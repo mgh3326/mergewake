@@ -1031,11 +1031,13 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		if scopeForbiddenRefusal(e) {
 			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
 		}
-		// The row's reason is the retry key a restart restores
-		// (closeRetryBlocked), so both carry the same text.
-		failure := fleetevent.Redact(integrations.Detail(e))
-		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+failure)
+		// The retry key is the failure id, not the reason: the reason keeps
+		// stderr, which can change per call. The row carries the id so a
+		// restart restores the same backoff (closeRetryBlocked).
+		key := abandonRetryKey(e)
+		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryKey = key
+		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
@@ -1085,11 +1087,11 @@ func (w *reviewerSweep) settleScopeForbidden(ctx context.Context, gate reapRecei
 		return true
 	}
 	if w.ownsJob(job) {
-		// The row's reason is the retry key a restart restores
-		// (closeRetryBlocked), so both carry the same text.
-		failure := fleetevent.Redact(integrations.Detail(closeErr))
-		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+failure)
+		// The retry key is the failure id (abandonRetryKey), kept on the row.
+		key := abandonRetryKey(closeErr)
+		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryKey = key
+		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(closeErr)))
 		w.noteScopeForbidden(ctx, l, job, closeErr)
 		return false
 	}
@@ -1201,7 +1203,12 @@ func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 	}
 	for _, row := range w.streams[label] {
 		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") {
-			return w.s.reapRetryRestore(w.r.Name, label, strings.TrimPrefix(row.Reason, "abandon job: "), pass)
+			key := row.RetryKey
+			if key == "" {
+				// A row an older version wrote has no id: its reason is the key.
+				key = strings.TrimPrefix(row.Reason, "abandon job: ")
+			}
+			return w.s.reapRetryRestore(w.r.Name, label, key, pass)
 		}
 		if row.Result == "kept" && (row.Reason == reviewerNotClosable || row.Reason == reviewerOutOfScope) {
 			return w.s.reapRetryRestore(w.r.Name, label, row.Reason, pass)
@@ -1399,11 +1406,13 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		if scopeForbiddenRefusal(e) {
 			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
 		}
-		// The row's reason is the retry key a restart restores
-		// (closeRetryBlocked), so both carry the same text.
-		failure := fleetevent.Redact(integrations.Detail(e))
-		w.s.reapRetryFailed(w.r.Name, l.name, failure, reapPass(ctx))
-		w.record(gate, "error", "abandon job: "+failure)
+		// The retry key is the failure id, not the reason: the reason keeps
+		// stderr, which can change per call. The row carries the id so a
+		// restart restores the same backoff (closeRetryBlocked).
+		key := abandonRetryKey(e)
+		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryKey = key
+		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
 	}
 	w.s.reapRetrySucceeded(w.r.Name, l.name)
