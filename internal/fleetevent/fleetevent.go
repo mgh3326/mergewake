@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 // Event is the fleet-event v1 record.
@@ -99,7 +101,6 @@ func (w *Writer) Emit(kind, job, outcome, reason, detail string) bool {
 	if err != nil {
 		return false
 	}
-	line = append(line, '\n')
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	// Group-readable (0750 dir, 0640 file): on Linux the alloy system user
@@ -107,17 +108,8 @@ func (w *Writer) Emit(kind, job, outcome, reason, detail string) bool {
 	if os.MkdirAll(filepath.Dir(w.Path), 0o750) != nil {
 		return false
 	}
-	w.rotate(int64(len(line)))
-	f, err := os.OpenFile(w.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o640)
-	if err != nil {
-		return false
-	}
-	// One write per line: O_APPEND keeps concurrent writers' lines whole.
-	_, err = f.Write(line)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	return err == nil
+	w.rotate(int64(len(line)) + 1)
+	return fsutil.AppendLineMode(w.Path, 0o750, 0o640, line) == nil
 }
 
 // rotate renames the file to <path>.1 when the next line would cross

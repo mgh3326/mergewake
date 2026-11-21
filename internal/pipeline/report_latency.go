@@ -1,18 +1,14 @@
 package pipeline
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/outcomes"
 )
@@ -132,31 +128,9 @@ func observe(m map[latencyKey]time.Time, k latencyKey, t time.Time) {
 		m[k] = t
 	}
 }
-func scanFile(path string, fn func([]byte) error) error {
-	f, e := os.Open(path)
-	if errors.Is(e, os.ErrNotExist) {
-		return nil
-	}
-	if e != nil {
-		return e
-	}
-	defer f.Close()
-	s := bufio.NewScanner(f)
-	s.Buffer(make([]byte, 4096), 8<<20)
-	for s.Scan() {
-		if e := fn(s.Bytes()); e != nil {
-			return fmt.Errorf("%s: %w", path, e)
-		}
-	}
-	return s.Err()
-}
 func observations(dir string, repos []config.Repo) (map[latencyKey]time.Time, error) {
 	m := map[latencyKey]time.Time{}
-	e := scanFile(filepath.Join(dir, "outcomes.jsonl"), func(b []byte) error {
-		var ev outcomes.Event
-		if e := json.Unmarshal(b, &ev); e != nil {
-			return e
-		}
+	e := fsutil.ScanJSONL(filepath.Join(dir, "outcomes.jsonl"), func(ev outcomes.Event) error {
 		if ev.Kind == "outcome" && ev.Outcome != nil {
 			v := ev.Outcome
 			observe(m, latencyKey{v.Repo, v.PR, v.Head}, ev.At)
@@ -167,17 +141,13 @@ func observations(dir string, repos []config.Repo) (map[latencyKey]time.Time, er
 		return nil, e
 	}
 	for _, repo := range repos {
-		e = scanFile(filepath.Join(dir, repo.Name, "decisions.jsonl"), func(b []byte) error {
-			var ev struct {
-				Time  time.Time `json:"time"`
-				Value struct {
-					PR   int    `json:"pr"`
-					Head string `json:"head"`
-				} `json:"value"`
-			}
-			if e := json.Unmarshal(b, &ev); e != nil {
-				return e
-			}
+		e = fsutil.ScanJSONL(filepath.Join(dir, repo.Name, "decisions.jsonl"), func(ev struct {
+			Time  time.Time `json:"time"`
+			Value struct {
+				PR   int    `json:"pr"`
+				Head string `json:"head"`
+			} `json:"value"`
+		}) error {
 			observe(m, latencyKey{repo.Name, ev.Value.PR, ev.Value.Head}, ev.Time)
 			return nil
 		})

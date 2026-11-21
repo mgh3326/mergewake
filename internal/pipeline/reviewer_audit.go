@@ -101,7 +101,11 @@ func (s *Service) reviewerAuditLabels(repo string) (map[string]reviewerAudit, in
 				Pane  string `json:"pane"`
 			} `json:"value"`
 		}
-		if json.Unmarshal([]byte(line), &row) != nil || row.Command == "" || row.Value.Label == "" {
+		if json.Unmarshal([]byte(line), &row) != nil {
+			fsutil.SkipWindow(path, off, []byte(line))
+			continue
+		}
+		if row.Command == "" || row.Value.Label == "" {
 			continue
 		}
 		// Only reviewer labels are candidates here; every reviewer audit row

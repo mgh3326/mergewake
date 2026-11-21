@@ -1,12 +1,10 @@
 package pipeline
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -247,28 +245,23 @@ func (s *Service) AckLiveness(mechanism, reason string) error {
 	// recovery row would otherwise land after that row in file order and
 	// silence a later, unrelated stall.
 	latestDay, latestStalled := "", false
-	if f, err := os.Open(filepath.Join(s.state(target.Name), "decisions.jsonl")); err == nil {
-		rd := bufio.NewReader(f)
-		for {
-			line, err := rd.ReadBytes('\n')
-			if len(line) > 0 {
-				var row struct {
-					Command string          `json:"command"`
-					Value   json.RawMessage `json:"value"`
-				}
-				if json.Unmarshal(line, &row) == nil && row.Command == livenessDailyCommand {
-					var v struct {
-						Day       string `json:"day"`
-						Mechanism string `json:"mechanism"`
-						Stalled   bool   `json:"stalled"`
-					}
-					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism == norm && v.Day >= latestDay {
-						latestDay, latestStalled = v.Day, v.Stalled
-					}
-				}
+	jsonlPath := filepath.Join(s.state(target.Name), "decisions.jsonl")
+	if f, err := os.Open(jsonlPath); err == nil {
+		jl := fsutil.NewJSONL(jsonlPath, 0, f)
+		for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+			var row struct {
+				Command string          `json:"command"`
+				Value   json.RawMessage `json:"value"`
 			}
-			if err != nil {
-				break
+			if json.Unmarshal(line, &row) == nil && row.Command == livenessDailyCommand {
+				var v struct {
+					Day       string `json:"day"`
+					Mechanism string `json:"mechanism"`
+					Stalled   bool   `json:"stalled"`
+				}
+				if json.Unmarshal(row.Value, &v) == nil && v.Mechanism == norm && v.Day >= latestDay {
+					latestDay, latestStalled = v.Day, v.Stalled
+				}
 			}
 		}
 		_ = f.Close()
@@ -543,7 +536,8 @@ type livenessDailyValue struct {
 
 func (s *Service) livenessDailyRows(repo, day string) (map[string]livenessDailyValue, error) {
 	rows := map[string]livenessDailyValue{}
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return rows, nil
 	}
@@ -551,37 +545,32 @@ func (s *Service) livenessDailyRows(repo, day string) (map[string]livenessDailyV
 		return nil, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day       string  `json:"day"`
-					Mechanism string  `json:"mechanism"`
-					Made      int     `json:"made"`
-					Done      int     `json:"done"`
-					Ratio     float64 `json:"ratio"`
-					Stalled   bool    `json:"stalled"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == livenessDailyCommand && row.Value.Day == day {
-				rows[row.Value.Mechanism] = livenessDailyValue{
-					Made:    row.Value.Made,
-					Done:    row.Value.Done,
-					Ratio:   row.Value.Ratio,
-					Stalled: row.Value.Stalled,
-				}
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day       string  `json:"day"`
+				Mechanism string  `json:"mechanism"`
+				Made      int     `json:"made"`
+				Done      int     `json:"done"`
+				Ratio     float64 `json:"ratio"`
+				Stalled   bool    `json:"stalled"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return rows, nil
+		if json.Unmarshal(line, &row) == nil && row.Command == livenessDailyCommand && row.Value.Day == day {
+			rows[row.Value.Mechanism] = livenessDailyValue{
+				Made:    row.Value.Made,
+				Done:    row.Value.Done,
+				Ratio:   row.Value.Ratio,
+				Stalled: row.Value.Stalled,
 			}
-			return nil, err
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (s *Service) livenessRowsWritten(repo, day string) (map[string]bool, error) {
@@ -597,7 +586,8 @@ func (s *Service) livenessRowsWritten(repo, day string) (map[string]bool, error)
 }
 
 func (s *Service) livenessNoticeWritten(repo, day, mech string) (bool, error) {
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -605,32 +595,28 @@ func (s *Service) livenessNoticeWritten(repo, day, mech string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day       string `json:"day"`
-					Mechanism string `json:"mechanism"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == livenessNoticeCommand && row.Value.Day == day && row.Value.Mechanism == mech {
-				return true, nil
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day       string `json:"day"`
+				Mechanism string `json:"mechanism"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return false, nil
-			}
-			return false, err
+		if json.Unmarshal(line, &row) == nil && row.Command == livenessNoticeCommand && row.Value.Day == day && row.Value.Mechanism == mech {
+			return true, nil
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Service) livenessNoticeRow(repo, day, mech string) (livenessNoticeReceipt, bool, error) {
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return livenessNoticeReceipt{}, false, nil
 	}
@@ -638,41 +624,36 @@ func (s *Service) livenessNoticeRow(repo, day, mech string) (livenessNoticeRecei
 		return livenessNoticeReceipt{}, false, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day       string  `json:"day"`
-					Mechanism string  `json:"mechanism"`
-					Made      int     `json:"made"`
-					Done      int     `json:"done"`
-					Ratio     float64 `json:"ratio"`
-					Lane      string  `json:"lane"`
-					Via       string  `json:"via"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == livenessNoticeCommand && row.Value.Day == day && row.Value.Mechanism == mech {
-				return livenessNoticeReceipt{
-					Mechanism: row.Value.Mechanism,
-					Day:       row.Value.Day,
-					Made:      row.Value.Made,
-					Done:      row.Value.Done,
-					Ratio:     row.Value.Ratio,
-					Lane:      row.Value.Lane,
-					Via:       row.Value.Via,
-				}, true, nil
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day       string  `json:"day"`
+				Mechanism string  `json:"mechanism"`
+				Made      int     `json:"made"`
+				Done      int     `json:"done"`
+				Ratio     float64 `json:"ratio"`
+				Lane      string  `json:"lane"`
+				Via       string  `json:"via"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return livenessNoticeReceipt{}, false, nil
-			}
-			return livenessNoticeReceipt{}, false, err
+		if json.Unmarshal(line, &row) == nil && row.Command == livenessNoticeCommand && row.Value.Day == day && row.Value.Mechanism == mech {
+			return livenessNoticeReceipt{
+				Mechanism: row.Value.Mechanism,
+				Day:       row.Value.Day,
+				Made:      row.Value.Made,
+				Done:      row.Value.Done,
+				Ratio:     row.Value.Ratio,
+				Lane:      row.Value.Lane,
+				Via:       row.Value.Via,
+			}, true, nil
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return livenessNoticeReceipt{}, false, err
+	}
+	return livenessNoticeReceipt{}, false, nil
 }
 
 // activeLivenessAcks returns active answers by mechanism.
@@ -681,7 +662,8 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 	active := map[string]string{}
 	ackStalledDay := map[string]string{}
 	lastStalledDay := map[string]string{}
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return active, nil
 	}
@@ -691,60 +673,55 @@ func (s *Service) activeLivenessAcks(repo, currentDay string) (map[string]string
 	defer f.Close()
 
 	// Scan rows in order
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Time    time.Time       `json:"time"`
-				Command string          `json:"command"`
-				Value   json.RawMessage `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil {
-				switch row.Command {
-				case livenessDailyCommand:
-					var v struct {
-						Day       string `json:"day"`
-						Mechanism string `json:"mechanism"`
-						Stalled   bool   `json:"stalled"`
-					}
-					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" {
-						if v.Stalled {
-							lastStalledDay[v.Mechanism] = v.Day
-						} else {
-							// A recovery row clears the ack if its evaluated day is after the stalled day answered by the ack
-							if targetDay, hasAck := ackStalledDay[v.Mechanism]; hasAck {
-								if v.Day > targetDay {
-									delete(active, v.Mechanism)
-									delete(ackStalledDay, v.Mechanism)
-								}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Time    time.Time       `json:"time"`
+			Command string          `json:"command"`
+			Value   json.RawMessage `json:"value"`
+		}
+		if json.Unmarshal(line, &row) == nil {
+			switch row.Command {
+			case livenessDailyCommand:
+				var v struct {
+					Day       string `json:"day"`
+					Mechanism string `json:"mechanism"`
+					Stalled   bool   `json:"stalled"`
+				}
+				if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" {
+					if v.Stalled {
+						lastStalledDay[v.Mechanism] = v.Day
+					} else {
+						// A recovery row clears the ack if its evaluated day is after the stalled day answered by the ack
+						if targetDay, hasAck := ackStalledDay[v.Mechanism]; hasAck {
+							if v.Day > targetDay {
+								delete(active, v.Mechanism)
+								delete(ackStalledDay, v.Mechanism)
 							}
 						}
 					}
-				case livenessAckCommand:
-					var v struct {
-						Day       string `json:"day"`
-						Mechanism string `json:"mechanism"`
-						Reason    string `json:"reason"`
+				}
+			case livenessAckCommand:
+				var v struct {
+					Day       string `json:"day"`
+					Mechanism string `json:"mechanism"`
+					Reason    string `json:"reason"`
+				}
+				if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" && v.Reason != "" {
+					active[v.Mechanism] = v.Reason
+					stalledDay := v.Day
+					if stalledDay == "" {
+						stalledDay = lastStalledDay[v.Mechanism]
 					}
-					if json.Unmarshal(row.Value, &v) == nil && v.Mechanism != "" && v.Reason != "" {
-						active[v.Mechanism] = v.Reason
-						stalledDay := v.Day
-						if stalledDay == "" {
-							stalledDay = lastStalledDay[v.Mechanism]
-						}
-						ackStalledDay[v.Mechanism] = stalledDay
-					}
+					ackStalledDay[v.Mechanism] = stalledDay
 				}
 			}
 		}
-		if err != nil {
-			if err == io.EOF {
-				return active, nil
-			}
-			return nil, err
-		}
 	}
+	if err := jl.Err(); err != nil {
+		return nil, err
+	}
+	return active, nil
 }
 
 // livenessForDay scans repos and evaluates all mechanisms for day.
@@ -814,177 +791,170 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		if err != nil {
 			return nil, err
 		}
-		rd := bufio.NewReader(f)
-		for {
-			line, err := rd.ReadBytes('\n')
-			if len(line) > 0 {
-				var row struct {
-					Time    time.Time       `json:"time"`
-					Command string          `json:"command"`
-					Value   json.RawMessage `json:"value"`
-				}
-				if json.Unmarshal(line, &row) == nil {
-					rowDay := row.Time.UTC().Format(reviewerSummaryDay)
-					// Parse generic value fields
-					var v struct {
-						Head     string          `json:"head"`
-						Heads    []string        `json:"heads"`
-						PR       int             `json:"pr"`
-						Label    string          `json:"label"`
-						Action   string          `json:"action"`
-						State    string          `json:"state"`
-						Severity string          `json:"severity"`
-						Source   string          `json:"source"`
-						Task     string          `json:"task"`
-						Ref      string          `json:"source_ref"`
-						OldLabel string          `json:"old_label"`
-						OldHead  string          `json:"old_head"`
-						NewHead  string          `json:"new_head"`
-						Sha      string          `json:"sha"`
-						Error    string          `json:"error"`
-						Result   json.RawMessage `json:"result"`
-						Findings int             `json:"findings"`
-						Host     string          `json:"host"`
-						Pane     string          `json:"pane"`
-						Cause    string          `json:"cause"`
-						Sent     bool            `json:"sent"`
-					}
-					_ = json.Unmarshal(row.Value, &v)
-					if v.Head == "" && v.Sha != "" {
-						v.Head = v.Sha
-					}
-
-					keyHead := r.Name + "#" + v.Head
-					keyPR := fmt.Sprintf("%s#%d", r.Name, v.PR)
-
-					if rowDay == day {
-						// M1: review-pass
-						if row.Command == "review-start" && v.Head != "" {
-							m1Starts[keyHead] = v.PR
-						} else if (row.Command == "review" || row.Command == "review-skipped") && v.Head != "" {
-							m1Done[keyHead] = true
-						}
-
-						// M2: reviewer-landing
-						if row.Command == "review-brief-hk" && v.Label != "" {
-							m2Briefs[v.Label] = true
-						} else if row.Command == "reviewer-spawn" && v.Label != "" {
-							m2Landed[v.Label] = true
-						}
-
-						// M3: findings-delivery
-						if (row.Command == "review" && v.Findings > 0 && v.Head != "") || (row.Command == "review-round-finding" && v.Head != "") {
-							m3Critical[keyHead] = true
-						}
-						// An ack credits only the head it was sent for; a
-						// delivery's Heads list also spans later heads it stayed open across.
-						if row.Command == "findings-delivered" || row.Command == "findings-acked" {
-							if v.Head != "" {
-								m3Delivered[keyHead] = true
-							}
-						}
-						if row.Command == "findings-delivered" {
-							for _, h := range v.Heads {
-								m3Delivered[r.Name+"#"+h] = true
-							}
-						}
-
-						// M4: merge
-						if row.Command == "land" && v.Action == "merge" && v.PR > 0 {
-							m4Land[keyPR] = true
-						} else if row.Command == "pr-notify" && v.State == "merged" && v.PR > 0 {
-							m4Merged[keyPR] = true
-						} else if row.Command == "hk-task-event" && v.Source == "mergewake.merge" && v.Ref != "" {
-							if idx := strings.LastIndex(v.Ref, "/pull/"); idx != -1 {
-								p := v.Ref[idx+len("/pull/"):]
-								m4Merged[r.Name+"#"+p] = true
-							}
-						}
-
-						// M7: watch-revert
-						if row.Command == "watch" {
-							m7RepoWatches[r.Name]++
-						}
-						if (row.Command == "pr-notify" && v.State == "merged" && (v.PR > 0 || v.Head != "")) || (row.Command == "land" && v.Action == "merge" && (v.PR > 0 || v.Head != "")) {
-							k := keyPR
-							if v.PR == 0 && v.Head != "" {
-								k = keyHead
-							}
-							m7Merges[k] = r.Name
-						}
-
-						// M8: lane-notices
-						switch row.Command {
-						case "pr-notify", "review-blocked", "conflict-esc":
-							m8Attempts++
-						case "pr-notify-error", "conflict-esc-failed", "pr-stall-error":
-							m8Attempts++
-							m8Errors++
-						}
-
-						// M9: task-events
-						switch row.Command {
-						case "hk-task-event":
-							m9Attempts++
-							if v.Error == "" && len(v.Result) > 0 && string(v.Result) != "null" {
-								m9Successes++
-								m9Succeeded[v.Source+"\x00"+v.Task+"\x00"+v.Ref] = true
-							}
-						case "task-event-fields-refused":
-							// Counted after the scan: a refusal for an event
-							// that posted successfully is the same event,
-							// not a second attempt.
-							m9Refused = append(m9Refused, v.Source+"\x00"+v.Task+"\x00"+v.Ref)
-						}
-
-						// M10: outcome-publish errors
-						if row.Command == "outcome-publish-error" {
-							m10Errors++
-						}
-
-						// M12: reviewer-problem events by cause (notice-cause rows)
-						if row.Command == "notice-cause" && v.Cause != "" {
-							m12Events[v.Cause]++
-							m12RepoEvents[r.Name+"\x00"+v.Cause]++
-							if v.Sent {
-								m12Sent[v.Cause]++
-							}
-						}
-
-					}
-
-					// M11: review-retry tracks deferrals and resolutions across history up to endOfDay
-					if row.Time.UTC().Before(endOfDay) {
-						if row.Command == "review-retry-deferred" && v.Head != "" {
-							if _, exists := m11Deferred[keyHead]; !exists {
-								m11Deferred[keyHead] = deferredEntry{repo: r.Name, pr: v.PR, head: v.Head, first: row.Time.UTC()}
-							}
-						}
-						if (row.Command == "review" || row.Command == "escalate-author" || row.Command == "review-skipped") && v.Head != "" {
-							m11Resolved[keyHead] = true
-						}
-						if row.Command == "reviewer-head-moved" && v.OldHead != "" {
-							m11Resolved[r.Name+"#"+v.OldHead] = true
-						}
-						if (row.Command == "pr-notify" && (v.State == "closed" || v.State == "merged")) ||
-							(row.Command == "land" && v.Action == "merge") ||
-							row.Command == "pr-closed" {
-							if v.PR > 0 {
-								m11PRResolved[fmt.Sprintf("%s#%d", r.Name, v.PR)] = true
-							}
-						}
-					}
-				}
+		jl := fsutil.NewJSONL(f.Name(), 0, f)
+		for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+			var row struct {
+				Time    time.Time       `json:"time"`
+				Command string          `json:"command"`
+				Value   json.RawMessage `json:"value"`
 			}
-			if err != nil {
-				if err == io.EOF {
-					break
+			if json.Unmarshal(line, &row) == nil {
+				rowDay := row.Time.UTC().Format(reviewerSummaryDay)
+				// Parse generic value fields
+				var v struct {
+					Head     string          `json:"head"`
+					Heads    []string        `json:"heads"`
+					PR       int             `json:"pr"`
+					Label    string          `json:"label"`
+					Action   string          `json:"action"`
+					State    string          `json:"state"`
+					Severity string          `json:"severity"`
+					Source   string          `json:"source"`
+					Task     string          `json:"task"`
+					Ref      string          `json:"source_ref"`
+					OldLabel string          `json:"old_label"`
+					OldHead  string          `json:"old_head"`
+					NewHead  string          `json:"new_head"`
+					Sha      string          `json:"sha"`
+					Error    string          `json:"error"`
+					Result   json.RawMessage `json:"result"`
+					Findings int             `json:"findings"`
+					Host     string          `json:"host"`
+					Pane     string          `json:"pane"`
+					Cause    string          `json:"cause"`
+					Sent     bool            `json:"sent"`
 				}
-				_ = f.Close()
-				return nil, err
+				_ = json.Unmarshal(row.Value, &v)
+				if v.Head == "" && v.Sha != "" {
+					v.Head = v.Sha
+				}
+
+				keyHead := r.Name + "#" + v.Head
+				keyPR := fmt.Sprintf("%s#%d", r.Name, v.PR)
+
+				if rowDay == day {
+					// M1: review-pass
+					if row.Command == "review-start" && v.Head != "" {
+						m1Starts[keyHead] = v.PR
+					} else if (row.Command == "review" || row.Command == "review-skipped") && v.Head != "" {
+						m1Done[keyHead] = true
+					}
+
+					// M2: reviewer-landing
+					if row.Command == "review-brief-hk" && v.Label != "" {
+						m2Briefs[v.Label] = true
+					} else if row.Command == "reviewer-spawn" && v.Label != "" {
+						m2Landed[v.Label] = true
+					}
+
+					// M3: findings-delivery
+					if (row.Command == "review" && v.Findings > 0 && v.Head != "") || (row.Command == "review-round-finding" && v.Head != "") {
+						m3Critical[keyHead] = true
+					}
+					// An ack credits only the head it was sent for; a
+					// delivery's Heads list also spans later heads it stayed open across.
+					if row.Command == "findings-delivered" || row.Command == "findings-acked" {
+						if v.Head != "" {
+							m3Delivered[keyHead] = true
+						}
+					}
+					if row.Command == "findings-delivered" {
+						for _, h := range v.Heads {
+							m3Delivered[r.Name+"#"+h] = true
+						}
+					}
+
+					// M4: merge
+					if row.Command == "land" && v.Action == "merge" && v.PR > 0 {
+						m4Land[keyPR] = true
+					} else if row.Command == "pr-notify" && v.State == "merged" && v.PR > 0 {
+						m4Merged[keyPR] = true
+					} else if row.Command == "hk-task-event" && v.Source == "mergewake.merge" && v.Ref != "" {
+						if idx := strings.LastIndex(v.Ref, "/pull/"); idx != -1 {
+							p := v.Ref[idx+len("/pull/"):]
+							m4Merged[r.Name+"#"+p] = true
+						}
+					}
+
+					// M7: watch-revert
+					if row.Command == "watch" {
+						m7RepoWatches[r.Name]++
+					}
+					if (row.Command == "pr-notify" && v.State == "merged" && (v.PR > 0 || v.Head != "")) || (row.Command == "land" && v.Action == "merge" && (v.PR > 0 || v.Head != "")) {
+						k := keyPR
+						if v.PR == 0 && v.Head != "" {
+							k = keyHead
+						}
+						m7Merges[k] = r.Name
+					}
+
+					// M8: lane-notices
+					switch row.Command {
+					case "pr-notify", "review-blocked", "conflict-esc":
+						m8Attempts++
+					case "pr-notify-error", "conflict-esc-failed", "pr-stall-error":
+						m8Attempts++
+						m8Errors++
+					}
+
+					// M9: task-events
+					switch row.Command {
+					case "hk-task-event":
+						m9Attempts++
+						if v.Error == "" && len(v.Result) > 0 && string(v.Result) != "null" {
+							m9Successes++
+							m9Succeeded[v.Source+"\x00"+v.Task+"\x00"+v.Ref] = true
+						}
+					case "task-event-fields-refused":
+						// Counted after the scan: a refusal for an event
+						// that posted successfully is the same event,
+						// not a second attempt.
+						m9Refused = append(m9Refused, v.Source+"\x00"+v.Task+"\x00"+v.Ref)
+					}
+
+					// M10: outcome-publish errors
+					if row.Command == "outcome-publish-error" {
+						m10Errors++
+					}
+
+					// M12: reviewer-problem events by cause (notice-cause rows)
+					if row.Command == "notice-cause" && v.Cause != "" {
+						m12Events[v.Cause]++
+						m12RepoEvents[r.Name+"\x00"+v.Cause]++
+						if v.Sent {
+							m12Sent[v.Cause]++
+						}
+					}
+
+				}
+
+				// M11: review-retry tracks deferrals and resolutions across history up to endOfDay
+				if row.Time.UTC().Before(endOfDay) {
+					if row.Command == "review-retry-deferred" && v.Head != "" {
+						if _, exists := m11Deferred[keyHead]; !exists {
+							m11Deferred[keyHead] = deferredEntry{repo: r.Name, pr: v.PR, head: v.Head, first: row.Time.UTC()}
+						}
+					}
+					if (row.Command == "review" || row.Command == "escalate-author" || row.Command == "review-skipped") && v.Head != "" {
+						m11Resolved[keyHead] = true
+					}
+					if row.Command == "reviewer-head-moved" && v.OldHead != "" {
+						m11Resolved[r.Name+"#"+v.OldHead] = true
+					}
+					if (row.Command == "pr-notify" && (v.State == "closed" || v.State == "merged")) ||
+						(row.Command == "land" && v.Action == "merge") ||
+						row.Command == "pr-closed" {
+						if v.PR > 0 {
+							m11PRResolved[fmt.Sprintf("%s#%d", r.Name, v.PR)] = true
+						}
+					}
+				}
 			}
 		}
 		_ = f.Close()
+		if err := jl.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	// A fields-refused row for an event that posted successfully is that
@@ -1107,34 +1077,29 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 		reapMade := map[string]bool{}
 		reapDone := map[string]bool{}
 		for _, r := range repos {
-			f, err := os.Open(filepath.Join(s.state(r.Name), "reap.jsonl"))
+			jsonlPath := filepath.Join(s.state(r.Name), "reap.jsonl")
+			f, err := os.Open(jsonlPath)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			if err != nil {
 				return nil, err
 			}
-			rd := bufio.NewReader(f)
-			for {
-				line, err := rd.ReadBytes('\n')
-				if len(line) > 0 {
-					var row reapReceipt
-					if json.Unmarshal(line, &row) == nil && row.Action == "remove-worktree" {
-						if row.Time.UTC().Format(reviewerSummaryDay) == day {
-							wt := row.Worktree
-							if wt == "" {
-								wt = fmt.Sprintf("pr-%d", row.PR)
-							}
-							key := fmt.Sprintf("%s#%s#%s", r.Name, row.Host, wt)
-							reapMade[key] = true
-							if row.Result == "removed" || row.Reason == "worktree-gone" || row.Reason == "already-gone" {
-								reapDone[key] = true
-							}
+			jl := fsutil.NewJSONL(jsonlPath, 0, f)
+			for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+				var row reapReceipt
+				if json.Unmarshal(line, &row) == nil && row.Action == "remove-worktree" {
+					if row.Time.UTC().Format(reviewerSummaryDay) == day {
+						wt := row.Worktree
+						if wt == "" {
+							wt = fmt.Sprintf("pr-%d", row.PR)
+						}
+						key := fmt.Sprintf("%s#%s#%s", r.Name, row.Host, wt)
+						reapMade[key] = true
+						if row.Result == "removed" || row.Reason == "worktree-gone" || row.Reason == "already-gone" {
+							reapDone[key] = true
 						}
 					}
-				}
-				if err != nil {
-					break
 				}
 			}
 			_ = f.Close()
@@ -1242,23 +1207,18 @@ func (s *Service) livenessForDay(repos []config.Repo, day string) (*LivenessDayR
 	{
 		published := 0
 		outcomesFile := filepath.Join(s.Config.StateDir, "outcomes.jsonl")
-		if f, err := os.Open(outcomesFile); err == nil {
-			rd := bufio.NewReader(f)
-			for {
-				line, err := rd.ReadBytes('\n')
-				if len(line) > 0 {
-					var row struct {
-						Kind string    `json:"kind"`
-						At   time.Time `json:"at"`
-					}
-					if json.Unmarshal(line, &row) == nil && row.Kind == "published" {
-						if row.At.UTC().Format(reviewerSummaryDay) == day {
-							published++
-						}
-					}
+		jsonlPath := outcomesFile
+		if f, err := os.Open(jsonlPath); err == nil {
+			jl := fsutil.NewJSONL(jsonlPath, 0, f)
+			for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+				var row struct {
+					Kind string    `json:"kind"`
+					At   time.Time `json:"at"`
 				}
-				if err != nil {
-					break
+				if json.Unmarshal(line, &row) == nil && row.Kind == "published" {
+					if row.At.UTC().Format(reviewerSummaryDay) == day {
+						published++
+					}
 				}
 			}
 			_ = f.Close()

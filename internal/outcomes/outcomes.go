@@ -2,7 +2,6 @@
 package outcomes
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -230,6 +230,9 @@ func cloneNested[V any](m map[string]map[string]V) map[string]map[string]V {
 type ledgerFile struct {
 	dev, ino uint64
 	offset   int64
+	// lines is how many complete lines the cache has decoded, so an audit row
+	// can name a line by its number in the file.
+	lines int
 	// tail holds the bytes just before offset. A file replaced in place keeps
 	// its inode, so the tail is what tells it apart from the one decoded.
 	tail  []byte
@@ -293,9 +296,10 @@ func load(path string, f *os.File) (State, error) {
 		lf = &ledgerFile{dev: dev, ino: ino, state: emptyState()}
 		ledgerFiles[path] = lf
 	}
-	consumed, err := applyEvents(io.NewSectionReader(f, lf.offset, fi.Size()-lf.offset), &lf.state)
+	consumed, lines, err := applyEvents(path, io.NewSectionReader(f, lf.offset, fi.Size()-lf.offset), &lf.state, lf.lines)
 	if err == nil {
 		lf.offset += consumed
+		lf.lines = lines
 		err = lf.setTail(f)
 	}
 	if err != nil {
@@ -331,48 +335,43 @@ func (lf *ledgerFile) setTail(f *os.File) error {
 	return err
 }
 
-// applyEvents applies the events in r to s, in order. It returns how many
-// bytes it consumed; without an error that is all of r.
-func applyEvents(r io.Reader, s *State) (int64, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 4096), 8<<20)
-	var consumed int64
-	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-		advance, token, err := bufio.ScanLines(data, atEOF)
-		consumed += int64(advance)
-		return advance, token, err
-	})
-	for scanner.Scan() {
+// applyEvents applies the complete lines of r to s, in order. before is how
+// many lines precede r in the file at path. It returns how many bytes and how
+// many lines it consumed; without an error that is all of r's complete lines.
+// A line that does not decode is skipped and audited, so one damaged row never
+// fails the ledger's readers. A final line with no newline is left for later.
+func applyEvents(path string, r io.Reader, s *State, before int) (int64, int, error) {
+	j := fsutil.NewJSONL(path, before, r)
+	for line, ok := j.Next(); ok; line, ok = j.Next() {
 		var e Event
-		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			return consumed, fmt.Errorf("outcomes ledger corrupt: %w", err)
+		if err := json.Unmarshal(line, &e); err != nil {
+			j.Skip(line)
+			continue
 		}
 		if e.Version != 1 {
-			return consumed, errors.New("unsupported outcomes ledger version")
+			return j.Consumed(), j.Line(), errors.New("unsupported outcomes ledger version")
 		}
 		switch e.Kind {
 		case "outcome":
 			if e.Outcome == nil {
-				return consumed, errors.New("missing outcome")
+				return j.Consumed(), j.Line(), errors.New("missing outcome")
 			}
 			s.Latest[e.Outcome.Task] = *e.Outcome
 		case "published":
 			s.Published[e.ID] = e.Rep
 		default:
-			return consumed, errors.New("unknown outcomes event")
+			return j.Consumed(), j.Line(), errors.New("unknown outcomes event")
 		}
 	}
-	return consumed, scanner.Err()
+	return j.Consumed(), j.Line(), j.Err()
 }
+
 func appendEvent(f *os.File, e Event) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	if _, err = f.Write(append(b, '\n')); err != nil {
-		return err
-	}
-	return f.Sync()
+	return fsutil.AppendTo(f, b)
 }
 func (l Ledger) Read() (State, error) {
 	var s State

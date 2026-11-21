@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/archive"
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/reap"
@@ -91,25 +91,12 @@ func (s *Service) headCommit(ctx context.Context, r config.Repo, p github.Pull) 
 func (s *Service) reapLog(repo string) string { return filepath.Join(s.state(repo), "reap.jsonl") }
 
 func (s *Service) reapReceipts(repo string) ([]reapReceipt, error) {
-	b, err := os.ReadFile(s.reapLog(repo))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
 	var out []reapReceipt
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		if line == "" {
-			continue
-		}
-		var v reapReceipt
-		if e := json.Unmarshal([]byte(line), &v); e != nil {
-			return nil, fmt.Errorf("reap receipts corrupt: %w", e)
-		}
+	err := fsutil.ScanJSONL(s.reapLog(repo), func(v reapReceipt) error {
 		out = append(out, v)
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 func (s *Service) reapNote(v reapReceipt, dry bool) error {
