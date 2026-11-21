@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -45,17 +46,21 @@ func resultLostNotices(s *Service) (lost, failed int) {
 }
 
 // quotaStopped is an interrupted reviewer whose hk job panewire then recorded
-// as stopped on a quota pool.
+// as stopped on a quota pool. No placement candidate is left for the
+// replacement a give-up normally gets, so the pass falls back to waiting for
+// the pool's reset (hk 6023): the state this fixture exists to check.
 func quotaStopped(t *testing.T, endReason string) (*Service, *fakeGH, config.Repo, *panewireRunner, *clock) {
 	t.Helper()
 	s, g, r, runner, c := interruptedReviewer(t)
 	s.Config.Daemon.PR.ReviewRetry = config.ReviewRetry{Initial: "1m", Maximum: "30m", Failures: 3}
 	runner.sink.missing = &integrations.JobRecord{State: "lost", EndReason: endReason, Host: "node-a", PaneID: "p1"}
+	runner.noCandidateAlways = true
 	return s, g, r, runner, c
 }
 
-// (a) A quota-stopped reviewer is no lost result, spends no replacement and
-// counts no failure; the pass runs again at the pool's reset.
+// (a) A give-up whose replacement finds no placement candidate at all is no
+// review failure: the loss is recorded, and the pass runs again at the pool's
+// reset with its replacement unspent.
 func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	reset := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
 	s, g, r, runner, c := quotaStopped(t, "quota_stop pool=devin reset_at="+reset.Format(time.RFC3339))
@@ -71,31 +76,41 @@ func TestRetryQuotaStopWaitsForResetWithoutFailure(t *testing.T) {
 	if lost, failed := resultLostNotices(s); lost != 0 || failed != 0 {
 		t.Fatalf("notices lost=%d failed=%d: %v", lost, failed, s.Notifier.(*fakeNotifier).events)
 	}
-	if rows := auditRows(t, s, r, "review-result-lost"); len(rows) != 0 {
+	// The give-up is a loss mergewake counts, even though no placement was
+	// left for its replacement; the wait is the fallback, not the accounting.
+	rows := auditRows(t, s, r, "review-result-lost")
+	if len(rows) != 1 || rows[0]["label"] != old.Label {
 		t.Fatalf("result-lost audit: %v", rows)
 	}
-	rows := auditRows(t, s, r, "review-quota-stopped")
+	given := auditRows(t, s, r, "review-quota-given-up")
+	if len(given) != 1 || given[0]["label"] != old.Label || given[0]["pool"] != "devin" || given[0]["reset_at"] != reset.Format(time.RFC3339) {
+		t.Fatalf("give-up audit: %v", given)
+	}
+	rows = auditRows(t, s, r, "review-quota-stopped")
 	if len(rows) != 1 || rows[0]["pr"] != float64(7) || rows[0]["head"] != shaA || rows[0]["pass"] != float64(1) || rows[0]["label"] != old.Label || rows[0]["pool"] != "devin" || rows[0]["reset_at"] != reset.Format(time.RFC3339) {
 		t.Fatalf("quota audit: %v", rows)
 	}
 	reviewerJobGone(t, s, r, 1)
-	if len(runner.spawns) != 1 || len(runner.closes) != 0 {
-		t.Fatalf("spawns=%d closes=%v: the stopped reviewer must not be replaced or closed", len(runner.spawns), runner.closes)
+	// The original spawn, then the refused replacement and its retry without
+	// the exclusion: no reviewer was placed.
+	if len(runner.spawns) != 3 || arg(runner.spawns[1], "--exclude-pool") != "devin" || slices.Contains(runner.spawns[2], "--exclude-pool") {
+		t.Fatalf("spawns=%v: the give-up's replacement must be refused and then waited out", runner.spawns)
 	}
 	// Before the reset nothing runs; at the reset a fresh reviewer is placed
 	// with its one replacement unspent.
 	c.t = reset.Add(-time.Second)
-	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 1 {
+	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 3 {
 		t.Fatalf("before the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 	c.t = reset
+	runner.noCandidateAlways = false
 	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
 	runner.exits = []int{panewireWaitTimeout}
 	if err := s.RetryReview(context.Background(), r, g.pull, Options{}); err != nil && !errors.Is(err, ErrReviewPending) {
 		t.Fatal(err)
 	}
 	fresh := readReviewerJob(t, s, r, 1)
-	if len(runner.spawns) != 2 || fresh.Label == old.Label || fresh.Replacements != 0 {
+	if len(runner.spawns) != 4 || fresh.Label == old.Label || fresh.Replacements != 0 {
 		t.Fatalf("spawns=%d fresh=%+v", len(runner.spawns), fresh)
 	}
 }
@@ -118,9 +133,15 @@ func TestRetryQuotaStopWithoutResetWaitsInitial(t *testing.T) {
 				t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 			}
 			st := retryStateOf(t, s, r)
-			if st.Failures != 0 || !st.Next.Equal(c.t.Add(time.Minute)) || len(runner.spawns) != 1 {
-				t.Fatalf("state=%+v spawns=%d, want next=%v", st, len(runner.spawns), c.t.Add(time.Minute))
+			if st.Failures != 0 || !st.Next.Equal(c.t.Add(time.Minute)) {
+				t.Fatalf("state=%+v, want no failure and next=%v", st, c.t.Add(time.Minute))
 			}
+			// The give-up's replacement was refused (it names an exclusion only
+			// when the reason named a pool), so no reviewer record remains.
+			if len(runner.spawns) < 2 || len(runner.spawns) > 3 {
+				t.Fatalf("spawns=%d, want the refused replacement attempt", len(runner.spawns))
+			}
+			reviewerJobGone(t, s, r, 1)
 		})
 	}
 }
@@ -133,7 +154,7 @@ func TestRetryQuotaStopFarResetWaitsAtMostMaximum(t *testing.T) {
 		t.Fatalf("err=%v, want ErrReviewQuotaStopped", err)
 	}
 	st := retryStateOf(t, s, r)
-	if st.Failures != 0 || !st.Next.Equal(c.t.Add(30*time.Minute)) || len(runner.spawns) != 1 {
+	if st.Failures != 0 || !st.Next.Equal(c.t.Add(30*time.Minute)) || len(runner.spawns) != 3 {
 		t.Fatalf("state=%+v spawns=%d, want next=%v", st, len(runner.spawns), c.t.Add(30*time.Minute))
 	}
 }
@@ -149,17 +170,18 @@ func TestRetryQuotaStopSurvivesRestart(t *testing.T) {
 	}
 	restarted := *s
 	c.t = reset.Add(-time.Minute)
-	if err := restarted.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 1 {
+	if err := restarted.RetryReview(context.Background(), r, g.pull, Options{}); !errors.Is(err, ErrReviewQuotaStopped) || len(runner.spawns) != 3 {
 		t.Fatalf("restarted before the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 	if st := retryStateOf(t, &restarted, r); !st.Next.Equal(reset) {
 		t.Fatalf("next=%v, want %v", st.Next, reset)
 	}
 	c.t = reset
+	runner.noCandidateAlways = false
 	runner.sink.missing = &integrations.JobRecord{State: "claimed"}
 	runner.exits = []int{panewireWaitTimeout}
 	err := restarted.RetryReview(context.Background(), r, g.pull, Options{})
-	if (err != nil && !errors.Is(err, ErrReviewPending)) || len(runner.spawns) != 2 {
+	if (err != nil && !errors.Is(err, ErrReviewPending)) || len(runner.spawns) != 4 {
 		t.Fatalf("restarted at the reset: err=%v spawns=%d", err, len(runner.spawns))
 	}
 }
