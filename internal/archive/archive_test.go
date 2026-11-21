@@ -1681,6 +1681,51 @@ func TestArchiveStaleLockReclaimInterleavedRaceKeepsFirstWinner(t *testing.T) {
 	}
 }
 
+// TestArchiveStaleLockReclaimInterleavedPauseAtStaleKeepsOneWinner orders two
+// claimers using pauseAtStale: the first claimer pauses at its stale check,
+// the second claimer reclaims and acquires the lock, and the first resumes.
+// The first must see the second's fresh lock and back off with archive-lock-busy,
+// leaving exactly one winner.
+func TestArchiveStaleLockReclaimInterleavedPauseAtStaleKeepsOneWinner(t *testing.T) {
+	e := setup(t)
+	dest := filepath.Join(e.drive, "tasks", "2402", "pause-at-stale")
+	staleLockDir(t, e, dest, "dead 1")
+
+	var (
+		secondRelease func()
+		secondErr     error
+	)
+	first := &Archiver{
+		Runner: &pauseAtStale{
+			Runner: &fakeRunner{},
+			onStale: func() {
+				second := &Archiver{Runner: &fakeRunner{}, DriveDir: e.drive}
+				secondRelease, secondErr = second.claim(context.Background(), dest)
+			},
+		},
+		DriveDir: e.drive,
+	}
+
+	firstRelease, firstErr := first.claim(context.Background(), dest)
+	if firstRelease != nil {
+		defer firstRelease()
+	}
+	if secondRelease != nil {
+		defer secondRelease()
+	}
+
+	if secondErr != nil {
+		t.Fatalf("second claimer failed to reclaim: %v", secondErr)
+	}
+	if firstErr == nil {
+		t.Fatalf("first claimer acquired after second reclaimed; want archive-lock-busy")
+	}
+	var skip *Skip
+	if !errors.As(firstErr, &skip) || skip.Reason != "archive-lock-busy" {
+		t.Fatalf("first claimer err=%v, want archive-lock-busy", firstErr)
+	}
+}
+
 func TestArchiveStaleLockReclaimDeadOwnerOneOfN(t *testing.T) {
 	e := setup(t)
 	dest := filepath.Join(e.drive, "tasks", "2402", "dead-owner")
