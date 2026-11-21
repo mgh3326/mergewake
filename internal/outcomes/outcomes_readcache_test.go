@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -29,7 +28,7 @@ func decodeFromStart(t *testing.T, dir string) State {
 	}
 	defer f.Close()
 	s := emptyState()
-	if _, err := applyEvents(f, &s); err != nil {
+	if _, _, err := applyEvents(f.Name(), f, &s, 0); err != nil {
 		t.Fatalf("decode from start: %v", err)
 	}
 	return s
@@ -200,9 +199,11 @@ func TestReadResultsDoNotAlias(t *testing.T) {
 	}
 }
 
-// TestReadReportsCorruptLineAppendedAfterCache covers a line the file gained
-// after the cache was built, complete or cut short by a failed append.
-func TestReadReportsCorruptLineAppendedAfterCache(t *testing.T) {
+// TestReadSkipsCorruptLineAppendedAfterCache covers a line the file gained
+// after the cache was built, complete or cut short by a failed append. A
+// complete damaged line is skipped and audited; a cut last line waits for its
+// newline. Either way the cached Read agrees with a decode from the start.
+func TestReadSkipsCorruptLineAppendedAfterCache(t *testing.T) {
 	for name, tail := range map[string]string{
 		"complete line":  "{not json\n",
 		"partial append": `{"version":1,"event_id":"abc"`,
@@ -224,9 +225,9 @@ func TestReadReportsCorruptLineAppendedAfterCache(t *testing.T) {
 			}
 			f.Close()
 
-			_, err = l.Read()
-			if err == nil || !strings.Contains(err.Error(), "outcomes ledger corrupt") {
-				t.Fatalf("Read after corrupt append: err=%v, want outcomes ledger corrupt", err)
+			got := requireReadMatchesFile(t, l)
+			if _, ok := got.Latest[Key(readCacheRepo, 1)]; !ok {
+				t.Fatal("the good record before the damage is gone")
 			}
 		})
 	}

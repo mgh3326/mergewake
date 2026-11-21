@@ -573,7 +573,8 @@ func (s *Service) hubConsultComment(ctx context.Context, r config.Repo, pr githu
 // a re-POST, which would retry a row that may have gone terminal.
 func (s *Service) recoverConsultID(repo string, pr int, head string) string {
 	const maxScan = 8 << 20
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	path := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
@@ -593,7 +594,13 @@ func (s *Service) recoverConsultID(repo string, pr int, head string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(buf), "\n")
+	// Complete lines only: the text after the last newline is still being written.
+	text := string(buf)
+	cut := strings.LastIndexByte(text, '\n')
+	if cut < 0 {
+		return ""
+	}
+	lines := strings.Split(text[:cut], "\n")
 	if off > 0 && len(lines) > 0 {
 		lines = lines[1:] // the first line was cut mid-record
 	}
@@ -611,6 +618,7 @@ func (s *Service) recoverConsultID(repo string, pr int, head string) string {
 			continue
 		}
 		if json.Unmarshal([]byte(line), &rec) != nil {
+			fsutil.SkipWindow(path, off, []byte(line))
 			continue
 		}
 		if rec.Command == "consult-request" && rec.Value.PR == pr && rec.Value.Head == head && rec.Value.ID != "" {

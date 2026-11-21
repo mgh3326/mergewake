@@ -1,8 +1,6 @@
 package daemon
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -16,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 // receiptKeepDays is how many days before today a receipt file is kept.
@@ -63,23 +63,11 @@ func (r *Receipts) Write(rc Receipt) {
 }
 
 func (r *Receipts) append(day string, rc Receipt) error {
-	if err := os.MkdirAll(r.Dir, 0o700); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(filepath.Join(r.Dir, day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
 	b, err := json.Marshal(rc)
 	if err != nil {
-		_ = f.Close()
 		return err
 	}
-	_, err = f.Write(append(b, '\n'))
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	return err
+	return fsutil.AppendLine(filepath.Join(r.Dir, day+".jsonl"), b)
 }
 
 // prune removes receipt files dated before today minus receiptKeepDays.
@@ -91,7 +79,7 @@ func (r *Receipts) prune(today time.Time) {
 	}
 	for _, e := range entries {
 		day, ok := strings.CutSuffix(e.Name(), ".jsonl")
-		if !ok || e.IsDir() || day >= oldest {
+		if !ok || e.IsDir() || e.Name() == fsutil.AuditFile || day >= oldest {
 			continue
 		}
 		_ = os.Remove(filepath.Join(r.Dir, e.Name()))
@@ -113,23 +101,21 @@ func (r *Receipts) Known() (map[string]bool, time.Time, error) {
 	}
 	var earliest time.Time
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") || e.Name() == fsutil.AuditFile {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(r.Dir, e.Name()))
-		if err != nil {
-			return nil, time.Time{}, err
-		}
-		sc := bufio.NewScanner(bytes.NewReader(b))
-		for sc.Scan() {
-			var rc Receipt
-			if json.Unmarshal(sc.Bytes(), &rc) != nil || rc.GUID == "" {
-				continue
+		err := fsutil.ScanJSONL(filepath.Join(r.Dir, e.Name()), func(rc Receipt) error {
+			if rc.GUID == "" {
+				return nil
 			}
 			known[rc.GUID] = true
 			if earliest.IsZero() || rc.At.Before(earliest) {
 				earliest = rc.At
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, time.Time{}, err
 		}
 	}
 	return known, earliest, nil

@@ -1,17 +1,13 @@
 package pipeline
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -46,39 +42,26 @@ func countLateRoundFindings(facts []integrations.ReviewFindingRecord) lateRoundF
 }
 
 func (s *Service) roundFindingFactsFromAudit(repo string, pr int, head string, round int, posted map[int]github.PassReceipt) ([]integrations.ReviewFindingRecord, error) {
-	file, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
 	var facts []integrations.ReviewFindingRecord
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 4096), 1<<20)
-	for scanner.Scan() {
-		var row struct {
-			Command string `json:"command"`
-			Value   struct {
-				PR    int    `json:"pr"`
-				Head  string `json:"head"`
-				Pass  int    `json:"pass"`
-				Round int    `json:"round"`
-				integrations.ReviewFindingRecord
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
-			return nil, err
-		}
+	err := fsutil.ScanJSONL(filepath.Join(s.state(repo), "decisions.jsonl"), func(row struct {
+		Command string `json:"command"`
+		Value   struct {
+			PR    int    `json:"pr"`
+			Head  string `json:"head"`
+			Pass  int    `json:"pass"`
+			Round int    `json:"round"`
+			integrations.ReviewFindingRecord
+		} `json:"value"`
+	}) error {
 		if row.Command != "review-round-finding" || row.Value.PR != pr || row.Value.Head != head || row.Value.Round != round {
-			continue
+			return nil
 		}
 		if _, ok := posted[row.Value.Pass]; ok {
 			facts = append(facts, row.Value.ReviewFindingRecord)
 		}
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return facts, nil

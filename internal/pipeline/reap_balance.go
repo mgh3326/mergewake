@@ -1,12 +1,10 @@
 package pipeline
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -248,36 +246,28 @@ func (s *Service) scanBalanceDecisions(repo string, fn func(day, command, host, 
 	defer f.Close()
 	// bufio.Reader has no line-length cap: one giant row (a findings dump)
 	// must not break the day's balance.
-	rd := bufio.NewReader(f)
+	jl := fsutil.NewJSONL(f.Name(), 0, f)
 	var row struct {
 		Time    time.Time       `json:"time"`
 		Command string          `json:"command"`
 		Value   json.RawMessage `json:"value"`
 	}
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			row.Value = nil
-			if e := json.Unmarshal(line, &row); e == nil {
-				var v struct {
-					Host   string `json:"host"`
-					Label  string `json:"label"`
-					Result string `json:"result"`
-				}
-				if len(row.Value) != 0 && json.Unmarshal(row.Value, &v) == nil && v.Label != "" {
-					if _, ok := parseReviewerLabel(v.Label); ok {
-						fn(row.Time.UTC().Format(reviewerSummaryDay), row.Command, v.Host, v.Label, v.Result)
-					}
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		row.Value = nil
+		if e := json.Unmarshal(line, &row); e == nil {
+			var v struct {
+				Host   string `json:"host"`
+				Label  string `json:"label"`
+				Result string `json:"result"`
+			}
+			if len(row.Value) != 0 && json.Unmarshal(row.Value, &v) == nil && v.Label != "" {
+				if _, ok := parseReviewerLabel(v.Label); ok {
+					fn(row.Time.UTC().Format(reviewerSummaryDay), row.Command, v.Host, v.Label, v.Result)
 				}
 			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
 		}
 	}
+	return jl.Err()
 }
 
 // scanBalanceReceipts streams one repo's reap log, calling fn for every
@@ -293,26 +283,18 @@ func (s *Service) scanBalanceReceipts(repo string, fn func(day, host, label stri
 		return err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var v reapReceipt
-			if e := json.Unmarshal(line, &v); e == nil && reviewerRow(v) {
-				if label := reviewerLabelOf(v); label != "" {
-					if _, ok := parseReviewerLabel(label); ok {
-						fn(v.Time.UTC().Format(reviewerSummaryDay), v.Host, label, reviewerCheckoutRemoved(v))
-					}
+	jl := fsutil.NewJSONL(f.Name(), 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var v reapReceipt
+		if e := json.Unmarshal(line, &v); e == nil && reviewerRow(v) {
+			if label := reviewerLabelOf(v); label != "" {
+				if _, ok := parseReviewerLabel(label); ok {
+					fn(v.Time.UTC().Format(reviewerSummaryDay), v.Host, label, reviewerCheckoutRemoved(v))
 				}
 			}
 		}
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
 	}
+	return jl.Err()
 }
 
 // balanceHost normalizes a recorded host through the configured hosts: a
@@ -662,7 +644,8 @@ type balanceDailyValue struct {
 // rows it already wrote instead of duplicating them.
 func (s *Service) balanceDailyRows(repo, day string) (map[string]balanceDailyValue, error) {
 	rows := map[string]balanceDailyValue{}
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return rows, nil
 	}
@@ -670,35 +653,30 @@ func (s *Service) balanceDailyRows(repo, day string) (map[string]balanceDailyVal
 		return nil, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day         string `json:"day"`
-					Host        string `json:"host"`
-					Created     int    `json:"created"`
-					Removed     int    `json:"removed"`
-					OpenBalance int    `json:"open_balance"`
-					WindowDays  int    `json:"window_days"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == balanceDailyCommand && row.Value.Day == day {
-				rows[row.Value.Host] = balanceDailyValue{
-					Created: row.Value.Created, Removed: row.Value.Removed,
-					Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
-				}
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day         string `json:"day"`
+				Host        string `json:"host"`
+				Created     int    `json:"created"`
+				Removed     int    `json:"removed"`
+				OpenBalance int    `json:"open_balance"`
+				WindowDays  int    `json:"window_days"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return rows, nil
+		if json.Unmarshal(line, &row) == nil && row.Command == balanceDailyCommand && row.Value.Day == day {
+			rows[row.Value.Host] = balanceDailyValue{
+				Created: row.Value.Created, Removed: row.Value.Removed,
+				Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
 			}
-			return nil, err
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // balanceRowsWritten returns the hosts the target repo already holds a
@@ -828,7 +806,8 @@ func (s *Service) auditNoticeBalance(target config.Repo, day, host string, creat
 // balanceNoticeWritten reports whether the target repo already holds a
 // reviewer-balance-notice audit row for the host's day.
 func (s *Service) balanceNoticeWritten(repo, day, host string) (bool, error) {
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -836,28 +815,23 @@ func (s *Service) balanceNoticeWritten(repo, day, host string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day  string `json:"day"`
-					Host string `json:"host"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
-				return true, nil
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day  string `json:"day"`
+				Host string `json:"host"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return false, nil
-			}
-			return false, err
+		if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
+			return true, nil
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // balanceNoticeRow returns the stored reviewer-balance-notice payload for
@@ -865,7 +839,8 @@ func (s *Service) balanceNoticeWritten(repo, day, host string) (bool, error) {
 // delivery's lane and counts, so a lost sent key can be restored with the
 // receipt it implies.
 func (s *Service) balanceNoticeRow(repo, day, host string) (balanceNoticeReceipt, bool, error) {
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return balanceNoticeReceipt{}, false, nil
 	}
@@ -873,38 +848,33 @@ func (s *Service) balanceNoticeRow(repo, day, host string) (balanceNoticeReceipt
 		return balanceNoticeReceipt{}, false, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string `json:"command"`
-				Value   struct {
-					Day         string `json:"day"`
-					Host        string `json:"host"`
-					Created     int    `json:"created"`
-					Removed     int    `json:"removed"`
-					OpenBalance int    `json:"open_balance"`
-					WindowDays  int    `json:"window_days"`
-					Lane        string `json:"lane"`
-					Via         string `json:"via"`
-				} `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
-				return balanceNoticeReceipt{
-					Created: row.Value.Created, Removed: row.Value.Removed,
-					Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
-					Lane: row.Value.Lane, Via: row.Value.Via,
-				}, true, nil
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string `json:"command"`
+			Value   struct {
+				Day         string `json:"day"`
+				Host        string `json:"host"`
+				Created     int    `json:"created"`
+				Removed     int    `json:"removed"`
+				OpenBalance int    `json:"open_balance"`
+				WindowDays  int    `json:"window_days"`
+				Lane        string `json:"lane"`
+				Via         string `json:"via"`
+			} `json:"value"`
 		}
-		if err != nil {
-			if err == io.EOF {
-				return balanceNoticeReceipt{}, false, nil
-			}
-			return balanceNoticeReceipt{}, false, err
+		if json.Unmarshal(line, &row) == nil && row.Command == balanceNoticeCommand && row.Value.Day == day && row.Value.Host == host {
+			return balanceNoticeReceipt{
+				Created: row.Value.Created, Removed: row.Value.Removed,
+				Open: row.Value.OpenBalance, Window: row.Value.WindowDays,
+				Lane: row.Value.Lane, Via: row.Value.Via,
+			}, true, nil
 		}
 	}
+	if err := jl.Err(); err != nil {
+		return balanceNoticeReceipt{}, false, err
+	}
+	return balanceNoticeReceipt{}, false, nil
 }
 
 // auditReviewerSpawn writes one reviewer-spawn audit row naming the host a

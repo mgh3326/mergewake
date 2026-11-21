@@ -1,11 +1,9 @@
 package pipeline
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 )
 
 // Per-host worker-worktree made/removed balance (hk 5168, order a329 part 2).
@@ -110,57 +109,50 @@ func (s *Service) workerWorktreeScan(repos []config.Repo, fn func(workerWorktree
 		if err != nil {
 			return err
 		}
-		rd := bufio.NewReader(f)
-		for {
-			line, err := rd.ReadBytes('\n')
-			if len(line) > 0 {
-				var row reapReceipt
-				if json.Unmarshal(line, &row) == nil &&
-					(row.Action == "remove-worktree" || row.Action == legacyAction) {
-					if strings.HasPrefix(row.Result, "would-") {
-						continue
-					}
-					wt := row.Worktree
-					if wt == "" {
-						wt = row.Cwd
-					}
-					if row.Host == "" {
-						// Hostless rows (notably the hostless
-						// merge-commit-unknown skips) carry no worktree
-						// identity to tally; they are unattributed, never
-						// stalling, and must not be dropped here.
-						fn(workerWorktreeRow{
-							time:   row.Time.UTC(),
-							pr:     row.PR,
-							repo:   r.Name,
-							result: row.Result,
-							reason: row.Reason,
-						})
-						continue
-					}
-					if !isWorkerWorktree(wt) {
-						continue
-					}
+		jl := fsutil.NewJSONL(f.Name(), 0, f)
+		for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+			var row reapReceipt
+			if json.Unmarshal(line, &row) == nil &&
+				(row.Action == "remove-worktree" || row.Action == legacyAction) {
+				if strings.HasPrefix(row.Result, "would-") {
+					continue
+				}
+				wt := row.Worktree
+				if wt == "" {
+					wt = row.Cwd
+				}
+				if row.Host == "" {
+					// Hostless rows (notably the hostless
+					// merge-commit-unknown skips) carry no worktree
+					// identity to tally; they are unattributed, never
+					// stalling, and must not be dropped here.
 					fn(workerWorktreeRow{
-						time:     row.Time.UTC(),
-						host:     row.Host,
-						worktree: wt,
-						pr:       row.PR,
-						repo:     r.Name,
-						result:   row.Result,
-						reason:   row.Reason,
+						time:   row.Time.UTC(),
+						pr:     row.PR,
+						repo:   r.Name,
+						result: row.Result,
+						reason: row.Reason,
 					})
+					continue
 				}
-			}
-			if err != nil {
-				if err == io.EOF {
-					break
+				if !isWorkerWorktree(wt) {
+					continue
 				}
-				_ = f.Close()
-				return err
+				fn(workerWorktreeRow{
+					time:     row.Time.UTC(),
+					host:     row.Host,
+					worktree: wt,
+					pr:       row.PR,
+					repo:     r.Name,
+					result:   row.Result,
+					reason:   row.Reason,
+				})
 			}
 		}
 		_ = f.Close()
+		if err := jl.Err(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -261,7 +253,8 @@ func (s *Service) workerWorktreesForDay(repos []config.Repo, day string) ([]Work
 // a worker-worktrees-daily row for on day.
 func (s *Service) workerWorktreesRowsWritten(repo, day string) (map[string]bool, error) {
 	written := map[string]bool{}
-	f, err := os.Open(filepath.Join(s.state(repo), "decisions.jsonl"))
+	jsonlPath := filepath.Join(s.state(repo), "decisions.jsonl")
+	f, err := os.Open(jsonlPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return written, nil
 	}
@@ -269,26 +262,20 @@ func (s *Service) workerWorktreesRowsWritten(repo, day string) (map[string]bool,
 		return nil, err
 	}
 	defer f.Close()
-	rd := bufio.NewReader(f)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if len(line) > 0 {
-			var row struct {
-				Command string          `json:"command"`
-				Value   json.RawMessage `json:"value"`
-			}
-			if json.Unmarshal(line, &row) == nil && row.Command == workerWorktreesDailyCommand {
-				var v struct {
-					Day  string `json:"day"`
-					Host string `json:"host"`
-				}
-				if json.Unmarshal(row.Value, &v) == nil && v.Day == day {
-					written[v.Host] = true
-				}
-			}
+	jl := fsutil.NewJSONL(jsonlPath, 0, f)
+	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
+		var row struct {
+			Command string          `json:"command"`
+			Value   json.RawMessage `json:"value"`
 		}
-		if err != nil {
-			break
+		if json.Unmarshal(line, &row) == nil && row.Command == workerWorktreesDailyCommand {
+			var v struct {
+				Day  string `json:"day"`
+				Host string `json:"host"`
+			}
+			if json.Unmarshal(row.Value, &v) == nil && v.Day == day {
+				written[v.Host] = true
+			}
 		}
 	}
 	return written, nil
