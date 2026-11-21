@@ -37,13 +37,14 @@ type reapReceipt struct {
 	Saved    string    `json:"saved,omitempty"` // report/log path captured before a pane close
 	Result   string    `json:"result"`          // closed, removed, deleted, abandoned, would-*, skipped, error
 	Reason   string    `json:"reason,omitempty"`
-	Files    []string  `json:"files,omitempty"`  // ignored paths named by a refusing removal skip
-	Job      string    `json:"job,omitempty"`    // job dir name of a closed pane or archived job
-	Task     string    `json:"task,omitempty"`   // Mergewake-Task of a job-bound row
-	Open     []string  `json:"open,omitempty"`   // open PRs (owner/name#N) keeping a job's pane
-	Label    string    `json:"label,omitempty"`  // reviewer label of a reviewer-reap or reviewer-cleanup row
-	Head     string    `json:"head,omitempty"`   // checked-out commit of a legacy-sweep row
-	Source   string    `json:"source,omitempty"` // what named a merged-PR worktree: pane, receipt or job-record
+	RetryKey string    `json:"retry_key,omitempty"` // stable failure id a failed close backs off on (abandonRetryKey); a row without one keys on its reason
+	Files    []string  `json:"files,omitempty"`     // ignored paths named by a refusing removal skip
+	Job      string    `json:"job,omitempty"`       // job dir name of a closed pane or archived job
+	Task     string    `json:"task,omitempty"`      // Mergewake-Task of a job-bound row
+	Open     []string  `json:"open,omitempty"`      // open PRs (owner/name#N) keeping a job's pane
+	Label    string    `json:"label,omitempty"`     // reviewer label of a reviewer-reap or reviewer-cleanup row
+	Head     string    `json:"head,omitempty"`      // checked-out commit of a legacy-sweep row
+	Source   string    `json:"source,omitempty"`    // what named a merged-PR worktree: pane, receipt or job-record
 
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 }

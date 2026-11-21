@@ -247,6 +247,23 @@ func alreadyClosedRefusal(e error) bool {
 	return exitStatus(e) == panewireCloseRefused && strings.Contains(integrations.Detail(e), "already has a terminal record")
 }
 
+// abandonRetryKey is the retry key of a job close that failed: the exit status
+// and a normalised refusal code, never the stderr text. A close can name a
+// per-call temp file in its stderr, so keying on the text gave every pass a new
+// key and reset the backoff to one attempt (hk 6005).
+func abandonRetryKey(e error) string {
+	code := "other"
+	switch {
+	case alreadyClosedRefusal(e):
+		code = "already_closed"
+	case unknownJobRefusal(e):
+		code = "job_unknown"
+	case scopeForbiddenRefusal(e):
+		code = "scope_forbidden"
+	}
+	return fmt.Sprintf("exit %d %s", exitStatus(e), code)
+}
+
 // unknownJobRefusal reports whether panewire refused a job close because its hub
 // does not know the job: exit 5 with job_unknown on stderr. The refusal is
 // permanent for a job the hub never stored (unknownJob).
