@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -561,11 +562,13 @@ echo "$result"`
 // in reclaimScript, so one expired lock has exactly one winner and a live lock
 // is never moved or removed by another claim. A guard held past the TTL is
 // reported as an error and never broken.
+var claimSeq uint64
+
 func (a *Archiver) claim(ctx context.Context, dest string) (func(), error) {
 	sum := sha256.Sum256([]byte(dest))
 	locks := path.Join(a.DriveDir, ".locks")
 	lock := path.Join(locks, hex.EncodeToString(sum[:]))
-	owner := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	owner := fmt.Sprintf("%d-%d-%d", time.Now().UnixNano(), os.Getpid(), atomic.AddUint64(&claimSeq, 1))
 	ttl := strconv.FormatInt(archiveLockTTL, 10)
 	b, err := a.on(ctx, a.SSH, "", "sh", "-c", claimScript, "sh", lock, locks, owner, ttl)
 	if err != nil {
