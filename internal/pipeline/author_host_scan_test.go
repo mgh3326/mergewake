@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -156,5 +157,29 @@ func TestSplitHostScan(t *testing.T) {
 				t.Fatalf("hosts = %v, want %v", hosts, tc.wantHosts)
 			}
 		})
+	}
+}
+
+// Sweep WARN (hk 5825): a host whose pane scan fails during a clean verdict (CI
+// green, no finding delivery, no error returned) is still reported to the pass's
+// sink, so the sweep can name it. The answering host is not reported.
+func TestHostScanFailureReachesSinkOnCleanVerdict(t *testing.T) {
+	s, g, n, r := workerNotifySetup(t)
+	delete(s.Sink.(*jobSink).jobs, "42")
+	s.Sink.(*jobSink).recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
+	run := authorHost(paneB)
+	s.Runner = run
+	setPartialAuthorScan(s, run)
+	g.ci = github.Green
+	var reported []string
+	ctx := WithHostScanSink(context.Background(), func(host string) { reported = append(reported, host) })
+	if e := s.NotifyPR(ctx, r, 7, Options{}); e != nil {
+		t.Fatalf("NotifyPR returned %v for a clean verdict on a partial pane scan", e)
+	}
+	if n.count != 0 {
+		t.Fatalf("clean verdict sent %d events, want none", n.count)
+	}
+	if !slices.Contains(reported, "unavailable") || slices.Contains(reported, "healthy") {
+		t.Fatalf("sink reported %v, want the failed host \"unavailable\" and not the answering host", reported)
 	}
 }

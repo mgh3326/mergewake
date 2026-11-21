@@ -311,3 +311,22 @@ func TestEventQueueSweepRepairsADroppedDelivery(t *testing.T) {
 		t.Fatalf("the sweep did not evaluate PR 2 alone: %s", res)
 	}
 }
+
+// Sweep WARN (hk 5825): the hosts noted during a repo's evaluations drain once,
+// sorted and deduplicated, and only for that repo.
+func TestHostScanFailuresDrainOncePerRepo(t *testing.T) {
+	e := &prEngine{hostFails: map[string]map[string]bool{}}
+	e.noteHostScan("owner/a", "unavailable")
+	e.noteHostScan("owner/a", "gone")
+	e.noteHostScan("owner/a", "unavailable")
+	e.noteHostScan("owner/b", "other")
+	if got, want := e.takeHostScanFails("owner/a"), []string{"gone", "unavailable"}; !slices.Equal(got, want) {
+		t.Fatalf("takeHostScanFails(owner/a) = %v, want %v", got, want)
+	}
+	if got := e.takeHostScanFails("owner/a"); len(got) != 0 {
+		t.Fatalf("second drain of owner/a = %v, want none", got)
+	}
+	if got, want := e.takeHostScanFails("owner/b"), []string{"other"}; !slices.Equal(got, want) {
+		t.Fatalf("takeHostScanFails(owner/b) = %v, want %v", got, want)
+	}
+}
