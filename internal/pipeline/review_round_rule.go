@@ -119,7 +119,7 @@ func (s *Service) roundHoldNotifyFailed(r config.Repo, pr github.Pull, rounds in
 }
 
 // Round3Directive is sent to the author when round 3 (or configured consult round) ends without a pass.
-const Round3Directive = "stop patching; ask your design lane for a consult one grade above your seat in another family: ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself"
+const Round3Directive = "stop patching; ask your design lane for a consult one grade above your seat (another family preferred, not required): ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself"
 
 // RoundDirective is an alias for Round3Directive.
 const RoundDirective = Round3Directive

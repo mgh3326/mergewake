@@ -1090,7 +1090,7 @@ on it.
   that had nothing open, does not use the step up, and a round that reaches its number with nothing qualifying still
   does nothing (an all-low round gets no consult, decision 250):
   - **Round consult (`review.round_rule.consult`, default 3):** The findings delivery to the worker carries the directive once:
-    `stop patching; ask your design lane for a consult one grade above your seat in another family: ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself`
+    `stop patching; ask your design lane for a consult one grade above your seat (another family preferred, not required): ESC --type decision to your owner lane with the packet as an hk doc key (every finding so far, ask for the root cause); do not run panewire consult request and do not call any model API yourself`
     No panewire call or lane event is emitted.
   - **Hub consult (`review.round_rule.hub_consult`, default false):** When on, the consult round asks the hub for the
     consult instead of telling the author to (operator decision 250; panewire docs/consult-on-request.md). With the
