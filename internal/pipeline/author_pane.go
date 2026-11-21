@@ -43,6 +43,25 @@ func WithAuthorScan(ctx context.Context) context.Context {
 	return context.WithValue(ctx, authorScanKey{}, &authorScan{})
 }
 
+// hostScanSinkKey carries the report of pane-scan failures to a pass that
+// tolerates them.
+type hostScanSinkKey struct{}
+
+// WithHostScanSink returns ctx whose pane-scan failures are also reported to
+// sink, once per failed host per evaluation. The failure itself is unchanged:
+// the gate, the routes and the takeover still tolerate it as a host scan error
+// (see hostScanOnly). The report lets the pass that owns ctx name the host even
+// when the verdict stays clean and no error reaches it.
+func WithHostScanSink(ctx context.Context, sink func(host string)) context.Context {
+	return context.WithValue(ctx, hostScanSinkKey{}, sink)
+}
+
+func reportHostScanFailure(ctx context.Context, host string) {
+	if sink, ok := ctx.Value(hostScanSinkKey{}).(func(string)); ok && sink != nil {
+		sink(host)
+	}
+}
+
 func authorScanFailures(ctx context.Context) []string {
 	if scan, ok := ctx.Value(authorScanKey{}).(*authorScan); ok {
 		return append([]string(nil), scan.failedHosts...)
@@ -229,6 +248,7 @@ func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 			if hs.failed {
 				errs = append(errs, hostScanError{h.Name})
 				scan.failedHosts = append(scan.failedHosts, h.Name)
+				reportHostScanFailure(ctx, h.Name)
 			} else {
 				scan.readHosts++
 			}

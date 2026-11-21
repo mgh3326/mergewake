@@ -58,6 +58,9 @@ type prEngine struct {
 	// since is what happened per repo after the last pass line.
 	since map[string]*passCounts
 	errs  map[string][]error
+	// hostFails is each repo's hosts whose pane scan failed during evaluations
+	// the sweep tolerated; the sweep names them once (see takeHostScanFails).
+	hostFails map[string]map[string]bool
 	// taken is the queue state each repo's last sweep saw.
 	taken        map[string]daemon.Stats
 	evalRequests int
@@ -102,7 +105,7 @@ type passCounts struct {
 
 func newPREngine(s *pipeline.Service, gh *github.Client, o pipeline.Options, repos []config.Repo, skips *prSkips, log *slog.Logger, onMerge pipeline.MergeHook) *prEngine {
 	e := &prEngine{s: s, gh: gh, o: o, repos: map[string]config.Repo{}, skips: skips, log: log, onMerge: onMerge,
-		listEpoch: map[string]uint64{}, sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, since: map[string]*passCounts{}, errs: map[string][]error{}, taken: map[string]daemon.Stats{},
+		listEpoch: map[string]uint64{}, sweeping: map[string]*prSweepState{}, open: map[string]*openSet{}, since: map[string]*passCounts{}, errs: map[string][]error{}, hostFails: map[string]map[string]bool{}, taken: map[string]daemon.Stats{},
 		evalCounts: github.NewRequestCounts("pr")}
 	for _, r := range repos {
 		e.repos[r.Name] = r
@@ -183,6 +186,7 @@ func (e *prEngine) run(ctx context.Context, w daemon.Work) {
 	defer tracing.Finish(transaction)
 	ctx, requests := github.ContinueRequests(ctx, "pr")
 	ctx = pipeline.WithMergeHook(ctx, e.onMerge)
+	ctx = pipeline.WithHostScanSink(ctx, func(host string) { e.noteHostScan(r.Name, host) })
 	ctx, repoSpan := tracing.Span(ctx, "mergewake.repo")
 	tracing.Tag(repoSpan, "repo", r.Name)
 	defer tracing.Finish(repoSpan)
@@ -418,6 +422,7 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 // returns the errors the evaluations since the last sweep ended with. It does
 // not wait for them.
 func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
+	ctx = pipeline.WithHostScanSink(ctx, func(host string) { e.noteHostScan(r.Name, host) })
 	// Pending MERGED deliveries are independent of the open PR list; retry each
 	// once on every repository sweep.
 	mergedErr := e.s.RetryMergedPending(ctx, r)
@@ -458,6 +463,7 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	// routed on the hosts that answered. It is logged once, so the outage
 	// stays visible without a failed pass.
 	rest, hosts := pipeline.SplitHostScan(errors.Join(mergedErr, errors.Join(errs...)))
+	hosts = uniqueHosts(append(hosts, e.takeHostScanFails(r.Name)...))
 	if len(hosts) > 0 && e.log != nil {
 		e.log.Warn("pr sweep: pane scan failed on hosts; PRs routed on the hosts that answered", "repo", r.Name, "hosts", hosts)
 	}
@@ -639,6 +645,36 @@ func (e *prEngine) sweepBounded(ctx context.Context, r config.Repo) error {
 		}
 		return fmt.Errorf("pr sweep deadline exceeded during %s: %w", state.currentStep(), context.DeadlineExceeded)
 	}
+}
+
+// noteHostScan records that host's pane scan failed in one of repo's
+// evaluations. That evaluation tolerated the failure, so nothing else reports it.
+func (e *prEngine) noteHostScan(repo, host string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.hostFails[repo] == nil {
+		e.hostFails[repo] = map[string]bool{}
+	}
+	e.hostFails[repo][host] = true
+}
+
+// takeHostScanFails drains the hosts noted for repo, sorted and each once.
+func (e *prEngine) takeHostScanFails(repo string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []string
+	for host := range e.hostFails[repo] {
+		out = append(out, host)
+	}
+	delete(e.hostFails, repo)
+	return uniqueHosts(out)
+}
+
+// uniqueHosts sorts names and drops repeats, so a host named by several
+// evaluations or errors is logged once.
+func uniqueHosts(names []string) []string {
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 func (e *prEngine) takeErrors(repo string) []error {
