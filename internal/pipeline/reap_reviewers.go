@@ -288,6 +288,9 @@ type reviewerSweep struct {
 	// more mean the hub credential may have lost its close grant (hk 6010).
 	scopeForbidden       int
 	scopeForbiddenSample string
+	// resumable marks a durable full sweep: only it resumes the visit order
+	// from, and records where its budget stopped (reviewer_cursor.go).
+	resumable bool
 }
 
 // reviewerCandidate is one label to visit, the host it is known to run on and,
@@ -316,7 +319,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}, resumable: prNum == 0 && durable}
 	if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
@@ -353,12 +356,25 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	}
 
 	cands := w.candidates(lastCleanup, prNum)
+	// A full sweep resumes after the candidate its last budget stopped at, so
+	// a label behind a run of open ones is reached on a later pass.
+	var from reviewerCursor
+	if w.resumable {
+		c, e := s.reviewerSweepCursor(r.Name)
+		if e != nil {
+			w.errs = append(w.errs, fmt.Errorf("reviewer reap: sweep cursor: %w", e))
+		}
+		from = c
+		cands = w.resume(cands, from)
+	}
 	auditVisits := 0
-	for _, c := range cands {
+	for i, c := range cands {
 		if e := reapBudgetCheck(ctx, "reviewer labels and checkout cleanup"); e != nil {
+			w.stopAt(cands[i])
 			return append(w.errs, e)
 		}
 		if e := ctx.Err(); e != nil {
+			w.stopAt(cands[i])
 			return append(w.errs, e)
 		}
 		if w.auditOnly[c.label.name] {
@@ -386,6 +402,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 			}
 		}
 	}
+	w.finished(from)
 	if acting {
 		if e := s.reviewerDailySummary(r.Name, receipts, hosts, snapshot); e != nil {
 			w.errs = append(w.errs, e)
