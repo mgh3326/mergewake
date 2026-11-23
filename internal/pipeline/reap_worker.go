@@ -40,27 +40,42 @@ type workerRows struct {
 }
 
 // reapWorkerWorktrees is one repo's worker-worktree pass over every host.
-func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, records *passJobRecords, acting bool, note func(reapReceipt)) []error {
+// durable reports that this pass writes its rows: only then is the stage's
+// resume cursor read and saved (worker_cursor.go).
+func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, records *passJobRecords, acting, durable bool, note func(reapReceipt)) []error {
 	after, e := config.OptionalDuration(s.Config.Reap.WorktreeAfter)
 	if e != nil {
 		return []error{e}
 	}
 	w := &workerPass{s: s, r: r, records: records, acting: acting, now: s.now(), after: after,
-		healthyCache: map[string]bool{}, ancestry: map[string]bool{}}
+		healthyCache: map[string]bool{}, ancestry: map[string]bool{}, resumable: durable}
+	var errs []error
+	var from workerCursor
+	if durable {
+		c, e := s.workerStageCursor(r.Name)
+		if e != nil {
+			errs = append(errs, fmt.Errorf("worker worktrees: resume cursor: %w", e))
+		}
+		from = c
+	}
 	// Discovery comes first and is the only host read this pass costs when no
 	// worker worktree exists: the branch inventories below page every closed
 	// PR, so a quiet repo must never pay for them.
 	order := workerHostOrder(s.Config, hosts)
-	var errs []error
 	cands := map[*reapHost][]workerCand{}
 	total := 0
+	// discovered is false when the budget or the context ended discovery before
+	// every host: the stage is not finished then and keeps its cursor.
+	discovered := true
 	for _, hs := range order {
 		if e := reapBudgetCheck(ctx, "worker worktree discovery and cleanup"); e != nil {
 			errs = append(errs, e)
+			discovered = false
 			break
 		}
-		if e := ctx.Err(); e != nil {
+		if e := budgetCut(ctx, ctx.Err(), "worker worktree discovery"); e != nil {
 			errs = append(errs, e)
+			discovered = false
 			break
 		}
 		if hs.failed {
@@ -85,6 +100,11 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		total += len(found)
 	}
 	if total == 0 {
+		if discovered {
+			if e := w.finished(from); e != nil {
+				errs = append(errs, e)
+			}
+		}
 		return errs
 	}
 	closedLister, okClosed := s.GH.(legacyClosedLister)
@@ -98,11 +118,11 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 	}
 	closed, e := closedLister.AllClosedPulls(ctx, r.Name)
 	if e != nil {
-		return append(errs, fmt.Errorf("worker worktrees: closed PR listing: %w", e))
+		return append(errs, fmt.Errorf("worker worktrees: closed PR listing: %w", budgetCut(ctx, e, "closed PR listing")))
 	}
 	open, e := openLister.OpenPulls(ctx, r.Name, "")
 	if e != nil {
-		return append(errs, fmt.Errorf("worker worktrees: open PR listing: %w", e))
+		return append(errs, fmt.Errorf("worker worktrees: open PR listing: %w", budgetCut(ctx, e, "open PR listing")))
 	}
 	// The newest closed PR of this repository per head branch decides, whether
 	// or not it merged: a newer closed-unmerged PR on a reused branch keeps the
@@ -118,42 +138,66 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		}
 	}
 	openSet := openBranches(open, r.Name)
+	visits := make([]workerVisit, 0, total)
 	for _, hs := range order {
-		if e := ctx.Err(); e != nil {
+		for _, c := range cands[hs] {
+			visits = append(visits, workerVisit{hs: hs, cand: c})
+		}
+	}
+	// A full stage resumes after the candidate its last budget stopped before
+	// and wraps round, so a candidate behind a run of kept ones is reached on a
+	// later pass (worker_cursor.go).
+	visits = resumeWorkerVisits(visits, order, from)
+	drain := map[*reapHost]int{}
+	rows := map[*reapHost]*workerRows{}
+	for _, hs := range order {
+		drain[hs] = s.Config.Reap.WorktreeDrain.DrainPerHost(config.DefaultWorktreeDrainPerHost)
+		rows[hs] = &workerRows{Candidates: len(cands[hs]), Kept: map[string]int{}}
+	}
+	cut := -1
+	for i, v := range visits {
+		if e := reapBudgetCheck(ctx, "worker worktree candidates"); e != nil {
 			errs = append(errs, e)
+			cut = i
 			break
 		}
-		drain := s.Config.Reap.WorktreeDrain.DrainPerHost(config.DefaultWorktreeDrainPerHost)
-		rows := &workerRows{Kept: map[string]int{}}
-		rows.Candidates = len(cands[hs])
-		for _, c := range cands[hs] {
-			if e := reapBudgetCheck(ctx, "worker worktree candidates"); e != nil {
-				errs = append(errs, e)
-				break
-			}
-			if e := ctx.Err(); e != nil {
-				errs = append(errs, e)
-				break
-			}
-			if drain <= 0 {
-				// The cap only bounds removals; the rest wait for the next
-				// pass, so a host's backlog drains in bounded steps.
-				continue
-			}
-			rec := w.evaluate(ctx, hs, c, newest, openSet, &errs)
-			if rec == nil {
-				continue
-			}
-			note(*rec)
-			if rec.Result == "removed" || rec.Result == "would-remove" {
-				rows.Removed++
-				drain--
-			} else {
-				rows.Kept[rec.Result+"|"+strings.SplitN(rec.Reason, ":", 2)[0]]++
-			}
+		if e := budgetCut(ctx, ctx.Err(), "worker worktree candidates"); e != nil {
+			errs = append(errs, e)
+			cut = i
+			break
 		}
+		if drain[v.hs] <= 0 {
+			// The cap only bounds removals; the rest wait for the next
+			// pass, so a host's backlog drains in bounded steps.
+			continue
+		}
+		rec := w.evaluate(ctx, v.hs, v.cand, newest, openSet, &errs)
+		if rec == nil {
+			continue
+		}
+		note(*rec)
+		if rec.Result == "removed" || rec.Result == "would-remove" {
+			rows[v.hs].Removed++
+			drain[v.hs]--
+		} else {
+			rows[v.hs].Kept[rec.Result+"|"+strings.SplitN(rec.Reason, ":", 2)[0]]++
+		}
+	}
+	// A stage the budget cut keeps its cursor at the candidate it stopped
+	// before; a stage that visited the whole order clears it.
+	switch {
+	case cut >= 0:
+		if e := w.stopAt(visits[cut]); e != nil {
+			errs = append(errs, e)
+		}
+	case discovered:
+		if e := w.finished(from); e != nil {
+			errs = append(errs, e)
+		}
+	}
+	for _, hs := range order {
 		if e := s.Print(map[string]any{"action": "worker-worktrees", "repo": r.Name, "host": hs.host.Name,
-			"apply": acting, "candidates": rows.Candidates, "removed": rows.Removed, "kept": rows.Kept}); e != nil {
+			"apply": acting, "candidates": rows[hs].Candidates, "removed": rows[hs].Removed, "kept": rows[hs].Kept}); e != nil {
 			errs = append(errs, e)
 		}
 	}
@@ -192,6 +236,9 @@ type workerPass struct {
 	after        time.Duration
 	healthyCache map[string]bool
 	ancestry     map[string]bool
+	// resumable marks a durable stage: only it reads and records the resume
+	// cursor (worker_cursor.go).
+	resumable bool
 }
 
 // workerClone is one registered clone to list: its main checkout and its git
@@ -408,7 +455,7 @@ func (w *workerPass) merged(ctx context.Context, hs *reapHost, c workerCand, p *
 		fp, e := w.s.GH.Pull(github.Uncached(ctx), w.r.Name, p.Number)
 		switch {
 		case e != nil:
-			*errs = append(*errs, fmt.Errorf("PR %d merge commit: %w", p.Number, e))
+			*errs = append(*errs, fmt.Errorf("PR %d merge commit: %w", p.Number, budgetCut(ctx, e, "merge commit read")))
 			return "merge-commit-unknown"
 		case fp.MergeCommitSHA == "":
 			return "merge-commit-unknown"
@@ -423,7 +470,7 @@ func (w *workerPass) merged(ctx context.Context, hs *reapHost, c workerCand, p *
 	}
 	recovery, e := watcher.WatchRevert(ctx, w.r.Name, p.Number, mergeSHA)
 	if e != nil {
-		*errs = append(*errs, fmt.Errorf("PR %d revert check: %w", p.Number, e))
+		*errs = append(*errs, fmt.Errorf("PR %d revert check: %w", p.Number, budgetCut(ctx, e, "revert check")))
 		return "revert-check-failed"
 	}
 	if recovery != nil {
@@ -580,7 +627,7 @@ func (w *workerPass) healthy(ctx context.Context, sha string, errs *[]error) boo
 	}
 	ok, e := w.s.watchCovers(ctx, w.r, sha)
 	if e != nil {
-		*errs = append(*errs, fmt.Errorf("watch verdict: %w", e))
+		*errs = append(*errs, fmt.Errorf("watch verdict: %w", budgetCut(ctx, e, "watch verdict")))
 	}
 	w.healthyCache[sha] = ok
 	return ok
@@ -634,7 +681,7 @@ func (w *workerPass) ancestor(ctx context.Context, older, newer string, errs *[]
 	case github.NotFound(e):
 		ok = false
 	case e != nil:
-		*errs = append(*errs, fmt.Errorf("ancestry %s..%s: %w", older, newer, e))
+		*errs = append(*errs, fmt.Errorf("ancestry %s..%s: %w", older, newer, budgetCut(ctx, e, "ancestry read")))
 		ok = false
 	}
 	w.ancestry[k] = ok
