@@ -640,6 +640,22 @@ func budgetCut(ctx context.Context, err error, operation string) error {
 	return fmt.Errorf("%w: %s: %v", ErrReapRepoBudget, operation, err)
 }
 
+// reapStageShare runs one stage on num/den of the repo budget the pass has
+// left when the stage starts. The stage's deadline is a child of the pass's,
+// so the stages after it keep the rest and the pass still ends at its own
+// deadline; a stage the share ends reports the budget cause like any budget
+// stop. A pass with no budget gets ctx back unchanged.
+func reapStageShare(ctx context.Context, num, den int64) (context.Context, context.CancelFunc) {
+	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
+	if b.deadline.IsZero() {
+		return ctx, func() {}
+	}
+	left := max(time.Until(b.deadline), 0)
+	deadline := time.Now().Add(left * time.Duration(num) / time.Duration(den))
+	stage, cancel := context.WithDeadlineCause(ctx, deadline, ErrReapRepoBudget)
+	return context.WithValue(stage, reapBudgetKey{}, reapBudget{deadline: deadline}), cancel
+}
+
 func reapBudgetCheck(ctx context.Context, remaining string) error {
 	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
 	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
@@ -1283,7 +1299,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		if e := reapBudgetCheck(ctx, "worker worktrees, reviewer sweep and archive"); e != nil {
 			return errors.Join(append(errs, e)...)
 		}
-		errs = append(errs, s.reapWorkerWorktrees(ctx, r, hosts, records, acting, note)...)
+		// The worker stage gets two thirds of the budget the pass has left, so
+		// the reviewer sweep and what follows keep the last third: a worker
+		// stage that always fills the budget starves them on every pass.
+		workerCtx, cancelWorker := reapStageShare(ctx, 2, 3)
+		errs = append(errs, s.reapWorkerWorktrees(workerCtx, r, hosts, records, acting, !o.DryRun, note)...)
+		cancelWorker()
 	}
 	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
 		return errors.Join(append(errs, e)...)
