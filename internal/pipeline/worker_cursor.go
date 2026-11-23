@@ -87,9 +87,10 @@ func (w *workerPass) stopAt(v workerVisit) error {
 }
 
 // finished clears a cursor the stage has now passed, so the next full stage
-// starts from the front of the order again.
+// starts from the front of the order again. An unreadable cursor is cleared
+// too, so the file no longer fails the next pass.
 func (w *workerPass) finished(from workerCursor) error {
-	if !w.resumable || from.Path == "" {
+	if !w.resumable || (from.Path == "" && !w.unreadable) {
 		return nil
 	}
 	if e := w.s.saveWorkerStageCursor(w.r.Name, workerCursor{}); e != nil {

@@ -557,7 +557,14 @@ func (s *Service) reapRetrySucceeded(repo, job string) {
 }
 
 type reapBudgetKey struct{}
-type reapBudget struct{ deadline time.Time }
+
+// reapBudget is the deadline a context's budget ends at. A stage share sets
+// passDeadline to the pass's own deadline, so a stage that ends at its share
+// can tell that from the pass running out (stageShareEnded).
+type reapBudget struct {
+	deadline     time.Time
+	passDeadline time.Time
+}
 
 type reapPassStateKey struct{}
 
@@ -565,6 +572,9 @@ type reapPassState struct {
 	mu       sync.Mutex
 	left     string
 	inflight string
+	// share is the first stage whose share ended while the pass still had
+	// budget. It is not a pass stop: the pass goes on to its later stages.
+	share string
 }
 
 func (s *reapPassState) recordStage(stage string) {
@@ -589,6 +599,17 @@ func (s *reapPassState) recordCut(operation string) {
 	}
 }
 
+func (s *reapPassState) recordShare(stage string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.share == "" {
+		s.share = stage
+	}
+}
+
 func (s *reapPassState) snapshot() (left, inflight string) {
 	if s == nil {
 		return "", ""
@@ -596,6 +617,16 @@ func (s *reapPassState) snapshot() (left, inflight string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.left, s.inflight
+}
+
+// shareCut is the first stage whose share the pass cut short, "" when none did.
+func (s *reapPassState) shareCut() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.share
 }
 
 // ReapBudgetStop marks a repository pass that stopped at a safe point or
@@ -630,12 +661,24 @@ func reapBudgetResult(state *reapPassState, failures error) error {
 	return &ReapBudgetStop{Left: left, Failures: failures}
 }
 
+// stageShareEnded reports whether ctx is a stage share that has run out while
+// the pass still has budget. Such an end is local to the stage: the pass goes
+// on to its later stages, so it is not recorded as the pass's stop.
+func stageShareEnded(ctx context.Context) bool {
+	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
+	return !b.passDeadline.IsZero() && time.Now().Before(b.passDeadline)
+}
+
 func budgetCut(ctx context.Context, err error, operation string) error {
 	if err == nil || context.Cause(ctx) != ErrReapRepoBudget {
 		return err
 	}
 	if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
-		state.recordCut(operation)
+		if stageShareEnded(ctx) {
+			state.recordShare(operation)
+		} else {
+			state.recordCut(operation)
+		}
 	}
 	return fmt.Errorf("%w: %s: %v", ErrReapRepoBudget, operation, err)
 }
@@ -652,15 +695,23 @@ func reapStageShare(ctx context.Context, num, den int64) (context.Context, conte
 	}
 	left := max(time.Until(b.deadline), 0)
 	deadline := time.Now().Add(left * time.Duration(num) / time.Duration(den))
+	passDeadline := b.passDeadline
+	if passDeadline.IsZero() {
+		passDeadline = b.deadline
+	}
 	stage, cancel := context.WithDeadlineCause(ctx, deadline, ErrReapRepoBudget)
-	return context.WithValue(stage, reapBudgetKey{}, reapBudget{deadline: deadline}), cancel
+	return context.WithValue(stage, reapBudgetKey{}, reapBudget{deadline: deadline, passDeadline: passDeadline}), cancel
 }
 
 func reapBudgetCheck(ctx context.Context, remaining string) error {
 	b, _ := ctx.Value(reapBudgetKey{}).(reapBudget)
 	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
 		if state, _ := ctx.Value(reapPassStateKey{}).(*reapPassState); state != nil {
-			state.recordStage(remaining)
+			if stageShareEnded(ctx) {
+				state.recordShare(remaining)
+			} else {
+				state.recordStage(remaining)
+			}
 		}
 		return fmt.Errorf("%w; left: %s", ErrReapRepoBudget, remaining)
 	}
@@ -705,7 +756,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			failures = errors.Join(failures, s.audit(r.Name, "reap-error", map[string]any{"error": failures.Error()}, o.DryRun))
 		}
 		left, inflight := passState.snapshot()
-		if errors.Is(retErr, ErrReapRepoBudget) && left == "" && inflight == "" {
+		// A budget error with no recorded stop is an external operation cut by
+		// the pass's own deadline. One cut by a stage share (the pass still has
+		// budget) is not the pass's stop, so it is left unrecorded.
+		if errors.Is(retErr, ErrReapRepoBudget) && left == "" && inflight == "" && context.Cause(ctx) == ErrReapRepoBudget {
 			// GitHub transport boundaries carry the budget cause directly; they
 			// cannot update this package's pass state at the call site.
 			passState.recordCut("external operation")
@@ -1351,6 +1405,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// JobRecords is what the third discovery source reached: the job
 		// records of the tasks of the merged PRs past worktree_after.
 		JobRecords reapJobReach `json:"job_records"`
-	}{"reap", r.Name, !acting, scanned, planned, removed, deleted, archived, skipped, len(errs), reach}
+		// ShareCut names the stage whose budget share ended before its work
+		// did while the pass still had budget; the pass itself completed.
+		ShareCut string `json:"share_cut,omitempty"`
+	}{"reap", r.Name, !acting, scanned, planned, removed, deleted, archived, skipped, len(errs), reach, passState.shareCut()}
 	return errors.Join(append(errs, s.audit(r.Name, "reap", result, o.DryRun))...)
 }
