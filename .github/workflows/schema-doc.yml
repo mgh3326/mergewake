@@ -1,0 +1,91 @@
+name: mergewake-schema-doc
+
+# Documents the MySQL store schema with tbls (hk 6107, operator decision 480).
+# Runs only after a merge to main that touches the migrations, this workflow,
+# or the tbls config; pull-request CI does not run it. It connects only to the
+# throwaway database of its own service container and holds no secret.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'internal/server/store/schema/**'
+      - 'internal/server/store/migrate.go'
+      - '.github/workflows/schema-doc.yml'
+      - '.tbls.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  schema-doc:
+    name: schema-doc
+    # GitHub-hosted only: never PANEWIRE_POST_LINUX_RUNNER (decision 480).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: mergewake_schema_doc
+        ports: ["127.0.0.1:3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
+
+      - name: Migrate MySQL schema to head
+        env:
+          MERGEWAKE_SCHEMA_DOC_MYSQL_DSN: root@tcp(127.0.0.1:3306)/mergewake_schema_doc?parseTime=true
+          MERGEWAKE_SCHEMA_DOC_VERSION_FILE: ${{ runner.temp }}/mysql-version.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -v -count=1 -run '^TestSchemaDocMigrate$' ./internal/server/store/
+          MYSQL_VERSION=$(cat "${{ runner.temp }}/mysql-version.txt")
+          echo "MYSQL_VERSION=${MYSQL_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install tbls v1.97.0
+        env:
+          TBLS_VERSION: 1.97.0
+          TBLS_SHA256: 43c81f408495d9b626d0265a6ebb57c6d1c4a5e072d3eecc3e88825cc6c64e9a
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o tbls.tar.gz "https://github.com/k1LoW/tbls/releases/download/v${TBLS_VERSION}/tbls_v${TBLS_VERSION}_linux_amd64.tar.gz"
+          echo "${TBLS_SHA256}  tbls.tar.gz" | sha256sum -c -
+          tar -xzf tbls.tar.gz tbls
+          sudo install -m 0755 tbls /usr/local/bin/tbls
+          rm -f tbls.tar.gz tbls
+          tbls version
+
+      - name: Generate schema documentation with tbls
+        env:
+          TBLS_DSN: my://root@127.0.0.1:3306/mergewake_schema_doc
+        shell: bash
+        run: |
+          set -euo pipefail
+          start_sec=$(date +%s)
+          tbls doc --er-format mermaid
+          tbls out -t json -o schema-doc/schema.json
+          end_sec=$(date +%s)
+          echo "tbls step took $(( end_sec - start_sec )) seconds"
+
+      - name: Upload schema doc artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mergewake-schema-doc
+          path: schema-doc/
+          if-no-files-found: error

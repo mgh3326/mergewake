@@ -1,0 +1,6 @@
+name: mergewake
+desc: "Built from the embedded MySQL migrations by MySQL ${MYSQL_VERSION} in CI (production is MySQL 26.10.0-cloud, HeatWave; CI uses the service container's version)"
+dsn: ${TBLS_DSN}
+docPath: schema-doc
+er:
+  format: mermaid
