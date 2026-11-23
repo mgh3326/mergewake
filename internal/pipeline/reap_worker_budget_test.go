@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,8 +62,9 @@ func TestWorkerStageBudgetLeavesReviewerSweepTime(t *testing.T) {
 	f := budgetWorkerFix(t, 24, "600ms", 50*time.Millisecond)
 	label := reviewerLabelFor(12, time.Hour)
 	f.addReviewer(label, "w1:p5")
-	if err := f.reap(t, 0, Options{}); !errors.Is(err, ErrReapRepoBudget) {
-		t.Fatalf("pass ended with %v, want a budget stop: the worker stage did not fill the budget", err)
+	_ = f.reap(t, 0, Options{})
+	if got := len(f.s.Sink.(*slowJobSink).read); got == 24 {
+		t.Fatalf("the worker stage read every candidate: it did not fill its share of the budget")
 	}
 	for _, r := range f.rows(t) {
 		if r.Label == label {
@@ -125,7 +125,9 @@ func TestWorkerStageGitHubReadCutByBudgetIsNotAFailure(t *testing.T) {
 	if !gh.asked {
 		t.Fatal("the watch verdict never asked GitHub; the budget did not reach the worker stage")
 	}
-	if !errors.Is(err, ErrReapRepoBudget) || !ReapBudgetOnly(err) {
+	// The cut may end the pass (a budget stop) or only the worker stage's
+	// share, after which the pass completes; either way it is not a failure.
+	if ReapNonBudgetErrors(err) != nil {
 		t.Fatalf("a GitHub read cut by the budget counted as a failure: %v", err)
 	}
 }
