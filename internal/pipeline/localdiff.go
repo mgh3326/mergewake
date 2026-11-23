@@ -1,11 +1,14 @@
 package pipeline
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -30,11 +33,13 @@ type diffResult struct {
 
 // reviewDiff reads the PR patch. GitHub answers HTTP 406 to the diff media type
 // for very large PRs; only then does it build the same merge-base patch from the
-// local checkout. Every other error is returned unchanged.
+// local checkout. Every other error is returned unchanged. The GitHub patch is
+// bounded by boundDiff, the same as the local one.
 func (s *Service) reviewDiff(ctx context.Context, r config.Repo, pr github.Pull) (diffResult, error) {
 	text, e := s.GH.Diff(ctx, r.Name, pr.Number)
 	if e == nil {
-		return diffResult{text: text}, nil
+		text, summarized := boundDiff(text)
+		return diffResult{text: text, summarized: summarized}, nil
 	}
 	if !isHTTPStatus(e, http.StatusNotAcceptable) {
 		return diffResult{}, e
@@ -114,45 +119,76 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 	return diffResult{text: text, source: "local", summarized: summarized}, nil
 }
 
+// boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the
+// budget is returned byte for byte with no summarized paths; a larger one is
+// summarized exactly as the local fallback summarizes its patch, so both paths
+// hand the reviewer the same bounded text.
+func boundDiff(text string) (string, []string) {
+	if len(text) <= reviewDiffBudget {
+		return text, nil
+	}
+	return summarizeLocalDiff(text, reviewDiffBudget)
+}
+
 // summarizeLocalDiff applies the size bound the API path applies. Pure renames
-// carry no content and are listed by path (git diff -M); when the patch is still
-// over budget it keeps complete file blocks in their stable order while they
-// fit, and replaces each later block with its header and a digest of the
-// omitted text. Every summarized path is returned, so the pass body can name it.
+// carry no content and are listed by path (git diff -M). When the patch is over
+// budget, the largest elidable file blocks are elided first (ties: later file
+// first) until the rest fits; each elided block keeps its header and a digest of
+// the omitted text. The output keeps the original file order, and every
+// summarized path is returned, so the pass body can name it. If the headers
+// alone exceed the budget, the result is still over it and the caller refuses it.
 func summarizeLocalDiff(diff string, budget int) (string, []string) {
 	files := splitDiff(diff)
 	if len(files) == 0 {
 		return diff, nil
 	}
-	header := make([]string, len(files))
-	// suffix[i] reserves the headers of files i and later that could still be
-	// elided; a pure rename keeps its (tiny) block and is never headed alone.
-	suffix := make([]int, len(files)+1)
-	for i := len(files) - 1; i >= 0; i-- {
-		header[i] = elidedHeader(files[i])
-		if elidable(files[i]) {
-			suffix[i] = suffix[i+1] + len(header[i]) + len(elidedNote) + 65
-		} else {
-			suffix[i] = suffix[i+1]
+	blocks := make([]string, len(files))
+	headers := make([]string, len(files))
+	stubLen := make([]int, len(files))
+	total := 0
+	for i, f := range files {
+		blocks[i] = diffBlock(f)
+		total += len(blocks[i])
+		if elidable(f) {
+			headers[i] = elidedHeader(f)
+			stubLen[i] = len(headers[i]) + len(elidedNote) + hex.EncodedLen(sha256.Size) + 1
 		}
+	}
+	// Elide the largest blocks first. A block whose stub would not be smaller
+	// is never elided, so eliding can only shrink the output.
+	var order []int
+	for i, f := range files {
+		if elidable(f) && stubLen[i] < len(blocks[i]) {
+			order = append(order, i)
+		}
+	}
+	slices.SortFunc(order, func(a, b int) int {
+		if c := cmp.Compare(len(blocks[b]), len(blocks[a])); c != 0 {
+			return c
+		}
+		return cmp.Compare(b, a)
+	})
+	elided := make([]bool, len(files))
+	for _, i := range order {
+		if total <= budget {
+			break
+		}
+		elided[i] = true
+		total += stubLen[i] - len(blocks[i])
 	}
 	var b strings.Builder
 	var summarized []string
-	used := 0
 	for i, f := range files {
-		block := diffBlock(f)
 		if pureRename(f) {
 			summarized = append(summarized, diffFilePath(f))
 		}
-		if !elidable(f) || used+len(block)+suffix[i+1] <= budget {
-			b.WriteString(block)
-			used += len(block)
+		if !elided[i] {
+			b.WriteString(blocks[i])
 			continue
 		}
-		b.WriteString(header[i])
+		b.WriteString(headers[i])
 		b.WriteString(elidedNote)
-		fmt.Fprintf(&b, "%x\n", sha256.Sum256([]byte(block)))
-		used += len(header[i]) + len(elidedNote) + 65
+		fmt.Fprintf(&b, "%x\n", sha256.Sum256([]byte(blocks[i])))
 		if p := diffFilePath(f); p != "" {
 			summarized = append(summarized, p)
 		}
