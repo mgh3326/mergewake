@@ -78,8 +78,8 @@ jobs:
         run: |
           set -euo pipefail
           start_sec=$(date +%s)
-          tbls doc --er-format mermaid
-          tbls out -t json -o schema-doc/schema.json
+          tbls doc --config .tbls.yml --er-format mermaid
+          tbls out --config .tbls.yml -t json -o schema-doc/schema.json
           end_sec=$(date +%s)
           echo "tbls step took $(( end_sec - start_sec )) seconds"
 
