@@ -190,6 +190,9 @@ func (s *Service) patchIDOf(ctx context.Context, repo string, n int, head string
 	if e != nil {
 		return ""
 	}
+	// The review's patch id is computed on the bounded text (see reviewDiff),
+	// so this one must be too, or an oversized PR would never match itself.
+	diff, _ = boundDiff(diff)
 	return s.rememberPatch(key, reviewPatchID(diff))
 }
 

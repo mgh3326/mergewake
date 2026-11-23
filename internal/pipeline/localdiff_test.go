@@ -170,3 +170,92 @@ func TestSummarizeLocalDiffElidesBinaryContent(t *testing.T) {
 		t.Fatalf("summarized = %v\ntext:\n%s", summarized, text)
 	}
 }
+
+// fileBlock is one modified file whose body is size bytes of fill.
+func fileBlock(path string, size int, fill string) string {
+	return "diff --git a/" + path + " b/" + path + "\n--- a/" + path + "\n+++ b/" + path + "\n@@ -1 +1 @@\n-old\n+" +
+		strings.Repeat(fill, size) + "\n"
+}
+
+// Within the budget the largest blocks are elided first, so a small file that
+// sorts after large ones keeps its content, and the output keeps file order.
+func TestSummarizeLocalDiffElidesLargestFirst(t *testing.T) {
+	diff := fileBlock("a.txt", 300, "a") + fileBlock("b.txt", 900, "b") + fileBlock("c.txt", 100, "c")
+	text, summarized := summarizeLocalDiff(diff, 710)
+	if !strings.Contains(text, "+"+strings.Repeat("a", 300)) {
+		t.Fatalf("a.txt was elided though eliding b.txt alone fits:\n%.200s", text)
+	}
+	if strings.Contains(text, strings.Repeat("b", 50)) || !strings.Contains(text, "+"+strings.Repeat("c", 100)) {
+		t.Fatalf("b.txt kept or c.txt elided:\n%.200s", text)
+	}
+	if !slices.Equal(summarized, []string{"b.txt"}) {
+		t.Fatalf("summarized = %v", summarized)
+	}
+	if i, j := strings.Index(text, "a/a.txt"), strings.Index(text, "a/c.txt"); i < 0 || j < i {
+		t.Fatalf("file order not kept: a=%d c=%d", i, j)
+	}
+}
+
+// An API patch under the budget is returned byte for byte, with no summarized
+// paths, and a pure rename stays as the GitHub patch gave it.
+func TestReviewDiffUnderBudgetIsByteIdentical(t *testing.T) {
+	s, g, _, _, r := reviewSetup(t)
+	diff := fileBlock("tool", 4, "x") + "diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\n"
+	g.pull.Head = github.Ref{SHA: "under", Ref: "feature"}
+	g.diffs = map[string]string{"under": diff}
+	src, err := s.reviewDiff(context.Background(), r, g.pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.text != diff || src.summarized != nil || src.source != "" {
+		t.Fatalf("under budget changed: source=%q summarized=%v text=%q", src.source, src.summarized, src.text)
+	}
+}
+
+// An API patch over the budget is summarized, not refused: the small source file
+// after three large bundles keeps its content, the bundle that does not fit is
+// elided and named, and the review posts a pass that lists it.
+func TestReviewSummarizesOversizedAPIDiff(t *testing.T) {
+	s, g, _, _, r := reviewSetup(t)
+	size := reviewDiffBudget / 3
+	diff := fileBlock("internal/ui/static/console/shared-1.js", size, "a") +
+		fileBlock("internal/ui/static/console/shared-2.js", size, "b") +
+		fileBlock("internal/ui/static/console/shared-3.js", size, "c") +
+		fileBlock("web/console/src/app.ts", 3, "n")
+	g.pull.Base = github.Ref{Ref: "main", SHA: "base0"}
+	g.pull.Head = github.Ref{SHA: "over", Ref: "feature"}
+	g.pull.Head.Repo.FullName = r.Name
+	g.diffs = map[string]string{"over": diff}
+	src, err := s.reviewDiff(context.Background(), r, g.pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(src.summarized, []string{"internal/ui/static/console/shared-3.js"}) {
+		t.Fatalf("summarized = %v", src.summarized)
+	}
+	if strings.Contains(src.text, strings.Repeat("c", 100)) || !strings.Contains(src.text, "+nnn\n") {
+		t.Fatal("the elided bundle kept content, or the source file lost its content")
+	}
+	if len(src.text) > reviewDiffBudget {
+		t.Fatalf("summarized text is %d bytes, over the budget", len(src.text))
+	}
+	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
+		t.Fatalf("an oversized API diff was refused: %v", e)
+	}
+	p := g.passes["over"]
+	if len(p) != 1 || p[0].DiffSummarized != "internal/ui/static/console/shared-3.js" || p[0].DiffSource != "" {
+		t.Fatalf("pass receipt = %+v", p)
+	}
+}
+
+// Headers alone over the budget cannot be summarized into the budget, so the
+// review still refuses the diff, as it did before.
+func TestReviewRefusesDiffWhoseHeadersAloneExceedBudget(t *testing.T) {
+	s, g, _, _, r := reviewSetup(t)
+	g.diffs = map[string]string{"hdrs": strings.Repeat("diff --git a/x b/x\nindex 1..2 100644\n", reviewDiffBudget/30)}
+	g.pull.Head = github.Ref{SHA: "hdrs", Ref: "feature"}
+	err := s.Review(context.Background(), r, 7, "openai", Options{})
+	if err == nil || !strings.Contains(err.Error(), "manual review required") {
+		t.Fatalf("err = %v", err)
+	}
+}
