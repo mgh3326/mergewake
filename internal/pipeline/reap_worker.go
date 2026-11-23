@@ -55,8 +55,10 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		c, e := s.workerStageCursor(r.Name)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("worker worktrees: resume cursor: %w", e))
+			w.unreadable = true
+		} else {
+			from = c
 		}
-		from = c
 	}
 	// Discovery comes first and is the only host read this pass costs when no
 	// worker worktree exists: the branch inventories below page every closed
@@ -239,6 +241,9 @@ type workerPass struct {
 	// resumable marks a durable stage: only it reads and records the resume
 	// cursor (worker_cursor.go).
 	resumable bool
+	// unreadable marks a resume cursor the stage could not read: the stage
+	// starts from the front and its next save overwrites the file.
+	unreadable bool
 }
 
 // workerClone is one registered clone to list: its main checkout and its git

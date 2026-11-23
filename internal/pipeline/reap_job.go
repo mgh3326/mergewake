@@ -55,7 +55,11 @@ func (c *passJobRecords) job(ctx context.Context, id string) (integrations.JobRe
 	}
 	rec, e := c.jobs.Job(ctx, id)
 	if e != nil {
-		c.errs[id] = e
+		// A read the stage share cut is not kept: a later stage of the pass,
+		// with budget left, must read the record rather than replay the cut.
+		if !(errors.Is(e, ErrReapRepoBudget) && stageShareEnded(ctx)) {
+			c.errs[id] = e
+		}
 		return integrations.JobRecord{}, e
 	}
 	c.recs[id] = rec
