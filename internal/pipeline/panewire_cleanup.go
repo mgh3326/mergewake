@@ -280,6 +280,10 @@ func (c *reviewerCleanup) panePresent(ctx context.Context, ops reviewerPanes) (b
 func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost, cwd string) {
 	c.row.Worktree, c.row.Cwd = cwd, cwd
 	tree, err := host.Inspect(ctx, cwd)
+	if reviewerBudgetCut(ctx, err) {
+		c.record("pending-cleanup", reviewerBudgetHold)
+		return
+	}
 	if err != nil {
 		c.record("error", "worktree inspect: "+err.Error())
 		return
@@ -289,6 +293,10 @@ func (c *reviewerCleanup) removeWorktree(ctx context.Context, host reap.HubHost,
 		return
 	}
 	removed, err := host.WorktreeRemove(ctx, tree.Path, c.p.head, c.x.pr.Base.Ref, nil, true)
+	if reviewerBudgetCut(ctx, err) {
+		c.record("pending-cleanup", reviewerBudgetHold)
+		return
+	}
 	if err != nil {
 		c.record("error", "worktree remove: "+err.Error())
 		return

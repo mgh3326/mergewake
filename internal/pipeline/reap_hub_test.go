@@ -1,9 +1,11 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,6 +57,11 @@ type fakeReapHub struct {
 	lists    map[string][]map[string]any
 	listPage int
 	listErr  map[string]string
+	// hangInspect is a cwd whose worktree.inspect never answers, so the
+	// client's budget context ends the read; inspectErr answers that cwd's
+	// worktree.inspect with a node error code.
+	hangInspect string
+	inspectErr  map[string]string
 	// moreNodes are extra node rows GET /v1/nodes/agents reports beside the
 	// node-a row, so a test can place labels on more than one host.
 	moreNodes []any
@@ -73,10 +80,34 @@ func (h *fakeReapHub) ops(op string) []map[string]any {
 	return out
 }
 
+// inspectsCwd reports whether a hub request is a worktree.inspect of cwd. The
+// body is read and put back, so the handler still decodes it.
+func inspectsCwd(r *http.Request, cwd string) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	raw, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	var probe struct {
+		Op   string `json:"op"`
+		Args struct {
+			Cwd string `json:"cwd"`
+		} `json:"args"`
+	}
+	return json.Unmarshal(raw, &probe) == nil && probe.Op == "worktree.inspect" && probe.Args.Cwd == cwd
+}
+
 func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer svc-token" || r.Header.Get("X-Panewire-Machine-ID") != "svc-mergewake" {
 			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		h.mu.Lock()
+		hang := h.hangInspect
+		h.mu.Unlock()
+		if hang != "" && inspectsCwd(r, hang) {
+			<-r.Context().Done()
 			return
 		}
 		h.mu.Lock()
@@ -106,6 +137,10 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 		case "worktree.inspect":
 			if h.onInspect != nil {
 				h.onInspect()
+			}
+			if code := h.inspectErr[body["args"].(map[string]any)["cwd"].(string)]; code != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": code})
+				return
 			}
 			result = map[string]any{"worktree": nil}
 			if cwd := body["args"].(map[string]any)["cwd"].(string); cwd == "/repo.wt" || h.wtPaths[cwd] || h.detached[cwd] {
