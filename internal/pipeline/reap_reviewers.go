@@ -844,6 +844,9 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	case errors.Is(e, integrations.ErrJobNotFound):
 		w.record(gate, "kept", "job-record-missing")
 		return
+	case reviewerBudgetCut(ctx, e):
+		w.record(gate, "pending-cleanup", reviewerBudgetHold)
+		return
 	case e != nil:
 		w.record(gate, "error", "job record: "+integrations.Detail(e))
 		return
@@ -1036,6 +1039,10 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 	// pass may have taken. Read the pane again before the close, so a pane that
 	// started work since the scan keeps its job.
 	if fresh, e := freshPaneFinished(ctx, c); e != nil {
+		if reviewerBudgetCut(ctx, e) {
+			w.record(gate, "pending-cleanup", reviewerBudgetHold)
+			return false
+		}
 		w.record(gate, "error", "abandon job: pane read: "+e.Error())
 		return false
 	} else if !fresh {
@@ -1059,6 +1066,10 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		}
 		if scopeForbiddenRefusal(e) {
 			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
+		}
+		if reviewerBudgetCut(ctx, e) {
+			w.record(gate, "pending-cleanup", reviewerBudgetHold)
+			return false
 		}
 		// The retry key is the failure id, not the reason: the reason keeps
 		// stderr, which can change per call. The row carries the id so a
@@ -1444,6 +1455,10 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		}
 		if scopeForbiddenRefusal(e) {
 			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
+		}
+		if reviewerBudgetCut(ctx, e) {
+			w.record(gate, "pending-cleanup", reviewerBudgetHold)
+			return false
 		}
 		// The retry key is the failure id, not the reason: the reason keeps
 		// stderr, which can change per call. The row carries the id so a
