@@ -167,6 +167,10 @@ const (
 	// reviewerDrainHold is the pending reason of a removal held back by
 	// reap.reviewer_drain.per_host: the next pass takes it.
 	reviewerDrainHold = "drain cap reached for this host; the next pass continues"
+	// reviewerBudgetHold is the pending reason of a reviewer step the repo
+	// budget cut: the checkout is kept for a later sweep, and the cut is not an
+	// error row.
+	reviewerBudgetHold = "repo budget ended this step; checkout kept for a later sweep"
 	// reviewerRefusalRetry is how long a refused removal waits before the hub is
 	// asked again; reviewerRefusalRetries is how many times it is asked again
 	// before the refusal is final.
@@ -1601,6 +1605,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	}
 	tree, e := hs.ops.Inspect(ctx, cwd)
 	switch {
+	case reviewerBudgetCut(ctx, e):
+		w.record(rec, "pending-cleanup", reviewerBudgetHold)
+		return remoteStop
 	case e != nil:
 		w.record(rec, "error", "worktree inspect: "+e.Error())
 		return remoteStop
@@ -1621,6 +1628,10 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteStop
 	}
 	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil, true)
+	if reviewerBudgetCut(ctx, e) {
+		w.record(rec, "pending-cleanup", reviewerBudgetHold)
+		return remoteStop
+	}
 	if e != nil {
 		w.record(rec, "error", "worktree remove: "+e.Error())
 		return remoteStop
@@ -1647,6 +1658,14 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "pending-cleanup", fmt.Sprintf("%s%s (retry %d of %d)", reviewerRefused, reason, retries+1, reviewerRefusalRetries))
 	}
 	return remoteStop
+}
+
+// reviewerBudgetCut reports whether a reviewer step's error is the repo budget
+// (or a stage share of it) ending the step, not the step failing. Such a step
+// holds its checkout for a later sweep and writes no error row, so the pass's
+// only stop is its budget stop.
+func reviewerBudgetCut(ctx context.Context, err error) bool {
+	return err != nil && (errors.Is(err, ErrReapRepoBudget) || context.Cause(ctx) == ErrReapRepoBudget)
 }
 
 // reviewedTree reports whether a worktree is the reviewer's own: at path, in
@@ -1690,6 +1709,9 @@ func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
 	}
 	tree, e := hs.exec.Inspect(ctx, path)
 	switch {
+	case reviewerBudgetCut(ctx, e):
+		w.record(rec, "pending-cleanup", reviewerBudgetHold)
+		return
 	case e != nil:
 		w.record(rec, "error", "checkout inspect: "+e.Error())
 		return
@@ -1736,6 +1758,10 @@ func (w *reviewerSweep) removeLocal(ctx context.Context, l reviewerLabel) {
 		return
 	}
 	if e := hs.exec.RemoveWorktree(ctx, filepath.Dir(tree.Common), path); e != nil {
+		if reviewerBudgetCut(ctx, e) {
+			w.record(rec, "pending-cleanup", reviewerBudgetHold)
+			return
+		}
 		w.record(rec, "error", "checkout remove: "+e.Error())
 		return
 	}
