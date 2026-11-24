@@ -159,11 +159,12 @@ var authorScanTTL = 30 * time.Second
 // authorHostScanBound caps one host's pane scan on the author path (notify and
 // route), so one host can never hold a route longer than this, whatever the
 // error shape. It bounds the whole host, not each call: a scan makes one call
-// per pane. It sits above the hub's 45 s client timeout, so a single slow call
-// still gets its own answer, and only a host that keeps the scan past this
-// bound is cut. Expiry fails the host for the TTL, and the route goes on with
-// the hosts that answered.
-var authorHostScanBound = 60 * time.Second
+// per pane. It must sit above what a healthy scan costs: reap measured 25 to
+// 89 s per host (reap_pass_hosts.go), so 120 s leaves room above the top of
+// that range. A hung node does not wait for this bound: its first call fails
+// at the hub's 45 s client timeout, and the host fails there. Expiry fails the
+// host for the TTL, and the route goes on with the hosts that answered.
+var authorHostScanBound = 120 * time.Second
 
 // hostScanMu guards Service.hostScans. Like the other Service caches, the map
 // is shared by copies of a Service.

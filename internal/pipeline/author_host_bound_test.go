@@ -162,3 +162,12 @@ func TestAuthorHostFailureSharedWithConcurrentEvaluation(t *testing.T) {
 		t.Fatalf("node was scanned %d times across two evaluations, want 1 (the waiter shares the scan)", n)
 	}
 }
+
+// The default bound is above what a healthy host's scan has measured in
+// production (25 to 89 s, reap_pass_hosts.go), so a healthy host is not cut.
+func TestAuthorHostScanBoundCoversMeasuredScan(t *testing.T) {
+	const measuredMax = 89 * time.Second
+	if authorHostScanBound <= measuredMax {
+		t.Fatalf("authorHostScanBound = %v, want above the measured %v scan cost", authorHostScanBound, measuredMax)
+	}
+}
