@@ -76,3 +76,40 @@ func TestSplitReapRepoErrorKeepsOnlyRealFailures(t *testing.T) {
 		t.Fatalf("skip alone: budget=%v skips=%v kept=%v", budget, skips, kept)
 	}
 }
+
+type fakeTimeoutError struct {
+	msg string
+}
+
+func (e *fakeTimeoutError) Error() string { return e.msg }
+func (e *fakeTimeoutError) Timeout() bool { return true }
+
+func TestHostScanFailureTimeoutIsSkippedHost(t *testing.T) {
+	skip := hostScanFailure("node-timeout", &fakeTimeoutError{msg: "i/o timeout"})
+	skips, rest := SplitReapHostSkips(skip)
+	if len(skips) != 1 || skips[0] != (HostSkip{Host: "node-timeout", Reason: "timeout"}) {
+		t.Fatalf("skips=%v", skips)
+	}
+	if rest != nil {
+		t.Fatalf("timeout alone left a failure: %v", rest)
+	}
+
+	budget, repoSkips, kept := SplitReapRepoError(skip)
+	if budget != nil || len(repoSkips) != 1 || repoSkips[0] != (HostSkip{Host: "node-timeout", Reason: "timeout"}) || kept != nil {
+		t.Fatalf("SplitReapRepoError: budget=%v skips=%v kept=%v", budget, repoSkips, kept)
+	}
+}
+
+func TestSplitReapRepoErrorBudgetStopNotASkip(t *testing.T) {
+	stop := &ReapBudgetStop{Left: "hosts", Failures: ErrReapRepoBudget}
+	budget, skips, kept := SplitReapRepoError(stop)
+	if budget == nil || budget.Left != "hosts" {
+		t.Fatalf("budget=%v", budget)
+	}
+	if len(skips) != 0 {
+		t.Fatalf("budget cut produced skips: %v", skips)
+	}
+	if !errors.Is(kept, ErrReapRepoBudget) {
+		t.Fatalf("kept error missing budget: %v", kept)
+	}
+}
