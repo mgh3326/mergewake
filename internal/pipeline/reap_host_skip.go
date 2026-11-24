@@ -7,9 +7,11 @@ import (
 	"github.com/mgh3326/mergewake/internal/reap"
 )
 
-// HostSkip names a host a reap pass could not scan at all because its hub node
-// is unreachable or a call against it timed out. Reason is the hub's own word
-// (node_unavailable, node_timeout or unknown) or "timeout".
+// HostSkip names a host a reap pass could not scan at all because the hub cannot
+// serve it right now or a call against it timed out. Reason is the hub's own
+// word: node_lost, node_unavailable, node_timeout, hub_draining,
+// unexpected-response (the hub's front proxy answered 502/503/504 with no hub
+// body) or unknown (the hub does not know the machine); or "timeout".
 type HostSkip struct {
 	Host   string
 	Reason string
@@ -17,7 +19,8 @@ type HostSkip struct {
 
 // hostSkipError is a host-scan failure of an unreachable or timed-out host. It is
 // a typed leaf of the reap result, so the daemon can tell a skipped host from a
-// real error without matching message text. Removals on a host never produce it.
+// real error without matching message text. A hub call that failed on a host the
+// hub cannot serve is typed the same way wherever its error is collected.
 type hostSkipError struct {
 	skip HostSkip
 	err  error
@@ -27,18 +30,30 @@ func (e *hostSkipError) Error() string { return e.err.Error() }
 func (e *hostSkipError) Unwrap() error { return e.err }
 
 // hostScanFailure is the error a failed host scan reports: "<host>: <cause>",
-// typed as a host skip when the hub says the host's node is unreachable or
-// when the inspect timed out.
+// typed as a host skip when the hub says the host cannot be served or when the
+// inspect timed out.
 func hostScanFailure(host string, cause error) error {
 	wrapped := fmt.Errorf("%s: %w", host, cause)
-	var unreachable *reap.HostUnreachable
-	if errors.As(cause, &unreachable) {
-		return &hostSkipError{skip: HostSkip{Host: host, Reason: unreachable.Reason}, err: wrapped}
+	if isHostUnreachable(cause) {
+		return hostUnreachableFailure(host, wrapped)
 	}
 	if isTimeout(cause) {
 		return &hostSkipError{skip: HostSkip{Host: host, Reason: "timeout"}, err: wrapped}
 	}
 	return wrapped
+}
+
+// hostUnreachableFailure is err, a failure of a hub call against host, typed as
+// a host skip when the hub answered that the host cannot be served now. Any
+// other error is returned unchanged, so auth and cwd answers stay failures. Only
+// the hub's answer is typed here: a timeout is typed by hostScanFailure alone,
+// because a budget cut also reads as one.
+func hostUnreachableFailure(host string, err error) error {
+	var unreachable *reap.HostUnreachable
+	if errors.As(err, &unreachable) {
+		return &hostSkipError{skip: HostSkip{Host: host, Reason: unreachable.Reason}, err: err}
+	}
+	return err
 }
 
 // isHostUnreachable reports whether err is the hub's answer that a host's node

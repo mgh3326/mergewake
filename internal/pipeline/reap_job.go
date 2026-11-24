@@ -91,7 +91,9 @@ type jobResolved struct {
 	cand   jobCand
 	branch string
 	miss   string
-	err    error
+	// host is the host an err names, so a hub outage on it is a host skip.
+	host string
+	err  error
 }
 
 // reapJobCandidates returns the worktree PR p's task names through hk: the
@@ -123,7 +125,7 @@ func (s *Service) reapJobCandidates(ctx context.Context, p github.Pull, b reapBi
 	res := s.resolveJobWorktree(ctx, b.Job, records, byName, settled)
 	if res.err != nil {
 		reach.miss(res.miss)
-		return nil, fmt.Errorf("PR %d %w", p.Number, res.err)
+		return nil, hostUnreachableFailure(res.host, fmt.Errorf("PR %d %w", p.Number, res.err))
 	}
 	if res.miss != "" {
 		reach.miss(res.miss)
@@ -188,7 +190,13 @@ func (s *Service) jobWorktree(ctx context.Context, job string, records *passJobR
 	if !ok {
 		var e error
 		if w, e = hs.ops.Inspect(ctx, rec.Cwd); e != nil {
-			return jobResolved{miss: "job-worktree-error", err: fmt.Errorf("job %s worktree %s: %s", job, rec.Cwd, integrations.Detail(e))}
+			// A hub outage keeps its chain so the host is typed as a skip;
+			// any other failure keeps the detail text it always had.
+			err := fmt.Errorf("job %s worktree %s: %s", job, rec.Cwd, integrations.Detail(e))
+			if isHostUnreachable(e) {
+				err = fmt.Errorf("job %s worktree %s: %w", job, rec.Cwd, e)
+			}
+			return jobResolved{miss: "job-worktree-error", host: host, err: err}
 		}
 	}
 	if w == nil {

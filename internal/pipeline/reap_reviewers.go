@@ -1624,6 +1624,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
 		return remoteStop
 	case e != nil:
+		if isHostUnreachable(e) {
+			// The node cannot be served now: the host is skipped for this
+			// pass, so its other labels wait, and the row reports that skip
+			// rather than a repository error.
+			hs.failed = true
+			rec.hostSkip = hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s %s: %w", hs.host.Name, cwd, e))
+		}
 		w.record(rec, "error", "worktree inspect: "+e.Error())
 		return remoteStop
 	case tree == nil:

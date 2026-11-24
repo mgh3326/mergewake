@@ -275,12 +275,12 @@ func (h *Hub) Consult(ctx context.Context, id string) (ConsultRow, error) {
 	return row, e
 }
 
-// Agents returns one machine's row of GET /v1/nodes/agents, fetched once per
-// Hub. A machine the hub does not know is an error, never an empty host.
-// HostUnreachable is the hub's answer that a machine's node cannot be reached,
-// so its panes cannot be read at all: the node is unavailable or timed out, or
-// the hub does not know the machine (Reason "unknown"). A scan that fails this
-// way skipped the host; any other failure is a real error.
+// HostUnreachable is the hub's answer that a machine cannot be served right
+// now, so its panes cannot be read or changed: its node is lost, unavailable or
+// timed out, the hub is draining, the hub does not know the machine (Reason
+// "unknown"), or the hub's front proxy answered 502/503/504 with no hub body
+// ("unexpected-response"). A scan that fails this way skipped the host; any
+// other failure is a real error.
 type HostUnreachable struct {
 	Machine string
 	Reason  string
@@ -290,18 +290,37 @@ func (e *HostUnreachable) Error() string {
 	return fmt.Sprintf("hub: machine %s %s", e.Machine, e.Reason)
 }
 
+// unreachableCode reports whether a hub error code, as a call's error or a
+// node's inventory row, means the machine cannot be served right now.
+func unreachableCode(code string) bool {
+	switch code {
+	case "node_lost", "node_unavailable", "node_timeout", "hub_draining":
+		return true
+	}
+	return false
+}
+
 // unreachableNode is err as a HostUnreachable when the hub answered that the
-// machine's node cannot be reached (node_timeout or node_unavailable), as
-// Agents does for the agent list. A node answers every command the same way,
-// so a worktree inspect that reports it is a host answer, not a cwd answer.
+// machine cannot be served now (see HostUnreachable), and err unchanged for
+// every other answer: auth (ErrHubAuth), a cwd's invalid_args, or a body error
+// a caller must read itself. A node answers every command the same way, so a
+// worktree inspect that reports it is a host answer, not a cwd answer. Every
+// HubHost command classifies its error here.
 func unreachableNode(machine string, err error) error {
 	var h *hubError
-	if errors.As(err, &h) && (h.Code == "node_timeout" || h.Code == "node_unavailable") {
+	if !errors.As(err, &h) {
+		return err
+	}
+	gateway := h.Code == "unexpected-response" &&
+		(h.Status == http.StatusBadGateway || h.Status == http.StatusServiceUnavailable || h.Status == http.StatusGatewayTimeout)
+	if unreachableCode(h.Code) || gateway {
 		return &HostUnreachable{Machine: machine, Reason: h.Code}
 	}
 	return err
 }
 
+// Agents returns one machine's row of GET /v1/nodes/agents, fetched once per
+// Hub. A machine the hub does not know is an error, never an empty host.
 func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error) {
 	h.once.Do(func() {
 		var v struct {
@@ -322,13 +341,13 @@ func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error)
 		}
 	})
 	if h.err != nil {
-		return hubNodeAgents{}, h.err
+		return hubNodeAgents{}, unreachableNode(machine, h.err)
 	}
 	row, ok := h.agents[machine]
 	switch {
 	case !ok:
 		return hubNodeAgents{}, &HostUnreachable{Machine: machine, Reason: "unknown"}
-	case row.Error == "node_unavailable" || row.Error == "node_timeout":
+	case unreachableCode(row.Error):
 		return hubNodeAgents{}, &HostUnreachable{Machine: machine, Reason: row.Error}
 	case row.Error != "":
 		return hubNodeAgents{}, fmt.Errorf("hub: machine %s %s", machine, row.Error)
@@ -436,7 +455,7 @@ func (h HubHost) WorktreeList(ctx context.Context, common, cursor string) (Workt
 		args["cursor"] = cursor
 	}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.list", args, &v); err != nil {
-		return WorktreePage{}, err
+		return WorktreePage{}, unreachableNode(h.Machine, err)
 	}
 	page := WorktreePage{NextCursor: v.NextCursor, Total: v.Total}
 	for _, w := range v.Worktrees {
@@ -489,7 +508,7 @@ func (h HubHost) removeCommand(ctx context.Context, args map[string]any) (Worktr
 		RetryAfterS int      `json:"retry_after_s"`
 	}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.remove", args, &v); err != nil {
-		return WorktreeRemoveResult{}, err
+		return WorktreeRemoveResult{}, unreachableNode(h.Machine, err)
 	}
 	return WorktreeRemoveResult{Outcome: v.Outcome, Files: v.Files, RetryAfterS: v.RetryAfterS}, nil
 }
