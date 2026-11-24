@@ -290,6 +290,18 @@ func (e *HostUnreachable) Error() string {
 	return fmt.Sprintf("hub: machine %s %s", e.Machine, e.Reason)
 }
 
+// unreachableNode is err as a HostUnreachable when the hub answered that the
+// machine's node cannot be reached (node_timeout or node_unavailable), as
+// Agents does for the agent list. A node answers every command the same way,
+// so a worktree inspect that reports it is a host answer, not a cwd answer.
+func unreachableNode(machine string, err error) error {
+	var h *hubError
+	if errors.As(err, &h) && (h.Code == "node_timeout" || h.Code == "node_unavailable") {
+		return &HostUnreachable{Machine: machine, Reason: h.Code}
+	}
+	return err
+}
+
 func (h *Hub) Agents(ctx context.Context, machine string) (hubNodeAgents, error) {
 	h.once.Do(func() {
 		var v struct {
@@ -390,7 +402,7 @@ func (h HubHost) Inspect(ctx context.Context, cwd string) (*Worktree, error) {
 		} `json:"worktree"`
 	}
 	if err := h.Hub.Command(ctx, h.Machine, "worktree.inspect", map[string]string{"cwd": cwd}, &v); err != nil {
-		return nil, err
+		return nil, unreachableNode(h.Machine, err)
 	}
 	if v.Worktree == nil {
 		return nil, nil

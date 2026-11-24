@@ -37,6 +37,20 @@ func hostScanFailure(host string, cause error) error {
 	return wrapped
 }
 
+// isHostUnreachable reports whether err is the hub's answer that a host's node
+// cannot be reached.
+func isHostUnreachable(err error) bool {
+	var unreachable *reap.HostUnreachable
+	return errors.As(err, &unreachable)
+}
+
+// isTimeout reports whether err is a deadline or a client timeout: a hub call
+// that did not answer in time, or a scan cut by its own deadline.
+func isTimeout(err error) bool {
+	var t interface{ Timeout() bool }
+	return errors.As(err, &t) && t.Timeout()
+}
+
 // SplitReapRepoError splits one repository's reap error for the daemon: the
 // budget stop it hit (nil when none), the hosts it skipped, and the failure the
 // pass keeps. A skipped host is never kept, so it cannot reappear in the

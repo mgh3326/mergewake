@@ -400,6 +400,15 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 						hs.failed = true
 						return hs, append(errs, fmt.Errorf("%s: %w", h.Name, e))
 					}
+					// A node that cannot be reached, or a hub call that timed
+					// out against it, answers nothing about the host's other
+					// panes: stop here and fail the host, rather than wait
+					// once per pane. A budget cut is not an answer about the
+					// node; the budget check above ends the scan.
+					if e != nil && !errors.Is(e, ErrReapRepoBudget) && (isHostUnreachable(e) || isTimeout(e)) {
+						hs.failed = true
+						return hs, append(errs, hostScanFailure(h.Name, e))
+					}
 					// Only a proven answer is cached; a failed inspect is
 					// retried by the next reader instead of read as gone.
 					if e == nil {
