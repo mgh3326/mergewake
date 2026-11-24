@@ -102,7 +102,11 @@ func TestAuthorHostHangingScanRoutesWithinBoundAsFailed(t *testing.T) {
 	}
 
 	// Within the TTL a later evaluation reads the failed host, not the node.
+	// The cut request's handler may still be reading hangInspect, so the
+	// write takes the hub's lock.
+	hub.mu.Lock()
 	hub.hangInspect = ""
+	hub.mu.Unlock()
 	if _, err := s.findingsRoute(WithAuthorScan(context.Background()), testRepoFor(s), s.GH.(*fakeGH).pull); err != nil {
 		t.Fatal(err)
 	}
