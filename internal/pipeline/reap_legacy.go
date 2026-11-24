@@ -492,7 +492,7 @@ func (w *legacySweep) enumerate(ctx context.Context, hs *reapHost, bound map[str
 			found.NotFound++
 			continue
 		case e != nil:
-			*errs = append(*errs, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, common, e))
+			*errs = append(*errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, common, e)))
 			continue
 		}
 		main := filepath.Dir(common)
@@ -635,7 +635,7 @@ func (w *legacySweep) evaluate(ctx context.Context, hs *reapHost, c *legacyCand,
 	switch {
 	case e != nil:
 		rec.Result, rec.Reason = "error", "worktree-inspect-error"
-		*errs = append(*errs, fmt.Errorf("%s %s: %w", c.host, c.cwd, e))
+		*errs = append(*errs, hostUnreachableFailure(c.host, fmt.Errorf("%s %s: %w", c.host, c.cwd, e)))
 		return ""
 	case wt == nil:
 		// Inspection has no identity to bind a row to. The candidate's path

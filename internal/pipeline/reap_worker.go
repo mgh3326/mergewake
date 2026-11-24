@@ -310,7 +310,7 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 			if reap.InvalidArgs(e) {
 				continue
 			}
-			errs = append(errs, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, clone.common, e))
+			errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s worktree.list %s: %w", hs.host.Name, clone.common, e)))
 			continue
 		}
 		var listed []workerCand
@@ -341,7 +341,7 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 				wt, e := hs.ops.Inspect(ctx, c.path)
 				switch {
 				case e != nil:
-					errs = append(errs, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, c.path, e))
+					errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, c.path, e)))
 				case wt == nil:
 					// A registered worktree whose directory is gone: stale,
 					// inconclusive.
@@ -594,7 +594,7 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 	wt, e := hs.ops.Inspect(ctx, c.path)
 	switch {
 	case e != nil:
-		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e))
+		*errs = append(*errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e)))
 		return keep("worktree-inspect-error")
 	case wt == nil:
 		return keep("worktree-gone")
@@ -605,7 +605,7 @@ func (w *workerPass) remove(ctx context.Context, hs *reapHost, c workerCand, rec
 	result, e := remover.WorktreeRemoveDisposable(ctx, c.path, c.head, w.r.Branch,
 		w.s.Config.ReapRegenerable(w.r), w.s.Config.Reap.Disposable, false)
 	if e != nil {
-		*errs = append(*errs, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e))
+		*errs = append(*errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s %s: %w", hs.host.Name, c.path, e)))
 		return keep("guard-error")
 	}
 	rec.Files = result.Files

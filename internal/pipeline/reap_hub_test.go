@@ -63,6 +63,10 @@ type fakeReapHub struct {
 	// worktree.inspect with a node error code.
 	hangInspect string
 	inspectErr  map[string]string
+	// errStatus answers an op's node error (listErr, inspectErr) with that HTTP
+	// status and the error body, so a test can answer a proxy's 502 or 503;
+	// the default is a 200 body error, as a node answers.
+	errStatus map[string]int
 	// moreNodes are extra node rows GET /v1/nodes/agents reports beside the
 	// node-a row, so a test can place labels on more than one host.
 	moreNodes []any
@@ -96,6 +100,15 @@ func inspectsCwd(r *http.Request, cwd string) bool {
 		} `json:"args"`
 	}
 	return json.Unmarshal(raw, &probe) == nil && probe.Op == "worktree.inspect" && probe.Args.Cwd == cwd
+}
+
+// answerError writes op's node error code: a 200 body error, or the HTTP status
+// errStatus gives op with the same body.
+func (h *fakeReapHub) answerError(w http.ResponseWriter, op, code string) {
+	if status := h.errStatus[op]; status != 0 {
+		w.WriteHeader(status)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": code})
 }
 
 func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
@@ -141,7 +154,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 				h.onInspect()
 			}
 			if code := h.inspectErr[body["args"].(map[string]any)["cwd"].(string)]; code != "" {
-				_ = json.NewEncoder(w).Encode(map[string]any{"error": code})
+				h.answerError(w, "worktree.inspect", code)
 				return
 			}
 			result = map[string]any{"worktree": nil}
@@ -175,7 +188,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			args := body["args"].(map[string]any)
 			common, _ := args["common"].(string)
 			if code := h.listErr[common]; code != "" {
-				_ = json.NewEncoder(w).Encode(map[string]any{"error": code})
+				h.answerError(w, "worktree.list", code)
 				return
 			}
 			rows := h.lists[common]

@@ -58,7 +58,10 @@ func TestReapReviewerInspectFailureIsStillAnErrorRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.agents["agents"], f.hub.agents["panes"] = []any{}, []any{}
-	f.hub.inspectErr = map[string]string{"/repo/" + label: "node_unavailable"}
+	// A node the hub cannot serve is a host skip, not this error (see
+	// TestReapReviewerGatewayInspectIsASkippedHost), so the failure is a body
+	// error for this cwd.
+	f.hub.inspectErr = map[string]string{"/repo/" + label: "invalid_request"}
 
 	err := f.reap(t, 0, Options{})
 	if ReapNonBudgetErrors(err) == nil || !strings.Contains(err.Error(), "worktree inspect") {

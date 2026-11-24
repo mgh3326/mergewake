@@ -46,6 +46,10 @@ type reapReceipt struct {
 	Head     string    `json:"head,omitempty"`      // checked-out commit of a legacy-sweep row
 	Source   string    `json:"source,omitempty"`    // what named a merged-PR worktree: pane, receipt or job-record
 
+	// hostSkip is the typed host skip an error row reports instead of a
+	// repository error, when the hub cannot serve the row's host. Never persisted.
+	hostSkip error `json:"-"`
+
 	Archive *archive.Result `json:"archive,omitempty"` // Drive dir, hk ids and excluded files of an archive
 
 	// RetryAfter is the deadline of a kept not-closable row's backoff. A later
@@ -382,7 +386,13 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	all, e := hs.ops.AllPanes(ctx)
 	if e != nil {
 		hs.usageUnknown = true
-		errs = append(errs, fmt.Errorf("%s: %w", h.Name, e))
+		errs = append(errs, hostUnreachableFailure(h.Name, fmt.Errorf("%s: %w", h.Name, e)))
+		// A node the hub cannot serve now answers nothing about the host's
+		// worktrees either: fail the host here instead of inspecting its panes.
+		if isHostUnreachable(e) {
+			hs.failed = true
+			return hs, errs
+		}
 	}
 	hs.all = all
 	for _, list := range [][]reap.Pane{panes, all} {
@@ -906,7 +916,12 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			case "reviewer-reap":
 				subject = "reviewer " + v.Label
 			}
-			// A row-level error is the pass's report, not a failed write.
+			// A row-level error is the pass's report, not a failed write. A
+			// row whose host the hub cannot serve reports that host skip instead.
+			if v.hostSkip != nil {
+				errs = append(errs, v.hostSkip)
+				break
+			}
 			errs = append(errs, fmt.Errorf("%s %s %s: %s", v.Host, v.Action, subject, v.Reason))
 		}
 		// Every row prints; only changed outcomes append to the receipt file.
@@ -1207,7 +1222,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 				continue
 			case e != nil:
 				rec.Result, rec.Reason = "skipped", "worktree-inspect-error"
-				errs = append(errs, fmt.Errorf("%s %s: %w", c.hs.host.Name, c.path, e))
+				errs = append(errs, hostUnreachableFailure(c.hs.host.Name, fmt.Errorf("%s %s: %w", c.hs.host.Name, c.path, e)))
 			case w == nil:
 				rec.Result, rec.Reason = "skipped", "worktree-gone"
 			case !matches(w, p):
