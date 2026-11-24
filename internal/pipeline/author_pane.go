@@ -156,6 +156,16 @@ func uniqueSorted(names []string) []string {
 // reads a scan older than this.
 var authorScanTTL = 30 * time.Second
 
+// authorHostScanBound caps one host's pane scan on the author path (notify and
+// route), so one host can never hold a route longer than this, whatever the
+// error shape. It bounds the whole host, not each call: a scan makes one call
+// per pane. It must sit above what a healthy scan costs: reap measured 25 to
+// 89 s per host (reap_pass_hosts.go), so 120 s leaves room above the top of
+// that range. A hung node does not wait for this bound: its first call fails
+// at the hub's 45 s client timeout, and the host fails there. Expiry fails the
+// host for the TTL, and the route goes on with the hosts that answered.
+var authorHostScanBound = 120 * time.Second
+
 // hostScanMu guards Service.hostScans. Like the other Service caches, the map
 // is shared by copies of a Service.
 var hostScanMu sync.Mutex
@@ -214,7 +224,15 @@ func (s *Service) hostScan(ctx context.Context, hub *reap.Hub, h reap.Host) *rea
 }
 
 func (s *Service) runHostScan(ctx context.Context, hub *reap.Hub, h reap.Host, e *hostScanEntry) *reapHost {
-	hs, _ := s.reapScanHost(ctx, hub, h)
+	// The scan's own deadline is a host failure: the host did not answer in
+	// time, so it is kept failed for the TTL. Only the evaluation's own
+	// cancellation (ctx) drops a scan, since that says nothing about the host.
+	scan, cancel := context.WithTimeout(ctx, authorHostScanBound)
+	defer cancel()
+	hs, _ := s.reapScanHost(scan, hub, h)
+	if scan.Err() != nil && ctx.Err() == nil {
+		hs.failed = true
+	}
 	hostScanMu.Lock()
 	e.hs, e.at = hs, s.now()
 	if ctx.Err() != nil {
@@ -311,6 +329,9 @@ func (s *Service) authorPaneOn(ctx context.Context, jobs reapJobs, hosts []*reap
 	var pane, job string
 	n := 0
 	for _, hs := range hosts {
+		if hs.failed {
+			continue
+		}
 		for _, p := range hs.panes {
 			w := hs.trees[p.Cwd]
 			if p.Cwd == "" || w == nil || w.Branch != pr.Head.Ref || !strings.EqualFold(w.Repo, r.Name) {
@@ -501,6 +522,9 @@ func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pu
 	hosts, err := s.authorHosts(ctx)
 	var names []string
 	for _, hs := range hosts {
+		if hs.failed {
+			continue
+		}
 		for _, p := range hs.panes {
 			w := hs.trees[p.Cwd]
 			if p.Cwd == "" || w == nil || w.Branch != pr.Head.Ref || !strings.EqualFold(w.Repo, r.Name) {

@@ -31,6 +31,7 @@ type fakeReapHub struct {
 	capture        map[string]any
 	close          map[string]any
 	forbid         map[string]bool // paths or ops answered 403 scope_forbidden
+	agentReads     int             // GET /v1/nodes/agents answers served
 	wtHead         string          // HEAD worktree.inspect reports for /repo.wt; headSHA when empty
 	wtPaths        map[string]bool // extra cwds worktree.inspect reports as linked worktrees at wtHead
 	// removeOutcome is worktree.remove's answer; "removed" when empty.
@@ -122,6 +123,7 @@ func (h *fakeReapHub) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/nodes/agents" {
+			h.agentReads++
 			_ = json.NewEncoder(w).Encode(map[string]any{"nodes": append([]any{h.agents}, h.moreNodes...)})
 			return
 		}
