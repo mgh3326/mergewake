@@ -179,7 +179,10 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	}
 	switch st.Kind {
 	case settleMerged:
-		return nil
+		if o.DryRun {
+			return nil
+		}
+		return s.finishMerge(ctx, r, pr, o)
 	case settleLanded:
 		return s.holdSettledMerge(ctx, r, pr, st, o.DryRun)
 	}
@@ -230,8 +233,18 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e = s.mergePinned(ctx, r, pr); e != nil {
 		return e
 	}
+	return s.finishMerge(ctx, r, pr, o)
+}
+
+// finishMerge runs the post-merge steps shared by a fresh merge and a merge
+// that settled an unknown-outcome attempt: the merge task event (which also
+// runs the context's merge hook), a fresh PR read and observation, the
+// best-effort MERGED lane notice and the outcome nudge. The merge already
+// landed, so the notice failure is audited rather than returned; any other
+// error is returned as it is after a normal merge.
+func (s *Service) finishMerge(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
 	s.postTaskEvent(ctx, r, pr, integrations.SourceMerge, nil, s.now())
-	merged, e := s.GH.Pull(ctx, r.Name, n)
+	merged, e := s.GH.Pull(ctx, r.Name, pr.Number)
 	if e != nil {
 		return e
 	}
@@ -244,7 +257,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		landed := merged
 		landed.Head.SHA = pr.Head.SHA
 		if e = s.RetryMergedCandidate(ctx, r, landed, pr.Title); e != nil {
-			_ = s.audit(r.Name, "land-notify-error", map[string]any{"pr": n, "error": e.Error()}, false)
+			_ = s.audit(r.Name, "land-notify-error", map[string]any{"pr": pr.Number, "error": e.Error()}, false)
 		}
 	}
 	// The merge is observed; publishing its outcome is the daemon's publisher's
