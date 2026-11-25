@@ -634,10 +634,11 @@ The hosts are then walked from the one after the last host
 it entered, so a host late in `hosts` is not starved by the earlier ones; the
 next full run starts there, and a run that finishes every host returns to
 config order. A `--host` run neither reads nor writes that state. A `--dry-run` run reads it, so its preview lists hosts in the order the next apply run will use, and never writes it. The summary
-lists hosts it did not reach in `unscanned_hosts`; `eligible_left` counts jobs
-left on hosts the run reached, including eligible jobs already listed on a
-partly processed host, while jobs on hosts it never reached are not counted.
-Unscanned hosts are not scanned just to be counted.
+lists hosts it did not reach in `unscanned_hosts`; `eligible_left` counts
+eligible jobs listed on hosts whose pane scan and jobs listing completed,
+including jobs already listed on a partly processed host. Hosts whose pane scan
+or jobs listing did not complete, and hosts the run never reached, are not
+counted. Unscanned hosts are not scanned just to be counted.
 
 ### `liveness`
 

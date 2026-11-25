@@ -494,12 +494,23 @@ hosts:
 		for i := range ordered {
 			jobs[i] = ordered[i].name
 		}
+		countPendingEligible := func(from int) {
+			for _, pending := range jobs[from:] {
+				if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
+					continue
+				}
+				if reason, newest := archive.HostSkipReason(jobsByName[pending]); reason == "" && (jobsByName[pending].NeedsRefresh || now.Sub(time.Unix(newest, 0)) >= olderThan) {
+					eligibleLeft++
+				}
+			}
+		}
 		for jobIndex, job := range jobs {
 			if e := runCtx.Err(); e != nil {
 				if errors.Is(e, context.DeadlineExceeded) && ctx.Err() == nil {
 					stoppedOnBudget = true
 					unscannedReasons[h.Name] = "max_run deadline during job scan"
 					unscannedStart = entered - 1
+					countPendingEligible(jobIndex)
 				}
 				break hosts
 			}
@@ -507,14 +518,7 @@ hosts:
 				stoppedOnBudget = true
 				unscannedStart = entered - 1
 				unscannedReasons[h.Name] = "max_run deadline during job scan"
-				for _, pending := range jobs[jobIndex:] {
-					if pending == "" || !reap.ValidJobName(pending) || archive.ExcludedName(s.Config.Reap.Archive.Exclude, pending) || liveName(hs, pending) || hs.paneInUse(filepath.Join(root, pending)) {
-						continue
-					}
-					if reason, newest := archive.HostSkipReason(jobsByName[pending]); reason == "" && (jobsByName[pending].NeedsRefresh || now.Sub(time.Unix(newest, 0)) >= olderThan) {
-						eligibleLeft++
-					}
-				}
+				countPendingEligible(jobIndex)
 				break hosts
 			}
 			if job == "" {
@@ -543,6 +547,7 @@ hosts:
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline during job reads"
 						unscannedStart = entered - 1
+						countPendingEligible(jobIndex)
 						break hosts
 					}
 					row.Result, row.Reason = archiveJobsReason(refreshErr)
@@ -565,6 +570,7 @@ hosts:
 							stoppedOnBudget = true
 							unscannedReasons[h.Name] = "max_run deadline during hk reads"
 							unscannedStart = entered - 1
+							countPendingEligible(jobIndex)
 							break hosts
 						}
 						row.Result, row.Reason = archiveJobsReason(planErr)
@@ -572,6 +578,7 @@ hosts:
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline before archive apply"
 						unscannedStart = entered - 1
+						countPendingEligible(jobIndex)
 						break hosts
 					} else if e := s.Print(p); e != nil {
 						row.Result, row.Reason = "error", e.Error()
@@ -715,11 +722,11 @@ func (s *Service) archivePhase(host, phase string, duration time.Duration, err e
 // run starts at, next to the run's other state.
 const archiveNextHostFile = "archive-jobs-next-host"
 
-// archiveEligibleScope is what the summary's eligible_left counts: jobs still
-// waiting on hosts the run reached, including eligible jobs already listed on
-// a partly processed host. Hosts it never reached are named in unscanned_hosts
-// and are not scanned just to be counted.
-const archiveEligibleScope = "jobs left on hosts reached by the run, including eligible jobs already listed on a partly processed host; jobs on hosts never reached are not counted"
+// archiveEligibleScope is what the summary's eligible_left counts: eligible
+// jobs listed on hosts whose pane scan and jobs listing completed, including
+// eligible jobs already listed on a partly processed host. Hosts whose pane
+// scan or jobs listing did not complete, and hosts never reached, are not counted.
+const archiveEligibleScope = "eligible jobs listed on hosts whose pane scan and jobs listing completed, including jobs already listed on a partly processed host; hosts whose pane scan or jobs listing did not complete, and hosts never reached, are not counted"
 
 // archiveRunOrder returns the hosts a full run walks. A run that stopped on its
 // budget leaves the host after the last one it entered in the state file, and
