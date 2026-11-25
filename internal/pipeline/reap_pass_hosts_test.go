@@ -2,8 +2,10 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -161,8 +163,12 @@ func TestReapWorkerUnreadableCursorIsResetWithListedCandidate(t *testing.T) {
 	}
 	skipped := &reapHost{host: reap.Host{Name: "down", Jobs: "/jobs"}, failed: true, trees: map[string]*reap.Worktree{}}
 	hosts := []*reapHost{skipped, listed}
+	var receipts []reapReceipt
 	pass := func() []error {
-		return s.reapWorkerWorktrees(ctx, repo, hosts, &passJobRecords{}, false, true, func(reapReceipt) {})
+		receipts = nil
+		return s.reapWorkerWorktrees(ctx, repo, hosts, &passJobRecords{}, false, true, func(r reapReceipt) {
+			receipts = append(receipts, r)
+		})
 	}
 	cursorErr := func(errs []error) bool {
 		for _, e := range errs {
@@ -175,8 +181,26 @@ func TestReapWorkerUnreadableCursorIsResetWithListedCandidate(t *testing.T) {
 	if errs := pass(); !cursorErr(errs) {
 		t.Fatalf("the unreadable worker cursor was not reported on its pass: %v", errs)
 	}
-	if !decodes(path, &workerCursor{}) {
-		t.Fatalf("a pass with a listed candidate left the unreadable cursor %s in place", path)
+	var sawListed bool
+	for _, r := range receipts {
+		if r.Host == listed.host.Name && r.Branch == "wk/job" {
+			sawListed = true
+			break
+		}
+	}
+	if !sawListed {
+		t.Fatalf("pass with a listed candidate produced no receipt for it: receipts=%+v", receipts)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cur workerCursor
+	if err := json.Unmarshal(raw, &cur); err != nil {
+		t.Fatalf("a pass with a listed candidate left the unreadable cursor %s in place: %v", path, err)
+	}
+	if cur != (workerCursor{}) {
+		t.Fatalf("a pass with a listed candidate left cursor %+v, want the zero value a finished pass writes", cur)
 	}
 	if errs := pass(); cursorErr(errs) {
 		t.Fatalf("the next pass still reports the worker cursor: %v", errs)
