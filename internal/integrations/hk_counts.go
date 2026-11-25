@@ -86,9 +86,16 @@ func hkRoute(req *http.Request) string {
 	var b strings.Builder
 	b.WriteString(req.Method + " ")
 	inID := false
-	for _, part := range strings.Split(req.URL.Path, "/") {
+	parts := strings.Split(req.URL.Path, "/")
+	for i, part := range parts {
 		if part == "" {
 			continue
+		}
+		// A document key is the entire remainder of the path. hk accepts
+		// slashes in keys, so route words inside the key are not sub-routes.
+		if i > 0 && parts[i-1] == "documents" {
+			b.WriteString("/{id}")
+			break
 		}
 		if hkRouteWords[part] {
 			b.WriteString("/" + part)
