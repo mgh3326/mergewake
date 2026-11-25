@@ -15,6 +15,23 @@ def next_tag(tags):
     return f'v{major}.{minor}.{patch + 1}'
 
 
+def last_tag(head):
+    """Newest patch tag that is a strict ancestor of head, or None.
+
+    A tag on head itself is skipped so a re-pushed, already-tagged commit is
+    released again exactly as before instead of skipping as docs-only.
+    """
+    tags = [t for t in run('git', 'tag', '--list', 'v*').splitlines()
+            if re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', t) and t != 'v0.0.0']
+    for tag in sorted(tags, key=lambda t: tuple(map(int, t[1:].split('.'))), reverse=True):
+        if run('git', 'rev-list', '-n', '1', tag) == head:
+            continue
+        if subprocess.run(['git', 'merge-base', '--is-ancestor', tag, head],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return tag
+    return None
+
+
 def main():
     if os.environ.get('GITHUB_REF') != 'refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch'):
         raise SystemExit('auto-tag requires main and a push or explicit dispatch')
@@ -23,8 +40,14 @@ def main():
         raise SystemExit('checkout does not match push commit')
     before = os.environ.get('BEFORE_SHA', '')
     if re.fullmatch(r'[0-9a-f]{40}', before) and before != '0' * 40:
+        # Judge docs-only against everything since the last release tag, not
+        # just this push: a duplicate push of code (empty diff) must still release.
         try:
-            changed = run('git', 'diff', '--no-renames', '--name-only', before, sha).splitlines()
+            base = last_tag(sha)
+            if base is None:
+                changed = ['unknown']
+            else:
+                changed = run('git', 'diff', '--no-renames', '--name-only', base, sha).splitlines()
         except subprocess.CalledProcessError:
             # Docs-only skipping is an optimization; unknown content releases
             # normally. Deployment CI/range approval remains fail closed.

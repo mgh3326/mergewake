@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib.util
 import os
 from pathlib import Path
@@ -9,6 +10,10 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('auto_tag', Path(__file__).with_name('auto-tag.py'))
 auto = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auto)
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], text=True, stderr=subprocess.DEVNULL).strip()
 
 
 class AutoTagTests(unittest.TestCase):
@@ -84,6 +89,71 @@ class AutoTagTests(unittest.TestCase):
         self.assertIn(('git', 'push', 'origin', 'refs/tags/v0.0.2'), calls)
         self.assertIn(('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.2', '-f', 'publish=true'), calls)
         self.assertFalse(any('--force' in c for c in calls))
+
+    @contextmanager
+    def release_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.getcwd()
+            try:
+                os.chdir(d)
+                git('init', '--bare', 'remote.git')
+                git('clone', 'remote.git', 'repo')
+                os.chdir('repo')
+                git('config', 'user.name', 'Workflow test')
+                git('config', 'user.email', 'test@example.invalid')
+                git('checkout', '-b', 'main')
+                yield
+            finally:
+                os.chdir(old)
+
+    def commit(self, name, text='x', empty=False):
+        if not empty:
+            Path(name).write_text(text)
+            git('add', '.')
+        git('commit', *(['--allow-empty'] if empty else []), '-m', name)
+        return git('rev-parse', 'HEAD')
+
+    def push_main(self, sha, before, event='push'):
+        calls = []
+        real_run = auto.run
+        def run(*args):
+            if args[0] == 'gh':
+                calls.append(args)
+                return ''
+            return real_run(*args)
+        env = {'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': sha, 'BEFORE_SHA': before}
+        with patch.dict(os.environ, env), patch.object(auto, 'run', run):
+            auto.main()
+        return calls
+
+    def test_empty_duplicate_push_after_code_still_tags(self):
+        with self.release_repo():
+            a = self.commit('a.go', 'package a')
+            self.assertEqual(self.push_main(a, '0' * 40), [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.1', '-f', 'publish=true')])
+            b = self.commit('code.go', 'package code')
+            c = self.commit('dup', empty=True)
+            calls = self.push_main(c, b)
+            self.assertEqual(calls, [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.2', '-f', 'publish=true')])
+            self.assertEqual(git('tag', '--list'), 'v0.0.1\nv0.0.2')
+
+    def test_docs_only_since_last_tag_skips(self):
+        with self.release_repo():
+            a = self.commit('a.go', 'package a')
+            self.push_main(a, '0' * 40)
+            b = self.commit('README.md', 'docs')
+            c = self.commit('NOTES.md', 'more docs')
+            self.assertEqual(self.push_main(c, b), [])
+            self.assertEqual(git('tag', '--list'), 'v0.0.1')
+
+    def test_no_ancestor_tag_releases(self):
+        with self.release_repo():
+            a = self.commit('a.go', 'package a')
+            git('checkout', '-b', 'side')
+            self.commit('side.go', 'side')
+            git('tag', 'v0.0.9')
+            git('checkout', 'main')
+            b = self.commit('README.md', 'docs')
+            self.assertEqual(self.push_main(b, a), [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.10', '-f', 'publish=true')])
 
 
 if __name__ == '__main__':
