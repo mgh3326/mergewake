@@ -242,6 +242,19 @@ func culpritFromRevertBody(body string) (string, int) {
 	return culprit, 0
 }
 
+// freshRevertIncident rebuilds a missing or mismatched incident for revert PR
+// pr the way recovery() does: the window starts now so the row and the notice
+// carry a real time, and the incident names this revert so the merged-notice
+// retry guard matches it.
+func (s *watchStream) freshRevertIncident(pr *github.Pull, head, checks string) recoveryIncident {
+	culprit, culpritPR := culpritFromRevertBody(pr.Body)
+	return recoveryIncident{
+		RedSince: s.now().UTC(), Culprit: culprit, CulpritPR: culpritPR, Head: head,
+		RevertPR: pr.Number, RevertURL: pr.HTMLURL, Checks: checks,
+		Runs: map[string][]bool{}, Pending: map[string]time.Time{}, Dispatches: map[string]int{},
+	}
+}
+
 // confirmRecovery advances the failure evidence: each needed commit is re-run
 // through the repo's any-ref CI until it has confirmRuns results. It reports
 // whether the incident is confirmed and, when it is not, a reason and whether
@@ -680,13 +693,7 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 		// The revert exists but watch has no incident for it: a latch a person
 		// created, or a lost state file. Start the window now rather than merge
 		// a revert whose culprit watch cannot attest.
-		culprit, culpritPR := culpritFromRevertBody(pr.Body)
-		st = recoveryIncident{
-			RedSince: s.now().UTC(), Culprit: culprit, CulpritPR: culpritPR, Head: head,
-			RevertPR: pr.Number, RevertURL: pr.HTMLURL, Checks: strings.Join(p.BisectChecks(), ","),
-			Runs: map[string][]bool{}, Pending: map[string]time.Time{}, Dispatches: map[string]int{},
-		}
-		st.Confirmed = false
+		st = s.freshRevertIncident(pr, head, strings.Join(p.BisectChecks(), ","))
 		if acting {
 			if e = s.saveRecovery(r.Name, st); e != nil {
 				return e
@@ -1152,9 +1159,12 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 		return false, e
 	}
 	// A stored incident that names another revert PR is not this revert's
-	// incident: the culprit comes from this PR's body, as with no incident.
+	// incident: rebuild it the way recovery() does, so the row and the notice
+	// carry a real time and the retry guard below matches this revert. No task
+	// was reopened on this path, so the notice must not claim one.
 	if st.RevertPR != pr.Number {
-		st = recoveryIncident{}
+		st = s.freshRevertIncident(pr, head, "")
+		st.TaskReopen = "none"
 	}
 	if st.Culprit == "" {
 		st.Culprit, st.CulpritPR = culpritFromRevertBody(pr.Body)
@@ -1183,7 +1193,9 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 		return true, nil
 	}
 	// A merged revert whose record failed on an earlier pass is recorded now.
-	// Its keyed row and notice make this a no-op once they are written.
+	// Its keyed row and notice make this a no-op once they are written. A
+	// rebuilt mismatched incident names this revert, so the guard matches it;
+	// with no stored incident the latch-clear path below still owns the record.
 	if pr.MergedAt != nil && found && st.RevertPR == pr.Number {
 		return true, s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleMerged}, greenNote)
 	}

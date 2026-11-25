@@ -217,3 +217,91 @@ func TestWatchMergedRevertNoticeRetriedOnceOnNextGreenPass(t *testing.T) {
 		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
 	}
 }
+
+// A mismatched incident is rebuilt the way recovery() does: the row carries a
+// real red_since, and the notice neither a zero time nor a reopen claim.
+func TestWatchMismatchedRevertRebuildsIncident(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, _, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[shaC] = github.Green
+		at := "2026-11-07T11:00:00Z"
+		l.revert.State, l.revert.Merged, l.revert.MergedAt = "closed", true, &at
+	})
+	s.Now = func() time.Time { return now }
+	stale := strings.Repeat("e", 40)
+	if e := s.saveRecovery(r.Name, recoveryIncident{RedSince: now, Culprit: stale, CulpritPR: 6, Head: shaC, RevertPR: 8, Task: "99"}); e != nil {
+		t.Fatal(e)
+	}
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	rows := auditRows(t, s, r, "recovery-merged")
+	if len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d, want 1", len(rows))
+	}
+	if red, _ := rows[0]["red_since"].(string); red != now.Format(time.RFC3339) {
+		t.Fatalf("red_since %q, want %q", red, now.Format(time.RFC3339))
+	}
+	if rows[0]["culprit"] != shaB || rows[0]["culprit_pr"] != float64(7) {
+		t.Fatalf("recorded culprit %v #%v, want culprit PR #7", rows[0]["culprit"], rows[0]["culprit_pr"])
+	}
+	lines := ownerLaneEvents(n)
+	if len(lines) != 1 {
+		t.Fatalf("design-lane lines %v, want 1", lines)
+	}
+	if strings.Contains(lines[0], "0001-01-01") || strings.Contains(lines[0], "reopened") {
+		t.Fatalf("notice carries a zero time or a reopen claim: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "reverted by PR #9") || !strings.Contains(lines[0], "no task to reopen") {
+		t.Fatalf("notice missing revert or no-reopen note: %q", lines[0])
+	}
+}
+
+// A mismatched incident whose first notify fails is recorded and announced
+// once on the next green pass.
+func TestWatchMismatchedRevertNoticeRetriedOnceOnNextGreenPass(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, _, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[shaC] = github.Green
+		at := "2026-11-07T11:00:00Z"
+		l.revert.State, l.revert.Merged, l.revert.MergedAt = "closed", true, &at
+	})
+	s.Now = func() time.Time { return now }
+	s.Out = io.Discard
+	stale := strings.Repeat("e", 40)
+	if e := s.saveRecovery(r.Name, recoveryIncident{RedSince: now, Culprit: stale, CulpritPR: 6, Head: shaC, RevertPR: 8, Task: "99"}); e != nil {
+		t.Fatal(e)
+	}
+
+	n.err = errors.New("design lane unreachable")
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("notify failure was hidden")
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 || len(ownerLaneEvents(n)) != 0 {
+		t.Fatalf("after failed notice: rows %d lines %v", len(rows), ownerLaneEvents(n))
+	}
+
+	n.err = nil
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("retry pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after retry, want 1", len(rows))
+	}
+	lines := ownerLaneEvents(n)
+	if len(lines) != 1 || !strings.Contains(lines[0], "reverted by PR #9") || strings.Contains(lines[0], "reopened") || strings.Contains(lines[0], "0001-01-01") {
+		t.Fatalf("design-lane lines after retry: %v", lines)
+	}
+
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("third pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after third pass, want 1", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
+	}
+}
