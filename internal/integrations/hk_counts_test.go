@@ -23,6 +23,11 @@ func TestHKRouteTemplates(t *testing.T) {
 		{http.MethodPut, "/v1/changes/pr-123-abc", "PUT /v1/changes/{id}"},
 		{http.MethodGet, "/v1/nodes/machine-7/command", "GET /v1/nodes/{id}/command"},
 		{http.MethodGet, "/v1/documents/handoff/plan/42", "GET /v1/documents/{id}"},
+		{http.MethodGet, "/v1/documents/plan/42", "GET /v1/documents/{id}"},
+		{http.MethodGet, "/v1/documents/gate/rollout", "GET /v1/documents/{id}"},
+		{http.MethodGet, "/v1/documents/decision/gate/rollout", "GET /v1/documents/{id}"},
+		{http.MethodGet, "/v1/documents/decision/rollout", "GET /v1/documents/{id}"},
+		{http.MethodGet, "/v1/documents/gate/decision-request/comments", "GET /v1/documents/{id}"},
 		{http.MethodGet, "/v1/changes/unreconciled", "GET /v1/changes/unreconciled"},
 	}
 	for _, c := range cases {
