@@ -196,7 +196,7 @@ func TestLandWithNoPendingAttemptDoesNotWaitForTheLock(t *testing.T) {
 	defer unlock()
 	done := make(chan settlement, 1)
 	go func() {
-		st, e := s.settleLocked(asPR("B"), r, github.Pull{Number: 8}, false)
+		st, e := s.settleLocked(asPR("B"), r, github.Pull{Number: 8}, false, false)
 		if e != nil {
 			t.Error(e)
 		}

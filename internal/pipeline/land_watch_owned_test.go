@@ -58,8 +58,9 @@ func TestLandLeavesWatchOwnedAttemptToWatch(t *testing.T) {
 			s.Out = &out
 			hooks := 0
 			ctx := WithMergeHook(context.Background(), func(string, int) { hooks++ })
-			if e := s.Land(ctx, r, 9, Options{}); e != nil {
-				t.Fatalf("Land = %v, want nil", e)
+			var waiting *WaitingOnWatchError
+			if e := s.Land(ctx, r, 9, Options{}); !errors.As(e, &waiting) {
+				t.Fatalf("Land = %v, want a typed wait on watch", e)
 			}
 			after, e := os.ReadFile(path)
 			if e != nil || !bytes.Equal(before, after) {
@@ -88,6 +89,58 @@ func TestLandLeavesWatchOwnedAttemptToWatch(t *testing.T) {
 				t.Fatalf("recovery-merged rows %d after a repeat pass, want 1", len(rows))
 			}
 		})
+	}
+}
+
+// If watch takes ownership while Land waits for the repository lock, Land
+// re-reads the attempt under that lock and leaves it for watch to settle.
+func TestLandRechecksWatchOwnershipUnderMergeLock(t *testing.T) {
+	s, g, n, r, path := landWatchSetup(t, mergeRolePR, "")
+	unlock, err := s.mergeLock(r.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	s.Out = &out
+	hooks := 0
+	ctx := WithMergeHook(context.Background(), func(string, int) { hooks++ })
+	done := make(chan error, 1)
+	go func() { done <- s.Land(ctx, r, 9, Options{}) }()
+	// The held lock keeps Land between the initial PR-role read and settle.
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("Land returned before the lock was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := fsutil.WriteJSON(path, mergeAttempt{PR: 9, Head: revertHead, Base: shaC, At: s.now(), Role: mergeRoleWatch}); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	var waiting *WaitingOnWatchError
+	select {
+	case err := <-done:
+		if !errors.As(err, &waiting) {
+			t.Fatalf("Land = %v, want a typed wait on watch", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Land did not return after releasing merge lock")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("watch-owned attempt changed or was cleared: %v", err)
+	}
+	if hooks != 0 || len(n.events) != 0 || g.merges != 0 {
+		t.Fatalf("hook calls %d, notices %d, merges %d; want none", hooks, len(n.events), g.merges)
+	}
+	if !strings.Contains(out.String(), "land-waiting-on-watch") {
+		t.Fatalf("Land printed %q, want a waiting-on-watch row", out.String())
 	}
 }
 

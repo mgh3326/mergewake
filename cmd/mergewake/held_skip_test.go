@@ -176,3 +176,32 @@ func TestHeldPRIsEvaluatedEveryPass(t *testing.T) {
 		t.Fatal("daemon did not stop")
 	}
 }
+
+// Waiting on a watch-owned attempt is held without an error and must not be
+// remembered by the skip cache, so the following pass checks the PR again.
+func TestWaitingOnWatchIsEvaluatedAgainWithoutFailure(t *testing.T) {
+	f := newSkipFixture(t, 1)
+	attemptPath := filepath.Join(f.s.Config.StateDir, f.repo.Name, "pr-1-merge-attempt.json")
+	if err := os.MkdirAll(filepath.Dir(attemptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	attempt := fmt.Sprintf(`{"pr":1,"head":%q,"base":%q,"at":%q,"role":"watch"}`, headOf(1), f.base, f.clock.UTC().Format(time.RFC3339))
+	if err := os.WriteFile(attemptPath, []byte(attempt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 1; pass <= 2; pass++ {
+		res, err := f.passErr()
+		if err != nil {
+			t.Fatalf("pass %d returned an error (which counts as a role failure): %v", pass, err)
+		}
+		if res.skipped != 0 || res.evaluated != 1 {
+			t.Fatalf("pass %d: skipped=%d evaluated=%d, want reevaluation: %s", pass, res.skipped, res.evaluated, res.audit)
+		}
+		if !strings.Contains(res.audit, `"action":"land-waiting-on-watch"`) {
+			t.Fatalf("pass %d did not report waiting on watch: %s", pass, res.audit)
+		}
+		if _, ok := cachedEvaluation(f.skips, f.repo.Name, 1); ok {
+			t.Fatalf("pass %d cached a watch wait as a clean settle", pass)
+		}
+	}
+}

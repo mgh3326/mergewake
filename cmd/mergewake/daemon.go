@@ -521,14 +521,21 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	e = s.Land(landCtx, r, n, o)
 	tracing.Finish(land)
 	var heldErr *pipeline.MergeHeldError
+	var waitingErr *pipeline.WaitingOnWatchError
 	switch {
-	case errors.As(e, &heldErr):
+	case errors.As(e, &heldErr), errors.As(e, &waitingErr):
 		// A deliberate hold is a verdict, not a failure: it is shown on every
 		// pass, but it counts neither toward the role's failures nor toward the
 		// clean-loop healthcheck, and the skip rule must not remember it as
 		// a clean settle.
 		held = true
-		if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": heldErr.Reason}); pe != nil {
+		reason := ""
+		if heldErr != nil {
+			reason = heldErr.Reason
+		} else {
+			reason = waitingErr.Error()
+		}
+		if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": reason}); pe != nil {
 			errs = append(errs, fmt.Errorf("PR %d land held: %w", n, pe))
 		}
 	case e != nil:
