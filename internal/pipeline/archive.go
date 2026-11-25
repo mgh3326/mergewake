@@ -554,6 +554,13 @@ hosts:
 						countPendingEligible(jobIndex)
 						break hosts
 					}
+					if errors.Is(ctx.Err(), context.Canceled) {
+						row.Result, row.Reason = "error", "caller cancelled during job reads: "+refreshErr.Error()
+						unscannedReasons[h.Name] = "caller cancelled during job reads"
+						unscannedStart = entered - 1
+						countPendingEligible(jobIndex)
+						break
+					}
 					row.Result, row.Reason = archiveJobsReason(refreshErr)
 				} else if reason != "" {
 					row.Result, row.Reason = "skipped", reason
@@ -576,6 +583,13 @@ hosts:
 							unscannedStart = entered - 1
 							countPendingEligible(jobIndex)
 							break hosts
+						}
+						if errors.Is(ctx.Err(), context.Canceled) {
+							row.Result, row.Reason = "error", "caller cancelled during hk reads: "+planErr.Error()
+							unscannedReasons[h.Name] = "caller cancelled during hk reads"
+							unscannedStart = entered - 1
+							countPendingEligible(jobIndex)
+							break
 						}
 						row.Result, row.Reason = archiveJobsReason(planErr)
 					} else if budgetSpent() {
@@ -602,6 +616,10 @@ hosts:
 						row.Archive = res
 						if applyErr != nil {
 							row.Result, row.Reason = archiveJobsReason(applyErr)
+							cancelled := errors.Is(ctx.Err(), context.Canceled)
+							if cancelled {
+								row.Result, row.Reason = "error", "caller cancelled during archive apply: "+applyErr.Error()
+							}
 							// A skip after publish leaves a half-archived job (manifest
 							// written, source still present); it must not read as routine.
 							if row.Result == "skipped" && res != nil && res.Manifest != "" && !res.Deleted {
@@ -611,6 +629,11 @@ hosts:
 							row.Result, row.Reason = "archived-retained", retentionReason(res.Retained)
 						} else {
 							row.Result = "archived"
+						}
+						if applyErr != nil && errors.Is(ctx.Err(), context.Canceled) {
+							unscannedReasons[h.Name] = "caller cancelled during archive apply"
+							unscannedStart = entered - 1
+							countPendingEligible(jobIndex)
 						}
 						if row.Result == "archived" || row.Result == "archived-retained" {
 							archivedThisRun++
@@ -624,6 +647,9 @@ hosts:
 			counts[row.Result]++
 			if e := s.archiveNote(row, o.DryRun); e != nil {
 				errs = append(errs, e)
+			}
+			if errors.Is(ctx.Err(), context.Canceled) && unscannedStart >= 0 {
+				break hosts
 			}
 		}
 	}

@@ -59,6 +59,20 @@ type archiveAfterCommandRunner struct {
 	after func()
 }
 
+type archiveCancelAfterCommandRunner struct {
+	base   integrations.Runner
+	match  string
+	cancel context.CancelFunc
+}
+
+func (r archiveCancelAfterCommandRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	out, err := r.base.Run(ctx, name, args, input, dir)
+	if err == nil && strings.Contains(name+" "+strings.Join(args, " "), r.match) {
+		r.cancel()
+	}
+	return out, err
+}
+
 func (r archiveAfterCommandRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	out, err := r.base.Run(ctx, name, args, input, dir)
 	if err == nil && strings.Contains(name+" "+strings.Join(args, " "), r.match) {
@@ -1016,6 +1030,75 @@ func TestArchiveJobsCancelledMidHostCountsInterruptedAndRemainingJobs(t *testing
 	out := f.out.String()
 	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"unscanned_host_reasons":{"local":"caller cancelled during job scan"}`) {
 		t.Fatalf("cancelled mid-host summary omitted eligible work or stop host: %s", out)
+	}
+}
+
+func TestArchiveJobsCancelledDuringRefreshCountsInterruptedJobs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		jobs []string
+	}{
+		{name: "two jobs", jobs: []string{"first", "second"}},
+		{name: "last job", jobs: []string{"first"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newArchiveFixture(t, noAgents)
+			for _, job := range tc.jobs {
+				jobDir(t, f.jobs, job, 20*24*time.Hour)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.s.Runner = archiveCancelAfterCommandRunner{base: f.run, match: "|| continue; printf \"%s %s %s\\0\"", cancel: cancel}
+			err := f.s.ArchiveJobs(ctx, "", 14*24*time.Hour, Options{Shadow: true})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled run returned %v, want context.Canceled", err)
+			}
+			out := f.out.String()
+			if !strings.Contains(out, `"eligible_left":`+strconv.Itoa(len(tc.jobs))) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+				t.Fatalf("refresh cancellation omitted pending work or stop host: %s", out)
+			}
+		})
+	}
+}
+
+func TestArchiveJobsCancelledDuringPlanCountsInterruptedJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.s.Runner = archiveCancelAfterCommandRunner{base: f.run, match: "cat " + filepath.Join(f.jobs, "first", "events", "00004-job.task_link.json"), cancel: cancel}
+	err := f.s.ArchiveJobs(ctx, "", 14*24*time.Hour, Options{Shadow: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+		t.Fatalf("plan cancellation omitted pending work or stop host: %s", out)
+	}
+}
+
+func TestArchiveJobsCancelledDuringApplyRecordsRowAndCountsPending(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.s.Runner = archiveCancelAfterCommandRunner{base: f.run, match: `mv -f "$1.partial" "$1"`, cancel: cancel}
+	err := f.s.ArchiveJobs(ctx, "", 14*24*time.Hour, Options{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+		t.Fatalf("apply cancellation omitted pending work or stop host: %s", out)
+	}
+	log, readErr := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(log), `"action":"archive-job","host":"local","job":"first","result":"error","reason":"caller cancelled during archive apply:`) || !strings.Contains(string(log), `"manifest_sha256"`) {
+		t.Fatalf("apply cancellation did not persist a cancelled partial archive row: %s", log)
 	}
 }
 
