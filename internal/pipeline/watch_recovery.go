@@ -1163,8 +1163,9 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 	// carry a real time and the retry guard below matches this revert. No task
 	// was reopened on this path, so the notice must not claim one.
 	// The rebuilt incident is saved before anything reads it, as recovery() does,
-	// so a notice retried on a later pass keeps this red_since.
-	if st.RevertPR != pr.Number {
+	// so a notice retried on a later pass keeps this red_since. With no stored
+	// incident there is nothing to rebuild: the zero value stays as before.
+	if found && st.RevertPR != pr.Number {
 		st = s.freshRevertIncident(pr, head, "")
 		st.TaskReopen = "none"
 		if e := s.saveRecovery(r.Name, st); e != nil {
