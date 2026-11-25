@@ -716,9 +716,10 @@ func (s *Service) archivePhase(host, phase string, duration time.Duration, err e
 const archiveNextHostFile = "archive-jobs-next-host"
 
 // archiveEligibleScope is what the summary's eligible_left counts: jobs still
-// waiting on the hosts a run scanned. Hosts it never reached are named in
-// unscanned_hosts and are not scanned just to be counted.
-const archiveEligibleScope = "jobs left on scanned hosts only; jobs on unscanned_hosts are not counted"
+// waiting on hosts the run reached, including eligible jobs already listed on
+// a partly processed host. Hosts it never reached are named in unscanned_hosts
+// and are not scanned just to be counted.
+const archiveEligibleScope = "jobs left on hosts reached by the run, including eligible jobs already listed on a partly processed host; jobs on hosts never reached are not counted"
 
 // archiveRunOrder returns the hosts a full run walks. A run that stopped on its
 // budget leaves the host after the last one it entered in the state file, and
