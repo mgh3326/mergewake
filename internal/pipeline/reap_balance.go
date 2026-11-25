@@ -247,14 +247,13 @@ func (s *Service) scanBalanceDecisions(repo string, fn func(day, command, host, 
 	// bufio.Reader has no line-length cap: one giant row (a findings dump)
 	// must not break the day's balance.
 	jl := fsutil.NewJSONL(f.Name(), 0, f)
-	var row struct {
-		Time    time.Time       `json:"time"`
-		Command string          `json:"command"`
-		Value   json.RawMessage `json:"value"`
-	}
 	for line, ok := jl.Next(); ok; line, ok = jl.Next() {
-		row.Value = nil
-		if e := json.Unmarshal(line, &row); e == nil {
+		var row struct {
+			Time    time.Time       `json:"time"`
+			Command string          `json:"command"`
+			Value   json.RawMessage `json:"value"`
+		}
+		if e := json.Unmarshal(line, &row); e == nil && !row.Time.IsZero() && row.Command != "" {
 			var v struct {
 				Host   string `json:"host"`
 				Label  string `json:"label"`

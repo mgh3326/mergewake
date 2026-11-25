@@ -52,6 +52,35 @@ func balanceDayTime(day string, hour int) time.Time {
 	return d.Add(time.Duration(hour) * time.Hour)
 }
 
+func TestScanBalanceDecisionsSkipsRowsMissingRequiredFields(t *testing.T) {
+	f := newBalanceFixture(t, balanceDayTime("2026-11-18", 10))
+	repo := f.repos[0].Name
+	validTime := balanceDayTime("2026-11-17", 12)
+	label := balanceLabel(99, validTime)
+	rows := []string{
+		`{"time":"2026-11-17T12:00:00Z","command":"reviewer-spawn","value":{"label":"` + label + `","host":"node-a"}}`,
+		`{"command":"reviewer-spawn","value":{"label":"` + label + `","host":"node-a"}}`,
+		`{"time":"2026-11-18T12:00:00Z","value":{"label":"` + label + `","host":"node-a"}}`,
+	}
+	path := filepath.Join(f.s.state(repo), "decisions.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	if err := f.s.scanBalanceDecisions(repo, func(day, command, host, gotLabel, result string) {
+		got = append(got, day+" "+command)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "2026-11-17 reviewer-spawn" {
+		t.Fatalf("scanBalanceDecisions rows = %v, want only the valid row on 2026-11-17", got)
+	}
+}
+
 // spawn seeds a reviewer-spawn audit row: the pass placed label on host.
 func (f *balanceFixture) spawn(t *testing.T, repo, host, label string, at time.Time) {
 	t.Helper()
