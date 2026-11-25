@@ -120,19 +120,22 @@ model invocation. It prevents two hosts from spending on the same head. The
 reviewer runs in a reviewer pane on a checkout of the reviewed head (a local
 `review.panewire.checkouts/<label>` worktree, or the node's own worktree when a
 checkout spec is used; see [reviewer checkouts](docs/config.md#reviewer-checkouts)).
-The pass reviews the PR's API diff. pi runs without tools, MCP, extensions,
-skills, context files or session history. Command Code uses safe mode, disabled
-skills, a one-turn cap, deny-all permissions, and a deny-all tool hook. Profile
-arguments are limited to model/provider/thinking/effort option-value pairs.
-A configured wrapper can supply provider credentials, but it must preserve the
-CLI name and these semantics.
+The pass reviews the PR diff. On round one the brief asks the reviewer to run
+`git diff <base>...<head>` in its checkout. From round two the brief inlines the
+delta patch (hunks changed since the last reviewed head) and asks for that delta
+only; if the delta brief cannot be published, the round falls back to the
+round-one instruction. mergewake imposes no tool sandbox on the reviewer pane:
+the spawn passes no tool, MCP, permission or profile restriction, and the pane
+runs as panewire launches it. The only restriction the code applies is the
+checkout: with `review.checkout_exclude` set, the worktree is sparse and omits
+the excluded paths, which is not access control because git can still read the
+repository.
 
 The response must be a bounded JSON findings array. Paths and new-side line
 numbers must exist in the supplied diff. mergewake checks that the PR head is
 still the same and submits the marker and all inline comments in one review.
 There is no second tester, fix round, or automatic retry on invalid model output.
-A failed or interrupted review leaves its claim for operator inspection. The
-adapter trusts installed CLI behavior; these switches are not an OS sandbox.
+A failed or interrupted review leaves its claim for operator inspection.
 Diffs larger than 2 MiB and unsupported output need manual review.
 
 ## Main CI recovery
