@@ -556,8 +556,6 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			intact["notified"] = notified
 		}
 		st.setEscalated(true, now, outputStr)
-		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
-		_ = s.audit(r.Name, "ladder-intact", intact, o.DryRun)
 		if !relayed {
 			// Empty output must still owe the owner a notice: an empty text
 			// would skip the send and leave the refusal owed with no retry.
@@ -568,7 +566,10 @@ func (s *Service) escalateAuthorLadder(ctx context.Context, r config.Repo, pr gi
 			st.LadderRefusalText = refusal
 			st.LadderRefusalRound = ladderRound
 			st.LadderRefusalEventSent = false
-			_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		}
+		_ = s.saveRoundRuleState(r.Name, pr.Number, *st)
+		_ = s.audit(r.Name, "ladder-intact", intact, o.DryRun)
+		if !relayed {
 			s.sendLadderRefusalDecision(ctx, r, pr, ladderRound, o, st)
 		}
 		if s.Log != nil {
