@@ -2,7 +2,7 @@
 
 This inventory lists every way code from this account's repositories reaches a host, so that deploy can become the strict gate after independent review. It also names the first path to gate. It changes nothing: no consumer, ruleset or updater moves until slice 2.
 
-**The NCP host is retired (2026-11-25).** The hub lost the node on 2026-11-24 19:00:53Z; the host is gone. Rows X5, X7, X8 and X18 and reads D7 to D11 describe that host as it was when read, not current state.
+**The NCP host is retired (2026-11-25).** The hub lost the node on 2026-11-24 19:00:53Z; the host is gone. Rows X5, X6, X7, X8, X17 and X18, the NCP parts of read D1, reads D7 to D11, and the findings that cite them describe that host as it was when read, not current state.
 
 Terms used here:
 
@@ -93,7 +93,7 @@ These rows change what runs on a host.
 - **The routes in daily use are not the gated ones.** Every reachable host runs desk-swapped binaries (X17), including `-desk` builds that no release publishes (D1, D16). mergewake's approval gate covers X10 to X12 only, and rollout is disabled on every reachable host (D2). Today, the gated routes deliver nothing.
 - **Two documented routes are not what runs.** fillwire runs as a host binary, not as the digest-pinned container its runbook describes (X8, D10). handoffkeep and the panewire hub run as hand-installed binaries, not as the containers that `examples/fleet-services.yaml` proposes (X11, D11).
 - **brewdial's follow has no admission of its own.** `deploy-oci.yml` (P1) is the publisher and X1 is the executor; together they replace a direct deploy. Their only link is a mutable GHCR tag, and neither reads the post-merge suite. The follow job is confirmed live, every 3 minutes (D4).
-- **A merge-is-deploy checkout is not clean.** The private application repo A checkout on the NCP host matches `main`, but `git status --short` prints 2614 lines (D8). What runs there is not exactly any commit.
+- **A merge-is-deploy checkout is not clean.** The private application repo A checkout on the NCP host matches `main`, but `git status --short` prints 2614 lines (D8). What runs there is not exactly any commit. (When read; the NCP host is now retired.)
 - **Branch protection is mostly absent.** `gh api repos/mgh3326/<repo>/branches/main/protection` returned "Branch not protected" for mergewake, handoffkeep, panewire and brewdial, and `branches/production` for brewdial; `rulesets` is empty for every public repository read. auto_trader's `main` is protected with `lint` and `PR gate` required. For the four private repositories, GitHub refused both the rulesets and the branch-protection reads with "Upgrade to GitHub Pro or make this repository public" (D15). On the current plan they cannot have either, so a protected `deployable` branch is only possible in a public repository.
 
 ## Repositories without a full post-merge suite
