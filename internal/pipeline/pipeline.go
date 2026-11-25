@@ -163,9 +163,17 @@ func distinctPasses(receipts []github.PassReceipt, needed int) (int, bool) {
 func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (retErr error) {
 	ctx = github.FreshEvidence(ctx)
 	defer func() {
-		if retErr != nil {
-			retErr = errors.Join(retErr, s.audit(r.Name, "land-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
+		if retErr == nil {
+			return
 		}
+		// A hold is a verdict, not a failure: it writes no land-error row.
+		// (Writing one would also hide a state-write failure behind the
+		// hold in the joined error.)
+		var held *MergeHeldError
+		if errors.As(retErr, &held) {
+			return
+		}
+		retErr = errors.Join(retErr, s.audit(r.Name, "land-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
 	}()
 	pr, e := s.GH.Pull(ctx, r.Name, n)
 	if e != nil {
