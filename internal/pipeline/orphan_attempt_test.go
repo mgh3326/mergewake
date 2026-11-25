@@ -48,6 +48,25 @@ func TestOrphanSweepLeavesWatchRevertAttempt(t *testing.T) {
 	}
 }
 
+func TestOrphanSweepLeavesLegacyRecoveryBranchAttempt(t *testing.T) {
+	s, g, _, r := unknownMergeSetup(t, 500)
+	g.pull.Head.Ref = github.RecoveryBranch
+	if err := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 7), mergeAttempt{PR: 7, Head: shaA, Base: shaB, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(s.mergeAttemptFile(r.Name, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SettleOrphanedMergeAttempts(context.Background(), r, map[int]bool{}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(s.mergeAttemptFile(r.Name, 7))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("legacy recovery attempt changed: %v", err)
+	}
+}
+
 // An orphan whose post-merge step fails once is finished on the next sweep.
 // The failure is injected after the task event and hook (the pull inside
 // finishMerge), so the first sweep sends the event and hook and then errors.

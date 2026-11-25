@@ -96,7 +96,9 @@ func Bisect(shas []string, check func(string) (github.CI, error)) (int, error) {
 	return hi, nil
 }
 func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr error) {
+	var finishErr error
 	defer func() {
+		retErr = errors.Join(retErr, finishErr)
 		if retErr != nil {
 			retErr = errors.Join(retErr, s.audit(r.Name, "watch-error", map[string]any{"error": retErr.Error()}, o.DryRun))
 		}
@@ -113,9 +115,10 @@ func (s *Service) Watch(ctx context.Context, r config.Repo, o Options) (retErr e
 	if p.DeployStage() {
 		deploy := watchStream{Service: s, deploy: true}
 		if p.Enabled && !o.Shadow && !o.DryRun {
-			if err := deploy.finishMerged(ctx, r, head); err != nil {
-				return err
-			}
+			finishErr = deploy.finishMerged(ctx, r, head)
+			// A notification or observation failure must not suppress main
+			// diagnosis or deploy recovery. finishMerged retains its attempt for
+			// a later pass when post-processing has not completed.
 			st, found, err := deploy.loadRecovery(r.Name)
 			if err != nil {
 				return err
