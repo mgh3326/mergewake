@@ -15,21 +15,29 @@ def next_tag(tags):
     return f'v{major}.{minor}.{patch + 1}'
 
 
-def last_tag(head):
-    """Newest patch tag that is a strict ancestor of head, or None.
+def nearest_tags(head):
+    """Patch tags that are strict ancestors of head and have no tagged descendant
+    among them, by topology. Tag versions say nothing about commit order, so the
+    nearest tag is found from the commit graph, not from the version number.
 
     A tag on head itself is skipped so a re-pushed, already-tagged commit is
     released again exactly as before instead of skipping as docs-only.
     """
     tags = [t for t in run('git', 'tag', '--list', 'v*').splitlines()
             if re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', t) and t != 'v0.0.0']
-    for tag in sorted(tags, key=lambda t: tuple(map(int, t[1:].split('.'))), reverse=True):
-        if run('git', 'rev-list', '-n', '1', tag) == head:
+    ancestors = []
+    for tag in tags:
+        commit = run('git', 'rev-list', '-n', '1', tag)
+        if commit == head:
             continue
         if subprocess.run(['git', 'merge-base', '--is-ancestor', tag, head],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            return tag
-    return None
+            ancestors.append((tag, commit))
+    if not ancestors:
+        return []
+    # --independent keeps the commits no other listed commit descends from.
+    nearest = set(run('git', 'merge-base', '--independent', *{c for _, c in ancestors}).splitlines())
+    return sorted(tag for tag, commit in ancestors if commit in nearest)
 
 
 def main():
@@ -43,11 +51,15 @@ def main():
         # Judge docs-only against everything since the last release tag, not
         # just this push: a duplicate push of code (empty diff) must still release.
         try:
-            base = last_tag(sha)
-            if base is None:
+            bases = nearest_tags(sha)
+            if not bases:
                 changed = ['unknown']
             else:
-                changed = run('git', 'diff', '--no-renames', '--name-only', base, sha).splitlines()
+                # Release unless every nearest tag's diff is docs-only: the
+                # union of the diffs is docs-only exactly then.
+                changed = []
+                for base in bases:
+                    changed += run('git', 'diff', '--no-renames', '--name-only', base, sha).splitlines()
         except subprocess.CalledProcessError:
             # Docs-only skipping is an optimization; unknown content releases
             # normally. Deployment CI/range approval remains fail closed.
