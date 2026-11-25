@@ -949,7 +949,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	}
 	// An unknown-outcome merge of this revert settles first: a merged revert is
 	// recorded as merged, and content already on main holds it.
-	settled, e := s.settleMerge(freshCtx, r, fresh, o.DryRun)
+	settled, e := s.settleLocked(freshCtx, r, fresh, o.DryRun)
 	if e != nil {
 		return e
 	}
@@ -995,7 +995,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		result.Reason = "main CI is " + string(ci) + " on the watch checks; revert held"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
-	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
+	if e = s.mergeOnceLocked(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
 		return e
 	}
 	return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)

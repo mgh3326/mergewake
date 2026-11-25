@@ -70,20 +70,46 @@ func (s *Service) clearMergeAttempt(repo string, n int) error {
 
 // mergeOnce sends the squash of PR n pinned to head, against the base branch
 // head base. The attempt is on disk before the PUT, so a crash mid-call leaves
-// it for settleMerge. A definite answer clears it; an unknown outcome keeps it.
+// it for settleMerge. A definite answer clears it; an unknown outcome keeps it,
+// rewritten after the PUT returns so no clear can have erased it.
+//
+// The caller holds the repository's merge lock, which covers this whole
+// write-attempt → PUT → result sequence. A pending attempt is never overwritten:
+// it is settled first.
 func (s *Service) mergeOnce(ctx context.Context, r config.Repo, n int, head, base string) error {
+	pending, e := s.readMergeAttempt(r.Name, n)
+	if e != nil {
+		return e
+	}
+	if pending != nil {
+		return fmt.Errorf("PR #%d has an unsettled merge attempt; settle it before merging again", n)
+	}
 	a := mergeAttempt{PR: n, Head: head, Base: base, At: s.now().UTC()}
 	if e := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, n), a); e != nil {
 		return e
 	}
-	e := s.GH.Merge(ctx, r.Name, n, head)
+	e = s.GH.Merge(ctx, r.Name, n, head)
 	if github.IsUnknownOutcome(e) {
+		if we := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, n), a); we != nil {
+			return errors.Join(e, we)
+		}
 		return e
 	}
 	if ce := s.clearMergeAttempt(r.Name, n); ce != nil {
 		return errors.Join(e, ce)
 	}
 	return e
+}
+
+// mergeOnceLocked is mergeOnce under the repository's merge lock, for a caller
+// that holds no lock across its own GitHub reads.
+func (s *Service) mergeOnceLocked(ctx context.Context, r config.Repo, n int, head, base string) error {
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		return e
+	}
+	defer unlock()
+	return s.mergeOnce(ctx, r, n, head, base)
 }
 
 // settleMerge settles the pending unknown attempt on pr, if there is one,

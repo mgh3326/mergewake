@@ -2,7 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/mgh3326/mergewake/internal/fsutil"
 )
@@ -35,6 +39,30 @@ func lockPath(name string) func() {
 	m := v.(*sync.Mutex)
 	m.Lock()
 	return m.Unlock
+}
+
+// lockFile takes an exclusive flock on path, creating its directory and file.
+// Unlike lockPath it holds across processes: the daemon and a `mergewake land`
+// run from a shell exclude each other on it. It blocks until the lock is free
+// and returns the unlock.
+func lockFile(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if err == nil {
+			return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EINTR) {
+			f.Close()
+			return nil, err
+		}
+	}
 }
 
 // gitIn runs git in the repo checkout at root. Concurrent reviews share that

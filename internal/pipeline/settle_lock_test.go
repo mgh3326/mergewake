@@ -147,18 +147,10 @@ func TestSecondMergeOfARepoGatesAgainstTheBaseTheFirstLeft(t *testing.T) {
 	<-g.mergeStarted
 	wg.Add(1)
 	go land("B", 8)
-	// B reads the base once, to decide, then waits for A's merge. Give it the
-	// time to read it again before the lock, if the lock were taken too late.
-	settleWaitFor(t, "B's first read of the base", func() bool { return settleCount(g.events(), "head B ") >= 1 })
-	deadline := time.After(300 * time.Millisecond)
-	for done := false; !done; {
-		select {
-		case <-deadline:
-			done = true
-		case <-time.After(5 * time.Millisecond):
-			done = settleCount(g.events(), "head B ") >= 2
-		}
-	}
+	// B reaches its settle and waits for A's merge. The settle is under the
+	// repository's merge lock, so B reads the base only after A's merge
+	// returns. Give B the time to reach the lock.
+	time.Sleep(300 * time.Millisecond)
 	if slices.Contains(g.events(), "merge-start B") {
 		t.Fatalf("B's merge started while A's was in flight: %v", g.events())
 	}
