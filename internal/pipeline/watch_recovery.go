@@ -969,7 +969,8 @@ func sortedKeys(m map[string]bool) []string {
 // not changed, records the outcome and tells the design lane once. The merge
 // lock is taken before the fresh reads and held through settle, the checks and
 // the PUT, as mergePinned does: a merge by another caller moves main, and the
-// checks must read main after it.
+// checks must read main after it. Reporting and announcing run after the lock
+// is released, so a slow hub never blocks another caller's Land or merge.
 func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head string, checks []string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
 	// Earlier reads in this pass are memoized, and a same-sha re-run can settle
 	// since. The merge turns on the PR, the head and main's CI, so read them
@@ -981,9 +982,9 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	if e != nil {
 		return e
 	}
-	defer unlock()
 	fresh, e := s.GH.Pull(freshCtx, r.Name, pr.Number)
 	if e != nil {
+		unlock()
 		return e
 	}
 	// An unknown-outcome merge of this revert settles first: a merged revert is
@@ -991,15 +992,18 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	// here, so settle without taking it again.
 	settled, e := s.settleMerge(freshCtx, r, fresh, o.DryRun)
 	if e != nil {
+		unlock()
 		return e
 	}
 	switch settled.Kind {
 	case settleMerged:
 		result.Action = "recovery-merged"
+		unlock()
 		return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
 	case settleLanded:
 		result.Action = "recovery-merged"
 		result.Reason = fmt.Sprintf("pending merge of revert PR #%d settled", pr.Number)
+		unlock()
 		if e := s.recordLanded(ctx, r, st, pr.Number, head, settled.Commit, "main red at "+short7(head)); e != nil {
 			return e
 		}
@@ -1008,15 +1012,18 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	if fresh.State != "open" || fresh.MergedAt != nil || fresh.Head.SHA != pr.Head.SHA {
 		result.Action = "recovery-hold"
 		result.Reason = "revert PR changed during recovery"
+		unlock()
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":changed", o)
 	}
 	main, e := s.GH.Head(freshCtx, r.Name, r.Branch)
 	if e != nil {
+		unlock()
 		return e
 	}
 	if main != s.targetHead(head) {
 		result.Action = "recovery-hold"
 		result.Reason = "main changed during recovery"
+		unlock()
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-moved", o)
 	}
 	if s.deploy {
@@ -1024,6 +1031,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		if err != nil || mainCI != github.Green {
 			result.Action = "recovery-hold"
 			result.Reason = "main CI is not green; deploy recovery waits"
+			unlock()
 			return s.reportWatch(ctx, r, result, "deploy:main-not-green", o)
 		}
 	}
@@ -1031,16 +1039,20 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	if e != nil {
 		result.Action = "recovery-hold"
 		result.Reason = "main CI check failed before the merge: " + integrations.Detail(e)
+		unlock()
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-failed", o)
 	}
 	if ci != github.Red {
 		result.Action = "recovery-hold"
 		result.Reason = "main CI is " + string(ci) + " on the watch checks; revert held"
+		unlock()
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
 	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
+		unlock()
 		return e
 	}
+	unlock()
 	return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
 }
 
