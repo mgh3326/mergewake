@@ -449,6 +449,26 @@ func TestRoundRule_f_Round5ReleaseEndsHold(t *testing.T) {
 	}
 }
 
+func TestRoundHoldStateWriteFailureDoesNotReturnHoldVerdictOrDecision(t *testing.T) {
+	s, g, notifier, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	if err := os.MkdirAll(filepath.Dir(s.roundRuleFile(r.Name, 7)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.roundRuleFile(r.Name, 7), 0700); err != nil {
+		t.Fatal(err)
+	}
+	err := s.NotifyPR(context.Background(), r, 7, Options{})
+	if err == nil {
+		t.Fatal("NotifyPR succeeded after the hold state write failed")
+	}
+	for _, event := range notifier.events {
+		if event.Type == "decision" {
+			t.Fatalf("decision sent without durable hold and baseline: %+v", event)
+		}
+	}
+}
+
 // (g) a PR that passes in round 3, 5 or 7 gets neither directive/escalate nor hold.
 func TestRoundRule_g_PassRound3Or5GetsNeither(t *testing.T) {
 	// Passing round 3 (no open blocking findings)
