@@ -353,9 +353,6 @@ func (s *watchStream) finishMerged(ctx context.Context, r config.Repo, head stri
 	if err != nil || !contains {
 		return err
 	}
-	if err := s.finishPendingDeployRevert(ctx, r, pr, head); err != nil {
-		return err
-	}
 	if err := fsutil.Atomic(filepath.Join(s.state(r.Name), "last-deploy-revert"), []byte(pr.MergeCommitSHA), 0600); err != nil {
 		return err
 	}
@@ -373,6 +370,9 @@ func (s *watchStream) finishMerged(ctx context.Context, r config.Repo, head stri
 		}
 	}
 	if err := s.endAnyRef(r.Name); err != nil {
+		return err
+	}
+	if err := s.finishPendingDeployRevert(ctx, r, pr, head); err != nil {
 		return err
 	}
 	return s.clearRecoveryState(r.Name)
@@ -400,10 +400,10 @@ func (s *watchStream) finishPendingDeployRevert(ctx context.Context, r config.Re
 	}
 	switch settled.Kind {
 	case settleMerged:
-		if err := s.recordRevertMerged(ctx, r, st, pr.Number, head, watchResult{Action: "recovery-merged"}, Options{}); err != nil {
+		if err := s.recordRevertMerged(ctx, r, st, pr.Number, head, watchResult{Head: head, Stage: "deploy", Action: "recovery-merged"}, Options{}); err != nil {
 			return err
 		}
-		return s.finishOrphanMerge(ctx, r, pr, Options{})
+		return s.clearMergeAttempt(r.Name, pr.Number)
 	case settleLanded:
 		return s.recordLanded(ctx, r, st, pr.Number, head, settled.Commit, "main green at "+short7(head))
 	}

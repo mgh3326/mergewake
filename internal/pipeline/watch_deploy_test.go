@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,7 +68,13 @@ func TestWatchWithoutDeployLeavesNoCheckpoint(t *testing.T) {
 
 type deployTestGH struct {
 	*recoveryGH
-	suite bool
+	suite      bool
+	checkCalls int
+}
+
+func (g *deployTestGH) Check(ctx context.Context, repo, sha string, names []string) (github.CI, error) {
+	g.checkCalls++
+	return g.recoveryGH.Check(ctx, repo, sha, names)
 }
 
 func (g *deployTestGH) ReadFile(ctx context.Context, repo, sha, name string) ([]byte, error) {
@@ -401,6 +408,38 @@ func TestWatchDeployMergedRevertEndsIncident(t *testing.T) {
 	recoveryWatch(t, s, r)
 	if _, found := readDeployIncident(t, s, r); found {
 		t.Fatal("old red restarted after revert merged")
+	}
+}
+
+func TestWatchDeployNoticeFailureDoesNotBlockWatchOrLatchRelease(t *testing.T) {
+	s, g, n, r, _ := deploySetup(t)
+	st := confirmedDeploy(time.Now().UTC())
+	st.RevertPR = 9
+	seedDeployIncident(t, s, r, st)
+	g.latch = true
+	g.revert.Merged = true
+	mergedAt := "2026-11-07T11:00:00Z"
+	g.revert.MergedAt = &mergedAt
+	g.revert.MergeCommitSHA = advancedHead
+	g.head = advancedHead
+	g.parents[advancedHead] = shaC
+	g.checkNames[advancedHead] = map[string]github.CI{"CI": github.Green, "deploy-ok": github.Green}
+	if err := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 9), mergeAttempt{PR: 9, Head: revertHead, Base: shaC, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	n.err = errors.New("notification unavailable")
+	before := g.checkCalls
+	if err := s.Watch(context.Background(), r, Options{}); err == nil {
+		t.Fatal("Watch returned nil after the expected notice failure")
+	}
+	if g.latch {
+		t.Fatal("merged recovery latch was not released")
+	}
+	if g.checkCalls <= before {
+		t.Fatal("Watch returned before running main/deploy checks")
+	}
+	if _, err := os.Stat(s.mergeAttemptFile(r.Name, 9)); err != nil {
+		t.Fatalf("attempt should stay pending until notice retry succeeds: %v", err)
 	}
 }
 
