@@ -256,7 +256,18 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 // landed, so the notice failure is audited rather than returned; any other
 // error is returned as it is after a normal merge.
 func (s *Service) finishMerge(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
+	s.postMergeEvent(ctx, r, pr)
+	return s.finishMergeObserved(ctx, r, pr, o)
+}
+
+// postMergeEvent sends the merge task event, which also runs the merge hook.
+func (s *Service) postMergeEvent(ctx context.Context, r config.Repo, pr github.Pull) {
 	s.postTaskEvent(ctx, r, pr, integrations.SourceMerge, nil, s.now())
+}
+
+// finishMergeObserved is finishMerge after the task event: the fresh PR read,
+// the observation, the MERGED notice and the nudge.
+func (s *Service) finishMergeObserved(ctx context.Context, r config.Repo, pr github.Pull, o Options) error {
 	merged, e := s.GH.Pull(ctx, r.Name, pr.Number)
 	if e != nil {
 		return e
@@ -383,5 +394,5 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 	if v.State != "ready" {
 		return errors.New("gate changed during decision")
 	}
-	return s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, fresh)
+	return s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, fresh, mergeRolePR)
 }
