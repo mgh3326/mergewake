@@ -353,6 +353,9 @@ func (s *watchStream) finishMerged(ctx context.Context, r config.Repo, head stri
 	if err != nil || !contains {
 		return err
 	}
+	if err := s.finishPendingDeployRevert(ctx, r, pr, head); err != nil {
+		return err
+	}
 	if err := fsutil.Atomic(filepath.Join(s.state(r.Name), "last-deploy-revert"), []byte(pr.MergeCommitSHA), 0600); err != nil {
 		return err
 	}
@@ -373,4 +376,36 @@ func (s *watchStream) finishMerged(ctx context.Context, r config.Repo, head stri
 		return err
 	}
 	return s.clearRecoveryState(r.Name)
+}
+
+func (s *watchStream) finishPendingDeployRevert(ctx context.Context, r config.Repo, pr github.Pull, head string) error {
+	a, err := s.readMergeAttempt(r.Name, pr.Number)
+	if err != nil || a == nil {
+		return err
+	}
+	st, found, err := s.loadRecovery(r.Name)
+	if err != nil {
+		return err
+	}
+	if !found || st.RevertPR != pr.Number {
+		st = s.freshRevertIncident(&pr, head, "")
+		st.TaskReopen = "none"
+		if err := s.saveRecovery(r.Name, st); err != nil {
+			return err
+		}
+	}
+	settled, err := s.settleOrphan(ctx, r, pr)
+	if err != nil {
+		return err
+	}
+	switch settled.Kind {
+	case settleMerged:
+		if err := s.recordRevertMerged(ctx, r, st, pr.Number, head, watchResult{Action: "recovery-merged"}, Options{}); err != nil {
+			return err
+		}
+		return s.finishOrphanMerge(ctx, r, pr, Options{})
+	case settleLanded:
+		return s.recordLanded(ctx, r, st, pr.Number, head, settled.Commit, "main green at "+short7(head))
+	}
+	return nil
 }

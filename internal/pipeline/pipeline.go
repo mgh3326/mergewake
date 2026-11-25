@@ -195,6 +195,9 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		if !o.Acting() {
 			return nil
 		}
+		if st.Posted {
+			return s.finishMergeObserved(ctx, r, pr, o)
+		}
 		return s.finishMerge(ctx, r, pr, o)
 	case settleLanded:
 		return s.holdSettledMerge(ctx, r, pr, st, o.DryRun)

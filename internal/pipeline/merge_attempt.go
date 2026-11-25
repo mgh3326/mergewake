@@ -57,7 +57,8 @@ const (
 )
 
 type settlement struct {
-	Kind settleKind
+	Kind   settleKind
+	Posted bool
 	// Commit is the base commit that carries the content, for settleLanded.
 	Commit string
 }
@@ -139,7 +140,7 @@ func (s *Service) settleMergeKeeping(ctx context.Context, r config.Repo, pr gith
 		return settlement{}, e
 	}
 	if now.MergedAt != nil {
-		return settlement{Kind: settleMerged}, s.endMergeAttempt(r, pr.Number, "merged", "", dry, keepMerged)
+		return settlement{Kind: settleMerged, Posted: a.Posted}, s.endMergeAttempt(r, pr.Number, "merged", "", dry, keepMerged)
 	}
 	if now.State != "open" {
 		return settlement{}, s.endMergeAttempt(r, pr.Number, "closed-unmerged", "", dry, false)
@@ -241,6 +242,9 @@ func (s *Service) SettleOrphanedMergeAttempts(ctx context.Context, r config.Repo
 			continue
 		}
 		if open != nil && open[pr.Number] {
+			continue
+		}
+		if a.Role == "" && pr.Head.Ref == github.RecoveryBranch {
 			continue
 		}
 		st, err := s.settleOrphan(fresh, r, pr)

@@ -135,6 +135,29 @@ func TestUnknownMergeReadBackMergedRecordedWithoutSecondMerge(t *testing.T) {
 	}
 }
 
+func TestLandPostedAttemptDoesNotRepeatEventOrHook(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	n := s.Notifier.(*fakeNotifier)
+	r.Lane = "example-lane"
+	g.pull.Title = "Add feature"
+	withMergeSHA(g)
+	mergedAt := time.Now().UTC().Format(time.RFC3339)
+	g.pull.State, g.pull.Merged, g.pull.MergedAt = "closed", true, &mergedAt
+	if err := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 7), mergeAttempt{PR: 7, Head: shaA, Base: shaB, At: time.Now(), Posted: true}); err != nil {
+		t.Fatal(err)
+	}
+	hooks := 0
+	if err := s.Land(WithMergeHook(context.Background(), func(string, int) { hooks++ }), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hk.received()) != 0 || hooks != 0 {
+		t.Fatalf("repeated task events=%d hook calls=%d", len(hk.received()), hooks)
+	}
+	if n.count != 1 {
+		t.Fatalf("MERGED notices=%d, want one", n.count)
+	}
+}
+
 // A refusal (405) is an ordinary refusal: nothing is kept pending and a later
 // pass merges as it did before.
 func TestRefusalIsNotUnknownAndMergesLater(t *testing.T) {
