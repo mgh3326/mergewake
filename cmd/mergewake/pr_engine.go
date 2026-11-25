@@ -451,6 +451,13 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 		heads[pr.Number] = pr.Head.SHA
 	}
 	e.replaceOpenList(r.Name, epoch, heads)
+	// A shadow Land that settled a merged attempt left the file for the next
+	// acting pass, but a merged PR is closed so no evaluation ever reads it.
+	// The acting sweep settles those orphaned attempts here, running
+	// finishMerge once for a merged PR. A shadow pass stays read-only.
+	setPRSweepStep(ctx, "settle_orphans")
+	orphanCtx := pipeline.WithMergeHook(ctx, e.onMerge)
+	orphanErr := e.s.SettleOrphanedMergeAttempts(orphanCtx, r, seen, e.o)
 	prs = skipBotPulls(prs, e.s.Config.Daemon.PR.SkipBots)
 	// PRs a fresh status read marked go first.
 	prs = dirtyFirst(prs, prstatus.DirtyPRs(e.s.Config.StateDir, r.Name))
@@ -466,6 +473,9 @@ func (e *prEngine) sweep(ctx context.Context, r config.Repo) error {
 	e.q.Enqueue(daemon.SourceSweep, keys...)
 	e.skips.forget(r.Name, seen)
 	errs = append(errs, e.takeErrors(r.Name)...)
+	if orphanErr != nil {
+		errs = append(errs, orphanErr)
+	}
 	// A host that could not list its panes is not this sweep's failure: its PRs
 	// routed on the hosts that answered. It is logged once, so the outage
 	// stays visible without a failed pass.
