@@ -384,15 +384,41 @@ func (c *Client) Diff(ctx context.Context, repo string, n int) (string, error) {
 	}
 	return text, e
 }
+
+// UnknownOutcomeError is a merge whose result never came back cleanly: GitHub
+// answered 5xx, or no answer arrived at all (a timeout, a lost connection, a
+// body that did not read). The merge may still have landed, so callers must
+// settle it before merging the same PR again.
+type UnknownOutcomeError struct{ Err error }
+
+func (e *UnknownOutcomeError) Error() string {
+	return "merge outcome unknown: " + e.Err.Error()
+}
+func (e *UnknownOutcomeError) Unwrap() error { return e.Err }
+
+// IsUnknownOutcome reports whether err is an unknown merge outcome. A 4xx is a
+// refusal GitHub made without merging, so it is never unknown.
+func IsUnknownOutcome(err error) bool {
+	var u *UnknownOutcomeError
+	return errors.As(err, &u)
+}
+
 func (c *Client) Merge(ctx context.Context, repo string, n int, sha string) error {
 	var result struct {
 		Merged bool `json:"merged"`
 	}
 	e := c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/merge", base(repo), n), map[string]any{"sha": sha, "merge_method": "squash"}, &result)
-	if e == nil && !result.Merged {
+	if e != nil {
+		var api *APIError
+		if errors.As(e, &api) && api.Code < http.StatusInternalServerError {
+			return e
+		}
+		return &UnknownOutcomeError{Err: e}
+	}
+	if !result.Merged {
 		return errors.New("GitHub did not merge PR")
 	}
-	return e
+	return nil
 }
 func (c *Client) UpdateBranch(ctx context.Context, repo string, n int, head string) error {
 	return c.json(ctx, "PUT", fmt.Sprintf("%s/pulls/%d/update-branch", base(repo), n), map[string]string{"expected_head_sha": head}, nil)
@@ -1141,6 +1167,19 @@ func (c *Client) ReviewedHeads(ctx context.Context, repo string, n int, login st
 func (c *Client) CompareDiff(ctx context.Context, repo, baseRef, head string) (string, error) {
 	b, e := c.request(ctx, "GET", base(repo)+"/compare/"+url.PathEscape(baseRef)+"..."+url.PathEscape(head), "application/vnd.github.diff", nil)
 	return string(b), e
+}
+
+// CommitsSince lists the commits reachable from head and not from since: on a
+// base branch, the commits that landed after since. GitHub answers the list
+// newest first.
+func (c *Client) CommitsSince(ctx context.Context, repo, since, head string) ([]Commit, error) {
+	var r struct {
+		Commits []Commit `json:"commits"`
+	}
+	if e := c.json(ctx, "GET", base(repo)+"/compare/"+url.PathEscape(since)+"..."+url.PathEscape(head), nil, &r); e != nil {
+		return nil, e
+	}
+	return r.Commits, nil
 }
 
 // CIStarted reports whether any check run or status exists for sha.

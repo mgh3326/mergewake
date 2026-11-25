@@ -45,6 +45,7 @@ type GitHub interface {
 	PRsForCommit(context.Context, string, string) ([]github.Pull, error)
 	MergedPulls(context.Context, string, string, time.Time) ([]github.Pull, error)
 	Ancestor(context.Context, string, string, string) (bool, error)
+	CommitsSince(context.Context, string, string, string) ([]github.Commit, error)
 	ReadFile(context.Context, string, string, string) ([]byte, error)
 	Revert(context.Context, string, string, string, string, int) (string, error)
 }
@@ -170,6 +171,18 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
+	// A pending unknown-outcome merge settles before the PR's state is read
+	// further: a merged PR is not merged again, and landed content holds it.
+	st, e := s.settleMerge(ctx, r, pr, o.DryRun)
+	if e != nil {
+		return e
+	}
+	switch st.Kind {
+	case settleMerged:
+		return nil
+	case settleLanded:
+		return s.holdSettledMerge(ctx, r, pr, st, o.DryRun)
+	}
 	if !o.Observed {
 		if e = s.ObservePR(ctx, r, pr, o); e != nil {
 			return e
@@ -269,6 +282,16 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 	if e != nil {
 		return e
 	}
+	st, e := s.settleMerge(ctx, r, freshPR, false)
+	if e != nil {
+		return e
+	}
+	switch st.Kind {
+	case settleMerged:
+		return nil
+	case settleLanded:
+		return s.holdSettledMerge(ctx, r, freshPR, st, false)
+	}
 	if freshPR.Head.SHA != pr.Head.SHA || freshPR.State != "open" || freshPR.Draft || freshPR.Base.Ref != r.Branch {
 		return errors.New("PR changed during decision")
 	}
@@ -290,5 +313,5 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 	if v.State != "ready" {
 		return errors.New("gate changed during decision")
 	}
-	return s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA)
+	return s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, fresh)
 }

@@ -947,6 +947,21 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	if e != nil {
 		return e
 	}
+	// An unknown-outcome merge of this revert settles first: a merged revert is
+	// recorded as merged, and content already on main holds it.
+	settled, e := s.settleMerge(freshCtx, r, fresh, o.DryRun)
+	if e != nil {
+		return e
+	}
+	switch settled.Kind {
+	case settleMerged:
+		result.Action = "recovery-merged"
+		return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
+	case settleLanded:
+		result.Action = "recovery-hold"
+		result.Reason = "revert content already on " + r.Branch + " as " + short7(settled.Commit) + "; GitHub left the PR open, so a person closes it"
+		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":merge-settled", o)
+	}
 	if fresh.State != "open" || fresh.MergedAt != nil || fresh.Head.SHA != pr.Head.SHA {
 		result.Action = "recovery-hold"
 		result.Reason = "revert PR changed during recovery"
@@ -980,9 +995,14 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		result.Reason = "main CI is " + string(ci) + " on the watch checks; revert held"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
-	if e = s.GH.Merge(ctx, r.Name, pr.Number, pr.Head.SHA); e != nil {
+	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
 		return e
 	}
+	return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
+}
+
+// recordRevertMerged audits a revert merged on main and sends its design-lane line.
+func (s *watchStream) recordRevertMerged(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head string, result watchResult, o Options) error {
 	result.Action = "recovery-merged"
 	row := struct {
 		Culprit   string    `json:"culprit"`
@@ -990,14 +1010,14 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		RevertPR  int       `json:"revert_pr"`
 		RedSince  time.Time `json:"red_since"`
 		Head      string    `json:"head"`
-	}{Culprit: st.Culprit, CulpritPR: st.CulpritPR, RevertPR: pr.Number, RedSince: st.RedSince, Head: head}
-	if e = s.audit(r.Name, "watch", result, o.DryRun); e != nil {
+	}{Culprit: st.Culprit, CulpritPR: st.CulpritPR, RevertPR: revertPR, RedSince: st.RedSince, Head: head}
+	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
-	if e = s.audit(r.Name, "recovery-merged", row, false); e != nil {
+	if e := s.audit(r.Name, "recovery-merged", row, false); e != nil {
 		return e
 	}
-	return s.announceRevert(ctx, r, st, pr.Number)
+	return s.announceRevert(ctx, r, st, revertPR)
 }
 
 // announceRevert sends the one design-lane line for a merged revert.
