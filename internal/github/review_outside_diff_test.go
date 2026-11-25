@@ -123,7 +123,7 @@ func TestPostReviewBodyUnchangedWithoutOutsideFindings(t *testing.T) {
 	sent, _ := postAndReadBack(t, []Finding{{Path: "a.go", Line: 3, Body: "bug", Anchor: AnchorLine}}, meta)
 	want := "<!-- mergewake-review:" + testSHA + " -->\n" +
 		`<!-- mergewake-pass:{"pass":2,"lens":"state-risk","reviewer":"r","family":"openai","same_family":false,"answered_context":0,"patch":"p"} -->` + "\n" +
-		"One independent diff-only pass (lens: state-risk). Findings outside the PR's Acceptance contract (marked Advisory) never hold the gate; the rest are graded by severity."
+		"One independent diff-only pass (lens: state-risk). Whether a finding holds the merge depends on the repository's review gate; the author answers each thread with a disposition."
 	if sent["body"] != want {
 		t.Fatalf("body=%q\nwant %q", sent["body"], want)
 	}
