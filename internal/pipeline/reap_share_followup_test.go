@@ -135,6 +135,49 @@ func TestReviewerCursorIOErrorPreservesFile(t *testing.T) {
 	}
 }
 
+// The self-referencing symlink makes the durable cursor read fail with ELOOP.
+// The budget then cuts the worker candidate loop, exercising stopAt. Earlier
+// tests did not reach that write path: they completed with no candidates, so
+// finished saw an empty cursor and had nothing to save.
+func TestWorkerCursorIOErrorPreservesFileOnBudgetCut(t *testing.T) {
+	f := budgetWorkerFix(t, 24, "600ms", 50*time.Millisecond)
+	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.reap(t, 0, Options{})
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("worker cursor path changed after I/O error and budget cut: info=%v err=%v", info, err)
+	}
+	if got := len(f.s.Sink.(*slowJobSink).read); got == 0 || got == 24 {
+		t.Fatalf("worker stage did not run and cut mid-stage: read %d candidates", got)
+	}
+}
+
+// A slow job lookup makes the real reviewer sweep hit its repository budget
+// between labels, where stopAt would otherwise replace the unreadable cursor.
+func TestReviewerCursorIOErrorPreservesFileOnBudgetCut(t *testing.T) {
+	f := newReviewerFix(t)
+	for i := 12; i < 32; i++ {
+		f.addReviewer(reviewerLabelFor(i, time.Hour), fmt.Sprintf("w%d:p5", i))
+	}
+	const budget = "2s"
+	f.s.Config.Reap.RepoBudget = budget
+	slow := &slowJobSink{jobSink: f.sink, step: 500 * time.Millisecond, read: map[string]bool{}}
+	f.s.Sink = slow
+	path := filepath.Join(f.s.state(testRepo.Name), "reviewer-sweep-cursor.json")
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.reap(t, 0, Options{})
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("reviewer cursor path changed after I/O error and budget cut: info=%v err=%v", info, err)
+	}
+	if len(slow.read) < 2 || len(slow.read) == 20 {
+		t.Fatalf("reviewer stage did not run and cut mid-stage: read %d labels", len(slow.read))
+	}
+}
+
 func writeCorrupt(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
