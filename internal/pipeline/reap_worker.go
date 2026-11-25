@@ -105,7 +105,7 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		total += len(found)
 	}
 	if total == 0 {
-		if discovered {
+		if discovered || w.unreadable {
 			if e := w.finished(from); e != nil {
 				errs = append(errs, e)
 			}
@@ -189,13 +189,15 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		}
 	}
 	// A stage the budget cut keeps its cursor at the candidate it stopped
-	// before; a stage that visited the whole order clears it.
+	// before; a stage that visited the whole order clears it. An unreadable
+	// cursor holds no position to keep, so it is cleared even when a skipped
+	// host left discovery incomplete.
 	switch {
 	case cut >= 0:
 		if e := w.stopAt(visits[cut]); e != nil {
 			errs = append(errs, e)
 		}
-	case discovered:
+	case discovered || w.unreadable:
 		if e := w.finished(from); e != nil {
 			errs = append(errs, e)
 		}

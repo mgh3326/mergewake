@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,5 +106,35 @@ func TestReapWorkerSkippedHostKeepsCursor(t *testing.T) {
 	}
 	if got != saved {
 		t.Fatalf("a skipped host cleared the worker cursor: got %+v, want %+v", got, saved)
+	}
+}
+
+// An unreadable worker cursor has no position to keep, so a pass that skips a
+// host still rewrites it: the next pass does not report the same error again.
+func TestReapWorkerUnreadableCursorIsResetWithSkippedHost(t *testing.T) {
+	s := svc(t, &passGH{}, &scriptRunner{})
+	repo := s.Config.Repos[0]
+	path := filepath.Join(s.state(repo.Name), "worker-worktree-cursor.json")
+	writeCorrupt(t, path)
+	skipped := &reapHost{host: s.Config.Hosts[0], failed: true, trees: map[string]*reap.Worktree{}}
+	pass := func() []error {
+		return s.reapWorkerWorktrees(context.Background(), repo, []*reapHost{skipped}, &passJobRecords{}, false, true, func(reapReceipt) {})
+	}
+	cursorErr := func(errs []error) bool {
+		for _, e := range errs {
+			if strings.Contains(e.Error(), "worker worktrees: resume cursor") {
+				return true
+			}
+		}
+		return false
+	}
+	if errs := pass(); !cursorErr(errs) {
+		t.Fatalf("the unreadable worker cursor was not reported on its pass: %v", errs)
+	}
+	if !decodes(path, &workerCursor{}) {
+		t.Fatalf("a pass with a skipped host left the unreadable cursor %s in place", path)
+	}
+	if errs := pass(); cursorErr(errs) {
+		t.Fatalf("the next pass still reports the worker cursor: %v", errs)
 	}
 }
