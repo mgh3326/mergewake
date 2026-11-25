@@ -53,14 +53,20 @@ type Phases struct {
 // fake clock to book slow reads deterministically.
 func NewPhases(now func() time.Time) *Phases { return newPhases(now) }
 
-// Took reports how long the evaluation spent in ph so far.
+// Took reports how long the evaluation spent in ph so far, including the part
+// of ph that is still running.
 func (p *Phases) Took(ph Phase) time.Duration {
 	if p == nil {
 		return 0
 	}
+	at := p.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.took[ph]
+	d := p.took[ph]
+	if p.cur == ph {
+		d += at.Sub(p.since)
+	}
+	return d
 }
 
 func newPhases(now func() time.Time) *Phases { return &Phases{now: now} }
