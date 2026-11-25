@@ -53,6 +53,20 @@ type archiveBlockRunner struct {
 	match string
 }
 
+type archiveAfterCommandRunner struct {
+	base  integrations.Runner
+	match string
+	after func()
+}
+
+func (r archiveAfterCommandRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	out, err := r.base.Run(ctx, name, args, input, dir)
+	if err == nil && strings.Contains(name+" "+strings.Join(args, " "), r.match) {
+		r.after()
+	}
+	return out, err
+}
+
 func (r archiveBlockRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	if strings.Contains(name+" "+strings.Join(args, " "), r.match) {
 		<-ctx.Done()
@@ -230,6 +244,9 @@ func TestArchiveJobsPaneScanFailureIsUnscannedWithoutFailingRun(t *testing.T) {
 	if !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"unscanned_host_reasons":{"local":"pane scan: pane response truncated"}`) {
 		t.Fatalf("summary lacks pane scan failure reason: %s", out)
 	}
+	if !strings.Contains(out, `"eligible_left":0`) || !strings.Contains(out, "pane scan or jobs listing did not complete") {
+		t.Fatalf("pane-scan-failed host should contribute zero and be excluded by scope: %s", out)
+	}
 }
 
 func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
@@ -277,7 +294,8 @@ func TestArchiveJobsBudgetStopDuringHostScanAdvancesRotation(t *testing.T) {
 func TestArchiveJobsApplyFinishesAndRecordsAfterMaxRun(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
-	dir := jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	dir := jobDir(t, f.jobs, "a-old-job", 20*24*time.Hour)
+	jobDir(t, f.jobs, "z-next-job", 20*24*time.Hour)
 	runner := &archivePauseDeleteRunner{base: f.run, entered: make(chan struct{}), release: make(chan struct{})}
 	t.Cleanup(runner.unblock)
 	f.s.Runner = runner
@@ -308,12 +326,15 @@ func TestArchiveJobsApplyFinishesAndRecordsAfterMaxRun(t *testing.T) {
 	var found bool
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		var row archiveRow
-		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "a-old-job" {
 			found = row.Result == "archived" && row.Archive != nil && row.Archive.Deleted
 		}
 	}
 	if !found {
 		t.Fatalf("durable archive result missing after apply completed: %s", b)
+	}
+	if !strings.Contains(f.out.String(), `"eligible_left":1`) {
+		t.Fatalf("runCtx deadline after apply did not count the remaining listed job: %s", f.out.String())
 	}
 }
 
@@ -1856,5 +1877,54 @@ func TestArchiveJobsBudgetGateBetweenJobsNamesCurrentHost(t *testing.T) {
 	out := f.out.String()
 	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"max_run deadline during job scan"`) {
 		t.Fatalf("summary omits the host stopped between jobs: %s", out)
+	}
+	if !strings.Contains(out, `"eligible_left":1`) {
+		t.Fatalf("between-jobs stop did not count remaining listed eligible job: %s", out)
+	}
+}
+
+func TestArchiveJobsDeadlineDuringJobReadsCountsInterruptedAndRemainingJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "500ms"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "|| continue; printf \"%s %s %s\\0\""}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out := f.out.String(); !strings.Contains(out, `"max_run deadline during job reads"`) || !strings.Contains(out, `"eligible_left":2`) {
+		t.Fatalf("job-read deadline did not count interrupted and remaining jobs: %s", out)
+	}
+}
+
+func TestArchiveJobsDeadlineDuringHKReadsCountsInterruptedAndRemainingJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "500ms"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "cat " + filepath.Join(f.jobs, "first", "events", "00004-job.task_link.json")}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out := f.out.String(); !strings.Contains(out, `"max_run deadline during hk reads"`) || !strings.Contains(out, `"eligible_left":2`) {
+		t.Fatalf("hk-read deadline did not count interrupted and remaining jobs: %s", out)
+	}
+}
+
+func TestArchiveJobsDeadlineBeforeApplyCountsInterruptedAndRemainingJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	base := time.Now()
+	f.s.Now = func() time.Time { return base }
+	f.s.Runner = archiveAfterCommandRunner{base: f.run, match: "cat " + filepath.Join(f.jobs, "first", "events", "00004-job.task_link.json"), after: func() {
+		f.s.Now = func() time.Time { return base.Add(time.Hour) }
+	}}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out := f.out.String(); !strings.Contains(out, `"max_run deadline before archive apply"`) || !strings.Contains(out, `"eligible_left":2`) {
+		t.Fatalf("pre-apply deadline did not count interrupted and remaining jobs: %s", out)
 	}
 }
