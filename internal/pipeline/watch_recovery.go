@@ -1139,6 +1139,11 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 	if e != nil {
 		return false, e
 	}
+	// A stored incident that names another revert PR is not this revert's
+	// incident: the culprit comes from this PR's body, as with no incident.
+	if st.RevertPR != pr.Number {
+		st = recoveryIncident{}
+	}
 	if st.Culprit == "" {
 		st.Culprit, st.CulpritPR = culpritFromRevertBody(pr.Body)
 	}
