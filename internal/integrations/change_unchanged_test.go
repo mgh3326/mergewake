@@ -15,8 +15,13 @@ func TestHKChangeUnchangedSectionIsNotRewritten(t *testing.T) {
 	w.outbox = filepath.Join(t.TempDir(), "outbox")
 	base := time.Now().UTC()
 	observe := func(at time.Time, head string) {
+		// Keep the timer-triggered flush from taking the first section while
+		// Queue persists the second one. This test compares observations as
+		// batches, so both sections must be pending before a flush can start.
+		w.sendMu.Lock()
 		w.Queue("o/r", 7, "checks", ChangeSection{At: at, Value: map[string]any{"head_sha": head, "checks": []string{"lint ok"}, "observed_at": at, "source": "poll", "complete": true}})
 		w.Queue("o/r", 7, "gate", ChangeSection{At: at, Value: map[string]any{"head_sha": head, "state": "pending", "decided_at": at, "source": "review"}})
+		w.sendMu.Unlock()
 		drainChange(t, w)
 	}
 	for i := range 3 {
