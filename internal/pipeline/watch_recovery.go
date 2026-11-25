@@ -1055,7 +1055,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		unlock()
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
-	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
+	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main, mergeRoleWatch); e != nil {
 		unlock()
 		return e
 	}
