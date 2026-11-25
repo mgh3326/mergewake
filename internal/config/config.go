@@ -495,7 +495,36 @@ type Reap struct {
 	// first.
 	ReviewerDrain ReviewerDrain `yaml:"reviewer_drain"`
 	// WorktreeDrain bounds and orders the worker-worktree pass the same way.
-	WorktreeDrain ReviewerDrain `yaml:"worktree_drain"`
+	WorktreeDrain   ReviewerDrain   `yaml:"worktree_drain"`
+	OrphanWorktrees OrphanWorktrees `yaml:"orphan_worktrees"`
+}
+
+// OrphanWorktrees configures the shadow-first sweep for registered worktrees
+// under hosts[].work_root. Act defaults false; MinAge and PerHost have safe
+// defaults when omitted.
+type OrphanWorktrees struct {
+	Act     bool   `yaml:"act"`
+	MinAge  string `yaml:"min_age"`
+	PerHost int    `yaml:"per_host"`
+}
+
+const (
+	OrphanWorktreeMinAgeDefault  = 14 * 24 * time.Hour
+	OrphanWorktreePerHostDefault = 20
+)
+
+func (o OrphanWorktrees) MinAgeOrDefault() (time.Duration, error) {
+	if o.MinAge == "" {
+		return OrphanWorktreeMinAgeDefault, nil
+	}
+	return Age(o.MinAge)
+}
+
+func (o OrphanWorktrees) PerHostOrDefault() int {
+	if o.PerHost <= 0 {
+		return OrphanWorktreePerHostDefault
+	}
+	return o.PerHost
 }
 
 // ReviewerDrain is reap.reviewer_drain. PerHost caps the hub guarded
@@ -1121,6 +1150,18 @@ func validateReap(c *Config) error {
 	var e error
 	if c.Reap.Act && !c.Reap.Enabled {
 		return errors.New("reap.act requires reap.enabled")
+	}
+	if c.Reap.OrphanWorktrees.Act && !c.Reap.Enabled {
+		return errors.New("reap.orphan_worktrees.act requires reap.enabled")
+	}
+	if c.Reap.OrphanWorktrees.MinAge == "" {
+		c.Reap.OrphanWorktrees.MinAge = "14d"
+	}
+	if _, err := Age(c.Reap.OrphanWorktrees.MinAge); err != nil {
+		return errors.New("reap.orphan_worktrees.min_age must be a positive duration")
+	}
+	if c.Reap.OrphanWorktrees.PerHost < 0 {
+		return errors.New("reap.orphan_worktrees.per_host must not be negative")
 	}
 	if c.Reap.WorktreeAfter == "" {
 		c.Reap.WorktreeAfter = "0"

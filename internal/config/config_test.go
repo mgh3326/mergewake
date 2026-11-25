@@ -31,6 +31,44 @@ func TestStrictConfig(t *testing.T) {
 	}
 }
 
+func TestOrphanWorktreeConfigDefaultsAndValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, reap string
+		wantErr    string
+		wantAge    string
+		wantCap    int
+	}{
+		{name: "defaults", wantAge: "14d", wantCap: OrphanWorktreePerHostDefault},
+		{name: "configured", reap: "enabled: true\norphan_worktrees:\n  act: true\n  min_age: 21d\n  per_host: 7\n", wantAge: "21d", wantCap: 7},
+		{name: "act requires enabled", reap: "orphan_worktrees:\n  act: true\n", wantErr: "requires reap.enabled"},
+		{name: "bad age", reap: "orphan_worktrees:\n  min_age: 0s\n", wantErr: "orphan_worktrees.min_age"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			body := "version: 1\nhost: host-a\n"
+			if tc.reap != "" {
+				body += "reap:\n  " + strings.ReplaceAll(tc.reap, "\n", "\n  ")
+			}
+			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := Load(p)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Reap.OrphanWorktrees.MinAge != tc.wantAge || c.Reap.OrphanWorktrees.PerHostOrDefault() != tc.wantCap || c.Reap.OrphanWorktrees.Act != (tc.name == "configured") {
+				t.Fatalf("orphan_worktrees = %+v", c.Reap.OrphanWorktrees)
+			}
+		})
+	}
+}
+
 func TestNotifierPanewireLaneValidation(t *testing.T) {
 	tests := []struct {
 		name, notifier, wantError string

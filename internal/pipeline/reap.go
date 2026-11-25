@@ -45,6 +45,7 @@ type reapReceipt struct {
 	Label    string    `json:"label,omitempty"`     // reviewer label of a reviewer-reap or reviewer-cleanup row
 	Head     string    `json:"head,omitempty"`      // checked-out commit of a legacy-sweep row
 	Source   string    `json:"source,omitempty"`    // what named a merged-PR worktree: pane, receipt or job-record
+	Kind     string    `json:"kind,omitempty"`      // orphan-worktree classification
 
 	// hostSkip is the typed host skip an error row reports instead of a
 	// repository error, when the hub cannot serve the row's host. Never persisted.
@@ -1383,6 +1384,10 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		workerCtx, cancelWorker := reapStageShare(ctx, 2, 3)
 		errs = append(errs, s.reapWorkerWorktrees(workerCtx, r, hosts, records, acting, !o.DryRun, note)...)
 		cancelWorker()
+		if e := reapBudgetCheck(ctx, "orphan worktrees"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
+		errs = append(errs, s.reapOrphanWorktrees(ctx, r, hosts, acting && s.Config.Reap.OrphanWorktrees.Act, note)...)
 	}
 	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
 		return errors.Join(append(errs, e)...)
