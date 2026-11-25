@@ -511,6 +511,10 @@ hosts:
 					unscannedReasons[h.Name] = "max_run deadline during job scan"
 					unscannedStart = entered - 1
 					countPendingEligible(jobIndex)
+				} else if errors.Is(e, context.Canceled) {
+					unscannedReasons[h.Name] = "caller cancelled during job scan"
+					unscannedStart = entered - 1
+					countPendingEligible(jobIndex)
 				}
 				break hosts
 			}
@@ -624,7 +628,7 @@ hosts:
 		}
 	}
 	var unscanned []string
-	if stoppedOnBudget {
+	if stoppedOnBudget || ctx.Err() != nil && unscannedStart >= 0 {
 		unscannedFrom := entered
 		if unscannedStart >= 0 {
 			unscannedFrom = unscannedStart
@@ -723,10 +727,10 @@ func (s *Service) archivePhase(host, phase string, duration time.Duration, err e
 const archiveNextHostFile = "archive-jobs-next-host"
 
 // archiveEligibleScope is what the summary's eligible_left counts: eligible
-// jobs listed on hosts whose pane scan and jobs listing completed, including
-// eligible jobs already listed on a partly processed host. Hosts whose pane
-// scan or jobs listing did not complete, and hosts never reached, are not counted.
-const archiveEligibleScope = "eligible jobs listed on hosts whose pane scan and jobs listing completed, including jobs already listed on a partly processed host; hosts whose pane scan or jobs listing did not complete, and hosts never reached, are not counted"
+// jobs left unprocessed on hosts whose pane scan and jobs listing completed.
+// Hosts whose pane scan or jobs listing did not complete, and hosts never
+// reached, are not counted.
+const archiveEligibleScope = "eligible jobs left unprocessed on hosts whose pane scan and jobs listing completed; hosts whose pane scan or jobs listing did not complete, and hosts never reached, are not counted"
 
 // archiveRunOrder returns the hosts a full run walks. A run that stopped on its
 // budget leaves the host after the last one it entered in the state file, and

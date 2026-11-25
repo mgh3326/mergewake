@@ -1003,6 +1003,22 @@ func TestArchiveJobsCancelledRunWithSpentBudgetReturnsContextError(t *testing.T)
 	}
 }
 
+func TestArchiveJobsCancelledMidHostCountsInterruptedAndRemainingJobs(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "first", 20*24*time.Hour)
+	jobDir(t, f.jobs, "second", 20*24*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.run.afterTreeListing = cancel
+	err := f.s.ArchiveJobs(ctx, "", 14*24*time.Hour, Options{Shadow: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"unscanned_host_reasons":{"local":"caller cancelled during job scan"}`) {
+		t.Fatalf("cancelled mid-host summary omitted eligible work or stop host: %s", out)
+	}
+}
+
 func TestArchiveJobsSummaryNamesUnscannedHostsAndEligibleScope(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "2s"
