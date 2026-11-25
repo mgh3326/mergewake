@@ -181,9 +181,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	}
 	// A pending unknown-outcome merge settles before the PR's state is read
 	// further: a merged PR is not merged again, and landed content holds it.
-	// A shadow pass settles with dry semantics so it writes no state: the
-	// attempt file stays for the next acting pass, which runs the full
-	// post-merge steps (task event, merge hook, MERGED notice) exactly once.
+	// A non-acting (dry-run or shadow) pass settles without clearing state:
+	// a merged attempt stays pending and its post-merge steps (task event,
+	// merge hook, MERGED notice) run only on an acting pass. A landed hold
+	// still notifies on every pass kind: telling a lane is reporting, which
+	// shadow passes do (Options.Reporting), not acting.
 	st, e := s.settleLocked(ctx, r, pr, !o.Acting())
 	if e != nil {
 		return e
@@ -195,7 +197,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		}
 		return s.finishMerge(ctx, r, pr, o)
 	case settleLanded:
-		return s.holdSettledMerge(ctx, r, pr, st, !o.Acting())
+		return s.holdSettledMerge(ctx, r, pr, st, o.DryRun)
 	}
 	if !o.Observed {
 		if e = s.ObservePR(ctx, r, pr, o); e != nil {
