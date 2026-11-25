@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -145,5 +146,53 @@ func TestHostJobsMatchesOracleAndExpectedRecords(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("records differ from expected\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+func TestFinishedMatchesHostListingEndedKinds(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+		want   bool
+	}{
+		{"revoked", []string{"job.claim", "job.revoked"}, true},
+		{"reaped", []string{"job.spawned", "job.reaped"}, true},
+		{"never landed release", []string{"job.claim", "quota_pool.release"}, true},
+		{"never landed retryable", []string{"job.placement", "job.spawn_retryable"}, true},
+		{"cleanup pending", []string{"job.spawned", "job.cleanup_pending"}, false},
+		{"start after revoke", []string{"job.revoked", "job.claim"}, false},
+		{"release then claim", []string{"quota_pool.release", "job.claim"}, false},
+		{"released after landing", []string{"job.spawned", "quota_pool.release"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			var files []File
+			for i, kind := range tc.events {
+				name := fmt.Sprintf("%05d-%s.json", i+1, kind)
+				if err := os.MkdirAll(filepath.Join(root, "job", "events"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "job", "events", name), []byte("{}"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				files = append(files, File{Path: filepath.Join("events", name), kind: 'f'})
+			}
+			goResult := finished(files)
+			if goResult != tc.want {
+				t.Errorf("finished() = %t, want %t", goResult, tc.want)
+			}
+			out, err := (&fakeRunner{}).Run(context.Background(), "sh", []string{"-c", hostListScript, "sh", root}, "", "")
+			if err != nil {
+				t.Fatalf("host listing: %v", err)
+			}
+			got, err := parseHostJobs(root, out)
+			if err != nil {
+				t.Fatalf("parse host listing: %v", err)
+			}
+			if got["job"].Finished != tc.want {
+				t.Errorf("host listing Finished = %t, want %t", got["job"].Finished, tc.want)
+			}
+		})
 	}
 }
