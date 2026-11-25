@@ -10,6 +10,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 // mergeRunner answers the git calls of a clean-merge check from a fixed tree:
@@ -108,6 +109,31 @@ func TestRoundsCountMergeOfUnreviewedParent(t *testing.T) {
 	g.enabled = true
 	if v := gateAt(t, s, g, shaB); v.Review.Rounds != 2 {
 		t.Fatalf("merge of an unreviewed parent did not count: rounds=%d", v.Review.Rounds)
+	}
+}
+
+func TestCountedHistoryUsesFirstParentsRecordedPasses(t *testing.T) {
+	s, g, _, _, r := setup(t)
+	first, merge := shaA, shaD
+	g.head = shaD
+	g.pull.Head.SHA = merge
+	g.blocking = true
+	g.files = []policy.File{{Path: "tool", Kind: "modified"}}
+	g.passes = map[string][]github.PassReceipt{
+		first: {{Pass: 1, Lens: "correctness", Patch: "old-policy"}},
+		shaB:  {{Pass: 1, Lens: "correctness", Patch: "next"}},
+		merge: {{Pass: 1, Lens: "correctness", Patch: "merge"}},
+	}
+	g.parents2 = map[string][]string{merge: {first, shaC}}
+	g.refs = map[string]bool{doneRef(g.pull.Number, first): true}
+	history := []github.ReviewedPass{
+		{Head: first, PassReceipt: g.passes[first][0]},
+		{Head: shaB, PassReceipt: g.passes[shaB][0]},
+		{Head: merge, PassReceipt: g.passes[merge][0]},
+	}
+	got := s.countedHistory(context.Background(), r, g.pull, history)
+	if len(got) != 2 {
+		t.Fatalf("countedHistory retained base merge under changed two-pass policy: got %d records, want 2", len(got))
 	}
 }
 

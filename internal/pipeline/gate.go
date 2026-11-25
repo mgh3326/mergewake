@@ -491,7 +491,9 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	v.SameFamily = sameFamilyOf(counted)
 	v.PassClean = reviewed && !holdsPostedOn(v.Holds, pr.Head.SHA)
-	s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v)
+	if e := s.checkRound5Gate(ctx, r, pr, fb, v.Review.Rounds, reviewed, &v); e != nil {
+		return v, e
+	}
 	records, legacyOutside, e := s.outsideGate(ctx, r, pr, history, v.Review.PatchID, v.Review.Inherited, reviewed, fixes)
 	if e != nil {
 		return v, e

@@ -24,6 +24,8 @@ import (
 // the log and the audit.
 const roundHoldNotifyDetailLimit = 512
 
+var errRoundHoldState = errors.New("round hold state persistence failed")
+
 // ladderPendingBound bounds how long a pending (rc 124) escalate-author may
 // be retried before the outcome is treated as ended without a successor.
 const ladderPendingBound = 2 * time.Hour
@@ -286,9 +288,24 @@ func (s *Service) saveRoundRuleState(repo string, pr int, st roundRuleState) err
 
 // roundEndsWithoutPass reports whether the PR has at least one critical or high
 // finding still open after the verdict.
-func (s *Service) roundEndsWithoutPass(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (bool, []github.ReviewThread) {
-	blocking, _ := s.openFindings(ctx, r, pr, fb)
-	return len(blocking) > 0, blocking
+func (s *Service) roundEndsWithoutPass(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback) (bool, []github.ReviewThread, error) {
+	verify := s.fixVerifier(ctx, r.Name, pr.Head.SHA)
+	var blocking []github.ReviewThread
+	own := policy.NormalizeAuthor(s.Config.Review.Login)
+	for _, t := range fb.Threads {
+		if t.IsResolved || len(t.Comments) == 0 {
+			continue
+		}
+		first := t.Comments[0]
+		sev := github.ThreadSeverity(first.Author, first.Body)
+		if !mustFix(sev) && !aboveLow(sev) {
+			continue
+		}
+		if mustFix(sev) && !disposed(t, own, verify.verified, s.Config.Review.FleetAuthors) {
+			blocking = append(blocking, t)
+		}
+	}
+	return len(blocking) > 0, blocking, verify.err
 }
 
 // aboveLow reports whether a finding's severity ranks above low for the hub
@@ -807,31 +824,38 @@ func (s *Service) isRoundHoldActive(ctx context.Context, r config.Repo, pr githu
 }
 
 // checkRound5Gate evaluates the round hold condition during gate evaluation.
-func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
+func (s *Service) checkRound5Gate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) error {
 	return s.checkRoundHoldGate(ctx, r, pr, fb, rounds, reviewed, v)
 }
 
 // checkRoundHoldGate evaluates the round hold condition during gate evaluation.
-func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) bool {
+func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr github.Pull, fb github.ReviewFeedback, rounds int, reviewed bool, v *gateVerdict) error {
 	st := s.loadRoundRuleState(r.Name, pr.Number)
-	open, _ := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	open, _, err := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	if err != nil {
+		return err
+	}
 	holdRound := s.Config.Review.RoundRuleHold()
 
 	if st.held() {
 		if st.released() {
-			return false
+			return nil
 		}
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
 		if err == nil {
 			if !st.baselineCaptured() {
 				st.setHeld(true, st.HoldAt, len(comments), true)
-				_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+				if err := s.saveRoundRuleState(r.Name, pr.Number, st); err != nil {
+					return fmt.Errorf("%w: save round hold state: %v", errRoundHoldState, err)
+				}
 			} else if len(comments) > st.commentCount() {
 				if released, by := checkRoundHoldRelease(comments[st.commentCount():]); released {
 					st.setReleased(true, by)
-					_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+					if err := s.saveRoundRuleState(r.Name, pr.Number, st); err != nil {
+						return fmt.Errorf("%w: save round hold release: %v", errRoundHoldState, err)
+					}
 					_ = s.audit(r.Name, "round-hold-release", map[string]any{"pr": pr.Number, "by": by}, false)
-					return false
+					return nil
 				}
 			}
 		}
@@ -839,28 +863,27 @@ func (s *Service) checkRoundHoldGate(ctx context.Context, r config.Repo, pr gith
 		v.Review.Block = "round_hold"
 		v.Review.Hold = "round_hold"
 		v.State = "blocked"
-		return true
+		return nil
 	}
 
 	if reviewed && rounds >= holdRound && open {
 		comments, err := s.issueComments(ctx, r.Name, pr.Number)
-		count := 0
-		captured := false
-		if err == nil {
-			count = len(comments)
-			captured = true
+		if err != nil {
+			return fmt.Errorf("read round hold release baseline: %w", err)
 		}
-		st.setHeld(true, s.now().UTC(), count, captured)
-		_ = s.saveRoundRuleState(r.Name, pr.Number, st)
+		st.setHeld(true, s.now().UTC(), len(comments), true)
+		if err := s.saveRoundRuleState(r.Name, pr.Number, st); err != nil {
+			return fmt.Errorf("%w: save round hold state: %v", errRoundHoldState, err)
+		}
 
 		v.Reasons = append(v.Reasons, "round_hold")
 		v.Review.Block = "round_hold"
 		v.Review.Hold = "round_hold"
 		v.State = "blocked"
-		return true
+		return nil
 	}
 
-	return false
+	return nil
 }
 
 // sendRound5Decision sends exactly one decision event for compatibility.
@@ -874,7 +897,10 @@ func (s *Service) sendRoundHoldDecision(ctx context.Context, r config.Repo, pr g
 	if st.eventSent() || st.released() {
 		return nil
 	}
-	open, openThreads := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	open, openThreads, err := s.roundEndsWithoutPass(ctx, r, pr, fb)
+	if err != nil {
+		return err
+	}
 	holdRound := s.Config.Review.RoundRuleHold()
 	if !st.held() && !(rounds >= holdRound && open) {
 		return nil

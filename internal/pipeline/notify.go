@@ -104,11 +104,10 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	v, e := s.mergeGate(ctx, r, pr, p, baseSHA)
 	end()
 	if e != nil {
-		// mergeGate hands back the verdict it had reached. A round hold it set
-		// before the failing read still gets its decision (hk 5536); the read
-		// error returns after it. Outside findings settled before the failure
-		// are audited the same way; recordStatus needs a finished verdict and
-		// waits for the next pass.
+		// mergeGate hands back the verdict it had reached. A persisted hold still
+		// needs its decision sent when a later gate read fails. Outside findings
+		// settled before the failure are audited the same way; recordStatus
+		// needs a finished verdict and waits for the next pass.
 		if slices.Contains(v.Reasons, "round_hold") {
 			notifyStep(ctx, "round_hold", func() error { s.notifyRoundHold(ctx, r, pr, v, o); return nil })
 		}

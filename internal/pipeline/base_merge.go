@@ -59,6 +59,21 @@ func (s *Service) baseMergeShape(ctx context.Context, repo string, pr github.Pul
 // clean merge, so its tree is its first parent's tree plus base text only and no
 // unreviewed text hides behind the chain.
 func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed, depth int) (string, bool) {
+	if needed == 0 {
+		var complete bool
+		needed, complete = s.historicalPassCount(ctx, r, pr, history, head)
+		if complete {
+			return head, true
+		}
+		if depth <= 0 {
+			return "", false
+		}
+		m, ok := s.baseMergeShape(ctx, r.Name, pr, head)
+		if !ok || !s.cleanMerge(ctx, r, head, m.First, m.Second) {
+			return "", false
+		}
+		return s.reviewedAncestor(ctx, r, pr, history, m.First, 0, depth-1)
+	}
 	if _, complete := distinctPasses(passesFor(history, head), needed); complete {
 		return head, true
 	}
@@ -70,6 +85,23 @@ func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github
 		return "", false
 	}
 	return s.reviewedAncestor(ctx, r, pr, history, m.First, needed, depth-1)
+}
+
+// historicalPassCount returns the completed pass count recorded for head.
+// The done marker establishes that the review ended; receipts establish which
+// pass numbers actually completed. Current policy is deliberately not read.
+func (s *Service) historicalPassCount(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string) (int, bool) {
+	receipts := passesFor(history, head)
+	needed := maxPassNumber(receipts)
+	if needed == 0 {
+		return 0, false
+	}
+	done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, head+"-done")
+	if err != nil || !done {
+		return 0, false
+	}
+	_, complete := distinctPasses(receipts, needed)
+	return needed, complete
 }
 
 // baseMergeOf reports whether head is a base merge of a reviewed head: a merge
@@ -98,12 +130,8 @@ func (s *Service) baseMerges(ctx context.Context, r config.Repo, pr github.Pull,
 	if len(heads) < 2 {
 		return out
 	}
-	needed, settled, err := s.reviewPassesNeeded(ctx, r, pr)
-	if err != nil || !settled {
-		return out
-	}
 	for _, head := range heads {
-		if m, ok := s.baseMergeOf(ctx, r, pr, history, head, needed); ok {
+		if m, ok := s.baseMergeOf(ctx, r, pr, history, head, 0); ok {
 			out[head] = m
 		}
 	}
@@ -134,13 +162,11 @@ func (s *Service) countedHistory(ctx context.Context, r config.Repo, pr github.P
 	if len(merges) == 0 {
 		return history
 	}
-	needed, settled, e := s.reviewPassesNeeded(ctx, r, pr)
-	if e != nil || !settled {
-		return history
-	}
 	skip := map[string]bool{}
 	for head, m := range merges {
-		if _, complete := distinctPasses(passesFor(history, m.Reviewed), needed); complete {
+		// The receipts are the durable evidence of how many passes the first
+		// parent actually completed. Current policy can change after that review.
+		if _, complete := s.historicalPassCount(ctx, r, pr, history, m.Reviewed); complete {
 			skip[head] = true
 		}
 	}
@@ -154,6 +180,16 @@ func (s *Service) countedHistory(ctx context.Context, r config.Repo, pr github.P
 		}
 	}
 	return out
+}
+
+func maxPassNumber(receipts []github.PassReceipt) int {
+	max := 0
+	for _, receipt := range receipts {
+		if receipt.Pass >= 1 && receipt.Pass <= 2 && receipt.Pass > max {
+			max = receipt.Pass
+		}
+	}
+	return max
 }
 
 // cleanBaseMergePasses inherits the review of the head's first parent when the

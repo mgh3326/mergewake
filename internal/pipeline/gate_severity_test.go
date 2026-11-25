@@ -473,6 +473,15 @@ func TestGateFixClaimMustBeARealCommitInThePR(t *testing.T) {
 	}
 }
 
+func TestRoundHoldHistoricalFixVerifierErrorPropagates(t *testing.T) {
+	s, g, _, _, _, r := roundRuleSetup(t, 7)
+	g.commitErr = map[string]error{"81149ea": errors.New("transient historical compare failure")}
+	g.feedback.Threads = []github.ReviewThread{gateThread("review-bot", "<!-- mergewake-severity:high -->\nthe finding", false, [2]string{"dev", "Fixed in 81149ea."})}
+	if err := s.sendRoundHoldDecision(context.Background(), r, g.pull, g.feedback, 7, Options{}); err == nil {
+		t.Fatal("merge gate swallowed historical fix verifier error")
+	}
+}
+
 func TestOwnMediumTriageGateAndNotify(t *testing.T) {
 	s, g, n, sink, r, _ := deliverSetup(t)
 	sink.recs["w-7"] = integrations.JobRecord{Role: "worker", Label: "author-lane", OwnerLane: "operator-desk", State: "completed"}
