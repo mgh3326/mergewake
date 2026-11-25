@@ -378,7 +378,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	panes, e := hs.ops.Panes(ctx)
 	if e != nil {
 		hs.failed = true
-		return hs, append(errs, hostScanFailure(h.Name, e))
+		return hs, append(errs, hostScanFailure(ctx, h.Name, "host panes", e))
 	}
 	hs.panes = panes
 	// The full pane list also covers non-agent shells and jobs: without it
@@ -417,7 +417,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 					// node; the budget check above ends the scan.
 					if e != nil && !errors.Is(e, ErrReapRepoBudget) && (isHostUnreachable(e) || isTimeout(e)) {
 						hs.failed = true
-						return hs, append(errs, hostScanFailure(h.Name, e))
+						return hs, append(errs, hostScanFailure(ctx, h.Name, "worktree inspect", e))
 					}
 					// Only a proven answer is cached; a failed inspect is
 					// retried by the next reader instead of read as gone.

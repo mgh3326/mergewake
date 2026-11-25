@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -31,9 +32,19 @@ func (e *hostSkipError) Unwrap() error { return e.err }
 
 // hostScanFailure is the error a failed host scan reports: "<host>: <cause>",
 // typed as a host skip when the hub says the host cannot be served or when the
-// inspect timed out.
-func hostScanFailure(host string, cause error) error {
+// inspect timed out. A failure caused by the repository budget is never a host
+// skip, on any host kind: it is the budget stop, recorded the way budgetCut
+// records every other cut. operation names the call the budget cut.
+func hostScanFailure(ctx context.Context, host, operation string, cause error) error {
 	wrapped := fmt.Errorf("%s: %w", host, cause)
+	if repoBudgetFailure(ctx, cause) {
+		// A hub call already recorded its own cut (timedHubOps), so a cause that
+		// wraps the budget stop is returned as it is.
+		if errors.Is(cause, ErrReapRepoBudget) {
+			return wrapped
+		}
+		return budgetCut(ctx, wrapped, operation)
+	}
 	if isHostUnreachable(cause) {
 		return hostUnreachableFailure(host, wrapped)
 	}
@@ -54,6 +65,14 @@ func hostUnreachableFailure(host string, err error) error {
 		return &hostSkipError{skip: HostSkip{Host: host, Reason: unreachable.Reason}, err: err}
 	}
 	return err
+}
+
+// repoBudgetFailure reports whether a failed call ended because the repository
+// budget ran out: its error wraps the budget stop, or the scan's own context
+// ended by the budget. A call cut by its own timeout while the budget still has
+// time is not one.
+func repoBudgetFailure(ctx context.Context, cause error) bool {
+	return errors.Is(cause, ErrReapRepoBudget) || context.Cause(ctx) == ErrReapRepoBudget
 }
 
 // isHostUnreachable reports whether err is the hub's answer that a host's node
