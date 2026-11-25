@@ -174,6 +174,166 @@ func TestReviewerWorktreePathNeedsAWorkRoot(t *testing.T) {
 	}
 }
 
+func TestReapReviewerLegacyWorkRootCheckoutIsRemoved(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	label := reviewerLabelFor(52, 3*24*time.Hour)
+	path := "/work/" + label
+	f.hub.detached[path] = true
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 52,
+		Host: "node-a", Label: label, Worktree: label, Result: "pending-cleanup", Reason: "old placement"})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "removed" || rows[0].Worktree != path {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+func TestReapReviewerLegacyWorkRootCheckoutHonorsGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pane       bool
+		removeWith string
+		wantResult string
+		wantRemove bool
+		want       string
+	}{
+		{name: "dirty", removeWith: "dirty", wantResult: "pending-cleanup", wantRemove: true, want: reviewerRefused + "dirty"},
+		{name: "pane in use", pane: true, wantResult: "kept", want: "pane-in-use"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviewerFix(t)
+			f.s.Config.Hosts[0].WorkRoot = "/work"
+			label := reviewerLabelFor(53, 3*24*time.Hour)
+			path := "/work/" + label
+			f.hub.detached[path] = true
+			f.hub.removeOutcome = tc.removeWith
+			if tc.pane {
+				f.addPane("w1:p8", "other", path)
+			}
+			seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 53,
+				Host: "node-a", Label: label, Worktree: label, Result: "pending-cleanup", Reason: "old placement"})
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := len(f.hub.ops("worktree.remove")); (got > 0) != tc.wantRemove {
+				t.Fatalf("removal count %d, want remove=%t: %v", got, tc.wantRemove, f.hub.ops("worktree.remove"))
+			}
+			rows := f.rows(t)
+			if len(rows) != 1 || rows[0].Result != tc.wantResult || rows[0].Reason != tc.want || rows[0].Worktree != path {
+				t.Fatalf("rows: %v", rowSummary(rows))
+			}
+		})
+	}
+}
+
+func TestReapReviewerLegacyPathRescansAlreadyGoneRow(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	label := reviewerLabelFor(54, 3*24*time.Hour)
+	path := "/work/" + label
+	f.hub.detached[path] = true
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 54,
+		Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+		Result: "skipped", Reason: reviewerAlreadyGone})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[1].Result != "removed" || rows[1].Worktree != path {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+	inspectCount := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.rows(t)); got != 2 {
+		t.Fatalf("legacy path was revisited after its row: %v", rowSummary(f.rows(t)))
+	}
+	if got := len(f.hub.ops("worktree.inspect")); got != inspectCount {
+		t.Fatalf("settled legacy label was inspected again: %v", f.hub.ops("worktree.inspect"))
+	}
+}
+
+func TestReapReviewerLegacyPathRescanUsesPerHostDrain(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 1, HostOrder: []string{"node"}}
+	var labels []string
+	var initial []reapReceipt
+	for pr := 55; pr <= 56; pr++ {
+		label := reviewerLabelFor(pr, 3*24*time.Hour)
+		labels = append(labels, label)
+		f.hub.detached["/work/"+label] = true
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.hub.ops("worktree.remove")); got != 1 {
+		t.Fatalf("first-pass removals=%d, want 1: %v", got, f.hub.ops("worktree.remove"))
+	}
+	var deferred *reapReceipt
+	for _, row := range f.rows(t) {
+		if row.Label == labels[1] && row.Worktree == "/work/"+labels[1] && row.Result == "pending-cleanup" && row.Reason == reviewerDrainHold {
+			copy := row
+			deferred = &copy
+		}
+	}
+	if deferred == nil {
+		t.Fatalf("the capped rescan did not record its legacy source path: %v", rowSummary(f.rows(t)))
+	}
+}
+
+func TestReapReviewerLegacyPathRefusalUsesItsOwnRetryWindow(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.hub.removeOutcome = "dirty"
+	label := reviewerLabelFor(57, 3*24*time.Hour)
+	legacy := "/work/" + label
+	suffixed := legacy + reviewerCheckoutSuffix
+	f.hub.detached[legacy] = true
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a", Cwd: suffixed}
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 57,
+		Host: "node-a", Label: label, Worktree: suffixed, Result: "pending-cleanup", Reason: "old attempt"})
+	now := reviewerNow
+	f.s.Now = func() time.Time { return now }
+	for attempt := 1; attempt <= 4; attempt++ {
+		if attempt > 1 {
+			now = now.Add(reviewerRefusalRetry)
+		}
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(f.hub.ops("worktree.remove")); got != attempt {
+			t.Fatalf("attempt %d: remove calls=%d, want %d", attempt, got, attempt)
+		}
+	}
+	rows := f.rows(t)
+	if last := rows[len(rows)-1]; last.Result != "kept" || last.Reason != reviewerRefused+"dirty" || last.Worktree != legacy {
+		t.Fatalf("final refusal row: %v", rowSummary(rows))
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.hub.ops("worktree.remove")); got != 4 {
+		t.Fatalf("final refusal was retried immediately: removes=%v", f.hub.ops("worktree.remove"))
+	}
+}
+
 // The sweep respects a context that is already over before the first visit.
 func TestReapReviewerStopsOnACancelledContext(t *testing.T) {
 	f := newReviewerFix(t)
