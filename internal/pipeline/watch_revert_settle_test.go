@@ -1,6 +1,9 @@
 package pipeline
 
 import (
+	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -129,5 +132,88 @@ func TestWatchSettledRevertClosedAfterLandingEndsLatch(t *testing.T) {
 	}
 	if len(g.comments) != 0 {
 		t.Fatalf("comments %v on a landed revert", g.comments)
+	}
+}
+
+// A stored incident that names another revert PR is not this revert's: the
+// landed revert on PR #9 records the culprit of its own body, not the stale
+// incident of PR #8. A stored incident that names PR #9 is kept.
+func TestWatchSettledRevertIgnoresOtherRevertsIncident(t *testing.T) {
+	staleCulprit := strings.Repeat("e", 40)
+	cases := []struct {
+		name      string
+		stored    recoveryIncident
+		culprit   string
+		culpritPR int
+	}{
+		{"other revert PR", recoveryIncident{RevertPR: 8, Culprit: staleCulprit, CulpritPR: 6}, shaB, 7},
+		{"matching revert PR", recoveryIncident{RevertPR: 9, Culprit: staleCulprit, CulpritPR: 6}, staleCulprit, 6},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, r, now := landedRevertSetup(t, github.Green)
+			st := tc.stored
+			st.RedSince, st.Head = now, shaC
+			if e := s.saveRecovery(r.Name, st); e != nil {
+				t.Fatal(e)
+			}
+			if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+				t.Fatalf("action %q (%s), want healthy", got.Action, got.Reason)
+			}
+			rows := auditRows(t, s, r, "recovery-merged")
+			if len(rows) != 1 {
+				t.Fatalf("recovery-merged rows %d, want 1", len(rows))
+			}
+			if rows[0]["culprit"] != tc.culprit || rows[0]["culprit_pr"] != float64(tc.culpritPR) {
+				t.Fatalf("recorded culprit %v #%v, want %s #%d", rows[0]["culprit"], rows[0]["culprit_pr"], tc.culprit, tc.culpritPR)
+			}
+		})
+	}
+}
+
+// A merged revert whose notice failed on an earlier green pass is recorded and
+// noticed on the next green pass; a third pass adds neither the row nor the
+// notice.
+func TestWatchMergedRevertNoticeRetriedOnceOnNextGreenPass(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, _, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[shaC] = github.Green
+		at := "2026-11-07T11:00:00Z"
+		l.revert.State, l.revert.Merged, l.revert.MergedAt = "closed", true, &at
+	})
+	s.Now = func() time.Time { return now }
+	s.Out = io.Discard
+	if e := s.saveRecovery(r.Name, recoveryIncident{RedSince: now, Culprit: shaB, CulpritPR: 7, Head: shaC, RevertPR: 9, Task: "42"}); e != nil {
+		t.Fatal(e)
+	}
+
+	n.err = errors.New("design lane unreachable")
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("notify failure was hidden")
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 || len(ownerLaneEvents(n)) != 0 {
+		t.Fatalf("after failed notice: rows %d lines %v", len(rows), ownerLaneEvents(n))
+	}
+
+	n.err = nil
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("retry pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after retry, want 1", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "reverted by PR #9") {
+		t.Fatalf("design-lane lines after retry: %v", lines)
+	}
+
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("third pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after third pass, want 1", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
 	}
 }
