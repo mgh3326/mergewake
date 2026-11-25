@@ -181,13 +181,18 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	}
 	// A pending unknown-outcome merge settles before the PR's state is read
 	// further: a merged PR is not merged again, and landed content holds it.
-	st, e := s.settleLocked(ctx, r, pr, o.DryRun)
+	// A non-acting (dry-run or shadow) pass settles without clearing state:
+	// a merged attempt stays pending and its post-merge steps (task event,
+	// merge hook, MERGED notice) run only on an acting pass. A landed hold
+	// still notifies on every pass kind: telling a lane is reporting, which
+	// shadow passes do (Options.Reporting), not acting.
+	st, e := s.settleLocked(ctx, r, pr, !o.Acting())
 	if e != nil {
 		return e
 	}
 	switch st.Kind {
 	case settleMerged:
-		if o.DryRun {
+		if !o.Acting() {
 			return nil
 		}
 		return s.finishMerge(ctx, r, pr, o)
@@ -302,8 +307,8 @@ func (s *Service) lockMerges(ctx context.Context, repo string) (func(), error) {
 // is in flight to wait for. An attempt is written under the lock before its
 // PUT, so one in flight is visible here; only then does it take the lock and
 // settle under it, so no write-attempt of another caller is in flight while it
-// decides and clears. A dry run clears nothing and takes no lock, so it writes
-// no state.
+// decides and clears. A dry (non-acting: dry-run or shadow) settle clears
+// nothing and takes no lock, so it writes no state.
 func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pull, dry bool) (settlement, error) {
 	if dry {
 		return s.settleMerge(ctx, r, pr, dry)
