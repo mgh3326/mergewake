@@ -58,8 +58,8 @@ func (s *Service) baseMergeShape(ctx context.Context, repo string, pr github.Pul
 // parent, at most depth merges deep. Each inherited merge on the way must be a
 // clean merge, so its tree is its first parent's tree plus base text only and no
 // unreviewed text hides behind the chain.
-func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, depth int) (string, bool) {
-	if len(passesFor(history, head)) > 0 {
+func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed, depth int) (string, bool) {
+	if _, complete := distinctPasses(passesFor(history, head), needed); complete {
 		return head, true
 	}
 	if depth <= 0 {
@@ -69,19 +69,19 @@ func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github
 	if !ok || !s.cleanMerge(ctx, r, head, m.First, m.Second) {
 		return "", false
 	}
-	return s.reviewedAncestor(ctx, r, pr, history, m.First, depth-1)
+	return s.reviewedAncestor(ctx, r, pr, history, m.First, needed, depth-1)
 }
 
 // baseMergeOf reports whether head is a base merge of a reviewed head: a merge
 // commit whose second parent is an ancestor of the PR's base and whose first
 // parent has a review in history, directly or through inherited base merges (see
 // reviewedAncestor). A head whose commit cannot be read is not a base merge.
-func (s *Service) baseMergeOf(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string) (baseMerge, bool) {
+func (s *Service) baseMergeOf(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed int) (baseMerge, bool) {
 	m, ok := s.baseMergeShape(ctx, r.Name, pr, head)
 	if !ok {
 		return baseMerge{}, false
 	}
-	reviewed, ok := s.reviewedAncestor(ctx, r, pr, history, m.First, maxBaseMergeChain)
+	reviewed, ok := s.reviewedAncestor(ctx, r, pr, history, m.First, needed, maxBaseMergeChain)
 	if !ok {
 		return baseMerge{}, false
 	}
@@ -98,8 +98,12 @@ func (s *Service) baseMerges(ctx context.Context, r config.Repo, pr github.Pull,
 	if len(heads) < 2 {
 		return out
 	}
+	needed, settled, err := s.reviewPassesNeeded(ctx, r, pr)
+	if err != nil || !settled {
+		return out
+	}
 	for _, head := range heads {
-		if m, ok := s.baseMergeOf(ctx, r, pr, history, head); ok {
+		if m, ok := s.baseMergeOf(ctx, r, pr, history, head, needed); ok {
 			out[head] = m
 		}
 	}
@@ -162,7 +166,7 @@ func (s *Service) cleanBaseMergePasses(ctx context.Context, r config.Repo, pr gi
 		// Nothing is reviewed yet, so no first parent can carry a review.
 		return "", nil, false
 	}
-	m, ok := s.baseMergeOf(ctx, r, pr, history, pr.Head.SHA)
+	m, ok := s.baseMergeOf(ctx, r, pr, history, pr.Head.SHA, needed)
 	if !ok {
 		return "", nil, false
 	}
