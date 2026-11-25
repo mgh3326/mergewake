@@ -251,8 +251,16 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			}
 			if !result.Shadow {
 				if !s.otherLatch {
-					if e = s.fixWon(ctx, r, head); e != nil {
+					// A revert whose unknown merge landed is on main: it is recorded
+					// as merged and never closed as fix-won.
+					settled, e := s.settleLatchRevert(ctx, r, head)
+					if e != nil {
 						return e
+					}
+					if !settled {
+						if e = s.fixWon(ctx, r, head); e != nil {
+							return e
+						}
 					}
 					if e = s.clearRecoveryLatch(ctx, r, head); e != nil {
 						return e
