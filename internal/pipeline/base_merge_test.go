@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
@@ -18,6 +19,7 @@ type mergeRunner struct {
 	integrations.Runner
 	headTree, mergedTree string
 	conflict             bool
+	results              map[[2]string]bool
 }
 
 func (m *mergeRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -30,12 +32,38 @@ func (m *mergeRunner) Run(ctx context.Context, command string, args []string, in
 	case sub == "rev-parse" && strings.HasSuffix(args[len(args)-1], "^{tree}"):
 		return []byte(m.headTree + "\n"), nil
 	case sub == "merge-tree":
-		if m.conflict {
+		clean := !m.conflict
+		if m.results != nil && len(args) >= 6 {
+			clean = m.results[[2]string{args[4], args[5]}]
+		}
+		if !clean {
 			return []byte("conflicted\n"), errors.New("exit status 1")
 		}
 		return []byte(m.mergedTree + "\n"), nil
 	}
 	return m.Runner.Run(ctx, command, args, input, dir)
+}
+
+func TestReviewInheritsChainPastPartialReceipt(t *testing.T) {
+	s, g, runner, review := baseMergedAtB(t)
+	g.blocking = true
+	g.passes[shaA] = append(g.passes[shaA], github.PassReceipt{Pass: 2})
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	// B inherits A. Leave a stale partial receipt on C before reviewing D.
+	g.passes[shaC] = []github.PassReceipt{{Pass: 1}}
+	g.parents2[shaC] = []string{shaB, shaC}
+	g.parents2[shaD] = []string{shaC, shaA}
+	g.pull.Head.SHA = shaD
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m", results: map[[2]string]bool{{shaB, shaC}: true, {shaC, shaA}: true}}
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if runner.calls != 1 || len(g.passes[shaD]) != 0 {
+		t.Fatalf("chain with a partial receipt did not inherit: calls=%d passes=%d", runner.calls, len(g.passes[shaD]))
+	}
 }
 
 // baseMergedAtB makes head B a base merge of reviewed head A: its first parent is
@@ -157,7 +185,7 @@ func TestReviewInheritsBaseMergeOfInheritedMerge(t *testing.T) {
 // stops there, so the head is reviewed as before.
 func TestReviewSchedulesBaseMergeOfConflictedMerge(t *testing.T) {
 	s, g, runner, review := baseMergedAtB(t)
-	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", conflict: true}
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m", results: map[[2]string]bool{{shaA, shaC}: false, {shaB, shaC}: true}}
 	g.parents2[shaD] = []string{shaB, shaC}
 	g.pull.Head.SHA = shaD
 	if e := review(Options{}); e != nil {
