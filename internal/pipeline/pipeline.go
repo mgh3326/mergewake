@@ -179,6 +179,15 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if e != nil {
 		return e
 	}
+	// A pending attempt that watch owns is watch's to settle: Land neither
+	// settles it nor runs the post-merge steps, on any pass kind.
+	pending, e := s.readMergeAttempt(r.Name, n)
+	if e != nil {
+		return e
+	}
+	if pending != nil && watchOwns(pending, pr.Head.Ref) {
+		return s.waitOnWatch(r, n)
+	}
 	// A pending unknown-outcome merge settles before the PR's state is read
 	// further: a merged PR is not merged again, and landed content holds it.
 	// A non-acting (dry-run or shadow) pass settles without clearing state:
@@ -246,10 +255,22 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	if v.State != "ready" || d.Shadow || o.DryRun {
 		return nil
 	}
-	if e = s.mergePinned(ctx, r, pr); e != nil {
+	if e = s.mergePinned(ctx, r, pr); errors.Is(e, errWaitingOnWatch) {
+		return s.waitOnWatch(r, n)
+	} else if e != nil {
 		return e
 	}
 	return s.finishMerge(ctx, r, pr, o)
+}
+
+// errWaitingOnWatch is mergePinned's refusal when a watch-owned attempt became
+// pending after Land's check: no merge is sent and Land waits on watch.
+var errWaitingOnWatch = errors.New("pending merge attempt belongs to watch")
+
+// waitOnWatch reports that PR n's pending merge attempt belongs to watch, which
+// settles it. Land returns nil: nothing is merged and no post-merge step runs.
+func (s *Service) waitOnWatch(r config.Repo, n int) error {
+	return s.Print(map[string]any{"action": "land-waiting-on-watch", "repo": r.Name, "pr": n, "reason": "pending merge attempt belongs to watch; watch settles it"})
 }
 
 // finishMerge runs the post-merge steps shared by a fresh merge and a merge
@@ -365,6 +386,15 @@ func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull
 	freshPR, e := s.GH.Pull(ctx, r.Name, pr.Number)
 	if e != nil {
 		return e
+	}
+	// A watch attempt written after Land's check is watch's to settle, not
+	// this merge's: the settle below would clear it.
+	pending, e := s.readMergeAttempt(r.Name, pr.Number)
+	if e != nil {
+		return e
+	}
+	if pending != nil && watchOwns(pending, freshPR.Head.Ref) {
+		return errWaitingOnWatch
 	}
 	st, e := s.settleMerge(ctx, r, freshPR, false)
 	if e != nil {

@@ -36,12 +36,20 @@ type mergeAttempt struct {
 	Posted bool `json:"posted,omitempty"`
 }
 
-// The writers of a merge attempt. The orphan sweep leaves a watch attempt to
-// settlePendingRevert, which records the revert it belongs to.
+// The writers of a merge attempt. The orphan sweep and Land leave a watch
+// attempt to settlePendingRevert, which records the revert it belongs to.
 const (
 	mergeRolePR    = "pr"
 	mergeRoleWatch = "watch"
 )
+
+// watchOwns reports whether the pending attempt a belongs to watch: it was
+// written by the watch path, or it is role-less (written before the field
+// existed) on the recovery branch. headRef is the PR's head branch; pass ""
+// when the PR is not read yet, which decides only a role=watch attempt.
+func watchOwns(a *mergeAttempt, headRef string) bool {
+	return a.Role == mergeRoleWatch || (a.Role == "" && headRef == github.RecoveryBranch)
+}
 
 type settleKind int
 
@@ -233,7 +241,7 @@ func (s *Service) SettleOrphanedMergeAttempts(ctx context.Context, r config.Repo
 			errs = append(errs, fmt.Errorf("PR %d: %w", n, err))
 			continue
 		}
-		if a == nil || a.Role == mergeRoleWatch {
+		if a == nil || watchOwns(a, "") {
 			continue
 		}
 		pr, err := s.GH.Pull(fresh, r.Name, n)
@@ -244,7 +252,7 @@ func (s *Service) SettleOrphanedMergeAttempts(ctx context.Context, r config.Repo
 		if open != nil && open[pr.Number] {
 			continue
 		}
-		if a.Role == "" && pr.Head.Ref == github.RecoveryBranch {
+		if watchOwns(a, pr.Head.Ref) {
 			continue
 		}
 		st, err := s.settleOrphan(fresh, r, pr)
