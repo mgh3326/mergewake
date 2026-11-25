@@ -999,11 +999,52 @@ func TestArchiveJobsSummaryNamesUnscannedHostsAndEligibleScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := f.out.String()
-	if !strings.Contains(out, `"unscanned_hosts":["local","other"]`) || !strings.Contains(out, `"eligible_left":1`) || !strings.Contains(out, `"eligible_left_scope":"jobs left on scanned hosts only`) {
+	if !strings.Contains(out, `"unscanned_hosts":["local","other"]`) || !strings.Contains(out, `"eligible_left":1`) || !strings.Contains(out, `"eligible_left_scope":"`+archiveEligibleScope+`"`) {
 		t.Fatalf("summary does not name unscanned hosts or scope eligible_left: %s", out)
 	}
 	if strings.Contains(out, `"job":"third"`) {
 		t.Fatalf("unscanned host was scanned to count it: %s", out)
+	}
+}
+
+func TestArchiveJobsSummaryScopeWhenNoHostIsReached(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	otherJobs := filepath.Join(filepath.Dir(f.jobs), "other-jobs")
+	if err := os.MkdirAll(otherJobs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Config.Hosts = append(f.s.Config.Hosts, reap.Host{Name: "other", Jobs: otherJobs})
+	base := time.Now()
+	calls := 0
+	f.s.Now = func() time.Time {
+		calls++
+		if calls > 1 {
+			return base.Add(2 * time.Second)
+		}
+		return base
+	}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"unscanned_hosts":["local","other"]`) || !strings.Contains(out, `"eligible_left":0`) || !strings.Contains(out, `"eligible_left_scope":"`+archiveEligibleScope+`"`) {
+		t.Fatalf("summary has incorrect scope when no host was reached: %s", out)
+	}
+	if f.run.calls != 0 {
+		t.Fatalf("budget stop before first host issued %d commands", f.run.calls)
+	}
+}
+
+func TestArchiveJobsCompletedSummaryScope(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":false`) || strings.Contains(out, `"unscanned_hosts"`) || !strings.Contains(out, `"eligible_left_scope":"`+archiveEligibleScope+`"`) {
+		t.Fatalf("completed run summary has incorrect scope: %s", out)
 	}
 }
 
