@@ -101,17 +101,6 @@ func (s *Service) mergeOnce(ctx context.Context, r config.Repo, n int, head, bas
 	return e
 }
 
-// mergeOnceLocked is mergeOnce under the repository's merge lock, for a caller
-// that holds no lock across its own GitHub reads.
-func (s *Service) mergeOnceLocked(ctx context.Context, r config.Repo, n int, head, base string) error {
-	unlock, e := s.mergeLock(r.Name)
-	if e != nil {
-		return e
-	}
-	defer unlock()
-	return s.mergeOnce(ctx, r, n, head, base)
-}
-
 // settleMerge settles the pending unknown attempt on pr, if there is one,
 // before pr can be merged again. A merged PR is recorded as merged. An open PR
 // whose base took, after the attempt's base, a commit whose subject ends with

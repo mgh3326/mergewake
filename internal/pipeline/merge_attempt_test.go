@@ -153,6 +153,39 @@ func TestRefusalIsNotUnknownAndMergesLater(t *testing.T) {
 	}
 }
 
+// A revert merge that waits on the merge lock reads main after the lock is
+// taken: when another caller moved main meanwhile, it holds with the "main
+// changed" outcome and sends no PUT.
+func TestRevertWaitingOnTheLockSeesMainMove(t *testing.T) {
+	s, rg, _, n, r := recoverySetup(t, nil)
+	ws := &watchStream{Service: s}
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		t.Fatal(e)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- ws.mergeRevert(context.Background(), r, shaC, nil, rg.revert, recoveryIncident{}, watchResult{}, Options{})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	rg.head = advancedHead
+	unlock()
+	select {
+	case e := <-done:
+		if e != nil {
+			t.Fatal(e)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("mergeRevert did not return after the merge lock was released")
+	}
+	if rg.merges != 0 {
+		t.Fatalf("revert PUT %d times after main moved", rg.merges)
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "main changed during recovery") {
+		t.Fatalf("%d design-lane lines: %v", len(lines), lines)
+	}
+}
+
 // The watch's revert merge settles a pending unknown outcome before it reads
 // main again: the squash of the revert is on main, so the revert is held once
 // and is not sent a second time.
