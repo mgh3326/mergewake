@@ -685,7 +685,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		labels[label] = true
 	}
 	for label := range labels {
-		if paned[label] || w.finishedLabel(label, lastCleanup) {
+		if paned[label] || (w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label)) {
 			continue
 		}
 		if l, ok := keep(label); ok {
@@ -738,6 +738,19 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		return cands[i].label.name < cands[j].label.name
 	})
 	return cands
+}
+
+// oldPathRetry reopens a label whose last attempt found the spec-format path
+// missing. Older placements used <work root>/<label>, so that terminal row
+// must not hide the legacy path from a later sweep.
+func (w *reviewerSweep) oldPathRetry(label string) bool {
+	for _, row := range w.streams[label] {
+		if row.Result == "skipped" && row.Reason == reviewerAlreadyGone &&
+			filepath.Base(filepath.Clean(row.Worktree)) == label+reviewerCheckoutSuffix {
+			return true
+		}
+	}
+	return false
 }
 
 // reviewerStuckAfter is review.panewire.stuck_after: how old a claimed or
@@ -1620,6 +1633,27 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteStop
 	}
 	tree, e := hs.ops.Inspect(ctx, cwd)
+	// A suffix path is the current placement. If it is absent, try the
+	// pre-suffix work-root layout once. Preserve that path in the receipt so
+	// the source of this cleanup is visible and terminal rows stop repeating.
+	if e == nil && tree == nil && filepath.Base(filepath.Clean(cwd)) == l.name+reviewerCheckoutSuffix {
+		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" {
+			cwd = legacy
+			rec.Cwd, rec.Worktree = cwd, cwd
+			prior = w.streams[l.name][reviewerStream(rec)]
+			if w.acting {
+				if e := hs.refreshPanes(ctx); e != nil {
+					w.record(rec, "kept", "pane-scan-failed")
+					return remoteStop
+				}
+			}
+			if hs.paneInUse(cwd) {
+				w.record(rec, "kept", "pane-in-use")
+				return remoteStop
+			}
+			tree, e = hs.ops.Inspect(ctx, cwd)
+		}
+	}
 	switch {
 	case reviewerBudgetCut(ctx, e):
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
@@ -1650,7 +1684,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "pending-cleanup", reviewerDrainHold)
 		return remoteStop
 	}
-	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil, true)
+	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, w.s.Config.ReapRegenerable(w.r), true)
 	if reviewerBudgetCut(ctx, e) {
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
 		return remoteStop
@@ -1681,6 +1715,14 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "pending-cleanup", fmt.Sprintf("%s%s (retry %d of %d)", reviewerRefused, reason, retries+1, reviewerRefusalRetries))
 	}
 	return remoteStop
+}
+
+func reviewerLegacyWorktreePath(hs *reapHost, l reviewerLabel) string {
+	root := hs.host.WorkRoot
+	if root == "" || !filepath.IsAbs(root) {
+		return ""
+	}
+	return filepath.Join(root, l.name)
 }
 
 // reviewerBudgetCut reports whether a reviewer step's error is the repo budget
