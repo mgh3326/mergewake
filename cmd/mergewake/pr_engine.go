@@ -387,11 +387,17 @@ func (e *prEngine) trackTimers(ctx context.Context, repo string, pr int) (contex
 func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o pipeline.Options, w daemon.Work) (errs []error, clean, handled, reviewed bool) {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseReview)
+	// A held settle is neither a failure nor a settle: the PR is shown as
+	// held on every pass and evaluated again, without counting a role
+	// failure.
+	var held bool
 	// An unreadable or poll-skipped marker is not done: the PR is reviewed.
 	if done, err := e.gh.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done"); err == nil && done {
 		handled = true
 		ph.Enter(daemon.PhaseSettle)
-		errs = settlePR(ctx, e.s, r, pr.Number, o)
+		var settleErrs []error
+		settleErrs, held = settlePR(ctx, e.s, r, pr.Number, o)
+		errs = settleErrs
 		ph.Enter(daemon.PhaseReview)
 	} else {
 		// A PR that never had to wait for a slot has not been looked up yet.
@@ -411,11 +417,12 @@ func (e *prEngine) review(ctx context.Context, r config.Repo, pr github.Pull, o 
 	c.reviewing++
 	c.peak = max(c.peak, c.reviewing)
 	e.mu.Unlock()
-	reviewErrs, ok, reviewed, unreviewed := reviewPR(ctx, e.s, r, pr, o, !handled)
+	reviewErrs, ok, reviewed, unreviewed, settleHeld := reviewPR(ctx, e.s, r, pr, o, !handled)
+	held = held || settleHeld
 	e.mu.Lock()
 	e.counts(r.Name).reviewing--
 	e.mu.Unlock()
-	return append(errs, reviewErrs...), ok && len(errs) == 0, handled && !unreviewed, reviewed
+	return append(errs, reviewErrs...), ok && len(errs) == 0, handled && !unreviewed && !held, reviewed
 }
 
 // sweep is one pass over repo r: it puts the open PRs on the queue and

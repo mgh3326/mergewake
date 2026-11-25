@@ -444,7 +444,7 @@ func dirtyFirst(prs []github.Pull, dirty map[int]bool) []github.Pull {
 // settled by the next evaluation of the PR. A review that ran nothing — held,
 // quota-stopped, pending or a skipped poll — sends only the review-stall
 // check: findings delivery and Land stay off that path.
-func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool) (errs []error, clean, reviewed, unreviewed bool) {
+func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github.Pull, o pipeline.Options, settle bool) (errs []error, clean, reviewed, unreviewed, held bool) {
 	clean = true
 	reviewCtx, reviewSpan := tracing.Span(ctx, "mergewake.review")
 	e := s.RetryReview(reviewCtx, r, pr, o)
@@ -485,22 +485,24 @@ func reviewPR(ctx context.Context, s *pipeline.Service, r config.Repo, pr github
 		}
 	}
 	if !settle || unreviewed {
-		return errs, clean, reviewed, unreviewed
+		return errs, clean, reviewed, unreviewed, false
 	}
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseSettle)
-	settleErrs := settlePR(ctx, s, r, pr.Number, o)
-	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed, unreviewed
+	settleErrs, settleHeld := settlePR(ctx, s, r, pr.Number, o)
+	return append(errs, settleErrs...), clean && len(settleErrs) == 0, reviewed, unreviewed, settleHeld
 }
 
 // settlePR delivers findings to the author lane before the verdict, so the
 // author fixes them without the desk relaying anything, then notifies the
 // verdict and lands the PR. It takes no repository lock: each ledger the
 // delivery and the notice write has its own, and Land takes the merge lock.
-func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) []error {
+// It reports a deliberate hold separately from errors: a held PR is shown on
+// every pass but is neither a failure nor a clean settle, so the skip rule
+// must not remember it.
+func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o pipeline.Options) (errs []error, held bool) {
 	ctx, span := tracing.Span(ctx, "mergewake.settle")
 	defer tracing.Finish(span)
-	var errs []error
 	// FINDINGS and READY for this PR share one author-pane scan.
 	ctx = pipeline.WithAuthorScan(ctx)
 	deliverCtx, deliver := tracing.Span(ctx, "mergewake.deliver")
@@ -518,19 +520,21 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	landCtx, land := tracing.Span(ctx, "mergewake.land")
 	e = s.Land(landCtx, r, n, o)
 	tracing.Finish(land)
-	var held *pipeline.MergeHeldError
+	var heldErr *pipeline.MergeHeldError
 	switch {
-	case errors.As(e, &held):
+	case errors.As(e, &heldErr):
 		// A deliberate hold is a verdict, not a failure: it is shown on every
 		// pass, but it counts neither toward the role's failures nor toward the
-		// clean-loop healthcheck.
-		if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": held.Reason}); pe != nil {
+		// clean-loop healthcheck, and the skip rule must not remember it as
+		// a clean settle.
+		held = true
+		if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": heldErr.Reason}); pe != nil {
 			errs = append(errs, fmt.Errorf("PR %d land held: %w", n, pe))
 		}
 	case e != nil:
 		errs = append(errs, fmt.Errorf("PR %d land: %w", n, e))
 	}
-	return errs
+	return errs, held
 }
 
 // skipBotPulls drops PRs opened by bot accounts when skip is set.

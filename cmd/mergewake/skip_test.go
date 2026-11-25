@@ -42,20 +42,23 @@ type fakePR struct {
 // its body and answers a matching If-None-Match with 304, plus the daemon-side
 // pieces the skip rule reads.
 type skipFixture struct {
-	t     *testing.T
-	mu    sync.Mutex
-	prs   []*fakePR
-	base  string
-	log   []string // "METHOD path status"
-	srv   *httptest.Server
-	s     *pipeline.Service
-	gh    *github.Client
-	repo  config.Repo
-	skips *prSkips
-	dirty *daemon.Dirty
-	clock time.Time
-	out   *syncBuffer
-	logs  *syncBuffer
+	t    *testing.T
+	mu   sync.Mutex
+	prs  []*fakePR
+	base string
+	// landedSHA, when set, makes compare answer one landed commit carrying
+	// landedMsg, so a planted merge attempt settles as landed.
+	landedSHA, landedMsg string
+	log                  []string // "METHOD path status"
+	srv                  *httptest.Server
+	s                    *pipeline.Service
+	gh                   *github.Client
+	repo                 config.Repo
+	skips                *prSkips
+	dirty                *daemon.Dirty
+	clock                time.Time
+	out                  *syncBuffer
+	logs                 *syncBuffer
 }
 
 type syncBuffer struct {
@@ -194,6 +197,9 @@ func (f *skipFixture) route(r *http.Request, policy []byte) (string, bool) {
 	case strings.HasSuffix(path, "/statuses"), strings.HasSuffix(path, "/comments"):
 		return `[]`, true
 	case strings.Contains(path, "/compare/"):
+		if f.landedSHA != "" {
+			return fmt.Sprintf(`{"status":"ahead","merge_base_commit":{"sha":%q},"commits":[{"sha":%q,"commit":{"message":%q}}]}`, f.base, f.landedSHA, f.landedMsg), true
+		}
 		return fmt.Sprintf(`{"status":"ahead","merge_base_commit":{"sha":%q}}`, f.base), true
 	case len(seg) == 5 && seg[3] == "commits":
 		return `{"commit":{"tree":{"sha":"tree"}}}`, true
@@ -223,10 +229,17 @@ type passResult struct {
 
 func (f *skipFixture) pass() passResult {
 	f.t.Helper()
-	ctx, counts := github.CountRequests(context.Background(), "pr")
-	if err := pollPRsSkipping(ctx, f.s, f.gh, f.repo, pipeline.Options{Shadow: true}, f.skips); err != nil {
+	res, err := f.passErr()
+	if err != nil {
 		f.t.Fatalf("pass: %v", err)
 	}
+	return res
+}
+
+func (f *skipFixture) passErr() (passResult, error) {
+	f.t.Helper()
+	ctx, counts := github.CountRequests(context.Background(), "pr")
+	passErr := pollPRsSkipping(ctx, f.s, f.gh, f.repo, pipeline.Options{Shadow: true}, f.skips)
 	var res passResult
 	for _, c := range counts.Snapshot() {
 		if c.Status == http.StatusNotModified {
@@ -259,7 +272,7 @@ func (f *skipFixture) pass() passResult {
 			res.reasons[atoi(n)] = strings.Split(why, "+")
 		}
 	}
-	return res
+	return res, passErr
 }
 
 func (r passResult) String() string {

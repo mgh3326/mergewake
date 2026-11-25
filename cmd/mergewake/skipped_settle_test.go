@@ -65,9 +65,9 @@ func TestReviewPRSkippedPollIsUnreviewed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	errs, clean, reviewed, unreviewed := reviewPR(context.Background(), f.s, f.repo, pr, pipeline.Options{}, true)
-	if len(errs) != 0 || !clean || reviewed || !unreviewed {
-		t.Fatalf("errs=%v clean=%v reviewed=%v unreviewed=%v, want a clean unreviewed skip", errs, clean, reviewed, unreviewed)
+	errs, clean, reviewed, unreviewed, held := reviewPR(context.Background(), f.s, f.repo, pr, pipeline.Options{}, true)
+	if len(errs) != 0 || !clean || reviewed || !unreviewed || held {
+		t.Fatalf("errs=%v clean=%v reviewed=%v unreviewed=%v held=%v, want a clean unreviewed skip", errs, clean, reviewed, unreviewed, held)
 	}
 	for _, e := range f.trace.snapshot() {
 		if e == "merge 1" || e == "notify 1" {
