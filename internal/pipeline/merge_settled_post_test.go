@@ -90,3 +90,55 @@ func TestLandSettledMergeDryRunIsReadOnly(t *testing.T) {
 		t.Fatalf("dry run dropped the attempt: %v", e)
 	}
 }
+
+// A shadow Land that settles a merged PR stays read-only like a dry run: no
+// task event, no hook call, no MERGED notice, and the attempt file is left so
+// the next acting Land runs the full post-merge steps exactly once.
+func TestLandSettledMergeShadowIsReadOnly(t *testing.T) {
+	s, g, hk, r := hkSetup(t)
+	n := s.Notifier.(*fakeNotifier)
+	r.Lane = "repo-design"
+	withMergeSHA(g)
+	mergedAt := time.Now().UTC().Format(time.RFC3339)
+	g.pull.State, g.pull.Merged, g.pull.MergedAt = "closed", true, &mergedAt
+	if e := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 7), mergeAttempt{PR: 7, Head: shaA, Base: shaB, At: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	hooks := 0
+	ctx := WithMergeHook(context.Background(), func(repo string, pr int) {
+		if repo != r.Name || pr != 7 {
+			t.Errorf("hook got %s#%d, want %s#7", repo, pr, r.Name)
+		}
+		hooks++
+	})
+	if e := s.Land(ctx, r, 7, Options{Shadow: true}); e != nil {
+		t.Fatal(e)
+	}
+	if got := hk.received(); len(got) != 0 {
+		t.Fatalf("shadow posted task events=%+v", got)
+	}
+	if hooks != 0 {
+		t.Fatalf("shadow hook calls %d, want 0", hooks)
+	}
+	if n.count != 0 {
+		t.Fatalf("shadow MERGED notices=%+v", n.events)
+	}
+	if _, e := os.Stat(s.mergeAttemptFile(r.Name, 7)); e != nil {
+		t.Fatalf("shadow dropped the attempt: %v", e)
+	}
+	if e := s.Land(ctx, r, 7, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if got := hk.received(); len(got) != 1 || got[0].Source != integrations.SourceMerge {
+		t.Fatalf("acting task events=%+v", got)
+	}
+	if hooks != 1 {
+		t.Fatalf("acting hook calls %d, want 1", hooks)
+	}
+	if n.count != 1 {
+		t.Fatalf("acting MERGED notices=%+v", n.events)
+	}
+	if _, e := os.Stat(s.mergeAttemptFile(r.Name, 7)); !os.IsNotExist(e) {
+		t.Fatalf("attempt still pending: %v", e)
+	}
+}
