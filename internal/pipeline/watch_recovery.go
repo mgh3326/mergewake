@@ -1163,23 +1163,44 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 	// carry a real time and the retry guard below matches this revert. No task
 	// was reopened on this path, so the notice must not claim one.
 	// The rebuilt incident is saved before anything reads it, as recovery() does,
-	// so a notice retried on a later pass keeps this red_since. With no stored
-	// incident there is nothing to rebuild: the zero value stays as before.
+	// so a notice retried on a later pass keeps this red_since.
+	// With no stored incident there is nothing to match: a pending merge
+	// attempt or a landed record for this revert still rebuilds and saves one
+	// before any settle or record, for the same real time and retry. With
+	// neither, the zero value stays unsaved: a revert merged earlier with
+	// nothing pending writes no recovery-merged row and no notice, and the
+	// latch-clear path below still owns the record.
+	landed, e := s.readLanded(r.Name, pr.Number)
+	if e != nil {
+		return false, e
+	}
 	if found && st.RevertPR != pr.Number {
 		st = s.freshRevertIncident(pr, head, "")
 		st.TaskReopen = "none"
 		if e := s.saveRecovery(r.Name, st); e != nil {
 			return false, e
 		}
+	} else if !found {
+		var pending *mergeAttempt
+		if landed == nil {
+			pending, e = s.readMergeAttempt(r.Name, pr.Number)
+			if e != nil {
+				return false, e
+			}
+		}
+		if landed != nil || pending != nil {
+			st = s.freshRevertIncident(pr, head, "")
+			st.TaskReopen = "none"
+			if e := s.saveRecovery(r.Name, st); e != nil {
+				return false, e
+			}
+			found = true
+		}
 	}
 	if st.Culprit == "" {
 		st.Culprit, st.CulpritPR = culpritFromRevertBody(pr.Body)
 	}
 	greenNote := "main green at " + short7(head)
-	landed, e := s.readLanded(r.Name, pr.Number)
-	if e != nil {
-		return false, e
-	}
 	if landed != nil {
 		if e = s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleLanded, Commit: landed.Commit}, greenNote); e != nil {
 			return true, e
@@ -1200,8 +1221,9 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 	}
 	// A merged revert whose record failed on an earlier pass is recorded now.
 	// Its keyed row and notice make this a no-op once they are written. A
-	// rebuilt mismatched incident names this revert, so the guard matches it;
-	// with no stored incident the latch-clear path below still owns the record.
+	// rebuilt mismatched or missing incident names this revert, so the guard
+	// matches it; with no stored incident and nothing pending the latch-clear
+	// path below still owns the record.
 	if pr.MergedAt != nil && found && st.RevertPR == pr.Number {
 		return true, s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleMerged}, greenNote)
 	}

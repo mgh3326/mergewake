@@ -306,10 +306,10 @@ func TestWatchMismatchedRevertNoticeRetriedOnceOnNextGreenPass(t *testing.T) {
 	}
 }
 
-// With no stored incident, a merged revert whose latch clear failed on the
-// first pass is not recorded as merged on the retry: the rebuilt incident is
-// only saved for a stored incident that names another revert PR, so the retry
-// clears the latch and writes no row or notice.
+// With no stored incident and nothing pending, a merged revert whose latch
+// clear failed on the first pass is not recorded as merged on the retry: no
+// incident is rebuilt without a pending attempt or a landed record for this
+// revert, so the retry clears the latch and writes no row or notice.
 func TestWatchMergedRevertNoStoredIncidentLatchClearRetry(t *testing.T) {
 	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
 	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
@@ -342,5 +342,128 @@ func TestWatchMergedRevertNoStoredIncidentLatchClearRetry(t *testing.T) {
 	}
 	if lines := ownerLaneEvents(n); len(lines) != 0 {
 		t.Fatalf("design-lane lines %v on retry, want none", lines)
+	}
+}
+
+// With no stored incident, a pending merged attempt for this revert rebuilds
+// the incident before the settle: the row carries a real red_since, the notice
+// claims no reopen, and a notice that failed on the first pass is retried on
+// the next pass with the same red_since.
+func TestWatchMissingIncidentPendingAttemptRebuildsAndRetriesNotice(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, _, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[shaC] = github.Green
+		at := "2026-11-07T11:00:00Z"
+		l.revert.State, l.revert.Merged, l.revert.MergedAt = "closed", true, &at
+		l.revert.MergeCommitSHA = shaC
+	})
+	s.Now = func() time.Time { return now }
+	s.Out = io.Discard
+	if e := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 9), mergeAttempt{PR: 9, Head: revertHead, Base: shaC, At: now}); e != nil {
+		t.Fatal(e)
+	}
+
+	n.err = errors.New("design lane unreachable")
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("notify failure was hidden")
+	}
+	rows := auditRows(t, s, r, "recovery-merged")
+	if len(rows) != 1 || len(ownerLaneEvents(n)) != 0 {
+		t.Fatalf("after failed notice: rows %d lines %v", len(rows), ownerLaneEvents(n))
+	}
+	red, _ := rows[0]["red_since"].(string)
+	if red != now.Format(time.RFC3339) {
+		t.Fatalf("red_since %q, want %q", red, now.Format(time.RFC3339))
+	}
+	st, found := recoveryState(t, s, r)
+	if !found || st.RevertPR != 9 || st.TaskReopen != "none" || !st.RedSince.Equal(now) {
+		t.Fatalf("saved incident %+v found %v, want PR 9 with TaskReopen none at %v", st, found, now)
+	}
+
+	n.err = nil
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("retry pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after retry, want 1", len(rows))
+	}
+	lines := ownerLaneEvents(n)
+	if len(lines) != 1 || !strings.Contains(lines[0], "reverted by PR #9") || !strings.Contains(lines[0], now.Format(time.RFC3339)) {
+		t.Fatalf("design-lane lines after retry: %v", lines)
+	}
+	if strings.Contains(lines[0], "reopened") || strings.Contains(lines[0], "0001-01-01") {
+		t.Fatalf("notice claims a reopen or a zero time: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "no task to reopen") {
+		t.Fatalf("notice missing no-reopen note: %q", lines[0])
+	}
+
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("third pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after third pass, want 1", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
+	}
+}
+
+// With no stored incident, a landed record for this revert rebuilds the
+// incident before the record: the row carries a real red_since and a notice
+// that failed on the first pass is retried on the next pass without a second
+// row.
+func TestWatchMissingIncidentLandedRecordRebuildsIncident(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.messages = map[string]string{shaSquashed: "Revert the culprit (#9)"}
+		l.parents[shaSquashed] = shaC
+		l.head = shaSquashed
+		l.checks[shaSquashed] = github.Green
+	})
+	s.Now = func() time.Time { return now }
+	s.Out = io.Discard
+	if e := s.writeLanded(r.Name, 9, shaSquashed); e != nil {
+		t.Fatal(e)
+	}
+	n.err = errors.New("design lane unreachable")
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("notify failure was hidden")
+	}
+	rows := auditRows(t, s, r, "recovery-merged")
+	if len(rows) != 1 || len(ownerLaneEvents(n)) != 0 {
+		t.Fatalf("after failed notice: rows %d lines %v", len(rows), ownerLaneEvents(n))
+	}
+	if red, _ := rows[0]["red_since"].(string); red != now.Format(time.RFC3339) {
+		t.Fatalf("red_since %q, want %q", red, now.Format(time.RFC3339))
+	}
+	st, found := recoveryState(t, s, r)
+	if !found || st.RevertPR != 9 || st.TaskReopen != "none" || !st.RedSince.Equal(now) {
+		t.Fatalf("saved incident %+v found %v, want PR 9 with TaskReopen none at %v", st, found, now)
+	}
+	n.err = nil
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("retry pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after retry, want 1", len(rows))
+	}
+	lines := ownerLaneEvents(n)
+	if len(lines) != 1 || !strings.Contains(lines[0], "already on main") || !strings.Contains(lines[0], "main green at") {
+		t.Fatalf("design-lane lines after retry: %v", lines)
+	}
+	if len(g.closed) != 0 || len(g.comments) != 0 {
+		t.Fatalf("closed %v comments %v; a landed revert must not be closed as fix-won", g.closed, g.comments)
+	}
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("third pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after third pass, want 1", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 1 {
+		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
 	}
 }
