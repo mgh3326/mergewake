@@ -270,15 +270,28 @@ func (s *Service) mergeLock(repo string) (func(), error) {
 	return func() { unlockFile(); unlockProc() }, nil
 }
 
-// settleLocked settles pr's pending unknown attempt under the repository's
-// merge lock, so no write-attempt of another caller is in flight while it
+// lockMerges takes the repository's merge lock and books the wait as lock_wait.
+func (s *Service) lockMerges(ctx context.Context, repo string) (func(), error) {
+	daemon.PhasesOf(ctx).Enter(daemon.PhaseLockWait)
+	return s.mergeLock(repo)
+}
+
+// settleLocked settles pr's pending unknown attempt. With no attempt pending,
+// which is the normal case, it returns settleNone and takes no lock: nothing
+// is in flight to wait for. An attempt is written under the lock before its
+// PUT, so one in flight is visible here; only then does it take the lock and
+// settle under it, so no write-attempt of another caller is in flight while it
 // decides and clears. A dry run clears nothing and takes no lock, so it writes
 // no state.
 func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pull, dry bool) (settlement, error) {
 	if dry {
 		return s.settleMerge(ctx, r, pr, dry)
 	}
-	unlock, e := s.mergeLock(r.Name)
+	pending, e := s.readMergeAttempt(r.Name, pr.Number)
+	if e != nil || pending == nil {
+		return settlement{}, e
+	}
+	unlock, e := s.lockMerges(ctx, r.Name)
 	if e != nil {
 		return settlement{}, e
 	}
@@ -298,14 +311,12 @@ func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pul
 // read before a long wait for the lock would be checked against a stale head.
 // GH.Merge is the step being serialised.
 func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull) error {
-	ph := daemon.PhasesOf(ctx)
-	ph.Enter(daemon.PhaseLockWait)
-	unlock, e := s.mergeLock(r.Name)
+	unlock, e := s.lockMerges(ctx, r.Name)
 	if e != nil {
 		return e
 	}
 	defer unlock()
-	ph.Enter(daemon.PhaseSettle)
+	daemon.PhasesOf(ctx).Enter(daemon.PhaseSettle)
 	// Recheck everything immediately before the SHA-bound merge: the head must
 	// be unchanged and must still gate ready under the current base and policy.
 	freshPR, e := s.GH.Pull(ctx, r.Name, pr.Number)

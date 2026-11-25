@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
+	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
@@ -147,9 +148,11 @@ func TestSecondMergeOfARepoGatesAgainstTheBaseTheFirstLeft(t *testing.T) {
 	<-g.mergeStarted
 	wg.Add(1)
 	go land("B", 8)
-	// B reaches its settle and waits for A's merge. The settle is under the
-	// repository's merge lock, so B reads the base only after A's merge
-	// returns. Give B the time to reach the lock.
+	// B reads the base before A's merge returns: with no attempt pending its
+	// settle takes no lock, so its gate reads the base at once. Wait for that
+	// first read, so a lock taken only after it cannot pass as the lock taken
+	// first. B's merge then waits on the lock for A's.
+	settleWaitFor(t, "B's first base read", func() bool { return settleCount(g.events(), "head B ") > 0 })
 	time.Sleep(300 * time.Millisecond)
 	if slices.Contains(g.events(), "merge-start B") {
 		t.Fatalf("B's merge started while A's was in flight: %v", g.events())
@@ -178,6 +181,63 @@ func TestSecondMergeOfARepoGatesAgainstTheBaseTheFirstLeft(t *testing.T) {
 	}
 	if !slices.Contains(g.fakeGH.policyReads, shaD) {
 		t.Fatalf("policy was read at %v, never at the base A left (%s)", g.fakeGH.policyReads, shaD)
+	}
+}
+
+// A Land with no pending unknown attempt does not wait for the repository's
+// merge lock: another PR holds it for its whole merge, and the settle of this
+// PR has nothing to settle.
+func TestLandWithNoPendingAttemptDoesNotWaitForTheLock(t *testing.T) {
+	s, _, _, r := settleSetup(t, 2)
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer unlock()
+	done := make(chan settlement, 1)
+	go func() {
+		st, e := s.settleLocked(asPR("B"), r, github.Pull{Number: 8}, false)
+		if e != nil {
+			t.Error(e)
+		}
+		done <- st
+	}()
+	select {
+	case st := <-done:
+		if st.Kind != settleNone {
+			t.Fatalf("settle kind %v, want settleNone", st.Kind)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Land with no pending attempt waited for the merge lock")
+	}
+}
+
+// A Land with a pending unknown attempt still waits for the merge lock: the
+// settle is under it, so it cannot clear an attempt another caller is writing.
+func TestLandWithPendingAttemptStillWaitsForTheLock(t *testing.T) {
+	s, _, _, r := settleSetup(t, 1)
+	if e := fsutil.WriteJSON(s.mergeAttemptFile(r.Name, 7), mergeAttempt{PR: 7, Head: shaA, Base: shaB, At: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		t.Fatal(e)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Land(asPR("A"), r, 7, Options{}) }()
+	select {
+	case e := <-done:
+		t.Fatalf("Land returned while another holds the merge lock: %v", e)
+	case <-time.After(300 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case e := <-done:
+		if e != nil {
+			t.Fatal(e)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Land did not return after the merge lock was released")
 	}
 }
 

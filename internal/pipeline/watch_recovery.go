@@ -937,19 +937,30 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // mergeRevert merges the revert PR at its current head once the evidence has
-// not changed, records the outcome and tells the design lane once.
+// not changed, records the outcome and tells the design lane once. The merge
+// lock is taken before the fresh reads and held through settle, the checks and
+// the PUT, as mergePinned does: a merge by another caller moves main, and the
+// checks must read main after it.
 func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head string, checks []string, pr github.Pull, st recoveryIncident, result watchResult, o Options) error {
 	// Earlier reads in this pass are memoized, and a same-sha re-run can settle
 	// since. The merge turns on the PR, the head and main's CI, so read them
 	// fresh rather than from the pass snapshot.
 	freshCtx := github.FreshEvidence(ctx)
+	// mergeRevert runs only for a live pass (a dry run returns before it), so
+	// the lock is always taken.
+	unlock, e := s.lockMerges(freshCtx, r.Name)
+	if e != nil {
+		return e
+	}
+	defer unlock()
 	fresh, e := s.GH.Pull(freshCtx, r.Name, pr.Number)
 	if e != nil {
 		return e
 	}
 	// An unknown-outcome merge of this revert settles first: a merged revert is
-	// recorded as merged, and content already on main holds it.
-	settled, e := s.settleLocked(freshCtx, r, fresh, o.DryRun)
+	// recorded as merged, and content already on main holds it. The lock is held
+	// here, so settle without taking it again.
+	settled, e := s.settleMerge(freshCtx, r, fresh, o.DryRun)
 	if e != nil {
 		return e
 	}
@@ -995,7 +1006,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		result.Reason = "main CI is " + string(ci) + " on the watch checks; revert held"
 		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":main-ci-"+string(ci), o)
 	}
-	if e = s.mergeOnceLocked(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
+	if e = s.mergeOnce(ctx, r, pr.Number, pr.Head.SHA, main); e != nil {
 		return e
 	}
 	return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
