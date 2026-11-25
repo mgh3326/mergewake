@@ -137,8 +137,8 @@ func eventTexts(n *ackNotifier) []string {
 
 // A force-push back to the requested head does not make a carried row
 // replayable: the POST marker, not the current head, decides.
-func TestConsultCarry_ForcePushBackToTheRequestedHeadDoesNotReplayThePost(t *testing.T) {
-	s, g, _, sink, _, _, r, _ := hubConsultSetup(t, 3)
+func TestConsultCarry_ForcePushBackToTheRequestedHeadHoldsWithoutReplayingThePost(t *testing.T) {
+	s, g, n, sink, _, _, r, _ := hubConsultSetup(t, 3)
 	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
 	tr := &timeoutRunner{inner: s.Runner}
 	s.Runner = tr
@@ -146,11 +146,17 @@ func TestConsultCarry_ForcePushBackToTheRequestedHeadDoesNotReplayThePost(t *tes
 	deliver(t, s, r)
 	pushHead(g, shaC, "patch-3", 3, true)
 	deliver(t, s, r)
+	if n.count != 1 {
+		t.Fatalf("findings on the carried head were held: %+v", n.events)
+	}
 	pushHead(g, shaA, "patch-3", 3, true)
 	deliver(t, s, r)
-	deliver(t, s, r)
-	if tr.calls != 1 || len(sink.writes) != 1 {
-		t.Fatalf("the POST was replayed after a force-push back: calls=%d writes=%v", tr.calls, sink.writes)
+	if tr.calls != 1 || len(sink.writes) != 1 || n.count != 1 {
+		t.Fatalf("the POST replayed or findings were released on the requested head: calls=%d writes=%v events=%+v", tr.calls, sink.writes, n.events)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	if !st.HubConsultCarried {
+		t.Fatalf("carry marker was lost after force-push back: %+v", st)
 	}
 }
 

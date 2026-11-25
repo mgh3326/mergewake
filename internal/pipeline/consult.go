@@ -152,7 +152,7 @@ func (s *Service) hubConsultStep(ctx context.Context, r config.Repo, pr github.P
 	// followed on its row and its outcome goes out with the next author
 	// delivery, naming the head it was asked for. The PR's one consult
 	// (decision 250) is never requested again.
-	carried := st.HubConsultOwed && st.consultAsked() && (st.HubConsultCarried || st.HubConsultHead != pr.Head.SHA)
+	carried := st.HubConsultOwed && st.consultAsked() && st.HubConsultHead != pr.Head.SHA
 	if carried && !st.HubConsultCarried {
 		// Remember it: a force-push back to the requested head must not turn a
 		// carried row into one this pass may replay.
