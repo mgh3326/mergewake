@@ -678,6 +678,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 	}
 	labels := map[string]bool{}
+	labelCandidate := map[string]bool{}
 	for label := range w.streams {
 		labels[label] = true
 	}
@@ -685,11 +686,12 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		labels[label] = true
 	}
 	for label := range labels {
-		if paned[label] || w.finishedLabel(label, lastCleanup) {
+		if paned[label] || (w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label])) {
 			continue
 		}
 		if l, ok := keep(label); ok {
 			cands = append(cands, reviewerCandidate{label: l, host: w.labelHost[label]})
+			labelCandidate[label] = true
 		}
 	}
 	// The journal names labels whose receipts predate the label field, and a
@@ -725,10 +727,11 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 			if !paned[name] {
 				cands = append(cands, reviewerCandidate{label: l, host: host})
 			}
-		case host != "" && !paned[name] && w.hostUnknownTerminal(name):
+		case host != "" && !paned[name] && !labelCandidate[name] && (w.hostUnknownTerminal(name) || w.oldPathRetry(name, host)):
 			// The label once ended because no host was named; a later journal
 			// row named one, so it is a candidate again.
 			cands = append(cands, reviewerCandidate{label: l, host: host})
+			labelCandidate[name] = true
 		}
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -738,6 +741,31 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		return cands[i].label.name < cands[j].label.name
 	})
 	return cands
+}
+
+// oldPathRetry reopens a label whose last attempt found the spec-format path
+// missing. Older placements used <work root>/<label>, so that terminal row
+// must not hide the legacy path from a later sweep.
+func (w *reviewerSweep) oldPathRetry(label, host string) bool {
+	if host == "" {
+		return false
+	}
+	host = w.hostName(host)
+	missingSuffixedPath := false
+	legacyPathVisited := false
+	for _, row := range w.streams[label] {
+		if w.hostName(row.Host) != host {
+			continue
+		}
+		if row.Result == "skipped" && row.Reason == reviewerAlreadyGone &&
+			filepath.Base(filepath.Clean(row.Worktree)) == label+reviewerCheckoutSuffix {
+			missingSuffixedPath = true
+		}
+		if row.Action == "reviewer-reap" && filepath.Base(filepath.Clean(row.Worktree)) == label {
+			legacyPathVisited = true
+		}
+	}
+	return missingSuffixedPath && !legacyPathVisited
 }
 
 // reviewerStuckAfter is review.panewire.stuck_after: how old a claimed or
@@ -818,6 +846,13 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 	// A host whose guarded removals for this pass are spent waits for the next
 	// one: its labels keep their streams or their audit rows until then.
 	if c.host != "" && !w.hostIsLocal(c.host) && w.drained(c.host) {
+		if hs := w.scannedHost(c.host); hs != nil && w.oldPathRetry(l.name, c.host) {
+			if path := reviewerLegacyWorktreePath(hs, l); path != "" {
+				rec := w.row(l)
+				rec.Host, rec.Cwd, rec.Worktree = hs.host.Name, path, path
+				w.record(rec, "pending-cleanup", reviewerDrainHold)
+			}
+		}
 		return
 	}
 	gate := w.row(l)
@@ -1620,6 +1655,41 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteStop
 	}
 	tree, e := hs.ops.Inspect(ctx, cwd)
+	drainTaken := false
+	// A suffix path is the current placement. If it is absent, try the
+	// pre-suffix work-root layout once. Preserve that path in the receipt so
+	// the source of this cleanup is visible and terminal rows stop repeating.
+	if e == nil && tree == nil && filepath.Base(filepath.Clean(cwd)) == l.name+reviewerCheckoutSuffix {
+		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" {
+			cwd = legacy
+			rec.Cwd, rec.Worktree = cwd, cwd
+			prior = w.streams[l.name][reviewerStream(rec)]
+			if reviewerTerminal(prior) && prior.Result == "kept" {
+				return remoteDone
+			}
+			if reviewerWaiting(prior, w.now) {
+				return remoteStop
+			}
+			if w.oldPathRetry(l.name, hs.host.Name) {
+				if !w.takeDrain(hs.host.Name) {
+					w.record(rec, "pending-cleanup", reviewerDrainHold)
+					return remoteStop
+				}
+				drainTaken = true
+			}
+			if w.acting {
+				if e := hs.refreshPanes(ctx); e != nil {
+					w.record(rec, "kept", "pane-scan-failed")
+					return remoteStop
+				}
+			}
+			if hs.paneInUse(cwd) {
+				w.record(rec, "kept", "pane-in-use")
+				return remoteStop
+			}
+			tree, e = hs.ops.Inspect(ctx, cwd)
+		}
+	}
 	switch {
 	case reviewerBudgetCut(ctx, e):
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
@@ -1646,11 +1716,11 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	}
 	// The drain cap bounds how many guarded removals one host takes in a pass;
 	// the rest waits with a row of their own, so the label stays a candidate.
-	if !w.takeDrain(hs.host.Name) {
+	if !drainTaken && !w.takeDrain(hs.host.Name) {
 		w.record(rec, "pending-cleanup", reviewerDrainHold)
 		return remoteStop
 	}
-	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, nil, true)
+	removed, e := remover.WorktreeRemove(ctx, tree.Path, tree.Head, w.r.Branch, w.s.Config.ReapRegenerable(w.r), true)
 	if reviewerBudgetCut(ctx, e) {
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
 		return remoteStop
@@ -1681,6 +1751,14 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "pending-cleanup", fmt.Sprintf("%s%s (retry %d of %d)", reviewerRefused, reason, retries+1, reviewerRefusalRetries))
 	}
 	return remoteStop
+}
+
+func reviewerLegacyWorktreePath(hs *reapHost, l reviewerLabel) string {
+	root := hs.host.WorkRoot
+	if root == "" || !filepath.IsAbs(root) {
+		return ""
+	}
+	return filepath.Join(root, l.name)
 }
 
 // reviewerBudgetCut reports whether a reviewer step's error is the repo budget

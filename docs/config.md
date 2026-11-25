@@ -358,6 +358,47 @@ A checkout whose only extra file is a disposable entry stays `skipped | dirty`
 until the node accepts `reap.disposable` (see the `disposable` key above). The
 row's `source` is `worktree-list` for a candidate only the listing reached.
 
+#### Orphan worktrees
+
+`reap.orphan_worktrees` adds a shadow-first pass for registered linked
+worktrees one directory below each configured `hosts[].work_root`. It never
+considers the main clone, unregistered directories, `wk/` worktrees owned by
+the worker reap, or paths recorded by the reviewer reap.
+
+```yaml
+reap:
+  orphan_worktrees:
+    act: false
+    min_age: 14d
+    per_host: 20
+```
+
+| Key | Required / default | Meaning |
+| --- | --- | --- |
+| `act` | `false` | Enables removal for candidates that pass every guard. It also requires the top-level `reap.act: true` and an acting reap invocation. |
+| `min_age` | `14d` | Minimum age based on the newest mtime among the linked worktree's git index, `HEAD`, `logs/HEAD`, and top-level directory. Accepts Go durations and whole days. |
+| `per_host` | `20` | Maximum candidates considered per host and repo pass. |
+
+Before a worktree is planned or removed, the pass requires all four checks:
+
+1. `git --no-optional-locks status --porcelain --ignored` reports no modified
+   or untracked files, and every ignored path matches `reap.regenerable`.
+2. Its `HEAD` is an ancestor of the fetch-free `origin/<default branch>` ref,
+   or its configured upstream ref resolves to the exact `HEAD` commit.
+3. The newest of the gitdir `index`, `HEAD`, `logs/HEAD`, and worktree root
+   mtimes is older than `min_age`.
+4. A fresh full pane-cwd scan finds no pane using the path; acting passes
+   repeat that scan immediately before `git worktree remove`.
+
+Unknown evidence keeps the worktree with a reason. Each considered path writes
+an `orphan-worktree` row with `would-remove` or `kept`; the `kind` is `exp`,
+`detached`, `branch`, `wk-no-pr`, or `other`. The CLI also prints counts by
+host and kind for routing-policy review before `act` is enabled. On panewire
+hosts the current `worktree.list` response does not provide the no-lock status
+paths, filesystem mtimes, or upstream refs needed for these checks, so those
+paths are recorded as kept with `host-evidence-unavailable` until the node
+command exposes that evidence. No host is enabled by this config default.
+
 #### Panewire transport
 
 Under `transport: panewire` no remote operation uses ssh, including archive
