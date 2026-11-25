@@ -71,6 +71,13 @@ type settlement struct {
 	Commit string
 }
 
+// WaitingOnWatchError means a watch-owned attempt is still pending. It is a
+// deliberate wait, not a Land failure; the daemon uses it to keep the PR out
+// of the clean-settle skip cache until watch resolves the attempt.
+type WaitingOnWatchError struct{}
+
+func (*WaitingOnWatchError) Error() string { return "pending merge attempt belongs to watch" }
+
 func (s *Service) mergeAttemptFile(repo string, n int) string {
 	return filepath.Join(s.state(repo), fmt.Sprintf("pr-%d-merge-attempt.json", n))
 }

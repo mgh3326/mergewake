@@ -170,7 +170,8 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		// (Writing one would also hide a state-write failure behind the
 		// hold in the joined error.)
 		var held *MergeHeldError
-		if errors.As(retErr, &held) {
+		var waiting *WaitingOnWatchError
+		if errors.As(retErr, &held) || errors.As(retErr, &waiting) {
 			return
 		}
 		retErr = errors.Join(retErr, s.audit(r.Name, "land-error", map[string]any{"pr": n, "error": retErr.Error()}, o.DryRun))
@@ -195,7 +196,11 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	// merge hook, MERGED notice) run only on an acting pass. A landed hold
 	// still notifies on every pass kind: telling a lane is reporting, which
 	// shadow passes do (Options.Reporting), not acting.
-	st, e := s.settleLocked(ctx, r, pr, !o.Acting())
+	st, e := s.settleLocked(ctx, r, pr, !o.Acting(), true)
+	var waiting *WaitingOnWatchError
+	if errors.As(e, &waiting) {
+		return s.waitOnWatch(r, n)
+	}
 	if e != nil {
 		return e
 	}
@@ -268,9 +273,12 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 var errWaitingOnWatch = errors.New("pending merge attempt belongs to watch")
 
 // waitOnWatch reports that PR n's pending merge attempt belongs to watch, which
-// settles it. Land returns nil: nothing is merged and no post-merge step runs.
+// settles it. The typed result keeps this wait out of the clean-settle cache.
 func (s *Service) waitOnWatch(r config.Repo, n int) error {
-	return s.Print(map[string]any{"action": "land-waiting-on-watch", "repo": r.Name, "pr": n, "reason": "pending merge attempt belongs to watch; watch settles it"})
+	if e := s.Print(map[string]any{"action": "land-waiting-on-watch", "repo": r.Name, "pr": n, "reason": "pending merge attempt belongs to watch; watch settles it"}); e != nil {
+		return e
+	}
+	return &WaitingOnWatchError{}
 }
 
 // finishMerge runs the post-merge steps shared by a fresh merge and a merge
@@ -344,7 +352,7 @@ func (s *Service) lockMerges(ctx context.Context, repo string) (func(), error) {
 // settle under it, so no write-attempt of another caller is in flight while it
 // decides and clears. A dry (non-acting: dry-run or shadow) settle clears
 // nothing and takes no lock, so it writes no state.
-func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pull, dry bool) (settlement, error) {
+func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pull, dry, leaveWatch bool) (settlement, error) {
 	if dry {
 		return s.settleMerge(ctx, r, pr, dry)
 	}
@@ -360,6 +368,16 @@ func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pul
 	// in PhaseSettle, not lock_wait.
 	daemon.PhasesOf(ctx).Enter(daemon.PhaseSettle)
 	defer unlock()
+	// The first read only decides whether taking the lock is necessary. Watch
+	// may have written or replaced the attempt while Land waited, so ownership
+	// must be checked again under the lock before settling it.
+	pending, e = s.readMergeAttempt(r.Name, pr.Number)
+	if e != nil {
+		return settlement{}, e
+	}
+	if leaveWatch && pending != nil && watchOwns(pending, pr.Head.Ref) {
+		return settlement{}, &WaitingOnWatchError{}
+	}
 	return s.settleMerge(ctx, r, pr, dry)
 }
 

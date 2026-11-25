@@ -1116,7 +1116,7 @@ func (s *Service) writeLanded(repo string, n int, commit string) error {
 // nothing settled. The caller audits its own watch row. mainNote says where
 // main stands for the notice.
 func (s *watchStream) settlePendingRevert(ctx context.Context, r config.Repo, pr github.Pull, st recoveryIncident, head, mainNote string) (settleKind, error) {
-	settled, e := s.settleLocked(ctx, r, pr, false)
+	settled, e := s.settleLocked(ctx, r, pr, false, false)
 	if e != nil {
 		return settleNone, e
 	}
