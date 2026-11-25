@@ -106,14 +106,14 @@ func TestCorruptReviewerCursorIsRepaired(t *testing.T) {
 func TestWorkerCursorIOErrorPreservesFile(t *testing.T) {
 	f := budgetWorkerFix(t, 3, "", 0)
 	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
-	if err := os.Mkdir(path, 0o700); err != nil {
+	if err := os.Symlink(path, path); err != nil {
 		t.Fatal(err)
 	}
 	err := f.reap(t, 0, Options{})
 	if err == nil || !strings.Contains(err.Error(), "worker worktrees: resume cursor") {
 		t.Fatalf("worker cursor I/O error was not reported: %v", err)
 	}
-	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("worker cursor path changed after I/O error: info=%v err=%v", info, err)
 	}
 }
@@ -123,14 +123,14 @@ func TestReviewerCursorIOErrorPreservesFile(t *testing.T) {
 	label := reviewerLabelFor(12, time.Hour)
 	f.addReviewer(label, "w1:p5")
 	path := filepath.Join(f.s.state(testRepo.Name), "reviewer-sweep-cursor.json")
-	if err := os.Mkdir(path, 0o700); err != nil {
+	if err := os.Symlink(path, path); err != nil {
 		t.Fatal(err)
 	}
 	err := f.reap(t, 0, Options{})
 	if err == nil || !strings.Contains(err.Error(), "reviewer reap: sweep cursor") {
 		t.Fatalf("reviewer cursor I/O error was not reported: %v", err)
 	}
-	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("reviewer cursor path changed after I/O error: info=%v err=%v", info, err)
 	}
 }
