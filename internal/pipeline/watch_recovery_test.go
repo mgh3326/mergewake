@@ -23,10 +23,12 @@ const advancedHead = "ffffffffffffffffffffffffffffffffffffffff"
 // trees the exact-inverse proof reads.
 type recoveryGH struct {
 	*fakeGH
-	revert  github.Pull
-	merges  int
-	clears  int
-	entries map[string]map[string]github.TreeEntry
+	revert github.Pull
+	merges int
+	clears int
+	// clearErr fails ClearRecovery while set, after the call is counted.
+	clearErr error
+	entries  map[string]map[string]github.TreeEntry
 	// ambiguousSHA names the sha whose Check reads change from readResult to
 	// the ambiguous check/status disagreement on read number ambiguousFrom.
 	// Zero values leave Check as the shared fake.
@@ -66,6 +68,9 @@ func (g *recoveryGH) RecoveryRevert(context.Context, string) (*github.Pull, erro
 }
 func (g *recoveryGH) ClearRecovery(context.Context, string) error {
 	g.clears++
+	if g.clearErr != nil {
+		return g.clearErr
+	}
 	g.latch = false
 	return nil
 }

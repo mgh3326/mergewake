@@ -305,3 +305,42 @@ func TestWatchMismatchedRevertNoticeRetriedOnceOnNextGreenPass(t *testing.T) {
 		t.Fatalf("design-lane lines %v after third pass, want 1", lines)
 	}
 }
+
+// With no stored incident, a merged revert whose latch clear failed on the
+// first pass is not recorded as merged on the retry: the rebuilt incident is
+// only saved for a stored incident that names another revert PR, so the retry
+// clears the latch and writes no row or notice.
+func TestWatchMergedRevertNoStoredIncidentLatchClearRetry(t *testing.T) {
+	now := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	s, g, _, n, r := recoverySetup(t, func(l *recoveryGH) {
+		l.latch = true
+		l.checks[shaC] = github.Green
+		at := "2026-11-07T11:00:00Z"
+		l.revert.State, l.revert.Merged, l.revert.MergedAt = "closed", true, &at
+		l.revert.MergeCommitSHA = shaC
+		l.clearErr = errors.New("latch clear refused")
+	})
+	s.Now = func() time.Time { return now }
+	s.Out = io.Discard
+
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("latch clear failure was hidden")
+	}
+	if _, found, _ := s.loadRecovery(r.Name); found {
+		t.Fatal("a rebuilt incident was saved with no stored incident")
+	}
+
+	g.clearErr = nil
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("retry pass action %q (%s), want healthy", got.Action, got.Reason)
+	}
+	if g.latch {
+		t.Fatal("latch still active after the retry")
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 0 {
+		t.Fatalf("recovery-merged rows %d on retry, want 0", len(rows))
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 0 {
+		t.Fatalf("design-lane lines %v on retry, want none", lines)
+	}
+}
