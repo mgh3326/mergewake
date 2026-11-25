@@ -138,3 +138,47 @@ func TestReapWorkerUnreadableCursorIsResetWithSkippedHost(t *testing.T) {
 		t.Fatalf("the next pass still reports the worker cursor: %v", errs)
 	}
 }
+
+// An unreadable cursor is still rewritten when one host lists a candidate
+// while another is skipped: the cursor holds no position to keep, so the next
+// pass must not report the same error again. One listed candidate puts total
+// above zero, exercising the candidate-path rewrite; the skipped-only test
+// above covers the early return.
+func TestReapWorkerUnreadableCursorIsResetWithListedCandidate(t *testing.T) {
+	s, _, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	repo := s.Config.Repos[0]
+	path := filepath.Join(s.state(repo.Name), "worker-worktree-cursor.json")
+	writeCorrupt(t, path)
+	ctx := context.Background()
+	hub, err := s.reapHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, scanErrs := s.reapScanHost(ctx, hub, s.Config.Hosts[0])
+	if len(scanErrs) != 0 {
+		t.Fatalf("listed host scan: %v", scanErrs)
+	}
+	skipped := &reapHost{host: reap.Host{Name: "down", Jobs: "/jobs"}, failed: true, trees: map[string]*reap.Worktree{}}
+	hosts := []*reapHost{skipped, listed}
+	pass := func() []error {
+		return s.reapWorkerWorktrees(ctx, repo, hosts, &passJobRecords{}, false, true, func(reapReceipt) {})
+	}
+	cursorErr := func(errs []error) bool {
+		for _, e := range errs {
+			if strings.Contains(e.Error(), "worker worktrees: resume cursor") {
+				return true
+			}
+		}
+		return false
+	}
+	if errs := pass(); !cursorErr(errs) {
+		t.Fatalf("the unreadable worker cursor was not reported on its pass: %v", errs)
+	}
+	if !decodes(path, &workerCursor{}) {
+		t.Fatalf("a pass with a listed candidate left the unreadable cursor %s in place", path)
+	}
+	if errs := pass(); cursorErr(errs) {
+		t.Fatalf("the next pass still reports the worker cursor: %v", errs)
+	}
+}
