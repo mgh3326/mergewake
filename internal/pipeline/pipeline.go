@@ -316,6 +316,9 @@ func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pul
 	if e != nil {
 		return settlement{}, e
 	}
+	// The lock is taken: the settle and everything after it in Land are back
+	// in PhaseSettle, not lock_wait.
+	daemon.PhasesOf(ctx).Enter(daemon.PhaseSettle)
 	defer unlock()
 	return s.settleMerge(ctx, r, pr, dry)
 }

@@ -49,6 +49,20 @@ type Phases struct {
 	settling []string
 }
 
+// NewPhases reports one evaluation's time with now as its clock. Tests use a
+// fake clock to book slow reads deterministically.
+func NewPhases(now func() time.Time) *Phases { return newPhases(now) }
+
+// Took reports how long the evaluation spent in ph so far.
+func (p *Phases) Took(ph Phase) time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.took[ph]
+}
+
 func newPhases(now func() time.Time) *Phases { return &Phases{now: now} }
 
 // Now is the clock of the evaluation.
