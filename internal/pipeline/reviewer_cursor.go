@@ -62,7 +62,7 @@ func (w *reviewerSweep) resume(cands []reviewerCandidate, from reviewerCursor) [
 // the next full sweep starts with c. Only a durable full sweep writes it: a
 // dry run and a single-PR sweep leave the order alone.
 func (w *reviewerSweep) stopAt(c reviewerCandidate) {
-	if !w.resumable {
+	if !w.resumable || w.cursorReadFailed {
 		return
 	}
 	cur := reviewerCursor{Host: c.host, Label: c.label.name}

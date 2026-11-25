@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -55,7 +56,8 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 		c, e := s.workerStageCursor(r.Name)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("worker worktrees: resume cursor: %w", e))
-			w.unreadable = true
+			w.unreadable = cursorDecodeError(e)
+			w.cursorReadFailed = !w.unreadable
 		} else {
 			from = c
 		}
@@ -246,9 +248,17 @@ type workerPass struct {
 	// resumable marks a durable stage: only it reads and records the resume
 	// cursor (worker_cursor.go).
 	resumable bool
-	// unreadable marks a resume cursor the stage could not read: the stage
-	// starts from the front and its next save overwrites the file.
+	// unreadable marks a corrupt resume cursor the stage can safely reset.
 	unreadable bool
+	// cursorReadFailed prevents a later budget stop from overwriting a cursor
+	// that could not be read due to an I/O error.
+	cursorReadFailed bool
+}
+
+func cursorDecodeError(err error) bool {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	return errors.As(err, &syntaxErr) || errors.As(err, &typeErr)
 }
 
 // workerClone is one registered clone to list: its main checkout and its git
