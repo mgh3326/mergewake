@@ -693,6 +693,20 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 			}
 		}
 	}
+	// A pending unknown-outcome merge of the revert settles before anything
+	// else reads the incident: content that landed on main is the revert, so it
+	// is recorded as merged whatever main is now, and never sent again.
+	if acting {
+		settled, e := s.settlePendingRevert(ctx, r, *pr, st, head)
+		if e != nil {
+			return e
+		}
+		if settled {
+			result.Action = "recovery-merged"
+			result.Reason = fmt.Sprintf("pending merge of revert PR #%d settled", pr.Number)
+			return s.audit(r.Name, "watch", result, o.DryRun)
+		}
+	}
 	// A green commit between the recorded head and this red means main was
 	// fixed and broke again while no poll saw it: the revert belongs to the old
 	// failure, so hold rather than merge it.
@@ -969,9 +983,12 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 		result.Action = "recovery-merged"
 		return s.recordRevertMerged(ctx, r, st, pr.Number, head, result, o)
 	case settleLanded:
-		result.Action = "recovery-hold"
-		result.Reason = "revert content already on " + r.Branch + " as " + short7(settled.Commit) + "; GitHub left the PR open, so a person closes it"
-		return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":merge-settled", o)
+		result.Action = "recovery-merged"
+		result.Reason = fmt.Sprintf("pending merge of revert PR #%d settled", pr.Number)
+		if e := s.recordSettled(ctx, r, st, pr.Number, head, settled); e != nil {
+			return e
+		}
+		return s.audit(r.Name, "watch", result, o.DryRun)
 	}
 	if fresh.State != "open" || fresh.MergedAt != nil || fresh.Head.SHA != pr.Head.SHA {
 		result.Action = "recovery-hold"
@@ -1015,20 +1032,111 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 // recordRevertMerged audits a revert merged on main and sends its design-lane line.
 func (s *watchStream) recordRevertMerged(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head string, result watchResult, o Options) error {
 	result.Action = "recovery-merged"
-	row := struct {
-		Culprit   string    `json:"culprit"`
-		CulpritPR int       `json:"culprit_pr"`
-		RevertPR  int       `json:"revert_pr"`
-		RedSince  time.Time `json:"red_since"`
-		Head      string    `json:"head"`
-	}{Culprit: st.Culprit, CulpritPR: st.CulpritPR, RevertPR: revertPR, RedSince: st.RedSince, Head: head}
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
-	if e := s.audit(r.Name, "recovery-merged", row, false); e != nil {
+	if e := s.audit(r.Name, "recovery-merged", revertMergedRow(st, revertPR, head), false); e != nil {
 		return e
 	}
 	return s.announceRevert(ctx, r, st, revertPR)
+}
+
+// revertMergedRecord is the recovery-merged audit row for a revert on main.
+type revertMergedRecord struct {
+	Culprit   string    `json:"culprit"`
+	CulpritPR int       `json:"culprit_pr"`
+	RevertPR  int       `json:"revert_pr"`
+	RedSince  time.Time `json:"red_since"`
+	Head      string    `json:"head"`
+}
+
+func revertMergedRow(st recoveryIncident, revertPR int, head string) revertMergedRecord {
+	return revertMergedRecord{Culprit: st.Culprit, CulpritPR: st.CulpritPR, RevertPR: revertPR, RedSince: st.RedSince, Head: head}
+}
+
+// settlePendingRevert settles the revert PR's pending unknown-outcome merge,
+// if there is one, and reports whether it settled to merged or landed. A
+// settled revert is recorded as merged and is never merged, closed as fix-won
+// or reverted again. The caller audits its own watch row. A landed revert stays
+// open for a person, so it is announced once rather than on every pass.
+func (s *watchStream) settlePendingRevert(ctx context.Context, r config.Repo, pr github.Pull, st recoveryIncident, head string) (bool, error) {
+	settled, e := s.settleLocked(ctx, r, pr, false)
+	if e != nil {
+		return false, e
+	}
+	if settled.Kind != settleMerged && settled.Kind != settleLanded {
+		return false, nil
+	}
+	return true, s.recordSettled(ctx, r, st, pr.Number, head, settled)
+}
+
+// settleLatchRevert runs settlePendingRevert for the revert PR the latch
+// belongs to, on a green main, before fixWon could close that PR as no longer
+// needed.
+func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head string) (bool, error) {
+	latch, ok := s.GH.(recoveryLatchGH)
+	if !ok {
+		return false, nil
+	}
+	active, e := s.GH.RecoveryActive(ctx, r.Name)
+	if e != nil || !active {
+		return false, e
+	}
+	pr, e := latch.RecoveryRevert(ctx, r.Name)
+	if e != nil || pr == nil {
+		return false, e
+	}
+	st, _, e := s.loadRecovery(r.Name)
+	if e != nil {
+		return false, e
+	}
+	if st.Culprit == "" {
+		st.Culprit, st.CulpritPR = culpritFromRevertBody(pr.Body)
+	}
+	return s.settlePendingRevert(ctx, r, *pr, st, head)
+}
+
+// recordSettled audits a settled revert merge on main and sends its one notice.
+// A merged revert is announced as merged; a landed one is announced as left
+// open for a person to close.
+func (s *watchStream) recordSettled(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head string, settled settlement) error {
+	if e := s.audit(r.Name, "recovery-merged", revertMergedRow(st, revertPR, head), false); e != nil {
+		return e
+	}
+	if settled.Kind == settleLanded {
+		return s.announceLanded(ctx, r, st, revertPR, settled.Commit)
+	}
+	return s.announceRevert(ctx, r, st, revertPR)
+}
+
+// announceLanded sends the one design-lane line for a revert whose content is
+// on main while GitHub left its PR open.
+func (s *watchStream) announceLanded(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, commit string) error {
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
+	if e != nil {
+		return e
+	}
+	key := "recovery-merged-open:" + st.Culprit + ":" + strconv.Itoa(revertPR)
+	if sent.has(key) {
+		return nil
+	}
+	stage := "main"
+	if s.deploy {
+		stage = "deploy"
+	}
+	text := fmt.Sprintf("%s %s revert PR #%d content already on %s as %s; GitHub left the PR open, so a person closes it",
+		r.Name, stage, revertPR, r.Branch, short7(commit))
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	if e = s.Notifier.Notify(reportCtx, integrations.Event{
+		ID:   fmt.Sprintf("mergewake-recovery-merged-open-%s-%d", r.Name, revertPR),
+		Text: text,
+		Lane: s.ownerLane(r),
+		Type: "info",
+	}); e != nil {
+		return e
+	}
+	return sent.add(key)
 }
 
 // announceRevert sends the one design-lane line for a merged revert.
