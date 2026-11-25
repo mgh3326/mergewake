@@ -518,7 +518,16 @@ func settlePR(ctx context.Context, s *pipeline.Service, r config.Repo, n int, o 
 	landCtx, land := tracing.Span(ctx, "mergewake.land")
 	e = s.Land(landCtx, r, n, o)
 	tracing.Finish(land)
-	if e != nil {
+	var held *pipeline.MergeHeldError
+	switch {
+	case errors.As(e, &held):
+		// A deliberate hold is a verdict, not a failure: it is shown on every
+		// pass, but it counts neither toward the role's failures nor toward the
+		// clean-loop healthcheck.
+		if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": held.Reason}); pe != nil {
+			errs = append(errs, fmt.Errorf("PR %d land held: %w", n, pe))
+		}
+	case e != nil:
 		errs = append(errs, fmt.Errorf("PR %d land: %w", n, e))
 	}
 	return errs

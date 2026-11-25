@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,5 +210,49 @@ func TestRecoveryUnknownOutcomeLandedHolds(t *testing.T) {
 	}
 	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "already on main") {
 		t.Fatalf("%d design-lane lines: %v", len(lines), lines)
+	}
+}
+
+// A landed-but-open hold is a typed verdict on every pass, and its notice is
+// still sent once: the caller can tell the hold from a failure.
+func TestHeldMergeIsTypedOnEveryPassAndNoticedOnce(t *testing.T) {
+	s, u, n, r := unknownMergeSetup(t, 500)
+	u.landed = true
+	ctx := context.Background()
+	if e := s.Land(ctx, r, 7, Options{}); !github.IsUnknownOutcome(e) {
+		t.Fatalf("first land: %v", e)
+	}
+	for pass := 0; pass < 3; pass++ {
+		var held *MergeHeldError
+		if e := s.Land(ctx, r, 7, Options{}); !errors.As(e, &held) {
+			t.Fatalf("pass %d: want *MergeHeldError, got %v", pass, e)
+		}
+	}
+	notices := 0
+	for _, e := range n.events {
+		if strings.HasPrefix(e.ID, "mergewake-merge-held-7-") {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("hold notices %d, want 1", notices)
+	}
+}
+
+// A notify error during the hold is a real failure: it is returned as itself,
+// not as the typed hold, so it still counts toward the role's failures.
+func TestHeldMergeNotifyErrorIsAFailure(t *testing.T) {
+	s, u, n, r := unknownMergeSetup(t, 500)
+	u.landed = true
+	ctx := context.Background()
+	if e := s.Land(ctx, r, 7, Options{}); !github.IsUnknownOutcome(e) {
+		t.Fatalf("first land: %v", e)
+	}
+	boom := errors.New("notify down")
+	n.err = boom
+	var held *MergeHeldError
+	e := s.Land(ctx, r, 7, Options{})
+	if !errors.Is(e, boom) || errors.As(e, &held) {
+		t.Fatalf("notify error during hold: got %v, want the notify error and no hold", e)
 	}
 }

@@ -156,14 +156,25 @@ func (s *Service) endMergeAttempt(r config.Repo, n int, state, commit string, dr
 	return s.clearMergeAttempt(r.Name, n)
 }
 
+// MergeHeldError is the deliberate refusal of a merge whose content already
+// landed on the base while GitHub left the PR open. The hold is a verdict, not
+// a failure: the caller shows it as held and does not count it as an error.
+type MergeHeldError struct {
+	Reason string
+}
+
+func (e *MergeHeldError) Error() string { return e.Reason }
+
 // holdSettledMerge refuses to merge pr again: its content already landed on
 // the base. It sends one notice to the repository's owner lane and returns the
-// reason the merge refuses with.
+// typed hold. A notify or state-write error is returned as it is, so it still
+// counts as a failure.
 func (s *Service) holdSettledMerge(ctx context.Context, r config.Repo, pr github.Pull, st settlement, dry bool) error {
 	reason := fmt.Sprintf("merge of head %s had an unknown outcome and its content landed on %s as %s; GitHub left the PR open, so a person closes it",
 		short7(pr.Head.SHA), r.Branch, short7(st.Commit))
+	held := &MergeHeldError{Reason: reason}
 	if dry {
-		return errors.New(reason)
+		return held
 	}
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "merge-held-reported"), 127)
 	if e != nil {
@@ -171,7 +182,7 @@ func (s *Service) holdSettledMerge(ctx context.Context, r config.Repo, pr github
 	}
 	key := strconv.Itoa(pr.Number) + ":" + pr.Head.SHA + ":" + st.Commit
 	if sent.has(key) {
-		return errors.New(reason)
+		return held
 	}
 	nctx, cancel := reportContext(ctx)
 	defer cancel()
@@ -186,5 +197,5 @@ func (s *Service) holdSettledMerge(ctx context.Context, r config.Repo, pr github
 	if e := sent.add(key); e != nil {
 		return e
 	}
-	return errors.New(reason)
+	return held
 }
