@@ -55,7 +55,10 @@ func (s *Service) reapHostScan(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	hs, errs := s.reapScanHost(ctx, hub, h)
 	budgetCut := slices.ContainsFunc(errs, func(e error) bool { return errors.Is(e, ErrReapRepoBudget) })
 	if ctx.Err() == nil && !budgetCut {
+		// The stored scan is never handed out: the first repository works on
+		// its own copy too, so a failure it sees mid-sweep stays its own.
 		pass.scans[h.Name] = reapPassScan{hs: hs, errs: errs}
+		return s.rebindHostScan(ctx, hub, hs), errs
 	}
 	return hs, errs
 }

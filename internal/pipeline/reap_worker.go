@@ -81,6 +81,9 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 			break
 		}
 		if hs.failed {
+			// A skipped host was not discovered: the stage is not finished,
+			// so its resume cursor survives until a pass reads the host.
+			discovered = false
 			continue
 		}
 		if _, ok := hs.ops.(reap.WorktreeLister); !ok || !hs.viaHub {

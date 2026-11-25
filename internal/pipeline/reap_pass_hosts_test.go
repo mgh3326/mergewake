@@ -9,6 +9,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/reap"
 )
 
 // passGH has no pull requests in any repository: the pass's host scans are what
@@ -63,5 +64,45 @@ func TestReapPassFailedHostIsReportedOnceScanned(t *testing.T) {
 	}
 	if n := passRunCalls(run, key("herdr", "pane", "list")); n != 1 {
 		t.Fatalf("pane list reads of a failed host in one pass = %d, want 1", n)
+	}
+}
+
+// A host that a repository's own sweep marks failed (a reviewer inspect the
+// hub answers 502) fails for that repository only: the next repository of the
+// pass gets its own copy of the scan, unmarked, and sweeps the host.
+func TestReapPassMidSweepFailureStaysWithItsRepository(t *testing.T) {
+	run := &scriptRunner{outs: worktreeOuts("/repo.wt")}
+	s := svc(t, &passGH{}, run)
+	s.Out = io.Discard
+	ctx := WithReapPassHosts(context.Background())
+	h := s.Config.Hosts[0]
+	first, _ := s.reapHostScan(ctx, nil, h)
+	first.failed = true
+	second, errs := s.reapHostScan(ctx, nil, h)
+	if second.failed || len(errs) != 0 {
+		t.Fatalf("a mid-sweep failure of the first repository reached the second: failed=%v errs=%v", second.failed, errs)
+	}
+	if n := passRunCalls(run, key("herdr", "pane", "list")); n != 1 {
+		t.Fatalf("pane list scans for two repositories of one pass = %d, want 1", n)
+	}
+}
+
+// A host the worker stage skips (its scan failed) was never discovered, so the
+// stage does not finish: its resume cursor survives for the next pass.
+func TestReapWorkerSkippedHostKeepsCursor(t *testing.T) {
+	s := svc(t, &passGH{}, &scriptRunner{})
+	repo := s.Config.Repos[0]
+	saved := workerCursor{Host: "local", Path: "/repo.wt/wk/x"}
+	if err := s.saveWorkerStageCursor(repo.Name, saved); err != nil {
+		t.Fatal(err)
+	}
+	skipped := &reapHost{host: s.Config.Hosts[0], failed: true, trees: map[string]*reap.Worktree{}}
+	s.reapWorkerWorktrees(context.Background(), repo, []*reapHost{skipped}, &passJobRecords{}, false, true, func(reapReceipt) {})
+	got, err := s.workerStageCursor(repo.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != saved {
+		t.Fatalf("a skipped host cleared the worker cursor: got %+v, want %+v", got, saved)
 	}
 }
