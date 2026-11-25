@@ -76,7 +76,7 @@ func resumeWorkerVisits(visits []workerVisit, order []*reapHost, from workerCurs
 // next full stage starts with v. Only a durable stage writes it: a dry run
 // leaves the order alone.
 func (w *workerPass) stopAt(v workerVisit) error {
-	if !w.resumable {
+	if !w.resumable || w.cursorReadFailed {
 		return nil
 	}
 	cur := workerCursor{Host: v.hs.host.Name, Path: v.cand.path}

@@ -295,9 +295,9 @@ type reviewerSweep struct {
 	// resumable marks a durable full sweep: only it resumes the visit order
 	// from, and records where its budget stopped (reviewer_cursor.go).
 	resumable bool
-	// unreadable marks a sweep cursor the sweep could not read: the sweep
-	// starts from the front and its next save overwrites the file.
-	unreadable bool
+	// unreadable marks a corrupt sweep cursor the sweep can safely reset.
+	unreadable       bool
+	cursorReadFailed bool
 }
 
 // reviewerCandidate is one label to visit, the host it is known to run on and,
@@ -370,7 +370,8 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		c, e := s.reviewerSweepCursor(r.Name)
 		if e != nil {
 			w.errs = append(w.errs, fmt.Errorf("reviewer reap: sweep cursor: %w", e))
-			w.unreadable = true
+			w.unreadable = cursorDecodeError(e)
+			w.cursorReadFailed = !w.unreadable
 		} else {
 			from = c
 		}
