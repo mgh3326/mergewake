@@ -2,7 +2,7 @@
 
 This inventory lists every way code from this account's repositories reaches a host, so that deploy can become the strict gate after independent review. It also names the first path to gate. It changes nothing: no consumer, ruleset or updater moves until slice 2.
 
-**The NCP host is retired (2026-11-25).** The hub lost the node on 2026-11-24 19:00:53Z; the host is gone. Rows X5, X6, X7, X8, X17 and X18, the NCP parts of read D1, reads D7 to D11, and the findings that cite them describe that host as it was when read, not current state.
+**The NCP host is retired (2026-11-25).** The hub lost the node on 2026-11-24 19:00:53Z; the host is gone. Every row, read and finding below that names the NCP host, or cites a read taken on it, describes that host as it was when read, not current state. That includes rows X5 to X9, X11, X17 and X18, the NCP parts of read D1, and reads D7 to D11.
 
 Terms used here:
 
