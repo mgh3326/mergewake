@@ -155,6 +155,19 @@ class AutoTagTests(unittest.TestCase):
             b = self.commit('README.md', 'docs')
             self.assertEqual(self.push_main(b, a), [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.10', '-f', 'publish=true')])
 
+    def test_revert_releases_when_older_commit_holds_higher_tag(self):
+        # Tags follow reservation order, not commit order: A (older) holds v0.0.3,
+        # its descendant B holds v0.0.2, and C reverts B. The nearest tag to C is
+        # B's, so the revert's diff is code and must release.
+        with self.release_repo():
+            a = self.commit('a.go', 'package a')
+            b = self.commit('code.go', 'package code')
+            git('tag', 'v0.0.3', a)
+            git('tag', 'v0.0.2', b)
+            git('revert', '--no-edit', b)
+            c = git('rev-parse', 'HEAD')
+            self.assertEqual(self.push_main(c, b), [('gh', 'workflow', 'run', 'release.yml', '--ref', 'v0.0.4', '-f', 'publish=true')])
+
 
 if __name__ == '__main__':
     unittest.main()
