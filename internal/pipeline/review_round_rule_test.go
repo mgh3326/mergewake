@@ -81,6 +81,15 @@ type roundRuleGH struct {
 	issueComments []github.IssueComment
 }
 
+type failedAncestorRoundGH struct {
+	*roundRuleGH
+	err error
+}
+
+func (g *failedAncestorRoundGH) Ancestor(context.Context, string, string, string) (bool, error) {
+	return false, g.err
+}
+
 func (g *roundRuleGH) IssueComments(_ context.Context, _ string, _ int) ([]github.IssueComment, error) {
 	g.commentsMu.Lock()
 	defer g.commentsMu.Unlock()
@@ -466,6 +475,24 @@ func TestRoundHoldStateWriteFailureDoesNotReturnHoldVerdictOrDecision(t *testing
 		if event.Type == "decision" {
 			t.Fatalf("decision sent without durable hold and baseline: %+v", event)
 		}
+	}
+}
+
+func TestRoundHoldDecisionSentWhenLaterGateReadFails(t *testing.T) {
+	s, g, notifier, _, _, r := roundRuleSetup(t, 7)
+	g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+	s.GH = &failedAncestorRoundGH{roundRuleGH: g, err: errors.New("transient base comparison failure")}
+	if err := s.NotifyPR(context.Background(), r, 7, Options{}); err == nil {
+		t.Fatal("NotifyPR swallowed the later gate read failure")
+	}
+	decisions := 0
+	for _, event := range notifier.events {
+		if event.Type == "decision" {
+			decisions++
+		}
+	}
+	if decisions != 1 {
+		t.Fatalf("got %d hold decisions after persisted hold and later read failure, want 1; events=%+v", decisions, notifier.events)
 	}
 }
 
