@@ -222,3 +222,40 @@ func TestOrphanWorktreeActRemovesQualifyingWorktree(t *testing.T) {
 		t.Fatalf("worktree still exists, stat err=%v", err)
 	}
 }
+
+func TestOrphanWorktreesMissingCloneIsAbsence(t *testing.T) {
+	root := t.TempDir()
+	host := reap.Host{Name: "local", WorkRoot: root}
+	ex := reap.Exec{Runner: integrations.Exec{}, Host: host}
+	cfg := config.Config{
+		StateDir: filepath.Join(root, "state"), Repos: []config.Repo{{Name: "example/project", Branch: "main"}},
+		Hosts: []reap.Host{host}, Reap: config.Reap{Regenerable: config.DefaultReapRegenerable},
+	}
+	s := &Service{Config: cfg, Runner: integrations.Exec{}, Out: &bytes.Buffer{}}
+	hs := &reapHost{host: host, ops: orphanTestOps{Exec: ex}, exec: ex, trees: map[string]*reap.Worktree{}}
+	var rows []reapReceipt
+	errs := s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{hs}, false, func(r reapReceipt) { rows = append(rows, r) })
+	if len(errs) != 0 || len(rows) != 0 {
+		t.Fatalf("missing clone: rows=%#v errors=%v", rows, errs)
+	}
+}
+
+func TestOrphanWorktreeKeepsWhenProcessUsesCheckout(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	f.age(t, 30*24*time.Hour)
+	previous := mergedProcessEvidence
+	mergedProcessEvidence = func(context.Context, *Service) (procEvidence, error) {
+		return procEvidence{cwds: []string{f.path}}, nil
+	}
+	defer func() { mergedProcessEvidence = previous }()
+	rows, _, errs := runOrphanFixture(f, true)
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != "process-in-use" {
+		t.Fatalf("rows = %#v, want process-in-use keep", rows)
+	}
+	if _, err := os.Stat(f.path); err != nil {
+		t.Fatalf("worktree removed while process used it: %v", err)
+	}
+}

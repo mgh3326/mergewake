@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -46,16 +47,36 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			}
 			rows, e := reap.ListWorktrees(ctx, lister, filepath.Join(main, ".git"))
 			if e != nil {
-				errs = append(errs, fmt.Errorf("%s orphan worktrees list: %w", hs.host.Name, e))
+				if reap.InvalidArgs(e) {
+					continue // this host has no clone of this repo
+				}
+				errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s orphan worktrees list: %w", hs.host.Name, e)))
 				continue
 			}
 			for _, row := range rows {
 				entries = append(entries, reap.Entry{Path: row.Path, Branch: row.Branch, Detached: row.Detached})
 			}
 		} else {
+			if hs.host.Local() {
+				if _, e := os.Stat(main); os.IsNotExist(e) {
+					continue // a host need not clone every configured repo
+				} else if e != nil {
+					errs = append(errs, fmt.Errorf("%s orphan worktrees root: %w", hs.host.Name, e))
+					continue
+				}
+			} else if _, e := hs.exec.Run(ctx, "test", "-d", main); e != nil {
+				if commandExitCode(e) == 1 {
+					continue
+				}
+				errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s orphan worktrees root: %w", hs.host.Name, e)))
+				continue
+			}
 			entries, err = hs.exec.WorktreeEntries(ctx, main)
 			if err != nil {
-				errs = append(errs, fmt.Errorf("%s orphan worktrees list: %w", hs.host.Name, err))
+				if commandExitCode(err) == 128 {
+					continue // existing path is not a git clone
+				}
+				errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s orphan worktrees list: %w", hs.host.Name, err)))
 				continue
 			}
 		}
@@ -124,6 +145,14 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 				keep("pane-in-use")
 				continue
 			}
+			if !hs.host.Local() {
+				keep("process-scan-unavailable")
+				continue
+			}
+			if reason := s.processInUse(ctx, entry.Path); reason != "" {
+				keep(reason)
+				continue
+			}
 			if !acting {
 				rec.Result, rec.Reason = "would-remove", ""
 				note(rec)
@@ -156,6 +185,10 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			}
 			if hs.paneInUse(entry.Path) {
 				keep("pane-in-use")
+				continue
+			}
+			if reason := s.processInUse(ctx, entry.Path); reason != "" {
+				keep(reason)
 				continue
 			}
 			if e := hs.exec.RemoveWorktree(ctx, main, entry.Path); e != nil {
