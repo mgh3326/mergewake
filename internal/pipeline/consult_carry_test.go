@@ -150,6 +150,7 @@ func TestConsultCarry_ForcePushBackToTheRequestedHeadHoldsWithoutReplayingThePos
 		t.Fatalf("findings on the carried head were held: %+v", n.events)
 	}
 	pushHead(g, shaA, "patch-3", 3, true)
+	g.feedback.Threads = append(g.feedback.Threads, ownFinding("T2", "high", 20))
 	deliver(t, s, r)
 	if tr.calls != 1 || len(sink.writes) != 1 || n.count != 1 {
 		t.Fatalf("the POST replayed or findings were released on the requested head: calls=%d writes=%v events=%+v", tr.calls, sink.writes, n.events)
