@@ -678,6 +678,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 	}
 	labels := map[string]bool{}
+	labelCandidate := map[string]bool{}
 	for label := range w.streams {
 		labels[label] = true
 	}
@@ -690,6 +691,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 		if l, ok := keep(label); ok {
 			cands = append(cands, reviewerCandidate{label: l, host: w.labelHost[label]})
+			labelCandidate[label] = true
 		}
 	}
 	// The journal names labels whose receipts predate the label field, and a
@@ -725,10 +727,11 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 			if !paned[name] {
 				cands = append(cands, reviewerCandidate{label: l, host: host})
 			}
-		case host != "" && !paned[name] && (w.hostUnknownTerminal(name) || w.oldPathRetry(name, host)):
+		case host != "" && !paned[name] && !labelCandidate[name] && (w.hostUnknownTerminal(name) || w.oldPathRetry(name, host)):
 			// The label once ended because no host was named; a later journal
 			// row named one, so it is a candidate again.
 			cands = append(cands, reviewerCandidate{label: l, host: host})
+			labelCandidate[name] = true
 		}
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
