@@ -2101,8 +2101,9 @@ time-based hold can lag: a cancelled check's settling wait, a stall notice and a
 review retry backoff are re-read at most 60 minutes late for a skipped PR.
 
 Only a settled PR is remembered: a draft, or a PR whose head has its review done
-marker, evaluated without an error. A PR still being reviewed, one whose review poll the GitHub client skipped, or one whose last
-evaluation failed, is evaluated every pass. Memory is in the daemon process: a restart
+marker, evaluated without an error. A PR still being reviewed, one whose review poll the GitHub client skipped, one whose merge is
+held (its content landed while GitHub left it open), or one whose last evaluation failed, is
+evaluated every pass. Memory is in the daemon process: a restart
 evaluates every PR once. Without `daemon.webhook`, nothing is skipped.
 
 Each repository's pass logs `pr pass` with `prs_skipped`, `prs_evaluated`,
