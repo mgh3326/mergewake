@@ -86,6 +86,43 @@ func TestMergeUsesSHAAndSquash(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+// A 5xx or a lost answer leaves the merge outcome unknown; a 4xx is a refusal
+// GitHub made without merging, and a 200 that says not merged is one too.
+func TestMergeOutcomeClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  int
+		body    string
+		abort   bool
+		unknown bool
+	}{
+		{"server error", http.StatusInternalServerError, `{"message":"boom"}`, false, true},
+		{"bad gateway", http.StatusBadGateway, `{"message":"boom"}`, false, true},
+		{"lost connection", 0, "", true, true},
+		{"not mergeable", http.StatusMethodNotAllowed, `{"message":"not mergeable"}`, false, false},
+		{"head moved", http.StatusConflict, `{"message":"head moved"}`, false, false},
+		{"unprocessable", http.StatusUnprocessableEntity, `{"message":"invalid"}`, false, false},
+		{"not merged", http.StatusOK, `{"merged":false}`, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := api(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.abort {
+					panic(http.ErrAbortHandler)
+				}
+				w.WriteHeader(tt.status)
+				fmt.Fprint(w, tt.body)
+			})
+			e := c.Merge(context.Background(), "example/project", 7, testSHA)
+			if e == nil {
+				t.Fatal("merge reported success")
+			}
+			if IsUnknownOutcome(e) != tt.unknown {
+				t.Fatalf("unknown=%v want %v: %v", IsUnknownOutcome(e), tt.unknown, e)
+			}
+		})
+	}
+}
 func TestReviewResolutionFailsClosed(t *testing.T) {
 	for _, tt := range []struct {
 		name, body string

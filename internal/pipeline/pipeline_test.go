@@ -394,6 +394,17 @@ func (g *fakeGH) ReviewFeedback(_ context.Context, _ string, _ int) (github.Revi
 	return fb, nil
 }
 func (g *fakeGH) Unresolved(context.Context, string, int) (int, error) { return g.findings, nil }
+
+// CommitsSince walks the fake's parent chain from head back to since.
+func (g *fakeGH) CommitsSince(_ context.Context, _, since, head string) ([]github.Commit, error) {
+	var out []github.Commit
+	for sha := head; sha != "" && sha != since; sha = g.parents[sha] {
+		c := github.Commit{SHA: sha}
+		c.Commit.Message = g.messages[sha]
+		out = append(out, c)
+	}
+	return out, nil
+}
 func (g *fakeGH) Merge(_ context.Context, _ string, _ int, sha string) error {
 	if sha != g.pull.Head.SHA {
 		return errors.New("unbound head")
