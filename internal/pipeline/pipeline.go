@@ -173,7 +173,7 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	}
 	// A pending unknown-outcome merge settles before the PR's state is read
 	// further: a merged PR is not merged again, and landed content holds it.
-	st, e := s.settleMerge(ctx, r, pr, o.DryRun)
+	st, e := s.settleLocked(ctx, r, pr, o.DryRun)
 	if e != nil {
 		return e
 	}
@@ -253,10 +253,37 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 	return nil
 }
 
-// mergeLock is the lock of one repository's merges. It lives in this process:
-// the daemon is the one place two PRs of a repository reach a merge at once.
-func (s *Service) mergeLock(repo string) func() {
-	return lockPath("merge:" + s.state(repo))
+// mergeLock is the lock of one repository's merges. It is two locks taken in
+// this fixed order: the in-process mutex, which orders the goroutines of the
+// daemon, then the flock under the repository's state dir, which also excludes
+// another process (the daemon and a `mergewake land` run from a shell). Held
+// across the settle and the write-attempt → PUT → result sequence, never while
+// waiting on GitHub for anything else.
+func (s *Service) mergeLock(repo string) (func(), error) {
+	dir := s.state(repo)
+	unlockProc := lockPath("merge:" + dir)
+	unlockFile, e := lockFile(filepath.Join(dir, "merges.lock"))
+	if e != nil {
+		unlockProc()
+		return nil, e
+	}
+	return func() { unlockFile(); unlockProc() }, nil
+}
+
+// settleLocked settles pr's pending unknown attempt under the repository's
+// merge lock, so no write-attempt of another caller is in flight while it
+// decides and clears. A dry run clears nothing and takes no lock, so it writes
+// no state.
+func (s *Service) settleLocked(ctx context.Context, r config.Repo, pr github.Pull, dry bool) (settlement, error) {
+	if dry {
+		return s.settleMerge(ctx, r, pr, dry)
+	}
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		return settlement{}, e
+	}
+	defer unlock()
+	return s.settleMerge(ctx, r, pr, dry)
 }
 
 // mergePinned rechecks a PR and merges it pinned to the head Land gated. It
@@ -273,7 +300,10 @@ func (s *Service) mergeLock(repo string) func() {
 func (s *Service) mergePinned(ctx context.Context, r config.Repo, pr github.Pull) error {
 	ph := daemon.PhasesOf(ctx)
 	ph.Enter(daemon.PhaseLockWait)
-	unlock := s.mergeLock(r.Name)
+	unlock, e := s.mergeLock(r.Name)
+	if e != nil {
+		return e
+	}
 	defer unlock()
 	ph.Enter(daemon.PhaseSettle)
 	// Recheck everything immediately before the SHA-bound merge: the head must
