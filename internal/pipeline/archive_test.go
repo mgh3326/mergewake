@@ -1054,8 +1054,21 @@ func TestArchiveJobsCancelledDuringRefreshCountsInterruptedJobs(t *testing.T) {
 				t.Fatalf("cancelled run returned %v, want context.Canceled", err)
 			}
 			out := f.out.String()
-			if !strings.Contains(out, `"eligible_left":`+strconv.Itoa(len(tc.jobs))) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+			if !strings.Contains(out, `"eligible_left":`+strconv.Itoa(len(tc.jobs))) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"errors":2`) {
 				t.Fatalf("refresh cancellation omitted pending work or stop host: %s", out)
+			}
+			if !strings.Contains(out, `"job":"first","result":"error","reason":"caller cancelled during job reads:`) {
+				t.Fatalf("refresh cancellation omitted the interrupted job row: %s", out)
+			}
+			if !strings.Contains(err.Error(), "job first: caller cancelled during job reads:") {
+				t.Fatalf("refresh cancellation error omitted interrupted job: %v", err)
+			}
+			log, readErr := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(log), `"job":"first","result":"error","reason":"caller cancelled during job reads:`) {
+				t.Fatalf("refresh cancellation did not persist the interrupted job row: %s", log)
 			}
 		})
 	}
@@ -1073,8 +1086,21 @@ func TestArchiveJobsCancelledDuringPlanCountsInterruptedJobs(t *testing.T) {
 		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
 	}
 	out := f.out.String()
-	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"errors":2`) {
 		t.Fatalf("plan cancellation omitted pending work or stop host: %s", out)
+	}
+	if !strings.Contains(out, `"job":"first","result":"error","reason":"caller cancelled during hk reads:`) {
+		t.Fatalf("plan cancellation omitted the interrupted job row: %s", out)
+	}
+	if !strings.Contains(err.Error(), "job first: caller cancelled during hk reads:") {
+		t.Fatalf("plan cancellation error omitted interrupted job: %v", err)
+	}
+	log, readErr := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(log), `"job":"first","result":"error","reason":"caller cancelled during hk reads:`) {
+		t.Fatalf("plan cancellation did not persist the interrupted job row: %s", log)
 	}
 }
 
@@ -1090,8 +1116,11 @@ func TestArchiveJobsCancelledDuringApplyRecordsRowAndCountsPending(t *testing.T)
 		t.Fatalf("cancelled run returned %v, want context.Canceled", err)
 	}
 	out := f.out.String()
-	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) {
+	if !strings.Contains(out, `"eligible_left":2`) || !strings.Contains(out, `"unscanned_hosts":["local"]`) || !strings.Contains(out, `"errors":2`) {
 		t.Fatalf("apply cancellation omitted pending work or stop host: %s", out)
+	}
+	if !strings.Contains(err.Error(), "job first: caller cancelled during archive apply:") {
+		t.Fatalf("apply cancellation error omitted interrupted job: %v", err)
 	}
 	log, readErr := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
 	if readErr != nil {

@@ -559,9 +559,9 @@ hosts:
 						unscannedReasons[h.Name] = "caller cancelled during job reads"
 						unscannedStart = entered - 1
 						countPendingEligible(jobIndex)
-						break
+					} else {
+						row.Result, row.Reason = archiveJobsReason(refreshErr)
 					}
-					row.Result, row.Reason = archiveJobsReason(refreshErr)
 				} else if reason != "" {
 					row.Result, row.Reason = "skipped", reason
 				} else if now.Sub(time.Unix(newest, 0)) < olderThan {
@@ -589,9 +589,9 @@ hosts:
 							unscannedReasons[h.Name] = "caller cancelled during hk reads"
 							unscannedStart = entered - 1
 							countPendingEligible(jobIndex)
-							break
+						} else {
+							row.Result, row.Reason = archiveJobsReason(planErr)
 						}
-						row.Result, row.Reason = archiveJobsReason(planErr)
 					} else if budgetSpent() {
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline before archive apply"
