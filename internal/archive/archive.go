@@ -314,7 +314,7 @@ for d in *; do
     if [ ! -d "$d/events" ] || [ ! -r "$d/events" ] || [ ! -x "$d/events" ]; then
       done=0; invalidEvents=1
     else
-      eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost) printf "%s T\n" "$seq";; job.claim|job.spawned|job.joined|job.placement) printf "%s S\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $1+0 >= max {max=$1+0; latestKind=$2} END {print (latestKind == "T"), rc+0}')
+      eventSummary=$({ find "$d/events" -type f -exec sh -c 'for f; do b=${f##*/}; seq=${b%%-*}; [ ${#seq} -eq 5 ] || continue; case "$seq" in *[!0-9]*) continue;; esac; rest=${b#*-}; case "$rest" in *.json) kind=${rest%.json};; *) continue;; esac; case "$kind" in job.completed|job.lost|job.revoked|job.reaped) printf "%s T\n" "$seq";; job.claim|job.claimed|job.reclaim|job.placement) printf "%s S\n" "$seq";; job.spawned|job.joined) printf "%s L\n" "$seq";; quota_pool.release|job.spawn_retryable) printf "%s N\n" "$seq";; job.cleanup_pending) printf "%s C\n" "$seq";; esac; done' sh {} + 2>/dev/null; rc=$?; printf 'R %s\n' "$rc"; } | awk '$1 == "R" {rc=$2; next} $2 == "S" {if ($1+0 > start) start=$1+0} $2 == "L" {landed=1; if ($1+0 > start) start=$1+0} $2 == "T" {if ($1+0 > terminal) terminal=$1+0} $2 == "N" {if ($1+0 > neverLanded) neverLanded=$1+0} $2 == "C" {if ($1+0 > cleanup) cleanup=$1+0} END {print ((terminal > start && terminal > cleanup) || (!landed && neverLanded > start && neverLanded > cleanup)), rc+0}')
       set -- $eventSummary; done=$1; rc=$2
       if [ "$rc" -ne 0 ]; then uncertain=1; fi
     fi
@@ -902,18 +902,33 @@ func finished(files []File) bool {
 		events = append(events, event{seq, kind})
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
-	terminal, laterStart := false, false
+	terminal, terminalSeq, startSeq, cleanupSeq := false, -1, -1, -1
 	for _, e := range events {
 		switch e.kind {
-		case "job.completed", "job.lost":
-			terminal, laterStart = true, false
-		case "job.claim", "job.spawned", "job.joined", "job.placement":
-			if terminal {
-				laterStart = true
-			}
+		case "job.completed", "job.lost", "job.revoked", "job.reaped":
+			terminal, terminalSeq = true, e.seq
+		case "job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.joined", "job.placement":
+			startSeq = e.seq
+		case "job.cleanup_pending":
+			cleanupSeq = e.seq
 		}
 	}
-	return terminal && !laterStart
+	if terminal && terminalSeq > startSeq && terminalSeq > cleanupSeq {
+		return true
+	}
+	landed, neverLandedSeq := false, -1
+	for _, e := range events {
+		switch e.kind {
+		case "job.spawned", "job.joined":
+			landed = true
+			neverLandedSeq = -1
+		case "quota_pool.release", "job.spawn_retryable":
+			neverLandedSeq = e.seq
+		case "job.claim", "job.claimed", "job.reclaim", "job.placement":
+			neverLandedSeq = -1
+		}
+	}
+	return !landed && neverLandedSeq > startSeq && neverLandedSeq > cleanupSeq
 }
 
 // HostSkipReason applies the archive-jobs checks that can be decided from a
