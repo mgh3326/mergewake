@@ -114,7 +114,12 @@ func TestHeldPRIsEvaluatedEveryPass(t *testing.T) {
 		if json.Unmarshal(b, &cur) != nil {
 			return false
 		}
-		if cur.Running || !cur.LastFinish.After(third) {
+		// Equality is a finish that landed in the same clock tick as the
+		// third pass's stamp (macOS wall clock is microsecond-resolution,
+		// and the JSON round trip drops the monotonic reading). Pass 2's
+		// finish is at least one inter-pass interval before third, so it
+		// is still rejected.
+		if cur.Running || cur.LastFinish.Before(third) {
 			return false
 		}
 		st = cur
