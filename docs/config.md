@@ -2158,8 +2158,8 @@ and records a READY one — the notify path observes rather than merges, so it
 also runs in shadow mode. `READY`
 requires every required check green on the head, zero unresolved review
 threads, the `mergewake/reviews/<pr>/<head>-done` marker and the passes from
-`review.login` it attests (on the head, or on a head with the same patch id), the base branch an ancestor of the
-head, and a mergeable PR; `BLOCKED` names the hold from a
+`review.login` it attests (on the head, or on a head with the same patch id), and a mergeable PR; a base that
+moved on never blocks and is recorded as `base_behind: true`; `BLOCKED` names the hold from a
 closed vocabulary: `check_failed:<name>` per failing required check,
 `check_absent:<name>` per required check with no run or status on the head at all (see below),
 `threads_open:<n>` (or, under a graded policy, `blocking_findings:<n>` and
@@ -2351,15 +2351,9 @@ hold's end and spans that overlap or touch are taken off once. Nothing depends o
 the order the clocks were filled in or on which pass could reach a read: a hold
 that closed before a clock was filled still comes off it. A file an earlier
 release wrote has no spans, and its clocks already carry the holds they went
-through, so it keeps its ages. A new head starts its own clocks, with one
-exception: a head mergewake made itself by updating a stale branch inherits the
-old head's `head_seen` and `ready`, because only the author's push resets that
-clock. mergewake records the update in the same file when the call succeeds and
-carries the clocks only when the new head's first parent is the recorded old
-head and the commit is a merge, which is what an update produces: a head the
-author pushed on top of the update's result is not carried, nor is the head of
-any other push. The update record is written with the clocks, so a restart
-between the update and the head it produced keeps the carry.
+through, so it keeps its ages. A new head starts its own clocks. mergewake does
+not update PR branches (see `require_up_to_date` above), so no head inherits
+clocks from an earlier head.
 
 | Condition | Overdue when |
 | --- | --- |
@@ -2381,10 +2375,7 @@ a hold to mergewake.
 
 The notice is a `decision`: `[mergewake] MERGE_OVERDUE <repo>#<n> head=<sha7> |
 <condition> after <age> | gate: <state> <reasons> | checks: <name>=<state>, ... |
-review: passes x/y, reviewer <label or none>`. A head mergewake made by updating
-the branch carries `| clocks carried from <sha7> after mergewake updated the
-branch` between the age and the gate, so an age older than the head is not read
-as a stale entry. The notice goes to the lane `lead` first.
+review: passes x/y, reviewer <label or none>`. The notice goes to the lane `lead` first.
 When the notifier refuses that lane (it is not registered on the host), the notice
 goes to the PR's `notifyLane` lane (task lane, `Mergewake-Notify-Lane` trailer,
 repo lane, then the configured fallback), and the desk gets one short `info` FYI

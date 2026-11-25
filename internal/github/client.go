@@ -1289,7 +1289,7 @@ func (c *Client) PostReview(ctx context.Context, repo string, n int, sha string,
 			comments = append(comments, map[string]any{"path": f.Path, "line": f.Line, "side": "RIGHT", "body": body})
 		}
 	}
-	body := Marker(sha) + "\n" + PassMarker(meta) + "\nOne independent diff-only pass (lens: " + meta.Lens + "). Findings are advisory except under blocking policy."
+	body := Marker(sha) + "\n" + PassMarker(meta) + "\nOne independent diff-only pass (lens: " + meta.Lens + "). Findings outside the PR's Acceptance contract (marked Advisory) never hold the gate; the rest are graded by severity."
 	if meta.DiffSource != "" {
 		body += "\n\nDiff source: " + meta.DiffSource + " checkout fallback; GitHub refused the PR diff, so the patch was built from the reviewed head and base locally."
 	}

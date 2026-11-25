@@ -94,8 +94,9 @@ succeeded at the head (missing, queued, skipped, neutral, and ambiguous
 check/status evidence cannot be green and waits silently), zero unresolved
 review threads, the `mergewake/reviews/<pr>/<head>-done` marker for a reviewed
 head together with the head-bound passes `review.login` posted (a bare ref is
-forgeable; the receipts are the trust anchor), the base branch an ancestor of
-the head, and a mergeable PR. A blocking PR still needs its two distinct
+forgeable; the receipts are the trust anchor), and a mergeable PR. A base that
+moved on never blocks: the gate records it as `base_behind` for information, and
+a conflict-free PR lands on its own head. A blocking PR still needs its two distinct
 passes because the marker is only written once every required pass posts. Reviewing a subsequent head is another single
 pass, not a review round.
 
@@ -116,8 +117,10 @@ for truthful author metadata and profile-family declarations.
 
 A server-side ref named `mergewake/reviews/<PR>/<head>` claims the pass before
 model invocation. It prevents two hosts from spending on the same head. The
-reviewer runs in an empty temporary directory, receives only the API diff on
-stdin, and cannot request a checkout. pi runs without tools, MCP, extensions,
+reviewer runs in a reviewer pane on a checkout of the reviewed head (a local
+`review.panewire.checkouts/<label>` worktree, or the node's own worktree when a
+checkout spec is used; see [reviewer checkouts](docs/config.md#reviewer-checkouts)).
+The pass reviews the PR's API diff. pi runs without tools, MCP, extensions,
 skills, context files or session history. Command Code uses safe mode, disabled
 skills, a one-turn cap, deny-all permissions, and a deny-all tool hook. Profile
 arguments are limited to model/provider/thinking/effort option-value pairs.
