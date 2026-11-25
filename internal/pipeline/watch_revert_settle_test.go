@@ -32,9 +32,10 @@ func landedRevertSetup(t *testing.T, mainCI github.CI) (*Service, *recoveryGH, *
 	return s, g, n, r, now
 }
 
-// A revert whose unknown merge landed, with main still red and the fix window
-// open, is recorded as merged on the watch pass: no blocker, no second revert,
-// no merge PUT, and one design-lane notice that the PR was left open.
+// A revert whose unknown merge landed, with main red, is recorded as merged on
+// the pass that first sees it: no blocker, no merge PUT, no close, one
+// design-lane notice that the PR was left open and main is red. Later red
+// passes hold per head rather than passing silently.
 func TestWatchSettledRevertLandedRedMainRecordsMerged(t *testing.T) {
 	s, g, n, r, _ := landedRevertSetup(t, github.Red)
 
@@ -49,22 +50,28 @@ func TestWatchSettledRevertLandedRedMainRecordsMerged(t *testing.T) {
 		t.Fatalf("recovery-merged rows %d, want 1", len(rows))
 	}
 	lines := ownerLaneEvents(n)
-	if len(lines) != 1 || !strings.Contains(lines[0], "already on main") || !strings.Contains(lines[0], "left the PR open") {
+	if len(lines) != 1 || !strings.Contains(lines[0], "already on main") || !strings.Contains(lines[0], "main red at") || !strings.Contains(lines[0], "left the PR open") {
 		t.Fatalf("design-lane lines %v", lines)
 	}
 
-	// The attempt stays pending while the PR is open, so a later pass settles
-	// it again: it records and notifies nothing new.
-	if got := recoveryWatch(t, s, r); got.Action != "recovery-merged" {
-		t.Fatalf("repeat action %q (%s)", got.Action, got.Reason)
+	// The attempt stays pending while the PR is open. A later red pass on the
+	// same head holds, once, and merges nothing.
+	for pass := 0; pass < 2; pass++ {
+		if got := recoveryWatch(t, s, r); got.Action != "recovery-hold" {
+			t.Fatalf("pass %d action %q (%s), want recovery-hold", pass, got.Action, got.Reason)
+		}
 	}
-	if len(ownerLaneEvents(n)) != 1 || g.merges != 0 {
-		t.Fatalf("repeat notified again or merged: lines %v merges %d", ownerLaneEvents(n), g.merges)
+	if len(ownerLaneEvents(n)) != 2 || g.merges != 0 || len(g.closed) != 0 {
+		t.Fatalf("lines %v merges %d closed %v", ownerLaneEvents(n), g.merges, g.closed)
+	}
+	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
+		t.Fatalf("recovery-merged rows %d after repeat passes, want 1", len(rows))
 	}
 }
 
 // The same landed revert with main green is not closed as fix-won, is not
-// reverted again, and is still recorded as merged once.
+// reverted again, and is recorded as merged once. A later red at a new head is
+// held for that head, not silenced by the landed revert.
 func TestWatchSettledRevertLandedGreenMainNotFixWon(t *testing.T) {
 	s, g, n, r, _ := landedRevertSetup(t, github.Green)
 
@@ -80,10 +87,47 @@ func TestWatchSettledRevertLandedGreenMainNotFixWon(t *testing.T) {
 	if rows := auditRows(t, s, r, "recovery-merged"); len(rows) != 1 {
 		t.Fatalf("recovery-merged rows %d, want 1", len(rows))
 	}
-	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "already on main") {
+	if lines := ownerLaneEvents(n); len(lines) != 1 || !strings.Contains(lines[0], "already on main") || !strings.Contains(lines[0], "main green at") {
 		t.Fatalf("design-lane lines %v", lines)
 	}
 	if g.merges != 0 {
 		t.Fatalf("revert merged %d times", g.merges)
+	}
+
+	// Main breaks again at a new head, with the revert still open: the watch
+	// holds for that head and merges nothing.
+	g.head, g.latch = advancedHead, true
+	g.parents[advancedHead] = shaSquashed
+	g.checks[advancedHead] = github.Red
+	if got := recoveryWatch(t, s, r); got.Action != "recovery-hold" || !strings.Contains(got.Reason, "left the PR open") {
+		t.Fatalf("new red: action %q (%s), want recovery-hold", got.Action, got.Reason)
+	}
+	if g.merges != 0 || len(g.closed) != 0 {
+		t.Fatalf("new red merged %d closed %v", g.merges, g.closed)
+	}
+	if lines := ownerLaneEvents(n); len(lines) != 2 {
+		t.Fatalf("design-lane lines %v; want the landing notice and one hold for the new head", lines)
+	}
+}
+
+// A landed revert that a person then closes, as the notice asks, ends the
+// latch without a fix-won record for a revert that landed on main.
+func TestWatchSettledRevertClosedAfterLandingEndsLatch(t *testing.T) {
+	s, g, _, r, _ := landedRevertSetup(t, github.Green)
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("landing pass: %+v", got)
+	}
+	g.revert.State = "closed"
+	if got := recoveryWatch(t, s, r); got.Action != "healthy" {
+		t.Fatalf("closed pass: %+v", got)
+	}
+	if g.latch {
+		t.Fatal("latch still active after the landed revert was closed")
+	}
+	if rows := auditRows(t, s, r, "recovery-fix-won"); len(rows) != 0 {
+		t.Fatalf("recovery-fix-won recorded %d times for a landed revert", len(rows))
+	}
+	if len(g.comments) != 0 {
+		t.Fatalf("comments %v on a landed revert", g.comments)
 	}
 }

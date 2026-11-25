@@ -694,14 +694,29 @@ func (s *watchStream) recovery(ctx context.Context, r config.Repo, p policy.Poli
 		}
 	}
 	// A pending unknown-outcome merge of the revert settles before anything
-	// else reads the incident: content that landed on main is the revert, so it
-	// is recorded as merged whatever main is now, and never sent again.
+	// else reads the incident. Content that landed on main is recorded once, on
+	// the pass that first sees it. Later red passes hold per head: the revert is
+	// never merged again while its PR is open, and a new failure is not
+	// diagnosed silently behind the landed revert.
 	if acting {
-		settled, e := s.settlePendingRevert(ctx, r, *pr, st, head)
+		redNote := "main red at " + short7(head)
+		landed, e := s.readLanded(r.Name, pr.Number)
 		if e != nil {
 			return e
 		}
-		if settled {
+		if landed != nil {
+			if e = s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleLanded, Commit: landed.Commit}, redNote); e != nil {
+				return e
+			}
+			result.Action = "recovery-hold"
+			result.Reason = fmt.Sprintf("revert PR #%d content is already on %s as %s and GitHub left the PR open; a person closes it, and automatic recovery is held", pr.Number, r.Branch, short7(landed.Commit))
+			return s.reportWatch(ctx, r, result, "recovery:"+strconv.Itoa(pr.Number)+":landed:"+head, o)
+		}
+		kind, e := s.settlePendingRevert(ctx, r, *pr, st, head, redNote)
+		if e != nil {
+			return e
+		}
+		if kind != settleNone {
 			result.Action = "recovery-merged"
 			result.Reason = fmt.Sprintf("pending merge of revert PR #%d settled", pr.Number)
 			return s.audit(r.Name, "watch", result, o.DryRun)
@@ -985,7 +1000,7 @@ func (s *watchStream) mergeRevert(ctx context.Context, r config.Repo, head strin
 	case settleLanded:
 		result.Action = "recovery-merged"
 		result.Reason = fmt.Sprintf("pending merge of revert PR #%d settled", pr.Number)
-		if e := s.recordSettled(ctx, r, st, pr.Number, head, settled); e != nil {
+		if e := s.recordLanded(ctx, r, st, pr.Number, head, settled.Commit, "main red at "+short7(head)); e != nil {
 			return e
 		}
 		return s.audit(r.Name, "watch", result, o.DryRun)
@@ -1035,10 +1050,7 @@ func (s *watchStream) recordRevertMerged(ctx context.Context, r config.Repo, st 
 	if e := s.audit(r.Name, "watch", result, o.DryRun); e != nil {
 		return e
 	}
-	if e := s.audit(r.Name, "recovery-merged", revertMergedRow(st, revertPR, head), false); e != nil {
-		return e
-	}
-	return s.announceRevert(ctx, r, st, revertPR)
+	return s.recordMerged(ctx, r, st, revertPR, head, settlement{Kind: settleMerged}, "")
 }
 
 // revertMergedRecord is the recovery-merged audit row for a revert on main.
@@ -1054,20 +1066,57 @@ func revertMergedRow(st recoveryIncident, revertPR int, head string) revertMerge
 	return revertMergedRecord{Culprit: st.Culprit, CulpritPR: st.CulpritPR, RevertPR: revertPR, RedSince: st.RedSince, Head: head}
 }
 
+// revertLanded is the durable record that a revert's squash landed on main
+// while GitHub left its PR open. The merge attempt stays pending for as long as
+// the PR is open, so later passes read this record instead of settling again.
+type revertLanded struct {
+	PR     int    `json:"pr"`
+	Commit string `json:"commit"`
+}
+
+func (s *Service) landedFile(repo string, n int) string {
+	return filepath.Join(s.state(repo), fmt.Sprintf("pr-%d-revert-landed.json", n))
+}
+
+func (s *Service) readLanded(repo string, n int) (*revertLanded, error) {
+	var l revertLanded
+	ok, e := fsutil.ReadJSON(s.landedFile(repo, n), &l)
+	if e != nil || !ok {
+		return nil, e
+	}
+	return &l, nil
+}
+
+func (s *Service) writeLanded(repo string, n int, commit string) error {
+	return fsutil.WriteJSON(s.landedFile(repo, n), revertLanded{PR: n, Commit: commit})
+}
+
 // settlePendingRevert settles the revert PR's pending unknown-outcome merge,
-// if there is one, and reports whether it settled to merged or landed. A
-// settled revert is recorded as merged and is never merged, closed as fix-won
-// or reverted again. The caller audits its own watch row. A landed revert stays
-// open for a person, so it is announced once rather than on every pass.
-func (s *watchStream) settlePendingRevert(ctx context.Context, r config.Repo, pr github.Pull, st recoveryIncident, head string) (bool, error) {
+// if there is one, and records what it settled to. A merged or landed revert is
+// never merged, closed as fix-won or reverted again. It returns settleNone when
+// nothing settled. The caller audits its own watch row. mainNote says where
+// main stands for the notice.
+func (s *watchStream) settlePendingRevert(ctx context.Context, r config.Repo, pr github.Pull, st recoveryIncident, head, mainNote string) (settleKind, error) {
 	settled, e := s.settleLocked(ctx, r, pr, false)
 	if e != nil {
-		return false, e
+		return settleNone, e
 	}
-	if settled.Kind != settleMerged && settled.Kind != settleLanded {
-		return false, nil
+	switch settled.Kind {
+	case settleMerged:
+		return settleMerged, s.recordMerged(ctx, r, st, pr.Number, head, settled, mainNote)
+	case settleLanded:
+		return settleLanded, s.recordLanded(ctx, r, st, pr.Number, head, settled.Commit, mainNote)
 	}
-	return true, s.recordSettled(ctx, r, st, pr.Number, head, settled)
+	return settleNone, nil
+}
+
+// recordLanded records a landed revert: the durable landing record first, then
+// the keyed row and the one notice.
+func (s *watchStream) recordLanded(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head, commit, mainNote string) error {
+	if e := s.writeLanded(r.Name, revertPR, commit); e != nil {
+		return e
+	}
+	return s.recordMerged(ctx, r, st, revertPR, head, settlement{Kind: settleLanded, Commit: commit}, mainNote)
 }
 
 // settleLatchRevert runs settlePendingRevert for the revert PR the latch
@@ -1086,32 +1135,70 @@ func (s *watchStream) settleLatchRevert(ctx context.Context, r config.Repo, head
 	if e != nil || pr == nil {
 		return false, e
 	}
-	st, _, e := s.loadRecovery(r.Name)
+	st, found, e := s.loadRecovery(r.Name)
 	if e != nil {
 		return false, e
 	}
 	if st.Culprit == "" {
 		st.Culprit, st.CulpritPR = culpritFromRevertBody(pr.Body)
 	}
-	return s.settlePendingRevert(ctx, r, *pr, st, head)
+	greenNote := "main green at " + short7(head)
+	landed, e := s.readLanded(r.Name, pr.Number)
+	if e != nil {
+		return false, e
+	}
+	if landed != nil {
+		if e = s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleLanded, Commit: landed.Commit}, greenNote); e != nil {
+			return true, e
+		}
+		if pr.State != "open" {
+			// A person closed the landed revert as the notice asked: the latch
+			// ends here, without a fix-won record for a revert that landed.
+			return true, latch.ClearRecovery(ctx, r.Name)
+		}
+		return true, nil
+	}
+	kind, e := s.settlePendingRevert(ctx, r, *pr, st, head, greenNote)
+	if e != nil {
+		return false, e
+	}
+	if kind != settleNone {
+		return true, nil
+	}
+	// A merged revert whose record failed on an earlier pass is recorded now.
+	// Its keyed row and notice make this a no-op once they are written.
+	if pr.MergedAt != nil && found && st.RevertPR == pr.Number {
+		return true, s.recordMerged(ctx, r, st, pr.Number, head, settlement{Kind: settleMerged}, greenNote)
+	}
+	return false, nil
 }
 
-// recordSettled audits a settled revert merge on main and sends its one notice.
-// A merged revert is announced as merged; a landed one is announced as left
-// open for a person to close.
-func (s *watchStream) recordSettled(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head string, settled settlement) error {
-	if e := s.audit(r.Name, "recovery-merged", revertMergedRow(st, revertPR, head), false); e != nil {
+// recordMerged records a revert whose content is on main, once per revert PR.
+// The row and the notice have their own keys: a notice that failed to send is
+// retried on a later pass without writing the row a second time.
+func (s *watchStream) recordMerged(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, head string, settled settlement, mainNote string) error {
+	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
+	if e != nil {
 		return e
 	}
+	rowKey := "recovery-merged-row:" + strconv.Itoa(revertPR)
+	if !sent.has(rowKey) {
+		if e = s.audit(r.Name, "recovery-merged", revertMergedRow(st, revertPR, head), false); e != nil {
+			return e
+		}
+		if e = sent.add(rowKey); e != nil {
+			return e
+		}
+	}
 	if settled.Kind == settleLanded {
-		return s.announceLanded(ctx, r, st, revertPR, settled.Commit)
+		return s.announceLanded(ctx, r, st, revertPR, settled.Commit, mainNote)
 	}
 	return s.announceRevert(ctx, r, st, revertPR)
 }
 
 // announceLanded sends the one design-lane line for a revert whose content is
-// on main while GitHub left its PR open.
-func (s *watchStream) announceLanded(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, commit string) error {
+// on main while GitHub left its PR open. mainNote says where main stands.
+func (s *watchStream) announceLanded(ctx context.Context, r config.Repo, st recoveryIncident, revertPR int, commit, mainNote string) error {
 	sent, e := loadSentKeys(filepath.Join(s.state(r.Name), "watch-reported"), 127)
 	if e != nil {
 		return e
@@ -1124,8 +1211,8 @@ func (s *watchStream) announceLanded(ctx context.Context, r config.Repo, st reco
 	if s.deploy {
 		stage = "deploy"
 	}
-	text := fmt.Sprintf("%s %s revert PR #%d content already on %s as %s; GitHub left the PR open, so a person closes it",
-		r.Name, stage, revertPR, r.Branch, short7(commit))
+	text := fmt.Sprintf("%s %s revert PR #%d content already on %s as %s while %s; GitHub left the PR open, so a person closes it",
+		r.Name, stage, revertPR, r.Branch, short7(commit), mainNote)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
 	if e = s.Notifier.Notify(reportCtx, integrations.Event{
