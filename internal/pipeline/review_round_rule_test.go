@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,15 @@ type roundRuleRunner struct {
 	escalateRC     int
 	escalateErr    error
 	escalateOutput string
+}
+
+type stopAtLadderIntactWriter struct{}
+
+func (stopAtLadderIntactWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "ladder-intact") {
+		panic("simulated stop after ladder state save")
+	}
+	return len(p), nil
 }
 
 func (r *roundRuleRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -1249,6 +1259,51 @@ func TestRoundRule_LadderRc2Refusals(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestRoundRule_LadderRefusalOwedBeforeAudit(t *testing.T) {
+	s, n, run, r := func() (*Service, *ackNotifier, *roundRuleRunner, config.Repo) {
+		s, g, n, _, run, r := roundRuleSetup(t, 5)
+		g.feedback.Threads = []github.ReviewThread{ownFinding("T1", "high", 10)}
+		run.escalateRC = 2
+		run.escalateOutput = "panewire: job_not_live: task is no longer live notified=none"
+		return s, n, run, r
+	}()
+	s.Out = stopAtLadderIntactWriter{}
+	stopped := false
+	for i := 0; i < 4 && !stopped; i++ {
+		func() {
+			defer func() { stopped = recover() != nil }()
+			deliver(t, s, r)
+		}()
+	}
+	if !stopped {
+		t.Fatal("expected simulated stop at ladder-intact audit")
+	}
+
+	// Reload from the persisted file as a process restart would.
+	st := s.loadRoundRuleState(r.Name, 7)
+	if !st.escalated() || !st.ladderRefusalOwed() {
+		t.Fatalf("first save must contain settled state and owed refusal: %+v", st)
+	}
+	restarted := *s
+	restarted.Out = io.Discard
+	deliver(t, &restarted, r)
+	count := 0
+	for _, event := range n.events {
+		if event.ID == "mergewake-ladder-refusal-example/project-7-5" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("reloaded refusal notices = %d, want 1: %+v", count, n.events)
+	}
+	if st := restarted.loadRoundRuleState(r.Name, 7); !st.LadderRefusalEventSent {
+		t.Fatalf("reloaded refusal was not marked sent: %+v", st)
+	}
+	if calls, _, _ := escalateSnapshot(run); calls != 1 {
+		t.Fatalf("reloaded refusal retried escalation %d times, want 1", calls)
+	}
 }
 
 // A pending (rc 124) call keeps retrying and an ended ladder keeps retrying
