@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mgh3326/mergewake/internal/pipeline"
 )
 
 func TestHelpAndFlagValidation(t *testing.T) {
@@ -26,6 +30,20 @@ func TestHelpAndFlagValidation(t *testing.T) {
 		if e := run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); e == nil {
 			t.Fatal(args)
 		}
+	}
+}
+
+func TestLandCommandWaitsSuccessfullyOnWatch(t *testing.T) {
+	var waiting *pipeline.WaitingOnWatchError
+	if err := landCommandResult(fmt.Errorf("land: %w", waiting)); err != nil {
+		t.Fatalf("watch wait returned %v, want success", err)
+	}
+}
+
+func TestLandCommandKeepsRealErrorsFailing(t *testing.T) {
+	want := errors.New("GitHub request failed")
+	if err := landCommandResult(want); !errors.Is(err, want) {
+		t.Fatalf("real Land error returned %v, want %v", err, want)
 	}
 }
 func TestArchiveJobsGates(t *testing.T) {

@@ -252,7 +252,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	case "daemon":
 		return runDaemon(ctx, &s, gh, *repo, o, stderr)
 	case "land":
-		return s.Land(ctx, r, *pr, o)
+		return landCommandResult(s.Land(ctx, r, *pr, o))
 	case "review":
 		return s.Review(ctx, r, *pr, *family, o)
 	case "watch":
@@ -272,6 +272,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		return runReapBalance(ctx, &s, c, *repo, *balanceDay)
 	}
 	return nil
+}
+
+func landCommandResult(err error) error {
+	var waiting *pipeline.WaitingOnWatchError
+	if errors.As(err, &waiting) {
+		return nil
+	}
+	return err
 }
 
 // runReapBalance prints one UTC day's reviewer-checkout balance across --repo
