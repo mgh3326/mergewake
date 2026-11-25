@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -154,6 +155,88 @@ func (s *Service) endMergeAttempt(r config.Repo, n int, state, commit string, dr
 		return nil
 	}
 	return s.clearMergeAttempt(r.Name, n)
+}
+
+// SettleOrphanedMergeAttempts settles pending merge attempts for PRs absent
+// from the open list (a merged PR is closed, so the pr sweep never enqueues
+// it). A shadow pass stays read-only and does nothing. On merged it runs
+// finishMerge exactly once: the attempt is cleared as today, posting one
+// merge task event, one merge hook call, one MERGED notice and the outcome
+// nudge. On closed-unmerged or not-merged the attempt is dropped as
+// settleMerge does. A landed attempt is held as Land holds it.
+func (s *Service) SettleOrphanedMergeAttempts(ctx context.Context, r config.Repo, open map[int]bool, o Options) error {
+	if !o.Acting() {
+		return nil
+	}
+	ents, e := os.ReadDir(s.state(r.Name))
+	if errors.Is(e, fs.ErrNotExist) {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	var nums []int
+	for _, ent := range ents {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !strings.HasPrefix(name, "pr-") || !strings.HasSuffix(name, "-merge-attempt.json") {
+			continue
+		}
+		mid := strings.TrimSuffix(strings.TrimPrefix(name, "pr-"), "-merge-attempt.json")
+		n, err := strconv.Atoi(mid)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if open != nil && open[n] {
+			continue
+		}
+		nums = append(nums, n)
+	}
+	if len(nums) == 0 {
+		return nil
+	}
+	sort.Ints(nums)
+	fresh := github.FreshEvidence(ctx)
+	var errs []error
+	for _, n := range nums {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		pr, err := s.GH.Pull(fresh, r.Name, n)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("PR %d: %w", n, err))
+			continue
+		}
+		if open != nil && open[pr.Number] {
+			continue
+		}
+		st, err := s.settleLocked(fresh, r, pr, false)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("PR %d settle: %w", n, err))
+			continue
+		}
+		switch st.Kind {
+		case settleMerged:
+			if err := s.finishMerge(fresh, r, pr, o); err != nil {
+				errs = append(errs, fmt.Errorf("PR %d finish merge: %w", n, err))
+			}
+		case settleLanded:
+			if err := s.holdSettledMerge(fresh, r, pr, st, o.DryRun); err != nil {
+				var held *MergeHeldError
+				if errors.As(err, &held) {
+					if pe := s.Print(map[string]any{"action": "land-held", "repo": r.Name, "pr": n, "reason": held.Reason}); pe != nil {
+						errs = append(errs, fmt.Errorf("PR %d land held: %w", n, pe))
+					}
+					continue
+				}
+				errs = append(errs, fmt.Errorf("PR %d land held: %w", n, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // MergeHeldError is the deliberate refusal of a merge whose content already
