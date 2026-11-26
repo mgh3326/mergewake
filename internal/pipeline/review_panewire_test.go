@@ -108,8 +108,10 @@ type panewireRunner struct {
 	sink       *taskJobSink
 	// hk serves a spawn whose brief is "-p hk:doc/<key>"; jobs is
 	// review.panewire.jobs, where such a spawn's same-host pane writes.
-	hk   *hktest.Server
-	jobs string
+	hk            *hktest.Server
+	jobs          string
+	versionOutput string
+	versionErr    error
 }
 
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -119,6 +121,15 @@ func (r *panewireRunner) Run(ctx context.Context, command string, args []string,
 }
 
 func (r *panewireRunner) run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if (command == "panewire" || strings.HasPrefix(command, "panewire-test-")) && slices.Equal(args, []string{"version", "--json"}) {
+		if r.versionErr != nil {
+			return nil, r.versionErr
+		}
+		if r.versionOutput != "" {
+			return []byte(r.versionOutput), nil
+		}
+		return []byte(`{"capabilities":["owner_notify_v1"]}`), nil
+	}
 	if len(args) > 0 && (args[0] == "--recommend" || args[0] == "gate" || args[0] == "observe") {
 		r.quotaActions = append(r.quotaActions, slices.Clone(args))
 	}
@@ -188,7 +199,7 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 			return nil, r.usageErr
 		}
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
-	case "panewire":
+	case "panewire", "panewire-test-supported", "panewire-test-unsupported", "panewire-test-probe-failure":
 		r.spawns = append(r.spawns, args)
 		if r.sparseRefused && slices.Contains(args, "--checkout-exclude") {
 			// panewire's pre-submit sparse feature check: no request, job or pane.
@@ -497,6 +508,34 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	diff, _ := g.Diff(context.Background(), "", 0)
 	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", SameFamily: false, AuthorFamily: "anthropic", Executor: "panewire", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestReviewerOwnerNotifyCapabilityIsOptional(t *testing.T) {
+	for _, tc := range []struct {
+		name, output string
+		probeErr     error
+		want         bool
+	}{
+		{name: "supported", output: `{"capabilities":["owner_notify_v1"]}`, want: true},
+		{name: "unsupported", output: `{"capabilities":[]}`},
+		{name: "probe failure", probeErr: errors.New("version unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &panewireRunner{family: "openai", findings: `{"findings":[]}`, versionOutput: tc.output, versionErr: tc.probeErr}
+			s, _, repo := panewireSetup(t, runner)
+			s.Config.Review.Panewire.Command = "panewire-test-" + strings.ReplaceAll(tc.name, " ", "-")
+			if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.spawns) != 1 {
+				t.Fatalf("spawn count = %d", len(runner.spawns))
+			}
+			got := slices.Contains(runner.spawns[0], "--owner-notify")
+			if got != tc.want {
+				t.Fatalf("spawn args %v, owner-notify present=%v, want %v", runner.spawns[0], got, tc.want)
+			}
+		})
 	}
 }
 

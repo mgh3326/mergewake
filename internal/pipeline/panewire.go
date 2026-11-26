@@ -209,6 +209,28 @@ func (c *panewireSpawnCompatibility) launch(ctx context.Context, runner integrat
 
 var panewireSpawnCompat panewireSpawnCompatibility
 
+type panewireVersion struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+var ownerNotifyCapabilities = struct {
+	sync.Mutex
+	values map[string]bool
+}{values: make(map[string]bool)}
+
+func supportsOwnerNotify(ctx context.Context, runner integrations.Runner, command string) bool {
+	ownerNotifyCapabilities.Lock()
+	defer ownerNotifyCapabilities.Unlock()
+	if cached, ok := ownerNotifyCapabilities.values[command]; ok {
+		return cached
+	}
+	out, err := runner.Run(ctx, command, []string{"version", "--json"}, "", "")
+	var version panewireVersion
+	supported := err == nil && json.Unmarshal(out, &version) == nil && slices.Contains(version.Capabilities, "owner_notify_v1")
+	ownerNotifyCapabilities.values[command] = supported
+	return supported
+}
+
 func oldPanewireSpawnArgs(args []string) []string {
 	out := slices.Clone(args)
 	for i := 0; i < len(out); i++ {
@@ -902,6 +924,9 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 			args = append(args, "--builder-family", panewireAuthorFamily(builderFamily), "--report", reportPath, "--host", cfg.Host, "--wait", "--wait-timeout", strconv.Itoa(int(wait.Seconds())), "--expires", reviewerExpires(expires))
 			if cfg.Owner != "" {
 				args = append(args, "--owner", cfg.Owner)
+			}
+			if supportsOwnerNotify(ctx, s.Runner, cfg.Command) {
+				args = append(args, "--owner-notify", "final")
 			}
 			if cfg.Host != "auto" {
 				args = append(args, "--override-reason", "mergewake review: configured review.panewire.host")
