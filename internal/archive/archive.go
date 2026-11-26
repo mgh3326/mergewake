@@ -779,9 +779,9 @@ func (a *Archiver) Drop(ctx context.Context, h reap.Host, dir string, files []Fi
 rm -rf "$1" || {
 	# chmod never follows symlinks; find does not descend through symlinks.
 	# Restore owner write/search only within the checked job tree, then retry.
-	chmod u+rwx "$1"
-	find "$1" -type d -exec chmod u+rwx {} +
-	find "$1" ! -type l -type f -exec chmod u+rw {} +
+	chmod u+rwx "$1" &&
+	find "$1" -type d -exec chmod u+rwx {} \; &&
+	find "$1" ! -type l -type f -exec chmod u+rw {} + &&
 	rm -rf "$1"
 }
 `, "sh", dir)
@@ -1687,8 +1687,7 @@ rm -rf "$1" || {
 	# Restore owner write/search only within the checked job tree, then retry.
 	chmod u+rwx "$1" &&
 	find "$1" -type d -exec chmod u+rwx {} \; &&
-	find "$1" ! -type l -type f -exec chmod u+rw {} +
-	&&
+	find "$1" ! -type l -type f -exec chmod u+rw {} + &&
 	rm -rf "$1"
 }
 `, "sh", p.Dir); err != nil {
