@@ -1384,10 +1384,6 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		workerCtx, cancelWorker := reapStageShare(ctx, 2, 3)
 		errs = append(errs, s.reapWorkerWorktrees(workerCtx, r, hosts, records, acting, !o.DryRun, note)...)
 		cancelWorker()
-		if e := reapBudgetCheck(ctx, "orphan worktrees"); e != nil {
-			return errors.Join(append(errs, e)...)
-		}
-		errs = append(errs, s.reapOrphanWorktrees(ctx, r, hosts, acting && s.Config.Reap.OrphanWorktrees.Act, note)...)
 	}
 	if e := reapBudgetCheck(ctx, "reviewer sweep, balance, orphan scan and archive"); e != nil {
 		return errors.Join(append(errs, e)...)
@@ -1416,6 +1412,14 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			return errors.Join(append(errs, e)...)
 		}
 		errs = append(errs, s.reapArchive(ctx, r, prNum, receipts, byName, records, acting, note, func(v reapReceipt) { delete(h.lastRow, reapRowKey(v)) })...)
+	}
+	if prNum == 0 && s.Config.Reap.OrphanWorktrees.Enabled {
+		if e := reapBudgetCheck(ctx, "orphan worktrees"); e != nil {
+			return errors.Join(append(errs, e)...)
+		}
+		orphanCtx, cancelOrphan := reapStageShare(ctx, 1, 4)
+		errs = append(errs, s.reapOrphanWorktrees(orphanCtx, r, hosts, acting && s.Config.Reap.OrphanWorktrees.Act, !o.DryRun, note)...)
+		cancelOrphan()
 	}
 	if e := reapBudgetCheck(ctx, "final receipt and pass audit"); e != nil {
 		return errors.Join(append(errs, e)...)

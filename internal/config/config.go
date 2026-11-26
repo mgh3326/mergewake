@@ -503,6 +503,7 @@ type Reap struct {
 // under hosts[].work_root. Act defaults false; MinAge and PerHost have safe
 // defaults when omitted.
 type OrphanWorktrees struct {
+	Enabled bool   `yaml:"enabled"`
 	Act     bool   `yaml:"act"`
 	MinAge  string `yaml:"min_age"`
 	PerHost int    `yaml:"per_host"`
@@ -1157,6 +1158,9 @@ func validateReap(c *Config) error {
 	var e error
 	if c.Reap.Act && !c.Reap.Enabled {
 		return errors.New("reap.act requires reap.enabled")
+	}
+	if c.Reap.OrphanWorktrees.Act && !c.Reap.OrphanWorktrees.Enabled {
+		return errors.New("reap.orphan_worktrees.act requires reap.orphan_worktrees.enabled")
 	}
 	if c.Reap.OrphanWorktrees.Act && !c.Reap.Enabled {
 		return errors.New("reap.orphan_worktrees.act requires reap.enabled")
