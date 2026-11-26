@@ -117,6 +117,17 @@ func reviewerStream(v reapReceipt) string {
 	return v.Host + "\x00" + v.Worktree
 }
 
+// hasWorktreeStream reports whether a label's streams include one that names a
+// worktree, as opposed to the pane stream alone.
+func hasWorktreeStream(streams map[string]reapReceipt) bool {
+	for key := range streams {
+		if key != "pane" {
+			return true
+		}
+	}
+	return false
+}
+
 // reviewerCheckoutSuffix ends the directory a hub node prepares for a
 // spec-placed reviewer (panewire names it <job>-checkout). A local reviewer
 // checkout is named for the label alone.
@@ -659,6 +670,12 @@ func (w *reviewerSweep) finishedLabel(label string, lastCleanup map[string]reapR
 			return false
 		}
 	}
+	// A closure recorded on the pane stream alone has not reached the remote
+	// worktree yet, so a restart between the two leaves it stranded: the label
+	// stays eligible until one of its worktree streams records an outcome.
+	if len(streams) > 0 && !hasWorktreeStream(streams) && w.labelHost[label] != "" && !w.hostIsLocal(w.labelHost[label]) {
+		return false
+	}
 	// A refused removal that still waits keeps the local checkout too
 	// (L2): the label is not visited until the hub is due to be asked.
 	if waiting {
@@ -1059,8 +1076,15 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		// guards below keep it until panewire's node closes the pane.
 		cwd = c.pane.Cwd
 	}
-	if stuckEnded && !w.abandoned[l.name] && !w.abandonStuck(ctx, gate, job, l, hs) {
-		return
+	if stuckEnded && !w.abandoned[l.name] {
+		switch {
+		case aged && w.acting && w.notClosableBackoff(l.name) && w.closeRetryBlocked(l.name, reapPass(ctx)):
+			// A close still backing off does not hold a label past the checkout
+			// TTL: its terminal evidence is read once more, then cleanup goes on.
+			w.settleBackedOff(ctx, gate, l, hs)
+		case !w.abandonStuck(ctx, gate, job, l, hs):
+			return
+		}
 	}
 	if hs != nil {
 		// L1: an unknown remote path is recorded as pending-cleanup and does not
@@ -1140,7 +1164,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		return keep()
 	}
 	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
-		return false
+		return w.settleBackedOff(ctx, gate, l, hs)
 	}
 	if job.OwnerLane == "" {
 		w.record(gate, "error", "abandon job: owner lane unavailable")
@@ -1274,6 +1298,36 @@ func (w *reviewerSweep) notClosable(ctx context.Context, gate reapReceipt, l rev
 	return false
 }
 
+// settleBackedOff runs while a job's close backs off after a refusal. The close
+// itself is not repeated, but the job's terminal evidence is read again on every
+// pass: a node or hub that now reports an end settles the label as closed, as
+// notClosable does. It reports whether the label was settled.
+func (w *reviewerSweep) settleBackedOff(ctx context.Context, gate reapReceipt, l reviewerLabel, hs *reapHost) bool {
+	if !w.notClosableBackoff(l.name) {
+		return false
+	}
+	kind := w.terminalEvent(ctx, hs, l.name)
+	if kind == "" {
+		return false
+	}
+	w.s.reapRetrySucceeded(w.r.Name, l.name)
+	w.abandoned[l.name] = true
+	w.record(gate, "closed", "already closed (terminal event "+kind+")")
+	return true
+}
+
+// notClosableBackoff reports whether a label's close backs off after a
+// job_unknown refusal: its kept row names that refusal. Other refusals keep
+// their own retry and are never settled by the node's terminal evidence.
+func (w *reviewerSweep) notClosableBackoff(label string) bool {
+	for _, row := range w.streams[label] {
+		if row.Result == "kept" && row.Reason == reviewerNotClosable {
+			return true
+		}
+	}
+	return false
+}
+
 // terminalEvent names the terminal event in a job's node dir, "" when none can
 // be read. A host the daemon reaches directly is read in its job dir, which
 // holds every terminal kind. A hub host's job dir belongs to its node, which the
@@ -1285,7 +1339,13 @@ func (w *reviewerSweep) terminalEvent(ctx context.Context, hs *reapHost, label s
 	case hs == nil:
 		return ""
 	case !hs.viaHub:
-		kind, e := hs.exec.TerminalEvent(ctx, label)
+		// A local host with no jobs path (the documented default) keeps its
+		// reviewer ledgers under the reviewer jobs root, as the close does.
+		ex := hs.exec
+		if ex.Host.Jobs == "" && ex.Host.Local() {
+			ex.Host.Jobs = config.Expand(w.s.Config.Review.Panewire.Jobs)
+		}
+		kind, e := ex.TerminalEvent(ctx, label)
 		if e != nil {
 			return ""
 		}
@@ -1529,7 +1589,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		return true
 	}
 	if w.closeRetryBlocked(l.name, reapPass(ctx)) {
-		return false
+		return w.settleBackedOff(ctx, gate, l, hs)
 	}
 	if job.OwnerLane == "" {
 		w.record(gate, "error", "abandon job: owner lane unavailable")

@@ -500,21 +500,35 @@ func (e Exec) TerminalEvent(ctx context.Context, job string) (string, error) {
 	return newestTerminalEvent(string(b)), nil
 }
 
-// newestTerminalEvent picks the kind of the newest terminal event in an events
-// directory listing: one NNNNN-<kind>.json name per line, the sequence padded to
-// five digits, so the names order by sequence as strings.
+// jobRevivalEvents are the lifecycle events that start an attempt again: panewire
+// clears a job's end on each of them, so a terminal event before one does not
+// end the attempt that follows.
+var jobRevivalEvents = map[string]bool{
+	"job.claim": true, "job.claimed": true, "job.reclaim": true, "job.placement": true,
+	"job.spawned": true, "job.joined": true, "job.reprompted": true,
+}
+
+// newestTerminalEvent evaluates an events directory listing through its latest
+// lifecycle transition and returns the kind of that transition when it is
+// terminal, "" otherwise. The listing is one NNNNN-<kind>.json name per line,
+// the sequence padded to five digits, so the names order by sequence as strings.
+// A revival after a terminal event leaves the job open until its own terminal
+// event lands.
 func newestTerminalEvent(listing string) string {
-	var best, kind string
+	var last, kind string
 	for _, name := range strings.Fields(listing) {
 		seq, rest, ok := strings.Cut(name, "-")
 		if !ok || len(seq) != 5 || strings.Trim(seq, "0123456789") != "" {
 			continue
 		}
 		k, ok := strings.CutSuffix(rest, ".json")
-		if !ok || !terminalJobEvents[k] || seq <= best {
+		if !ok || !(terminalJobEvents[k] || jobRevivalEvents[k]) || seq <= last {
 			continue
 		}
-		best, kind = seq, k
+		last, kind = seq, k
+	}
+	if !terminalJobEvents[kind] {
+		return ""
 	}
 	return kind
 }

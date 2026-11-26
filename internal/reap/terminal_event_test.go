@@ -27,12 +27,15 @@ func TestNewestTerminalEvent(t *testing.T) {
 		listing string
 		want    string
 	}{
-		"no events":           {"", ""},
-		"no terminal event":   {"00001-job.spawned.json\n00002-job.claim.json\n", ""},
-		"one terminal":        {"00001-job.spawned.json\n00002-job.revoked.json\n", "job.revoked"},
-		"newest terminal":     {"00003-job.lost.json\n00001-job.completed.json\n00002-job.reaped.json\n", "job.lost"},
-		"names not ledger":    {"job.completed.json\n0002-job.completed.json\n00004-job.completed.txt\n", ""},
-		"sequence not digits": {"0000a-job.completed.json\n", ""},
+		"no events":                {"", ""},
+		"no terminal event":        {"00001-job.spawned.json\n00002-job.claim.json\n", ""},
+		"one terminal":             {"00001-job.spawned.json\n00002-job.revoked.json\n", "job.revoked"},
+		"newest terminal":          {"00003-job.lost.json\n00001-job.completed.json\n00002-job.reaped.json\n", "job.lost"},
+		"revived after completion": {"00001-job.completed.json\n00002-job.reclaim.json\n", ""},
+		"reprompted after reaped":  {"00001-job.reaped.json\n00002-job.reprompted.json\n", ""},
+		"revived then ended again": {"00001-job.revoked.json\n00002-job.spawned.json\n00003-job.completed.json\n", "job.completed"},
+		"names not ledger":         {"job.completed.json\n0002-job.completed.json\n00004-job.completed.txt\n", ""},
+		"sequence not digits":      {"0000a-job.completed.json\n", ""},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
