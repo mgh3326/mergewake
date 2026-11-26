@@ -23,7 +23,7 @@ func TestRepositoryReapPolicy(t *testing.T) {
 		{"reap package", "internal/reap/exec.go", "blocking", reapReason},
 		{"pipeline reap", "internal/pipeline/reap_job.go", "blocking", reapReason},
 		{"unrelated pipeline", "internal/pipeline/notify.go", "routine", ""},
-		{"existing rollout", "internal/rollout/x.go", "blocking", "Installation writes may damage files before a revert lands"},
+		{"removed rollout path", "internal/rollout/x.go", "routine", ""},
 		{"pipeline watch", "internal/pipeline/watch_stream.go", "blocking", "Watch opens revert PRs and holds recovery; a wrong or missed revert leaves main red until a person steps in"},
 		{"watch test only", "internal/pipeline/watch_deploy_test.go", "blocking", ""},
 	} {
