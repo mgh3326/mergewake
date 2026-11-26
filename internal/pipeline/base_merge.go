@@ -58,31 +58,35 @@ func (s *Service) baseMergeShape(ctx context.Context, repo string, pr github.Pul
 // parent, at most depth merges deep. Each inherited merge on the way must be a
 // clean merge, so its tree is its first parent's tree plus base text only and no
 // unreviewed text hides behind the chain.
-func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed, depth int) (string, bool) {
+func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed, depth int) (string, bool, error) {
 	if needed == 0 {
 		var complete bool
-		needed, complete = s.historicalPassCount(ctx, r, pr, history, head)
+		var err error
+		needed, complete, err = s.historicalPassCount(ctx, r, pr, history, head)
+		if err != nil {
+			return "", false, err
+		}
 		if complete {
-			return head, true
+			return head, true, nil
 		}
 		if depth <= 0 {
-			return "", false
+			return "", false, nil
 		}
 		m, ok := s.baseMergeShape(ctx, r.Name, pr, head)
 		if !ok || !s.cleanMerge(ctx, r, head, m.First, m.Second) {
-			return "", false
+			return "", false, nil
 		}
 		return s.reviewedAncestor(ctx, r, pr, history, m.First, 0, depth-1)
 	}
 	if _, complete := distinctPasses(passesFor(history, head), needed); complete {
-		return head, true
+		return head, true, nil
 	}
 	if depth <= 0 {
-		return "", false
+		return "", false, nil
 	}
 	m, ok := s.baseMergeShape(ctx, r.Name, pr, head)
 	if !ok || !s.cleanMerge(ctx, r, head, m.First, m.Second) {
-		return "", false
+		return "", false, nil
 	}
 	return s.reviewedAncestor(ctx, r, pr, history, m.First, needed, depth-1)
 }
@@ -90,52 +94,59 @@ func (s *Service) reviewedAncestor(ctx context.Context, r config.Repo, pr github
 // historicalPassCount returns the completed pass count recorded for head.
 // The done marker establishes that the review ended; receipts establish which
 // pass numbers actually completed. Current policy is deliberately not read.
-func (s *Service) historicalPassCount(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string) (int, bool) {
+func (s *Service) historicalPassCount(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string) (int, bool, error) {
 	receipts := passesFor(history, head)
 	needed := maxPassNumber(receipts)
 	if needed == 0 {
-		return 0, false
+		return 0, false, nil
 	}
 	done, err := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, head+"-done")
 	if err != nil || !done {
-		return 0, false
+		return 0, false, err
 	}
 	_, complete := distinctPasses(receipts, needed)
-	return needed, complete
+	return needed, complete, nil
 }
 
 // baseMergeOf reports whether head is a base merge of a reviewed head: a merge
 // commit whose second parent is an ancestor of the PR's base and whose first
 // parent has a review in history, directly or through inherited base merges (see
 // reviewedAncestor). A head whose commit cannot be read is not a base merge.
-func (s *Service) baseMergeOf(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed int) (baseMerge, bool) {
+func (s *Service) baseMergeOf(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, head string, needed int) (baseMerge, bool, error) {
 	m, ok := s.baseMergeShape(ctx, r.Name, pr, head)
 	if !ok {
-		return baseMerge{}, false
+		return baseMerge{}, false, nil
 	}
-	reviewed, ok := s.reviewedAncestor(ctx, r, pr, history, m.First, needed, maxBaseMergeChain)
+	reviewed, ok, err := s.reviewedAncestor(ctx, r, pr, history, m.First, needed, maxBaseMergeChain)
+	if err != nil {
+		return baseMerge{}, false, err
+	}
 	if !ok {
-		return baseMerge{}, false
+		return baseMerge{}, false, nil
 	}
 	m.Reviewed = reviewed
-	return m, true
+	return m, true, nil
 }
 
 // baseMerges maps each reviewed head in history that is a base merge to its
 // parents. A base merge needs its first parent reviewed too, so a history with
 // fewer than two reviewed heads has none and reads no commit at all.
-func (s *Service) baseMerges(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) map[string]baseMerge {
+func (s *Service) baseMerges(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) (map[string]baseMerge, error) {
 	out := map[string]baseMerge{}
 	heads := reviewedHeads(history)
 	if len(heads) < 2 {
-		return out
+		return out, nil
 	}
 	for _, head := range heads {
-		if m, ok := s.baseMergeOf(ctx, r, pr, history, head, 0); ok {
+		m, ok, err := s.baseMergeOf(ctx, r, pr, history, head, 0)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			out[head] = m
 		}
 	}
-	return out
+	return out, nil
 }
 
 // reviewedHeads lists the distinct heads in history, in history order.
@@ -157,21 +168,26 @@ func reviewedHeads(history []github.ReviewedPass) []string {
 // review is complete for the policy's needed passes, which is read only when a
 // base merge exists, and an unsettled or unreadable policy counts every head as
 // before.
-func (s *Service) countedHistory(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) []github.ReviewedPass {
-	merges := s.baseMerges(ctx, r, pr, history)
+func (s *Service) countedHistory(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass) ([]github.ReviewedPass, error) {
+	merges, err := s.baseMerges(ctx, r, pr, history)
+	if err != nil {
+		return nil, err
+	}
 	if len(merges) == 0 {
-		return history
+		return history, nil
 	}
 	skip := map[string]bool{}
 	for head, m := range merges {
 		// The receipts are the durable evidence of how many passes the first
 		// parent actually completed. Current policy can change after that review.
-		if _, complete := s.historicalPassCount(ctx, r, pr, history, m.Reviewed); complete {
+		if _, complete, err := s.historicalPassCount(ctx, r, pr, history, m.Reviewed); err != nil {
+			return nil, err
+		} else if complete {
 			skip[head] = true
 		}
 	}
 	if len(skip) == 0 {
-		return history
+		return history, nil
 	}
 	out := make([]github.ReviewedPass, 0, len(history))
 	for _, p := range history {
@@ -179,7 +195,7 @@ func (s *Service) countedHistory(ctx context.Context, r config.Repo, pr github.P
 			out = append(out, p)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func maxPassNumber(receipts []github.PassReceipt) int {
@@ -197,23 +213,26 @@ func maxPassNumber(receipts []github.PassReceipt) int {
 // one git makes of its two parents with no conflict. It returns the inherited
 // head and its receipts, which the caller records as an inherited review. A head
 // whose cleanness cannot be read is not inherited and is reviewed as before.
-func (s *Service) cleanBaseMergePasses(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, needed int) (string, []github.PassReceipt, bool) {
+func (s *Service) cleanBaseMergePasses(ctx context.Context, r config.Repo, pr github.Pull, history []github.ReviewedPass, needed int) (string, []github.PassReceipt, bool, error) {
 	if len(history) == 0 {
 		// Nothing is reviewed yet, so no first parent can carry a review.
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	m, ok := s.baseMergeOf(ctx, r, pr, history, pr.Head.SHA, needed)
+	m, ok, err := s.baseMergeOf(ctx, r, pr, history, pr.Head.SHA, needed)
+	if err != nil {
+		return "", nil, false, err
+	}
 	if !ok {
-		return "", nil, false
+		return "", nil, false, nil
 	}
 	receipts := passesFor(history, m.Reviewed)
 	if _, complete := distinctPasses(receipts, needed); !complete {
-		return "", nil, false
+		return "", nil, false, nil
 	}
 	if !s.cleanMerge(ctx, r, pr.Head.SHA, m.First, m.Second) {
-		return "", nil, false
+		return "", nil, false, nil
 	}
-	return m.Reviewed, receipts, true
+	return m.Reviewed, receipts, true, nil
 }
 
 // onBase reports whether sha is an ancestor of base, the PR's base commit. A

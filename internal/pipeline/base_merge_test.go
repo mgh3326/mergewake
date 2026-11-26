@@ -131,7 +131,10 @@ func TestCountedHistoryUsesFirstParentsRecordedPasses(t *testing.T) {
 		{Head: shaB, PassReceipt: g.passes[shaB][0]},
 		{Head: merge, PassReceipt: g.passes[merge][0]},
 	}
-	got := s.countedHistory(context.Background(), r, g.pull, history)
+	got, err := s.countedHistory(context.Background(), r, g.pull, history)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("countedHistory retained base merge under changed two-pass policy: got %d records, want 2", len(got))
 	}

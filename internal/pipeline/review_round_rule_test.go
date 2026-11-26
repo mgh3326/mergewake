@@ -79,6 +79,14 @@ type roundRuleGH struct {
 	*fakeGH
 	commentsMu    sync.Mutex
 	issueComments []github.IssueComment
+	doneErr       map[string]error
+}
+
+func (g *roundRuleGH) ReviewClaimed(ctx context.Context, repo string, n int, marker string) (bool, error) {
+	if err := g.doneErr[marker]; err != nil {
+		return false, err
+	}
+	return g.fakeGH.ReviewClaimed(ctx, repo, n, marker)
 }
 
 type failedAncestorRoundGH struct {
@@ -337,6 +345,86 @@ func TestRoundRule_d_BaseOnlyMergeHeadNoRound(t *testing.T) {
 
 // (e) round 7 (hold) without a pass holds the PR and sends exactly one decision event
 // to the task lane (desk when the task lane is the desk or unknown); a later pass does not send another.
+func TestRoundCountMarkerReadErrorDoesNotPersistHold(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantError bool
+		wantQuiet bool
+	}{
+		{name: "read succeeds"},
+		{name: "read error", err: errors.New("temporary GitHub failure"), wantError: true},
+		{name: "poll skipped", err: github.ErrPollSkipped, wantQuiet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, _, _, _, r := roundRuleSetup(t, 7)
+			a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+			head := strings.Repeat("7", 40)
+			g.passes = map[string][]github.PassReceipt{
+				a: {{Pass: 1, Round: 1}},
+				b: {{Pass: 1, Round: 2}},
+				"3333333333333333333333333333333333333333": {{Pass: 1, Round: 3}},
+				"4444444444444444444444444444444444444444": {{Pass: 1, Round: 4}},
+				"5555555555555555555555555555555555555555": {{Pass: 1, Round: 5}},
+				"6666666666666666666666666666666666666666": {{Pass: 1, Round: 6}},
+				head: {{Pass: 1, Round: 7}},
+			}
+			g.pull.Head.SHA = head
+			g.refs[doneRef(7, head)] = true
+			g.parents2 = map[string][]string{b: {a, shaB}}
+			g.refs["mergewake/reviews/7/"+a+"-done"] = true
+			g.refs["mergewake/reviews/7/"+b+"-done"] = true
+			g.doneErr = map[string]error{a + "-done": tc.err}
+			g.feedback = github.ReviewFeedback{HeadSHA: head, PRAuthor: "pr-author", ReviewAuthors: map[string]int{"review-bot": 1}, Threads: []github.ReviewThread{ownFinding("T1", "high", 1)}}
+			s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+			p := policy.Policy{ReviewGate: &policy.ReviewGate{Land: "graded"}}
+			v, err := s.mergeGate(context.Background(), r, g.pull, p, shaB)
+			if tc.wantQuiet {
+				if err != nil || (v.State != "pending" && v.State != "blocked") {
+					t.Fatalf("verdict = %+v, err=%v", v, err)
+				}
+			} else if tc.wantError {
+				if err == nil {
+					t.Fatalf("gate did not return historical marker error: %+v", v)
+				}
+			} else if err != nil || v.Review.Rounds != 6 || slices.Contains(v.Reasons, "round_hold") {
+				t.Fatalf("successful marker verdict = %+v, err=%v", v, err)
+			}
+			state := s.loadRoundRuleState(r.Name, 7)
+			if state.held() {
+				t.Fatal("persisted round hold on unverified count")
+			}
+		})
+	}
+}
+
+func TestDeliverSkipsRoundEscalationWhenCountIsUnverified(t *testing.T) {
+	s, g, _, _, run, r := roundRuleSetup(t, 7)
+	a, b, head := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("7", 40)
+	g.passes = map[string][]github.PassReceipt{
+		a: {{Pass: 1, Round: 1}},
+		b: {{Pass: 1, Round: 2}},
+		"3333333333333333333333333333333333333333": {{Pass: 1, Round: 3}},
+		"4444444444444444444444444444444444444444": {{Pass: 1, Round: 4}},
+		"5555555555555555555555555555555555555555": {{Pass: 1, Round: 5}},
+		"6666666666666666666666666666666666666666": {{Pass: 1, Round: 6}},
+		head: {{Pass: 1, Round: 7}},
+	}
+	g.pull.Head.SHA = head
+	g.refs[doneRef(7, head)] = true
+	g.parents2 = map[string][]string{b: {a, shaB}}
+	g.refs[doneRef(7, a)] = true
+	g.refs[doneRef(7, b)] = true
+	g.doneErr = map[string]error{a + "-done": errors.New("temporary GitHub failure")}
+	g.feedback = github.ReviewFeedback{HeadSHA: head, PRAuthor: "pr-author", ReviewAuthors: map[string]int{"review-bot": 1}, Threads: []github.ReviewThread{ownFinding("T1", "high", 1)}}
+	if err := s.DeliverFindings(context.Background(), r, 7, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls, _, _ := escalateSnapshot(run); calls != 0 {
+		t.Fatalf("round escalation calls = %d, want 0 for unverified count", calls)
+	}
+}
+
 func TestRoundRule_e_Round5HoldAndDecisionEvent(t *testing.T) {
 	s, g, n, _, _, r := roundRuleSetup(t, 7)
 	g.feedback.Threads = []github.ReviewThread{

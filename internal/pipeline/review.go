@@ -198,7 +198,10 @@ func (s *Service) Review(ctx context.Context, r config.Repo, n int, family strin
 		}
 		from, inherited, ok := inheritedPasses(history, patch, pr.Head.SHA, needed)
 		if !ok {
-			from, inherited, ok = s.cleanBaseMergePasses(ctx, r, pr, history, needed)
+			from, inherited, ok, e = s.cleanBaseMergePasses(ctx, r, pr, history, needed)
+			if e != nil {
+				return e
+			}
 		}
 		if ok {
 			if e = s.recordReviewBlock(r.Name, n, pr.Head.SHA, "", o.DryRun); e != nil {

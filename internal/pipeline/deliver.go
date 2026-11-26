@@ -122,7 +122,12 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	changed, followErr := s.followUpDeliveries(ctx, r, pr, fb, ledger, o, verify)
 	inScope, outScope := s.undeliveredFindings(pr, fb, ledger, done, verify)
 	history, _ := s.GH.ReviewHistory(ctx, r.Name, n, s.Config.Review.Login)
-	rounds, _ := reviewRounds(s.countedHistory(ctx, r, pr, history))
+	var rounds int
+	counted, roundsErr := s.countedHistory(ctx, r, pr, history)
+	roundsVerified := roundsErr == nil
+	if roundsVerified {
+		rounds, _ = reviewRounds(counted)
+	}
 	openBlockingThreads, openAboveLowThreads := s.openFindings(ctx, r, pr, fb)
 	openBlocking := len(openBlockingThreads) > 0
 	// A head's review outcome is recorded once its review ends, for the
@@ -149,7 +154,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	}
 	consultDirective := ""
 	consultPending := false
-	if consultOn {
+	if consultOn && roundsVerified {
 		consultDirective, consultPending = s.hubConsultStep(ctx, r, pr, fb, o, &st, done, rounds, consultOwed)
 	}
 	// With the hub consult on, a forced delivery is owed only for an outcome the
@@ -246,7 +251,7 @@ func (s *Service) DeliverFindings(ctx context.Context, r config.Repo, n int, o O
 	// The ladder runs on the first done round at or after its round that has a
 	// critical/high finding open, once per PR: a round that was not done, or had
 	// nothing open, does not use it up.
-	if (done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRefusalOwed || ladderRetry {
+	if roundsVerified && ((done && rounds >= ladderRound && openBlocking && !st.escalated()) || ladderOwed || ladderRefusalOwed || ladderRetry) {
 		s.escalateAuthorLadder(ctx, r, pr, fb, o, ladderRound, &st)
 	}
 	if changed && o.Reporting() {
