@@ -21,6 +21,8 @@ func (r noMergeGitHistoryRunner) Run(ctx context.Context, command string, args [
 		switch {
 		case len(gitArgs) >= 2 && gitArgs[0] == "rev-parse" && gitArgs[1] == "--git-dir":
 			return []byte(".git\n"), nil
+		case len(gitArgs) >= 2 && gitArgs[0] == "rev-parse" && gitArgs[1] == "--is-shallow-repository":
+			return []byte("false\n"), nil
 		case len(gitArgs) > 0 && gitArgs[0] == "cat-file":
 			return nil, nil
 		case len(gitArgs) > 0 && gitArgs[0] == "fetch":
