@@ -138,6 +138,10 @@ type reapHost struct {
 	trees        map[string]*reap.Worktree
 	failed       bool
 	usageUnknown bool
+	// rootPath and rootErr memoize the resolved work root for this sweep.
+	rootPath     string
+	rootErr      error
+	rootResolved bool
 }
 
 // refreshPanes re-reads the full pane list so an in-use check runs on current

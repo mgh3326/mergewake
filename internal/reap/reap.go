@@ -469,6 +469,16 @@ func (e Exec) DirExists(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// ResolveDir returns the physical path of an existing directory on this host
+// (symlinks expanded), so it can be compared with paths git prints.
+func (e Exec) ResolveDir(ctx context.Context, path string) (string, error) {
+	b, err := e.Run(ctx, "sh", "-c", `cd "$1" && pwd -P`, "sh", path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 // terminalJobEvents are the events that end a job on its node.
 var terminalJobEvents = map[string]bool{"job.revoked": true, "job.reaped": true, "job.completed": true, "job.lost": true}
 
