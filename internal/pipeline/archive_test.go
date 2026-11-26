@@ -2317,3 +2317,37 @@ func TestArchiveJobsDriveManifestExistsTimeoutSkipsJobAndContinues(t *testing.T)
 		t.Fatalf("per-read timeout reported as max_run stop: %s", out)
 	}
 }
+
+// A stalled Drive read is transient: its prior skip is not terminal, so the job
+// is re-attempted after the one-hour archiveRetry backoff, not before.
+func TestReapArchiveDriveReadTimeoutRetriesAfterHour(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
+	f.withJobs(t, map[string]string{"wk-7": "completed"})
+	f.seedArchive(t, "wk-7", "skipped", "drive-read-timeout", time.Now().Add(-30*time.Minute))
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.rows(t)); n != 1 {
+		t.Fatalf("re-attempted inside the hour: rows = %+v", f.rows(t))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
+		t.Fatal("job archived inside the one-hour backoff")
+	}
+	f.s.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if len(rows) != 2 || rows[1].Result != "skipped" || rows[1].Reason != "awaiting-min-age" {
+		t.Fatalf("not re-attempted after the backoff: rows = %+v", rows)
+	}
+	// The fresh sighting then ages out like any new job, and the job archives.
+	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
+	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("job not archived after its sighting aged out: rows = %+v", f.rows(t))
+	}
+}
