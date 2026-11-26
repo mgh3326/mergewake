@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,34 @@ import (
 	"github.com/mgh3326/mergewake/internal/github"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
+
+func TestHubConsult_QueuedConsultAdvancesWhenRoundCountReadFails(t *testing.T) {
+	s, g, n, _, run, hub, r, _ := hubConsultSetup(t, 7)
+	head := strings.Repeat("7", 40)
+	setCountReadFailure(g, head, nil)
+	g.feedback = github.ReviewFeedback{HeadSHA: head, PRAuthor: "pr-author", ReviewAuthors: map[string]int{"review-bot": 1}, Threads: []github.ReviewThread{ownFinding("T1", "high", 10)}}
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+	hub.rows["c-1"] = reap.ConsultRow{ID: "c-1", State: "queued"}
+
+	deliver(t, s, r)
+	if run.requestCount() != 1 || n.count != 0 {
+		t.Fatalf("initial consult: requests=%d events=%d", run.requestCount(), n.count)
+	}
+	st := s.loadRoundRuleState(r.Name, 7)
+	if !st.HubConsultOwed || st.HubConsultID != "c-1" {
+		t.Fatalf("consult was not persisted as queued: %+v", st)
+	}
+
+	g.doneErr[strings.Repeat("a", 40)+"-done"] = errors.New("temporary GitHub failure")
+	deliver(t, s, r)
+	ledger, err := s.loadDeliveries(r.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.count != 0 || len(ledger) != 0 || !s.loadRoundRuleState(r.Name, 7).HubConsultOwed {
+		t.Fatalf("unverified count released queued consult: events=%d ledger_entries=%d consult_owed=%t", n.count, len(ledger), s.loadRoundRuleState(r.Name, 7).HubConsultOwed)
+	}
+}
 
 // A consult a push superseded before its answer keeps being followed on its
 // row: no second POST, no rewrite of its question, and the answer goes out

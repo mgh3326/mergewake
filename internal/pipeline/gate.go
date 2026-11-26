@@ -159,7 +159,9 @@ func (s *Service) settledFeedback(ctx context.Context, repo string, pr github.Pu
 func (s *Service) readReviewRecord(ctx context.Context, r config.Repo, pr github.Pull, v *gateVerdict) {
 	if history, e := s.GH.ReviewHistory(ctx, r.Name, pr.Number, s.Config.Review.Login); e == nil {
 		v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
-		v.Review.Rounds, v.Review.Reviewed = reviewRounds(s.countedHistory(ctx, r, pr, history))
+		if counted, err := s.countedHistory(ctx, r, pr, history); err == nil {
+			v.Review.Rounds, v.Review.Reviewed = reviewRounds(counted)
+		}
 	}
 }
 
@@ -458,7 +460,20 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	posted, complete := distinctPasses(receipts, needed)
 	v.HeadPasses, v.PassesNeeded = posted, needed
 	v.Review.PatchID = s.patchIDOf(ctx, r.Name, pr.Number, pr.Head.SHA)
-	v.Review.Rounds, v.Review.Reviewed = reviewRounds(s.countedHistory(ctx, r, pr, history))
+	countedRounds, countErr := s.countedHistory(ctx, r, pr, history)
+	if countErr == nil {
+		v.Review.Rounds, v.Review.Reviewed = reviewRounds(countedRounds)
+	}
+	if countErr != nil {
+		if errors.Is(countErr, github.ErrPollSkipped) {
+			v.State = "blocked"
+			if len(v.Reasons) == 0 {
+				v.State = "pending"
+			}
+			return v, nil
+		}
+		return v, countErr
+	}
 	done, e := s.GH.ReviewClaimed(ctx, r.Name, pr.Number, pr.Head.SHA+"-done")
 	if errors.Is(e, github.ErrPollSkipped) {
 		// The done-marker probe is inside its poll interval: hold the verdict
@@ -485,7 +500,10 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		// review.
 		from, inherited, ok := inheritedPasses(history, v.Review.PatchID, pr.Head.SHA, needed)
 		if !ok {
-			from, inherited, ok = s.cleanBaseMergePasses(ctx, r, pr, history, needed)
+			from, inherited, ok, e = s.cleanBaseMergePasses(ctx, r, pr, history, needed)
+			if e != nil {
+				return v, e
+			}
 		}
 		if ok {
 			reviewed = true
