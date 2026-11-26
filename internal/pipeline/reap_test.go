@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 )
 
 type scriptRunner struct {
+	mu    sync.Mutex
 	outs  map[string]string
 	queue map[string][]string // consumed in order before outs, for re-reads
 	errs  map[string]error
@@ -30,6 +32,8 @@ type scriptRunner struct {
 }
 
 func (s *scriptRunner) Run(_ context.Context, name string, args []string, _ string, _ string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	k := name + "\x00" + strings.Join(args, "\x00")
 	s.calls = append(s.calls, k)
 	if q := s.queue[k]; len(q) > 0 {
