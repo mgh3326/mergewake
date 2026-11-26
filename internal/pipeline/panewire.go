@@ -213,22 +213,89 @@ type panewireVersion struct {
 	Capabilities []string `json:"capabilities"`
 }
 
+// ownerNotifyProbeTTL bounds how long a successful probe answer is trusted, so
+// a panewire upgrade or rollback at the same path is picked up without a
+// daemon restart.
+const ownerNotifyProbeTTL = 10 * time.Minute
+
+// ownerNotifyClock is the probe cache's clock; tests replace it.
+var ownerNotifyClock = time.Now
+
+type ownerNotifyAnswer struct {
+	supported bool
+	expires   time.Time
+}
+
 var ownerNotifyCapabilities = struct {
 	sync.Mutex
-	values map[string]bool
-}{values: make(map[string]bool)}
+	values   map[string]ownerNotifyAnswer
+	inflight map[string]chan struct{}
+}{values: make(map[string]ownerNotifyAnswer), inflight: make(map[string]chan struct{})}
 
+// supportsOwnerNotify reports whether the hub behind command accepts
+// --owner-notify. Only a successful, parsable probe is cached, and only for
+// ownerNotifyProbeTTL; a failed or cancelled probe is retried by the next
+// spawn. Concurrent spawns for one command share a single probe, and a waiter
+// stops waiting when its own context ends.
 func supportsOwnerNotify(ctx context.Context, runner integrations.Runner, command string) bool {
+	c := &ownerNotifyCapabilities
+	c.Lock()
+	if supported, ok := cachedOwnerNotifyLocked(command); ok {
+		c.Unlock()
+		return supported
+	}
+	if done, ok := c.inflight[command]; ok {
+		c.Unlock()
+		select {
+		case <-done:
+			supported, _ := cachedOwnerNotify(command)
+			return supported
+		case <-ctx.Done():
+			return false
+		}
+	}
+	done := make(chan struct{})
+	c.inflight[command] = done
+	c.Unlock()
+
+	supported, ok := probeOwnerNotify(ctx, runner, command)
+
+	c.Lock()
+	if ok {
+		c.values[command] = ownerNotifyAnswer{supported: supported, expires: ownerNotifyClock().Add(ownerNotifyProbeTTL)}
+	}
+	delete(c.inflight, command)
+	c.Unlock()
+	close(done)
+	return supported
+}
+
+func probeOwnerNotify(ctx context.Context, runner integrations.Runner, command string) (supported, ok bool) {
+	out, err := runner.Run(ctx, command, []string{"version", "--json"}, "", "")
+	if err != nil {
+		return false, false
+	}
+	var version panewireVersion
+	if json.Unmarshal(out, &version) != nil {
+		return false, false
+	}
+	return slices.Contains(version.Capabilities, "owner_notify_v1"), true
+}
+
+// cachedOwnerNotify returns the unexpired cached answer for command, if any.
+func cachedOwnerNotify(command string) (supported, ok bool) {
 	ownerNotifyCapabilities.Lock()
 	defer ownerNotifyCapabilities.Unlock()
-	if cached, ok := ownerNotifyCapabilities.values[command]; ok {
-		return cached
+	return cachedOwnerNotifyLocked(command)
+}
+
+// cachedOwnerNotifyLocked is cachedOwnerNotify for a caller holding the lock.
+func cachedOwnerNotifyLocked(command string) (supported, ok bool) {
+	a, ok := ownerNotifyCapabilities.values[command]
+	if !ok || !ownerNotifyClock().Before(a.expires) {
+		return false, false
 	}
-	out, err := runner.Run(ctx, command, []string{"version", "--json"}, "", "")
-	var version panewireVersion
-	supported := err == nil && json.Unmarshal(out, &version) == nil && slices.Contains(version.Capabilities, "owner_notify_v1")
-	ownerNotifyCapabilities.values[command] = supported
-	return supported
+	return a.supported, true
 }
 
 func oldPanewireSpawnArgs(args []string) []string {
