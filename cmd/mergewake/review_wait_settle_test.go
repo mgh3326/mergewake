@@ -58,7 +58,7 @@ func TestWaitReviewNeverSettles(t *testing.T) {
 	// The review deadline outlasts the pass: the placed reviewer still runs
 	// when the pass ends pending, so the evaluation produced no result.
 	s.f.s.Config.Review.Timeout = "3h"
-	s.f.s.Runner = &quotaRunner{}
+	s.f.s.Runner = noMergeGitHistoryRunner{next: &quotaRunner{}}
 	s.f.s.Sink = &quotaSink{rec: integrations.JobRecord{State: "running", Host: "node-a", PaneID: "p1"}}
 
 	s.pass(t)

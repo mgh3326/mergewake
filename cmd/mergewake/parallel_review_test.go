@@ -460,7 +460,7 @@ func newParallelFixtureForRepo(t *testing.T, prs, parallel int, name string) *pa
 	results := &paneResults{}
 	runner := &blockingRunner{results: results, trace: trace, release: make(chan struct{}), changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: resultSink{results: results}, Notifier: recordingNotifier{trace}, Out: out}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: noMergeGitHistoryRunner{next: runner}, Sink: resultSink{results: results}, Notifier: recordingNotifier{trace}, Out: out}
 	return &parallelFixture{results: results, hub: hub, s: s, gh: gh, repo: repo, runner: runner, trace: trace, out: out}
 }
 
@@ -656,7 +656,7 @@ func TestSlowReviewerDoesNotDelayNextRepo(t *testing.T) {
 	b := newParallelFixtureForRepo(t, 1, 1, "o/two")
 	a.s.Config.Review.Timeout = "25m"
 	slow := &slowPassRunner{}
-	a.s.Runner = slow
+	a.s.Runner = noMergeGitHistoryRunner{next: slow}
 	close(b.runner.release)
 	for _, f := range []*parallelFixture{a, b} {
 		if err := pollPRs(context.Background(), f.s, f.gh, f.repo, pipeline.Options{}); err != nil && !strings.Contains(err.Error(), "land") {

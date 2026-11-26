@@ -53,7 +53,7 @@ func authorPaneSetup(t *testing.T, panes ...aPane) (*Service, *jobSink, *scriptR
 		panes = []aPane{{"w1:p1", "w-9", "/wt/a", "feature", projectOrigin}}
 	}
 	run := authorHost(panes...)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	s.Config.Hosts = []reap.Host{{Name: "local"}}
 	g.pull.Body = "Summary\n\nMergewake-Task: 2481\nMergewake-Notify-Lane: trailer-lane\n"
 	return s, sink, run
@@ -564,7 +564,9 @@ func TestAuthorPaneFindingsTextCarriesLaneInAck(t *testing.T) {
 	}
 }
 
-func testRepoFor(*Service) config.Repo { return config.Repo{Name: "example/project", Branch: "main"} }
+func testRepoFor(*Service) config.Repo {
+	return config.Repo{Name: "example/project", Branch: "main", Root: "/tmp"}
+}
 
 // hostPaneOuts scripts one configured host's herdr agent and pane lists for
 // panes that carry no cwd, answering locally or through the ssh wrapper a

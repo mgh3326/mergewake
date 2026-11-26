@@ -37,7 +37,7 @@ func hostScanLandSetup(t *testing.T, posted time.Time, sink *jobSink, panes ...a
 	g.findings = 1
 	s.Sink = sink
 	run := authorHost(panes...)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	return s, g, r
 }
@@ -115,7 +115,7 @@ func TestNotifyRoutesOnAnsweringHostWhenAHostScanFails(t *testing.T) {
 	delete(s.Sink.(*jobSink).jobs, "42")
 	s.Sink.(*jobSink).recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
 	run := authorHost(paneB)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	s.GH.(*fakeGH).ci = github.Red
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
@@ -168,7 +168,7 @@ func TestHostScanFailureReachesSinkOnCleanVerdict(t *testing.T) {
 	delete(s.Sink.(*jobSink).jobs, "42")
 	s.Sink.(*jobSink).recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
 	run := authorHost(paneB)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	g.ci = github.Green
 	var reported []string
