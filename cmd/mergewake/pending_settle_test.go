@@ -35,7 +35,7 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := &reviewerSink{jobs: map[string]integrations.JobRecord{}}
 	runner := &asyncRunner{sink: sink, done: ctx.Done(), labels: map[int][]string{}}
-	f.s.Sink, f.s.Runner = sink, runner
+	f.s.Sink, f.s.Runner = sink, noMergeGitHistoryRunner{next: runner}
 
 	logs := &syncBuffer{}
 	skips := &prSkips{Dirty: &daemon.Dirty{}, Log: slog.New(slog.NewJSONHandler(logs, nil))}

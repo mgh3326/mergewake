@@ -117,7 +117,7 @@ func TestDaemonMergeWakesReapRole(t *testing.T) {
 			h := &mergeHub{}
 			srv := httptest.NewServer(h)
 			defer srv.Close()
-			repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml"}
+			repo := config.Repo{Name: "o/one", Branch: "main", Policy: "policy.yaml", Root: t.TempDir()}
 			cfg := config.Config{StateDir: t.TempDir(), Repos: []config.Repo{repo}, WatchLimit: 10, PollInterval: "1h", Review: config.Review{Login: "reviewer"}}
 			cfg.Daemon.PR.SkipBots = true
 			cfg.Daemon.PR.Loop = config.Loop{Enabled: true, Interval: "1h"}
@@ -125,7 +125,7 @@ func TestDaemonMergeWakesReapRole(t *testing.T) {
 			gh := github.New("")
 			gh.BaseURL = srv.URL
 			gh.Stderr = io.Discard
-			s := &pipeline.Service{Config: cfg, GH: gh, Runner: integrations.Exec{}, Sink: integrations.Noop{}, Notifier: integrations.Noop{}, Out: io.Discard}
+			s := &pipeline.Service{Config: cfg, GH: gh, Runner: noMergeGitHistoryRunner{next: integrations.Exec{}}, Sink: integrations.Noop{}, Notifier: integrations.Noop{}, Out: io.Discard}
 
 			var stderr lockedBuffer
 			ctx, cancel := context.WithCancel(context.Background())
