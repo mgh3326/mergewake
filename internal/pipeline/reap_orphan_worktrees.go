@@ -361,6 +361,9 @@ func (hs *reapHost) orphanResolvedRoot(ctx context.Context) (string, error) {
 		root := filepath.Clean(hs.host.WorkRoot)
 		switch {
 		case hs.viaHub:
+			// Hub hosts: no shell to resolve with. Candidates here are always kept
+			// as host-evidence-unavailable (see the viaHub branch in the visit loop),
+			// so the configured spelling is never used to remove anything.
 			hs.rootPath = root
 		case hs.host.Local():
 			hs.rootPath, hs.rootErr = filepath.EvalSymlinks(root)
