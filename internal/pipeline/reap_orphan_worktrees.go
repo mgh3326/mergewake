@@ -387,10 +387,12 @@ func (s *Service) orphanReviewerPaths() (map[string]bool, error) {
 	}
 	dir := config.Expand(s.Config.Review.Panewire.Checkouts)
 	if dir != "" {
-		var err error
-		named, err = s.recordedCheckouts(dir)
+		recorded, err := s.recordedCheckouts(dir)
 		if err != nil {
 			return nil, err
+		}
+		for path := range recorded {
+			named[path] = true
 		}
 	}
 	for _, r := range s.Config.Repos {

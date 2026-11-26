@@ -329,6 +329,11 @@ func TestOrphanWorktreeRemovalErrorIsReported(t *testing.T) {
 
 func TestOrphanWorktreeReviewerLabelPathIsOwned(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
+	checkouts := filepath.Join(f.root, "reviewer-checkouts")
+	if err := os.MkdirAll(checkouts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Config.Review.Panewire.Checkouts = checkouts
 	if err := os.MkdirAll(filepath.Join(f.s.Config.StateDir, "example", "project", "reviewer-jobs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +343,7 @@ func TestOrphanWorktreeReviewerLabelPathIsOwned(t *testing.T) {
 		t.Fatal(err)
 	}
 	owned, err := f.s.orphanReviewerPaths()
-	if err != nil || !owned[filepath.Join(f.root, label+reviewerCheckoutSuffix)] {
+	if err != nil || !owned[filepath.Join(f.root, label+reviewerCheckoutSuffix)] || !owned[filepath.Join(checkouts, label)] {
 		t.Fatalf("owned=%v err=%v", owned, err)
 	}
 }
