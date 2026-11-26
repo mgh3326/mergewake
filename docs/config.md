@@ -368,6 +368,7 @@ the worker reap, or paths recorded by the reviewer reap.
 ```yaml
 reap:
   orphan_worktrees:
+    enabled: false
     act: false
     min_age: 14d
     per_host: 20
@@ -375,9 +376,12 @@ reap:
 
 | Key | Required / default | Meaning |
 | --- | --- | --- |
+| `enabled` | `false` | Runs the orphan worktree listing and inspection stage. When false, the stage does no work and uses no budget. |
 | `act` | `false` | Enables removal for candidates that pass every guard. It also requires the top-level `reap.act: true` and an acting reap invocation. |
 | `min_age` | `14d` | Minimum age based on the newest mtime among the linked worktree's git index, `HEAD`, `logs/HEAD`, and top-level directory. Accepts Go durations and whole days. |
-| `per_host` | `20` | Maximum candidates considered per host and repo pass. |
+| `per_host` | `20` | Maximum candidates considered per host and repo pass. A persisted rotating cursor advances between passes. |
+
+When enabled, this stage runs after the worker, reviewer, orphan-checkout, and archive stages. It receives one quarter of the repo budget remaining at that point; each candidate checks the stage budget before inspection.
 
 Before a worktree is planned or removed, the pass requires all four checks:
 

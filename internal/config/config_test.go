@@ -39,8 +39,8 @@ func TestOrphanWorktreeConfigDefaultsAndValidation(t *testing.T) {
 		wantCap    int
 	}{
 		{name: "defaults", wantAge: "14d", wantCap: OrphanWorktreePerHostDefault},
-		{name: "configured", reap: "enabled: true\norphan_worktrees:\n  act: true\n  min_age: 21d\n  per_host: 7\n", wantAge: "21d", wantCap: 7},
-		{name: "act requires enabled", reap: "orphan_worktrees:\n  act: true\n", wantErr: "requires reap.enabled"},
+		{name: "configured", reap: "enabled: true\norphan_worktrees:\n  enabled: true\n  act: true\n  min_age: 21d\n  per_host: 7\n", wantAge: "21d", wantCap: 7},
+		{name: "act requires enabled", reap: "orphan_worktrees:\n  act: true\n", wantErr: "requires reap.orphan_worktrees.enabled"},
 		{name: "bad age", reap: "orphan_worktrees:\n  min_age: 0s\n", wantErr: "orphan_worktrees.min_age"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
