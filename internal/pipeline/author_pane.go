@@ -345,7 +345,7 @@ func (s *Service) authorPaneOn(ctx context.Context, jobs reapJobs, hosts []*reap
 	var pane, job string
 	n := 0
 	for _, hs := range hosts {
-		if hs.failed {
+		if !authorComplete(hs) {
 			continue
 		}
 		for _, p := range hs.panes {
@@ -397,9 +397,9 @@ type authorRoute struct {
 // the candidates for an audit row. A bound job that is terminal and that no
 // read host shows a pane for is finished: its lane is not returned (the caller
 // falls through to authorPane and the trailer), and the route names it in
-// finished so a delivery still on it can be rerouted. On a partial scan with
-// takeover candidates the bound lane is kept, never cleared, even when the job
-// is finished; it is named in finished too, so the reroute waits for a full scan. A host or job read error
+// finished so a delivery still on it can be rerouted. A scan that is not
+// complete with takeover candidates keeps the bound lane and the candidates,
+// unknown and never finished. A host or job read error
 // is returned so the caller retries rather than picking a lane.
 func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.Pull, task string) (authorRoute, error) {
 	// One scan record for the whole route, so the hosts that failed are the
@@ -435,12 +435,9 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	// A partial scan cannot establish that one observed pane is the unique
 	// takeover candidate. Keep the bound author lane and report every observed
 	// candidate in the partial-route audit.
-	if len(bound.failedHosts) > 0 && len(others) > 0 {
+	if !s.authorScanComplete(ctx) && len(others) > 0 {
 		bound.candidates = others
 		bound.unknown = unknown
-		if finished {
-			bound.finished = lane
-		}
 		return bound, nil
 	}
 	route, takenOver := bound, false
@@ -476,10 +473,9 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 // on the configured hosts. finished is true only when every host was read and
 // none shows a pane named for the job, its label, or its recorded pane id —
 // the pane id counting only on the host the record names, since a pane id is
-// local to its host. A match on a host that failed after its pane list was
-// read still proves the job live. Otherwise a failed host that has an agent
-// pane whose cwd was never inspected, or a host whose pane list was not read,
-// makes liveness unknown: the bound lane stands. Also unknown with no hosts
+// local to its host. A match on a host whose pane list was read proves the job
+// live. Otherwise finished needs the scan complete (every host's pane list and
+// agent trees read); an incomplete scan is unknown, and so is no hosts
 // configured. A job that is not terminal is never finished.
 func (s *Service) authorFinished(ctx context.Context, job string, rec integrations.JobRecord) (finished, unknown bool, err error) {
 	if !terminalJob(rec.State) {
@@ -503,31 +499,28 @@ func (s *Service) authorFinished(ctx context.Context, job string, rec integratio
 			break
 		}
 	}
-	// A match on any host proves the job live, whatever else was cut. Without
-	// one, finished needs every host's pane list read and every agent pane of
-	// a failed host inspected: a pane whose cwd was never inspected could be
-	// the job's own takeover.
-	cut := false
+	// A match on a host whose pane list was read proves the job live, whatever
+	// else was cut. Finished needs the whole scan complete: a pane whose cwd
+	// was never inspected could be the job's own takeover.
 	for _, hs := range hosts {
-		if hs.failed && !hs.panesRead {
-			cut = true
-		}
 		paneID := rec.PaneID != "" && (!placed || authorHostNamed(rec.Host, hs.host))
 		for _, p := range hs.panes {
 			if p.Name == job || (rec.Label != "" && p.Name == rec.Label) || (paneID && p.ID == rec.PaneID) {
 				return false, false, nil
 			}
-			if hs.failed && p.Cwd != "" {
-				if _, ok := hs.trees[p.Cwd]; !ok {
-					cut = true
-				}
-			}
 		}
 	}
-	if cut || len(hosts) < len(s.Config.Hosts) {
+	if !scanAuthorComplete(hosts, len(s.Config.Hosts)) {
 		return false, true, nil
 	}
 	return true, false, nil
+}
+
+// authorScanComplete reports whether the author scan of this route read every
+// configured host completely (see scanAuthorComplete).
+func (s *Service) authorScanComplete(ctx context.Context) bool {
+	hosts, _ := s.authorHosts(ctx)
+	return scanAuthorComplete(hosts, len(s.Config.Hosts))
 }
 
 // authorHostNamed reports whether a job record's host names this configured
@@ -555,10 +548,10 @@ func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pu
 	hosts, err := s.authorHosts(ctx)
 	var names []string
 	for _, hs := range hosts {
-		// A host whose pane list was never read has no names to judge. One
-		// that failed after its list was read still judges the panes whose
-		// cwd was inspected: the others have no tree and are skipped below.
-		if hs.failed && !hs.panesRead {
+		// A host whose agent trees or pane list were not read in full has no
+		// complete candidate set to judge; a host cut only after its agent
+		// trees were read still counts.
+		if !authorComplete(hs) {
 			continue
 		}
 		for _, p := range hs.panes {
