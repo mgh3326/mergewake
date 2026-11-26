@@ -244,6 +244,101 @@ func TestOrphanWorktreePerHostCursorDoesNotStarveCandidate(t *testing.T) {
 	}
 }
 
+func addOrphanCandidates(t *testing.T, f orphanFixture, prefix string, count int) {
+	t.Helper()
+	for i := 1; i <= count; i++ {
+		path := filepath.Join(f.root, fmt.Sprintf("%s%02d", prefix, i))
+		gitRunAt(t, f.main, "worktree", "add", "--detach", path, "origin/main")
+	}
+}
+
+func TestOrphanWorktreePerHostRotationReachesTail(t *testing.T) {
+	a, b := newOrphanFixture(t, "", false), newOrphanFixture(t, "", false)
+	a.hs.host.Name, b.hs.host.Name = "a", "b"
+	a.hs.host.WorkRoot, b.hs.host.WorkRoot = a.root, b.root
+	a.s.Config.Hosts = []reap.Host{a.hs.host, b.hs.host}
+	a.s.Config.Reap.OrphanWorktrees.PerHost = 20
+	addOrphanCandidates(t, a, "a", 50)
+	addOrphanCandidates(t, b, "b", 5)
+	var reachedTail bool
+	for pass := 0; pass < 3; pass++ {
+		var rows []reapReceipt
+		if errs := a.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{a.hs, b.hs}, false, true, func(r reapReceipt) { rows = append(rows, r) }); len(errs) != 0 {
+			t.Fatal(errs)
+		}
+		if pass == 2 {
+			seen := map[string]bool{}
+			for _, row := range rows {
+				seen[filepath.Base(row.Worktree)] = true
+			}
+			reachedTail = seen["a41"] && seen["a50"]
+		}
+	}
+	if !reachedTail {
+		t.Fatal("third pass did not reach a41-a50")
+	}
+}
+
+func TestOrphanWorktreeLegacyCursorIsTreatedAsEmpty(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	second := filepath.Join(f.root, "candidate-2")
+	gitRunAt(t, f.main, "worktree", "add", "--detach", second, "origin/main")
+	resolvedCandidate, err := filepath.EvalSymlinks(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.s.orphanWorktreeCursorPath(testRepo.Name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := json.Marshal(orphanWorktreeCursor{Host: "local", Path: resolvedCandidate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, errs := runOrphanFixture(f, false)
+	if len(errs) != 0 || len(rows) != 2 || filepath.Base(rows[0].Worktree) != filepath.Base(f.path) {
+		t.Fatalf("legacy cursor should start empty: rows=%+v errors=%v", rows, errs)
+	}
+}
+
+func TestOrphanWorktreeCorruptCursorContinues(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	path := f.s.orphanWorktreeCursorPath(testRepo.Name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var rows []reapReceipt
+	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, true, func(r reapReceipt) { rows = append(rows, r) })
+	if len(errs) != 0 || len(rows) != 2 || rows[0].Result != "error" || filepath.Base(rows[1].Worktree) != filepath.Base(f.path) {
+		t.Fatalf("corrupt cursor prevented scan: rows=%+v errors=%v", rows, errs)
+	}
+}
+
+func TestOrphanWorktreeKeptOwnedAndLockedDoNotUseVisitSlots(t *testing.T) {
+	f := newOrphanFixture(t, "wk/owned", false)
+	locked := filepath.Join(f.root, "locked")
+	regular := filepath.Join(f.root, "regular")
+	gitRunAt(t, f.main, "worktree", "add", "--detach", locked, "origin/main")
+	gitRunAt(t, f.main, "worktree", "lock", locked)
+	gitRunAt(t, f.main, "worktree", "add", "--detach", regular, "origin/main")
+	f.s.Config.Reap.OrphanWorktrees.PerHost = 1
+	var rows []reapReceipt
+	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, true, func(r reapReceipt) { rows = append(rows, r) })
+	seen := map[string]bool{}
+	for _, row := range rows {
+		seen[filepath.Base(row.Worktree)] = true
+	}
+	if len(errs) != 0 || !seen["candidate"] || !seen["locked"] || !seen["regular"] {
+		t.Fatalf("kept rows used visit slots: rows=%+v errors=%v", rows, errs)
+	}
+}
+
 func TestOrphanWorktreeDiscoveryDoesNotSpendBudgetOnMarkerChecks(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
 	runner := &orphanDiscoveryRunner{}
@@ -320,12 +415,21 @@ func TestOrphanWorktreeDiscoveryRotatesPastSlowFirstHost(t *testing.T) {
 
 func TestOrphanWorktreeDryRunDoesNotWriteCursor(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
+	path := f.s.orphanWorktreeCursorPath(testRepo.Name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"hosts":{"local":"/stable"},"next_host":"local"}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, false, func(reapReceipt) {})
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
-	if _, err := os.Stat(f.s.orphanWorktreeCursorPath(testRepo.Name)); !os.IsNotExist(err) {
-		t.Fatalf("dry run wrote cursor: %v", err)
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("dry run changed cursor bytes: got=%q err=%v", got, err)
 	}
 }
 
@@ -356,6 +460,14 @@ func TestOrphanWorktreeBudgetBeforeVisitDoesNotAdvanceCursor(t *testing.T) {
 func TestOrphanWorktreeKindIncludesWorkerWithoutPR(t *testing.T) {
 	if got := orphanWorktreeKind(reap.Entry{Path: "/work/wk/job", Branch: "wk/job"}); got != "worker-owned" {
 		t.Fatalf("kind=%q", got)
+	}
+}
+
+func TestOrphanWorktreeSummaryUsesWorkerOwnedKind(t *testing.T) {
+	f := newOrphanFixture(t, "wk/job", false)
+	_, output, errs := runOrphanFixture(f, false)
+	if len(errs) != 0 || !strings.Contains(output, `"kind":"worker-owned"`) {
+		t.Fatalf("summary output does not use worker-owned: %s errors=%v", output, errs)
 	}
 }
 
