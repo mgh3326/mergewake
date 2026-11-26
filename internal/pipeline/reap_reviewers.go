@@ -213,6 +213,21 @@ func reviewerTerminal(v reapReceipt) bool {
 	return false
 }
 
+// closeOutcome reports whether a row records the outcome of a close attempt:
+// a close, an abandon error, or a refusal kept for its backoff. A stuck marker
+// never replaces such a row in its stream.
+func closeOutcome(v reapReceipt) bool {
+	switch v.Result {
+	case "closed", "abandoned":
+		return true
+	case "error":
+		return strings.HasPrefix(v.Reason, "abandon job:")
+	case "kept":
+		return v.Reason == reviewerNotClosable || v.Reason == reviewerOutOfScope
+	}
+	return false
+}
+
 // refusalRetries reports how many retries a pending refusal row records: the
 // first refusal carries none, each later one ends its reason with
 // " (retry n of 3)". ok is false for a row that is not a pending refusal.
@@ -477,7 +492,11 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 			if w.streams[rec.Label] == nil {
 				w.streams[rec.Label] = map[string]reapReceipt{}
 			}
-			w.streams[rec.Label][reviewerStream(rec)] = rec
+			// A stuck marker written after a close outcome does not replace it:
+			// the outcome carries the close backoff, which the marker would hide.
+			if prev := w.streams[rec.Label][reviewerStream(rec)]; rec.Result != "stuck-reviewer" || !closeOutcome(prev) {
+				w.streams[rec.Label][reviewerStream(rec)] = rec
+			}
 			if rec.Worktree != "" && rec.Worktree != rec.Label {
 				w.remember(rec.Label, rec.Host, rec.Cwd)
 			}
@@ -670,10 +689,11 @@ func (w *reviewerSweep) finishedLabel(label string, lastCleanup map[string]reapR
 			return false
 		}
 	}
-	// A closure recorded on the pane stream alone has not reached the remote
+	// A close recorded on the pane stream alone has not reached the remote
 	// worktree yet, so a restart between the two leaves it stranded: the label
-	// stays eligible until one of its worktree streams records an outcome.
-	if len(streams) > 0 && !hasWorktreeStream(streams) && w.labelHost[label] != "" && !w.hostIsLocal(w.labelHost[label]) {
+	// stays eligible until one of its worktree streams records an outcome. Any
+	// other pane-only row (an other-repository skip, for one) is terminal.
+	if !hasWorktreeStream(streams) && streams["pane"].Result == "closed" && w.labelHost[label] != "" && !w.hostIsLocal(w.labelHost[label]) {
 		return false
 	}
 	// A refused removal that still waits keeps the local checkout too
@@ -1595,6 +1615,9 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		w.record(gate, "error", "abandon job: owner lane unavailable")
 		return false
 	}
+	// The label is past the checkout TTL when its pane is gone: the stuck
+	// sweep runs only for an unused label, so this is the aged release.
+	aged := !l.started.Add(reviewerCheckoutTTL).After(w.now)
 	cmd := w.s.Config.Review.Panewire.Command
 	argv := integrations.HubArgv(w.s.Config.Reap.Hub, "job", "close", l.name, "--lane", job.OwnerLane, "--outcome", "abandoned", "--reason", reason)
 	if _, e := reapRunner(ctx, w.s.Runner).Run(ctx, cmd, argv, "", ""); e != nil {
@@ -1602,7 +1625,12 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 			return w.alreadyClosed(gate, l)
 		}
 		if unknownJobRefusal(e) {
-			return w.unknownJob(ctx, gate, l, hs)
+			// An aged label's refusal keeps its kept row and backoff, and its
+			// cleanup goes on: the checkout TTL releases it, not the backoff.
+			if w.unknownJob(ctx, gate, l, hs) {
+				return true
+			}
+			return aged
 		}
 		if scopeForbiddenRefusal(e) {
 			return w.settleScopeForbidden(ctx, gate, l, hs, job, e)
@@ -1822,6 +1850,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	prior := w.streams[l.name][reviewerStream(rec)]
 	switch {
 	case reviewerTerminal(prior) && prior.Result == "kept":
+		return remoteDone
+	case prior.Result == "removed":
+		// The worktree was removed by an earlier pass: the hub is not asked again.
 		return remoteDone
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
