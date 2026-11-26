@@ -179,8 +179,12 @@ type Plan struct {
 	oversizedHashes map[string]string
 	textSnapshots   map[string][]byte
 	checkouts       []string
-	done            *manifest
-	doneRaw         []byte
+	// done is the manifest as published on Drive, and doneRaw its bytes; a
+	// republish from remove starts from done. doneView is the cache-filtered
+	// view of done (see manifest.matches) that the Result counts report.
+	done     *manifest
+	doneRaw  []byte
+	doneView *manifest
 }
 
 type Exclusion struct {
@@ -662,7 +666,7 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 	if !ok {
 		return false, &Skip{"drive-dir-exists"}
 	}
-	p.Resume, p.done, p.doneRaw = true, filtered, raw
+	p.Resume, p.done, p.doneRaw, p.doneView = true, &m, raw, filtered
 	return true, nil
 }
 
@@ -989,7 +993,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		if !ok {
 			return nil, &Skip{"drive-dir-exists"}
 		}
-		p.Resume, p.done, p.doneRaw = true, filtered, raw
+		p.Resume, p.done, p.doneRaw, p.doneView = true, &m, raw, filtered
 	}
 	return p, nil
 }
@@ -1674,10 +1678,10 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 // resume finishes an archive whose Drive copy and hk record completed but
 // whose delete did not: the job's files must still hash to the manifest.
 func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (*Result, error) {
-	m := p.done
+	m, view := p.done, p.doneView
 	sum := sha256.Sum256(p.doneRaw)
-	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
-	for _, f := range m.Files {
+	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(view.Files), Bytes: view.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: view.Excluded, Retained: view.Retained}
+	for _, f := range view.Files {
 		if src[f.Path] != f.SHA256 && !isCachePath(f.Path, a.CachePaths) {
 			cur, err := a.instance(ctx, p.host.SSH, p.Dir)
 			if err != nil {
