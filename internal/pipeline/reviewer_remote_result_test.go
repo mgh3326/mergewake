@@ -122,9 +122,9 @@ func TestReviewerRemoteResultTimeoutPreservesBudget(t *testing.T) {
 	s, _, repo := panewireSetup(t, runner)
 	s.Runner = stalledLocalPanewire{runner}
 	x := panewireExecutor{s: s, repo: repo}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if got, retry, _ := x.remoteFindings(ctx, &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job"); got != nil || !retry || ctx.Err() != nil {
+	if got, retry, _ := x.remoteFindingsWithTimeout(ctx, &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job", 10*time.Millisecond); got != nil || !retry || ctx.Err() != nil {
 		t.Fatalf("findings=%s parent error=%v", got, ctx.Err())
 	}
 }

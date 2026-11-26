@@ -310,8 +310,8 @@ func TestDaemonStopsWithAPublishInFlight(t *testing.T) {
 	go func() { exit <- runDaemonLoops(ctx, m.s, m.gh, "", pipeline.Options{}, io.Discard) }()
 	select {
 	case <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the daemon never started publishing")
+	case err := <-exit:
+		t.Fatalf("the daemon exited before publishing: %v", err)
 	}
 	cancel()
 	select {

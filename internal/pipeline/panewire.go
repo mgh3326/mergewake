@@ -2245,9 +2245,13 @@ func (x *panewireExecutor) recordResult(ctx context.Context, label string) (jobO
 // outcome names what the read produced (found, not_found, missing, error, …)
 // so a caller that has no retry left can say why it got nothing.
 func (x *panewireExecutor) remoteFindings(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string) ([]byte, bool, string) {
+	return x.remoteFindingsWithTimeout(ctx, plan, rec, label, 10*time.Second)
+}
+
+func (x *panewireExecutor) remoteFindingsWithTimeout(ctx context.Context, plan *passPlan, rec integrations.JobRecord, label string, timeout time.Duration) ([]byte, bool, string) {
 	outcome := "error"
 	var findings json.RawMessage
-	lookupTimeout := 10 * time.Second
+	lookupTimeout := timeout
 	if deadline, ok := ctx.Deadline(); ok {
 		lookupTimeout = min(lookupTimeout, time.Until(deadline)/2)
 	}
