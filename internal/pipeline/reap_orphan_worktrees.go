@@ -151,17 +151,30 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 				continue
 			}
 		}
+		// git prints physical paths; the configured work root may be a symlink
+		// (macOS /var -> /private/var). Compare against the resolved root.
+		root, rootErr := hs.orphanResolvedRoot(ctx)
+		if rootErr != nil {
+			if hs.host.Local() {
+				errs = append(errs, fmt.Errorf("%s orphan worktrees root resolve: %w", hs.host.Name, rootErr))
+			} else {
+				errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s orphan worktrees root resolve: %w", hs.host.Name, rootErr)))
+			}
+			continue
+		}
+		resolvedMain := filepath.Join(root, repoSegment(r.Name))
 		candidates := make([]reap.Entry, 0, len(entries))
 		for _, entry := range entries {
 			path := filepath.Clean(entry.Path)
-			if path == filepath.Clean(main) || filepath.Dir(path) != filepath.Clean(hs.host.WorkRoot) || filepath.Base(path) == "" || filepath.Base(path) == "herdr-inbox" {
+			if path == filepath.Clean(resolvedMain) || filepath.Dir(path) != root || filepath.Base(path) == "" || filepath.Base(path) == "herdr-inbox" {
 				continue
 			}
 			// The canonical clone and arbitrary directories never qualify: require
 			// registration in this clone's worktree list. Inspect validates identity
 			// before any removal; a separate test -f per entry made discovery
 			// unbounded and could consume the entire stage budget.
-			if owned[path] {
+			// Reviewer receipts record the configured spelling, so match both.
+			if owned[path] || owned[filepath.Join(filepath.Clean(hs.host.WorkRoot), filepath.Base(path))] {
 				continue // reviewer receipts own this path
 			}
 			candidates = append(candidates, entry)
@@ -336,6 +349,27 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 		}
 	}
 	return errs
+}
+
+// orphanResolvedRoot returns the host's work root as the host resolves it, once
+// per sweep. Local hosts expand symlinks in process; ssh hosts run `pwd -P`.
+// Hub hosts have no shell, so they keep the configured spelling: the stage
+// keeps every hub candidate as host-evidence-unavailable and never removes it.
+func (hs *reapHost) orphanResolvedRoot(ctx context.Context) (string, error) {
+	if !hs.rootResolved {
+		hs.rootResolved = true
+		root := filepath.Clean(hs.host.WorkRoot)
+		switch {
+		case hs.viaHub:
+			hs.rootPath = root
+		case hs.host.Local():
+			hs.rootPath, hs.rootErr = filepath.EvalSymlinks(root)
+		default:
+			hs.rootPath, hs.rootErr = hs.exec.ResolveDir(ctx, root)
+		}
+		hs.rootPath = filepath.Clean(hs.rootPath)
+	}
+	return hs.rootPath, hs.rootErr
 }
 
 func orphanWorktreeKind(entry reap.Entry) string {

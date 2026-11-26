@@ -731,7 +731,9 @@ func (s *Service) processInUse(ctx context.Context, path string) string {
 	}
 	held, unresolved := ev.heldPaths()
 	for _, p := range held {
-		if under(path, p) {
+		// Fail closed across spellings: a held path may name a symlinked root
+		// (macOS /var) while path is the physical path git printed.
+		if under(path, p) || under(path, physicalPath(p)) {
 			return "process-in-use"
 		}
 	}
@@ -739,4 +741,13 @@ func (s *Service) processInUse(ctx context.Context, path string) string {
 		return "process-unknown"
 	}
 	return ""
+}
+
+// physicalPath returns p with symlinks expanded, or p unchanged when it cannot
+// be resolved (for example, the directory is gone).
+func physicalPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
 }
