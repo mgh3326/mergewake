@@ -290,6 +290,20 @@ func (h repsHang) Run(ctx context.Context, command string, args []string, input,
 	return h.next.Run(ctx, command, args, input, dir)
 }
 
+// seedLandedRow writes PR 5 of o/one as a landed, attributed outcome that the
+// closed-row reconcile has already finished. The fake hub reports every PR as
+// open, so a row the reconcile still had to read would be observed as reopened:
+// ObservePR then sets Final=false and the publisher skips the row for good.
+func seedLandedRow(t *testing.T, dir string) {
+	t.Helper()
+	if err := (outcomes.Ledger{Dir: dir}).Update("o/one", 5, func(v *outcomes.Outcome) {
+		v.Final, v.Decision, v.ReconcileFinished = true, "landed", true
+		v.Profile, v.Model, v.Effort, v.Grade, v.Tier = "example", "example-model", "high", "B", "T1"
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The daemon runs the publisher while the pr role is on, and stops it with its
 // context even when a publish is hanging: a stuck outcomes command never keeps
 // the daemon from shutting down.
@@ -297,13 +311,8 @@ func TestDaemonStopsWithAPublishInFlight(t *testing.T) {
 	m := newMultiRepo(t, []string{"o/one"}, 0, 1)
 	started := make(chan struct{}, 1)
 	m.s.Runner = repsHang{next: m.s.Runner, started: started}
+	seedLandedRow(t, m.s.Config.StateDir)
 	ledger := outcomes.Ledger{Dir: m.s.Config.StateDir}
-	if err := ledger.Update("o/one", 5, func(v *outcomes.Outcome) {
-		v.Final, v.Decision = true, "landed"
-		v.Profile, v.Model, v.Effort, v.Grade, v.Tier = "example", "example-model", "high", "B", "T1"
-	}); err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	exit := make(chan error, 1)
@@ -312,6 +321,10 @@ func TestDaemonStopsWithAPublishInFlight(t *testing.T) {
 	case <-started:
 	case err := <-exit:
 		t.Fatalf("the daemon exited before publishing: %v", err)
+	case <-time.After(30 * time.Second):
+		state, _ := ledger.Read()
+		t.Fatalf("the publisher never started a publish: %d latest rows, %d published, row %+v",
+			len(state.Latest), len(state.Published), state.Latest[outcomes.Key("o/one", 5)])
 	}
 	cancel()
 	select {
@@ -324,5 +337,27 @@ func TestDaemonStopsWithAPublishInFlight(t *testing.T) {
 	}
 	if state, _ := ledger.Read(); len(state.Published) != 0 {
 		t.Fatalf("a cut-off publish was acknowledged: %v", state.Published)
+	}
+}
+
+// The closed-row reconcile runs beside the publisher. If it still had to read a
+// landed row, it would withdraw the row before the publisher's first flush, and
+// that row would never publish. This pins the ordering that the seeded row must
+// survive: a reconcile pass, then a flush that reaches reps.
+func TestSeededRowStaysPublishableThroughReconcile(t *testing.T) {
+	m := newMultiRepo(t, []string{"o/one"}, 0, 1)
+	started := make(chan struct{}, 1)
+	m.s.Runner = repsHang{next: m.s.Runner, started: started}
+	seedLandedRow(t, m.s.Config.StateDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m.s.ReconcileOutcomes(ctx, m.s.Config.Repos[0], func(int) bool { return false }, pipeline.Options{}); err != nil {
+		t.Logf("reconcile: %v", err)
+	}
+	go func() { _ = m.s.FlushOutcomes(ctx, "o/one") }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reconcile withdrew the landed row: the flush never reached reps")
 	}
 }
