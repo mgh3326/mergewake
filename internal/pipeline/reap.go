@@ -138,6 +138,14 @@ type reapHost struct {
 	trees        map[string]*reap.Worktree
 	failed       bool
 	usageUnknown bool
+	// panesRead is set once the agent pane list was read in full, even when a
+	// later inspect failed the host: the list still answers liveness.
+	panesRead bool
+	// agentTreesRead is set only when, after the agent pane list is walked,
+	// every agent pane with a non-empty cwd has an entry in trees. A cut inside
+	// that walk, or a tolerated inspect error, leaves a cwd without an entry
+	// and the flag false. A cut in the full pane list after it leaves it true.
+	agentTreesRead bool
 	// rootPath and rootErr memoize the resolved work root for this sweep.
 	rootPath     string
 	rootErr      error
@@ -385,7 +393,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 		hs.failed = true
 		return hs, append(errs, hostScanFailure(ctx, h.Name, "host panes", e))
 	}
-	hs.panes = panes
+	hs.panes, hs.panesRead = panes, true
 	// The full pane list also covers non-agent shells and jobs: without it
 	// the usage check is unknown and removals must skip.
 	all, e := hs.ops.AllPanes(ctx)
@@ -400,7 +408,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 		}
 	}
 	hs.all = all
-	for _, list := range [][]reap.Pane{panes, all} {
+	for i, list := range [][]reap.Pane{panes, all} {
 		for _, p := range list {
 			if e := reapBudgetCheck(ctx, "host pane/worktree scan"); e != nil {
 				return hs, append(errs, e)
@@ -432,8 +440,45 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 				}
 			}
 		}
+		if i == 0 {
+			hs.agentTreesRead = agentTreesInspected(hs, panes)
+		}
 	}
 	return hs, errs
+}
+
+// agentTreesInspected reports whether every agent pane with a cwd has a tree
+// entry on hs, so a tolerated inspect error leaves the host incomplete.
+func agentTreesInspected(hs *reapHost, panes []reap.Pane) bool {
+	for _, p := range panes {
+		if p.Cwd == "" {
+			continue
+		}
+		if _, ok := hs.trees[p.Cwd]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// authorComplete reports whether a host's scan answers the author route's two
+// reads: its agent pane list, and a tree for every agent pane cwd.
+func authorComplete(hs *reapHost) bool {
+	return hs.panesRead && hs.agentTreesRead
+}
+
+// scanAuthorComplete reports whether the scan read every configured host (n
+// hosts) completely enough for authorComplete.
+func scanAuthorComplete(hosts []*reapHost, n int) bool {
+	if len(hosts) < n {
+		return false
+	}
+	for _, hs := range hosts {
+		if !authorComplete(hs) {
+			return false
+		}
+	}
+	return true
 }
 
 type reviewersOnlyKey struct{}
