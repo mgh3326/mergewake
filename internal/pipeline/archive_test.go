@@ -263,6 +263,44 @@ func TestArchiveJobsPaneScanFailureIsUnscannedWithoutFailingRun(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsDropsConfiguredOldJobWithoutHK(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MinAge = "1h"
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("drop dir remains: %v", err)
+	}
+	if f.hkCalls() != 0 {
+		t.Fatalf("drop made %d hk calls", f.hkCalls())
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"result":"dropped"`) || !strings.Contains(string(b), `"files":5`) {
+		t.Fatalf("missing dropped receipt: %s", b)
+	}
+}
+
+func TestArchiveJobsDropDryRunKeepsJob(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dry run deleted job: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"result":"would-drop"`) {
+		t.Fatalf("missing would-drop: %s", f.out.String())
+	}
+}
+
 func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "50ms"

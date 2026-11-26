@@ -802,13 +802,20 @@ type Archive struct {
 	DriveDir string `yaml:"drive_dir"`
 	// ArchiveHost is an ssh destination reachable from this machine; empty or
 	// "local" means the Drive folder is on this machine.
-	ArchiveHost       string   `yaml:"archive_host"`
-	TextMaxBytes      int64    `yaml:"text_max_bytes"`
-	DriveMaxFileBytes int64    `yaml:"drive_max_file_bytes"`
-	MinAge            string   `yaml:"min_age"`
-	MaxJobsPerRun     int      `yaml:"max_jobs_per_run"`
-	MaxRun            string   `yaml:"max_run"`
-	Exclude           []string `yaml:"exclude"`
+	ArchiveHost       string        `yaml:"archive_host"`
+	TextMaxBytes      int64         `yaml:"text_max_bytes"`
+	DriveMaxFileBytes int64         `yaml:"drive_max_file_bytes"`
+	MinAge            string        `yaml:"min_age"`
+	MaxJobsPerRun     int           `yaml:"max_jobs_per_run"`
+	MaxRun            string        `yaml:"max_run"`
+	Exclude           []string      `yaml:"exclude"`
+	Drop              []ArchiveDrop `yaml:"drop"`
+	MaxDropsPerRun    int           `yaml:"max_drops_per_run"`
+}
+
+type ArchiveDrop struct {
+	Host string `yaml:"host"`
+	Glob string `yaml:"glob"`
 }
 
 var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
@@ -1682,6 +1689,17 @@ func validateArchive(a *Archive) error {
 	for _, pattern := range a.Exclude {
 		if _, err := path.Match(pattern, ""); err != nil {
 			return fmt.Errorf("reap.archive.exclude: invalid glob %q: %w", pattern, err)
+		}
+	}
+	if a.MaxDropsPerRun < 0 {
+		return errors.New("reap.archive.max_drops_per_run must be non-negative")
+	}
+	for _, rule := range a.Drop {
+		if rule.Host == "" || rule.Glob == "" {
+			return errors.New("reap.archive.drop entries require host and glob")
+		}
+		if _, err := path.Match(rule.Glob, ""); err != nil {
+			return fmt.Errorf("reap.archive.drop: invalid glob %q: %w", rule.Glob, err)
 		}
 	}
 	if a.DriveMaxFileBytes < 0 {

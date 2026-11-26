@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -22,6 +23,13 @@ import (
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
 	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
+}
+
+func (s *Service) refreshArchivePane(ctx context.Context, hs *reapHost, root, job string) error {
+	if err := refreshPaneLists(ctx, hs); err != nil {
+		return fmt.Errorf("refresh pane read: %w", err)
+	}
+	return nil
 }
 
 // archiveRetry spaces retries of a job whose archive failed, so a persistent
@@ -319,6 +327,8 @@ type archiveRow struct {
 	Job     string          `json:"job"`
 	Result  string          `json:"result"` // archived, archived-retained, would-archive, skipped, error
 	Reason  string          `json:"reason,omitempty"`
+	Files   int             `json:"files,omitempty"`
+	Bytes   int64           `json:"bytes,omitempty"`
 	Archive *archive.Result `json:"archive,omitempty"`
 }
 
@@ -401,6 +411,11 @@ func (s *Service) ArchiveJobs(ctx context.Context, host string, olderThan time.D
 	stoppedOnBudget := false
 	unscannedReasons := map[string]string{}
 	maxJobs := s.Config.Reap.Archive.MaxJobsPerRun
+	maxDrops := s.Config.Reap.Archive.MaxDropsPerRun
+	if maxDrops == 0 {
+		maxDrops = 2000
+	}
+	droppedThisRun := 0
 hosts:
 	for _, h := range order {
 		// The gate comes before the first remote command for this host.
@@ -422,7 +437,7 @@ hosts:
 			continue
 		}
 		timed := &archiveTimedRunner{base: s.Runner, spent: make(map[string]time.Duration)}
-		hs := &reapHost{host: h, exec: reap.Exec{Runner: timed, Host: h}}
+		hs := &reapHost{host: h, exec: reap.Exec{Runner: timed, Host: h}, ops: reap.Exec{Runner: timed, Host: h}, trees: map[string]*reap.Worktree{}}
 		var e error
 		timed.phase = "pane_scan"
 		if hs.panes, e = hs.exec.Panes(runCtx); e == nil {
@@ -539,6 +554,26 @@ hosts:
 				row.Result, row.Reason = "skipped", reason
 			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
+			} else if dropConfigured(s.Config.Reap.Archive.Drop, h.Name, job) && droppedThisRun < maxDrops {
+				count, size, safeFiles, dropErr := a.DropInfo(runCtx, h, filepath.Join(root, job))
+				if dropErr != nil {
+					row.Result, row.Reason = archive.Reason(dropErr)
+				} else if !acting {
+					row.Result, row.Files, row.Bytes = "would-drop", count, size
+				} else if refreshErr := s.refreshArchivePane(ctx, hs, root, job); refreshErr != nil {
+					row.Result, row.Reason = "error", refreshErr.Error()
+				} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
+					row.Result, row.Reason = "skipped", "pane-live"
+				} else if dropErr = a.Drop(ctx, h, filepath.Join(root, job), safeFiles); dropErr != nil {
+					row.Result, row.Reason = archive.Reason(dropErr)
+				} else {
+					row.Result, row.Files, row.Bytes = "dropped", count, size
+				}
+				if row.Result == "dropped" || row.Result == "would-drop" {
+					droppedThisRun++
+				}
+			} else if dropConfigured(s.Config.Reap.Archive.Drop, h.Name, job) {
+				eligibleLeft++
 			} else {
 				timed.phase = "job_reads"
 				files, reason, newest, refreshErr := a.RefreshJob(runCtx, h, job, filepath.Join(root, job))
@@ -566,6 +601,9 @@ hosts:
 					row.Result, row.Reason = "skipped", reason
 				} else if now.Sub(time.Unix(newest, 0)) < olderThan {
 					row.Result, row.Reason = "skipped", "too-new"
+				} else if dropConfigured(s.Config.Reap.Archive.Drop, h.Name, job) {
+					eligibleLeft++
+					continue
 				} else if maxJobs > 0 && archivedThisRun >= maxJobs {
 					eligibleLeft++
 					continue
@@ -707,6 +745,17 @@ hosts:
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func dropConfigured(rules []config.ArchiveDrop, host, job string) bool {
+	for _, rule := range rules {
+		if rule.Host == host {
+			if ok, _ := path.Match(rule.Glob, job); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func compactStrings(in []string) []string {

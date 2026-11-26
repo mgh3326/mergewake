@@ -718,6 +718,67 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 	return files, reason, newest, nil
 }
 
+// DropInfo returns file totals only for a job tree containing regular files
+// and directories, with no git metadata. Drop rechecks the listing at delete.
+func (a *Archiver) DropInfo(ctx context.Context, h reap.Host, dir string) (int, int64, []File, error) {
+	git, err := a.on(ctx, h.SSH, "", "sh", "-c", `find "$1" -name .git -print -quit`, "sh", dir)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	if len(bytes.TrimSpace(git)) != 0 {
+		return 0, 0, nil, &Skip{"drop-git-checkout"}
+	}
+	files, err := a.refreshList(ctx, h, dir)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	hasEvents, err := a.exists(ctx, h.SSH, path.Join(dir, "events"))
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	if hasEvents && !finished(files) {
+		return 0, 0, nil, &Skip{"not-finished"}
+	}
+	var bytes int64
+	for _, f := range files {
+		if f.kind != 'f' || hasGitSegment(f.Path) {
+			return 0, 0, nil, &Skip{"drop-unsafe-tree"}
+		}
+		bytes += f.Size
+	}
+	return len(files), bytes, files, nil
+}
+
+func hasGitSegment(p string) bool {
+	for _, part := range strings.Split(p, "/") {
+		if part == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
+// Drop deletes a previously classified tree only if the listing is unchanged.
+func (a *Archiver) Drop(ctx context.Context, h reap.Host, dir string, files []File) error {
+	again, err := a.refreshList(ctx, h, dir)
+	if err != nil {
+		return err
+	}
+	if len(again) != len(files) {
+		return &Skip{"job-changed"}
+	}
+	for i := range files {
+		if again[i].Path != files[i].Path || again[i].Size != files[i].Size || again[i].mtime != files[i].mtime || again[i].kind != files[i].kind {
+			return &Skip{"job-changed"}
+		}
+	}
+	if !path.IsAbs(dir) {
+		return errors.New("drop path is not absolute")
+	}
+	_, err = a.on(ctx, h.SSH, "", "sh", "-c", `rm -rf "$1"`, "sh", dir)
+	return err
+}
+
 // PlanListed performs the expensive planning from refreshed listing metadata at an already-resolved job
 // path, avoiding another remote tilde expansion for eligible jobs.
 func (a *Archiver) PlanListed(ctx context.Context, h reap.Host, job, dir string, files []File) (*Plan, error) {

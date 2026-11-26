@@ -496,6 +496,8 @@ A single PR's fetch failure never aborts the pass.
 | `min_age` | `24h` | How long after reap first sights an ended job whose pane is gone its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 | `max_jobs_per_run` | `0` | Maximum jobs selected for archive or resume by one `archive-jobs` run; `0` means no limit. Dry-run and shadow use the same cap and selection as apply. Oldest jobs are taken first and the summary reports eligible jobs left. |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
+| `drop` | `[]` | Host and job-name glob pairs eligible for deletion without Drive or hk upload, after age, pane, events, regular-file, and no-checkout checks. |
+| `max_drops_per_run` | `2000` | Maximum matching job dirs dropped in one archive-jobs run. |
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
 unit. Directories containing a `.git` file or directory are named as
