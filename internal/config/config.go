@@ -809,6 +809,7 @@ type Archive struct {
 	MinAge            string        `yaml:"min_age"`
 	MaxJobsPerRun     int           `yaml:"max_jobs_per_run"`
 	MaxRun            string        `yaml:"max_run"`
+	DriveReadTimeout  string        `yaml:"drive_read_timeout"`
 	Exclude           []string      `yaml:"exclude"`
 	Drop              []ArchiveDrop `yaml:"drop"`
 	MaxDropsPerRun    int           `yaml:"max_drops_per_run"`
@@ -1688,6 +1689,11 @@ func validateArchive(a *Archive) error {
 	if a.MaxRun != "" {
 		if _, err := OptionalDuration(a.MaxRun); err != nil {
 			return fmt.Errorf("reap.archive.max_run: %w", err)
+		}
+	}
+	if a.DriveReadTimeout != "" {
+		if d, err := OptionalDuration(a.DriveReadTimeout); err != nil || d == 0 {
+			return fmt.Errorf("reap.archive.drive_read_timeout: must be a positive duration")
 		}
 	}
 	if a.Exclude == nil {

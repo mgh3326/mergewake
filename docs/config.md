@@ -669,6 +669,12 @@ needs no GitHub token.
 When `max_jobs_per_run` is positive, the oldest eligible jobs are processed up
 to that limit and the summary reports `eligible_left` for a later run.
 
+Each planner read of a Drive file (the `manifest.json` existence probe and its
+`cat`) also has its own bound, `reap.archive.drive_read_timeout` (a positive
+duration; default `1m`). A read that exceeds it skips only that job, with reason
+`drive-read-timeout`; the job is retried on the next run and the run continues
+with the next job and host. Such a skip does not set `stopped_on_budget`.
+
 A run's `reap.archive.max_run` deadline bounds pane scans, SSH listings, job reads,
 and Handoffkeep event reads, and is checked before an archive apply starts. An
 apply already in progress finishes its publish/delete boundary before the run

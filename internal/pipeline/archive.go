@@ -22,7 +22,8 @@ import (
 
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
-	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, CachePaths: a.CachePaths, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
+	driveRead, _ := config.OptionalDuration(a.DriveReadTimeout)
+	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, CachePaths: a.CachePaths, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes, DriveReadTimeout: driveRead}
 }
 
 func (s *Service) refreshArchivePane(ctx context.Context, hs *reapHost, root, job string) error {
@@ -41,14 +42,14 @@ type jobRef struct{ host, job string }
 
 // archiveTerminal reports whether a job's newest archive row ends its work.
 // Only a live or unscannable pane, an active, unfinished or unknown job, a
-// fresh sighting (awaiting-min-age) or a job-gone race is worth retrying;
-// every other skip waits for a person.
+// fresh sighting (awaiting-min-age), a job-gone race or a stalled Drive read
+// (drive-read-timeout) is worth retrying; every other skip waits for a person.
 func archiveTerminal(v reapReceipt) bool {
 	switch v.Result {
 	case "archived":
 		return true
 	case "skipped":
-		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed" && v.Reason != "awaiting-min-age" && v.Reason != "job-active" && v.Reason != "not-finished" && v.Reason != "job-gone" && v.Reason != "job-unknown"
+		return v.Reason != "pane-live" && v.Reason != "pane-scan-failed" && v.Reason != "awaiting-min-age" && v.Reason != "job-active" && v.Reason != "not-finished" && v.Reason != "job-gone" && v.Reason != "job-unknown" && v.Reason != "drive-read-timeout"
 	}
 	return false
 }
@@ -243,7 +244,7 @@ func (s *Service) reapArchive(ctx context.Context, r config.Repo, prNum int, rec
 			if tried && archiveTerminal(prior) {
 				continue
 			}
-			if tried && (prior.Result == "error" || prior.Result == "archived-retained") && now.Sub(prior.Time) < archiveRetry {
+			if tried && (prior.Result == "error" || prior.Result == "archived-retained" || prior.Reason == "drive-read-timeout") && now.Sub(prior.Time) < archiveRetry {
 				continue
 			}
 			if tried && prior.Result == "would-archive" && !acting {
