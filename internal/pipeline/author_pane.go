@@ -471,9 +471,11 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 // on the configured hosts. finished is true only when every host was read and
 // none shows a pane named for the job, its label, or its recorded pane id —
 // the pane id counting only on the host the record names, since a pane id is
-// local to its host. unknown is set for a terminal job whose hosts were not
-// all read, or with no hosts configured: liveness is then unknown and the
-// bound lane stands. A job that is not terminal is never finished.
+// local to its host. A host that failed after its pane list was read still
+// answers for the names it holds. unknown is set for a terminal job whose
+// hosts' pane lists were not all read, or with no hosts configured: liveness
+// is then unknown and the bound lane stands. A job that is not terminal is
+// never finished.
 func (s *Service) authorFinished(ctx context.Context, job string, rec integrations.JobRecord) (finished, unknown bool, err error) {
 	if !terminalJob(rec.State) {
 		return false, false, nil
@@ -497,7 +499,7 @@ func (s *Service) authorFinished(ctx context.Context, job string, rec integratio
 		}
 	}
 	for _, hs := range hosts {
-		if hs.failed {
+		if hs.failed && !hs.panesRead {
 			return false, true, nil
 		}
 		paneID := rec.PaneID != "" && (!placed || authorHostNamed(rec.Host, hs.host))
@@ -538,7 +540,10 @@ func (s *Service) takeoverPanes(ctx context.Context, r config.Repo, pr github.Pu
 	hosts, err := s.authorHosts(ctx)
 	var names []string
 	for _, hs := range hosts {
-		if hs.failed {
+		// A host whose pane list was never read has no names to judge. One
+		// that failed after its list was read still judges the panes whose
+		// cwd was inspected: the others have no tree and are skipped below.
+		if hs.failed && !hs.panesRead {
 			continue
 		}
 		for _, p := range hs.panes {

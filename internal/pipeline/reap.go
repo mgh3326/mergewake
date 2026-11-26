@@ -138,6 +138,9 @@ type reapHost struct {
 	trees        map[string]*reap.Worktree
 	failed       bool
 	usageUnknown bool
+	// panesRead is set once the agent pane list was read in full, even when a
+	// later inspect failed the host: the list still answers liveness.
+	panesRead bool
 	// rootPath and rootErr memoize the resolved work root for this sweep.
 	rootPath     string
 	rootErr      error
@@ -385,7 +388,7 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 		hs.failed = true
 		return hs, append(errs, hostScanFailure(ctx, h.Name, "host panes", e))
 	}
-	hs.panes = panes
+	hs.panes, hs.panesRead = panes, true
 	// The full pane list also covers non-agent shells and jobs: without it
 	// the usage check is unknown and removals must skip.
 	all, e := hs.ops.AllPanes(ctx)
