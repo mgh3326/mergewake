@@ -17,8 +17,10 @@ import (
 const orphanWorktreeAction = "orphan-worktree"
 
 type orphanWorktreeCursor struct {
-	Host string `json:"host"`
-	Path string `json:"path"`
+	Hosts map[string]string `json:"hosts,omitempty"`
+	// Host and Path read cursors written by the first version.
+	Host string `json:"host,omitempty"`
+	Path string `json:"path,omitempty"`
 }
 type orphanWorktreeVisit struct {
 	host  string
@@ -54,7 +56,7 @@ func resumeOrphanWorktreeVisits(visits []orphanWorktreeVisit, from orphanWorktre
 // configured work root. Unknown evidence is always a kept row. The default
 // configuration is shadow-only; acting additionally requires reap.act and
 // the CLI's acting mode.
-func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, acting bool, note func(reapReceipt)) []error {
+func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts []*reapHost, acting, durable bool, note func(reapReceipt)) []error {
 	if !s.Config.Reap.OrphanWorktrees.Enabled {
 		return nil
 	}
@@ -144,11 +146,9 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			}
 			// The canonical clone and arbitrary directories never qualify: require
 			// the worktree marker and a registration in this clone's worktree list.
-			if !hs.viaHub {
-				if _, e := hs.exec.Run(ctx, "test", "-f", filepath.Join(path, ".git")); e != nil {
-					continue
-				}
-			}
+			// WorktreeEntries is the registration proof. Inspect validates identity
+			// before any removal; a separate test -f per entry made discovery
+			// unbounded and could consume the entire stage budget.
 			if owned[path] {
 				continue // reviewer receipts own this path
 			}
@@ -159,10 +159,24 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			visits = append(visits, orphanWorktreeVisit{hs.host.Name, hs, entry})
 		}
 	}
-	visits = resumeOrphanWorktreeVisits(visits, from)
+	// Resume independently per host so a small host cannot move another host's
+	// cursor past candidates hidden by its per-host limit.
+	byHost := map[string][]orphanWorktreeVisit{}
+	for _, v := range visits {
+		byHost[v.host] = append(byHost[v.host], v)
+	}
+	visits = visits[:0]
+	for _, hs := range orderedHosts {
+		rows := byHost[hs.host.Name]
+		cursor := orphanWorktreeCursor{Host: hs.host.Name, Path: from.Hosts[hs.host.Name]}
+		if from.Hosts == nil && from.Host == hs.host.Name {
+			cursor.Path = from.Path
+		}
+		visits = append(visits, resumeOrphanWorktreeVisits(rows, cursor)...)
+	}
 	visited := map[string]int{}
-	lastVisited := orphanWorktreeCursor{}
-	for i, visit := range visits {
+	lastVisited := map[string]string{}
+	for _, visit := range visits {
 		hs, entry := visit.hs, visit.entry
 		main := filepath.Join(hs.host.WorkRoot, repoSegment(r.Name))
 		if visited[visit.host] >= limit {
@@ -171,19 +185,15 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 		if err := reapBudgetCheck(ctx, "orphan worktrees"); err != nil {
 			errs = append(errs, err)
 			budgetStopped = true
-			if i < len(visits) {
-				errs = append(errs, s.saveOrphanWorktreeCursor(r.Name, orphanWorktreeCursor{visit.host, entry.Path}))
-			}
 			break
 		}
 		if err := budgetCut(ctx, ctx.Err(), "orphan worktree candidate"); err != nil {
 			errs = append(errs, err)
 			budgetStopped = true
-			errs = append(errs, s.saveOrphanWorktreeCursor(r.Name, orphanWorktreeCursor{visit.host, entry.Path}))
 			break
 		}
 		visited[visit.host]++
-		lastVisited = orphanWorktreeCursor{visit.host, entry.Path}
+		lastVisited[visit.host] = entry.Path
 		kind := orphanWorktreeKind(entry)
 		rec := reapReceipt{Action: orphanWorktreeAction, Repo: r.Name, Host: hs.host.Name, Worktree: entry.Path, Branch: entry.Branch, Kind: kind}
 		keep := func(reason string) {
@@ -196,7 +206,7 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			continue
 		}
 		if strings.HasPrefix(entry.Branch, workerBranchPrefix) {
-			keep("worker-owned-no-pr")
+			keep("worker-owned")
 			continue
 		}
 		if hs.viaHub {
@@ -284,18 +294,24 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			rec.Result, rec.Reason = "error", e.Error()
 			note(rec)
 			counts[hs.host.Name+"\x00"+kind]++
-			errs = append(errs, fmt.Errorf("%s orphan worktree %s removal: %w", hs.host.Name, entry.Path, e))
 			continue
 		}
 		rec.Result = "removed"
 		note(rec)
 		counts[hs.host.Name+"\x00"+kind]++
 	}
-	if lastVisited.Path != "" {
-		if e := s.saveOrphanWorktreeCursor(r.Name, lastVisited); e != nil {
+	if durable && len(lastVisited) != 0 {
+		if from.Hosts == nil {
+			from.Hosts = map[string]string{}
+		}
+		for host, path := range lastVisited {
+			from.Hosts[host] = path
+		}
+		from.Host, from.Path = "", ""
+		if e := s.saveOrphanWorktreeCursor(r.Name, from); e != nil {
 			errs = append(errs, e)
 		}
-	} else if !budgetStopped {
+	} else if durable && !budgetStopped {
 		if e := s.saveOrphanWorktreeCursor(r.Name, orphanWorktreeCursor{}); e != nil {
 			errs = append(errs, e)
 		}
@@ -326,7 +342,7 @@ func orphanWorktreeKind(entry reap.Entry) string {
 		return "exp"
 	}
 	if strings.HasPrefix(branch, workerBranchPrefix) {
-		return "wk-no-pr"
+		return "worker-owned"
 	}
 	if branch != "" {
 		return "branch"

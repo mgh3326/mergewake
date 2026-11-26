@@ -22,6 +22,18 @@ type orphanTestOps struct {
 	panes []reap.Pane
 }
 
+type orphanDiscoveryRunner struct {
+	integrations.Exec
+	testFileChecks int
+}
+
+func (r *orphanDiscoveryRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "test" && len(args) > 0 && args[0] == "-f" {
+		r.testFileChecks++
+	}
+	return r.Exec.Run(ctx, command, args, input, dir)
+}
+
 func (o orphanTestOps) Panes(context.Context) ([]reap.Pane, error)    { return o.panes, nil }
 func (o orphanTestOps) AllPanes(context.Context) ([]reap.Pane, error) { return o.panes, nil }
 
@@ -109,10 +121,13 @@ func runOrphanFixture(f orphanFixture, act bool) ([]reapReceipt, string, []error
 	var errs []error
 	var output bytes.Buffer
 	f.s.Out = &output
-	errs = append(errs, f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, act, func(r reapReceipt) {
+	errs = append(errs, f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, act, true, func(r reapReceipt) {
 		rows = append(rows, r)
 		if err := f.s.reapNote(r, false); err != nil {
 			errs = append(errs, err)
+		}
+		if r.Result == "error" {
+			errs = append(errs, fmt.Errorf("%s %s %s: %s", r.Host, r.Action, r.Worktree, r.Reason))
 		}
 	})...)
 	return rows, output.String(), errs
@@ -167,7 +182,7 @@ func TestOrphanWorktreeKeepsWhenAnySafetyConditionFails(t *testing.T) {
 func TestOrphanWorktreeDisabledDoesNoListing(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
 	f.s.Config.Reap.OrphanWorktrees.Enabled = false
-	if err := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, true, func(reapReceipt) {}); len(err) != 0 {
+	if err := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, true, true, func(reapReceipt) {}); len(err) != 0 {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(f.s.Config.StateDir, testRepo.Name, "orphan-worktree-cursor.json")); !os.IsNotExist(err) {
@@ -208,8 +223,77 @@ func TestOrphanWorktreeCursorWraps(t *testing.T) {
 	}
 }
 
+func TestOrphanWorktreePerHostCursorDoesNotStarveCandidate(t *testing.T) {
+	// A2 must follow A1 on the next pass even though host B also has work.
+	a := newOrphanFixture(t, "", false)
+	b := newOrphanFixture(t, "", false)
+	a.hs.host.Name, b.hs.host.Name = "a", "b"
+	a.hs.host.WorkRoot, b.hs.host.WorkRoot = a.root, b.root
+	a.s.Config.Hosts = []reap.Host{a.hs.host, b.hs.host}
+	a.s.Config.Reap.OrphanWorktrees.PerHost = 1
+	second := filepath.Join(a.root, "candidate-2")
+	gitRunAt(t, a.main, "worktree", "add", "--detach", second, "origin/main")
+	var seen []string
+	for pass := 0; pass < 2; pass++ {
+		if errs := a.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{a.hs, b.hs}, false, true, func(r reapReceipt) { seen = append(seen, filepath.Base(r.Worktree)) }); len(errs) != 0 {
+			t.Fatal(errs)
+		}
+	}
+	if len(seen) < 3 || seen[0] != "candidate" || seen[1] != "candidate" || seen[2] != "candidate-2" {
+		t.Fatalf("visited candidates across passes = %v; want A1 then A2 inspected on pass two", seen)
+	}
+}
+
+func TestOrphanWorktreeDiscoveryDoesNotSpendBudgetOnMarkerChecks(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	runner := &orphanDiscoveryRunner{}
+	f.hs.exec.Runner = runner
+	var rows []reapReceipt
+	if errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, true, func(r reapReceipt) { rows = append(rows, r) }); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if runner.testFileChecks != 0 || len(rows) != 1 {
+		t.Fatalf("discovery test -f checks=%d inspected rows=%d", runner.testFileChecks, len(rows))
+	}
+}
+
+func TestOrphanWorktreeDryRunDoesNotWriteCursor(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, false, func(reapReceipt) {})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if _, err := os.Stat(f.s.orphanWorktreeCursorPath(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatalf("dry run wrote cursor: %v", err)
+	}
+}
+
+func TestReapOrphanWorktreeDryRunDoesNotWriteCursor(t *testing.T) {
+	runner := &scriptRunner{outs: worktreeOuts("/repo")}
+	s := svc(t, &reapGH{}, runner)
+	s.Config.Reap.OrphanWorktrees.Enabled = true
+	if err := s.Reap(context.Background(), testRepo, 0, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.orphanWorktreeCursorPath(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run reap wrote cursor: %v", err)
+	}
+}
+
+func TestOrphanWorktreeBudgetBeforeVisitDoesNotAdvanceCursor(t *testing.T) {
+	f := newOrphanFixture(t, "", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if errs := f.s.reapOrphanWorktrees(ctx, testRepo, []*reapHost{f.hs}, false, true, func(reapReceipt) {}); len(errs) == 0 {
+		t.Fatal("expected budget stop")
+	}
+	if _, err := os.Stat(f.s.orphanWorktreeCursorPath(testRepo.Name)); !os.IsNotExist(err) {
+		t.Fatalf("unvisited candidate advanced cursor: %v", err)
+	}
+}
+
 func TestOrphanWorktreeKindIncludesWorkerWithoutPR(t *testing.T) {
-	if got := orphanWorktreeKind(reap.Entry{Path: "/work/wk/job", Branch: "wk/job"}); got != "wk-no-pr" {
+	if got := orphanWorktreeKind(reap.Entry{Path: "/work/wk/job", Branch: "wk/job"}); got != "worker-owned" {
 		t.Fatalf("kind=%q", got)
 	}
 }
@@ -298,7 +382,7 @@ func TestOrphanWorktreeSkipsWorkerAndReviewerOwned(t *testing.T) {
 	f := newOrphanFixture(t, "wk/job-1", false)
 	f.age(t, 30*24*time.Hour)
 	rows, _, errs := runOrphanFixture(f, false)
-	if len(errs) != 0 || len(rows) != 1 || rows[0].Kind != "wk-no-pr" || rows[0].Result != "kept" {
+	if len(errs) != 0 || len(rows) != 1 || rows[0].Kind != "worker-owned" || rows[0].Result != "kept" {
 		t.Fatalf("worker-owned: rows=%#v errors=%v", rows, errs)
 	}
 
@@ -343,7 +427,7 @@ func TestOrphanWorktreesMissingCloneIsAbsence(t *testing.T) {
 	s := &Service{Config: cfg, Runner: integrations.Exec{}, Out: &bytes.Buffer{}}
 	hs := &reapHost{host: host, ops: orphanTestOps{Exec: ex}, exec: ex, trees: map[string]*reap.Worktree{}}
 	var rows []reapReceipt
-	errs := s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{hs}, false, func(r reapReceipt) { rows = append(rows, r) })
+	errs := s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{hs}, false, true, func(r reapReceipt) { rows = append(rows, r) })
 	if len(errs) != 0 || len(rows) != 0 {
 		t.Fatalf("missing clone: rows=%#v errors=%v", rows, errs)
 	}

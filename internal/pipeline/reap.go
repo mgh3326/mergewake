@@ -1418,7 +1418,7 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 			return errors.Join(append(errs, e)...)
 		}
 		orphanCtx, cancelOrphan := reapStageShare(ctx, 1, 4)
-		errs = append(errs, s.reapOrphanWorktrees(orphanCtx, r, hosts, acting && s.Config.Reap.OrphanWorktrees.Act, note)...)
+		errs = append(errs, s.reapOrphanWorktrees(orphanCtx, r, hosts, acting && s.Config.Reap.OrphanWorktrees.Act, !o.DryRun, note)...)
 		cancelOrphan()
 	}
 	if e := reapBudgetCheck(ctx, "final receipt and pass audit"); e != nil {
