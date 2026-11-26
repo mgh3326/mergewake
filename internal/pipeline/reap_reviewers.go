@@ -167,6 +167,12 @@ const (
 	// reviewerDrainHold is the pending reason of a removal held back by
 	// reap.reviewer_drain.per_host: the next pass takes it.
 	reviewerDrainHold = "drain cap reached for this host; the next pass continues"
+	// reviewerLegacyProbeHold bounds the extra refresh and inspect used to
+	// check the pre-suffix worktree layout for an already-gone label.
+	reviewerLegacyProbeHold = "legacy path probe cap reached for this host; the next pass continues"
+	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
+	// of guarded removals. The old-path backlog must not monopolize a pass.
+	reviewerLegacyProbesPerHost = 5
 	// reviewerBudgetHold is the pending reason of a reviewer step the repo
 	// budget cut: the checkout is kept for a later sweep, and the cut is not an
 	// error row.
@@ -272,8 +278,9 @@ type reviewerSweep struct {
 	pendingAudit bool
 	// drain is the guarded removals one host still takes this pass, and host
 	// the names in host_order.
-	drain    map[string]int
-	hostRank map[string]int
+	drain        map[string]int
+	legacyProbes map[string]int
+	hostRank     map[string]int
 	// paneHost maps a PR and pane id to the host a receipt recorded for it,
 	// the fallback when a leaked label's audit row names no host. A key two
 	// hosts claim is not used: the pane id alone would be a guess.
@@ -377,13 +384,23 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 		}
 		cands = w.resume(cands, from)
 	}
+	visitCtx, cancelVisit := ctx, func() {}
+	for _, c := range cands {
+		if w.oldPathRetry(c.label.name, c.host) {
+			// Keep time for later reap stages when replaying the historical
+			// already-gone labels. The cursor resumes the remaining candidates.
+			visitCtx, cancelVisit = reapStageShare(ctx, 2, 3)
+			break
+		}
+	}
+	defer cancelVisit()
 	auditVisits := 0
 	for i, c := range cands {
-		if e := reapBudgetCheck(ctx, "reviewer labels and checkout cleanup"); e != nil {
+		if e := reapBudgetCheck(visitCtx, "reviewer labels and checkout cleanup"); e != nil {
 			w.stopAt(cands[i])
 			return append(w.errs, e)
 		}
-		if e := ctx.Err(); e != nil {
+		if e := visitCtx.Err(); e != nil {
 			w.stopAt(cands[i])
 			return append(w.errs, e)
 		}
@@ -401,7 +418,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 				continue
 			}
 		}
-		w.visit(ctx, c)
+		w.visit(visitCtx, c)
 		// An audit-only label with no row of its own is read again next pass:
 		// nothing else would name it.
 		if w.auditOnly[c.label.name] {
@@ -576,6 +593,18 @@ func (w *reviewerSweep) takeDrain(host string) bool {
 		return false
 	}
 	w.drain[host] = n - 1
+	return true
+}
+
+// takeLegacyProbe spends one host's bounded legacy-path probe for this pass.
+func (w *reviewerSweep) takeLegacyProbe(host string) bool {
+	if w.legacyProbes == nil {
+		w.legacyProbes = map[string]int{}
+	}
+	if w.legacyProbes[host] >= reviewerLegacyProbesPerHost {
+		return false
+	}
+	w.legacyProbes[host]++
 	return true
 }
 
@@ -1660,6 +1689,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	// the source of this cleanup is visible and terminal rows stop repeating.
 	if e == nil && tree == nil && filepath.Base(filepath.Clean(cwd)) == l.name+reviewerCheckoutSuffix {
 		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" {
+			if w.oldPathRetry(l.name, hs.host.Name) && !w.takeLegacyProbe(hs.host.Name) {
+				// Keep the hold separate from the reviewer-reap stream so the
+				// original already-gone row continues to make this label a candidate.
+				rec.Action = "reviewer-cleanup"
+				w.record(rec, "pending-cleanup", reviewerLegacyProbeHold)
+				return remoteStop
+			}
 			cwd = legacy
 			rec.Cwd, rec.Worktree = cwd, cwd
 			prior = w.streams[l.name][reviewerStream(rec)]
