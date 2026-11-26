@@ -292,6 +292,24 @@ func hubLacksSparseCheckout(err error) bool {
 		strings.Contains(detail, "flag provided but not defined:")
 }
 
+// ownerNotifyRefused reports a definite pre-submission refusal of the optional
+// owner notification flag. Panewire checks hub feature support before it sends
+// the spawn, so retrying without this flag cannot create a duplicate job.
+func ownerNotifyRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch exitStatus(err) {
+	case panewireUsage, panewireConfigRefused:
+	default:
+		return false
+	}
+	detail := integrations.Detail(err)
+	return strings.Contains(detail, "does not support --owner-notify") ||
+		strings.Contains(detail, "unable to verify hub support for --owner-notify") ||
+		strings.Contains(detail, "flag provided but not defined: --owner-notify")
+}
+
 // sparseFallbackArgs rewrites a spawn argv that names sparse flags into the
 // full-spec form: the three --checkout-* flags stay, the sparse flags go.
 // ok is false when the argv names no sparse flag, so the caller keeps its
