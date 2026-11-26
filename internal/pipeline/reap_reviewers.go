@@ -170,6 +170,8 @@ const (
 	// reviewerLegacyProbeHold bounds the extra refresh and inspect used to
 	// check the pre-suffix worktree layout for an already-gone label.
 	reviewerLegacyProbeHold = "legacy path probe cap reached for this host; the next pass continues"
+	reviewerHostProbeHold   = "host checkout probe cap reached at %s; the next pass continues"
+	reviewerHostDiscovered  = "host discovery resolved; cleanup is tracked on the host stream"
 	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
 	// of guarded removals. The old-path backlog must not monopolize a pass.
 	reviewerLegacyProbesPerHost = 5
@@ -193,7 +195,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "closed", "removed":
 		return true
 	case "skipped":
-		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo)
+		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo) || v.Reason == reviewerHostDiscovered
 	case "kept":
 		return v.Worktree != "" && (v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
@@ -1632,16 +1634,95 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 		w.record(rec, "kept", "job-host-unconfigured")
 	} else {
 		// No record, receipt or audit row names a host, so no remote path can
-		// be built: the label holds no worktree this sweep can find.
-		rec := w.row(l)
-		rec.Host, rec.Worktree = c.host, l.name
-		if w.acting {
-			w.record(rec, "kept", reviewerHostUnknown)
+		// be built. Search the configured work roots before settling it.
+		if hs, uncertain, capped := w.findUnrecordedCheckout(ctx, l); hs != nil {
+			w.settleHostlessStream(l)
+			if w.removeRemote(ctx, hs, l, "") == remoteStop {
+				return
+			}
+		} else if uncertain {
+			rec := w.row(l)
+			rec.Worktree = l.name
+			if capped != "" {
+				w.record(rec, "pending-cleanup", fmt.Sprintf(reviewerHostProbeHold, capped))
+			} else {
+				w.record(rec, "pending-cleanup", "host checkout probe unavailable")
+			}
 		} else {
-			w.record(rec, "pending-cleanup", "remote host unavailable")
+			rec := w.row(l)
+			rec.Host, rec.Worktree = c.host, l.name
+			if w.acting {
+				w.record(rec, "kept", reviewerHostUnknown)
+			} else {
+				w.record(rec, "pending-cleanup", "remote host unavailable")
+			}
 		}
 	}
 	w.removeLocal(ctx, l)
+}
+
+// settleHostlessStream closes a prior discovery placeholder once a unique
+// host is known. The concrete host stream then owns the remaining cleanup.
+func (w *reviewerSweep) settleHostlessStream(l reviewerLabel) {
+	rec := w.row(l)
+	rec.Worktree = l.name
+	key := reviewerStream(rec)
+	prior, ok := w.streams[l.name][key]
+	if !ok || reviewerTerminal(prior) {
+		return
+	}
+	w.record(rec, "skipped", reviewerHostDiscovered)
+}
+
+// findUnrecordedCheckout probes the spec checkout path on hosts without a
+// work root or failed scan left the result uncertain. The shared probe budget
+// never spends a guarded-removal slot; dry runs do no remote inspection.
+func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel) (*reapHost, bool, string) {
+	if !w.acting {
+		return nil, false, ""
+	}
+	var found *reapHost
+	uncertain := false
+	capped := ""
+	for _, hs := range w.hosts {
+		if hs.host.Local() {
+			continue
+		}
+		path := reviewerWorktreePath(hs, l)
+		if path == "" {
+			uncertain = true
+			continue
+		}
+		if hs.failed {
+			uncertain = true
+			continue
+		}
+		if !w.takeLegacyProbe(hs.host.Name) {
+			uncertain = true
+			if capped == "" {
+				capped = hs.host.Name
+			}
+			continue
+		}
+		tree, err := hs.ops.Inspect(ctx, path)
+		if err != nil {
+			if isHostUnreachable(err) {
+				hs.failed = true
+			}
+			uncertain = true
+			continue
+		}
+		if tree != nil {
+			if found != nil {
+				return nil, false, ""
+			}
+			found = hs
+		}
+	}
+	if found != nil && !uncertain {
+		return found, false, ""
+	}
+	return nil, uncertain, capped
 }
 
 // remoteStep is how the remote worktree step ended, as the local step needs it.
